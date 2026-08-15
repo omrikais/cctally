@@ -1,0 +1,5 @@
+Codex quota history · local-rollout
+primary · 168h · root=root-attributed · limit=limit-weekly
+  2026-07-15T09:00:00Z  11.0%  reset 2026-07-15T15:00:00Z  path ed9c90a81ad9d6b046bfa3cd6828facc
+  2026-07-15T10:00:00Z  18.5%  reset 2026-07-15T15:00:00Z  path ed9c90a81ad9d6b046bfa3cd6828facc
+  2026-07-15T11:00:00Z  24.0%  reset 2026-07-15T15:00:00Z  path ed9c90a81ad9d6b046bfa3cd6828facc

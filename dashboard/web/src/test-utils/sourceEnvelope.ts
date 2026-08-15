@@ -17,6 +17,7 @@ import type {
   AllCombinedLeg,
   AllCombinedPeriod,
   AllSourceData,
+  ClaudeBudgetDomain,
   ClaudeSourceData,
   CodexAccountScope,
   CodexCycle,
@@ -24,6 +25,7 @@ import type {
   CodexSourceData,
   CombinedUnavailable,
   CurrentWeekEnvelope,
+  ProviderBudgetStatus,
   SourceEntry,
   SourcesMap,
 } from '../types/envelope';
@@ -339,6 +341,15 @@ export const ACCOUNT_A = 'a'.repeat(32);
 export const ACCOUNT_B = 'b'.repeat(32);
 export const ACCOUNT_EMPTY = 'e'.repeat(32);
 
+// #564 — a full native cycle width ending at the fixture's clock. `ACCOUNT_EMPTY`
+// has no live cycle, so the server totals its card over this window and
+// publishes the bounds; the fixture carries them for the same reason.
+export const FALLBACK_SPEND_WINDOW = {
+  kind: 'trailing-cycle',
+  startAt: '2026-04-17T13:00:00Z',
+  endAt: '2026-04-24T13:00:00Z',
+} as const;
+
 function accountCard(over: Partial<AccountCard> & { accountKey: string }): AccountCard {
   return {
     accountKey: over.accountKey,
@@ -355,6 +366,7 @@ function accountCard(over: Partial<AccountCard> & { accountKey: string }): Accou
     reasoningOutputTokens: over.reasoningOutputTokens ?? 0,
     totalTokens: over.totalTokens ?? 0,
     ...(over.unattributed ? { unattributed: true as const } : {}),
+    ...(over.spendWindow ? { spendWindow: over.spendWindow } : {}),
   };
 }
 
@@ -495,6 +507,54 @@ function accountWeeklyHistory(
 // let a test construct the opposite (a stamped parent over empty children),
 // which is not a wire shape, and any selector that consults a child then reads
 // as broken against a fixture rather than against the server.
+// #556 S5 §4.8 — give each per-account CHILD its own configured-budget status,
+// distinct from the parent's ($100 / calendar-month / ok) and from each other's.
+// A focused block that fell back to the parent would then print $100 where the
+// child says something else, so the check is value-distinctness rather than
+// mere presence.
+export function withScopedCodexBudget(
+  data: CodexSourceData,
+  byAccount: Record<string, ProviderBudgetStatus | null>,
+): CodexSourceData {
+  const scopes = data.account_scopes ?? {};
+  return {
+    ...data,
+    account_scopes: Object.fromEntries(
+      Object.entries(scopes).map(([key, child]) => [
+        key,
+        key in byAccount
+          ? { ...child, budget: { ...child.budget, status: byAccount[key] } }
+          : child,
+      ]),
+    ),
+  };
+}
+
+export function makeScopedCodexBudgetStatus(
+  over: Partial<ProviderBudgetStatus> = {},
+): ProviderBudgetStatus {
+  return {
+    period: 'calendar-week',
+    budget_usd: 42.0,
+    spent_usd: 9.25,
+    remaining_usd: 32.75,
+    consumption_pct: 22.0,
+    verdict: 'ok',
+    low_confidence: false,
+    window_start_at: '2026-04-20T00:00:00Z',
+    window_end_at: '2026-04-27T00:00:00Z',
+    recent_24h_usd: 1.1,
+    alert_thresholds: [75],
+    pace: {
+      daily_usd: 2.31,
+      projected_low_usd: 15.0,
+      projected_high_usd: 18.0,
+      week_avg_projection_usd: 16.2,
+    },
+    ...over,
+  };
+}
+
 export function makeDecoratedCodexSourceData(): CodexSourceData {
   return withAccountScopedQuotaHistories(makeDecoratedCodexParentOnly());
 }
@@ -601,7 +661,10 @@ function makeDecoratedCodexParentOnly(): CodexSourceData {
         accountKey: ACCOUNT_B, label: 'personal@example.com', weeklyPercent: 12,
         spendUsd: 4.3, inputTokens: 120000, totalTokens: 152000,
       }),
-      accountCard({ accountKey: ACCOUNT_EMPTY, label: 'quiet@example.com' }),
+      accountCard({
+        accountKey: ACCOUNT_EMPTY, label: 'quiet@example.com',
+        spendWindow: FALLBACK_SPEND_WINDOW,
+      }),
     ],
     account_scopes: {
       [ACCOUNT_A]: accountScope({
@@ -822,12 +885,28 @@ export function withSharedRootWeeklyWindows(data: CodexSourceData): CodexSourceD
       quota: summary,
       // B has no live cycle, exactly as `hero_cycles_wire` emits it.
       cycles: (data.hero.cycles ?? []).filter((c) => c.accountKey !== ACCOUNT_B),
+      // #564: B is a fallback card below, so the headline is A's live cycle plus
+      // B's BOUNDED window. Leaving the wide figure here would make this fixture
+      // encode the exact overstatement #564 removes, and would break the #416 D6
+      // invariant that the decorated headline is the sum of its cards.
+      cost_usd: 8.0 + 2.15,
     },
     accounts: (data.accounts ?? []).map((card) => (
       card.accountKey === ACCOUNT_A
         ? { ...card, weeklyPercent: 78.2 }
         : card.accountKey === ACCOUNT_B
-          ? { ...card, weeklyPercent: null, resetsAt: null }
+          // A real account whose weekly cycle has expired: the server reads it
+          // over one native cycle width ending now and publishes those bounds,
+          // so the fixture carries the bounded totals AND the window (#564).
+          ? {
+            ...card,
+            weeklyPercent: null,
+            resetsAt: null,
+            spendUsd: 2.15,
+            inputTokens: 60000,
+            totalTokens: 76000,
+            spendWindow: FALLBACK_SPEND_WINDOW,
+          }
           : card
     )),
     account_scopes: scopes,
@@ -977,6 +1056,43 @@ export function makeClaudeSourceData(): ClaudeSourceData {
     budget: { forecast: null, settings: {} },
     alerts: { rows: [] },
   } satisfies ClaudeSourceData;
+}
+
+// #556 S5 — a CLAUDE configured-budget status, deliberately UNEQUAL to the
+// Codex one in every field a provider swap could hide: a different period, a
+// different amount, a different spend, a different verdict and a different
+// pace. Equal values would let a section that reads the wrong provider pass
+// green, which is exactly the discriminator §6.7 asks for.
+export function makeClaudeBudgetStatus(): ProviderBudgetStatus {
+  return {
+    period: 'subscription-week',
+    budget_usd: 250.0,
+    spent_usd: 212.75,
+    remaining_usd: 37.25,
+    consumption_pct: 85.1,
+    verdict: 'warn',
+    low_confidence: false,
+    window_start_at: '2026-04-20T17:00:00Z',
+    window_end_at: '2026-04-27T17:00:00Z',
+    recent_24h_usd: 31.4,
+    alert_thresholds: [80, 95],
+    pace: {
+      daily_usd: 30.39,
+      projected_low_usd: 240.0,
+      projected_high_usd: 268.0,
+      week_avg_projection_usd: 254.0,
+    },
+  };
+}
+
+// Overlay one budget domain onto the Claude source data. The default builder
+// keeps `{forecast, settings}` — the `provider_budget_unset` shape — so every
+// pre-S5 fixture stays byte-identical and a test opts in explicitly.
+export function withClaudeBudget(
+  data: ClaudeSourceData,
+  budget: Partial<ClaudeBudgetDomain>,
+): ClaudeSourceData {
+  return { ...data, budget: { ...data.budget, ...budget } };
 }
 
 export const CLAUDE_ACCOUNT_MAIN = 'c'.repeat(32);
@@ -1268,7 +1384,7 @@ export function makeSourceEnvelope(
   return {
     // #556 S2 §3.9 — tracks the server's current `SOURCE_SCHEMA_VERSION`. No
     // production client branches on it; the number is a signal, not a gate.
-    source_schema_version: 7,
+    source_schema_version: 9,
     default_source: 'claude',
     source_order: ['claude', 'codex', 'all'],
     sources: makeSourcesMap(),

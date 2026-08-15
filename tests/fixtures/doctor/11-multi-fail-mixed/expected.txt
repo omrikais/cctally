@@ -29,7 +29,7 @@ Database
   ✓ Version ahead            none ahead
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
-  ⚠ Pending migrations       53 pending
+  ⚠ Pending migrations       56 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -68,6 +68,7 @@ Accounts
   ✓ Account attribution freshness no attribution activity recorded
   ✓ Account attribution      usage attribution healthy
   ✓ Codex reset anchors      Codex reset anchors complete
+  ✓ Codex window attribution no operator window attribution recorded
 Pricing
   ✓ Coverage                 all observed models priced
 Safety
@@ -81,4 +82,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 49 OK · 8 WARN · 3 FAIL
+Summary: 50 OK · 8 WARN · 3 FAIL

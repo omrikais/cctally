@@ -1,0 +1,2 @@
+Codex quota blocks · local-rollout
+primary · 168h · root=root-attributed · limit=limit-weekly · 11.0% → 24.0% · reset 2026-07-15T15:00:00Z

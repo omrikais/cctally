@@ -37,10 +37,12 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import os
 import pathlib
 import sys
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
@@ -476,13 +478,16 @@ def _aggregate_codex_buckets(
         })
         order = models_order.setdefault(key, [])
 
-        cost = _calculate_codex_entry_cost(
-            entry.model,
-            entry.input_tokens,
-            entry.cached_input_tokens,
-            entry.output_tokens,
-            entry.reasoning_output_tokens,
-            speed=speed,
+        cost = (
+            entry.cost_usd if entry.cost_usd is not None
+            else _calculate_codex_entry_cost(
+                entry.model,
+                entry.input_tokens,
+                entry.cached_input_tokens,
+                entry.output_tokens,
+                entry.reasoning_output_tokens,
+                speed=speed,
+            )
         )
 
         bucket["input"] += entry.input_tokens
@@ -588,8 +593,107 @@ def _aggregate_codex_weekly(
     return _aggregate_codex_buckets(entries, key_fn=_week_key, speed=speed)
 
 
+_CODEX_PATH_SCOPE = threading.local()
+
+
+class CodexPathScope:
+    """One source build's Codex path-identity memo (#566 §5.1 item 1).
+
+    Holds the ordered session roots captured when the build opened, plus one
+    parsed identity per distinct ``source_path``. It holds plain tuples only —
+    never a connection, cursor, iterator or open transaction (spec §5.4) — and
+    dies with the ``codex_path_scope`` block that created it, so a
+    ``$CODEX_HOME`` or configuration change between builds can never be served
+    from it.
+
+    ``misses`` counts the parses actually performed, which is the bounded-work
+    quantity the suite asserts on: it can never exceed the number of distinct
+    session paths the build touched.
+    """
+
+    __slots__ = ("_roots", "_parts", "misses")
+
+    def __init__(self, roots: "Iterable[Any] | None" = None) -> None:
+        self._roots: "tuple[Any, ...] | None" = (
+            None if roots is None else tuple(roots)
+        )
+        self._parts: dict[str, tuple[str, str, str]] = {}
+        self.misses = 0
+
+    @property
+    def roots(self) -> "tuple[Any, ...]":
+        """The session roots this build resolved, resolved on FIRST USE.
+
+        Lazy, not eager. ``_codex_session_roots()`` runs an ``is_dir()`` syscall
+        per configured root, and the rooted fallback session view is
+        contractually filesystem-free — it derives identity lexically from
+        ``(source_root_key, source_path)`` and must never discover anything.
+        Resolving at scope entry made every build touch the filesystem even
+        when nothing in it ever asked for a path identity, which broke that
+        contract. Resolving on the first miss still pins one answer for the
+        whole build, which is what the memo key needs.
+        """
+        if self._roots is None:
+            self._roots = tuple(_cctally()._codex_session_roots())
+        return self._roots
+
+    def parts(self, source_path: str) -> tuple[str, str, str]:
+        hit = self._parts.get(source_path)
+        if hit is None:
+            hit = _session_path_parts_for_roots(self.roots, source_path)
+            self._parts[source_path] = hit
+            self.misses += 1
+        return hit
+
+
+def active_codex_path_scope() -> "CodexPathScope | None":
+    """The scope this thread is building under, or None outside a build."""
+    return getattr(_CODEX_PATH_SCOPE, "scope", None)
+
+
+@contextlib.contextmanager
+def codex_path_scope(roots: "Iterable[Any] | None" = None):
+    """Open a build-scoped Codex path memo on this thread.
+
+    The roots are resolved ONCE per scope rather than once per entry, which is
+    the whole point: ``_codex_session_roots()`` runs an ``is_dir()`` syscall per
+    configured root, and the per-entry form ran it 191,304 times on a store
+    holding 2,324 distinct session files. Resolution is deferred to the first
+    path the scope is actually asked about, so a build that never needs a path
+    identity — the rooted fallback session view, which is contractually
+    filesystem-free — still touches nothing.
+
+    Scopes nest and restore, and the memo is thread-local, so the dashboard's
+    sync thread and its HTTP threads never share one.
+    """
+    scope = CodexPathScope(roots)
+    previous = getattr(_CODEX_PATH_SCOPE, "scope", None)
+    _CODEX_PATH_SCOPE.scope = scope
+    try:
+        yield scope
+    finally:
+        _CODEX_PATH_SCOPE.scope = previous
+
+
 def _session_path_parts(source_path: str) -> tuple[str, str, str]:
     """Return (session_id_path, session_file, directory) from a full path.
+
+    Inside a ``codex_path_scope`` the answer comes from that build's memo,
+    keyed on ``(scope roots, source_path)``. Outside one the roots are
+    resolved per call, which is the historic behaviour every CLI caller keeps.
+    """
+    scope = getattr(_CODEX_PATH_SCOPE, "scope", None)
+    if scope is not None:
+        return scope.parts(source_path)
+    return _session_path_parts_for_roots(
+        _cctally()._codex_session_roots(), source_path,
+    )
+
+
+def _session_path_parts_for_roots(
+    roots: Iterable[Any], source_path: str,
+) -> tuple[str, str, str]:
+    """Return (session_id_path, session_file, directory) under ``roots``.
 
     session_id_path = relative path under the matched $CODEX_HOME session
                       root with .jsonl stripped (e.g. "2025/12/25/rollout-...").
@@ -604,7 +708,6 @@ def _session_path_parts(source_path: str) -> tuple[str, str, str]:
     files stay free of maintainer absolute paths), then basename. Direct-JSONL
     roots yield an id relative to <entry> itself (no sessions/ prefix).
     """
-    roots = _cctally()._codex_session_roots()
     p = pathlib.Path(source_path)
     rel: pathlib.PurePath | None = None
     for root in roots:
@@ -659,9 +762,12 @@ def _aggregate_codex_sessions_keyed(
             "cost": 0.0, "models": {}, "models_order": [],
             "last": entry.timestamp,
         })
-        cost = _calculate_codex_entry_cost(
-            entry.model, entry.input_tokens, entry.cached_input_tokens,
-            entry.output_tokens, entry.reasoning_output_tokens, speed=speed,
+        cost = (
+            entry.cost_usd if entry.cost_usd is not None
+            else _calculate_codex_entry_cost(
+                entry.model, entry.input_tokens, entry.cached_input_tokens,
+                entry.output_tokens, entry.reasoning_output_tokens, speed=speed,
+            )
         )
         sess["input"] += entry.input_tokens
         sess["cached_input"] += entry.cached_input_tokens

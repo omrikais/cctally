@@ -11,9 +11,10 @@ production 023 handler against a copy, and asserts it arms the flag.
 flock-held post-walk recompute does the one-time full recompute+fill that
 populates the new git_branch/models_json/title columns on
 ``conversation_sessions``. The handler does NOT touch any data table (the fill is
-sync-side). The three columns themselves are added by ``_apply_cache_schema``
-(runs on every open, via CREATE TABLE + add_column_if_missing), so they are
-present in BOTH pre and post. The dispatcher central-stamps the migration marker
+sync-side). Migration 023's head bump opens the version-gated
+``_apply_cache_schema`` path, which adds the three columns via CREATE TABLE +
+add_column_if_missing, so they are present in BOTH pre and post. The dispatcher
+central-stamps the migration marker
 (#140); a fresh install stamps it WITHOUT running (its incremental DELETE+INSERT
 re-derive fills the columns at ingest). Mirrors 013.
 """

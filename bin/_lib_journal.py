@@ -1308,6 +1308,218 @@ def make_codex_file_account(
     return make_op(at=at, src="codex-file-account", payload=payload)
 
 
+#: Only account-level weekly Codex quota is attributable (#500 spec §5). A 5h
+#: window and a model-scoped pool are out of scope, and the builder refuses
+#: rather than recording an assertion the overlay would always suppress.
+ACCOUNT_WEEKLY_WINDOW_MINUTES = 10_080
+
+#: The sentinel is never an assertable subject and is never written into a
+#: payload (the two-shaped stamp rule, docs/accounts-gotchas.md).
+_ATTRIBUTION_SENTINEL = "unattributed"
+
+WINDOW_ATTRIBUTION_KIND = "codex_window_attribution"
+WINDOW_ATTRIBUTION_RETRACT_KIND = "codex_window_attribution_retract"
+WINDOW_ATTRIBUTION_SRC = "account-attribute"
+
+
+def _sorted_unique_strings(values, what: str) -> list:
+    """Sorted, de-duplicated, non-empty strings, or ``ValueError``.
+
+    A bare string is refused rather than iterated: ``"abc"`` would otherwise
+    silently become three one-character witnesses. Types are checked BEFORE the
+    sort, so a non-string member raises ``ValueError`` rather than the
+    ``TypeError`` a mixed-type ``sorted`` would raise.
+    """
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{what} must be a sequence of strings, not a string")
+    try:
+        items = list(values)
+    except TypeError as exc:
+        raise ValueError(f"{what} must be a sequence of strings") from exc
+    for item in items:
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"every {what} entry must be a non-empty string")
+    return sorted(set(items))
+
+
+def _normalize_attribution_instant(at: str) -> str:
+    """One ISO spelling for a #500 assertion's `at` (review finding F9).
+
+    `make_op` stores the caller's string verbatim, and the active read orders
+    assertions with `ORDER BY asserted_at_utc ASC` — a LEXICOGRAPHIC sort over
+    that stored text. Lexicographic order is chronological order only while
+    every value uses one spelling: `2026-08-14T12:00:00+00:00` sorts before
+    `2026-08-14T06:00:00Z` because `+` (0x2B) precedes `Z` (0x5A), so a single
+    offset-form assertion would silently take precedence over every later
+    Z-form one. Normalizing HERE, at the one chokepoint both builders pass
+    through, is what makes the cheap SQL ordering correct.
+
+    MICROSECOND precision with a `Z` suffix, and the six fractional digits are
+    written ALWAYS, even when they are zero (review round 2, finding R2-1).
+    Two separate rules meet here and both require the fixed width.
+
+    Truncating to seconds is a correctness defect, not a cosmetic one. The
+    normalized value is what `content_id` digests, so two assertions inside one
+    wall-clock second with otherwise-identical payloads collapse to the SAME
+    `op_id`. Spec §7.2's assert -> retract -> re-assert then loses its last
+    step: the re-assertion carries the id the tombstone already names, so
+    `INSERT OR IGNORE` drops it against the retracted row and the operator's
+    second assertion vanishes with no error. §7.2 requires a re-assertion to
+    carry an id no earlier tombstone names, and sub-second precision is what
+    supplies it.
+
+    Emitting the fraction only when non-zero would break the ordering rule
+    above: `.` (0x2E) precedes `Z` (0x5A), so `2026-08-14T00:00:05.500000Z`
+    would sort BEFORE `2026-08-14T00:00:05Z` — a fractional value ahead of the
+    whole second it follows. One fixed-width spelling is what keeps
+    lexicographic order equal to chronological order.
+
+    A naive value is refused rather than assumed to be UTC: the assertion is
+    durable, and guessing a zone for it is not recoverable.
+    """
+    if not isinstance(at, str) or not at:
+        raise ValueError("at must be a non-empty ISO instant")
+    try:
+        parsed = dt.datetime.fromisoformat(at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"at is not an ISO instant: {at!r}") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"at must carry a timezone offset: {at!r}")
+    return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _window_attribution_payload(
+    kind: str,
+    *,
+    account_key: str,
+    source_root_key: str,
+    logical_limit_key: str,
+    observed_slot: str,
+    window_minutes: int,
+    raw_resets_at_utc,
+    canonical_resets_at_utc: str,
+) -> dict:
+    """Shared payload for the two #500 operator-attribution op kinds.
+
+    The binding is the four normalized axes plus the tolerance-connected
+    component WITNESSED by ``raw_resets_at_utc``. The canonical anchor is
+    carried for audit and preview only and is NEVER matched on: it is
+    population-dependent, because a later bridging observation can union two
+    components and retire the earlier anchor (``_lib_quota`` component union),
+    which is exactly why the canonical value is not journaled anywhere else.
+
+    The ``account_key`` here is the SUBJECT of the assertion — the account the
+    operator says the window belongs to — not the two-shaped stamp naming which
+    account wrote the record. Both kinds are registered in
+    ``_ACCOUNTS_MACHINERY_KINDS``, but NOT because the legacy normalizer would
+    otherwise mistake this field for a missing stamp (review finding F7) — it
+    would not, being gated on ``_REAL_ACCOUNT_EVT_OP_KINDS``, which these kinds
+    were never in. Registration is what puts the kinds into the re-derive
+    planner's ``op_kinds`` set, which makes their
+    ``_lib_rederive._OP_CLASSIFICATIONS`` entries mandatory.
+    """
+    if not isinstance(account_key, str) or not account_key:
+        raise ValueError("account_key must be a non-empty string")
+    if account_key == _ATTRIBUTION_SENTINEL:
+        raise ValueError("the unattributed sentinel is not an assertable subject")
+    for name, value in (("source_root_key", source_root_key),
+                        ("logical_limit_key", logical_limit_key),
+                        ("observed_slot", observed_slot),
+                        ("canonical_resets_at_utc", canonical_resets_at_utc)):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{name} must be a non-empty string")
+    if (not isinstance(window_minutes, int)
+            or isinstance(window_minutes, bool)
+            or window_minutes != ACCOUNT_WEEKLY_WINDOW_MINUTES):
+        raise ValueError(
+            f"window_minutes must be {ACCOUNT_WEEKLY_WINDOW_MINUTES} "
+            "(account weekly quota)")
+    witnesses = _sorted_unique_strings(raw_resets_at_utc, "raw reset witness")
+    if not witnesses:
+        raise ValueError("raw_resets_at_utc must carry at least one witness")
+    return {
+        "kind": kind,
+        "source": "codex",
+        "account_key": account_key,
+        "source_root_key": source_root_key,
+        "logical_limit_key": logical_limit_key,
+        "observed_slot": observed_slot,
+        "window_minutes": window_minutes,
+        "raw_resets_at_utc": witnesses,
+        "canonical_resets_at_utc": canonical_resets_at_utc,
+    }
+
+
+def make_codex_window_attribution(
+    at: str,
+    *,
+    account_key: str,
+    source_root_key: str,
+    logical_limit_key: str,
+    observed_slot: str,
+    window_minutes: int,
+    raw_resets_at_utc,
+    canonical_resets_at_utc: str,
+) -> dict:
+    """Build a ``codex_window_attribution`` op — the operator's durable
+    assertion that one physical Codex quota window group belongs to one account
+    (#500 spec §5).
+
+    Ordinary ``content_id``, deliberately NOT a stable singleton id like the
+    accounts cutover's: a fixed id would make assert -> retract -> reassert
+    impossible, because the second assertion would collide with the first.
+    """
+    payload = _window_attribution_payload(
+        WINDOW_ATTRIBUTION_KIND,
+        account_key=account_key,
+        source_root_key=source_root_key,
+        logical_limit_key=logical_limit_key,
+        observed_slot=observed_slot,
+        window_minutes=window_minutes,
+        raw_resets_at_utc=raw_resets_at_utc,
+        canonical_resets_at_utc=canonical_resets_at_utc,
+    )
+    return make_op(at=_normalize_attribution_instant(at),
+                   src=WINDOW_ATTRIBUTION_SRC, payload=payload)
+
+
+def make_codex_window_attribution_retract(
+    at: str,
+    *,
+    account_key: str,
+    source_root_key: str,
+    logical_limit_key: str,
+    observed_slot: str,
+    window_minutes: int,
+    raw_resets_at_utc,
+    canonical_resets_at_utc: str,
+    retracted_assertion_ids,
+) -> dict:
+    """Build a ``codex_window_attribution_retract`` op (#500 spec §5, §7.2).
+
+    Targets specific assertion op IDs rather than the group, so an older
+    tombstone can never suppress a later reassertion: the reassertion carries a
+    new content id that no earlier tombstone names.
+    """
+    payload = _window_attribution_payload(
+        WINDOW_ATTRIBUTION_RETRACT_KIND,
+        account_key=account_key,
+        source_root_key=source_root_key,
+        logical_limit_key=logical_limit_key,
+        observed_slot=observed_slot,
+        window_minutes=window_minutes,
+        raw_resets_at_utc=raw_resets_at_utc,
+        canonical_resets_at_utc=canonical_resets_at_utc,
+    )
+    targets = _sorted_unique_strings(
+        retracted_assertion_ids, "retracted assertion id")
+    if not targets:
+        raise ValueError("retracted_assertion_ids must name at least one assertion")
+    payload["retracted_assertion_ids"] = targets
+    return make_op(at=_normalize_attribution_instant(at),
+                   src=WINDOW_ATTRIBUTION_SRC, payload=payload)
+
+
 # --------------------------------------------------------------------------
 # segment naming + canonical order
 # --------------------------------------------------------------------------

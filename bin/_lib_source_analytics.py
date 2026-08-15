@@ -5,7 +5,7 @@ import datetime as dt
 import hashlib
 import math
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Generic, Iterable, Literal, TypeVar
 
 
@@ -79,6 +79,11 @@ class QualifiedCodexEntry:
     # contributes to. The default is the reserved `unattributed` sentinel, so
     # every existing constructor (and the whole CLI path) is unchanged.
     account_key: str = "unattributed"
+    # Internal stable ordering identity from cache.db.  It is deliberately
+    # excluded from equality and representation: provider outputs do not carry
+    # it, while #582's dirty-path replacement needs the original SQL tie-break
+    # when rows share timestamp/root/conversation.
+    cache_entry_id: int = field(default=0, compare=False, repr=False)
 
 
 def emitted_project_label(entry: QualifiedCodexEntry) -> str:
@@ -205,7 +210,20 @@ class TokenTotals:
 
 
 def _totals(entries: Iterable[QualifiedCodexEntry]) -> TokenTotals:
-    values = assign_collision_safe_project_labels(entries)
+    # #566 §5.1 item 7. `TokenTotals` carries no label, and nothing this
+    # function returns can observe one, so the collision-safe allocation this
+    # line used to run was dead work: it re-created every entry through
+    # `dataclasses.replace` purely to sum six numeric fields off the copies.
+    # On the maintainer's store the 148 calls from here drove 775,568
+    # `dataclasses.replace` calls and about 1.9s of every build.
+    #
+    # The allocation that MATTERS still runs, once, in
+    # `build_codex_project_result`, over the complete population, before any
+    # subset is taken -- which is the only place it can be correct. Guarding
+    # this call on "the subset holds more than one project identity" would
+    # have kept nearly all of the cost, because the expensive callers are the
+    # per-block totals over a population spanning every project.
+    values = tuple(entries)
     return TokenTotals(
         input_tokens=sum(entry.input_tokens for entry in values),
         cached_input_tokens=sum(entry.cached_input_tokens for entry in values),

@@ -3,22 +3,44 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSnapshot } from '../hooks/useSnapshot';
 import {
   ALL_ACCOUNTS,
-  resolveAccountFocus,
+  decoratedProvidersFor,
+  focusSlotFor,
+  resolveViewAccountFocus,
   sourceAccounts,
 } from '../store/accountFocus';
-import type { AccountCard, SourceEntry, SourceName } from '../types/envelope';
+import type {
+  AccountCard,
+  DashboardSelection,
+  SourceEntry,
+  SourceName,
+} from '../types/envelope';
 
 // #341 Task 4 — the per-account chip row (Q6 Option A, spec §5).
 //
-// Rendered under the source switcher for the DASHBOARD workspace ONLY when the
-// ACTIVE physical source has >1 real account (`sourceAccounts != null`);
-// otherwise absent, so single-account layouts are pixel-identical and source
-// `all` never shows it. WAI-ARIA radiogroup exactly like SourceSwitcher: one
-// roving tab stop, Left/Right (+ Up/Down) move focus AND selection with wrap,
-// Home/End jump to the ends. Chips: "All accounts" (default) · one per account
-// (label + live weekly-% hint) · the unattributed bucket rides the accounts
-// array (dimmed styling from its `unattributed` flag). Keyboard `a` cycles the
-// same order (globalBindings.cycleActiveAccount).
+// Rendered under the source switcher for the DASHBOARD workspace ONLY when a
+// provider has >1 real account (`sourceAccounts != null`); otherwise absent, so
+// single-account layouts are pixel-identical. WAI-ARIA radiogroup exactly like
+// SourceSwitcher: one roving tab stop, Left/Right (+ Up/Down) move focus AND
+// selection with wrap, Home/End jump to the ends. Chips: "All accounts"
+// (default) · one per account (label + live weekly-% hint) · the unattributed
+// bucket rides the accounts array (dimmed styling from its `unattributed`
+// flag). Keyboard `a` cycles the same order (globalBindings.cycleActiveAccount).
+//
+// #556 S5 §5.5 — under All there is ONE ROW PER DECORATED PROVIDER, each doing
+// exactly what it does on that provider's own tab, and each carrying a VISIBLE
+// effect qualifier. The qualifier is on screen and not only in `title` or
+// `aria-label`, because finding B5 in this epic was a state word reachable only
+// by tooltip. The two effects genuinely differ: only Codex publishes
+// `account_scopes`, so only a Codex focus can narrow a panel.
+const ROW_QUALIFIER: Record<SourceName, string> = {
+  claude: 'hero and alerts only',
+  codex: 'filters every panel',
+};
+
+const ROW_PROVIDER_LABEL: Record<SourceName, string> = {
+  claude: 'Claude accounts',
+  codex: 'Codex accounts',
+};
 
 interface Chip {
   key: string; // ALL_ACCOUNTS or an accountKey
@@ -40,32 +62,33 @@ function buildChips(accounts: AccountCard[]): Chip[] {
   return chips;
 }
 
-export function AccountChipRow() {
+function AccountChipProviderRow({
+  provider,
+  selection,
+  labelled,
+}: {
+  provider: SourceName;
+  selection: DashboardSelection;
+  // True only under All, where two rows can be on screen at once and each
+  // therefore needs its own accessible name and its own visible effect
+  // qualifier. A single-provider tab keeps the pre-S5 markup byte-identical.
+  labelled: boolean;
+}) {
   const env = useSnapshot();
-  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
-  const view = useSyncExternalStore(subscribeStore, () => getState().view);
-  const focusSlot = useSyncExternalStore(
-    subscribeStore,
-    () => (activeSource === 'all' ? ALL_ACCOUNTS : getState().accountFocus[activeSource as SourceName]),
-  );
+  const focusState = useSyncExternalStore(subscribeStore, () => getState().accountFocus);
   const segRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const [announce, setAnnounce] = useState('');
   const prevKeyRef = useRef<string | null>(null);
 
   // Effective per-account focus, computed BEFORE the conditional-render early
-  // returns so the announce effect (a hook) always runs in the same order.
-  const shown = view === 'dashboard' && activeSource !== 'all';
-  const source = shown ? (activeSource as SourceName) : null;
-  const entry = source != null
-    ? ((env?.sources?.[source] ?? null) as SourceEntry<unknown> | null)
+  // return so the announce effect (a hook) always runs in the same order.
+  const entry = (env?.sources?.[provider] ?? null) as SourceEntry<unknown> | null;
+  const accounts = sourceAccounts(entry);
+  const focused = accounts != null
+    ? resolveViewAccountFocus(env, selection, provider, focusState)
     : null;
-  const accounts = source != null ? sourceAccounts(entry) : null;
-  const focused = source != null && accounts != null
-    ? resolveAccountFocus(env, source, focusSlot ?? ALL_ACCOUNTS)
-    : null;
-  // The active chip key while the row is visible; null when the row is absent
-  // (undecorated / source `all` / non-dashboard view).
-  const activeKey = source != null && accounts != null ? (focused ?? ALL_ACCOUNTS) : null;
+  // The active chip key while the row is visible; null when the row is absent.
+  const activeKey = accounts != null ? (focused ?? ALL_ACCOUNTS) : null;
   const activeLabel = activeKey == null
     ? null
     : activeKey === ALL_ACCOUNTS
@@ -97,14 +120,22 @@ export function AccountChipRow() {
     }
   }, [activeKey, activeLabel]);
 
-  // Hooks first, then the conditional-render early returns.
-  if (source == null || accounts == null) return null; // undecorated / all → no chip row.
+  // Hooks first, then the conditional-render early return.
+  if (accounts == null) return null; // undecorated → no chip row.
 
   const chips = buildChips(accounts);
+  const labelId = `account-focus-${provider}-label`;
 
   const select = (i: number): void => {
     const chip = chips[i];
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source, account: chip.key });
+    dispatch({
+      type: 'SET_ACCOUNT_FOCUS',
+      source: provider,
+      // #556 S5 §5.1 — the slot follows the VIEW, and is passed explicitly so
+      // the reducer never has to infer it from the mutable `activeSource`.
+      slot: focusSlotFor(selection),
+      account: chip.key,
+    });
     segRefs.current[i]?.focus();
     // Announce is state-derived from the store's focus (see the effect above),
     // so the arrow/click path and the global `a` shortcut announce identically.
@@ -138,9 +169,21 @@ export function AccountChipRow() {
     <div
       className="account-chip-row"
       role="radiogroup"
-      aria-label="Account focus"
+      {...(labelled
+        ? { 'aria-labelledby': labelId }
+        : { 'aria-label': 'Account focus' })}
       data-testid="account-chip-row"
+      data-provider={provider}
     >
+      {labelled && (
+        <span className="account-chip-rowlabel" id={labelId}>
+          <span className="account-chip-rowprovider">{ROW_PROVIDER_LABEL[provider]}</span>
+          {' '}
+          <span className="account-chip-rowqualifier" data-testid={`account-chip-qualifier-${provider}`}>
+            {ROW_QUALIFIER[provider]}
+          </span>
+        </span>
+      )}
       {chips.map((chip, i) => {
         const checked = chip.key === activeKey;
         return (
@@ -167,6 +210,37 @@ export function AccountChipRow() {
       <div className="sr-only" role="status" aria-live="polite" data-testid="account-chip-live">
         {announce}
       </div>
+    </div>
+  );
+}
+
+export function AccountChipRow() {
+  const env = useSnapshot();
+  const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const view = useSyncExternalStore(subscribeStore, () => getState().view);
+  if (view !== 'dashboard') return null;
+  const providers = decoratedProvidersFor(env, activeSource);
+  if (providers.length === 0) return null;
+  if (activeSource !== 'all') {
+    // Single-provider tab: exactly the pre-S5 markup, no wrapper and no label.
+    return (
+      <AccountChipProviderRow
+        provider={providers[0]}
+        selection={activeSource}
+        labelled={false}
+      />
+    );
+  }
+  return (
+    <div className="account-chip-rows" data-testid="account-chip-rows">
+      {providers.map((provider) => (
+        <AccountChipProviderRow
+          key={provider}
+          provider={provider}
+          selection="all"
+          labelled
+        />
+      ))}
     </div>
   );
 }

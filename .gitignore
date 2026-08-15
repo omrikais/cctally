@@ -43,6 +43,10 @@ cache.db-wal
 cache.db-shm
 stats.db-wal
 stats.db-shm
+# The migrations fixtures name their databases `*.sqlite`, so the `.db` entries
+# above never matched their sidecars (#566).
+*.sqlite-wal
+*.sqlite-shm
 tests/fixtures/*/*/.local/share/ccusage-subscription/config.json
 tests/fixtures/*/*/.local/share/ccusage-subscription/logs/
 tests/fixtures/*/*/.local/share/cctally/config.json

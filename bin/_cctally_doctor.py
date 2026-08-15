@@ -646,6 +646,175 @@ def _codex_quota_verify_activity_24h(*, now_utc: "dt.datetime") -> dict:
     return counts
 
 
+#: How much journal tail the `accounts.codex_window_attribution` leg will read
+#: to decide whether an attribution op is sitting unconsumed. Past this, the
+#: condition is left unreported: `doctor` is a read-only health report, not an
+#: ingest, and the state it would have reported self-heals on the next sync.
+_WINDOW_ATTRIBUTION_TAIL_BUDGET_BYTES = 8 * 1024 * 1024
+
+#: The same discipline on the same leg's OTHER unbounded read. Every distinct
+#: `(source_root_key, source_path)` in `codex_session_entries` costs a path
+#: canonicalization and one or two indexed probes, and a store carrying an
+#: assertion pays that on every `doctor` run. Past the cap the condition is
+#: reported as NOT CHECKED rather than partially counted, because a partial
+#: count of a whole-store condition reads exactly like a complete one.
+_WINDOW_ATTRIBUTION_BASELINE_FILE_CAP = 5_000
+
+
+def _unconsumed_window_attribution_ops(cursor, high_water) -> bool:
+    """Whether the journal tail after `cursor` holds an attribution op."""
+    import _cctally_journal
+    import _lib_journal
+
+    if (_lib_journal.segment_sort_key(str(cursor[0])), int(cursor[1])) >= (
+            _lib_journal.segment_sort_key(str(high_water[0])),
+            int(high_water[1])):
+        return False
+    kinds = (b'"codex_window_attribution"',
+             b'"codex_window_attribution_retract"')
+    scanned = 0
+    try:
+        for _segment, _offset, raw in _cctally_journal.iter_range(
+                cursor, high_water):
+            scanned += len(raw)
+            if scanned > _WINDOW_ATTRIBUTION_TAIL_BUDGET_BYTES:
+                return False
+            if any(kind in raw for kind in kinds):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _gather_codex_window_attribution_state() -> "dict | None":
+    """Read-only state for the ``accounts.codex_window_attribution`` leg (#500 §9).
+
+    ``None`` means "this store cannot be inspected" — no cache.db, or a cache
+    too old to carry the derived table — which the kernel renders as OK rather
+    than as a finding, exactly as every other pre-feature cache shape degrades.
+
+    Four conditions the spec names, plus one the Task-2 review added. The added
+    one is an OBSERVABILITY check, not a health claim in its own right:
+    ``_CodexFileBaselineResolver`` recovers a file identity by re-canonicalizing
+    the stored ``source_path``, so a rollout whose path spelling changed after
+    ingest reads as "no per-file decision" and is INDISTINGUISHABLE from a
+    genuine absence. Counting the files whose derived identity has neither an
+    incarnation row nor any account row is what makes that condition visible
+    instead of silent, and it is computed only when this store carries an
+    assertion at all — the restore path is the only thing it can affect.
+    """
+    if not _cctally_core.CACHE_DB_PATH.exists():
+        return None
+    try:
+        conn = sqlite3.connect(
+            f"file:{_cctally_core.CACHE_DB_PATH}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        import _cctally_cache
+        import _cctally_journal
+        import _cctally_quota
+        import _lib_codex_window_attribution as _wa
+        import _lib_journal
+
+        try:
+            active = _cctally_cache.load_active_window_attributions(conn)
+            retracted = _cctally_cache.load_active_window_attributions(
+                conn, retracted_only=True)
+        except sqlite3.DatabaseError:
+            return None
+        state = {
+            "active": len(active), "retracted": len(retracted),
+            "dormant": 0, "split": 0, "conflicting": 0, "model_scoped": 0,
+            "cursor_behind": False, "unrecoverable_baselines": 0,
+            "baselines_checked": True,
+        }
+        # The cursor check runs BEFORE the empty-table early return, and that
+        # ordering is the whole point of it: the state it exists to report is a
+        # journal holding attribution records the derived index has not
+        # consumed, which is exactly a store whose table is EMPTY. Returning
+        # early on an empty table would make the leg blind to the condition it
+        # names.
+        #
+        # The predicate is "an unconsumed attribution op EXISTS", never "the
+        # cursor is behind the journal high-water". The attribution replay
+        # cursor advances only inside a Codex sync while the high-water advances
+        # on ALL journal traffic, so the positional comparison reports every
+        # store that has appended anything since its last sync — measured
+        # against this feature's own test fixture, which appends two
+        # `account_observe` ops after its syncs and would report a stale index
+        # with no attribution record in existence. It is the same trap §8.3
+        # names for the projection certificate.
+        #
+        # A cursor of `None` reads as "not behind": it means no replay has ever
+        # run, which is true of every store until its first Codex sync after
+        # this feature shipped, and that sync replays from byte zero.
+        #
+        # The tail scan is BUDGETED. On a store whose Codex sync has not run in
+        # a long time the tail is the whole journal — 1.7 GB on the maintainer's
+        # store — and `doctor` must not read that. Past the budget the condition
+        # is left unreported rather than guessed at, because it self-heals on
+        # the next sync either way.
+        cursor = _cctally_cache.load_codex_window_attribution_cursor(conn)
+        high_water = _cctally_journal.journal_high_water()
+        if cursor is not None and high_water is not None:
+            state["cursor_behind"] = _unconsumed_window_attribution_ops(
+                cursor, high_water)
+        if not active and not retracted:
+            return state
+
+        resolutions, _ownership = _cctally_quota.resolve_codex_window_attributions(
+            conn)
+        for resolution in resolutions:
+            if resolution.outcome == _wa.DORMANT:
+                state["dormant"] += 1
+            elif resolution.outcome == _wa.SPLIT:
+                state["split"] += 1
+            elif resolution.outcome in (_wa.SUPPRESSED_NATIVE,
+                                        _wa.SUPPRESSED_CONFLICT):
+                state["conflicting"] += 1
+            elif resolution.outcome == _wa.SUPPRESSED_MODEL_SCOPED:
+                state["model_scoped"] += 1
+
+        try:
+            files = conn.execute(
+                "SELECT DISTINCT source_root_key, source_path "
+                "  FROM codex_session_entries "
+                " WHERE source_root_key IS NOT NULL AND source_path IS NOT NULL"
+                " LIMIT ?", (_WINDOW_ATTRIBUTION_BASELINE_FILE_CAP + 1,)
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            files = []
+        if len(files) > _WINDOW_ATTRIBUTION_BASELINE_FILE_CAP:
+            # Declined whole rather than truncated: see the cap's own note.
+            state["baselines_checked"] = False
+            files = []
+        for root_key, source_path in files:
+            try:
+                identity = _cctally_cache.codex_file_key_for_entry_path(
+                    str(root_key), str(source_path))
+            except (ValueError, OSError):
+                state["unrecoverable_baselines"] += 1
+                continue
+            try:
+                known = conn.execute(
+                    "SELECT 1 FROM codex_file_incarnations "
+                    " WHERE file_identity = ? LIMIT 1", (identity,)
+                ).fetchone() or conn.execute(
+                    "SELECT 1 FROM codex_file_accounts "
+                    " WHERE file_identity = ? LIMIT 1", (identity,)
+                ).fetchone()
+            except sqlite3.DatabaseError:
+                known = None
+            if not known:
+                state["unrecoverable_baselines"] += 1
+        return state
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
 def _gather_accounts_state(now_utc: "dt.datetime") -> dict:
     """Best-effort account-attribution state for the doctor `accounts.*` legs
     (#341). Never raises: identity + registry reads are read-only and each guard
@@ -1311,8 +1480,19 @@ def _doctor_gather_state_impl(
     # inspector supplies the exact owned-hook state without exposing paths.
     codex_quota_windows: list[dict] = []
     try:
+        # #566 §5.1 item 5: the population is unchanged — all history, every
+        # root, no row cap — but the read returns each identity's latest
+        # physical capture instead of every retained row, because that is the
+        # only thing this probe consumes. On the maintainer's store the former
+        # shape interpreted 266,337 rows to answer a question about 608 windows
+        # and cost about 2.7s of every dashboard build. Nothing here may bound
+        # the range: doing so would drop old and inactive-root identities and
+        # silently change `window_count`, the responsible identity and the
+        # WARN/OK verdict.
         observations = (
-            c._cctally_quota.load_codex_quota_observations()
+            c._cctally_quota.load_codex_quota_observations(
+                latest_per_identity=True,
+            )
             if _cache_probe_allowed
             else ()
         )
@@ -1995,6 +2175,9 @@ def _doctor_gather_state_impl(
     )
     accounts_state = _gather_accounts_state(now_utc)
     accounts_state["codex_null_reset_anchors"] = codex_null_reset_anchors
+    accounts_state["codex_window_attribution"] = (
+        _gather_codex_window_attribution_state()
+        if _cache_probe_allowed else None)
 
     return _lib_doctor.DoctorState(
         symlink_state=symlink_state,

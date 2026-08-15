@@ -24,9 +24,10 @@
 # Exits non-zero if any scenario fails. A trap ensures stray server PIDs die
 # on harness exit / Ctrl-C.
 #
-# The eleven fixture scenarios (ok, warn, over, reset-week, no-data,
+# The fourteen fixture scenarios (ok, warn, over, reset-week, no-data,
 # utc-tz, tz-override, projected-alerts, command-secret,
-# codex-cache-active, codex-cache-idle) run in parallel
+# codex-cache-active, codex-cache-idle, all-combined,
+# all-combined-decorated, all-budget-account-focus) run in parallel
 # via `xargs -P`
 # — each scenario
 # already has its own scratch HOME under $SCRATCH_ROOT/<name> and
@@ -371,11 +372,18 @@ _run_scenario_inner () {
         local weekly_usd_check
         weekly_usd_check=$(printf '%s' "$raw" | CCTALLY_SCENARIO="$name" python3 -c '
 import json, os, sys
-# The two scenarios whose fixture config.json carries a `budget` block
-# (bin/build-dashboard-fixtures.py seeds weekly_usd=50.0 for both). Every
-# other scenario writes no budget block, so the validated getter yields None
-# and the mirror must be an explicit null rather than an absent key.
-EXPECTED = {"ok": 50.0, "projected-alerts": 50.0, "cache-report-qa": 50.0}
+# Every scenario whose fixture config.json carries a `budget` block with a
+# Claude `weekly_usd`. The comment here used to say "the two scenarios" while
+# naming three, and #556 S5 adds a fourth at a DIFFERENT amount — the map is
+# the authority, not the prose. Every other scenario writes no budget block, so
+# the validated getter yields None and the mirror must be an explicit null
+# rather than an absent key.
+EXPECTED = {
+    "ok": 50.0,
+    "projected-alerts": 50.0,
+    "cache-report-qa": 50.0,
+    "all-budget-account-focus": 180.0,
+}
 scenario = os.environ["CCTALLY_SCENARIO"]
 d = json.load(sys.stdin)
 s = d.get("alerts_settings")
@@ -393,6 +401,119 @@ print("ok")
 ' 2>&1)
         if [ "$weekly_usd_check" != "ok" ]; then
             echo "FAIL $name: weekly-budget mirror assertion: $weekly_usd_check"
+            ok=0
+        fi
+    fi
+
+    # #556 S5 §6.3: the budget comparison and the account-focus subtree, pinned
+    # BY VALUE for the dedicated scenario, in addition to the golden diff above.
+    # The golden alone is not enough for the same reason the weekly-budget
+    # mirror above is asserted separately: a future rebaseline that regenerated
+    # goldens from a build which dropped a field would erase it from both sides
+    # at once and stay green.
+    #
+    # Every asserted amount is DISTINCT and the two periods differ, so a
+    # provider swap, or a child read that fell back to the parent, changes a
+    # value here rather than passing.
+    if [ "$name" = "all-budget-account-focus" ] && [ -n "${raw:-}" ]; then
+        local s5_check
+        s5_check=$(printf '%s' "$raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+errs = []
+
+def need(cond, msg):
+    if not cond:
+        errs.append(msg)
+
+need(d.get("source_schema_version") == 9,
+     "source_schema_version != 9: %r" % (d.get("source_schema_version"),))
+
+sources = d.get("sources") or {}
+claude = sources.get("claude") or {}
+codex = sources.get("codex") or {}
+allsrc = sources.get("all") or {}
+
+# The Claude capability detail names the CONFIGURED period, not a constant.
+cap = ((claude.get("capabilities") or {}).get("budget")) or {}
+need(cap.get("status") == "supported",
+     "claude capabilities.budget.status: %r" % (cap.get("status"),))
+need(cap.get("semantics") == "calendar-month",
+     "claude capabilities.budget.semantics: %r" % (cap.get("semantics"),))
+
+# All is NOT a budget quantity. Rendering two provider-native child budgets
+# side by side does not create one.
+allcap = ((allsrc.get("capabilities") or {}).get("budget")) or {}
+need(allcap.get("status") == "not_applicable",
+     "all capabilities.budget.status: %r" % (allcap.get("status"),))
+need(allcap.get("semantics") == "provider-native",
+     "all capabilities.budget.semantics: %r" % (allcap.get("semantics"),))
+
+cl_status = (((claude.get("data") or {}).get("budget")) or {}).get("status")
+cx_status = (((codex.get("data") or {}).get("budget")) or {}).get("status")
+need(isinstance(cl_status, dict), "claude budget.status absent")
+need(isinstance(cx_status, dict), "codex budget.status absent")
+if isinstance(cl_status, dict) and isinstance(cx_status, dict):
+    need(cl_status.get("period") == "calendar-month",
+         "claude budget period: %r" % (cl_status.get("period"),))
+    need(cx_status.get("period") == "calendar-week",
+         "codex budget period: %r" % (cx_status.get("period"),))
+    need(cl_status.get("budget_usd") == 180.0,
+         "claude budget_usd: %r" % (cl_status.get("budget_usd"),))
+    need(cx_status.get("budget_usd") == 90.0,
+         "codex budget_usd: %r" % (cx_status.get("budget_usd"),))
+    for label, st in (("claude", cl_status), ("codex", cx_status)):
+        need(st.get("verdict") in ("ok", "warn", "over"),
+             "%s budget verdict: %r" % (label, st.get("verdict")))
+        need(isinstance(st.get("spent_usd"), float) and st["spent_usd"] > 0,
+             "%s budget spent_usd not positive: %r" % (label, st.get("spent_usd")))
+        pace = st.get("pace") or {}
+        need("daily_usd" in pace,
+             "%s budget pace.daily_usd absent" % (label,))
+        need(isinstance(st.get("alert_thresholds"), list),
+             "%s budget alert_thresholds absent" % (label,))
+    need(cl_status["window_start_at"] != cx_status["window_start_at"],
+         "the two providers resolved the SAME window; the periods must differ")
+    need(cl_status["spent_usd"] != cx_status["spent_usd"],
+         "the two providers report equal spend; a swap would be undetectable")
+
+# The Claude status is VENDOR-WIDE even though `budget.accounts` is populated:
+# Claude publishes no `account_scopes` for a per-account map to describe.
+need("account_scopes" not in (claude.get("data") or {}),
+     "the Claude source published account_scopes")
+
+# Composition mirrors the SAME object under All.
+mirrored = ((((allsrc.get("data") or {}).get("providers") or {})
+             .get("claude") or {}).get("budget") or {}).get("status")
+need(mirrored == cl_status, "the All Claude mirror disagrees with the provider")
+
+# Two Codex accounts, each with its OWN scoped budget and quota.
+scopes = (codex.get("data") or {}).get("account_scopes") or {}
+need(len(scopes) == 2, "expected 2 Codex account scopes, got %d" % (len(scopes),))
+expected_scoped = {55.0, 35.0}
+seen_scoped = set()
+seen_pct = set()
+for key, scope in scopes.items():
+    st = ((scope.get("budget") or {}).get("status")) or {}
+    need(isinstance(st, dict) and st, "scope %s has no budget status" % (key,))
+    if st:
+        seen_scoped.add(st.get("budget_usd"))
+        need(st.get("budget_usd") != 90.0,
+             "scope %s read the vendor-wide amount" % (key,))
+    summary = ((scope.get("quota") or {}).get("summary")) or {}
+    seen_pct.add(summary.get("latest_percent"))
+need(seen_scoped == expected_scoped,
+     "scoped budget amounts %r != %r" % (sorted(seen_scoped), sorted(expected_scoped)))
+need(len(seen_pct) == 2,
+     "the two scopes share one quota percent %r; distinct quota is the "
+     "discriminator" % (sorted(seen_pct, key=repr),))
+
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+        if [ "$s5_check" != "ok" ]; then
+            echo "FAIL $name: budget/account-focus assertion: $s5_check"
             ok=0
         fi
     fi
@@ -1046,11 +1167,11 @@ run_scenario () {
     fi
 }
 
-# Dispatch the thirteen fixture scenarios in parallel. Each scenario's
+# Dispatch the fourteen fixture scenarios in parallel. Each scenario's
 # output goes to its own _output.log; the loop after `xargs` flushes
 # them in fixed scenario order so the harness output reads identically
 # to the old sequential version.
-fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts command-secret codex-cache-active codex-cache-idle all-combined all-combined-decorated)
+fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts command-secret codex-cache-active codex-cache-idle all-combined all-combined-decorated all-budget-account-focus)
 export -f _run_scenario_inner run_scenario normalize_json normalize_session_json
 export -f kill_server_bounded
 # Golden-diff helpers must reach the xargs `bash -c` subshells too.

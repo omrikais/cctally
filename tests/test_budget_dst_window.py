@@ -197,6 +197,76 @@ def test_local_calendar_window_non_dst_zone_stable(ns, monkeypatch):
     assert end_before == dt.datetime(2026, 4, 1, 7, 0, tzinfo=UTC)
 
 
+def test_pure_window_helper_preserves_dst_bounds(ns, monkeypatch):
+    """#556 S5 §3.1: ``budget_status_payload`` operates on ALREADY-RESOLVED
+    bounds and never re-derives them.
+
+    The narrowed kernel rule is that host-local and subscription-week resolution
+    stay in the forecast / dashboard glue and the pure kernel receives the
+    resolved window. This resolves a ``calendar-month`` window that straddles the
+    2026 spring-forward transition through the production resolver, hands those
+    bounds to the pure helper, and asserts the emitted window equals them to the
+    second. A helper that collapsed the zone to one fixed offset — the pre-#136
+    shape reproduced in the non-vacuity assertion below — would move the start by
+    an hour, which is exactly the drift ``_resolve_local_calendar_window`` exists
+    to prevent.
+    """
+    _set_tz(monkeypatch, "America/New_York")
+    now = dt.datetime(2026, 3, 20, 16, 0, tzinfo=UTC)      # Mar 20 12:00 EDT
+    start, end = _local_window(ns, "calendar-month", now)
+
+    payload = ns["budget_status_payload"](
+        period="calendar-month",
+        window_start_at=start,
+        window_end_at=end,
+        target_usd=100.0,
+        spent_usd=25.0,
+        recent_24h_usd=5.0,
+        now=now,
+        alert_thresholds=(90, 100),
+    )
+
+    assert dt.datetime.fromisoformat(payload["window_start_at"]) == start
+    assert dt.datetime.fromisoformat(payload["window_end_at"]) == end
+    # The true DST month: 31 days minus the spring-forward hour.
+    assert (end - start).total_seconds() == 743 * 3600
+
+    # Non-vacuity: a fixed-offset re-derivation from the same `now` produces a
+    # DIFFERENT start, so the equality above is not trivially true.
+    fixed_start = ns["calendar_month_window"](now, now.astimezone().tzinfo)[0]
+    assert fixed_start != start
+    assert dt.datetime.fromisoformat(payload["window_start_at"]) != fixed_start
+
+
+def test_pure_window_helper_matches_the_codex_status_shape(ns):
+    """The Claude and Codex statuses must be field-for-field identical, so one
+    client component renders either (#556 S5 §3.3)."""
+    now = dt.datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
+    payload = ns["budget_status_payload"](
+        period="calendar-month",
+        window_start_at=dt.datetime(2026, 6, 1, tzinfo=UTC),
+        window_end_at=dt.datetime(2026, 7, 1, tzinfo=UTC),
+        target_usd=200.0,
+        spent_usd=50.0,
+        recent_24h_usd=4.0,
+        now=now,
+        alert_thresholds=(90, 100),
+    )
+    assert set(payload) == {
+        "period", "budget_usd", "spent_usd", "remaining_usd", "consumption_pct",
+        "verdict", "low_confidence", "window_start_at", "window_end_at",
+        "recent_24h_usd", "alert_thresholds", "pace",
+    }
+    assert set(payload["pace"]) == {
+        "daily_usd", "projected_low_usd", "projected_high_usd",
+        "week_avg_projection_usd",
+    }
+    assert payload["budget_usd"] == 200.0
+    assert payload["spent_usd"] == 50.0
+    assert payload["remaining_usd"] == 150.0
+    assert payload["alert_thresholds"] == (90, 100)
+
+
 def test_fixed_offset_resolution_would_drift_nonvacuity(ns, monkeypatch):
     """Non-vacuity guard: reproduce the pre-#136 fixed-offset resolution and
     show it yields two DIFFERENT period starts for one civil month — proving the

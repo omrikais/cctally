@@ -879,8 +879,13 @@ def test_rehydration_failure_defers_the_walk_without_minting_a_decision(
     def fail_rehydration(*_args, **_kwargs):
         raise sqlite3.OperationalError("forced rehydration failure")
 
+    # #500 review finding F4 fused both journal-derived Codex rehydrations into
+    # one traversal, so this is the function `sync_codex_cache` calls — and the
+    # one whose failure must defer the walk. Patching the old
+    # `rehydrate_codex_file_accounts` name would leave the injection unreached
+    # and the test vacuously green.
     monkeypatch.setattr(
-        jr, "rehydrate_codex_file_accounts", fail_rehydration)
+        jr, "rehydrate_codex_journal_families", fail_rehydration)
     cache = ns["open_cache_db"]()
     try:
         stats = ns["sync_codex_cache"](cache)

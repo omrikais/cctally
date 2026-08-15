@@ -37,7 +37,7 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 
 ## Quick start
 
-Requirements: Python 3.11+, macOS or Linux, Claude Code installed and run at least once.
+Requirements: Python 3.11+, macOS or Linux, and Claude Code and/or OpenAI's Codex CLI installed and run at least once.
 
 ```bash
 # Homebrew (macOS / Linux)
@@ -50,7 +50,7 @@ npm install -g cctally && cctally setup
 git clone https://github.com/omrikais/cctally && cd cctally && ./bin/cctally setup
 ```
 
-The reporting commands work immediately on your existing logs, before any setup. Running `cctally setup` once adds the hooks that record your quota percentage continuously as you work.
+The reporting commands work immediately on your existing logs, before any setup. Running `cctally setup` once adds the Claude hooks and native Codex handlers that keep each provider's local quota observations current as you work.
 
 ```bash
 cctally daily              # cost by day: your first table
@@ -87,7 +87,7 @@ See [docs/commands/dashboard.md](docs/commands/dashboard.md).
 
 ## Conversation viewer
 
-The dashboard's Conversations tab is a read-only reader for your Claude Code transcripts. A searchable rail lists every conversation with its project, branch, models, and cost; the reader shows the full turn-by-turn flow with thinking blocks, tool calls, and per-turn cost. Subagent runs render as nested threads, and the open conversation live-tails as you work. It never modifies your transcripts, and it never leaves your machine.
+The dashboard's Conversations tab is a read-only reader for your Claude Code and Codex transcripts. A searchable rail lists every conversation with its source, project, branch, models, and cost; the reader shows the full turn-by-turn flow with reasoning, tool calls, and per-turn cost. Subagent runs render as nested threads, and the open conversation live-tails as you work. It never modifies your transcripts, and it never leaves your machine.
 
 <p align="center">
   <img src="docs/img/conversation-reader.png" alt="Conversation viewer: rail, threaded reader, and outline" width="900">
@@ -141,7 +141,7 @@ See [docs/commands/codex.md](docs/commands/codex.md) and [docs/commands/codex-qu
 
 ## Terminal UI
 
-Prefer to stay in the terminal, or working over SSH? `cctally tui` shows the same live data as a refreshing terminal dashboard. It is the one feature that needs the optional `rich` library; everything else runs on a plain Python install.
+Prefer to stay in the terminal, or working over SSH? `cctally tui` is the Claude-only, bugfix-only terminal dashboard. It remains supported, but it does not track newer web-dashboard capabilities and is not part of cross-provider parity. It is the one feature that needs the optional `rich` library; everything else runs on a plain Python install.
 
 <p align="center">
   <img src="docs/img/cli-tui.svg" alt="cctally tui: live terminal dashboard">

@@ -68,7 +68,32 @@ CapabilityStatus = Literal[
 # remains present, so a pre-v7 client reading `created_at` keeps working — but
 # the VALUE it reads changed on two of the three Codex legs, which is why this
 # is a version bump and not a silent addition.
-SOURCE_SCHEMA_VERSION = 7
+# 7 -> 8 (#556 S5): the Claude provider's `capabilities.budget` detail changed
+# MEANING. It said `subscription-week` unconditionally, as a constant, while
+# Codex advertised `calendar-period`; it now names the CONFIGURED period, so on
+# an install with `budget.period = calendar-month` the same field reads
+# `calendar-month`. `docs/cli-contract.md:58` says an optional additive key
+# alone does not bump but a changed value or meaning does, which is exactly how
+# S1, S2 and S3 justified theirs. The Claude source also gained an optional
+# `data.budget.status` — the same object Codex publishes — plus its
+# `status_unavailable` / `not_configured` siblings, and the Codex budget domain
+# gained the same optional `status_unavailable` sibling. Those are additive and
+# omitted when inapplicable, so an install with no budget configured publishes
+# byte-identical bytes and the bump rests on the capability detail alone.
+# `sources.all.capabilities.budget` is a DIFFERENT field and is unchanged at
+# `not_applicable` / `provider-native`: rendering two provider-native child
+# budgets side by side does not create an All-level budget quantity.
+# 8 -> 9 (#564): on a decorated Codex provider, a card whose totals do not come
+# from a live weekly cycle — a real account whose boundary is not live, and the
+# unattributed sentinel — now covers one native cycle width ending at `now`
+# instead of the whole ~30-day accounting range. `accounts[].spendUsd`, its five
+# token siblings, and the decorated `hero.cost_usd` / `hero.total_tokens` summed
+# from them therefore changed VALUE without changing shape, which is the same
+# class of change the 4 -> 5 entry records. Those cards additionally publish the
+# optional `spendWindow` bounds, which a cycle-bounded card omits. No client
+# branches on this number; after an in-place `execvp` update a still-loaded old
+# client renders the new figures under old copy until it reloads.
+SOURCE_SCHEMA_VERSION = 9
 DEFAULT_SOURCE = "claude"
 SOURCE_ORDER = ("claude", "codex", "all")
 SOURCE_FRESHNESS_DOMAINS = ("hero", "quota", "sessions")

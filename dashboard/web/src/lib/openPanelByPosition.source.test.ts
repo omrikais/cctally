@@ -51,7 +51,7 @@ describe('openPanelByPosition — source-bound non-Claude interactions', () => {
     env.sources!.codex.data = makeDecoratedCodexSourceData();
     updateSnapshot(env);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: ACCOUNT_B });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: ACCOUNT_B });
 
     openPanelByPosition(1);
 
@@ -74,7 +74,7 @@ describe('openPanelByPosition — source-bound non-Claude interactions', () => {
     env.sources!.codex.data = codex;
     updateSnapshot(env);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: ACCOUNT_B });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: ACCOUNT_B });
 
     openPanelByPosition(8);
 

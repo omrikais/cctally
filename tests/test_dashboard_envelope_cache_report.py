@@ -862,9 +862,19 @@ def test_source_schema_version_moves_with_the_retired_s2_transition():
     #556 S3 takes it to 7: every Codex alert row gained `alerted_at`, and
     `created_at` became an equal-valued alias for that firing instant rather
     than the crossing instant two of the three legs used to publish.
+
+    #556 S5 takes it to 8: the Claude provider's `capabilities.budget` detail
+    said `subscription-week` as a CONSTANT and now names the CONFIGURED period,
+    so on an install with `budget.period = calendar-month` the same field reads
+    `calendar-month`.
+
+    #564 takes it to 9: on a decorated Codex provider a card with no live
+    weekly cycle now totals one native cycle width ending at `now` instead of
+    the whole accounting range, so `accounts[].spendUsd`, its token siblings
+    and the decorated hero totals summed from them changed value.
     """
     from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION
-    assert SOURCE_SCHEMA_VERSION == 7
+    assert SOURCE_SCHEMA_VERSION == 9
 
 
 # Spec §5 also asked for Codex "field-survival assertions" HERE. They live

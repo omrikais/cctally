@@ -1,8 +1,8 @@
 import { useSyncExternalStore } from 'react';
 import { getScopedSnapshot, getState, subscribeStore } from '../store/store';
 import { scopeToAccount, type AccountScopeResult } from '../store/accountScope';
-import { ALL_ACCOUNTS } from '../store/accountFocus';
-import type { DashboardSelection, Envelope } from '../types/envelope';
+import { ALL_ACCOUNTS, storedFocusFor } from '../store/accountFocus';
+import type { DashboardSelection, Envelope, SourceName } from '../types/envelope';
 
 // #416 Task 15 — the panel-facing account-scope chokepoint.
 //
@@ -38,13 +38,35 @@ export function useScopedSnapshot(source?: DashboardSelection): Envelope | null 
 // open — and a caller that guards on the mismatch has to fall back to the
 // harsher "could not be built" rather than the empty state it meant.
 // Passing the same source it bound its data to keeps them in step.
-export function useAccountScope(forSource?: DashboardSelection): AccountScopeResult {
+//
+// #556 S5 §5.4 — `forProvider` names the PROVIDER under a combined view, where
+// the view and the provider are no longer the same thing. Omitted, it defaults
+// to the view's own provider and to "no provider" under All, which is exactly
+// what every pre-S5 caller got. The stored value is read through
+// `storedFocusFor`, the one place that decides which of a provider's two slots
+// a view uses.
+// #556 S5 §5.4 — the provider whose account focus a SURFACE follows for a given
+// view. On a provider tab that is the tab itself; under All it is Codex, the
+// only provider that publishes `account_scopes` and therefore the only one a
+// focus can actually narrow. Passed explicitly by every All-aware caller rather
+// than defaulted, so each surface's decision is visible at its call site.
+export function scopeProviderFor(selection: DashboardSelection): SourceName {
+  return selection === 'all' ? 'codex' : selection;
+}
+
+export function useAccountScope(
+  forSource?: DashboardSelection,
+  forProvider?: SourceName,
+): AccountScopeResult {
   const env = useSyncExternalStore(subscribeStore, () => getState().snapshot);
   const active = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const source = forSource ?? active;
+  const provider: SourceName | null = forProvider ?? (source === 'all' ? null : source);
   const stored = useSyncExternalStore(
     subscribeStore,
-    () => (source === 'all' ? ALL_ACCOUNTS : getState().accountFocus[source] ?? ALL_ACCOUNTS),
+    () => (provider == null
+      ? ALL_ACCOUNTS
+      : storedFocusFor(getState().accountFocus, source, provider)),
   );
-  return scopeToAccount(env, source, stored);
+  return scopeToAccount(env, source, stored, provider);
 }

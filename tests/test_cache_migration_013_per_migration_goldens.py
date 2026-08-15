@@ -11,8 +11,9 @@ production 013 handler against a copy, and asserts it arms the flag.
 flock-held post-walk recompute does the one-time full GROUP BY over all
 conversation_messages to populate ``conversation_sessions``. The handler does
 NOT touch any data table (the recompute is sync-side). The
-conversation_sessions table itself is created by ``_apply_cache_schema`` (runs
-on every open), so it is present in BOTH pre and post. The dispatcher
+conversation_sessions table itself is created by the version-gated
+``_apply_cache_schema`` when migration 013 bumps the head, so it is present in
+BOTH pre and post. The dispatcher
 central-stamps the migration marker (#140); a fresh install stamps it WITHOUT
 running (its incremental UPSERT fills the table at ingest).
 """
@@ -93,8 +94,8 @@ def test_pre_fixture_at_012_head_without_flag_or_marker(cctally_module):
             (_MIGRATION,),
         ).fetchone()[0] == 0
         assert _flag(conn) is None, "pre fixture must NOT carry the backfill flag"
-        # The table exists (schema is applied on every open) but is empty — the
-        # flock-held recompute is what populates it.
+        # The table exists because the migration-013 head bump opened the schema
+        # gate, but is empty — the flock-held recompute is what populates it.
         assert conn.execute(
             "SELECT COUNT(*) FROM conversation_sessions"
         ).fetchone()[0] == 0

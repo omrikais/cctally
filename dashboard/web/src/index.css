@@ -533,7 +533,16 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 /* #459 — both responsive labels are spans only so CSS can switch them without
    changing the visible disclosure's DOM position. They retain the parent
    sub-line's deliberately dim weight rather than inheriting the bright metric
-   span treatment above. */
+   span treatment above.
+
+   #564 ui-qa P2 — the dim treatment is claimed by its OWN class, because the
+   two `-full` / `-compact` classes also carry the responsive swap below. Until
+   #564 every note had both a full and a compact form, so the styling and the
+   swap could ride on one class; a note with no compact form now exists, and it
+   must keep the dim style WITHOUT being hidden at the breakpoint. Adding the
+   responsive class to it unconditionally would delete the disclosure on
+   mobile — the opposite of the fix. */
+.hs-sub .hero-spent-note-text,
 .hs-sub .hero-ingest-backlog-label-full,
 .hs-sub .hero-ingest-backlog-label-compact {
   color: inherit;
@@ -1398,6 +1407,113 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 .fc-foot-k { color: var(--text-dim); }
 .fc-foot-v { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
 
+/* #556 S5 §4 — the configured-BUDGET block. One component on three hosts, so
+   the vocabulary is shared with the Forecast tile rather than reinvented: the
+   verdict chip copies `.fc-verdict-chip`'s three states and the consumption bar
+   copies `.fc-pace`'s geometry. The card chrome itself is the SHIPPED
+   `.provider-summary-card`, which is why the block needs no responsive rule of
+   its own — under All it rides `.provider-composition--panel`, whose existing
+   `max-width: 640px` rule collapses the grid to one column. */
+.fc-budget-block {
+  margin-top: var(--space-2);
+  min-width: 0;
+}
+/* #556 S5 Unit 2 review F6 — SCOPED, not bare. `.source-provider-section` has
+   equal specificity, sets `gap: var(--space-1)` and comes later in the file, so
+   the bare selector never applied and the card shipped at
+   4px. 8px is the right figure here: this card stacks five separately-bounded
+   rows (head, numeric line, a 6px bar, the verdict chip row, and a key/value
+   footer), and at 4px the bar reads as part of the numeric line above it rather
+   than as its own row. The forecast card beside it stacks three and keeps 4px. */
+.source-provider-section.budget-provider-summary { gap: var(--space-2); }
+.budget-block-title { color: var(--text); font-size: var(--fs-meta); }
+.budget-figures {
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.budget-spend { color: var(--text); font-weight: 700; font-size: 18px; }
+.budget-of { color: var(--text-dim); font-size: var(--fs-meta); }
+.budget-target { color: var(--text-dim); font-weight: 600; }
+/* #556 S5 browser-QA P2 — the target is secondary only because a spend figure
+   sits beside it. In the unavailable state there is no spend, so the same
+   treatment left the card with no stated number at all and made the amber
+   qualifier its most salient element, beside a configured card that leads with
+   an 18px figure. Promote the lone figure to that same prominence. It still
+   does not read as spend, because spend is always the left half of a
+   "$spend of $target" pair and this figure is followed by the word
+   "configured" with no pair around it. */
+.budget-target.is-lone { color: var(--text); font-weight: 700; font-size: 18px; }
+.budget-period-chip {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: var(--fs-eyebrow);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  white-space: nowrap;
+}
+.budget-bar {
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+.budget-bar-fill { height: 100%; background: var(--accent-green); }
+.budget-bar.is-warn .budget-bar-fill { background: var(--accent-amber); }
+.budget-bar.is-over .budget-bar-fill { background: var(--accent-red); }
+.budget-verdict-line {
+  display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2);
+}
+.budget-consumption { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.budget-verdict-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 10px; border-radius: var(--radius-pill);
+  font-size: var(--fs-eyebrow); font-weight: 700; letter-spacing: 0.4px;
+  border: 1px solid transparent; text-transform: uppercase;
+}
+.budget-verdict-chip.is-good {
+  color: var(--accent-green);
+  border-color: color-mix(in srgb, var(--accent-green) 45%, transparent);
+  background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+}
+.budget-verdict-chip.is-warn {
+  color: #1a1400;
+  background: var(--accent-amber);
+  border-color: var(--accent-amber);
+}
+.budget-verdict-chip.is-over {
+  color: #ffe7e7;
+  background: var(--accent-red);
+  border-color: var(--accent-red);
+}
+.budget-lowconf {
+  color: var(--accent-amber);
+  font-size: var(--fs-eyebrow);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+/* #556 S5 §4.6 — the "window unresolved" qualifier beside a CONFIGURED amount.
+   Deliberately not a verdict chip: there is no verdict, and borrowing that
+   vocabulary would read as one. */
+.budget-window-unresolved {
+  color: var(--accent-amber);
+  font-size: var(--fs-eyebrow);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  white-space: nowrap;
+}
+.budget-empty { display: flex; flex-direction: column; gap: 4px; }
+.budget-empty-copy { color: var(--text); font-size: var(--fs-meta); margin: 0; }
+.budget-empty-hint { color: var(--text-dim); font-size: var(--fs-meta); margin: 0; }
+.budget-empty-cmd {
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: var(--radius-sm);
+  padding: 1px 6px;
+  word-break: break-word;
+}
+
 /* -------- Trend panel -------- */
 .trend-table { width: 100%; border-collapse: collapse; font-size: 13px; font-family: var(--font-mono); }
 .trend-table thead th {
@@ -2084,6 +2200,17 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 .mcw-mini .s .v { font-weight: 700; font-size: var(--fs-data); margin-left: 6px; color: var(--text); }
 .mcw-mini .s .v.v-magenta { color: var(--accent-magenta); }
 .mcw-mini .s .v.v-cyan    { color: var(--accent-cyan); }
+
+/* #564 — the per-account cycle table's fallback qualifier. It sits under the
+   figure in the same numeric cell, in the dim eyebrow vocabulary the table's
+   own note already uses, so it reads as a caption on that total rather than as
+   a second number. */
+.mcw-spend-window {
+  display: block;
+  font-size: var(--fs-eyebrow);
+  font-weight: 400;
+  color: var(--text-dim);
+}
 
 .mcw-mshead { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .mcw-ms-sub { color: var(--text-dim); font-size: var(--fs-eyebrow); }
@@ -5518,6 +5645,20 @@ mark.current {
     margin-top: 2px;
   }
 
+  /* #574 — RecentAlertsPanel row. `.alert-row` is one nowrap flex line and
+     `.alert-when` is `flex: 1` with the default `min-width: auto`, so the cell
+     cannot shrink below its min-content width. Rendering the absolute instant
+     instead of a bare calendar day grew that min-content from the token "Apr"
+     to "16:59", and at 320px with an account chip the cell was measured 33.7px
+     outside its row and 10.7px past the panel card, giving the document 3px of
+     horizontal scroll. The modal below already answers the same crowding by
+     handing its when-cell a full-width row beneath the chips; the panel now
+     does the same, which also stops the timestamp stacking onto four lines at
+     the 390px design target. `gap: 14px` would apply on the new cross axis
+     too, so row-gap is reset to keep the row compact. */
+  .alert-row { flex-wrap: wrap; row-gap: 2px; }
+  .alert-row > .alert-when { flex: 1 1 100%; min-width: 0; }
+
   /* RecentAlertsModal table — optional Source/Account columns use semantic
      cell classes so the mobile anatomy cannot drift with column count. */
   .alerts-table { width: 100%; }
@@ -7610,6 +7751,53 @@ mark.current {
 }
 .account-chip.is-active .account-chip-hint { color: var(--accent-blue); }
 
+/* #556 S5 §5.5 (Unit 2 review F4) — under All there is ONE ROW PER DECORATED
+   PROVIDER, each with a visible provider name and a visible effect qualifier.
+   `.account-chip-row` is `display: inline-flex`, so without a block wrapper the
+   two rows flowed inline with no gap, and the label inherited body size and
+   colour beside 12px mono chips. This lives in the sticky topbar, so the
+   wrapper wraps and the label never forces a nowrap overflow. A single-provider
+   tab renders no wrapper and no label, and is untouched by every rule here. */
+.account-chip-rows {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.account-chip-rows .account-chip-row { min-width: 0; }
+/* Rendered as the first child INSIDE the bordered radiogroup, so it needs its
+   own separation from the first chip: the row's own `gap` is 2px. */
+.account-chip-rowlabel {
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding-left: var(--space-1);
+  margin-right: var(--space-1);
+  font-size: var(--fs-eyebrow);
+  line-height: 1.3;
+}
+.account-chip-rowprovider {
+  color: var(--text);
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.account-chip-rowqualifier {
+  color: var(--text-dim);
+  font-weight: 500;
+}
+/* At phone widths the two rows stack and each label sits on its own line above
+   its chips, so the qualifier stays readable instead of competing for the
+   topbar's single line. */
+@media (max-width: 480px) {
+  .account-chip-rows { gap: var(--space-1); }
+  .account-chip-rows .account-chip-row { width: 100%; }
+  .account-chip-rowlabel { width: 100%; }
+}
+
 /* #341 Task 4 — the unified per-account hero cards. A wrapping row of compact
    cards under the hero; each card's accent is the deterministic account color
    (--account-color). The unattributed card renders dimmed with totals only. */
@@ -7689,6 +7877,7 @@ mark.current {
 }
 .account-hero-card-spend { font-family: var(--font-mono); font-weight: 700; color: var(--text); }
 .account-hero-card-reset,
+.account-hero-card-window,
 .account-hero-card-note { font-size: 11px; color: var(--text-dim); }
 
 /* #416 QA — the combined tab renders this strip for CODEX, so it names its
@@ -7830,6 +8019,25 @@ mark.current {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-2);
   align-items: stretch;
+  /* #556 S5 browser-QA P1, measured in Chrome at 1440px on the Forecast All
+     panel. This body has a definite height (the 368px `.row-medium` track less
+     the header, so 287px), and with the implicit `grid-auto-rows: auto` its two
+     rows resolved to 139.5px each — exactly half the body. Injecting 200px of
+     content into the first card did not move them, so the tracks were sized by
+     the container and never by the content. The Claude forecast card needs
+     166px, so it overflowed its 138px box by 28px; because that surplus lands
+     INSIDE the body's own box, `scrollHeight` stayed equal to `clientHeight`
+     (287 === 287) and the budget card below painted over the forecast footer
+     with no scroll able to recover it.
+
+     `minmax(min-content, 1fr)` keeps the shipped fill behaviour wherever the
+     content already fits — the Cache and Monthly All panels measure byte-
+     identical — and grows the track past the body only where it does not, which
+     turns the silent clip into the in-card scroll the bento contract already
+     intends (`.dash-grid .panel .panel-body { overflow-y: auto }` above). It
+     also repairs the same latent clip on the Weekly All panel, whose section
+     needed 270px in a 224px box before this line. */
+  grid-auto-rows: minmax(min-content, 1fr);
 }
 .provider-summary-card,
 .provider-composition-section {

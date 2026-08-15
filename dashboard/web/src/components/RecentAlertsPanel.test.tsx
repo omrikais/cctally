@@ -6,7 +6,7 @@
 // what the threshold would derive, proving the panel consumes rather than
 // recomputes.
 import { act, render, screen } from '@testing-library/react';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RecentAlertsPanel } from './RecentAlertsPanel';
 import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
 import type { AlertEntry, Envelope } from '../types/envelope';
@@ -133,5 +133,73 @@ describe('RecentAlertsPanel empty-state teaching gauge (#264 S1)', () => {
     expect(container.querySelector('.ra-gauge-hero')?.textContent).toBe('—');
     expect(container.querySelector('.panel-empty')).toBeNull();
     expect(container.textContent).toContain('No alerts yet');
+  });
+});
+
+// #574 — the when-cell must disclose the firing instant. The visible text is
+// what AC1/AC3 are written against; the `title` is the desktop convenience AC4
+// specifies, and it must be ABSENT rather than "—" when the instant does not
+// parse.
+describe('RecentAlertsPanel firing instant (#574)', () => {
+  // The render sites omit `nowMs`, so the component reads `Date.now()`. Only
+  // the "recent" fixture below pins the clock; the absolute-branch fixtures use
+  // instants far enough in the past that they can only age further into that
+  // branch.
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const whenCells = (container: HTMLElement): HTMLElement[] =>
+    [...container.querySelectorAll<HTMLElement>('.alert-when')];
+
+  it('titles an absolute-branch row with the instant, including its calendar year', () => {
+    ingest([entry({ id: 'when:abs', alerted_at: '2026-04-16T13:56:00Z' })]);
+    const { container } = render(<RecentAlertsPanel />);
+    expect(whenCells(container)[0].getAttribute('title')).toBe('2026-04-16 13:56 UTC');
+  });
+
+  it('renders different visible text for two alerts minutes apart on one calendar day', () => {
+    ingest([
+      entry({ id: 'when:first', alerted_at: '2026-04-16T13:56:00Z' }),
+      entry({ id: 'when:last', alerted_at: '2026-04-16T13:59:00Z' }),
+    ]);
+    const { container } = render(<RecentAlertsPanel />);
+    expect(whenCells(container).map((c) => c.textContent))
+      .toEqual(['Apr 16 13:56 UTC', 'Apr 16 13:59 UTC']);
+  });
+
+  it('titles a relative-branch row too, with the clock pinned so the row stays recent', () => {
+    // Pinning is mandatory: a hard-coded "recent" instant would eventually age
+    // into the absolute branch and this test would stop testing the relative
+    // branch without ever failing.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date('2026-04-16T14:00:00Z'));
+    ingest([entry({ id: 'when:recent', alerted_at: '2026-04-16T13:56:00Z' })]);
+    const { container } = render(<RecentAlertsPanel />);
+    const cell = whenCells(container)[0];
+    expect(cell.textContent).toBe('4m ago');
+    expect(cell.getAttribute('title')).toBe('2026-04-16 13:56 UTC');
+  });
+
+  it('carries no title attribute when the instant is absent', () => {
+    ingest([entry({
+      id: 'when:null',
+      alerted_at: undefined as unknown as string,
+    })]);
+    const { container } = render(<RecentAlertsPanel />);
+    const cell = whenCells(container)[0];
+    expect(cell.textContent).toBe('—');
+    expect(cell.hasAttribute('title')).toBe(false);
+  });
+
+  it('carries no title attribute when the instant is a non-empty string that does not parse', () => {
+    // The case that separates a parse-aware guard from a truthiness check: a
+    // truthy-but-unparseable instant formats to the "—" sentinel, so
+    // `title={fmt.startedShort(...)}` would emit title="—" here.
+    ingest([entry({ id: 'when:bad', alerted_at: 'not-a-date' })]);
+    const { container } = render(<RecentAlertsPanel />);
+    const cell = whenCells(container)[0];
+    expect(cell.textContent).toBe('—');
+    expect(cell.hasAttribute('title')).toBe(false);
   });
 });

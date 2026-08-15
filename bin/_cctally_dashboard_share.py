@@ -1662,7 +1662,8 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
                 ls.ColumnSpec(key="current", label="Current", align="right"),
                 ls.ColumnSpec(key="projected", label="Projected", align="right"),
             ),
-            rows=tuple(rows), chart=None, totals=(), notes=(), generated_at=end,
+            rows=tuple(rows), chart=None, totals=(),
+            notes=_share_budget_notes(data), generated_at=end,
             version=sys.modules["cctally"]._share_resolve_version(),
             template_id=template_id, source="codex", source_label="Codex",
             availability=availability, availability_reason=reason,
@@ -1979,6 +1980,38 @@ def _share_scope_codex_state(state, account: "str | None"):
     return replace(state, data=MappingProxyType({**dict(data), **scoped}))
 
 
+def _share_budget_notes(data) -> tuple[str, ...]:
+    """The configured-budget status, as an artifact note (#556 S5 §5.12).
+
+    The Forecast artifact carried quota projections and nothing about the
+    CONFIGURED budget, so a shared Forecast said less than the panel it was
+    taken from — and after S5 the panel renders both side by side. The note is
+    ADDITIVE and omitted when no status is published, so an install with no
+    budget produces a byte-identical artifact.
+
+    ``data`` is already the ACCOUNT-SCOPED provider body when the request named
+    an account (`_share_scope_codex_state` rewrites the scoped
+    domains before this runs), so a focused share carries that account's own
+    budget and never the vendor-wide one.
+    """
+    budget = data.get("budget") if isinstance(data, Mapping) else None
+    status = budget.get("status") if isinstance(budget, Mapping) else None
+    if not isinstance(status, Mapping):
+        return ()
+    try:
+        spent = float(status["spent_usd"])
+        target = float(status["budget_usd"])
+        consumed = float(status["consumption_pct"])
+        period = str(status["period"])
+        verdict = str(status["verdict"])
+    except (KeyError, TypeError, ValueError):
+        return ()
+    return (
+        f"Budget ({period}): ${spent:,.2f} of ${target:,.2f} "
+        f"({consumed:.1f}%) — {verdict}",
+    )
+
+
 def _share_build_source_snapshots(*, ls, template, template_id: str,
                                   panel: str, options: dict, source: str,
                                   source_explicit: bool, data_snap,
@@ -2010,6 +2043,22 @@ def _share_build_source_snapshots(*, ls, template, template_id: str,
             claude_snapshot = _share_apply_current_week_freshness(
                 claude_snapshot, claude_state, panel,
             )
+            # #556 S5 §5.12 (Unit 2 review F7). The budget note was wired into
+            # the Codex builder only, while §5.12 says "the configured-budget
+            # sections" and the Claude Forecast panel renders one after S5 — so
+            # a shared Claude Forecast said less than the panel it came from.
+            # Gated exactly like the freshness stamp above: a source-less
+            # request is the shipped legacy Claude contract and stays
+            # byte-identical, because it has no source state to read at all.
+            if panel == "forecast":
+                notes = _share_budget_notes(
+                    getattr(claude_state, "data", None) or {},
+                )
+                if notes:
+                    claude_snapshot = replace(
+                        claude_snapshot,
+                        notes=tuple(claude_snapshot.notes) + notes,
+                    )
 
     codex_snapshot = None
     codex_state = None

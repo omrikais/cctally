@@ -2,7 +2,7 @@ import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useDisplayTz } from '../hooks/useDisplayTz';
-import { fmt, type FmtCtx } from '../lib/fmt';
+import { fmt, spendWindowLabel, type FmtCtx } from '../lib/fmt';
 import { resolveVerdict } from '../lib/verdict';
 import { humanizeAge } from '../lib/syncFreshness';
 import { heroFreshnessLabel } from '../lib/heroFreshness';
@@ -15,6 +15,7 @@ import { sourceAccounts } from '../store/accountFocus';
 import { AccountHeroCards } from './AccountHeroCards';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import type {
+  AccountCard,
   AllCombinedLeg,
   AllCombinedPeriod,
   AllSourceData,
@@ -37,6 +38,43 @@ import type {
 export const CODEX_STALE_CYCLE_NOTE =
   'Codex quota evidence is stale — this spend is current, but the forecast is paused '
   + 'until Codex reports again.';
+
+// The spend zone's default spoken period claim. Named because the zone's
+// `aria-label` compares against it to decide whether the label has to be
+// announced on its own (#564 review P2).
+const DEFAULT_SPENT_LABEL_SPOKEN = 'Spent this week';
+
+// #564 — the decorated headline is the SUM of the cards beneath it, and a card
+// with no live cycle is totalled over one native cycle width ending now rather
+// than over the whole accounting range. The aggregate hero shows that sum with
+// no date range of its own, so it states the fallback period here. Read from the
+// published `spendWindow`, never inferred from a null `resetsAt`; the period is
+// derived from the bounds so a clamped window names its true span. Every
+// fallback card carries the same server-computed window, so the first one found
+// describes them all.
+export function codexSpendWindowNote(
+  accounts: readonly AccountCard[] | null | undefined,
+): string | null {
+  const window = accounts?.find((card) => card.spendWindow != null)?.spendWindow;
+  if (window == null) return null;
+  return 'Includes accounts with no live cycle, counted over the '
+    + `${spendWindowLabel(window)}.`;
+}
+
+// #564 ui-qa P2 — the mobile shorthand for the note above. The full sentence
+// wrapped to five lines at 375px and nine at 320px, adding 160px of hero to
+// qualify a 34px figure — worse than the ingest-backlog case the #459 shorthand
+// mechanism was built for, and shipping with no shorthand of its own. The
+// period claim is what must survive the narrowing, so it is what the short form
+// keeps; the period is still DERIVED from the published bounds, never a fixed
+// "7 days", so a clamped window shortens both forms together.
+export function codexSpendWindowCompactNote(
+  accounts: readonly AccountCard[] | null | undefined,
+): string | null {
+  const window = accounts?.find((card) => card.spendWindow != null)?.spendWindow;
+  if (window == null) return null;
+  return `Incl. no-cycle accounts · ${spendWindowLabel(window)}`;
+}
 
 // public #5 — the Codex hook's ingest leg is budgeted, so on a large or freshly
 // upgraded store some rollout history has not been read yet. Disclosure ONLY:
@@ -178,7 +216,11 @@ function SharedHero({
 }) {
   const h = env?.header;
   const cw = env?.current_week ?? null;
-  const scope = useAccountScope();
+  // #556 S5 §5.4 — one scope PER PROVIDER. Under All the view and the provider
+  // are no longer the same thing, and the two providers carry independent
+  // focus slots, so a single view-shaped scope cannot answer for both.
+  const claudeScope = useAccountScope(source, 'claude');
+  const codexScope = useAccountScope(source, 'codex');
   // Every countdown on this hero is measured from the SERVER's snapshot
   // instant, never from the browser clock. The Claude tab already prints a
   // server-computed `current_week.reset_in_sec`, so a skewed client clock used
@@ -190,19 +232,30 @@ function SharedHero({
   if (source === 'claude') {
     const claudeEntry = resolveSourceView(env, 'claude').entry;
     const accounts = sourceAccounts(claudeEntry);
-    const focusedCard = scope.requestedKey == null
+    const focusedCard = claudeScope.requestedKey == null
       ? null
-      : accounts?.find((card) => card.accountKey === scope.requestedKey) ?? null;
+      : accounts?.find((card) => card.accountKey === claudeScope.requestedKey) ?? null;
     const perAccount = accounts != null && focusedCard == null;
     const focusedResetInSec = remainingSeconds(focusedCard?.resetsAt, nowMs);
     const mergedSpendUsd = accounts?.reduce((sum, card) => sum + card.spendUsd, 0) ?? null;
     return (
       <CanonicalHero
         weekLabel={accounts == null ? h?.week_label : null}
-        usedPct={focusedCard?.weeklyPercent ?? (perAccount ? null : h?.used_pct)}
-        fiveHourPct={focusedCard?.fiveHourPercent ?? (perAccount ? null : h?.five_hour_pct)}
+        // #556 S5 round-2 QA P1 — a FOCUSED card answers for every slot it owns,
+        // including when its answer is "no figure". `??` made a null per-account
+        // percent fall through to the merged `header.used_pct`, which published
+        // the whole provider's weekly consumption under one account's chip and
+        // printed the same number for every account. Claude's per-account quota
+        // evidence is far sparser than its accounting, so that null is the
+        // COMMON case, not an edge one. Each slot switches on card PRESENCE.
+        usedPct={focusedCard != null ? focusedCard.weeklyPercent : perAccount ? null : h?.used_pct}
+        fiveHourPct={focusedCard != null
+          ? focusedCard.fiveHourPercent
+          : perAccount ? null : h?.five_hour_pct}
         resetInSec={focusedCard != null ? focusedResetInSec : perAccount ? null : cw?.reset_in_sec}
-        spentUsd={focusedCard?.spendUsd ?? (perAccount ? mergedSpendUsd : cw?.spent_usd)}
+        spentUsd={focusedCard != null
+          ? focusedCard.spendUsd
+          : perAccount ? mergedSpendUsd : cw?.spent_usd}
         // The account wire does not emit this metric. Do not manufacture it
         // from rounded card values: the canonical merged value is a different
         // accounting scope and cannot be borrowed while focused.
@@ -215,6 +268,7 @@ function SharedHero({
         heroLabel={heroLabel}
         showFiveHour={!perAccount && (focusedCard?.fiveHourPercent != null || accounts == null)}
         perAccountNote={perAccount ? 'per account' : null}
+        withheldUsedPct={focusedCard != null && focusedCard.weeklyPercent == null}
       />
     );
   }
@@ -222,12 +276,19 @@ function SharedHero({
   const codex = codexEntry?.data as CodexSourceData | undefined;
   const cycle = codex?.hero.cycle;
   const codexDecorated = sourceAccounts(codexEntry) != null;
+  // #556 S5 §5.8 — a Codex focus under All UN-BLANKS the provider-native quota
+  // surfaces and reads the scoped child. `env` is the scoped envelope, so
+  // `codex` is already that child's composition; the only thing that changes
+  // here is the gate. Combined SPEND stays withheld through the unchanged
+  // `combinedPresentation` predicate and is never recomputed from a child.
   const suppressAccountBlindQuota = (
-    source === 'codex' && scope.scopesSupported && scope.accountKey == null
-  ) || (source === 'all' && codexDecorated);
+    source === 'codex' && codexScope.scopesSupported && codexScope.accountKey == null
+  ) || (source === 'all' && codexDecorated && codexScope.accountKey == null);
   const quota = suppressAccountBlindQuota
     ? null
-    : scope.accountKey != null ? scope.scope?.quota ?? null : codex?.quota ?? null;
+    : codexScope.accountKey != null
+      ? codexScope.scope?.quota ?? null
+      : codex?.quota ?? null;
   const windows = codex?.hero && quota ? joinCodexQuotaLabels(codex.hero, quota) : [];
   const weekly = [...windows].sort((a, b) => {
     const aMatchesCycle = a.current.resets_at === cycle?.resets_at;
@@ -305,7 +366,20 @@ function SharedHero({
     // lone surviving cycle's percentage through would publish a blended $/1%
     // by construction — merged spend over one account's percent — and would
     // silently change what the headline means as cycles expire.
-    const perAccount = scope.scopesSupported && scope.accountKey == null;
+    const perAccount = codexScope.scopesSupported && codexScope.accountKey == null;
+    // #564 — the two states disclose the fallback period differently. The
+    // aggregate figure is the sum of every card, so it takes a note whenever ANY
+    // published card was totalled over the bounded window. Under focus the
+    // figure is that one account's card, so the disclosure belongs in the spend
+    // label, which otherwise reads a flat "SPENT THIS WEEK" over a total that
+    // does not cover a week.
+    const spendWindowNote = perAccount
+      ? codexSpendWindowNote(sourceAccounts(codexEntry))
+      : null;
+    const spendWindowCompactNote = perAccount
+      ? codexSpendWindowCompactNote(sourceAccounts(codexEntry))
+      : null;
+    const focusedSpendWindow = perAccount ? null : codexScope.card?.spendWindow ?? null;
     return (
       <CanonicalHero
         // #416 QA P1-C: `hero.cycle` is the REPRESENTATIVE account's window.
@@ -338,10 +412,30 @@ function SharedHero({
         // caveat in the one view that most needed it (QA P1).
         spentNote={joinHeroNotes(
           perAccount || !codexCycleStale ? null : CODEX_STALE_CYCLE_NOTE,
+          spendWindowNote,
           codexBacklogNote,
         )}
-        spentNoteLabel={codexBacklogLabel}
-        spentNoteCompactLabel={codexBacklogCompactLabel}
+        spentNoteLabel={joinHeroNotes(spendWindowNote, codexBacklogLabel)}
+        // #564 ui-qa P2 — the fallback note now has its own shorthand, so the
+        // compact line is set whenever EITHER disclosure has one. It was
+        // previously gated on the backlog shorthand alone, which left the
+        // fallback sentence with no mobile form at all: the responsive swap
+        // needs a compact sibling to swap TO, so it simply never engaged and the
+        // full sentence rendered at every width. When both apply the mobile line
+        // still carries both rather than dropping the period.
+        spentNoteCompactLabel={
+          spendWindowCompactNote == null && codexBacklogCompactLabel == null
+            ? null
+            : joinHeroNotes(
+              spendWindowCompactNote ?? spendWindowNote,
+              codexBacklogCompactLabel ?? codexBacklogLabel,
+            )}
+        spentLabel={focusedSpendWindow == null
+          ? undefined
+          : `SPENT · ${spendWindowLabel(focusedSpendWindow).toUpperCase()}`}
+        spentLabelSpoken={focusedSpendWindow == null
+          ? undefined
+          : `Spent over the ${spendWindowLabel(focusedSpendWindow)}`}
         perAccountNote={perAccount ? 'per account' : null}
       />
     );
@@ -399,9 +493,35 @@ function SharedHero({
   // and COMBINED SPEND is this tab's headline — blanking it would be the
   // opposite failure. Gated on decoration, so a <=1-real-account install is
   // byte-identical (R8).
-  const codexPerAccount = codexDecorated;
+  //
+  // #556 S5 §5.8/§5.9 — a focus under All un-blanks the focused provider's own
+  // slots. Codex reads its scoped child; Claude substitutes the focused card's
+  // weekly percent and reset, which is the SAME substitution the Claude tab
+  // performs (§1.4) and is what the row's `hero and alerts only` qualifier
+  // states. The panels stay unscoped for Claude, because Claude publishes no
+  // `account_scopes`.
+  const codexPerAccount = codexDecorated && codexScope.accountKey == null;
   const claudeEntry = resolveSourceView(env, 'claude').entry;
-  const claudePerAccount = sourceAccounts(claudeEntry) != null;
+  const claudeAccounts = sourceAccounts(claudeEntry);
+  const claudeFocusedCard = claudeScope.requestedKey == null
+    ? null
+    : claudeAccounts?.find((card) => card.accountKey === claudeScope.requestedKey) ?? null;
+  const claudePerAccount = claudeAccounts != null && claudeFocusedCard == null;
+  // #556 S5 round-2 QA P1 — the focused card answers, including when its answer
+  // is "no figure". Falling through to `h.used_pct` published the PROVIDER-WIDE
+  // weekly percentage as one account's own, so two accounts that had consumed
+  // nothing measurable both showed the whole provider's number — while the leg
+  // beside it said `no data` and the account's own card said `Weekly —`. This
+  // is the headline layer of the rule `store/accountScope.ts` states for the
+  // panels: under focus, never fall back to the parent. Claude's per-account
+  // quota evidence is much sparser than its accounting, so a null weekly
+  // percent is the common case rather than an edge one.
+  const claudeHeadlinePct = claudeFocusedCard != null
+    ? claudeFocusedCard.weeklyPercent
+    : claudePerAccount ? null : h?.used_pct ?? null;
+  // Decorated and without a figure is a DELIBERATE blank, so it is dimmed. The
+  // undecorated case keeps its undimmed em-dash byte-for-byte (R8).
+  const claudeHeadlineBlank = claudeAccounts != null && claudeHeadlinePct == null;
 
   // Each provider block carries its OWN labelled reset (§5, retiring A6).
   //
@@ -419,9 +539,11 @@ function SharedHero({
   // published row of the matrix, so without this an install with Codex quota
   // observations but no Codex accounting rows showed a percentage with no
   // countdown beneath it, where the previous hero showed one.
-  const claudeResetSeconds = claudeLeg?.state === 'current'
-    ? periodResetSeconds(claudeLeg.period, nowMs)
-    : cw?.reset_in_sec ?? null;
+  const claudeResetSeconds = claudeFocusedCard != null
+    ? remainingSeconds(claudeFocusedCard.resetsAt, nowMs)
+    : claudeLeg?.state === 'current'
+      ? periodResetSeconds(claudeLeg.period, nowMs)
+      : cw?.reset_in_sec ?? null;
   const codexResetSeconds = codexLeg?.state === 'current'
     ? periodResetSeconds(codexLeg.period, nowMs)
     : resetSeconds;
@@ -436,8 +558,8 @@ function SharedHero({
           </div>
           {/* A7 — the deliberate blank carries `.is-blank`, so it reads as an
               intentional absence rather than an unfinished load. */}
-          <div className={claudePerAccount ? 'hu-num is-blank' : 'hu-num'}>
-            {claudePerAccount ? '—' : fmt.pct1(h?.used_pct)}
+          <div className={claudeHeadlineBlank ? 'hu-num is-blank' : 'hu-num'}>
+            {fmt.pct1(claudeHeadlinePct)}
           </div>
           <ProviderReset
             provider="claude"
@@ -666,7 +788,10 @@ function CanonicalHero({
   spentNote = null,
   spentNoteLabel = null,
   spentNoteCompactLabel = null,
+  spentLabel = 'SPENT THIS WEEK',
+  spentLabelSpoken = DEFAULT_SPENT_LABEL_SPOKEN,
   perAccountNote = null,
+  withheldUsedPct = false,
 }: {
   weekLabel: string | null | undefined;
   usedPct: number | null | undefined;
@@ -689,19 +814,35 @@ function CanonicalHero({
   // public #5 QA P2 — the VISIBLE short form of `spentNote`, printed under the
   // `$/1%` sub-line. `spentNote` alone only ever reached a `title` on a
   // non-interactive div, which is hover-only and therefore unreachable on
-  // touch; a disclosure nobody can see does not disclose. Set only for the
-  // store-wide ingest backlog: the account-scoped stale-cycle note keeps its
-  // #350 tooltip-only disposition, and widening that is a separate decision.
+  // touch; a disclosure nobody can see does not disclose. Set for the
+  // store-wide ingest backlog and, since #564, for the fallback-window note:
+  // the merged figure is the only period claim the aggregate hero makes, so a
+  // tooltip-only form would leave that claim unqualified for touch users. The
+  // account-scoped stale-cycle note keeps its #350 tooltip-only disposition.
   spentNoteLabel?: string | null;
   // #459 — mobile-only shorthand for the same disclosure. The full sentence
   // remains in `spentNote`, so responsive sighted copy never weakens the
   // accessible explanation of what is loading or how totals will change.
   spentNoteCompactLabel?: string | null;
+  // #564 — the spend zone's own period claim. It defaults to the week because
+  // that is what a cycle-bounded hero covers; a focused account whose card was
+  // totalled over the bounded fallback overrides it with the window it actually
+  // covers. Two props because the visible label is upper case, which several
+  // screen readers spell out letter by letter, so the spoken form is supplied
+  // separately rather than derived from the display string.
+  spentLabel?: string;
+  spentLabelSpoken?: string;
   // #416 D6 — set when the headline percentage/reset are deliberately BLANK
   // because each account owns an independent quota cycle. Replaces the reset
   // countdown AND every other deliberately-blank slot with a pointer to the
   // per-account cards; it is never a failure state.
   perAccountNote?: string | null;
+  // #556 S5 round-2 QA P1 — set when ONE account is focused and publishes no
+  // weekly percentage. The blank is deliberate, so it takes the same dimmed
+  // presentation the per-account blank uses, but it must not also rewrite the
+  // reset line and the three other slots the way `perAccountNote` does: those
+  // slots have their own focused answers.
+  withheldUsedPct?: boolean;
 }) {
   // #416 QA P2-D — a bare em-dash reads as missing data, not as a deliberate
   // blank. The reset slot already carried the caption; `Forecast @ reset`,
@@ -732,7 +873,9 @@ function CanonicalHero({
               takes `--text-dim` to match. Only the deliberate blank is dimmed:
               a real percentage is untouched. */}
           <div
-            className={`hu-num${perAccountNote != null && usedPct == null ? ' is-blank' : ''}`}
+            className={`hu-num${
+              usedPct == null && (perAccountNote != null || withheldUsedPct) ? ' is-blank' : ''
+            }`}
           >
             {fmt.pct1(usedPct)}
           </div>
@@ -774,13 +917,22 @@ function CanonicalHero({
         // unreachable on touch and not reliably announced by screen readers. The
         // visual design stays as chosen (spec §3.8, no new hero visual), but the
         // reason must at least reach assistive tech.
-        aria-label={
-          unavailableReason ?? spentNote
-            ? `Spent this week. ${unavailableReason ?? spentNote}`
-            : undefined
-        }
+        // #564 review P2: the note is what USED to gate this, which left the
+        // spoken label unreachable in the one state it was written for. A
+        // focused fallback account overrides `spentLabelSpoken` but carries no
+        // note (`spendWindowNote` is aggregate-only), so assistive tech fell
+        // back to reading the raw upper-case `SPENT · LAST 7 DAYS`. Whenever
+        // the zone makes a period claim other than the default, the label is
+        // announced whether or not a note accompanies it.
+        aria-label={((): string | undefined => {
+          const note = unavailableReason ?? spentNote;
+          if (note) return `${spentLabelSpoken}. ${note}`;
+          return spentLabelSpoken === DEFAULT_SPENT_LABEL_SPOKEN
+            ? undefined
+            : spentLabelSpoken;
+        })()}
       >
-        <div className="hs-label">SPENT THIS WEEK</div>
+        <div className="hs-label">{spentLabel}</div>
         <div className="hs-big">{fmt.usd0(spentUsd)}</div>
         <div className="hs-sub">
           {perAccountValue == null
@@ -798,8 +950,15 @@ function CanonicalHero({
             stray separator. */}
         {unavailableReason == null && spentNoteLabel != null ? (
           <div className="hs-sub" data-testid="hero-spent-note" aria-hidden="true">
+            {/* #564 ui-qa P2 — the dim style comes from `hero-spent-note-text`,
+                which every note carries; the responsive `-full` class is added
+                only when a compact sibling exists to swap with. Before #564 the
+                two were always both present, so one class carried both jobs and
+                a note without a compact form fell through to the bright
+                `.hs-sub span` metric treatment. */}
             <span className={spentNoteCompactLabel == null
-              ? undefined : 'hero-ingest-backlog-label-full'}>{spentNoteLabel}</span>
+              ? 'hero-spent-note-text'
+              : 'hero-spent-note-text hero-ingest-backlog-label-full'}>{spentNoteLabel}</span>
             {spentNoteCompactLabel == null ? null : (
               <span className="hero-ingest-backlog-label-compact">
                 {spentNoteCompactLabel}

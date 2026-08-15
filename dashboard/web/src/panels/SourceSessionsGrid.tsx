@@ -27,7 +27,7 @@ import { costClass } from '../lib/cost';
 import { transcriptsEnabled } from '../lib/transcripts';
 import { SourceChip, DegradedChip } from './sourcePanel';
 import type { DashboardSelection } from '../types/envelope';
-import { useAccountScope } from '../hooks/useScopedSnapshot';
+import { scopeProviderFor, useAccountScope } from '../hooks/useScopedSnapshot';
 import { openShareModal } from '../store/shareSlice';
 import { legacyClaudeConversationRef } from '../types/conversation';
 
@@ -71,7 +71,10 @@ export function SourceSessionsGrid() {
   // Claude keeps the disclaimer. It ships `accounts[]` (the chip row) but no
   // `account_scopes`, so a Claude focus really is unfiltered — dropping the
   // badge there would turn an honest caveat into a false claim.
-  const scope = useAccountScope();
+  // #556 S5 §5.4 — `getRenderedSourceRows` reads the SCOPED snapshot, whose
+  // All mirror is rewritten under a Codex focus, so the Codex rows really are
+  // narrowed on this tab and the badge is honest there.
+  const scope = useAccountScope(activeSource, scopeProviderFor(activeSource));
   const accountScoped = scope.accountKey != null;
   const accountUnfiltered = scope.requestedKey != null && !scope.scopesSupported;
 
@@ -201,12 +204,23 @@ export function SourceSessionsGrid() {
             </span>
           )}
           {gate.mode === 'degraded' && <DegradedChip gate={gate} />}
+          {/* #556 S5 Unit 2 review F3 — QUALIFIED BY PROVIDER under All. The
+              badge read "<label> only" while the All grid still listed every
+              Claude session, because only Codex publishes `account_scopes`.
+              Qualifying rather than suppressing: under All the table really is
+              narrowed for one provider, so removing the badge would leave a
+              user who watched rows disappear with nothing saying why. The
+              badge names the filtered provider and the title states that the
+              other provider's sessions are not filtered. */}
           {accountScoped && (
             <span
               className="sessions-account-note"
               data-testid="sessions-account-note"
-              title={`Showing only ${scope.card?.label ?? 'this account'}'s sessions.`}
+              title={isAll
+                ? `Showing only ${scope.card?.label ?? 'this account'}'s Codex sessions. Claude sessions are not filtered by account.`
+                : `Showing only ${scope.card?.label ?? 'this account'}'s sessions.`}
             >
+              {isAll ? 'Codex: ' : ''}
               {shortAccountLabel(scope.card?.label ?? 'focused account')} only
             </span>
           )}
@@ -214,7 +228,16 @@ export function SourceSessionsGrid() {
             <span
               className="sessions-unfiltered-note"
               data-testid="sessions-unfiltered-note"
-              title="Claude sessions are not filtered by account (conversations are account-agnostic)."
+              // Names the provider this scope was RESOLVED for, with that
+              // provider's own reason. The predicate above is
+              // `requestedKey != null && !scopesSupported`, and under All the
+              // scope provider is Codex — so a Codex focus over a Codex source
+              // that published no `account_scopes` reached this badge while the
+              // hardcoded string named Claude and gave Claude's reason. Same
+              // over-claim the remediation review found on the alerts twin.
+              title={scopeProviderFor(activeSource) === 'codex'
+                ? 'Codex sessions are not filtered by account (this source published no account scopes).'
+                : 'Claude sessions are not filtered by account (conversations are account-agnostic).'}
             >
               all accounts (unfiltered)
             </span>

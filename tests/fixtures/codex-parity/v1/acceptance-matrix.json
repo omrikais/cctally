@@ -159,14 +159,18 @@
     },
     {
       "capability": "qualified-identity",
-      "contractState": "deferred",
+      "contractState": "supported",
       "fixtureScenarios": [
         "root-a-collision",
         "root-b-collision",
         "claude-collision"
       ],
       "futureTestTargets": [
-        "tests/test_codex_fused_ingest.py"
+        "tests/test_codex_fused_ingest.py",
+        "tests/test_codex_conversation_api.py",
+        "tests/test_source_aware_share.py",
+        "dashboard/web/src/store/readingPosition.test.ts",
+        "dashboard/web/e2e/codex-reader.spec.ts"
       ],
       "id": "provider-qualified-collision-safety",
       "ownerSession": "S1",
@@ -256,13 +260,14 @@
     },
     {
       "capability": "share-identity",
-      "contractState": "deferred",
+      "contractState": "supported",
       "fixtureScenarios": [
         "mixed-source",
         "root-a-collision"
       ],
       "futureTestTargets": [
-        "tests/test_source_aware_dashboard_share.py"
+        "tests/test_dashboard_source_share.py",
+        "dashboard/web/src/share/sourceIdentity.test.tsx"
       ],
       "id": "source-aware-dashboard-share-identity",
       "ownerSession": "S5",
@@ -481,22 +486,36 @@
     },
     {
       "capability": "ui-certification",
-      "contractState": "deferred",
-      "fixtureScenarios": [],
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "mixed-source",
+        "root-a-collision",
+        "nested-child"
+      ],
       "futureTestTargets": [
-        "dashboard/web/src/conversations/CodexConversationReader.test.tsx"
+        "tests/test_codex_parity_certification.py",
+        "dashboard/web/src/lib/sourceGating.test.ts",
+        "dashboard/web/src/share/sourceIdentity.test.tsx",
+        "dashboard/web/src/store/readingPosition.test.ts",
+        "dashboard/web/e2e/codex-reader.spec.ts",
+        "dashboard/web/e2e/session-e-polish.spec.ts",
+        "bin/cctally-dashboard-test"
       ],
       "id": "s5-s8-ui-qa-gates",
       "ownerSession": "S9",
-      "requirement": "React/CSS tests, typecheck/build, dashboard goldens, and browser QA gate S5 and S8.",
+      "requirement": "React/CSS tests, typecheck/build, dashboard goldens, and paired Claude/Codex/All browser QA certify S5 and S8.",
       "sources": [
         "all"
       ]
     },
     {
       "capability": "documentation",
-      "contractState": "deferred",
-      "fixtureScenarios": [],
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "claude-only",
+        "codex-only",
+        "mixed-source"
+      ],
       "futureTestTargets": [
         "tests/test_codex_parity_certification.py"
       ],
@@ -509,14 +528,26 @@
     },
     {
       "capability": "production-scale-certification",
-      "contractState": "deferred",
-      "fixtureScenarios": [],
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full",
+        "mixed-source",
+        "root-a-collision",
+        "root-b-collision",
+        "nested-child",
+        "malformed-tail"
+      ],
       "futureTestTargets": [
-        "tests/test_codex_parity_certification.py"
+        "tests/test_codex_parity_certification.py",
+        "tests/test_snapshot_bounded_work.py",
+        "tests/test_conversation_assembly_perf.py",
+        "tests/test_dashboard_drill_perf.py",
+        "tests/test_bench.py",
+        "bin/cctally-bench-test"
       ],
       "id": "production-scale-final-certification",
       "ownerSession": "S9",
-      "requirement": "S9 certifies production-scale source-qualified behavior.",
+      "requirement": "S9 certifies production-scale source-qualified ingest, analytics, dashboard, and conversation behavior with structural bounds and the large benchmark corpus.",
       "sources": [
         "all"
       ]
@@ -610,16 +641,18 @@
     },
     {
       "capability": "five-hour-breakdown",
-      "contractState": "deferred",
+      "contractState": "supported",
       "fixtureScenarios": [
         "modern-full"
       ],
       "futureTestTargets": [
-        "tests/test_codex_quota.py"
+        "tests/test_codex_quota_cli.py",
+        "tests/test_codex_quota_projection.py",
+        "bin/cctally-codex-quota-test"
       ],
       "id": "five-hour-breakdown-per-source",
       "ownerSession": "S2",
-      "requirement": "Breakdowns preserve native quota identity rather than slot aliases.",
+      "requirement": "Claude five-hour-breakdown and Codex native quota breakdown preserve their provider-native window identity rather than slot aliases.",
       "sources": [
         "all"
       ]
@@ -631,7 +664,8 @@
         "modern-full"
       ],
       "futureTestTargets": [
-        "tests/test_codex_quota.py"
+        "tests/test_lib_quota.py",
+        "tests/test_codex_quota_cli.py"
       ],
       "id": "codex-refresh-is-local-rollout-reread",
       "ownerSession": "S2",
@@ -886,28 +920,37 @@
     },
     {
       "capability": "dashboard-sequencing",
-      "contractState": "deferred",
-      "fixtureScenarios": [],
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "mixed-source"
+      ],
       "futureTestTargets": [
-        "tests/test_source_aware_dashboard.py"
+        "dashboard/web/src/lib/sourceGating.test.ts",
+        "dashboard/web/e2e/codex-reader.spec.ts"
       ],
       "id": "dashboard-s5-after-293-s4",
       "ownerSession": "S5",
-      "requirement": "S5 waits for issue 293 S4 or an approved ownership split.",
+      "requirement": "S5 shipped after issue 293 S4 and consumes its source-aware dashboard contract.",
       "sources": [
         "all"
       ]
     },
     {
       "capability": "conversation-phase",
-      "contractState": "deferred",
-      "fixtureScenarios": [],
+      "contractState": "supported",
+      "fixtureScenarios": [
+        "modern-full",
+        "nested-child",
+        "mixed-source"
+      ],
       "futureTestTargets": [
-        "tests/test_codex_conversation_normalization.py"
+        "tests/test_codex_conversation_normalization.py",
+        "tests/test_codex_conversation_api.py",
+        "dashboard/web/e2e/codex-reader.spec.ts"
       ],
       "id": "conversation-phase-independently-deferrable",
       "ownerSession": "S6",
-      "requirement": "S6 through S8 may defer without falsely certifying the whole epic.",
+      "requirement": "S6 through S8 are shipped and S9 certifies the complete conversation phase without narrowing its truthful provider exceptions.",
       "sources": [
         "all"
       ]

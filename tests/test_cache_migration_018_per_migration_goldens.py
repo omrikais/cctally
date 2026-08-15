@@ -75,8 +75,8 @@ def _flag(conn, key=_FLAG) -> "str | None":
 def test_pre_fixture_at_017_head_without_flag_or_marker(cctally_module):
     """Sanity: pre.sqlite has 017 applied, has NOT the 018 marker, and does NOT
     carry the title-FTS backfill flag — the existing-install shape before the
-    title FTS is armed. The title FTS table itself is present (created by
-    _apply_cache_schema on every open)."""
+    title FTS is armed. The title FTS table itself is present because migration
+    018's head bump opened the version-gated _apply_cache_schema path."""
     assert PRE_DB.exists(), f"missing pre fixture: {PRE_DB}"
     conn = sqlite3.connect(PRE_DB)
     try:

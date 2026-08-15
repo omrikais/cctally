@@ -1322,3 +1322,30 @@ def _jsonable(value):
     if isinstance(value, (tuple, list)):
         return [_jsonable(item) for item in value]
     return value
+
+
+# === #556 S5 §3.6 — the budget capability records ==========================
+
+
+def test_all_budget_capability_stays_not_applicable():
+    """Rendering two provider-native child budgets side by side does NOT create
+    an All-level budget quantity.
+
+    `sources.all.capabilities.budget` is a DIFFERENT field from the Claude
+    provider's own budget capability, which this session does change. No test
+    asserted this value before S5, so it is pinned by name here whichever way
+    the value goes — a new named pin, not a red test.
+    """
+    combined = source_kernel.compose_all_state(
+        _provider_state("claude"), _provider_state("codex"),
+    )
+    assert combined.capabilities["budget"] == CapabilityRecord(
+        "not_applicable", "provider-native",
+    )
+
+
+def test_source_schema_version_is_eight():
+    """#556 S5 §3.6. The Claude budget capability detail changed MEANING — it
+    names the CONFIGURED period rather than a constant — and
+    `docs/cli-contract.md:58` bumps on a changed value or meaning."""
+    assert SOURCE_SCHEMA_VERSION == 9

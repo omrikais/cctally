@@ -2611,12 +2611,18 @@ def _build_account_parser(subparsers, name, *, help_text, xref=None):
                       show <ref>      Show one account's identity + attribution summary.
                       label <ref> <name>
                                       Set a durable user label (survives db rebuild).
+                      attribute <ref> --since <iso> [--until <iso>]
+                                      Attribute already-recorded Codex quota windows
+                                      and spend to a known Codex account. Previews by
+                                      default; --yes applies; --retract withdraws.
 
                     Examples:
                       cctally account list
                       cctally account list --json
                       cctally account show work@example.com
                       cctally account label 3f2a1b work
+                      cctally account attribute work --since 2025-12-01T00:00:00Z
+                      cctally account attribute work --since 2025-12-01T00:00:00Z --yes
                 """),
     )
     acct_sub = acct_p.add_subparsers(dest="account_action", required=True)
@@ -2633,6 +2639,65 @@ def _build_account_parser(subparsers, name, *, help_text, xref=None):
     acct_label.add_argument("ref", help="Account ref (label / email / key prefix)")
     acct_label.add_argument("label", help="New label")
     acct_label.set_defaults(func=c.cmd_account)
+    acct_attr = acct_sub.add_parser(
+        "attribute",
+        help="Attribute recorded Codex windows and spend to an account",
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent("""\
+            Attribute already-recorded Codex quota windows and spend to a known
+            Codex account (#500).
+
+            Codex only. A Claude ref is rejected, and so is the literal
+            'unattributed' — attributing data TO the sentinel is not a fact an
+            operator can assert.
+
+            --since is required and --until optional; both are timezone-aware ISO
+            instants normalized to UTC, and the range is half-open [since, until).
+            A naive value is a usage error. An omitted --until means "up to now".
+
+            Attribution is asserted per WHOLE physical window group. A group the
+            range covers only partially is refused rather than split; widen the
+            range and rerun.
+
+            Preview is the default and writes nothing. --yes applies, all or
+            nothing over the groups the range could have meant: a partial_group,
+            native_account_conflict, assertion_conflict or spend_account_conflict
+            refusal stops the whole run and nothing is written. A group that is
+            not account weekly quota (not_weekly, model_scoped) is reported as
+            refused and left alone WITHOUT blocking the rest, because a time
+            range selected it rather than you naming it.
+
+            --retract withdraws assertions instead, selecting over the durable
+            assertion records rather than over observations, so a dormant or split
+            assertion can still be tombstoned.
+
+            Exit codes: 0 preview / empty selection / no-op / successful apply;
+            2 every validation failure and every refusal; 3 operational failure.
+
+            Examples:
+              cctally account attribute work --since 2025-12-01T00:00:00Z
+              cctally account attribute work --since 2025-12-01T00:00:00Z \\
+                  --until 2026-07-01T00:00:00Z --yes
+              cctally account attribute work --since 2025-12-01T00:00:00Z \\
+                  --retract --yes
+        """),
+    )
+    acct_attr.add_argument("ref", help="Codex account ref (label / email / key prefix)")
+    acct_attr.add_argument(
+        "--since", dest="since", required=True,
+        help="Inclusive start, timezone-aware ISO instant (required).")
+    acct_attr.add_argument(
+        "--until", dest="until",
+        help="Exclusive end, timezone-aware ISO instant (default: now).")
+    acct_attr.add_argument(
+        "--retract", dest="retract", action="store_true",
+        help="Withdraw matching assertions instead of recording one.")
+    acct_attr.add_argument(
+        "--yes", dest="yes", action="store_true",
+        help="Apply the plan (default is a preview that writes nothing).")
+    acct_attr.add_argument("--json", dest="emit_json", action="store_true",
+                           help="Emit the stamped-first camelCase JSON envelope.")
+    acct_attr.set_defaults(func=c.cmd_account)
 
 
 def _build_alerts_parser(subparsers, name, *, help_text, xref=None):

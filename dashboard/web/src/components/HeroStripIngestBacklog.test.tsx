@@ -169,7 +169,7 @@ function renderCodex(codexData: CodexSourceData, focus?: string): HTMLElement {
   updateSnapshot(envWith(codexData));
   dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
   if (focus != null) {
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: focus });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: focus });
   }
   const { container } = render(<HeroStrip />);
   return container.querySelector('.hero-spent') as HTMLElement;

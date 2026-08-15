@@ -91,6 +91,11 @@ class SnapshotSignature(NamedTuple):
     # sequence supplies that missing identity leg; the stats digest arrives
     # from the independently-committed quota/budget projection database.
     codex_physical_mutation_seq: int = 0
+    # #582: path-ledger accounting changes must leave the snapshot idle path,
+    # even when MAX(id) and the broader physical counter stay flat. This leg
+    # is internal dispatch identity only; published data-version bytes retain
+    # their existing contract.
+    codex_accounting_mutation_seq: int = 0
     codex_stats_digest: str = ""
     # #341 finding 9: a digest of the account registry + the providers' on-disk
     # identity-file/active-account state. Empty for every <=1-account install (no
@@ -251,6 +256,9 @@ def compute_signature(
         generation=int(generation),
         entry_mutation_seq=_entry_mutation_seq(cache_conn),
         codex_physical_mutation_seq=_codex_physical_mutation_seq(cache_conn),
+        codex_accounting_mutation_seq=(
+            _codex_accounting_mutation_seq(cache_conn) or 0
+        ),
         codex_stats_digest=str(codex_stats_digest),
         accounts_digest=str(accounts_digest),
         codex_ingest_backlog_sig=_codex_ingest_backlog_sig(cache_conn),
@@ -960,6 +968,228 @@ def reset_session_cache_state() -> None:
     _SESSION_LAST_SEEN.clear()
 
 
+# === #582 — persistent Codex accounting rows by dirty physical path =========
+
+
+@dataclass(frozen=True)
+class CodexAccountingCacheResult:
+    """One cold or incrementally refreshed accounting population."""
+
+    entries: tuple[object, ...]
+    dirty_paths: tuple[tuple[str, str], ...]
+    dirty_accounts: tuple[str, ...]
+    cold: bool
+    changed_old: tuple[object, ...] = ()
+    changed_new: tuple[object, ...] = ()
+
+
+_CODEX_ACCOUNTING_CACHE_STATE: dict[str, object] = {}
+_CODEX_ACCOUNTING_MAX_DIRTY_PATHS = 300
+
+
+def reset_codex_accounting_cache_state() -> None:
+    """Drop #582's value-only Codex accounting cache and ledger cursor."""
+    _assert_owner()
+    _CODEX_ACCOUNTING_CACHE_STATE.clear()
+
+
+def checkpoint_codex_accounting_cache_state() -> dict[str, object]:
+    """Copy the value-only state so a failed source build can roll back."""
+    _assert_owner()
+    return dict(_CODEX_ACCOUNTING_CACHE_STATE)
+
+
+def restore_codex_accounting_cache_state(state: dict[str, object]) -> None:
+    """Restore a checkpoint after downstream source construction fails."""
+    _assert_owner()
+    _CODEX_ACCOUNTING_CACHE_STATE.clear()
+    _CODEX_ACCOUNTING_CACHE_STATE.update(state)
+
+
+def _codex_accounting_mutation_seq(conn: sqlite3.Connection) -> int | None:
+    """Return the dedicated ledger sequence, or ``None`` when unsupported."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_accounting_mutation_seq'"
+        ).fetchone()
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='codex_accounting_change_log'"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if table is None or row is None or row[0] is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def codex_accounting_cache_pending(conn: sqlite3.Connection) -> bool:
+    """Whether the process cache has not consumed the durable ledger head."""
+    _assert_owner()
+    current = _codex_accounting_mutation_seq(conn)
+    if current is None or not _CODEX_ACCOUNTING_CACHE_STATE:
+        return True
+    return current != int(_CODEX_ACCOUNTING_CACHE_STATE.get("seq", -1))
+
+
+def build_cached_codex_accounting(
+    *,
+    cache_conn: sqlite3.Connection,
+    range_start: dt.datetime,
+    range_end: dt.datetime,
+    extra_signature: object,
+    load_all: "Callable[[], tuple[object, ...]]",
+    load_paths: "Callable[[tuple[tuple[str, str], ...]], tuple[object, ...]]",
+    path_of: "Callable[[object], tuple[str, str]]",
+    account_of: "Callable[[object], str]",
+    order_key: "Callable[[object], object]",
+    identity_of: "Callable[[object], object] | None" = None,
+    finalize_entries: "Callable[[tuple[object, ...], tuple[object, ...] | None], tuple[object, ...]] | None" = None,
+) -> CodexAccountingCacheResult:
+    """Cold-load once, then replace only ledger-dirty Codex file populations.
+
+    The cache retains plain immutable values and one integer cursor.  A missing
+    ledger, cursor gap, full marker, semantic-key change, range-start change,
+    or clock regression goes cold.  When the upper bound advances, paths with
+    already-stored future rows crossing into the range are dirtied even though
+    no mutation sequence moved.
+    """
+    _assert_owner()
+    if (
+        range_start.tzinfo is None or range_start.utcoffset() is None
+        or range_end.tzinfo is None or range_end.utcoffset() is None
+        or range_end <= range_start
+    ):
+        raise ValueError("Codex accounting cache range must be aware and ordered")
+    current_seq = _codex_accounting_mutation_seq(cache_conn)
+    state = _CODEX_ACCOUNTING_CACHE_STATE
+    prior_cached_entries = tuple(state.get("entries", ())) if state else ()
+    cold = (
+        current_seq is None
+        or not state
+        or state.get("extra") != extra_signature
+        or state.get("start") != range_start
+        or range_end < state.get("end", range_end)
+        or current_seq < int(state.get("seq", 0))
+    )
+    dirty: set[tuple[str, str]] = set()
+    if not cold:
+        last_seq = int(state["seq"])
+        if current_seq > last_seq:
+            try:
+                changes = tuple(cache_conn.execute(
+                    "SELECT mutation_seq, change_kind, source_root_key, source_path "
+                    "FROM codex_accounting_change_log "
+                    "WHERE mutation_seq > ? ORDER BY mutation_seq, seq",
+                    (last_seq,),
+                ))
+            except sqlite3.Error:
+                cold = True
+            else:
+                if (
+                    not changes
+                    or int(changes[0][0]) > last_seq + 1
+                    or int(changes[-1][0]) != current_seq
+                    or any(row[1] == "full" for row in changes)
+                ):
+                    cold = True
+                else:
+                    dirty.update(
+                        (str(row[2] or ""), str(row[3]))
+                        for row in changes
+                        if row[1] == "path" and row[3]
+                    )
+        prior_end = state.get("end")
+        if not cold and isinstance(prior_end, dt.datetime) and range_end > prior_end:
+            try:
+                dirty.update(
+                    (str(root or ""), str(path))
+                    for root, path in cache_conn.execute(
+                        "SELECT DISTINCT source_root_key, source_path "
+                        "FROM codex_session_entries "
+                        "WHERE timestamp_utc >= ? AND timestamp_utc < ?",
+                        (prior_end.astimezone(dt.timezone.utc).isoformat(),
+                         range_end.astimezone(dt.timezone.utc).isoformat()),
+                    )
+                )
+            except sqlite3.Error:
+                cold = True
+        # The qualified path loader emits two SQL parameters and one OR arm per
+        # identity. Beyond this bound a cold indexed range read is both safer
+        # and cheaper than approaching SQLite's variable/expression limits.
+        if not cold and len(dirty) > _CODEX_ACCOUNTING_MAX_DIRTY_PATHS:
+            cold = True
+
+    if cold:
+        entries = tuple(sorted(tuple(load_all()), key=order_key))
+        if finalize_entries is not None:
+            entries = tuple(finalize_entries(entries, None))
+        accounts = tuple(sorted({
+            str(account_of(entry))
+            for entry in (*prior_cached_entries, *entries)
+        }))
+        _CODEX_ACCOUNTING_CACHE_STATE.clear()
+        _CODEX_ACCOUNTING_CACHE_STATE.update({
+            "entries": entries,
+            "seq": 0 if current_seq is None else current_seq,
+            "start": range_start,
+            "end": range_end,
+            "extra": extra_signature,
+        })
+        return CodexAccountingCacheResult(
+            entries, (), accounts, True, prior_cached_entries, entries,
+        )
+
+    prior_entries = tuple(state["entries"])
+    if not dirty:
+        state["seq"] = current_seq
+        state["end"] = range_end
+        return CodexAccountingCacheResult(prior_entries, (), (), False)
+
+    dirty_paths = tuple(sorted(dirty))
+    prior_dirty = tuple(
+        entry for entry in prior_entries if path_of(entry) in dirty
+    )
+    replacements = tuple(load_paths(dirty_paths))
+    entries = tuple(sorted(
+        (
+            *(entry for entry in prior_entries if path_of(entry) not in dirty),
+            *replacements,
+        ),
+        key=order_key,
+    ))
+    if finalize_entries is not None:
+        entries = tuple(finalize_entries(entries, prior_entries))
+    entry_identity = identity_of or order_key
+    prior_by_identity = {entry_identity(entry): entry for entry in prior_dirty}
+    replacement_by_identity = {
+        entry_identity(entry): entry for entry in replacements
+    }
+    changed_old = tuple(
+        entry for identity, entry in prior_by_identity.items()
+        if identity not in replacement_by_identity
+        or replacement_by_identity[identity] != entry
+    )
+    changed_new = tuple(
+        entry for identity, entry in replacement_by_identity.items()
+        if identity not in prior_by_identity
+        or prior_by_identity[identity] != entry
+    )
+    dirty_accounts = tuple(sorted(
+        {str(account_of(entry)) for entry in (*changed_old, *changed_new)}
+    ))
+    state["entries"] = entries
+    state["seq"] = current_seq
+    state["end"] = range_end
+    return CodexAccountingCacheResult(
+        entries, dirty_paths, dirty_accounts, False, changed_old, changed_new,
+    )
+
+
 def build_cached_sessions(
     *,
     cache_conn: sqlite3.Connection,
@@ -1370,14 +1600,13 @@ def session_files_sig(cache_conn) -> "tuple[int, int]":
     moves. Returns ``(0, 0)`` on a missing table (fresh DB) so callers never
     raise.
 
-    #271 §9d rider (from the #269 final review): this ``(COUNT(*), MAX(rowid))``
-    leg does NOT by itself catch the in-place ``ON CONFLICT(path) DO UPDATE SET
+    #271 §9d rider (tightened by #567): this ``(COUNT(*), MAX(rowid))`` leg
+    does NOT by itself catch the in-place ``ON CONFLICT(path) DO UPDATE SET
     project_path = COALESCE(...)`` attribution backfill — that UPDATE preserves
-    the rowid and the row count, so both legs are unmoved. It is covered
-    belt-and-suspenders, though: the backfill lands in the SAME ``sync_cache``
-    ingest-loop iteration as the file's new ``session_entries`` rows, which bump
-    ``max_entry_id`` — caught by the watermark eviction path. So a pure
-    attribution move never both slips this signal and leaves the cache stale.
+    both values. `_ensure_session_files_row` therefore stamps the joined
+    `session_entries` rows with a fresh mutation sequence when it fills either
+    identity column. The envelope's mutation-sequence reconcile catches that
+    pure metadata move even when no new entry is ingested.
     """
     try:
         row = cache_conn.execute(

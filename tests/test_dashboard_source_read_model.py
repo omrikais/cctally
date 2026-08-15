@@ -9,6 +9,7 @@ import shutil
 import sys
 from collections.abc import Mapping
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -20,7 +21,7 @@ from _cctally_dashboard_sources import (
     resolve_dashboard_source_semantics,
 )
 from conftest import load_script, redirect_paths
-from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION
+from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION, CapabilityRecord
 from _lib_quota import QuotaObservation, QuotaWindowIdentity
 
 
@@ -3522,7 +3523,7 @@ def _install_observations(monkeypatch, source_module, observations):
     )
 
 
-def _build_tick_bundle(tui, stats, *, now_utc, prior_bundle=None):
+def _build_tick_bundle(tui, stats, *, now_utc, prior_bundle=None, raw_config=None):
     return tui._tui_build_source_bundle(
         stats_conn=stats,
         now_utc=now_utc,
@@ -3542,7 +3543,7 @@ def _build_tick_bundle(tui, stats, *, now_utc, prior_bundle=None):
             (), now_utc=now_utc, display_tz=dt.timezone.utc,
         ),
         prior_bundle=prior_bundle,
-        raw_config=_TICK_CONFIG,
+        raw_config=_TICK_CONFIG if raw_config is None else raw_config,
     )
 
 
@@ -4189,6 +4190,662 @@ def test_one_tick_applies_quota_expiry_and_budget_together(tmp_path, monkeypatch
     assert any(w.code == "codex_cycle_unavailable" for w in clocked.warnings)
 
 
+# =========================================================================
+# #556 S5 §3.3/§3.5 — the Claude budget status and its five dispositions.
+#
+# The client must be able to tell the five apart, because rendering
+# "No budget set." to a user who has one set is a lie. The wire encodes them as:
+#
+#   provider_budget_unset   `budget.status` absent, no sibling  (byte-identical)
+#   configured              `budget.status` published
+#   account_budgets_only    `budget.not_configured.disposition`
+#   period_unresolved       `budget.status_unavailable.code`
+#   budget_compute_failed   `budget.status_unavailable.code`
+# =========================================================================
+
+_S5_BUDGET_NOW = dt.datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+
+
+def _s5_claude_config(budget):
+    config = {"collector": {"week_start": "sunday"}}
+    if budget is not None:
+        config["budget"] = budget
+    return config
+
+
+def _s5_seed_claude_spend(ns, cache, *, at, cost_model="claude-sonnet-4-20250514",
+                          line_offset=1, input_tokens=200_000, output_tokens=40_000):
+    """One priced Claude entry, so a configured budget has real spend."""
+    import _fixture_builders as fb
+
+    fb.seed_session_entry(
+        cache,
+        source_path="/private/556-s5-budget.jsonl",
+        line_offset=line_offset,
+        timestamp_utc=at.isoformat(),
+        model=cost_model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+    cache.commit()
+
+
+def _s5_build_claude_budget_domain(tmp_path, monkeypatch, *, budget, seed_spend=True,
+                                   now_utc=_S5_BUDGET_NOW, mutate=None):
+    """Build one bundle under ``budget`` and return ``(claude_state, domain)``."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    tui = ns["_cctally_tui"]
+    cache = ns["open_cache_db"]()
+    stats = ns["open_db"]()
+    try:
+        if seed_spend:
+            _s5_seed_claude_spend(ns, cache, at=now_utc - dt.timedelta(hours=3))
+        if mutate is not None:
+            mutate(ns, cache, stats)
+        bundle = tui._tui_build_source_bundle(
+            stats_conn=stats,
+            now_utc=now_utc,
+            display_tz_name="UTC",
+            codex_ingest_contended=False,
+            claude_cost_usd=0.0,
+            claude_total_tokens=0,
+            # Derived from the zone NAME above, the way production does it, not
+            # hard-coded to UTC beside it (Unit 2 review F2, remediation review
+            # finding 8). Identical instants while that name is "UTC"; the point
+            # is that the helper cannot drift into modelling a pairing no
+            # install can have.
+            common_range_start=tui._tui_common_source_range_start(
+                (), now_utc=now_utc, display_tz=ZoneInfo("UTC"),
+            ),
+            raw_config=_s5_claude_config(budget),
+        )
+    finally:
+        cache.close()
+        stats.close()
+    claude = bundle.sources["claude"]
+    return claude, claude.data["budget"]
+
+
+def _s5_build_bundle(ns, tui, *, budget, now_utc, prior_bundle=None,
+                     seed=None, display_tz_name="UTC", projects_envelope=None,
+                     common_range_start=None):
+    """Build one source bundle under ``budget`` at ``now_utc``.
+
+    ``common_range_start`` matters for any test that varies ``now_utc`` across
+    two builds. Derived, it comes from `resolve_shared_range`'s empty-panel
+    fallback `today_local - (n-1) days`, so it MOVES with `now_utc` and enters
+    `claude_version` through `aggregate_scope_identity` at exact-instant
+    granularity. Two builds either side of a midnight therefore differ on that
+    fragment alone and the provider is rebuilt, which silently defeats a test
+    trying to prove some OTHER fragment forced the rebuild. Pass one explicit
+    value to both builds to hold it constant.
+
+    ``projects_envelope`` matters for any test about REUSE. Without one the
+    Claude aggregate fold fails, `aggregate_scope_failed` forces `claude = None`
+    after the version check, and the provider is rebuilt on every tick — so a
+    reuse-shaped test silently exercises the rebuild path instead.
+
+    #556 S5 Unit 2 review F2 — the range start is derived from
+    ``display_tz_name``, NOT hard-coded to UTC. Production resolves one
+    ``ZoneInfo`` and passes it to both legs (`_tui_build_snapshot` sets
+    `source_display_tz_name` from `_build_display_tz` and hands that same object
+    to `_tui_common_source_range_start`), so a UTC range start beside a non-UTC
+    zone name modelled an install that cannot exist — and a fixture in an
+    impossible state can manufacture a RED that proves nothing.
+    """
+    cache = ns["open_cache_db"]()
+    stats = ns["open_db"]()
+    try:
+        if seed is not None:
+            seed(ns, cache)
+        return tui._tui_build_source_bundle(
+            stats_conn=stats,
+            now_utc=now_utc,
+            display_tz_name=display_tz_name,
+            codex_ingest_contended=False,
+            claude_cost_usd=0.0,
+            claude_total_tokens=0,
+            common_range_start=(
+                common_range_start
+                if common_range_start is not None
+                else tui._tui_common_source_range_start(
+                    (), now_utc=now_utc, display_tz=ZoneInfo(display_tz_name),
+                )
+            ),
+            prior_bundle=prior_bundle,
+            projects_envelope=projects_envelope,
+            raw_config=_s5_claude_config(budget),
+        )
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_claude_budget_status_matches_the_budget_cli_value_for_value(
+    tmp_path, monkeypatch,
+):
+    """#556 S5 Unit 1 review R1 — the Claude twin of the Codex parity pins.
+
+    `bin/_cctally_record.py` documents the two projected-alert legs as
+    "value-exact by construction" with `budget --json` precisely BECAUSE they
+    call `_build_vendor_budget_inputs`. The dashboard's Claude status does not:
+    it computes spend by a second independent path (`iter_shared_range_entries`
+    plus `_calculate_entry_cost`), so "by construction" does not apply and
+    nothing else asserts that the two agree.
+
+    Two entries are seeded at deliberately different ages so `spent_usd` and
+    `recent_24h_usd` are DIFFERENT numbers; equal ones would let the two fields
+    be swapped and still pass.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    tui = ns["_cctally_tui"]
+    budget = {"weekly_usd": 120.0, "period": "calendar-month",
+              "alert_thresholds": [90, 100]}
+
+    def _seed(inner_ns, cache):
+        _s5_seed_claude_spend(
+            inner_ns, cache, at=_S5_BUDGET_NOW - dt.timedelta(hours=3),
+            line_offset=1,
+        )
+        _s5_seed_claude_spend(
+            inner_ns, cache, at=_S5_BUDGET_NOW - dt.timedelta(days=5),
+            line_offset=2, input_tokens=90_000, output_tokens=15_000,
+        )
+
+    bundle = _s5_build_bundle(
+        ns, tui, budget=budget, now_utc=_S5_BUDGET_NOW, seed=_seed,
+    )
+    status = bundle.sources["claude"].data["budget"]["status"]
+
+    expected_inputs = ns["_build_vendor_budget_inputs"](
+        vendor="claude",
+        period="calendar-month",
+        target_usd=120.0,
+        alert_thresholds=(90, 100),
+        now_utc=_S5_BUDGET_NOW,
+        config=_s5_claude_config(budget),
+        tz=dt.timezone.utc,
+        skip_sync=True,
+    )
+    expected = ns["compute_budget_status"](expected_inputs)
+
+    assert expected_inputs.spent_usd > 0.0, (
+        "precondition: the CLI path must see priced spend, or every equality "
+        "below is 0 == 0")
+    assert expected_inputs.recent_24h_usd < expected_inputs.spent_usd, (
+        "precondition: the two windows must differ, or a swapped pair passes")
+
+    assert status["spent_usd"] == pytest.approx(expected_inputs.spent_usd)
+    assert status["recent_24h_usd"] == pytest.approx(
+        expected_inputs.recent_24h_usd)
+    assert status["budget_usd"] == pytest.approx(expected_inputs.target_usd)
+    assert status["remaining_usd"] == pytest.approx(expected.remaining_usd)
+    assert status["consumption_pct"] == pytest.approx(expected.consumption_pct)
+    assert status["verdict"] == expected.verdict
+    assert status["low_confidence"] == expected.low_confidence
+    assert status["pace"]["daily_usd"] == pytest.approx(expected.daily_pace_usd)
+    assert status["pace"]["projected_low_usd"] == pytest.approx(
+        expected.projected_eow_low_usd)
+    assert status["pace"]["projected_high_usd"] == pytest.approx(
+        expected.projected_eow_high_usd)
+    assert status["pace"]["week_avg_projection_usd"] == pytest.approx(
+        expected.week_avg_projection_usd)
+    assert status["window_start_at"] == _iso_z_or_offset(
+        expected_inputs.week_start_at)
+    assert status["window_end_at"] == _iso_z_or_offset(
+        expected_inputs.week_end_at)
+
+
+def _iso_z_or_offset(value):
+    """The published spelling of a resolved bound, whichever form it takes."""
+    return value.isoformat()
+
+
+def test_claude_budget_cost_event_carrier_is_bounded_to_the_reclock_window(
+    tmp_path, monkeypatch,
+):
+    """#556 S5 Unit 1 review R4 — the retained tuple is bounded.
+
+    `_refresh_budget_status_clock` reads the retained events ONLY to recompute
+    `recent_24h_usd` over ``[max(start_at, now - 24h), now)``, and ``now`` is
+    monotonic, so every event older than ``build_now - 24h`` is provably
+    unreadable for the life of the retained state. Retaining the whole budget
+    window — up to 31 days of Claude `session_entries` — therefore buys nothing
+    and makes every reclock tick walk the whole set.
+
+    Total spend is summed at BUILD from the full set, so bounding the carrier
+    loses no published figure. Both facts are asserted here.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    tui = ns["_cctally_tui"]
+
+    def _seed(inner_ns, cache):
+        _s5_seed_claude_spend(
+            inner_ns, cache, at=_S5_BUDGET_NOW - dt.timedelta(hours=3),
+            line_offset=1,
+        )
+        # Inside the calendar month, OUTSIDE the trailing-24h reclock window.
+        _s5_seed_claude_spend(
+            inner_ns, cache, at=_S5_BUDGET_NOW - dt.timedelta(days=5),
+            line_offset=2, input_tokens=90_000, output_tokens=15_000,
+        )
+
+    bundle = _s5_build_bundle(
+        ns, tui,
+        budget={"weekly_usd": 120.0, "period": "calendar-month"},
+        now_utc=_S5_BUDGET_NOW,
+        seed=_seed,
+    )
+    claude = bundle.sources["claude"]
+    status = claude.data["budget"]["status"]
+    events = claude.clock_data["claude_budget_cost_events"]
+
+    cutoff = _S5_BUDGET_NOW - dt.timedelta(hours=24)
+    assert len(events) == 1, (
+        "the carrier must hold only the events a later reclock can read")
+    assert all(timestamp >= cutoff for timestamp, _cost in events)
+    # Nothing is lost: the published total still covers BOTH entries.
+    assert status["spent_usd"] > sum(cost for _ts, cost in events), (
+        "precondition: the older entry must contribute real spend, or this "
+        "test cannot tell a bounded carrier from a lost one")
+    assert status["recent_24h_usd"] == pytest.approx(
+        sum(cost for _ts, cost in events))
+
+
+def test_claude_budget_window_boundary_invalidates_a_reused_generation(
+    tmp_path, monkeypatch,
+):
+    """#556 S5 Unit 1 review R5, kept as a BOUNDARY PIN (Unit 2 review F2).
+
+    `claude_version` carries `_tui_claude_period_identity`, which reads the
+    SUBSCRIPTION-WEEK bounds and therefore tracks that period's boundary and no
+    other, while `_refresh_claude_budget_clock` deliberately preserves
+    `window_start_at` / `window_end_at` / `spent_usd`. This asserts that an idle
+    generation crossing a CONFIGURED `calendar-month` boundary republishes the
+    new period's window rather than the previous one.
+
+    It is NOT a reproduction of a production defect, and the Unit 1 claim that
+    it was is withdrawn. S2's aggregate-range fragment also moves at
+    display-timezone midnight — `resolve_shared_range` floors to midnight in the
+    resolved display zone and production passes one zone object to both legs —
+    so on a real install both fragments move at the same instant. The original
+    RED came from `_s5_build_bundle` hard-coding a UTC range start beside
+    `display_tz_name="America/New_York"`, which production never constructs;
+    that helper now derives its range start from `display_tz_name`.
+
+    Two fixture details are load-bearing, and each defeats this test silently
+    rather than loudly when omitted.
+
+    A supplied `projects_envelope`: without one the Claude aggregate fold fails,
+    `aggregate_scope_failed` rebuilds the provider on every tick, and the reuse
+    branch is never reached at all.
+
+    A pinned `common_range_start`: derived, it moves with `now_utc` and enters
+    `claude_version` through `aggregate_scope_identity`, so the two builds would
+    differ on THAT fragment and be rebuilt for a reason this test does not name
+    — passing while proving nothing about the budget fragment. Holding it
+    constant leaves the budget window as the only thing that can differ, which
+    is what makes the version comparison below evidence (Unit 2 review F2,
+    remediation review finding 1).
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    tui = ns["_cctally_tui"]
+    budget = {"weekly_usd": 120.0, "period": "calendar-month"}
+    tzname = "America/New_York"
+    before = dt.datetime(2026, 8, 1, 1, 0, tzinfo=UTC)   # still July locally
+    after = dt.datetime(2026, 8, 1, 5, 0, tzinfo=UTC)    # August locally
+    pinned_range_start = tui._tui_common_source_range_start(
+        (), now_utc=before, display_tz=ZoneInfo(tzname),
+    )
+
+    first = _s5_build_bundle(
+        ns, tui, budget=budget, now_utc=before, display_tz_name=tzname,
+        projects_envelope={}, common_range_start=pinned_range_start,
+        seed=lambda inner_ns, cache: _s5_seed_claude_spend(
+            inner_ns, cache, at=before - dt.timedelta(hours=3),
+        ),
+    )
+    assert first.sources["claude"].data["budget"]["status"][
+        "window_start_at"] == "2026-07-01T04:00:00+00:00", (
+        "precondition: the FIRST build must resolve July's local window, or "
+        "the boundary this test crosses was never on the near side")
+
+    second = _s5_build_bundle(
+        ns, tui, budget=budget, now_utc=after, display_tz_name=tzname,
+        projects_envelope={}, prior_bundle=first,
+        common_range_start=pinned_range_start,
+    )
+    status = second.sources["claude"].data["budget"]["status"]
+    assert status["window_start_at"] == "2026-08-01T04:00:00+00:00", (
+        "an idle install that crossed its CONFIGURED budget boundary "
+        "republished the previous period's window "
+        f"({first.sources['claude'].data_version!r} -> "
+        f"{second.sources['claude'].data_version!r})")
+    assert status["window_end_at"] == "2026-09-01T04:00:00+00:00"
+
+    # The MECHANISM, not just the outcome: strip the budget fragment from both
+    # versions and the remainders must be equal. That is what says the budget
+    # window is the only reason these two generations differ — so this bundle
+    # would have been REUSED without it, which is the failure being pinned.
+    # Asserting the republished window alone cannot distinguish that from a
+    # rebuild forced by some unrelated fragment.
+    def _without_budget_fragment(version):
+        head, sep, _tail = version.partition(":b")
+        assert sep, f"expected a budget fragment in {version!r}"
+        return head
+
+    first_version = first.sources["claude"].data_version
+    second_version = second.sources["claude"].data_version
+    assert _without_budget_fragment(first_version) == _without_budget_fragment(
+        second_version), (
+        "something OTHER than the budget window differs between these two "
+        f"generations, so this test is not pinning what it claims "
+        f"({first_version!r} -> {second_version!r})")
+    assert first_version != second_version
+
+
+def test_claude_budget_version_is_unchanged_without_a_calendar_budget(
+    tmp_path, monkeypatch,
+):
+    """The new version fragment is EMPTY for an unconfigured budget and for
+    `subscription-week`, whose boundary `_tui_claude_period_identity` already
+    tracks from the same bounds. So no install that had a stable version string
+    before this session gets a different one."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    tui = ns["_cctally_tui"]
+    now = dt.datetime(2026, 8, 1, 5, 0, tzinfo=UTC)
+    for budget in (None, {"weekly_usd": 120.0, "period": "subscription-week"}):
+        bundle = _s5_build_bundle(
+            ns, tui, budget=budget, now_utc=now,
+            display_tz_name="America/New_York", projects_envelope={},
+        )
+        assert ":b" not in bundle.sources["claude"].data_version, budget
+    # ... and NON-VACUOUS: a calendar budget really does add one.
+    calendar = _s5_build_bundle(
+        ns, tui, budget={"weekly_usd": 120.0, "period": "calendar-month"},
+        now_utc=now, display_tz_name="America/New_York", projects_envelope={},
+    )
+    assert ":b2026-09-01T04:00:00+00:00" in (
+        calendar.sources["claude"].data_version)
+
+
+def test_claude_budget_status_published_when_configured(tmp_path, monkeypatch):
+    """A configured Claude budget publishes the same object Codex publishes."""
+    claude, domain = _s5_build_claude_budget_domain(
+        tmp_path, monkeypatch,
+        budget={"weekly_usd": 120.0, "period": "calendar-month",
+                "alert_thresholds": [90, 100]},
+    )
+    status = domain["status"]
+    assert status["period"] == "calendar-month"
+    assert status["budget_usd"] == 120.0
+    assert status["spent_usd"] > 0.0, (
+        "precondition: the seeded entry must price above zero, or this test "
+        "cannot tell a published status from an empty one")
+    assert status["verdict"] in {"ok", "warn", "over"}
+    assert set(status["pace"]) == {
+        "daily_usd", "projected_low_usd", "projected_high_usd",
+        "week_avg_projection_usd",
+    }
+    assert tuple(status["alert_thresholds"]) == (90, 100)
+    assert status["window_start_at"] == "2026-07-01T00:00:00+00:00"
+    assert status["window_end_at"] == "2026-08-01T00:00:00+00:00"
+    assert "status_unavailable" not in domain
+    assert "not_configured" not in domain
+    # The cost events that keep the status current are server-private.
+    assert "claude_budget_cost_events" in claude.clock_data
+    assert claude.clock_data["claude_budget_cost_events"], (
+        "precondition: the carrier must actually carry the seeded event")
+    _assert_no_cost_events_under_data(claude.data)
+
+
+@pytest.mark.parametrize("period", ["calendar-month", "calendar-week"])
+def test_claude_budget_capability_names_configured_period(
+    tmp_path, monkeypatch, period,
+):
+    """#556 S5 §3.6. Claude advertised a CONSTANT `subscription-week` while
+    Codex advertises `calendar-period`. Once the published status can carry
+    `calendar-week` or `calendar-month`, the constant contradicts the very
+    object beside it in the same envelope.
+
+    Lives here rather than in `tests/test_dashboard_source_kernel.py` as the
+    plan named: the record is written by `_tui_build_source_bundle`, which that
+    module never calls — it constructs `SourceDashboardState` objects directly.
+    """
+    claude, _domain = _s5_build_claude_budget_domain(
+        tmp_path, monkeypatch,
+        budget={"weekly_usd": 120.0, "period": period},
+    )
+    assert claude.capabilities["budget"] == CapabilityRecord("supported", period)
+
+
+def test_claude_budget_capability_stays_subscription_week_when_unconfigured(
+    tmp_path, monkeypatch,
+):
+    """The default period is `subscription-week`, so an install with no budget
+    configured advertises exactly what it advertised before this session."""
+    claude, _domain = _s5_build_claude_budget_domain(
+        tmp_path, monkeypatch, budget=None,
+    )
+    assert claude.capabilities["budget"] == CapabilityRecord(
+        "supported", "subscription-week",
+    )
+
+
+def _assert_no_cost_events_under_data(node, path="data"):
+    """#556 S5 §3.7: the cost-event carrier is never published."""
+    if isinstance(node, Mapping):
+        for key, value in node.items():
+            assert "cost_events" not in str(key), (
+                f"cost events reached the public wire at {path}.{key}")
+            _assert_no_cost_events_under_data(value, f"{path}.{key}")
+    elif isinstance(node, (list, tuple)):
+        for index, value in enumerate(node):
+            _assert_no_cost_events_under_data(value, f"{path}[{index}]")
+
+
+def test_claude_budget_status_omitted_when_unset(tmp_path, monkeypatch):
+    """`provider_budget_unset` is the ABSENCE of every budget-status key, so the
+    normal payload stays byte-identical."""
+    _claude, domain = _s5_build_claude_budget_domain(
+        tmp_path, monkeypatch, budget=None,
+    )
+    assert "status" not in domain
+    assert "status_unavailable" not in domain
+    assert "not_configured" not in domain
+
+
+def test_claude_budget_status_account_budgets_only_names_disposition(
+    tmp_path, monkeypatch,
+):
+    """Per-account budgets with no vendor-wide amount is its OWN state. Rendering
+    `No budget set.` here would be false."""
+    _claude, domain = _s5_build_claude_budget_domain(
+        tmp_path, monkeypatch,
+        budget={"accounts": {"acct-one": 40.0, "acct-two": 60.0}},
+    )
+    assert "status" not in domain
+    assert domain["not_configured"]["disposition"] == "account_budgets_only"
+    assert "status_unavailable" not in domain
+
+
+def test_claude_budget_status_period_unresolved_names_reason(tmp_path, monkeypatch):
+    """A configured subscription-week budget with no usage snapshot cannot
+    resolve a window. The CLI calls this `status: "no_data"`."""
+    _claude, domain = _s5_build_claude_budget_domain(
+        tmp_path, monkeypatch,
+        budget={"weekly_usd": 120.0, "period": "subscription-week"},
+    )
+    assert "status" not in domain
+    assert domain["status_unavailable"]["code"] == "period_unresolved"
+    assert domain["status_unavailable"]["provider"] == "claude"
+    assert domain["status_unavailable"]["message"]
+    # #556 S5 §4.6 / Unit 2 review F5 — §4.6 requires the block to render "the
+    # configured amount with the window named as unresolved", and it had no
+    # amount to render. Both codes are reached ONLY from a configured budget,
+    # so both carry what was configured.
+    assert domain["status_unavailable"]["budget_usd"] == 120.0
+    assert domain["status_unavailable"]["period"] == "subscription-week"
+
+
+def test_claude_budget_compute_failure_degrades_locally_without_failing_provider(
+    tmp_path, monkeypatch,
+):
+    """The important one. A budget error must degrade the budget domain and
+    NOTHING else: today it escapes the Claude build, which has no catch of its
+    own at all, and takes the whole bundle down."""
+    def _explode(ns, _cache, _stats):
+        def _boom(**_kwargs):
+            raise RuntimeError("budget kernel exploded")
+        monkeypatch.setitem(ns, "budget_status_payload", _boom)
+
+    claude, domain = _s5_build_claude_budget_domain(
+        tmp_path, monkeypatch,
+        budget={"weekly_usd": 120.0, "period": "calendar-month"},
+        mutate=_explode,
+    )
+    assert domain["status_unavailable"]["code"] == "budget_compute_failed"
+    assert domain["status_unavailable"]["provider"] == "claude"
+    # The configured amount and period survive the failure — `period` in
+    # particular is resolved BEFORE the boundary so this payload can name it
+    # even when the raise happened on the first statement inside the `try`.
+    assert domain["status_unavailable"]["budget_usd"] == 120.0
+    assert domain["status_unavailable"]["period"] == "calendar-month"
+    assert "status" not in domain
+    # The provider still has its data — this is a LOCAL degradation.
+    assert claude.availability != "unavailable"
+    assert claude.data is not None
+    assert "hero" in claude.data
+    assert not any(
+        warning.code == "source_build_failed" for warning in claude.warnings
+    )
+
+
+# =========================================================================
+# #556 S5 §3.7 — Claude is clocked after EVERY branch, not only pure idle.
+# =========================================================================
+
+_S5_RECLOCK_BUDGET = {"weekly_usd": 120.0, "period": "calendar-month"}
+
+
+def _s5_reclock_env(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    tui = ns["_cctally_tui"]
+    cache = ns["open_cache_db"]()
+    stats = ns["open_db"]()
+    _s5_seed_claude_spend(ns, cache, at=_S5_BUDGET_NOW - dt.timedelta(hours=3))
+    return ns, tui, cache, stats
+
+
+def _s5_build_reclock_bundle(tui, stats, *, now_utc, prior_bundle=None):
+    return tui._tui_build_source_bundle(
+        stats_conn=stats,
+        now_utc=now_utc,
+        display_tz_name="UTC",
+        codex_ingest_contended=False,
+        claude_cost_usd=0.0,
+        claude_total_tokens=0,
+        common_range_start=tui._tui_common_source_range_start(
+            (), now_utc=now_utc, display_tz=dt.timezone.utc,
+        ),
+        # An EMPTY envelope, not `None`. `None` means "the routable population
+        # is unknown", which withholds the projects aggregate as a FAILED fold —
+        # and `aggregate_scope_failed` then disqualifies the provider from
+        # exact-version reuse on the next tick, so the reuse branch these tests
+        # exist to reach would never be taken.
+        projects_envelope={},
+        prior_bundle=prior_bundle,
+        raw_config=_s5_claude_config(_S5_RECLOCK_BUDGET),
+    )
+
+
+def test_claude_budget_reclocks_on_pure_idle_tick(tmp_path, monkeypatch):
+    """`_refresh_claude_source_clock` is the pure-idle short circuit. Before S5
+    it advanced only the two freshness axes, so a budget pace published at build
+    time stayed frozen for the whole idle stretch."""
+    ns, tui, cache, stats = _s5_reclock_env(tmp_path, monkeypatch)
+    try:
+        bundle = _s5_build_reclock_bundle(tui, stats, now_utc=_S5_BUDGET_NOW)
+    finally:
+        cache.close()
+        stats.close()
+    claude = bundle.sources["claude"]
+    built = claude.data["budget"]["status"]
+    assert built["pace"]["daily_usd"] > 0.0, (
+        "precondition: a zero pace could not be observed to move")
+
+    later = _S5_BUDGET_NOW + dt.timedelta(hours=6)
+    clocked = tui._refresh_claude_source_clock(
+        claude,
+        current_week=SimpleNamespace(week_end_at=None, latest_snapshot_at=None),
+        now_utc=later,
+        raw_config=_s5_claude_config(_S5_RECLOCK_BUDGET),
+    )
+    reclocked = clocked.data["budget"]["status"]
+    assert reclocked["pace"]["daily_usd"] != built["pace"]["daily_usd"]
+    # The reclock advances presentation only: the window and the spend it
+    # bounds are frozen evidence.
+    assert reclocked["window_start_at"] == built["window_start_at"]
+    assert reclocked["spent_usd"] == built["spent_usd"]
+    assert clocked.data_version == claude.data_version
+
+
+def test_claude_budget_stays_current_when_reused_during_a_codex_only_rebuild(
+    tmp_path, monkeypatch,
+):
+    """The one the current code fails.
+
+    Exact-version Claude reuse returns the PRIOR OBJECT unchanged, and after
+    every build / reuse / degrade branch only Codex was clocked — with a comment
+    saying Claude is deliberately untouched. So any tick another source forced
+    left the Claude budget stale.
+    """
+    ns, tui, cache, stats = _s5_reclock_env(tmp_path, monkeypatch)
+    try:
+        first = _s5_build_reclock_bundle(tui, stats, now_utc=_S5_BUDGET_NOW)
+        later = _S5_BUDGET_NOW + dt.timedelta(hours=6)
+        second = _s5_build_reclock_bundle(
+            tui, stats, now_utc=later, prior_bundle=first,
+        )
+    finally:
+        cache.close()
+        stats.close()
+
+    before = first.sources["claude"]
+    after = second.sources["claude"]
+    assert after.data_version == before.data_version
+    # The load-bearing precondition. Equal versions alone do NOT prove reuse:
+    # a rebuild over unmoved evidence produces the same version string AND
+    # recomputes the budget at the new `now`, so a test resting on the version
+    # would pass without ever reaching the branch it exists to exercise. Reuse
+    # hands back the PRIOR frozen objects, so an untouched sibling domain is
+    # the same object; a rebuild constructs a new one.
+    assert after.data["sessions"] is before.data["sessions"], (
+        "precondition: this test must reach the REUSE branch")
+
+    built = before.data["budget"]["status"]
+    reused = after.data["budget"]["status"]
+    assert reused["pace"]["daily_usd"] != built["pace"]["daily_usd"]
+    assert reused["spent_usd"] == built["spent_usd"]
+    # And the composed All mirror carries the same refreshed object.
+    assert (
+        second.sources["all"].data["providers"]["claude"]["budget"]["status"]
+        == reused
+    )
+
+
 # -------------------------------------------------------------------------
 # #429 §5.6 — the non-regression oracle. Regenerated goldens accept whatever
 # bytes they are given, and no single run can execute both the pre- and
@@ -4267,6 +4924,30 @@ S2_556_SCOPED_DELTA_PREFIXES = (
 )
 
 
+# #556 S5 — the v8 budget contract (spec §3.6). Fully qualified, and each entry
+# is a PREFIX because `status` is a whole subtree. Broad prefixes such as
+# `budget` or `status` are FORBIDDEN: they would mask an unrelated change to the
+# Codex budget domain or to any other object that happens to have a `status`.
+#
+#   * the Claude provider's own status, and the SAME object as composition
+#     mirrors it under All — two paths, because the oracle walks both subtrees
+#     and neither implies the other.
+#   * the Claude budget capability's `semantics`, which changed from the
+#     constant `subscription-week` to the configured period.
+#   * the bundle-level version field.
+#
+# `sources.claude.data.budget.status_unavailable` and `not_configured` are
+# deliberately ABSENT from this set. The capture configures a real budget that
+# resolves, so neither can appear; admitting them here would widen the oracle
+# for states this artifact cannot reach.
+S5_556_SCOPED_DELTA_PREFIXES = (
+    "sources.claude.data.budget.status",
+    "sources.all.data.providers.claude.budget.status",
+    "sources.claude.capabilities.budget.semantics",
+    "source_schema_version",
+)
+
+
 def _is_s2_556_delta(path):
     return any(
         path == prefix or path.startswith(prefix + ".")
@@ -4275,11 +4956,21 @@ def _is_s2_556_delta(path):
     )
 
 
+def _is_s5_556_delta(path):
+    return any(
+        path == prefix or path.startswith(prefix + ".")
+        or path.startswith(prefix + "[")
+        for prefix in S5_556_SCOPED_DELTA_PREFIXES
+    )
+
+
 def _is_allowed_delta(path):
     segments = path.split(".")
     if segments[-1] in ALLOWED_DELTAS:
         return True
     if path in S1_556_SCOPED_DELTAS or _is_s2_556_delta(path):
+        return True
+    if _is_s5_556_delta(path):
         return True
     return segments[-1] in CODEX_SCOPED_DELTAS and "codex" in segments
 # NOT a wire semantic: `data_version` embeds `current_generation()`, a
@@ -4410,6 +5101,7 @@ def _unexpected_claude_deltas(before_claude, after_claude):
         if path.split(".")[-1] not in VOLATILE_FIELDS
         and path not in S1_556_SCOPED_DELTAS
         and not _is_s2_556_delta(path)
+        and not _is_s5_556_delta(path)
     ]
 
 
@@ -4456,3 +5148,107 @@ def test_claude_delta_oracle_reports_an_injected_change():
     exempt = copy.deepcopy(before)
     exempt["domain_freshness"]["hero"] = "__mutated__"
     assert _unexpected_claude_deltas(before, exempt) == []
+
+
+# #556 S5 §3.6 — the oracle prefixes must actually match something.
+
+
+_S5_ORACLE_BUDGET_CONFIG = {
+    "collector": {"week_start": "sunday"},
+    "budget": {"weekly_usd": 150.0, "period": "calendar-month"},
+}
+
+# The two prefixes whose whole purpose is to admit a published budget status.
+# The capability-detail and version prefixes are deliberately excluded: the
+# capture's configured period is the DEFAULT, so the capability value does not
+# move, and the version is a scalar the general check already admits by name.
+_S5_STATUS_PREFIXES = (
+    "sources.claude.data.budget.status",
+    "sources.all.data.providers.claude.budget.status",
+)
+
+
+def _capture_envelope_with_a_claude_budget(tmp_path, monkeypatch):
+    """The same capture path, with a budget the Claude provider can compute."""
+    import json as _json
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    tui = ns["_cctally_tui"]
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    _install_observations(
+        monkeypatch, source_module, _quota_observations_with_repeated_value(NOW),
+    )
+    cache = ns["open_cache_db"]()
+    stats = ns["open_db"]()
+    try:
+        bundle = _build_tick_bundle(
+            tui, stats, now_utc=NOW, raw_config=_S5_ORACLE_BUDGET_CONFIG,
+        )
+        envelope = sys.modules[
+            "_cctally_dashboard_envelope"
+        ]._source_bundle_to_envelope(bundle)
+        return _json.loads(_json.dumps(envelope, sort_keys=True, default=str))
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_s5_delta_prefixes_are_non_vacuous(tmp_path, monkeypatch):
+    """MANDATORY (spec §3.6, §6.7). The committed capture configures NO budget,
+    so under it these prefixes admit nothing and would assert nothing at all —
+    a permanently vacuous widening of the oracle that no failing run could
+    reveal. This captures WITH a budget configured and requires each prefix to
+    have real descendants."""
+    import json as _json
+
+    before = _json.loads(_429_PRE_CHANGE_ENVELOPE.read_text())
+    after = _capture_envelope_with_a_claude_budget(tmp_path, monkeypatch)
+    diffs = [
+        (path, old, new) for path, old, new in _deep_diff(before, after)
+        if path.split(".")[-1] not in VOLATILE_FIELDS
+    ]
+    for prefix in _S5_STATUS_PREFIXES:
+        matched = [
+            (path, old, new) for path, old, new in diffs
+            if path == prefix or path.startswith(prefix + ".")
+        ]
+        assert matched, f"{prefix} matched no delta — the prefix asserts nothing"
+        # A real status OBJECT, not just the container key appearing. A wholly
+        # new subtree is reported by `_deep_diff` as one delta AT the prefix
+        # carrying the whole object, so "has descendants" is the wrong shape of
+        # check here; naming the fields is the right one.
+        published = [
+            new for path, old, new in matched
+            if path == prefix and isinstance(new, dict)
+        ]
+        assert published, f"{prefix} matched no published status object"
+        assert {"budget_usd", "verdict", "pace"} <= set(published[0]), (
+            f"{prefix} matched something that is not a budget status")
+        assert published[0]["budget_usd"] == 150.0
+    # And the widening is exactly as wide as it claims: with a budget
+    # configured, every delta is still an admitted one.
+    unexpected = [
+        (path, old, new) for path, old, new in diffs
+        if not _is_allowed_delta(path)
+    ]
+    assert unexpected == [], f"unintended envelope changes: {unexpected}"
+
+
+def test_s5_delta_predicate_reports_a_path_it_does_not_name():
+    """The matcher REJECTS something — the test above passing does not show
+    that, since a predicate admitting everything would also pass it."""
+    assert _is_s5_556_delta("sources.claude.data.budget.status")
+    assert _is_s5_556_delta("sources.claude.data.budget.status.verdict")
+    assert _is_s5_556_delta("sources.all.data.providers.claude.budget.status.pace.daily_usd")
+    assert _is_s5_556_delta("sources.claude.capabilities.budget.semantics")
+    assert _is_s5_556_delta("source_schema_version")
+    # Neighbours that must NOT be admitted. A broad `budget` or `status` prefix
+    # would swallow every one of these.
+    assert not _is_s5_556_delta("sources.claude.data.budget.settings")
+    assert not _is_s5_556_delta("sources.claude.data.budget.forecast.verdict")
+    assert not _is_s5_556_delta("sources.codex.data.budget.status")
+    assert not _is_s5_556_delta("sources.all.data.providers.codex.budget.status")
+    assert not _is_s5_556_delta("sources.claude.capabilities.budget.status")
+    assert not _is_s5_556_delta("sources.claude.capabilities.quota.semantics")

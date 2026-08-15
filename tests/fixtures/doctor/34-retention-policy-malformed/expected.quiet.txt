@@ -9,7 +9,7 @@ Hooks
 Auth
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Pending migrations       54 pending
+  ⚠ Pending migrations       57 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✗ Retained evidence        retention policy in config.json is malformed — automatic reclaim is off
       → Fix or remove the storage.artifact_retention block: storage.artifact_retention.max_age_days must be >= 1, got 0
@@ -22,4 +22,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 54 OK · 5 WARN · 1 FAIL
+Summary: 55 OK · 5 WARN · 1 FAIL

@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react';
-import { useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
+import { scopeProviderFor, useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { sourceAccounts } from '../store/accountFocus';
 import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
@@ -16,6 +16,7 @@ import {
   type ForecastPresentation,
 } from '../lib/dashboardPresentation';
 import { SourceChip } from './sourcePanel';
+import { BudgetComposition } from '../components/BudgetBlock';
 import type { Envelope } from '../types/envelope';
 
 // #416 QA P0 — the shared blank. A forecast is a claim about ONE quota
@@ -60,7 +61,7 @@ function ForecastProviderSummary({
     // the FIRST eligible weekly history — one arbitrarily chosen account — so
     // publishing it as the provider's would reconcile against no account card
     // and no tab. The canonical per-account panel already filters it out; this
-    // is that same rule. `Budget pace` is a SPEND axis and stays.
+    // is that same rule.
     ? value.foot.filter((line) => line.label !== 'Confidence')
     : value.foot;
   return (
@@ -114,9 +115,11 @@ function ForecastProviderSummary({
         <div className="provider-section-reason">{section.reason}</div>
       )}
       {/* #556 S4 — the panel dropped every foot line although the composition
-          already handed it one, so Codex lost Confidence and Budget pace and
-          Claude lost both budget rows. Same markup as the single-provider
-          card's footer below. */}
+          already handed it one, so both providers lost their footers. Same
+          markup as the single-provider card's footer below. (S4's footers are
+          described here in general terms because S5 moved `Budget pace` out of
+          this footer into the budget block; naming it would describe a line
+          that is no longer here.) */}
       {foot.length > 0 && (
         <div className="fc-budget-foot">
           {foot.map((line) => (
@@ -147,14 +150,18 @@ function ForecastProviderSummary({
 export function ForecastPanel() {
   const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
-  const scope = useAccountScope();
+  const scope = useAccountScope(activeSource, scopeProviderFor(activeSource));
   const composition = presentationForecastComposition(env, activeSource);
   // #416 QA P0. On the Codex tab the gate is the scope chokepoint's own answer
   // (decorated AND unfocused), the same predicate the hero uses. On the
   // combined tab there is no Codex chip to focus, so the gate is simply whether
   // the provider ships `accounts[]` — matching `SharedHero`'s `all` branch.
+  // #556 S5 §5.8 — a Codex focus under All un-blanks the forecast, exactly as
+  // it does on the Codex tab: the scoped envelope has already replaced the
+  // Codex subtree with that account's child, so the tile is a claim about ONE
+  // allowance again and the D6 blank no longer applies.
   const codexPerAccount = activeSource === 'all'
-    ? sourceAccounts(env?.sources?.codex ?? null) != null
+    ? sourceAccounts(env?.sources?.codex ?? null) != null && scope.accountKey == null
     : scope.scopesSupported && scope.accountKey == null;
   if (activeSource === 'all') {
     return (
@@ -186,6 +193,12 @@ export function ForecastPanel() {
             <PanelGrip />
           </div>
         </div>
+        {/* #556 S5 §4.2 — the two forecast provider sections first, then the
+            two budget sections, in ONE grid. At desktop widths that puts the
+            budget cards adjacent on their own row; at `max-width: 640px` the
+            shipped `.provider-composition--panel` rule collapses to one
+            column, so the mobile shape is ordered stacked cards with Claude
+            first. That existing rule is reused rather than fought. */}
         <div className="panel-body source-all-sections provider-composition provider-composition--panel">
           {composition.sections.map((section) => (
             <ForecastProviderSummary
@@ -195,6 +208,7 @@ export function ForecastPanel() {
               perAccount={section.source === 'codex' && codexPerAccount}
             />
           ))}
+          <BudgetComposition env={env} selection="all" surface="panel" />
         </div>
       </section>
     );
@@ -279,15 +293,21 @@ export function ForecastPanel() {
             </span>
           </div>
           {/* `Confidence` describes one account's sample history, so it blanks
-              with the projection it qualifies. `Budget pace` is a SPEND axis —
-              the one thing D6 does let "All accounts" merge — and the server
-              already merges it, so it rides through unchanged. */}
+              with the projection it qualifies. */}
           {(perAccount ? fc.foot.filter((l) => l.label !== 'Confidence') : fc.foot).map((line) => (
             <div className="fc-foot-line" key={line.label}>
               <span className="fc-foot-k">{line.label}</span>
               <span className="fc-foot-v">{line.value}</span>
             </div>
           ))}
+        </div>
+        {/* #556 S5 §1.3 / decision 4 — the same block ships on both provider
+            tabs, not only under All: once the status is on the wire and the
+            component exists, rendering it here is nearly free, and otherwise
+            All would state more about a provider's budget than that provider's
+            own tab does. */}
+        <div className="fc-budget-block">
+          <BudgetComposition env={env} selection={activeSource} surface="panel" />
         </div>
       </div>
     </section>

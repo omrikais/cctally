@@ -1,10 +1,13 @@
 import type {
   AggregateOutcome,
+  BudgetPresentation,
   AggregateQualification,
   AggregateRange,
   AllSourceData,
   BlocksPanelRow,
   CacheReportEnvelope,
+  ClaudeBudgetDomain,
+  CodexBudgetDomain,
   CodexPeriodBucket,
   CodexQuotaBlockRow,
   CodexQuotaDomain,
@@ -749,15 +752,17 @@ export function presentationForecast(env: Envelope | null, selection: SourceName
   // undecorated, the parent has exactly one account.
   const live = weekly != null && codexLiveQuotaKeys(codex?.quota).has(weekly.key);
   const projected = live && forecast?.status === 'ok' ? forecast.projected_percent : null;
-  const budget = codex?.budget.status;
   return {
     projected,
     recent: live ? forecast?.current_percent ?? null : null,
     primaryLabel: 'Projected @ reset',
     recentLabel: weekly?.label ?? 'Current quota',
+    // #556 S5 §4.7 — `Budget pace` LEFT this footer for the budget block, which
+    // is where the configured-budget quantities now live, and is rendered
+    // exactly once. `Confidence` stays: it qualifies the PROJECTION, under its
+    // existing liveness and decorated-account suppression rules.
     foot: [
       { label: 'Confidence', value: (live && forecast?.confidence) || 'unavailable' },
-      { label: 'Budget pace', value: budget?.pace.daily_usd == null ? '—' : `$${budget.pace.daily_usd.toFixed(2)}/day` },
     ],
     verdict: projected == null ? null : projected >= 100 ? 'capped' : projected >= 90 ? 'cap' : 'ok',
   };
@@ -840,6 +845,69 @@ export function presentationCodexAccountForecasts(
         : projected >= 100 ? 'capped' : projected >= 90 ? 'cap' : 'ok',
     };
   });
+}
+
+// #556 S5 §4.1 — the configured-BUDGET presentation, beside the forecast one.
+//
+// Two verdicts must never be confused (§4.5): the forecast surface already
+// carries an `ok`/`cap`/`capped` chip for the PROJECTION, while a budget
+// verdict is `ok`/`warn`/`over` over configured spend. They are different
+// quantities, so this adapter is a separate symbol and touches none of S2's or
+// S4's forecast adapters.
+//
+// The dispositions the server can express (§3.5) are mutually exclusive and all
+// OPTIONAL, so the ordinary no-budget payload carries none of them. One
+// documented asymmetry is absorbed here: Claude OMITS `status` when there is
+// nothing to publish, while Codex's enclosing domain always emits
+// `"status": <object|null>`. Both map to the same presentation state.
+//
+// The union arms are closed for SERVER GENERATION AND TESTS ONLY: `disposition`
+// and `reason` are bare strings, and every rendering caller must carry a
+// fallback branch for a code this client has never seen. That is S2's rule.
+function budgetPresentationOf(
+  domain: ClaudeBudgetDomain | CodexBudgetDomain | null | undefined,
+): BudgetPresentation {
+  if (domain == null) {
+    return { state: 'not_configured', disposition: 'provider_budget_unset' };
+  }
+  const status = domain.status;
+  if (status != null) return { state: 'configured', status };
+  const unavailable = domain.status_unavailable;
+  if (unavailable != null) {
+    return { state: 'unavailable', reason: unavailable.code, unavailable };
+  }
+  const notConfigured = domain.not_configured;
+  if (notConfigured != null) {
+    return { state: 'not_configured', disposition: notConfigured.disposition };
+  }
+  return { state: 'not_configured', disposition: 'provider_budget_unset' };
+}
+
+export function presentationBudgetComposition(
+  env: Envelope | null,
+  selection: DashboardSelection,
+): ProviderPresentationComposition<BudgetPresentation> {
+  const providers = presentationProviders(env, selection);
+  return {
+    selection,
+    sections: compositionSources(selection).map((source) => {
+      // Under a Codex account focus the envelope handed in is already SCOPED,
+      // so `providers.codex` is the focused child and its `budget` is
+      // `account_scopes[key].budget` — never the parent vendor-wide status
+      // (§4.8). Nothing here falls back to the parent, for the same reason
+      // `accountScope.ts` never does: the parent under focus would attribute
+      // every account's spend to one.
+      const data = source === 'claude' ? providers.claude : providers.codex;
+      return providerSection(
+        env,
+        source,
+        data == null ? null : budgetPresentationOf(data.budget),
+        ['budget'],
+        [],
+        `${providerLabel(source)} budget is unavailable.`,
+      );
+    }),
+  };
 }
 
 export function presentationForecastComposition(

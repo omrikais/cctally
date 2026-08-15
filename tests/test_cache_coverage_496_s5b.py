@@ -547,7 +547,11 @@ def test_every_covered_writer_carries_exactly_one_action(core):
         "advance", "mint", "preserve", "invalidate"}
     assert actions[
         "_cctally_cache._write_codex_file_batch(reset_file=True)"] == "invalidate"
-    assert actions["_cctally_journal.rehydrate_codex_file_accounts"] == "preserve"
+    # #500 review finding F4 fused the two journal-derived Codex rehydrations
+    # into one traversal, so the inventory names the fused writer — the wrappers
+    # that replaced the old entries hold no DML of their own.
+    assert actions[
+        "_cctally_journal.rehydrate_codex_journal_families"] == "preserve"
     assert actions["_cctally_journal._cache_applier"] == "advance"
     assert actions["_cctally_journal._rebuild_quota_cache_leg_raw"] == "mint"
 
@@ -1054,15 +1058,18 @@ def test_the_non_leaf_keys_are_exactly_the_unscannable_ones(core):
 
 
 def test_the_scan_reads_the_families_the_certificate_covers(core):
-    """The scan is only as complete as its family list. These three are the
+    """The scan is only as complete as its family list. These four are the
     tables a journal record materializes into: a Codex quota observation
-    becomes a `quota_window_snapshots` row, and a file-account decision becomes
-    a `codex_file_accounts` row plus its `codex_file_incarnations` MAX-set."""
+    becomes a `quota_window_snapshots` row, a file-account decision becomes a
+    `codex_file_accounts` row plus its `codex_file_incarnations` MAX-set, and
+    an operator window attribution (#500) becomes a
+    `codex_window_attributions` row."""
     cache = _cache()
     assert set(cache.COVERAGE_CACHE_FAMILIES) == {
         "quota_window_snapshots",
         "codex_file_accounts",
         "codex_file_incarnations",
+        "codex_window_attributions",
     }
 
 

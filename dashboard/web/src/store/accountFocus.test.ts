@@ -1,15 +1,20 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ACCOUNT_STORAGE_PREFIX,
   ALL_ACCOUNTS,
+  decoratedProvidersFor,
+  focusSlotFor,
   loadAccountFocus,
   nextAccountFocus,
+  providerIsDecorated,
   resolveAccountFocus,
+  resolveViewAccountFocus,
   saveAccountFocus,
   seedAccountFocus,
   shortAccountLabel,
   sourceAccounts,
   sourceIsDecorated,
+  storedFocusFor,
 } from './accountFocus';
 import type { AccountCard, Envelope, SourceEntry } from '../types/envelope';
 
@@ -69,8 +74,88 @@ describe('accountFocus persistence (cctally:dashboard:account:<source>)', () => 
   it('seeds both persisted sources', () => {
     saveAccountFocus('claude', B);
     const seed = seedAccountFocus();
-    expect(seed.claude).toBe(B);
-    expect(seed.codex).toBe(ALL_ACCOUNTS);
+    expect(seed.provider.claude).toBe(B);
+    expect(seed.provider.codex).toBe(ALL_ACCOUNTS);
+  });
+});
+
+// #556 S5 §5.1/§5.2 — the two slots and their isolation.
+describe('#556 S5 — the All focus slot', () => {
+  it('an All focus does not write the provider slot', () => {
+    saveAccountFocus('codex', A, 'all');
+    expect(localStorage.getItem(`${ACCOUNT_STORAGE_PREFIX}all:codex`)).toBe(A);
+    expect(localStorage.getItem(`${ACCOUNT_STORAGE_PREFIX}codex`)).toBeNull();
+    const seed = seedAccountFocus();
+    expect(seed.all.codex).toBe(A);
+    expect(seed.provider.codex).toBe(ALL_ACCOUNTS);
+  });
+
+  it('a provider focus does not write the All slot', () => {
+    saveAccountFocus('codex', B, 'provider');
+    expect(localStorage.getItem(`${ACCOUNT_STORAGE_PREFIX}all:codex`)).toBeNull();
+    const seed = seedAccountFocus();
+    expect(seed.provider.codex).toBe(B);
+    expect(seed.all.codex).toBe(ALL_ACCOUNTS);
+  });
+
+  it('focusSlotFor maps the view, not the provider', () => {
+    expect(focusSlotFor('all')).toBe('all');
+    expect(focusSlotFor('codex')).toBe('provider');
+    expect(focusSlotFor('claude')).toBe('provider');
+  });
+
+  it('storedFocusFor reads the view slot and never a provider the view is not showing', () => {
+    const focus = {
+      provider: { claude: ALL_ACCOUNTS, codex: A },
+      all: { claude: B, codex: B },
+    };
+    expect(storedFocusFor(focus, 'codex', 'codex')).toBe(A);
+    expect(storedFocusFor(focus, 'all', 'codex')).toBe(B);
+    // The Claude tab must not read the Codex slot at all.
+    expect(storedFocusFor(focus, 'claude', 'codex')).toBe(ALL_ACCOUNTS);
+  });
+});
+
+describe('#556 S5 — resolveViewAccountFocus (the one shared resolver)', () => {
+  const env = envWith([card({ accountKey: A }), card({ accountKey: B })]);
+  const focus = {
+    provider: { claude: ALL_ACCOUNTS, codex: A },
+    all: { claude: ALL_ACCOUNTS, codex: B },
+  };
+
+  it('selects the slot from the view and reconciles against the provider', () => {
+    expect(resolveViewAccountFocus(env, 'codex', 'codex', focus)).toBe(A);
+    expect(resolveViewAccountFocus(env, 'all', 'codex', focus)).toBe(B);
+  });
+
+  it('returns null for a provider the view does not show', () => {
+    expect(resolveViewAccountFocus(env, 'claude', 'codex', focus)).toBeNull();
+  });
+
+  it('a vanished account resolves to All accounts without mutating storage', () => {
+    const vanished = {
+      provider: { claude: ALL_ACCOUNTS, codex: 'c'.repeat(32) },
+      all: { claude: ALL_ACCOUNTS, codex: 'c'.repeat(32) },
+    };
+    const spy = vi.spyOn(Storage.prototype, 'setItem');
+    expect(resolveViewAccountFocus(env, 'codex', 'codex', vanished)).toBeNull();
+    expect(resolveViewAccountFocus(env, 'all', 'codex', vanished)).toBeNull();
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+});
+
+describe('#556 S5 — per-provider decoration under All', () => {
+  it('names every decorated provider for All, and only the tab provider otherwise', () => {
+    const env = envWith([card({ accountKey: A }), card({ accountKey: B })]);
+    expect(providerIsDecorated(env, 'codex')).toBe(true);
+    expect(providerIsDecorated(env, 'claude')).toBe(false);
+    // `sourceIsDecorated` keeps its older, view-shaped answer for `all`.
+    expect(sourceIsDecorated(env, 'all')).toBe(false);
+    expect(decoratedProvidersFor(env, 'all')).toEqual(['codex']);
+    expect(decoratedProvidersFor(env, 'codex')).toEqual(['codex']);
+    expect(decoratedProvidersFor(env, 'claude')).toEqual([]);
+    expect(decoratedProvidersFor(envWith(null), 'all')).toEqual([]);
   });
 });
 

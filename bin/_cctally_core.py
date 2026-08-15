@@ -888,6 +888,58 @@ def note_stats_maintenance_released() -> None:
     _STATS_MAINTENANCE_HELD.set(max(0, _STATS_MAINTENANCE_HELD.get() - 1))
 
 
+# === #500 §8.1 ordered-partial-release apply lock set =====================
+#
+# `_cctally_rederive.codex_attribution_apply_locks` takes the two cache writer
+# flocks INSIDE the stats maintenance and ingest locks, and the repository
+# lock-order law requires every cache write to be committed and unlocked before
+# the stats transaction opens. The ordered partial release is what satisfies
+# that law; this counter is what MAKES it a law rather than a convention, by
+# letting `_run_stats_ingest_once(locks_held=True)` refuse while they are still
+# held instead of quietly running the stats transaction underneath them.
+#
+# A ContextVar like the two above, but NOT for their reason, and the difference
+# is worth stating because copying their rationale here inverts it. Those two
+# are AUTHORIZATION counters: a global would let one sanctioned context
+# authorize an unsanctioned one, so per-context isolation is what fails safe.
+# This one is a REFUSAL guard, and for a refusal per-context isolation fails
+# OPEN — a context that cannot see the hold does not refuse.
+#
+# What the ContextVar buys is therefore narrower and still worth having: the
+# guard reports the state of the context that is about to open the stats
+# transaction, so it can never be silenced by an unrelated dashboard thread that
+# happens to hold the cache flocks for its own read, and it can never be left
+# armed by one. It is a guard against the apply sequence's own steps running out
+# of order, not a process-wide interlock.
+#
+# The cost of that choice: the guard is ADVISORY across a context boundary. A
+# bare `os.fork()` inherits the value by copy and a thread spawned inside the
+# `with` block starts from a copy of the spawning context, so neither child sees
+# a later release, and a thread created BEFORE the acquisition never sees the
+# hold at all. `codex_attribution_apply_locks` therefore forbids both inside its
+# block; the flocks themselves remain the real mutual exclusion.
+
+_ATTRIBUTION_APPLY_CACHE_FLOCKS_HELD = contextvars.ContextVar(
+    "cctally_attribution_apply_cache_flocks_held", default=0
+)
+
+
+def holds_attribution_apply_cache_flocks() -> bool:
+    """True while this context still holds the #500 apply set's cache flocks."""
+    return _ATTRIBUTION_APPLY_CACHE_FLOCKS_HELD.get() > 0
+
+
+def note_attribution_apply_cache_flocks_acquired() -> None:
+    _ATTRIBUTION_APPLY_CACHE_FLOCKS_HELD.set(
+        _ATTRIBUTION_APPLY_CACHE_FLOCKS_HELD.get() + 1)
+
+
+def note_attribution_apply_cache_flocks_released() -> None:
+    """Clamped at zero, for the reason the maintenance twin above states."""
+    _ATTRIBUTION_APPLY_CACHE_FLOCKS_HELD.set(
+        max(0, _ATTRIBUTION_APPLY_CACHE_FLOCKS_HELD.get() - 1))
+
+
 # === Alerts validation cluster ======================================
 
 

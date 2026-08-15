@@ -26,6 +26,19 @@ function decoratedEnv(accounts: AccountCard[]): Envelope {
   return slice as unknown as Envelope;
 }
 
+// Both providers decorated — the two-row state under All.
+function decoratedBothEnv(): Envelope {
+  const slice = makeSourceEnvelope() as unknown as {
+    sources: {
+      claude: { data: { accounts?: AccountCard[] } };
+      codex: { data: { accounts?: AccountCard[] } };
+    };
+  };
+  slice.sources.claude.data.accounts = [card(A, 'ada', 12), card(B, 'ben', 34)];
+  slice.sources.codex.data.accounts = [card(A, 'alice', 40), card(B, 'bob', 55)];
+  return slice as unknown as Envelope;
+}
+
 beforeEach(() => {
   localStorage.clear();
   _resetForTests();
@@ -40,11 +53,65 @@ describe('AccountChipRow (Q6 Option A)', () => {
     expect(container.querySelector('[data-testid="account-chip-row"]')).toBeNull();
   });
 
-  it('renders nothing under source `all`', () => {
+  // #556 S5 §5.5 REPLACES the pre-S5 contract asserted here, which was
+  // "renders nothing under source `all`". That was the #341 decision this
+  // session deliberately reverses; the assertion is rewritten rather than
+  // deleted so the reversal is visible in the estate.
+  it('renders one row per DECORATED provider under source `all`', () => {
     updateSnapshot(decoratedEnv([card(A, 'alice', 40), card(B, 'bob', 55)]));
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     const { container } = render(<AccountChipRow />);
-    expect(container.querySelector('[data-testid="account-chip-row"]')).toBeNull();
+    const rows = container.querySelectorAll('[data-testid="account-chip-row"]');
+    // Only Codex is decorated in this fixture, so exactly one row appears.
+    expect(rows.length).toBe(1);
+    expect(rows[0].getAttribute('data-provider')).toBe('codex');
+  });
+
+  it('renders both rows when both providers are decorated, Claude first', () => {
+    updateSnapshot(decoratedBothEnv());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<AccountChipRow />);
+    const rows = Array.from(container.querySelectorAll('[data-testid="account-chip-row"]'));
+    expect(rows.map((r) => r.getAttribute('data-provider'))).toEqual(['claude', 'codex']);
+  });
+
+  it('shows each row\u2019s visible effect qualifier in the DOM, not only in a tooltip', () => {
+    updateSnapshot(decoratedBothEnv());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<AccountChipRow />);
+    // Finding B5 in this epic was a state word reachable only by tooltip.
+    expect(screen.getByTestId('account-chip-qualifier-claude').textContent)
+      .toBe('hero and alerts only');
+    expect(screen.getByTestId('account-chip-qualifier-codex').textContent)
+      .toBe('filters every panel');
+  });
+
+  it('gives each row its own accessible name, not the generic "Account focus"', () => {
+    updateSnapshot(decoratedBothEnv());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<AccountChipRow />);
+    expect(screen.getByRole('radiogroup', { name: 'Claude accounts hero and alerts only' }))
+      .toBeTruthy();
+    expect(screen.getByRole('radiogroup', { name: 'Codex accounts filters every panel' }))
+      .toBeTruthy();
+    expect(screen.queryAllByRole('radiogroup', { name: 'Account focus' }).length).toBe(0);
+  });
+
+  it('a provider tab keeps the single unlabelled row and its generic name', () => {
+    updateSnapshot(decoratedEnv([card(A, 'alice', 40), card(B, 'bob', 55)]));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    const { container } = render(<AccountChipRow />);
+    expect(screen.getByRole('radiogroup', { name: 'Account focus' })).toBeTruthy();
+    expect(container.querySelector('.account-chip-rowqualifier')).toBeNull();
+  });
+
+  it('writes the All slot from an All row and leaves the provider slot alone', () => {
+    updateSnapshot(decoratedEnv([card(A, 'alice', 40), card(B, 'bob', 55)]));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<AccountChipRow />);
+    fireEvent.click(screen.getByRole('radio', { name: /bob/ }));
+    expect(getState().accountFocus.all.codex).toBe(B);
+    expect(getState().accountFocus.provider.codex).toBe('all');
   });
 
   it('renders a radiogroup with All + one chip per account (weekly hint)', () => {
@@ -66,7 +133,7 @@ describe('AccountChipRow (Q6 Option A)', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     render(<AccountChipRow />);
     fireEvent.click(screen.getByRole('radio', { name: /bob/ }));
-    expect(getState().accountFocus.codex).toBe(B);
+    expect(getState().accountFocus.provider.codex).toBe(B);
   });
 
   it('dims the unattributed chip', () => {

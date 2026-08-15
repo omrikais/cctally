@@ -1,3 +1,4 @@
-PROVIDER  LABEL  EMAIL              PLAN  FIRST SEEN  LAST SEEN   ACTIVE
-claude    alice  alice@example.com  max   2026-05-01  2026-05-20
-claude    bob    bob@example.com    pro   2026-05-02  2026-05-21
+PROVIDER  LABEL      EMAIL              PLAN  FIRST SEEN  LAST SEEN   ACTIVE
+claude    alice      alice@example.com  max   2026-05-01  2026-05-20
+claude    bob        bob@example.com    pro   2026-05-02  2026-05-21
+codex     codexwork  codex@example.com  pro   2026-05-03  2026-05-21

@@ -1,3 +1,5 @@
+import type { SpendWindow } from '../types/envelope';
+
 const pad2 = (n: number): string => String(n).padStart(2, '0');
 
 // FmtCtx — the per-call display context that drives every datetime
@@ -164,19 +166,49 @@ function fmtStartedShort(
   return opts.noSuffix ? body : `${body} ${tzSuffixForInstant(d, ctx.tz)}`;
 }
 
-// "just now" / "5m ago" / "2h ago" / "Yesterday" / "May 01" — coarse
-// relative-time formatter for surfaces (Recent alerts panel/modal,
+// Null-returning twin of `fmtStartedShort`, for a caller that must DISTINGUISH
+// an unformattable instant rather than display one. #574: the Recent-alerts
+// when-cells attach the instant as a `title`, and a tooltip reading "—" is
+// worse than no tooltip, so they need the parse decision itself. Testing the
+// input for truthiness does not substitute — `fmtStartedShort` returns the
+// sentinel for a non-empty unparseable string too. Keeping the decision here
+// rather than comparing against "—" at each call site means the two surfaces
+// share one contract and neither depends on the display sentinel's spelling.
+// Matches the `string | null` convention of `fmtDateShort`,
+// `fmtDateShortWithYear` and `fmtCalendarDateShort`.
+function fmtStartedShortOrNull(
+  iso: string | null | undefined,
+  ctx: FmtCtx,
+  opts: { noSuffix?: boolean } = {},
+): string | null {
+  return isoToDate(iso) ? fmtStartedShort(iso, ctx, opts) : null;
+}
+
+// "just now" / "5m ago" / "2h ago" / "Yesterday" / "May 01 14:32 PDT" —
+// coarse relative-time formatter for surfaces (Recent alerts panel/modal,
 // future activity feeds) where exact-to-the-minute timestamps add
 // noise. Threshold ladder mirrors common social/dashboard conventions:
 //   < 60s        → "just now"
 //   < 60min      → "Nm ago"
 //   < 24h        → "Nh ago"
-//   < 48h        → "Yesterday"
-//   else         → calendar `dateShort` (no clock)
-// Calendar transitions (today/yesterday) honor `ctx.tz` so a 23:30
-// alert in a +03 zone correctly reads "Yesterday" the next morning
-// even if `Date.now()` lives in UTC. Matches the chokepoint rule:
-// every datetime render in the dashboard goes through `lib/fmt.ts`.
+//   on the PREVIOUS calendar day in ctx.tz, and < 48h → "Yesterday"
+//   else         → absolute `datetimeShort` (clock + zone suffix)
+// The "Yesterday" rung is NOT an unconditional "< 48h" band: past the
+// 24h rung the function compares the instant's calendar day in `ctx.tz`
+// against yesterday's, and returns "Yesterday" only when they match.
+// Every other instant reaches the absolute branch — including one that
+// is under 48 hours old but already two calendar days back, such as a
+// 30-hour-old alert seen just after midnight. Calendar transitions
+// honor `ctx.tz` so a 23:30 alert in a +03 zone correctly reads
+// "Yesterday" the next morning even if `Date.now()` lives in UTC.
+// CAVEAT: "the previous calendar day" is DERIVED by subtracting 24h from
+// `nowMs`, which is one calendar day back on every day except a fall-back
+// DST day, where the subtraction lands inside today and no instant can
+// match. Known defect, tracked in #584; #574 left the ladder untouched.
+// #574: the absolute branch carries the clock time, because a bare
+// calendar day rendered every alert that fired on one day as the same
+// string. Matches the chokepoint rule: every datetime render in the
+// dashboard goes through `lib/fmt.ts`.
 function fmtRelativeOrAbsolute(
   iso: string | null | undefined,
   ctx: FmtCtx,
@@ -211,7 +243,7 @@ function fmtRelativeOrAbsolute(
     const yKey = `${yp.year}-${yp.month}-${yp.day}`;
     if (thenKey === yKey) return 'Yesterday';
   }
-  return fmtDateShort(iso, ctx) ?? '—';
+  return fmtDatetimeShort(iso, ctx);
 }
 
 // "14:00 UTC" — clock-only format. Replaces ad-hoc
@@ -257,6 +289,23 @@ export function roundIsoToTenMinutes(iso: string): string {
   if (Number.isNaN(ms)) return iso;
   const BUCKET = 600_000; // 10 min in ms
   return new Date(Math.round(ms / BUCKET) * BUCKET).toISOString();
+}
+
+// #564 — the phrase naming the period a fallback account card covers. Derived
+// from the published bounds rather than hardcoded to seven days, because the
+// server clamps the window to the accounting range it loaded, and the operator's
+// wording would then be false in the one case the clamp exists for. Unparseable
+// bounds fall back to the full-cycle wording rather than rendering `last NaN
+// days`. The three surfaces that disclose the window share this one derivation.
+export function spendWindowLabel(w: SpendWindow): string {
+  const start = Date.parse(w.startAt);
+  const end = Date.parse(w.endAt);
+  if (Number.isNaN(start) || Number.isNaN(end)) return 'last 7 days';
+  // Rounding alone would let a sub-12-hour clamp render `last 0 days`, which is
+  // the same class of false period claim publishing the bounds exists to
+  // prevent. A window shorter than a day is still at most one day of spend.
+  const days = Math.max(1, Math.round((end - start) / 86_400_000));
+  return days === 7 ? 'last 7 days' : `last ${plural(days, 'day')}`;
 }
 
 export const fmt = {
@@ -398,6 +447,7 @@ export const fmt = {
   dateShort:      fmtDateShort,
   dateShortWithYear: fmtDateShortWithYear,
   startedShort:   fmtStartedShort,
+  startedShortOrNull: fmtStartedShortOrNull,
   timeHHmm:       fmtTimeHHmm,
   // Threshold-actions T8: Toast helpers. `weekStart` deliberately
   // bypasses the tz-conversion path because its input is a calendar
@@ -424,8 +474,14 @@ export const fmt = {
   timeOnly:       fmtTimeHHmm,
   // Threshold-actions T10/T11: relative-time formatter for the Recent
   // alerts panel/modal (and any future "X ago" surface). Goes through
-  // `dateShort` for the >48h fallback so the chokepoint rule still
-  // applies. See `fmtRelativeOrAbsolute` for ladder + edge cases.
+  // `datetimeShort` for the absolute fallback so the chokepoint rule
+  // still applies. That fallback is reached by every instant the ladder
+  // does not claim — an instant older than 48 hours, and equally one
+  // under 48 hours old whose calendar day in `ctx.tz` is neither today
+  // nor yesterday. "Yesterday" is derived by subtracting 24h, so on a
+  // fall-back DST day an instant that IS on the previous calendar day
+  // reaches this fallback too (#584). See `fmtRelativeOrAbsolute` for
+  // the ladder and its edge cases.
   relativeOrAbsolute: fmtRelativeOrAbsolute,
   delta(v: number | null | undefined): string {
     if (v == null) return '—';

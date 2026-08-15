@@ -2,8 +2,8 @@
 (#416 spec sections 3.2/3.3).
 
 The two attribution-map tables (``codex_file_incarnations``,
-``codex_file_accounts``) are created by ``_apply_cache_schema`` in its
-unconditional executescript — the repo's table-addition rule, and specifically
+``codex_file_accounts``) are created by the version-gated
+``_apply_cache_schema`` executescript — the repo's table-addition rule, and specifically
 before the FTS5 ``legacy_present`` early-return so a legacy-shape cache still
 receives them. Migration 031 exists because that schema apply is VERSION-GATED:
 ``_cctally_store.schema_current`` compares ``PRAGMA user_version`` against

@@ -3351,6 +3351,75 @@ def _check_accounts_codex_reset_anchors(s: DoctorState) -> CheckResult:
     )
 
 
+#: The `accounts.codex_window_attribution` conditions, in the order the summary
+#: names them. Each is resolved by retracting or re-asserting, which is why the
+#: leg is WARN in every case rather than FAIL: none of them is a broken install.
+_WINDOW_ATTRIBUTION_CONDITIONS: tuple[tuple[str, str], ...] = (
+    ("cursor_behind", "the derived index is behind the journal"),
+    ("dormant", "dormant assertion(s) matching no current window group"),
+    ("split", "assertion(s) matching more than one group after a split"),
+    ("conflicting", "assertion(s) in conflict with native evidence or each other"),
+    ("model_scoped", "assertion(s) over a window that is not account weekly quota"),
+    ("unrecoverable_baselines",
+     "rollout file(s) whose per-file decision cannot be recovered"),
+)
+
+
+def _check_accounts_codex_window_attribution(s: DoctorState) -> CheckResult:
+    """Operator attribution of recorded Codex windows (#500 §9).
+
+    WARN in every case. The four spec conditions are a stale derived cursor
+    (attribution is being UNDER-applied), a dormant assertion, a split
+    assertion, and an assertion in conflict; the fifth and sixth are a
+    model-scoped window an assertion can never file as account weekly quota, and
+    a rollout file whose per-file baseline cannot be recovered — which matters
+    because a retraction restores spend to that baseline, so an unrecoverable
+    one is silently indistinguishable from "no decision was ever made".
+    """
+    st = (s.accounts_state or {}).get("codex_window_attribution")
+    if not isinstance(st, dict):
+        # No cache.db, a cache too old to carry the derived table, or a probe
+        # this run declined. Nothing to under-apply, so nothing to report.
+        return CheckResult(
+            id="accounts.codex_window_attribution",
+            title="Codex window attribution", severity="ok",
+            summary="no operator window attribution recorded",
+            remediation=None, details={"active": 0, "retracted": 0},
+        )
+    details = dict(st)
+    findings = []
+    for name, phrase in _WINDOW_ATTRIBUTION_CONDITIONS:
+        value = st.get(name)
+        if name == "cursor_behind":
+            if value:
+                findings.append(phrase)
+            continue
+        try:
+            count = int(value or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0:
+            findings.append(f"{count} {phrase}")
+    if not findings:
+        return CheckResult(
+            id="accounts.codex_window_attribution",
+            title="Codex window attribution", severity="ok",
+            summary=(f"{int(st.get('active') or 0)} active window "
+                     "attribution(s), all applying cleanly"),
+            remediation=None, details=details,
+        )
+    return CheckResult(
+        id="accounts.codex_window_attribution",
+        title="Codex window attribution", severity="warn",
+        summary="; ".join(findings),
+        remediation=(
+            "Run `cctally account attribute <ref> --since <iso> --retract` to "
+            "clear an assertion that no longer applies, or re-assert it over "
+            "the group it should name"),
+        details=details,
+    )
+
+
 _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] = (
     ("install", "Install", (
         ("install.mode", "_check_install_dev_mode"),
@@ -3423,6 +3492,8 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("accounts.freshness", "_check_accounts_freshness"),
         ("accounts.attribution", "_check_accounts_attribution"),
         ("accounts.codex_reset_anchors", "_check_accounts_codex_reset_anchors"),
+        ("accounts.codex_window_attribution",
+         "_check_accounts_codex_window_attribution"),
     )),
     ("pricing", "Pricing", (
         ("pricing.coverage", "_check_pricing_coverage"),

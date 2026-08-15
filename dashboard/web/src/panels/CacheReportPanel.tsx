@@ -29,7 +29,7 @@
 //
 // No ShareIcon in v1 — cache-report is not in SHARE_CAPABLE_PANELS
 // (spec §2.6).
-import { useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
+import { scopeProviderFor, useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { useSyncExternalStore } from 'react';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { dispatch, getState, subscribeStore } from '../store/store';
@@ -140,7 +140,11 @@ export function CacheReportPanel() {
   // 3-in-all / 6-in-single, so flipping the selector threw "Rendered more
   // hooks than during the previous render" and, with no error boundary in
   // the app, unmounted the whole dashboard to a blank page.
-  const scope = useAccountScope();
+  // #556 S5 §5.4 — under All the Codex subtree is the one a focus narrows, and
+  // that narrowing arrives entirely through `useScopedSnapshot` above: the
+  // `activeSource === 'all'` branch returns before `accountEmpty` is computed,
+  // so the explicit account-empty state below is the PROVIDER TAB's alone.
+  const scope = useAccountScope(activeSource, scopeProviderFor(activeSource));
   const collapseClass = isMobile ? ' cache-report-collapsed' : '';
   const openModal = () => {
     dispatch({ type: 'OPEN_MODAL', kind: 'cache-report' });

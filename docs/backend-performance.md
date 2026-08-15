@@ -13,7 +13,7 @@ cctally has three tiers of state. Knowing which tier owns a fact tells you wheth
 | Authoritative | `stats.db` | User/runtime facts: weekly usage snapshots, percent milestones, week-reset events, weekly credit floors, budget milestones. | **No** — the source of truth. Losing it loses recorded history. |
 | Core derived read model | `cache.db` | Compact Claude/Codex accounting entries and cursors, quota observations, Codex thread identity, and the `mutation_seq` change-signal counters. | **Yes** — re-derived from local JSONL by `cache-sync --rebuild`; direct readers may fall back to JSONL where documented. |
 | Transcript derived read model | `conversations.db` | Claude prose, Codex physical/normalized events, browse rollups, file-touch axes, AI titles, and FTS indexes. | **Yes** — independently re-derived from the same JSONL without blocking the core cache. |
-| Per-process accelerators | dashboard in-memory caches | Signature-keyed rebuild state in `bin/_lib_snapshot_cache.py`: the four reconcile caches (weekref cost, projects-envelope, Bug-K segment, cache-report per-day) plus the Group A/B bucket + session caches and the idle-dispatch `(signature, snapshot)` memo. | **Yes** — dropped on process exit; re-warmed on the next rebuild. Never persisted. |
+| Per-process accelerators | dashboard in-memory caches | Signature-keyed rebuild state in `bin/_lib_snapshot_cache.py`: the reconcile caches, bucket/session caches, the Codex dirty-path accounting population, and the idle-dispatch `(signature, snapshot)` memo. | **Yes** — dropped on process exit; re-warmed on the next rebuild. Never persisted. |
 
 Above those stores sit the **endpoint groups** the dashboard serves: the snapshot/SSE spine (`/api/data`, `/api/events`); the conversation viewer (browse/search/reader/find/live-tail under `/api/conversation*`); share/export; and doctor/update. Each group reads the tiers above but never writes authoritative state on a GET.
 
@@ -29,6 +29,15 @@ Every dashboard rebuild is a three-path dispatch keyed on a cheap composite `sig
 - **Warm/cold rebuild** — signature moved ⇒ run the builders. Under the `snapshot` root the phases are: `sync` (the once-per-rebuild ingest, which nests the `sync_cache` seams below), `signature`, the four `reconcile.{weekref, projects_env, bugk, cache_report}` phases (each carrying its `use_*_cache` hit boolean as meta — the only place those build-time locals are observable), the builders `build.{current_week, forecast, trend, sessions, milestones, weekly_periods, monthly_periods, projects_envelope}`, then `doctor` and `envelope.precompute`.
 
 The reconciles run **once per rebuild** (not once per SSE client): they refresh the signature-keyed accelerator caches so each builder can opt into an incremental read instead of a full-window walk. A failed or absent reconcile always falls back to direct compute — byte-identical output, just slower.
+
+For a Codex-active warm rebuild, cache migration 044's durable accounting
+change ledger identifies the dirty `(source_root_key, source_path)` pairs. The
+source builder reloads those paths, replaces their prior immutable entries,
+and updates only the affected daily/monthly/weekly/session/project/account
+groups. A cursor gap, whole-store clear, range regression, or semantic-key
+change takes the cold path. The ledger is an invalidation index, never an
+authoritative store: `codex_session_entries` remains the re-derivable source
+population.
 
 ### Ingest (`sync_cache`)
 
@@ -51,6 +60,7 @@ These hold regardless of performance work; a change that violates one is a bug e
 - **Byte-identical CLI stdout.** Instrumentation and diagnostics change no command's stdout or `--json` output. `CCTALLY_PERF_TRACE` writes only to stderr. No golden moves.
 - **`mutation_seq` change-stamp correctness.** An id-stable in-place finalization UPSERT still advances the per-file `mutation_seq` leg, so the dashboard leaves the idle path and recomputes exactly the affected bucket. A signature that fails to move on a real data change silently serves stale rows.
 - **Leading-and-trailing-edge cache eviction.** Signature-keyed accelerator caches must evict at both edges of their window — a leading-edge-only eviction leaves stale trailing buckets that a later read wrongly reuses.
+- **Codex dirty-path completeness.** Every accounting insert, semantic update, delete, and project-identity metadata change must advance migration 044's accounting sequence and retain both old and new path identities where they differ. A destructive clear emits one full marker. If a consumer cannot prove an unbroken sequence, it must rebuild cold.
 
 ## 4. Introspection (`CCTALLY_PERF_TRACE` + `/api/debug/backend`)
 
@@ -131,3 +141,25 @@ A3 would persist the full snapshot across restarts (keyed by `SnapshotSignature`
 **It is not justified today.** The headline panels are instant (~2 s time-to-accept, dominated by fixed process overhead A3 would not touch), and the heavy panels hydrate progressively (A2) ~3 s later while the user is still orienting — not an empty-then-jump. Crucially, of the ~5 s time-to-full-data on the heaviest synthetic fixture, only the ~2.1 s `snapshot.cold` aggregation is what A3 targets; the rest is the same fixed import + one-time 720 MB migration-open that persisting a snapshot cannot remove. A3 is a substantial, risk-bearing build (a durable snapshot store that must stay parity-correct with the live builder, invalidate exactly on signature change, and revalidate the reset-to-0 `generation` leg once per fresh process) whose marginal benefit — shaving a background ~2 s that lands *behind* an already-interactive first paint — does not clear that bar. Classic premature optimization at today's data shape.
 
 **Decision: no durable snapshot store, no schema change.** The trigger to revisit is empirical: if real-instance evidence shows the **background full build** (`snapshot.cold`) growing beyond **~5 s** — the point where the ~2 s-to-headline + progressive-hydration UX starts to read as broken because the *aggregation itself* (not fixed startup overhead) is the wait — re-open A3 as a gated follow-up (mirroring the M4/M5 leashes), grounded in that measured build time. Until then, re-measure with `cctally-bench --scale large --compare` (build time) and the `tests/test_dashboard_responsive_startup.py` subprocess timing (startup); the standing levers are A1 (headline-first paint) + A2 (progressive fill).
+
+## 7. Incremental Codex aggregation (#582)
+
+Issue #566 removed repeated per-row lookups but left one full-population Codex
+aggregation on every dirty tick. Migration 044 and the process-local caches
+described above close that remaining path without changing the published data
+version or the #313 cooldown formula.
+
+The acceptance copy held 429,035 Claude entries, 154,600 Codex entries in
+2,376 rollout files, and 267,503 quota observations. A frozen two-row dirty
+tick measured 10.04 s before the change, including 7.88 s in
+`build.source_bundle`. The final frozen dirty build measured 4.47 s. A
+caught-up live Codex-active iteration that ingested two new JSONL rows completed
+in 4.767 s: 2.204 s ingest and 2.151 s source construction. Under the unchanged
+#313 formula (`work + max(5 s, work)`), that is a 9.767 s publish period. The
+frozen output remained exactly 3,083,774 bytes with SHA-256
+`564af30f87bd7afce8580ad038410dc862e162cf2e168a66cf15457d1ace1074`.
+
+The regression gate is structural as well as temporal: tests require a warm
+dirty build to request only the changed physical path, reuse precomputed costs,
+and reproduce the cold builder's full `SourceDashboardState` exactly. A mutant
+that forces the accounting cache cold must fail the bounded-path assertion.

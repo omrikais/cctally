@@ -407,3 +407,216 @@ def test_block_close_children_keep_stamped_account_on_rebuild(ns):
         conn.close()
     assert model_accts == [real]
     assert proj_accts == [real]
+
+
+# --------------------------------------------------------------------------
+# #500: operator attribution of recorded Codex quota windows.
+#
+# Two new op kinds — `codex_window_attribution` and its retraction — carrying
+# the operator's durable assertion that one physical Codex quota window group
+# belongs to one account. The payload's `account_key` is the SUBJECT of the
+# assertion, not the two-shaped stamp naming which account wrote the record,
+# which is exactly why both kinds are registered as accounts machinery.
+# --------------------------------------------------------------------------
+
+_ATTR_ACCOUNT = "9154a111c5076756554754f3043dccf6"
+
+
+def _attribution_kwargs(**overrides):
+    kwargs = dict(
+        at="2026-08-14T00:00:00Z",
+        account_key=_ATTR_ACCOUNT,
+        source_root_key="root-a",
+        logical_limit_key='{"kind":"weekly"}',
+        observed_slot="primary",
+        window_minutes=10080,
+        raw_resets_at_utc=["2026-01-01T09:45:35Z"],
+        canonical_resets_at_utc="2026-01-01T09:40:00Z",
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_window_attribution_builder_shape(ns):
+    _jr, J, _acc = _siblings()
+    rec = J.make_codex_window_attribution(**_attribution_kwargs(
+        raw_resets_at_utc=["2026-01-01T09:45:35Z", "2026-01-01T09:45:41Z"]))
+    assert rec["t"] == "op"
+    assert rec["src"] == "account-attribute"
+    assert rec["id"].startswith("o:")
+    assert "account" not in rec          # ops carry the account inside payload
+    payload = rec["payload"]
+    assert payload["kind"] == "codex_window_attribution"
+    assert payload["source"] == "codex"
+    assert payload["account_key"] == _ATTR_ACCOUNT
+    assert payload["window_minutes"] == 10080
+    assert payload["raw_resets_at_utc"] == [
+        "2026-01-01T09:45:35Z", "2026-01-01T09:45:41Z"]
+    assert payload["canonical_resets_at_utc"] == "2026-01-01T09:40:00Z"
+
+
+def test_window_attribution_builder_sorts_and_dedups_witnesses(ns):
+    _jr, J, _acc = _siblings()
+    rec = J.make_codex_window_attribution(**_attribution_kwargs(
+        raw_resets_at_utc=["2026-01-01T09:45:41Z", "2026-01-01T09:45:35Z",
+                           "2026-01-01T09:45:41Z"]))
+    assert rec["payload"]["raw_resets_at_utc"] == [
+        "2026-01-01T09:45:35Z", "2026-01-01T09:45:41Z"]
+
+
+def test_window_attribution_builder_rejects_empty_witnesses(ns):
+    _jr, J, _acc = _siblings()
+    with pytest.raises(ValueError):
+        J.make_codex_window_attribution(**_attribution_kwargs(
+            raw_resets_at_utc=[]))
+
+
+def test_window_attribution_builder_rejects_non_weekly_window(ns):
+    _jr, J, _acc = _siblings()
+    with pytest.raises(ValueError):
+        J.make_codex_window_attribution(**_attribution_kwargs(
+            logical_limit_key='{"kind":"5h"}', window_minutes=300))
+
+
+def test_window_attribution_builder_rejects_the_sentinel_subject(ns):
+    """Attributing data TO `unattributed` is not a fact an operator asserts,
+    and the two-shaped stamp rule forbids the literal in a payload anyway."""
+    _jr, J, acc = _siblings()
+    with pytest.raises(ValueError):
+        J.make_codex_window_attribution(**_attribution_kwargs(
+            account_key=acc.UNATTRIBUTED))
+
+
+def test_retract_builder_requires_assertion_ids(ns):
+    _jr, J, _acc = _siblings()
+    with pytest.raises(ValueError):
+        J.make_codex_window_attribution_retract(
+            **_attribution_kwargs(), retracted_assertion_ids=[])
+
+
+def test_retract_builder_sorts_and_dedups_targets(ns):
+    _jr, J, _acc = _siblings()
+    rec = J.make_codex_window_attribution_retract(
+        **_attribution_kwargs(),
+        retracted_assertion_ids=["o:bbb", "o:aaa", "o:bbb"])
+    assert rec["payload"]["kind"] == "codex_window_attribution_retract"
+    assert rec["payload"]["retracted_assertion_ids"] == ["o:aaa", "o:bbb"]
+
+
+def test_window_attribution_uses_an_ordinary_content_id(ns):
+    """NOT a stable singleton id like `CUTOVER_OP_ID` (spec §5.3): a fixed id
+    would make assert -> retract -> reassert impossible, because the second
+    assertion would collide with the first."""
+    _jr, J, _acc = _siblings()
+    first = J.make_codex_window_attribution(**_attribution_kwargs())
+    other = J.make_codex_window_attribution(**_attribution_kwargs(
+        at="2026-08-15T00:00:00Z"))
+    assert first["id"] != other["id"]
+    assert first["id"] == J.content_id(
+        {k: v for k, v in first.items() if k not in ("v", "id")})
+
+
+def test_window_attribution_kinds_are_accounts_machinery(ns):
+    jr, _J, _acc = _siblings()
+    assert "codex_window_attribution" in jr._ACCOUNTS_MACHINERY_KINDS
+    assert "codex_window_attribution_retract" in jr._ACCOUNTS_MACHINERY_KINDS
+
+
+def test_window_attribution_kinds_are_classified_for_rederive(ns):
+    import _lib_rederive as lr
+    for kind in ("codex_window_attribution", "codex_window_attribution_retract"):
+        assert lr._OP_CLASSIFICATIONS[kind].mode == "retained"
+
+
+def _unstamped(rec):
+    """`rec` with its payload `account_key` removed.
+
+    #500 review finding F5. With the field present, `classify_legacy_provider`
+    returns at its two-shaped already-stamped guard before reaching anything
+    #500 registered, so a test built on a minted record cannot see the
+    classifier decision it means to pin. Removing the field is what makes the
+    record reach the kind checks at all.
+    """
+    stripped = dict(rec)
+    payload = dict(rec["payload"])
+    payload.pop("account_key", None)
+    stripped["payload"] = payload
+    return stripped
+
+
+@pytest.mark.parametrize("stamped", [True, False])
+def test_window_attribution_is_not_legacy_and_is_not_renormalized(ns, stamped):
+    """The op guard in this file iterates only FOLD_APPLIERS, and these kinds
+    deliberately never enter that registry, so it would pass without ever
+    seeing them. Assert both classifier paths directly (#500 spec §10).
+
+    Parametrized over the account-stamp shape (review finding F5). The
+    unstamped case is the one that reaches the kind checks; the stamped case
+    pins the guard that short-circuits ahead of them. Note what this test does
+    NOT prove: `classify_legacy_provider`'s `t == "op"` branch returns None for
+    every kind except `weekly_credit_floor`, and `_normalize_legacy_account_stamp`
+    is gated on `_REAL_ACCOUNT_EVT_OP_KINDS`, which these kinds were never in.
+    Both therefore hold with or without the `_ACCOUNTS_MACHINERY_KINDS`
+    registration. What that registration actually binds is asserted by
+    `test_window_attribution_kinds_are_accounts_machinery` and
+    `test_window_attribution_registration_requires_a_rederive_classification`.
+    """
+    jr, J, _acc = _siblings()
+    rec = J.make_codex_window_attribution(**_attribution_kwargs())
+    if not stamped:
+        rec = _unstamped(rec)
+        assert "account_key" not in rec["payload"]
+    assert jr.classify_legacy_provider(rec) is None
+    before = dict(rec["payload"])
+    jr._normalize_legacy_account_stamp(rec, "some-claude-legacy-key")
+    assert rec["payload"] == before
+    assert "account" not in rec
+
+
+@pytest.mark.parametrize("stamped", [True, False])
+def test_window_retraction_is_not_legacy_and_is_not_renormalized(ns, stamped):
+    jr, J, _acc = _siblings()
+    rec = J.make_codex_window_attribution_retract(
+        **_attribution_kwargs(), retracted_assertion_ids=["o:aaa"])
+    if not stamped:
+        rec = _unstamped(rec)
+        assert "account_key" not in rec["payload"]
+    assert jr.classify_legacy_provider(rec) is None
+    before = dict(rec["payload"])
+    jr._normalize_legacy_account_stamp(rec, "some-claude-legacy-key")
+    assert rec["payload"] == before
+    assert "account" not in rec
+
+
+def test_window_attribution_registration_requires_a_rederive_classification(ns):
+    """What `_ACCOUNTS_MACHINERY_KINDS` membership actually binds (#500 review
+    findings F5/F7).
+
+    The set has exactly one runtime consumer: `_cctally_rederive` unions it into
+    the `op_kinds` it hands `validate_family_registry`, which raises
+    `RederiveConflict` on any kind lacking a `_lib_rederive._OP_CLASSIFICATIONS`
+    entry. So registration is what makes the classification MANDATORY — and a
+    future kind registered without one fails here rather than at re-derive time
+    on a user's machine.
+    """
+    jr, _J, _acc = _siblings()
+    import _cctally_rederive as rederive
+    import _lib_rederive as lr
+
+    # The planner's OWN union, obtained from the module that hands it to
+    # `validate_family_registry` (review round 2, finding R2-6). Rebuilding the
+    # expression locally made this a membership check against a set the test
+    # itself constructed — true by construction, and blind to `_cctally_rederive`
+    # changing what it actually validates.
+    planner_op_kinds = rederive._planner_op_kinds()
+    for kind in ("codex_window_attribution", "codex_window_attribution_retract"):
+        assert kind in planner_op_kinds
+    report = lr.validate_family_registry(
+        evt_kinds=set(jr._EVT_SPECS), op_kinds=planner_op_kinds)
+    assert report.unclassified_op_kinds == ()
+    # Non-vacuity: the guard must actually fire on an unclassified kind.
+    unregistered = lr.validate_family_registry(
+        evt_kinds=set(jr._EVT_SPECS),
+        op_kinds=planner_op_kinds | {"codex_window_attribution_unclassified"})
+    assert "codex_window_attribution_unclassified" in (
+        unregistered.unclassified_op_kinds)

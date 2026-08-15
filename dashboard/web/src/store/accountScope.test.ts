@@ -204,6 +204,41 @@ const DECORATED = envelope(codexData({
 
 const UNDECORATED = envelope(codexData({}));
 
+// #556 S5 §5.4 — the SAME decorated Codex data, plus the `all` entry the server
+// composes: `providers` MIRRORS the provider data objects, and `combined` and
+// `aggregates` are deliberately unscoped outcomes that a focus must not touch.
+const COMBINED_MARKER = { state: 'available', spend_usd: 999 };
+const AGGREGATES_MARKER = { range: { kind: 'shared', start_at: 'x', end_at: 'y' } };
+const DECORATED_ALL = (() => {
+  const env = envelope(codexData({
+    accounts: [
+      card({ accountKey: A, label: 'nova@example.com', spendUsd: 12.5, weeklyPercent: 41 }),
+      card({ accountKey: B, label: 'lark@example.com', spendUsd: 3.5, weeklyPercent: 7 }),
+    ],
+    scopes: { [A]: scope({ marker: 'A' }), [B]: scope({ marker: 'B' }) },
+  }));
+  const codexData_ = env.sources!.codex!.data;
+  return {
+    ...env,
+    sources: {
+      ...env.sources,
+      all: {
+        availability: 'ok',
+        freshness: 'fresh',
+        warnings: [],
+        data_version: 'v1',
+        last_success_at: '2026-07-28T00:00:00Z',
+        capabilities: {},
+        data: {
+          providers: { claude: null, codex: codexData_ },
+          combined: COMBINED_MARKER,
+          aggregates: AGGREGATES_MARKER,
+        },
+      },
+    },
+  } as unknown as Envelope;
+})();
+
 describe('accountScopesOf', () => {
   it('reads the map off a decorated entry and null when the key is ABSENT', () => {
     expect(Object.keys(accountScopesOf(DECORATED.sources!.codex)!).sort())
@@ -307,7 +342,10 @@ describe('scopeToAccount', () => {
 describe('scopeEnvelope', () => {
   it('returns the SAME envelope object identity for All accounts', () => {
     expect(scopeEnvelope(DECORATED, 'codex', ALL_ACCOUNTS)).toBe(DECORATED);
-    expect(scopeEnvelope(DECORATED, 'all', A)).toBe(DECORATED);
+    // #556 S5 §5.4 — All under "All accounts" is still identity-preserving.
+    // What CHANGED is that a focused key under All now scopes (below); before
+    // S5 the `all` selection returned identity unconditionally.
+    expect(scopeEnvelope(DECORATED_ALL, 'all', ALL_ACCOUNTS)).toBe(DECORATED_ALL);
     expect(scopeEnvelope(UNDECORATED, 'codex', A)).toBe(UNDECORATED);
     expect(scopeEnvelope(null, 'codex', A)).toBeNull();
   });
@@ -327,6 +365,50 @@ describe('scopeEnvelope', () => {
     const second = scopeEnvelope(DECORATED, 'codex', A);
     expect(second).toBe(first);
     expect(scopeEnvelope(DECORATED, 'codex', B)).not.toBe(first);
+  });
+
+  // #556 S5 §5.4 — under All the SERVER mirrors each provider's data object
+  // under `sources.all.data.providers`, and `presentationProviders` PREFERS
+  // that mirror. Rewriting only the physical source would leave most All panels
+  // reading unscoped data while the chip claimed to be filtering.
+  it('an All Codex focus rewrites both the physical source and the All provider mirror', () => {
+    const scoped = scopeEnvelope(DECORATED_ALL, 'all', A)!;
+    expect(scoped).not.toBe(DECORATED_ALL);
+    const physical = scoped.sources!.codex!.data as CodexSourceData;
+    const mirrored = (scoped.sources!.all!.data as unknown as {
+      providers: { codex: CodexSourceData };
+    }).providers.codex;
+    expect(physical.periods.daily.rows[0].label).toBe('A-daily');
+    // The mirror is the SAME rewritten object, not a second independent one.
+    expect(mirrored).toBe(physical);
+  });
+
+  it('an All Codex focus leaves all.data.combined and the aggregates untouched', () => {
+    const scoped = scopeEnvelope(DECORATED_ALL, 'all', A)!;
+    const allData = scoped.sources!.all!.data as unknown as {
+      combined: unknown; aggregates: unknown;
+    };
+    // A combined figure is never recomputed from a focused child.
+    expect(allData.combined).toBe(COMBINED_MARKER);
+    expect(allData.aggregates).toBe(AGGREGATES_MARKER);
+    expect(scoped.sources!.all!.availability).toBe('ok');
+  });
+
+  it('the All rewrite and the Codex-tab rewrite are memoised separately', () => {
+    const underAll = scopeEnvelope(DECORATED_ALL, 'all', A);
+    const underTab = scopeEnvelope(DECORATED_ALL, 'codex', A);
+    expect(underAll).not.toBe(underTab);
+    // Only the All rewrite touches the mirror.
+    const tabMirror = (underTab!.sources!.all!.data as unknown as {
+      providers: { codex: CodexSourceData };
+    }).providers.codex;
+    expect(tabMirror.periods.daily.rows[0].label).toBe('parent-daily');
+    expect(scopeEnvelope(DECORATED_ALL, 'all', A)).toBe(underAll);
+  });
+
+  it('identity is preserved when no focus resolves under All', () => {
+    // A stale key that names no current account resolves to All accounts.
+    expect(scopeEnvelope(DECORATED_ALL, 'all', 'f'.repeat(32))).toBe(DECORATED_ALL);
   });
 
   it('leaves Claude unscoped — Claude ships no account_scopes', () => {

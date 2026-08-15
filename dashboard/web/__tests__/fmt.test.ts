@@ -175,6 +175,37 @@ describe('fmt.startedShort (ctx-based)', () => {
   it('returns — for null', () => {
     expect(fmt.startedShort(null, CTX_UTC)).toBe('—');
   });
+  // #574 — the same sentinel comes back for a NON-EMPTY string that does not
+  // parse, which is why a caller that must distinguish "no instant" from "an
+  // instant" cannot test the input for truthiness. `startedShortOrNull` below
+  // is the variant such callers use.
+  it('returns — for a non-empty string that does not parse', () => {
+    expect(fmt.startedShort('not-a-date', CTX_UTC)).toBe('—');
+    expect(fmt.startedShort('', CTX_UTC)).toBe('—');
+  });
+});
+
+describe('fmt.startedShortOrNull (#574)', () => {
+  it('formats a parseable instant exactly as startedShort does', () => {
+    expect(fmt.startedShortOrNull('2026-04-24T13:07:00Z', CTX_UTC))
+      .toBe('2026-04-24 13:07 UTC');
+    expect(fmt.startedShortOrNull('2026-04-24T13:07:00Z', CTX_PDT))
+      .toBe('2026-04-24 06:07 PDT');
+  });
+  it('forwards the noSuffix option', () => {
+    expect(fmt.startedShortOrNull('2026-04-24T13:07:00Z', CTX_UTC, { noSuffix: true }))
+      .toBe('2026-04-24 13:07');
+  });
+  // The whole point of the variant: every unformattable input collapses to
+  // null, so a caller can omit an attribute entirely instead of writing the
+  // display sentinel into it. A truthiness test on the input would pass the
+  // first two and fail the last two.
+  it('returns null for every input startedShort renders as —', () => {
+    expect(fmt.startedShortOrNull(null, CTX_UTC)).toBeNull();
+    expect(fmt.startedShortOrNull(undefined, CTX_UTC)).toBeNull();
+    expect(fmt.startedShortOrNull('', CTX_UTC)).toBeNull();
+    expect(fmt.startedShortOrNull('not-a-date', CTX_UTC)).toBeNull();
+  });
 });
 
 describe('fmt.timeHHmm (ctx-based)', () => {

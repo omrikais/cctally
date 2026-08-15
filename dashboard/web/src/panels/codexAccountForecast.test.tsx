@@ -29,13 +29,16 @@ import {
   ACCOUNT_A,
   ACCOUNT_B,
   ACCOUNT_EMPTY,
+  FALLBACK_SPEND_WINDOW,
   makeAllSourceEntry,
   makeClaudeSourceEntry,
   makeCodexSourceEntry,
   makeCodexSourceData,
   makeDecoratedCodexSourceData,
   makeSourceEnvelope,
+  makeScopedCodexBudgetStatus,
   withAccountScopedQuotaHistories,
+  withScopedCodexBudget,
   withSharedRootWeeklyWindows,
 } from '../test-utils/sourceEnvelope';
 import { presentationCodexAccountForecasts } from '../lib/dashboardPresentation';
@@ -58,7 +61,7 @@ function renderPanel(codexData: CodexSourceData, focus?: string) {
   updateSnapshot(envWith(codexData));
   dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
   if (focus != null) {
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: focus });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: focus });
   }
   return render(<ForecastPanel />);
 }
@@ -67,7 +70,7 @@ function renderModal(codexData: CodexSourceData, focus?: string) {
   updateSnapshot(envWith(codexData));
   dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
   if (focus != null) {
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: focus });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: focus });
   }
   return render(<ForecastModal />);
 }
@@ -186,6 +189,13 @@ function withExpiredWeekly(
     active_window_count: data.quota.summary.active_window_count - 1,
     active: data.quota.summary.active.filter((row) => row.key !== weeklyKey),
   };
+  // #564: once the cycle is dead the server reads this account over one native
+  // cycle width, so the fixture bounds the card and publishes the window. Half
+  // the wide figure, so the bounding is actually visible here.
+  const wideSpend = (data.accounts ?? []).find(
+    (card) => card.accountKey === accountKey,
+  )?.spendUsd ?? 0;
+  const boundedSpend = Math.round((wideSpend / 2) * 100) / 100;
   return {
     ...data,
     quota: {
@@ -213,11 +223,20 @@ function withExpiredWeekly(
       // No live cycle for that account, exactly as `_codex_accounts_wire` /
       // `hero_cycles_wire` emit it.
       cycles: (data.hero.cycles ?? []).filter((c) => c.accountKey !== accountKey),
+      // The decorated headline is the SUM of the cards (#416 D6), so bounding
+      // one card drops it by exactly what the bounding removed (#564).
+      cost_usd: (data.hero.cost_usd ?? 0) - (wideSpend - boundedSpend),
     },
     accounts: (data.accounts ?? []).map((card) => (
       card.accountKey !== accountKey
         ? card
-        : { ...card, weeklyPercent: null, resetsAt: null }
+        : {
+          ...card,
+          weeklyPercent: null,
+          resetsAt: null,
+          spendUsd: boundedSpend,
+          spendWindow: FALLBACK_SPEND_WINDOW,
+        }
     )),
   } as CodexSourceData;
 }
@@ -281,7 +300,9 @@ describe('An expired Codex quota window is not a current quota', () => {
       ACCOUNT_B,
     );
     const foot = container.querySelector('.fc-budget-foot') as HTMLElement;
-    // Observed RED: `7-day limit12.0%ConfidencemediumBudget pace—`.
+    // Observed RED: `7-day limit12.0%Confidencemedium`. (#556 S5 §4.7 moved
+    // `Budget pace` out of this footer into the budget block, so the original
+    // RED string's trailing `Budget pace—` no longer describes this element.)
     expect(foot.textContent).not.toContain('12.0%');
     expect(foot.textContent).not.toContain('medium');
     expect(foot.textContent).toContain('—');
@@ -564,5 +585,64 @@ describe('Blocks panel — merged Codex rows name their account', () => {
     const { container } = render(<BlocksPanel />);
     expect(container.querySelector('[data-testid="block-account-chip"]')).toBeNull();
     expect(container.querySelector('.panel-foot')!.textContent).toContain('1 blocks');
+  });
+});
+
+// #556 S5 §4.8 — the focused Codex budget block reads
+// `account_scopes[key].budget.status` and NEVER falls back to the parent
+// vendor-wide status. Every assertion here is a VALUE-DISTINCTNESS check: the
+// parent is $100 / calendar-month, account A is $42 / calendar-week and
+// account B is $77 / calendar-month, so a block that read the wrong subtree
+// prints a wrong number rather than merely a present one.
+describe('#556 S5 — the Codex budget block under an account focus', () => {
+  function scopedBudgetData(): CodexSourceData {
+    return withScopedCodexBudget(makeDecoratedCodexSourceData(), {
+      [ACCOUNT_A]: makeScopedCodexBudgetStatus(),
+      [ACCOUNT_B]: makeScopedCodexBudgetStatus({
+        budget_usd: 77.0, spent_usd: 70.4, consumption_pct: 91.4,
+        verdict: 'warn', period: 'calendar-month',
+      }),
+    });
+  }
+
+  it('renders the PARENT vendor-wide status under All accounts', () => {
+    const { container } = renderPanel(scopedBudgetData());
+    const block = container.querySelector('[data-budget-section="codex"]') as HTMLElement;
+    expect(block.querySelector('[data-testid="budget-target-codex"]')!.textContent)
+      .toBe('$100');
+    expect(block.querySelector('[data-testid="budget-period-codex"]')!.textContent)
+      .toBe('calendar-month');
+  });
+
+  it('renders the CHILD status under focus, never the parent', () => {
+    const { container } = renderPanel(scopedBudgetData(), ACCOUNT_A);
+    const block = container.querySelector('[data-budget-section="codex"]') as HTMLElement;
+    expect(block.querySelector('[data-testid="budget-target-codex"]')!.textContent)
+      .toBe('$42');
+    expect(block.querySelector('[data-testid="budget-period-codex"]')!.textContent)
+      .toBe('calendar-week');
+    // The parent's amount must be nowhere in this card.
+    expect(block.textContent).not.toContain('$100');
+  });
+
+  it('renders a DIFFERENT child for a different focused account', () => {
+    const { container } = renderPanel(scopedBudgetData(), ACCOUNT_B);
+    const block = container.querySelector('[data-budget-section="codex"]') as HTMLElement;
+    expect(block.querySelector('[data-testid="budget-target-codex"]')!.textContent)
+      .toBe('$77');
+    expect(block.querySelector('[data-testid="budget-verdict-codex"]')!.textContent)
+      .toBe('warn');
+  });
+
+  it('shows the unset state for a focused account with no child budget', () => {
+    // Degrading to the parent here would attribute the whole vendor's budget to
+    // one account, which is the law `accountScope.ts` already states for data.
+    const { container } = renderPanel(
+      withScopedCodexBudget(makeDecoratedCodexSourceData(), { [ACCOUNT_A]: null }),
+      ACCOUNT_A,
+    );
+    const block = container.querySelector('[data-budget-section="codex"]') as HTMLElement;
+    expect(block.textContent).toContain('No budget set.');
+    expect(block.textContent).not.toContain('$100');
   });
 });

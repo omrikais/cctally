@@ -270,7 +270,11 @@ function conversationEntryActions(
 ): Action[] {
   const actions: Action[] = [
     { type: 'SET_ACTIVE_SOURCE', source: ref.source },
-    { type: 'SET_ACCOUNT_FOCUS', source: ref.source, account: ref.account_key ?? ALL_ACCOUNTS },
+    // #556 S5 §5.1 — the batch above sets the ACTIVE SOURCE to `ref.source`, a
+    // physical provider, so the view this entry establishes is that provider's
+    // own tab and the focus belongs in its `provider` slot. A permalink never
+    // lands on All, so it never writes an All slot.
+    { type: 'SET_ACCOUNT_FOCUS', source: ref.source, slot: 'provider', account: ref.account_key ?? ALL_ACCOUNTS },
   ];
   // #463 S5 (review F5) — a Back/Forward traversal keeps the rail's own state.
   // `applyHashToStore` is the `hashchange` handler, and the reflector's pushes

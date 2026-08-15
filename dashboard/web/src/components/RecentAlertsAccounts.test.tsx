@@ -78,7 +78,7 @@ function focusWork(): void {
     isFirstTick: true,
   });
   dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
-  dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'claude', account: WORK });
+  dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'claude', slot: 'provider', account: WORK });
 }
 
 beforeEach(() => {

@@ -44,6 +44,10 @@ CREATE TABLE session_files (
     session_id       TEXT,
     project_path     TEXT
 );
+CREATE TABLE cache_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE session_entries (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     source_path         TEXT    NOT NULL,
@@ -481,6 +485,366 @@ def test_daily_aggregate_wire_rows_match_the_legacy_daily_row_shape(
         "input_tokens", "output_tokens", "cache_creation_tokens",
         "cache_read_tokens", "total_tokens", "cache_hit_pct",
     }
+
+
+def test_shared_aggregate_prices_each_entry_once(
+    three_week_store, monkeypatch,
+):
+    """The projects pass must hand its effective costs to the daily pass.
+
+    The production regression was two pricing calls per retained row: once in
+    ``_fold_projects_entry`` and again in ``_aggregate_daily``.  Wrap the real
+    model-price resolver so the aggregate values are still computed by the
+    real kernels, then prove the daily fold consumes the project pass's result.
+    """
+    tui = sys.modules["_cctally_tui"]
+    pricing = sys.modules["_lib_pricing"]
+    real_resolver = pricing._resolve_model_pricing
+    pricing_resolutions = 0
+
+    def count_pricing_resolution(*args, **kwargs):
+        nonlocal pricing_resolutions
+        pricing_resolutions += 1
+        return real_resolver(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pricing, "_resolve_model_pricing", count_pricing_resolution,
+    )
+
+    payload, outcomes = tui._tui_build_claude_aggregates(
+        three_week_store,
+        shared_start=START,
+        shared_end_exclusive=END_EXCLUSIVE,
+        now_utc=NOW,
+        display_tz_name="UTC",
+        legacy_labels={},
+    )
+
+    assert outcomes == {
+        "projects": {"state": "ok"}, "daily": {"state": "ok"},
+    }
+    assert pricing_resolutions == 3
+    assert sum(row["cost_usd"] for row in payload["projects"]) == pytest.approx(
+        sum(row["cost_usd"] for row in payload["daily"]), abs=1e-9,
+    )
+
+
+def test_shared_aggregate_incrementally_folds_a_live_append(
+    three_week_store, monkeypatch,
+):
+    """A typical active-session rebuild prices and folds only the new row."""
+    ns = sys.modules["cctally"]
+    tui = sys.modules["_cctally_tui"]
+    pricing = sys.modules["_lib_pricing"]
+    real_resolver = pricing._resolve_model_pricing
+    pricing_resolutions = 0
+
+    def count_pricing_resolution(*args, **kwargs):
+        nonlocal pricing_resolutions
+        pricing_resolutions += 1
+        return real_resolver(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pricing, "_resolve_model_pricing", count_pricing_resolution,
+    )
+    ns.reset_claude_range_aggregate_memo()
+    first, _outcomes = tui._tui_build_claude_aggregates(
+        three_week_store,
+        shared_start=START,
+        shared_end_exclusive=END_EXCLUSIVE,
+        now_utc=NOW,
+        display_tz_name="UTC",
+        legacy_labels={},
+    )
+    assert pricing_resolutions == 3
+
+    _seed(
+        three_week_store,
+        ts=NOW - dt.timedelta(hours=1),
+        project_path="/fake/repos/alpha",
+        session_id="alpha",
+        input_tokens=40_000,
+        output_tokens=4_000,
+    )
+    three_week_store.commit()
+    second, outcomes = tui._tui_build_claude_aggregates(
+        three_week_store,
+        shared_start=START,
+        shared_end_exclusive=END_EXCLUSIVE,
+        now_utc=NOW,
+        display_tz_name="UTC",
+        legacy_labels={},
+    )
+
+    assert outcomes == {
+        "projects": {"state": "ok"}, "daily": {"state": "ok"},
+    }
+    assert pricing_resolutions == 4, "only the appended row is newly priced"
+    assert {row["label"] for row in second["projects"]} == {
+        "alpha", "beta", "gamma",
+    }
+    assert sum(row["cost_usd"] for row in second["projects"]) == pytest.approx(
+        sum(row["cost_usd"] for row in second["daily"]), abs=1e-9,
+    )
+    assert sum(row["cost_usd"] for row in second["projects"]) > sum(
+        row["cost_usd"] for row in first["projects"]
+    )
+
+    # A forced cold fold over the same snapshot is byte-identical.
+    ns.reset_claude_range_aggregate_memo()
+    cold, cold_outcomes = tui._tui_build_claude_aggregates(
+        three_week_store,
+        shared_start=START,
+        shared_end_exclusive=END_EXCLUSIVE,
+        now_utc=NOW,
+        display_tz_name="UTC",
+        legacy_labels={},
+    )
+    assert cold_outcomes == outcomes
+    assert cold == second
+
+
+def test_shared_aggregate_rebuilds_for_an_out_of_order_append(tmp_path):
+    """Incremental order is the raw timestamp/id order used by the cold SQL."""
+    ns = sys.modules["cctally"]
+    tui = sys.modules["_cctally_tui"]
+    conn = _open_store(tmp_path / "out-of-order.db")
+    try:
+        for session_id in ("z-large", "z-negative"):
+            _seed(
+                conn,
+                ts=NOW,
+                project_path="/fake/repos/same-project",
+                session_id=session_id,
+            )
+        conn.execute(
+            "UPDATE session_entries SET timestamp_utc = ?, cost_usd_raw = ? "
+            "WHERE id = 1",
+            (NOW.strftime("%Y-%m-%dT%H:%M:%SZ"), 1e16),
+        )
+        conn.execute(
+            "UPDATE session_entries SET timestamp_utc = ?, cost_usd_raw = ? "
+            "WHERE id = 2",
+            (NOW.strftime("%Y-%m-%dT%H:%M:%SZ"), -1e16),
+        )
+        conn.commit()
+        ns.reset_claude_range_aggregate_memo()
+        tui._tui_build_claude_aggregates(
+            conn,
+            shared_start=START,
+            shared_end_exclusive=END_EXCLUSIVE,
+            now_utc=NOW,
+            display_tz_name="UTC",
+            legacy_labels={},
+        )
+
+        _seed(
+            conn,
+            ts=NOW,
+            project_path="/fake/repos/same-project",
+            session_id="plus-one",
+        )
+        conn.execute(
+            "UPDATE session_entries SET cost_usd_raw = 1.0 WHERE id = 3"
+        )
+        conn.commit()
+        warm, _outcomes = tui._tui_build_claude_aggregates(
+            conn,
+            shared_start=START,
+            shared_end_exclusive=END_EXCLUSIVE,
+            now_utc=NOW,
+            display_tz_name="UTC",
+            legacy_labels={},
+        )
+
+        ns.reset_claude_range_aggregate_memo()
+        cold, _outcomes = tui._tui_build_claude_aggregates(
+            conn,
+            shared_start=START,
+            shared_end_exclusive=END_EXCLUSIVE,
+            now_utc=NOW,
+            display_tz_name="UTC",
+            legacy_labels={},
+        )
+        assert warm == cold
+    finally:
+        conn.close()
+
+
+def test_shared_aggregate_rebuilds_when_session_file_identity_moves(tmp_path):
+    """Project/session metadata can move without an entry watermark change."""
+    ns = sys.modules["cctally"]
+    tui = sys.modules["_cctally_tui"]
+    source = tmp_path / "metadata-backfill.jsonl"
+    source.write_text(
+        '{"sessionId":"backfilled-session","cwd":"/fake/repos/backfilled"}\n',
+        encoding="utf-8",
+    )
+    conn = _open_store(tmp_path / "metadata-backfill.db")
+    conn.execute(
+        "INSERT INTO session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+        " session_id, project_path) VALUES (?, 0, 0, 0, ?, ?, ?)",
+        (str(source), fb.FIXED_LAST_INGESTED_AT, None, None),
+    )
+    conn.execute(
+        "INSERT INTO session_entries "
+        "(source_path, line_offset, timestamp_utc, model, input_tokens, "
+        " output_tokens, mutation_seq) VALUES (?, 1, ?, ?, 1000, 100, 1)",
+        (
+            str(source), fb.fixture_timestamp_utc(NOW),
+            "claude-sonnet-4-6",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES "
+        "('session_entries_mutation_seq', '1')"
+    )
+    conn.commit()
+    try:
+        ns.reset_claude_range_aggregate_memo()
+        tui._tui_build_claude_aggregates(
+            conn,
+            shared_start=START,
+            shared_end_exclusive=END_EXCLUSIVE,
+            now_utc=NOW,
+            display_tz_name="UTC",
+            legacy_labels={},
+        )
+
+        ns._ensure_session_files_row(conn, str(source))
+        warm, _outcomes = tui._tui_build_claude_aggregates(
+            conn,
+            shared_start=START,
+            shared_end_exclusive=END_EXCLUSIVE,
+            now_utc=NOW,
+            display_tz_name="UTC",
+            legacy_labels={},
+        )
+        ns.reset_claude_range_aggregate_memo()
+        cold, _outcomes = tui._tui_build_claude_aggregates(
+            conn,
+            shared_start=START,
+            shared_end_exclusive=END_EXCLUSIVE,
+            now_utc=NOW,
+            display_tz_name="UTC",
+            legacy_labels={},
+        )
+
+        assert warm == cold
+        assert "backfilled" in {row["label"] for row in warm["projects"]}
+    finally:
+        conn.close()
+
+
+def test_shared_aggregate_rebuilds_after_same_path_store_replacement(tmp_path):
+    """A new physical cache at the same pathname cannot reuse old folds."""
+    ns = sys.modules["cctally"]
+    tui = sys.modules["_cctally_tui"]
+    store_path = tmp_path / "replace.db"
+    original = _open_store(store_path)
+    _seed(
+        original, ts=NOW, project_path="/fake/repos/original",
+        session_id="same-watermark",
+    )
+    original.commit()
+    ns.reset_claude_range_aggregate_memo()
+    tui._tui_build_claude_aggregates(
+        original,
+        shared_start=START,
+        shared_end_exclusive=END_EXCLUSIVE,
+        now_utc=NOW,
+        display_tz_name="UTC",
+        legacy_labels={},
+    )
+    original.close()
+
+    replacement_path = tmp_path / "replacement.db"
+    replacement = _open_store(replacement_path)
+    _seed(
+        replacement, ts=NOW, project_path="/fake/repos/replacement",
+        session_id="same-watermark",
+    )
+    replacement.commit()
+    replacement.close()
+    replacement_path.replace(store_path)
+
+    current = sqlite3.connect(store_path)
+    try:
+        warm, _outcomes = tui._tui_build_claude_aggregates(
+            current,
+            shared_start=START,
+            shared_end_exclusive=END_EXCLUSIVE,
+            now_utc=NOW,
+            display_tz_name="UTC",
+            legacy_labels={},
+        )
+        ns.reset_claude_range_aggregate_memo()
+        cold, _outcomes = tui._tui_build_claude_aggregates(
+            current,
+            shared_start=START,
+            shared_end_exclusive=END_EXCLUSIVE,
+            now_utc=NOW,
+            display_tz_name="UTC",
+            legacy_labels={},
+        )
+
+        assert warm == cold
+        assert {row["label"] for row in warm["projects"]} == {"replacement"}
+    finally:
+        current.close()
+
+
+def test_shared_aggregate_rebuilds_after_in_place_cache_rebuild(tmp_path):
+    """A DELETE-and-reingest generation cannot extend retained old totals."""
+    ns = sys.modules["cctally"]
+    tui = sys.modules["_cctally_tui"]
+    conn = _open_store(tmp_path / "in-place-rebuild.db")
+    try:
+        _seed(
+            conn, ts=NOW, project_path="/fake/repos/original",
+            session_id="original",
+        )
+        conn.commit()
+        ns.reset_claude_range_aggregate_memo()
+        tui._tui_build_claude_aggregates(
+            conn,
+            shared_start=START,
+            shared_end_exclusive=END_EXCLUSIVE,
+            now_utc=NOW,
+            display_tz_name="UTC",
+            legacy_labels={},
+        )
+
+        conn.execute("DELETE FROM session_entries")
+        conn.execute("DELETE FROM session_files")
+        _seed(
+            conn, ts=NOW, project_path="/fake/repos/rebuilt",
+            session_id="rebuilt",
+        )
+        conn.commit()
+        warm, _outcomes = tui._tui_build_claude_aggregates(
+            conn,
+            shared_start=START,
+            shared_end_exclusive=END_EXCLUSIVE,
+            now_utc=NOW,
+            display_tz_name="UTC",
+            legacy_labels={},
+        )
+        ns.reset_claude_range_aggregate_memo()
+        cold, _outcomes = tui._tui_build_claude_aggregates(
+            conn,
+            shared_start=START,
+            shared_end_exclusive=END_EXCLUSIVE,
+            now_utc=NOW,
+            display_tz_name="UTC",
+            legacy_labels={},
+        )
+
+        assert warm == cold
+        assert {row["label"] for row in warm["projects"]} == {"rebuilt"}
+    finally:
+        conn.close()
 
 
 # === Task 4 — label disambiguation over the bounded population =============
@@ -1560,7 +1924,11 @@ def test_the_committed_golden_states_the_boundary_by_value():
     import json
 
     golden = json.loads(_GOLDEN.read_text())
-    assert golden["source_schema_version"] == 7
+    # #556 S5 bumped this to 8 (the Claude budget capability detail changed
+    # meaning) and #564 to 9 (a decorated Codex fallback card's totals
+    # changed value). The assertion is kept rather than deleted: it is what
+    # tells a reader which wire version this golden was captured against.
+    assert golden["source_schema_version"] == 9
     aggregates = golden["sources"]["all"]["data"]["aggregates"]
     assert aggregates["range"] == {
         "kind": "absolute_range",

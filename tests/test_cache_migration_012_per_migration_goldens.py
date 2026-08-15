@@ -11,8 +11,9 @@ handler against a copy, and asserts the result matches ``post.sqlite``.
 ``_cctally_cache.backfill_ai_titles`` walks all history once (mtime-ascending,
 last-write-wins) and upserts ``conversation_ai_titles``. The handler does NOT
 touch any data table (the backfill is sync-side). The conversation_ai_titles
-table itself is created by ``_apply_cache_schema`` (runs on every open), so it is
-present in BOTH pre and post. The dispatcher central-stamps the migration marker
+table itself is created by the version-gated ``_apply_cache_schema`` when
+migration 012 bumps the head, so it is present in BOTH pre and post. The
+dispatcher central-stamps the migration marker
 (#140); a fresh install stamps it WITHOUT running (its incremental fused walk
 fills the table at ingest).
 """
@@ -93,8 +94,8 @@ def test_pre_fixture_at_011_head_without_flag_or_marker(cctally_module):
             (_MIGRATION,),
         ).fetchone()[0] == 0
         assert _flag(conn) is None, "pre fixture must NOT carry the backfill flag"
-        # The table exists (schema is applied on every open) but is empty — the
-        # flock-held backfill is what populates it.
+        # The table exists because the migration-012 head bump opened the schema
+        # gate, but is empty — the flock-held backfill is what populates it.
         assert conn.execute(
             "SELECT COUNT(*) FROM conversation_ai_titles"
         ).fetchone()[0] == 0

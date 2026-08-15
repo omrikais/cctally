@@ -22,10 +22,18 @@ import {
   ACCOUNT_A,
   ACCOUNT_B,
   ACCOUNT_EMPTY,
+  makeAllSourceEntry,
+  makeClaudeSourceEntry,
+  makeCodexSourceEntry,
   makeDecoratedCodexSourceData,
   makeSourceEnvelope,
 } from '../test-utils/sourceEnvelope';
-import type { AccountCard, CodexSourceData, Envelope } from '../types/envelope';
+import type {
+  AccountCard,
+  CodexSourceData,
+  Envelope,
+  SourcesMap,
+} from '../types/envelope';
 
 function decoratedEnv(): Envelope {
   const slice = makeSourceEnvelope() as unknown as {
@@ -33,6 +41,29 @@ function decoratedEnv(): Envelope {
   };
   slice.sources.codex.data = makeDecoratedCodexSourceData();
   return slice as unknown as Envelope;
+}
+
+// The same decoration, with the `all` entry COMPOSED FROM IT rather than from
+// the default undecorated Codex data. `decoratedEnv` mutates `sources.codex`
+// after `makeSourceEnvelope` has already built `sources.all`, so its combined
+// alert union carries no account keys at all.
+//
+// That does not make the badge unreachable under `decoratedEnv` — the badge
+// reads `sources.codex` through `scopeToAccount`, so it renders either way.
+// What `decoratedAllEnv` is for is the CONTENT: only a union composed after the
+// decoration carries the account keys these assertions read. Every other test
+// in this file dispatches `SET_ACTIVE_SOURCE: 'codex'` and never touches the
+// union, so none of them is weakened by the stale composition.
+function decoratedAllEnv(): Envelope {
+  const claude = makeClaudeSourceEntry();
+  const codex = makeCodexSourceEntry({ data: makeDecoratedCodexSourceData() });
+  return makeSourceEnvelope({
+    sources: {
+      claude,
+      codex,
+      all: makeAllSourceEntry(claude, codex),
+    } as unknown as SourcesMap,
+  }) as unknown as Envelope;
 }
 
 // Claude is decorated (>1 real account) but ships NO `account_scopes` — the
@@ -61,7 +92,7 @@ function claudeDecoratedEnv(): Envelope {
 function focusCodex(account: string): void {
   updateSnapshot(decoratedEnv());
   dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
-  dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account });
+  dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account });
 }
 
 beforeEach(() => {
@@ -76,7 +107,7 @@ describe('getScopedSnapshot (the store-side chokepoint)', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     const all = getScopedSnapshot()!.sources!.codex!.data as CodexSourceData;
     expect(all.periods.daily.rows[0].label).toBe('04-24');
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: ACCOUNT_B });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: ACCOUNT_B });
     const scoped = getScopedSnapshot()!.sources!.codex!.data as CodexSourceData;
     expect(scoped.periods.daily.rows[0].label).toBe('B-04-24');
     // Reference-stable across repeated reads so downstream memoisation holds.
@@ -104,9 +135,32 @@ describe('Sessions grid scopes to the focused account', () => {
   it('KEEPS the unfiltered disclaimer on Claude, which emits no account scopes', () => {
     updateSnapshot(claudeDecoratedEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'claude', account: ACCOUNT_A });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'claude', slot: 'provider', account: ACCOUNT_A });
     render(<SessionsPanel />);
     expect(screen.getByTestId('sessions-unfiltered-note')).toBeTruthy();
+  });
+
+  // #556 S5 Unit 2 review F3 — under All the grid lists BOTH providers, and
+  // only Codex publishes `account_scopes`, so an unqualified "<label> only"
+  // claimed a narrowing the Claude half never got.
+  it('qualifies the badge by provider under All, where Claude stays unfiltered', () => {
+    updateSnapshot(decoratedAllEnv());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'all', account: ACCOUNT_A });
+    render(<SessionsPanel />);
+    const note = screen.getByTestId('sessions-account-note');
+    expect(note.textContent).toContain('Codex:');
+    expect(note.getAttribute('title'))
+      .toContain('Claude sessions are not filtered by account');
+  });
+
+  it('leaves the provider-tab badge unqualified, where the claim is true', () => {
+    focusCodex(ACCOUNT_A);
+    render(<SessionsPanel />);
+    const note = screen.getByTestId('sessions-account-note');
+    expect(note.textContent).not.toContain('Codex:');
+    expect(note.getAttribute('title'))
+      .not.toContain('Claude sessions are not filtered by account');
   });
 });
 
@@ -129,9 +183,37 @@ describe('Recent alerts scopes to the focused account', () => {
   it('KEEPS the unfiltered disclaimer on Claude', () => {
     updateSnapshot(claudeDecoratedEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'claude', account: ACCOUNT_A });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'claude', slot: 'provider', account: ACCOUNT_A });
     render(<RecentAlertsPanel />);
     expect(screen.getByTestId('alerts-unfiltered-note')).toBeTruthy();
+  });
+
+  // #556 S5 Unit 2 review F3 — the alerts twin. Under All each provider's rows
+  // are filtered by that provider's OWN focus, so focusing one provider leaves
+  // the other's rows in full and an unqualified "<label> only" over-claims.
+  it('qualifies the badge by provider when only one provider is focused under All', () => {
+    updateSnapshot(decoratedAllEnv());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'all', account: ACCOUNT_A });
+    const { container } = render(<RecentAlertsPanel />);
+    const note = screen.getByTestId('alerts-account-note');
+    expect(note.textContent).toContain('Codex:');
+    expect(note.getAttribute('title'))
+      .toContain('Claude alerts are not filtered by account');
+    // ... and NOT the opposite over-claim. A bare `useAccountScope()` resolved
+    // no provider under All, so `scopesSupported` was false there whatever was
+    // focused and this panel printed "all accounts (unfiltered)" over a Codex
+    // subtree that had already been narrowed to one account.
+    expect(container.querySelector('[data-testid="alerts-unfiltered-note"]')).toBeNull();
+  });
+
+  it('leaves the provider-tab badge unqualified, where the claim is true', () => {
+    focusCodex(ACCOUNT_A);
+    render(<RecentAlertsPanel />);
+    const note = screen.getByTestId('alerts-account-note');
+    expect(note.textContent).not.toContain('Codex:');
+    expect(note.getAttribute('title'))
+      .not.toContain('Claude alerts are not filtered by account');
   });
 });
 

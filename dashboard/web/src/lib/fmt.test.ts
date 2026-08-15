@@ -155,3 +155,113 @@ describe('fmt.durationCompact', () => {
     expect(fmt.durationCompact(undefined)).toBe('—');
   });
 });
+
+// #574 — the Recent Alerts when-cell formatter. Every case below passes `nowMs`
+// explicitly, so no assertion here depends on the wall clock.
+//
+// The terminal branch is the subject of this issue: it used to emit a bare
+// calendar day (`Apr 16`), which collapsed every alert that fired on one day
+// into one string. It now emits the canonical absolute instant.
+describe('fmt.relativeOrAbsolute (#574 — inspectable firing instant)', () => {
+  const UTC = { tz: 'Etc/UTC', offsetLabel: 'UTC' };
+  // Midday, so the whole sub-24h ladder stays inside one calendar day.
+  const NOON = Date.parse('2026-04-17T12:00:00Z');
+  // The last millisecond of a day, which is the only vantage point from which
+  // an instant can be both nearly 48 hours old and still on yesterday's date.
+  const END_OF_DAY = Date.parse('2026-04-17T23:59:59.999Z');
+
+  // The instant that is `deltaMs` older than `nowMs`. A negative delta yields a
+  // future instant.
+  const ago = (nowMs: number, deltaMs: number): string =>
+    new Date(nowMs - deltaMs).toISOString();
+
+  it('reads "just now" up to but not including 60 seconds', () => {
+    expect(fmt.relativeOrAbsolute(ago(NOON, 0), UTC, NOON)).toBe('just now');
+    expect(fmt.relativeOrAbsolute(ago(NOON, 59_999), UTC, NOON)).toBe('just now');
+    // Exact boundary: 60_000 leaves the rung. A `<` → `<=` regression reds here.
+    expect(fmt.relativeOrAbsolute(ago(NOON, 60_000), UTC, NOON)).toBe('1m ago');
+  });
+
+  it('reads "just now" for a future instant (clock skew)', () => {
+    expect(fmt.relativeOrAbsolute(ago(NOON, -5_000), UTC, NOON)).toBe('just now');
+    expect(fmt.relativeOrAbsolute(ago(NOON, -86_400_000), UTC, NOON)).toBe('just now');
+  });
+
+  it('reads "Nm ago" up to but not including one hour', () => {
+    expect(fmt.relativeOrAbsolute(ago(NOON, 300_000), UTC, NOON)).toBe('5m ago');
+    expect(fmt.relativeOrAbsolute(ago(NOON, 3_599_999), UTC, NOON)).toBe('59m ago');
+    // Exact boundary.
+    expect(fmt.relativeOrAbsolute(ago(NOON, 3_600_000), UTC, NOON)).toBe('1h ago');
+  });
+
+  it('reads "Nh ago" up to but not including 24 hours', () => {
+    expect(fmt.relativeOrAbsolute(ago(NOON, 7_200_000), UTC, NOON)).toBe('2h ago');
+    expect(fmt.relativeOrAbsolute(ago(NOON, 86_399_999), UTC, NOON)).toBe('23h ago');
+    // Exact boundary: at 24h the instant is the previous calendar day here.
+    expect(fmt.relativeOrAbsolute(ago(NOON, 86_400_000), UTC, NOON)).toBe('Yesterday');
+  });
+
+  it('reads "Yesterday" up to but not including 48 hours, then the absolute instant', () => {
+    // 172_799_999 ms before the last millisecond of 2026-04-17 is
+    // 2026-04-16T00:00:00Z — still yesterday's calendar day.
+    expect(fmt.relativeOrAbsolute(ago(END_OF_DAY, 172_799_999), UTC, END_OF_DAY))
+      .toBe('Yesterday');
+    // Exact boundary: one millisecond older lands on 2026-04-15.
+    expect(fmt.relativeOrAbsolute(ago(END_OF_DAY, 172_800_000), UTC, END_OF_DAY))
+      .toBe('Apr 15 23:59 UTC');
+  });
+
+  it('falls through to the absolute branch between 24h and 48h when the instant is already two calendar days back', () => {
+    // 30 hours before 2026-04-17T02:00:00Z is 2026-04-15T20:00:00Z. The delta is
+    // under 48 hours, but the calendar day is not yesterday, so the `Yesterday`
+    // rung does not apply. The old header comment denied this branch existed.
+    const now = Date.parse('2026-04-17T02:00:00Z');
+    expect(fmt.relativeOrAbsolute(ago(now, 108_000_000), UTC, now))
+      .toBe('Apr 15 20:00 UTC');
+  });
+
+  it('decides the "Yesterday" rung by the calendar day in ctx.tz, not by the delta', () => {
+    // One instant, one `nowMs`, two display zones. In UTC the instant is two
+    // calendar days back and reaches the absolute branch; in Los Angeles the
+    // same instant is yesterday.
+    const now = Date.parse('2026-04-18T00:30:00Z');
+    const instant = '2026-04-16T20:00:00Z';
+    expect(fmt.relativeOrAbsolute(instant, UTC, now)).toBe('Apr 16 20:00 UTC');
+    expect(fmt.relativeOrAbsolute(
+      instant, { tz: 'America/Los_Angeles', offsetLabel: 'PDT' }, now,
+    )).toBe('Yesterday');
+  });
+
+  it('renders the absolute branch in ctx.tz with the instant\'s own zone abbreviation', () => {
+    const now = Date.parse('2026-04-20T00:00:00Z');
+    const instant = '2026-04-16T21:32:00Z';
+    expect(fmt.relativeOrAbsolute(
+      instant, { tz: 'America/Los_Angeles', offsetLabel: 'PDT' }, now,
+    )).toBe('Apr 16 14:32 PDT');
+  });
+
+  it('renders a normalized numeric offset for a zone Intl gives no abbreviation for', () => {
+    const now = Date.parse('2026-04-20T00:00:00Z');
+    // Etc/GMT-3 is three hours EAST of UTC (the POSIX sign convention), and
+    // CLDR supplies no abbreviation for it, so the suffix is the padded "+03".
+    expect(fmt.relativeOrAbsolute(
+      '2026-04-16T21:32:00Z', { tz: 'Etc/GMT-3', offsetLabel: '+03' }, now,
+    )).toBe('Apr 17 00:32 +03');
+  });
+
+  it('distinguishes two instants minutes apart on one long-past calendar day', () => {
+    const now = Date.parse('2026-08-15T09:00:00Z');
+    const first = fmt.relativeOrAbsolute('2026-04-16T13:56:00Z', UTC, now);
+    const last = fmt.relativeOrAbsolute('2026-04-16T13:59:00Z', UTC, now);
+    expect(first).toBe('Apr 16 13:56 UTC');
+    expect(last).toBe('Apr 16 13:59 UTC');
+    expect(first).not.toBe(last);
+  });
+
+  it('renders an em dash for absent, empty and unparseable input', () => {
+    expect(fmt.relativeOrAbsolute(null, UTC, NOON)).toBe('—');
+    expect(fmt.relativeOrAbsolute(undefined, UTC, NOON)).toBe('—');
+    expect(fmt.relativeOrAbsolute('', UTC, NOON)).toBe('—');
+    expect(fmt.relativeOrAbsolute('not-a-date', UTC, NOON)).toBe('—');
+  });
+});

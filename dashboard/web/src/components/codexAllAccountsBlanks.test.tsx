@@ -19,12 +19,14 @@ import { RecentAlertsPanel } from './RecentAlertsPanel';
 import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
 import {
   ACCOUNT_B,
+  ACCOUNT_EMPTY,
   makeAllSourceEntry,
   makeClaudeSourceEntry,
   makeCodexSourceData,
   makeCodexSourceEntry,
   makeDecoratedCodexSourceData,
   makeSourceEnvelope,
+  withSharedRootWeeklyWindows,
 } from '../test-utils/sourceEnvelope';
 import type { CodexSourceData, Envelope, SourcesMap } from '../types/envelope';
 
@@ -49,7 +51,7 @@ function renderCodex(
   updateSnapshot(envWith(codexData));
   dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
   if (focus != null) {
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: focus });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: focus });
   }
   return render(<Component />);
 }
@@ -121,5 +123,121 @@ describe('The All-accounts alerts gauge never publishes one account percent', ()
       RecentAlertsPanel, withoutAlerts(makeCodexSourceData()));
     expect((container.querySelector('.ra-gauge-hero') as HTMLElement).textContent)
       .toBe('61%');
+  });
+});
+
+// #564 — the decorated headline sums the cards beneath it, and a card with no
+// live cycle now covers one native cycle width rather than the whole accounting
+// range. The hero says so in both of its states, because the aggregate prints
+// the merged figure with no date range at all and the focused view prints one
+// account's figure under a bare "SPENT THIS WEEK".
+function withoutFallbackCards(data: CodexSourceData): CodexSourceData {
+  return {
+    ...data,
+    accounts: (data.accounts ?? []).map(({ spendWindow: _drop, ...card }) => card),
+  };
+}
+
+describe('#564 — the decorated hero discloses the fallback window', () => {
+  const NOTE = 'Includes accounts with no live cycle, counted over the last 7 days.';
+
+  it('notes the fallback period beside the merged figure', () => {
+    const { container } = renderCodex(HeroStrip, makeDecoratedCodexSourceData());
+    const zone = container.querySelector('.hero-spent') as HTMLElement;
+    expect(zone.textContent).toContain(NOTE);
+    expect(zone.getAttribute('title')).toContain(NOTE);
+    // The merged figure stays published — bounding the addends is what made it
+    // honest, so withholding it would undo the fix.
+    expect((zone.querySelector('.hs-big') as HTMLElement).textContent).toBe('$12.30');
+  });
+
+  // ui-qa P2: the full sentence wrapped to five lines at 375px and nine at
+  // 320px because the responsive swap has nothing to swap to unless a compact
+  // sibling exists. The swap itself is a `@media` rule and only the browser can
+  // judge it; what this pins is that both forms are emitted, each with the class
+  // the swap keys on, and that the short form still names the period.
+  it('emits a mobile shorthand beside the full disclosure sentence', () => {
+    const { container } = renderCodex(HeroStrip, makeDecoratedCodexSourceData());
+    const note = container.querySelector(
+      '[data-testid="hero-spent-note"]') as HTMLElement;
+    const full = note.querySelector('.hero-ingest-backlog-label-full');
+    const compact = note.querySelector('.hero-ingest-backlog-label-compact');
+    expect(full?.textContent).toBe(NOTE);
+    expect(compact?.textContent).toBe('Incl. no-cycle accounts · last 7 days');
+  });
+
+  // The dim treatment rides on its own class, so it cannot be lost by a note
+  // that has no responsive form. Without it such a span carries no class at all
+  // and falls through to the bright `.hs-sub span` metric rule.
+  it('keeps the disclosure in the dim caption class, not the metric one', () => {
+    const { container } = renderCodex(HeroStrip, makeDecoratedCodexSourceData());
+    const note = container.querySelector(
+      '[data-testid="hero-spent-note"]') as HTMLElement;
+    for (const span of [...note.querySelectorAll('span')]) {
+      expect(span.getAttribute('class')).not.toBeNull();
+    }
+    expect(note.querySelector('.hero-spent-note-text')).not.toBeNull();
+  });
+
+  it('renders no note when every card is cycle-bounded', () => {
+    const { container } = renderCodex(
+      HeroStrip, withoutFallbackCards(makeDecoratedCodexSourceData()));
+    const zone = container.querySelector('.hero-spent') as HTMLElement;
+    expect(zone.textContent).not.toContain('no live cycle');
+    expect((zone.querySelector('.hs-label') as HTMLElement).textContent)
+      .toBe('SPENT THIS WEEK');
+  });
+
+  it('names the window in the focused label instead of "this week"', () => {
+    const { container } = renderCodex(
+      HeroStrip, makeDecoratedCodexSourceData(), ACCOUNT_EMPTY);
+    const label = container.querySelector('.hero-spent .hs-label') as HTMLElement;
+    expect(label.textContent).toBe('SPENT · LAST 7 DAYS');
+  });
+
+  it('leaves a focused cycle-bounded account reading "this week"', () => {
+    const { container } = renderCodex(
+      HeroStrip, makeDecoratedCodexSourceData(), ACCOUNT_B);
+    const label = container.querySelector('.hero-spent .hs-label') as HTMLElement;
+    expect(label.textContent).toBe('SPENT THIS WEEK');
+  });
+
+  // Review P3: every other focused-fallback assertion runs on `ACCOUNT_EMPTY`,
+  // whose card is legitimately $0.00, so none of them could tell the window
+  // label apart from a label sitting over an empty state. `ACCOUNT_B` under
+  // `withSharedRootWeeklyWindows` is a real account whose cycle has expired and
+  // whose bounded window still carries spend.
+  it('names the window over a fallback account that actually spent', () => {
+    const { container } = renderCodex(
+      HeroStrip,
+      withSharedRootWeeklyWindows(makeDecoratedCodexSourceData()),
+      ACCOUNT_B,
+    );
+    const zone = container.querySelector('.hero-spent') as HTMLElement;
+    expect((zone.querySelector('.hs-label') as HTMLElement).textContent)
+      .toBe('SPENT · LAST 7 DAYS');
+    expect((zone.querySelector('.hs-big') as HTMLElement).textContent)
+      .toBe('$2.15');
+  });
+
+  // Review P2: the spoken label is supplied precisely because the visible one is
+  // upper case, and this is the state it exists for — a focused fallback account
+  // carries no note, so the note-gated `aria-label` used to be absent entirely
+  // and assistive tech read the raw `SPENT · LAST 7 DAYS`.
+  it('announces the focused window label to assistive tech', () => {
+    const { container } = renderCodex(
+      HeroStrip,
+      withSharedRootWeeklyWindows(makeDecoratedCodexSourceData()),
+      ACCOUNT_B,
+    );
+    const zone = container.querySelector('.hero-spent') as HTMLElement;
+    expect(zone.getAttribute('aria-label')).toBe('Spent over the last 7 days');
+  });
+
+  it('leaves the default week label unannounced, so nothing is said twice', () => {
+    const { container } = renderCodex(
+      HeroStrip, withoutFallbackCards(makeDecoratedCodexSourceData()));
+    const zone = container.querySelector('.hero-spent') as HTMLElement;
+    expect(zone.getAttribute('aria-label')).toBeNull();
   });
 });

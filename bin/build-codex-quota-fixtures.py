@@ -19,6 +19,10 @@ from _fixture_builders import (  # noqa: E402
     fixture_timestamp_utc,
     seed_account,
 )
+# The SAME normalizer the overlay applies to both sides of the witness binding,
+# taken from the pure ledger leaf so the fixture cannot spell a witness the
+# matcher would miss.
+from _lib_quota_ledger import normalize_reset  # noqa: E402
 
 
 UTC_DAY = "2026-07-15"
@@ -246,7 +250,30 @@ _SCENARIO_FLAGS = {
         "blocks": "--since 2026-07-15 --until 2026-07-16",
         "breakdown": "--root-key root-shared --limit-key limit-primary --reset-at 2026-07-15T15:00:00Z",
     },
+    # #500: a weekly window whose ONLY account evidence is an operator
+    # attribution. `breakdown` selects that same window by its own key.
+    "attributed": {
+        "history": "--since 2026-07-15 --until 2026-07-16",
+        "statusline": "--as-of 2026-07-15T12:00:00Z",
+        "forecast": "--as-of 2026-07-15T12:00:00Z",
+        "blocks": "--since 2026-07-15 --until 2026-07-16",
+        "breakdown": "--root-key root-attributed --limit-key limit-weekly --reset-at 2026-07-15T15:00:00Z",
+    },
 }
+
+# #500: the `--account` render variants for the attributed scenario. `work`
+# owns the window only because the operator said so, so a merged render and a
+# `--account work` render must both show it while `--account personal` shows
+# nothing — which is what makes the pair non-vacuous.
+_ATTRIBUTED_FLAGS = {
+    "history": "--since 2026-07-15 --until 2026-07-16",
+    "blocks": "--since 2026-07-15 --until 2026-07-16",
+}
+_ATTRIBUTED_CASES = (
+    ("history", "work"),
+    ("history", "personal"),
+    ("blocks", "work"),
+)
 
 # #341 Task 4 (Ruling B): the `--account <ref>` render variants for the
 # multi-account scenario, exercising all five views at the pinned AS_OF. The
@@ -298,6 +325,61 @@ _ERROR_CASES = {
 }
 
 
+def build_attributed(out: Path) -> None:
+    """A weekly window the OPERATOR attributed, rendered through the read path.
+
+    The physical evidence carries no account at all — exactly the shape #500
+    exists for — and the only thing naming one is a `codex_window_attributions`
+    record. So this scenario proves the rendered quota state honours the
+    fold-time overlay: a `--account work` render that showed nothing here would
+    mean the attribution reaches the derived tables but not the views.
+
+    Two real Codex accounts are registered so the R8 gate is on and the render
+    decorates, matching the multi-account scenario.
+    """
+    home, cache_path = _paths(out, "attributed")
+    stats_path = home / ".local" / "share" / "cctally" / "stats.db"
+    with sqlite3.connect(stats_path) as stats:
+        seed_account(
+            stats, account_key=ACCOUNT_WORK, provider="codex",
+            natural_id="acct-work", email="work@example.com", label="work",
+            plan_type="pro", label_source="user",
+            first_seen_utc=_iso(8), last_seen_utc=_iso(12),
+        )
+        seed_account(
+            stats, account_key=ACCOUNT_PERSONAL, provider="codex",
+            natural_id="acct-personal", email="personal@example.com",
+            label="personal", plan_type="pro", label_source="user",
+            first_seen_utc=_iso(8), last_seen_utc=_iso(12),
+        )
+    root = "root-attributed"
+    source_path = "/codex/root-attributed/rollout.jsonl"
+    with sqlite3.connect(cache_path) as conn:
+        _seed_window(
+            conn, root=root, source_path=source_path, limit="limit-weekly",
+            slot="primary", minutes=10_080, reset=RESET,
+            captures=[(_iso(9), 10, 11.0), (_iso(10), 20, 18.5),
+                      (_iso(11), 30, 24.0)],
+        )
+        _seed_entries(conn, root=root, source_path=source_path)
+        # Raw SQL with NO backing journal op, which is safe ONLY because the
+        # harness runs this fixture with `--no-sync`: nothing rehydrates the
+        # derived table, so the row stands. An authoritative rehydration would
+        # find no `codex_window_attribution` op for this id and delete it. Add a
+        # real journal record here before ever running this fixture with a sync.
+        conn.execute(
+            """INSERT INTO codex_window_attributions
+               (op_id, account_key, source_root_key, logical_limit_key,
+                observed_slot, window_minutes, raw_resets_at_utc,
+                canonical_resets_at_utc, asserted_at_utc, retracted_by_op_id)
+               VALUES (?,?,?,?,?,?,?,?,?,NULL)""",
+            ("o:fixture-attribution", ACCOUNT_WORK, root, "limit-weekly",
+             "primary", 10_080,
+             json.dumps([normalize_reset(RESET)], separators=(",", ":")),
+             RESET, "2026-07-15T11:45:00.000000Z"),
+        )
+
+
 def regenerate_goldens(out: Path, fixtures: Path) -> None:
     """Capture goldens through the same deterministic command posture as CI.
 
@@ -319,6 +401,15 @@ def regenerate_goldens(out: Path, fixtures: Path) -> None:
     for mode, (leaf, flags) in _ERROR_CASES.items():
         _write_golden(out, full, "full", leaf, mode, flags, ())
     # #341 Task 4 (Ruling B): the `--account <ref>` variants for all five views.
+    attributed = fixtures / "attributed"
+    attributed.mkdir(parents=True, exist_ok=True)
+    for leaf, ref in _ATTRIBUTED_CASES:
+        flag_text = f"{_ATTRIBUTED_FLAGS[leaf]} --account {ref}"
+        for suffix, additions in (("terminal", ()), ("json", ("--json",))):
+            _write_golden(
+                out, attributed, "attributed", leaf, f"account-{ref}-{suffix}",
+                flag_text, additions,
+            )
     multi = fixtures / "multi-account"
     multi.mkdir(parents=True, exist_ok=True)
     for leaf, ref, breakdown_override in _ACCOUNT_CASES:
@@ -368,6 +459,7 @@ def main() -> int:
     build_future_skew(args.out)
     build_empty(args.out)
     build_multi_account(args.out)
+    build_attributed(args.out)
     if args.regenerate_goldens:
         regenerate_goldens(args.out, REPO_ROOT / "tests" / "fixtures" / "codex-quota")
     return 0

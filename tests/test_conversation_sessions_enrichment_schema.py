@@ -1,8 +1,9 @@
 """#302 Task 1 — schema for the browse-rail enrichment columns.
 
 Two guards:
-  1. ``_apply_cache_schema`` (runs on every open, before the dispatcher and any
-     rail read) adds ``git_branch`` / ``models_json`` / ``title`` to an existing
+  1. Migration 023 bumps the cache head, so the version-gated
+     ``_apply_cache_schema`` adds ``git_branch`` / ``models_json`` / ``title``
+     before the dispatcher and any rail read on that upgrade. It applies them to a
      pre-023 ``conversation_sessions`` rollup via ``add_column_if_missing`` — so a
      rail read can never ``SELECT`` a missing column (Codex P1-2, the repo's
      column-addition rule, NOT a raw ALTER in a migration).

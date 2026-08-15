@@ -48,7 +48,14 @@ import {
   type BasketSlice,
 } from './basketSlice';
 import { loadActiveSource, saveActiveSource } from './sourcePrefs';
-import { seedAccountFocus, saveAccountFocus, resolveAccountFocus, ALL_ACCOUNTS } from './accountFocus';
+import {
+  resolveViewAccountFocus,
+  saveAccountFocus,
+  seedAccountFocus,
+  storedFocusFor,
+  type AccountFocusSlot,
+  type AccountFocusState,
+} from './accountFocus';
 import { scopeEnvelope } from './accountScope';
 import { resolveSourceView } from './sourceView';
 import { deriveVisiblePanelOrder, mapVisibleReorderToFull } from '../lib/visiblePanelOrder';
@@ -364,14 +371,16 @@ export interface UIState {
   // the already-delivered `sources` bundle: the store NEVER waits for or
   // reconciles this against an envelope (§5.1).
   activeSource: DashboardSelection;
-  // #341 Task 4 — per-source account focus (Q6 Option A). Keyed by physical
-  // source ('claude'/'codex'; 'all' has no selector). The value is an
-  // `accountKey` or the ALL_ACCOUNTS sentinel; seeded from
-  // `cctally:dashboard:account:<source>` and persisted on every real
-  // SET_ACCOUNT_FOCUS. Reconciled against the envelope at read time
-  // (`resolveAccountFocus`) — a vanished account resolves to All without a
-  // store mutation.
-  accountFocus: Record<SourceName, string>;
+  // #341 Task 4 / #556 S5 §5.1 — per-provider account focus, in TWO SLOTS:
+  // `provider` is that provider's own tab and `all` is the combined view. Each
+  // slot is keyed by physical provider ('claude'/'codex'), holds an
+  // `accountKey` or the ALL_ACCOUNTS sentinel, is seeded from its own
+  // localStorage key and is persisted on every real SET_ACCOUNT_FOCUS. The two
+  // slots NEVER write to each other, which is what keeps a provider-tab focus
+  // from narrowing All and an All focus from narrowing the provider tab.
+  // Reconciled against the envelope at read time (`resolveViewAccountFocus`) —
+  // a vanished account resolves to All without a store mutation.
+  accountFocus: AccountFocusState;
   // Conversation viewer (spec §4). Top-level view mode + the small
   // cross-cutting reader/search state. Fetched list/reader DATA lives in
   // hook state, not here (mirrors useProjectDetail). None of these persist
@@ -941,10 +950,12 @@ export function getScopedSnapshot(
   s: UIState = state,
   source: DashboardSelection = s.activeSource,
 ): Envelope | null {
-  const stored = source === 'all'
-    ? ALL_ACCOUNTS
-    : s.accountFocus[source] ?? ALL_ACCOUNTS;
-  return scopeEnvelope(s.snapshot, source, stored);
+  // #556 S5 §5.4 — Codex is the only provider that publishes `account_scopes`,
+  // so it is the only one a rewrite can narrow. Under All this reads the All
+  // slot; on a provider tab it reads that tab's own slot.
+  return scopeEnvelope(
+    s.snapshot, source, storedFocusFor(s.accountFocus, source, 'codex'),
+  );
 }
 
 // #294 S5 §6.3 — the source-aware parallel of getRenderedRows: the currently-
@@ -1028,7 +1039,11 @@ export type Action =
   | { type: 'SET_ACTIVE_SOURCE'; source: DashboardSelection }
   // #341 Task 4 — set the focused account for one physical source (Q6 Option A).
   // Persists to `cctally:dashboard:account:<source>` only on a real change.
-  | { type: 'SET_ACCOUNT_FOCUS'; source: SourceName; account: string }
+  // #556 S5 §5.1 — `slot` is REQUIRED and explicit. With two slots per
+  // provider, `source: 'codex'` alone is ambiguous, and inferring the slot from
+  // the mutable `activeSource` at reduce time would write the wrong one
+  // whenever a dispatch and a source switch interleave.
+  | { type: 'SET_ACCOUNT_FOCUS'; source: SourceName; slot: AccountFocusSlot; account: string }
   // #294 S5 §5.6 — open / close the qualified source-detail modal (Codex/All
   // source rows). The modal fetches `/api/source/<source>/<resource>/<key>`.
   | { type: 'OPEN_SOURCE_DETAIL'; source: SourceName; resource: SourceResource; key: string }
@@ -1288,13 +1303,20 @@ export function dispatch(action: Action): void {
       }
       break;
     case 'SET_ACCOUNT_FOCUS':
-      // Per-source account focus. No-op same-value dispatch first (skip the
-      // persist + reassignment), then persist the bare literal and set the slot.
-      if (state.accountFocus[action.source] === action.account) break;
-      saveAccountFocus(action.source, action.account);
+      // Per-provider account focus, written into ONE slot. No-op same-value
+      // dispatch first (skip the persist + reassignment), then persist the bare
+      // literal and set the slot.
+      if (state.accountFocus[action.slot][action.source] === action.account) break;
+      saveAccountFocus(action.source, action.account, action.slot);
       state = {
         ...state,
-        accountFocus: { ...state.accountFocus, [action.source]: action.account },
+        accountFocus: {
+          ...state.accountFocus,
+          [action.slot]: {
+            ...state.accountFocus[action.slot],
+            [action.source]: action.account,
+          },
+        },
         // #347 an open reader is account-qualified identity.  Clear it before
         // the rail reloads so content fetched under the prior focus can never
         // remain visible while the global chip names a different account.
@@ -2126,9 +2148,21 @@ export function dispatch(action: Action): void {
       // #341 Task 4 — stamp the focused account of the CAPTURED source, resolved
       // against the current envelope (a vanished/absent account → null = All).
       // Frozen for the flow's lifetime, exactly like the captured source.
+      //
+      // #556 S5 §5.12 — All no longer forcibly captures NO account. Codex is
+      // the only provider the server's All share builder can scope, so an All
+      // capture reads the All slot's CODEX focus; a Claude focus under All
+      // qualifies nothing, because Claude publishes no `account_scopes` for the
+      // server to narrow. Exporting all-account data under a focused chip is
+      // classified as a privacy problem in this project, not a follow-up.
       const capturedAccount =
-        action.type === 'OPEN_SHARE' && capturedSource !== 'all'
-          ? resolveAccountFocus(state.snapshot, capturedSource, state.accountFocus[capturedSource] ?? ALL_ACCOUNTS)
+        action.type === 'OPEN_SHARE'
+          ? resolveViewAccountFocus(
+            state.snapshot,
+            capturedSource,
+            capturedSource === 'all' ? 'codex' : capturedSource,
+            state.accountFocus,
+          )
           : null;
       const enriched: ShareAction =
         action.type === 'OPEN_SHARE'

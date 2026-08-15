@@ -45,7 +45,7 @@ describe('Alerts R4 unfiltered label', () => {
   it('shows the unfiltered note when an account is focused', () => {
     updateSnapshot(decoratedEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: A });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: A });
     render(<RecentAlertsPanel />);
     expect(screen.getByTestId('alerts-unfiltered-note')).toBeTruthy();
   });

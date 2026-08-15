@@ -2,9 +2,9 @@ import { useSyncExternalStore } from 'react';
 import { getState, subscribeStore } from '../store/store';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { humanizeDuration } from '../lib/syncFreshness';
+import { spendWindowLabel } from '../lib/fmt';
 import {
-  ALL_ACCOUNTS,
-  resolveAccountFocus,
+  resolveViewAccountFocus,
   sourceAccounts,
 } from '../store/accountFocus';
 import { useAccountScope } from '../hooks/useScopedSnapshot';
@@ -26,8 +26,13 @@ import type { AccountCard, SourceEntry, SourceName } from '../types/envelope';
 // blanks its Codex percent, countdown and quota row precisely because each
 // account owns an independent cycle (D6), and spec §6 names the per-account strip
 // as the thing those slots point at. Without it the combined tab would point at
-// nothing. It renders unfocused and provider-labelled there — Codex only, because
-// Codex is the only provider whose numbers this tab blanks.
+// nothing. It rendered unfocused and provider-labelled there.
+//
+// #556 S5 §5.7 — under All the strip now shows BOTH providers' cards, and an
+// All focus HIGHLIGHTS its card rather than filtering the strip down to it.
+// Both provider groups can carry independent highlights, because each provider
+// has its own All focus slot. Filtering here would hide the very evidence the
+// blanked combined headline points at.
 
 // Deterministic per-account color palette, assigned by registry order (spec §5).
 const ACCOUNT_COLORS = [
@@ -111,6 +116,14 @@ function AccountHeroCard({ card, color, focused }: {
       <div className="account-hero-card-foot">
         <span className="account-hero-card-spend">${card.spendUsd.toFixed(2)}</span>
         {countdown != null && <span className="account-hero-card-reset">{countdown}</span>}
+        {card.spendWindow != null && (
+          <span
+            className="account-hero-card-window"
+            data-testid="account-card-window"
+          >
+            {spendWindowLabel(card.spendWindow)}
+          </span>
+        )}
         {dimmed && <span className="account-hero-card-note">totals only</span>}
       </div>
     </div>
@@ -121,10 +134,7 @@ export function AccountHeroCards() {
   const env = useSnapshot();
   const scope = useAccountScope();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
-  const focusSlot = useSyncExternalStore(
-    subscribeStore,
-    () => (activeSource === 'all' ? ALL_ACCOUNTS : getState().accountFocus[activeSource as SourceName]),
-  );
+  const focusState = useSyncExternalStore(subscribeStore, () => getState().accountFocus);
   // The combined tab has no account chip and no provider context, so it shows
   // every decorated physical provider unfocused and labels each group.
   const combined = activeSource === 'all';
@@ -138,14 +148,15 @@ export function AccountHeroCards() {
   });
   if (groups.length === 0) return null; // <=1 real account everywhere → no cards.
 
-  // A focus stored for the Codex TAB must never narrow the combined tab: there
-  // is no chip there to show or undo it, so a narrowed strip would silently
-  // reintroduce exactly the one-account-as-the-whole-picture defect this fixes.
-  const providerGroup = groups[0];
-  const source = providerGroup.source;
-  const focused = combined
-    ? null
-    : resolveAccountFocus(env, source, focusSlot ?? ALL_ACCOUNTS);
+  // A focus stored for the Codex TAB must never narrow the combined tab: the
+  // two slots are independent, and a narrowed strip would silently reintroduce
+  // exactly the one-account-as-the-whole-picture defect this fixes.
+  //
+  // #556 S5 §5.7 — under All the strip HIGHLIGHTS and never filters. It is the
+  // disclosure that makes a blanked combined headline honest, so filtering it
+  // would hide the evidence; both provider groups can carry independent
+  // highlights, because the two providers have independent focus slots.
+  const source = groups[0].source;
   // #416 §6 — the explicit empty state. An account with neither accounting rows
   // nor quota evidence renders a NAMED "no activity" note with its bars and
   // reset blank, rather than silently inheriting the previous account's numbers
@@ -163,8 +174,12 @@ export function AccountHeroCards() {
   return (
     <div className="account-hero-cards" data-testid="account-hero-cards">
       {groups.map((group) => {
-        const groupFocused = combined ? null : focused;
-        const visible = groupFocused == null
+        const groupFocused = resolveViewAccountFocus(
+          env, activeSource, group.source, focusState,
+        );
+        // All → every card stays on screen and the focused one is merely
+        // highlighted. A provider tab keeps its filtering behaviour.
+        const visible = combined || groupFocused == null
           ? group.accounts
           : group.accounts.filter((card) => card.accountKey === groupFocused);
         return (

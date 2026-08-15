@@ -4,10 +4,10 @@ Turns the former "per-migration goldens are lazy-adopted; not retroactively
 backfilled" policy into an ENFORCED invariant, now that W3 has backfilled the
 last 7 gaps:
 
-  1. Registry counts are pinned (13 stats / 39 cache) with the test-injection
+  1. Registry counts are pinned (13 stats / 44 cache) with the test-injection
      env var (``CCTALLY_MIGRATION_TEST_MODE``) asserted ABSENT — when it is
      armed, ``bin/_cctally_db`` registers one REAL extra entry in each registry
-     that has no golden, so the guard must run against the clean 13/27 shape.
+     that has no golden, so the guard must run against the clean 13/43 shape.
   2. Bijection: the set of migration names in BOTH registries equals the set of
      ``per-migration/<name>/`` golden dirs — no migration missing a golden, and
      no orphan golden dir. Each dir carries both ``pre.sqlite`` + ``post.sqlite``.
@@ -44,7 +44,7 @@ PER_MIGRATION_ROOT = (
 # Pinned registry sizes. Bump the matching one when a migration ships (see
 # module docstring).
 EXPECTED_STATS_COUNT = 13
-EXPECTED_CACHE_COUNT = 41
+EXPECTED_CACHE_COUNT = 44
 EXPECTED_CONVERSATIONS_COUNT = 7
 
 # migration name -> its per-migration golden TEST MODULE (stem). The module must
@@ -110,6 +110,9 @@ MANIFEST = {
     "039_codex_quota_observed_model_backfill": "test_cache_migration_039_per_migration_goldens",
     "040_codex_quota_physical_group_index": "test_cache_migration_040_per_migration_goldens",
     "041_codex_quota_unresolved_model_index": "test_cache_migration_041_per_migration_goldens",
+    "042_codex_entries_root_path_index": "test_cache_migration_042_root_path_index",
+    "043_codex_window_attributions": "test_cache_migration_043_per_migration_goldens",
+    "044_codex_accounting_change_ledger": "test_cache_migration_044_per_migration_goldens",
     # ── conversations registry (DB journal redesign spec §7.2) ──
     "001_adopt_schema_version_marker": "test_conversations_migration_001_per_migration_goldens",
     "002_codex_thread_source_inference_replay": "test_conversations_migration_002_per_migration_goldens",
@@ -130,7 +133,7 @@ _CONVERSATIONS_GOLDEN_PREFIX = "conversations_"
 def _registry_names():
     # The test-injection block registers one REAL extra stats/cache entry
     # when armed (bin/_cctally_db.py). Assert it is OFF so the registries hold
-    # exactly the shippable 13/27 — else the guard would demand a golden for an
+    # exactly the shippable 13/42 — else the guard would demand a golden for an
     # injected migration.
     assert os.environ.get("CCTALLY_MIGRATION_TEST_MODE") != "1", (
         "CCTALLY_MIGRATION_TEST_MODE must be unset for this guard — it injects "

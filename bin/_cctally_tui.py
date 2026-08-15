@@ -193,6 +193,7 @@ import sqlite3
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -264,6 +265,7 @@ _ensure_sibling_loaded("_cctally_dashboard_sources")
 from _cctally_dashboard_sources import (
     DashboardReadContext,
     _claude_accounts_wire,
+    _refresh_budget_status_clock,
     accounts_identity_digest,
     build_codex_source_state,
     codex_decision_deadline_passed,
@@ -2604,6 +2606,54 @@ def _tui_claude_domain_freshness(
     return {"hero": accounting, "quota": quota, "sessions": "fresh"}
 
 
+def _refresh_claude_budget_clock(
+    state: SourceDashboardState,
+    *,
+    now_utc: dt.datetime,
+) -> SourceDashboardState:
+    """Re-run the pure pace kernel over Claude's frozen budget facts.
+
+    #556 S5 §3.7. Separate from ``_refresh_claude_source_clock`` because the two
+    are called from different places: that one runs ONLY on the pure-idle short
+    circuit and needs the legacy ``current_week`` object and the raw config,
+    neither of which the source-bundle builder holds. This one needs only the
+    published status and the server-private cost events, so it can be called
+    unconditionally after every build, reuse and degrade branch — which is what
+    §3.7 requires, because exact-version Claude reuse returns the prior object
+    unchanged and would otherwise republish a budget frozen at the instant it
+    was built.
+
+    Same-instant identity is preserved: the underlying kernel is deterministic
+    in ``now``, so a freshly built state reclocks to itself and the equality
+    guards below hand the caller the exact object it passed in.
+    """
+    if state.source != "claude" or not isinstance(state.data, Mapping):
+        return state
+    if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+        raise ValueError("now_utc must be timezone-aware")
+    now_utc = now_utc.astimezone(dt.timezone.utc)
+    budget_domain = state.data.get("budget")
+    if not isinstance(budget_domain, Mapping):
+        return state
+    status = budget_domain.get("status")
+    if not isinstance(status, Mapping):
+        return state
+    refreshed = _refresh_budget_status_clock(
+        status,
+        now_utc,
+        cost_events=(
+            state.clock_data.get("claude_budget_cost_events", ())
+            if isinstance(state.clock_data, Mapping) else ()
+        ),
+    )
+    if refreshed is None or refreshed == status:
+        return state
+    data = dict(state.data)
+    data["budget"] = {**dict(budget_domain), "status": refreshed}
+    refreshed_state = dataclasses.replace(state, data=data)
+    return state if refreshed_state == state else refreshed_state
+
+
 def _refresh_claude_source_clock(
     state: SourceDashboardState,
     *,
@@ -2655,6 +2705,10 @@ def _refresh_claude_source_clock(
         state,
         domain_freshness=domain_freshness,
     )
+    # #556 S5 §3.7: the budget leg runs on the pure-idle path too. It is the
+    # SAME helper the bundle builder calls after every other branch, so the two
+    # paths cannot drift.
+    refreshed = _refresh_claude_budget_clock(refreshed, now_utc=now_utc)
     return state if refreshed == state else refreshed
 
 
@@ -2767,6 +2821,9 @@ def _tui_build_claude_aggregates(
     # parameter shadowing it inside a function that also calls it reads as a
     # recursive reference.
     legacy_labels: "dict[str, str] | None" = None,
+    max_entry_id: "int | None" = None,
+    entry_mutation_seq: "int | None" = None,
+    generation: int = 0,
 ):
     """Both All-only Claude legs, from ONE candidate read (spec §3.3, §3.4).
 
@@ -2793,6 +2850,32 @@ def _tui_build_claude_aggregates(
     outcomes: dict[str, object] = {
         "projects": {"state": "ok"}, "daily": {"state": "ok"},
     }
+    dashboard_module = sys.modules["_cctally_dashboard"]
+    cache_seams_unpatched = (
+        c.build_project_aggregate_rows
+        is dashboard_module.build_project_aggregate_rows
+        and c.build_daily_aggregate_rows
+        is dashboard_module.build_daily_aggregate_rows
+    )
+    if legacy_labels is not None and cache_seams_unpatched:
+        try:
+            return c.build_cached_claude_range_aggregates(
+                cache_conn,
+                shared_start=shared_start,
+                shared_end_exclusive=shared_end_exclusive,
+                now_utc=now_utc,
+                display_tz=display_tz,
+                legacy_labels=legacy_labels,
+                max_entry_id=max_entry_id,
+                entry_mutation_seq=entry_mutation_seq,
+                generation=generation,
+            ), outcomes
+        except Exception:
+            # The accumulator is only an optimization.  Its failure falls
+            # through to the original two independent fold boundaries below.
+            _lib_log.get_logger("dashboard").error(
+                "claude range aggregate cache failed", exc_info=True,
+            )
     try:
         rows = tuple(c.iter_shared_range_entries(
             cache_conn, start=shared_start, end_exclusive=shared_end_exclusive,
@@ -2805,6 +2888,7 @@ def _tui_build_claude_aggregates(
             "projects": dict(_AGGREGATE_FOLD_FAILED),
             "daily": dict(_AGGREGATE_FOLD_FAILED),
         }
+    prepared_daily_entries = None
     if legacy_labels is None:
         # No projects envelope was built this tick, so the routable population
         # is unknown. Publishing anyway would relabel every row from the
@@ -2819,10 +2903,14 @@ def _tui_build_claude_aggregates(
         )
         outcomes["projects"] = dict(_AGGREGATE_FOLD_FAILED)
     else:
+        candidate_daily_entries = []
         try:
             payload["projects"] = c.build_project_aggregate_rows(
-                rows, legacy_labels=legacy_labels,
+                rows,
+                legacy_labels=legacy_labels,
+                prepared_daily_entries=candidate_daily_entries,
             )
+            prepared_daily_entries = candidate_daily_entries
         except Exception:
             _lib_log.get_logger("dashboard").error(
                 "claude range projects fold failed", exc_info=True,
@@ -2832,7 +2920,10 @@ def _tui_build_claude_aggregates(
         payload["daily"] = [
             c.daily_panel_row_to_wire(row)
             for row in c.build_daily_aggregate_rows(
-                rows, now_utc=now_utc, display_tz=display_tz,
+                rows,
+                now_utc=now_utc,
+                display_tz=display_tz,
+                prepared_entries=prepared_daily_entries,
             )
         ]
     except Exception:
@@ -2865,6 +2956,307 @@ def _tui_claude_data_with_aggregates(
         periods["daily_aggregate"] = {"rows": payload["daily"]}
         base["periods"] = periods
     return base
+
+
+# #556 S5 §3.5 — the five dispositions, encoded on the wire. `status` published
+# means CONFIGURED AND COMPUTED. Everything else is an optional sibling that is
+# omitted when inapplicable, so the ordinary no-budget payload is byte-identical
+# to what shipped before this session:
+#
+#   provider_budget_unset  no key at all (the default the client assumes)
+#   account_budgets_only   `not_configured.disposition`
+#   period_unresolved      `status_unavailable.code`
+#   budget_compute_failed  `status_unavailable.code`
+#
+# The unavailable shape follows S1's `combined_unavailable` — {code, message,
+# provider} — so one client reader handles both.
+_CLAUDE_BUDGET_UNAVAILABLE_MESSAGES = {
+    "period_unresolved": (
+        "Claude's budget period could not be resolved, so no budget status "
+        "is published."
+    ),
+    "budget_compute_failed": (
+        "Claude's budget status could not be computed."
+    ),
+}
+
+
+def _tui_claude_budget_period(claude_budget: "Mapping[str, object] | None") -> str:
+    """The configured Claude budget period, defaulting to ``subscription-week``.
+
+    One reader for the capability record and the published status, so the two
+    can never name different periods.
+    """
+    config = claude_budget if isinstance(claude_budget, Mapping) else {}
+    return str(config.get("period") or "subscription-week")
+
+
+def _tui_claude_budget_window_identity(
+    claude_budget: "Mapping[str, object] | None",
+    *,
+    now_utc: dt.datetime,
+    display_tz_name: str | None,
+    week_start_name: str,
+) -> str:
+    """The configured CALENDAR budget window's end, as a version fragment.
+
+    #556 S5 Unit 1 review R5, kept as DEFENCE IN DEPTH — not a fix for a
+    shipped user-visible defect. `claude_version` carries
+    `_tui_claude_period_identity`, which reads the SUBSCRIPTION-WEEK bounds and
+    therefore tracks that period's boundary and no other. On a `calendar-week`
+    or `calendar-month` budget the fragment that already moved was S2's
+    aggregate-range fragment, and that one moves at DISPLAY-TIMEZONE midnight:
+    `resolve_shared_range` (`bin/_cctally_dashboard.py`) floors the earliest
+    day to midnight in the resolved display zone, and production passes ONE
+    resolved zone object to both legs — `_tui_build_snapshot` sets
+    `source_display_tz_name` from `_build_display_tz` and hands the same object
+    to `_tui_common_source_range_start`, while `_resolve_display_tz_obj` always
+    returns a `ZoneInfo`. A `calendar-week` or `calendar-month` boundary falls
+    at local midnight, so the aggregate fragment already moved with it.
+
+    The Unit 2 review corrected the Unit 1 claim that this reproduced a
+    production defect: the reproduction went red only because the test helper
+    paired `display_tz_name="America/New_York"` with a UTC range start, which
+    is a configuration production cannot construct. The fragment stays because
+    it makes the budget window's own boundary the thing that invalidates the
+    budget's own generation, rather than leaving that to a neighbouring
+    fragment that happens to move at the same instant.
+
+    Returns `""` for `subscription-week`, which `_tui_claude_period_identity`
+    already covers from the same bounds, and for an unconfigured budget — so an
+    install with no budget produces a byte-identical version string. Calendar
+    resolution is PURE (no database), which is what lets it run before the reuse
+    decision on every tick.
+
+    A resolution failure contributes `""` rather than raising: the same failure
+    reaches `_tui_claude_budget_domain`, which names `budget_compute_failed`.
+    """
+    config = claude_budget if isinstance(claude_budget, Mapping) else {}
+    if config.get("weekly_usd") is None:
+        return ""
+    period = _tui_claude_budget_period(config)
+    if period == "subscription-week":
+        return ""
+    try:
+        window = _tui_claude_budget_window(
+            None,
+            period=period,
+            now_utc=now_utc,
+            display_tz_name=display_tz_name,
+            week_start_name=week_start_name,
+        )
+    except Exception:
+        return ""
+    if window is None:
+        return ""
+    return window[1].isoformat()
+
+
+def _tui_claude_budget_unavailable(
+    code: str,
+    *,
+    budget_usd: float | None = None,
+    period: str | None = None,
+) -> dict[str, object]:
+    """The `{code, message, provider}` sibling, plus what the user configured.
+
+    #556 S5 Unit 2 review F5. §4.6 requires `period_unresolved` to render "the
+    configured amount with the window named as unresolved", and the client had
+    no amount to render: this payload carried the code, the message and the
+    provider, so the block printed the bare code and nothing else. Both codes
+    are reached ONLY from a configured budget, so both carry the configured
+    amount and period; they are additive and omitted when the caller has
+    nothing to state, which keeps every other consumer's shape unchanged.
+    """
+    payload: dict[str, object] = {
+        "code": code,
+        "message": _CLAUDE_BUDGET_UNAVAILABLE_MESSAGES[code],
+        "provider": "claude",
+    }
+    if budget_usd is not None:
+        try:
+            payload["budget_usd"] = float(budget_usd)
+        except (TypeError, ValueError):
+            # The `budget_compute_failed` caller runs INSIDE the only exception
+            # boundary the Claude build has, so a second raise here would take
+            # the whole bundle down. Omitting the amount degrades this one line.
+            pass
+    if period is not None:
+        payload["period"] = period
+    return payload
+
+
+def _tui_claude_budget_window(
+    stats_conn,
+    *,
+    period: str,
+    now_utc: dt.datetime,
+    display_tz_name: str | None,
+    week_start_name: str,
+):
+    """Resolve the Claude budget window, or ``None`` when it cannot be resolved.
+
+    #556 S5 §3.1: the IMPURE resolvers stay here and are injected into the pure
+    kernel. Subscription-week resolution reads ``weekly_usage_snapshots`` (and
+    returns ``None`` before the first snapshot lands, which the CLI reports as
+    ``status: "no_data"``); calendar resolution goes through the same DST-correct
+    `_resolve_calendar_window` the Codex side already uses, including its
+    per-instant `display.tz = local` path.
+    """
+    from zoneinfo import ZoneInfo
+
+    c = _cctally()
+    forecast = c._load_sibling("_cctally_forecast")
+    if period == "subscription-week":
+        window = forecast._resolve_current_budget_window(stats_conn, now_utc)
+        if window is None:
+            return None
+        start_at, end_at = window
+    else:
+        tz = ZoneInfo(display_tz_name) if display_tz_name else None
+        start_at, end_at = forecast._resolve_calendar_window(
+            period, now_utc, {"collector": {"week_start": week_start_name}}, tz,
+        )
+    return (
+        start_at.astimezone(dt.timezone.utc),
+        end_at.astimezone(dt.timezone.utc),
+    )
+
+
+def _tui_claude_budget_cost_events(
+    cache_conn, *, start_at: dt.datetime, end_at: dt.datetime,
+) -> tuple[tuple[dt.datetime, float], ...]:
+    """Freeze every configured-window Claude cost event for idle pace updates.
+
+    #556 S5 §3.7: trailing-24h spend CANNOT be derived from the status
+    aggregate — `_refresh_budget_status_clock` iterates individual events — so
+    the same per-event carrier Codex keeps in server-private `clock_data` is
+    built here for Claude. It runs on the caller's PINNED cache connection and
+    reuses `iter_shared_range_entries` plus `_shared_range_row_to_usage_entry`,
+    which route through the `claude_usage_dict` chokepoint and therefore price
+    the 1-hour cache-write portion correctly (#195).
+    """
+    c = _cctally()
+    events: list[tuple[dt.datetime, float]] = []
+    for row in c.iter_shared_range_entries(
+        cache_conn, start=start_at, end_exclusive=end_at,
+    ):
+        entry = c._shared_range_row_to_usage_entry(row)
+        timestamp = entry.timestamp
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
+        events.append((
+            timestamp.astimezone(dt.timezone.utc),
+            c._calculate_entry_cost(
+                entry.model, entry.usage, mode="auto", cost_usd=entry.cost_usd,
+            ),
+        ))
+    return tuple(events)
+
+
+def _tui_claude_budget_domain(
+    cache_conn,
+    stats_conn,
+    *,
+    claude_budget: "Mapping[str, object] | None",
+    now_utc: dt.datetime,
+    display_tz_name: str | None,
+    week_start_name: str,
+) -> tuple[dict[str, object], tuple[tuple[dt.datetime, float], ...]]:
+    """Return ``(budget_domain_overlay, cost_events)`` for the Claude provider.
+
+    The status is VENDOR-WIDE (spec §3.4). A populated `budget.accounts` is NOT
+    consumed to simulate per-account scoping: Claude publishes no
+    `account_scopes` for such a map to describe, so an account-only
+    configuration is its own disposition rather than a fabricated status.
+
+    Every failure is caught HERE. The Claude build has no error boundary of its
+    own — unlike the Codex build at `_tui_build_source_bundle`'s
+    `source_build_failed` handler — so an escaping budget error would take the
+    whole bundle down, not merely the provider.
+    """
+    config = claude_budget if isinstance(claude_budget, Mapping) else {}
+    target = config.get("weekly_usd")
+    if target is None:
+        if config.get("accounts"):
+            return {"not_configured": {"disposition": "account_budgets_only"}}, ()
+        return {}, ()
+    # Resolved BEFORE the boundary so the `budget_compute_failed` payload can
+    # still name the configured period (#556 S5 Unit 2 review F5); the reader
+    # is a pure config lookup with no failure mode of its own.
+    period = _tui_claude_budget_period(config)
+    try:
+        c = _cctally()
+        window = _tui_claude_budget_window(
+            stats_conn,
+            period=period,
+            now_utc=now_utc,
+            display_tz_name=display_tz_name,
+            week_start_name=week_start_name,
+        )
+        if window is None:
+            return {
+                "status_unavailable": _tui_claude_budget_unavailable(
+                    "period_unresolved", budget_usd=target, period=period),
+            }, ()
+        start_at, end_at = window
+        events = _tui_claude_budget_cost_events(
+            cache_conn, start_at=start_at, end_at=end_at,
+        )
+        recent_start = max(start_at, now_utc - dt.timedelta(hours=24))
+        status = c.budget_status_payload(
+            period=period,
+            window_start_at=start_at,
+            window_end_at=end_at,
+            target_usd=target,
+            spent_usd=sum(
+                cost for timestamp, cost in events
+                if start_at <= timestamp < now_utc
+            ),
+            recent_24h_usd=sum(
+                cost for timestamp, cost in events
+                if recent_start <= timestamp < now_utc
+            ),
+            now=now_utc,
+            alert_thresholds=config["alert_thresholds"],
+        )
+    except Exception:
+        _lib_log.get_logger("dashboard").error(
+            "claude budget status could not be computed", exc_info=True,
+        )
+        return {
+            "status_unavailable": _tui_claude_budget_unavailable(
+                "budget_compute_failed", budget_usd=target, period=period),
+        }, ()
+    # #556 S5 Unit 1 review R4 — retain ONLY the events a later reclock can
+    # read. `_refresh_budget_status_clock` consults the carrier for exactly one
+    # quantity, `recent_24h_usd` over `[max(window_start, now - 24h), now)`, and
+    # `now` advances monotonically, so an event older than `now_utc - 24h` is
+    # unreadable for the life of this retained state. `spent_usd` above is
+    # already summed from the FULL set, so nothing published is lost — while a
+    # `calendar-month` budget would otherwise pin up to 31 days of Claude
+    # `session_entries` and make every reclock tick walk all of them.
+    reclock_floor = now_utc - dt.timedelta(hours=24)
+    retained = tuple(
+        (timestamp, cost) for timestamp, cost in events
+        if timestamp >= reclock_floor
+    )
+    return {"status": status}, retained
+
+
+def _tui_claude_data_with_budget(
+    base: dict[str, object], overlay: dict[str, object],
+) -> dict[str, object]:
+    """Merge the budget overlay without mutating the caller's dict.
+
+    An empty overlay returns the base unchanged, which is what keeps the
+    `provider_budget_unset` payload byte-identical.
+    """
+    if not overlay:
+        return base
+    merged = dict(base)
+    merged["budget"] = {**(merged.get("budget") or {}), **overlay}
+    return merged
 
 
 def _tui_build_source_bundle(
@@ -3016,16 +3408,34 @@ def _tui_build_source_bundle(
             f"{semantics.codex_identity}{_acct_suffix}{_backlog_suffix}"
             f"{_aggregate_suffix}"
         )
+        # #582: the dedicated accounting ledger is deliberately absent from
+        # the published version string (byte-stable API contract), but an
+        # id-stable token/account/project mutation still has to bypass exact
+        # provider reuse so the incremental path can consume it.
+        _codex_accounting_pending = c._load_sibling(
+            "_lib_snapshot_cache"
+        ).codex_accounting_cache_pending(cache_conn)
         # #556 S1 §3.6: normalized period identity, so a nominal week rollover
         # invalidates the generation even when no database signature moved.
         _period_identity = _tui_claude_period_identity(claude_data)
+        # #556 S5 (Unit 1 review R5) — the CONFIGURED budget period has its own
+        # boundary, and `_period_identity` above tracks only the subscription
+        # week. Empty for an unconfigured or subscription-week budget, so the
+        # version string is byte-identical on every install that had one before.
+        _budget_identity = _tui_claude_budget_window_identity(
+            semantics.claude_budget,
+            now_utc=now_utc,
+            display_tz_name=display_tz_name,
+            week_start_name=semantics.week_start_name,
+        )
+        _budget_suffix = f":b{_budget_identity}" if _budget_identity else ""
         claude_version = (
             f"claude:{signature.max_entry_id}:{signature.entry_mutation_seq}:"
             f"{signature.max_wus_id}:{signature.max_wcs_id}:"
             f"{signature.reset_sig[0]}:{signature.reset_sig[1]}:"
             f"{signature.generation}:{semantics.claude_identity}"
-            f":p{_period_identity}{_acct_suffix}{_aggregate_suffix}"
-            f":x{claude_digest}"
+            f":p{_period_identity}{_budget_suffix}{_acct_suffix}"
+            f"{_aggregate_suffix}:x{claude_digest}"
         )
         prior_claude = (
             prior_bundle.sources.get("claude")
@@ -3114,6 +3524,23 @@ def _tui_build_source_bundle(
                     c.legacy_project_labels(projects_envelope)
                     if projects_envelope is not None else None
                 ),
+                max_entry_id=signature.max_entry_id,
+                entry_mutation_seq=signature.entry_mutation_seq,
+                generation=signature.generation,
+            )
+            # #556 S5 §3.2: the Claude budget fold runs HERE, on this
+            # function's own pinned cache snapshot — the same snapshot the S2
+            # folds and the Codex read use. That is the narrow, true claim: the
+            # legacy Claude envelope was constructed BEFORE this call, and
+            # stats.db deliberately stays in statement-scoped autocommit, so
+            # this is not coherence with every number in the envelope.
+            claude_budget_overlay, claude_budget_events = _tui_claude_budget_domain(
+                cache_conn,
+                stats_conn,
+                claude_budget=semantics.claude_budget,
+                now_utc=now_utc,
+                display_tz_name=semantics.display_tz_name,
+                week_start_name=semantics.week_start_name,
             )
             claude_aggregate_scope = build_aggregate_scope(
                 published_range, aggregate_outcomes,
@@ -3143,32 +3570,50 @@ def _tui_build_source_bundle(
                     "sessions": CapabilityRecord("supported", "legacy-session-rollup"),
                     "forensics": CapabilityRecord("supported", "legacy-projection"),
                     "quota": CapabilityRecord("supported", "subscription-week"),
-                    "budget": CapabilityRecord("supported", "subscription-week"),
+                    # #556 S5 §3.6: the CONFIGURED period, not a constant. This
+                    # record used to say `subscription-week` unconditionally
+                    # while Codex advertised `calendar-period`, and once the
+                    # published status beside it can carry `calendar-week` or
+                    # `calendar-month` the constant contradicts the very object
+                    # it describes. The default period IS `subscription-week`,
+                    # so an install with no budget configured advertises exactly
+                    # what it advertised before.
+                    "budget": CapabilityRecord(
+                        "supported", _tui_claude_budget_period(
+                            semantics.claude_budget),
+                    ),
                     "projects": CapabilityRecord("supported", "legacy-projection"),
                     "alerts": CapabilityRecord("supported", "provider-native"),
                 },
                 data={
-                    **_tui_claude_data_with_aggregates(
-                        claude_data,
-                        aggregate_payload,
-                        fallback={
-                            "hero": {
-                                "cost_usd": claude_cost_usd,
-                                "total_tokens": claude_total_tokens,
+                    **_tui_claude_data_with_budget(
+                        _tui_claude_data_with_aggregates(
+                            claude_data,
+                            aggregate_payload,
+                            fallback={
+                                "hero": {
+                                    "cost_usd": claude_cost_usd,
+                                    "total_tokens": claude_total_tokens,
+                                },
+                                "periods": {"daily": {"total_cost_usd": claude_cost_usd, "total_tokens": claude_total_tokens}},
+                                "sessions": {"rows": ()},
+                                "projects": {"rows": ()},
+                                "quota": {"blocks": (), "milestones": ()},
+                                "budget": {"label": "Claude subscription budget"},
+                                "alerts": {"rows": ()},
                             },
-                            "periods": {"daily": {"total_cost_usd": claude_cost_usd, "total_tokens": claude_total_tokens}},
-                            "sessions": {"rows": ()},
-                            "projects": {"rows": ()},
-                            "quota": {"blocks": (), "milestones": ()},
-                            "budget": {"label": "Claude subscription budget"},
-                            "alerts": {"rows": ()},
-                        },
+                        ),
+                        claude_budget_overlay,
                     ),
                     **({"accounts": claude_accounts} if claude_accounts else {}),
                 },
                 domain_freshness=_tui_claude_domain_freshness(
                     claude_data, now_utc=now_utc,
                 ),
+                # #556 S5 §3.7: server-private, NEVER published. The idle clock
+                # recomputes trailing-24h spend by iterating individual events,
+                # which the status aggregate cannot supply.
+                clock_data={"claude_budget_cost_events": claude_budget_events},
                 aggregate_scope=claude_aggregate_scope,
             )
         if codex_ingest_failed:
@@ -3204,7 +3649,8 @@ def _tui_build_source_bundle(
             # construction: one rebuild per crossing, not one per tick.
             codex = (
                 None if prior_codex is not None and (
-                    any(
+                    _codex_accounting_pending
+                    or any(
                         warning.code == "codex_projection_incoherent"
                         for warning in prior_codex.warnings
                     )
@@ -3264,9 +3710,18 @@ def _tui_build_source_bundle(
         # cycle's expiry invariant holds on EVERY path, including the reuse
         # path that returns the exact prior object (§2.5). Same-instant identity
         # is preserved by ``refresh_codex_source_clock``'s own data-equality
-        # guard, so a freshly built state is handed back unchanged. Claude is
-        # deliberately untouched.
+        # guard, so a freshly built state is handed back unchanged.
         codex = refresh_codex_source_clock(codex, now_utc=now_utc)
+        # #556 S5 §3.7: Claude is clocked here too, on the same terms and for
+        # the same reason. This comment used to say Claude was deliberately
+        # untouched, and that was correct only while Claude published nothing
+        # time-dependent. It now publishes a budget pace, and exact-version
+        # reuse returns the PRIOR OBJECT unchanged — so any tick another source
+        # forced would have republished a budget frozen at its build instant.
+        # Only the budget leg runs here: the two freshness axes need the legacy
+        # `current_week` object, which this builder does not hold, and they are
+        # already advanced by the pure-idle clock that does.
+        claude = _refresh_claude_budget_clock(claude, now_utc=now_utc)
         # #556 S1 §3.8: the decoration fact reaches composition as authoritative
         # server-only metadata. It is attached HERE, after every build / reuse /
         # degrade / clock branch, so no branch can publish a state without it.
@@ -4338,31 +4793,37 @@ def _tui_build_snapshot_once(
                             "fingerprint": "source-projection",
                         },
                     )
-                legacy_envelope = _cctally().snapshot_to_envelope(
-                    source_snapshot,
-                    now_utc=now_utc,
-                    display_tz_pref_override=display_tz_pref_override,
-                    runtime_bind=runtime_bind,
-                )
-                source_bundle = _tui_build_source_bundle(
-                    stats_conn=conn,
-                    now_utc=now_utc,
-                    display_tz_name=(
-                        getattr(_build_display_tz, "key", None)
-                        if _build_display_tz is not None else None
-                    ),
-                    codex_ingest_contended=codex_ingest_contended,
-                    codex_ingest_failed=codex_ingest_failed,
-                    claude_ingest_contended=claude_ingest_contended,
-                    claude_ingest_failed=claude_ingest_failed,
-                    claude_cost_usd=daily_total_cost_usd,
-                    claude_total_tokens=daily_total_tokens,
-                    claude_data=_tui_project_claude_source_data(legacy_envelope),
-                    common_range_start=common_range_start,
-                    projects_envelope=projects_envelope_block,
-                    prior_bundle=prior_source_bundle,
-                    raw_config=raw_config,
-                )
+                # #566 §5.1 item 6: both calls carry their own phase. The two
+                # of them are the tail of the build and were the only region
+                # the trace never entered, so a slow store attributed 79% of
+                # its build to the root's unnamed remainder.
+                with _perf.phase("envelope.legacy_projection"):
+                    legacy_envelope = _cctally().snapshot_to_envelope(
+                        source_snapshot,
+                        now_utc=now_utc,
+                        display_tz_pref_override=display_tz_pref_override,
+                        runtime_bind=runtime_bind,
+                    )
+                with _perf.phase("build.source_bundle"):
+                    source_bundle = _tui_build_source_bundle(
+                        stats_conn=conn,
+                        now_utc=now_utc,
+                        display_tz_name=(
+                            getattr(_build_display_tz, "key", None)
+                            if _build_display_tz is not None else None
+                        ),
+                        codex_ingest_contended=codex_ingest_contended,
+                        codex_ingest_failed=codex_ingest_failed,
+                        claude_ingest_contended=claude_ingest_contended,
+                        claude_ingest_failed=claude_ingest_failed,
+                        claude_cost_usd=daily_total_cost_usd,
+                        claude_total_tokens=daily_total_tokens,
+                        claude_data=_tui_project_claude_source_data(legacy_envelope),
+                        common_range_start=common_range_start,
+                        projects_envelope=projects_envelope_block,
+                        prior_bundle=prior_source_bundle,
+                        raw_config=raw_config,
+                    )
                 if source_bundle is None:
                     raise RuntimeError("source bundle builder returned no bundle")
             except QuotaProjectionIncomplete as exc:

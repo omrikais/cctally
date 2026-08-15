@@ -108,6 +108,23 @@ describe.each(['claude', 'codex', 'all'] as const)(
         expect(container.querySelector('.modal-forecast .m-unavailable')).not.toBeNull();
       }
     });
+
+    // #556 S5 §4.5 — the two are DIFFERENT quantities and must be pinned
+    // separately. `.sec-bud` is the quota-ceiling "Daily budgets to stay under"
+    // heading derived from the projection; `[data-budget-section]` is the
+    // CONFIGURED budget the user set. Letting one check stand in for the other
+    // would let the block disappear while this test stayed green.
+    it('carries the configured-budget block beside the quota-ceiling rows', () => {
+      const { container } = renderFor(source, <ForecastModal />);
+      const blocks = container.querySelectorAll('[data-budget-section]');
+      expect(blocks.length).toBe(source === 'all' ? 2 : 1);
+      blocks.forEach((block) => {
+        expect(block.getAttribute('data-surface')).toBe('modal');
+        expect(block.getAttribute('role')).toBe('region');
+      });
+      // The quota-ceiling heading is a different element and still present.
+      expect(container.querySelector('.modal-forecast .sec-bud')).not.toBeNull();
+    });
   },
 );
 
@@ -637,6 +654,23 @@ describe('All provider sections are named by their own heading (#556 S4)', () =>
   it('names both Forecast modal sections', () => {
     const { container } = renderFor('all', <ForecastModal />);
     assertHeadings(container, /^(Claude|Codex) forecast detail$/, false);
+  });
+
+  // #556 S5 §4.3 — the same rule for the budget sections, on their own
+  // selector so a budget card is never counted as a forecast section.
+  it('names both Forecast modal budget sections', () => {
+    const { container } = renderFor('all', <ForecastModal />);
+    const sections = container.querySelectorAll('[data-budget-section]');
+    expect(sections.length).toBe(2);
+    sections.forEach((s) => {
+      expect(s.getAttribute('role')).toBe('region');
+      const labelledBy = s.getAttribute('aria-labelledby');
+      expect(labelledBy).toMatch(/^budget-modal-(claude|codex)-heading$/);
+      const heading = container.querySelector(`[id="${labelledBy}"]`);
+      expect(heading).not.toBeNull();
+      expect(heading!.tagName).toBe('H3');
+      expect(heading!.textContent).toMatch(/^(Claude|Codex) budget$/);
+    });
   });
 
   it('names both Trend modal sections', () => {

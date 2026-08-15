@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   alertDisplay,
   collectToastAlertRows,
+  filterAlertRowsForFocus,
   seedFormsForRow,
   selectAlertRowsForView,
   selectSourceAlertRows,
@@ -270,5 +271,88 @@ describe('selectAlertRowsForView (§3.3)', () => {
       resolveSourceView(null, 'claude'), legacy, false,
     );
     expect(rows.map((r) => (r as { id?: string }).id)).toEqual(['legacy-only']);
+  });
+});
+
+// #556 S5 §5.11 — PROVIDER-AWARE alert focus.
+//
+// All's Recent Alerts reads the server-built union of both providers' rows, and
+// under All each provider carries its OWN focus slot. One account key applied to
+// the whole set cannot express that state, and the failure is not subtle: a
+// Codex focus would delete every Claude row, because no Claude row carries a
+// Codex key.
+describe('#556 S5 — filterAlertRowsForFocus', () => {
+  const CLAUDE_A = 'c'.repeat(32);
+  const CLAUDE_B = 'd'.repeat(32);
+  const CODEX_A = 'a'.repeat(32);
+  const CODEX_B = 'b'.repeat(32);
+
+  function tagged(
+    row: SourceAlertRow, accountKey: string, alertedAt: string,
+  ): SourceAlertRow {
+    return { ...row, key: `${row.key}:${accountKey}`, accountKey, alerted_at: alertedAt } as SourceAlertRow;
+  }
+
+  // One union in canonical `alerted_at` order, exactly as the server builds it.
+  const union: SourceAlertRow[] = [
+    tagged(codexBudgetRow, CODEX_A, '2026-04-24T04:00:00Z'),
+    tagged(claudeRow, CLAUDE_A, '2026-04-24T03:00:00Z'),
+    tagged(codexQuotaRow, '*', '2026-04-24T02:00:00Z'),
+    tagged(claudeRow, CLAUDE_B, '2026-04-24T01:00:00Z'),
+    tagged(codexBudgetRow, CODEX_B, '2026-04-24T00:00:00Z'),
+  ];
+
+  function keysOf(rows: SourceAlertRow[]): string[] {
+    return rows.map((row) => String(
+      (row as SourceAlertRow & { accountKey?: string }).accountKey,
+    ));
+  }
+
+  it('a Codex focus filters only Codex rows', () => {
+    const rows = filterAlertRowsForFocus(union, { claude: null, codex: CODEX_A });
+    // Both Claude rows survive untouched; only the unfocused Codex sibling goes.
+    expect(keysOf(rows)).toEqual([CODEX_A, CLAUDE_A, '*', CLAUDE_B]);
+  });
+
+  it('a Claude focus filters only Claude rows', () => {
+    const rows = filterAlertRowsForFocus(union, { claude: CLAUDE_B, codex: null });
+    expect(keysOf(rows)).toEqual([CODEX_A, '*', CLAUDE_B, CODEX_B]);
+  });
+
+  it('vendor-wide star rows survive any focus', () => {
+    const both = filterAlertRowsForFocus(
+      union, { claude: CLAUDE_A, codex: CODEX_B },
+    );
+    expect(keysOf(both)).toEqual([CLAUDE_A, '*', CODEX_B]);
+  });
+
+  it('the canonical alerted_at order is preserved under focus', () => {
+    const rows = filterAlertRowsForFocus(union, { claude: CLAUDE_A, codex: CODEX_A });
+    const instants = rows.map(
+      (row) => (row as SourceAlertRow & { alerted_at?: string }).alerted_at ?? '',
+    );
+    expect(instants).toEqual([...instants].sort().reverse());
+    // Non-vacuity: the filter really did remove rows.
+    expect(rows.length).toBeLessThan(union.length);
+  });
+
+  it('never filters a provider whose rows carry no account fields', () => {
+    // Compatibility must not become data loss disguised as filtering, and the
+    // check is PER PROVIDER: a decorated Codex beside an undecorated Claude is
+    // a real state, and the whole-set check would have deleted the Claude rows.
+    const mixed: SourceAlertRow[] = [
+      claudeRow,
+      tagged(codexBudgetRow, CODEX_A, '2026-04-24T04:00:00Z'),
+      tagged(codexBudgetRow, CODEX_B, '2026-04-24T00:00:00Z'),
+    ];
+    const rows = filterAlertRowsForFocus(
+      mixed, { claude: CLAUDE_A, codex: CODEX_A },
+    );
+    expect(rows).toContain(claudeRow);
+    expect(rows.length).toBe(2);
+  });
+
+  it('an unfocused pair returns the input untouched', () => {
+    expect(filterAlertRowsForFocus(union, { claude: null, codex: null })).toBe(union);
   });
 });

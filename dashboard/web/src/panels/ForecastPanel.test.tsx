@@ -264,12 +264,34 @@ function renderAllForecast(opts: { claudeForecast: boolean; codexData?: CodexSou
 }
 
 describe('the All Forecast panel carries each provider\'s own detail (#556 S4)', () => {
-  it('renders each provider footer line under All', () => {
-    renderAllForecast({ claudeForecast: true });
+  // #556 S5 §4.7 AMENDS this criterion rather than breaking it. `Budget pace`
+  // is a CONFIGURED-BUDGET quantity and moved into the budget block; the two
+  // Claude quota-ceiling rows and the Codex `Confidence` row qualify the
+  // PROJECTION and stay in the forecast footer under their existing rules.
+  it('renders each provider forecast footer line under All', () => {
+    const { container } = renderAllForecast({ claudeForecast: true });
     expect(screen.getByText('Budget ≤100%')).toBeInTheDocument();
     expect(screen.getByText('Budget ≤90%')).toBeInTheDocument();
     expect(screen.getByText('Confidence')).toBeInTheDocument();
-    expect(screen.getByText('Budget pace')).toBeInTheDocument();
+    // Not in EITHER forecast section any more.
+    for (const section of container.querySelectorAll('[data-provider-section]')) {
+      expect(within(section as HTMLElement).queryByText('Budget pace')).toBeNull();
+    }
+  });
+
+  it('renders `Budget pace` exactly once, inside the budget block', () => {
+    const { container } = renderAllForecast({ claudeForecast: true });
+    // One line per CONFIGURED provider, and never a duplicate left behind in a
+    // forecast footer. This fixture configures a Codex budget and leaves Claude
+    // unconfigured, so exactly one line is the correct count — the Claude card
+    // renders its unset state instead.
+    expect(screen.getAllByText('Budget pace').length).toBe(1);
+    const codexBudget = container
+      .querySelector('[data-budget-section="codex"]') as HTMLElement;
+    expect(within(codexBudget).getByText('Budget pace')).toBeInTheDocument();
+    const claudeBudget = container
+      .querySelector('[data-budget-section="claude"]') as HTMLElement;
+    expect(within(claudeBudget).getByText('No budget set.')).toBeInTheDocument();
   });
 
   it('omits Confidence for a decorated Codex under All', () => {
@@ -283,7 +305,12 @@ describe('the All Forecast panel carries each provider\'s own detail (#556 S4)',
     const codex = container.querySelector('[data-provider-section="codex"]') as HTMLElement;
     expect(within(codex).getAllByTestId('forecast-per-account').length).toBeGreaterThan(0);
     expect(screen.queryByText('Confidence')).not.toBeInTheDocument();
-    expect(within(codex).getByText('Budget pace')).toBeInTheDocument();
+    // #556 S4's criterion, restated for S5: the forecast footer omits a
+    // representative account's Confidence, while the ADJACENT budget block
+    // retains `Budget pace`.
+    const codexBudget = container
+      .querySelector('[data-budget-section="codex"]') as HTMLElement;
+    expect(within(codexBudget).getByText('Budget pace')).toBeInTheDocument();
   });
 
   // #556 S4 F8 — see WeeklyPanel.test.tsx for the rule this asserts. Like the
@@ -305,6 +332,23 @@ describe('the All Forecast panel carries each provider\'s own detail (#556 S4)',
     });
     const ids = [...container.querySelectorAll('h3[id]')].map((h) => h.id);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  // #556 S5 §4.3 — the same pattern for the budget sections, which carry their
+  // OWN selector so a budget card can never be counted as a forecast section.
+  it('names each budget section by its own surface-qualified heading', () => {
+    const { container } = renderAllForecast({ claudeForecast: true });
+    const sections = container.querySelectorAll('[data-budget-section]');
+    expect(sections.length).toBe(2);
+    sections.forEach((s) => {
+      expect(s.getAttribute('role')).toBe('region');
+      const labelledBy = s.getAttribute('aria-labelledby');
+      expect(labelledBy).toMatch(/^budget-panel-(claude|codex)-heading$/);
+      const heading = container.querySelector(`[id="${labelledBy}"]`);
+      expect(heading).not.toBeNull();
+      expect(heading!.tagName).toBe('H3');
+      expect(heading!.textContent).toMatch(/^(Claude|Codex) budget$/);
+    });
   });
 
   it('renders the dashed structure and the reason, and no status chip, when Claude has no forecast', () => {

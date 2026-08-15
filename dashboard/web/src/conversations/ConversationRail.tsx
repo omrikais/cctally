@@ -172,9 +172,14 @@ export function ConversationRail() {
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const source: ConversationSource | 'all' = activeSource;
   const snapshot = useSyncExternalStore(subscribeStore, () => getState().snapshot);
+  // #556 S5 §5.4 — the rail is the ONE deliberate exclusion from All's account
+  // focus, carried over from the multi-account design's R4 decision: a
+  // conversation is not account-scoped evidence, so the All path stays
+  // EXPLICITLY unqualified and reads neither All slot. Only a provider tab
+  // qualifies, and only from that provider's own slot.
   const storedAccount = useSyncExternalStore(
     subscribeStore,
-    () => source === 'all' ? ALL_ACCOUNTS : getState().accountFocus[source],
+    () => source === 'all' ? ALL_ACCOUNTS : getState().accountFocus.provider[source],
   );
   const accountKey = resolveAccountFocus(snapshot, source, storedAccount);
   const search = useSyncExternalStore(subscribeStore, () => getState().conversationSearch);

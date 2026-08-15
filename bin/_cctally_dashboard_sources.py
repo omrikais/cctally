@@ -31,6 +31,7 @@ from _cctally_source_analytics import (
 )
 import _lib_log
 import _lib_accounts
+import _lib_snapshot_cache
 from _lib_dashboard_sources import (
     CapabilityRecord,
     ProjectionCoherence,
@@ -53,6 +54,7 @@ from _lib_quota import (
     stale_after_seconds,
 )
 from _lib_jsonl import CodexEntry
+from _lib_codex_account_adoption import ACCOUNT_WEEKLY_WINDOW_MINUTES
 from _lib_codex_pools import (
     codex_history_is_model_scoped,
     codex_model_scoped_quota_pool,
@@ -60,9 +62,10 @@ from _lib_codex_pools import (
 )
 from _lib_codex_conversation import _display_title as _codex_display_title
 from _lib_fmt import stable_sum
-from _lib_aggregators import _aggregate_codex_buckets
+from _lib_aggregators import _aggregate_codex_buckets, codex_path_scope
 from _lib_five_hour import _FIVE_HOUR_JITTER_FLOOR_SECONDS
 from _lib_source_analytics import (
+    assign_collision_safe_project_labels,
     build_codex_project_result,
     collision_safe_project_label_map,
 )
@@ -76,6 +79,70 @@ from _lib_view_models import (
 
 
 UTC = dt.timezone.utc
+
+
+_CODEX_QUOTA_OBSERVATION_CACHE: dict[object, tuple[object, ...]] = {}
+
+
+def reset_codex_quota_observation_cache() -> None:
+    """Clear #582's value-only quota-read memo."""
+    _CODEX_QUOTA_OBSERVATION_CACHE.clear()
+
+
+def _cached_codex_quota_observations(**kwargs) -> tuple[object, ...]:
+    """Reuse bounded quota reads while their dedicated mutation stream is idle."""
+    conn = kwargs.get("cache_conn")
+    if not isinstance(conn, sqlite3.Connection):
+        return load_codex_quota_observations(**kwargs)
+    try:
+        seq_row = conn.execute(
+            "SELECT seq FROM sqlite_sequence "
+            "WHERE name='quota_window_change_log'"
+        ).fetchone()
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='quota_window_change_log'"
+        ).fetchone()
+        revision_row = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_window_attribution_revision'"
+        ).fetchone()
+        db_path = next(
+            str(row[2]) for row in conn.execute("PRAGMA database_list")
+            if str(row[1]) == "main"
+        )
+    except (sqlite3.Error, StopIteration):
+        return load_codex_quota_observations(**kwargs)
+    if table is None:
+        return load_codex_quota_observations(**kwargs)
+    roots = kwargs.get("source_root_keys")
+    physical_signatures = kwargs.get("physical_signatures")
+    physical_groups = kwargs.get("physical_groups")
+    key = (
+        id(load_codex_quota_observations),
+        db_path,
+        0 if seq_row is None else int(seq_row[0]),
+        "" if revision_row is None else str(revision_row[0]),
+        None if roots is None else tuple(sorted(str(root) for root in roots)),
+        kwargs.get("captured_at_or_after"),
+        kwargs.get("active_at"),
+        kwargs.get("max_rows"),
+        None if physical_signatures is None else tuple(sorted(
+            (str(name), str(value))
+            for name, value in physical_signatures.items()
+        )),
+        kwargs.get("canonical_resets_between"),
+        None if physical_groups is None else tuple(sorted(physical_groups)),
+        bool(kwargs.get("latest_per_identity", False)),
+    )
+    cached = _CODEX_QUOTA_OBSERVATION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    loaded = tuple(load_codex_quota_observations(**kwargs))
+    if len(_CODEX_QUOTA_OBSERVATION_CACHE) >= 32:
+        _CODEX_QUOTA_OBSERVATION_CACHE.clear()
+    _CODEX_QUOTA_OBSERVATION_CACHE[key] = loaded
+    return loaded
 SOURCE_HISTORY_LIMIT = 250
 DASHBOARD_QUOTA_OBSERVATION_LIMIT = 1000
 DASHBOARD_QUOTA_RECENT_DAYS = 35
@@ -418,7 +485,7 @@ def resolve_codex_cycle_detail_identity(
         ))
         if not active_roots:
             return identity
-        observations = load_codex_quota_observations(
+        observations = _cached_codex_quota_observations(
             source_root_keys=active_roots,
             cache_conn=cache_conn,
             captured_at_or_after=(
@@ -744,6 +811,12 @@ class DashboardSourceSemantics:
     cache_report_anomaly_threshold_pp: int
     claude_identity: str
     codex_identity: str
+    # #556 S5 §3.4 — the Claude half of the same budget block, resolved through
+    # the same `_get_budget_config` call so the validator's warn-and-ignore
+    # stderr line is emitted ONCE per tick rather than once per consumer.
+    # Always a mapping (the validator fills defaults); `weekly_usd` is `None`
+    # when nothing is configured.
+    claude_budget: Mapping[str, object] | None = None
 
 
 def resolve_dashboard_source_semantics(
@@ -822,6 +895,10 @@ def resolve_dashboard_source_semantics(
         cache_report_anomaly_threshold_pp=cache_threshold,
         claude_identity=claude_identity,
         codex_identity=codex_identity,
+        claude_budget=MappingProxyType({
+            name: value for name, value in budget_config.items()
+            if name != "codex"
+        }),
     )
 
 
@@ -1013,14 +1090,55 @@ def codex_projection_coherence(
     )
 
 
+# #556 S5 Unit 2 review F13 — one-shot per process, following the repo's
+# established warn-once pattern (`_CONFIG_CORRUPT_WARNED` in
+# `bin/_cctally_config.py`, `_DISPLAY_TZ_BAD_CONFIG_WARNED` in
+# `bin/_lib_display_tz.py`). Both call sites below run on EVERY dashboard
+# rebuild tick, so an unresolvable window — a bad `display.tz` or `period` is
+# not transient — wrote a full traceback per tick indefinitely. The condition
+# is already visible to the user: the same failure nulls the budget status and
+# publishes `budget_compute_failed`.
+_CODEX_BUDGET_WINDOW_WARNED: set[str] = set()
+
+
+def _warn_codex_budget_window_once(site: str) -> None:
+    """Log an unresolvable Codex budget window once PER CALL SITE.
+
+    Keyed by site, not by module. A single flag shared by both callers would let
+    whichever failed first permanently silence the other, and the two are not
+    interchangeable: one degrades the accounting range, the other is the site
+    that used to destroy the whole Codex provider. The site also reaches the
+    message, so a reader of the log knows which one they are looking at.
+    """
+    if site in _CODEX_BUDGET_WINDOW_WARNED:
+        return
+    _CODEX_BUDGET_WINDOW_WARNED.add(site)
+    _lib_log.get_logger("dashboard").error(
+        "codex budget window could not be resolved at %s "
+        "(logged once per process per site)", site, exc_info=True,
+    )
+
+
 def _codex_budget_cost_events(
     context: DashboardReadContext,
     entries: Iterable[object],
 ) -> tuple[tuple[dt.datetime, float], ...]:
-    """Freeze every configured-window cost event for exact idle pace updates."""
+    """Freeze every configured-window cost event for exact idle pace updates.
+
+    #556 S5 §3.5: window resolution is guarded here as well as in
+    ``_codex_budget_status_domain``. This runs FIRST at the build site, so an
+    unresolvable period raising out of it would take the provider down before
+    the status helper's own boundary could name the reason. Degrading to no
+    events cannot publish a false ``$0``, because the same failure reaches the
+    status helper and nulls the status instead.
+    """
     if context.codex_budget is None:
         return ()
-    _period, start_at, end_at = _configured_codex_budget_window(context)
+    try:
+        _period, start_at, end_at = _configured_codex_budget_window(context)
+    except Exception:
+        _warn_codex_budget_window_once("cost_events")
+        return ()
     c = sys.modules["cctally"]
     events: list[tuple[dt.datetime, float]] = []
     for entry in entries:
@@ -1030,8 +1148,10 @@ def _codex_budget_cost_events(
         timestamp = timestamp.astimezone(UTC)
         if not start_at <= timestamp < end_at:
             continue
+        loaded_cost = getattr(entry, "cost_usd", None)
         events.append((
             timestamp,
+            float(loaded_cost) if loaded_cost is not None else
             c._calculate_codex_entry_cost(
                 str(getattr(entry, "model")),
                 int(getattr(entry, "input_tokens")),
@@ -1079,6 +1199,251 @@ def _period_wire(view: Any) -> dict[str, object]:
     }
 
 
+_CODEX_PERIOD_VIEW_CACHE: dict[object, tuple] = {}
+_CODEX_CACHE_REPORT_ROWS: dict[object, tuple] = {}
+_CODEX_SESSION_VIEW_CACHE: dict[object, tuple[object, Any]] = {}
+
+
+def _codex_session_row_key(row: object) -> tuple[str, str]:
+    return (
+        str(getattr(row, "codex_root", "") or ""),
+        str(getattr(row, "session_id_path", "") or ""),
+    )
+
+
+def _codex_session_path_key(source_path: str) -> tuple[str, str]:
+    import _lib_aggregators
+    id_path, _file_name, _directory = _lib_aggregators._session_path_parts(
+        source_path,
+    )
+    suffix = id_path + ".jsonl"
+    root_prefix = (
+        source_path[: -len(suffix)]
+        if source_path.endswith(suffix) else source_path
+    )
+    return (
+        _lib_aggregators._codex_home_root_from_prefix(root_prefix), id_path,
+    )
+
+
+def _codex_incremental_entry_order(entry: object) -> tuple[object, str, str, int]:
+    """Canonical accounting encounter key retained by incremental groups."""
+    return (
+        getattr(entry, "timestamp"),
+        str(getattr(entry, "source_root_key", "") or ""),
+        str(getattr(entry, "conversation_key", "") or ""),
+        int(getattr(entry, "cache_entry_id", 0) or 0),
+    )
+
+
+def _cached_codex_session_view(
+    entries: Iterable[CodexEntry],
+    *,
+    changed_old: Iterable[object],
+    changed_new: Iterable[object],
+    cache_key: object,
+    semantic_signature: object,
+    now_utc: dt.datetime,
+    tz_name: str | None,
+    speed: str,
+) -> Any:
+    """Rebuild only session-file groups touched by accounting changes."""
+    values = tuple(entries)
+    signature = (semantic_signature, tz_name, speed)
+    state = _CODEX_SESSION_VIEW_CACHE.get(cache_key)
+    if state is None or state[0] != signature:
+        view = build_codex_session_view(
+            values, now_utc=now_utc, tz_name=tz_name, speed=speed,
+        )
+        groups: dict[tuple[str, str], list[CodexEntry]] = {}
+        for entry in values:
+            groups.setdefault(
+                _codex_session_path_key(entry.source_path), [],
+            ).append(entry)
+        _CODEX_SESSION_VIEW_CACHE[cache_key] = (
+            signature, view,
+            {key: tuple(group) for key, group in groups.items()},
+        )
+        return view
+    changed_paths = {
+        str(getattr(entry, "source_path", "") or "")
+        for entry in (*tuple(changed_old), *tuple(changed_new))
+        if getattr(entry, "source_path", None)
+    }
+    if not changed_paths:
+        return state[1]
+    affected_keys = {
+        _codex_session_path_key(source_path) for source_path in changed_paths
+    }
+    old_ids = {
+        int(getattr(entry, "cache_entry_id", 0) or 0)
+        for entry in changed_old
+    }
+    groups = dict(state[2])
+    for key in affected_keys:
+        groups[key] = tuple(
+            entry for entry in groups.get(key, ())
+            if int(getattr(entry, "cache_entry_id", 0) or 0) not in old_ids
+        )
+    for entry in changed_new:
+        key = _codex_session_path_key(entry.source_path)
+        groups[key] = (*groups.get(key, ()), entry)
+    for key in affected_keys:
+        if groups.get(key):
+            groups[key] = tuple(sorted(
+                groups[key], key=_codex_incremental_entry_order,
+            ))
+        else:
+            groups.pop(key, None)
+    partial_entries = tuple(sorted(
+        (
+            entry for key in affected_keys for entry in groups.get(key, ())
+        ),
+        key=_codex_incremental_entry_order,
+    ))
+    partial = build_codex_session_view(
+        partial_entries,
+        now_utc=now_utc, tz_name=tz_name, speed=speed,
+    )
+    encounter_order = {
+        key: _codex_incremental_entry_order(group[0])
+        for key, group in groups.items() if group
+    }
+    rows_by_encounter = sorted(
+        (
+            *(row for row in state[1].rows
+              if _codex_session_row_key(row) not in affected_keys),
+            *partial.rows,
+        ),
+        key=lambda row: encounter_order.get(
+            _codex_session_row_key(row),
+            (dt.datetime.max.replace(tzinfo=UTC), "", "", 0),
+        ),
+    )
+    # The canonical aggregator performs a stable descending timestamp sort, so
+    # establish first-encounter order before applying that same stable sort.
+    rows = tuple(sorted(
+        rows_by_encounter, key=lambda row: row.last_activity, reverse=True,
+    ))
+    total_cost = 0.0
+    total_tokens = 0
+    for row in rows:
+        total_cost += row.cost_usd
+        total_tokens += row.total_tokens
+    view = replace(
+        state[1], rows=rows, total_sessions=len(rows),
+        total_cost_usd=total_cost,
+        total_tokens=total_tokens,
+        period_start=(min((row.last_activity for row in rows), default=None)),
+        period_end=now_utc,
+    )
+    _CODEX_SESSION_VIEW_CACHE[cache_key] = (signature, view, groups)
+    return view
+
+
+def _codex_period_bucket(
+    entry: CodexEntry, *, kind: str, tz_name: str | None,
+) -> str:
+    zone = ZoneInfo(tz_name) if tz_name else None
+    local = entry.timestamp.astimezone(zone) if zone else entry.timestamp.astimezone()
+    return local.strftime("%Y-%m-%d" if kind == "daily" else "%Y-%m")
+
+
+def _cached_codex_period_view(
+    entries: Iterable[CodexEntry],
+    *,
+    changed_old: Iterable[CodexEntry],
+    changed_new: Iterable[CodexEntry],
+    kind: str,
+    cache_key: object,
+    semantic_signature: object,
+    now_utc: dt.datetime,
+    tz_name: str | None,
+    speed: str,
+) -> Any:
+    """Rebuild only date/month buckets touched by changed accounting rows."""
+    values = tuple(entries)
+    signature = (semantic_signature, kind, tz_name, speed)
+    state = _CODEX_PERIOD_VIEW_CACHE.get((cache_key, kind))
+    builder = build_codex_daily_view if kind == "daily" else build_codex_monthly_view
+    if state is None or state[0] != signature:
+        view = builder(values, now_utc=now_utc, tz_name=tz_name, speed=speed)
+        groups: dict[str, list[CodexEntry]] = {}
+        for entry in values:
+            groups.setdefault(
+                _codex_period_bucket(entry, kind=kind, tz_name=tz_name), [],
+            ).append(entry)
+        _CODEX_PERIOD_VIEW_CACHE[(cache_key, kind)] = (signature, view, groups)
+        return view
+    old_values = tuple(changed_old)
+    new_values = tuple(changed_new)
+    affected = {
+        _codex_period_bucket(entry, kind=kind, tz_name=tz_name)
+        for entry in (*old_values, *new_values)
+    }
+    if not affected:
+        return state[1]
+    prior = state[1]
+    # Copy the mapping only. Unaffected bucket lists are immutable-by-contract
+    # and remain shared; affected buckets below receive fresh lists.
+    groups = dict(state[2])
+    old_ids = {int(entry.cache_entry_id) for entry in old_values}
+    for label in affected:
+        groups[label] = [
+            entry for entry in groups.get(label, ())
+            if int(entry.cache_entry_id) not in old_ids
+        ]
+    for entry in new_values:
+        label = _codex_period_bucket(entry, kind=kind, tz_name=tz_name)
+        groups.setdefault(label, []).append(entry)
+    for label in affected:
+        groups[label].sort(key=lambda entry: (
+            entry.timestamp, entry.source_root_key,
+            entry.conversation_key, int(entry.cache_entry_id),
+        ))
+    replacements: dict[str, object] = {}
+    for label in affected:
+        partial = builder(
+            tuple(groups[label]),
+            now_utc=now_utc, tz_name=tz_name, speed=speed,
+        )
+        if partial.rows:
+            replacements[label] = partial.rows[0]
+        else:
+            groups.pop(label, None)
+    rows = tuple(sorted(
+        (
+            *(row for row in prior.rows if row.bucket not in affected),
+            *replacements.values(),
+        ),
+        key=lambda row: row.bucket,
+    ))
+    total_cost = 0.0
+    total_tokens = 0
+    for row in rows:
+        total_cost += row.cost_usd
+        total_tokens += row.total_tokens
+    period_start = None
+    if rows:
+        if kind == "daily":
+            first = dt.date.fromisoformat(rows[0].bucket)
+            period_start = dt.datetime.combine(first, dt.time.min, tzinfo=UTC)
+        else:
+            year, month = rows[0].bucket.split("-")
+            period_start = dt.datetime(int(year), int(month), 1, tzinfo=UTC)
+    view = replace(
+        prior,
+        rows=rows,
+        total_cost_usd=total_cost,
+        total_tokens=total_tokens,
+        period_start=period_start,
+        period_end=now_utc,
+        period_civil_bucket=bool(rows),
+    )
+    _CODEX_PERIOD_VIEW_CACHE[(cache_key, kind)] = (signature, view, groups)
+    return view
+
+
 def _codex_cache_report_wire(
     entries: Iterable[object],
     *,
@@ -1088,6 +1453,10 @@ def _codex_cache_report_wire(
     speed: str,
     anomaly_threshold_pp: int = 15,
     window_days: int = 14,
+    cache_key: object | None = None,
+    changed_old: Iterable[object] = (),
+    changed_new: Iterable[object] = (),
+    semantic_signature: object | None = None,
 ) -> dict[str, object]:
     """Compute the canonical cache report from Codex's inclusive counters.
 
@@ -1102,6 +1471,7 @@ def _codex_cache_report_wire(
     wire = c._load_sibling("_lib_cache_report_wire")
     display_tz = ZoneInfo(display_tz_name) if display_tz_name else None
     cutoff = now_utc - dt.timedelta(days=window_days)
+    bucket_tz = crk._resolve_bucket_tz(display_tz)
 
     def _tiered_cost(tokens: int, pricing: Mapping[str, object], base: str, above: str) -> float:
         if tokens <= 0:
@@ -1113,11 +1483,10 @@ def _codex_cache_report_wire(
             return threshold * base_rate + (tokens - threshold) * float(above_rate)
         return tokens * base_rate
 
-    wrapped = []
-    for entry in entries:
+    def _wrap_entry(entry: object) -> object | None:
         timestamp = getattr(entry, "timestamp", None)
         if not isinstance(timestamp, dt.datetime) or timestamp < cutoff:
-            continue
+            return None
         model = str(getattr(entry, "model", "") or "unknown")
         input_tokens = int(getattr(entry, "input_tokens", 0))
         cached_tokens = min(input_tokens, int(getattr(entry, "cached_input_tokens", 0)))
@@ -1144,7 +1513,7 @@ def _codex_cache_report_wire(
             or str(item_metadata.get("project_label") or "").strip()
             or "(unknown)"
         )
-        wrapped.append(SimpleNamespace(
+        return SimpleNamespace(
             timestamp=timestamp,
             model=model,
             cost_usd=float(getattr(entry, "cost_usd", 0.0)),
@@ -1156,22 +1525,189 @@ def _codex_cache_report_wire(
             cache_saved_usd=saved,
             cache_wasted_usd=0.0,
             cache_net_usd=saved,
+            _cache_entry_id=int(getattr(entry, "cache_entry_id", 0) or 0),
+            _cache_day=timestamp.astimezone(bucket_tz).strftime("%Y-%m-%d"),
+            _cache_order=_codex_incremental_entry_order(entry),
             usage={
                 "input_tokens": uncached_tokens,
                 "output_tokens": int(getattr(entry, "output_tokens", 0)),
                 "cache_creation_input_tokens": 0,
                 "cache_read_input_tokens": cached_tokens,
             },
+        )
+
+    def _freeze_day(day_entries: Iterable[object]):
+        """Freeze one changed day without re-folding the retained window."""
+        day_values = tuple(day_entries)
+        rows = crk._aggregate_cache_by_day(
+            day_values,
+            display_tz=display_tz,
+            pricing=c.CODEX_MODEL_PRICING,
+            cost_calculator=(
+                lambda _model, _usage, _mode, cost: float(cost or 0.0)
+            ),
+        )
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise AssertionError("one cache-report day produced multiple rows")
+        row = rows[0]
+        project_nets: dict[str, list[float]] = {}
+        project_tokens: dict[str, list[int]] = {}
+        for entry in day_values:
+            if entry.model == "<synthetic>":
+                continue
+            project = entry.project_path or "(unknown)"
+            project_nets.setdefault(project, []).append(entry.cache_net_usd)
+            tokens = project_tokens.setdefault(project, [0, 0, 0])
+            tokens[0] += entry.input_tokens
+            tokens[1] += entry.cache_creation_tokens
+            tokens[2] += entry.cache_read_tokens
+        project_partials = tuple(sorted(
+            (
+                project,
+                crk._ProjectPartial(
+                    net_usd=stable_sum(project_nets[project]),
+                    input_tokens=tokens[0],
+                    cache_creation_tokens=tokens[1],
+                    cache_read_tokens=tokens[2],
+                ),
+            )
+            for project, tokens in project_tokens.items()
         ))
+        return crk.CachedCacheReportDay(
+            date=row.date,
+            cache_hit_percent=row.cache_hit_percent,
+            input_tokens=row.input_tokens,
+            output_tokens=row.output_tokens,
+            cache_creation_tokens=row.cache_creation_tokens,
+            cache_read_tokens=row.cache_read_tokens,
+            cost=row.cost,
+            saved_usd=row.saved_usd,
+            wasted_usd=row.wasted_usd,
+            net_usd=row.net_usd,
+            model_breakdowns=tuple(
+                crk._FrozenModelBreakdown(
+                    model_name=model.model_name,
+                    input_tokens=model.input_tokens,
+                    output_tokens=model.output_tokens,
+                    cache_creation_tokens=model.cache_creation_tokens,
+                    cache_read_tokens=model.cache_read_tokens,
+                    cache_hit_percent=model.cache_hit_percent,
+                    cost=model.cost,
+                    saved_usd=model.saved_usd,
+                    wasted_usd=model.wasted_usd,
+                    net_usd=model.net_usd,
+                )
+                for model in row.model_breakdowns
+            ),
+            project_partials=project_partials,
+        )
+
+    values = tuple(entries)
+    cacheable = cache_key is not None and all(
+        int(getattr(entry, "cache_entry_id", 0) or 0) for entry in values
+    )
+    signature = (semantic_signature, speed, window_days, display_tz_name)
+    cached_days = None
+    if not cacheable:
+        wrapped = [
+            wrapped_entry for entry in values
+            if (wrapped_entry := _wrap_entry(entry)) is not None
+        ]
+    else:
+        state = _CODEX_CACHE_REPORT_ROWS.get(cache_key)
+        if state is None or len(state) != 4 or state[0] != signature:
+            cached_rows = {}
+            for entry in values:
+                wrapped_entry = _wrap_entry(entry)
+                if wrapped_entry is not None:
+                    cached_rows[int(entry.cache_entry_id)] = wrapped_entry
+            groups: dict[str, tuple[int, ...]] = {}
+            mutable_groups: dict[str, list[int]] = {}
+            for entry in cached_rows.values():
+                mutable_groups.setdefault(entry._cache_day, []).append(
+                    entry._cache_entry_id)
+            for day, ids in mutable_groups.items():
+                groups[day] = tuple(sorted(
+                    ids, key=lambda cache_id: cached_rows[cache_id]._cache_order,
+                ))
+            cached_days = {
+                day: _freeze_day(cached_rows[cache_id] for cache_id in ids)
+                for day, ids in groups.items()
+            }
+        else:
+            cached_rows = dict(state[1])
+            groups = dict(state[2])
+            cached_days = dict(state[3])
+            affected_days: set[str] = set()
+            old_ids: set[int] = set()
+            # The accounting population is wider than the cache-report window.
+            # Rows can therefore age out without any ledger mutation. Preserve
+            # the old full-fold contract by evicting them whenever a later
+            # dirty source build advances `now_utc`.
+            for cache_entry_id, prior in tuple(cached_rows.items()):
+                if prior.timestamp < cutoff:
+                    old_ids.add(cache_entry_id)
+                    affected_days.add(prior._cache_day)
+                    cached_rows.pop(cache_entry_id, None)
+            for entry in changed_old:
+                cache_entry_id = int(getattr(entry, "cache_entry_id", 0) or 0)
+                if cache_entry_id:
+                    old_ids.add(cache_entry_id)
+                    prior = cached_rows.get(cache_entry_id)
+                    if prior is not None:
+                        affected_days.add(prior._cache_day)
+                    cached_rows.pop(cache_entry_id, None)
+            for entry in changed_new:
+                cache_entry_id = int(getattr(entry, "cache_entry_id", 0) or 0)
+                if not cache_entry_id:
+                    continue
+                wrapped_entry = _wrap_entry(entry)
+                if wrapped_entry is None:
+                    cached_rows.pop(cache_entry_id, None)
+                else:
+                    cached_rows[cache_entry_id] = wrapped_entry
+                    affected_days.add(wrapped_entry._cache_day)
+            for day in affected_days:
+                groups[day] = tuple(
+                    cache_id for cache_id in groups.get(day, ())
+                    if cache_id not in old_ids
+                )
+            for entry in changed_new:
+                cache_entry_id = int(getattr(entry, "cache_entry_id", 0) or 0)
+                wrapped_entry = cached_rows.get(cache_entry_id)
+                if wrapped_entry is not None:
+                    groups[wrapped_entry._cache_day] = (
+                        *groups.get(wrapped_entry._cache_day, ()), cache_entry_id,
+                    )
+            for day in affected_days:
+                ids = tuple(sorted(
+                    dict.fromkeys(groups.get(day, ())),
+                    key=lambda cache_id: cached_rows[cache_id]._cache_order,
+                ))
+                if ids:
+                    groups[day] = ids
+                    cached_days[day] = _freeze_day(
+                        cached_rows[cache_id] for cache_id in ids)
+                else:
+                    groups.pop(day, None)
+                    cached_days.pop(day, None)
+        cached_days = {
+            day: unit for day, unit in cached_days.items() if unit is not None
+        }
+        _CODEX_CACHE_REPORT_ROWS[cache_key] = (
+            signature, cached_rows, groups, cached_days,
+        )
+        wrapped = []
 
     # One current day per invocation (#443 S3 F23): the focal day and the
     # entry filter below both resolve through the SAME zone the kernel
     # buckets by. ``display_tz or UTC`` diverged from host-local bucketing
     # on every non-UTC host, which published a fabricated spotlight and let
     # the breakdowns draw from a different entry population than the days.
-    bucket_tz = crk._resolve_bucket_tz(display_tz)
     today_iso = now_utc.astimezone(bucket_tz).strftime("%Y-%m-%d")
-    if not wrapped:
+    if not wrapped and not cached_days:
         # An empty store measured nothing, so ``observed`` is False and
         # every applicable predicate is unevaluated. The client
         # short-circuits on ``is_empty`` before reading either, so this
@@ -1194,16 +1730,29 @@ def _codex_cache_report_wire(
             fourteen_day_efficiency_ratio=0.0, is_empty=True,
         )
 
-    result = crk._build_cache_report(
-        wrapped,
-        now_utc=now_utc,
-        window_days=window_days,
-        anomaly_threshold_pp=anomaly_threshold_pp,
-        anomaly_window_days=window_days,
-        display_tz=display_tz,
-        pricing=c.CODEX_MODEL_PRICING,
-        cost_calculator=lambda _model, _usage, _mode, cost: float(cost or 0.0),
-    )
+    if cached_days is None:
+        result = crk._build_cache_report(
+            wrapped,
+            now_utc=now_utc,
+            window_days=window_days,
+            anomaly_threshold_pp=anomaly_threshold_pp,
+            anomaly_window_days=window_days,
+            display_tz=display_tz,
+            pricing=c.CODEX_MODEL_PRICING,
+            cost_calculator=lambda _model, _usage, _mode, cost: float(cost or 0.0),
+        )
+    else:
+        result = crk.classify_and_summarize(
+            [
+                crk.reconstruct_cache_row(cached_days[day])
+                for day in sorted(cached_days)
+            ],
+            now_utc=now_utc,
+            window_days=window_days,
+            anomaly_threshold_pp=anomaly_threshold_pp,
+            anomaly_window_days=window_days,
+            display_tz=display_tz,
+        )
     raw_rows = sorted(result.rows, key=lambda row: row.date or "", reverse=True)
     today_row = next((row for row in raw_rows if row.date == today_iso), None)
     # #443 F13/F14 — both charts label their rightmost element "Today"
@@ -1243,18 +1792,65 @@ def _codex_cache_report_wire(
     baseline = result.today_baseline_median
     today_hit = today_row.cache_hit_percent if today_row else 0.0
     kept_dates = {row["date"] for row in days}
-    kept_entries = [
-        entry for entry in wrapped
-        if entry.timestamp.astimezone(bucket_tz).strftime("%Y-%m-%d") in kept_dates
-    ]
-    by_project = crk._aggregate_cache_breakdown(
-        kept_entries, key_fn=lambda entry: entry.project_path,
-        pricing=c.CODEX_MODEL_PRICING,
-    )
-    by_model = crk._aggregate_cache_breakdown(
-        kept_entries, key_fn=lambda entry: entry.model,
-        pricing=c.CODEX_MODEL_PRICING,
-    )
+    if cached_days is None:
+        kept_entries = [
+            entry for entry in wrapped
+            if entry.timestamp.astimezone(bucket_tz).strftime("%Y-%m-%d")
+            in kept_dates
+        ]
+        by_project = crk._aggregate_cache_breakdown(
+            kept_entries, key_fn=lambda entry: entry.project_path,
+            pricing=c.CODEX_MODEL_PRICING,
+        )
+        by_model = crk._aggregate_cache_breakdown(
+            kept_entries, key_fn=lambda entry: entry.model,
+            pricing=c.CODEX_MODEL_PRICING,
+        )
+    else:
+        # Preserve the prior exact float fold: one stable_sum over every
+        # individual entry net, not a stable_sum of per-day stable_sums (the
+        # latter can differ by one ULP). Walk the already-wrapped immutable
+        # rows once and accumulate both axes together, avoiding the old two
+        # full pricing/adapter folds while retaining first-seen tie order.
+        breakdowns: dict[str, dict[str, list[object]]] = {
+            "project": {}, "model": {},
+        }
+        for raw in values:
+            cache_entry_id = int(getattr(raw, "cache_entry_id", 0) or 0)
+            entry = cached_rows.get(cache_entry_id)
+            if (
+                entry is None or entry._cache_day not in kept_dates
+                or entry.model == "<synthetic>"
+            ):
+                continue
+            for axis, key in (
+                ("project", entry.project_path), ("model", entry.model),
+            ):
+                parts = breakdowns[axis].setdefault(
+                    key, [[], 0, 0, 0],
+                )
+                parts[0].append(entry.cache_net_usd)
+                parts[1] += entry.input_tokens
+                parts[2] += entry.cache_creation_tokens
+                parts[3] += entry.cache_read_tokens
+
+        def _finish_breakdown(axis: str):
+            rows = []
+            for key, parts in breakdowns[axis].items():
+                rows.append(crk.CacheBreakdownRow(
+                    key=key,
+                    cache_hit_percent=crk._compute_cache_hit_percent(
+                        parts[1], parts[2], parts[3],
+                    ),
+                    net_usd=stable_sum(parts[0]),
+                    input_tokens=parts[1],
+                    cache_creation_tokens=parts[2],
+                    cache_read_tokens=parts[3],
+                ))
+            return crk._finalize_breakdown_rows(rows)
+
+        by_project = _finish_breakdown("project")
+        by_model = _finish_breakdown("model")
     seven = days[:7]
     saved_total = stable_sum(float(row["saved_usd"]) for row in days)
     wasted_total = stable_sum(float(row["wasted_usd"]) for row in days)
@@ -1759,6 +2355,15 @@ def _configured_codex_budget_status(
     with no configured budget therefore has no budget status at all (``None``),
     exactly as an unconfigured vendor does; the merged vendor status stays on the
     parent. ``None`` keeps the merged behaviour and is byte-stable.
+
+    #556 S5 §3.5: a VENDOR-WIDE read of a PER-ACCOUNT-ONLY configuration is the
+    same "nothing to compute against" state. ``_validate_codex_budget_block``
+    accepts a Codex block with no ``amount_usd`` when a non-empty ``accounts``
+    map is present (``bin/_cctally_core.py:1350``), and this function used to
+    call ``float(amount_usd)`` on that ``None`` with no exception boundary
+    anywhere between here and ``_tui_build_source_bundle``'s
+    ``source_build_failed`` handler — so one valid configuration destroyed the
+    entire Codex provider's data.
     """
     config = context.codex_budget
     if config is None:
@@ -1769,6 +2374,8 @@ def _configured_codex_budget_status(
         if not isinstance(per_account, Mapping) or account_key not in per_account:
             return None
         amount_usd = per_account[account_key]
+    if amount_usd is None:
+        return None
     c = sys.modules["cctally"]
     period, start_at, end_at = _configured_codex_budget_window(context)
 
@@ -1780,35 +2387,75 @@ def _configured_codex_budget_status(
         return sum(cost for timestamp, cost in resolved_events if start <= timestamp < end)
 
     recent_start = max(start_at, context.now_utc - dt.timedelta(hours=24))
-    inputs = c.BudgetInputs(
-        target_usd=float(amount_usd),
+    # #556 S5 §3.1/§3.3: ONE producer of the wire status, shared with Claude.
+    return c.budget_status_payload(
+        period=period,
+        window_start_at=start_at,
+        window_end_at=end_at,
+        target_usd=amount_usd,
         spent_usd=_sum_cost(start_at, context.now_utc),
         recent_24h_usd=_sum_cost(recent_start, context.now_utc),
-        week_start_at=start_at,
-        week_end_at=end_at,
         now=context.now_utc,
-        alert_thresholds=tuple(config["alert_thresholds"]),
+        alert_thresholds=config["alert_thresholds"],
     )
-    status = c.compute_budget_status(inputs)
-    return {
-        "period": period,
-        "budget_usd": inputs.target_usd,
-        "spent_usd": status.spent_usd,
-        "remaining_usd": status.remaining_usd,
-        "consumption_pct": status.consumption_pct,
-        "verdict": status.verdict,
-        "low_confidence": status.low_confidence,
-        "window_start_at": start_at.astimezone(UTC).isoformat(),
-        "window_end_at": end_at.astimezone(UTC).isoformat(),
-        "recent_24h_usd": inputs.recent_24h_usd,
-        "alert_thresholds": inputs.alert_thresholds,
-        "pace": {
-            "daily_usd": status.daily_pace_usd,
-            "projected_low_usd": status.projected_eow_low_usd,
-            "projected_high_usd": status.projected_eow_high_usd,
-            "week_avg_projection_usd": status.week_avg_projection_usd,
-        },
-    }
+
+
+def _codex_budget_status_domain(
+    context: DashboardReadContext,
+    entries: Iterable[object],
+    *,
+    cost_events: tuple[tuple[dt.datetime, float], ...] | None = None,
+    account_key: str | None = None,
+) -> dict[str, object]:
+    """The Codex budget domain's status half, with a LOCAL failure contract.
+
+    #556 S5 §3.5. ``status`` stays required-and-nullable, which is the shape
+    Codex's enclosing domain has always emitted and which this session does not
+    normalise. What is new is the boundary: a computation that raises now
+    degrades this one domain and names its reason, following the same
+    ``{code, message, provider}`` shape the Claude half uses, instead of
+    escaping into the provider-level handler and turning the whole Codex source
+    into ``source_build_failed``.
+
+    ``status_unavailable`` is additive and omitted when inapplicable, so the
+    ordinary payload is byte-identical.
+
+    #556 S5 Unit 2 review F1. A VENDOR-WIDE read of a per-account-only Codex
+    configuration is a configured state, not an unset one, and returning a bare
+    ``{"status": None}`` for it made the client render "No budget set." beside
+    the command that sets one — to a user who has budgets set. It publishes the
+    same ``not_configured.disposition`` the Claude half publishes, which the
+    client already handles. An ACCOUNT-SCOPED read is deliberately excluded:
+    ``account_budgets_only`` describes the vendor-wide axis, and that account's
+    own missing budget is genuinely unset.
+    """
+    config = context.codex_budget
+    if (
+        account_key is None
+        and isinstance(config, Mapping)
+        and config.get("amount_usd") is None
+        and config.get("accounts")
+    ):
+        return {
+            "status": None,
+            "not_configured": {"disposition": "account_budgets_only"},
+        }
+    try:
+        return {"status": _configured_codex_budget_status(
+            context, entries, cost_events=cost_events, account_key=account_key,
+        )}
+    except Exception:
+        _lib_log.get_logger("dashboard").error(
+            "codex budget status could not be computed", exc_info=True,
+        )
+        return {
+            "status": None,
+            "status_unavailable": {
+                "code": "budget_compute_failed",
+                "message": "Codex's budget status could not be computed.",
+                "provider": "codex",
+            },
+        }
 
 
 def _configured_codex_budget_window(
@@ -1995,7 +2642,7 @@ def _quota_read_model(
                 # with whichever ACCOUNT's 5h observation happened to sort last.
                 correlated_five_hour = tuple(
                     observation
-                    for observation in load_codex_quota_observations(
+                    for observation in _cached_codex_quota_observations(
                         source_root_keys={identity.source_root_key},
                         cache_conn=context.cache_conn,
                         captured_at_or_after=block.nominal_start_at,
@@ -2363,19 +3010,50 @@ def refresh_codex_source_clock(
     scopes = data.get("account_scopes")
     scopes_changed = False
     if isinstance(scopes, Mapping):
+        # #556 S5 §3.8: each child's budget reclocks from ITS OWN retained event
+        # tuple, never the vendor-wide one — the accounts hold different spend,
+        # so borrowing the parent's events would publish another account's
+        # trailing-24h rate under this account's card.
+        child_budget_events = (
+            state.clock_data.get("codex_budget_cost_events_by_account", {})
+            if isinstance(state.clock_data, Mapping) else {}
+        )
         rebuilt_scopes = dict(scopes)
         for scope_key, scope in scopes.items():
             if not isinstance(scope, Mapping):
                 continue
+            rebuilt_scope: dict[str, object] | None = None
             scope_quota = scope.get("quota")
-            if not isinstance(scope_quota, Mapping):
+            if isinstance(scope_quota, Mapping):
+                reclocked_scope_quota = _reclock_quota_domain(
+                    scope_quota, now_utc=now_utc)
+                if reclocked_scope_quota != scope_quota:
+                    rebuilt_scope = dict(scope)
+                    rebuilt_scope["quota"] = reclocked_scope_quota
+            # #556 S5 §3.8: the child budget status was computed at build and
+            # then never advanced, while the quota beside it was. Focused cards
+            # read this object, so an unclocked one is a knowingly stale number
+            # on the surface a user is looking straight at.
+            scope_budget = scope.get("budget")
+            if isinstance(scope_budget, Mapping) and isinstance(
+                scope_budget.get("status"), Mapping,
+            ):
+                reclocked_child_budget = _refresh_budget_status_clock(
+                    scope_budget["status"],
+                    now_utc,
+                    cost_events=child_budget_events.get(scope_key, ()),
+                )
+                if (
+                    reclocked_child_budget is not None
+                    and reclocked_child_budget != scope_budget["status"]
+                ):
+                    if rebuilt_scope is None:
+                        rebuilt_scope = dict(scope)
+                    rebuilt_scope["budget"] = {
+                        **dict(scope_budget), "status": reclocked_child_budget,
+                    }
+            if rebuilt_scope is None:
                 continue
-            reclocked_scope_quota = _reclock_quota_domain(
-                scope_quota, now_utc=now_utc)
-            if reclocked_scope_quota == scope_quota:
-                continue
-            rebuilt_scope = dict(scope)
-            rebuilt_scope["quota"] = reclocked_scope_quota
             rebuilt_scopes[scope_key] = rebuilt_scope
             scopes_changed = True
         if scopes_changed:
@@ -2596,22 +3274,66 @@ def _alerts_wire(
     )[:SOURCE_HISTORY_LIMIT])
 
 
+_CODEX_PROJECT_LABEL_CACHE: dict[object, dict[str, object]] = {}
+
+
+def _cached_project_labeled_entries(
+    entries: tuple[object, ...], cache_key: object | None,
+) -> tuple[object, ...]:
+    """Reuse per-scope display-label annotation for unchanged accounting rows."""
+    if cache_key is None or any(
+        not int(getattr(entry, "cache_entry_id", 0) or 0) for entry in entries
+    ):
+        return tuple(assign_collision_safe_project_labels(entries))
+    pairs = frozenset(
+        (str(entry.project_key), str(entry.project_label)) for entry in entries
+    )
+    state = _CODEX_PROJECT_LABEL_CACHE.get(cache_key)
+    if state is None or state.get("pairs") != pairs:
+        labeled = tuple(assign_collision_safe_project_labels(entries))
+    else:
+        labels = state["labels"]
+        prior = state["entries"]
+        labeled = tuple(
+            prior[int(entry.cache_entry_id)][1]
+            if (
+                int(entry.cache_entry_id) in prior
+                and prior[int(entry.cache_entry_id)][0] == entry
+            ) else replace(
+                entry, display_label=labels[str(entry.project_key)],
+            )
+            for entry in entries
+        )
+    _CODEX_PROJECT_LABEL_CACHE[cache_key] = {
+        "pairs": pairs,
+        "labels": {
+            str(entry.project_key): entry.display_label for entry in labeled
+        },
+        "entries": {
+            int(entry.cache_entry_id): (raw, entry)
+            for raw, entry in zip(entries, labeled)
+        },
+    }
+    return labeled
+
+
 def _projects_wire(
     context: DashboardReadContext,
-    quota_observations: Iterable[object],
+    _quota_observations: Iterable[object],
     entries: Iterable[object],
     *,
     accounting_end: dt.datetime,
+    cache_key: object | None = None,
 ) -> dict[str, object]:
     """Adapt S3's already-qualified attribution result without re-formulas."""
-    qualified_entries = tuple(entries)
+    qualified_entries = _cached_project_labeled_entries(
+        tuple(entries), cache_key,
+    )
     result = build_codex_project_result(
         qualified_entries,
         range_start=context.range_start,
         range_end=accounting_end,
-        blocks=build_blocks(quota_observations),
         as_of=context.now_utc,
-        allocation_entries=qualified_entries,
     )
     data = result.data
     if data is None:
@@ -2634,6 +3356,125 @@ def _projects_wire(
         "total_cost_usd": data.totals.cost_usd,
         "total_tokens": data.totals.total_tokens,
     }
+
+
+_CODEX_PROJECT_WIRE_CACHE: dict[object, tuple] = {}
+
+
+def _cached_projects_wire(
+    context: DashboardReadContext,
+    quota_observations: Iterable[object],
+    entries: Iterable[object],
+    *,
+    changed_old: Iterable[object],
+    changed_new: Iterable[object],
+    accounting_end: dt.datetime,
+    cache_key: object,
+    semantic_signature: object,
+) -> dict[str, object]:
+    """Rebuild only project groups touched by accounting changes."""
+    values = tuple(entries)
+    pairs = frozenset(
+        (str(entry.project_key), str(entry.project_label)) for entry in values
+    )
+    # `entries` is already the complete half-open population for the advancing
+    # upper bound.  A moving wall clock is therefore not an aggregation
+    # semantic: `build_cached_codex_accounting` emits newly-visible rows in the
+    # delta when its upper bound advances.  Keeping `accounting_end` here made
+    # every live dirty tick discard every project group before that delta could
+    # be spliced.
+    signature = (semantic_signature, pairs, context.range_start)
+    state = _CODEX_PROJECT_WIRE_CACHE.get(cache_key)
+    if state is None or state[0] != signature:
+        value = _projects_wire(
+            context, quota_observations, values,
+            accounting_end=accounting_end, cache_key=cache_key,
+        )
+        groups: dict[tuple[str, str], list[object]] = {}
+        for entry in values:
+            groups.setdefault(
+                (str(entry.source_root_key), str(entry.project_key)), [],
+            ).append(entry)
+        _CODEX_PROJECT_WIRE_CACHE[cache_key] = (
+            signature, value,
+            {key: tuple(group) for key, group in groups.items()},
+        )
+        return value
+
+    affected = {
+        (str(entry.source_root_key), str(entry.project_key))
+        for entry in (*tuple(changed_old), *tuple(changed_new))
+    }
+    if not affected:
+        return state[1]
+    label_state = _CODEX_PROJECT_LABEL_CACHE.get(cache_key) or {}
+    labels = label_state.get("labels") or {}
+    old_ids = {
+        int(getattr(entry, "cache_entry_id", 0) or 0)
+        for entry in changed_old
+    }
+    groups = dict(state[2])
+    for key in affected:
+        groups[key] = tuple(
+            entry for entry in groups.get(key, ())
+            if int(getattr(entry, "cache_entry_id", 0) or 0) not in old_ids
+        )
+    for entry in changed_new:
+        key = (str(entry.source_root_key), str(entry.project_key))
+        groups[key] = (*groups.get(key, ()), entry)
+    for key in affected:
+        if groups.get(key):
+            groups[key] = tuple(sorted(
+                groups[key], key=_codex_incremental_entry_order,
+            ))
+        else:
+            groups.pop(key, None)
+    partial_entries = tuple(
+        replace(entry, display_label=labels[str(entry.project_key)])
+        for key in sorted(affected) for entry in groups.get(key, ())
+    )
+    result = build_codex_project_result(
+        partial_entries,
+        range_start=context.range_start,
+        range_end=accounting_end,
+        as_of=context.now_utc,
+    )
+    partial_rows = () if result.data is None else tuple({
+        "key": dashboard_resource_key("project", "codex", row.project_key),
+        "source": "codex",
+        "label": row.display_label,
+        "session_count": row.session_count,
+        "first_seen": row.first_seen.astimezone(UTC).isoformat(),
+        "last_seen": row.last_seen.astimezone(UTC).isoformat(),
+        "cost_usd": row.totals.cost_usd,
+        "input_tokens": row.totals.input_tokens,
+        "cached_input_tokens": row.totals.cached_input_tokens,
+        "output_tokens": row.totals.output_tokens,
+        "reasoning_output_tokens": row.totals.reasoning_output_tokens,
+        "total_tokens": row.totals.total_tokens,
+    } for row in result.data.projects)
+    affected_keys = {
+        dashboard_resource_key("project", "codex", project_key)
+        for _root_key, project_key in affected
+    }
+    rows = tuple(sorted(
+        (
+            *(row for row in state[1]["rows"] if row["key"] not in affected_keys),
+            *partial_rows,
+        ),
+        key=lambda row: (
+            float(row["cost_usd"]), str(row["label"]), str(row["key"]),
+        ),
+        reverse=True,
+    ))
+    value = {
+        "rows": rows,
+        "total_cost_usd": stable_sum(
+            float(row["cost_usd"]) for row in rows),
+        "total_tokens": sum(int(row["total_tokens"]) for row in rows),
+    }
+    _CODEX_PROJECT_WIRE_CACHE[cache_key] = (signature, value, groups)
+    return value
 
 
 def _partial_projects_wire(
@@ -2744,15 +3585,23 @@ def _partial_projects_wire(
     }
 
 
+_CODEX_ENTRY_ADAPTER_CACHE: dict[int, tuple[object, CodexEntry]] = {}
+
+
 def _codex_entries_from_accounting(entries: Iterable[object]) -> list[CodexEntry]:
     """Adapt coordinated accounting rows for the shipped non-project kernels."""
     converted: list[CodexEntry] = []
     for entry in entries:
+        cache_entry_id = int(getattr(entry, "cache_entry_id", 0) or 0)
+        cached = _CODEX_ENTRY_ADAPTER_CACHE.get(cache_entry_id)
+        if cache_entry_id and cached is not None and cached[0] == entry:
+            converted.append(cached[1])
+            continue
         source_path = str(getattr(entry, "source_path", "") or "")
         session_id = str(getattr(entry, "session_id", "") or "")
         if not source_path or not session_id:
             raise SourceCapabilityUnavailable("Codex accounting lacks session identity")
-        converted.append(CodexEntry(
+        value = CodexEntry(
             timestamp=getattr(entry, "timestamp"),
             session_id=session_id,
             model=str(getattr(entry, "model")),
@@ -2762,7 +3611,17 @@ def _codex_entries_from_accounting(entries: Iterable[object]) -> list[CodexEntry
             reasoning_output_tokens=int(getattr(entry, "reasoning_output_tokens")),
             total_tokens=int(getattr(entry, "total_tokens")),
             source_path=source_path,
-        ))
+            cost_usd=(
+                float(entry.cost_usd)
+                if getattr(entry, "cost_usd", None) is not None else None
+            ),
+            cache_entry_id=cache_entry_id,
+            source_root_key=str(getattr(entry, "source_root_key", "") or ""),
+            conversation_key=str(getattr(entry, "conversation_key", "") or ""),
+        )
+        converted.append(value)
+        if cache_entry_id:
+            _CODEX_ENTRY_ADAPTER_CACHE[cache_entry_id] = (entry, value)
     return converted
 
 
@@ -2867,6 +3726,136 @@ def _build_codex_native_weekly_view(
     )
 
 
+_CODEX_WEEKLY_VIEW_CACHE: dict[object, tuple] = {}
+
+
+def _codex_weekly_period_for_entry(
+    entry: object, periods: Iterable[CodexWeeklyPeriod],
+) -> CodexWeeklyPeriod | None:
+    if codex_model_scoped_quota_pool(getattr(entry, "model", None)) is not None:
+        return None
+    timestamp = getattr(entry, "timestamp").astimezone(UTC)
+    root_key = str(getattr(entry, "source_root_key", "") or "")
+    return next((
+        period for period in periods
+        if root_key in period.source_root_keys
+        and period.start_at <= timestamp < period.end_at
+    ), None)
+
+
+def _cached_codex_native_weekly_view(
+    stats_conn: sqlite3.Connection,
+    entries: Iterable[object],
+    *,
+    changed_old: Iterable[object],
+    changed_new: Iterable[object],
+    cache_key: object,
+    semantic_signature: object,
+    source_root_keys: Iterable[str],
+    active_cycle: CodexCycleBoundary | None,
+    now_utc: dt.datetime,
+    display_tz_name: str | None,
+    speed: str,
+    account_key: str | None = None,
+    include_account_keys: bool = False,
+) -> CodexWeeklyView:
+    """Rebuild only native quota periods touched by accounting changes."""
+    values = tuple(entries)
+    roots = tuple(source_root_keys)
+    periods = _codex_weekly_periods(
+        stats_conn,
+        source_root_keys=roots,
+        active_cycle=active_cycle,
+        account_key=account_key,
+    )
+    signature = (
+        semantic_signature, periods, roots, display_tz_name, speed,
+        account_key, include_account_keys,
+    )
+    state = _CODEX_WEEKLY_VIEW_CACHE.get(cache_key)
+    if state is None or state[0] != signature:
+        view = _build_codex_native_weekly_view(
+            stats_conn, values, source_root_keys=roots,
+            active_cycle=active_cycle, now_utc=now_utc,
+            display_tz_name=display_tz_name, speed=speed,
+            account_key=account_key, include_account_keys=include_account_keys,
+        )
+        groups: dict[dt.datetime, list[object]] = {}
+        for entry in values:
+            period = _codex_weekly_period_for_entry(entry, periods)
+            if period is not None:
+                groups.setdefault(period.start_at, []).append(entry)
+        _CODEX_WEEKLY_VIEW_CACHE[cache_key] = (
+            signature, view,
+            {key: tuple(group) for key, group in groups.items()},
+        )
+        return view
+
+    affected = {
+        period.start_at
+        for entry in (*tuple(changed_old), *tuple(changed_new))
+        if (period := _codex_weekly_period_for_entry(entry, periods)) is not None
+    }
+    if not affected:
+        return state[1]
+
+    prior = state[1]
+    old_ids = {
+        int(getattr(entry, "cache_entry_id", 0) or 0)
+        for entry in changed_old
+    }
+    groups = dict(state[2])
+    for start_at in affected:
+        groups[start_at] = tuple(
+            entry for entry in groups.get(start_at, ())
+            if int(getattr(entry, "cache_entry_id", 0) or 0) not in old_ids
+        )
+    for entry in changed_new:
+        period = _codex_weekly_period_for_entry(entry, periods)
+        if period is not None:
+            groups[period.start_at] = (*groups.get(period.start_at, ()), entry)
+    for start_at in affected:
+        if groups.get(start_at):
+            groups[start_at] = tuple(sorted(
+                groups[start_at], key=_codex_incremental_entry_order,
+            ))
+        else:
+            groups.pop(start_at, None)
+    replacements: dict[dt.datetime, object] = {}
+    for start_at in affected:
+        partial = _build_codex_native_weekly_view(
+            stats_conn,
+            groups.get(start_at, ()),
+            source_root_keys=roots, active_cycle=active_cycle,
+            now_utc=now_utc, display_tz_name=display_tz_name, speed=speed,
+            account_key=account_key, include_account_keys=include_account_keys,
+        )
+        row = next((
+            row for row in partial.rows
+            if getattr(row, "period_start_at", None) == start_at
+        ), None)
+        if row is not None:
+            replacements[start_at] = row
+    rows = tuple(sorted(
+        (
+            *(row for row in prior.rows
+              if getattr(row, "period_start_at", None) not in affected),
+            *replacements.values(),
+        ),
+        key=lambda row: row.period_start_at,
+    ))
+    view = replace(
+        prior,
+        rows=rows,
+        total_cost_usd=stable_sum(row.cost_usd for row in rows),
+        total_tokens=sum(row.total_tokens for row in rows),
+        period_start=(periods[0].start_at if periods else None),
+        period_end=now_utc,
+    )
+    _CODEX_WEEKLY_VIEW_CACHE[cache_key] = (signature, view, groups)
+    return view
+
+
 def _codex_account_five_hour_percent(
     observations: Iterable[object],
     now_utc: dt.datetime,
@@ -2913,8 +3902,9 @@ def _codex_accounts_wire(
     so the envelope stays byte-identical, spec R8). Each account carries
     ``{accountKey, label, plan, active, weeklyPercent, fiveHourPercent, resetsAt,
     spendUsd, inputTokens, cachedInputTokens, outputTokens,
-    reasoningOutputTokens, totalTokens, unattributed?}``; ``hero_cycles_wire`` is
-    the thin per-account cycle-boundary list the hero renders (``cycles[]``).
+    reasoningOutputTokens, totalTokens, unattributed?, spendWindow?}``;
+    ``hero_cycles_wire`` is the thin per-account cycle-boundary list the hero
+    renders (``cycles[]``).
     """
     import _cctally_account
     active_keys = _cctally_account.resolve_active_account_keys()
@@ -2932,10 +3922,38 @@ def _codex_accounts_wire(
     reg = _cctally_account.load_accounts(context.stats_conn, "codex")
     plan_by_key = {r["account_key"]: r.get("plan_type") for r in reg}
     ordered_keys = [r["account_key"] for r in reg]
+    # #564: a card with no live cycle is read over ONE native cycle width
+    # ending at `now`, never the whole accounting range. The decorated hero is
+    # the sum of these cards under a week label, so an addend spanning the full
+    # ~30-day range put spend that label does not cover into the headline.
+    #
+    # The start comes from `now_utc`, NOT `accounting_end`: the latter is
+    # `now + 1us`, an adapter that lets an inclusive-now surface call a
+    # half-open reader, so subtracting the width from it would drop a row
+    # landing exactly on the boundary while keeping one landing at `now`.
+    fallback_start = max(
+        accounting_start,
+        context.now_utc - dt.timedelta(minutes=ACCOUNT_WEEKLY_WINDOW_MINUTES),
+    )
+    fallback_window = {
+        "kind": "trailing-cycle",
+        "startAt": fallback_start.astimezone(UTC).isoformat(),
+        "endAt": context.now_utc.astimezone(UTC).isoformat(),
+    }
     # Include unattributed last iff it has cycle/5h/spend evidence.
     unattributed_rows = load_cached_rooted_codex_accounting_entries(
         accounting_start, accounting_end, speed=context.speed,
         cache_conn=context.cache_conn, account_key=_lib_accounts.UNATTRIBUTED,
+    )
+    # Existence is decided over the accounting range so a sentinel holding only
+    # older spend keeps its card; the totals below cover the bounded window, so
+    # a resolved $0.00 is an honest empty state rather than an absence (#564).
+    # The bounded set is a strict subset of the rows already loaded above, so it
+    # is derived in memory rather than re-queried on every publish. `timestamp`
+    # is normalized to UTC by the reader and the upper bound is already applied,
+    # so the two predicates coincide.
+    unattributed_window_rows = tuple(
+        row for row in unattributed_rows if row.timestamp >= fallback_start
     )
     if (
         unattributed_rows
@@ -2978,12 +3996,14 @@ def _codex_accounts_wire(
             )
             totals = _totals(rows)
         elif is_unattributed:
-            totals = _totals(unattributed_rows)
+            totals = _totals(unattributed_window_rows)
         else:
-            # A real account without a live weekly cycle: totals over the
-            # accounting range so the card still shows spend (no bars/reset).
+            # A real account without a live weekly cycle: totals over ONE
+            # native cycle width ending now, so this card can be summed into a
+            # week-labelled headline without overstating it (#564). No bars or
+            # reset, because there is no live cycle to describe.
             rows = load_cached_rooted_codex_accounting_entries(
-                accounting_start, accounting_end, speed=context.speed,
+                fallback_start, accounting_end, speed=context.speed,
                 cache_conn=context.cache_conn, account_key=key,
             )
             totals = _totals(rows)
@@ -3010,6 +4030,12 @@ def _codex_accounts_wire(
             # cannot speak for a fresh sibling, and staleness is disclosure
             # only — the retained percentage, reset and spend remain useful.
             card["cycleFreshness"] = "stale"
+        if is_unattributed or cyc is None:
+            # The card's totals came from the bounded fallback rather than a
+            # live cycle, so it publishes the exact window it covers. The client
+            # reads this key and never infers the case from a null `resetsAt`,
+            # which is true of several unrelated states (#564 D3).
+            card["spendWindow"] = fallback_window
         accounts_wire.append(card)
         if cyc is not None and not is_unattributed:
             hero_cycles_wire.append({
@@ -3054,6 +4080,66 @@ def _codex_partition_by_account(
     return {key: tuple(values) for key, values in buckets.items()}
 
 
+def _codex_fold_visible_rows(
+    entries: Iterable[object],
+) -> "tuple[list[CodexEntry], dict[str, tuple[object, ...]], dict[str, tuple[CodexEntry, ...]]]":
+    """One encounter-ordered pass producing the parent's and each account's rows.
+
+    #566 §5.1 item 2. Each visible row is adapted to a ``CodexEntry`` exactly
+    once and then routed into the merged "All" list and into its owning
+    account's list, instead of the parent converting the whole population and
+    every child re-converting its own slice.
+
+    This removes exactly the four whole-population re-adaptations the children
+    performed, worth about 0.4s of a profiled tick on the maintainer's store.
+    It does NOT reduce the 191,225 total calls to
+    ``_codex_entries_from_accounting`` that a build makes: 191,220 of them come
+    from ``_build_codex_native_weekly_view``, which adapts one entry at a time
+    per scope, and this fold does not touch that site.
+
+    Encounter order is preserved in every output, and the ordering matters:
+    ``_aggregate_codex_buckets`` accumulates in encounter order and preserves
+    first-seen model order, so routing through a set, or sorting, would move a
+    bucket's ``models`` order for free. Adaptation is
+    1:1 and order-preserving, so each account's list is byte-identical to
+    adapting that account's rows on their own — which is what makes the fold a
+    reuse of work rather than a change to any builder's arithmetic. The
+    shipped builders still run per scope, so the merged parent stays
+    byte-identical BY CONSTRUCTION (#416 §5.2 review F9/F10).
+    """
+    rows = tuple(entries)
+    all_entries = _codex_entries_from_accounting(rows)
+    rows_by_account: dict[str, list[object]] = {}
+    entries_by_account: dict[str, list[CodexEntry]] = {}
+    for row, converted in zip(rows, all_entries):
+        key = str(
+            getattr(row, "account_key", "") or _lib_accounts.UNATTRIBUTED)
+        rows_by_account.setdefault(key, []).append(row)
+        entries_by_account.setdefault(key, []).append(converted)
+    return (
+        all_entries,
+        {key: tuple(values) for key, values in rows_by_account.items()},
+        {key: tuple(values) for key, values in entries_by_account.items()},
+    )
+
+
+_CODEX_ACCOUNT_SCOPE_CACHE: dict[
+    str, tuple[object, dict[str, object]]
+] = {}
+
+
+def reset_codex_account_scope_cache() -> None:
+    """Test/process reset for #582's immutable finalized account scopes."""
+    _CODEX_ACCOUNT_SCOPE_CACHE.clear()
+    _CODEX_ENTRY_ADAPTER_CACHE.clear()
+    _CODEX_PROJECT_LABEL_CACHE.clear()
+    _CODEX_PERIOD_VIEW_CACHE.clear()
+    _CODEX_WEEKLY_VIEW_CACHE.clear()
+    _CODEX_CACHE_REPORT_ROWS.clear()
+    _CODEX_SESSION_VIEW_CACHE.clear()
+    _CODEX_PROJECT_WIRE_CACHE.clear()
+
+
 def _codex_account_scopes_wire(
     context: DashboardReadContext,
     *,
@@ -3061,6 +4147,8 @@ def _codex_account_scopes_wire(
     quota_observations: Iterable[object],
     cycle_by_account: Mapping[str, "CodexCycleBoundary"],
     visible_accounting_entries: Iterable[object],
+    visible_rows_by_account: "Mapping[str, tuple[object, ...]] | None" = None,
+    visible_entries_by_account: "Mapping[str, tuple[CodexEntry, ...]] | None" = None,
     active_roots: Iterable[str],
     accounting_end: dt.datetime,
     metadata_incomplete: bool,
@@ -3071,6 +4159,12 @@ def _codex_account_scopes_wire(
     budget_cost_events_by_account: Mapping[str, tuple[tuple[dt.datetime, float], ...]],
     private_session_labels: dict[str, str],
     hero_failure: bool = False,
+    dirty_accounts: Iterable[str] = (),
+    scope_signature: object | None = None,
+    changed_old_by_account: Mapping[str, tuple[CodexEntry, ...]] | None = None,
+    changed_new_by_account: Mapping[str, tuple[CodexEntry, ...]] | None = None,
+    changed_old_rows_by_account: Mapping[str, tuple[object, ...]] | None = None,
+    changed_new_rows_by_account: Mapping[str, tuple[object, ...]] | None = None,
 ) -> dict[str, dict[str, object]]:
     """The per-account CHILDREN of the merged Codex read model (spec §5.3).
 
@@ -3101,7 +4195,15 @@ def _codex_account_scopes_wire(
     """
     visible = tuple(visible_accounting_entries)
     observations = tuple(quota_observations)
-    partition = _codex_partition_by_account(visible)
+    # #566 §5.1 item 2: the caller folded the visible rows once and hands both
+    # partitions down. Re-deriving them here is retained only for direct
+    # callers (tests, the source-detail reader) that have no fold to share.
+    if visible_rows_by_account is None or visible_entries_by_account is None:
+        _all, visible_rows_by_account, visible_entries_by_account = (
+            _codex_fold_visible_rows(visible)
+        )
+    partition = visible_rows_by_account
+    entries_partition = visible_entries_by_account
     obs_partition: dict[str, list[object]] = {}
     for observation in observations:
         obs_partition.setdefault(
@@ -3110,19 +4212,29 @@ def _codex_account_scopes_wire(
     budget_rows = tuple(budget_milestones)
     projected_rows = tuple(projected_budget_milestones)
     roots = tuple(active_roots)
+    dirty_account_keys = {str(key) for key in dirty_accounts}
+    changed_old_by_account = changed_old_by_account or {}
+    changed_new_by_account = changed_new_by_account or {}
+    changed_old_rows_by_account = changed_old_rows_by_account or {}
+    changed_new_rows_by_account = changed_new_rows_by_account or {}
 
     def _for_account(key: str) -> dict[str, object]:
         rows = partition.get(key, ())
         account_observations = tuple(obs_partition.get(key, ()))
-        entries = _codex_entries_from_accounting(rows)
+        entries = list(entries_partition.get(key, ()))
         cycle = cycle_by_account.get(key)
         sessions_view = (
             build_rooted_codex_session_view(
                 rows, now_utc=context.now_utc,
                 tz_name=context.display_tz_name, speed=context.speed,
             )
-            if metadata_incomplete else build_codex_session_view(
-                entries, now_utc=context.now_utc,
+            if metadata_incomplete else _cached_codex_session_view(
+                entries,
+                changed_old=changed_old_rows_by_account.get(key, ()),
+                changed_new=changed_new_rows_by_account.get(key, ()),
+                cache_key=("account", key),
+                semantic_signature=scope_signature,
+                now_utc=context.now_utc,
                 tz_name=context.display_tz_name, speed=context.speed,
             )
         )
@@ -3165,16 +4277,31 @@ def _codex_account_scopes_wire(
             # quota window with no spend yet, and a retired one the reverse.
             "is_empty": not rows and not account_observations,
             "periods": {
-                "daily": _period_wire(build_codex_daily_view(
-                    entries, now_utc=context.now_utc,
-                    tz_name=context.display_tz_name, speed=context.speed,
+                "daily": _period_wire(_cached_codex_period_view(
+                    entries,
+                    changed_old=changed_old_by_account.get(key, ()),
+                    changed_new=changed_new_by_account.get(key, ()),
+                    kind="daily", cache_key=("account", key),
+                    semantic_signature=scope_signature,
+                    now_utc=context.now_utc, tz_name=context.display_tz_name,
+                    speed=context.speed,
                 )),
-                "monthly": _period_wire(build_codex_monthly_view(
-                    entries, now_utc=context.now_utc,
-                    tz_name=context.display_tz_name, speed=context.speed,
+                "monthly": _period_wire(_cached_codex_period_view(
+                    entries,
+                    changed_old=changed_old_by_account.get(key, ()),
+                    changed_new=changed_new_by_account.get(key, ()),
+                    kind="monthly", cache_key=("account", key),
+                    semantic_signature=scope_signature,
+                    now_utc=context.now_utc, tz_name=context.display_tz_name,
+                    speed=context.speed,
                 )),
-                "weekly": _period_wire(_build_codex_native_weekly_view(
-                    context.stats_conn, rows, source_root_keys=roots,
+                "weekly": _period_wire(_cached_codex_native_weekly_view(
+                    context.stats_conn, rows,
+                    changed_old=changed_old_rows_by_account.get(key, ()),
+                    changed_new=changed_new_rows_by_account.get(key, ()),
+                    cache_key=("account", key),
+                    semantic_signature=scope_signature,
+                    source_root_keys=roots,
                     active_cycle=cycle, now_utc=context.now_utc,
                     display_tz_name=context.display_tz_name, speed=context.speed,
                     account_key=key,
@@ -3186,18 +4313,26 @@ def _codex_account_scopes_wire(
             ),
             "projects": (
                 _partial_projects_wire(rows, conversation_metadata)
-                if metadata_incomplete else _projects_wire(
+                if metadata_incomplete else _cached_projects_wire(
                     context, account_observations, rows,
+                    changed_old=changed_old_rows_by_account.get(key, ()),
+                    changed_new=changed_new_rows_by_account.get(key, ()),
                     accounting_end=accounting_end,
+                    cache_key=("account", key),
+                    semantic_signature=scope_signature,
                 )
             ),
             "cache_report": _codex_cache_report_wire(
                 rows, metadata=conversation_metadata, now_utc=context.now_utc,
                 display_tz_name=context.display_tz_name, speed=context.speed,
                 anomaly_threshold_pp=context.cache_report_anomaly_threshold_pp,
+                cache_key=("account", key),
+                changed_old=changed_old_rows_by_account.get(key, ()),
+                changed_new=changed_new_rows_by_account.get(key, ()),
+                semantic_signature=scope_signature,
             ),
             "budget": {
-                "status": _configured_codex_budget_status(
+                **_codex_budget_status_domain(
                     context, rows,
                     cost_events=budget_cost_events_by_account.get(key, ()),
                     account_key=key,
@@ -3237,7 +4372,52 @@ def _codex_account_scopes_wire(
         (set(partition) | set(obs_partition) | _codex_block_account_keys(
             context.stats_conn, roots)) - set(ordered_keys)
     )
-    return {key: _for_account(key) for key in ordered_keys + residual_keys}
+    result: dict[str, dict[str, object]] = {}
+    live_keys = ordered_keys + residual_keys
+    for key in live_keys:
+        account_observations = tuple(obs_partition.get(key, ()))
+        account_metadata = tuple(
+            (identity, conversation_metadata.get(identity))
+            for identity in sorted({
+                (
+                    str(getattr(row, "source_root_key", "")),
+                    str(getattr(row, "source_path", "")),
+                )
+                for row in partition.get(key, ())
+            })
+        )
+        signature = (
+            scope_signature,
+            account_observations,
+            cycle_by_account.get(key),
+            account_metadata,
+            tuple(_codex_account_scoped_rows(alert_rows, key)),
+            tuple(_codex_account_scoped_rows(budget_rows, key)),
+            tuple(_codex_account_scoped_rows(projected_rows, key)),
+            budget_cost_events_by_account.get(key, ()),
+            context.codex_budget,
+            context.codex_quota_actual_thresholds,
+            context.codex_quota_projected_thresholds,
+            context.cache_report_anomaly_threshold_pp,
+            metadata_incomplete,
+            hero_failure,
+        )
+        cached = _CODEX_ACCOUNT_SCOPE_CACHE.get(key)
+        if (
+            scope_signature is not None
+            and key not in dirty_account_keys
+            and cached is not None
+            and cached[0] == signature
+        ):
+            result[key] = cached[1]
+            continue
+        value = _for_account(key)
+        result[key] = value
+        if scope_signature is not None:
+            _CODEX_ACCOUNT_SCOPE_CACHE[key] = (signature, value)
+    for stale_key in set(_CODEX_ACCOUNT_SCOPE_CACHE) - set(live_keys):
+        _CODEX_ACCOUNT_SCOPE_CACHE.pop(stale_key, None)
+    return result
 
 
 def _codex_block_account_keys(
@@ -3418,13 +4598,61 @@ def build_codex_source_state(
     No sync, rollout scan, CLI parser, or fallback is reachable from this
     adapter.  Period and session arithmetic remains delegated to the shipped
     S3 view kernels, preserving the CLI's inclusive-token vocabulary.
+
+    The whole read runs under ONE ``codex_path_scope`` (#566 §5.1 item 1), so
+    the merged parent view and every per-account child share a single session
+    root resolution and a single parse per distinct session file. The scope is
+    opened here rather than further out because this is the boundary that owns
+    every Codex session view in the build, and it is discarded when the read
+    returns.
     """
+    # This memo deduplicates the several account/parent consumers inside ONE
+    # coordinated source build. It may not cross that boundary: a caller can
+    # deliberately request a fresh build after stats/account decoration changes
+    # without advancing cache.db's quota ledger, and the established contract
+    # requires one bounded physical load for that new build.
+    reset_codex_quota_observation_cache()
+    caches = (
+        _CODEX_QUOTA_OBSERVATION_CACHE,
+        _CODEX_PERIOD_VIEW_CACHE,
+        _CODEX_CACHE_REPORT_ROWS,
+        _CODEX_SESSION_VIEW_CACHE,
+        _CODEX_PROJECT_LABEL_CACHE,
+        _CODEX_PROJECT_WIRE_CACHE,
+        _CODEX_ENTRY_ADAPTER_CACHE,
+        _CODEX_WEEKLY_VIEW_CACHE,
+        _CODEX_ACCOUNT_SCOPE_CACHE,
+    )
+    cache_checkpoint = tuple(dict(cache) for cache in caches)
+    accounting_checkpoint = (
+        _lib_snapshot_cache.checkpoint_codex_accounting_cache_state()
+    )
+    try:
+        with codex_path_scope() as path_scope:
+            return _build_codex_source_state(
+                context, data_version=data_version, path_scope=path_scope,
+            )
+    except Exception:
+        for cache, prior in zip(caches, cache_checkpoint):
+            cache.clear()
+            cache.update(prior)
+        _lib_snapshot_cache.restore_codex_accounting_cache_state(
+            accounting_checkpoint)
+        raise
+
+
+def _build_codex_source_state(
+    context: DashboardReadContext,
+    *,
+    data_version: str,
+    path_scope: object,
+) -> SourceDashboardState:
     active_roots = tuple(sorted(
         str(row[0]) for row in context.cache_conn.execute(
             "SELECT source_root_key FROM codex_source_roots"
         )
     ))
-    quota_observations = load_codex_quota_observations(
+    quota_observations = _cached_codex_quota_observations(
         source_root_keys=active_roots,
         cache_conn=context.cache_conn,
         captured_at_or_after=(
@@ -3445,8 +4673,23 @@ def build_codex_source_state(
     accounting_end = context.now_utc + dt.timedelta(microseconds=1)
     accounting_start = context.range_start
     if context.codex_budget is not None:
-        _period, budget_start, _budget_end = _configured_codex_budget_window(context)
-        accounting_start = min(accounting_start, budget_start)
+        # #556 S5 Unit 2 (Unit 1 review R6, widened) — this is the SECOND
+        # unguarded call to the window resolver, and unlike
+        # `_codex_budget_cost_events` it had no boundary of its own. It sits
+        # outside every other `try` in this function, so an unresolvable window
+        # escaped into `_tui_build_source_bundle`'s `source_build_failed`
+        # handler and destroyed the entire Codex provider's data — the exact
+        # failure §3.5 exists to prevent, reached from a different line.
+        #
+        # Degrading to the un-widened accounting range cannot publish a false
+        # figure: the same failure reaches `_codex_budget_status_domain`, which
+        # nulls the status and names `budget_compute_failed`.
+        try:
+            _period, budget_start, _budget_end = _configured_codex_budget_window(context)
+        except Exception:
+            _warn_codex_budget_window_once("accounting_range")
+        else:
+            accounting_start = min(accounting_start, budget_start)
     health = load_codex_project_metadata_health(
         cache_conn=context.cache_conn,
         start=accounting_start,
@@ -3461,15 +4704,51 @@ def build_codex_source_state(
         "run `cctally cache-sync --source codex --rebuild`."
     )
     qualified_entries: tuple[object, ...] = ()
+    accounting_dirty_accounts: tuple[str, ...] = ()
+    accounting_changed_old: tuple[object, ...] = ()
+    accounting_changed_new: tuple[object, ...] = ()
     if not metadata_incomplete:
         try:
-            qualified_entries = load_qualified_codex_entries(
-                accounting_start,
-                accounting_end,
-                speed=context.speed,
-                sync=False,
+            cached_accounting = _lib_snapshot_cache.build_cached_codex_accounting(
                 cache_conn=context.cache_conn,
+                range_start=accounting_start,
+                range_end=accounting_end,
+                extra_signature=(
+                    context.speed,
+                    tuple(str(root) for root in path_scope.roots),
+                    active_roots,
+                ),
+                load_all=lambda: load_qualified_codex_entries(
+                    accounting_start,
+                    accounting_end,
+                    speed=context.speed,
+                    sync=False,
+                    cache_conn=context.cache_conn,
+                ),
+                load_paths=lambda identities: load_qualified_codex_entries(
+                    accounting_start,
+                    accounting_end,
+                    speed=context.speed,
+                    sync=False,
+                    cache_conn=context.cache_conn,
+                    source_identities=identities,
+                ),
+                path_of=lambda entry: (
+                    str(entry.source_root_key), str(entry.source_path),
+                ),
+                account_of=lambda entry: str(entry.account_key),
+                order_key=lambda entry: (
+                    entry.timestamp,
+                    str(entry.source_root_key),
+                    str(entry.conversation_key),
+                    int(entry.cache_entry_id),
+                ),
+                identity_of=lambda entry: int(entry.cache_entry_id),
             )
+            qualified_entries = cached_accounting.entries
+            accounting_dirty_accounts = cached_accounting.dirty_accounts
+            accounting_changed_old = cached_accounting.changed_old
+            accounting_changed_new = cached_accounting.changed_new
             accounting_entries: tuple[object, ...] = qualified_entries
         except QualifiedMetadataUnavailable:
             # A cached read must be internally coherent, but retain accounting
@@ -3478,19 +4757,31 @@ def build_codex_source_state(
                 "Codex qualified metadata read became unavailable; using cache-only accounting fallback"
             )
             metadata_incomplete = True
+            _lib_snapshot_cache.reset_codex_accounting_cache_state()
             accounting_entries = load_cached_rooted_codex_accounting_entries(
                 accounting_start,
                 accounting_end,
                 speed=context.speed,
                 cache_conn=context.cache_conn,
             )
+            accounting_dirty_accounts = tuple(sorted({
+                str(getattr(entry, "account_key", "") or
+                    _lib_accounts.UNATTRIBUTED)
+                for entry in accounting_entries
+            }))
     else:
+        _lib_snapshot_cache.reset_codex_accounting_cache_state()
         accounting_entries = load_cached_rooted_codex_accounting_entries(
             accounting_start,
             accounting_end,
             speed=context.speed,
             cache_conn=context.cache_conn,
         )
+        accounting_dirty_accounts = tuple(sorted({
+            str(getattr(entry, "account_key", "") or
+                _lib_accounts.UNATTRIBUTED)
+            for entry in accounting_entries
+        }))
     budget_entries = _codex_entries_from_accounting(accounting_entries)
     cycles_all: list[CodexCycleBoundary] = []
     try:
@@ -3535,12 +4826,66 @@ def build_codex_source_state(
         entry for entry in accounting_entries
         if context.range_start <= getattr(entry, "timestamp").astimezone(UTC) < accounting_end
     )
-    entries = _codex_entries_from_accounting(visible_accounting_entries)
-    daily = build_codex_daily_view(
-        entries, now_utc=context.now_utc, tz_name=context.display_tz_name, speed=context.speed,
+    # #566 §5.1 item 2: one pass over the visible rows produces the merged
+    # population and both per-account partitions. The children below reuse
+    # these instead of re-partitioning and re-adapting the same rows.
+    entries, visible_rows_by_account, visible_entries_by_account = (
+        _codex_fold_visible_rows(visible_accounting_entries)
     )
-    monthly = build_codex_monthly_view(
-        entries, now_utc=context.now_utc, tz_name=context.display_tz_name, speed=context.speed,
+    changed_old_visible = tuple(
+        entry for entry in accounting_changed_old
+        if context.range_start <= entry.timestamp.astimezone(UTC) < accounting_end
+    )
+    changed_new_visible = tuple(
+        entry for entry in accounting_changed_new
+        if context.range_start <= entry.timestamp.astimezone(UTC) < accounting_end
+    )
+    changed_old_entries = tuple(_codex_entries_from_accounting(changed_old_visible))
+    changed_new_entries = tuple(_codex_entries_from_accounting(changed_new_visible))
+
+    def _changed_by_account(rows, converted):
+        grouped: dict[str, list[CodexEntry]] = {}
+        for row, entry in zip(rows, converted):
+            key = str(getattr(row, "account_key", "") or
+                      _lib_accounts.UNATTRIBUTED)
+            grouped.setdefault(key, []).append(entry)
+        return {key: tuple(values) for key, values in grouped.items()}
+
+    changed_old_by_account = _changed_by_account(
+        changed_old_visible, changed_old_entries)
+    changed_new_by_account = _changed_by_account(
+        changed_new_visible, changed_new_entries)
+
+    def _changed_rows_by_account(rows):
+        grouped: dict[str, list[object]] = {}
+        for row in rows:
+            key = str(getattr(row, "account_key", "") or
+                      _lib_accounts.UNATTRIBUTED)
+            grouped.setdefault(key, []).append(row)
+        return {key: tuple(values) for key, values in grouped.items()}
+
+    changed_old_rows_by_account = _changed_rows_by_account(changed_old_visible)
+    changed_new_rows_by_account = _changed_rows_by_account(changed_new_visible)
+    # The published provider version also carries quota/stat generations.
+    # Those generations must rebuild quota domains, but they are not accounting
+    # semantics: folding them into these cache keys made one fresh quota sample
+    # discard every clean period/session/project/account group.  The accounting
+    # population cache above owns upper-bound, root and speed invalidation; the
+    # individual builders add their own tz/speed/period/cycle dimensions.
+    period_signature = (
+        "codex-accounting-v1", context.range_start, metadata_incomplete,
+    )
+    daily = _cached_codex_period_view(
+        entries, changed_old=changed_old_entries,
+        changed_new=changed_new_entries, kind="daily", cache_key=("parent",),
+        semantic_signature=period_signature, now_utc=context.now_utc,
+        tz_name=context.display_tz_name, speed=context.speed,
+    )
+    monthly = _cached_codex_period_view(
+        entries, changed_old=changed_old_entries,
+        changed_new=changed_new_entries, kind="monthly", cache_key=("parent",),
+        semantic_signature=period_signature, now_utc=context.now_utc,
+        tz_name=context.display_tz_name, speed=context.speed,
     )
     # R8 gate, resolved once before the parent weekly projection so that only
     # a decorated merged row gains the additive account axis. Focused children
@@ -3551,9 +4896,13 @@ def build_codex_source_state(
             context.stats_conn, "codex")
     except Exception:
         _codex_decorated = False
-    weekly = _build_codex_native_weekly_view(
+    weekly = _cached_codex_native_weekly_view(
         context.stats_conn,
         visible_accounting_entries,
+        changed_old=changed_old_visible,
+        changed_new=changed_new_visible,
+        cache_key=("parent",),
+        semantic_signature=period_signature,
         source_root_keys=active_roots,
         active_cycle=cycle,
         now_utc=context.now_utc,
@@ -3568,8 +4917,11 @@ def build_codex_source_state(
             tz_name=context.display_tz_name,
             speed=context.speed,
         )
-        if metadata_incomplete else build_codex_session_view(
-            entries, now_utc=context.now_utc, tz_name=context.display_tz_name, speed=context.speed,
+        if metadata_incomplete else _cached_codex_session_view(
+            entries, changed_old=changed_old_visible,
+            changed_new=changed_new_visible, cache_key=("parent",),
+            semantic_signature=period_signature, now_utc=context.now_utc,
+            tz_name=context.display_tz_name, speed=context.speed,
         )
     )
     quota = _quota_read_model(
@@ -3611,9 +4963,10 @@ def build_codex_source_state(
     projected_budget_rows = _projected_budget_wire(
         context.stats_conn, decorated=_codex_decorated)
     budget_cost_events = _codex_budget_cost_events(context, budget_entries)
-    configured_budget = _configured_codex_budget_status(
+    configured_budget_domain = _codex_budget_status_domain(
         context, budget_entries, cost_events=budget_cost_events,
     )
+    configured_budget = configured_budget_domain["status"]
     conversation_metadata = _codex_conversation_metadata(context.cache_conn)
     cache_report = _codex_cache_report_wire(
         visible_accounting_entries,
@@ -3622,14 +4975,22 @@ def build_codex_source_state(
         display_tz_name=context.display_tz_name,
         speed=context.speed,
         anomaly_threshold_pp=context.cache_report_anomaly_threshold_pp,
+        cache_key=("parent",),
+        changed_old=changed_old_visible,
+        changed_new=changed_new_visible,
+        semantic_signature=period_signature,
     )
     projects = (
         _partial_projects_wire(visible_accounting_entries, conversation_metadata)
-        if metadata_incomplete else _projects_wire(
+        if metadata_incomplete else _cached_projects_wire(
             context,
             quota_observations,
             visible_accounting_entries,
+            changed_old=changed_old_visible,
+            changed_new=changed_new_visible,
             accounting_end=accounting_end,
+            cache_key=("parent",),
+            semantic_signature=period_signature,
         )
     )
     alerts = _alerts_wire(context.stats_conn, decorated=_codex_decorated)
@@ -3677,6 +5038,9 @@ def build_codex_source_state(
     accounts_wire: list[dict[str, object]] = []
     hero_cycles_wire: list[dict[str, object]] = []
     account_scopes: dict[str, dict[str, object]] = {}
+    # #556 S5 §3.8: bound OUTSIDE the try, because the degrade path below has to
+    # be able to clear it, and the retained `clock_data` reads it either way.
+    budget_events_by_account: dict[str, tuple[tuple[dt.datetime, float], ...]] = {}
     if _codex_decorated:
         try:
             accounts_wire, hero_cycles_wire = _codex_accounts_wire(
@@ -3704,17 +5068,19 @@ def build_codex_source_state(
             # Budget cost events are frozen per account over the CONFIGURED
             # budget window, which can start before `range_start` — so they come
             # from the full `accounting_entries`, not the visible slice.
-            budget_events_by_account = {
+            budget_events_by_account = ({
                 key: _codex_budget_cost_events(context, rows)
                 for key, rows in _codex_partition_by_account(
                     accounting_entries).items()
-            } if context.codex_budget is not None else {}
+            } if context.codex_budget is not None else {})
             account_scopes = _codex_account_scopes_wire(
                 context,
                 account_keys=[str(card["accountKey"]) for card in accounts_wire],
                 quota_observations=quota_observations,
                 cycle_by_account=cycle_by_account,
                 visible_accounting_entries=visible_accounting_entries,
+                visible_rows_by_account=visible_rows_by_account,
+                visible_entries_by_account=visible_entries_by_account,
                 active_roots=active_roots,
                 accounting_end=accounting_end,
                 metadata_incomplete=metadata_incomplete,
@@ -3725,6 +5091,17 @@ def build_codex_source_state(
                 budget_cost_events_by_account=budget_events_by_account,
                 private_session_labels=private_session_labels,
                 hero_failure=hero_failure,
+                dirty_accounts=accounting_dirty_accounts,
+                changed_old_by_account=changed_old_by_account,
+                changed_new_by_account=changed_new_by_account,
+                changed_old_rows_by_account=changed_old_rows_by_account,
+                changed_new_rows_by_account=changed_new_rows_by_account,
+                # Quota/stat generations are already represented by each
+                # child's quota observations, cycle and alert/budget rows in
+                # `_codex_account_scopes_wire`'s outer signature. Reuse the
+                # accounting-only semantic key here so an unrelated account's
+                # fresh quota sample cannot evict every clean child.
+                scope_signature=period_signature,
             )
             # #416 QA P1-A — the "All accounts" Blocks panel is the UNION of
             # every account's 5-hour blocks. `_quota_wire` filters
@@ -3787,6 +5164,7 @@ def build_codex_source_state(
             accounts_wire = []
             hero_cycles_wire = []
             account_scopes = {}
+            budget_events_by_account = {}
     # #416 QA P0-A — the "All accounts" headline is the MERGED spend and tokens
     # (spec §6, decision D6). Everything above resolves the hero from ONE
     # representative cycle (`cycles_all[0]` plus that cycle's own
@@ -3800,11 +5178,11 @@ def build_codex_source_state(
     # blanks them with a pointer to the cards. The merge is a SUM OF THE CARDS
     # rather than a fresh query, so the headline can never disagree with the
     # strip it sits above (an account without a live cycle contributes exactly
-    # what its own card shows, over the accounting range — the card's documented
-    # fallback). Gated on `_codex_decorated`, so a <=1-real-account install
-    # keeps the single-cycle hero byte-for-byte (R8); gated on `hero_failure`,
-    # so an unavailable hero stays unavailable rather than gaining totals the
-    # rest of the envelope says are absent.
+    # what its own card shows, over the bounded fallback window that card
+    # publishes — #564). Gated on `_codex_decorated`, so a <=1-real-account
+    # install keeps the single-cycle hero byte-for-byte (R8); gated on
+    # `hero_failure`, so an unavailable hero stays unavailable rather than
+    # gaining totals the rest of the envelope says are absent.
     if _codex_decorated and accounts_wire and not hero_failure:
         cycle_cost_usd = stable_sum(
             float(card["spendUsd"]) for card in accounts_wire)
@@ -3893,7 +5271,7 @@ def build_codex_source_state(
             "sessions": sessions_wire,
             "quota": quota,
             "budget": {
-                "status": configured_budget,
+                **configured_budget_domain,
                 "milestones": budget_rows,
                 "projected": projected_budget_rows,
             },
@@ -3932,6 +5310,11 @@ def build_codex_source_state(
         },
         clock_data={
             "codex_budget_cost_events": budget_cost_events,
+            # #556 S5 §3.8: the per-account tuples were computed at build and
+            # discarded, so idle refresh had nothing to reclock a child budget
+            # from. Empty for every undecorated install, which keeps the
+            # retained carrier byte-neutral there.
+            "codex_budget_cost_events_by_account": budget_events_by_account,
             # #350 spec §3.3: when the tick passes this instant it must rebuild
             # Codex authoritatively instead of idle-clocking or reusing, because
             # weekly-cycle resolution can change on identical frozen evidence.

@@ -6,14 +6,20 @@ import { fmt } from '../lib/fmt';
 import {
   alertAccount,
   alertDisplay,
-  filterAlertRowsForAccount,
+  filterAlertRowsForFocus,
   selectAlertRowsForView,
+  type AlertAccountFocus,
   toastAlertId,
 } from '../lib/alertIdentity';
-import { VENDOR_WIDE_ACCOUNT, type AccountCard, type SourceAlertRow } from '../types/envelope';
+import {
+  VENDOR_WIDE_ACCOUNT,
+  type AccountCard,
+  type SourceAlertRow,
+  type SourceName,
+} from '../types/envelope';
 import { resolveSourceView } from '../store/sourceView';
-import { shortAccountLabel } from '../store/accountFocus';
-import { useAccountScope } from '../hooks/useScopedSnapshot';
+import { resolveViewAccountFocus, shortAccountLabel } from '../store/accountFocus';
+import { scopeProviderFor, useAccountScope } from '../hooks/useScopedSnapshot';
 import { cardRegionClick } from '../lib/cardRegion';
 import { PANEL_REGISTRY } from '../lib/panelRegistry';
 import { PanelGrip } from './PanelGrip';
@@ -44,7 +50,17 @@ export function RecentAlertsPanel(): JSX.Element {
   const hasBundle = env?.sources != null;
   const view = resolveSourceView(env ?? null, activeSource);
 
-  const scope = useAccountScope();
+  // #556 S5 Unit 2 review F3 — NAME THE PROVIDER. A bare `useAccountScope()`
+  // resolves to "no provider" under All, so `scopesSupported` was false and
+  // `accountKey` null there no matter what was focused. With a Codex account
+  // focused under All that made `accountScoped` false and `accountUnfiltered`
+  // TRUE, and the panel printed "all accounts (unfiltered)" while the Codex
+  // subtree it was reading had already been narrowed to one account. Naming the
+  // provider is the same decision every other All-aware surface makes, and on a
+  // provider tab it resolves to that tab, so those paths are unchanged.
+  const scope = useAccountScope(activeSource, scopeProviderFor(activeSource));
+  // True when a Codex focus really narrowed the subtree this panel is reading.
+  const scopeNarrows = scope.accountKey != null;
   const claudeLegacyRows: SourceAlertRow[] = legacyAlerts.map((a) => ({
     ...a,
     source: 'claude' as const,
@@ -56,19 +72,55 @@ export function RecentAlertsPanel(): JSX.Element {
   const allRows: SourceAlertRow[] = selectAlertRowsForView(
     view, claudeLegacyRows, hasBundle,
   );
+  // #556 S5 §5.11 — under All each provider carries its OWN focus slot, so the
+  // filter is per provider. On a provider tab exactly one leg can be non-null,
+  // which reproduces the pre-S5 single-key behaviour exactly.
+  const focusState = useSyncExternalStore(subscribeStore, () => getState().accountFocus);
+  const alertFocus: AlertAccountFocus = {
+    claude: resolveViewAccountFocus(env, activeSource, 'claude', focusState),
+    codex: resolveViewAccountFocus(env, activeSource, 'codex', focusState),
+  };
   const rowsCarryAccounts = allRows.some((row) => alertAccount(row) != null);
-  const accountScoped = scope.accountKey != null
-    || (scope.requestedKey != null && rowsCarryAccounts);
-  const accountUnfiltered = scope.requestedKey != null
-    && !scope.scopesSupported
-    && !rowsCarryAccounts;
-  const focusedRows = filterAlertRowsForAccount(allRows, scope.requestedKey);
-  const sourceAccounts = activeSource === 'all'
-    ? []
-    : ((env?.sources?.[activeSource]?.data as { accounts?: AccountCard[] } | undefined)?.accounts ?? []);
-  const focusedCard = scope.card
-    ?? sourceAccounts.find((card) => card.accountKey === scope.requestedKey)
-    ?? null;
+  const focusedProviders = (['claude', 'codex'] as SourceName[])
+    .filter((provider) => alertFocus[provider] != null);
+  // The two badges answer one question between them: did focusing narrow this
+  // list? Evidence is either that the rows carry accounts (so the per-provider
+  // filter had something to act on) or that a Codex focus replaced the subtree.
+  // `scopesSupported` is deliberately no longer consulted: on the Claude tab it
+  // is false and `scopeNarrows` is false too, so that path is byte-identical,
+  // while under All it described the absent provider rather than the focus.
+  const accountScoped = focusedProviders.length > 0
+    && (rowsCarryAccounts || scopeNarrows);
+  const accountUnfiltered = focusedProviders.length > 0
+    && !rowsCarryAccounts
+    && !scopeNarrows;
+  const focusedRows = filterAlertRowsForFocus(allRows, alertFocus);
+  const focusedCards = focusedProviders
+    .map((provider) => (
+      (env?.sources?.[provider]?.data as { accounts?: AccountCard[] } | undefined)?.accounts ?? []
+    ).find((card) => card.accountKey === alertFocus[provider]) ?? null)
+    .filter((card): card is AccountCard => card != null);
+  const focusedCard = scope.card ?? focusedCards[0] ?? null;
+  // Two providers can be focused at once under All, and one account's label
+  // would then name the filter wrongly.
+  //
+  // #556 S5 Unit 2 review F3 — and ONE provider focused under All over-claimed
+  // the other way: the badge read "<label> only" while the panel still listed
+  // the other provider's alerts in full, because each provider's rows are
+  // filtered by that provider's own focus. Qualifying by provider rather than
+  // suppressing the badge: the list really is narrowed for one provider, so
+  // saying nothing would leave a user who watched rows disappear with no
+  // explanation. On a provider tab exactly one leg can be non-null and only
+  // that provider's rows are present, so the unqualified label stays correct
+  // there and that markup is unchanged.
+  const soleFocusedProvider = focusedProviders.length === 1 ? focusedProviders[0] : null;
+  const qualifyByProvider = activeSource === 'all' && soleFocusedProvider != null;
+  const focusedProviderLabel = soleFocusedProvider === 'codex' ? 'Codex' : 'Claude';
+  const otherProviderLabel = soleFocusedProvider === 'codex' ? 'Claude' : 'Codex';
+  const focusNoteLabel = focusedProviders.length > 1
+    ? 'focused accounts'
+    : `${qualifyByProvider ? `${focusedProviderLabel}: ` : ''}${
+      shortAccountLabel(focusedCard?.label ?? 'focused account')}`;
 
   // #248 §5 / #264 S1 / #265 A — the Claude empty state reads the current Used %
   // (header) + the configured weekly fire thresholds (default [90, 95]) and
@@ -143,16 +195,26 @@ export function RecentAlertsPanel(): JSX.Element {
             <span
               className="alerts-account-note"
               data-testid="alerts-account-note"
-              title={`Showing only ${focusedCard?.label ?? 'this account'}'s alerts, plus vendor-wide crossings.`}
+              title={focusedProviders.length > 1
+                ? 'Showing only the focused accounts\u2019 alerts, plus vendor-wide crossings.'
+                : qualifyByProvider
+                  ? `Showing only ${focusedCard?.label ?? 'this account'}'s ${focusedProviderLabel} alerts, plus vendor-wide crossings. ${otherProviderLabel} alerts are not filtered by account.`
+                  : `Showing only ${focusedCard?.label ?? 'this account'}'s alerts, plus vendor-wide crossings.`}
             >
-              {shortAccountLabel(focusedCard?.label ?? 'focused account')} only
+              {focusNoteLabel} only
             </span>
           )}
           {accountUnfiltered && (
             <span
               className="alerts-unfiltered-note"
               data-testid="alerts-unfiltered-note"
-              title="Claude alerts are not filtered by account (showing all accounts)."
+              // Names the FOCUSED provider, not a constant. Under All this
+              // badge now fires when only Codex is focused, where the previous
+              // hardcoded "Claude" named the wrong provider — the same
+              // over-claim the sibling badge above was fixed for.
+              title={soleFocusedProvider != null
+                ? `${focusedProviderLabel} alerts are not filtered by account (showing all accounts).`
+                : 'These alerts are not filtered by account (showing all accounts).'}
             >
               all accounts (unfiltered)
             </span>
@@ -207,6 +269,14 @@ export function RecentAlertsPanel(): JSX.Element {
             {alerts.map((row) => {
               const d = alertDisplay(row);
               const account = alertAccount(row);
+              // #574 — the exact instant, with the calendar year the visible
+              // text omits. The OrNull variant is what keeps an unformattable
+              // instant from becoming title="—": it returns null for a null
+              // `whenIso` and for a non-empty string that does not parse,
+              // which testing `d.whenIso` for truthiness would not catch. The
+              // modal's when-cell reads the same helper, so the contract has
+              // one home rather than a copy per surface.
+              const whenTitle = fmt.startedShortOrNull(d.whenIso, ctx);
               return (
                 <li key={toastAlertId(row)} className="alert-row">
                   <span
@@ -233,7 +303,10 @@ export function RecentAlertsPanel(): JSX.Element {
                       {account.label}
                     </span>
                   )}
-                  <span className="alert-when">
+                  <span
+                    className="alert-when"
+                    title={whenTitle ?? undefined}
+                  >
                     {fmt.relativeOrAbsolute(d.whenIso ?? '', ctx)}
                   </span>
                 </li>

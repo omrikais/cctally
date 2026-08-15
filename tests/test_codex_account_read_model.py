@@ -1290,3 +1290,297 @@ def test_one_scoped_identity_resolves_to_one_evidence_tuple(tmp_path, monkeypatc
     parent_active = codex["quota"]["summary"]["active"]
     assert len({row["key"] for row in parent_active}) < len(parent_active), (
         "precondition: the fixture must collide two accounts on one bare key")
+
+
+# --------------------------------------------------------------------------
+# #556 S5 §3.5 — a per-account-only Codex budget must not destroy the provider.
+# --------------------------------------------------------------------------
+
+
+def _per_account_only_codex_context(cache, stats, ns):
+    """A VALID Codex budget with per-account amounts and no vendor-wide one.
+
+    `_validate_codex_budget_block` accepts this shape explicitly
+    (`bin/_cctally_core.py:1350`): `amount_usd` stays `None` when a non-empty
+    `accounts` map is present.
+    """
+    config = {
+        "collector": {"week_start": "sunday"},
+        "budget": {
+            "codex": {
+                "period": "calendar-month",
+                "alert_thresholds": [90, 100],
+                "accounts": {_ACCT_A: 25.0, _ACCT_B: 40.0},
+            },
+        },
+    }
+    codex_budget = ns["_get_budget_config"](config)["codex"]
+    assert codex_budget["amount_usd"] is None, (
+        "precondition: the fixture must be per-account-ONLY, or it cannot "
+        "reach the vendor-wide `float(None)` site at all")
+    return DashboardReadContext(
+        cache_conn=cache, stats_conn=stats, range_start=START,
+        now_utc=NOW, display_tz_name="UTC", week_start_idx=6,
+        week_start_name="sunday", codex_budget=codex_budget,
+    )
+
+
+def test_codex_per_account_only_budget_does_not_fail_the_source_build(codex_env):
+    """A per-account-only Codex configuration leaves `amount_usd = None` while
+    `_configured_codex_budget_status` calls `float(amount_usd)`. There is no
+    exception boundary around it, its caller sits outside any budget-local
+    catch, and `_tui_build_source_bundle` turns the escape into
+    `source_build_failed` for the WHOLE Codex provider.
+
+    A per-account-only configuration must omit or null ONLY the vendor status.
+    """
+    ns, cache, stats, source_module, _root = codex_env
+    _decorate(stats)
+    state = source_module.build_codex_source_state(
+        _per_account_only_codex_context(cache, stats, ns),
+        data_version="s5-per-account-only-v1",
+    )
+
+    assert state.data is not None
+    assert state.availability != "unavailable"
+    assert not any(
+        warning.code == "source_build_failed" for warning in state.warnings)
+    # The vendor-wide status has no amount to compute against.
+    assert state.data["budget"]["status"] is None
+    # ... while the per-account statuses are real.
+    scopes = state.data["account_scopes"]
+    assert scopes[_ACCT_A]["budget"]["status"]["budget_usd"] == 25.0
+    assert scopes[_ACCT_B]["budget"]["status"]["budget_usd"] == 40.0
+    assert scopes[_ACCT_A]["budget"]["status"]["period"] == "calendar-month"
+
+
+def test_codex_per_account_only_budget_names_the_account_budgets_only_disposition(
+    codex_env,
+):
+    """#556 S5 §3.5 / Unit 2 review F1 — the VENDOR-WIDE read of a
+    per-account-only Codex configuration is a configured state, not an unset
+    one, and it must say so on the wire.
+
+    A bare `{"status": None}` is exactly what an install with no Codex budget at
+    all publishes, so the client mapped this to `provider_budget_unset` and
+    rendered "No budget set." beside `cctally budget set <amount> --vendor
+    codex` — to a user whose per-account Codex budgets are configured and
+    published in the same envelope. The Claude half already named this
+    disposition; the Codex half nulled the status and named nothing.
+    """
+    ns, cache, stats, source_module, _root = codex_env
+    _decorate(stats)
+    state = source_module.build_codex_source_state(
+        _per_account_only_codex_context(cache, stats, ns),
+        data_version="s5-per-account-only-disposition-v1",
+    )
+
+    budget = state.data["budget"]
+    assert budget["status"] is None
+    assert budget["not_configured"] == {"disposition": "account_budgets_only"}
+    assert "status_unavailable" not in budget, (
+        "this is a configuration state, not a computation failure")
+    # NON-VACUOUS: an ACCOUNT-scoped read never takes this branch. That account
+    # HAS a budget, so it publishes a status; and an account without one is
+    # genuinely unset rather than account-budgets-only.
+    scoped = state.data["account_scopes"][_ACCT_A]["budget"]
+    assert scoped["status"] is not None
+    assert "not_configured" not in scoped
+
+
+def test_codex_vendor_wide_budget_does_not_claim_account_budgets_only(codex_env):
+    """The disposition is reached ONLY by the per-account-only shape.
+
+    A vendor-wide Codex budget publishes a real status and no disposition, so
+    the new branch cannot be a blanket "Codex budget" marker.
+    """
+    ns, cache, stats, source_module, _root = codex_env
+    _decorate(stats)
+    config = {
+        "collector": {"week_start": "sunday"},
+        "budget": {"codex": {
+            "amount_usd": 300.0,
+            "period": "calendar-month",
+            "alert_thresholds": [90, 100],
+        }},
+    }
+    codex_budget = ns["_get_budget_config"](config)["codex"]
+    assert codex_budget["amount_usd"] == 300.0, (
+        "precondition: the fixture must carry a VENDOR-WIDE amount")
+    context = DashboardReadContext(
+        cache_conn=cache, stats_conn=stats, range_start=START,
+        now_utc=NOW, display_tz_name="UTC", week_start_idx=6,
+        week_start_name="sunday", codex_budget=codex_budget,
+    )
+    state = source_module.build_codex_source_state(
+        context, data_version="s5-codex-vendor-wide-v1",
+    )
+    budget = state.data["budget"]
+    assert budget["status"] is not None
+    assert budget["status"]["budget_usd"] == 300.0
+    assert "not_configured" not in budget
+
+
+def test_codex_budget_cost_event_window_failure_does_not_fail_the_provider(
+    codex_env, monkeypatch,
+):
+    """#556 S5 Unit 1 review R6 — the `_codex_budget_cost_events` boundary is
+    load-bearing and had no test.
+
+    That call sits OUTSIDE every other `try` in `build_codex_source_state`, so
+    without its own catch an unresolvable window raises straight past the
+    budget-local contract and out through the provider-level
+    `source_build_failed` handler. Nothing pinned the silent `return ()`, which
+    is exactly the kind of guard a later reader deletes as dead code.
+    """
+    ns, cache, stats, source_module, _root = codex_env
+    _decorate(stats)
+
+    def _boom(_context):
+        raise ValueError("window resolver exploded")
+
+    monkeypatch.setattr(
+        source_module, "_configured_codex_budget_window", _boom,
+    )
+    state = source_module.build_codex_source_state(
+        _per_account_codex_context(cache, stats, ns),
+        data_version="s5-codex-window-boom-v1",
+    )
+
+    assert state.data is not None
+    assert state.availability != "unavailable"
+    assert not any(
+        warning.code == "source_build_failed" for warning in state.warnings)
+    # The provider survives, and the budget names its reason rather than
+    # publishing a false $0.
+    assert state.data["budget"]["status"] is None
+    unavailable = state.data["budget"]["status_unavailable"]
+    assert unavailable["code"] == "budget_compute_failed"
+    assert unavailable["provider"] == "codex"
+    assert unavailable["message"].strip()
+
+
+def test_codex_budget_compute_failure_degrades_locally_without_failing_provider(
+    codex_env, monkeypatch,
+):
+    """The same explicit local contract Claude gets: a genuine computation error
+    nulls the budget status, NAMES its reason, and does not take the provider
+    down.
+
+    The Unit 1 review found the original form of this test vacuous twice over.
+    It ran on the per-account-ONLY fixture, where the parent status is ``None``
+    before any failure, and it asserted only ``status is None`` — which the
+    child would still satisfy if the ``status_unavailable`` sibling were
+    deleted outright. So the fixture now carries a vendor-wide amount (making
+    the parent's ``None`` a real consequence of the failure) and both scopes
+    assert the named reason.
+    """
+    ns, cache, stats, source_module, _root = codex_env
+    _decorate(stats)
+
+    def _boom(**_kwargs):
+        raise RuntimeError("budget kernel exploded")
+
+    monkeypatch.setitem(ns, "budget_status_payload", _boom)
+    context = _per_account_codex_context(cache, stats, ns)
+    assert context.codex_budget["amount_usd"] == 100.0, (
+        "precondition: a VENDOR-WIDE amount must be configured, or the parent "
+        "status is None before the failure and this test proves nothing")
+    state = source_module.build_codex_source_state(
+        context, data_version="s5-codex-budget-boom-v1",
+    )
+    assert state.data is not None
+    assert state.availability != "unavailable"
+    assert not any(
+        warning.code == "source_build_failed" for warning in state.warnings)
+
+    for scope_label, domain in (
+        ("vendor-wide", state.data["budget"]),
+        ("account", state.data["account_scopes"][_ACCT_A]["budget"]),
+    ):
+        assert domain["status"] is None, scope_label
+        unavailable = domain["status_unavailable"]
+        assert unavailable["code"] == "budget_compute_failed", scope_label
+        assert unavailable["provider"] == "codex", scope_label
+        assert unavailable["message"].strip(), scope_label
+
+
+# --------------------------------------------------------------------------
+# #556 S5 §3.8 — focused child budget statuses reclock with their quota.
+# --------------------------------------------------------------------------
+
+
+def _per_account_codex_context(cache, stats, ns):
+    """Both accounts carry their own Codex budget, at UNEQUAL amounts."""
+    config = {
+        "collector": {"week_start": "sunday"},
+        "budget": {
+            "codex": {
+                "amount_usd": 100.0,
+                "period": "calendar-month",
+                "alert_thresholds": [90, 100],
+                "accounts": {_ACCT_A: 25.0, _ACCT_B: 40.0},
+            },
+        },
+    }
+    return DashboardReadContext(
+        cache_conn=cache, stats_conn=stats, range_start=START,
+        now_utc=NOW, display_tz_name="UTC", week_start_idx=6,
+        week_start_name="sunday",
+        codex_budget=ns["_get_budget_config"](config)["codex"],
+    )
+
+
+def test_focused_codex_child_budget_reclocks_with_its_quota(codex_env):
+    """Per-account cost-event tuples were computed at build but only the
+    vendor-wide tuple was retained, and idle refresh reclocked each child's
+    quota while refreshing only the PARENT status. Pre-existing — but #556 S5
+    makes focused cards read the child status, so shipping it unchanged would
+    put a knowingly stale number on a newly prominent surface.
+    """
+    ns, cache, stats, source_module, _root = codex_env
+    _decorate(stats)
+    state = source_module.build_codex_source_state(
+        _per_account_codex_context(cache, stats, ns),
+        data_version="s5-child-reclock-v1",
+    )
+    child_before = state.data["account_scopes"][_ACCT_A]["budget"]["status"]
+    assert child_before is not None
+    assert child_before["spent_usd"] > 0.0, (
+        "precondition: a zero-spend child has a zero pace, which cannot be "
+        "observed to move")
+    quota_before = state.data["account_scopes"][_ACCT_A]["quota"]
+
+    clocked = source_module.refresh_codex_source_clock(
+        state, now_utc=NOW + dt.timedelta(hours=6),
+    )
+    child_after = clocked.data["account_scopes"][_ACCT_A]["budget"]["status"]
+    quota_after = clocked.data["account_scopes"][_ACCT_A]["quota"]
+
+    assert quota_after != quota_before, (
+        "precondition: the tick must move this child's quota, or 'in step with "
+        "its quota' asserts nothing")
+    assert child_after["pace"]["daily_usd"] != child_before["pace"]["daily_usd"]
+    # Presentation only: the frozen evidence the pace is derived from is intact.
+    assert child_after["spent_usd"] == child_before["spent_usd"]
+    assert child_after["budget_usd"] == 25.0
+    assert child_after["window_start_at"] == child_before["window_start_at"]
+
+
+def test_child_budget_reclock_uses_its_own_events_not_the_parent_tuple(codex_env):
+    """Value-distinctness. The two accounts hold different spend, so a child
+    reclocked from the vendor-wide event tuple would carry the PARENT's
+    trailing-24h figure."""
+    ns, cache, stats, source_module, _root = codex_env
+    _decorate(stats)
+    state = source_module.build_codex_source_state(
+        _per_account_codex_context(cache, stats, ns),
+        data_version="s5-child-events-v1",
+    )
+    later = NOW + dt.timedelta(hours=6)
+    clocked = source_module.refresh_codex_source_clock(state, now_utc=later)
+    parent = clocked.data["budget"]["status"]
+    child = clocked.data["account_scopes"][_ACCT_A]["budget"]["status"]
+    assert parent["recent_24h_usd"] != child["recent_24h_usd"], (
+        "the child's trailing-24h spend must come from its OWN events")
+    assert child["recent_24h_usd"] < parent["recent_24h_usd"]

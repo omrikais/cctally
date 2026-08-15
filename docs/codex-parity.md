@@ -13,8 +13,8 @@ dispatch. S7 now exposes that layer through the dual-form conversation routes,
 the source-aware transcript CLI, qualified export/anonymization, payload
 readback, and the qualified live-tail with Codex child discovery. S8 now ships
 the native React Claude/Codex/All conversation workspace, qualified reading
-position and navigation, and truthful mixed-provider comparison/export. Final
-S9 certification remains deferred.
+position and navigation, and truthful mixed-provider comparison/export. S9 certification is complete on the exact tree recorded in issue #322; the
+executable acceptance matrix contains no deferred outcome.
 
 ## S3 provider-aware CLI analytics
 
@@ -55,8 +55,8 @@ remains deliberately not applicable. S4's dashboard backend contract and S5's
 `source-aware-dashboard-share-identity` acceptance row are supported; S6 ships
 the Codex conversation normalization/assembly kernel layer and S7 exposes it
 through the conversation routes, transcript CLI, export/anonymization, payload
-readback, and live-tail, while the native React UI and reading position (S8) and
-later certification remain deferred, so issue #294 is still open.
+readback, and live-tail. S8 ships the native React UI and qualified reading
+position, and S9 certifies the combined contract.
 
 ## Capability states
 
@@ -209,22 +209,22 @@ blended transcript.
 | forecast | supported | supported | S2 | `codex quota forecast` fits each provider-native reset window independently. |
 | blocks | supported | supported | S2 | `codex quota blocks` preserves native reset windows; it does not translate `primary` or `secondary` to a fixed duration. |
 | thresholds and alerts | supported | supported | S2 | Opt-in alerts are source-root and logical-limit qualified, with one terminal lifecycle per threshold/reset. |
-| `report` and `$ / 1%` | supported | deferred | S3 | Consume S2 quota kernels but compute per source and quota limit. |
+| `report` and `$ / 1%` | supported | supported | S3 | Consume S2 quota kernels but compute per source and quota limit. |
 | `percent-breakdown` / native quota breakdown | supported | supported | S2 | `codex quota breakdown` keeps milestone and query-time cost correlation per source root and logical limit. |
-| `five-hour-breakdown` | supported | deferred | S2 | It is not a substitute for an arbitrary Codex slot. |
+| `five-hour-breakdown` / native quota breakdown | supported | supported | S2 | Claude uses its five-hour breakdown; Codex uses `codex quota breakdown` over the selected native window rather than relabeling an arbitrary slot. |
 
 ### Analytics, sharing, and composition
 
 | Outcome | Claude | Codex | Owner | Truthful contract |
 | --- | --- | --- | --- | --- |
-| project attribution | supported | deferred | S3 | Group only after provider-qualified identity. |
-| `diff` | supported | deferred | S3 | Compare compatible, source-qualified measures. |
-| `range-cost` | supported | deferred | S3 | USD is source-native before optional combination. |
+| project attribution | supported | supported | S3 | Group only after provider-qualified identity. |
+| `diff` | supported | supported | S3 | Compare compatible, source-qualified measures. |
+| `range-cost` | supported | supported | S3 | USD is source-native before optional combination. |
 | `cache-report` cache hit rate | supported | not applicable | S3 | Codex has no Claude cache hit/miss/create/read analogue. |
 | Codex token-reuse forensics | not applicable | supported | S3 | Shipped on the CLI: `build_codex_reuse_result` publishes `cachedInputPercent` / `cachedInputTokens` under a "Cached Input" column with the share title "Token Reuse Report". `cached_input_tokens` is a truthful provider-native outcome, never a hit rate. |
-| share formats | supported | deferred | S3 | Share artifacts retain source-qualified identity. |
-| JSON/config behavior | supported | deferred | S3 | New JSON fields are additive and use `schemaVersion` conventions. |
-| source-aware composition | deferred | deferred | S3 | All-source views retain source labels and native detail. |
+| share formats | supported | supported | S3 | Share artifacts retain source-qualified identity. |
+| JSON/config behavior | supported | supported | S3 | New JSON fields are additive and use `schemaVersion` conventions. |
+| source-aware composition | supported | supported | S3 | All-source views retain source labels and native detail. |
 
 ### Cache Report vocabulary
 
@@ -245,7 +245,7 @@ Normative. This subsection is what the CLI, the dashboard wire, and the dashboar
 
 **One threshold.** `anomaly_threshold_pp` stays a single global setting and governs the reuse-drop predicate on Codex exactly as it governs `cache_drop` on Claude. No per-provider threshold exists.
 
-**The transition is retired atomically (#465).** The Codex wire publishes only the authoritative `cached_input_percent`; `wasted_usd` and `fourteen_day_efficiency_ratio` are `null`, with `not_applicable` carrying the user-facing reason; and `SOURCE_SCHEMA_VERSION` is 4. The source-aware client accessor reads only `cache_hit_percent` for Claude and only `cached_input_percent` for Codex, so neither provider silently borrows the other's field.
+**The transition is retired atomically (#465).** The Codex wire publishes only the authoritative `cached_input_percent`; `wasted_usd` and `fourteen_day_efficiency_ratio` are `null`, with `not_applicable` carrying the user-facing reason; and `SOURCE_SCHEMA_VERSION` was 4 at the time of that change (it is 8 as of #556 S5; the authoritative ledger is `docs/dashboard-gotchas.md`). The source-aware client accessor reads only `cache_hit_percent` for Claude and only `cached_input_percent` for Codex, so neither provider silently borrows the other's field.
 
 ### Dashboard
 
@@ -367,11 +367,12 @@ is a fallback title, not an assumed provider AI title. There is no fake Codex
 record-credit/reset reanchoring or Claude Code hooks. The TUI freeze remains
 explicit.
 
-The delivery graph is `S0 → S1`; `S1 → S2, S3, S4, S6`; `S4 → S5`; and
-`S6 → S7 → S8`, with S2/S3/S5/S8 feeding S9. #293 S4 is a hard predecessor
-for S5 absent a maintainer-approved ownership split. S6–S8 are independently
-deferrable, but the epic cannot claim completion while their matrix rows remain
-`deferred`.
+The completed delivery graph is `S0 → S1`; `S1 → S2, S3, S4, S6`; `S4 → S5`;
+and `S6 → S7 → S8`, with S2/S3/S5/S8 feeding S9. #293 S4 preceded S5. The
+phase boundaries allowed S6–S8 to defer independently during delivery; final
+S9 certification promotes the shipped rows only after their executable and
+real-product evidence passes. TUI stays under the approved bugfix-only freeze
+and remains explicitly not applicable to cross-provider parity.
 
 ## Evidence
 

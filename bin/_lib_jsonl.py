@@ -81,6 +81,12 @@ class CodexEntry:
     reasoning_output_tokens: int
     total_tokens: int
     source_path: str
+    # Cache-backed readers already compute the canonical price while loading.
+    # Direct JSONL/CLI readers leave this unset and retain historical pricing.
+    cost_usd: float | None = None
+    cache_entry_id: int = field(default=0, compare=False, repr=False)
+    source_root_key: str = field(default="", compare=False, repr=False)
+    conversation_key: str = field(default="", compare=False, repr=False)
 
 
 def _entry_token_total(entry: "UsageEntry") -> int:

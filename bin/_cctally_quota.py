@@ -14,11 +14,13 @@ import secrets
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Mapping, NoReturn, Sequence
 
 import _cctally_core
 import _lib_accounts
+import _lib_codex_window_attribution as _wa
+import _lib_quota
 from _cctally_core import _command_as_of, eprint
 from _lib_quota import (
     CODEX_RESET_ANCHOR_TOLERANCE_SECONDS,
@@ -538,10 +540,15 @@ def codex_physical_mutation_seq(conn: sqlite3.Connection) -> int:
         return 0
 
 
-def load_codex_quota_projection_certificate(
+def _codex_quota_projection_certificate_payload(
     conn: sqlite3.Connection,
-) -> tuple[int, dict[str, str]] | None:
-    """Read the post-reconciliation physical-signature certificate in O(1)."""
+) -> "dict | None":
+    """The stored certificate as written, with no revision gate applied.
+
+    Separate from the reader below because the reconcile needs to know WHY a
+    certificate is not usable: an attribution-stale one has to widen the pass to
+    the attribution's own groups, while an absent one is an ordinary full pass.
+    """
     try:
         row = conn.execute(
             "SELECT value FROM cache_meta WHERE key=?",
@@ -550,6 +557,46 @@ def load_codex_quota_projection_certificate(
         if row is None:
             return None
         payload = json.loads(str(row[0]))
+    except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _certificate_attribution_revision(payload: "Mapping[str, object] | None") -> int:
+    """The attribution revision a stored certificate was computed against.
+
+    A certificate written before #500 carries no such member and reads as ``0``,
+    which is also the revision of a store where nothing has ever been asserted —
+    so an install with no attributions keeps its existing certificate and its
+    existing short-circuit unchanged.
+    """
+    if not payload:
+        return 0
+    try:
+        return int(payload.get("attributionRevision", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def load_codex_quota_projection_certificate(
+    conn: sqlite3.Connection,
+) -> tuple[int, dict[str, str]] | None:
+    """Read the post-reconciliation physical-signature certificate in O(1).
+
+    Also gated on the ATTRIBUTION REVISION (#500 spec §8.3). This design writes
+    nothing to ``quota_window_snapshots``, so an operator attribution fires no
+    trigger and appears in no change-ledger entry; left alone, every consumer of
+    this certificate would read a confident no-op and the attribution would never
+    reach ``quota_window_blocks`` until some unrelated future ingest happened to
+    dirty the same group. Returning ``None`` when the stored revision is not the
+    live one puts every consumer — the reconcile short-circuit, the dashboard
+    source coherence check, the deferred cache-sync gate — on the fail-safe side
+    of that question at once.
+    """
+    payload = _codex_quota_projection_certificate_payload(conn)
+    if payload is None:
+        return None
+    try:
         if (
             int(payload["interpretationVersion"])
             != _CODEX_QUOTA_INTERPRETATION_VERSION
@@ -560,9 +607,13 @@ def load_codex_quota_projection_certificate(
             str(root_key): str(signature)
             for root_key, signature in dict(payload["signatures"]).items()
         }
-    except (sqlite3.Error, TypeError, ValueError, KeyError, json.JSONDecodeError):
+    except (sqlite3.Error, TypeError, ValueError, KeyError):
         return None
     if sequence < 0 or any(len(signature) != 64 for signature in signatures.values()):
+        return None
+    if _certificate_attribution_revision(payload) != (
+        _cache_module().codex_window_attribution_revision(conn)
+    ):
         return None
     return sequence, signatures
 
@@ -572,6 +623,7 @@ def _store_codex_quota_projection_certificate(
     sequence: int,
     signatures: Mapping[str, str],
     prune_ledger_through: "int | None" = None,
+    attribution_revision: "int | None" = None,
 ) -> None:
     """Stamp exact validated signatures only if cache physical state is unchanged.
 
@@ -592,6 +644,17 @@ def _store_codex_quota_projection_certificate(
     The prune runs even when the certificate itself is declined: a sequence that
     advanced mid-pass means new evidence landed, not that the old entries are
     unconsumed.
+
+    ``attribution_revision`` (#500 §8.3) is the SEMANTIC twin of ``sequence``
+    and is gated the same way: the caller passes the revision its pass actually
+    computed against, and a live revision that no longer equals it declines the
+    stamp. Reading the live value here instead would certify a projection built
+    from observations that never saw the assertion — and it needs no concurrency
+    to happen, because the pass's OWN ingest cycle materializes a pending
+    ``codex_window_attribution`` op after the observations are loaded. That is
+    §8.5's ``recordedPending`` state, and the certificate would poison every
+    later reconcile with a confident no-op. ``None`` means no gate, for callers
+    that are not a projection pass.
     """
     path = _cctally_core.CACHE_DB_PATH
     if not path.exists():
@@ -611,10 +674,21 @@ def _store_codex_quota_projection_certificate(
             if codex_physical_mutation_seq(conn) != sequence:
                 conn.commit()
                 return
+            live_revision = _cache_module().codex_window_attribution_revision(
+                conn)
+            if (
+                attribution_revision is not None
+                and live_revision != int(attribution_revision)
+            ):
+                conn.commit()
+                return
             payload = json.dumps({
                 "interpretationVersion": _CODEX_QUOTA_INTERPRETATION_VERSION,
                 "sequence": sequence,
                 "signatures": dict(sorted(signatures.items())),
+                # #500 §8.3: the semantic revision this projection was computed
+                # against — the caller's, verified equal to the live one above.
+                "attributionRevision": live_revision,
             }, sort_keys=True, separators=(",", ":"))
             conn.execute(
                 "INSERT INTO cache_meta(key, value) VALUES (?, ?) "
@@ -1110,6 +1184,640 @@ def _iter_shard_rows(conn, shards):
         yield from conn.execute(shard_sql, shard_params)
 
 
+#: Every ``quota_window_snapshots`` column that must be present and non-blank
+#: before ``load_codex_quota_observations`` will interpret the row.
+#:
+#: Named once because TWO populations have to agree on it: the loader's own, and
+#: the #500 attribution evidence pass's. A row one of them keeps and the other
+#: drops is a silent divergence in BOTH directions — an evidence row the loader
+#: discarded can name an account no loaded observation carries, turning a group
+#: the fold sees as cleanly unattributed into a suppressed one.
+#:
+#: One divergence between those two populations is KNOWN and is not on this
+#: list, because it is not about a required column. Both sides derive the group
+#: anchor as ``COALESCE(canonical_resets_at_utc, resets_at_utc)``, but SQL
+#: ``COALESCE`` only replaces NULL, while the loader's per-row interpretation
+#: treats ``''`` as absent too (``in (None, "")``) and falls back to the raw
+#: reset. So a row storing an EMPTY canonical anchor is kept by the loader and
+#: dropped by the evidence pass, which discards one witness for that group. The
+#: append path never writes ``''`` — this shape comes from a hand-repaired row —
+#: and the effect is one-directional (a narrower witness set can only make an
+#: assertion dormant, never make it claim a group it does not own), so it is
+#: recorded here rather than repaired. It predates #500.
+_CODEX_QUOTA_REQUIRED_TEXT = (
+    "source", "source_root_key", "source_path", "captured_at_utc",
+    "observed_slot", "logical_limit_key", "resets_at_utc",
+)
+
+
+def _codex_quota_required_text_present(values: Iterable[object]) -> bool:
+    """True iff every required text value is present and not blank."""
+    return not any(
+        value is None or not str(value).strip() for value in values)
+
+
+# --------------------------------------------------------------------------
+# #500 §6.4 — the fold-time operator attribution overlay
+# --------------------------------------------------------------------------
+#
+# The operator's assertions live in the append-only journal and are indexed into
+# cache.db's `codex_window_attributions` (#500 Task 1). This is where they are
+# APPLIED: immediately before the continuity fold, so an attributed group is
+# genuinely identified by the time `adopt_unidentified_observations`,
+# `build_blocks` and the spend-adoption pass see it. Nothing is written back to
+# `quota_window_snapshots`, which stays raw pre-fold provider evidence.
+#
+# Resolution and application are separate phases and are NOT interchangeable
+# (spec §6.4.1). Witness matching is population-dependent, and several callers
+# deliberately hand the loader a reduced population — the dashboard bounds by
+# recent days and a row cap, doctor asks for the latest row per identity. If
+# matching ran against the reduced set, a component a later observation bridged
+# could present a subset carrying none of the assertion's original witnesses and
+# the attribution would vanish from the dashboard alone. So resolution always
+# reads its own COMPLETE evidence for the roots in play, and only application
+# touches the caller's rows.
+
+
+def _cache_module():
+    """`_cctally_cache`, imported lazily.
+
+    That module imports THIS one inside its own functions for the same reason:
+    the cache leg reads quota observations and the quota leg reads the cache's
+    derived attribution index, so a module-level import either way is a cycle.
+    """
+    import _cctally_cache
+
+    return _cctally_cache
+
+
+def _codex_quota_instant_is_valid(value: object) -> bool:
+    """``_parse_utc`` succeeds on ``value``, without paying for the conversion.
+
+    The evidence pass asks this question about every row's capture and reset
+    only to agree with the loader on which rows exist, and never uses the
+    resulting datetime — while ``astimezone`` is the expensive half of
+    ``_parse_utc``.
+
+    Same acceptance set, and the last branch is what makes that true rather than
+    approximately true. ``_parse_utc`` ends in ``astimezone(UTC)``, which raises
+    ``OverflowError`` when shifting the instant leaves the representable range —
+    a year-9999 instant with a negative offset, or a year-1 instant with a
+    positive one. Skipping the conversion outright would accept a row the loader
+    rejects, so it is performed on exactly the two years where it can fail, and
+    nowhere else.
+    """
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return False
+    if parsed.year in (dt.MINYEAR, dt.MAXYEAR):
+        try:
+            parsed.astimezone(UTC)
+        except (OverflowError, OSError, ValueError):
+            return False
+    return True
+
+
+def _codex_attribution_witness(value: object) -> str:
+    """One spelling for one reset instant, applied to BOTH sides of the binding.
+
+    The cache retains whichever spelling the provider sent and the journal
+    payload carries whichever spelling the command read, so a `Z` witness and a
+    `+00:00` group member are the same instant and must intersect. This is the
+    same fail-open normalizer the loading-unit key uses.
+    """
+    return _ledger.normalize_reset(value)
+
+
+def _codex_attribution_table_present(conn: sqlite3.Connection) -> bool:
+    """Whether this cache carries the derived index at all.
+
+    A cache too old to have it degrades to "no assertions", exactly as every
+    other column probe in this loader degrades. The fail-LOUD requirement of
+    §6.2 is about the rebuild's publication gate, which is where a partial index
+    would be certified as complete; a read against a pre-#500 cache has no
+    assertion to under-apply.
+    """
+    try:
+        return bool(conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            " WHERE type='table' AND name='codex_window_attributions' LIMIT 1"
+        ).fetchone())
+    except sqlite3.DatabaseError:
+        return False
+
+
+def _codex_attribution_axis_shards(
+    assertions: "Sequence[Mapping[str, object]]",
+) -> "dict[tuple, set[str]]":
+    """Assertions grouped by their four normalized axes, witnesses unioned.
+
+    The shard, not the assertion, is the unit both evidence passes are issued
+    per — because the kernel binds on ``group.axes == assertion.axes`` and every
+    assertion sharing one axis combination therefore reaches the same candidate
+    groups. One query per combination is what keeps the pass proportional to the
+    axes in play instead of to the number of assertions.
+    """
+    shards: "dict[tuple, set[str]]" = {}
+    for assertion in assertions:
+        try:
+            axes = (
+                str(assertion["source_root_key"]),
+                str(assertion["logical_limit_key"]),
+                str(assertion["observed_slot"]),
+                int(assertion["window_minutes"]),
+            )
+            witnesses = {
+                str(witness) for witness in assertion["raw_resets_at_utc"]}
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not all(str(member).strip() for member in axes[:3]) or not witnesses:
+            continue
+        shards.setdefault(axes, set()).update(witnesses)
+    return shards
+
+
+def _codex_attribution_stored_limit_keys(logical_limit_key: str) -> "list[str]":
+    """Every spelling ``quota_window_snapshots`` can hold for one axis key.
+
+    Two closures, because the stored key and the INTERPRETED key are not the
+    same value. The snap closure covers the weekly jitter that lives in the key
+    as well as in the column, and the model-pool strip covers the read-path
+    rewrite: a row the interpretation moves INTO a model-scoped bucket is stored
+    under the ordinary key, so an axis key carrying a ``modelPool`` member has to
+    ask for the stripped spellings too or its own members become unreachable.
+    For an ordinary key ``strip_model_pool`` is the identity and this is exactly
+    the three snap spellings.
+    """
+    return sorted(
+        set(codex_snap_equivalent_limit_keys(logical_limit_key))
+        | set(codex_snap_equivalent_limit_keys(
+            _ledger.strip_model_pool(logical_limit_key)))
+    )
+
+
+def _load_codex_window_group_evidence(
+    conn: sqlite3.Connection, assertions: "Sequence[Mapping[str, object]]",
+) -> "tuple[_wa.WindowGroup, ...]":
+    """Complete current evidence for every group a stored witness can reach.
+
+    Two indexed passes rather than one interpretation of all history, and the
+    two are exactly equivalent to a full read for RESOLUTION's purposes:
+
+    * Pass 1 finds the canonical anchors of every group holding a row whose RAW
+      reset is one of the stored witnesses. The kernel binds on an intersection
+      against those witnesses, so a group holding none of them cannot match and
+      its absence here changes no verdict — the assertion is dormant either way.
+    * Pass 2 loads the COMPLETE membership of exactly those groups. Every member
+      of a group shares its axes and its canonical anchor by definition of the
+      physical window key, so the shard is a superset of the group and the
+      identified accounts, the model-pool verdict and the full witness set are
+      all read over the whole population.
+
+    BOTH passes are sharded on the assertion's four axes, and that is the whole
+    performance story. ``idx_qws_physical_group`` is ``(source_root_key,
+    logical_limit_key, observed_slot, window_minutes, unixepoch(COALESCE(
+    canonical_resets_at_utc, resets_at_utc))) WHERE source='codex'``, and SQLite
+    cannot skip an interior member: a pass constraining only the root falls back
+    to ``idx_quota_window_source_root`` and reads the root's whole history per
+    query. Measured read-only on the maintainer's 267,163-row store, 63
+    assertions over 2 axis combinations resolving 57 groups:
+
+    ==============================================  =========  =========
+    pass                                            root-only   sharded
+    ==============================================  =========  =========
+    1 (one query, or one per axis combination)        63.9 ms   43.8 ms
+    2 (one query per group)                         3609.7 ms  119.2 ms
+    whole call, SQL and interpretation together     4443.5 ms  453.8 ms
+    ==============================================  =========  =========
+
+    Pass 2 is where the plan actually changes, and it is the dominant cost. It
+    moves from ``SEARCH ... USING INDEX idx_quota_window_source_root
+    (source_root_key=?)`` at 63.3 ms per group to ``SEARCH ... USING INDEX
+    idx_qws_physical_group (source_root_key=? AND logical_limit_key=? AND
+    observed_slot=? AND window_minutes=? AND <expr>=?)`` at 2.1 ms per group.
+    Pass 1 cannot constrain the fifth member at all — it matches RAW resets
+    while the index holds the coalesced anchor — so it seeks the four-member
+    prefix and scans that range; its gain is modest and, on a store where every
+    axis combination is asserted at once, it can cost slightly more than one
+    root-wide query. That is accepted: pass 1 is under 2% of the call, and
+    pairing the axes with each anchor is what lets pass 2 seek all five members.
+
+    This runs three times per ``sync_codex_cache`` and once per dashboard tick
+    and per ``codex quota``, inside both cache flocks.
+
+    Interpretation matches ``load_codex_quota_observations`` member for member —
+    the ``window_minutes`` snap, the limit-key snap, the model-pool rewrite, and
+    the row-validity predicate — because the group key produced here has to equal
+    ``_lib_quota._physical_window_key`` of the observations it will own, and the
+    accounts read here have to be the accounts those observations carry.
+
+    A row whose ``canonical_resets_at_utc`` is NULL is NOT lost: the anchor
+    expression coalesces onto the raw reset, and ``QuotaObservation`` fills
+    ``canonical_resets_at`` from ``resets_at`` under exactly the same rule
+    (``bin/_lib_quota.py`` ``__post_init__``), so both sides key such a row on
+    its own raw reset and they agree. Cache migration 032 backfills the column
+    for ``source='codex'`` anyway.
+    """
+    shards = _codex_attribution_axis_shards(assertions)
+    if not shards:
+        return ()
+    columns = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(quota_window_snapshots)")
+    }
+    if not {"source", "source_root_key", "resets_at_utc"} <= columns:
+        return ()
+    has_anchor = "canonical_resets_at_utc" in columns
+    has_account = "account_key" in columns
+    has_model = "observed_model" in columns
+    anchor_expr = (
+        "COALESCE(canonical_resets_at_utc, resets_at_utc)"
+        if has_anchor else "resets_at_utc"
+    )
+    account_expr = "account_key" if has_account else "NULL"
+    model_expr = "observed_model" if has_model else "NULL"
+    # The seven required-text columns first, in `_CODEX_QUOTA_REQUIRED_TEXT`
+    # order, so the shared predicate can be applied to `row[:7]` verbatim.
+    pass_two_select = (
+        "SELECT source, source_root_key, source_path, captured_at_utc,"
+        "       observed_slot, logical_limit_key, resets_at_utc,"
+        "       window_minutes, limit_id, limit_name, used_percent,"
+        "       line_offset,"
+        f"       {model_expr} AS observed_model,"
+        f"       {account_expr} AS account_key,"
+        f"       {anchor_expr} AS anchor"
+        "  FROM quota_window_snapshots"
+    )
+
+    buckets: "dict[tuple, dict]" = {}
+    # Per-CALL memos. Every one of these is a pure function of a value drawn
+    # from a tiny domain — at most a handful of stored limit-key spellings, one
+    # anchor spelling per group, a few distinct raw resets, one or two models —
+    # evaluated once per ROW over a population that is ~1,700 rows per group on
+    # the maintainer's store. Interpreting each row independently made the
+    # Python half of this pass cost more than the (now indexed) SQL half.
+    snapped_keys: "dict[str, str]" = {}
+    pools: "dict[object, object]" = {}
+    instants: "dict[str, object]" = {}
+    valid_instants: "dict[str, bool]" = {}
+    witness_texts: "dict[str, str]" = {}
+    model_scoped: "dict[tuple, bool]" = {}
+    for axes, shard_witnesses in sorted(shards.items()):
+        root_key, limit_key, slot, window_minutes = axes
+        # Rows are STORED under whichever length and key spelling the provider
+        # sent, so the filter enumerates every equivalent rather than snapping
+        # in SQL — which it could not do and still seek the index.
+        limit_keys = _codex_attribution_stored_limit_keys(limit_key)
+        minutes = sorted({
+            int(value)
+            for value in codex_snap_equivalent_window_minutes(window_minutes)
+        })
+        witnesses = sorted(shard_witnesses)
+        axis_clause = (
+            " WHERE source='codex' AND source_root_key = ?"
+            "   AND logical_limit_key IN ("
+            + ",".join("?" * len(limit_keys)) + ")"
+            "   AND observed_slot = ?"
+            "   AND window_minutes IN (" + ",".join("?" * len(minutes)) + ")"
+        )
+        axis_params = (root_key, *limit_keys, slot, *minutes)
+        anchors: "set[str]" = set()
+        pass_one = (
+            f"SELECT DISTINCT {anchor_expr} AS anchor"
+            "  FROM quota_window_snapshots"
+            + axis_clause
+            + "   AND unixepoch(resets_at_utc) IN ("
+            + ",".join("unixepoch(?)" for _ in witnesses) + ")"
+        )
+        for row in conn.execute(pass_one, (*axis_params, *witnesses)):
+            if row[0] is None or not str(row[0]).strip():
+                continue
+            anchors.add(str(row[0]))
+        if not anchors:
+            continue
+        # ONE SHARD PER GROUP, for the reason the loader states at its own group
+        # filter: an OR over the equality gives up and scans, while each group
+        # as its own query seeks all five members of `idx_qws_physical_group`.
+        pass_two = (
+            pass_two_select + axis_clause
+            + f"   AND unixepoch({anchor_expr}) = unixepoch(?)"
+        )
+        for anchor_text in sorted(anchors):
+            for row in conn.execute(pass_two, (*axis_params, anchor_text)):
+                if not _codex_quota_required_text_present(row[:7]):
+                    continue
+                if row[14] is None or not str(row[14]).strip():
+                    continue
+                stored_key = str(row[5])
+                anchor_value = str(row[14])
+                capture_text = str(row[3])
+                reset_text = str(row[6])
+                try:
+                    snapped_minutes = snap_codex_window_minutes(int(row[7]))
+                    logical_limit_key = snapped_keys.get(stored_key)
+                    if logical_limit_key is None:
+                        logical_limit_key = snapped_keys[stored_key] = (
+                            snap_window_minutes(stored_key))
+                    model = row[12]
+                    if model not in pools:
+                        pools[model] = codex_model_scoped_quota_pool(model)
+                    if pools[model] is not None:
+                        logical_limit_key = _codex_logical_limit_key(
+                            str(row[1]), row[8], str(row[4]), snapped_minutes,
+                            str(model),
+                        )
+                    anchor = instants.get(anchor_value)
+                    if anchor is None:
+                        anchor = instants[anchor_value] = _parse_utc(
+                            anchor_value, "canonical_resets_at_utc")
+                    used_percent = float(row[10])
+                    line_offset = int(row[11])
+                except (TypeError, ValueError, OverflowError):
+                    # The loader skips a malformed physical row window-by-window
+                    # rather than suppressing unrelated valid windows; so does
+                    # this.
+                    continue
+                # The rest of the loader's per-row contract, which
+                # `QuotaObservation.__post_init__` enforces there and which has
+                # to be enforced here or the two populations disagree.
+                for text in (capture_text, reset_text):
+                    if text not in valid_instants:
+                        valid_instants[text] = _codex_quota_instant_is_valid(
+                            text)
+                if (
+                    not valid_instants[capture_text]
+                    or not valid_instants[reset_text]
+                    or not 0 <= used_percent <= 100
+                    or line_offset < 0
+                    or not str(row[2]).startswith("/")
+                ):
+                    continue
+                key = ("codex", str(row[1]), logical_limit_key, str(row[4]),
+                       snapped_minutes, anchor)
+                bucket = buckets.get(key)
+                if bucket is None:
+                    bucket = buckets[key] = {
+                        "root": str(row[1]),
+                        "limit_key": logical_limit_key,
+                        "slot": str(row[4]),
+                        "minutes": snapped_minutes,
+                        "witnesses": set(),
+                        "accounts": set(),
+                        "model_scoped": False,
+                    }
+                witness = witness_texts.get(reset_text)
+                if witness is None:
+                    witness = witness_texts[reset_text] = (
+                        _codex_attribution_witness(reset_text))
+                bucket["witnesses"].add(witness)
+                account = row[13]
+                if account not in (None, "", _lib_accounts.UNATTRIBUTED):
+                    bucket["accounts"].add(str(account))
+                # `limit_name` is compare=False on the identity, so the label can
+                # differ across one group's observations; ANY Spark evidence
+                # demotes the whole group out of account weekly quota (#373),
+                # matching the spend fold. That direction only ever withholds an
+                # attribution.
+                scope_key = (logical_limit_key, row[9])
+                if scope_key not in model_scoped:
+                    model_scoped[scope_key] = is_model_scoped_codex_quota(
+                        logical_limit_key, row[9])
+                if model_scoped[scope_key]:
+                    bucket["model_scoped"] = True
+    return tuple(
+        _wa.WindowGroup(
+            group_key=key,
+            source_root_key=bucket["root"],
+            logical_limit_key=bucket["limit_key"],
+            observed_slot=bucket["slot"],
+            window_minutes=bucket["minutes"],
+            raw_resets_at_utc=frozenset(bucket["witnesses"]),
+            identified_accounts=frozenset(bucket["accounts"]),
+            model_scoped=bucket["model_scoped"],
+        )
+        for key, bucket in sorted(buckets.items(), key=lambda item: str(item[0]))
+    )
+
+
+def resolve_codex_window_attributions(
+    conn: sqlite3.Connection,
+    *,
+    source_root_keys: "Iterable[str] | None" = None,
+    include_retracted: bool = False,
+) -> "tuple[tuple[_wa.AssertionResolution, ...], Mapping[tuple, str]]":
+    """``resolve_codex_window_attributions_with_evidence`` without the groups."""
+    resolutions, ownership, _groups = (
+        resolve_codex_window_attributions_with_evidence(
+            conn, source_root_keys=source_root_keys,
+            include_retracted=include_retracted))
+    return resolutions, ownership
+
+
+def resolve_codex_window_attributions_with_evidence(
+    conn: sqlite3.Connection,
+    *,
+    source_root_keys: "Iterable[str] | None" = None,
+    include_retracted: bool = False,
+) -> "tuple[tuple[_wa.AssertionResolution, ...], Mapping[tuple, str], tuple[_wa.WindowGroup, ...]]":
+    """Resolve every recorded assertion against COMPLETE current evidence.
+
+    Returns the loaded GROUPS alongside the resolutions and the ownership map,
+    because one caller needs a question the resolutions cannot answer: the §7.1
+    spend reconciliation has to know every account the current world can
+    JUSTIFY for a group, not only the account a resolved assertion supplies. A
+    group's own ``identified_accounts`` is that justification — the fold adopts
+    every unattributed member into it — and a resolution carries it only for
+    ``SUPPRESSED_NATIVE``, so reading it from the groups covers the split and
+    dormant shapes as well. The evidence is loaded once either way; this only
+    stops it being discarded.
+
+    The seam the overlay, ``account attribute``'s preview and the
+    ``accounts.codex_window_attribution`` doctor leg all read: it returns a
+    resolution for EVERY assertion, including the dormant, split and suppressed
+    ones that apply nothing, plus the ownership map only the resolved ones
+    populate.
+
+    ``source_root_keys`` bounds which ASSERTIONS are loaded. It never bounds the
+    evidence they are resolved against — that read derives its own roots from
+    the assertions and is deliberately independent of any presentation bound.
+
+    ``include_retracted`` additionally returns the tombstoned records so the
+    §7.1 spend reconciliation can see the groups an assertion used to own. Their
+    resolutions are reported, but they never enter the ownership map.
+    """
+    if not _codex_attribution_table_present(conn):
+        return (), {}, ()
+    assertions = _cache_module().load_active_window_attributions(
+        conn, source_root_keys=source_root_keys)
+    retracted: "tuple[Mapping[str, object], ...]" = ()
+    if include_retracted:
+        retracted = _cache_module().load_active_window_attributions(
+            conn, source_root_keys=source_root_keys, retracted_only=True)
+    if not assertions and not retracted:
+        return (), {}, ()
+    groups = _load_codex_window_group_evidence(conn, (*assertions, *retracted))
+    resolutions, ownership = _wa.resolve_window_attributions(
+        [
+            _wa.WindowAssertion(
+                op_id=str(record["op_id"]),
+                account_key=str(record["account_key"]),
+                source_root_key=str(record["source_root_key"]),
+                logical_limit_key=str(record["logical_limit_key"]),
+                observed_slot=str(record["observed_slot"]),
+                window_minutes=int(record["window_minutes"]),
+                raw_resets_at_utc=frozenset(
+                    _codex_attribution_witness(value)
+                    for value in record["raw_resets_at_utc"]
+                ),
+            )
+            for record in assertions
+        ],
+        groups,
+    )
+    if not include_retracted:
+        return resolutions, ownership, groups
+    # Retracted records are resolved SEPARATELY, against the same evidence, so a
+    # tombstone can never claim a group or join a conflict. Their only purpose
+    # here is to name the range whose spend rows may still be stamped.
+    tombstoned, _ignored = _wa.resolve_window_attributions(
+        [
+            _wa.WindowAssertion(
+                op_id=str(record["op_id"]),
+                account_key=str(record["account_key"]),
+                source_root_key=str(record["source_root_key"]),
+                logical_limit_key=str(record["logical_limit_key"]),
+                observed_slot=str(record["observed_slot"]),
+                window_minutes=int(record["window_minutes"]),
+                raw_resets_at_utc=frozenset(
+                    _codex_attribution_witness(value)
+                    for value in record["raw_resets_at_utc"]
+                ),
+            )
+            for record in retracted
+        ],
+        groups,
+    )
+    return (*resolutions, *tombstoned), ownership, groups
+
+
+def codex_attribution_projection_scope(
+    conn: sqlite3.Connection,
+) -> "dict[str, frozenset] | None":
+    """The dirty units an attribution change makes the projection owe.
+
+    Returns the same ``{"raw_groups", "units"}`` shape ``_resolve_pass_scope``
+    returns for a ledger-derived scope, so the two are unioned rather than
+    special-cased, or ``None`` when this store has no attribution records at all.
+
+    Three of §8.3's four points live here.
+
+    **Snap expansion.** ``_apply_quota_projection_rows`` requires the loaded
+    observations to carry the COMPLETE current membership of every dirty unit,
+    and the loader's targeted filter matches RAW stored coordinates. One minute
+    of weekly jitter lives in both the limit key and the column, so two raw
+    groups can interpret into one window and asking only for the un-snapped
+    spelling would hand the fold a partial population. This inherits the ledger's
+    own helper rather than re-deriving the closure.
+
+    **Prior units, not only current ones.** A retraction, a newly dormant
+    assertion and a component split all change which unit a group's rows belong
+    to, so the sweep set carries every unit a record named AT ASSERTION TIME
+    alongside every unit its current resolution names. Without the first half the
+    obsolete blocks survive as exactly the duplicated window this work removes.
+
+    **Suppressed and dormant records still count.** A record that resolves to
+    nothing is precisely the one whose previously-materialized rows have to be
+    swept, so the scope is built from every record — active, retracted,
+    suppressed, split — and not from the ownership map.
+    """
+    if not _codex_attribution_table_present(conn):
+        return None
+    cache = _cache_module()
+    records = (
+        *cache.load_active_window_attributions(conn),
+        *cache.load_active_window_attributions(conn, retracted_only=True),
+    )
+    if not records:
+        return None
+    raw: "set[tuple]" = set()
+    units: "set[str]" = set()
+    for record in records:
+        anchor = _ledger.normalize_reset(record["canonical_resets_at_utc"])
+        group = (
+            str(record["source_root_key"]),
+            str(record["logical_limit_key"]),
+            str(record["observed_slot"]),
+            int(record["window_minutes"]),
+            anchor,
+        )
+        raw.add(group)
+        units.add(_ledger.physical_group_key_text(
+            _ledger.loading_unit_from_raw(group)))
+    resolutions, _ownership = resolve_codex_window_attributions(
+        conn, include_retracted=True)
+    for resolution in resolutions:
+        group_key = resolution.group_key
+        if group_key is None:
+            continue
+        # A resolution's group key is the INTERPRETED one, so its unit is taken
+        # through `loading_unit_from_identity` — the half that strips a
+        # `modelPool` member. `loading_unit_from_raw` applies the length snap
+        # only, so a SUPPRESSED_MODEL_SCOPED resolution fed through it would
+        # produce a unit string no block ever wrote, and the sweep would look for
+        # a key nothing stamped. The raw-coordinate filter below is a different
+        # question and keeps the raw helper: the loader matches STORED columns,
+        # and the stored row is what carries the un-stripped key.
+        raw.add((
+            str(group_key[1]), str(group_key[2]), str(group_key[3]),
+            int(group_key[4]), _ledger.normalize_reset(_utc_iso(group_key[5])),
+        ))
+        units.add(_ledger.physical_group_key_text(
+            _ledger.loading_unit_from_identity(
+                source_root_key=str(group_key[1]),
+                logical_limit_key=str(group_key[2]),
+                observed_slot=str(group_key[3]),
+                window_minutes=int(group_key[4]),
+                canonical_reset_iso=_utc_iso(group_key[5]),
+            )))
+    return {
+        "raw_groups": _ledger.snap_equivalent_raw_groups(raw),
+        "units": frozenset(units),
+    }
+
+
+def _apply_codex_window_attribution_overlay(
+    conn: sqlite3.Connection,
+    observations: "list[QuotaObservation]",
+    *,
+    source_root_keys: "set[str] | None",
+) -> "list[QuotaObservation]":
+    """Stamp resolved ownership onto this load's currently-unattributed rows.
+
+    The table-presence probe lives in the resolver, so this is one extra
+    `sqlite_master` read and one indexed read of an empty table on a store that
+    has never asserted anything, and nothing else.
+    """
+    if not observations:
+        return observations
+    _resolutions, ownership = resolve_codex_window_attributions(
+        conn, source_root_keys=source_root_keys)
+    if not ownership:
+        return observations
+    return list(_wa.apply_resolution(
+        ownership,
+        observations,
+        _lib_quota._physical_window_key,
+        lambda observation: observation.identity.account_key,
+        lambda observation, account: replace(
+            observation,
+            identity=replace(observation.identity, account_key=account),
+        ),
+    ))
+
+
 def load_codex_quota_observations(
     *,
     source_root_keys: Iterable[str] | None = None,
@@ -1120,6 +1828,7 @@ def load_codex_quota_observations(
     physical_signatures: dict[str, str] | None = None,
     canonical_resets_between: "tuple[dt.datetime, dt.datetime] | None" = None,
     physical_groups: "Iterable[tuple[str, str, str, int, str]] | None" = None,
+    latest_per_identity: bool = False,
 ) -> tuple[QuotaObservation, ...]:
     """Load only valid root-qualified S1 physical quota rows.
 
@@ -1173,6 +1882,39 @@ def load_codex_quota_observations(
     the account over the population) happens below, in Python, exactly as it
     does on the unbounded path — so the caller is responsible for widening a
     dirty group to every raw spelling that snaps onto it before asking for it.
+
+    ``latest_per_identity`` (#566 §5.1 item 5) returns exactly the latest
+    physical observation of each interpreted identity over the SAME all-history
+    population, without materializing one Python object per retained row. It is
+    a work bound, not a scope bound: no time range, no root filter and no row
+    cap is introduced, so a caller that only needs each window's most recent
+    capture — ``doctor`` — reads the same identities, the same latest captures
+    and therefore the same verdict as the full load, on a store where the full
+    load meant interpreting 266,337 rows to answer a question about 608 of them.
+
+    SQL narrows to the rows that can possibly win, and Python still decides. The
+    partition is the RAW spelling of every column the interpretation reads
+    (root, limit key, slot, window minutes, limit id and name, observed model,
+    account key, and the coalesced reset anchor), which is strictly FINER than
+    the interpreted identity — snapping and the model-pool rewrite only ever
+    merge raw partitions, never split one — and the maximum over a set equals
+    the maximum of its parts' maxima, so narrowing to per-partition winners
+    cannot change the answer. Two consequences are load-bearing rather than
+    incidental: the account key is a partition member, so every (physical
+    window, identified account) pair still contributes a row and the
+    window-account continuity fold below sees the same identified-account set it
+    sees on the full population; and the cut keeps EVERY row tied at the
+    partition's maximum whole-second capture rather than one row per partition,
+    because SQL compares seconds while ``physical_order_key`` compares full
+    datetimes and then breaks ties on the reset anchor and physical position.
+
+    The residual difference is a malformed row. Rows whose required text is
+    blank, or whose capture or reset instant SQLite cannot read as a time, are
+    excluded in SQL exactly as the loop below excludes them; a row that survives
+    those predicates but still fails a Python parse can, on this path, hide an
+    older valid capture of the same window that the full load would have
+    reported. That trade is confined to a store already carrying corrupt quota
+    rows, and it is the only behavioural difference between the two paths.
     """
     for name, value in (
         ("captured_at_or_after", captured_at_or_after), ("active_at", active_at),
@@ -1200,6 +1942,20 @@ def load_codex_quota_observations(
     if max_rows is not None:
         if not isinstance(max_rows, int) or isinstance(max_rows, bool) or max_rows <= 0:
             raise ValueError("max_rows must be a positive integer or None")
+    if latest_per_identity and (
+        max_rows is not None
+        or physical_signatures is not None
+        or physical_groups is not None
+        or captured_at_or_after is not None
+        or active_at is not None
+        or canonical_resets_between is not None
+    ):
+        # Every one of these either bounds the population or accumulates over
+        # it, and the reduction below already discards the rows a bound would
+        # act on. Refuse the combination rather than return a set whose meaning
+        # depends on which narrowing ran first.
+        raise ValueError(
+            "latest_per_identity cannot be combined with a population bound")
     group_filter: tuple[tuple[object, ...], ...] | None = None
     if physical_groups is not None:
         # Neither combination has a coherent meaning, and both would fail
@@ -1273,16 +2029,19 @@ def load_codex_quota_observations(
             "quota_window_snapshots.observed_model AS observed_model"
             if has_observed_model else "NULL AS observed_model"
         )
-        sql = """
-            SELECT source, source_root_key, source_path, line_offset,
+        select_list = """source, source_root_key, source_path, line_offset,
                    captured_at_utc, observed_slot, logical_limit_key, limit_id,
                    limit_name, window_minutes, used_percent, resets_at_utc,
                    plan_type, individual_limit_json, reached_type,
-                   {model_expr}, {account_expr}, {anchor_expr}
+                   {model_expr}, {account_expr}, {anchor_expr}""".format(
+            model_expr=model_expr, account_expr=account_expr,
+            anchor_expr=anchor_expr,
+        )
+        sql = f"""
+            SELECT {select_list}
               FROM quota_window_snapshots
              WHERE source='codex' AND source_root_key IS NOT NULL
-        """.format(model_expr=model_expr, account_expr=account_expr,
-                   anchor_expr=anchor_expr)
+        """
         params: list[object] = []
         if requested is not None:
             if not requested:
@@ -1354,6 +2113,52 @@ def load_codex_quota_observations(
             "COALESCE(canonical_resets_at_utc, resets_at_utc)"
             if has_anchor else "resets_at_utc"
         )
+        if latest_per_identity:
+            # Every column the per-row interpretation reads, in its RAW
+            # spelling. Partitioning on the raw columns is strictly finer than
+            # the interpreted identity, which is what makes the per-partition
+            # maximum a safe candidate set (see the docstring).
+            partition_by = ", ".join((
+                "source_root_key",
+                "logical_limit_key",
+                "observed_slot",
+                "window_minutes",
+                "limit_id",
+                "limit_name",
+                "observed_model" if has_observed_model else "NULL",
+                "account_key" if has_account else "NULL",
+                reset_group_expr,
+            ))
+            # The same validity predicates the interpretation loop applies,
+            # restricted to the ones SQL can state. A row SQLite cannot read as
+            # a time can never win its partition, which matters because the
+            # window maximum ignores NULLs.
+            required_not_blank = " AND ".join(
+                f"trim(coalesce({column}, '')) <> ''"
+                for column in _CODEX_QUOTA_REQUIRED_TEXT
+            )
+            # The root filter is the only optional clause that can still be in
+            # play here, because every other bound is refused above, so the
+            # inner query is rebuilt rather than surgically edited.
+            root_clause = (
+                " AND source_root_key IN ("
+                + ",".join("?" for _ in requested) + ")"
+                if requested is not None else ""
+            )
+            sql = (
+                f"SELECT * FROM (SELECT {select_list},"
+                " MAX(unixepoch(captured_at_utc)) OVER"
+                f" (PARTITION BY {partition_by}) AS _group_latest_capture"
+                " FROM quota_window_snapshots WHERE"
+                " source='codex' AND source_root_key IS NOT NULL"
+                f" AND {required_not_blank}"
+                " AND unixepoch(captured_at_utc) IS NOT NULL"
+                " AND unixepoch(resets_at_utc) IS NOT NULL"
+                f"{root_clause}"
+                ") WHERE unixepoch(captured_at_utc) = _group_latest_capture"
+                " ORDER BY source_root_key, captured_at_utc, resets_at_utc,"
+                " source_path, line_offset"
+            )
         shards: list[tuple[str, tuple[object, ...]]] = []
         if group_filter is None:
             shards.append((sql, tuple(params)))
@@ -1371,11 +2176,9 @@ def load_codex_quota_observations(
         result: list[QuotaObservation] = []
         signature_tuples: dict[str, dict[str, list[tuple[object, ...]]]] = {}
         for row in _iter_shard_rows(conn, shards):
-            required_text = (
-                "source", "source_root_key", "source_path", "captured_at_utc",
-                "observed_slot", "logical_limit_key", "resets_at_utc",
-            )
-            if any(row[name] is None or not str(row[name]).strip() for name in required_text):
+            if not _codex_quota_required_text_present(
+                row[name] for name in _CODEX_QUOTA_REQUIRED_TEXT
+            ):
                 continue
             try:
                 # #416 spec §4.3: snap a jittered `window_minutes` (the stray
@@ -1467,6 +2270,19 @@ def load_codex_quota_observations(
                 observation.source_path,
                 observation.line_offset,
             ))
+        # Operator attribution overlay (#500 spec §6.4), immediately before the
+        # fold. Ordered here and nowhere else: the fold then finds nothing left
+        # to adopt in an attributed group, `build_blocks` carries the account
+        # into `quota_window_blocks`, and the spend-adoption pass sees a
+        # claiming window that identifies exactly one account — all three axes
+        # from ONE insertion point, with no new adoption logic anywhere.
+        #
+        # Ordered AFTER the physical signatures too, which are computed from the
+        # physical tuple alone and are therefore account-independent, so the
+        # certificate a bounded read stamps does not depend on whether an
+        # assertion happened to apply.
+        result = _apply_codex_window_attribution_overlay(
+            conn, result, source_root_keys=requested)
         # Window-account continuity fold (#341 spec §2): adopt unidentified
         # observations into a same-physical-window identified account (exactly
         # one). Physical signatures above are account-independent (computed from
@@ -1474,6 +2290,23 @@ def load_codex_quota_observations(
         # recursion path below re-fetches + re-folds. Idempotent for an
         # already-identified set — a single-account cache is a no-op.
         result = list(adopt_unidentified_observations(result))
+        if latest_per_identity:
+            # Python decides the winner, using the same total order every other
+            # caller uses. SQL only removed rows that could not have won.
+            latest: dict[QuotaWindowIdentity, QuotaObservation] = {}
+            for observation in result:
+                held = latest.get(observation.identity)
+                if held is None or physical_order_key(
+                    observation,
+                ) > physical_order_key(held):
+                    latest[observation.identity] = observation
+            result = sorted(latest.values(), key=lambda observation: (
+                observation.identity.source_root_key,
+                observation.captured_at,
+                observation.resets_at,
+                observation.source_path,
+                observation.line_offset,
+            ))
         if physical_signatures is not None:
             physical_signatures.clear()
             roots = requested if requested is not None else set(signature_tuples)
@@ -2806,6 +3639,21 @@ def reconcile_codex_quota_projection(
             physical_sequence = codex_physical_mutation_seq(cache)
             certificate = load_codex_quota_projection_certificate(cache)
             ledger_high = _ledger_max_seq(cache)
+            # #500 §8.3. An attribution change fires no `quota_window_snapshots`
+            # trigger and writes no ledger entry, so the change ledger cannot
+            # see it and the certificate reader above has already declined a
+            # certificate computed against a different revision. What is left is
+            # naming the groups the pass now owes, which is only worth reading
+            # when the revision actually moved.
+            attribution_revision = (
+                _cache_module().codex_window_attribution_revision(cache))
+            attribution_stale = _certificate_attribution_revision(
+                _codex_quota_projection_certificate_payload(cache)
+            ) != attribution_revision
+            attribution_scope = (
+                codex_attribution_projection_scope(cache)
+                if attribution_stale else None
+            )
         finally:
             cache.commit()
         # ONE stats read decides the whole shape of the pass: whether the
@@ -2924,6 +3772,22 @@ def reconcile_codex_quota_projection(
             stale_reverse_map=stale_reverse_map,
             verification_due=verification_due,
         )
+        if dirty_units is not None and attribution_scope:
+            # Union, never replace: the ledger's own dirty set is still owed.
+            # A bounded pass that then exceeds the incremental ceiling falls
+            # back to whole history exactly as `_resolve_pass_scope` would,
+            # because N indexed seeks stop beating one scan at the same point
+            # however the units were arrived at.
+            merged_units = (
+                frozenset(dirty_units["units"]) | attribution_scope["units"])
+            if len(merged_units) > _MAX_INCREMENTAL_UNITS:
+                dirty_units = None
+            else:
+                dirty_units = {
+                    "raw_groups": frozenset(dirty_units["raw_groups"])
+                    | attribution_scope["raw_groups"],
+                    "units": merged_units,
+                }
         # ``None`` means the genuine whole-history path. A set means complete
         # histories for only those roots — axis 2 and epoch-1007 axis 4 can both
         # be satisfied without scanning unrelated roots.
@@ -3202,9 +4066,15 @@ def reconcile_codex_quota_projection(
     # cache write this function makes, and folding it in avoids adding a second
     # unflocked mutator.
     if holder["signatures"] is not None:
+        # `attribution_revision` is the value read at the top of the pass, and
+        # passing it is what makes the certificate bind THIS pass's inputs: the
+        # ingest cycle above can materialize a pending attribution op, and a
+        # certificate stamped at the post-ingest revision would certify a
+        # projection built from pre-ingest observations (#500 §8.3).
         _store_codex_quota_projection_certificate(
             sequence=physical_sequence, signatures=holder["signatures"],
             prune_ledger_through=watermark_target,
+            attribution_revision=attribution_revision,
         )
     return holder["result"]
 
@@ -3266,7 +4136,7 @@ def _codex_cache_account_predicate(
       dollars are these" — widening it IS attribution, which D1 forbids, and it
       puts one row in two scopes.
 
-    FOUR stamping mechanisms exist and must never be conflated: the
+    FIVE stamping mechanisms exist and must never be conflated: the
     quota-observation fold (``adopt_unidentified_observations``, per physical-
     window group, landing post-fold in ``quota_window_blocks`` /
     ``quota_percent_milestones`` and NEVER written back to
@@ -3276,7 +4146,16 @@ def _codex_cache_account_predicate(
     spec — ``_lib_codex_account_adoption`` +
     ``_cctally_cache.apply_codex_window_spend_adoption``, which stamps that same
     ``codex_session_entries.account_key`` column at ingest from the window's
-    single identified account); and the stats ``accounts`` registry.
+    single identified account); OPERATOR ATTRIBUTION (#500 —
+    ``_lib_codex_window_attribution`` + ``_apply_codex_window_attribution_overlay``,
+    which makes a group identified at FOLD time from a journal-recorded
+    assertion and therefore reaches both the percentage and the spend axis
+    through the two mechanisms above rather than beside them); and the stats
+    ``accounts`` registry.
+
+    The rule below is unchanged by that fifth entry, and deliberately so:
+    operator attribution feeds the fold, so every read already scoped by the
+    fold's answer stays scoped the same way and no predicate flavour moves.
 
     So ``codex_session_entries.account_key`` now carries window-derived
     attribution IN ADDITION to per-file decisions, and that is precisely what

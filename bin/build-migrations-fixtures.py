@@ -5885,6 +5885,25 @@ def build_per_migration_037_codex_quota_change_ledger(
     _build_post(pre, post)
 
 
+_CODEX_ACCOUNTING_TRIGGER_NAMES = (
+    "trg_codex_accounting_ins",
+    "trg_codex_accounting_del",
+    "trg_codex_accounting_upd",
+    "trg_codex_accounting_thread_ins",
+    "trg_codex_accounting_thread_del",
+    "trg_codex_accounting_thread_upd",
+    "trg_codex_accounting_file_ins",
+    "trg_codex_accounting_file_del",
+    "trg_codex_accounting_file_upd",
+)
+
+
+def _drop_codex_accounting_triggers(conn: sqlite3.Connection) -> None:
+    """Let historical fixture builders reshape ledger-watched tables."""
+    for trigger in _CODEX_ACCOUNTING_TRIGGER_NAMES:
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+
 def build_per_migration_038_codex_session_files_ingest_complete(
     scenario_dir: Path,
 ) -> None:
@@ -5933,6 +5952,7 @@ def build_per_migration_038_codex_session_files_ingest_complete(
                 if str(row[1]) != "ingest_complete"
             ]
             column_list = ", ".join(columns)
+            _drop_codex_accounting_triggers(conn)
             conn.execute(
                 "CREATE TABLE codex_session_files_pre038 AS "
                 f"SELECT {column_list} FROM codex_session_files WHERE 0"
@@ -5942,6 +5962,7 @@ def build_per_migration_038_codex_session_files_ingest_complete(
                 "ALTER TABLE codex_session_files_pre038 "
                 "RENAME TO codex_session_files"
             )
+            db._apply_codex_accounting_change_ledger(conn)
             conn.executemany(
                 "INSERT INTO codex_session_files "
                 "(path, size_bytes, mtime_ns, last_byte_offset, "
@@ -6269,6 +6290,313 @@ def build_per_migration_041_codex_quota_unresolved_model_index(
                 (migration, _TS_PUBLIC_5),
             )
             conn.execute("PRAGMA user_version=41")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+_ROOT_PATH_INDEX = "idx_codex_entries_root_path"
+
+
+def _seed_566_codex_entries(conn) -> None:
+    """One Codex root, two rollout files, two accounting rows each.
+
+    An index over an empty table proves nothing, and one file per root would
+    not show the population this index exists for: the alias join matches on
+    (source_root_key, source_path), and a machine normally has ONE provider
+    root, so a root-only search visits every entry row for every file.
+    """
+    conn.execute(
+        "INSERT INTO codex_source_roots "
+        "(source_root_key, canonical_root_path, first_seen_utc, last_seen_utc) "
+        "VALUES (?,?,?,?)",
+        ("r" * 32, "/roots/rk", _TS_PUBLIC_5, _TS_PUBLIC_5),
+    )
+    rows = [
+        ("/roots/rk/sessions/a.jsonl", 10, "2026-07-31T10:00:00Z", "sess-a"),
+        ("/roots/rk/sessions/a.jsonl", 20, "2026-07-31T10:05:00Z", "sess-a"),
+        ("/roots/rk/sessions/b.jsonl", 10, "2026-07-31T11:00:00Z", "sess-b"),
+        ("/roots/rk/sessions/b.jsonl", 20, "2026-07-31T11:05:00Z", "sess-b"),
+    ]
+    conn.executemany(
+        "INSERT INTO codex_session_entries "
+        "(source_path, line_offset, timestamp_utc, session_id, model, "
+        " input_tokens, cached_input_tokens, output_tokens, "
+        " reasoning_output_tokens, total_tokens, source_root_key, "
+        " conversation_key) "
+        "VALUES (?,?,?,?,'gpt-5',100,0,50,0,150,?,?)",
+        [
+            (path, offset, ts, session, "r" * 32, f"v1.{session}")
+            for path, offset, ts, session in rows
+        ],
+    )
+
+
+def build_per_migration_042_codex_entries_root_path_index(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for the per-file alias join index (#566).
+
+    ``pre.sqlite`` is a genuine 041-head install with the index absent — the
+    shape EVERY existing install had on disk, because ``d1f14fad3`` added the
+    index to ``_apply_cache_schema`` and a steady-state open skips that path
+    outright once ``user_version`` matches the registry head. That version gate
+    is the whole reason this migration exists. ``post.sqlite`` is that database
+    after the handler: ``idx_codex_entries_root_path`` present and every entry
+    row untouched.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "042_codex_entries_root_path_index"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill",
+                         "040_codex_quota_physical_group_index",
+                         "041_codex_quota_unresolved_model_index"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            _seed_566_codex_entries(conn)
+            conn.execute(f"DROP INDEX IF EXISTS {_ROOT_PATH_INDEX}")
+            conn.execute("PRAGMA user_version=41")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=42")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+_CACHE_043_TABLE = "codex_window_attributions"
+
+
+def build_per_migration_043_codex_window_attributions(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for the #500 operator-attribution index.
+
+    ``pre.sqlite`` is a genuine 042-head install with ``codex_window_attributions``
+    ABSENT — the shape every existing install has on disk, because the table
+    lives in ``_apply_cache_schema``'s version-gated executescript and a
+    steady-state open skips that pass outright once ``user_version`` matches the
+    registry head. That version gate is the whole reason this migration exists.
+
+    ``post.sqlite`` is that database after the production handler: the table and
+    its index exist and are EMPTY, and every seeded Codex accounting row is
+    untouched. Empty is correct here for the same reason migration 031's map
+    starts empty — the journal is the only source, and nothing is inferred. The
+    replay itself is pinned by
+    ``tests/test_codex_window_attributions_table.py`` against a real seeded
+    journal, which a committed fixture cannot carry.
+
+    ``JOURNAL_DIR`` is redirected to an empty scratch directory for the handler
+    run. Without that the handler would read the BUILDING MACHINE's real
+    journal, which would make the golden depend on the developer's own data and
+    could copy real assertions into a committed fixture.
+    """
+    import tempfile
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "043_codex_window_attributions"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill",
+                         "040_codex_quota_physical_group_index",
+                         "041_codex_quota_unresolved_model_index",
+                         "042_codex_entries_root_path_index"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            # Non-vacuity: a table addition over an entirely empty cache proves
+            # nothing about leaving the rest of the store alone.
+            conn.execute(
+                "INSERT INTO codex_session_entries "
+                "(source_path, line_offset, timestamp_utc, session_id, model, "
+                " input_tokens, cached_input_tokens, output_tokens, "
+                " reasoning_output_tokens, total_tokens, source_root_key, "
+                " conversation_key, account_key) "
+                "VALUES (?,?,?,'session','gpt-5',1000,0,0,0,1000,'rk',NULL,NULL)",
+                ("/roots/rk/sessions/a.jsonl", 1, "2026-08-01T00:00:00Z"),
+            )
+            conn.execute(f"DROP TABLE IF EXISTS {_CACHE_043_TABLE}")
+            conn.execute("PRAGMA user_version=42")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        core = sys.modules["_cctally_core"]
+        conn = sqlite3.connect(dst)
+        saved_journal_dir = core.JOURNAL_DIR
+        scratch = tempfile.TemporaryDirectory(prefix="cctally-043-journal-")
+        try:
+            core.JOURNAL_DIR = Path(scratch.name)
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=43")
+            conn.commit()
+        finally:
+            core.JOURNAL_DIR = saved_journal_dir
+            scratch.cleanup()
+            conn.close()
+        # The handler takes the Codex provider flock (024-027, 034 do too),
+        # which creates a sibling lock file next to the golden.
+        lock = Path(str(dst) + ".codex.lock")
+        if lock.exists():
+            lock.unlink()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_044_codex_accounting_change_ledger(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for #582's accounting dirty-path ledger."""
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "044_codex_accounting_change_ledger"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill",
+                         "040_codex_quota_physical_group_index",
+                         "041_codex_quota_unresolved_model_index",
+                         "042_codex_entries_root_path_index",
+                         "043_codex_window_attributions"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            conn.execute(
+                "INSERT INTO codex_session_entries "
+                "(source_path, line_offset, timestamp_utc, session_id, model, "
+                " input_tokens, cached_input_tokens, output_tokens, "
+                " reasoning_output_tokens, total_tokens, source_root_key, "
+                " conversation_key, account_key) "
+                "VALUES (?,?,?,'session','gpt-5',1000,0,0,0,1000,'rk',NULL,NULL)",
+                ("/roots/rk/sessions/a.jsonl", 1, "2026-08-01T00:00:00Z"),
+            )
+            _drop_codex_accounting_triggers(conn)
+            conn.execute("DROP TABLE IF EXISTS codex_accounting_change_log")
+            conn.execute(
+                "DELETE FROM cache_meta "
+                "WHERE key IN ('codex_accounting_mutation_seq', "
+                "              'codex_accounting_bulk_clear')"
+            )
+            conn.execute("PRAGMA user_version=43")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=44")
             conn.commit()
         finally:
             conn.close()
@@ -7583,6 +7911,18 @@ def main() -> int:
     build_per_migration_041_codex_quota_unresolved_model_index(
         FIXTURES_ROOT / "per-migration"
         / "041_codex_quota_unresolved_model_index"
+    )
+    build_per_migration_042_codex_entries_root_path_index(
+        FIXTURES_ROOT / "per-migration"
+        / "042_codex_entries_root_path_index"
+    )
+    build_per_migration_043_codex_window_attributions(
+        FIXTURES_ROOT / "per-migration"
+        / "043_codex_window_attributions"
+    )
+    build_per_migration_044_codex_accounting_change_ledger(
+        FIXTURES_ROOT / "per-migration"
+        / "044_codex_accounting_change_ledger"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0

@@ -28,13 +28,12 @@ ENTRY_COLUMNS = ("source_root_key", "source_path")
 
 @pytest.fixture()
 def cache_conn(cctally_module, tmp_path):
-    """A fresh cache.db carrying only the unconditional schema path.
+    """A fresh cache.db carrying the current version-gated schema path.
 
-    The index under test is deliberately NOT a migration — it is re-derivable, so
-    it belongs in ``_apply_cache_schema`` where an existing install gains the plan
-    on its next open without a data migration (the same disposition as
-    ``idx_codex_entries_ts_root_conversation``). Building through that function is
-    therefore what proves an upgrading user is covered.
+    Fresh stores gain the index through ``_apply_cache_schema``. Existing stores
+    gain it through migration 042, which calls the same ensure helper; the schema
+    delivery tests pin that provenance. This fixture exercises only the fresh
+    path and query plan, not the migration path.
     """
     conn = sqlite3.connect(tmp_path / "cache.db")
     sys.modules["_cctally_db"]._apply_cache_schema(conn)
@@ -93,15 +92,15 @@ def _seed(conn, *, files=3, entries_per_file=4):
     conn.commit()
 
 
-def test_index_is_created_by_the_unconditional_schema_path(cache_conn):
-    """An upgrading install gains the index on open, with no migration marker."""
+def test_index_is_created_by_the_fresh_schema_path(cache_conn):
+    """A fresh schema gains the same index migration 042 delivers on upgrade."""
     names = {
         r[0] for r in cache_conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index'")
     }
     assert INDEX in names, (
-        f"{INDEX} must be created by _apply_cache_schema so existing caches gain "
-        "the plan without a data migration"
+        f"{INDEX} must be created by _apply_cache_schema for fresh caches; "
+        "migration 042 separately covers existing caches"
     )
 
 

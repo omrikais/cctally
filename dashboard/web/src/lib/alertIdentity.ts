@@ -55,20 +55,41 @@ export function seedFormsForRow(row: SourceAlertRow): string[] {
     : [current, priorNormalized, bare];
 }
 
-// Focused alert rows are selected directly from their conditional #345 wire.
-// A vendor-wide `*` crossing remains visible. An old/undecorated envelope with
-// no account fields is returned untouched so compatibility never becomes data
-// loss disguised as filtering.
-export function filterAlertRowsForAccount(
+// #556 S5 §5.11 — PROVIDER-AWARE alert focus.
+//
+// All's Recent Alerts reads the server-built union of both providers' rows, and
+// under All each provider has its OWN focus slot. One account key applied to
+// the whole row set cannot express that state: a Codex focus would delete every
+// Claude row, because no Claude row carries a Codex key. So the filter takes
+// one key per provider and decides each row against its own `source`.
+//
+// Three properties are preserved from the single-key form:
+//   * a vendor-wide `*` crossing stays visible under any focus;
+//   * a provider whose rows carry no account fields at all (an old or
+//     undecorated envelope) is never filtered, so compatibility cannot become
+//     data loss disguised as filtering — and that check is now PER PROVIDER,
+//     because a decorated Codex beside an undecorated Claude is a real state;
+//   * the input order is preserved, which under All is the canonical
+//     `alerted_at` order S3 shipped.
+export interface AlertAccountFocus {
+  claude: string | null;
+  codex: string | null;
+}
+
+export function filterAlertRowsForFocus(
   rows: SourceAlertRow[],
-  accountKey: string | null,
+  focus: AlertAccountFocus,
 ): SourceAlertRow[] {
-  if (accountKey == null || !rows.some((row) => alertAccount(row) != null)) {
-    return rows;
+  if (focus.claude == null && focus.codex == null) return rows;
+  const carries: Record<SourceName, boolean> = { claude: false, codex: false };
+  for (const row of rows) {
+    if (alertAccount(row) != null) carries[row.source] = true;
   }
   return rows.filter((row) => {
+    const wanted = focus[row.source];
+    if (wanted == null || !carries[row.source]) return true;
     const key = alertAccount(row)?.key;
-    return key === accountKey || key === '*';
+    return key === wanted || key === '*';
   });
 }
 

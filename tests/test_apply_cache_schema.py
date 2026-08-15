@@ -89,8 +89,8 @@ def test_apply_cache_schema_creates_physical_index_when_clean(tmp_path):
 
 
 def test_apply_cache_schema_tolerates_preexisting_physical_dupes(tmp_path):
-    # #279 S3 F3: the guarded create runs on EVERY open BEFORE the migration
-    # dispatcher, so a legacy DB holding historical physical-key duplicates must
+    # #279 S3 F3: when the version gate opens, the guarded create runs BEFORE
+    # the migration dispatcher, so a legacy DB holding historical duplicates must
     # still open (index left ABSENT) — never crash at schema-apply time. Cache
     # migration 020 dedups it, after which a later open creates the index.
     conn = sqlite3.connect(tmp_path / "legacy.db")

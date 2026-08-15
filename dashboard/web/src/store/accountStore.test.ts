@@ -26,6 +26,15 @@ function decoratedCodexEnv(): Envelope {
   return slice as unknown as Envelope;
 }
 
+// Claude decorated, Codex not — the state that makes `a` cycle a Claude row.
+function decoratedClaudeOnlyEnv(): Envelope {
+  const slice = makeSourceEnvelope() as unknown as {
+    sources: { claude: { data: { accounts?: AccountCard[] } } };
+  };
+  slice.sources.claude.data.accounts = [card(A, 40), card(B, 55)];
+  return slice as unknown as Envelope;
+}
+
 beforeEach(() => {
   localStorage.clear();
   _resetForTests();
@@ -33,18 +42,18 @@ beforeEach(() => {
 
 describe('SET_ACCOUNT_FOCUS reducer', () => {
   it('sets the per-source slot and persists a bare literal', () => {
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: A });
-    expect(getState().accountFocus.codex).toBe(A);
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: A });
+    expect(getState().accountFocus.provider.codex).toBe(A);
     expect(localStorage.getItem(`${ACCOUNT_STORAGE_PREFIX}codex`)).toBe(A);
     // Per-source: claude is untouched.
-    expect(getState().accountFocus.claude).toBe(ALL_ACCOUNTS);
+    expect(getState().accountFocus.provider.claude).toBe(ALL_ACCOUNTS);
   });
 
   it('same-value dispatch is a no-op (no write, identity preserved)', () => {
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: A });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: A });
     const before = getState();
     const spy = vi.spyOn(Storage.prototype, 'setItem');
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: A });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: A });
     expect(spy).not.toHaveBeenCalled();
     expect(getState()).toBe(before);
     spy.mockRestore();
@@ -56,11 +65,11 @@ describe('cycleActiveAccount (the `a` key)', () => {
     updateSnapshot(decoratedCodexEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     cycleActiveAccount();
-    expect(getState().accountFocus.codex).toBe(A);
+    expect(getState().accountFocus.provider.codex).toBe(A);
     cycleActiveAccount();
-    expect(getState().accountFocus.codex).toBe(B);
+    expect(getState().accountFocus.provider.codex).toBe(B);
     cycleActiveAccount();
-    expect(getState().accountFocus.codex).toBe(ALL_ACCOUNTS);
+    expect(getState().accountFocus.provider.codex).toBe(ALL_ACCOUNTS);
   });
 
   it('is a no-op on an undecorated source (single-account inert)', () => {
@@ -71,12 +80,38 @@ describe('cycleActiveAccount (the `a` key)', () => {
     expect(getState()).toBe(before);
   });
 
-  it('is a no-op under source `all` (no selector)', () => {
+  // #556 S5 §5.6 REPLACES the pre-S5 contract asserted here, which was "is a
+  // no-op under source `all` (no selector)". All has a selector now, so the
+  // shortcut must reach it; the assertion is rewritten rather than deleted so
+  // the reversal is visible in the estate.
+  it('cycles the CODEX row under source `all`, writing only the All slot', () => {
     updateSnapshot(decoratedCodexEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
-    const before = getState().accountFocus;
     cycleActiveAccount();
-    expect(getState().accountFocus).toBe(before);
+    expect(getState().accountFocus.all.codex).toBe(A);
+    // The Codex TAB slot is untouched — the two never write to each other.
+    expect(getState().accountFocus.provider.codex).toBe(ALL_ACCOUNTS);
+    cycleActiveAccount();
+    expect(getState().accountFocus.all.codex).toBe(B);
+    cycleActiveAccount();
+    expect(getState().accountFocus.all.codex).toBe(ALL_ACCOUNTS);
+  });
+
+  it('cycles the lone CLAUDE row under `all` when Codex is undecorated', () => {
+    updateSnapshot(decoratedClaudeOnlyEnv());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    cycleActiveAccount();
+    // The shortcut is never inert beside a visible control.
+    expect(getState().accountFocus.all.claude).toBe(A);
+    expect(getState().accountFocus.all.codex).toBe(ALL_ACCOUNTS);
+  });
+
+  it('is still a no-op under `all` when neither provider is decorated', () => {
+    updateSnapshot(makeSourceEnvelope() as unknown as Envelope);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const before = getState();
+    cycleActiveAccount();
+    expect(getState()).toBe(before);
   });
 });
 
@@ -84,12 +119,12 @@ describe('share capture (source, account) at OPEN_SHARE', () => {
   it('stamps the focused account and is immune to a mid-flow switch', () => {
     updateSnapshot(decoratedCodexEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: B });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: B });
     dispatch({ type: 'OPEN_SHARE', panel: 'trend', triggerId: null });
     expect(getState().shareModal?.source).toBe('codex');
     expect(getState().shareModal?.account).toBe(B);
     // A mid-flow account switch must NOT restamp the captured account.
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: A });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: A });
     expect(getState().shareModal?.account).toBe(B);
   });
 
@@ -100,11 +135,33 @@ describe('share capture (source, account) at OPEN_SHARE', () => {
     expect(getState().shareModal?.account).toBeNull();
   });
 
+  // #556 S5 §5.12 — All no longer forcibly captures NO account. A shared
+  // artifact taken under a focused chip must match the view that produced it;
+  // exporting all-account data from a focused view is classified as a privacy
+  // problem in this project, not a follow-up.
+  it('captures the All slot\u2019s Codex focus when the share is taken under All', () => {
+    updateSnapshot(decoratedCodexEnv());
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'all', account: B });
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    dispatch({ type: 'OPEN_SHARE', panel: 'trend', triggerId: null });
+    expect(getState().shareModal?.source).toBe('all');
+    expect(getState().shareModal?.account).toBe(B);
+  });
+
+  it('an All share reads the All slot, never the provider tab slot', () => {
+    updateSnapshot(decoratedCodexEnv());
+    // Focused on the CODEX TAB only. All must not inherit it.
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: A });
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    dispatch({ type: 'OPEN_SHARE', panel: 'trend', triggerId: null });
+    expect(getState().shareModal?.account).toBeNull();
+  });
+
   it('a share captured with a since-vanished account resolves to All (null)', () => {
     updateSnapshot(decoratedCodexEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     // Persist a focus, then deliver an envelope WITHOUT that account.
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: B });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: B });
     const gone = makeSourceEnvelope() as unknown as {
       sources: { codex: { data: { accounts?: AccountCard[] } } };
     };

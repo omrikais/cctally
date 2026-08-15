@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationRail, MATCH_KIND_LABELS } from './ConversationRail';
-import { _resetForTests, dispatch, getState } from '../store/store';
+import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
 import { clearRailPrefs } from '../store/conversationRailPrefs';
 import { SOURCE_STORAGE_KEY } from '../store/sourcePrefs';
 import type { ConversationSummary, SearchHit } from '../types/conversation';
@@ -1204,5 +1204,67 @@ describe('ConversationRail search-state a11y (#228 S1 §6c)', () => {
     const count = document.querySelector('.conv-rail-count');
     expect(count).toBeTruthy();
     expect(count).toHaveAttribute('aria-live', 'polite');
+  });
+});
+
+// #556 S5 §5.4 — the ONE deliberate exclusion from All's account focus.
+//
+// The multi-account design's R4 decision keeps conversations account-agnostic
+// under `all`. Without this pin a later reader folds the rail into the new All
+// slots as an oversight, and every rail request silently becomes
+// account-qualified on the combined tab.
+describe('#556 S5 — the conversation rail does not consume the All focus slots', () => {
+  const CODEX_ACCOUNT = 'c'.repeat(32);
+
+  function decoratedCodexEnvelope() {
+    return {
+      sources: {
+        claude: null,
+        codex: {
+          availability: 'ok',
+          freshness: 'fresh',
+          warnings: [],
+          data_version: 'v1',
+          last_success_at: null,
+          capabilities: {},
+          data: {
+            accounts: [
+              { accountKey: CODEX_ACCOUNT, label: 'nova', plan: null, active: true,
+                weeklyPercent: null, fiveHourPercent: null, resetsAt: null,
+                spendUsd: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0,
+                reasoningOutputTokens: 0, totalTokens: 0 },
+              { accountKey: 'd'.repeat(32), label: 'lark', plan: null, active: true,
+                weeklyPercent: null, fiveHourPercent: null, resetsAt: null,
+                spendUsd: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0,
+                reasoningOutputTokens: 0, totalTokens: 0 },
+            ],
+          },
+        },
+        all: null,
+      },
+    } as never;
+  }
+
+  it('renders no account-scoped note under All even with an All Codex focus stored', () => {
+    updateSnapshot(decoratedCodexEnvelope());
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'all', account: CODEX_ACCOUNT });
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<ConversationRail />);
+    // All carries its own `.conv-rail-composed-note` ("Merged locally ..."), so
+    // the pin is on the ACCOUNT claim, not on the element.
+    const notes = Array.from(document.querySelectorAll('.conv-rail-composed-note'))
+      .map((el) => el.textContent ?? '');
+    expect(notes.some((text) => text.includes('Scoped to the selected account')))
+      .toBe(false);
+  });
+
+  it('still qualifies on the provider tab from that tab own slot', () => {
+    updateSnapshot(decoratedCodexEnvelope());
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: CODEX_ACCOUNT });
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<ConversationRail />);
+    const note = document.querySelector('.conv-rail-composed-note');
+    expect(note).toBeTruthy();
+    expect(note!.textContent).toContain('Scoped to the selected account');
   });
 });

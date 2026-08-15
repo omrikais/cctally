@@ -187,3 +187,63 @@ def compute_budget_status(inputs: BudgetInputs) -> BudgetStatus:
         low_confidence=low_confidence,
         crossed_thresholds=crossed,
     )
+
+
+def budget_status_payload(
+    *,
+    period: str,
+    window_start_at: dt.datetime,
+    window_end_at: dt.datetime,
+    target_usd: float,
+    spent_usd: float,
+    recent_24h_usd: float,
+    now: dt.datetime,
+    alert_thresholds,
+) -> dict:
+    """The one dashboard-wire budget status, from ALREADY-RESOLVED bounds.
+
+    #556 S5 §3.1/§3.3. Both providers publish this exact object, so a single
+    client component renders either — which is only true if there is one
+    producer. It is a pure operation over resolved bounds and supplied spend
+    facts: it opens no database, reads no configuration, and never calls a bare
+    host-local ``astimezone()``.
+
+    Window resolution deliberately stays OUTSIDE this kernel. ``display.tz =
+    local`` has no DST-aware stdlib handle, so its per-instant resolution lives
+    in ``_cctally_forecast._resolve_local_calendar_window``, and
+    subscription-week resolution opens stats.db. Both are injected by the
+    caller; re-deriving either here would shift a window that straddles a DST
+    transition (issue #136) or make the kernel impure.
+
+    ``alert_thresholds`` is emitted as the normalized tuple the kernel consumed,
+    not as the caller's raw sequence.
+    """
+    inputs = BudgetInputs(
+        target_usd=float(target_usd),
+        spent_usd=float(spent_usd),
+        recent_24h_usd=float(recent_24h_usd),
+        week_start_at=window_start_at,
+        week_end_at=window_end_at,
+        now=now,
+        alert_thresholds=tuple(int(value) for value in alert_thresholds),
+    )
+    status = compute_budget_status(inputs)
+    return {
+        "period": period,
+        "budget_usd": inputs.target_usd,
+        "spent_usd": status.spent_usd,
+        "remaining_usd": status.remaining_usd,
+        "consumption_pct": status.consumption_pct,
+        "verdict": status.verdict,
+        "low_confidence": status.low_confidence,
+        "window_start_at": window_start_at.astimezone(dt.timezone.utc).isoformat(),
+        "window_end_at": window_end_at.astimezone(dt.timezone.utc).isoformat(),
+        "recent_24h_usd": inputs.recent_24h_usd,
+        "alert_thresholds": inputs.alert_thresholds,
+        "pace": {
+            "daily_usd": status.daily_pace_usd,
+            "projected_low_usd": status.projected_eow_low_usd,
+            "projected_high_usd": status.projected_eow_high_usd,
+            "week_avg_projection_usd": status.week_avg_projection_usd,
+        },
+    }

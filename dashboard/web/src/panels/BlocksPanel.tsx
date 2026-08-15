@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
+import { scopeProviderFor, useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
 import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ShareIcon } from '../components/ShareIcon';
@@ -138,9 +138,12 @@ export function BlocksPanel() {
   // provider is decorated AND no chip is focused; a focused view has exactly
   // one owner and an undecorated envelope ships no `accounts[]` at all, so both
   // keep today's unlabelled rows (R8).
-  const scope = useAccountScope();
+  // #556 S5 §5.4 — under All the focus that can narrow these rows is CODEX's,
+  // so the stated rule (decorated AND no chip focused) now holds on that tab
+  // too: a focused view has exactly one owner and needs no per-row label.
+  const scope = useAccountScope(activeSource, scopeProviderFor(activeSource));
   const showCodexAccountLabels = activeSource === 'all'
-    ? sourceAccounts(codexEntry) != null
+    ? sourceAccounts(codexEntry) != null && scope.accountKey == null
     : scope.scopesSupported && scope.accountKey == null;
   const codexAccountLabels = showCodexAccountLabels
     ? new Map((codex?.accounts ?? []).map((card) => [card.accountKey, card.label]))

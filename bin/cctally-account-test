@@ -83,6 +83,17 @@ run_exit () {
 run_golden account-list-table   list-table  account list
 run_golden account-list-json    list-json   account list --json
 run_golden account-show-alice   show-alice  account show alice
+# `account attribute` (#500). This fixture carries no Codex quota evidence, so
+# the selector matches nothing — which is exactly the render an operator sees
+# when they name the wrong range, and it pins the command's table and envelope
+# bytes without a second fixture store. The applying paths are owned by
+# tests/test_account_attribute.py, which drives the real CLI over a store built
+# from rollout JSONL.
+run_golden account-attribute-empty      attr-empty       account attribute \
+    codexwork --since 2026-05-01T00:00:00Z --until 2026-05-20T00:00:00Z
+run_golden account-attribute-empty-json attr-empty-json  account attribute \
+    codexwork --since 2026-05-01T00:00:00Z --until 2026-05-20T00:00:00Z --json
+run_golden account-attribute-help       attr-help        account attribute --help
 run_golden range-cost-merged    rc-merged   range-cost \
     --start 2026-05-22T00:00:00Z --end 2026-05-23T00:00:00Z --json
 run_golden range-cost-alice     rc-alice    range-cost \
@@ -107,6 +118,19 @@ run_exit ref-ambiguous-or-unknown 2 "ambiguous or unknown" \
 run_exit account-show-bad-ref     2 "ambiguous or unknown" account show nobody-here
 run_exit account-x-source-codex   2 "only valid with --source claude" \
     range-cost --start 2026-05-22T00:00:00Z --source codex --account alice
+
+# `account attribute` validation (#500 AC11 + the time-selector contract).
+run_exit attribute-unknown-ref    2 "ambiguous or unknown" \
+    account attribute nobody-here --since 2026-05-01T00:00:00Z
+run_exit attribute-sentinel       2 "cannot be the SUBJECT" \
+    account attribute unattributed --since 2026-05-01T00:00:00Z
+run_exit attribute-claude-ref     2 "attributes codex data only" \
+    account attribute alice --since 2026-05-01T00:00:00Z
+run_exit attribute-naive-since    2 "timezone-aware instant is required" \
+    account attribute codexwork --since 2026-05-01T00:00:00
+run_exit attribute-inverted-range 2 "strictly after" \
+    account attribute codexwork --since 2026-05-02T00:00:00Z \
+    --until 2026-05-01T00:00:00Z
 
 # needs_cache exit-3: destroy the entry cache (LAST — mutates FAKE_HOME) so the
 # --account read fails closed rather than silently returning unfiltered results.

@@ -40,6 +40,11 @@ FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests/fixtures/account"
 
 ALICE = _lib_accounts.account_key("claude", "uuid-alice")
 BOB = _lib_accounts.account_key("claude", "uuid-bob")
+# One CODEX account, so the fixture can exercise `account attribute` — which
+# is codex-only and refuses a Claude ref. Deliberately the provider's ONLY
+# real account, so the codex half stays R8-undecorated and no existing
+# per-command golden moves.
+CODEX = _lib_accounts.account_key("codex", "uuid-codex")
 
 
 def _seed(db_dir: Path) -> None:
@@ -59,6 +64,11 @@ def _seed(db_dir: Path) -> None:
                      natural_id="uuid-bob", email="bob@example.com",
                      label="bob", plan_type="pro", label_source="auto",
                      first_seen_utc="2026-05-02T00:00:00Z",
+                     last_seen_utc="2026-05-21T00:00:00Z")
+        seed_account(conn, account_key=CODEX, provider="codex",
+                     natural_id="uuid-codex", email="codex@example.com",
+                     label="codexwork", plan_type="pro", label_source="auto",
+                     first_seen_utc="2026-05-03T00:00:00Z",
                      last_seen_utc="2026-05-21T00:00:00Z")
         # Per-account usage snapshots (attribution counts: alice=2, bob=1).
         for cap, pct in (("2026-05-18T12:00:00Z", 20.0),

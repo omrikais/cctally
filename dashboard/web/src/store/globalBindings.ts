@@ -6,13 +6,14 @@ import { buildShareKeyBinding } from '../share/keyboardShare';
 import { buildBasketKeyBindings } from '../share/keyboardBasket';
 import { BENTO_MEDIA_QUERY } from '../lib/breakpoints';
 import {
-  ALL_ACCOUNTS,
+  focusSlotFor,
   nextAccountFocus,
-  resolveAccountFocus,
+  providerIsDecorated,
+  resolveViewAccountFocus,
   sourceAccounts,
 } from './accountFocus';
 import type { Binding } from './keymap';
-import type { DashboardSelection, SourceEntry } from '../types/envelope';
+import type { DashboardSelection, SourceEntry, SourceName } from '../types/envelope';
 
 // #294 S5 — the `v` cycle order for the global source selector. Dashboard-view
 // scoped; the Conversations `v` (cycle focus mode) is view:'conversations' and
@@ -27,22 +28,35 @@ export function cycleActiveSource(): void {
   dispatch({ type: 'SET_ACTIVE_SOURCE', source: next });
 }
 
-// #341 Task 4 — cycle the focused account within the active physical source
-// (All → account₁ → … → accountₙ → All). A no-op when the active source is
-// source `all` or has <=1 real account (undecorated — no chip row to cycle).
+// #341 Task 4 — cycle the focused account within the active view (All →
+// account₁ → … → accountₙ → All). A no-op when no chip row is visible to cycle.
+//
+// #556 S5 §5.6 — under All the shortcut cycles the CODEX row, because Codex is
+// the provider whose focus filters every panel. When Codex is undecorated and
+// only a Claude row is on screen, `a` cycles that row instead, so the shortcut
+// is never inert beside a visible control. The slot it writes follows the view,
+// never the provider alone.
 export function cycleActiveAccount(): void {
   const s = getState();
-  const source = s.activeSource;
-  if (source === 'all') return;
+  const selection = s.activeSource;
+  const provider: SourceName | null = selection === 'all'
+    ? (providerIsDecorated(s.snapshot, 'codex')
+      ? 'codex'
+      : providerIsDecorated(s.snapshot, 'claude') ? 'claude' : null)
+    : selection;
+  if (provider == null) return;
   const accounts = sourceAccounts(
-    (s.snapshot?.sources?.[source] ?? null) as SourceEntry<unknown> | null,
+    (s.snapshot?.sources?.[provider] ?? null) as SourceEntry<unknown> | null,
   );
   if (accounts == null) return;
-  const current = resolveAccountFocus(
-    s.snapshot, source, s.accountFocus[source] ?? ALL_ACCOUNTS,
-  );
+  const current = resolveViewAccountFocus(s.snapshot, selection, provider, s.accountFocus);
   const next = nextAccountFocus(accounts, current);
-  dispatch({ type: 'SET_ACCOUNT_FOCUS', source, account: next });
+  dispatch({
+    type: 'SET_ACCOUNT_FOCUS',
+    source: provider,
+    slot: focusSlotFor(selection),
+    account: next,
+  });
 }
 
 // True in the desktop bento (>=900px), where per-card collapse is removed (A3).

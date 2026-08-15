@@ -149,10 +149,7 @@ describe('decorated Claude hero disclosure (#423 items 15 and 21)', () => {
   it('uses the focused Claude card without borrowing the merged forecast', () => {
     updateSnapshot(decoratedClaudeHeroEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
-    dispatch({
-      type: 'SET_ACCOUNT_FOCUS',
-      source: 'claude',
-      account: CLAUDE_ACCOUNT_ALT,
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'claude', slot: 'provider', account: CLAUDE_ACCOUNT_ALT,
     });
     const { container } = render(<HeroStrip />);
 
@@ -165,6 +162,36 @@ describe('decorated Claude hero disclosure (#423 items 15 and 21)', () => {
     expect(hero).not.toHaveTextContent('64.0%');
     expect(hero).not.toHaveTextContent('5-HOUR37%');
     expect(hero).not.toHaveTextContent('Forecast @ reset95%');
+  });
+
+  // #556 S5 round-2 browser gate, P1 — the provider tab half of the same
+  // defect, which predates S5 (the expression is byte-identical at the merge
+  // base). Spec §5.9 requires All to MATCH the tab, so the two are corrected
+  // together: a focused account with no published weekly percentage withholds
+  // the headline instead of borrowing `header.used_pct`.
+  it('withholds the tab headline when the focused card publishes no weekly percent', () => {
+    const env = decoratedClaudeHeroEnv() as unknown as {
+      sources: { claude: { data: { accounts: AccountCard[] } } };
+    };
+    env.sources.claude.data = {
+      ...env.sources.claude.data,
+      accounts: env.sources.claude.data.accounts.map((c) => ({
+        ...c, weeklyPercent: null, fiveHourPercent: null, resetsAt: null,
+      })),
+    };
+    updateSnapshot(env as unknown as Envelope);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
+    dispatch({
+      type: 'SET_ACCOUNT_FOCUS', source: 'claude', slot: 'provider', account: CLAUDE_ACCOUNT_ALT,
+    });
+    const { container } = render(<HeroStrip />);
+
+    const num = container.querySelector('.hero-usage .hu-num')!;
+    // 64 is BOTH the merged `header.used_pct` and the main account's own
+    // figure, so nulling the cards leaves the header as its only source.
+    expect(num.textContent).toBe('—');
+    expect(num.className).toContain('is-blank');
+    expect(container.querySelector('.hero-usage')!.textContent).not.toContain('64.0%');
   });
 
   it('blanks both Claude quota slots on All and keeps Claude cards visible', () => {

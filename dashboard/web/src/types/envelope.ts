@@ -1111,8 +1111,82 @@ export interface CodexProjectedBudgetRow {
   account_key?: string;
 }
 
+// #556 S5 §3.3 — the SAME object both providers publish, so one component
+// renders either. `CodexBudgetStatus` predates this session and keeps its name;
+// this alias is what non-Codex code should refer to.
+export type ProviderBudgetStatus = CodexBudgetStatus;
+
+// #556 S5 §3.5 — the five dispositions the server can express. The client must
+// be able to tell them apart, because rendering "No budget set." to a user who
+// has one set is a lie.
+//
+// These unions are closed for SERVER GENERATION AND TESTS ONLY. The client must
+// accept an unrecognised string and render generic copy, with a required
+// fallback branch — S2's closed-for-the-server, open-for-the-client rule, and
+// the reason its four-arm declaration had to collapse to two.
+export type BudgetUnavailableReason =
+  | 'period_unresolved'
+  | 'budget_compute_failed';
+
+export type BudgetNotConfiguredDisposition =
+  | 'provider_budget_unset'
+  | 'account_budgets_only';
+
+// Every client-facing position below is a BARE `string`, not the union. This is
+// S2's shape for the same rule (`CombinedUnavailableCause.code`, `:1663`), and
+// it is deliberate: `BudgetUnavailableReason | string` collapses to `string` in
+// TypeScript anyway, so it reads as a closed union while providing none of the
+// completion or exhaustiveness a real one would. A bare `string` plus the named
+// union above states honestly that the server's set is authoritative and the
+// client must tolerate a code it has never seen.
+
+/** The `{code, message, provider}` sibling, following S1's `combined_unavailable`. */
+export interface BudgetStatusUnavailable {
+  /** One of `BudgetUnavailableReason`, or a code a newer server added. */
+  code: string;
+  message: string;
+  provider: 'claude' | 'codex';
+  /**
+   * #556 S5 §4.6 / Unit 2 review F5 — what the user CONFIGURED, so an
+   * unavailable state can state the amount and name the window as unresolved
+   * rather than printing a bare code. Both are optional: a server that has
+   * nothing to state omits them, and Codex does not send them today.
+   */
+  budget_usd?: number;
+  period?: string;
+}
+
+export interface BudgetNotConfigured {
+  /** One of `BudgetNotConfiguredDisposition`, or a newer server's addition. */
+  disposition: string;
+}
+
+// The adapted presentation `presentationBudgetComposition` produces.
+export type BudgetPresentation =
+  | { state: 'configured'; status: ProviderBudgetStatus }
+  | { state: 'not_configured'; disposition: string }
+  // `unavailable` carries the WHOLE server object rather than a copy of its
+  // code, because §4.6 renders three of its fields — the human `message`, the
+  // configured `budget_usd` and the configured `period`. `reason` stays as the
+  // code so every caller keeps one short name for the branch it switches on.
+  | { state: 'unavailable'; reason: string; unavailable: BudgetStatusUnavailable };
+
 export interface CodexBudgetDomain {
-  status: CodexBudgetStatus | null;
+  // ONE documented asymmetry (#556 S5 §3.3). Codex's enclosing domain always
+  // emits `"status": <object|null>`, so the key is required and nullable here;
+  // Claude OMITS the key entirely when there is nothing to publish, which is
+  // what keeps its normal payload byte-identical. Normalising Codex would be a
+  // wire change outside S5's scope, so both are typed honestly and the client
+  // maps an absent key and a null value to the same presentation state.
+  status: ProviderBudgetStatus | null;
+  /** #556 S5 §3.5 — present only when a configured computation failed. */
+  status_unavailable?: BudgetStatusUnavailable;
+  /**
+   * #556 S5 Unit 2 review F1 — present only for `account_budgets_only`, the
+   * vendor-wide read of a per-account-only configuration. Codex still emits
+   * `status: null` beside it, which is the asymmetry documented above.
+   */
+  not_configured?: BudgetNotConfigured;
   milestones: CodexBudgetMilestoneRow[];
   projected: CodexProjectedBudgetRow[];
 }
@@ -1123,6 +1197,17 @@ export interface CodexCycle {
   window_minutes: number;
   start_at: string;
   resets_at: string;
+}
+
+// #564 — the exact window a fallback card's totals cover. `startAt` is the
+// semantic start (`now` minus one native cycle width, clamped to the accounting
+// range) and `endAt` is `now`, never the server's `+1us` SQL bound. Copy that
+// names a span must be derived from these bounds, because the clamp can make
+// the real span shorter than a full cycle.
+export interface SpendWindow {
+  kind: 'trailing-cycle';
+  startAt: string;
+  endAt: string;
 }
 
 // #341 Task 4 — one per-account hero card. Emitted (conditional, R8) only when
@@ -1147,6 +1232,12 @@ export interface AccountCard {
   // Present + true only for the reserved unattributed bucket (renders dimmed,
   // totals only, no live bars).
   unattributed?: boolean;
+  // #564 — additive, and present only when this card's totals came from the
+  // bounded fallback rather than from a live cycle. Never infer that from
+  // `resetsAt == null`: the sentinel, an expired boundary, an unresolved
+  // observation and a within-account conflict all produce a null reset, and
+  // only the server knows which of them was totalled over this window.
+  spendWindow?: SpendWindow;
 }
 
 // #341 Task 4 — the per-account hero cycle boundary (one per account with a
@@ -1532,13 +1623,39 @@ export interface ClaudeQuotaDomain {
   five_hour_milestones: Array<Record<string, unknown>>;
 }
 
+// #556 S5 §3.3/§3.5 — the Claude budget domain. `forecast` and `settings`
+// predate this session; the three status keys are additive and MUTUALLY
+// EXCLUSIVE, at most one present at a time:
+//
+//   none of the three  `provider_budget_unset` — the client's default
+//   `status`           configured and computed
+//   `not_configured`   `account_budgets_only`
+//   `status_unavailable`  `period_unresolved` or `budget_compute_failed`
+//
+// Note the asymmetry with `CodexBudgetDomain`, which is documented there: this
+// key is ABSENT rather than null when there is nothing to publish.
+export interface ClaudeBudgetDomain {
+  // OPTIONAL, not required-and-nullable. The synthetic no-envelope fallback at
+  // `bin/_cctally_tui.py`'s `fallback=` emits `{"label": …}` with neither key,
+  // so declaring them required described a shape the server does not always
+  // send. That inaccuracy predates S5; it is corrected here because S5's
+  // adapter is the first code to read this type.
+  forecast?: ForecastEnvelope | null;
+  settings?: Record<string, unknown> | null;
+  status?: ProviderBudgetStatus;
+  status_unavailable?: BudgetStatusUnavailable;
+  not_configured?: BudgetNotConfigured;
+  /** The synthetic no-envelope fallback shape carries only this. */
+  label?: string;
+}
+
 export interface ClaudeSourceData {
   hero: ClaudeHero;
   periods: ClaudePeriodsDomain;
   sessions: ClaudeSessionsDomain;
   projects: ClaudeProjectsDomain;
   quota: ClaudeQuotaDomain;
-  budget: { forecast: ForecastEnvelope | null; settings: Record<string, unknown> | null };
+  budget: ClaudeBudgetDomain;
   alerts: { rows: Array<Record<string, unknown>> };
   // #341 Task 4 (Ruling C): the conditional per-account cards, emitted only when
   // the Claude provider has >1 real account (R8). Absent (undecorated) → the

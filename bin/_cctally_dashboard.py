@@ -262,6 +262,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import copy
 import contextlib
 import dataclasses
 import datetime as dt
@@ -383,7 +384,14 @@ from _lib_display_tz import (
     normalize_display_tz_value,
     _compute_display_block,
 )
-from _lib_aggregators import _aggregate_daily, _aggregate_monthly, _aggregate_weekly
+from _lib_aggregators import (
+    _aggregate_daily,
+    _aggregate_monthly,
+    _aggregate_weekly,
+    _new_bucket_acc,
+    _fold_entry,
+    _finalize_bucket,
+)
 from _lib_fmt import stable_sum
 from _lib_pricing import (_calculate_entry_cost, _chip_for_model,
                           _short_model_name, claude_usage_dict)
@@ -3554,18 +3562,43 @@ def _shared_range_row_to_usage_entry(row):
     )
 
 
-def fold_daily_over_range(rows, *, display_tz=None, mode: str = "auto"):
+def _fold_prepared_daily_entries(
+    accumulators, entries, *, display_tz=None, mode: str = "auto",
+):
+    """Append prepared entries through the canonical daily fold primitive."""
+    for entry in entries:
+        if entry.model == "<synthetic>":
+            continue
+        key = entry.timestamp.astimezone(display_tz).strftime("%Y-%m-%d")
+        accumulator = accumulators.get(key)
+        if accumulator is None:
+            accumulator = _new_bucket_acc()
+            accumulators[key] = accumulator
+        _fold_entry(accumulator, entry, mode)
+
+
+def _finalize_daily_accumulators(accumulators):
+    return [
+        _finalize_bucket(key, accumulators[key])
+        for key in sorted(accumulators)
+    ]
+
+
+def fold_daily_over_range(
+    rows, *, display_tz=None, mode: str = "auto", prepared_entries=None,
+):
     """Fold the shared candidate stream into per-day ``BucketUsage``.
 
     Consumes the SAME already-materialised sequence the projects fold reads
     (spec §3.4 — one candidate read, two folds). ``_aggregate_daily`` skips
     ``<synthetic>`` rows itself, so both folds share that policy.
     """
-    return _aggregate_daily(
-        [_shared_range_row_to_usage_entry(row) for row in rows],
-        mode=mode,
-        tz=display_tz,
+    entries = (
+        prepared_entries
+        if prepared_entries is not None and mode == "auto"
+        else [_shared_range_row_to_usage_entry(row) for row in rows]
     )
+    return _aggregate_daily(entries, mode=mode, tz=display_tz)
 
 
 def build_daily_aggregate_rows(
@@ -3575,6 +3608,7 @@ def build_daily_aggregate_rows(
     display_tz=None,
     n: int = 30,
     mode: str = "auto",
+    prepared_entries=None,
 ) -> "list[DailyPanelRow]":
     """The complete canonical thirty-day shape for the All Daily aggregate.
 
@@ -3583,7 +3617,29 @@ def build_daily_aggregate_rows(
     the legacy panel uses, then materializes the contiguous calendar — so an
     empty Claude provider still publishes a full zero-cost shape (§6.3a).
     """
-    buckets = fold_daily_over_range(rows, display_tz=display_tz, mode=mode)
+    buckets = fold_daily_over_range(
+        rows,
+        display_tz=display_tz,
+        mode=mode,
+        prepared_entries=prepared_entries,
+    )
+    return _build_daily_aggregate_rows_from_buckets(
+        buckets,
+        now_utc=now_utc,
+        display_tz=display_tz,
+        n=n,
+        mode=mode,
+    )
+
+
+def _build_daily_aggregate_rows_from_buckets(
+    buckets,
+    *,
+    now_utc,
+    display_tz=None,
+    n: int = 30,
+    mode: str = "auto",
+):
     view = _cctally().build_daily_view(
         (), now_utc=now_utc, display_tz=display_tz, mode=mode,
         aggregated_override=buckets,
@@ -3625,6 +3681,7 @@ def _fold_projects_entry(
     *,
     resolver_cache: dict,
     week_start: "dt.datetime | None",
+    prepared_daily_entries: "list | None" = None,
 ) -> "float | None":
     """Fold ONE ``_projects_iter_session_entries`` row onto ``mut`` (the shared
     per-row body, #271 §20 Codex-P1a).
@@ -3660,19 +3717,30 @@ def _fold_projects_entry(
     ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
     if week_start is not None and _projects_week_start_monday_utc(ts) != week_start:
         return None
+    usage = claude_usage_dict(   # #195 chokepoint
+        input_tokens=input_tok,
+        output_tokens=output_tok,
+        cache_creation_tokens=cache_create,
+        cache_read_tokens=cache_read,
+        cache_1h_tokens=cache_1h,
+        speed=speed,
+    )
     entry_cost = _calculate_entry_cost(
         model,
-        claude_usage_dict(   # #195 chokepoint
-            input_tokens=input_tok,
-            output_tokens=output_tok,
-            cache_creation_tokens=cache_create,
-            cache_read_tokens=cache_read,
-            cache_1h_tokens=cache_1h,
-            speed=speed,
-        ),
+        usage,
         mode="auto",
         cost_usd=cost_raw,
     )
+    if prepared_daily_entries is not None:
+        # #567: preserve the canonical daily entry and aggregator while
+        # handing off the effective cost this pass already computed.
+        prepared_daily_entries.append(c.UsageEntry(
+            timestamp=dt.datetime.fromisoformat(ts_iso),
+            model=model,
+            usage=usage,
+            cost_usd=entry_cost,
+            source_path=source_path,
+        ))
     pkey = c._resolve_project_key(project_path, "git-root", resolver_cache)
     bp = pkey.bucket_path
     a = mut.get(bp)
@@ -3699,7 +3767,9 @@ def _fold_projects_entry(
     return entry_cost
 
 
-def fold_projects_over_range(rows, *, resolver_cache=None) -> "dict[str, dict]":
+def fold_projects_over_range(
+    rows, *, resolver_cache=None, prepared_daily_entries=None,
+) -> "dict[str, dict]":
     """Fold an ALREADY-MATERIALISED candidate stream into per-bucket totals.
 
     #556 S2 §3.4. Takes rows rather than a connection because one candidate read
@@ -3722,7 +3792,13 @@ def fold_projects_over_range(rows, *, resolver_cache=None) -> "dict[str, dict]":
     mut: "dict[str, dict]" = {}
     cache = {} if resolver_cache is None else resolver_cache
     for row in rows:
-        _fold_projects_entry(mut, row, resolver_cache=cache, week_start=None)
+        _fold_projects_entry(
+            mut,
+            row,
+            resolver_cache=cache,
+            week_start=None,
+            prepared_daily_entries=prepared_daily_entries,
+        )
     return mut
 
 
@@ -3759,7 +3835,11 @@ def legacy_project_labels(projects_envelope: object) -> "dict[str, str]":
 
 
 def build_project_aggregate_rows(
-    rows, *, resolver_cache=None, legacy_labels=None,
+    rows,
+    *,
+    resolver_cache=None,
+    legacy_labels=None,
+    prepared_daily_entries=None,
 ) -> "list[dict]":
     """Published `providers.claude.projects.aggregate.rows` (spec §3.5.1).
 
@@ -3831,8 +3911,17 @@ def build_project_aggregate_rows(
     total and means nothing over an absolute range. No ``bucket_path``, git
     root or raw source path — opaque keys stay non-reversible.
     """
+    folded = fold_projects_over_range(
+        rows,
+        resolver_cache=resolver_cache,
+        prepared_daily_entries=prepared_daily_entries,
+    )
+    return _project_aggregate_rows_from_folded(folded, legacy_labels)
+
+
+def _project_aggregate_rows_from_folded(folded, legacy_labels):
+    """Finalize cached/raw project accumulators into the public row shape."""
     c = _cctally()
-    folded = fold_projects_over_range(rows, resolver_cache=resolver_cache)
     bucket_paths_sorted = sorted(folded)
     augmented_by_idx = c._project_disambiguate_labels(
         [{"key": folded[bp]["first_key"]} for bp in bucket_paths_sorted],
@@ -3863,6 +3952,273 @@ def build_project_aggregate_rows(
     # Desc by cost, ties broken by label so the ranking is byte-stable.
     published.sort(key=lambda row: (-row["cost_usd"], row["label"]))
     return published
+
+
+_CLAUDE_RANGE_AGGREGATE_MEMO: dict[str, object] = {"state": None}
+
+
+def reset_claude_range_aggregate_memo() -> None:
+    """Drop the process-local #567 range-fold accumulator."""
+    _CLAUDE_RANGE_AGGREGATE_MEMO["state"] = None
+
+
+def _shared_range_store_identity(conn):
+    for _seq, name, path in conn.execute("PRAGMA database_list"):
+        if name == "main":
+            if not path:
+                return (f":memory:{id(conn)}", None, None)
+            try:
+                stat = os.stat(path)
+            except OSError:
+                return (str(path), None, None)
+            return (str(path), int(stat.st_dev), int(stat.st_ino))
+    return f":connection:{id(conn)}"
+
+
+def _shared_range_entry_signature(conn) -> tuple[int, int]:
+    max_id = int(conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM main.session_entries"
+    ).fetchone()[0])
+    try:
+        max_seq = int(conn.execute(
+            "SELECT COALESCE(MAX(mutation_seq), 0) FROM main.session_entries"
+        ).fetchone()[0])
+    except sqlite3.OperationalError:
+        max_seq = 0
+    return max_id, max_seq
+
+
+def _shared_range_session_files_signature(conn) -> tuple[int, int]:
+    """Cheap identity signal for lazy session/project metadata backfills."""
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM session_files"
+        ).fetchone()
+    except sqlite3.Error:
+        return (0, 0)
+    return int(row[0]), int(row[1])
+
+
+def _shared_range_entries_after_id(conn, after_id: int):
+    """Yield appended rows in canonical timestamp/id fold order."""
+    cur = conn.execute(
+        "SELECT e.id, e.timestamp_utc, e.model, e.input_tokens, "
+        "       e.output_tokens, e.cache_create_tokens, e.cache_read_tokens, "
+        "       e.cost_usd_raw, e.source_path, "
+        "       sf.session_id, sf.project_path, "
+        "       e.cache_create_1h_tokens, e.speed "
+        "FROM session_entries e "
+        "LEFT JOIN session_files sf ON sf.path = e.source_path "
+        "WHERE e.id > ? "
+        "ORDER BY e.timestamp_utc ASC, e.id ASC",
+        (after_id,),
+    )
+    yield from cur
+
+
+def _shared_range_prior_row_mutated(
+    conn, *, after_seq: int, through_id: int,
+) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM main.session_entries "
+            "WHERE mutation_seq > ? AND id <= ? LIMIT 1",
+            (after_seq, through_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return True
+    return row is not None
+
+
+def _shared_range_cache_base(
+    conn, *, shared_start, display_tz, generation: int,
+):
+    tz_key = getattr(display_tz, "key", None)
+    if tz_key is None:
+        tz_key = str(display_tz) if display_tz is not None else "local"
+    return (
+        _shared_range_store_identity(conn),
+        shared_start.astimezone(dt.timezone.utc).isoformat(),
+        tz_key,
+        int(generation),
+        _shared_range_session_files_signature(conn),
+        int(conn.execute(
+            "SELECT COALESCE(MIN(id), 0) FROM main.session_entries"
+        ).fetchone()[0]),
+    )
+
+
+def _shared_range_cache_payload(
+    state,
+    *,
+    legacy_labels,
+    now_utc,
+    display_tz,
+):
+    project_rows = _project_aggregate_rows_from_folded(
+        state["project_mut"], legacy_labels,
+    )
+    daily_buckets = _finalize_daily_accumulators(state["daily_accumulators"])
+    daily_rows = _build_daily_aggregate_rows_from_buckets(
+        daily_buckets, now_utc=now_utc, display_tz=display_tz,
+    )
+    c = _cctally()
+    return {
+        "projects": project_rows,
+        "daily": [c.daily_panel_row_to_wire(row) for row in daily_rows],
+    }
+
+
+def build_cached_claude_range_aggregates(
+    conn,
+    *,
+    shared_start,
+    shared_end_exclusive,
+    now_utc,
+    display_tz,
+    legacy_labels,
+    max_entry_id: "int | None" = None,
+    entry_mutation_seq: "int | None" = None,
+    generation: int = 0,
+):
+    """Build or increment the one-snapshot Claude range folds (#567).
+
+    Pure appends are folded onto the cached raw accumulators.  A shifted range
+    floor, backwards clock, generation or session-file identity change,
+    non-monotone signature, or an id-stable mutation of an already-folded row
+    falls back to one full ordered pass.  The cache stores no public labels, so
+    the current legacy population is reapplied on every publication.
+    """
+    if max_entry_id is None or entry_mutation_seq is None:
+        observed_id, observed_seq = _shared_range_entry_signature(conn)
+        if max_entry_id is None:
+            max_entry_id = observed_id
+        if entry_mutation_seq is None:
+            entry_mutation_seq = observed_seq
+    max_entry_id = int(max_entry_id)
+    entry_mutation_seq = int(entry_mutation_seq)
+    base = _shared_range_cache_base(
+        conn,
+        shared_start=shared_start,
+        display_tz=display_tz,
+        generation=generation,
+    )
+    prior = _CLAUDE_RANGE_AGGREGATE_MEMO.get("state")
+    state = None
+    if isinstance(prior, dict) and prior.get("base") == base:
+        monotone = (
+            max_entry_id >= prior["max_entry_id"]
+            and entry_mutation_seq >= prior["entry_mutation_seq"]
+            and shared_end_exclusive >= prior["end_exclusive"]
+        )
+        old_row_changed = (
+            entry_mutation_seq != prior["entry_mutation_seq"]
+            and _shared_range_prior_row_mutated(
+                conn,
+                after_seq=prior["entry_mutation_seq"],
+                through_id=prior["max_entry_id"],
+            )
+        )
+        if monotone and not old_row_changed:
+            project_mut = copy.deepcopy(prior["project_mut"])
+            daily_accumulators = copy.deepcopy(prior["daily_accumulators"])
+            resolver_cache = dict(prior["resolver_cache"])
+            delta_by_id = {}
+            for row in _shared_range_entries_after_id(
+                conn, prior["max_entry_id"],
+            ):
+                ts = parse_iso_datetime(
+                    row[1], "session_entries.timestamp_utc",
+                )
+                if shared_start <= ts < shared_end_exclusive:
+                    delta_by_id[row[0]] = row
+            if shared_end_exclusive > prior["end_exclusive"]:
+                for row in iter_shared_range_entries(
+                    conn,
+                    start=prior["end_exclusive"],
+                    end_exclusive=shared_end_exclusive,
+                ):
+                    if row[0] <= prior["max_entry_id"]:
+                        delta_by_id[row[0]] = row
+            delta_rows = sorted(
+                delta_by_id.values(),
+                key=lambda row: (row[1], row[0]),
+            )
+            prior_tail = prior["tail"]
+            if prior_tail is None or all(
+                (row[1], row[0]) > prior_tail
+                for row in delta_rows
+                if row[2] != "<synthetic>"
+            ):
+                prepared = []
+                for row in delta_rows:
+                    _fold_projects_entry(
+                        project_mut,
+                        row,
+                        resolver_cache=resolver_cache,
+                        week_start=None,
+                        prepared_daily_entries=prepared,
+                    )
+                _fold_prepared_daily_entries(
+                    daily_accumulators,
+                    prepared,
+                    display_tz=display_tz,
+                )
+                tail = prior_tail
+                real_delta = [
+                    row for row in delta_rows if row[2] != "<synthetic>"
+                ]
+                if real_delta:
+                    last = real_delta[-1]
+                    tail = (last[1], last[0])
+                state = {
+                    "base": base,
+                    "max_entry_id": max_entry_id,
+                    "entry_mutation_seq": entry_mutation_seq,
+                    "end_exclusive": shared_end_exclusive,
+                    "tail": tail,
+                    "project_mut": project_mut,
+                    "daily_accumulators": daily_accumulators,
+                    "resolver_cache": resolver_cache,
+                }
+    if state is None:
+        rows = tuple(iter_shared_range_entries(
+            conn, start=shared_start, end_exclusive=shared_end_exclusive,
+        ))
+        prepared = []
+        resolver_cache = {}
+        project_mut = fold_projects_over_range(
+            rows,
+            resolver_cache=resolver_cache,
+            prepared_daily_entries=prepared,
+        )
+        daily_accumulators = {}
+        _fold_prepared_daily_entries(
+            daily_accumulators, prepared, display_tz=display_tz,
+        )
+        real_rows = [row for row in rows if row[2] != "<synthetic>"]
+        tail = None
+        if real_rows:
+            last = real_rows[-1]
+            tail = (last[1], last[0])
+        state = {
+            "base": base,
+            "max_entry_id": max_entry_id,
+            "entry_mutation_seq": entry_mutation_seq,
+            "end_exclusive": shared_end_exclusive,
+            "tail": tail,
+            "project_mut": project_mut,
+            "daily_accumulators": daily_accumulators,
+            "resolver_cache": resolver_cache,
+        }
+    payload = _shared_range_cache_payload(
+        state,
+        legacy_labels=legacy_labels,
+        now_utc=now_utc,
+        display_tz=display_tz,
+    )
+    _CLAUDE_RANGE_AGGREGATE_MEMO["state"] = state
+    return payload
 
 
 def _aggregate_projects_week_raw(

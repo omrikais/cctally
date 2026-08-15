@@ -2,7 +2,7 @@ import { useCallback, useState, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSourceDetail } from '../hooks/useSourceDetail';
 import { useSnapshot } from '../hooks/useSnapshot';
-import { ALL_ACCOUNTS, resolveAccountFocus } from '../store/accountFocus';
+import { resolveViewAccountFocus } from '../store/accountFocus';
 import { fmt } from '../lib/fmt';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { formatSpan } from '../lib/projectWindow';
@@ -49,12 +49,16 @@ export function SourceDetailModal() {
   // server verifies row ownership when it is present (spec §4 finding 10).
   const env = useSnapshot();
   const detailSource = open?.source ?? 'codex';
-  const focusSlot = useSyncExternalStore(
+  // #556 S5 §5.4 — resolved through the one shared resolver against the
+  // SELECTION the detail was opened from, so a block opened under All while a
+  // Codex account is focused there carries that account's qualifier, exactly as
+  // it does on the Codex tab.
+  const focusState = useSyncExternalStore(
     subscribeStore,
-    () => getState().accountFocus[detailSource] ?? ALL_ACCOUNTS,
+    () => getState().accountFocus,
   );
   const detailAccount = open?.resource === 'block'
-    ? resolveAccountFocus(env, detailSource, focusSlot)
+    ? resolveViewAccountFocus(env, selection, detailSource, focusState)
     : null;
   const detail = useSourceDetail<SourceDetailBody>(
     open?.source ?? 'codex',

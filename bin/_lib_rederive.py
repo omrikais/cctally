@@ -105,6 +105,14 @@ _OP_CLASSIFICATIONS = {
     # leg rather than into the claude-usage scratch index.
     "codex_file_account": KindClassification(
         "retained", "Codex file attribution decision is outside claude-usage"),
+    # #500: operator attribution of recorded Codex quota windows. `retained`,
+    # exactly like the `codex_file_account` precedent above — provider state
+    # OUTSIDE the claude-usage family, replayed by the Codex cache leg rather
+    # than into the claude-usage scratch index.
+    "codex_window_attribution": KindClassification(
+        "retained", "operator Codex window attribution is outside claude-usage"),
+    "codex_window_attribution_retract": KindClassification(
+        "retained", "operator Codex window retraction is outside claude-usage"),
 }
 
 

@@ -9,7 +9,7 @@ Hooks
 Auth
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Pending migrations       54 pending
+  ⚠ Pending migrations       57 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ⚠ Retained evidence        9.0 MiB retained, 9.0 MiB reclaimable — over the 1-day age bound
       → Run `cctally db prune` to preview, `--yes` to apply.
@@ -24,4 +24,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 53 OK · 7 WARN · 0 FAIL
+Summary: 54 OK · 7 WARN · 0 FAIL

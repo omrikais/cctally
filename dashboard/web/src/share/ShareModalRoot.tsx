@@ -113,7 +113,14 @@ export function ShareModalRoot() {
             // explicitly unfiltered, so qualifying those bodies would assert
             // a false scope. Keep them account-agnostic until the data plane
             // exposes equivalent children.
-            account={slot.source === 'codex' ? slot.account : null}
+            //
+            // #556 S5 §5.12 — `all` joins Codex here. The server's All share
+            // builder can scope its Codex half when given an account, and the
+            // store now captures the All slot's CODEX focus, so a share taken
+            // under a focused chip matches the view that produced it. Exporting
+            // all-account data from a focused view is classified as a privacy
+            // problem in this project, not a follow-up.
+            account={slot.source === 'claude' ? null : slot.account}
             initialParams={slot.params}
             onClose={close}
           />

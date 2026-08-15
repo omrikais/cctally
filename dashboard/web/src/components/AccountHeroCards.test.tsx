@@ -17,6 +17,7 @@ function card(over: Partial<AccountCard> & { accountKey: string; label: string }
     spendUsd: over.spendUsd ?? 0, inputTokens: 0, cachedInputTokens: 0,
     outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0,
     unattributed: over.unattributed,
+    ...(over.spendWindow ? { spendWindow: over.spendWindow } : {}),
   };
 }
 
@@ -62,7 +63,7 @@ describe('AccountHeroCards (unified per-account view)', () => {
       card({ accountKey: B, label: 'bob', weeklyPercent: 55, spendUsd: 2 }),
     ]));
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: B });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: B });
     render(<AccountHeroCards />);
     const cards = screen.getAllByTestId('account-hero-card');
     expect(cards.length).toBe(1);
@@ -145,6 +146,52 @@ describe('AccountHeroCards — reset countdown copy (ui-qa P3)', () => {
       expect(el.textContent).not.toMatch(/ago/);
       expect(el.textContent).not.toBe('resets now');
     });
+  });
+});
+
+// #564 — a card totalled over the bounded fallback window says which window it
+// covers, in the slot a cycle card uses for its reset countdown. The caption is
+// derived from the published bounds, never from a hardcoded seven days, because
+// the server clamps the window to the accounting range it actually loaded.
+describe('#564 — a fallback card names the window its total covers', () => {
+  const WEEK = {
+    kind: 'trailing-cycle' as const,
+    startAt: '2026-04-17T13:00:00Z',
+    endAt: '2026-04-24T13:00:00Z',
+  };
+
+  it('captions a full-width window with the operator wording', () => {
+    updateSnapshot(decoratedEnv([
+      card({ accountKey: A, label: 'alice', weeklyPercent: 40, spendUsd: 1.5,
+        resetsAt: '2026-04-30T00:00:00Z' }),
+      card({ accountKey: B, label: 'bob', spendUsd: 2.25, spendWindow: WEEK }),
+    ]));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    const { container } = render(<AccountHeroCards />);
+    const captions = [...container.querySelectorAll('[data-testid="account-card-window"]')];
+    expect(captions.length).toBe(1);
+    expect(captions[0].textContent).toBe('last 7 days');
+    // The caption belongs to the fallback card, not to the cycle-bounded one.
+    expect(captions[0].closest('[data-account]')?.getAttribute('data-account')).toBe(B);
+  });
+
+  it('names the true span when the window is clamped shorter', () => {
+    updateSnapshot(decoratedEnv([
+      card({ accountKey: A, label: 'alice', weeklyPercent: 40, spendUsd: 1.5,
+        resetsAt: '2026-04-30T00:00:00Z' }),
+      card({
+        accountKey: B, label: 'bob', spendUsd: 2.25,
+        spendWindow: {
+          kind: 'trailing-cycle',
+          startAt: '2026-04-21T13:00:00Z',
+          endAt: '2026-04-24T13:00:00Z',
+        },
+      }),
+    ]));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    const { container } = render(<AccountHeroCards />);
+    const caption = container.querySelector('[data-testid="account-card-window"]');
+    expect(caption?.textContent).toBe('last 3 days');
   });
 });
 

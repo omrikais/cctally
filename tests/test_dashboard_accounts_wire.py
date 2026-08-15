@@ -303,6 +303,180 @@ def test_expired_account_clears_cycle_fields_but_keeps_historical_spend(
         stats.close()
 
 
+def _drop_corpus_accounting_rows(cache):
+    """Remove the rows ``_seeded_context`` imported from ``modern-full.jsonl``.
+
+    Those rows carry no account, so ``NULL ≡ unattributed`` files them under the
+    sentinel. A test that asserts the sentinel's exact total must delete them
+    first or it measures the corpus instead of the change (#564).
+    """
+    cache.execute(
+        "DELETE FROM codex_session_entries WHERE source_path NOT LIKE '/cached/%'")
+
+
+def test_fallback_cards_are_bounded_to_one_native_cycle_width(tmp_path, monkeypatch):
+    """#564: every addend of the decorated hero covers one native cycle at most.
+
+    A card with no live weekly cycle — a real account whose boundary expired, and
+    the unattributed sentinel — used to be totalled over the whole ~30-day
+    accounting range while the headline summing those cards is labelled as the
+    week. Every row below is a clone of one template row, so the live-cycle
+    account's single-row card is the unit the bounded cards are compared against.
+    """
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    root = _cache_root_key(cache)
+    _seed_codex_accounts(stats, [
+        dict(account_key=_ACCT_A, email="a@x.com", label="alice", plan_type="pro"),
+        dict(account_key=_ACCT_B, email="b@x.com", label="bob", plan_type="team"),
+    ])
+    window_start = NOW - dt.timedelta(minutes=10_080)
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_A,
+        timestamp=NOW - dt.timedelta(hours=1), session_id="a-live",
+        line_offset=93_001)
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_B,
+        timestamp=NOW - dt.timedelta(days=2), session_id="b-recent",
+        line_offset=93_002)
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_B,
+        timestamp=NOW - dt.timedelta(days=10), session_id="b-old",
+        line_offset=93_003)
+    # The sentinel's in-window row sits EXACTLY on the seven-day edge, which is
+    # included because the window starts at `now` rather than at the `+1us` SQL
+    # upper bound.
+    _insert_account_accounting_row(
+        cache, root=root, account_key="unattributed",
+        timestamp=window_start, session_id="u-edge", line_offset=93_004)
+    _insert_account_accounting_row(
+        cache, root=root, account_key="unattributed",
+        timestamp=NOW - dt.timedelta(days=12), session_id="u-old",
+        line_offset=93_005)
+    _drop_corpus_accounting_rows(cache)
+    cache.commit()
+    observations = (
+        *_weekly_and_5h(
+            root, _ACCT_A, NOW + dt.timedelta(days=2),
+            used_weekly=40.0, used_5h=12.0,
+        ),
+        *_weekly_and_5h(
+            root, _ACCT_B, NOW - dt.timedelta(minutes=1),
+            used_weekly=55.0, used_5h=30.0,
+        ),
+    )
+    monkeypatch.setattr(
+        source_module, "load_codex_quota_observations", lambda **_k: observations)
+    try:
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="bounded-fallback-v1",
+        )
+        cards = state.data["accounts"]
+        by_key = {card["accountKey"]: card for card in cards}
+        live, expired = by_key[_ACCT_A], by_key[_ACCT_B]
+        sentinel = by_key["unattributed"]
+        # Non-vacuity: one row is worth something, so one row and two rows are
+        # distinguishable totals.
+        assert live["spendUsd"] > 0
+        assert expired["resetsAt"] is None
+        # Exclusion first: on the unbounded read both of these are twice the unit.
+        assert expired["spendUsd"] == pytest.approx(live["spendUsd"])
+        assert sentinel["spendUsd"] == pytest.approx(live["spendUsd"])
+        for field in (
+            "inputTokens", "cachedInputTokens", "outputTokens",
+            "reasoningOutputTokens", "totalTokens",
+        ):
+            assert expired[field] == live[field], field
+            assert sentinel[field] == live[field], field
+        hero = state.data["hero"]
+        assert hero["cost_usd"] == pytest.approx(
+            sum(card["spendUsd"] for card in cards), abs=1e-9)
+        for hero_field, card_field in (
+            ("input_tokens", "inputTokens"),
+            ("cached_input_tokens", "cachedInputTokens"),
+            ("output_tokens", "outputTokens"),
+            ("reasoning_output_tokens", "reasoningOutputTokens"),
+            ("total_tokens", "totalTokens"),
+        ):
+            assert hero[hero_field] == sum(card[card_field] for card in cards)
+        expected_window = {
+            "kind": "trailing-cycle",
+            "startAt": window_start.isoformat(),
+            "endAt": NOW.isoformat(),
+        }
+        assert expired["spendWindow"] == expected_window
+        assert sentinel["spendWindow"] == expected_window
+        assert "spendWindow" not in live
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_sentinel_window_card_survives_when_all_its_spend_is_older(
+    tmp_path, monkeypatch,
+):
+    """#564 spec §8 criterion 2a: existence is decided over the wide range.
+
+    Bounding the load that decides whether the sentinel gets a card at all would
+    delete the card on any install whose unattributed spend is older than a week.
+    The card stays, reports $0.00 for the window, and says which window that is.
+    """
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    root = _cache_root_key(cache)
+    _seed_codex_accounts(stats, [
+        dict(account_key=_ACCT_A, email="a@x.com", label="alice", plan_type="pro"),
+        dict(account_key=_ACCT_B, email="b@x.com", label="bob", plan_type="team"),
+    ])
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_A,
+        timestamp=NOW - dt.timedelta(hours=1), session_id="a-live",
+        line_offset=94_001)
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_B,
+        timestamp=NOW - dt.timedelta(hours=1), session_id="b-live",
+        line_offset=94_002)
+    _insert_account_accounting_row(
+        cache, root=root, account_key="unattributed",
+        timestamp=NOW - dt.timedelta(days=12), session_id="u-old",
+        line_offset=94_003)
+    _drop_corpus_accounting_rows(cache)
+    cache.commit()
+    observations = (
+        *_weekly_and_5h(
+            root, _ACCT_A, NOW + dt.timedelta(days=2),
+            used_weekly=40.0, used_5h=12.0,
+        ),
+        *_weekly_and_5h(
+            root, _ACCT_B, NOW + dt.timedelta(days=3),
+            used_weekly=55.0, used_5h=30.0,
+        ),
+    )
+    monkeypatch.setattr(
+        source_module, "load_codex_quota_observations", lambda **_k: observations)
+    try:
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="sentinel-window-v1",
+        )
+        by_key = {card["accountKey"]: card for card in state.data["accounts"]}
+        sentinel = by_key.get("unattributed")
+        assert sentinel is not None, "the sentinel keeps its card"
+        assert sentinel["spendUsd"] == 0.0
+        assert sentinel["totalTokens"] == 0
+        assert sentinel["spendWindow"]["kind"] == "trailing-cycle"
+    finally:
+        cache.close()
+        stats.close()
+
+
 def _seed_five_hour_block(stats, *, root, account_key, start, reset, pct=42.0):
     stats.execute(
         "INSERT INTO quota_window_blocks "

@@ -1698,7 +1698,7 @@ def _iter_segment_lines(seg_path, lo: int, hi: int, *, on_bytes=None):
                 buf_at += start
 
 
-def iter_range(cursor, hw):
+def iter_range(cursor, hw, segments=None):
     """Stream `cursor -> HW` across segments in canonical order (spec §5.2.2).
 
     Prior segments (before HW's) are immutable and read to their full size;
@@ -1710,8 +1710,14 @@ def iter_range(cursor, hw):
     the size of the whole journal on the hot path. `_read_range` remains the
     materialized form for the ingest cycle, which genuinely needs the batch as
     an indexable sequence (prefix-stop indices address into it).
+
+    `segments` lets a caller supply the enumeration it already took. The fused
+    Codex rehydration needs it: it derives per-family range floors as indices
+    into a segment list, and those keys only address the same positions the
+    traversal yields while both come from ONE enumeration.
     """
-    yield from _iter_range_with_segments(cursor, hw, list_segments())
+    yield from _iter_range_with_segments(
+        cursor, hw, list_segments() if segments is None else segments)
 
 
 def _iter_range_with_segments(cursor, hw, segments, *, on_segment=None,
@@ -1746,13 +1752,21 @@ def _iter_range_with_segments(cursor, hw, segments, *, on_segment=None,
     if hw_seg not in segments:
         return
     hw_idx = segments.index(hw_seg)
-    if cursor is None:
-        start_idx, start_off = 0, 0
-    else:
-        cur_seg, cur_off = cursor
-        if cur_seg in segments:
-            start_idx, start_off = segments.index(cur_seg), cur_off
-        else:
+    start_idx, start_off = 0, 0
+    if cursor is not None:
+        # The unpack sits INSIDE the guard, which is what
+        # `_journal_cursor_order_key`'s docstring already claims the two
+        # functions do alike: a cursor this enumeration cannot place restarts
+        # the pass from the beginning rather than raising. Unreachable today
+        # because both loaders validate before calling, and a from-zero pass is
+        # always sound because every apply is idempotent on its natural key —
+        # but a raise here would turn an unreadable cursor into a failed pass
+        # instead of a complete one.
+        try:
+            cur_seg, cur_off = cursor
+            if cur_seg in segments:
+                start_idx, start_off = segments.index(cur_seg), int(cur_off)
+        except (TypeError, ValueError):
             start_idx, start_off = 0, 0
     for idx in range(start_idx, hw_idx + 1):
         seg = segments[idx]
@@ -2003,6 +2017,269 @@ def _file_account_values(rec: dict) -> tuple:
         p.get("file_identity"), p.get("incarnation"), p.get("from_offset"),
         p.get("root_scope"), p.get("account_key"), rec.get("at"),
     )
+
+
+# --------------------------------------------------------------------------
+# #500: the third family this leg carries — the operator's durable attribution
+# of one recorded Codex quota window group to one account (spec §5, §6.1). It
+# shares the leg for the same reason the attribution map does: `run_stats_ingest`
+# invokes exactly ONE applier and truncates the batch afterwards, so a second
+# independent prefix-stopping applier could commit past this one's stop.
+# --------------------------------------------------------------------------
+
+_WINDOW_ATTRIBUTION_KIND = _lib_journal.WINDOW_ATTRIBUTION_KIND
+_WINDOW_ATTRIBUTION_RETRACT_KIND = _lib_journal.WINDOW_ATTRIBUTION_RETRACT_KIND
+# Byte prefilter for the streamed replay, exactly as the file-account family
+# uses: the canonical encoder is `json.dumps(..., ensure_ascii=False)`, which
+# never escapes an ASCII token, so a genuine op carries the kind verbatim. The
+# assertion kind is a PREFIX of the retraction kind, so one marker matches both.
+_WINDOW_ATTRIBUTION_KIND_MARKER = f'"{_WINDOW_ATTRIBUTION_KIND}'.encode("ascii")
+
+# FIRST-WINS on the op id, which is a content digest — so a duplicate line is
+# byte-identical and the insert is a genuine no-op rather than a silent
+# overwrite. `OR IGNORE` for the same reason both attribution-map statements
+# carry it: an `IntegrityError` raised here prefix-stops `_cache_applier`, and
+# the scalar cursor could then never advance past that record.
+#
+# `OR IGNORE` suppresses EVERY constraint violation, not only the op-id
+# conflict, so it cannot be the gate on a malformed record: the cursor advances
+# past that record in the same transaction, which makes the drop permanent.
+# `_window_attribution_defect` runs BEFORE the statement and routes such a
+# record to a counted, reported skip instead — the silence removed, the
+# tolerance kept (review finding F2).
+_WINDOW_ATTRIBUTION_INSERT = (
+    "INSERT OR IGNORE INTO codex_window_attributions "
+    "(op_id, account_key, source_root_key, logical_limit_key, observed_slot, "
+    " window_minutes, raw_resets_at_utc, canonical_resets_at_utc, "
+    " asserted_at_utc) "
+    "VALUES (?,?,?,?,?,?,?,?,?) "
+    "ON CONFLICT(op_id) DO NOTHING"
+)
+
+# A retraction stamps only assertions that are not already retracted, so replay
+# is order-deterministic and idempotent: the FIRST tombstone in journal order
+# owns the row, and re-running the same prefix changes nothing.
+_WINDOW_ATTRIBUTION_RETRACT_UPDATE = (
+    "UPDATE codex_window_attributions SET retracted_by_op_id = ? "
+    "WHERE op_id = ? AND retracted_by_op_id IS NULL"
+)
+
+
+class CodexWindowAttributionReplayFailed(RuntimeError):
+    """The #500 attribution replay could not materialize its records.
+
+    Typed rather than bare so the quota cache leg can distinguish it from an
+    ordinary SQLite write failure and report `attributionReplayFailed`, which
+    lands in `stats_quota_projection_state.incomplete` inside the publication
+    transaction. The surrounding rebuild code deliberately flattens failures
+    into logged no-ops (spec §6.2), so a replay failure that was NOT typed and
+    routed here would be published as a complete projection that silently omits
+    the operator's attribution.
+    """
+
+
+def _is_codex_window_attribution_op(rec: dict) -> bool:
+    return (
+        rec.get("t") == "op"
+        and (rec.get("payload") or {}).get("kind") == _WINDOW_ATTRIBUTION_KIND
+    )
+
+
+def _is_codex_window_attribution_retract_op(rec: dict) -> bool:
+    return (
+        rec.get("t") == "op"
+        and (rec.get("payload") or {}).get("kind")
+        == _WINDOW_ATTRIBUTION_RETRACT_KIND
+    )
+
+
+def _is_codex_window_attribution_record(rec: dict) -> bool:
+    return (
+        _is_codex_window_attribution_op(rec)
+        or _is_codex_window_attribution_retract_op(rec)
+    )
+
+
+#: Payload fields an assertion row cannot be built without. Each is NOT NULL in
+#: `codex_window_attributions`, and the builder already refuses to mint an op
+#: that omits one — so a record missing any of them is damaged, not merely old.
+_WINDOW_ATTRIBUTION_REQUIRED_TEXT = (
+    "account_key", "source_root_key", "logical_limit_key", "observed_slot",
+)
+
+
+def _window_attribution_defect(rec: dict) -> "str | None":
+    """Why this record cannot be materialized, or `None` when it is sound.
+
+    Runs BEFORE the INSERT, because `OR IGNORE` cannot distinguish a duplicate
+    op id (a genuine no-op) from a NOT NULL violation (a permanent silent
+    drop). The two shapes that motivated it, review finding F2:
+
+      * a payload missing a required field inserts nothing, raises nothing and
+        leaves `asserted` at 0, so the batch looks like a clean no-op;
+      * `raw_resets_at_utc: null` is WORSE — `json.dumps(None)` is the literal
+        text `null`, which satisfies NOT NULL, so the row lands and
+        `load_active_window_attributions` then skips it as undecodable. The
+        assertion is durable, dormant and invisible.
+
+    Returns a short reason rather than a bool so the caller can name the defect
+    in its diagnostic instead of reporting an anonymous count.
+    """
+    if not isinstance(rec.get("id"), str) or not rec.get("id"):
+        return "record carries no op id"
+    if not isinstance(rec.get("at"), str) or not rec.get("at"):
+        return "record carries no `at` instant"
+    payload = rec.get("payload")
+    if not isinstance(payload, dict):
+        return "record carries no payload"
+    for field in _WINDOW_ATTRIBUTION_REQUIRED_TEXT:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value:
+            return f"payload field {field!r} is missing or not a non-empty string"
+    minutes = payload.get("window_minutes")
+    if not isinstance(minutes, int) or isinstance(minutes, bool):
+        return "payload field 'window_minutes' is missing or not an integer"
+    witnesses = payload.get("raw_resets_at_utc")
+    if not isinstance(witnesses, list) or not witnesses:
+        return ("payload field 'raw_resets_at_utc' is missing or not a "
+                "non-empty list")
+    for witness in witnesses:
+        if not isinstance(witness, str) or not witness:
+            return "payload field 'raw_resets_at_utc' holds a non-string witness"
+    if _is_codex_window_attribution_retract_op(rec):
+        targets = payload.get("retracted_assertion_ids")
+        if not isinstance(targets, list) or not targets:
+            return ("payload field 'retracted_assertion_ids' is missing or "
+                    "not a non-empty list")
+        for target in targets:
+            if not isinstance(target, str) or not target:
+                return ("payload field 'retracted_assertion_ids' holds a "
+                        "non-string assertion id")
+    return None
+
+
+def _report_window_attribution_skips(skipped: int, *,
+                                     quiet: bool = False) -> None:
+    """One stderr line for a run of replayed attribution records that were
+    STRUCTURALLY INVALID and therefore not applied (review finding F2).
+
+    The journal is append-only and the builders refuse every shape
+    `_window_attribution_defect` rejects, so reaching this line means a journal
+    line was damaged or hand-edited. The record is skipped rather than raised
+    on for the reason its `OR IGNORE` sibling exists: an `IntegrityError` here
+    would prefix-stop the ingest cycle forever on one bad record. What is
+    removed is the silence, not the tolerance.
+
+    Every call site must invoke this AFTER its commit, the rule
+    `_report_file_account_conflicts` states: a rolled-back transaction applied
+    nothing, so a line printed from inside it would describe a skip on a cycle
+    that is about to be retried.
+
+    `quiet` is the reconciliation's caller, exactly as it is for the sibling.
+    """
+    if skipped > 0 and not quiet:
+        print(
+            f"[ingest] codex window attribution replay skipped {skipped} "
+            "structurally invalid record(s); each is missing a field the "
+            "assertion cannot be built without, so no attribution was applied "
+            "for it — re-record the attribution, and report the journal damage "
+            "if it recurs",
+            file=sys.stderr,
+        )
+
+
+def _window_attribution_values(rec: dict) -> tuple:
+    """INSERT values for one assertion.
+
+    `raw_resets_at_utc` is stored as canonical JSON — the same separators and
+    key order the journal encoder uses — so the stored text is byte-stable
+    across replays and a reader can decode it back to the exact witness list.
+    """
+    p = rec.get("payload") or {}
+    witnesses = p.get("raw_resets_at_utc")
+    return (
+        rec.get("id"),
+        p.get("account_key"),
+        p.get("source_root_key"),
+        p.get("logical_limit_key"),
+        p.get("observed_slot"),
+        p.get("window_minutes"),
+        json.dumps(witnesses, separators=(",", ":"), sort_keys=True,
+                   ensure_ascii=False),
+        p.get("canonical_resets_at_utc"),
+        rec.get("at"),
+    )
+
+
+def _apply_window_attribution_records(cache, records) -> "tuple[int, int, int]":
+    """Materialize `codex_window_attribution` / `..._retract` ops into an OPEN
+    cache.db transaction; return `(asserted, retracted, skipped)` — how many
+    assertion rows were ABSENT before and actually landed, how many assertions a
+    retraction in this batch tombstoned, and how many records were structurally
+    invalid and therefore not applied at all.
+
+    Never opens or commits a transaction itself: every call site owns the flocks
+    and the single `BEGIN IMMEDIATE`, so the attribution family stays atomic
+    with the quota rows and the attribution map beside it.
+
+    Records apply in the order given, which is journal order at every call site.
+    That is what makes a retraction reach the assertion it names: the assertion
+    was recorded first, so its row exists by the time the tombstone runs.
+
+    A record `_window_attribution_defect` rejects is SKIPPED and counted rather
+    than inserted or raised on (review finding F2). Raising would prefix-stop
+    the ingest cycle forever on one damaged line, and inserting is what produced
+    the permanently dormant `raw_resets_at_utc = 'null'` row. Every caller must
+    pass the count to `_report_window_attribution_skips` after its commit.
+
+    Any OTHER failure is re-raised as `CodexWindowAttributionReplayFailed` so
+    the rebuild's quota leg reports an incomplete projection rather than
+    flattening it into a successful publish (spec §6.2).
+    """
+    asserted = retracted = skipped = 0
+    try:
+        for rec in records:
+            # Kind first, so a record of some other family that reached this
+            # list is ignored as before rather than counted as damaged.
+            if not _is_codex_window_attribution_record(rec):
+                continue
+            if _window_attribution_defect(rec) is not None:
+                skipped += 1
+                continue
+            if _is_codex_window_attribution_op(rec):
+                before = cache.total_changes
+                cache.execute(_WINDOW_ATTRIBUTION_INSERT,
+                              _window_attribution_values(rec))
+                if cache.total_changes > before:
+                    asserted += 1
+                continue
+            if not _is_codex_window_attribution_retract_op(rec):
+                continue
+            payload = rec.get("payload") or {}
+            targets = payload.get("retracted_assertion_ids") or ()
+            for target in targets:
+                before = cache.total_changes
+                cache.execute(_WINDOW_ATTRIBUTION_RETRACT_UPDATE,
+                              (rec.get("id"), target))
+                if cache.total_changes > before:
+                    retracted += 1
+        if asserted or retracted:
+            # #500 §8.3: the semantic revision the quota projection certificate
+            # binds. Advanced HERE and only here, in the same transaction as the
+            # rows, so a certificate can never claim to have been computed
+            # against attributions this replay had not yet applied. Deliberately
+            # not the journal replay cursor, which advances on all traffic and
+            # would invalidate the quota projection continuously.
+            import _cctally_cache as _cc
+
+            _cc.bump_codex_window_attribution_revision(cache)
+    except CodexWindowAttributionReplayFailed:
+        raise
+    except Exception as exc:
+        raise CodexWindowAttributionReplayFailed(
+            f"could not replay a Codex window attribution record: {exc}"
+        ) from exc
+    return asserted, retracted, skipped
 
 
 def _apply_file_account_records(cache, records) -> "tuple[int, int]":
@@ -2359,8 +2636,16 @@ class CoverageInvariantViolation(RuntimeError):
     """
 
 
-def _assert_coverage_already_invalidated(cache_conn) -> None:
+def _assert_coverage_already_invalidated(
+    cache_conn, *,
+    caller: str = "rehydrate_codex_file_accounts(authoritative=True)",
+) -> None:
     """Refuse an authoritative replay while a coverage certificate stands.
+
+    ``caller`` names the authoritative replay in the refusal. #500 added a
+    second one (`rehydrate_codex_window_attributions`) over the same covered
+    families, and a message naming the wrong function would send the next
+    debugger to the wrong call site.
 
     `rehydrate_codex_file_accounts(authoritative=True)` empties
     `codex_file_accounts`, a member of `COVERAGE_CACHE_FAMILIES`, before
@@ -2393,10 +2678,228 @@ def _assert_coverage_already_invalidated(cache_conn) -> None:
         return
     if row is not None:
         raise CoverageInvariantViolation(
-            "rehydrate_codex_file_accounts(authoritative=True) clears a covered "
+            f"{caller} clears a covered "
             f"family while {row[0]!r} is still stored; the caller must "
             "invalidate coverage in the transaction that clears"
         )
+
+
+#: What one fused rehydration pass materialized, per family (#500 review
+#: finding F4). A record rather than a flat tuple because the two families
+#: report different things and a positional 5-tuple would be unreadable at the
+#: call sites.
+CodexJournalRehydration = collections.namedtuple(
+    "CodexJournalRehydration",
+    ("file_accounts_applied", "file_accounts_high_water",
+     "file_accounts_declined",
+     "window_attributions_applied", "window_attributions_skipped"),
+)
+
+
+def _journal_cursor_order_key(cursor, segments) -> "tuple[int, int]":
+    """Sort key for a `(segment, offset)` journal cursor within `segments`.
+
+    A cursor this enumeration cannot place sorts FIRST — a segment the list does
+    not carry, and equally a value that is not a `(segment, offset)` pair at all.
+    That is the same thing `_iter_range_with_segments` does with it: it restarts
+    from the beginning. Ordering it any later would skip bytes, and raising on it
+    would turn an unreadable cursor into a failed pass rather than a from-zero
+    one. The unpack therefore sits INSIDE the guard (review round 2, finding
+    R2-11), where the docstring always claimed it was.
+
+    `(-1, 0)` is below every real record position, whose segment index is `>= 0`,
+    so a family floor derived from an unplaceable cursor admits every record.
+    """
+    try:
+        seg, off = cursor
+        return (segments.index(seg), int(off))
+    except (ValueError, TypeError):
+        return (-1, 0)
+
+
+def _earliest_journal_cursor(cursors, segments) -> "tuple[str, int] | None":
+    """The earliest of several per-family cursors, or `None` if any is `None`.
+
+    `None` means "replay from the beginning", so it dominates: a pass that must
+    satisfy a from-zero family has to start at zero regardless of how far the
+    other family has already been carried.
+
+    This decides only where the TRAVERSAL starts. It does not decide what each
+    family applies — that is a per-family floor, because a from-zero family must
+    not drag its sibling back over settled history (review round 2, finding
+    R2-2).
+
+    `segments` is the caller's enumeration, taken once and shared with
+    `iter_range`, so the keys this returns address the same positions the
+    traversal yields.
+    """
+    chosen = None
+    chosen_key = None
+    for cursor in cursors:
+        if cursor is None:
+            return None
+        key = _journal_cursor_order_key(cursor, segments)
+        if chosen_key is None or key < chosen_key:
+            chosen, chosen_key = cursor, key
+    return chosen
+
+
+def rehydrate_codex_journal_families(
+    cache_conn, *, authoritative: bool = False,
+    file_account_since=None, window_attribution_since=None,
+    want_file_accounts: bool = True, want_window_attributions: bool = True,
+    caller: str = "rehydrate_codex_journal_families(authoritative=True)",
+) -> CodexJournalRehydration:
+    """ONE journal traversal that materializes BOTH journal-derived Codex cache
+    families — the ``codex_file_account`` attribution map and the #500 operator
+    window attributions (review finding F4).
+
+    Why fused. Both families are rehydrated inside the SAME locked phase of
+    ``sync_codex_cache``, and with no cursor — a fresh install, ``rm cache.db``,
+    the corruption auto-heal's re-sync, or ``cache-sync --rebuild``, which forces
+    a from-zero replay on both — two independent passes stream the whole journal
+    while the global ``cache.db.lock`` AND the Codex provider flock are held.
+    ``rehydrate_codex_file_accounts`` calls a single such traversal "a
+    multi-second global cache-writer stall — itself a ``database is locked``
+    trigger" (#297). One pass, two byte prefilters, two appliers.
+
+    The two families keep INDEPENDENT cursors, because each is advanced by call
+    sites the other never reaches (``_cache_applier`` carries the window cursor
+    forward on an ordinary ingest tick; ``sync_codex_cache`` carries the map's).
+    The pass therefore starts at the EARLIER of the two, and each family then
+    applies only from its OWN cursor within that one traversal (review round 2,
+    finding R2-2). The traversal range and the application range are separate
+    decisions and must stay separate: one family's absent cursor forces the
+    traversal to zero, but letting it also force the SIBLING's appliers to zero
+    couples the two families' replay ranges to each other's cursor health.
+
+    Row idempotence is not enough to make that coupling safe, which is why the
+    first round's argument for it was wrong. ``_apply_file_account_records`` is
+    idempotent in its rows but not in its REPORTING: it re-counts every
+    historical first-wins decline inside whatever range it re-reads, and
+    ``sync_codex_cache`` prints that count, telling the operator to run
+    ``cache-sync --rebuild`` over decisions settled months ago. A from-zero
+    sibling would also reinstate exactly the whole-journal traversal under both
+    cache flocks that this fusion exists to remove.
+
+    The caller owns the flocks, the transaction and the commit; this function
+    only runs the idempotent statements, so it can sit inside
+    ``sync_codex_cache``'s already-locked phases without inverting the lock
+    order. Both declined/skipped counts are RETURNED rather than reported here,
+    the rule ``_report_file_account_conflicts`` states: this runs inside a
+    transaction the caller may roll back.
+    """
+    import _cctally_cache
+
+    if authoritative:
+        _assert_coverage_already_invalidated(cache_conn, caller=caller)
+    hw = journal_high_water()
+    if hw is None:
+        # No journal at all: an authoritative pass still says "the journal is
+        # the truth", and the truth is that there is nothing to attribute.
+        if authoritative and want_file_accounts:
+            cache_conn.execute("DELETE FROM codex_file_accounts")
+            # Review round 2, finding R2-4: the same rule F10 states for the
+            # window cursor, and the file family needs it stated here because
+            # `sync_codex_cache` writes no replacement when the pass returns no
+            # high-water. `_iter_range_with_segments` restarting from zero for a
+            # vanished segment does not cover this: `segment_name` is
+            # `observations-YYYY-MM.jsonl`, so a wiped journal that receives a
+            # record in the same calendar month re-creates the SAME segment name
+            # at offset 0 and a stale non-zero cursor skips the new bytes.
+            cache_conn.execute(
+                "DELETE FROM cache_meta WHERE key = ?",
+                (_cctally_cache.CODEX_FILE_ACCOUNT_CURSOR_KEY,))
+        if authoritative and want_window_attributions:
+            cache_conn.execute("DELETE FROM codex_window_attributions")
+            # #500 review finding F10: the cursor describes a table that no
+            # longer has any rows, so leaving it would let the NEXT delta pass
+            # skip journal bytes on the strength of a claim this branch just
+            # falsified.
+            cache_conn.execute(
+                "DELETE FROM cache_meta WHERE key = ?",
+                (_cctally_cache.CODEX_WINDOW_ATTRIBUTION_CURSOR_KEY,))
+        return CodexJournalRehydration(0, None, 0, 0, 0)
+    if authoritative:
+        if want_file_accounts:
+            cache_conn.execute("DELETE FROM codex_file_accounts")
+        if want_window_attributions:
+            cache_conn.execute("DELETE FROM codex_window_attributions")
+        # A clear-then-replay is only correct from the beginning of the journal.
+        file_account_since = window_attribution_since = None
+
+    # ONE enumeration, shared by the range floors below and by the traversal, so
+    # a floor's segment index and a yielded record's segment index name the same
+    # position. Two enumerations could disagree by a segment appended between
+    # them, and a floor computed against the other list would then admit or
+    # exclude the wrong records.
+    segments = list_segments()
+    starts = []
+    if want_file_accounts:
+        starts.append(file_account_since)
+    if want_window_attributions:
+        starts.append(window_attribution_since)
+    since = _earliest_journal_cursor(starts, segments) if starts else hw
+
+    # The traversal starts at the EARLIER cursor; each family applies only from
+    # its OWN (review round 2, finding R2-2). Without this, one family's absent
+    # cursor drags the other back over settled history — and
+    # `_apply_file_account_records` is idempotent in its ROWS but not in its
+    # REPORTING, so it re-counts every historical first-wins decline and
+    # `sync_codex_cache` tells the operator to `cache-sync --rebuild` over
+    # decisions settled long ago. It also reinstates the whole-journal traversal
+    # under both cache flocks that this fusion exists to remove. `None` means no
+    # floor at all, which is a from-zero replay for that family.
+    file_floor = (None if file_account_since is None
+                  else _journal_cursor_order_key(file_account_since, segments))
+    window_floor = (
+        None if window_attribution_since is None
+        else _journal_cursor_order_key(window_attribution_since, segments))
+    segment_positions = {name: idx for idx, name in enumerate(segments)}
+
+    applied = conflicts = attributed = skipped = 0
+    # Streamed, never materialized, for the reason above: this runs on the FIRST
+    # ordinary sync of every cache.db while both cache flocks are held. The
+    # cheap byte prefilters skip the JSON decode for every uninteresting line;
+    # the canonical encoder is `json.dumps(..., ensure_ascii=False)`, which never
+    # escapes an ASCII kind token, so a genuine op always carries its marker
+    # substring verbatim. A false positive is harmless — it is decoded and
+    # rejected by the real predicate.
+    for _seg, _off, raw in iter_range(since, hw, segments):
+        position = (segment_positions[_seg], int(_off))
+        want_file_here = want_file_accounts and (
+            file_floor is None or position >= file_floor)
+        want_window_here = want_window_attributions and (
+            window_floor is None or position >= window_floor)
+        file_hit = want_file_here and _FILE_ACCOUNT_KIND_MARKER in raw
+        window_hit = want_window_here and _WINDOW_ATTRIBUTION_KIND_MARKER in raw
+        if not (file_hit or window_hit):
+            continue
+        # ONE decode per line (review round 2, finding R2-10). The prefilters are
+        # substring tests, so a single line can match both; decoding inside each
+        # branch parsed such a line twice.
+        rec = _lib_journal.decode_line(raw)
+        if rec is None:
+            continue
+        if file_hit and _is_codex_file_account_op(rec):
+            _restored, _conflicts = _apply_file_account_records(
+                cache_conn, (rec,))
+            applied += _restored
+            conflicts += _conflicts
+            continue
+        if window_hit and _is_codex_window_attribution_record(rec):
+            _asserted, _retracted, _skipped = (
+                _apply_window_attribution_records(cache_conn, (rec,)))
+            attributed += _asserted
+            skipped += _skipped
+    if want_window_attributions and (
+            authoritative or window_attribution_since != (str(hw[0]), int(hw[1]))):
+        # Only when it actually moves. This runs on every ordinary Codex sync,
+        # and a cursor rewritten per tick would dirty the transaction each time
+        # for no change at all.
+        _cctally_cache.store_codex_window_attribution_cursor(cache_conn, hw)
+    return CodexJournalRehydration(
+        applied, hw, conflicts, attributed, skipped)
 
 
 def rehydrate_codex_file_accounts(
@@ -2465,39 +2968,23 @@ def rehydrate_codex_file_accounts(
     ``auth.json`` branch and re-decides — the original defect. Since the MAX-set
     upsert already converges the counter, a clear has no upside and that
     downside.
+    Since #500 review finding F4 this is a thin wrapper over
+    ``rehydrate_codex_journal_families``, which owns the one traversal both
+    journal-derived Codex families share. The semantics above are unchanged —
+    the window-attribution family is simply switched off — so a caller that
+    needs only the map still pays for only the map.
     """
-    if authoritative:
-        _assert_coverage_already_invalidated(cache_conn)
-    hw = journal_high_water()
-    if hw is None:
-        if authoritative:
-            # No journal at all: an authoritative pass still says "the journal
-            # is the truth", and the truth is that there are no decisions.
-            cache_conn.execute("DELETE FROM codex_file_accounts")
-        return 0, None, 0
-    if authoritative:
-        cache_conn.execute("DELETE FROM codex_file_accounts")
-        since = None
-    applied = 0
-    conflicts = 0
-    # Streamed, never materialized: this runs on the FIRST ordinary sync of
-    # every cache.db (hook-tick, the dashboard, the corruption auto-heal's
-    # re-sync) while both cache flocks are held, so a whole-journal transient
-    # here is a multi-second global cache-writer stall — itself a
-    # `database is locked` trigger. The cheap byte prefilter skips the JSON
-    # decode for every non-decision line; the canonical encoder is
-    # `json.dumps(..., ensure_ascii=False)`, which never escapes an ASCII kind
-    # token, so a genuine op always carries this substring verbatim. A false
-    # positive is harmless — it is decoded and rejected by the real predicate.
-    for _seg, _off, raw in iter_range(since, hw):
-        if _FILE_ACCOUNT_KIND_MARKER not in raw:
-            continue
-        rec = _lib_journal.decode_line(raw)
-        if rec is not None and _is_codex_file_account_op(rec):
-            _restored, _conflicts = _apply_file_account_records(cache_conn, (rec,))
-            applied += _restored
-            conflicts += _conflicts
-    return applied, hw, conflicts
+    result = rehydrate_codex_journal_families(
+        cache_conn,
+        authoritative=authoritative,
+        file_account_since=since,
+        want_file_accounts=True,
+        want_window_attributions=False,
+        caller="rehydrate_codex_file_accounts(authoritative=True)",
+    )
+    return (result.file_accounts_applied,
+            result.file_accounts_high_water,
+            result.file_accounts_declined)
 
 
 def _bounded_covered_offset(segment, raw_offset, covered_offset, decoded_end):
@@ -2572,22 +3059,33 @@ def _coverage_advance_plan(cursor, covered_to, decoded_end=None):
 
 def _cache_applier(decoded, *, cursor=None, covered_to=None,
                    decoded_end=None) -> int | None:
-    """Composite cache leg (spec §5.2 step 3 + #416 spec §3.4): materialize this
-    batch's Codex quota obs into `quota_window_snapshots` AND its
-    `codex_file_account` ops into the attribution map, under the NON-BLOCKING
-    global cache writer lock followed by `cache.db.codex.lock`, in ONE
-    `BEGIN IMMEDIATE`. Contract (journal seam): `(decoded) -> stop | None`,
+    """Composite cache leg (spec §5.2 step 3 + #416 spec §3.4 + #500 spec §6.2):
+    materialize this batch's THREE Codex families — quota obs into
+    `quota_window_snapshots`, `codex_file_account` ops into the attribution map,
+    and `codex_window_attribution`/`..._retract` ops into
+    `codex_window_attributions` — under the NON-BLOCKING global cache writer
+    lock followed by `cache.db.codex.lock`, in ONE `BEGIN IMMEDIATE`. Contract
+    (journal seam): `(decoded) -> stop | None`,
     `decoded = [(record, segment, offset), ...]` in canonical order.
 
-    - Neither family present in the batch → return None (no flock taken).
+    - NO family present in the batch → return None (no flock taken).
     - Busy global/provider flock, OR a cache write it cannot complete → PREFIX-STOP:
-      return the EARLIEST index across BOTH families having committed NEITHER, so
-      the cycle processes only `decoded[:stop]` and advances the cursor to
-      `decoded[stop]`'s offset, retrying the remainder next cycle (the scalar
-      cursor never advances past an unmaterialized record — spec §5.2 step 3).
+      return the EARLIEST index across ALL THREE families having committed NONE
+      of them, so the cycle processes only `decoded[:stop]` and advances the
+      cursor to `decoded[stop]`'s offset, retrying the remainder next cycle (the
+      scalar cursor never advances past an unmaterialized record — spec §5.2
+      step 3). "A cache write it cannot complete" covers
+      `CodexWindowAttributionReplayFailed` as well as `sqlite3.Error` since
+      review finding F3: the typed attribution failure takes the same
+      prefix-stop, rather than escaping to `_run_stats_ingest_once`, which
+      re-raises under `mode="authoritative"` and would hard-fail `record-usage`,
+      `record-credit`, `sync-week` and statusline publication.
     - Flock acquired + everything upserted → return None (full consumption).
       A quota-row change advances ``codex_physical_mutation_seq`` in the same
-      transaction; an idempotent replay leaves the sequence unchanged.
+      transaction; an idempotent replay leaves the sequence unchanged. A
+      structurally invalid attribution record is SKIPPED, counted, and reported
+      after the commit (review finding F2) — it never prefix-stops, because a
+      damaged line would otherwise wedge the cursor forever.
 
     ``cursor``, ``covered_to`` and ``decoded_end`` carry the cycle's journal
     range so this leg can ADVANCE the #496 S5b coverage certificate (spec §4.3).
@@ -2604,15 +3102,22 @@ def _cache_applier(decoded, *, cursor=None, covered_to=None,
                  if _is_codex_quota_obs(rec)]
     file_idx = [i for i, (rec, _s, _o) in enumerate(decoded)
                 if _is_codex_file_account_op(rec)]
-    if not quota_idx and not file_idx:
+    # #500: the operator's window attributions are a covered family too, so the
+    # certificate this leg advances would otherwise claim coverage for records
+    # nobody materialized — and a later rebuild would trust it and skip them.
+    # Materializing here is also what makes spec §6.2's "ingest reconciles the
+    # tail" true on the ordinary status-line tick.
+    attr_idx = [i for i, (rec, _s, _o) in enumerate(decoded)
+                if _is_codex_window_attribution_record(rec)]
+    if not quota_idx and not file_idx and not attr_idx:
         return None
     # BEFORE the flocks, for the reason `_coverage_advance_plan` states, and
     # before them for a second reason too: it is journal file I/O, and the leg's
     # whole purpose is to hold the global cache writer lock as briefly as it can.
     plan = _coverage_advance_plan(cursor, covered_to, decoded_end)
-    # All-or-nothing across the two families: one stop, the earliest of either.
-    stop_idx = min(quota_idx[0] if quota_idx else file_idx[0],
-                   file_idx[0] if file_idx else quota_idx[0])
+    # All-or-nothing across the three families: one stop, the earliest of any.
+    stop_idx = min(
+        idx[0] for idx in (quota_idx, file_idx, attr_idx) if idx)
     from _lib_cache_writer_lock import (
         acquire_cache_writer_flocks,
         release_cache_writer_flocks,
@@ -2660,6 +3165,24 @@ def _cache_applier(decoded, *, cursor=None, covered_to=None,
             # must already govern the observations it covers.
             _, _file_conflicts = _apply_file_account_records(
                 cache, [decoded[i][0] for i in file_idx])
+            _attr_skipped = 0
+            if attr_idx:
+                # In journal order, so a retraction reaches the assertion it
+                # names.
+                _, _, _attr_skipped = _apply_window_attribution_records(
+                    cache, [decoded[i][0] for i in attr_idx])
+                # The cursor moves only when the CYCLE supplied its contiguous
+                # range. A direct call (a test, or any caller that does not know
+                # the range) leaves it alone: a cursor behind the table is
+                # harmless, because every apply is idempotent on its op id, while
+                # a cursor ahead of it skips a durable assertion forever. Bounded
+                # by what the cycle DECODED, for the same reason the coverage
+                # claim is.
+                _attr_through = decoded_end if decoded_end is not None else covered_to
+                if _attr_through is not None:
+                    _cctally_cache.store_codex_window_attribution_cursor(
+                        cache,
+                        (str(_attr_through[0]), int(_attr_through[1])))
             quota_changes_before = cache.total_changes
             _apply_quota_records(cache, [decoded[i][0] for i in quota_idx])
             if cache.total_changes != quota_changes_before:
@@ -2677,14 +3200,29 @@ def _cache_applier(decoded, *, cursor=None, covered_to=None,
                     applied_through=applied_through, pinned_vector=vector)
             cache.commit()
             _report_file_account_conflicts(_file_conflicts)
-        except sqlite3.Error as exc:
+            _report_window_attribution_skips(_attr_skipped)
+        except (sqlite3.Error, CodexWindowAttributionReplayFailed) as exc:
             try:
                 cache.rollback()
             except sqlite3.Error:
                 pass
             # Could not materialize -> prefix-stop so the cursor holds and the
             # next cycle retries (the records stay durable in the journal
-            # regardless). NEITHER family is committed.
+            # regardless). NO family is committed.
+            #
+            # #500 review finding F3: the typed attribution failure belongs
+            # HERE, not escaping to the caller. It subclasses `RuntimeError`, so
+            # without this clause it propagated out of `_cache_applier`, out of
+            # `_run_cycle`, and reached only `_run_stats_ingest_once`'s broad
+            # handler — which RE-RAISES under `mode="authoritative"`. That mode
+            # is `record-usage`, `record-credit`, `sync-week` and statusline
+            # publication, so a transient `database is locked` on this one table
+            # would hard-fail those commands while the two families beside it
+            # merely held the cursor. Spec §6.2's fail-loud obligation is about
+            # stats-rebuild PUBLICATION and `_run_bounded_recovery` discharges
+            # it separately at its own typed handler; the ingest leg's fail-safe
+            # is the prefix-stop, and holding the cursor gives the identical
+            # guarantee.
             print(f"[ingest] cache leg write failed: {exc}", file=sys.stderr)
             return stop_idx
         finally:
@@ -3039,9 +3577,26 @@ _EVT_KIND_PROVIDER = {
 # `op_kinds` set, so the kind MUST additionally carry a
 # `_lib_rederive._OP_CLASSIFICATIONS` entry or the re-derive planner raises
 # `RederiveConflict` on every run.
+# #500: the operator's attribution of an already-recorded Codex quota window,
+# and its retraction. Machinery, not data-bearing: the payload's `account_key`
+# is the SUBJECT of the assertion — the account the operator says the window
+# belongs to — rather than the two-shaped stamp naming which account wrote the
+# record.
+#
+# Registration is NOT what makes `classify_legacy_provider` and
+# `_normalize_legacy_account_stamp` leave that field alone (review finding F7).
+# Both already do: the former's `t == "op"` branch returns None for every kind
+# except `weekly_credit_floor`, and the latter is gated on
+# `_REAL_ACCOUNT_EVT_OP_KINDS`, which these kinds were never in. Removing these
+# two names changes neither function's answer — verified by experiment.
+# Registration's real effect is that `_cctally_rederive` unions this set into
+# the `op_kinds` it hands `validate_family_registry`, so a registered kind MUST
+# also carry a `_lib_rederive._OP_CLASSIFICATIONS` entry or the re-derive
+# planner raises `RederiveConflict` on every run.
 _ACCOUNTS_MACHINERY_KINDS = frozenset(
     ("account_observe", "account_label", "accounts_cutover",
-     "codex_file_account"))
+     "codex_file_account",
+     "codex_window_attribution", "codex_window_attribution_retract"))
 
 # Legacy-classifier exhaustiveness guard (#341, review finding P2-1). EVERY evt
 # kind in `_EVT_SPECS` and every harvest kind in `_HARVEST_SPECS` must carry a
@@ -5712,6 +6267,7 @@ def _run_stats_ingest_once(
     reconcile_config=None,
     codex_apply=None,
     post_commit=None,
+    locks_held: bool = False,
 ) -> IngestResult:
     """Run one single-flight attempt, without correction-recovery orchestration.
 
@@ -5745,7 +6301,33 @@ def _run_stats_ingest_once(
     returns `IngestResult(ran=True, error=<exc>)` so a statusline/hook tick is
     never broken; an AUTHORITATIVE ingest re-raises so its caller (record-usage,
     record-credit, sync-week, statusline publication) sees the failure.
+
+    `locks_held=True` (#500 spec §8.1) declares that the CALLER already owns
+    stats maintenance and `journal.ingest.lock` for the duration, so this cycle
+    neither acquires nor releases them. Without it, `account attribute`'s apply
+    sequence — which has to hold both across its cache transaction and its stats
+    transaction — would call in here and block on locks it already owns, and a
+    same-process flock request on a second descriptor is a timeout rather than a
+    reentrant no-op. It is deliberately a PARAMETER on this one function and not
+    a second entry point: the cycle, its transaction boundaries, its
+    correction-recovery signal and its alert dispatch are all the same, because a
+    second subtly different ingest path is a worse outcome than the deadlock it
+    was written to avoid. The one behavioural difference lives in
+    `run_stats_ingest`, which declines automatic correction recovery under this
+    flag exactly as it already declines it for a caller-owned connection.
     """
+    if locks_held and _cctally_core.holds_attribution_apply_cache_flocks():
+        # #500 §8.1 / the lock-order law in `docs/journal-gotchas.md`: every
+        # cache write must be committed and unlocked BEFORE the stats
+        # transaction opens. `codex_attribution_apply_locks` yields an owner
+        # whose `release_cache_flocks()` is what satisfies that; a caller that
+        # forgets it would violate the law silently, so the violation is refused
+        # here rather than diagnosed later from a deadlock or a torn generation.
+        raise ValueError(
+            "run_stats_ingest(locks_held=True) requires the apply set's cache "
+            "writer flocks to be released first — call "
+            "owner.release_cache_flocks() before the stats transaction"
+        )
     own_conn = conn is None
     maintenance_fd = None
     lock_fd = None
@@ -5758,7 +6340,17 @@ def _run_stats_ingest_once(
         # For a current/mismatched epoch, open first, then take maintenance SH
         # and verify the main-file identity did not change across the open; if
         # a sibling rebuilt in that gap, discard the stale handle and retry.
-        if own_conn:
+        if locks_held:
+            # #500 §8.1: the caller already owns maintenance EXCLUSIVE, which is
+            # strictly stronger than the SHARED hold this branch would take, so
+            # the whole resolution dance has nothing left to serialize — no
+            # sibling can rebuild the main file underneath this open. Requesting
+            # either lock again on a second descriptor would be a same-process
+            # timeout, not a reentrant no-op, which is the deadlock this
+            # parameter exists to avoid.
+            if own_conn:
+                conn = _cctally_core.open_db()
+        elif own_conn:
             while True:
                 raw_epoch = _stats_db_user_version()
                 if (
@@ -5822,18 +6414,19 @@ def _run_stats_ingest_once(
                     alerts=[],
                 )
 
-        lock_fd = _acquire_ingest_lock(mode, timeout_s)
-        if lock_fd is None:
-            if own_conn and conn is not None:
-                conn.close()
-                conn = None
-            return IngestResult(
-                ran=False,
-                consumed=0,
-                malformed=0,
-                events_emitted=0,
-                alerts=[],
-            )
+        if not locks_held:
+            lock_fd = _acquire_ingest_lock(mode, timeout_s)
+            if lock_fd is None:
+                if own_conn and conn is not None:
+                    conn.close()
+                    conn = None
+                return IngestResult(
+                    ran=False,
+                    consumed=0,
+                    malformed=0,
+                    events_emitted=0,
+                    alerts=[],
+                )
         try:
             # #386: declare the sanctioned steady-state write regime for the
             # duration of the cycle. Two consumers: the Stage 3 authorizer, and
@@ -6112,6 +6705,7 @@ def run_stats_ingest(
     reconcile_config=None,
     codex_apply=None,
     post_commit=None,
+    locks_held: bool = False,
 ) -> IngestResult:
     """Run one cycle, healing one completed-correction mismatch when safe.
 
@@ -6120,6 +6714,14 @@ def run_stats_ingest(
     triggering commit, releases both locks, and retries once on a freshly opened
     current-family connection. Caller-owned connections are never closed or
     replaced. A second correction signal is surfaced with the manual remedy.
+
+    `locks_held=True` (#500 spec §8.1) says the caller already owns stats
+    maintenance and `journal.ingest.lock`, so the cycle neither acquires nor
+    releases them. It declines automatic correction recovery for the same reason
+    a caller-owned CONNECTION does — recovery works by unwinding every lock and
+    then seeking maintenance EXCLUSIVE in total order, which it cannot do while
+    the caller owns the set — and surfaces the same signal with the same manual
+    remedy rather than inventing a second recovery path.
     """
     kwargs = {
         "mode": mode,
@@ -6128,17 +6730,21 @@ def run_stats_ingest(
         "reconcile_config": reconcile_config,
         "codex_apply": codex_apply,
         "post_commit": post_commit,
+        "locks_held": locks_held,
     }
     try:
         return _run_stats_ingest_once(**kwargs)
     except CorrectionRebuildRequired as signal:
         if not signal.recovery_eligible:
             raise
-        if conn is not None:
+        if conn is not None or locks_held:
             raise CorrectionRebuildRequired(
                 _correction_recovery_guidance(
                     "automatic correction recovery cannot replace a "
                     "caller-owned stats.db connection"
+                    if conn is not None else
+                    "automatic correction recovery cannot run while the "
+                    "caller holds the stats maintenance and ingest locks"
                 ),
                 batch_id=signal.batch_id,
                 event_id=signal.event_id,
@@ -8544,6 +9150,16 @@ def _rebuild_quota_cache_leg_raw(
     file_accounts = [
         r for r in decoded if r is not None and _is_codex_file_account_op(r)
     ]
+    # #500 spec §6.3: the operator's attribution assertions ride the SAME leg,
+    # so they are replayed under the same flocks, in the same transaction, and
+    # under the same coverage certificate as the quota rows and the attribution
+    # map. A separate pass after this one could not be covered by that
+    # certificate, and a failure in it would be flattened into a successful
+    # publish (§6.2).
+    attributions = [
+        r for r in decoded
+        if r is not None and _is_codex_window_attribution_record(r)
+    ]
     if coverage is not None:
         # `complete` is TRUE for a skip, and that is not a slip. Spec §4.7
         # distinguishes stats publication success from cache-recovery
@@ -8559,7 +9175,7 @@ def _rebuild_quota_cache_leg_raw(
     # that elided every quota-bearing segment has an empty `quota_raw` and a
     # cache that may still need those observations if the certificate stopped
     # being valid while the pass ran.
-    if not quota_raw and not file_accounts and not elision_gaps:
+    if not quota_raw and not file_accounts and not attributions and not elision_gaps:
         return 0.0
     cache_path = _cctally_core.CACHE_DB_PATH
     if not cache_path.exists():
@@ -8630,6 +9246,7 @@ def _rebuild_quota_cache_leg_raw(
         quota_raw, file_accounts, cutover_claude, counters,
         cache_path=cache_path, vector=vector, covered=covered,
         high_water=high_water, coverage=coverage, quiet=quiet,
+        attributions=attributions,
     )
 
 
@@ -8688,6 +9305,7 @@ def _recovery_state(cache):
 def _run_bounded_recovery(
     quota_raw, file_accounts, cutover_claude, counters, *,
     cache_path, vector, covered, high_water, coverage, quiet=False,
+    attributions=(),
 ) -> float:
     """Recovery as resumable chunks, each capped by bytes AND record count.
 
@@ -8854,11 +9472,27 @@ def _run_bounded_recovery(
                             counters.update(counter_baseline)
                         continue
                 file_conflicts = 0
+                attr_skipped = 0
                 if with_decisions:
                     # Decisions FIRST inside this transaction — the same §3.5
                     # precedence ordering `_cache_applier` keeps.
                     _restored, file_conflicts = _apply_file_account_records(
                         cache, file_accounts)
+                    # #500: the whole attribution population rides chunk 0 for
+                    # the same reason the decisions do — it is bounded by the
+                    # operator's assertions (dozens of records on a store with
+                    # years of history), not by the observations, so it cannot
+                    # reintroduce the unbounded hold the chunking removed. The
+                    # cursor commits with them: once this transaction lands, the
+                    # table IS current through the pinned high water, because
+                    # every attribution record in the prefix is in this list.
+                    if attributions:
+                        _, _, attr_skipped = _apply_window_attribution_records(
+                            cache, attributions)
+                    if attributions and high_water is not None:
+                        _cctally_cache.store_codex_window_attribution_cursor(
+                            cache,
+                            (str(high_water[0]), int(high_water[1])))
                 if decoded_chunk is not None:
                     _apply_quota_records(
                         cache, decoded_chunk,
@@ -8878,6 +9512,7 @@ def _run_bounded_recovery(
                     committed_chunks += 1
                     chunk_index += 1
                     _report_file_account_conflicts(file_conflicts, quiet=quiet)
+                    _report_window_attribution_skips(attr_skipped, quiet=quiet)
                     outcome, stop_reason = "incomplete", "noCoverageEstablished"
                     break
                 if last and covered is not None:
@@ -8907,6 +9542,7 @@ def _run_bounded_recovery(
                         committed_chunks += 1
                         chunk_index += 1
                         _report_file_account_conflicts(file_conflicts, quiet=quiet)
+                        _report_window_attribution_skips(attr_skipped, quiet=quiet)
                         outcome, stop_reason = "incomplete", "mintRefused"
                         break
                 else:
@@ -8925,6 +9561,26 @@ def _run_bounded_recovery(
                 committed_chunks += 1
                 chunk_index += 1
                 _report_file_account_conflicts(file_conflicts, quiet=quiet)
+                _report_window_attribution_skips(attr_skipped, quiet=quiet)
+            except CodexWindowAttributionReplayFailed as exc:
+                # #500 spec §6.2. Typed, and reported through the SAME coverage
+                # channel a write failure uses, so `_write_quota_projection_state`
+                # stamps `stats_quota_projection_state.incomplete` inside the
+                # publication transaction. It must never be flattened into a
+                # successful empty result: a generation published with
+                # `incomplete = 0` while omitting the operator's attribution is
+                # exactly the silent under-attribution this design exists to
+                # prevent.
+                if cache is not None:
+                    try:
+                        cache.rollback()
+                    except sqlite3.Error:
+                        pass
+                if not quiet:
+                    print("[rebuild] Codex window attribution replay failed: "
+                          f"{exc}", file=sys.stderr)
+                outcome, stop_reason = "failed", "attributionReplayFailed"
+                break
             except sqlite3.Error as exc:
                 if cache is not None:
                     try:

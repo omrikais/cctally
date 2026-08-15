@@ -192,7 +192,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 41,
+                            "registry_size": 44,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -254,7 +254,10 @@
                                     "038_codex_session_files_ingest_complete",
                                     "039_codex_quota_observed_model_backfill",
                                     "040_codex_quota_physical_group_index",
-                                    "041_codex_quota_unresolved_model_index"
+                                    "041_codex_quota_unresolved_model_index",
+                                    "042_codex_entries_root_path_index",
+                                    "043_codex_window_attributions",
+                                    "044_codex_accounting_change_ledger"
                                 ],
                                 "skipped": []
                             },
@@ -282,7 +285,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/54 applied",
+                    "summary": "0/57 applied",
                     "title": "Migrations"
                 },
                 {
@@ -503,13 +506,25 @@
                             [
                                 "cache.db",
                                 "041_codex_quota_unresolved_model_index"
+                            ],
+                            [
+                                "cache.db",
+                                "042_codex_entries_root_path_index"
+                            ],
+                            [
+                                "cache.db",
+                                "043_codex_window_attributions"
+                            ],
+                            [
+                                "cache.db",
+                                "044_codex_accounting_change_ledger"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "54 pending",
+                    "summary": "57 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -904,6 +919,16 @@
                     "severity": "ok",
                     "summary": "Codex reset anchors complete",
                     "title": "Codex reset anchors"
+                },
+                {
+                    "details": {
+                        "active": 0,
+                        "retracted": 0
+                    },
+                    "id": "accounts.codex_window_attribution",
+                    "severity": "ok",
+                    "summary": "no operator window attribution recorded",
+                    "title": "Codex window attribution"
                 }
             ],
             "id": "accounts",
@@ -1013,7 +1038,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 54,
+            "ok": 55,
             "warn": 6
         },
         "severity": "warn"

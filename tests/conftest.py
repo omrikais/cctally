@@ -496,6 +496,7 @@ def _reset_snapshot_dispatch_state():
             "reset_dispatch_state",
             "reset_group_a_state",
             "reset_session_cache_state",
+            "reset_codex_accounting_cache_state",
             "reset_doctor_memo",
             "reset_bugk_segment_state",
             # #271 M4: the projects-envelope current-week accumulator slot —
@@ -508,6 +509,12 @@ def _reset_snapshot_dispatch_state():
                     _fn()
                 except Exception:
                     pass
+    try:
+        import _cctally_dashboard_sources as _sources
+        _sources.reset_codex_account_scope_cache()
+        _sources.reset_codex_quota_observation_cache()
+    except Exception:
+        pass
     yield
 
 

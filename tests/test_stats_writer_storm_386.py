@@ -1854,6 +1854,12 @@ def test_dashboard_source_reader_releases_rollback_snapshot(
             week_start_name="monday",
             speed="auto",
             codex_budget=None,
+            # #556 S5 §3.4: the Claude half of the same resolved budget block.
+            # `None` is the no-budget shape the real resolver never produces
+            # (it always returns the defaults-filled mapping), and it is what
+            # this stub wants: no Claude budget status is published, so this
+            # test's rollback-snapshot assertion is untouched by S5.
+            claude_budget=None,
             codex_quota_actual_thresholds=(),
             codex_quota_projected_thresholds=(),
             cache_report_anomaly_threshold_pp=15,

@@ -7,7 +7,7 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from 'react';
-import { useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
+import { scopeProviderFor, useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useKeymap } from '../hooks/useKeymap';
 import { Modal } from './Modal';
@@ -16,7 +16,7 @@ import {
   CODEX_STALE_CYCLE_NOTE,
   codexIngestBacklogNote,
 } from '../components/HeroStrip';
-import { fmt, type FmtCtx } from '../lib/fmt';
+import { fmt, spendWindowLabel, type FmtCtx } from '../lib/fmt';
 import { dispatch, getState, subscribeStore, topmostStoreFocusLayer } from '../store/store';
 import type { Binding } from '../store/keymap';
 import { openShareModal } from '../store/shareSlice';
@@ -29,6 +29,7 @@ import type {
   CodexQuotaMilestoneRow,
   CodexSourceData,
   AllSourceData,
+  DashboardSelection,
   Envelope,
   Milestone,
   FiveHourMilestone,
@@ -569,7 +570,21 @@ function CodexPerAccountCycleTable({
                 <td>{card.label}</td>
                 <td className="num">{fmt.pct1(activeWeekly?.current_percent)}</td>
                 <td className="d">{fmt.datetimeShortZ(activeWeekly?.resets_at, ctx)}</td>
-                <td className="num">{fmt.usd2(card.spendUsd)}</td>
+                <td className="num">
+                  {fmt.usd2(card.spendUsd)}
+                  {/* #564 — this row's total covers the bounded fallback
+                      window, not the "native 7-day quota" the chip above the
+                      table claims. A compact qualifier rather than a sentence:
+                      the row already carries a label and two figures. */}
+                  {card.spendWindow != null && (
+                    <span
+                      className="mcw-spend-window"
+                      data-testid="cycle-row-window"
+                    >
+                      {spendWindowLabel(card.spendWindow)}
+                    </span>
+                  )}
+                </td>
                 <td className="num">{fmt.tokens(card.totalTokens)}</td>
               </tr>
             );
@@ -605,7 +620,19 @@ function CodexCurrentCycleModal({
   // source-tab scope. It qualifies every current Codex total derived from this
   // store, including the per-account landing table and the embedded All modal.
   const ingestBacklogNote = codexIngestBacklogNote(codex?.ingest_backlog);
-  const accountKey = useAccountScope().accountKey;
+  // #556 S5 §5.4 — under All the Codex focus slot is what qualifies this
+  // route, so a focused account reaches its own cycle detail from the
+  // combined tab exactly as it does from the Codex tab.
+  // `embedded` is the All-providers variant of this same component, so the
+  // view it belongs to is All and the slot it reads is the All Codex one.
+  const selection: DashboardSelection = embedded ? 'all' : 'codex';
+  const accountScope = useAccountScope(selection, scopeProviderFor(selection));
+  const accountKey = accountScope.accountKey;
+  // #564 — under focus this modal reads `hero.cost_usd`, which for an account
+  // with no live cycle is that card's bounded fallback total. The "spent" key
+  // below names the window so the figure is not read as the 7-day quota the
+  // chipstrip announces.
+  const focusedSpendWindow = accountScope.card?.spendWindow ?? null;
   // #416 QA P0-B — "All accounts" on a decorated Codex provider. `accounts` is
   // emitted ONLY above one real account (R8), so a single-account install can
   // never take this branch and its modal is byte-identical. `accountKey` is
@@ -629,6 +656,13 @@ function CodexCurrentCycleModal({
     clearPendingBlockStep,
   } = nav;
   const isHistoric = weekKey != null;
+  // #564 review P3: the trailing window describes `hero.cost_usd` only. Once a
+  // historic cycle is selected the figure below becomes that CYCLE's last
+  // milestone, so the window would name a period the number does not cover.
+  // Reachable for the unattributed sentinel, which can own a cycle index (a
+  // boundary with no quota identity is filed under `unattributed`) while still
+  // taking the bounded fallback branch that publishes `spendWindow`.
+  const spentWindow = isHistoric ? null : focusedSpendWindow;
 
   const weeklyHistories = codex?.quota.histories
     .filter((row) => row.window_minutes === 10_080)
@@ -898,7 +932,14 @@ function CodexCurrentCycleModal({
             </div>
           </div>
           <div className="mcw-mini" id={singleId('mcw-mini')}>
-            <div className="s"><span className="k">spent</span><span className="v v-magenta">{fmt.usd2(spent)}</span></div>
+            <div className="s">
+              <span className="k">
+                {spentWindow == null
+                  ? 'spent'
+                  : `spent · ${spendWindowLabel(spentWindow)}`}
+              </span>
+              <span className="v v-magenta">{fmt.usd2(spent)}</span>
+            </div>
             <div className="s"><span className="k">$ / 1%</span><span className="v v-cyan">{fmt.usd3(dpp)}</span></div>
             <div className="s"><span className="k">{resetLabel}</span><span className="v">{fmt.datetimeShortZ(resetCell, ctx)}</span></div>
           </div>

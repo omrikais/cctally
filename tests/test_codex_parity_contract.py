@@ -340,22 +340,21 @@ def test_capability_truth_and_owner_decisions_are_independent_of_builder_constan
         "s4-dashboard-quota-reconciliation": ("S4", "supported"),
         "source-derived-project-attribution": ("S3", "supported"),
         "source-aware-cli-share-identity": ("S3", "supported"),
-        "source-aware-dashboard-share-identity": ("S5", "deferred"),
+        "source-aware-dashboard-share-identity": ("S5", "supported"),
         "report-per-source-never-blended": ("S3", "supported"),
         "codex-cache-hit-rate-not-applicable": ("S3", "not_applicable"),
         "codex-token-reuse-forensics": ("S3", "supported"),
         "provider-ingest-lifecycle": ("S2", "supported"),
         "autonomous-codex-alerts": ("S2", "supported"),
         "percent-breakdown-per-source": ("S2", "supported"),
-        "five-hour-breakdown-per-source": ("S2", "deferred"),
+        "five-hour-breakdown-per-source": ("S2", "supported"),
         "codex-refresh-is-local-rollout-reread": ("S2", "unavailable"),
         "codex-local-rollout-quota-freshness": ("S2", "supported"),
-        # #294 S6 conversation normalization kernel layer shipped: the title and
-        # threading rows flip to supported (owner S6); the whole-phase deferral
-        # row stays deferred (S6–S8 may defer independently).
+        # #294 S6-S8 shipped the complete conversation phase. S9 certifies it
+        # without erasing the explicit unavailable/not-applicable outcomes.
         "codex-title-first-prompt-fallback": ("S6", "supported"),
         "codex-threading-uses-thread-metadata": ("S6", "supported"),
-        "conversation-phase-independently-deferrable": ("S6", "deferred"),
+        "conversation-phase-independently-deferrable": ("S6", "supported"),
     }
     assert {key: (rows[key]["ownerSession"], rows[key]["contractState"]) for key in expected} == expected
 
@@ -457,7 +456,7 @@ def test_s4_dashboard_backend_rows_are_supported_with_executable_source_contract
     assert rows["source-aware-dashboard-share-identity"] == {
         **rows["source-aware-dashboard-share-identity"],
         "ownerSession": "S5",
-        "contractState": "deferred",
+        "contractState": "supported",
     }
     coverage = set(rows["s4-dashboard-share-backend-contract"]["fixtureScenarios"])
     assert {
@@ -518,7 +517,7 @@ def test_public_matrix_current_state_and_owner_decisions_are_explicit():
         "| pricing coverage and drift | supported | supported | S1 |",
         "| budget calculation and actual/projected alerts | supported | supported | S1 |",
         "| quota history | supported | supported | S2 |",
-        "| `report` and `$ / 1%` | supported | deferred | S3 |",
+        "| `report` and `$ / 1%` | supported | supported | S3 |",
         "| `cache-report` cache hit rate | supported | not applicable | S3 |",
         "| setup-managed autonomous sync and alerts | supported | supported | S2 |",
         "| `refresh-usage` / provider-live OAuth refresh | supported | unavailable | S2 |",

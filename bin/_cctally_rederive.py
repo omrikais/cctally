@@ -342,6 +342,25 @@ def _derive_desired_events_into(records, cache_conn, scratch_path) -> list[dict]
         conn.close()
 
 
+def _planner_op_kinds() -> "set[str]":
+    """Every `op` kind the planner validates against `_OP_CLASSIFICATIONS`.
+
+    One definition, so a test can assert what the planner ACTUALLY validates
+    rather than re-deriving the same union beside it (review round 2, finding
+    R2-6). A test that rebuilds the expression locally is a membership check
+    against a set it constructed itself: it passes whatever this module does.
+
+    `sync_week` is named literally because it is journaled as an `op` with no
+    fold applier and no accounts machinery entry, so neither registry carries
+    it, and an unclassified op kind raises `RederiveConflict`.
+    """
+    return (
+        set(_journal.FOLD_APPLIERS)
+        | set(_journal._ACCOUNTS_MACHINERY_KINDS)
+        | {"sync_week"}
+    )
+
+
 def plan_claude_usage(
     records,
     *,
@@ -360,11 +379,7 @@ def plan_claude_usage(
     _normalize_legacy_accounts(records)
     report = _lib_rederive.validate_family_registry(
         evt_kinds=set(_journal._EVT_SPECS),
-        op_kinds=(
-            set(_journal.FOLD_APPLIERS)
-            | set(_journal._ACCOUNTS_MACHINERY_KINDS)
-            | {"sync_week"}
-        ),
+        op_kinds=_planner_op_kinds(),
     )
     if report.unclassified_evt_kinds or report.unclassified_op_kinds:
         raise _lib_rederive.RederiveConflict(
@@ -735,6 +750,143 @@ def _rederive_locks(*, apply: bool, timeout: float):
     finally:
         _cctally_core.note_stats_maintenance_released()
         release_cache_writer_flocks(held)
+
+
+# --------------------------------------------------------------------------
+# #500 §8/§8.1 — the operator-attribution apply lock set
+# --------------------------------------------------------------------------
+#
+# `_rederive_locks` above yields no handles and releases its whole set together,
+# so there is no way to drop only the two cache flocks at the end of the cache
+# transaction while retaining stats maintenance and the ingest lock for the
+# stats transaction that follows. `account attribute` needs exactly that: its
+# cache work must be committed and unlocked before the stats transaction begins,
+# which is the repository law that all cache work precedes the stats transaction
+# (`docs/journal-gotchas.md`), while the ingest lock has to be held ACROSS both
+# so nothing can consume the appended prefix in between.
+#
+# ORDERED PARTIAL RELEASE is the whole mechanism: the owner below releases a
+# SUFFIX of the acquired set in reverse acquisition order and nothing else. A
+# release that skipped an inner lock, or that took them in acquisition order,
+# would be the lock-order violation this exists to avoid rather than a
+# convenience on top of it.
+
+
+class _OrderedApplyLockOwner:
+    """A held ordered flock set that can release a suffix of itself."""
+
+    __slots__ = ("_paths", "_held", "_cache_flock_count", "_cache_flocks_noted")
+
+    def __init__(self, paths, held, *, cache_flock_count: int) -> None:
+        self._paths = tuple(paths)
+        self._held = list(held)
+        self._cache_flock_count = int(cache_flock_count)
+        self._cache_flocks_noted = True
+        _cctally_core.note_attribution_apply_cache_flocks_acquired()
+
+    @property
+    def held_paths(self) -> tuple:
+        return tuple(self._paths[:len(self._held)])
+
+    def _note_cache_flocks_released(self) -> None:
+        if self._cache_flocks_noted:
+            self._cache_flocks_noted = False
+            _cctally_core.note_attribution_apply_cache_flocks_released()
+
+    def release_cache_flocks(self) -> None:
+        """Drop the global cache writer flock and the Codex provider flock.
+
+        Idempotent, because the apply sequence releases them at the end of its
+        cache transaction and the context manager's ``finally`` releases
+        whatever is left — the second call must not close a descriptor twice.
+
+        The release is RECORDED as well as performed, and that is what turns the
+        repository lock-order law into something the code enforces:
+        `_run_stats_ingest_once(locks_held=True)` refuses while this context
+        still holds them, so a caller that forgets this call gets a loud refusal
+        instead of a stats transaction opened underneath live cache flocks.
+        """
+        from _lib_cache_writer_lock import release_cache_writer_flocks
+
+        if len(self._held) <= len(self._paths) - self._cache_flock_count:
+            self._note_cache_flocks_released()
+            return
+        keep = len(self._paths) - self._cache_flock_count
+        # `release_cache_writer_flocks` releases the list it is given in REVERSE
+        # order, which is what makes this a suffix release rather than an
+        # arbitrary one.
+        release_cache_writer_flocks(self._held[keep:])
+        del self._held[keep:]
+        self._note_cache_flocks_released()
+
+    def release_all(self) -> None:
+        from _lib_cache_writer_lock import release_cache_writer_flocks
+
+        release_cache_writer_flocks(self._held)
+        self._held.clear()
+        self._note_cache_flocks_released()
+
+
+@contextlib.contextmanager
+def codex_attribution_apply_locks(*, timeout: float = _REDERIVE_LOCK_TIMEOUT_SECONDS):
+    """Acquire the #500 §8 apply order and yield an ordered-partial-release owner.
+
+    The order is ``_rederive_locks``' applying order extended by the Codex
+    provider flock, exactly as the spec states:
+
+    1. stats maintenance, exclusive
+    2. cache maintenance, shared
+    3. ``journal.ingest.lock``, exclusive
+    4. global ``cache.db.lock``, exclusive
+    5. the Codex provider flock, exclusive
+
+    ``owner.release_cache_flocks()`` drops 5 then 4 and retains 1-3, so the
+    stats transaction runs with the ingest lock still held while every cache
+    writer is free again.
+
+    Do not ``os.fork()`` and do not start a thread inside this block. The
+    lock-order guard behind ``release_cache_flocks()`` is a ContextVar counter,
+    so a child context starts from a COPY of this one and never observes the
+    later release — a forked or spawned worker would either refuse a stats
+    ingest that is legitimately unblocked, or, if it were created before the
+    acquisition, run one while the cache flocks are still held. The flocks
+    themselves are process-wide and unaffected; the guard is what is advisory
+    across a context boundary.
+    """
+    from _lib_cache_writer_lock import acquire_ordered_flocks
+
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    locks = [
+        (_cctally_core.STATS_LOCK_MAINTENANCE_PATH, fcntl.LOCK_EX),
+        (_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
+        (_cctally_core.JOURNAL_INGEST_LOCK_PATH, fcntl.LOCK_EX),
+        (_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
+        (_cctally_core.CACHE_LOCK_CODEX_PATH, fcntl.LOCK_EX),
+    ]
+    held = acquire_ordered_flocks(locks, timeout=timeout)
+    if held is None:
+        raise RederiveBusy(
+            "another database sync or maintenance operation holds the "
+            "attribution apply lock set; retry shortly"
+        )
+    owner = _OrderedApplyLockOwner(
+        [path for path, _mode in locks], held, cache_flock_count=2)
+    # #386, the same declaration `_rederive_locks` makes: record the stats
+    # maintenance hold so a nested live `open_db()` does not request SHARED on a
+    # second fd of this same file and self-deadlock, and declare the sanctioned
+    # write regime plus the ingest hold so a heal reached from in here
+    # recognises itself as the serialized writer.
+    import _cctally_store
+
+    _cctally_core.note_stats_maintenance_acquired()
+    try:
+        with _cctally_store.stats_write_scope(
+            "codex-window-attribution", ingest_lock=True,
+        ):
+            yield owner
+    finally:
+        _cctally_core.note_stats_maintenance_released()
+        owner.release_all()
 
 
 def preview_db_rederive(

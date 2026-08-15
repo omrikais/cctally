@@ -99,7 +99,8 @@ _QUALIFIED_CODEX_ENTRIES_SQL = """
            entries.output_tokens, entries.reasoning_output_tokens,
            entries.total_tokens, threads.cwd, threads.git_json,
            threads.conversation_key AS joined_conversation_key,
-           threads.source_root_key AS joined_source_root_key
+           threads.source_root_key AS joined_source_root_key,
+           entries.id AS cache_entry_id
       FROM codex_session_entries AS entries
            INDEXED BY idx_codex_entries_ts_root_conversation
       LEFT JOIN codex_conversation_threads AS threads
@@ -112,6 +113,21 @@ _QUALIFIED_CODEX_ENTRIES_SQL = """
 """
 
 
+def _qualified_codex_path_entries_sql(identity_count: int) -> str:
+    """Return the qualified read constrained to physical cache identities."""
+    predicates = " OR ".join(
+        "(entries.source_root_key = ? AND entries.source_path = ?)"
+        for _ in range(identity_count)
+    )
+    return _QUALIFIED_CODEX_ENTRIES_SQL.replace(
+        "INDEXED BY idx_codex_entries_ts_root_conversation",
+        "INDEXED BY idx_codex_entries_root_path",
+    ).replace(
+        "     ORDER BY entries.timestamp_utc ASC",
+        f"       AND ({predicates})\n     ORDER BY entries.timestamp_utc ASC",
+    )
+
+
 _INHERITED_CODEX_PROJECT_METADATA_SQL = """
     SELECT files.source_root_key, files.path, inherited.cwd, inherited.git_json
       FROM codex_session_files AS files
@@ -122,6 +138,21 @@ _INHERITED_CODEX_PROJECT_METADATA_SQL = """
        AND files.last_native_thread_id != ''
      ORDER BY inherited.last_seen_utc DESC, inherited.conversation_key DESC
 """
+
+
+def _inherited_codex_path_metadata_sql(identity_count: int) -> str:
+    """Constrain inherited file-alias metadata to dirty physical paths."""
+    if identity_count < 1:
+        raise ValueError("identity_count must be positive")
+    predicates = " OR ".join(
+        "(files.source_root_key = ? AND files.path = ?)"
+        for _ in range(identity_count)
+    )
+    return _INHERITED_CODEX_PROJECT_METADATA_SQL.replace(
+        "     WHERE files.last_native_thread_id IS NOT NULL",
+        f"     WHERE ({predicates})\n"
+        "       AND files.last_native_thread_id IS NOT NULL",
+    )
 
 
 _CODEX_ACCOUNTING_ENTRIES_SQL = """
@@ -458,6 +489,7 @@ def load_qualified_codex_entries(
     sync: bool = True,
     group: str = "git-root",
     cache_conn: sqlite3.Connection | None = None,
+    source_identities: Iterable[tuple[str, str]] | None = None,
 ) -> tuple[QualifiedCodexEntry, ...]:
     """Load exactly one bounded, root-qualified Codex accounting read.
 
@@ -474,6 +506,15 @@ def load_qualified_codex_entries(
 
     if cache_conn is not None and sync:
         raise ValueError("cache_conn requires sync=False")
+
+    identities: tuple[tuple[str, str], ...] | None = None
+    if source_identities is not None:
+        identities = tuple(sorted({
+            (str(root), str(path)) for root, path in source_identities
+            if str(root) and str(path)
+        }))
+        if not identities:
+            return ()
 
     c = _cctally()
     owns_conn = cache_conn is None
@@ -496,13 +537,25 @@ def load_qualified_codex_entries(
             if stats.lock_contended:
                 raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable")
         conn.row_factory = sqlite3.Row
-        rows = tuple(conn.execute(
-            _QUALIFIED_CODEX_ENTRIES_SQL,
-            (start.astimezone(UTC).isoformat(), end.astimezone(UTC).isoformat()),
-        ))
+        sql = (
+            _QUALIFIED_CODEX_ENTRIES_SQL if identities is None
+            else _qualified_codex_path_entries_sql(len(identities))
+        )
+        params: tuple[object, ...] = (
+            start.astimezone(UTC).isoformat(), end.astimezone(UTC).isoformat(),
+            *(value for identity in (identities or ()) for value in identity),
+        )
+        rows = tuple(conn.execute(sql, params))
         inherited_metadata: dict[tuple[str, str], sqlite3.Row] = {}
         if _supports_native_file_aliases(conn):
-            for inherited in conn.execute(_INHERITED_CODEX_PROJECT_METADATA_SQL):
+            inherited_sql = (
+                _INHERITED_CODEX_PROJECT_METADATA_SQL if identities is None
+                else _inherited_codex_path_metadata_sql(len(identities))
+            )
+            inherited_params = tuple(
+                value for identity in (identities or ()) for value in identity
+            )
+            for inherited in conn.execute(inherited_sql, inherited_params):
                 identity = (str(inherited["source_root_key"] or ""), str(inherited["path"] or ""))
                 if all(identity):
                     inherited_metadata.setdefault(identity, inherited)
@@ -580,6 +633,7 @@ def load_qualified_codex_entries(
             # NULL ≡ unattributed — the cache-read rule (#416 §5.2). Carried,
             # never grouped; see the field's comment on `QualifiedCodexEntry`.
             account_key=str(row["account_key"] or _lib_accounts.UNATTRIBUTED),
+            cache_entry_id=int(row["cache_entry_id"]),
         ))
     return tuple(result)
 

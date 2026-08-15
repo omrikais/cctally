@@ -240,7 +240,7 @@ describe('#503 S4 §4.4 / #520 item 2 — one PreviewPane, placed by CSS', () =>
       });
       // The global selector can move while the modal is open. The request must
       // remain qualified by the flow's frozen account, not this later value.
-      dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: 'a'.repeat(32) });
+      dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: 'a'.repeat(32) });
     });
 
     await waitFor(() => {

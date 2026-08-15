@@ -76,7 +76,7 @@ import tempfile
 import time
 import traceback
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 
 def _cctally():
@@ -743,6 +743,42 @@ def _would_block_prod_migration(conn: sqlite3.Connection) -> bool:
         return db_dir == _cctally_core._real_prod_data_dir().resolve()
     except OSError:
         return False
+
+
+def _refuse_prod_migration_before_schema_write(
+    conn: sqlite3.Connection,
+    registry: "list[Migration]",
+    db_label: str,
+) -> None:
+    """Raise ``ProdMigrationRefused`` BEFORE the caller writes policy or DDL.
+
+    The #142 guard lives inside ``_run_pending_migrations``, which both
+    cache-open paths reach only AFTER ``apply_policy``, ``_apply_cache_schema``
+    and the ``last_total_tokens`` ALTER-plus-purge. A dev-checkout binary
+    pointed at the real prod dir therefore modified the production schema and
+    only then refused (#566). This preflight is the same decision, evaluated
+    where nothing has been written yet.
+
+    The conditions are the dispatcher's, unchanged: there must be pending
+    migrations that would advance ``user_version``
+    (``cur_version < len(registry)``), and ``_would_block_prod_migration`` must
+    hold — connection-scoped, password-DB-resolved, suppressor-independent,
+    with ``CCTALLY_ALLOW_PROD_MIGRATION`` as the escape.
+
+    A version-AHEAD store is deliberately NOT refused here. That is the #145
+    self-heal case, which the dispatcher owns and which cache.db opts into.
+
+    Callers must already hold cache maintenance exclusive and the global writer
+    flock, so the version this reads is the one the upgrade would act on.
+    """
+    cur_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if cur_version >= len(registry):
+        return
+    if not _would_block_prod_migration(conn):
+        return
+    raise ProdMigrationRefused(
+        db_label, _first_pending_migration_name(conn, registry, cur_version)
+    )
 
 
 def _would_block_prod_stats(path: pathlib.Path) -> bool:
@@ -3843,6 +3879,25 @@ def _apply_codex_quota_unresolved_model_index(conn: sqlite3.Connection) -> None:
     conn.execute(_QUOTA_UNRESOLVED_MODEL_INDEX_DDL)
 
 
+def _apply_codex_entries_root_path_index(conn: sqlite3.Connection) -> None:
+    """Create the per-file alias join index (#566).
+
+    ``_codex_conversation_metadata`` matches on (source_root_key, source_path).
+    ``idx_codex_entries_source_root`` cannot serve it: a machine normally has
+    ONE provider root, so a root-only search visits every entry row for every
+    file and the join costs files x entries on every dashboard snapshot build.
+    Measured on a real store, the alias query alone went 57.20s -> 0.208s.
+
+    Called from BOTH ``_apply_cache_schema`` and cache migration 042 so the two
+    delivery paths cannot drift. Creating it on a 153K-row store costs 0.23s;
+    re-running is free.
+    """
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_codex_entries_root_path "
+        "ON codex_session_entries(source_root_key, source_path)"
+    )
+
+
 def _apply_codex_quota_change_ledger(conn: sqlite3.Connection) -> None:
     """Create the Codex quota change ledger + triggers, idempotently.
 
@@ -3861,7 +3916,484 @@ def _apply_codex_quota_change_ledger(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+_CODEX_ACCOUNTING_SEMANTIC_COLUMNS = (
+    "source_path",
+    "source_root_key",
+    "timestamp_utc",
+    "session_id",
+    "model",
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+    "account_key",
+    "conversation_key",
+)
+
+
+def _codex_accounting_ledger_ddl() -> tuple[str, ...]:
+    """DDL for #582's path-granular Codex accounting dirty signal.
+
+    The counter is independent of ``codex_physical_mutation_seq``: the latter
+    covers quota, cursors and metadata too, while this sequence advances only
+    when an accounting row's rendered semantics move.  UPDATE records both row
+    images under one sequence; the UNIQUE constraint collapses them when the
+    physical path itself did not change (the ordinary account-adoption case).
+    """
+    update_of = ", ".join(_CODEX_ACCOUNTING_SEMANTIC_COLUMNS)
+    changed = " OR ".join(
+        f"OLD.{name} IS NOT NEW.{name}"
+        for name in _CODEX_ACCOUNTING_SEMANTIC_COLUMNS
+    )
+    # The row is installed before every trigger below. Use a plain UPDATE:
+    # SQLite propagates an outer statement's conflict policy into trigger-body
+    # INSERT/UPSERT statements, so a thread `INSERT ... ON CONFLICT DO UPDATE`
+    # could suppress this bump and make the following ledger insert collide
+    # with the prior sequence. UPDATE has no conflict branch for the outer
+    # policy to override.
+    bump = (
+        "UPDATE cache_meta SET value=CAST(value AS INTEGER) + 1 "
+        "WHERE key='codex_accounting_mutation_seq';"
+    )
+    def thread_paths(image: str) -> str:
+        return f"""
+            SELECT DISTINCT entries.source_root_key, entries.source_path
+              FROM codex_session_entries AS entries
+              LEFT JOIN codex_session_files AS files
+                ON files.source_root_key = entries.source_root_key
+               AND files.path = entries.source_path
+             WHERE (
+                    entries.source_root_key = {image}.source_root_key
+                AND entries.conversation_key = {image}.conversation_key
+             ) OR (
+                    files.source_root_key = {image}.source_root_key
+                AND files.last_native_thread_id = {image}.native_thread_id
+             )
+        """
+    old_thread_paths = thread_paths("OLD")
+    new_thread_paths = thread_paths("NEW")
+    thread_changed = " OR ".join(
+        f"OLD.{name} IS NOT NEW.{name}"
+        for name in (
+            "conversation_key", "source_root_key", "native_thread_id", "cwd",
+            "git_json", "last_seen_utc",
+        )
+    )
+    def file_has_entries(image: str) -> str:
+        return f"""
+            SELECT 1 FROM codex_session_entries AS entries
+             WHERE entries.source_root_key = {image}.source_root_key
+               AND entries.source_path = {image}.path
+        """
+    old_file_entries = file_has_entries("OLD")
+    new_file_entries = file_has_entries("NEW")
+    file_changed = " OR ".join(
+        f"OLD.{name} IS NOT NEW.{name}"
+        for name in ("path", "source_root_key", "last_native_thread_id")
+    )
+    return (
+        """
+        CREATE TABLE IF NOT EXISTS codex_accounting_change_log (
+            seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+            mutation_seq    INTEGER NOT NULL,
+            change_kind     TEXT NOT NULL
+                CHECK(change_kind IN ('path','full')),
+            source_root_key TEXT,
+            source_path     TEXT,
+            UNIQUE(mutation_seq, change_kind, source_root_key, source_path)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_codex_accounting_change_mutation "
+        "ON codex_accounting_change_log(mutation_seq, seq)",
+        "INSERT OR IGNORE INTO cache_meta(key, value) VALUES "
+        "('codex_accounting_mutation_seq', '0')",
+        "DROP TRIGGER IF EXISTS trg_codex_accounting_ins",
+        f"""
+        CREATE TRIGGER trg_codex_accounting_ins
+        AFTER INSERT ON codex_session_entries
+        WHEN NOT EXISTS (
+            SELECT 1 FROM cache_meta
+             WHERE key='codex_accounting_bulk_clear'
+        )
+        BEGIN
+            {bump}
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(value AS INTEGER), 'path',
+                   COALESCE(NEW.source_root_key, ''), NEW.source_path
+              FROM cache_meta
+             WHERE key='codex_accounting_mutation_seq';
+        END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_accounting_del",
+        f"""
+        CREATE TRIGGER trg_codex_accounting_del
+        AFTER DELETE ON codex_session_entries
+        WHEN NOT EXISTS (
+            SELECT 1 FROM cache_meta
+             WHERE key='codex_accounting_bulk_clear'
+        )
+        BEGIN
+            {bump}
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(value AS INTEGER), 'path',
+                   COALESCE(OLD.source_root_key, ''), OLD.source_path
+              FROM cache_meta
+             WHERE key='codex_accounting_mutation_seq';
+        END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_accounting_upd",
+        f"""
+        CREATE TRIGGER trg_codex_accounting_upd
+        AFTER UPDATE OF {update_of} ON codex_session_entries
+        WHEN ({changed}) AND NOT EXISTS (
+            SELECT 1 FROM cache_meta
+             WHERE key='codex_accounting_bulk_clear'
+        )
+        BEGIN
+            {bump}
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(value AS INTEGER), 'path',
+                   COALESCE(OLD.source_root_key, ''), OLD.source_path
+              FROM cache_meta
+             WHERE key='codex_accounting_mutation_seq'
+            UNION
+            SELECT CAST(value AS INTEGER), 'path',
+                   COALESCE(NEW.source_root_key, ''), NEW.source_path
+              FROM cache_meta
+             WHERE key='codex_accounting_mutation_seq';
+        END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_accounting_thread_ins",
+        f"""
+        CREATE TRIGGER trg_codex_accounting_thread_ins
+        AFTER INSERT ON codex_conversation_threads
+        WHEN EXISTS ({new_thread_paths})
+        BEGIN
+            {bump}
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(meta.value AS INTEGER), 'path', paths.source_root_key,
+                   paths.source_path
+              FROM ({new_thread_paths}) AS paths
+              JOIN cache_meta AS meta
+                ON meta.key='codex_accounting_mutation_seq';
+        END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_accounting_thread_del",
+        f"""
+        CREATE TRIGGER trg_codex_accounting_thread_del
+        AFTER DELETE ON codex_conversation_threads
+        WHEN EXISTS ({old_thread_paths})
+        BEGIN
+            {bump}
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(meta.value AS INTEGER), 'path', paths.source_root_key,
+                   paths.source_path
+              FROM ({old_thread_paths}) AS paths
+              JOIN cache_meta AS meta
+                ON meta.key='codex_accounting_mutation_seq';
+        END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_accounting_thread_upd",
+        f"""
+        CREATE TRIGGER trg_codex_accounting_thread_upd
+        AFTER UPDATE OF conversation_key, source_root_key, native_thread_id,
+                        cwd, git_json, last_seen_utc
+          ON codex_conversation_threads
+        WHEN ({thread_changed})
+         AND (EXISTS ({old_thread_paths}) OR EXISTS ({new_thread_paths}))
+        BEGIN
+            {bump}
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(meta.value AS INTEGER), 'path', paths.source_root_key,
+                   paths.source_path
+              FROM ({old_thread_paths}) AS paths
+              JOIN cache_meta AS meta
+                ON meta.key='codex_accounting_mutation_seq'
+            UNION
+            SELECT CAST(meta.value AS INTEGER), 'path', paths.source_root_key,
+                   paths.source_path
+              FROM ({new_thread_paths}) AS paths
+              JOIN cache_meta AS meta
+                ON meta.key='codex_accounting_mutation_seq';
+        END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_accounting_file_ins",
+        f"""
+        CREATE TRIGGER trg_codex_accounting_file_ins
+        AFTER INSERT ON codex_session_files
+        WHEN EXISTS ({new_file_entries})
+        BEGIN
+            {bump}
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(value AS INTEGER), 'path',
+                   COALESCE(NEW.source_root_key, ''), NEW.path
+              FROM cache_meta
+             WHERE key='codex_accounting_mutation_seq';
+        END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_accounting_file_del",
+        f"""
+        CREATE TRIGGER trg_codex_accounting_file_del
+        AFTER DELETE ON codex_session_files
+        WHEN EXISTS ({old_file_entries})
+        BEGIN
+            {bump}
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(value AS INTEGER), 'path',
+                   COALESCE(OLD.source_root_key, ''), OLD.path
+              FROM cache_meta
+             WHERE key='codex_accounting_mutation_seq';
+        END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_accounting_file_upd",
+        f"""
+        CREATE TRIGGER trg_codex_accounting_file_upd
+        AFTER UPDATE OF path, source_root_key, last_native_thread_id
+          ON codex_session_files
+        WHEN ({file_changed})
+         AND (EXISTS ({old_file_entries}) OR EXISTS ({new_file_entries}))
+        BEGIN
+            {bump}
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(meta.value AS INTEGER), 'path',
+                   COALESCE(OLD.source_root_key, ''), OLD.path
+              FROM cache_meta AS meta
+             WHERE meta.key='codex_accounting_mutation_seq'
+               AND EXISTS ({old_file_entries})
+            UNION
+            SELECT CAST(meta.value AS INTEGER), 'path',
+                   COALESCE(NEW.source_root_key, ''), NEW.path
+              FROM cache_meta AS meta
+             WHERE meta.key='codex_accounting_mutation_seq'
+               AND EXISTS ({new_file_entries});
+        END
+        """,
+    )
+
+
+def _apply_codex_accounting_change_ledger(conn: sqlite3.Connection) -> None:
+    """Install #582's accounting ledger on every schema delivery path."""
+    entry_cols = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(codex_session_entries)")
+    }
+    file_cols = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(codex_session_files)")
+    }
+    if (
+        not set(_CODEX_ACCOUNTING_SEMANTIC_COLUMNS) <= entry_cols
+        or not {"path", "source_root_key", "last_native_thread_id"} <= file_cols
+    ):
+        return
+    for statement in _codex_accounting_ledger_ddl():
+        conn.execute(statement)
+
+
 # === Region 7b2: Eager cache-migration trigger (V4 — same-invocation 008 apply) ===
+
+
+class SchemaDeliveryObject(NamedTuple):
+    """One re-derivable schema object declared by a version-gated apply.
+
+    ``kind`` is one of ``table``, ``view``, ``trigger`` or ``index``.  The two
+    store registries and their structural tests cover every explicit object of
+    those kinds, including virtual tables while excluding SQLite-created FTS
+    shadow objects.
+
+    ``ensure_helper`` names the shared module-level function that owns the DDL,
+    or is ``None`` when the statement is written inline in the schema body.
+    ``introduced_by`` names the store migration whose handler delivers the
+    object to a store already stamped at the previous head, or is ``None`` for
+    the archaeologically audited frozen baseline described below.
+    """
+
+    kind: str
+    name: str
+    ensure_helper: "str | None"
+    introduced_by: "str | None"
+
+
+#: Every table, view, trigger and index ``_apply_cache_schema`` declares, and
+#: how it reaches a store that is NOT newly created (#566, #580).
+#:
+#: The schema apply is version-gated: ``open_cache_db`` runs it only when the
+#: store's ``user_version`` differs from ``len(_CACHE_MIGRATIONS)``. So an object
+#: added to the schema body alone reaches new stores only — which is exactly
+#: what happened to ``idx_codex_entries_root_path``, absent from a real install
+#: running the release that shipped it. ``tests/test_cache_schema_delivery.py``
+#: compares this registry against the schema body in both directions, so an
+#: unregistered object fails a test instead of reaching users.
+#:
+#: THE BASELINE IS FROZEN. The ``introduced_by=None`` records are the objects
+#: that predate this registry and have no index-delivery migration; requiring
+#: provenance for them would mean fabricating history. A NEW object may never
+#: join them: anything added from now on needs a migration, because that is the
+#: only way an already-current store picks it up. The test pins every baseline
+#: identity so even a same-kind remove-one/add-one substitution fails.
+CACHE_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
+    # ── frozen baseline: audited objects without handler-owned delivery DDL ──
+    SchemaDeliveryObject("index", "idx_codex_conv_msgs_conversation", None, None),
+    SchemaDeliveryObject("index", "idx_codex_conv_msgs_source", None, None),
+    SchemaDeliveryObject("index", "idx_codex_conv_rollups_recent", None, None),
+    SchemaDeliveryObject("index", "idx_codex_conv_touches_source", None, None),
+    SchemaDeliveryObject("index", "idx_codex_entries_conversation", None, None),
+    SchemaDeliveryObject("index", "idx_codex_entries_session", None, None),
+    SchemaDeliveryObject("index", "idx_codex_entries_source", None, None),
+    SchemaDeliveryObject("index", "idx_codex_entries_source_root", None, None),
+    SchemaDeliveryObject("index", "idx_codex_entries_timestamp", None, None),
+    SchemaDeliveryObject("index", "idx_codex_entries_ts_root_conversation", None, None),
+    SchemaDeliveryObject("index", "idx_codex_events_conversation", None, None),
+    SchemaDeliveryObject("index", "idx_codex_events_timestamp", None, None),
+    SchemaDeliveryObject("index", "idx_codex_files_conversation", None, None),
+    SchemaDeliveryObject("index", "idx_codex_files_source_root", None, None),
+    SchemaDeliveryObject("index", "idx_codex_threads_source_path", None, None),
+    SchemaDeliveryObject("index", "idx_codex_threads_source_root", None, None),
+    SchemaDeliveryObject("index", "idx_conv_session_ts", None, None),
+    SchemaDeliveryObject("index", "idx_conv_session_uuid", None, None),
+    SchemaDeliveryObject("index", "idx_conv_sessions_recent", None, None),
+    SchemaDeliveryObject("index", "idx_conv_source", None, None),
+    SchemaDeliveryObject("index", "idx_conv_turnkey", None, None),
+    SchemaDeliveryObject("index", "idx_entries_dedup", None, None),
+    SchemaDeliveryObject("index", "idx_entries_mutation_seq", None, None),
+    SchemaDeliveryObject("index", "idx_entries_source", None, None),
+    SchemaDeliveryObject("index", "idx_entries_timestamp", None, None),
+    SchemaDeliveryObject("index", "idx_file_touches_path", None, None),
+    SchemaDeliveryObject("index", "idx_quota_window_captured_at", None, None),
+    SchemaDeliveryObject("index", "idx_quota_window_source_root", None, None),
+    SchemaDeliveryObject("index", "idx_session_files_session_id", None, None),
+    SchemaDeliveryObject("table", "cache_meta", None, None),
+    SchemaDeliveryObject("table", "codex_conversation_events", None, None),
+    SchemaDeliveryObject("table", "codex_conversation_file_touches", None, None),
+    SchemaDeliveryObject("table", "codex_conversation_fts", None, None),
+    SchemaDeliveryObject("table", "codex_conversation_messages", None, None),
+    SchemaDeliveryObject("table", "codex_conversation_rollups", None, None),
+    SchemaDeliveryObject("table", "codex_conversation_threads", None, None),
+    SchemaDeliveryObject("table", "codex_session_entries", None, None),
+    SchemaDeliveryObject("table", "codex_session_files", None, None),
+    SchemaDeliveryObject("table", "codex_source_roots", None, None),
+    SchemaDeliveryObject("table", "conversation_ai_titles", None, None),
+    SchemaDeliveryObject("table", "conversation_file_touches", None, None),
+    SchemaDeliveryObject("table", "conversation_fts", None, None),
+    SchemaDeliveryObject("table", "conversation_messages", None, None),
+    SchemaDeliveryObject("table", "conversation_sessions", None, None),
+    SchemaDeliveryObject("table", "conversation_title_fts", None, None),
+    SchemaDeliveryObject("table", "quota_window_snapshots", None, None),
+    SchemaDeliveryObject("table", "session_entries", None, None),
+    SchemaDeliveryObject("table", "session_files", None, None),
+    SchemaDeliveryObject("trigger", "codex_conv_fts_ad", None, None),
+    SchemaDeliveryObject("trigger", "codex_conv_fts_ai", None, None),
+    SchemaDeliveryObject("trigger", "codex_conv_fts_au", None, None),
+    SchemaDeliveryObject("trigger", "conv_fts_ad", None, None),
+    SchemaDeliveryObject("trigger", "conv_fts_ai", None, None),
+    SchemaDeliveryObject("trigger", "conv_fts_au", None, None),
+    SchemaDeliveryObject("trigger", "conv_title_fts_ad", None, None),
+    SchemaDeliveryObject("trigger", "conv_title_fts_ai", None, None),
+    SchemaDeliveryObject("trigger", "conv_title_fts_au", None, None),
+    # ── post-baseline: each migration owns the object's delivery DDL ──
+    SchemaDeliveryObject(
+        "index", "idx_entries_physical", None,
+        "020_session_entries_physical_unique"),
+    SchemaDeliveryObject(
+        "index", "idx_conversation_messages_cwd", None,
+        "021_index_conversation_messages_cwd"),
+    SchemaDeliveryObject(
+        "index", "idx_conversation_messages_model_session", None,
+        "022_index_conversation_messages_model"),
+    SchemaDeliveryObject(
+        "index", "idx_codex_file_accounts_root", None,
+        "031_codex_file_account_map"),
+    SchemaDeliveryObject(
+        "index", "idx_qws_physical_group", "_apply_codex_quota_group_index",
+        "040_codex_quota_physical_group_index"),
+    SchemaDeliveryObject(
+        "index", "idx_qws_unresolved_model",
+        "_apply_codex_quota_unresolved_model_index",
+        "041_codex_quota_unresolved_model_index"),
+    SchemaDeliveryObject(
+        "index", "idx_codex_entries_root_path",
+        "_apply_codex_entries_root_path_index",
+        "042_codex_entries_root_path_index"),
+    SchemaDeliveryObject(
+        "index", "idx_codex_window_attributions_root", None,
+        "043_codex_window_attributions"),
+    SchemaDeliveryObject(
+        "index", "idx_codex_accounting_change_mutation",
+        "_apply_codex_accounting_change_ledger",
+        "044_codex_accounting_change_ledger"),
+    SchemaDeliveryObject(
+        "table", "codex_file_accounts", None,
+        "031_codex_file_account_map"),
+    SchemaDeliveryObject(
+        "table", "codex_file_incarnations", None,
+        "031_codex_file_account_map"),
+    SchemaDeliveryObject(
+        "table", "quota_window_change_log",
+        "_apply_codex_quota_change_ledger",
+        "037_codex_quota_change_ledger"),
+    SchemaDeliveryObject(
+        "table", "codex_window_attributions", None,
+        "043_codex_window_attributions"),
+    SchemaDeliveryObject(
+        "table", "codex_accounting_change_log",
+        "_apply_codex_accounting_change_ledger",
+        "044_codex_accounting_change_ledger"),
+    SchemaDeliveryObject(
+        "trigger", "trg_qws_ledger_del", "_apply_codex_quota_change_ledger",
+        "037_codex_quota_change_ledger"),
+    SchemaDeliveryObject(
+        "trigger", "trg_qws_ledger_ins", "_apply_codex_quota_change_ledger",
+        "037_codex_quota_change_ledger"),
+    SchemaDeliveryObject(
+        "trigger", "trg_qws_ledger_upd", "_apply_codex_quota_change_ledger",
+        "037_codex_quota_change_ledger"),
+    SchemaDeliveryObject(
+        "trigger", "trg_codex_accounting_del",
+        "_apply_codex_accounting_change_ledger",
+        "044_codex_accounting_change_ledger"),
+    SchemaDeliveryObject(
+        "trigger", "trg_codex_accounting_file_del",
+        "_apply_codex_accounting_change_ledger",
+        "044_codex_accounting_change_ledger"),
+    SchemaDeliveryObject(
+        "trigger", "trg_codex_accounting_file_ins",
+        "_apply_codex_accounting_change_ledger",
+        "044_codex_accounting_change_ledger"),
+    SchemaDeliveryObject(
+        "trigger", "trg_codex_accounting_file_upd",
+        "_apply_codex_accounting_change_ledger",
+        "044_codex_accounting_change_ledger"),
+    SchemaDeliveryObject(
+        "trigger", "trg_codex_accounting_ins",
+        "_apply_codex_accounting_change_ledger",
+        "044_codex_accounting_change_ledger"),
+    SchemaDeliveryObject(
+        "trigger", "trg_codex_accounting_thread_del",
+        "_apply_codex_accounting_change_ledger",
+        "044_codex_accounting_change_ledger"),
+    SchemaDeliveryObject(
+        "trigger", "trg_codex_accounting_thread_ins",
+        "_apply_codex_accounting_change_ledger",
+        "044_codex_accounting_change_ledger"),
+    SchemaDeliveryObject(
+        "trigger", "trg_codex_accounting_thread_upd",
+        "_apply_codex_accounting_change_ledger",
+        "044_codex_accounting_change_ledger"),
+    SchemaDeliveryObject(
+        "trigger", "trg_codex_accounting_upd",
+        "_apply_codex_accounting_change_ledger",
+        "044_codex_accounting_change_ledger"),
+)
 
 
 def _apply_cache_schema(conn: sqlite3.Connection) -> None:
@@ -4027,9 +4559,11 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         -- reingest), and migration 019 arms a one-time history backfill.
         --
         -- CRITICAL: this is a PLAIN table with NO dependency on the FTS shape, and
-        -- it is created HERE — inside the unconditional executescript, BEFORE the
-        -- FTS5 ``legacy_present`` early-return below — so it ALWAYS exists
-        -- regardless of FTS topology. (The I-2 title-FTS bug created its vtable
+        -- it is created HERE — inside the version-gated schema executescript,
+        -- BEFORE the FTS5 ``legacy_present`` early-return below — so every
+        -- schema application creates it regardless of FTS topology. Migration
+        -- 019 supplies the head bump for existing stores. (The I-2 title-FTS
+        -- bug created its vtable
         -- AFTER that early-return, so its consumer crashed on a legacy-shape +
         -- both-pending upgrade; the file-touches table must not repeat that class.)
         CREATE TABLE IF NOT EXISTS conversation_file_touches (
@@ -4083,10 +4617,10 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             ON codex_session_entries(source_path);
 
         -- #294 S1: physical Codex rollout retention. These tables deliberately
-        -- live in the unconditional base-schema script, before the legacy-FTS
-        -- topology checks below: an existing cache with an old FTS shape must
-        -- still gain the S1 tables on every open, just as conversation_file_touches
-        -- does above.
+        -- live in the version-gated base-schema script, before the legacy-FTS
+        -- topology checks below: when migration 024 bumps the head, an existing
+        -- cache with an old FTS shape must still gain the S1 tables during that
+        -- schema application, just as conversation_file_touches does above.
         CREATE TABLE IF NOT EXISTS codex_source_roots (
             source_root_key      TEXT NOT NULL PRIMARY KEY,
             canonical_root_path  TEXT NOT NULL UNIQUE,
@@ -4108,10 +4642,11 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         -- records NO ROW AT ALL — "undecided" and "decided: no account" are
         -- distinct states and readers must not collapse them.
         --
-        -- Both live in the UNCONDITIONAL executescript, BEFORE the FTS5
+        -- Both live in the top-level executescript of the version-gated apply,
+        -- BEFORE the FTS5
         -- `legacy_present` early-return below, because they are plain tables
-        -- with no FTS-shape dependency and the ingest path needs them on every
-        -- open (the `_apply_cache_schema_legacy_early_return_before_new_table`
+        -- with no FTS-shape dependency and the ingest path needs them whenever
+        -- that apply runs (the `_apply_cache_schema_legacy_early_return_before_new_table`
         -- class). Cache migration 031 exists only to bump the registry head so
         -- an existing install re-runs this schema apply.
         CREATE TABLE IF NOT EXISTS codex_file_incarnations (
@@ -4130,6 +4665,43 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_codex_file_accounts_root
             ON codex_file_accounts(root_scope);
+
+        -- #500 spec §6.1: the derived index over the operator's durable
+        -- attribution assertions. One row per `codex_window_attribution` op,
+        -- keyed by that op's ordinary content id; a
+        -- `codex_window_attribution_retract` op stamps `retracted_by_op_id` on
+        -- each assertion it names.
+        --
+        -- `account_key` is NOT NULL here, unlike `codex_file_accounts`: this is
+        -- the SUBJECT of an operator assertion, and "the operator asserted no
+        -- account" is not a fact. The builder refuses the `unattributed`
+        -- sentinel outright.
+        --
+        -- `raw_resets_at_utc` stores the witness list as canonical JSON, the
+        -- same spelling the journal payload carries. The group binding is the
+        -- four normalized axes plus an INTERSECTION against those witnesses,
+        -- and `canonical_resets_at_utc` is audit-only — it is
+        -- population-dependent (a later bridging observation can union two
+        -- components and retire the anchor), so it is never matched on.
+        -- Cardinality is dozens of rows, so matching happens in Python.
+        --
+        -- Top-level version-gated executescript for the same reason
+        -- `codex_file_accounts` is: cache migration 043 exists
+        -- to bump the registry head and make an existing install re-run it.
+        CREATE TABLE IF NOT EXISTS codex_window_attributions (
+            op_id                   TEXT    PRIMARY KEY,
+            account_key             TEXT    NOT NULL,
+            source_root_key         TEXT    NOT NULL,
+            logical_limit_key       TEXT    NOT NULL,
+            observed_slot           TEXT    NOT NULL,
+            window_minutes          INTEGER NOT NULL,
+            raw_resets_at_utc       TEXT    NOT NULL,
+            canonical_resets_at_utc TEXT,
+            asserted_at_utc         TEXT    NOT NULL,
+            retracted_by_op_id      TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_window_attributions_root
+            ON codex_window_attributions(source_root_key, window_minutes);
 
         CREATE TABLE IF NOT EXISTS codex_conversation_threads (
             conversation_key     TEXT NOT NULL PRIMARY KEY,
@@ -4202,9 +4774,9 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             ON codex_conversation_events(timestamp_utc);
 
         -- #294 S6: normalized Codex conversation storage. Like the S1 tables
-        -- above, these live in the UNCONDITIONAL base-schema script — before the
-        -- legacy-FTS topology checks below — so an existing cache gains them on
-        -- every open. The independent Codex FTS layer
+        -- above, these live before the legacy-FTS topology checks in the
+        -- version-gated base schema; the S6 migration head bump makes existing
+        -- caches run that apply once. The independent Codex FTS layer
         -- (_apply_codex_conversation_fts) stands up codex_conversation_fts + its
         -- own triggers separately, BEFORE the Claude legacy-FTS early-return, so
         -- a legacy-shape Claude cache still gets the Codex search index.
@@ -4304,22 +4876,19 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     )
     # #294 S3: the qualified accounting adapter is bounded by timestamp and
     # joins only through the S1 root-qualified conversation identity.  Keep
-    # this re-derivable index in the unconditional schema path so an existing
-    # cache gains the same scale-safe plan without a data migration.
+    # this re-derivable index in the version-gated schema path. Migration 024's
+    # head bump delivered it to existing caches; future additions need their own
+    # handler-owned delivery path.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_codex_entries_ts_root_conversation "
         "ON codex_session_entries(timestamp_utc, source_root_key, conversation_key)"
     )
     # The per-file alias join in `_codex_conversation_metadata` matches on
-    # (source_root_key, source_path). `idx_codex_entries_source_root` cannot
-    # serve it: a machine normally has ONE provider root, so a root-only search
-    # visits every entry row for every file and the join costs files x entries
-    # on every dashboard snapshot build. Re-derivable, so it belongs on the
-    # unconditional path with the S3 index above rather than in a migration.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_codex_entries_root_path "
-        "ON codex_session_entries(source_root_key, source_path)"
-    )
+    # (source_root_key, source_path). #566: this path is NOT unconditional —
+    # `open_cache_db` runs the schema apply only when `user_version` differs
+    # from the migration count — so the index also needs cache migration 042,
+    # which delegates to the same helper.
+    _apply_codex_entries_root_path_index(conn)
     # The per-file terminal thread facts seed a later append without rereading
     # the prefix. They are nullable for old cache rows; migration 024 never
     # fabricates these source facts and instead clears/rederives them.
@@ -4419,8 +4988,8 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         "ON session_entries(mutation_seq, mutation_min_ts)")
     # #279 S3 F3: DB-level idempotency backstop mirroring
     # codex_session_entries' UNIQUE(source_path, line_offset). Guarded and
-    # OUTSIDE the top executescript: this function runs on EVERY open BEFORE the
-    # migration dispatcher, so a legacy cache.db holding historical
+    # OUTSIDE the top executescript: when the version gate opens, this function
+    # runs BEFORE the migration dispatcher, so a legacy cache.db holding historical
     # physical-key duplicates must tolerate the index being ABSENT until cache
     # migration 020 dedups it — an unguarded CREATE UNIQUE INDEX here would
     # brick every open of such a DB before 020 could ever run. Fresh and clean
@@ -4496,6 +5065,7 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     _apply_codex_quota_group_index(conn)
     _apply_codex_quota_unresolved_model_index(conn)
     _apply_codex_quota_change_ledger(conn)
+    _apply_codex_accounting_change_ledger(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
         "ON session_files(session_id)"
@@ -4655,6 +5225,7 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         -- it), so this only clears the now-orphan ledger and keeps
         -- conversations.db transcripts-only.
         DROP TABLE IF EXISTS quota_window_change_log;
+        DROP TABLE IF EXISTS codex_accounting_change_log;
         DROP TABLE IF EXISTS codex_conversation_threads;
         DROP TABLE IF EXISTS codex_source_roots;
         -- #416: the Codex attribution map is a cache.db accounting concern; it
@@ -4662,6 +5233,13 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         -- rest of the accounting families so conversations.db stays transcripts-only.
         DROP TABLE IF EXISTS codex_file_accounts;
         DROP TABLE IF EXISTS codex_file_incarnations;
+        -- #500: the operator's window-attribution index is the same kind of
+        -- cache.db accounting concern and rides in the same way. Dropping the
+        -- table also drops idx_codex_window_attributions_root, because SQLite
+        -- drops a table's indexes with it. Guarded by
+        -- tests/test_conversations_transcripts_only.py, which derives its
+        -- expectation from COVERAGE_CACHE_FAMILIES rather than restating a list.
+        DROP TABLE IF EXISTS codex_window_attributions;
 
         CREATE TABLE IF NOT EXISTS conversation_source_files (
             path             TEXT PRIMARY KEY,
@@ -4767,6 +5345,72 @@ def _apply_codex_find_projection_schema(conn: sqlite3.Connection) -> None:
             str(CODEX_FIND_PROJECTION_VERSION),
         )
         _set_cache_meta(conn, "codex_find_projection_generation", "0")
+
+
+#: Every surviving table, view, trigger and index declared by
+#: ``_apply_conversations_schema``, and how it reaches an already-current
+#: conversations.db (#580).  Most transcript objects predate this registry and
+#: are therefore frozen baseline records.  In particular, the three account
+#: indexes added by ``b3f859fec`` do NOT claim a migration: their DDL was not
+#: owned by the migration handler and only reached existing stores because a
+#: later registry-head bump happened to re-run the schema apply.  The Codex find
+#: projection is the one audited family with handler-owned delivery DDL.
+CONVERSATIONS_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
+    # ── frozen baseline: audited objects without handler-owned delivery DDL ──
+    SchemaDeliveryObject(
+        "index", "idx_codex_conv_messages_account_conversation", None, None),
+    SchemaDeliveryObject("index", "idx_codex_conv_msgs_conversation", None, None),
+    SchemaDeliveryObject("index", "idx_codex_conv_msgs_source", None, None),
+    SchemaDeliveryObject("index", "idx_codex_conv_rollups_recent", None, None),
+    SchemaDeliveryObject("index", "idx_codex_conv_touches_source", None, None),
+    SchemaDeliveryObject(
+        "index", "idx_codex_events_account_conversation", None, None),
+    SchemaDeliveryObject("index", "idx_codex_events_conversation", None, None),
+    SchemaDeliveryObject("index", "idx_codex_events_timestamp", None, None),
+    SchemaDeliveryObject("index", "idx_conv_messages_account_session", None, None),
+    SchemaDeliveryObject("index", "idx_conv_session_ts", None, None),
+    SchemaDeliveryObject("index", "idx_conv_session_uuid", None, None),
+    SchemaDeliveryObject("index", "idx_conv_sessions_recent", None, None),
+    SchemaDeliveryObject("index", "idx_conv_source", None, None),
+    SchemaDeliveryObject("index", "idx_conv_turnkey", None, None),
+    SchemaDeliveryObject("index", "idx_conversation_messages_cwd", None, None),
+    SchemaDeliveryObject(
+        "index", "idx_conversation_messages_model_session", None, None),
+    SchemaDeliveryObject("index", "idx_file_touches_path", None, None),
+    SchemaDeliveryObject("table", "cache_meta", None, None),
+    SchemaDeliveryObject("table", "codex_conversation_events", None, None),
+    SchemaDeliveryObject("table", "codex_conversation_file_touches", None, None),
+    SchemaDeliveryObject("table", "codex_conversation_fts", None, None),
+    SchemaDeliveryObject("table", "codex_conversation_messages", None, None),
+    SchemaDeliveryObject("table", "codex_conversation_rollups", None, None),
+    SchemaDeliveryObject("table", "codex_conversation_source_files", None, None),
+    SchemaDeliveryObject("table", "conversation_ai_titles", None, None),
+    SchemaDeliveryObject("table", "conversation_file_touches", None, None),
+    SchemaDeliveryObject("table", "conversation_fts", None, None),
+    SchemaDeliveryObject("table", "conversation_messages", None, None),
+    SchemaDeliveryObject("table", "conversation_sessions", None, None),
+    SchemaDeliveryObject("table", "conversation_source_files", None, None),
+    SchemaDeliveryObject("table", "conversation_title_fts", None, None),
+    SchemaDeliveryObject("trigger", "codex_conv_fts_ad", None, None),
+    SchemaDeliveryObject("trigger", "codex_conv_fts_ai", None, None),
+    SchemaDeliveryObject("trigger", "codex_conv_fts_au", None, None),
+    SchemaDeliveryObject("trigger", "conv_fts_ad", None, None),
+    SchemaDeliveryObject("trigger", "conv_fts_ai", None, None),
+    SchemaDeliveryObject("trigger", "conv_fts_au", None, None),
+    SchemaDeliveryObject("trigger", "conv_title_fts_ad", None, None),
+    SchemaDeliveryObject("trigger", "conv_title_fts_ai", None, None),
+    SchemaDeliveryObject("trigger", "conv_title_fts_au", None, None),
+    # ── post-baseline: migration 004 owns the shared projection helper ──
+    SchemaDeliveryObject(
+        "index", "idx_codex_find_projection_conversation_order",
+        "_apply_codex_find_projection_schema", "004_codex_find_projection"),
+    SchemaDeliveryObject(
+        "table", "codex_find_projection",
+        "_apply_codex_find_projection_schema", "004_codex_find_projection"),
+    SchemaDeliveryObject(
+        "trigger", "codex_find_projection_message_ad",
+        "_apply_codex_find_projection_schema", "004_codex_find_projection"),
+)
 
 
 def _fts5_available(conn: sqlite3.Connection) -> bool:
@@ -5644,6 +6288,14 @@ def _eagerly_apply_cache_migrations_under_writer_lock() -> None:
             pass
         conn = sqlite3.connect(cache_db_path)
     try:
+        # #566: the refusal must precede the DDL it exists to prevent. Both
+        # cache-open paths used to reach the dispatcher's #142 guard only after
+        # the schema apply had already run, so a dev-checkout binary pointed at
+        # the real prod dir modified the production schema and only then
+        # refused. `journal_mode` is itself a persistent write, so this comes
+        # before it.
+        _refuse_prod_migration_before_schema_write(
+            conn, _CACHE_MIGRATIONS, "cache.db")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         # Apply the shared cache.db schema (cctally-dev#93, D4). This is the
@@ -6338,8 +6990,9 @@ def _011_conversation_promote_command_args(conn: sqlite3.Connection) -> None:
 @cache_migration("012_create_conversation_ai_titles")
 def _012_create_conversation_ai_titles(conn: sqlite3.Connection) -> None:
     """Flag-only arm for #193. The conversation_ai_titles table itself is created
-    by _apply_cache_schema (runs on every open, fresh + existing installs); this
-    migration sets ``ai_titles_backfill_pending`` so sync_cache walks all history
+    by _apply_cache_schema when the version gate opens; this migration's head
+    bump makes existing installs take that path. This migration sets
+    ``ai_titles_backfill_pending`` so sync_cache walks all history
     once via backfill_ai_titles under the cache.db.lock flock. No data work here
     -> the dispatcher's central stamp (#140) marks a complete handler; a fresh
     install stamps WITHOUT a populated history (its incremental walk fills the
@@ -6351,7 +7004,8 @@ def _012_create_conversation_ai_titles(conn: sqlite3.Connection) -> None:
 @cache_migration("013_create_conversation_sessions")
 def _013_create_conversation_sessions(conn: sqlite3.Connection) -> None:
     """Flag-only arm for the conversation_sessions browse-rail rollup. The table
-    is created by _apply_cache_schema (every open); this sets
+    is created by _apply_cache_schema when the version gate opens; this
+    migration's head bump makes existing installs take that path. It sets
     conversation_sessions_backfill_pending so sync_cache does the one-time full
     GROUP BY recompute under the cache.db.lock flock. No data work here — the
     dispatcher's central stamp (#140) marks a complete handler; a fresh install
@@ -6545,7 +7199,8 @@ def _018_create_conversation_title_fts(conn: sqlite3.Connection) -> None:
 
     Flag-only arm. The ``conversation_title_fts`` virtual table + its
     conv_title_fts_ai/ad/au sync triggers are created by ``_apply_cache_schema``
-    (runs on every open, fresh + existing installs) inside the SAME FTS5-available
+    when the version gate opens (this migration bumps the head for existing
+    installs) inside the SAME FTS5-available
     envelope as the message FTS (P1-6) — so on a no-FTS5 build the table+triggers
     are simply absent and a title upsert never rolls back the ingest. This handler
     does NO DDL (mirrors 012's flag-only pattern): it just arms the DISTINCT
@@ -6576,7 +7231,8 @@ def _019_create_conversation_file_touches(conn: sqlite3.Connection) -> None:
 
     Flag-only arm (mirrors 018's pattern). The ``conversation_file_touches`` table
     + its ``COLLATE NOCASE`` path index (``idx_file_touches_path``) are created by
-    ``_apply_cache_schema`` (runs on every open, fresh + existing installs) — and
+    ``_apply_cache_schema`` when the version gate opens (this migration bumps
+    the head for existing installs) — and
     CRITICALLY before the FTS5 ``legacy_present`` early-return, since the table is
     plain and has NO dependency on the FTS shape (so a legacy-shape upgrade still
     gets it). The NOCASE collation is what lets the kind=files PREFIX search ride
@@ -7169,8 +7825,9 @@ def _031_codex_file_account_map(conn: sqlite3.Connection) -> None:
     existing install.
 
     The two tables (``codex_file_incarnations``, ``codex_file_accounts``) are
-    created by ``_apply_cache_schema`` in its UNCONDITIONAL executescript — the
-    repo's table-addition rule, and specifically BEFORE the FTS5
+    created by the top-level executescript in the version-gated
+    ``_apply_cache_schema`` — the repo's table-addition rule, and specifically
+    BEFORE the FTS5
     ``legacy_present`` early-return so a legacy-shape cache still receives them.
     This migration exists because that schema apply is VERSION-GATED: a
     steady-state open compares ``PRAGMA user_version`` against
@@ -7679,6 +8336,125 @@ def _041_codex_quota_unresolved_model_index(conn: sqlite3.Connection) -> None:
     central-stamps on a clean return (#140).
     """
     _apply_codex_quota_unresolved_model_index(conn)
+    conn.commit()
+
+
+@cache_migration("042_codex_entries_root_path_index")
+def _042_codex_entries_root_path_index(conn: sqlite3.Connection) -> None:
+    """#566: deliver the per-file alias join index to already-current stores.
+
+    ``d1f14fad3`` added this index to ``_apply_cache_schema`` believing that
+    path was unconditional. ``open_cache_db`` runs the schema apply only under
+    ``if not schema_current:``, and ``schema_current`` is true when
+    ``user_version`` equals ``len(_CACHE_MIGRATIONS)``. Every existing install
+    was already at head, so the index reached new stores only, and a real
+    install measured a ~90s snapshot build and a 167-184s publish period while
+    running the release that contained the fix.
+
+    Same version-gate reason as 036/037/038/040/041: registering here is what
+    makes an already-current install pick it up.
+
+    Re-running is a no-op (``IF NOT EXISTS``). NO self-stamp — the dispatcher
+    central-stamps on a clean return (#140).
+    """
+    _apply_codex_entries_root_path_index(conn)
+    conn.commit()
+
+
+@cache_migration("043_codex_window_attributions")
+def _043_codex_window_attributions(conn: sqlite3.Connection) -> None:
+    """Deliver the #500 operator-attribution index to already-current stores.
+
+    Spec:
+    ``docs/superpowers/specs/2026-08-14-500-codex-window-attribution-design.md``
+    §6.1.
+
+    ``codex_window_attributions`` lives in the top-level executescript of the
+    version-gated ``_apply_cache_schema``, and ``open_cache_db`` runs that
+    script only when ``schema_current(conn, store)`` is false — i.e. when
+    ``user_version`` differs from ``len(_CACHE_MIGRATIONS)``. Every existing
+    install is already at head, so the DDL alone would reach new stores only.
+    Registering here is what bumps the head and makes an existing install
+    re-run the schema apply, exactly as 031/036/037/038/040/041/042 do.
+
+    The handler then materializes the table from the journal, which is its only
+    source. That is a from-zero ADDITIVE replay rather than the authoritative
+    clear-then-replay ``cache-sync --rebuild`` uses: the table has just been
+    created empty, so an additive pass materializes it completely, and a
+    clear here would delete a covered family while a coverage certificate may
+    still stand — the invariant
+    ``_cctally_journal._assert_coverage_already_invalidated`` exists to refuse.
+
+    Idempotent by construction: assertions insert on the op-id primary key with
+    ``OR IGNORE`` and a retraction stamps only an assertion that is not already
+    retracted, so a re-run over its own output writes nothing but the cursor.
+    NO self-stamp — the dispatcher central-stamps on a clean return (#140).
+
+    Takes the Codex provider flock like handlers 024-027 and 034: this writes a
+    Codex-derived table, so a mid-walk ``sync_codex_cache`` must not interleave.
+    On contention it DEFERS (``MigrationGateNotMet``) before touching any data,
+    which is free here because that same sync rehydrates this table at its own
+    start anyway.
+    """
+    import _cctally_cache as cache_mod
+
+    # Defensive re-assert, not the primary creation path — the same shape
+    # migration 031 carries and for the same reason: it keeps the handler
+    # self-contained if `_apply_cache_schema`'s ordering ever drifts, and it is
+    # what the per-migration golden exercises, whose `pre.sqlite` is a genuine
+    # 042-head install that predates the table. Re-running is a no-op.
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS codex_window_attributions (
+            op_id                   TEXT    PRIMARY KEY,
+            account_key             TEXT    NOT NULL,
+            source_root_key         TEXT    NOT NULL,
+            logical_limit_key       TEXT    NOT NULL,
+            observed_slot           TEXT    NOT NULL,
+            window_minutes          INTEGER NOT NULL,
+            raw_resets_at_utc       TEXT    NOT NULL,
+            canonical_resets_at_utc TEXT,
+            asserted_at_utc         TEXT    NOT NULL,
+            retracted_by_op_id      TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_window_attributions_root
+            ON codex_window_attributions(source_root_key, window_minutes);
+        """
+    )
+    held = _acquire_cache_db_codex_provider_flock(
+        conn, migration="043 window attributions")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _applied, skipped = cache_mod.rehydrate_codex_window_attributions(
+                conn, authoritative=False)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        # AFTER the commit, the rule `_report_file_account_conflicts` states:
+        # the `except` above rolls back, so a line printed before it would
+        # describe a skip on work that was undone (review finding F2).
+        import _cctally_journal as journal_mod
+        journal_mod._report_window_attribution_skips(skipped)
+    finally:
+        _release_cache_db_writer_flocks(held)
+
+
+@cache_migration("044_codex_accounting_change_ledger")
+def _044_codex_accounting_change_ledger(conn: sqlite3.Connection) -> None:
+    """Deliver #582's dirty-path ledger to already-current cache stores.
+
+    The steady-state schema apply is version-gated, so adding the table and
+    triggers there alone would leave every 043-head installation without the
+    mutation stream the dashboard requires.  The shared helper keeps fresh and
+    upgraded stores byte-identical.  Existing accounting rows need no backfill:
+    the first dashboard build is deliberately cold and subsequent mutations
+    advance the new sequence.
+
+    The DDL is idempotent and the dispatcher owns the applied marker.
+    """
+    _apply_codex_accounting_change_ledger(conn)
     conn.commit()
 
 

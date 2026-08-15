@@ -2534,7 +2534,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 7,
+  "source_schema_version": 9,
   "sources": {
     "all": {
       "availability": "ok",
@@ -2728,6 +2728,28 @@
                   95
                 ],
                 "weekly_usd": 50.0
+              },
+              "status": {
+                "alert_thresholds": [
+                  90,
+                  100
+                ],
+                "budget_usd": 50.0,
+                "consumption_pct": 98.4084897,
+                "low_confidence": false,
+                "pace": {
+                  "daily_usd": 16.40141495,
+                  "projected_high_usd": 114.80990465,
+                  "projected_low_usd": 93.00424484999999,
+                  "week_avg_projection_usd": 114.80990465
+                },
+                "period": "subscription-week",
+                "recent_24h_usd": 10.95,
+                "remaining_usd": 0.795755149999998,
+                "spent_usd": 49.20424485,
+                "verdict": "over",
+                "window_end_at": "2026-04-20T14:00:00+00:00",
+                "window_start_at": "2026-04-13T14:00:00+00:00"
               }
             },
             "hero": {
@@ -6838,6 +6860,28 @@
               95
             ],
             "weekly_usd": 50.0
+          },
+          "status": {
+            "alert_thresholds": [
+              90,
+              100
+            ],
+            "budget_usd": 50.0,
+            "consumption_pct": 98.4084897,
+            "low_confidence": false,
+            "pace": {
+              "daily_usd": 16.40141495,
+              "projected_high_usd": 114.80990465,
+              "projected_low_usd": 93.00424484999999,
+              "week_avg_projection_usd": 114.80990465
+            },
+            "period": "subscription-week",
+            "recent_24h_usd": 10.95,
+            "remaining_usd": 0.795755149999998,
+            "spent_usd": 49.20424485,
+            "verdict": "over",
+            "window_end_at": "2026-04-20T14:00:00+00:00",
+            "window_start_at": "2026-04-13T14:00:00+00:00"
           }
         },
         "hero": {

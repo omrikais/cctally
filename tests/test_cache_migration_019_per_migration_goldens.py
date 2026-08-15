@@ -13,8 +13,8 @@ conversation_file_touches from existing blocks_json history. The handler does NO
 touch any data table and NEVER arms any reingest flag (P1-2: the file-touch flag
 joins ``_TARGETED_DECLINE_FLAGS`` only, never ``_REINGEST_FLAG_KEYS``). The
 dispatcher central-stamps the migration marker (#140). The
-``conversation_file_touches`` table itself is part of the baseline schema (created
-by ``_apply_cache_schema`` on every open, before the FTS branch).
+``conversation_file_touches`` table itself is part of the baseline schema. The
+migration-019 head bump opens ``_apply_cache_schema`` before the FTS branch.
 """
 from __future__ import annotations
 
@@ -77,8 +77,9 @@ def _flag(conn, key=_FLAG) -> "str | None":
 def test_pre_fixture_at_018_head_without_flag_or_marker(cctally_module):
     """Sanity: pre.sqlite has 018 applied, has NOT the 019 marker, and does NOT
     carry the file-touch backfill flag — the existing-install shape before the
-    file-path axis is armed. The conversation_file_touches table itself is present
-    (created by _apply_cache_schema on every open)."""
+    file-path axis is armed. The conversation_file_touches table itself is
+    present because migration 019's head bump opened the version-gated
+    _apply_cache_schema path."""
     assert PRE_DB.exists(), f"missing pre fixture: {PRE_DB}"
     conn = sqlite3.connect(PRE_DB)
     try:

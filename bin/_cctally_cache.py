@@ -98,6 +98,7 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 from __future__ import annotations
 
 import argparse
+import bisect
 import contextlib
 import datetime as dt
 import fcntl
@@ -113,7 +114,7 @@ import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Iterator, NamedTuple
+from typing import Any, Callable, Iterable, Iterator, NamedTuple
 
 
 def _cctally():
@@ -1080,6 +1081,261 @@ def resolve_codex_file_account(
 
 
 # --------------------------------------------------------------------------
+# #500 spec §6.1/§6.2 — the derived index over operator window attributions.
+#
+# The journal holds the truth (two op kinds); `codex_window_attributions` is a
+# disposable index over it, carried by the same cache leg that carries the
+# quota observations and the attribution map. A high-water cursor in
+# `cache_meta` records the journal position the table was materialized through,
+# so the ordinary sync reconciles only the tail.
+# --------------------------------------------------------------------------
+
+#: `cache_meta` key for the derived table's journal high-water cursor.
+CODEX_WINDOW_ATTRIBUTION_CURSOR_KEY = "codex_window_attribution_cursor"
+
+#: `cache_meta` key for the ATTRIBUTION REVISION — a counter advanced only when
+#: an attribution record actually lands or is tombstoned (#500 spec §8.3).
+#:
+#: Deliberately NOT the journal replay cursor beside it, and the two must never
+#: be collapsed. The cursor advances on all journal traffic, so a certificate
+#: keyed on it would be invalidated by every unrelated observation and the
+#: targeted quota projection would degrade into continuous re-projection. The
+#: revision that matters is the last attribution-CHANGING one.
+CODEX_WINDOW_ATTRIBUTION_REVISION_KEY = "codex_window_attribution_revision"
+
+#: `cache_meta` key for the #416 attribution MAP's journal high-water cursor
+#: (`codex_file_accounts`). Named here beside its sibling rather than only as a
+#: local inside `sync_codex_cache`, because the no-journal authoritative branch
+#: of `rehydrate_codex_journal_families` must drop it in the same breath as the
+#: rows it describes (review round 2, finding R2-4) and cannot spell a literal
+#: that lives in another module's function body.
+CODEX_FILE_ACCOUNT_CURSOR_KEY = "codex_attribution_rehydrated_hw"
+
+
+def load_codex_window_attribution_cursor(
+    conn: sqlite3.Connection,
+) -> "tuple[str, int] | None":
+    """The journal position `codex_window_attributions` was replayed through.
+
+    `None` means "never replayed", which is also what a malformed or
+    unreadable value means: a cursor nobody can parse must not be trusted to
+    skip journal bytes, and a from-zero replay is always sound because every
+    apply is idempotent on its natural key.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key = ? LIMIT 1",
+            (CODEX_WINDOW_ATTRIBUTION_CURSOR_KEY,),
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        return None
+    if not row or not row[0]:
+        return None
+    try:
+        stored = json.loads(row[0])
+        segment, offset = stored["high_water"]
+    except (ValueError, TypeError, KeyError):
+        return None
+    if not isinstance(segment, str) or not segment:
+        return None
+    try:
+        return (segment, int(offset))
+    except (TypeError, ValueError):
+        return None
+
+
+def store_codex_window_attribution_cursor(
+    conn: sqlite3.Connection, high_water, *, at_utc: "str | None" = None,
+) -> None:
+    """Record the journal position the table is now materialized through.
+
+    Runs inside the caller's transaction, which is the one that applied the
+    records it describes — the cursor and the rows must commit or roll back
+    together, or a crash between them would skip a durable assertion forever.
+    """
+    _set_cache_meta(
+        conn,
+        CODEX_WINDOW_ATTRIBUTION_CURSOR_KEY,
+        json.dumps(
+            {
+                "high_water": [str(high_water[0]), int(high_water[1])],
+                "at": at_utc or dt.datetime.now(
+                    dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            separators=(",", ":"), sort_keys=True,
+        ),
+    )
+
+
+def codex_window_attribution_revision(conn: sqlite3.Connection) -> int:
+    """The current attribution revision; `0` when nothing has ever landed.
+
+    An unreadable or malformed value reads as `0`, which is the FAIL-SAFE
+    direction here: a stored certificate carrying any other number then
+    disagrees, so the projection is treated as uncertified and re-derived,
+    rather than a stale projection being trusted.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key = ? LIMIT 1",
+            (CODEX_WINDOW_ATTRIBUTION_REVISION_KEY,),
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        return 0
+    if not row or row[0] in (None, ""):
+        return 0
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_codex_window_attribution_revision(conn: sqlite3.Connection) -> int:
+    """Advance the revision inside the caller's OPEN transaction.
+
+    Runs in the same transaction as the rows it describes, for the reason the
+    cursor beside it does: a revision that committed without its records would
+    certify a projection computed against attributions nobody applied.
+    """
+    nxt = codex_window_attribution_revision(conn) + 1
+    _set_cache_meta(conn, CODEX_WINDOW_ATTRIBUTION_REVISION_KEY, str(nxt))
+    return nxt
+
+
+def load_active_window_attributions(
+    conn: sqlite3.Connection, *, source_root_keys=None,
+    retracted_only: bool = False,
+) -> "tuple[dict, ...]":
+    """Every NON-RETRACTED assertion, oldest assertion first.
+
+    ``retracted_only=True`` inverts exactly that one predicate and returns the
+    tombstoned records instead (#500 §7.1). A retraction removes an assertion's
+    EFFECT, not the record of it, and the spend axis needs the record: a stored
+    stamp has no un-stamp path, so the reconciliation has to know which group's
+    rows an assertion used to own before it can restore them. Every other rule
+    below — weekly only, never the sentinel, undecodable witnesses skipped —
+    applies unchanged, because a tombstoned record the overlay would have
+    refused names no range worth visiting either.
+
+    `raw_resets_at_utc` comes back as a decoded `tuple[str, ...]`, not the
+    stored JSON text: the group binding is an INTERSECTION against those
+    witnesses and it happens in Python, because cardinality is dozens of rows
+    and the tolerance-connected component cannot be expressed in SQL.
+
+    `source_root_keys` bounds the read to the roots a caller is about to
+    resolve against. It is a bound on the ASSERTIONS loaded, never on the group
+    evidence they are resolved against — spec §6.4.1 requires resolution to run
+    against complete group evidence, and that is the caller's obligation.
+
+    A row whose stored witness JSON cannot be decoded is SKIPPED rather than
+    raising: it can bind to no group, so it is dormant, which is exactly the
+    honest outcome for an assertion nobody can match.
+
+    Two predicates repeat rules the BUILDERS already enforce, and that
+    duplication is the point (review finding F8). The builders bind the WRITE
+    path; this read is what the overlay trusts, and the replay path can land a
+    row the builders never minted — a hand-edited journal line, or a record
+    written before a rule existed. Only account-level weekly quota is
+    attributable, and "the operator asserted nobody" is not a fact, so neither
+    shape may reach the overlay. The existing index
+    `idx_codex_window_attributions_root(source_root_key, window_minutes)`
+    already anticipates the first. Task 2's overlay re-checks the model-scoped
+    axis independently; this is defense in depth, not the only check.
+    """
+    sql = (
+        "SELECT op_id, account_key, source_root_key, logical_limit_key, "
+        "       observed_slot, window_minutes, raw_resets_at_utc, "
+        "       canonical_resets_at_utc, asserted_at_utc "
+        "FROM codex_window_attributions "
+        "WHERE retracted_by_op_id IS "
+        + ("NOT NULL " if retracted_only else "NULL ")
+        + "  AND window_minutes = ? "
+        "  AND account_key <> ?"
+    )
+    params: list = [
+        _lib_codex_account_adoption.ACCOUNT_WEEKLY_WINDOW_MINUTES,
+        _lib_codex_account_adoption.UNATTRIBUTED_SENTINEL,
+    ]
+    if source_root_keys is not None:
+        keys = sorted({str(k) for k in source_root_keys})
+        if not keys:
+            return ()
+        sql += " AND source_root_key IN (%s)" % ",".join("?" * len(keys))
+        params.extend(keys)
+    sql += " ORDER BY asserted_at_utc ASC, op_id ASC"
+    rows = []
+    for row in conn.execute(sql, params):
+        try:
+            witnesses = json.loads(row[6])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(witnesses, list) or not witnesses:
+            continue
+        rows.append({
+            "op_id": row[0],
+            "account_key": row[1],
+            "source_root_key": row[2],
+            "logical_limit_key": row[3],
+            "observed_slot": row[4],
+            "window_minutes": int(row[5]),
+            "raw_resets_at_utc": tuple(str(w) for w in witnesses),
+            "canonical_resets_at_utc": row[7],
+            "asserted_at_utc": row[8],
+        })
+    return tuple(rows)
+
+
+def rehydrate_codex_window_attributions(
+    conn: sqlite3.Connection, *, authoritative: bool = False,
+) -> "tuple[int, int]":
+    """Replay journaled window-attribution ops into an OPEN cache.db
+    connection and advance the cursor; return
+    `(assertion_rows_landed, structurally_invalid_records_skipped)`
+    (spec §6.3).
+
+    The skip count is RETURNED rather than reported here, the rule
+    `_report_file_account_conflicts` states and #500 review finding F2 requires:
+    this runs inside the caller's transaction, and that caller rolls back on
+    failure, so a line printed from in here would describe a skip on a cycle
+    that is about to be retried. Every caller must pass it to
+    `_cctally_journal._report_window_attribution_skips` after its commit.
+
+    The caller owns the flocks, the transaction and the commit — this only runs
+    the idempotent statements, so it can sit inside `sync_codex_cache`'s already
+    locked phases without inverting the lock order. Since review finding F4 the
+    traversal itself belongs to `rehydrate_codex_journal_families`, so a sync
+    that rehydrates BOTH journal-derived Codex families reads the journal once.
+
+    `authoritative=True` is the clear-then-replay form used under
+    `cache-sync --rebuild`, mirroring `rehydrate_codex_file_accounts`: it makes
+    the replay a convergence operator rather than an inserter, so a row that has
+    drifted away from the journal — including a `retracted_by_op_id` stamp that
+    should no longer stand — is corrected instead of preserved by the
+    `DO NOTHING` conflict clause. It is lossless because the journal is
+    append-only and is the only source this table ever had.
+
+    Otherwise it is a DELTA replay from the stored cursor. A cursor is never a
+    one-shot "already rehydrated" marker: the command that appends these ops can
+    die between its append and its cache commit, and only a cursor makes the
+    retry replay the record it never materialized.
+    """
+    import _cctally_journal as _jr
+
+    result = _jr.rehydrate_codex_journal_families(
+        conn,
+        authoritative=authoritative,
+        window_attribution_since=(
+            None if authoritative
+            else load_codex_window_attribution_cursor(conn)),
+        want_file_accounts=False,
+        want_window_attributions=True,
+        caller="rehydrate_codex_window_attributions(authoritative=True)",
+    )
+    return (result.window_attributions_applied,
+            result.window_attributions_skipped)
+
+
+# --------------------------------------------------------------------------
 # #416 spec §4.1/§4.2 — the canonical reset anchor, resolved at INGEST.
 #
 # Read-time canonicalization is wrong here (review F7): the dashboard loads at
@@ -1788,6 +2044,43 @@ def _delete_codex_file_derived_rows(
     _invalidate_codex_journal_coverage_certificate(conn)
 
 
+def _prune_codex_accounting_change_log(
+    conn: sqlite3.Connection,
+    *,
+    retain_sequences: int = 50_000,
+) -> int:
+    """Bound #582's ledger while preserving cold-fallback gap detection.
+
+    The in-process dashboard cursor is intentionally not durable. Retaining a
+    generous sequence tail serves ordinary ticks; a process older than that
+    tail observes a non-contiguous first sequence and safely cold-loads.
+    """
+    if retain_sequences < 1:
+        raise ValueError("retain_sequences must be positive")
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_accounting_mutation_seq'"
+        ).fetchone()
+        current = 0 if row is None else int(row[0])
+        cutoff = current - retain_sequences
+        if cutoff <= 0:
+            return 0
+        if conn.execute(
+            "SELECT 1 FROM codex_accounting_change_log "
+            "WHERE mutation_seq <= ? LIMIT 1",
+            (cutoff,),
+        ).fetchone() is None:
+            return 0
+        cursor = conn.execute(
+            "DELETE FROM codex_accounting_change_log WHERE mutation_seq <= ?",
+            (cutoff,),
+        )
+        return max(0, int(cursor.rowcount))
+    except (sqlite3.Error, TypeError, ValueError):
+        return 0
+
+
 def _clear_codex_derived_rows(conn: sqlite3.Connection) -> bool:
     """Clear every re-derivable Codex row family and report whether state changed.
 
@@ -1804,6 +2097,14 @@ def _clear_codex_derived_rows(conn: sqlite3.Connection) -> bool:
     account switch. Wiping it is the defect. It is re-derivable only from the
     journal, and ``sync_codex_cache`` rehydrates it from there immediately after
     this call.
+
+    ``codex_window_attributions`` (#500 spec §6.3) is protected for the same
+    reason and must not be added either. It holds the operator's durable
+    assertions about which account owns a recorded quota window; no rollout byte
+    carries that fact, so a clear that did not replay would erase it outright.
+    ``sync_codex_cache`` rehydrates it from the journal — AUTHORITATIVELY under
+    ``--rebuild`` — immediately after this call, in the same position the
+    attribution map's rehydration occupies and BEFORE the rollout walk.
     """
     state_changed = any(
         conn.execute(query).fetchone() is not None
@@ -1825,7 +2126,39 @@ def _clear_codex_derived_rows(conn: sqlite3.Connection) -> bool:
             f"WHERE key='{_lib_cache_coverage.PROGRESS_KEY}' LIMIT 1",
         )
     )
-    conn.execute("DELETE FROM codex_session_entries")
+    # #582: a whole-provider clear is one cache invalidation, not N path
+    # tombstones.  Suppress the row trigger while deleting, then publish one
+    # durable full marker under the same transaction.  Older schemas have no
+    # ledger and safely ignore the extra cache_meta writes.
+    _has_accounting_ledger = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='codex_accounting_change_log'"
+    ).fetchone() is not None
+    if _has_accounting_ledger:
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta(key, value) VALUES "
+            "('codex_accounting_bulk_clear', '1')"
+        )
+    try:
+        conn.execute("DELETE FROM codex_session_entries")
+    finally:
+        if _has_accounting_ledger:
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key='codex_accounting_bulk_clear'"
+            )
+    if _has_accounting_ledger and state_changed:
+        conn.execute(
+            "INSERT INTO cache_meta(key, value) VALUES "
+            "('codex_accounting_mutation_seq', '1') "
+            "ON CONFLICT(key) DO UPDATE "
+            "SET value=CAST(value AS INTEGER) + 1"
+        )
+        conn.execute(
+            "INSERT INTO codex_accounting_change_log "
+            "(mutation_seq, change_kind) "
+            "SELECT CAST(value AS INTEGER), 'full' FROM cache_meta "
+            "WHERE key='codex_accounting_mutation_seq'"
+        )
     conn.execute("DELETE FROM quota_window_snapshots WHERE source = 'codex'")
     conn.execute("DELETE FROM codex_conversation_threads")
     conn.execute("DELETE FROM codex_conversation_events")
@@ -1857,6 +2190,21 @@ COVERAGE_CACHE_FAMILIES: "tuple[str, ...]" = (
     "quota_window_snapshots",
     "codex_file_accounts",
     "codex_file_incarnations",
+    # #500 spec §6.2. The certificate's promise is "every journal record in this
+    # prefix is materialized", and a `codex_window_attribution` op materializes
+    # HERE. Leaving the family out would let a certificate certify a prefix
+    # containing an assertion nobody applied — and a rebuild would then trust it
+    # and skip the replay, publishing a projection with `incomplete = 0` that
+    # silently omits the operator's attribution.
+    #
+    # Membership does NOT route a typed replay failure into
+    # `stats_quota_projection_state.incomplete` (review finding F7): this tuple
+    # has no RUNTIME consumer at all — every reader of it is a test. That
+    # routing is the `except CodexWindowAttributionReplayFailed` handler in
+    # `_cctally_journal._run_bounded_recovery`. What membership really does is
+    # force every writer of this table into `COVERAGE_WRITER_ACTIONS` below,
+    # which the static inventory guard enforces.
+    "codex_window_attributions",
 )
 
 #: Every path that mutates or materializes those families, mapped to the ONE
@@ -1928,31 +2276,40 @@ COVERAGE_WRITER_ACTIONS: "dict[str, str]" = {
     # transaction owner above them, not here.
     "_cctally_cache.record_codex_file_account": "preserve",
     "_cctally_cache.set_codex_file_incarnation": "preserve",
-    # The two journal-to-cache appliers. Same reasoning: INSERT OR IGNORE on the
-    # natural key, no deletes, and the certificate decision belongs to the
+    # The three journal-to-cache appliers. Same reasoning: INSERT OR IGNORE on
+    # the natural key, no deletes, and the certificate decision belongs to the
     # composite that owns their transaction.
     "_cctally_journal._apply_quota_records": "preserve",
     "_cctally_journal._apply_file_account_records": "preserve",
-    # Two branches, and only the additive one leaves the covered families
-    # untouched. `authoritative=False` replays journaled decisions into
-    # `codex_file_accounts` with an idempotent upsert and writes no quota row at
-    # all, so the coverage statement is unaffected.
+    "_cctally_journal._apply_window_attribution_records": "preserve",
+    # The ONE fused journal-to-cache rehydration for both journal-derived Codex
+    # families (#500 review finding F4). `rehydrate_codex_file_accounts` and
+    # `_cctally_cache.rehydrate_codex_window_attributions` are now thin wrappers
+    # over it and hold no DML of their own, which is why this key replaced both
+    # of theirs — the scanner found the writes here, and the inventory names
+    # where the writes ARE.
     #
-    # `authoritative=True` runs `DELETE FROM codex_file_accounts`, which IS a
-    # covered family. `preserve` holds there for a reason that lives in the
-    # caller rather than in this function, so it is written down here instead of
-    # left as an ordering nobody stated: `sync_codex_cache` passes
+    # Two branches, and only the additive one leaves the covered families
+    # untouched. `authoritative=False` replays journaled decisions and
+    # assertions with idempotent upserts and writes no quota row at all, so the
+    # coverage statement is unaffected.
+    #
+    # `authoritative=True` runs `DELETE FROM codex_file_accounts` and
+    # `DELETE FROM codex_window_attributions`, both COVERED families.
+    # `preserve` holds there for a reason that lives in the caller rather than
+    # in this function, so it is written down here instead of left as an
+    # ordering nobody stated: `sync_codex_cache` passes
     # `authoritative=bool(rebuild)`, and that same `rebuild` flag already ran
     # `_clear_codex_derived_rows` — which invalidates the certificate and the
     # progress record — and committed, before this call. The certificate is
-    # therefore already gone when the delete runs, and the clear-then-replay
-    # re-derives the whole map from `since=None` to the journal high water. A
+    # therefore already gone when the deletes run, and the clear-then-replay
+    # re-derives both families from `since=None` to the journal high water. A
     # second `authoritative=True` caller, or a reordering inside
     # `sync_codex_cache`, would break that silently, and the static scanner
     # cannot catch it because this key is already in the inventory with a green
-    # label. `rehydrate_codex_file_accounts` therefore checks the invariant
-    # itself and raises `CoverageInvariantViolation` rather than relying on it.
-    "_cctally_journal.rehydrate_codex_file_accounts": "preserve",
+    # label. The function therefore checks the invariant itself and raises
+    # `CoverageInvariantViolation` rather than relying on it.
+    "_cctally_journal.rehydrate_codex_journal_families": "preserve",
     # Spec §4.3's migrations row, enumerated rather than named — and enumerated
     # by the action each one TAKES, not by the action the spec's one-line row
     # assumed. Only `_024` deletes rows the journal still retains, and it is the
@@ -2820,8 +3177,7 @@ def _write_codex_file_batch(
     )
     rows_changed = 0
     if accounting_rows:
-        before = conn.total_changes
-        conn.executemany(
+        cursor = conn.executemany(
             """INSERT OR IGNORE INTO codex_session_entries
                (source_path, line_offset, timestamp_utc, session_id, model,
                 input_tokens, cached_input_tokens, output_tokens,
@@ -2830,7 +3186,10 @@ def _write_codex_file_batch(
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             accounting_rows,
         )
-        rows_changed = conn.total_changes - before
+        # `total_changes` includes #582's accounting-ledger trigger writes;
+        # cursor.rowcount is the top-level accounting-row count this metric
+        # has always promised.
+        rows_changed = max(0, int(cursor.rowcount))
     if quota_rows:
         if anchor_resolver is not None:
             anchor_resolver.apply_pending_merges()
@@ -2961,9 +3320,9 @@ class IngestStats:
     # Count of session_entries rows written by this sync — both genuinely-
     # new INSERTs and ccusage-parity ON CONFLICT DO UPDATE replacements
     # (the dedup tiebreaker swaps a streaming-intermediate row for the
-    # post-stream finalization). SQLite's `total_changes` counter
-    # increments on both, so this field is "rows changed", not "rows
-    # newly inserted". Pre-dedup builds used INSERT OR IGNORE where
+    # post-stream finalization). SQLite cursor rowcount increments on both, so
+    # this field is "rows changed", not "rows newly inserted", while excluding
+    # trigger-maintained ledger rows. Pre-dedup builds used INSERT OR IGNORE where
     # conflicts did NOT bump the counter; the name change preserves the
     # observability metric without misrepresenting UPSERT updates as
     # new inserts.
@@ -3088,6 +3447,11 @@ def _ensure_session_files_row(conn: sqlite3.Connection, source_path: str) -> Non
         parent = os.path.basename(os.path.dirname(source_path))
         cwd = _decode_escaped_cwd(parent)
 
+    metadata_changed = existing is not None and (
+        (existing[0] is None and session_id is not None)
+        or (existing[1] is None and cwd is not None)
+    )
+
     now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
     conn.execute(
         """
@@ -3101,6 +3465,21 @@ def _ensure_session_files_row(conn: sqlite3.Connection, source_path: str) -> Non
         """,
         (source_path, now_iso, session_id, cwd),
     )
+    if metadata_changed:
+        # `session_files` is part of every project/session aggregate row.  A
+        # NULL-to-known lazy backfill changes the joined accounting identity
+        # without inserting a `session_entries` row, so stamp every retained
+        # row for this file with the same durable mutation signal used by cost
+        # finalizations.  Snapshot caches then invalidate from their existing
+        # O(1) counter instead of scanning all session-file metadata each tick.
+        sync_seq = _bump_mutation_seq(conn)
+        conn.execute(
+            "UPDATE session_entries "
+            "SET mutation_seq = ?, "
+            "    mutation_min_ts = COALESCE(mutation_min_ts, timestamp_utc) "
+            "WHERE source_path = ?",
+            (sync_seq, source_path),
+        )
     # Commit per-call so the write lock is released before the caller's
     # subsequent JSONL read+parse. Leaving the implicit transaction open
     # across the per-file loop would both hold a writer lock across reads
@@ -6318,7 +6697,7 @@ def sync_codex_cache(
         #
         # The cursor keeps the Claude-only case cheap too — once it equals the
         # high-water, the replay reads no bytes and writes nothing.
-        _ATTR_CURSOR_KEY = "codex_attribution_rehydrated_hw"
+        _ATTR_CURSOR_KEY = CODEX_FILE_ACCOUNT_CURSOR_KEY
         try:
             _cursor_row = conn.execute(
                 "SELECT value FROM cache_meta WHERE key = ? LIMIT 1",
@@ -6333,8 +6712,33 @@ def sync_codex_cache(
                 _since = (_seg, int(_off))
         try:
             import _cctally_journal as _jr
-            restored, _applied_hw, _declined = _jr.rehydrate_codex_file_accounts(
-                conn, authoritative=bool(rebuild), since=_since)
+            # #500 spec §6.3: the operator's window attributions are rehydrated
+            # in the SAME transaction and the same position as the attribution
+            # map, and for the same reason — `_clear_codex_derived_rows`
+            # deliberately leaves the table standing, so the only thing that can
+            # converge it after a rebuild is a replay from the journal. Ordered
+            # BEFORE the rollout walk so every durable assertion visible to this
+            # locked walk is already in place. It keeps its own cursor, distinct
+            # from the attribution map's.
+            #
+            # ONE fused traversal (review finding F4). Two independent passes
+            # streamed the whole journal twice while the global cache-writer
+            # flock and the Codex provider flock were both held, which is the
+            # `database is locked` trigger #297 documents.
+            _rehydration = _jr.rehydrate_codex_journal_families(
+                conn,
+                authoritative=bool(rebuild),
+                file_account_since=_since,
+                window_attribution_since=(
+                    None if rebuild
+                    else load_codex_window_attribution_cursor(conn)),
+                caller="sync_codex_cache(rebuild=True)",
+            )
+            restored = _rehydration.file_accounts_applied
+            _applied_hw = _rehydration.file_accounts_high_water
+            _declined = _rehydration.file_accounts_declined
+            _attributed = _rehydration.window_attributions_applied
+            _attr_skipped = _rehydration.window_attributions_skipped
             _new_cursor = (
                 None if _applied_hw is None
                 else f"{_applied_hw[0]}:{_applied_hw[1]}")
@@ -6352,7 +6756,12 @@ def sync_codex_cache(
             # bytes), and `rebuild` covers the authoritative DELETE, which
             # happens even when there is nothing to replay. Getting this wrong
             # strands an open transaction across the whole walk.
-            if rebuild or _new_cursor != _cursor_text:
+            # `conn.in_transaction` is the precise witness — it is true iff
+            # uncommitted DML is pending — and it covers #500's rehydration too
+            # without the caller having to model that function's write
+            # conditions. Getting this wrong strands an open transaction across
+            # the whole walk.
+            if rebuild or _new_cursor != _cursor_text or conn.in_transaction:
                 conn.commit()
             # Both reports come AFTER the commit (closeout review C5): the
             # `except` below rolls back, so anything printed before it would
@@ -6361,13 +6770,23 @@ def sync_codex_cache(
                 eprint(
                     "[cache-sync] rehydrated "
                     f"{restored} Codex attribution decision(s) from the journal")
+            if _attributed:
+                eprint(
+                    "[cache-sync] rehydrated "
+                    f"{_attributed} Codex window attribution(s) from the journal")
             _jr._report_file_account_conflicts(_declined)
+            _jr._report_window_attribution_skips(_attr_skipped)
         except Exception as exc:
             conn.rollback()
             stats.deferred_reason = "attribution_rehydration"
+            # Both journal-derived Codex families are rehydrated by the one
+            # fused pass above, so this message names both (review finding F7):
+            # a failure here is just as likely to be a window attribution as an
+            # attribution decision, and a reader who saw only "decisions" would
+            # look in the wrong place.
             eprint(
-                "[cache-sync] could not rehydrate Codex attribution "
-                f"decisions: {exc}; deferring the Codex walk")
+                "[cache-sync] could not rehydrate Codex attribution decisions "
+                f"or window attributions: {exc}; deferring the Codex walk")
             return stats
 
         # Pure read (glob + is_file only); safe to run before the SELECT and
@@ -7461,6 +7880,33 @@ def sync_codex_cache(
                 # boundary, never to a best-effort local except.
                 raise
             eprint(f"[cache-sync] could not adopt Codex window spend: {exc}")
+        # #500 §7.1: the STANDING half of operator attribution. The condition it
+        # repairs is created by ordinary ingest, not only by an operator command
+        # — native evidence arriving for an attributed group, a second assertion,
+        # a component split, a window re-materializing as model-scoped — so it
+        # has to run wherever ingest runs, not only where `account attribute`
+        # does. Ordered AFTER the pass above so the reconciliation has the last
+        # word on any row that pass could also have touched, and inside the same
+        # flocks for the same reason: the observation evidence and the accounting
+        # rows it restores are one committed generation. Costs a store with no
+        # attribution records one indexed read; best-effort, like the pass above.
+        try:
+            restored, readopted = reconcile_codex_window_attribution_spend(conn)
+            conn.commit()
+            if restored:
+                eprint(f"[cache-sync] restored {restored} Codex row(s) whose "
+                       "operator attribution no longer resolves; "
+                       f"re-attributed {readopted}")
+        except sqlite3.DatabaseError as exc:
+            conn.rollback()
+            if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                raise
+            eprint("[cache-sync] could not reconcile Codex window "
+                   f"attribution spend: {exc}")
+        # #582: keep only a generous mutation-sequence tail. A dashboard that
+        # falls behind it detects the gap and cold-loads, preserving truth.
+        if _prune_codex_accounting_change_log(conn):
+            conn.commit()
         # Codex creates/extends cache.db sidecars independently of Claude's
         # sync path. Harden them while both cache flocks are still held and
         # after all Codex writes, before the optional checkpoint can rotate a
@@ -7570,8 +8016,19 @@ def apply_codex_window_spend_adoption(
     conn: sqlite3.Connection,
     *,
     touched: "dict[str, tuple[dt.datetime, dt.datetime]] | None" = None,
+    strict: bool = False,
 ) -> int:
     """Stamp window-derived attribution onto unattributed Codex spend.
+
+    ``strict`` (#500 spec §8.2) propagates every failure instead of converting a
+    schema or loader database error into a successful zero-row result. The
+    default stays best-effort because this pass's ordinary caller is a sync that
+    must not fail a whole ingest over an adoption problem, and the stamp is fully
+    re-derivable on the next one. Inside ``account attribute``'s transaction that
+    forgiveness is wrong in a specific and silent way: the journal op lands, the
+    percentage axis moves, adoption swallows the failure, and the command reports
+    success with the spend axis untouched — which is exactly the all-or-nothing
+    apply it promised not to break. Only that command passes ``strict=True``.
 
     The I/O half of ``_lib_codex_account_adoption``: read the folded window
     evidence and the candidate rows, hand both to the pure kernel, write back the
@@ -7636,8 +8093,19 @@ def apply_codex_window_spend_adoption(
                 "PRAGMA table_info(codex_session_entries)")
         }
     except sqlite3.DatabaseError:
+        if strict:
+            raise
         return 0
     if not {"account_key", "source_root_key", "timestamp_utc"} <= columns:
+        if strict:
+            # A dropped or pre-#341 table returns NO rows from `table_info`
+            # rather than raising, so the strict caller has to be told in the
+            # one currency it can act on. Reported as a database error because
+            # that is what it is: the schema this pass writes to is not there.
+            raise sqlite3.OperationalError(
+                "codex_session_entries is missing the columns window spend "
+                "adoption requires (account_key, source_root_key, "
+                "timestamp_utc)")
         return 0
 
     try:
@@ -7646,6 +8114,8 @@ def apply_codex_window_spend_adoption(
             canonical_resets_between=reset_bounds,
         )
     except sqlite3.DatabaseError:
+        if strict:
+            raise
         return 0
 
     # Group on the SAME key the observation fold groups on
@@ -7733,15 +8203,328 @@ def apply_codex_window_spend_adoption(
     plan = adopt.build_spend_adoption_plan(windows, candidates)
     if not plan:
         return 0
-    before = conn.total_changes
-    conn.executemany(
+    cursor = conn.executemany(
         "UPDATE codex_session_entries SET account_key = ? "
         " WHERE id = ? AND (account_key IS NULL OR account_key = '' "
         "                   OR account_key = ?)",
         [(stamp.account_key, stamp.entry_id, _lib_accounts.UNATTRIBUTED)
          for stamp in plan],
     )
-    return conn.total_changes - before
+    # Trigger-maintained change ledgers are intentionally excluded from this
+    # public semantic row count.
+    return max(0, int(cursor.rowcount))
+
+
+# --------------------------------------------------------------------------
+# #500 §7.1 — suppression must un-stamp spend, not merely stop attributing
+# --------------------------------------------------------------------------
+#
+# The precedence table suppresses an assertion at fold time whenever the world
+# changes under it. On the PERCENTAGE axis that is sufficient, because the
+# overlay is re-derived from scratch on every load: stop applying the assertion
+# and the percentage reverts by construction.
+#
+# The SPEND axis does not behave that way. `codex_session_entries.account_key`
+# is a stored stamp, and the adoption kernel never revisits an already-identified
+# row — it skips every non-sentinel candidate, and the surrounding SQL only
+# selects rows that are NULL, empty or the sentinel. There is no un-stamp path,
+# so without this the two axes disagree permanently after native evidence
+# arrives, with no error and no operator action that would reveal it.
+#
+# This reconciliation is STATELESS by design. The spec sketched recording, per
+# assertion, the ownership it last applied; that state would have to survive an
+# authoritative rehydrate of the assertions table (which deletes and replays it)
+# while the spend stamps it describes survive independently, and the two going
+# out of step is a worse failure than the one being fixed. Restoring to the
+# per-file baseline and re-running the bounded adoption pass converges to the
+# same answer from the durable inputs alone, and is idempotent because a row
+# already at its correct owner is not rewritten.
+
+
+def codex_file_key_for_entry_path(
+    source_root_key: str, source_path: str,
+) -> str:
+    """The durable file identity behind a stored ``source_path``.
+
+    ``codex_session_entries`` retains the first configured WALK spelling, while
+    the attribution map is keyed on ``(root, canonical physical path)``, so
+    recovering the identity means re-running the same canonicalization the walk
+    ran (``codex_file_identity`` over ``CodexDiscoveredFile.physical_path``).
+    """
+    from _lib_source_identity import codex_file_key
+
+    return codex_file_key(
+        str(source_root_key),
+        str(_canonical_codex_path(pathlib.Path(str(source_path)))),
+    )
+
+
+class _CodexFileBaselineResolver:
+    """Per-row ``codex_file_accounts`` baselines, memoised per file.
+
+    ``(covered, account_key)`` semantics are ``codex_account_for_offset``'s:
+    ``(True, None)`` is the stably-absent DECISION and ``(False, None)`` means
+    no decision covers those bytes at all. Both restore to ``NULL``, which is
+    what makes the row adoptable again; the distinction matters to the caller
+    only as documentation of why.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._ranges: "dict[tuple[str, str], list[tuple[int, str | None]]]" = {}
+
+    def baseline(
+        self, source_root_key: str, source_path: str, line_offset: int,
+    ) -> "str | None":
+        key = (str(source_root_key), str(source_path))
+        ranges = self._ranges.get(key)
+        if ranges is None:
+            identity = codex_file_key_for_entry_path(*key)
+            incarnation = codex_file_incarnation(self._conn, identity)
+            # Resolved at the file's CURRENT incarnation, never by path alone:
+            # a truncation resets the file to offset zero, so an older
+            # incarnation's ranges must not cover reused offsets.
+            ranges = self._ranges[key] = load_codex_file_account_ranges(
+                self._conn, identity, incarnation)
+        return codex_account_for_offset(ranges, int(line_offset))[1]
+
+
+def _codex_span_index(
+    spans: "Iterable[tuple[dt.datetime, dt.datetime]]",
+) -> "tuple[list[dt.datetime], list[dt.datetime]]":
+    """Index half-open spans for O(log n) containment.
+
+    Sorted starts plus the PREFIX MAXIMUM of the ends. Spans overlap — a
+    straddling weekly window and its neighbour share hours — so "some span
+    starting at or before ``t`` also ends after ``t``" is not answerable from
+    the immediately preceding span alone; the running maximum end over the
+    whole prefix is, and it is what keeps the lookup a single ``bisect``.
+    """
+    ordered = sorted(spans)
+    starts = [start for start, _end in ordered]
+    prefix_max_end: "list[dt.datetime]" = []
+    running: "dt.datetime | None" = None
+    for _start, end in ordered:
+        running = end if running is None or end > running else running
+        prefix_max_end.append(running)
+    return starts, prefix_max_end
+
+
+def _codex_span_covers(index, instant: dt.datetime) -> bool:
+    """True iff some indexed span half-open-contains ``instant``."""
+    starts, prefix_max_end = index
+    position = bisect.bisect_right(starts, instant)
+    return position > 0 and prefix_max_end[position - 1] > instant
+
+
+def reconcile_codex_window_attribution_spend(
+    conn: sqlite3.Connection, *, strict: bool = False,
+) -> "tuple[int, int]":
+    """Restore stranded attribution stamps, then re-adopt; ``(restored, adopted)``.
+
+    Standing, not one-shot: it runs at the end of every Codex sync and inside
+    ``account attribute``'s own transaction, because the condition it repairs is
+    created by ORDINARY ingest — native evidence arriving for a group an operator
+    had attributed, a second assertion appearing, a component splitting, a
+    re-materialized window turning out to be model-scoped — and by retraction
+    alike. Whichever of those happened, the effect is the same: a spend row is
+    stamped to an account the current resolution no longer names.
+
+    The restore is scoped in three ways, and each one bounds the blast radius of
+    a mistake:
+
+    * to the nominal ranges of groups some attribution record names, currently
+      or at assertion time;
+    * to rows whose stamp is an account some attribution record ASSERTED, so a
+      per-file decision the operator never touched is never a candidate;
+    * to rows whose stamp is not already an account the CURRENT WORLD can
+      justify for a group containing that instant — a resolved assertion's
+      owner, or a group's own native evidence — which is what makes a second
+      run write nothing.
+
+    Costs a store with no attribution records exactly one indexed read.
+
+    ``strict`` propagates failures for ``account attribute``'s all-or-nothing
+    apply; the default swallows them the way the sync-time adoption pass does,
+    because everything here is re-derivable on the next sync.
+    """
+    from _cctally_quota import resolve_codex_window_attributions_with_evidence
+
+    try:
+        active = load_active_window_attributions(conn)
+        retracted = load_active_window_attributions(conn, retracted_only=True)
+    except sqlite3.DatabaseError:
+        if strict:
+            raise
+        return (0, 0)
+    records = (*active, *retracted)
+    if not records:
+        return (0, 0)
+
+    roots = sorted({str(record["source_root_key"]) for record in records})
+    try:
+        _resolutions, ownership, groups = (
+            resolve_codex_window_attributions_with_evidence(
+                conn, source_root_keys=roots, include_retracted=True))
+    except sqlite3.DatabaseError:
+        if strict:
+            raise
+        return (0, 0)
+
+    asserted_keys = sorted({str(record["account_key"]) for record in records})
+    week = _CODEX_ACCOUNT_WEEK
+
+    # The ranges to visit: every group an assertion currently owns, plus every
+    # group any record named at assertion time. The second half is what reaches
+    # a retraction, a newly dormant assertion and a component split — all three
+    # move the rows OUT of a currently-resolved group, so a currently-resolved
+    # set alone would never look at them again.
+    ranges: "dict[str, list[tuple[dt.datetime, dt.datetime]]]" = {}
+    # Two deliberate loosenesses in `justified`, recorded because they are
+    # KNOWN and neither is worth restructuring this map for:
+    #
+    # 1. The predicate is "some covering group justifies this account", while
+    #    the adoption fold's rule is "the UNION of identified accounts across
+    #    every claiming window is exactly one". The two agree wherever one
+    #    account claims an instant and disagree where two do: the fold declines
+    #    to stamp, this map still justifies keeping a stamp already there. The
+    #    error is one-directional — it retains a stamp the operator's own
+    #    assertion put on a row the fold now declines to re-derive — and the
+    #    alternative, evaluating the union per instant, would cost a per-row
+    #    fold rather than a bisect.
+    # 2. It is keyed on `(root, account)` with no group axes, so a
+    #    justification earned by one group covers a same-account stamp inside
+    #    any other group whose span contains that instant. Weekly spans on one
+    #    root overlap by construction, so this is reachable rather than
+    #    theoretical; it is also the same one-directional retention.
+    justified: "dict[tuple[str, str], list[tuple[dt.datetime, dt.datetime]]]" = {}
+    for group_key, account_key in ownership.items():
+        root_key, reset = str(group_key[1]), group_key[5]
+        ranges.setdefault(root_key, []).append((reset - week, reset))
+        justified.setdefault((root_key, str(account_key)), []).append(
+            (reset - week, reset))
+    # A group's own NATIVE accounts justify a stamp exactly as ownership does:
+    # the fold adopts every unattributed member of such a group into that
+    # account, so a spend row already carrying it is at the answer the current
+    # world gives. Reading it from the loaded GROUPS rather than from a
+    # SUPPRESSED_NATIVE resolution also covers the dormant and split shapes,
+    # whose resolutions name no group at all.
+    #
+    # Without this the reconciliation churns forever whenever a group resolving
+    # SUPPRESSED_NATIVE names an account the operator also asserted elsewhere —
+    # which is ordinary, not exotic: the row is restored to a different per-file
+    # baseline and immediately re-adopted to the same account, on every sync,
+    # each time printing a line claiming an attribution no longer resolves. The
+    # end state was right; the write behaviour was not idempotent.
+    #
+    # An OUT-OF-SCOPE group justifies nothing, though. The kernel files a
+    # model-scoped group as SUPPRESSED_MODEL_SCOPED — it "neither stamps nor
+    # blocks" — so it can never be the source of a stamp, and letting it
+    # authorize keeping one is one-directional damage: the span below is a whole
+    # week, so a single Spark-labelled capture naming the account the operator
+    # asserted covers every stamped row in that week and a retraction over it
+    # silently accomplishes nothing. Such a group reaches this loop because it
+    # shares the assertion's four stored axes and its anchor while interpreting
+    # to a different limit key. `SUPPRESSED_NATIVE` is unaffected: that shape is
+    # in-scope by construction.
+    for group in groups:
+        if not group.in_scope:
+            continue
+        reset = group.group_key[5]
+        for account_key in group.identified_accounts:
+            justified.setdefault(
+                (group.source_root_key, str(account_key)), []).append(
+                    (reset - week, reset))
+    for record in records:
+        reset = _parse_anchor_iso(record["canonical_resets_at_utc"])
+        if reset is None:
+            continue
+        ranges.setdefault(str(record["source_root_key"]), []).append(
+            (reset - week, reset))
+    if not ranges:
+        return (0, 0)
+
+    # Both membership questions are asked once per candidate row, and the SQL
+    # range is the union of a root's spans, so on a whole-history attribution
+    # that is every stamped row against every span. Indexing them turns two
+    # linear scans into two binary searches: measured read-only on the
+    # maintainer's store at the §9.1 shape (58,806 stamped rows, 180 spans, 90
+    # justifications), the filter alone went from 358.8 ms to 30.3 ms — per
+    # `sync_codex_cache`, inside both cache flocks.
+    span_index = {
+        root_key: _codex_span_index(spans)
+        for root_key, spans in ranges.items()
+    }
+    justified_index = {
+        key: _codex_span_index(spans) for key, spans in justified.items()
+    }
+
+    resolver = _CodexFileBaselineResolver(conn)
+    restored = 0
+    try:
+        for root_key, spans in sorted(ranges.items()):
+            low = min(span[0] for span in spans)
+            high = max(span[1] for span in spans)
+            updates: "list[tuple[str | None, int]]" = []
+            for row in conn.execute(
+                "SELECT id, source_path, line_offset, timestamp_utc, "
+                "       account_key "
+                "  FROM codex_session_entries "
+                " WHERE source_root_key = ? "
+                "   AND account_key IN ("
+                + ",".join("?" * len(asserted_keys)) + ") "
+                "   AND unixepoch(timestamp_utc) >= unixepoch(?) "
+                "   AND unixepoch(timestamp_utc) <= unixepoch(?)",
+                (root_key, *asserted_keys,
+                 _codex_anchor_iso(low), _codex_anchor_iso(high)),
+            ):
+                account_key = str(row[4])
+                timestamp = _parse_anchor_iso(row[3])
+                if timestamp is None:
+                    continue
+                if not _codex_span_covers(span_index[root_key], timestamp):
+                    continue
+                owner = justified_index.get((root_key, account_key))
+                if owner is not None and _codex_span_covers(owner, timestamp):
+                    continue
+                try:
+                    baseline = resolver.baseline(root_key, row[1], row[2])
+                except (ValueError, OSError):
+                    # `codex_file_key` refuses a blank path and `pathlib`
+                    # refuses a NUL byte; neither is a `sqlite3.DatabaseError`,
+                    # so an unrecoverable row would have failed the WHOLE Codex
+                    # sync rather than degrading. A row whose durable file
+                    # identity cannot be recovered has no baseline to restore
+                    # to, so it is skipped — the same rule the quota loader
+                    # applies window-by-window rather than suppressing valid
+                    # ones. `strict` still propagates, because the command's
+                    # all-or-nothing apply must not report success over it.
+                    if strict:
+                        raise
+                    continue
+                if baseline == account_key:
+                    continue
+                updates.append((baseline, int(row[0])))
+            if updates:
+                cursor = conn.executemany(
+                    "UPDATE codex_session_entries SET account_key = ? "
+                    " WHERE id = ?",
+                    updates,
+                )
+                restored += max(0, int(cursor.rowcount))
+    except sqlite3.DatabaseError:
+        if strict:
+            raise
+        return (0, 0)
+
+    touched = {
+        root_key: (min(span[0] for span in spans),
+                   max(span[1] for span in spans))
+        for root_key, spans in ranges.items()
+    }
+    adopted = apply_codex_window_spend_adoption(
+        conn, touched=touched, strict=strict)
+    return (restored, adopted)
 
 
 def iter_codex_entries(
@@ -8595,6 +9378,21 @@ def open_cache_db() -> sqlite3.Connection:
         journal_mode = str(
             conn.execute("PRAGMA journal_mode").fetchone()[0]
         ).lower()
+
+        # #566: the refusal must precede the DDL it exists to prevent. The
+        # dispatcher's #142 guard runs inside
+        # `_run_pending_cache_migrations_under_writer_lock`, which this path
+        # reaches only after `apply_policy`, `_apply_cache_schema` and the
+        # `last_total_tokens` ALTER-plus-purge. A dev-checkout binary pointed at
+        # the real prod dir therefore modified the production schema and only
+        # then refused. Evaluated here, under both flocks and after the gates
+        # were re-read, nothing persistent has been written yet.
+        try:
+            _cctally_db_sib._refuse_prod_migration_before_schema_write(
+                conn, _CACHE_MIGRATIONS, "cache.db")
+        except _cctally_db_sib.ProdMigrationRefused:
+            conn.close()
+            raise
 
         if not schema_current or journal_mode != "wal":
             _cctally_store.apply_policy(conn, "cache")

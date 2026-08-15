@@ -32,19 +32,27 @@
 import { resolveAccountFocus, sourceAccounts } from './accountFocus';
 import type {
   AccountCard,
+  AllSourceData,
   CodexAccountScope,
   CodexHero,
   CodexSourceData,
   DashboardSelection,
   Envelope,
   SourceEntry,
+  SourceName,
+  SourcesMap,
 } from '../types/envelope';
 
 // The only provider that emits per-account children today.
 const SCOPED_SOURCE = 'codex';
 
 export interface AccountScopeResult {
+  // The VIEW this scope was resolved for ('claude' | 'codex' | 'all').
   source: DashboardSelection;
+  // #556 S5 §5.4 — the PROVIDER the scope describes, which under All is not
+  // the same thing as the view. `null` when the view names no provider (an All
+  // read that was given none).
+  provider: SourceName | null;
   // The effective focused account key, or null for "All accounts". Reconciled
   // against `accounts[]` (stored-valid-else-All), so a vanished or residual key
   // resolves to All rather than to a scope with no chip. Null whenever the
@@ -172,21 +180,30 @@ function composeScopedData(
 }
 
 // Resolve the effective scope for one source. Pure; safe to call per render.
+//
+// #556 S5 §5.4 — `provider` names the provider the scope describes and defaults
+// to the view's own provider, which keeps every pre-S5 two-and-three-argument
+// call byte-identical: a provider tab scopes itself, and an All read that names
+// no provider still resolves to "no scope", exactly as before. Under All a
+// caller passes the provider explicitly, and the stored value it hands in comes
+// from that provider's All slot.
 export function scopeToAccount(
   env: Envelope | null,
   source: DashboardSelection,
   stored: string,
+  provider: SourceName | null = source === 'all' ? null : source,
 ): AccountScopeResult {
-  const entry = source === 'all'
+  const entry = provider == null
     ? null
-    : ((env?.sources?.[source] ?? null) as SourceEntry<unknown> | null);
+    : ((env?.sources?.[provider] ?? null) as SourceEntry<unknown> | null);
   const parent = (entry?.data ?? null) as CodexSourceData | null;
-  const scopes = source === SCOPED_SOURCE ? accountScopesOf(entry) : null;
+  const scopes = provider === SCOPED_SOURCE ? accountScopesOf(entry) : null;
   const supported = scopes != null;
-  const key = resolveAccountFocus(env, source, stored);
+  const key = provider == null ? null : resolveAccountFocus(env, provider, stored);
   if (key == null || !supported) {
     return {
       source,
+      provider,
       accountKey: null,
       requestedKey: key,
       card: null,
@@ -203,6 +220,7 @@ export function scopeToAccount(
   const child = scopes![key] ?? emptyScope();
   return {
     source,
+    provider,
     accountKey: key,
     requestedKey: key,
     card,
@@ -223,12 +241,25 @@ const memo = new WeakMap<object, Map<string, Envelope>>();
 // resolves to "All accounts" (or the source cannot scope), so an undecorated /
 // unfocused dashboard is byte-identical to today and every existing consumer,
 // test and golden is untouched.
+// #556 S5 §5.4 — BOTH MIRRORS are rewritten.
+//
+// Server composition stores the provider data objects AGAIN under
+// `sources.all.data.providers` (`bin/_lib_dashboard_sources.py`), and under All
+// `presentationProviders` PREFERS those mirrored children over the physical
+// entries. Rewriting only `sources.codex.data` would therefore leave most All
+// panels reading the unscoped mirror while the chip claimed to be filtering.
+// `sources.all.data.combined`, the aggregates and every other deliberately
+// unscoped outcome are left intact: a combined figure is never recomputed from
+// a focused child.
 export function scopeEnvelope(
   env: Envelope | null,
   source: DashboardSelection,
   stored: string,
 ): Envelope | null {
   if (env == null) return null;
+  // Codex is the only provider with per-account children, so it is the only
+  // subtree a rewrite can narrow — on its own tab and under All alike.
+  if (source !== SCOPED_SOURCE && source !== 'all') return env;
   // The memo key needs only the RECONCILED FOCUS, never the scoped rewrite, so
   // resolve the cheap half first and consult the memo before running
   // `composeScopedData`. Doing the rewrite first and discarding it on a hit ran
@@ -237,12 +268,13 @@ export function scopeEnvelope(
   // per (source, focus). These guards are exactly the conditions under which
   // `scopeToAccount` returns a non-null `accountKey` AND a non-null `data`; the
   // full call below still re-checks both, so it stays the authority.
-  const sourceEntry = source === SCOPED_SOURCE
-    ? ((env.sources?.[source] ?? null) as SourceEntry<unknown> | null)
-    : null;
+  const sourceEntry = (env.sources?.[SCOPED_SOURCE] ?? null) as SourceEntry<unknown> | null;
   if (sourceEntry?.data == null || accountScopesOf(sourceEntry) == null) return env;
-  const focusKey = resolveAccountFocus(env, source, stored);
+  const focusKey = resolveAccountFocus(env, SCOPED_SOURCE, stored);
   if (focusKey == null) return env;
+  // The VIEW is part of the memo key, not just the focus: All and the Codex tab
+  // produce different envelopes from the same focus (All also rewrites the
+  // mirror), so collapsing them would serve one view the other's rewrite.
   const cacheKey = `${source}\u0000${focusKey}`;
   let perEnv = memo.get(env as unknown as object);
   if (perEnv == null) {
@@ -251,16 +283,26 @@ export function scopeEnvelope(
   }
   const hit = perEnv.get(cacheKey);
   if (hit != null) return hit;
-  const resolved = scopeToAccount(env, source, stored);
+  const resolved = scopeToAccount(env, source, stored, SCOPED_SOURCE);
   if (resolved.accountKey == null || resolved.data == null) return env;
-  const entry = env.sources![source as 'codex']!;
-  const scoped = {
-    ...env,
-    sources: {
-      ...env.sources,
-      [source]: { ...entry, data: resolved.data },
-    },
-  } as Envelope;
+  const sources = {
+    ...env.sources,
+    [SCOPED_SOURCE]: { ...sourceEntry, data: resolved.data },
+  } as SourcesMap;
+  if (source === 'all') {
+    const allEntry = sources.all ?? null;
+    const allData = (allEntry?.data ?? null) as AllSourceData | null;
+    if (allEntry != null && allData?.providers != null) {
+      sources.all = {
+        ...allEntry,
+        data: {
+          ...allData,
+          providers: { ...allData.providers, codex: resolved.data },
+        },
+      };
+    }
+  }
+  const scoped = { ...env, sources } as Envelope;
   perEnv.set(cacheKey, scoped);
   return scoped;
 }

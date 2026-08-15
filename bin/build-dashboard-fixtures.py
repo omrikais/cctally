@@ -2284,6 +2284,216 @@ def build_all_combined_decorated(as_of: dt.datetime) -> None:
     _assert_ac_display_zone(scenario_dir)
 
 
+# === #556 S5 §6.2 — `all-budget-account-focus` ==============================
+#
+# `all-combined-decorated` stays untouched. It is the focused oracle for Claude
+# decoration and combined withholding, and extending it would conflate two
+# regression purposes.
+#
+# Every configured amount below is DISTINCT, and the two provider periods
+# differ. That is the discriminator: equal values would let a provider swap, or
+# a parent-for-child substitution, pass green.
+#
+#   Claude vendor-wide   $180.00  calendar-month
+#   Claude per-account   $120.00  (populated, and deliberately NOT consumed —
+#                                  Claude publishes no `account_scopes`, so the
+#                                  status stays vendor-wide)
+#   Codex vendor-wide     $90.00  calendar-week
+#   Codex account A       $55.00
+#   Codex account B       $35.00
+_BAF_CLAUDE_BUDGET_USD = 180.0
+_BAF_CLAUDE_ACCOUNT_BUDGET_USD = 120.0
+_BAF_CODEX_BUDGET_USD = 90.0
+_BAF_CODEX_ACCOUNT_A_BUDGET_USD = 55.0
+_BAF_CODEX_ACCOUNT_B_BUDGET_USD = 35.0
+
+_BAF_CLAUDE_ACCOUNT_KEY = "c" * 32
+_BAF_CODEX_ACCOUNT_A = "d" * 32
+_BAF_CODEX_ACCOUNT_B = "e" * 32
+
+# ONE physical root shared by both accounts — the production shape, and the one
+# in which a bare resource key is not an identity (#429 §3.1).
+_BAF_CODEX_ROOT_KEY = "fixture-budget-focus-root"
+_BAF_CODEX_ROOT_PATH = "/fake/codex-budget-focus"
+_BAF_CODEX_CWD = "/fake/repos/budget-focus-codex"
+
+
+def _seed_budget_focus_codex(
+    cache_conn: sqlite3.Connection, as_of: dt.datetime,
+) -> None:
+    """Two real Codex accounts on one root, with DISTINCT spend and quota."""
+    seed_codex_source_root(
+        cache_conn,
+        source_root_key=_BAF_CODEX_ROOT_KEY,
+        canonical_root_path=_BAF_CODEX_ROOT_PATH,
+    )
+    # (account_key, session suffix, resets_at, used_percent, rows)
+    #
+    # Account A carries roughly twice B's spend and a later reset, so a read
+    # that returned the wrong child — or the merged parent — is visible in
+    # every scalar rather than only in the key.
+    accounts = (
+        (
+            _BAF_CODEX_ACCOUNT_A, "a", as_of + dt.timedelta(days=4, hours=2), 62.0,
+            (
+                (_AC_CODEX_CYCLE_START + dt.timedelta(hours=9), 220_000, 70_000, 18_000, 4_000),
+                (as_of - dt.timedelta(hours=3), 150_000, 48_000, 12_000, 2_500),
+            ),
+        ),
+        (
+            _BAF_CODEX_ACCOUNT_B, "b", as_of + dt.timedelta(days=2, hours=5), 27.0,
+            (
+                (_AC_CODEX_CYCLE_START + dt.timedelta(hours=11), 90_000, 28_000, 7_000, 1_500),
+                (as_of - dt.timedelta(hours=2), 60_000, 19_000, 5_000, 900),
+            ),
+        ),
+    )
+    for index, (account_key, suffix, resets_at, used_percent, rows) in enumerate(
+        accounts,
+    ):
+        session_id = f"fixture-budgetfocus-{suffix}-0000-000000000001"
+        conversation_key = f"v1.{_BAF_CODEX_ROOT_KEY}.{session_id}"
+        file_path = f"{_BAF_CODEX_ROOT_PATH}/sessions/{session_id}.jsonl"
+        seed_codex_session_file(
+            cache_conn,
+            path=file_path,
+            last_session_id=session_id,
+            last_model="gpt-5",
+            source_root_key=_BAF_CODEX_ROOT_KEY,
+            last_native_thread_id=session_id,
+            last_conversation_key=conversation_key,
+        )
+        seed_codex_conversation_thread(
+            cache_conn,
+            conversation_key=conversation_key,
+            source_root_key=_BAF_CODEX_ROOT_KEY,
+            native_thread_id=session_id,
+            source_path=file_path,
+            cwd=_BAF_CODEX_CWD,
+        )
+        for line_offset, (ts, inp, cached, out, reasoning) in enumerate(rows):
+            seed_codex_session_entry(
+                cache_conn,
+                source_path=file_path,
+                line_offset=line_offset,
+                timestamp_utc=ts,
+                session_id=session_id,
+                model="gpt-5",
+                input_tokens=inp,
+                cached_input_tokens=cached,
+                output_tokens=out,
+                reasoning_output_tokens=reasoning,
+                total_tokens=inp + out,
+                source_root_key=_BAF_CODEX_ROOT_KEY,
+                conversation_key=conversation_key,
+                account_key=account_key,
+            )
+        seed_codex_quota_snapshot(
+            cache_conn,
+            source_root_key=_BAF_CODEX_ROOT_KEY,
+            source_path=f"{_BAF_CODEX_ROOT_PATH}/sessions/weekly-quota-{suffix}.jsonl",
+            line_offset=index,
+            captured_at_utc=_iso(as_of - dt.timedelta(seconds=1200)),
+            logical_limit_key="fixture-budget-focus-weekly",
+            window_minutes=10_080,
+            used_percent=used_percent,
+            resets_at_utc=_iso(resets_at),
+            limit_name="Fixture weekly quota",
+            account_key=account_key,
+        )
+    bump_codex_physical_mutation_seq(cache_conn)
+
+
+def build_all_budget_account_focus(as_of: dt.datetime) -> None:
+    """Both provider budgets configured, and two focusable Codex accounts.
+
+    #556 S5 §6.2. The scenario the budget comparison and the account focus are
+    both read from: unequal amounts over different periods, a Claude
+    `budget.accounts` map alongside a vendor-wide amount (so a test can prove
+    the Claude status stays vendor-wide), and two real Codex accounts with
+    their own budgets, spend and quota.
+    """
+    scenario_dir, app_dir = _scenario_dirs("all-budget-account-focus")
+    stats_path = app_dir / "stats.db"
+    cache_path = app_dir / "cache.db"
+    create_stats_db(stats_path)
+    create_cache_db(cache_path)
+    stats_conn = sqlite3.connect(stats_path)
+    cache_conn = sqlite3.connect(cache_path)
+    try:
+        _seed_all_combined_claude(stats_conn, cache_conn, as_of)
+        _seed_budget_focus_codex(cache_conn, as_of)
+        seed_account(
+            stats_conn,
+            account_key=_BAF_CLAUDE_ACCOUNT_KEY,
+            provider="claude",
+            natural_id="uuid-budgetfocus-claude",
+            email="solo@example.com",
+            label="solo",
+            plan_type="max",
+            label_source="user",
+            first_seen_utc=_iso(_AC_CLAUDE_WEEK_START),
+            last_seen_utc=_iso(as_of),
+        )
+        for key, natural, email, label, plan in (
+            (_BAF_CODEX_ACCOUNT_A, "uuid-budgetfocus-codex-a",
+             "codex-a@example.com", "codex-work", "pro"),
+            (_BAF_CODEX_ACCOUNT_B, "uuid-budgetfocus-codex-b",
+             "codex-b@example.com", "codex-home", "plus"),
+        ):
+            seed_account(
+                stats_conn,
+                account_key=key,
+                provider="codex",
+                natural_id=natural,
+                email=email,
+                label=label,
+                plan_type=plan,
+                label_source="user",
+                first_seen_utc=_iso(_AC_CODEX_CYCLE_START),
+                last_seen_utc=_iso(as_of),
+            )
+        _stamp_and_verify(stats_conn)
+        stats_conn.commit()
+        cache_conn.commit()
+    finally:
+        stats_conn.close()
+        cache_conn.close()
+    _reconcile_fixture_quota_projection(
+        app_dir, root_key=_BAF_CODEX_ROOT_KEY, now=as_of,
+    )
+    config_path = app_dir / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "budget": {
+                    "weekly_usd": _BAF_CLAUDE_BUDGET_USD,
+                    "period": "calendar-month",
+                    "alerts_enabled": True,
+                    "alert_thresholds": [90, 100],
+                    "accounts": {
+                        _BAF_CLAUDE_ACCOUNT_KEY: _BAF_CLAUDE_ACCOUNT_BUDGET_USD,
+                    },
+                    "codex": {
+                        "amount_usd": _BAF_CODEX_BUDGET_USD,
+                        "period": "calendar-week",
+                        "alerts_enabled": True,
+                        "alert_thresholds": [80, 100],
+                        "accounts": {
+                            _BAF_CODEX_ACCOUNT_A: _BAF_CODEX_ACCOUNT_A_BUDGET_USD,
+                            _BAF_CODEX_ACCOUNT_B: _BAF_CODEX_ACCOUNT_B_BUDGET_USD,
+                        },
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+    _assert_ac_display_zone(scenario_dir)
+
+
 SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "ok": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
@@ -2340,6 +2550,10 @@ SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "all-combined-decorated": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
         build_all_combined_decorated,
+    ),
+    "all-budget-account-focus": (
+        dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
+        build_all_budget_account_focus,
     ),
 }
 

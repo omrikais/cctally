@@ -1087,7 +1087,7 @@ describe('<CacheReportModal /> #443 S2 fallback deletion', () => {
     slice.sources.codex.data = makeDecoratedCodexSourceData();
     updateSnapshot(slice as unknown as Envelope);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: ACCOUNT_EMPTY });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: ACCOUNT_EMPTY });
     render(<CacheReportModal />);
     expect(screen.getByText(/No Codex activity/i)).toBeInTheDocument();
     expect(screen.queryByText(/could not be built/i)).toBeNull();
@@ -1106,7 +1106,7 @@ describe('<CacheReportModal /> #443 S2 fallback deletion', () => {
     slice.sources.codex.data = data;
     updateSnapshot(slice as unknown as Envelope);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: ACCOUNT_A });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: ACCOUNT_A });
     const scoped = getScopedSnapshot()!.sources!.codex!.data as CodexSourceData;
     const cr = scoped.cache_report!;
     expect(cr.anomaly_predicates).toEqual(['cache_drop']);

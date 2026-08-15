@@ -649,7 +649,7 @@ describe('<CacheReportPanel /> #443 S2 the Codex compatibility fallback is gone'
     slice.sources.codex.data = makeDecoratedCodexSourceData();
     updateSnapshot(slice as unknown as Envelope);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: ACCOUNT_EMPTY });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: ACCOUNT_EMPTY });
     render(<CacheReportPanel />);
     expect(screen.getByText(/No Codex activity yet/i)).toBeInTheDocument();
     expect(screen.queryByText(/could not be built/i)).toBeNull();
@@ -664,7 +664,7 @@ describe('<CacheReportPanel /> #443 S2 the Codex compatibility fallback is gone'
     slice.sources.codex.data = makeDecoratedCodexSourceData();
     updateSnapshot(slice as unknown as Envelope);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: ACCOUNT_A });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: ACCOUNT_A });
     render(<CacheReportPanel />);
     expect(screen.getByText(/could not be built/i)).toBeInTheDocument();
   });

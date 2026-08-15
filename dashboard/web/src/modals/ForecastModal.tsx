@@ -1,5 +1,5 @@
 import { useEffect, useRef, useSyncExternalStore } from 'react';
-import { useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
+import { scopeProviderFor, useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { Modal } from './Modal';
 import { ShareIcon } from '../components/ShareIcon';
 import { resolveVerdict } from '../lib/verdict';
@@ -7,6 +7,7 @@ import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { sourceAccounts } from '../store/accountFocus';
+import { BudgetComposition } from '../components/BudgetBlock';
 import {
   codexLiveQuotaKeys,
   presentationCodexAccountForecasts,
@@ -526,7 +527,18 @@ function AllForecastSection({
             <div className="mfc-krow"><span className="l">Projected</span><span className="v v-cyan">{fmt.pct1(value.projected)}</span></div>
             <div className="mfc-krow"><span className="l">Current / recent</span><span className="v v-green">{fmt.pct1(value.recent)}</span></div>
           </div>
-          <h4 className="m-sec sec-bud">Provider-native budgets and confidence</h4>
+          {/* #556 S5 Unit 2 review F17 — named per provider, because each half
+              of the old title named something the other provider's footer does
+              not carry. Claude's footer is two per-day figures measured against
+              the 100% and 90% QUOTA caps, which are a different quantity from
+              the configured budget the block below now renders; Codex's only
+              remaining line is `Confidence`, since §4.7 moved `Budget pace` to
+              that block. */}
+          <h4 className="m-sec sec-bud">
+            {section.source === 'claude'
+              ? 'Daily budgets to the quota caps'
+              : 'Forecast confidence'}
+          </h4>
           <div className="mfc-kvgrid mfc-kvgrid-single">
             {value.foot.map((line) => (
               <div className="mfc-krow" key={line.label}>
@@ -544,8 +556,12 @@ function AllForecastSection({
 function AllForecastModal() {
   const env = useScopedSnapshot('all');
   const composition = presentationForecastComposition(env, 'all');
-  // The combined tab has no Codex account chip, so decoration alone gates it.
-  const perAccountRows = codexPerAccountRows(env, null);
+  // #556 S5 §5.8 — All DOES have a Codex account chip now, so the gate is the
+  // same one the Codex tab uses: decorated AND unfocused. Under a focus the
+  // per-account table gives way to that account's own canonical detail, which
+  // is what the row's `filters every panel` qualifier states.
+  const codexScope = useAccountScope('all', scopeProviderFor('all'));
+  const perAccountRows = codexPerAccountRows(env, codexScope.accountKey);
   const headerExtras = (
     <ShareIcon
       panel="forecast"
@@ -556,6 +572,10 @@ function AllForecastModal() {
   );
   return (
     <Modal title="Forecast — by provider" accentClass="accent-purple" headerExtras={headerExtras}>
+      {/* #556 S5 §4.2 — forecast sections first, then the budget sections, so
+          the two budget cards are adjacent. The modal body stays a plain block
+          scroller: it renders no `.period-two-pane`, so it must NOT start
+          passing `paneScroll`. */}
       <div className="provider-composition provider-composition--modal" aria-label="Claude and Codex forecast reports">
         {composition.sections.map((section) => (
           <AllForecastSection
@@ -564,6 +584,7 @@ function AllForecastModal() {
             perAccountRows={section.source === 'codex' ? perAccountRows : null}
           />
         ))}
+        <BudgetComposition env={env} selection="all" surface="modal" />
       </div>
     </Modal>
   );
@@ -702,6 +723,9 @@ function CanonicalForecastModal({ source }: { source: SourceName }) {
           </div>
           <CodexPerAccountForecastTable rows={perAccountRows} />
         </section>
+        <div className="provider-composition provider-composition--modal">
+          <BudgetComposition env={env} selection={source} surface="modal" />
+        </div>
       </Modal>
     );
   }
@@ -862,6 +886,13 @@ function CanonicalForecastModal({ source }: { source: SourceName }) {
           </div>
         </div>
       </section>
+      {/* The two rows above are QUOTA-CEILING daily allowances derived from the
+          projection; the block below is the CONFIGURED budget the user set.
+          Different quantities, different verdict vocabularies (§4.5), so they
+          are adjacent rather than merged. */}
+      <div className="provider-composition provider-composition--modal">
+        <BudgetComposition env={env} selection={source} surface="modal" />
+      </div>
     </Modal>
   );
 }

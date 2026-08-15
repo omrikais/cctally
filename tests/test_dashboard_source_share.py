@@ -52,7 +52,8 @@ def _quota_history(*, status, projected=82.5, current=61.0, now=None, stale_afte
     }
 
 
-def _state(source, now, *, total_cost, daily_label=None, quota_histories=()):
+def _state(source, now, *, total_cost, daily_label=None, quota_histories=(),
+           budget=None):
     return SourceDashboardState(
         source=source,
         availability="ok",
@@ -113,6 +114,7 @@ def _state(source, now, *, total_cost, daily_label=None, quota_histories=()):
             "quota": {
                 "blocks": (), "histories": tuple(quota_histories), "milestones": (),
             },
+            **({"budget": budget} if budget is not None else {}),
         },
     )
 
@@ -953,11 +955,261 @@ def _boot_forecast(ns, tmp_path, monkeypatch, *, status, projected=82.5):
     return server, thread
 
 
+# =========================================================================
+# #556 S5 §5.12 — the shared Forecast artifact carries the CONFIGURED budget.
+#
+# Before this the artifact published quota projections and said nothing about
+# the budget the user set, so a shared Forecast stated strictly less than the
+# panel it was taken from — and after S5 that panel renders both side by side.
+# =========================================================================
+
+_S5_SHARE_BUDGET_STATUS = {
+    "period": "calendar-month",
+    "budget_usd": 100.0,
+    "spent_usd": 38.5,
+    "remaining_usd": 61.5,
+    "consumption_pct": 38.5,
+    "verdict": "ok",
+    "low_confidence": False,
+    "window_start_at": "2026-07-01T00:00:00Z",
+    "window_end_at": "2026-08-01T00:00:00Z",
+    "recent_24h_usd": 4.2,
+    "alert_thresholds": (90, 100),
+    "pace": {
+        "daily_usd": 1.6, "projected_low_usd": 48.0,
+        "projected_high_usd": 55.0, "week_avg_projection_usd": 50.0,
+    },
+}
+
+
+def _boot_forecast_with_budget(ns, tmp_path, monkeypatch, *, budget):
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    now = dt.datetime(2026, 7, 16, tzinfo=UTC)
+    claude = _state("claude", now, total_cost=1.0)
+    codex = _state(
+        "codex", now, total_cost=2.0,
+        quota_histories=(_quota_history(status="ok", projected=82.5, now=now),),
+        budget=budget,
+    )
+    snap = ns["_empty_dashboard_snapshot"]()
+    snap.source_bundle = SourceDashboardBundle(
+        source_schema_version=SOURCE_SCHEMA_VERSION,
+        default_source="claude",
+        source_order=("claude", "codex", "all"),
+        sources={"claude": claude, "codex": codex,
+                 "all": compose_all_state(claude, codex)},
+    )
+    handler = ns["DashboardHTTPHandler"]
+    handler.snapshot_ref = ns["_SnapshotRef"](snap)
+    handler.hub = ns["SSEHub"]()
+    handler.sync_lock = threading.Lock()
+    handler.run_sync_now = staticmethod(lambda: None)
+    handler.run_sync_now_locked = staticmethod(lambda: None)
+    handler.no_sync = True
+    handler.display_tz_pref_override = None
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def test_share_forecast_carries_the_configured_budget_status(monkeypatch, tmp_path):
+    ns = load_script()
+    server, thread = _boot_forecast_with_budget(
+        ns, tmp_path, monkeypatch,
+        budget={"status": _S5_SHARE_BUDGET_STATUS, "milestones": (), "projected": ()},
+    )
+    try:
+        status_code, forecast = _request(
+            server, "POST", "/api/share/render", _forecast_recipe(),
+        )
+        assert status_code == 200
+        assert "Budget (calendar-month): $38.50 of $100.00 (38.5%) — ok" in (
+            forecast["body"])
+        # The quota projection it sits beside is untouched.
+        assert "| 61.0% | 82.5% |" in forecast["body"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_share_forecast_omits_the_budget_note_when_none_is_configured(
+    monkeypatch, tmp_path,
+):
+    """Additive and omitted when inapplicable, so an install with no budget
+    produces a byte-identical artifact."""
+    ns = load_script()
+    server, thread = _boot_forecast_with_budget(
+        ns, tmp_path, monkeypatch,
+        budget={"status": None, "milestones": (), "projected": ()},
+    )
+    try:
+        status_code, forecast = _request(
+            server, "POST", "/api/share/render", _forecast_recipe(),
+        )
+        assert status_code == 200
+        assert "Budget (" not in forecast["body"]
+        assert "| 61.0% | 82.5% |" in forecast["body"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def _forecast_recipe():
     return {
         "panel": "forecast", "template_id": "forecast-recap", "source": "codex",
         "options": {"format": "md"},
     }
+
+
+_S5_SHARE_ACCOUNT = "a" * 32
+
+# Deliberately unequal to the Codex parent ($100) and to the Codex child ($40),
+# on a different period, so no assertion below can pass by reading the wrong
+# provider's note.
+_S5_SHARE_CLAUDE_BUDGET_STATUS = {
+    **_S5_SHARE_BUDGET_STATUS,
+    "period": "subscription-week",
+    "budget_usd": 250.0,
+    "spent_usd": 212.75,
+    "remaining_usd": 37.25,
+    "consumption_pct": 85.1,
+    "verdict": "warn",
+}
+
+_S5_SHARE_CODEX_CHILD_BUDGET_STATUS = {
+    **_S5_SHARE_BUDGET_STATUS,
+    "budget_usd": 40.0,
+    "spent_usd": 36.0,
+    "consumption_pct": 90.0,
+    "verdict": "warn",
+}
+
+
+def _boot_forecast_budget_matrix(ns, tmp_path, monkeypatch):
+    """Claude + Codex parent + one Codex account child, all with DIFFERENT
+    budget figures, so every note below is attributable to exactly one of them.
+    """
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    now = dt.datetime(2026, 7, 16, tzinfo=UTC)
+    claude = _state(
+        "claude", now, total_cost=1.0,
+        budget={"status": _S5_SHARE_CLAUDE_BUDGET_STATUS},
+    )
+    codex = _state(
+        "codex", now, total_cost=2.0,
+        quota_histories=(_quota_history(status="ok", projected=82.5, now=now),),
+        budget={"status": _S5_SHARE_BUDGET_STATUS, "milestones": (), "projected": ()},
+    )
+    codex = replace(codex, data={
+        **dict(codex.data),
+        "account_scopes": {_S5_SHARE_ACCOUNT: {
+            "budget": {
+                "status": _S5_SHARE_CODEX_CHILD_BUDGET_STATUS,
+                "milestones": (), "projected": (),
+            },
+        }},
+    })
+    snap = ns["_empty_dashboard_snapshot"]()
+    snap.source_bundle = SourceDashboardBundle(
+        source_schema_version=SOURCE_SCHEMA_VERSION,
+        default_source="claude",
+        source_order=("claude", "codex", "all"),
+        sources={"claude": claude, "codex": codex,
+                 "all": compose_all_state(claude, codex)},
+    )
+    handler = ns["DashboardHTTPHandler"]
+    handler.snapshot_ref = ns["_SnapshotRef"](snap)
+    handler.hub = ns["SSEHub"]()
+    handler.sync_lock = threading.Lock()
+    handler.run_sync_now = staticmethod(lambda: None)
+    handler.run_sync_now_locked = staticmethod(lambda: None)
+    handler.no_sync = True
+    handler.display_tz_pref_override = None
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def test_share_claude_forecast_carries_its_configured_budget_status(
+    monkeypatch, tmp_path,
+):
+    """#556 S5 §5.12 / Unit 2 review F7 — §5.12 says "the configured-budget
+    sections", and after S5 the CLAUDE Forecast panel renders one too. The note
+    was wired into the Codex builder only, so a shared Claude Forecast said less
+    than the panel it came from.
+    """
+    ns = load_script()
+    server, thread = _boot_forecast_budget_matrix(ns, tmp_path, monkeypatch)
+    try:
+        status_code, forecast = _request(
+            server, "POST", "/api/share/render",
+            {**_forecast_recipe(), "source": "claude"},
+        )
+        assert status_code == 200
+        assert "Budget (subscription-week): $212.75 of $250.00 (85.1%) — warn" in (
+            forecast["body"])
+        # Never the OTHER provider's budget — nothing is composed across them.
+        assert "calendar-month" not in forecast["body"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_share_all_forecast_budget_note_is_the_ACCOUNT_status_not_the_vendor_one(
+    monkeypatch, tmp_path,
+):
+    """#556 S5 §5.12 / Unit 2 review F14 — the privacy claim needed a gate.
+
+    `_share_budget_notes` reads `data["budget"]["status"]` AFTER
+    `_share_scope_codex_state` has substituted the focused account's children,
+    so a focused share is supposed to carry that account's own budget. Nothing
+    asserted it: every existing case named `source: "codex"` with no account at
+    all, which never reaches the substitution.
+
+    The parent and the child amounts are deliberately DIFFERENT ($100 vs $40),
+    and the spend and verdict differ too, so a parent-for-child substitution
+    changes what this test reads instead of passing on an identical string.
+    """
+    ns = load_script()
+    server, thread = _boot_forecast_budget_matrix(ns, tmp_path, monkeypatch)
+    try:
+        status_code, forecast = _request(
+            server, "POST", "/api/share/render",
+            {**_forecast_recipe(), "source": "all", "account": _S5_SHARE_ACCOUNT},
+        )
+        assert status_code == 200
+        assert "Budget (calendar-month): $36.00 of $40.00 (90.0%) — warn" in (
+            forecast["body"])
+        # The Claude section keeps its OWN vendor-wide budget: the account
+        # qualifier is Codex's, and no figure is composed across providers.
+        assert "Budget (subscription-week): $212.75 of $250.00 (85.1%) — warn" in (
+            forecast["body"])
+        # The Codex VENDOR-wide figures must not appear anywhere.
+        assert "$100.00" not in forecast["body"]
+        assert "$38.50" not in forecast["body"]
+
+        # NON-VACUOUS: the same recipe WITHOUT the account carries the Codex
+        # parent's status, so the assertion above is discriminating rather than
+        # a restatement of the only string this fixture can produce.
+        status_code, unfocused = _request(
+            server, "POST", "/api/share/render",
+            {**_forecast_recipe(), "source": "all"},
+        )
+        assert status_code == 200
+        assert "Budget (calendar-month): $38.50 of $100.00 (38.5%) — ok" in (
+            unfocused["body"])
+        assert "$40.00" not in unfocused["body"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,2 @@
+Codex quota forecast · local-rollout
+primary · 168h · root=root-attributed · limit=limit-weekly · ok · current 24.0% · projected 24.4%

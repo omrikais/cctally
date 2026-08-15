@@ -58,7 +58,7 @@ function openScoped(
     updateSnapshot(decoratedEnv(data));
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     if (account != null) {
-      dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account });
+      dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account });
     }
     dispatch({ type: 'OPEN_MODAL', kind } as never);
   });
@@ -283,5 +283,55 @@ describe('The All-accounts cycle modal is per-account, never one account ladder'
     expect(miniRows.find((row) => row.textContent?.includes('reset'))?.textContent)
       .toContain('—');
     expect(container.textContent).not.toContain('41.0%');
+  });
+});
+
+// #564 — the modal one click below the hero renders the SAME two figures under
+// "Current Cycle" and "native 7-day quota" copy, so fixing the hero and leaving
+// this would keep the defect intact for anyone who opens it. Both states are
+// covered, and so is the embedded All-providers variant, which reuses the same
+// presenter.
+describe('The Current Cycle modal qualifies a bounded fallback total', () => {
+  function openAllTab(): void {
+    act(() => {
+      updateSnapshot(decoratedEnv());
+      dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+      dispatch({ type: 'OPEN_MODAL', kind: 'current-week' } as never);
+    });
+  }
+
+  it('marks the fallback row in the per-account table and no other row', () => {
+    openScoped('current-week', null);
+    const { container } = render(<CurrentWeekModal />);
+    const marked = [...container.querySelectorAll('[data-testid="cycle-row-window"]')];
+    expect(marked.length).toBe(1);
+    expect(marked[0].textContent).toBe('last 7 days');
+    expect(marked[0].closest('tr')?.getAttribute('data-account-key'))
+      .toBe(ACCOUNT_EMPTY);
+  });
+
+  it('marks the same row inside the embedded All-providers variant', () => {
+    openAllTab();
+    const { container } = render(<CurrentWeekModal />);
+    const marked = [...container.querySelectorAll('[data-testid="cycle-row-window"]')];
+    expect(marked.length).toBe(1);
+    expect(marked[0].closest('tr')?.getAttribute('data-account-key'))
+      .toBe(ACCOUNT_EMPTY);
+  });
+
+  it('qualifies the focused spend figure with the window it covers', () => {
+    openScoped('current-week', ACCOUNT_EMPTY);
+    const { container } = render(<CurrentWeekModal />);
+    const miniRows = [...container.querySelectorAll('.mcw-mini .s')];
+    const spendRow = miniRows.find((row) => row.textContent?.startsWith('spent'));
+    expect(spendRow?.querySelector('.k')?.textContent).toBe('spent · last 7 days');
+  });
+
+  it('leaves a focused cycle-bounded account reading a bare "spent"', () => {
+    openScoped('current-week', ACCOUNT_B);
+    const { container } = render(<CurrentWeekModal />);
+    const miniRows = [...container.querySelectorAll('.mcw-mini .s')];
+    const spendRow = miniRows.find((row) => row.textContent?.startsWith('spent'));
+    expect(spendRow?.querySelector('.k')?.textContent).toBe('spent');
   });
 });

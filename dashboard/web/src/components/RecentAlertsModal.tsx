@@ -13,11 +13,13 @@ import {
 import {
   alertAccount,
   alertDisplay,
-  filterAlertRowsForAccount,
+  filterAlertRowsForFocus,
   selectAlertRowsForView,
   toastAlertId,
+  type AlertAccountFocus,
 } from '../lib/alertIdentity';
 import { resolveSourceView } from '../store/sourceView';
+import { resolveViewAccountFocus } from '../store/accountFocus';
 import { AlertsEmptyGauge } from './AlertsEmptyGauge';
 import type { AlertEntry, CodexAlertRow, SourceAlertRow } from '../types/envelope';
 
@@ -190,7 +192,14 @@ export function RecentAlertsModal(): JSX.Element {
   const allRows: SourceAlertRow[] = selectAlertRowsForView(
     view, claudeLegacyRows, hasBundle,
   );
-  const focusedRows = filterAlertRowsForAccount(allRows, scope.requestedKey);
+  // #556 S5 §5.11 — the same provider-aware filter the panel calls, so the two
+  // still cannot be changed apart.
+  const focusState = useSyncExternalStore(subscribeStore, () => getState().accountFocus);
+  const alertFocus: AlertAccountFocus = {
+    claude: resolveViewAccountFocus(env, activeSource, 'claude', focusState),
+    codex: resolveViewAccountFocus(env, activeSource, 'codex', focusState),
+  };
+  const focusedRows = filterAlertRowsForFocus(allRows, alertFocus);
 
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
@@ -250,6 +259,13 @@ export function RecentAlertsModal(): JSX.Element {
               const isClaude = row.source === 'claude';
               const severity = isClaude ? alertSeverity(row) : d.severity;
               const account = alertAccount(row);
+              // #574 — same helper as the panel's when-cell, deliberately:
+              // `fmt.startedShortOrNull` returns null for a null instant AND
+              // for a non-empty string that does not parse, so neither surface
+              // can emit title="—" and neither carries its own copy of that
+              // rule. A truthiness test on `d.whenIso` would miss the second
+              // case.
+              const whenTitle = fmt.startedShortOrNull(d.whenIso, ctx);
               return (
                 <tr key={toastAlertId(row)} className="alert-modal-row">
                   <td className={`alert-threshold alert-cell-threshold severity-${severity} ${severity} num`}>
@@ -280,7 +296,10 @@ export function RecentAlertsModal(): JSX.Element {
                   <td className="alert-cell-context">
                     {isClaude ? <ContextCell alert={row} ctx={ctx} /> : <CodexContextCell row={row} />}
                   </td>
-                  <td className="alert-cell-when alert-when">
+                  <td
+                    className="alert-cell-when alert-when"
+                    title={whenTitle ?? undefined}
+                  >
                     {fmt.relativeOrAbsolute(d.whenIso ?? '', ctx)}
                   </td>
                 </tr>

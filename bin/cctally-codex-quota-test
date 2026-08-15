@@ -116,6 +116,23 @@ for entry in "${account_cases[@]}"; do
         "$ac_flags --account $ac_ref --json" "golden-$ac_leaf-account-$ac_ref-json.txt"
 done
 
+# #500: the same `--account <ref>` shape on a window whose ONLY account
+# evidence is an operator attribution. `work` must see it and `personal` must
+# not — a pair that fails in BOTH directions if the fold-time overlay stops
+# reaching the rendered quota views.
+attributed_cases=(
+    "history|work|--since 2026-07-15 --until 2026-07-16"
+    "history|personal|--since 2026-07-15 --until 2026-07-16"
+    "blocks|work|--since 2026-07-15 --until 2026-07-16"
+)
+for entry in "${attributed_cases[@]}"; do
+    IFS='|' read -r ac_leaf ac_ref ac_flags <<< "$entry"
+    run_one attributed "$ac_leaf" "account-$ac_ref-terminal" \
+        "$ac_flags --account $ac_ref" "golden-$ac_leaf-account-$ac_ref-terminal.txt"
+    run_one attributed "$ac_leaf" "account-$ac_ref-json" \
+        "$ac_flags --account $ac_ref --json" "golden-$ac_leaf-account-$ac_ref-json.txt"
+done
+
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]
