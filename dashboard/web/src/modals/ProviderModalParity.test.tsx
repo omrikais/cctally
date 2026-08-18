@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import fixture from '../../__tests__/fixtures/envelope.json';
 import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
@@ -75,9 +75,9 @@ describe.each(['claude', 'codex', 'all'] as const)(
       // report: seed Codex's from Claude's rather than assert slots over an
       // absent one, which would only pin the unavailable body.
       const composed = structuredClone(envelope);
+      // #583 S3 §4: physical entry only — the All mirror publishes null.
       composed.sources!.codex.data!.cache_report =
         asCodexCacheReport(composed.cache_report!);
-      composed.sources!.all.data!.providers.codex = composed.sources!.codex.data;
       act(() => {
         updateSnapshot(composed);
         dispatch({ type: 'SET_ACTIVE_SOURCE', source });
@@ -140,6 +140,16 @@ it('All Forecast modal labels and preserves both provider-native projections', (
   });
   const { container } = render(<ForecastModal />);
 
+  // #578 — the visual range is a named composition, not an anonymous generic
+  // div.  `getByRole` deliberately pins the accessible role/name pair rather
+  // than merely proving that an aria-label attribute exists in the DOM.
+  expect(screen.getByRole('group', {
+    name: 'Claude projected usage against caps',
+  })).toBeInTheDocument();
+  expect(screen.getByRole('group', {
+    name: 'Codex projected usage against caps',
+  })).toBeInTheDocument();
+
   const claude = container.querySelector('[data-provider-section="claude"]');
   const codex = container.querySelector('[data-provider-section="codex"]');
   expect(claude?.textContent).toContain('Claude');
@@ -160,13 +170,19 @@ it('All Cache modal labels and preserves both provider-native reports', () => {
   codexReport.today.cached_input_percent = 42;
   codexReport.today.net_usd = 12.5;
   codexReport.fourteen_day_counterfactual_usd = 99;
+  // #583 S3 §4: physical entry only — the All mirror publishes null.
   composed.sources!.codex.data!.cache_report = codexReport;
-  composed.sources!.all.data!.providers.codex = composed.sources!.codex.data;
   act(() => {
     updateSnapshot(composed);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
   });
   const { container } = render(<CacheReportModal />);
+
+  // #578 — the All-provider composition needs a real grouping role for its
+  // accessible name; an aria-label on a plain div is not the contract.
+  expect(screen.getByRole('group', {
+    name: 'Claude and Codex cache reports',
+  })).toBeInTheDocument();
 
   const claude = container.querySelector('[data-provider-section="claude"]');
   const codex = container.querySelector('[data-provider-section="codex"]');
@@ -263,6 +279,28 @@ it('All Trend modal renders two provider-owned histories and no All-sources quot
   expect(codex?.textContent).toContain('Codex');
   expect(codex?.querySelector('.mtr-sparkhero')).not.toBeNull();
   expect(container.textContent).not.toContain('All sources');
+});
+
+it('All Trend modal uses cycle vocabulary only in the Codex history (#576)', () => {
+  const { container } = renderFor('all', <TrendModal />);
+  const claude = container.querySelector('[data-provider-section="claude"]')!;
+  const codex = container.querySelector('[data-provider-section="codex"]')!;
+
+  expect(claude.querySelector('#mtr-weeks-pill-claude')?.textContent).toMatch(/weeks?/);
+  expect(claude.querySelector('.sec-spark')?.textContent).toMatch(/week history/i);
+  expect(claude.querySelector('.sec-tbl')?.textContent).toContain('Weekly detail');
+  expect(claude.querySelector('[data-col="week"]')?.textContent).toContain('Week');
+  expect(claude.querySelector('.mtr-tbl-sub')?.textContent).toContain('prior week');
+  expect(claude.querySelector('#mtr-svg-claude')?.getAttribute('aria-label')).toMatch(/weeks?/);
+
+  expect(codex.querySelector('#mtr-weeks-pill-codex')?.textContent).toMatch(/cycles?/);
+  expect(codex.querySelector('.sec-spark')?.textContent).toMatch(/-cycle history/i);
+  expect(codex.querySelector('.sec-tbl')?.textContent).toContain('Cycle detail');
+  expect(codex.querySelector('[data-col="week"]')?.textContent).toContain('Cycle');
+  expect(codex.querySelector('.mtr-tbl-sub')?.textContent).toContain('prior cycle');
+  expect(codex.querySelector('#mtr-svg-codex')?.getAttribute('aria-label')).toMatch(/cycles?/);
+  expect(codex.textContent).not.toMatch(/\bweek/i);
+  expect(codex.textContent).not.toContain('W−');
 });
 
 it.each(['codex', 'all'] as const)(
@@ -641,8 +679,8 @@ describe('All provider sections are named by their own heading (#556 S4)', () =>
 
   it('names both Cache Report modal sections', () => {
     const composed = structuredClone(envelope);
+    // #583 S3 §4: physical entry only — the All mirror publishes null.
     composed.sources!.codex.data!.cache_report = asCodexCacheReport(composed.cache_report!);
-    composed.sources!.all.data!.providers.codex = composed.sources!.codex.data;
     act(() => {
       updateSnapshot(composed);
       dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });

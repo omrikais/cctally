@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""Run the release-blocking Linux/Python compatibility matrix locally.
+
+The gate materializes the clean checked-out commit into a disposable real Git
+checkout, then runs the Linux platform profile as a non-root user in a fresh
+Linux/arm64 container for every supported Python minor. The profile is full
+pytest plus every harness except the macOS/Homebrew LAN-runner harness. It models
+the private ``ci-linux-matrix.yml`` lane without consuming Actions minutes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import shlex
+import subprocess
+import sys
+import tempfile
+
+
+PYTHON_VERSIONS = ("3.11", "3.12", "3.13")
+CONTAINER_PLATFORM = "linux/arm64"
+CONTAINER_CHECKOUT = "/workspace/cctally-dev"
+CONTAINER_DISTRO = "trixie"
+_SCRIPT = pathlib.Path(__file__).resolve()
+
+
+class GateError(RuntimeError):
+    """A local preflight or container-infrastructure refusal."""
+
+
+def _run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(command, check=False, **kwargs)
+
+
+def _capture(command: list[str], *, cwd: pathlib.Path) -> str:
+    result = _run(
+        command,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "command failed").strip()
+        raise GateError(f"{' '.join(command)}: {detail}")
+    return result.stdout.strip()
+
+
+def _repo_root() -> pathlib.Path:
+    root = _capture(
+        ["git", "rev-parse", "--show-toplevel"], cwd=_SCRIPT.parent.parent
+    )
+    return pathlib.Path(root).resolve()
+
+
+def _git_head(root: pathlib.Path) -> str:
+    head = _capture(["git", "rev-parse", "HEAD"], cwd=root)
+    if len(head) != 40 or any(ch not in "0123456789abcdef" for ch in head):
+        raise GateError(f"HEAD is not a full lowercase commit id: {head!r}")
+    return head
+
+
+def _git_status(root: pathlib.Path) -> str:
+    return _capture(
+        ["git", "status", "--porcelain", "--untracked-files=all"], cwd=root
+    )
+
+
+def _container_script(version: str, expected_head: str) -> str:
+    node_archive = 'node-v${node_version}-linux-arm64.tar.xz'
+    return f"""\
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+export TMPDIR=/opt/cctally-setup-tmp
+mkdir -p "$TMPDIR"
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends ca-certificates curl git jq bsdextrautils procps bc sqlite3 unzip xz-utils locales rsync gcc libc6-dev
+localedef -i en_US -f UTF-8 en_US.UTF-8
+
+node_version=$(tr -d '\\r\\n' < /source-repo/dashboard/web/.nvmrc)
+node_archive="{node_archive}"
+curl -fsSL --retry 3 --retry-all-errors "https://nodejs.org/dist/v${{node_version}}/${{node_archive}}" -o "/opt/${{node_archive}}"
+curl -fsSL --retry 3 --retry-all-errors "https://nodejs.org/dist/v${{node_version}}/SHASUMS256.txt" -o /opt/node-shasums.txt
+(cd /opt && grep "  ${{node_archive}}$" node-shasums.txt | sha256sum -c -)
+tar -xJf "/opt/${{node_archive}}" -C /usr/local --strip-components=1
+
+sqlite_archive=/opt/sqlite-autoconf-3530300.tar.gz
+curl -fsSL --retry 3 --retry-all-errors "https://sqlite.org/2026/sqlite-autoconf-3530300.tar.gz" -o "$sqlite_archive"
+echo "c917d7db16648ec95f714974ace5e5dcf46b7dc70e26600a0a102a3141125db0  $sqlite_archive" | sha256sum -c -
+mkdir -p /opt/cctally-sqlite /opt/cctally-sqlite-src
+tar -xzf "$sqlite_archive" -C /opt/cctally-sqlite-src --strip-components=1
+gcc -O2 -DSQLITE_ENABLE_DBPAGE_VTAB -DSQLITE_ENABLE_DBNSTAT_VTAB -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DHAVE_READLINE=0 \
+  /opt/cctally-sqlite-src/shell.c /opt/cctally-sqlite-src/sqlite3.c \
+  -ldl -lpthread -lm -o /opt/cctally-sqlite/sqlite3
+/opt/cctally-sqlite/sqlite3 :memory: '.recover' >/dev/null
+
+groupadd --gid 10001 cctally
+useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash cctally
+chown cctally:cctally "$TMPDIR"
+mkdir -p /workspace/cctally-dev
+cp -a /source-repo/. /workspace/cctally-dev/
+chown -R cctally:cctally /workspace/cctally-dev /home/cctally
+
+if find /tmp -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+  echo "linux-matrix: /tmp is not clean before the non-root suite" >&2
+  exit 3
+fi
+
+runuser -u cctally -- env \
+  HOME=/home/cctally \
+  TMPDIR=/opt/cctally-setup-tmp \
+  PATH=/opt/cctally-sqlite:/usr/local/bin:/usr/bin:/bin \
+  CI=true \
+  GITHUB_ACTIONS=true \
+  CCTALLY_AUTHORITATIVE_RUN=1 \
+  CCTALLY_AGENTMEM_TEST_POLICY=hosted-private-unavailable \
+  CCTALLY_LINUX_MATRIX_RUN=1 \
+  CCTALLY_OUTER_JOBS=2 \
+  CCTALLY_PYTEST_JOBS=2 \
+  CCTALLY_TEST_MATRIX_ID={shlex.quote(version)} \
+  LC_ALL=C.UTF-8 \
+  TZ=Etc/UTC \
+  bash -c '
+    set -euo pipefail
+    cd /workspace/cctally-dev
+    test "$(id -u)" -ne 0
+    test "$(basename "$PWD")" = cctally-dev
+    test "$(git rev-parse HEAD)" = {shlex.quote(expected_head)}
+    test -z "$(git status --porcelain --untracked-files=all)"
+    python -m venv .venv
+    . .venv/bin/activate
+    python -m pip install --no-deps -r tests/requirements-dev.txt
+    python -m pip check
+    npm ci --prefix dashboard/web
+    bash bin/_lib-fts5-probe.sh require python
+    bin/cctally-test-all
+  '
+"""
+
+
+def _container_command(
+    engine: str,
+    version: str,
+    source_checkout: pathlib.Path,
+    expected_head: str = "deadbeef" * 5,
+) -> list[str]:
+    return [
+        engine,
+        "run",
+        "--rm",
+        "--pull=always",
+        "--platform",
+        CONTAINER_PLATFORM,
+        "--tmpfs",
+        "/tmp:rw,exec,nosuid,size=4g,mode=1777",
+        "--volume",
+        f"{source_checkout}:/source-repo:ro",
+        f"python:{version}-{CONTAINER_DISTRO}",
+        "bash",
+        "-lc",
+        _container_script(version, expected_head),
+    ]
+
+
+def _materialize_clean_head(
+    root: pathlib.Path, destination: pathlib.Path, head: str
+) -> None:
+    clone = _run(
+        [
+            "git",
+            "clone",
+            "--quiet",
+            "--no-local",
+            "--no-checkout",
+            str(root),
+            str(destination),
+        ]
+    )
+    if clone.returncode != 0:
+        raise GateError(f"could not materialize {head} into disposable checkout")
+    checkout = _run(
+        ["git", "-C", str(destination), "checkout", "--quiet", "--detach", head]
+    )
+    if checkout.returncode != 0:
+        raise GateError(f"could not check out {head} in disposable checkout")
+    if _git_head(destination) != head or _git_status(destination):
+        raise GateError("disposable checkout does not exactly match clean HEAD")
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--engine",
+        default=os.environ.get("CCTALLY_LINUX_MATRIX_ENGINE", "docker"),
+        help="Docker-compatible container engine (default: docker)",
+    )
+    parser.add_argument(
+        "--python",
+        action="append",
+        choices=PYTHON_VERSIONS,
+        dest="versions",
+        help="Run one supported Python minor; repeat to select several",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    versions = tuple(args.versions or PYTHON_VERSIONS)
+    diagnostic_selection = args.versions is not None
+    try:
+        root = _repo_root()
+        head = _git_head(root)
+        dirty = _git_status(root)
+        if dirty:
+            print(
+                "linux-matrix: refusing a dirty tree; commit the exact release "
+                "candidate first",
+                file=sys.stderr,
+            )
+            return 2
+
+        ready = _run(
+            [args.engine, "info"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if ready.returncode != 0:
+            raise GateError(f"container engine {args.engine!r} is unavailable")
+
+        print(f"linux-matrix: testing {head}")
+        with tempfile.TemporaryDirectory(prefix="cctally-linux-matrix-") as raw:
+            source_checkout = pathlib.Path(raw) / "cctally-dev"
+            _materialize_clean_head(root, source_checkout, head)
+            for version in versions:
+                print(
+                    f"linux-matrix: Python {version} on {CONTAINER_PLATFORM}",
+                    flush=True,
+                )
+                result = _run(
+                    _container_command(
+                        args.engine, version, source_checkout, expected_head=head
+                    )
+                )
+                if result.returncode != 0:
+                    print(
+                        f"linux-matrix: Python {version} failed "
+                        f"(exit {result.returncode})",
+                        file=sys.stderr,
+                    )
+                    return 1 if result.returncode == 1 else 3
+        current_head = _git_head(root)
+        if current_head != head:
+            print(
+                "linux-matrix: refusing success because HEAD changed during "
+                f"matrix ({head} -> {current_head})",
+                file=sys.stderr,
+            )
+            return 2
+        if _git_status(root):
+            print(
+                "linux-matrix: refusing success because the working tree "
+                "changed during matrix",
+                file=sys.stderr,
+            )
+            return 2
+        if diagnostic_selection:
+            print(
+                "linux-matrix: INCOMPLETE diagnostic passed; the release gate "
+                "requires the fixed no-argument Python 3.11, 3.12, and 3.13 "
+                "matrix",
+                file=sys.stderr,
+            )
+            return 3
+        print(
+            "linux-matrix: PASS "
+            + ", ".join(f"Python {version}" for version in versions)
+            + f" at {head}"
+        )
+        return 0
+    except GateError as exc:
+        print(f"linux-matrix: infrastructure refusal: {exc}", file=sys.stderr)
+        return 3
+    except FileNotFoundError as exc:
+        print(
+            f"linux-matrix: infrastructure refusal: {exc.filename} is unavailable",
+            file=sys.stderr,
+        )
+        return 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

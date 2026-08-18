@@ -8,9 +8,12 @@ background ``_DashboardSyncThread`` owns the first full cold build + SSE-publish
 Under ``--no-sync`` (no background thread to fill the partial) it keeps the full
 pre-bind build (``hydrating=False``).
 
-The subprocess bind-timing check is gated on the ``large`` bench fixture; it
-skips where that fixture is absent (fresh CI), and is proven non-vacuous
-manually by stashing the cheap-seed impl → RED against the pre-change full-seed.
+#583 S1 replaced the old subprocess bind-TIMING check with an in-process
+ORDERING test. The old one skipped whenever the ``large`` bench fixture was
+absent, and nothing in the suite or CI ever built that path, so it never ran.
+The replacement holds the full builder on a barrier and asserts the order —
+bind, accept, hydrating frame, then a non-hydrating frame only after release —
+over the session-scoped ``small_corpus``, which is built rather than skipped.
 """
 import datetime as dt
 import json
@@ -18,8 +21,7 @@ import pathlib
 import shutil
 import socket
 import sqlite3
-import subprocess
-import sys
+import threading
 import time
 import types
 
@@ -28,10 +30,6 @@ from conftest import load_script, redirect_paths  # type: ignore
 REPO = pathlib.Path(__file__).resolve().parents[1]
 BIN = REPO / "bin" / "cctally"
 OK_AS_OF = dt.datetime(2026, 4, 16, 14, 0, tzinfo=dt.timezone.utc)
-LARGE_FIXTURE = (
-    pathlib.Path(__import__("tempfile").gettempdir())
-    / "cctally-bench" / "large-seed42"
-)
 
 
 def _dash_mod():
@@ -364,143 +362,200 @@ def _remaining(deadline: float) -> float:
     return max(1.0, deadline - time.monotonic())
 
 
-def _read_url_port(proc, deadline_s):
-    """Block on the subprocess stdout until the 'serving …:PORT' line (printed
-    right after the socket bind), returning (port, elapsed_since_start)."""
-    import re
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < deadline_s:
-        line = proc.stdout.readline()
-        if not line:
-            if proc.poll() is not None:
-                raise RuntimeError("dashboard exited before binding")
-            continue
-        m = re.search(r"://[^ ]*?:(\d+)/", line)
-        if m:
-            return int(m.group(1)), time.monotonic() - t0
-    raise RuntimeError("timed out waiting for the serving line")
+def _load_with_corpus(monkeypatch, tmp_path, small_corpus):
+    """Point every provider/home root at a private COPY of the bench corpus.
 
-
-def test_bind_before_build_timing(tmp_path):
-    """Bind-before-build on the heavy fixture: the socket accepts a TCP
-    connection WELL BEFORE the full-data SSE frame (hydrating=false, non-empty
-    sessions) arrives — proving the bind no longer waits on the ~2.2s
-    aggregation. Skips where the large bench fixture is absent.
-
-    Non-vacuous by construction: under the pre-change full-seed the first SSE
-    frame IS the full snapshot published at bind, so time-to-accept ≈
-    time-to-full-data and the ``bind precedes full data by ≥1s`` assertion
-    fails RED (measured: pre-change time-to-accept ~5.0s == time-to-full-data;
-    post-change ~2.0s vs ~5.0s). The absolute bound is a loose secondary guard
-    (fixed process overhead — module import + self-heal + the 720MB cache
-    migration-open — dominates the residual, NOT aggregation)."""
-    if not (LARGE_FIXTURE / "data" / "cache.db").exists():
-        import pytest
-        pytest.skip("large bench fixture absent (build via build-bench-fixtures.py)")
-    # Fresh copy so the launch's background sync never dirties the shared
-    # fixture. APFS clone (cp -c) is instant + space-free on darwin; fall back
-    # to a byte copy elsewhere.
-    data = tmp_path / "data"
-    src = LARGE_FIXTURE / "data"
-    cloned = False
-    if sys.platform == "darwin":
-        rc = subprocess.run(["cp", "-c", "-R", str(src), str(data)]).returncode
-        cloned = rc == 0
-    if not cloned:
-        shutil.copytree(src, data)
-    # Drop any stale lock so the fresh process can take the flock.
-    for lk in data.glob("*.lock"):
+    The whole corpus root is copied, not just its data dir: `sync_cache` prunes
+    cached rows whose source JSONL has gone, so pointing CLAUDE_CONFIG_DIR at an
+    empty directory would empty the very corpus this test needs. The copy also
+    keeps the shared session-scoped corpus clean — the dashboard writes WAL and
+    ingest state into whatever data dir it is given.
+    """
+    src_root = pathlib.Path(small_corpus).parent
+    root = tmp_path / "corpus"
+    shutil.copytree(src_root, root)
+    for lock in (root / "data").glob("*.lock"):
         try:
-            lk.unlink()
+            lock.unlink()
         except OSError:
             pass
-    claude = tmp_path / "claude" / "projects"
-    claude.mkdir(parents=True, exist_ok=True)
-    home = tmp_path / "home"
-    codex = tmp_path / "codex"
-    home.mkdir(parents=True, exist_ok=True)
-    (codex / "sessions").mkdir(parents=True, exist_ok=True)
-    env = dict(__import__("os").environ)
-    env["CCTALLY_DATA_DIR"] = str(data)
-    env["CLAUDE_CONFIG_DIR"] = str(tmp_path / "claude")
-    env["CODEX_HOME"] = str(codex)
-    env["HOME"] = str(home)
-    t0 = time.monotonic()
-    proc = subprocess.Popen(
-        [sys.executable, str(BIN), "dashboard", "--port", "0",
-         "--no-browser", "--host", "127.0.0.1"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-    )
+    codex_roots = sorted(p for p in root.glob("codex-*") if p.is_dir())
+    monkeypatch.setenv("CCTALLY_DATA_DIR", str(root / "data"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(root / "claude"))
+    monkeypatch.setenv("CODEX_HOME", ",".join(str(p) for p in codex_roots))
+    monkeypatch.setenv("HOME", str(root / "home"))
+    # The corpus is anchored at a fixed reference epoch, so against a real wall
+    # clock every recency-filtered panel is empty and the authoritative frame
+    # would be indistinguishable from the seed. The instant is the generator's
+    # own stated clock, read rather than restated: the corpus's quota geometry
+    # is built around it, so a second spelling that drifted would change what
+    # this test sees.
+    import importlib.machinery
+    import importlib.util
+
+    _loader = importlib.machinery.SourceFileLoader(
+        "build_bench_fixtures", str(REPO / "bin" / "build-bench-fixtures.py"))
+    _gen = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader("build_bench_fixtures", _loader))
+    _loader.exec_module(_gen)
+    monkeypatch.setenv(
+        "CCTALLY_AS_OF",
+        _gen.CORPUS_CLOCK_UTC.isoformat().replace("+00:00", "Z"))
+    return load_script()
+
+
+def _sse_frames(port, deadline):
+    """Yield decoded SSE payload objects from /api/events until `deadline`."""
+    import urllib.request
+    req = urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/api/events", timeout=_remaining(deadline))
     try:
-        # ONE budget for the whole test, shared by every phase below rather than
-        # given to each of them separately. Four independent 90-second deadlines
-        # summed to 280 seconds, which `bin/cctally-test-all` cannot grant: it
-        # runs the pytest phase under `--timeout=120`, so a phase that reached
-        # its own deadline would already have been killed. Each wait now takes
-        # what remains of the shared budget, so the test bounds itself once and
-        # the number means something. The assertion below is RELATIVE (bind
-        # precedes full data), so it stays valid regardless of absolute wall
-        # time; this budget only bounds a genuine hang.
-        overall_deadline = time.monotonic() + _WHOLE_TEST_BUDGET_S
-        port, time_to_accept = _read_url_port(
-            proc, deadline_s=_remaining(overall_deadline))
-        # time-to-URL ≈ time-to-bind ≈ time-to-accept (the serving line prints
-        # right after TCPServer.__init__ bound + listened).
-        with socket.create_connection(
-            ("127.0.0.1", port), timeout=min(5.0, _remaining(overall_deadline))
-        ):
-            pass
-        # Full data arrives later over SSE: read /api/events until a
-        # hydrating=false frame with non-empty sessions lands.
-        import json as _json
-        import urllib.request
-        time_to_full = None
-        req = urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/events",
-            timeout=_remaining(overall_deadline),
-        )
-        end = overall_deadline
-        data_lines: list[str] = []
-        while time.monotonic() < end and time_to_full is None:
+        chunks: list[str] = []
+        while time.monotonic() < deadline:
             raw = req.readline()
             if not raw:
-                break
-            s = raw.decode("utf-8", "replace").rstrip("\n")
-            if s.startswith("data:"):
-                data_lines.append(s[5:].strip())
-            elif s == "" and data_lines:
-                payload = "".join(data_lines)
-                data_lines = []
+                return
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            if line.startswith("data:"):
+                chunks.append(line[5:].strip())
+            elif line == "" and chunks:
+                payload = "".join(chunks)
+                chunks = []
                 try:
-                    frame = _json.loads(payload)
+                    yield json.loads(payload)
                 except ValueError:
                     continue
-                if frame.get("hydrating") is False and frame.get("sessions", {}).get("rows"):
-                    time_to_full = time.monotonic() - t0
-        req.close()
-        assert time_to_full is not None, (
-            "no full-data (hydrating=false, non-empty sessions) SSE frame"
-        )
-        # Core A1 property, and the ONLY assertion here: the socket binds WELL
-        # BEFORE the heavy build finishes — i.e. the bind no longer waits on the
-        # aggregation. This is machine- AND load-independent (both scale up under
-        # contention, but the ≥2s CPU-bound background build always keeps the gap
-        # ≥1s), so it survives the parallel test-all where an absolute wall-clock
-        # bound would false-fail. It is naturally RED under the pre-change
-        # full-seed (time-to-accept ≈ time-to-full-data). Absolute figures
-        # (~2s accept / ~5s full on the heavy fixture) are recorded in
-        # docs/backend-performance.md §6, not asserted (fixed process overhead
-        # makes them machine-dependent).
-        assert time_to_accept < time_to_full - 1.0, (
-            f"bind did not precede full data by >=1s: "
-            f"time_to_accept={time_to_accept:.3f}s time_to_full={time_to_full:.3f}s"
-        )
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        req.close()
+
+
+def test_bind_precedes_the_full_build_and_hydration_clears(
+    monkeypatch, tmp_path, small_corpus
+):
+    """Bind-before-build, proven as an EVENT ORDER rather than a duration.
+
+    The full builder is held on a barrier. While it is held, the real server
+    must already have bound, must accept a TCP connection, and must serve an SSE
+    frame whose `hydrating` is true. Only after the barrier is released may the
+    AUTHORITATIVE frame arrive — non-hydrating AND carrying sessions, which is
+    a state no publication before the release can reach. That ordering — bind,
+    then progressive fill — is the product invariant #278 A1 established; how
+    many seconds a particular corpus takes to aggregate is not, and asserting
+    it made this test machine-sensitive for no gain.
+
+    This replaces a SUBPROCESS test that could not do any of the above. A
+    `threading.Event` cannot reach a background builder across a process
+    boundary, so the old test could only compare two wall-clock durations, and
+    it guarded on `LARGE_FIXTURE ... .exists()` where nothing in the suite or CI
+    ever built that path — so it SKIPPED, silently, from the day it was written.
+    The corpus now arrives from the session-scoped `small_corpus` fixture, which
+    builds it and fails rather than skipping.
+    """
+    ns = _load_with_corpus(monkeypatch, tmp_path, small_corpus)
+    dash = _dash_mod()
+
+    deadline = time.monotonic() + _WHOLE_TEST_BUDGET_S
+
+    # The barrier. `_tui_build_snapshot` is the FULL builder; the A1 cheap seed
+    # deliberately does not call it (it uses the individual panel builders), so
+    # holding it here blocks the background build and nothing else. Patched via
+    # `setitem` on the cctally namespace, which is the documented way to reach
+    # the call site inside `_make_run_sync_now_locked`.
+    entered = threading.Event()
+    release = threading.Event()
+    real_build = ns["_tui_build_snapshot"]
+
+    def barrier_build(*args, **kwargs):
+        entered.set()
+        if not release.wait(timeout=_remaining(deadline)):
+            raise AssertionError("the barrier was never released")
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setitem(ns, "_tui_build_snapshot", barrier_build)
+
+    # Capture the REAL server instance so the test learns its bound port
+    # without parsing stdout from another thread.
+    bound = {}
+    real_server_cls = dash._QuietThreadingHTTPServer
+
+    class _RecordingServer(real_server_cls):
+        def __init__(self, address, handler):
+            super().__init__(address, handler)
+            bound["srv"] = self
+
+    monkeypatch.setattr(dash, "_QuietThreadingHTTPServer", _RecordingServer)
+
+    # `cmd_dashboard` blocks on a signal at the end; a thread cannot install a
+    # signal handler, so the wait is replaced by one this test can end.
+    stop = threading.Event()
+    monkeypatch.setattr(
+        dash, "_dashboard_wait_for_signal",
+        lambda *a, **k: stop.wait(timeout=_remaining(deadline)))
+
+    args = ns["build_parser"]().parse_args(
+        ["dashboard", "--port", "0", "--no-browser", "--host", "127.0.0.1"])
+    outcome = []
+    server_thread = threading.Thread(
+        target=lambda: outcome.append(dash.cmd_dashboard(args)),
+        daemon=True, name="s1-dashboard-under-test")
+    server_thread.start()
+    try:
+        while "srv" not in bound and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "srv" in bound, "the server never bound"
+        port = bound["srv"].server_address[1]
+
+        # An `assert not release.is_set()` stood here and could never fail:
+        # only this test sets that event, at a later line. It is deleted rather
+        # than replaced. Nothing may BLOCK here either — the dashboard
+        # republishes the seed with the hydration latch cleared about 50 ms
+        # after it, so waiting before connecting loses the hydrating frame and
+        # the assertion below fails for a reason that is not the product's.
+        # `entered.wait()` therefore stays where it is, after the first read.
+
+        with socket.create_connection(
+            ("127.0.0.1", port), timeout=min(5.0, _remaining(deadline))
+        ):
+            pass
+
+        frames = _sse_frames(port, deadline)
+        first = next(frames, None)
+        assert first is not None, "no SSE frame arrived while the builder was held"
+        assert first.get("hydrating") is True, (
+            "the first frame served before the full build must be hydrating; "
+            f"got hydrating={first.get('hydrating')!r}")
+        assert entered.wait(timeout=_remaining(deadline)), (
+            "the background full build never started, so nothing was held and "
+            "the hydrating frame above proves nothing")
+
+        release.set()
+
+        # The terminal condition must be one ONLY the authoritative build can
+        # satisfy, which is why it is `sessions.rows` and not `hydrating`
+        # alone. The dashboard republishes the still-empty seed with the
+        # hydration latch cleared about 50 ms after the seed and BEFORE this
+        # release, so a test that stopped at the first `hydrating is False`
+        # frame accepted a republished seed and never read the real build —
+        # and would have passed even if the released build never returned.
+        # Measured, with the frames timestamped relative to `release.set()`
+        # (session counts are whatever the profile carries; what matters is
+        # empty versus non-empty, and which side of the release each lands on):
+        #   t<0, before the release  hydrating=True   sessions=0
+        #   t<0, before the release  hydrating=False  sessions=0  <- republished seed
+        #   t>0, after the release   hydrating=False  sessions>0  <- authoritative
+        filled = None
+        for frame in frames:
+            if (frame.get("hydrating") is False
+                    and frame.get("sessions", {}).get("rows")):
+                filled = frame
+                break
+        assert filled is not None, (
+            "no authoritative frame (hydrating false AND non-empty sessions) "
+            "arrived after the builder was released")
+    finally:
+        release.set()
+        stop.set()
+        server_thread.join(timeout=10)
 
 
 # ---------------------------------------------------------------------------
@@ -538,11 +593,12 @@ def test_a2_progress_cb_fires_throttled_and_publishes_hydrating(monkeypatch, tmp
     hub = _CapturingHub()
     clock = {"t": 100.0}
     throttle = tui._A2ThrottleClock(2.0, start=100.0)
-    perf_off = types.SimpleNamespace(enabled=lambda: False)
+    # The real `_lib_perf`, not a stub: the callback now isolates the partial
+    # build's thread state rather than consulting `enabled()` (#583 S1 §2.1).
     cb = tui._make_a2_progress_cb(
         ref=ref, hub=hub,
         build_partial=lambda: ns["_empty_dashboard_snapshot"](),
-        throttle=throttle, monotonic=lambda: clock["t"], perf=perf_off,
+        throttle=throttle, monotonic=lambda: clock["t"],
     )
     cb(None)  # t=100 → < T → no fire
     assert hub.published == []
@@ -559,21 +615,56 @@ def test_a2_progress_cb_fires_throttled_and_publishes_hydrating(monkeypatch, tmp
     assert len(hub.published) == 2
 
 
-def test_a2_progress_cb_suppressed_under_perf_tracing(monkeypatch, tmp_path):
+def test_a2_progress_cb_publishes_under_perf_tracing(monkeypatch, tmp_path):
+    """#583 S1 §2.1: isolation replaced suppression.
+
+    Arming the trace used to switch progressive fill off — a diagnostic
+    silently changing product behaviour, which is the second half of F32. The
+    hazard it guarded against is real but narrower than a blanket skip: the
+    partial build's unconditional `reset_thread()` rebinds `_tls.stack` while
+    the enclosing `walk` phase still holds the ORIGINAL list in `Phase._stack`,
+    so the outer phase would later close into a detached root. The partial now
+    runs inside `isolated_thread_state()`, so both properties hold at once —
+    the caller's tree survives and the partial publishes.
+    """
     ns = _load_with_empty_roots(monkeypatch, tmp_path)
     import _cctally_tui as tui
+    import _lib_perf as perf
     ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
     hub = _CapturingHub()
-    throttle = tui._A2ThrottleClock(0.0, start=0.0)  # would otherwise always fire
-    perf_on = types.SimpleNamespace(enabled=lambda: True)
+    throttle = tui._A2ThrottleClock(0.0, start=0.0)  # always fires
+
+    def build_partial():
+        # Exactly what the real partial build does to this thread.
+        perf.reset_thread()
+        with perf.phase("partial-build"):
+            pass
+        return ns["_empty_dashboard_snapshot"]()
+
     cb = tui._make_a2_progress_cb(
-        ref=ref, hub=hub,
-        build_partial=lambda: ns["_empty_dashboard_snapshot"](),
-        throttle=throttle, monotonic=lambda: 999.0, perf=perf_on,
+        ref=ref, hub=hub, build_partial=build_partial,
+        throttle=throttle, monotonic=lambda: 999.0,
     )
-    cb(None)
-    cb(None)
-    assert hub.published == []  # progressive fill suppressed during a trace
+    perf.set_enabled(True)
+    try:
+        perf.reset_thread()
+        walk = perf.phase("walk")
+        walk.__enter__()
+        stack_before = perf._tls.stack
+        cb(None)
+        cb(None)
+        assert perf._tls.stack is stack_before, "the caller's stack was rebound"
+        walk.__exit__(None, None, None)
+        root = perf.current_root()
+    finally:
+        perf.set_enabled(False)
+        perf.reset_thread()
+
+    assert len(hub.published) == 2, "progressive fill was suppressed by tracing"
+    assert all(s.hydrating for s in hub.published)
+    assert root is walk, "the outer phase closed into a detached root"
+    assert [c.name for c in root.children] == [], (
+        "the isolated partial build's phases attached to the caller's tree")
 
 
 def test_a2_warm_sync_yields_single_publish(monkeypatch, tmp_path):
@@ -616,7 +707,9 @@ def test_a2_progressive_multi_frame(monkeypatch, tmp_path):
     assert hub.published[-1].hydrating is False, "final frame must be complete"
 
 
-def test_a2_perf_trace_suppresses_partials_integration(monkeypatch, tmp_path):
+def test_a2_partials_survive_a_live_perf_trace_integration(monkeypatch, tmp_path):
+    """The whole refresh, with the trace armed: partials publish AND the
+    final build's stashed tree is a well-formed `snapshot` root (§2.1)."""
     ns = _load_with_empty_roots(monkeypatch, tmp_path)
     import _cctally_tui as tui
     import _lib_perf as perf
@@ -641,9 +734,12 @@ def test_a2_perf_trace_suppresses_partials_integration(monkeypatch, tmp_path):
         perf.set_enabled(False)
         perf.reset_thread()
     hydrating_frames = [s for s in hub.published if getattr(s, "hydrating", False)]
-    assert hydrating_frames == []          # partials suppressed during a trace
-    assert len(hub.published) == 1         # only the final full build
-    assert hub.published[0].hydrating is False
+    assert len(hydrating_frames) == 2, (
+        f"tracing suppressed progressive fill: {hub.published}")
+    assert hub.published[-1].hydrating is False, "final frame must be complete"
+    last = perf.last_backend_perf()
+    assert last is not None and last["phases"]["name"] == "snapshot", (
+        f"the armed trace stashed no well-formed build root: {last}")
 
 
 def test_a2_decouple_parity_byte_identical(monkeypatch, tmp_path):
@@ -686,6 +782,15 @@ def test_a2_decouple_parity_byte_identical(monkeypatch, tmp_path):
     env_direct = ns["snapshot_to_envelope"](
         direct, now_utc=OK_AS_OF, monotonic_now=None, runtime_bind=BIND,
     )
+
+    # #583 S2: `sync_activity.server_epoch` is minted per SERVER PROCESS by
+    # `_SnapshotRef`, so the published frame carries one and a direct build —
+    # which never passes through a reference — cannot. It is publication state
+    # rather than build output, and it is the ONE field excluded here; every
+    # counter beside it stays under the byte-identity claim, which is what
+    # proves the decoupling did not move the activity state either.
+    for env in (env_decoupled, env_direct):
+        env["sync_activity"]["server_epoch"] = "__EPOCH__"
 
     assert json.dumps(env_decoupled, sort_keys=True) == json.dumps(
         env_direct, sort_keys=True

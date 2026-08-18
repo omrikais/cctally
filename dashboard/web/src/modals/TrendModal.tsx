@@ -5,8 +5,14 @@ import { ShareIcon } from '../components/ShareIcon';
 import { SortableHeader } from '../components/SortableHeader';
 import { fmt } from '../lib/fmt';
 import { applyTableSort, type SortOverride } from '../lib/tableSort';
-import { TREND_COLUMNS, type TrendTableRow } from '../lib/trendColumns';
+import { trendColumns, type TrendTableRow } from '../lib/trendColumns';
 import { buildTrendHistoryData, type TrendChartDatum } from '../store/selectors';
+import {
+  trendRelativeLabel,
+  trendUnitCount,
+  trendVocabulary,
+  type TrendVocabulary,
+} from '../lib/trendVocabulary';
 import { PeriodAccountChips } from '../components/PeriodAccountChips';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
@@ -14,7 +20,8 @@ import { presentationTrend } from '../lib/dashboardPresentation';
 import { providerAccentClass } from '../lib/providerAccent';
 import type { DashboardSelection } from '../types/envelope';
 
-function formatWeeksPill(n: number): string {
+function formatPeriodPill(n: number, vocabulary: TrendVocabulary): string {
+  if (vocabulary.unit === 'cycle') return trendUnitCount(n, vocabulary);
   const months = Math.max(1, Math.round(n / 4));
   return `${n} week${n === 1 ? '' : 's'} · ${months} month${months === 1 ? '' : 's'}`;
 }
@@ -70,7 +77,11 @@ function sparkXi(i: number, n: number): number {
   return SPARK_PAD.left + (n === 1 ? SPARK_INNER_W : (i / (n - 1)) * SPARK_INNER_W);
 }
 
-function buildSparklinePrimitives(rows: TrendChartDatum[], curIdx: number): SvgPrimitive[] {
+function buildSparklinePrimitives(
+  rows: TrendChartDatum[],
+  curIdx: number,
+  vocabulary: TrendVocabulary,
+): SvgPrimitive[] {
   const out: SvgPrimitive[] = [];
   if (!rows.length) return out;
   const W = SPARK_W;
@@ -130,7 +141,7 @@ function buildSparklinePrimitives(rows: TrendChartDatum[], curIdx: number): SvgP
       out.push({
         el: 'text',
         attrs: { class: 'mtr-medlabel', x: PAD.left + 2, y: yDpp(med) - 3 },
-        text: `${N}-wk median $` + med.toFixed(2),
+        text: `${N}-${vocabulary.unit === 'week' ? 'wk' : 'cycle'} median $` + med.toFixed(2),
         key: 'med-label',
       });
     }
@@ -235,12 +246,6 @@ function buildSparklinePrimitives(rows: TrendChartDatum[], curIdx: number): SvgP
   return out;
 }
 
-function historyWlab(r: TrendChartDatum, k: number): string {
-  return k === 0
-    ? 'Now' + (r.label ? ' · ' + r.label : '')
-    : 'W−' + k + (r.label ? ' · ' + r.label : '');
-}
-
 function renderDelta(delta: number | null): { cls: string; text: string } {
   if (delta == null || !isFinite(delta)) return { cls: 'flat', text: '—' };
   if (delta > 0.0005) return { cls: 'up', text: '+' + delta.toFixed(2) };
@@ -285,6 +290,7 @@ function CanonicalTrendModal({
   // #416 — the expansion of a scoped panel stays scoped (see `useScopedSnapshot`).
   const env = useScopedSnapshot(source);
   const isClaude = source === 'claude';
+  const vocabulary = trendVocabulary(isClaude ? 'claude' : 'codex');
   const presentation = presentationTrend(env, source);
   const rows: TrendChartDatum[] = isClaude
     ? buildTrendHistoryData(env)
@@ -327,7 +333,7 @@ function CanonicalTrendModal({
     cur && cur.dollar_per_pct != null && med != null ? cur.dollar_per_pct - med : null;
   const dkv = deltaKv(delta);
 
-  const svgPrims = buildSparklinePrimitives(rows, curIdx);
+  const svgPrims = buildSparklinePrimitives(rows, curIdx, vocabulary);
   const hasUsed = rows.some((r) => r.used_pct != null && isFinite(r.used_pct));
   const N = rows.length;
   const idFor = (base: string): string => embedded ? `${base}-${source}` : base;
@@ -345,7 +351,8 @@ function CanonicalTrendModal({
   // returns the input untouched when `localSort` is null, so the default view
   // stays chronological.
   const decorated: TrendTableRow[] = rows.map((r, i) => ({ ...r, _chronoIdx: i }));
-  const tableRows = applyTableSort(decorated, TREND_COLUMNS, localSort);
+  const columns = trendColumns(vocabulary.unit);
+  const tableRows = applyTableSort(decorated, columns, localSort);
 
   // Current $/1% hero tile — shared by the 3-tile (median present) and the
   // collapsed 2-tile (median unavailable) hero layouts.
@@ -369,7 +376,7 @@ function CanonicalTrendModal({
       <section className="modal-trend" data-source={source}>
         <div className="m-chipstrip">
           <span className={`m-pill accent-amber${N === 0 ? ' m-unavailable' : ''}`} id={idFor('mtr-weeks-pill')}>
-            {N === 0 ? 'History unavailable' : formatWeeksPill(N)}
+            {N === 0 ? 'History unavailable' : formatPeriodPill(N, vocabulary)}
           </span>
           {/* #463 S5 (F24b) — this pill is a provider identity ONLY when it names
               one. The `all` form names no provider, so it keeps the generic
@@ -394,7 +401,7 @@ function CanonicalTrendModal({
                 <div className="v" id={idFor('mtr-med')}>
                   {'$' + med.toFixed(3)}
                 </div>
-                <div className="lbl">4-week median</div>
+                <div className="lbl">4-{vocabulary.unit} median</div>
               </div>
             </div>
             <div className={`m-kv kv-delta ${dkv.cls}`} id={idFor('mtr-delta-kv')}>
@@ -419,7 +426,7 @@ function CanonicalTrendModal({
                 <use href="/static/icons.svg#minus" />
               </svg>
               <div>
-                <div className="v">needs 4 weeks</div>
+                <div className="v">needs 4 {vocabulary.plural}</div>
                 <div className="lbl">Median</div>
               </div>
             </div>
@@ -430,7 +437,7 @@ function CanonicalTrendModal({
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#trending-down" />
           </svg>
-          {N > 0 ? `${N}-week` : 'Weekly'} history · $/1%
+          {N > 0 ? `${N}-${vocabulary.unit}` : vocabulary.detail} history · $/1%
           <span className={'mtr-legend' + (hasUsed ? '' : ' legend-no-used')} aria-hidden="true">
             <span className="sw sw-dpp" />
             <span className="sw-lbl">$/1%</span>
@@ -443,7 +450,7 @@ function CanonicalTrendModal({
             viewBox="0 0 600 140"
             preserveAspectRatio="none"
             role="group"
-            aria-label={`$ per 1% over the last ${N} week${N === 1 ? '' : 's'}, with the used % line overlaid`}
+            aria-label={`$ per 1% over the last ${trendUnitCount(N, vocabulary)}, with the used % line overlaid`}
           >
             {svgPrims.map((p) => {
               const { el, attrs, text, key } = p;
@@ -493,7 +500,7 @@ function CanonicalTrendModal({
                   height={SPARK_INNER_H}
                   tabIndex={0}
                   role="button"
-                  aria-label={`${historyWlab(r, k)}: ${dppTxt}, ${usedTxt}`}
+                  aria-label={`${trendRelativeLabel(r.label, k, vocabulary)}: ${dppTxt}, ${usedTxt}`}
                   onMouseEnter={() => setHovered(i)}
                   onFocus={() => setHovered(i)}
                   onMouseLeave={() => setHovered(null)}
@@ -525,7 +532,7 @@ function CanonicalTrendModal({
                     role="status"
                     style={{ left: leftPct + '%' }}
                   >
-                    <span className="mtr-tip-wk">{historyWlab(r, k)}</span>
+                    <span className="mtr-tip-wk">{trendRelativeLabel(r.label, k, vocabulary)}</span>
                     <span className="mtr-tip-dpp">{dppTxt}</span>
                     <span className="mtr-tip-used">{usedTxt}</span>
                   </div>
@@ -535,8 +542,8 @@ function CanonicalTrendModal({
           <div className="mtr-sparkaxis" id={idFor('mtr-sparkaxis')}>
             {N > 0 ? (
               <Fragment>
-                <span>W−{N - 1}</span>
-                <span>W−{Math.floor((N - 1) / 2)}</span>
+                <span>{vocabulary.relativePrefix}−{N - 1}</span>
+                <span>{vocabulary.relativePrefix}−{Math.floor((N - 1) / 2)}</span>
                 <span>Now</span>
               </Fragment>
             ) : null}
@@ -549,14 +556,14 @@ function CanonicalTrendModal({
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#hash" />
           </svg>
-          Weekly detail
+          {vocabulary.detail} detail
         </SecTag>
         <div className="mtr-tbl-head">
           <span className="m-pill accent-purple" id={idFor('mtr-tbl-count')}>
-            {N} weeks
+            {trendUnitCount(N, vocabulary)}
           </span>
           <span className="mtr-tbl-sub">
-            current row highlighted · negative Δ = $/1% down vs prior week
+            current row highlighted · negative Δ = $/1% down vs prior {vocabulary.unit}
           </span>
         </div>
         <table className="m-histable" id={idFor('mtr-table')}>
@@ -566,7 +573,7 @@ function CanonicalTrendModal({
               The <tbody> stays hand-rendered so the modal keeps its week labels,
               `.cur` highlight, and delta formatting the panel lacks. */}
           <SortableHeader
-            columns={TREND_COLUMNS}
+            columns={columns}
             override={localSort}
             onChange={setLocalSort}
             accentVar="--accent-amber"
@@ -578,7 +585,7 @@ function CanonicalTrendModal({
               // sorted) render position — so sorting by Cost/Used% never
               // relabels rows.
               const k = N - 1 - r._chronoIdx;
-              const wlab = historyWlab(r, k);
+              const wlab = trendRelativeLabel(r.label, k, vocabulary);
               const usedTxt = r.used_pct != null ? Math.round(r.used_pct) + '%' : 'Unavailable';
               const dppTxt =
                 r.dollar_per_pct != null ? '$' + r.dollar_per_pct.toFixed(2) : 'Unavailable';
@@ -608,7 +615,7 @@ function CanonicalTrendModal({
   if (embedded) return content;
   return (
     <Modal
-      title={N > 0 ? `Trend — last ${N} weeks` : 'Trend'}
+      title={N > 0 ? `Trend — last ${trendUnitCount(N, vocabulary)}` : 'Trend'}
       accentClass="accent-amber"
       headerExtras={headerExtras}
       wide

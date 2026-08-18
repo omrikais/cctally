@@ -656,3 +656,311 @@ def test_decorated_merged_blocks_are_the_union_of_every_account(tmp_path, monkey
     finally:
         cache.close()
         stats.close()
+
+
+def _account_cards(state):
+    """``{accountKey: card}`` from a built Codex source state."""
+    return {card["accountKey"]: card for card in state.data.get("accounts", ())}
+
+
+def test_narrow_custom_share_range_keeps_full_cycle_card_spend(
+    tmp_path, monkeypatch,
+):
+    """A one-day share range must not truncate a card whose cycle is a week old.
+
+    `build_codex_source_state` serves the share path too
+    (bin/_cctally_dashboard_share.py:1419), where `range_start` is the user's
+    custom start verbatim. Partitioning a parent population bounded by that
+    start would drop up to six days of each card's spend with no error.
+    """
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    root = _cache_root_key(cache)
+    _seed_codex_accounts(stats, [
+        dict(account_key=_ACCT_A, email="a@x.com", label="alice", plan_type="pro"),
+        dict(account_key=_ACCT_B, email="b@x.com", label="bob", plan_type="team"),
+    ])
+    # Each live cycle begins days before `now`, and most of each account's spend
+    # sits INSIDE its cycle but OUTSIDE a one-day share range. That is exactly
+    # the population a naive partition of the published accounting range drops.
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_A,
+        timestamp=NOW - dt.timedelta(days=5), session_id="a-cycle",
+        line_offset=95_001)
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_A,
+        timestamp=NOW - dt.timedelta(hours=1), session_id="a-today",
+        line_offset=95_002)
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_B,
+        timestamp=NOW - dt.timedelta(days=4), session_id="b-cycle",
+        line_offset=95_003)
+    _drop_corpus_accounting_rows(cache)
+    cache.commit()
+    observations = (
+        *_weekly_and_5h(
+            root, _ACCT_A, NOW + dt.timedelta(days=1),
+            used_weekly=40.0, used_5h=12.0,
+        ),
+        *_weekly_and_5h(
+            root, _ACCT_B, NOW + dt.timedelta(days=2),
+            used_weekly=55.0, used_5h=30.0,
+        ),
+    )
+    monkeypatch.setattr(
+        source_module, "load_codex_quota_observations", lambda **_k: observations)
+    try:
+        narrow_cards = _account_cards(source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats,
+                range_start=NOW - dt.timedelta(days=1),
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="narrow-share-v1",
+        ))
+        wide_cards = _account_cards(source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats,
+                range_start=NOW - dt.timedelta(days=30),
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="wide-share-v1",
+        ))
+        live_keys = [
+            key for key, card in wide_cards.items()
+            if card.get("weeklyPercent") is not None
+        ]
+        # Non-vacuity: both real accounts must resolve a live cycle, and each
+        # must carry spend that a one-day range cannot see on its own.
+        assert sorted(live_keys) == sorted((_ACCT_A, _ACCT_B)), wide_cards
+        for key in live_keys:
+            card = wide_cards[key]
+            assert card["spendUsd"] > 0, key
+            assert card["totalTokens"] > 0, key
+            assert narrow_cards[key]["spendUsd"] == card["spendUsd"], (
+                f"card {key} lost cycle spend under a one-day share range"
+            )
+            assert narrow_cards[key]["totalTokens"] == card["totalTokens"], (
+                f"card {key} lost cycle tokens under a one-day share range"
+            )
+    finally:
+        cache.close()
+        stats.close()
+
+
+def _complete_codex_thread_metadata(cache):
+    """Join a thread to every accounting row, so the QUALIFIED reader is used.
+
+    `_insert_account_accounting_row` stamps `conv-<session_id>` and seeds no
+    matching `codex_conversation_threads` row, so
+    `load_codex_project_metadata_health` reports incomplete rows and a build
+    falls back to `load_cached_rooted_codex_accounting_entries`. That fallback
+    is a real branch, but it is not the one a healthy dashboard takes. Returns
+    how many rows it seeded, which is the non-vacuity evidence that the fixture
+    needed them.
+    """
+    missing = cache.execute(
+        "SELECT DISTINCT entries.source_root_key, entries.conversation_key, "
+        "       entries.source_path "
+        "  FROM codex_session_entries AS entries "
+        "  LEFT JOIN codex_conversation_threads AS threads "
+        "    ON threads.conversation_key = entries.conversation_key "
+        "   AND threads.source_root_key = entries.source_root_key "
+        " WHERE threads.conversation_key IS NULL "
+        "   AND entries.conversation_key IS NOT NULL "
+        "   AND entries.conversation_key <> ''"
+    ).fetchall()
+    for root_key, conversation_key, source_path in missing:
+        cache.execute(
+            "INSERT OR IGNORE INTO codex_conversation_threads "
+            "(conversation_key, source_root_key, native_thread_id, "
+            " root_thread_id, source_path, cwd) VALUES (?,?,?,?,?,?)",
+            (conversation_key, root_key, f"native-{conversation_key}",
+             f"root-{conversation_key}", source_path, "/tmp/bounded-project"),
+        )
+    cache.commit()
+    return len(missing)
+
+
+def _three_branch_card_fixture(cache, stats, *, root):
+    """Seed the three card branches `_codex_accounts_wire` can take.
+
+    Account A resolves a live weekly cycle (the cycle branch), account B's
+    weekly window has already reset (the trailing-cycle fallback branch), and
+    the unattributed sentinel holds spend inside the trailing window (the
+    sentinel branch). Returns the quota observations both accounts' cards are
+    built from.
+    """
+    _seed_codex_accounts(stats, [
+        dict(account_key=_ACCT_A, email="a@x.com", label="alice", plan_type="pro"),
+        dict(account_key=_ACCT_B, email="b@x.com", label="bob", plan_type="team"),
+    ])
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_A,
+        timestamp=NOW - dt.timedelta(days=3), session_id="a-cycle",
+        line_offset=97_001)
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_A,
+        timestamp=NOW - dt.timedelta(hours=2), session_id="a-today",
+        line_offset=97_002)
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_B,
+        timestamp=NOW - dt.timedelta(days=2), session_id="b-recent",
+        line_offset=97_003)
+    _insert_account_accounting_row(
+        cache, root=root, account_key="unattributed",
+        timestamp=NOW - dt.timedelta(days=1), session_id="u-recent",
+        line_offset=97_004)
+    _drop_corpus_accounting_rows(cache)
+    return (
+        *_weekly_and_5h(
+            root, _ACCT_A, NOW + dt.timedelta(days=1),
+            used_weekly=40.0, used_5h=12.0,
+        ),
+        *_weekly_and_5h(
+            root, _ACCT_B, NOW - dt.timedelta(minutes=1),
+            used_weekly=55.0, used_5h=30.0,
+        ),
+    )
+
+
+def test_card_values_are_identical_from_either_accounting_reader(
+    tmp_path, monkeypatch,
+):
+    """#583 S5 change 2's reader-equivalence claim, asserted on card VALUES.
+
+    The cards used to be derived from `load_cached_rooted_codex_accounting_
+    entries` and are now derived from whichever population the build already
+    holds, which on a healthy dashboard is `load_qualified_codex_entries`. That
+    substitution is a claim that the two readers admit the same rows, and a
+    read-count bound cannot test it: a reader admitting different rows would
+    still issue one read. So both populations are loaded over the same store and
+    the same range here, and the resulting cards are compared to each other.
+
+    The fixture reaches all three card branches, because the two readers could
+    agree on one of them and disagree on another: the live-cycle branch, the
+    trailing-cycle fallback for a real account whose weekly window has reset,
+    and the unattributed sentinel.
+    """
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    root = _cache_root_key(cache)
+    observations = _three_branch_card_fixture(cache, stats, root=root)
+    seeded = _complete_codex_thread_metadata(cache)
+    assert seeded, "non-vacuity: the fixture must have lacked thread metadata"
+    cache.commit()
+    monkeypatch.setattr(
+        source_module, "load_codex_quota_observations", lambda **_k: observations)
+    try:
+        context = DashboardReadContext(
+            cache_conn=cache, stats_conn=stats, range_start=START,
+            now_utc=NOW, display_tz_name="UTC",
+        )
+        accounting_end = NOW + dt.timedelta(microseconds=1)
+        cycles = source_module._resolve_codex_weekly_cycle(observations, NOW)
+        qualified = source_module.load_qualified_codex_entries(
+            START, accounting_end, speed=context.speed, sync=False,
+            cache_conn=cache,
+        )
+        rooted = source_module.load_cached_rooted_codex_accounting_entries(
+            START, accounting_end, speed=context.speed, cache_conn=cache,
+        )
+        # Non-vacuity: two empty populations would produce two equal empty card
+        # sets and prove nothing about either reader.
+        assert qualified, "the qualified reader must admit rows here"
+        assert len(qualified) == len(rooted), (
+            f"the two readers admitted {len(qualified)} and {len(rooted)} rows")
+
+        wire = dict(
+            quota_observations=observations, cycles=cycles,
+            accounting_start=START, accounting_end=accounting_end,
+        )
+        qualified_cards, qualified_cycles = source_module._codex_accounts_wire(
+            context, population=qualified, **wire)
+        rooted_cards, rooted_cycles = source_module._codex_accounts_wire(
+            context, population=rooted, **wire)
+
+        by_key = {card["accountKey"]: card for card in qualified_cards}
+        live, fallback = by_key[_ACCT_A], by_key[_ACCT_B]
+        sentinel = by_key["unattributed"]
+        # Each branch must have produced a non-zero card, so equality below is
+        # equality of real figures rather than of three zeroes.
+        assert live["weeklyPercent"] == 40.0 and live["resetsAt"] is not None
+        assert live["spendUsd"] > 0 and live["totalTokens"] > 0
+        assert fallback["weeklyPercent"] is None
+        assert fallback["spendWindow"]["kind"] == "trailing-cycle"
+        assert fallback["spendUsd"] > 0 and fallback["totalTokens"] > 0
+        assert sentinel["unattributed"] is True
+        assert sentinel["spendUsd"] > 0 and sentinel["totalTokens"] > 0
+
+        assert qualified_cards == rooted_cards, (
+            "the two accounting readers produced different account cards")
+        assert qualified_cycles == rooted_cycles, (
+            "the two accounting readers produced different hero cycles")
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_an_empty_source_path_row_parts_the_two_accounting_readers(
+    tmp_path, monkeypatch,
+):
+    """The one residual asymmetry, and why it cannot publish a wrong number.
+
+    `load_cached_rooted_codex_accounting_entries` requires a non-empty
+    `source_path` and raises `QualifiedMetadataUnavailable` for the whole read
+    when a row lacks one; `load_qualified_codex_entries` requires only the
+    joined thread identity, so it admits that row.
+    `load_codex_project_metadata_health` classifies a row by its
+    `conversation_key` and its thread join and never by its `source_path`, so
+    the build does not take the rooted fallback on account of one either.
+
+    The divergence is recorded rather than removed because the card derivation
+    fails loudly on such a row: `_codex_entries_from_accounting` raises
+    `SourceCapabilityUnavailable` for an entry with no session identity, so the
+    two readers cannot silently publish different card totals. No shipped
+    Codex ingest statement writes an empty `source_path`.
+    """
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    # Taken off the module under test rather than by a fresh import: the
+    # conftest load-script convention can leave a second copy of
+    # `_cctally_source_analytics` in the interpreter, whose exception class is
+    # a different object and would not be caught here.
+    QualifiedMetadataUnavailable = source_module.QualifiedMetadataUnavailable
+    root = _cache_root_key(cache)
+    _drop_corpus_accounting_rows(cache)
+    template = cache.execute(
+        "SELECT model, input_tokens, cached_input_tokens, output_tokens, "
+        "reasoning_output_tokens, total_tokens FROM codex_session_entries "
+        "ORDER BY id LIMIT 1"
+    ).fetchone()
+    assert template is None, (
+        "precondition: the corpus rows are dropped, so the only row read below "
+        "is the one this test inserts")
+    cache.execute(
+        "INSERT INTO codex_session_entries "
+        "(source_path, line_offset, timestamp_utc, session_id, model, "
+        "input_tokens, cached_input_tokens, output_tokens, "
+        "reasoning_output_tokens, total_tokens, source_root_key, "
+        "conversation_key, account_key) "
+        "VALUES ('', 1, ?, 'no-path', 'gpt-5', 10, 0, 5, 0, 15, ?, "
+        "'conv-no-path', NULL)",
+        ((NOW - dt.timedelta(hours=1)).isoformat(), root),
+    )
+    _complete_codex_thread_metadata(cache)
+    cache.commit()
+    try:
+        end = NOW + dt.timedelta(microseconds=1)
+        with pytest.raises(QualifiedMetadataUnavailable):
+            source_module.load_cached_rooted_codex_accounting_entries(
+                START, end, speed="standard", cache_conn=cache)
+        qualified = source_module.load_qualified_codex_entries(
+            START, end, speed="standard", sync=False, cache_conn=cache)
+        assert [entry.source_path for entry in qualified] == [""], (
+            "the qualified reader admits the row the rooted reader refuses")
+        with pytest.raises(source_module.SourceCapabilityUnavailable):
+            source_module._codex_entries_from_accounting(qualified)
+    finally:
+        cache.close()
+        stats.close()

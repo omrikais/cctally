@@ -195,6 +195,10 @@ def _boot(
         _make_snapshot(ns, with_codex_label=with_codex_label)
     )
     HandlerCls.hub = SSEHub()
+    # #583 S3 §7: `/api/data` serves the most recently PUBLISHED state,
+    # so a bare reference is not enough — seed the hub exactly as
+    # `cmd_dashboard` does before the HTTP server binds.
+    HandlerCls.hub.publish(HandlerCls.snapshot_ref.get())
     HandlerCls.sync_lock = threading.Lock()
     HandlerCls.run_sync_now = staticmethod(lambda: None)
     HandlerCls.cctally_host = bind
@@ -779,27 +783,32 @@ def test_api_data_codex_labels_follow_the_request_gate_without_contamination(
         port = srv.server_address[1]
 
         def labels(payload):
+            # #583 S3 §4: `sources.all.data.providers` publishes null for both
+            # members, so the physical `sources.codex` entry is the ONE place
+            # the label travels. The mirrored read this used to make resolved
+            # to the SAME row object, so it proved nothing the first read does
+            # not; the mirror's nulling is asserted here instead.
             sources = payload["sources"]
+            assert sources["all"]["data"]["providers"] == {
+                "claude": None, "codex": None,
+            }
             return (
                 sources["codex"]["data"]["sessions"]["rows"][0].get("label"),
-                sources["all"]["data"]["providers"]["codex"]["sessions"]["rows"][0].get("label"),
             )
 
         status, body = _get(port, "/api/data")
         opened = json.loads(body)
         assert status == 200 and opened["transcriptsEnabled"] is True
-        assert labels(opened) == ("Private first prompt", "Private first prompt")
+        assert labels(opened) == ("Private first prompt",)
 
         status, body = _get(port, "/api/data", host="machine.local:8789")
         closed = json.loads(body)
         assert status == 200 and closed["transcriptsEnabled"] is False
-        assert labels(closed) == (None, None)
+        assert labels(closed) == (None,)
 
         status, body = _get(port, "/api/data")
         reopened = json.loads(body)
-        assert status == 200 and labels(reopened) == (
-            "Private first prompt", "Private first prompt",
-        )
+        assert status == 200 and labels(reopened) == ("Private first prompt",)
     finally:
         srv.shutdown()
 
@@ -1161,11 +1170,11 @@ def test_sse_codex_labels_follow_each_connection_transcript_gate(
             opened["sources"]["codex"]["data"]["sessions"]["rows"][0]["label"]
             == "Private first prompt"
         )
-        assert (
-            opened["sources"]["all"]["data"]["providers"]["codex"]
-            ["sessions"]["rows"][0]["label"]
-            == "Private first prompt"
-        )
+        # #583 S3 §4: the mirror publishes null; the physical entry above is
+        # the one copy the label is injected into.
+        assert opened["sources"]["all"]["data"]["providers"] == {
+            "claude": None, "codex": None,
+        }
 
         closed = _first_sse_update_envelope(
             port, host="machine.local:8789",
@@ -1174,10 +1183,9 @@ def test_sse_codex_labels_follow_each_connection_transcript_gate(
         assert "label" not in (
             closed["sources"]["codex"]["data"]["sessions"]["rows"][0]
         )
-        assert "label" not in (
-            closed["sources"]["all"]["data"]["providers"]["codex"]
-            ["sessions"]["rows"][0]
-        )
+        assert closed["sources"]["all"]["data"]["providers"] == {
+            "claude": None, "codex": None,
+        }
     finally:
         srv.shutdown()
 

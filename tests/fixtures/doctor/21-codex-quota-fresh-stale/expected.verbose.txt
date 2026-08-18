@@ -88,6 +88,9 @@ Database
   ✓ cache.db WAL size        within limit
       details:
         cache_db_wal_bytes: 0
+  ✓ conversations.db WAL size within limit
+      details:
+        conversations_db_wal_bytes: 0
   ✓ Reclaimable cache space  below threshold
       details:
         cache_db_page_count: 4
@@ -286,4 +289,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 56 OK · 5 WARN · 0 FAIL
+Summary: 57 OK · 5 WARN · 0 FAIL

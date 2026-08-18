@@ -231,7 +231,14 @@ function AllCacheReportModal() {
   const composition = presentationCacheReportComposition(env, 'all');
   return (
     <Modal title="Cache Report — by provider" accentClass="accent-teal">
-      <div className="provider-composition provider-composition--modal" aria-label="Claude and Codex cache reports">
+      <div
+        className="provider-composition provider-composition--modal"
+        // #578 — this wrapper composes two provider regions, but is not itself
+        // a landmark. `group` makes its existing accessible name semantic
+        // without adding a redundant nested region to the modal.
+        role="group"
+        aria-label="Claude and Codex cache reports"
+      >
         {composition.sections.map((section) => (
           <AllCacheReportSection key={section.source} section={section} />
         ))}

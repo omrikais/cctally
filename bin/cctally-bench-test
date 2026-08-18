@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Structural / determinism self-test for the backend benchmark harness
 # (issue #276, M3 / Session B). Runs bin/cctally-bench at --scale small and
-# asserts the --json schema (all 14 benchmark families, finite ordered
+# asserts the --json schema (all 15 benchmark families, finite ordered
 # medians) + isolation (the real ~/.local/share/cctally and ~/.claude are
 # untouched). It NEVER asserts wall-clock timings — the only committed
 # timings live in bench/baselines/backend.json as advisory data.
+#
+# #583 S1 adds a second, cheaper check that reads the committed baseline
+# DIRECTLY and asserts its `contract` block — the benchmark-name set, the
+# corpus fingerprint, the generator version and the Codex dataset counts —
+# WITHOUT running the large benchmark. Still no timing value is asserted.
 #
 # Auto-discovered by bin/cctally-test-all via its bin/cctally-*-test glob once
 # `chmod +x`'d (no registration needed). Emits the standard `PASS <name>` /
@@ -105,6 +110,73 @@ PY
     else
         report FAIL json-schema "schema assertion failed"
     fi
+fi
+
+# #583 S1: the committed baseline's structural contract, asserted WITHOUT
+# running the large benchmark. This is what stops the baseline drifting away
+# from the harness again — it went 1.64.0-against-1.99.0 with 14 of 15 names
+# and a Codex-free corpus, and nothing in the estate noticed.
+if BASELINE_JSON="$(cat "$REPO_ROOT/bench/baselines/backend.json")" \
+   REPO_ROOT="$REPO_ROOT" python3 - <<'PY'
+import importlib.machinery, importlib.util, json, os, pathlib
+
+d = json.loads(os.environ["BASELINE_JSON"])
+for k in ("contract", "receipt"):
+    assert k in d, f"baseline is not contract-shaped: missing {k!r}"
+c, receipt = d["contract"], d["receipt"]
+need = {
+    "snapshot.cold", "snapshot.warm", "snapshot.idle",
+    "sync.noop", "sync.delta",
+    "conversations.page1", "conversations.sorted", "conversations.filtered",
+    "search.cross_session", "find.in_conversation",
+    "payload.assemble", "outline.build", "payload.assemble_memo_hit",
+    "reconcile.cache_report", "reconcile.projects_env",
+}
+got = set(c["benchmark_names"])
+assert got == need, (
+    f"baseline name set drifted: missing={sorted(need - got)} "
+    f"unexpected={sorted(got - need)}")
+assert c.get("corpus_fingerprint"), "baseline carries no corpus fingerprint"
+assert c.get("scale") == "large", f"baseline scale={c.get('scale')!r}"
+
+# EXACT, not merely present. GENERATOR_VERSION is a module constant, so it is
+# computable without building anything -- and it is the documented signal that
+# `_emit_corpus` changed. Asserting only its presence would let a bump silently
+# staleness the committed `corpus_fingerprint`, the same drift class that left
+# this baseline at 1.64.0 with 14 of 15 names. The fingerprint itself stays a
+# presence check, because recomputing it means building the corpus.
+bin_dir = pathlib.Path(os.environ["REPO_ROOT"]) / "bin"
+loader = importlib.machinery.SourceFileLoader(
+    "build_bench_fixtures", str(bin_dir / "build-bench-fixtures.py"))
+spec = importlib.util.spec_from_loader("build_bench_fixtures", loader)
+gen = importlib.util.module_from_spec(spec)
+loader.exec_module(gen)
+assert c.get("generator_version") == gen.GENERATOR_VERSION, (
+    f"baseline generator_version={c.get('generator_version')!r} but the "
+    f"generator is at {gen.GENERATOR_VERSION!r}; re-record the baseline")
+assert c.get("seed") == 42, f"baseline seed={c.get('seed')!r}"
+
+# The counts the profile OWES, not merely non-zero ones.
+want = gen.expected_counts(gen.SCALES["large"])
+assert c.get("dataset_counts") == want, (
+    f"baseline dataset_counts={c.get('dataset_counts')!r} but the `large` "
+    f"profile now owes {want!r}")
+
+# `_write_baseline` copies these into both blocks; nothing else checks they
+# still agree, and a hand edit to one is exactly how a contract goes stale.
+for key in ("scale", "seed", "dataset_counts", "corpus_fingerprint",
+            "generator_version"):
+    assert c.get(key) == receipt.get(key), (
+        f"contract and receipt disagree on {key!r}: "
+        f"{c.get(key)!r} vs {receipt.get(key)!r}")
+
+# Deliberately assert NO timing value: the receipt is advisory.
+assert isinstance(receipt.get("benchmarks"), dict), "receipt has no benchmarks"
+PY
+then
+    report PASS baseline-contract
+else
+    report FAIL baseline-contract "committed baseline failed its structural contract"
 fi
 
 # Isolation (positive): the bench wrote its cache.db into the scratch

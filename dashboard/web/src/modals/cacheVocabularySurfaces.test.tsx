@@ -108,8 +108,8 @@ function envFor(
     ...makeSourceEnvelope(),
   };
   e.cache_report = claude;
+  // #583 S3 §4: physical entry only — the All mirror publishes null.
   e.sources!.codex.data!.cache_report = codex;
-  e.sources!.all.data!.providers.codex = e.sources!.codex.data;
   updateSnapshot(e);
   dispatch({ type: 'SET_ACTIVE_SOURCE', source });
   return e;

@@ -22,11 +22,15 @@ cost on the maintainer's store: about 0.2s profiled across the whole build.
 """
 from __future__ import annotations
 
+import datetime as dt
 import sys
+
+from _lib_quota import QuotaObservation, QuotaWindowIdentity
 
 from test_codex_account_read_model import (  # noqa: E402
     _ACCT_A,
     _ACCT_B,
+    NOW,
     _build,
     _decorate,
     codex_env,  # noqa: F401  (pytest fixture, re-exported by import)
@@ -146,19 +150,45 @@ def test_a_child_never_sees_another_accounts_observations(
         assert {row.identity.account_key for row in rows} == {key}
 
 
-def test_a_model_pool_window_is_not_filed_as_account_weekly_quota():
-    """The classifier stays the single home for the pool decision.
-
-    `_codex_account_scopes_wire` partitions by account and never inspects the
-    limit, so this asserts the axis the partition must not be allowed to blur:
-    a Spark window is model-scoped whatever account stamped it.
-    """
-    from _lib_codex_pools import (
-        codex_model_scoped_quota_pool,
-        is_model_scoped_codex_quota,
+def test_a_model_pool_window_stays_listed_but_not_active_in_its_account_scope(
+    codex_env, monkeypatch,  # noqa: F811
+):
+    """Exercise the decorated path the model-pool guard protects."""
+    _ns, cache, stats, source_module, root = codex_env
+    _decorate(stats)
+    standard = tuple(source_module.load_codex_quota_observations())
+    spark = QuotaObservation(
+        identity=QuotaWindowIdentity(
+            source="codex",
+            source_root_key=root,
+            account_key=_ACCT_A,
+            logical_limit_key="spark-limit",
+            observed_slot="primary",
+            window_minutes=10_080,
+            limit_name="GPT-5.3-Codex-Spark",
+        ),
+        captured_at=NOW - dt.timedelta(minutes=5),
+        used_percent=88.0,
+        resets_at=NOW + dt.timedelta(days=1),
+        source_path="/private/spark.jsonl",
+        line_offset=99,
+    )
+    monkeypatch.setattr(
+        source_module,
+        "load_codex_quota_observations",
+        lambda **_kwargs: (*standard, spark),
     )
 
-    assert codex_model_scoped_quota_pool("gpt-5.3-codex-spark") is not None
-    assert codex_model_scoped_quota_pool("gpt-5") is None
-    assert is_model_scoped_codex_quota("limit", "GPT-5.3-Codex-Spark")
-    assert not is_model_scoped_codex_quota("limit", "weekly")
+    scopes = _build(
+        source_module, cache, stats, version="model-pool-path",
+    ).data["account_scopes"]
+    a_quota = scopes[_ACCT_A]["quota"]
+    b_quota = scopes[_ACCT_B]["quota"]
+    spark_rows = [row for row in a_quota["histories"] if row.get("model_scoped")]
+
+    assert len(spark_rows) == 1
+    assert spark_rows[0]["current_percent"] == 88.0
+    assert spark_rows[0]["key"] not in {
+        row["key"] for row in a_quota["summary"]["active"]
+    }
+    assert not [row for row in b_quota["histories"] if row.get("model_scoped")]

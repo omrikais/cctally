@@ -21,6 +21,7 @@ import datetime as dt
 import http.client
 import json
 import pathlib
+import socket
 import sys
 import threading
 
@@ -81,6 +82,27 @@ def _read_first_sse_data_frame(response, *, deadline_s=2.0):
     raise AssertionError(f"no data frame in SSE buffer: {text!r}")
 
 
+def _raw_get(port, path):
+    """Return every byte written for one close-delimited HTTP request."""
+    chunks = []
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        sock.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            "Connection: close\r\n\r\n".encode()
+        )
+        while True:
+            block = sock.recv(65536)
+            if not block:
+                break
+            chunks.append(block)
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    return b"".join(chunks)
+
+
 # ---------------------------------------------------------------------------
 # GET /api/doctor
 # ---------------------------------------------------------------------------
@@ -125,6 +147,65 @@ def test_api_doctor_no_csrf_required(tmp_path, monkeypatch):
         assert r.status == 200, r.status
     finally:
         srv.shutdown()
+
+
+def test_api_doctor_preparation_failure_returns_one_json_500(
+        tmp_path, monkeypatch):
+    """A failure before headers are sent still has a usable status channel."""
+    ns = load_script()
+    monkeypatch.setitem(
+        ns, "doctor_gather_state",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("prepare boom")),
+    )
+    srv, _ = _start_handler(ns, tmp_path, monkeypatch)
+    try:
+        raw = _raw_get(srv.server_address[1], "/api/doctor")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert raw.count(b"HTTP/1.") == 1, raw[:400]
+    assert raw.split(b"\r\n", 1)[0].split()[1:2] == [b"500"], raw[:200]
+    assert b'"error"' in raw
+
+
+def test_api_doctor_committed_write_failure_never_appends_a_second_response(
+        tmp_path, monkeypatch):
+    """A partial doctor body cannot be followed by a second HTTP response."""
+    ns = load_script()
+    handler = ns["DashboardHTTPHandler"]
+    real_doctor = handler._handle_get_doctor
+    fired = []
+
+    def fail_first_body_write(self):
+        real_write = self.wfile.write
+
+        def write(data):
+            if data[:1] == b"{" and not fired:
+                fired.append(bytes(data))
+                raise BrokenPipeError("simulated peer gone mid-body")
+            return real_write(data)
+
+        self.wfile.write = write
+        try:
+            return real_doctor(self)
+        finally:
+            self.wfile.write = real_write
+
+    monkeypatch.setattr(handler, "_handle_get_doctor", fail_first_body_write)
+    srv, _ = _start_handler(ns, tmp_path, monkeypatch)
+    try:
+        raw = _raw_get(srv.server_address[1], "/api/doctor")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert fired, "the injected doctor body failure never fired"
+    assert raw.split(b"\r\n", 1)[0].split()[1:2] == [b"200"], raw[:200]
+    assert raw.count(b"HTTP/1.") == 1, (
+        "a second HTTP response followed the committed doctor response: %r"
+        % (raw[:400],)
+    )
 
 
 def test_api_doctor_safety_dashboard_bind_runtime_override(tmp_path, monkeypatch):

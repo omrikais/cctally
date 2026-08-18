@@ -947,6 +947,7 @@ _bust_statusline_cache = _cctally_refresh._bust_statusline_cache
 _freshness_label = _cctally_refresh._freshness_label
 _cmd_refresh_usage_handle_rate_limit = _cctally_refresh._cmd_refresh_usage_handle_rate_limit
 _refresh_usage_inproc = _cctally_refresh._refresh_usage_inproc
+_resolve_dashboard_api_token = _cctally_refresh._resolve_dashboard_api_token
 _nudge_dashboard_repaint = _cctally_refresh._nudge_dashboard_repaint
 cmd_refresh_usage = _cctally_refresh.cmd_refresh_usage
 _hook_tick_oauth_refresh = _cctally_refresh._hook_tick_oauth_refresh
@@ -1324,12 +1325,9 @@ cmd_telemetry = _cctally_telemetry.cmd_telemetry
 # ``c = _cctally()`` accessor or module-level shim at call time so
 # ``setitem(ns, "_dashboard_build_weekly_periods", spy)`` propagates
 # into ``_share_apply_period_override`` / ``DashboardHTTPHandler``
-# request paths. Path constants (``STATIC_DIR``,
-# ``_DASHBOARD_SYNC_LOCK_TIMEOUT_SECONDS``) stay re-exported here so
-# ``setitem(ns, "STATIC_DIR", tmp)`` in
-# ``tests/test_dashboard_api_sync_refresh.py`` and the
-# ``monkeypatch.setitem(ns, "_DASHBOARD_SYNC_LOCK_TIMEOUT_SECONDS", …)``
-# sites propagate transparently.
+# request paths. Path constants (``STATIC_DIR``) stay re-exported here
+# so ``setitem(ns, "STATIC_DIR", tmp)`` in
+# ``tests/test_dashboard_api_sync_refresh.py`` propagates transparently.
 _cctally_dashboard = _load_sibling("_cctally_dashboard")
 _DASHBOARD_BIND_SEMANTIC_ALIASES = _cctally_dashboard._DASHBOARD_BIND_SEMANTIC_ALIASES
 _validate_dashboard_bind_value = _cctally_dashboard._validate_dashboard_bind_value
@@ -1358,7 +1356,22 @@ _build_blocks_share_panel_data = _cctally_dashboard._build_blocks_share_panel_da
 _build_sessions_share_panel_data = _cctally_dashboard._build_sessions_share_panel_data
 _build_projects_share_panel_data = _cctally_dashboard._build_projects_share_panel_data
 _SnapshotRef = _cctally_dashboard._SnapshotRef
+_resolve_dashboard_port = _cctally_dashboard._resolve_dashboard_port
+
+# Eager re-export of bin/_cctally_dashboard_perf.py (#583 S1 §3.3) —
+# `cmd_dashboard_perf` is the parser's `set_defaults(func=c.cmd_dashboard_perf)`
+# target. It loads AFTER `_cctally_dashboard` because it resolves the port
+# default through `_resolve_dashboard_port`, re-exported just above.
+_cctally_dashboard_perf = _load_sibling("_cctally_dashboard_perf")
+cmd_dashboard_perf = _cctally_dashboard_perf.cmd_dashboard_perf
 SSEHub = _cctally_dashboard.SSEHub
+# #583 S3 §5 — the per-tick projection cache the hub now fans out, plus the two
+# helpers its consumer needs. Re-exported so the tests can drive them directly
+# rather than only through a booted HTTP server.
+_SSEDelivery = _cctally_dashboard._SSEDelivery
+_drain_to_newest = _cctally_dashboard._drain_to_newest
+_accepts_gzip = _cctally_dashboard._accepts_gzip
+_canonical_oauth_key = _cctally_dashboard._canonical_oauth_key
 STATIC_DIR = _cctally_dashboard.STATIC_DIR
 _format_url = _cctally_dashboard._format_url
 _dashboard_auth_url = _cctally_dashboard._dashboard_auth_url
@@ -1410,7 +1423,6 @@ _select_current_block_for_envelope = _cctally_dashboard._select_current_block_fo
 _build_alerts_envelope_array = _cctally_dashboard._build_alerts_envelope_array
 snapshot_to_envelope = _cctally_dashboard.snapshot_to_envelope
 _session_detail_to_envelope = _cctally_dashboard._session_detail_to_envelope
-_DASHBOARD_SYNC_LOCK_TIMEOUT_SECONDS = _cctally_dashboard._DASHBOARD_SYNC_LOCK_TIMEOUT_SECONDS
 DashboardHTTPHandler = _cctally_dashboard.DashboardHTTPHandler
 _dashboard_self_heal_orphans = _cctally_dashboard._dashboard_self_heal_orphans
 _register_faulthandler_sigusr1 = _cctally_dashboard._register_faulthandler_sigusr1

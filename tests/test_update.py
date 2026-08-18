@@ -3111,8 +3111,11 @@ class TestDashboardUpdateCheckThread:
         reflects the freshly-written version, not the frozen held ``None``.
         """
         import dataclasses
+        import importlib
 
         ns = load_script()
+        tui = importlib.import_module("_cctally_tui")
+        snapshot_cache = importlib.import_module("_lib_snapshot_cache")
         monkeypatch.setitem(ns, "UPDATE_DASHBOARD_CHECK_POLL_S", 0.05)
         monkeypatch.setattr(
             _cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log"
@@ -3129,8 +3132,38 @@ class TestDashboardUpdateCheckThread:
         seed = dataclasses.replace(
             ns["_empty_dashboard_snapshot"](),
             envelope_precompute=stale_precompute,
+            doctor_payload={
+                "severity": "warn",
+                "counts": {"ok": 56, "warn": 4, "fail": 1},
+                "fingerprint": "sha1:stale",
+            },
         )
         ref = ns["_SnapshotRef"](seed)
+
+        fresh_doctor = {
+            "severity": "fail",
+            "counts": {"ok": 57, "warn": 3, "fail": 1},
+            "fingerprint": "sha1:fresh",
+        }
+        doctor_memo_reset = {"done": False}
+        monkeypatch.setattr(
+            snapshot_cache,
+            "reset_doctor_memo",
+            lambda: doctor_memo_reset.__setitem__("done", True),
+        )
+
+        def _fresh_doctor(now_utc, runtime_bind):
+            assert doctor_memo_reset["done"], (
+                "the update-state write must invalidate the doctor memo "
+                "before recomputing the summary"
+            )
+            return fresh_doctor
+
+        monkeypatch.setattr(
+            tui,
+            "_tui_precompute_doctor_payload",
+            _fresh_doctor,
+        )
 
         # Self-heal is a no-op so ONLY the update-due site republishes.
         monkeypatch.setitem(ns, "_self_heal_current_version", lambda: None)
@@ -3181,6 +3214,11 @@ class TestDashboardUpdateCheckThread:
         # The held snapshot is advanced too, so the next client reads fresh.
         held = ref.get().envelope_precompute
         assert held["update_state"]["latest_version"] == "9.9.9"
+        assert published[0].doctor_payload == fresh_doctor, (
+            "republished snapshot kept the doctor summary from before the "
+            "update-state write"
+        )
+        assert ref.get().doctor_payload == fresh_doctor
 
     def test_no_sync_republish_refreshes_envelope_precompute_on_self_heal(
         self, tmp_path, monkeypatch

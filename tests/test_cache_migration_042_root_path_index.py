@@ -76,6 +76,20 @@ def _store_at_old_head(db, path) -> sqlite3.Connection:
     return conn
 
 
+def _scratch_copy(golden: Path, tmp_path) -> Path:
+    """Copy a committed golden into the scratch dir before opening it.
+
+    `sqlite3.connect` opens read-write. On a WAL fixture that lets SQLite
+    checkpoint the committed bytes and leave `-wal`/`-shm` sidecars beside the
+    tracked file, so a read-only assertion could dirty the working tree.
+    `mode=ro` is NOT the fix: a read-only open of a WAL database still needs the
+    `-shm` file and fails outright when it is absent.
+    """
+    target = tmp_path / golden.name
+    shutil.copyfile(golden, target)
+    return target
+
+
 def test_migration_creates_the_index_on_a_store_stamped_at_the_old_head(db, tmp_path):
     conn = _store_at_old_head(db, tmp_path / "cache.db")
     try:
@@ -105,21 +119,6 @@ def test_schema_apply_and_migration_share_one_helper(db, tmp_path):
         assert _index_present(conn)
     finally:
         conn.close()
-
-
-
-def _scratch_copy(golden: Path, tmp_path) -> Path:
-    """Copy a committed golden into the scratch dir before opening it.
-
-    `sqlite3.connect` opens read-write. On a WAL fixture that lets SQLite
-    checkpoint the committed bytes and leave `-wal`/`-shm` sidecars beside the
-    tracked file, so a read-only assertion could dirty the working tree.
-    `mode=ro` is NOT the fix: a read-only open of a WAL database still needs the
-    `-shm` file and fails outright when it is absent.
-    """
-    target = tmp_path / golden.name
-    shutil.copyfile(golden, target)
-    return target
 
 
 def test_the_schema_apply_delegates_to_the_helper(db):

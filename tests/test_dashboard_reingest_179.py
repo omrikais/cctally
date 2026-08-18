@@ -269,6 +269,10 @@ def test_real_server_binds_and_serves_before_sync_completes(tmp_path, monkeypatc
 
     HandlerCls.snapshot_ref = SnapshotRef(_make_snapshot(ns))
     HandlerCls.hub = SSEHub()
+    # #583 S3 §7: `/api/data` serves the most recently PUBLISHED state,
+    # so a bare reference is not enough — seed the hub exactly as
+    # `cmd_dashboard` does before the HTTP server binds.
+    HandlerCls.hub.publish(HandlerCls.snapshot_ref.get())
     HandlerCls.sync_lock = threading.Lock()
     HandlerCls.no_sync = False
     HandlerCls.cctally_host = "127.0.0.1"

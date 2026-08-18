@@ -334,6 +334,11 @@ describe('combinedPresentation', () => {
   // §4.3 — the two inverse backlog cases. The Codex ingest backlog reaches the
   // figure through `combined.qualifications`, which composition LIFTS from the
   // provider; the provider field stays published for the Codex tab's own use.
+  // #583 S3 §4 — `sources.all.data.providers` publishes null on the wire, so
+  // the populated blocks below are a deliberate NEGATIVE CONTROL rather than a
+  // description of a real payload: they prove `combinedPresentation` reads
+  // `combined.qualifications` and nothing else even when handed provider data
+  // there, which is what would break if someone reintroduced a read of it.
   it('follows combined.qualifications even when the provider field disagrees', () => {
     const codex = makeCodexSourceEntry();
     const entry = allEntryWith({

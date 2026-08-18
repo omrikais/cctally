@@ -31,7 +31,7 @@
     {
       "name": "bench",
       "visibility": "public",
-      "minCases": 7,
+      "minCases": 8,
       "countPolicy": "fixed"
     },
     {

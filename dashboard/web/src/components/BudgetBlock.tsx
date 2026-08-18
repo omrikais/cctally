@@ -39,6 +39,7 @@ const SET_COMMAND: Record<SourceName, string> = {
 // block already names the period beside it.
 const UNSET_COPY = 'No budget set.';
 const ACCOUNT_ONLY_COPY = 'No provider-wide budget set.';
+const ACCOUNT_UNSET_COPY = 'No budget set for this account.';
 
 const VERDICT_CLASS: Record<string, string> = {
   ok: 'good',
@@ -49,9 +50,13 @@ const VERDICT_CLASS: Record<string, string> = {
 function BudgetUnconfigured({
   source,
   disposition,
+  accountKey,
+  configuredAccounts,
 }: {
   source: SourceName;
   disposition: string;
+  accountKey?: string;
+  configuredAccounts?: Record<string, number>;
 }) {
   // Rendering "No budget set." to a user who HAS one set is a lie, which is why
   // the server distinguishes these at all. An unrecognised disposition from a
@@ -64,6 +69,21 @@ function BudgetUnconfigured({
         <p className="budget-empty-copy">{ACCOUNT_ONLY_COPY}</p>
         <p className="budget-empty-hint">
           Per-account budgets are configured — see the account cards.
+        </p>
+      </div>
+    );
+  }
+  if (disposition === 'account_budget_unset' && accountKey != null) {
+    // `config set` replaces the JSON map; carry every sibling forward so the
+    // example fixes this card without silently unsetting another one (#586).
+    const updatedAccounts = { ...(configuredAccounts ?? {}), [accountKey]: 30 };
+    const command = `cctally config set budget.codex.accounts '${JSON.stringify(updatedAccounts)}'`;
+    return (
+      <div className="budget-empty" data-testid={`budget-empty-${source}`}>
+        <p className="budget-empty-copy">{ACCOUNT_UNSET_COPY}</p>
+        <p className="budget-empty-hint">Edit the per-account budget map for this key:</p>
+        <p className="budget-empty-hint">
+          <code className="budget-empty-cmd">{command}</code>
         </p>
       </div>
     );
@@ -298,7 +318,12 @@ export function BudgetProviderSection({
           ctx={ctx}
         />
       ) : presentation.state === 'not_configured' ? (
-        <BudgetUnconfigured source={section.source} disposition={presentation.disposition} />
+        <BudgetUnconfigured
+          source={section.source}
+          disposition={presentation.disposition}
+          accountKey={presentation.accountKey}
+          configuredAccounts={presentation.configuredAccounts}
+        />
       ) : (
         <BudgetUnavailable
           source={section.source}

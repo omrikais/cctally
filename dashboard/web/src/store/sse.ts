@@ -5,12 +5,30 @@ import { collectToastAlertRows } from '../lib/alertIdentity';
 
 let es: EventSource | null = null;
 let disconnected = false;
-// B2/B3 (#207): the bootstrap fetch failed AND no snapshot has landed from
-// any source yet — i.e. cold-start with no data. Distinct from `disconnected`
-// (which is a drop AFTER first data). `startGeneration` guards against a late
-// reject from a superseded startSSE() raising the error view after recovery.
+// B2/B3 (#207): no snapshot has landed from any source yet — i.e. cold-start
+// with no data. Distinct from `disconnected` (which is a drop AFTER first
+// data).
+//
+// #583 S3 §7: the condition used to be "the bootstrap fetch rejected"; that
+// fetch is gone, so the stream itself raises this when it errors before any
+// snapshot has landed.
 let bootstrapError = false;
+// What raised it, when the raiser knows something the shared banner text does
+// not. `null` means the ordinary case — a stream error — for which the banner's
+// own wording is right. The watchdog below fills it in, because "couldn't load
+// dashboard data" sends the reader to a server that is answering perfectly well.
+let bootstrapErrorMsg: string | null = null;
+// #583 S3 §7/§8: this no longer guards a late bootstrap rejection. It
+// invalidates every callback of a superseded or SUSPENDED EventSource — both
+// the update listener and the error handler capture it — so a callback already
+// queued when a stream was closed cannot write into the store afterwards.
 let startGeneration = 0;
+// #583 S3 §7: whether the first snapshot of this start has been accepted. The
+// first accepted update IS the bootstrap, so it is what fires `onConnect`;
+// afterwards only a reconnect transition does. A resume from a hidden tab does
+// NOT re-arm this, because the retained snapshot means the client was never
+// without data.
+let bootstrapped = false;
 const statusSubs = new Set<() => void>();
 
 // Threshold-actions T15: cold-start re-arm flag (spec §4.3, §8.7).
@@ -23,6 +41,39 @@ const statusSubs = new Set<() => void>();
 // React StrictMode double-mounts (matches the SSE singleton lifecycle).
 let isFirstTick = true;
 
+// #583 S3 §8. A connected client costs the server one projection and the
+// browser one full parse on every tick, for as long as the tab is open, whether
+// or not anyone is looking at it. A tab hidden beyond this grace disconnects the
+// main dashboard stream; returning reopens it.
+//
+// Thirty seconds spans two of the server's fifteen-second keep-alive intervals
+// and several publish periods, while absorbing an ordinary task switch: hiding
+// and returning inside it produces no reconnect at all, and a longer cycle
+// produces at most one reconnect per hidden interval.
+const HIDDEN_GRACE_MS = 30_000;
+let hiddenTimer: ReturnType<typeof setTimeout> | null = null;
+let visibilityHandler: (() => void) | null = null;
+
+// #583 S3 §7. The bootstrap `fetch('/api/data')` is gone, so the EventSource is
+// the only path to a first paint and `es.onerror` is the only thing that raises
+// the cold-start error view. A connection that is QUEUED rather than failed
+// never fires `onerror`: the browser's six-connections-per-origin HTTP/1.1
+// limit with several tabs open, an intermediary that buffers
+// `text/event-stream`, and a server that accepts the socket and then stalls all
+// leave a stream that is open and silent. `deriveAppState` renders `loading`
+// for as long as that lasts, so the user meets a skeleton grid with no
+// diagnostic; before this session the same situations still painted from
+// `/api/data` and merely stopped updating.
+//
+// Ten seconds bounds the wait. `SSEHub.subscribe` seeds a new connection
+// immediately from the last publication, so a healthy stream delivers its first
+// frame in milliseconds and ten seconds is far outside anything normal.
+export const FIRST_FRAME_TIMEOUT_MS = 10_000;
+const FIRST_FRAME_TIMEOUT_MESSAGE =
+  'The dashboard’s update stream is open but has sent no data. '
+  + 'Reload the page, and close other dashboard tabs if you have several open.';
+let firstFrameTimer: ReturnType<typeof setTimeout> | null = null;
+
 export interface SSECallbacks {
   onConnect?: () => void;
   onDisconnect?: () => void;
@@ -31,6 +82,28 @@ export interface SSECallbacks {
 export function isDisconnected(): boolean { return disconnected; }
 
 export function isBootstrapError(): boolean { return bootstrapError; }
+
+export function bootstrapErrorMessage(): string | null { return bootstrapErrorMsg; }
+
+// Armed when a stream is opened, disarmed by the first accepted snapshot, by
+// `closeSSE()` and by the hidden-tab suspend. The fire path re-checks that no
+// snapshot has landed, so it matches `es.onerror`'s condition exactly: the
+// error view claims there is nothing to show, and a client holding a retained
+// snapshot has something to show.
+function armFirstFrameWatchdog(): void {
+  disarmFirstFrameWatchdog();
+  firstFrameTimer = setTimeout(() => {
+    firstFrameTimer = null;
+    if (getState().snapshot != null || bootstrapError) return;
+    bootstrapError = true;
+    bootstrapErrorMsg = FIRST_FRAME_TIMEOUT_MESSAGE;
+    emitStatus();
+  }, FIRST_FRAME_TIMEOUT_MS);
+}
+
+function disarmFirstFrameWatchdog(): void {
+  if (firstFrameTimer != null) { clearTimeout(firstFrameTimer); firstFrameTimer = null; }
+}
 
 export function subscribeConnectionStatus(fn: () => void): () => void {
   statusSubs.add(fn);
@@ -47,77 +120,163 @@ function emitStatus(): void {
 export function startSSE(cb: SSECallbacks = {}): void {
   if (es) { es.close(); es = null; }
   disconnected = false;
-  // B2/B3: re-arm the bootstrap-error flag on every fresh start, and bump
-  // the start-generation token. The bootstrap closure captures `myGen` so a
-  // late reject from a SUPERSEDED start (a second startSSE only closes the
-  // old EventSource, not the in-flight old fetch) can't raise the error.
+  // B2/B3: re-arm the bootstrap-error flag on every fresh start, and bump the
+  // start-generation token so a callback queued by a superseded EventSource
+  // cannot raise the error view after recovery.
   bootstrapError = false;
-  const myGen = ++startGeneration;
+  bootstrapErrorMsg = null;
+  bootstrapped = false;
+  startGeneration += 1;
   // Re-arm the cold-start rule on every fresh startSSE — the next
-  // INGEST_SNAPSHOT_ALERTS dispatch (from bootstrap or first update)
-  // will populate seenAlertIds without surfacing toasts.
+  // INGEST_SNAPSHOT_ALERTS dispatch (from the first update) will populate
+  // seenAlertIds without surfacing toasts.
   isFirstTick = true;
   emitStatus();
   resetSnapshotOrdering();
 
-  // Initial one-shot snapshot.
-  // async/await (vs .then chain) keeps the microtask depth shallow enough
-  // that tests awaiting two microticks observe the bootstrap applied.
-  // ingestAlerts / ingestUpdate are gated on updateSnapshot's accept/reject
-  // return so a late-arriving bootstrap (older generated_at than an SSE
-  // update that already landed) can't replace fresh state.alerts /
-  // state.alertsConfig / state.update or pollute state.seenAlertIds with
-  // stale ids.
-  (async () => {
-    try {
-      const r = await fetch('/api/data');
-      const snap = (await r.json()) as Envelope;
-      if (updateSnapshot(snap)) {
-        // A snapshot landed — clear any bootstrap-error view (defensive;
-        // normally false on the success path).
-        if (bootstrapError) { bootstrapError = false; emitStatus(); }
-        ingestAlerts(snap);
-        ingestUpdate(snap);
-        ingestDoctor(snap);
-        ingestDashboardPrefs(snap);
-      }
-      cb.onConnect?.();
-    } catch (err) {
-      console.error('initial snapshot failed:', err);
-      // Only raise the error view if THIS start is still current AND no
-      // snapshot has landed from any source (an SSE update can beat the
-      // bootstrap fetch's reject). A late reject after recovery / after a
-      // newer startSSE is then a no-op (Codex P2 race guard).
-      if (myGen === startGeneration && getState().snapshot == null && !bootstrapError) {
-        bootstrapError = true;
-        emitStatus();
-      }
-    }
-  })();
+  // #583 S3 §7. There is no bootstrap `fetch('/api/data')` any more. A cold
+  // load used to transfer and parse the whole envelope TWICE — once as the
+  // fetch response and again as the hub's subscribe seed. `cmd_dashboard`
+  // publishes `ref.get()` BEFORE the HTTP server binds, so the hub's `_last`
+  // is never empty when a client connects and the seed alone is a sufficient
+  // bootstrap. Progressive hydration is unaffected, because the A2 partials
+  // travel through the same hub.
+  armVisibility(cb);
+  // Evaluate the CURRENT visibility, not only future changes. A page restored
+  // into a background tab never fires `visibilitychange`, because its
+  // visibility never changes.
+  //
+  // #583 S3 §8 / P3-9: such a tab opens NO stream at all. Opening one and
+  // suspending it after the grace downloaded and parsed roughly five full
+  // envelopes — thirty seconds against a measured 6.5-second publish period —
+  // multiplied by however many tabs the browser restored at once, to display
+  // nothing. A hidden tab has nothing to display, so the first transition to
+  // visible is what opens the stream. No stream also means no first-frame
+  // watchdog: there is no frame to wait for, and arming here would raise the
+  // error view against a tab that is deliberately not streaming.
+  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+  openStream(cb);
+}
 
+// #583 S3 §8. Suspension is NOT `closeSSE()`. `closeSSE()` calls
+// `resetSnapshotOrdering()`, which would discard the ordering state a returning
+// tab is required to retain, and it would clear the retained snapshot's claim on
+// the board. Suspension closes the stream and keeps everything else.
+function suspendForHidden(): void {
+  if (!es) return;
+  // Invalidate every callback of the stream being closed, for the WHOLE hidden
+  // interval rather than only until a new stream opens. A callback already
+  // queued at close time would otherwise write into the store minutes later.
+  startGeneration += 1;
+  es.close();
+  es = null;
+  // No stream, no first frame to wait for.
+  disarmFirstFrameWatchdog();
+  // Re-arm the cold-start rule. The accepted consequence, recorded in §8: an
+  // alert that fired while the tab was hidden repaints in its panel but raises
+  // no toast, because the client cannot distinguish a genuinely new crossing
+  // from one it simply did not receive.
+  isFirstTick = true;
+}
+
+// The visibility state machine. It governs ONLY the main dashboard stream. The
+// conversation live-tail (`hooks/useConversationLiveTail.ts`) and update
+// progress (`components/UpdateRunningModal.tsx`) own their own EventSources and
+// are deliberately untouched — an update running while the tab is hidden keeps
+// streaming to completion.
+function onVisibilityChange(cb: SSECallbacks): void {
+  if (typeof document === 'undefined') return;
+  if (document.visibilityState === 'hidden') {
+    if (hiddenTimer != null) return;       // already armed; do not restart it
+    hiddenTimer = setTimeout(() => {
+      hiddenTimer = null;
+      suspendForHidden();
+    }, HIDDEN_GRACE_MS);
+    return;
+  }
+  if (hiddenTimer != null) { clearTimeout(hiddenTimer); hiddenTimer = null; }
+  // Stream only. There is no bootstrap fetch to repeat: the returning tab
+  // renders from the hub's subscribe seed exactly as a cold load does.
+  if (es == null) openStream(cb);
+}
+
+function armVisibility(cb: SSECallbacks): void {
+  if (typeof document === 'undefined') return;
+  disarmVisibility();
+  visibilityHandler = () => onVisibilityChange(cb);
+  document.addEventListener('visibilitychange', visibilityHandler);
+}
+
+// Removing the listener is what makes `closeSSE()` a real teardown: left armed,
+// a later return to visible would reopen a stream the caller deliberately shut.
+function disarmVisibility(): void {
+  if (hiddenTimer != null) { clearTimeout(hiddenTimer); hiddenTimer = null; }
+  if (visibilityHandler != null && typeof document !== 'undefined') {
+    document.removeEventListener('visibilitychange', visibilityHandler);
+  }
+  visibilityHandler = null;
+}
+
+// The EventSource and its two callbacks, factored out so a resume from a hidden
+// tab (§8) reopens the stream WITHOUT re-running the cold-start reset above:
+// the retained snapshot and the ordering state are exactly what a returning tab
+// must keep.
+function openStream(cb: SSECallbacks): void {
+  // Captured, not read live: this stream's callbacks are valid only while this
+  // generation is current. `suspendForHidden` bumps the counter when it closes
+  // the stream, so a callback queued before the close is a no-op for the whole
+  // hidden interval rather than only until a new stream opens.
+  const myGen = startGeneration;
   es = new EventSource('/api/events');
+  armFirstFrameWatchdog();
   es.addEventListener('update', (ev: MessageEvent) => {
+    if (myGen !== startGeneration) return;
     try {
       const snap = JSON.parse(ev.data) as Envelope;
+      let connectFired = false;
       if (updateSnapshot(snap)) {
-        // A snapshot landed via SSE — clear any bootstrap-error view so a
-        // cold start that recovers through the stream self-heals (B2/B3).
-        if (bootstrapError) { bootstrapError = false; emitStatus(); }
+        // The stream delivered. Whatever this stream was going to be accused
+        // of, it is not silence.
+        disarmFirstFrameWatchdog();
+        // A snapshot landed — clear any cold-start error view so a start that
+        // recovers through the stream self-heals (B2/B3).
+        if (bootstrapError) {
+          bootstrapError = false;
+          bootstrapErrorMsg = null;
+          emitStatus();
+        }
         ingestAlerts(snap);
         ingestUpdate(snap);
         ingestDoctor(snap);
         ingestDashboardPrefs(snap);
+        if (!bootstrapped) {
+          // #583 S3 §7: the first ACCEPTED snapshot of this start is the
+          // bootstrap, so it fires `onConnect`. Gating on acceptance matters:
+          // an out-of-order frame is not a bootstrap.
+          bootstrapped = true;
+          cb.onConnect?.();
+          connectFired = true;
+        }
       }
       if (disconnected) {
         disconnected = false;
         emitStatus();
-        cb.onConnect?.();  // only on reconnect transition
+        // Only on the reconnect transition, and never twice for one event.
+        if (!connectFired) cb.onConnect?.();
       }
     } catch (err) {
       console.error('SSE parse failed:', err);
     }
   });
   es.onerror = () => {
+    if (myGen !== startGeneration) return;
+    // #583 S3 §7: with the bootstrap fetch gone, a stream error before any
+    // snapshot has landed IS the cold-start failure the error view exists for.
+    // Distinct from `disconnected`, which is a drop after first data.
+    if (getState().snapshot == null && !bootstrapError) {
+      bootstrapError = true;
+      emitStatus();
+    }
     if (!disconnected) {
       disconnected = true;
       // Re-arm cold-start: the next successful update (post-reconnect)
@@ -232,12 +391,24 @@ function ingestDashboardPrefs(snap: Envelope): void {
 }
 
 export function closeSSE(): void {
+  disarmVisibility();
+  disarmFirstFrameWatchdog();
+  // #583 S3 §7/§8: invalidate every callback of the stream being torn down,
+  // exactly as `suspendForHidden` does. `closeSSE()` is a DELIBERATE teardown —
+  // the caller has decided this client is finished — and without the bump a
+  // callback already queued when it ran still matches the current generation
+  // and writes into the store afterwards. The ordering guard does not cover
+  // this: `resetSnapshotOrdering()` below clears `lastGeneratedAt`, so any
+  // frame would be accepted.
+  startGeneration += 1;
   if (es) { es.close(); es = null; }
   // disconnected=false here models a clean teardown, not a retry-in-progress.
   disconnected = false;
   // Re-arm the bootstrap-error flag too (B2/B3) — a clean teardown clears
   // any cold-start error so the next startSSE begins fresh.
   bootstrapError = false;
+  bootstrapErrorMsg = null;
+  bootstrapped = false;
   // Re-arm cold-start so the next startSSE begins in cold-start mode
   // (matches startSSE's own re-arm on entry; defensive).
   isFirstTick = true;
@@ -246,9 +417,13 @@ export function closeSSE(): void {
 }
 
 export function _resetForTests(): void {
+  disarmVisibility();
+  disarmFirstFrameWatchdog();
   if (es) { es.close(); es = null; }
   disconnected = false;
   bootstrapError = false;
+  bootstrapErrorMsg = null;
+  bootstrapped = false;
   startGeneration = 0;
   isFirstTick = true;
   statusSubs.clear();

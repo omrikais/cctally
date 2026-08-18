@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
+import { fulfilJson } from './utils';
 
 const MATRIX = [
   { width: 1440, height: 900 },
@@ -30,13 +31,43 @@ async function installIdleTodayReport(page: Page) {
       onopen: ((this: EventSource, ev: Event) => any) | null = null;
       onmessage: ((this: EventSource, ev: MessageEvent) => any) | null = null;
       onerror: ((this: EventSource, ev: Event) => any) | null = null;
+      listeners = new Map<string, Array<(ev: MessageEvent) => any>>();
 
       constructor(url: string | URL) {
         this.url = String(url);
+        // #583 S3 §7 — the client's bootstrap `fetch('/api/data')` is gone, so
+        // this page receives its envelope ONLY as an `update` event. A stub
+        // whose `addEventListener` was a no-op therefore never renders
+        // anything at all. It still suppresses live ticks, which is what makes
+        // the fixture stable; it just delivers exactly ONE frame first, read
+        // through `/api/data` so this spec's own route handler keeps shaping
+        // it exactly as before.
+        if (!this.url.includes('/api/events')) return;
+        void fetch('/api/data')
+          .then((r) => r.json())
+          .then((payload) => {
+            const ev = new MessageEvent('update', { data: JSON.stringify(payload) });
+            for (const fn of this.listeners.get('update') ?? []) fn(ev);
+          })
+          // Never swallow this. The stub IS the page's only source of
+          // data, so a failed fixture delivery renders a blank dashboard
+          // and every later assertion fails on a missing element instead
+          // of on the real cause.
+          .catch((err) => { console.error(`fixture delivery failed: ${err}`); });
       }
 
-      addEventListener() {}
-      removeEventListener() {}
+      addEventListener(type: string, fn: (ev: MessageEvent) => any) {
+        const list = this.listeners.get(type) ?? [];
+        list.push(fn);
+        this.listeners.set(type, list);
+      }
+
+      removeEventListener(type: string, fn: (ev: MessageEvent) => any) {
+        this.listeners.set(
+          type, (this.listeners.get(type) ?? []).filter((f) => f !== fn),
+        );
+      }
+
       dispatchEvent() { return true; }
       close() { this.readyState = StableEventSource.CLOSED; }
     }
@@ -72,7 +103,7 @@ async function installIdleTodayReport(page: Page) {
     };
     report.today = { ...report.today, ...report.days[0] };
     envelope.cache_report = report;
-    await route.fulfill({ response, json: envelope });
+    await fulfilJson(route, response, envelope);
   });
 }
 

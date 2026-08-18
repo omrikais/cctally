@@ -31,6 +31,10 @@ def _wire(ns):
     H = ns["DashboardHTTPHandler"]
     H.hub = ns["SSEHub"]()
     H.snapshot_ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+    # #583 S3 §7: `/api/data` serves the most recently PUBLISHED state,
+    # so a bare reference is not enough — seed the hub exactly as
+    # `cmd_dashboard` does before the HTTP server binds.
+    H.hub.publish(H.snapshot_ref.get())
     H.static_dir = ns["STATIC_DIR"]
     H.sync_lock = threading.Lock()
     H.run_sync_now = staticmethod(lambda: None)

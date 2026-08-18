@@ -125,6 +125,20 @@ def test_plan_explicitly_includes_test_remote_harness():
     assert "test-remote" in _kv(p.stdout)["harnesses"].split()
 
 
+@pytest.mark.skipif(
+    not PRIVATE_TREE,
+    reason="the Linux profile's one omitted harness is private-only",
+)
+def test_linux_matrix_plan_excludes_only_the_mac_remote_harness():
+    full = _kv(_plan({}).stdout)
+    linux = _kv(_plan({"CCTALLY_LINUX_MATRIX_RUN": "1"}).stdout)
+    assert linux["mode"] == "linux-matrix"
+    assert set(full["harnesses"].split()) - set(linux["harnesses"].split()) == {
+        "test-remote"
+    }
+    assert linux["pytest_disposition"] == "full"
+
+
 def _expected_names(private):
     """Manifest rows for the synthetic checkout. test-remote is declared in the
     private profile whether or not the file is present, because its absence is

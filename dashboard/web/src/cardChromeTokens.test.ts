@@ -137,6 +137,13 @@ describe('#312 mobile source-layout containment', () => {
   });
 
   it('keeps both quota values separated and the support slots in one shared hero grid', () => {
+    // #590 — plain `1fr` tracks keep their automatic min-content floor. On a
+    // decorated Codex hero that let the usage zone force a 200px/102px split
+    // at 320px, leaving only 78px of content width for a 102px spend figure.
+    // Explicit zero minima let the two authored equal tracks stay equal.
+    expect(mobile).toMatch(
+      /\.hero-strip\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+minmax\(0,\s*1fr\)/,
+    );
     expect(mobile).toMatch(
       /\.hero-usage\s*\{(?=[^}]*grid-template-columns:\s*fit-content\(110px\)\s+minmax\(0,\s*1fr\))(?=[^}]*column-gap:\s*var\(--space-3\))/,
     );

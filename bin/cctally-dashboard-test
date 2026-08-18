@@ -24,10 +24,11 @@
 # Exits non-zero if any scenario fails. A trap ensures stray server PIDs die
 # on harness exit / Ctrl-C.
 #
-# The fourteen fixture scenarios (ok, warn, over, reset-week, no-data,
+# The fifteen fixture scenarios (ok, warn, over, reset-week, no-data,
 # utc-tz, tz-override, projected-alerts, command-secret,
 # codex-cache-active, codex-cache-idle, all-combined,
-# all-combined-decorated, all-budget-account-focus) run in parallel
+# all-combined-decorated, all-budget-account-focus,
+# codex-account-fallback) run in parallel
 # via `xargs -P`
 # — each scenario
 # already has its own scratch HOME under $SCRATCH_ROOT/<name> and
@@ -142,6 +143,13 @@ for source_state in (env.get("sources") or {}).values():
 # under pytest. Same compromise the `update` block already makes.
 if "doctor" in env:
     env["doctor"] = "__DOCTOR_BLOCK__"
+# #583 S2: sync_activity.server_epoch is a per-process token with no data
+# content — same treatment as data_version. Fixed length, so byte counts
+# elsewhere stay comparable. Only the epoch is sentinelized; the counters are
+# real published content and the golden pins them at their idle values.
+_act = env.get("sync_activity")
+if isinstance(_act, dict) and "server_epoch" in _act:
+    _act["server_epoch"] = "__EPOCH__"
 # last_sync_at is always None in the envelope today, but normalize
 # defensively so future changes do not leak wall clock into goldens.
 env["last_sync_at"] = "__SYNC_AT__" if env.get("last_sync_at") else None
@@ -426,8 +434,8 @@ def need(cond, msg):
     if not cond:
         errs.append(msg)
 
-need(d.get("source_schema_version") == 9,
-     "source_schema_version != 9: %r" % (d.get("source_schema_version"),))
+need(d.get("source_schema_version") == 10,
+     "source_schema_version != 10: %r" % (d.get("source_schema_version"),))
 
 sources = d.get("sources") or {}
 claude = sources.get("claude") or {}
@@ -482,10 +490,13 @@ if isinstance(cl_status, dict) and isinstance(cx_status, dict):
 need("account_scopes" not in (claude.get("data") or {}),
      "the Claude source published account_scopes")
 
-# Composition mirrors the SAME object under All.
-mirrored = ((((allsrc.get("data") or {}).get("providers") or {})
-             .get("claude") or {}).get("budget") or {}).get("status")
-need(mirrored == cl_status, "the All Claude mirror disagrees with the provider")
+# #583 S3 §4: composition no longer mirrors the provider data under All. The
+# mirror publishes null for both members, so the All view necessarily reads the
+# ONE copy on the physical `sources.claude` entry asserted above — the mirror
+# cannot disagree with the provider because it no longer carries a value.
+mirror = ((allsrc.get("data") or {}).get("providers"))
+need(mirror == {"claude": None, "codex": None},
+     "the All provider mirror is not the null stub: %r" % (mirror,))
 
 # Two Codex accounts, each with its OWN scoped budget and quota.
 scopes = (codex.get("data") or {}).get("account_scopes") or {}
@@ -514,6 +525,77 @@ print("ok")
 ' 2>&1)
         if [ "$s5_check" != "ok" ]; then
             echo "FAIL $name: budget/account-focus assertion: $s5_check"
+            ok=0
+        fi
+    fi
+
+    # #591: the decorated Codex fallback oracle is pinned BY VALUE as well as
+    # by its full golden. This prevents an accidental golden rebaseline from
+    # erasing the boundary discriminators that make the scenario useful.
+    if [ "$name" = "codex-account-fallback" ] && [ -n "${raw:-}" ]; then
+        local fallback_check
+        fallback_check=$(printf '%s' "$raw" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+errs = []
+
+def need(cond, msg):
+    if not cond:
+        errs.append(msg)
+
+codex = (((d.get("sources") or {}).get("codex") or {}).get("data") or {})
+cards = codex.get("accounts") or []
+by_key = {card.get("accountKey"): card for card in cards}
+live_key = "f" * 32
+fallback_key = "9" * 32
+need(set(by_key) == {live_key, fallback_key, "unattributed"},
+     "account keys: %r" % (sorted(by_key, key=repr),))
+
+live = by_key.get(live_key) or {}
+fallback = by_key.get(fallback_key) or {}
+sentinel = by_key.get("unattributed") or {}
+window = {
+    "kind": "trailing-cycle",
+    "startAt": "2026-04-09T14:00:00+00:00",
+    "endAt": "2026-04-16T14:00:00+00:00",
+}
+need(live.get("totalTokens") == 110000,
+     "live totalTokens: %r" % (live.get("totalTokens"),))
+need(live.get("weeklyPercent") == 61.0,
+     "live weeklyPercent: %r" % (live.get("weeklyPercent"),))
+need("spendWindow" not in live, "live account unexpectedly uses fallback window")
+need(fallback.get("totalTokens") == 220000,
+     "fallback totalTokens: %r" % (fallback.get("totalTokens"),))
+need(fallback.get("weeklyPercent") is None,
+     "fallback weeklyPercent: %r" % (fallback.get("weeklyPercent"),))
+need(fallback.get("resetsAt") is None,
+     "fallback resetsAt: %r" % (fallback.get("resetsAt"),))
+need(fallback.get("spendWindow") == window,
+     "fallback spendWindow: %r" % (fallback.get("spendWindow"),))
+need(sentinel.get("totalTokens") == 330000,
+     "sentinel totalTokens: %r" % (sentinel.get("totalTokens"),))
+need(sentinel.get("unattributed") is True,
+     "sentinel unattributed marker absent")
+need(sentinel.get("spendWindow") == window,
+     "sentinel spendWindow: %r" % (sentinel.get("spendWindow"),))
+
+cycles = ((codex.get("hero") or {}).get("cycles") or [])
+need(len(cycles) == 1, "expected one live cycle, got %d" % (len(cycles),))
+if cycles:
+    need(cycles[0].get("accountKey") == live_key,
+         "wrong live cycle owner: %r" % (cycles[0].get("accountKey"),))
+hero = codex.get("hero") or {}
+need(hero.get("total_tokens") == 660000,
+     "decorated headline total_tokens: %r" % (hero.get("total_tokens"),))
+need(hero.get("total_tokens") == sum(card.get("totalTokens", 0) for card in cards),
+     "decorated headline does not sum the three cards")
+
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+        if [ "$fallback_check" != "ok" ]; then
+            echo "FAIL $name: Codex fallback assertion: $fallback_check"
             ok=0
         fi
     fi
@@ -824,12 +906,32 @@ print("ok")
         ok=0
     fi
 
-    # POST /api/sync (v2): valid Origin → 204, bogus → 403, missing → 403.
-    local sync_code
-    sync_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+    # POST /api/sync (v2): valid Origin → 200, bogus → 403, missing → 403.
+    #
+    # #583 S2 §4: this server runs with --no-sync, and a manual refresh=1
+    # there now STATES the skip instead of performing no refresh silently, so
+    # the success answer is 200 with a `refresh_skipped_no_sync` warning
+    # rather than the pre-#583 bare 204. The body is checked too, because a
+    # 200 whose warnings array said something else would pass a status-only
+    # assertion while reporting the wrong thing to the user.
+    local sync_code sync_body
+    sync_body=$(curl -s -w '\n%{http_code}' --max-time 5 \
         -X POST -H "Origin: http://127.0.0.1:$port" "$base/api/sync")
+    sync_code=$(tail -n1 <<<"$sync_body")
+    if [ "$sync_code" != "200" ]; then
+        echo "FAIL $name: POST /api/sync (valid Origin) returned $sync_code (expected 200)"
+        ok=0
+    elif ! grep -q 'refresh_skipped_no_sync' <<<"$sync_body"; then
+        echo "FAIL $name: POST /api/sync under --no-sync did not warn refresh_skipped_no_sync: $sync_body"
+        ok=0
+    fi
+    # A MACHINE NUDGE under --no-sync is refused with 204 and enqueues
+    # nothing: the documented contract freezes data to the startup snapshot.
+    sync_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+        -X POST -H "Origin: http://127.0.0.1:$port" \
+        "$base/api/sync?refresh=0&queue=1")
     if [ "$sync_code" != "204" ]; then
-        echo "FAIL $name: POST /api/sync (valid Origin) returned $sync_code (expected 204)"
+        echo "FAIL $name: POST /api/sync?queue=1 under --no-sync returned $sync_code (expected 204)"
         ok=0
     fi
     sync_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
@@ -1171,7 +1273,7 @@ run_scenario () {
 # output goes to its own _output.log; the loop after `xargs` flushes
 # them in fixed scenario order so the harness output reads identically
 # to the old sequential version.
-fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts command-secret codex-cache-active codex-cache-idle all-combined all-combined-decorated all-budget-account-focus)
+fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts command-secret codex-cache-active codex-cache-idle all-combined all-combined-decorated all-budget-account-focus codex-account-fallback)
 export -f _run_scenario_inner run_scenario normalize_json normalize_session_json
 export -f kill_server_bounded
 # Golden-diff helpers must reach the xargs `bash -c` subshells too.

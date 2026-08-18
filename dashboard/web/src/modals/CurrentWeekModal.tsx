@@ -441,6 +441,14 @@ function CurrentBlockNavHeader({
   );
 }
 
+function BlockDetailLoading({ id }: { id?: string }) {
+  return (
+    <p className="empty-state" id={id} role="status">
+      Loading block detail…
+    </p>
+  );
+}
+
 function fiveHoursAfter(startAt: string | null | undefined): string | null {
   const startMs = Date.parse(startAt ?? '');
   return Number.isFinite(startMs)
@@ -987,7 +995,7 @@ function CodexCurrentCycleModal({
         </table>
         )}
 
-        {!loading && !error && (
+        {!error && (
           hasBlocks ? (
             <>
               <SecTag className="m-sec sec-ms sec-5h">
@@ -1002,6 +1010,7 @@ function CodexCurrentCycleModal({
                 singleId={singleId}
                 accentClass="accent-orange"
               />
+              {loading ? <BlockDetailLoading id={singleId('mcw-block-loading')} /> : null}
             </>
           ) : currentHasBlocks ? (
             // Current cycle with retained blocks but no fetched payload yet:
@@ -1021,6 +1030,7 @@ function CodexCurrentCycleModal({
                 singleId={singleId}
                 accentClass="accent-orange"
               />
+              {loading ? <BlockDetailLoading id={singleId('mcw-block-loading')} /> : null}
             </>
           ) : (
             <p className="mcw-ms-sub">No 5h data retained for this cycle.</p>
@@ -1358,7 +1368,7 @@ function ClaudeCurrentWeekModal({
             cross-reset straddler) never unmounts the navigator — and equally
             for the current-default navigator (`currentHasBlocks`) or a
             non-empty live stream; only the TABLE below varies (spec §4). */}
-        {!loading && !error && (showBlockNav || currentHasBlocks || selectedBlockStream.length > 0) && (
+        {!error && (showBlockNav || currentHasBlocks || selectedBlockStream.length > 0) && (
           <>
             <SecTag className="m-sec sec-ms sec-5h">
               <svg className="icon" aria-hidden="true">
@@ -1391,7 +1401,9 @@ function ClaudeCurrentWeekModal({
                 </span>
               </div>
             )}
-            {selectedBlockStream.length === 0 ? (
+            {loading ? (
+              <BlockDetailLoading id={singleId('mcw-5h-loading')} />
+            ) : selectedBlockStream.length === 0 ? (
               <p className="empty-state" id={singleId('mcw-5h-empty')}>
                 No integer-percent crossings in this block.
               </p>

@@ -68,6 +68,8 @@ def test_doctor_state_has_required_fields():
         "locks_held",
         # #297: read-only cache.db WAL-size backstop.
         "cache_db_wal_bytes",
+        # #583 S4 / F39: the same backstop for the transcript store.
+        "conversations_db_wal_bytes",
         # #315: read-only cache.db free-page evidence.
         "cache_db_page_count", "cache_db_freelist_count",
         "conversations_db_page_count", "conversations_db_freelist_count",

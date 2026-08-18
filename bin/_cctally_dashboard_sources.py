@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from _cctally_core import get_week_start_name
 from _cctally_quota import (
+    QuotaProjectionIncomplete,
     assert_projection_readable,
     codex_five_hour_percent_at_crossing,
     codex_quota_breakdown,
@@ -40,6 +41,8 @@ from _lib_dashboard_sources import (
     assess_codex_projection_coherence,
     canonical_alerted_at,
     canonical_alerted_at_sql,
+    claude_stats_digest,
+    codex_stats_digest,
     dashboard_resource_key,
 )
 from _lib_quota import (
@@ -85,44 +88,184 @@ _CODEX_QUOTA_OBSERVATION_CACHE: dict[object, tuple[object, ...]] = {}
 
 
 def reset_codex_quota_observation_cache() -> None:
-    """Clear #582's value-only quota-read memo."""
+    """Discard #582's value-only quota-read memo. TEST HOOK — no production caller.
+
+    Since #583 S5 removed the per-build clear, nothing in the shipped code path
+    calls this: the memo is invalidated by its key moving, never by a caller
+    emptying it. It survives as the isolation hook the pytest fixtures and the
+    cold-reference comparisons use, and `_codex_source_caches` is what the
+    build's own checkpoint/restore goes through.
+    """
     _CODEX_QUOTA_OBSERVATION_CACHE.clear()
 
 
-def _cached_codex_quota_observations(**kwargs) -> tuple[object, ...]:
-    """Reuse bounded quota reads while their dedicated mutation stream is idle."""
-    conn = kwargs.get("cache_conn")
-    if not isinstance(conn, sqlite3.Connection):
-        return load_codex_quota_observations(**kwargs)
+def _codex_quota_reuse_identity(
+    cache_conn, stats_conn, *, stats_identity: tuple | None = None,
+) -> tuple | None:
+    """The full invalidation basis for the cross-build quota memo (#583 S5).
+
+    The cache legs alone are not sufficient. ``_build_codex_source_state`` used
+    to discard this memo on every build precisely because a stats-side
+    decoration or account-registry change advances no cache.db leg, so a key
+    built only from cache.db would not move for a mutation that changes the
+    answer. Returning ``None`` means "cannot establish identity", and every
+    caller must treat that as a cold read rather than as a cache hit.
+
+    Six legs, in two halves. The cache.db half is the quota change ledger's
+    high-water sequence, the window-attribution revision and the ``main``
+    database path -- an unreadable ledger or an absent ledger table is not an
+    idle ledger, so both return ``None``. The stats.db half is the three
+    digests the build already computes for its own composite signature
+    (``bin/_cctally_tui.py``), reused rather than replaced by a fourth
+    identity.
+
+    ``stats_identity`` is that reuse, made literal: the caller passes
+    ``(codex_stats_digest, accounts_identity_digest, claude_stats_digest)``
+    already computed for its own signature and this function does not recompute
+    them. Deriving them here is not cheap -- the three helpers issue twelve
+    stats.db statements, several of them whole-relation scans with an ``ORDER
+    BY``, plus one uncached filesystem read per configured provider root once
+    the ``accounts`` registry is non-empty. Measured on a copy of the real store
+    (276,391 retained Codex quota rows), warm, five samples after one untimed
+    warm-up: 35.2 ms median, range 33.1-35.7 ms per derivation.
+
+    Without a supplied identity the digests are derived here, and then the
+    projection gate applies. ``codex_stats_digest``'s relations include
+    ``quota_projection_state`` and ``quota_window_blocks``, whose read site is
+    classified ``gate_at_caller`` in ``_cctally_quota.PROJECTION_READ_SITE_
+    ACTIONS`` precisely because that kernel may not import the gate; this
+    function is therefore named in ``PROJECTION_GATE_CALLERS`` and runs it. An
+    incomplete projection returns ``None`` rather than propagating, because the
+    honest answer for a REUSE IDENTITY is "cannot establish identity" and the
+    fail-safe for that is a cold read. Nothing is suppressed by swallowing it:
+    every caller of this memo runs a gated projection read of its own within a
+    few statements -- ``codex_projection_coherence`` on the build path -- so the
+    retry signal still reaches whoever owns the transaction.
+
+    A ``stats_identity`` of the wrong shape is the one input that RAISES instead
+    of returning ``None``, and the two cases are different in kind. Everything
+    above is an environmental inability to establish an identity -- an absent
+    ledger table, an unreadable database, an incomplete projection -- for which
+    a cold read is the correct degrade. A caller that hands this function a
+    two-element tuple has a defect in the caller, and taking the cold path for
+    it would leave the memo permanently and silently disabled. It is unreachable
+    from the production callers, all of which pass either ``None`` or
+    ``DashboardReadContext.stats_identity``.
+    """
+    if not isinstance(cache_conn, sqlite3.Connection):
+        return None
+    if stats_identity is not None:
+        if not isinstance(stats_identity, tuple) or len(stats_identity) != 3:
+            raise ValueError(
+                "stats_identity must be the three-digest tuple or None")
+    elif not isinstance(stats_conn, sqlite3.Connection):
+        return None
     try:
-        seq_row = conn.execute(
+        seq_row = cache_conn.execute(
             "SELECT seq FROM sqlite_sequence "
             "WHERE name='quota_window_change_log'"
         ).fetchone()
-        table = conn.execute(
+        table = cache_conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' "
             "AND name='quota_window_change_log'"
         ).fetchone()
-        revision_row = conn.execute(
+        revision_row = cache_conn.execute(
             "SELECT value FROM cache_meta "
             "WHERE key='codex_window_attribution_revision'"
         ).fetchone()
         db_path = next(
-            str(row[2]) for row in conn.execute("PRAGMA database_list")
+            str(row[2]) for row in cache_conn.execute("PRAGMA database_list")
             if str(row[1]) == "main"
         )
     except (sqlite3.Error, StopIteration):
-        return load_codex_quota_observations(**kwargs)
+        return None
     if table is None:
+        return None
+    if stats_identity is None:
+        try:
+            assert_projection_readable(stats_conn)
+            stats_identity = (
+                codex_stats_digest(stats_conn),
+                accounts_identity_digest(stats_conn),
+                claude_stats_digest(stats_conn),
+            )
+        except QuotaProjectionIncomplete:
+            return None
+        except sqlite3.Error:
+            return None
+    return (
+        db_path,
+        0 if seq_row is None else int(seq_row[0]),
+        "" if revision_row is None else str(revision_row[0]),
+        *stats_identity,
+    )
+
+
+def _cached_codex_quota_observations(**kwargs) -> tuple[object, ...]:
+    """Reuse bounded quota reads while their dedicated mutation stream is idle.
+
+    #583 S5: the memo now survives across source builds, so the key must carry
+    the stats-side identity as well as the cache.db legs. ``stats_conn``,
+    ``stats_identity`` and ``memoize`` are memo-only inputs; none is forwarded
+    to the loader. A caller that already holds the three digests passes
+    ``stats_identity`` so they are not recomputed once per memo call.
+
+    ``memoize=False`` is the opt-out for a key that CANNOT match, and it is a
+    cost decision rather than a correctness one. A caller whose key carries the
+    tick instant -- ``active_at=now`` and a ``now``-derived
+    ``captured_at_or_after`` -- moves both terms on every call, so it can never
+    read a prior entry. Going through the memo anyway would establish an
+    identity it cannot use (35 ms of stats.db work when no ``stats_identity`` is
+    supplied) and retain a result nobody can hit, which also evicts the
+    clock-free entries that DO reuse, because the memo is discarded whole on
+    reaching 32 entries.
+
+    THE GENERATION CONTRACT IS WEAKER THAN IT WAS, and the next reader of
+    ``_tui_build_source_bundle``'s pin needs to know exactly how. This dict is a
+    plain module global with no ``_assert_owner``, and the per-build clear that
+    used to stand in ``_build_codex_source_state`` is gone, so an entry
+    populated on a non-builder path -- the share render or the per-request
+    cycle-detail route, from an unpinned connection at whatever cache generation
+    it saw -- can now be served to the builder INSIDE its pinned read
+    transaction. Before #583 S5 every cache-backed read inside that pin was
+    physically issued on the pinned connection.
+
+    What still holds, and why that is safe:
+
+    * Every read the builder issues ITSELF still runs on the pinned connection
+      and sees the frozen generation. Only a memo HIT returns rows another
+      caller loaded, and after the ``memoize=False`` sites above the sole read
+      that can hit inside a build is the five-hour correlation read.
+    * A hit requires the whole key to match, and the key is the invalidation
+      basis: the ``main`` database path, ``quota_window_change_log``'s
+      high-water sequence, ``codex_window_attribution_revision`` and the three
+      stats digests. Every ``quota_window_snapshots`` mutation is recorded by
+      the three ledger triggers in ``bin/_cctally_db.py``
+      (``trg_qws_ledger_ins`` / ``_del`` / ``_upd``, the last firing on the
+      semantic column set the loader interprets), and the attribution overlay
+      bumps its revision in the same transaction as the rows it applies
+      (``bin/_cctally_journal.py``). A retained value is therefore served only
+      while the evidence it was derived from has not moved, whatever generation
+      the connection that loaded it was on.
+    * The value is a tuple of frozen ``QuotaObservation``s, so a hit hands back
+      no cursor, connection or lazily-read state belonging to the other caller.
+    """
+    stats_conn = kwargs.pop("stats_conn", None)
+    stats_identity = kwargs.pop("stats_identity", None)
+    memoize = bool(kwargs.pop("memoize", True))
+    conn = kwargs.get("cache_conn")
+    if not memoize or not isinstance(conn, sqlite3.Connection):
+        return load_codex_quota_observations(**kwargs)
+    identity = _codex_quota_reuse_identity(
+        conn, stats_conn, stats_identity=stats_identity)
+    if identity is None:
         return load_codex_quota_observations(**kwargs)
     roots = kwargs.get("source_root_keys")
     physical_signatures = kwargs.get("physical_signatures")
     physical_groups = kwargs.get("physical_groups")
     key = (
         id(load_codex_quota_observations),
-        db_path,
-        0 if seq_row is None else int(seq_row[0]),
-        "" if revision_row is None else str(revision_row[0]),
+        identity,
         None if roots is None else tuple(sorted(str(root) for root in roots)),
         kwargs.get("captured_at_or_after"),
         kwargs.get("active_at"),
@@ -139,6 +282,27 @@ def _cached_codex_quota_observations(**kwargs) -> tuple[object, ...]:
     if cached is not None:
         return cached
     loaded = tuple(load_codex_quota_observations(**kwargs))
+    # The written memory bound (#583 S5 spec §2.1 "Memory"). Now that this memo
+    # survives a build, "32 entries" is a bound on ENTRIES and says nothing on
+    # its own about rows, so the worst-case retained row count is stated here:
+    #
+    #   * at most 32 results are retained, and the whole memo is discarded on
+    #     reaching that count rather than evicted one entry at a time;
+    #   * a bounded dashboard read contributes at most
+    #     `DASHBOARD_QUOTA_OBSERVATION_LIMIT` (1,000) `QuotaObservation`s;
+    #   * the five-hour correlation read in `_quota_read_model` carries NO
+    #     `max_rows`. It is bounded only by one root's retained observations
+    #     captured at or after one weekly block's nominal start, which is the
+    #     term that actually sizes this cache, and it grows with the block's
+    #     age because an older block's nominal start reaches further back.
+    #     Measured on a store holding 276,391 Codex quota rows, over the seven
+    #     weekly blocks live at that instant: 15,129 observations for the
+    #     newest and 36,943 for the oldest. The worst case is therefore 32
+    #     times a population in the tens of thousands, not 32 times 1,000.
+    #   * the doctor's unbounded `latest_per_identity` read is NOT retained
+    #     here. `bin/_cctally_doctor.py` calls `load_codex_quota_observations`
+    #     directly rather than through this memo, so its all-history population
+    #     never enters this dict.
     if len(_CODEX_QUOTA_OBSERVATION_CACHE) >= 32:
         _CODEX_QUOTA_OBSERVATION_CACHE.clear()
     _CODEX_QUOTA_OBSERVATION_CACHE[key] = loaded
@@ -327,10 +491,10 @@ def _resolve_codex_weekly_cycle(
 
     #350 — FRESH-FIRST ranking (spec §3.2). Codex has no background quota poll,
     so ``stale_after_seconds(10_080) == 3600`` makes an idle weekly observation
-    stale after exactly one hour. Discarding a stale-but-FUTURE boundary blanked
+    stale after exactly one hour. Discarding a stale-but-ACTIVE boundary blanked
     the hero's backward-looking actuals even though the spend was never lost, so
-    each account's future weekly boundaries are now collected into a fresh set
-    and a stale set and ranked:
+    each account's weekly boundaries that contain ``now`` are collected into a
+    fresh set and a stale set and ranked:
 
     1. exactly one FRESH boundary -> valid, cycle fresh;
     2. else, no fresh boundaries and exactly one STALE boundary -> valid, cycle
@@ -363,7 +527,15 @@ def _resolve_codex_weekly_cycle(
         # current-cycle milestone filter matches `resets_at` exactly, so the
         # ladder empties for precisely the jittered cycles canonicalization
         # exists to collapse. Liveness rides the same instant the hero shows.
-        if baseline is None or baseline.canonical_resets_at <= now_utc:
+        # #599: a future reset is not active when its nominal start is also in
+        # the future; admitting it makes the bounded accounting range empty.
+        if (
+            baseline is None
+            or baseline.canonical_resets_at <= now_utc
+            or baseline.canonical_resets_at - dt.timedelta(
+                minutes=history.identity.window_minutes
+            ) >= now_utc
+        ):
             continue
         state = quota_freshness(history.physical_observations, now_utc).state
         boundary = (history.identity.window_minutes, baseline.canonical_resets_at)
@@ -435,6 +607,7 @@ def resolve_codex_cycle_detail_identity(
     source_root_keys: Iterable[str],
     now_utc: dt.datetime,
     account_key: str | None = None,
+    stats_conn=None,
 ):
     """The live-cycle identity for a per-request Codex cycle-DETAIL read (#373).
 
@@ -488,6 +661,10 @@ def resolve_codex_cycle_detail_identity(
         observations = _cached_codex_quota_observations(
             source_root_keys=active_roots,
             cache_conn=cache_conn,
+            stats_conn=stats_conn,
+            # Both bounds are derived from this request's own instant, so this
+            # key can never match a retained entry. See `memoize` there.
+            memoize=False,
             captured_at_or_after=(
                 now_utc - dt.timedelta(days=DASHBOARD_QUOTA_RECENT_DAYS)
             ),
@@ -918,6 +1095,14 @@ class DashboardReadContext:
     codex_quota_actual_thresholds: tuple[int, ...] = ()
     codex_quota_projected_thresholds: tuple[int, ...] = ()
     cache_report_anomaly_threshold_pp: int = 15
+    #: ``(codex_stats_digest, accounts_identity_digest, claude_stats_digest)``
+    #: when the caller already computed them for its own composite signature,
+    #: so the quota memo's reuse identity does not derive a second copy once
+    #: per call (#583 S5 spec §2.1 item 1, Preserve 2). ``None`` means the
+    #: identity derives them itself under the projection gate; that is the
+    #: share path and the per-request cycle-detail route, neither of which
+    #: computes a build signature.
+    stats_identity: tuple[str, str, str] | None = None
 
     def __post_init__(self) -> None:
         for name in ("range_start", "now_utc"):
@@ -2430,11 +2615,25 @@ def _codex_budget_status_domain(
     ``{"status": None}`` for it made the client render "No budget set." beside
     the command that sets one — to a user who has budgets set. It publishes the
     same ``not_configured.disposition`` the Claude half publishes, which the
-    client already handles. An ACCOUNT-SCOPED read is deliberately excluded:
-    ``account_budgets_only`` describes the vendor-wide axis, and that account's
-    own missing budget is genuinely unset.
+    client already handles. #586 gives the genuinely-unset ACCOUNT-SCOPED read
+    its own ``account_budget_unset`` disposition plus immutable account key, so
+    the card can name ``budget.codex.accounts`` rather than the unrelated
+    vendor-wide command.
     """
     config = context.codex_budget
+    if account_key is not None:
+        per_account = config.get("accounts") if isinstance(config, Mapping) else None
+        if not isinstance(per_account, Mapping) or account_key not in per_account:
+            return {
+                "status": None,
+                "not_configured": {
+                    "disposition": "account_budget_unset",
+                    "account_key": account_key,
+                    # `config set` replaces this map wholesale. Preserve every
+                    # sibling in the client-rendered example command (#586).
+                    "configured_accounts": dict(per_account or {}),
+                },
+            }
     if (
         account_key is None
         and isinstance(config, Mapping)
@@ -2650,6 +2849,8 @@ def _quota_read_model(
                     for observation in _cached_codex_quota_observations(
                         source_root_keys={identity.source_root_key},
                         cache_conn=context.cache_conn,
+                        stats_conn=context.stats_conn,
+                        stats_identity=context.stats_identity,
                         captured_at_or_after=block.nominal_start_at,
                     )
                     if observation.identity.window_minutes == 300
@@ -3133,8 +3334,8 @@ def refresh_codex_source_clock(
             availability = "partial"
             # #556 S1 §4.1: an EXPIRED boundary is exactly the state the
             # accounting axis reports as stale. Build time can never see it
-            # (`_resolve_codex_weekly_cycle` retains only `resets_at > now`),
-            # so this clock is the only writer of that value.
+            # (`_resolve_codex_weekly_cycle` retains only boundaries containing
+            # `now`), so this clock is the only writer of that value.
             domain_freshness["hero"] = "stale"
             cycle_changed = True
         # 3. budget last
@@ -3901,8 +4102,18 @@ def _codex_accounts_wire(
     cycles: list["CodexCycleBoundary"],
     accounting_start: dt.datetime,
     accounting_end: dt.datetime,
+    population: tuple[object, ...],
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     """Return ``(accounts_wire, hero_cycles_wire)`` for a decorated Codex source.
+
+    ``population`` is the merged, encounter-ordered accounting read every card
+    is derived from (#583 S5 change 2). This function issues no accounting SQL
+    of its own. It walks the population ONCE, partitioning it by account in
+    encounter order, and then range-filters each card's own partition, so
+    neither the read count nor the in-memory work grows with the account count.
+    The caller loads it over a range that starts no later than any card's own
+    range, which on the share path is EARLIER than the published accounting
+    range.
 
     Caller must gate on ``provider_is_decorated(stats_conn, "codex")`` — this
     builds nothing for a <=1-real-account install (the whole surface is absent,
@@ -3947,11 +4158,79 @@ def _codex_accounts_wire(
         "startAt": fallback_start.astimezone(UTC).isoformat(),
         "endAt": context.now_utc.astimezone(UTC).isoformat(),
     }
+    # ONE encounter-ordered pass over the population, in place of one pass per
+    # card (#583 S5 spec §2.2). `_codex_partition_by_account` applies the same
+    # `or UNATTRIBUTED` normalization each card's filter used to apply itself,
+    # so the buckets are the sets those filters selected from, and it preserves
+    # encounter order, which `_aggregate_codex_buckets` depends on for a
+    # bucket's first-seen model order.
+    by_account = _codex_partition_by_account(population)
+
+    def _slice(
+        account_key: str,
+        start: dt.datetime,
+        end: dt.datetime,
+        source_root_keys: Iterable[str] | None = None,
+    ) -> tuple[object, ...]:
+        """One card's rows, range-filtered from that account's partition.
+
+        The predicates match the reader these filters replaced, member for
+        member: half-open ``[start, end)`` on a UTC-normalized timestamp, the
+        reserved sentinel standing for a NULL stamp, and a root set that selects
+        nothing when it is supplied empty. Encounter order is the partition's,
+        which is the population's, which is the reader's ``ORDER BY`` over a
+        wider range, so a bucket's first-seen model order is unchanged.
+
+        Two comparisons are nevertheless not the SAME comparison, and both are
+        equivalent only because ingest cannot write the row that separates them.
+        Stated here so the next reader does not have to re-derive it, and
+        asserted at the producer by
+        ``test_ingest_writes_only_canonical_account_and_timestamp_values``.
+
+        1. The replaced per-card query passed ``account_key=<key>`` to
+           ``load_cached_rooted_codex_accounting_entries``, whose sentinel
+           predicate is ``account_key IS NULL OR account_key = 'unattributed'``.
+           A row stored as the EMPTY STRING matched neither that nor any real
+           account's ``account_key = ?``, so it appeared on no card at all,
+           while the reader maps ``''`` to the sentinel and this filter
+           therefore includes it. No shipped writer emits it: the three
+           statements that set this column (`bin/_cctally_cache.py` -- the
+           ingest insert, the window spend-adoption update and the attribution
+           restore) each write NULL or a resolved 32-hex account key, and the
+           ingest value comes from ``codex_file_accounts.account_key``, itself
+           written only by two statements with the same two outcomes. Measured:
+           zero empty strings among 163,424 rows of the maintainer's store.
+           Note also that every OTHER account-partitioned surface already files
+           such a row under the sentinel -- ``_codex_partition_by_account``
+           applies the identical ``or _lib_accounts.UNATTRIBUTED`` -- so the
+           card query was the sole outlier rather than the rule.
+        2. The reader bounds ``timestamp_utc`` by comparing ISO TEXT inside
+           SQLite; this filter compares parsed UTC datetimes. For the canonical
+           ``...+00:00`` spelling the two orders coincide, including against a
+           bound carrying microseconds, because ``+`` sorts before ``.``. They
+           diverge only for a stamp carrying a different valid offset, and a
+           NAIVE stamp is not a divergence at all: ``_parse_timestamp`` refuses
+           it, so such a row fails the whole read on the old path and the new
+           one alike. Codex ingest writes
+           ``entry.timestamp.astimezone(UTC).isoformat()``, always ``+00:00``.
+           Measured: 163,424 of 163,424 rows canonical.
+        """
+        roots = (
+            None if source_root_keys is None
+            else {key for key in source_root_keys
+                  if isinstance(key, str) and key}
+        )
+        if roots is not None and not roots:
+            return ()
+        return tuple(
+            row for row in by_account.get(account_key, ())
+            if start <= row.timestamp < end
+            and (roots is None or row.source_root_key in roots)
+        )
+
     # Include unattributed last iff it has cycle/5h/spend evidence.
-    unattributed_rows = load_cached_rooted_codex_accounting_entries(
-        accounting_start, accounting_end, speed=context.speed,
-        cache_conn=context.cache_conn, account_key=_lib_accounts.UNATTRIBUTED,
-    )
+    unattributed_rows = _slice(
+        _lib_accounts.UNATTRIBUTED, accounting_start, accounting_end)
     # Existence is decided over the accounting range so a sentinel holding only
     # older spend keeps its card; the totals below cover the bounded window, so
     # a resolved $0.00 is an honest empty state rather than an absence (#564).
@@ -3996,10 +4275,9 @@ def _codex_accounts_wire(
         is_unattributed = key == _lib_accounts.UNATTRIBUTED
         if cyc is not None and not is_unattributed:
             cycle_end = min(accounting_end, cyc.resets_at)
-            rows = load_cached_rooted_codex_accounting_entries(
-                cyc.start_at, cycle_end, speed=context.speed,
-                cache_conn=context.cache_conn,
-                source_root_keys=cyc.source_root_keys, account_key=key,
+            rows = _slice(
+                key, cyc.start_at, cycle_end,
+                source_root_keys=cyc.source_root_keys,
             )
             totals = _totals(rows)
         elif is_unattributed:
@@ -4009,10 +4287,7 @@ def _codex_accounts_wire(
             # native cycle width ending now, so this card can be summed into a
             # week-labelled headline without overstating it (#564). No bars or
             # reset, because there is no live cycle to describe.
-            rows = load_cached_rooted_codex_accounting_entries(
-                fallback_start, accounting_end, speed=context.speed,
-                cache_conn=context.cache_conn, account_key=key,
-            )
+            rows = _slice(key, fallback_start, accounting_end)
             totals = _totals(rows)
         card: dict[str, object] = {
             "accountKey": key,
@@ -4595,6 +4870,40 @@ def _codex_ingest_backlog_wire(
     }
 
 
+def _codex_source_caches() -> tuple[dict, ...]:
+    """Every process cache a Codex source build reuses across builds.
+
+    ONE definition, so the set the build checkpoints and the set a cold
+    reference discards cannot drift apart. A cold reference that discards only
+    some of them compares two partly-warm builds and calls the second cold
+    (#583 S5 criterion 10).
+    """
+    return (
+        _CODEX_QUOTA_OBSERVATION_CACHE,
+        _CODEX_PERIOD_VIEW_CACHE,
+        _CODEX_CACHE_REPORT_ROWS,
+        _CODEX_SESSION_VIEW_CACHE,
+        _CODEX_PROJECT_LABEL_CACHE,
+        _CODEX_PROJECT_WIRE_CACHE,
+        _CODEX_ENTRY_ADAPTER_CACHE,
+        _CODEX_WEEKLY_VIEW_CACHE,
+        _CODEX_ACCOUNT_SCOPE_CACHE,
+    )
+
+
+def reset_codex_source_caches() -> None:
+    """Discard every reuse a Codex source build could draw on.
+
+    The cold reference for a warm-versus-cold equality check: after this, the
+    next build reconstructs from the databases alone. It covers the accounting
+    cache state too, which lives in ``_lib_snapshot_cache`` rather than in a
+    dict here and is the other half of what a build retains.
+    """
+    for cache in _codex_source_caches():
+        cache.clear()
+    _lib_snapshot_cache.reset_codex_accounting_cache_state()
+
+
 def build_codex_source_state(
     context: DashboardReadContext,
     *,
@@ -4613,23 +4922,12 @@ def build_codex_source_state(
     every Codex session view in the build, and it is discarded when the read
     returns.
     """
-    # This memo deduplicates the several account/parent consumers inside ONE
-    # coordinated source build. It may not cross that boundary: a caller can
-    # deliberately request a fresh build after stats/account decoration changes
-    # without advancing cache.db's quota ledger, and the established contract
-    # requires one bounded physical load for that new build.
-    reset_codex_quota_observation_cache()
-    caches = (
-        _CODEX_QUOTA_OBSERVATION_CACHE,
-        _CODEX_PERIOD_VIEW_CACHE,
-        _CODEX_CACHE_REPORT_ROWS,
-        _CODEX_SESSION_VIEW_CACHE,
-        _CODEX_PROJECT_LABEL_CACHE,
-        _CODEX_PROJECT_WIRE_CACHE,
-        _CODEX_ENTRY_ADAPTER_CACHE,
-        _CODEX_WEEKLY_VIEW_CACHE,
-        _CODEX_ACCOUNT_SCOPE_CACHE,
-    )
+    # #583 S5: this memo now survives across builds. It may do so ONLY because
+    # its key carries the stats-side identity as well as the cache legs -- see
+    # `_codex_quota_reuse_identity`. The clear that used to stand here existed
+    # because a decoration or account-registry change advances no cache.db leg
+    # and so could not move a cache-only key. Do not narrow that identity.
+    caches = _codex_source_caches()
     cache_checkpoint = tuple(dict(cache) for cache in caches)
     accounting_checkpoint = (
         _lib_snapshot_cache.checkpoint_codex_accounting_cache_state()
@@ -4659,9 +4957,46 @@ def _build_codex_source_state(
             "SELECT source_root_key FROM codex_source_roots"
         )
     ))
+    # This read is a function of the tick instant, so it does NOT reuse across
+    # ticks and the cross-build memo above cannot help it. Both bounds move
+    # with `context.now_utc`, which in production is the tick's wall clock
+    # (`bin/_cctally_tui.py`: `now_utc or dt.datetime.now(dt.timezone.utc)`).
+    #
+    # It cannot be made reusable by loading a memoizable superset and filtering
+    # in memory, and the reason is a property of the loader rather than of this
+    # call: `max_rows` is a SQL `LIMIT` under an `ORDER BY` whose leading term
+    # is `resets_at_utc > active_at`, so a superset truncates a DIFFERENT set of
+    # rows; and `_apply_codex_window_attribution_overlay` plus
+    # `adopt_unidentified_observations` are population-dependent folds run after
+    # the bound, so a wider population can change the account a retained
+    # observation carries. Filtering a superset would therefore change the
+    # published answer, not just its cost.
+    #
+    # Measured on a copy of the real store (276,391 retained Codex quota rows),
+    # warm, five samples after one untimed warm-up: 222.5 ms median per tick,
+    # range 210.7-231.3 ms.
+    #
+    # As a share, that is 13.9% of 1.60 s, and the denominator has to be named:
+    # 1.60 s is the sum of the three quota call sites when each is timed ALONE
+    # and UN-profiled on that store (this bounded read 222.5 ms, the five-hour
+    # correlation read 209.6 ms, the doctor's all-history `latest_per_identity`
+    # read 1,164.7 ms). The S5 measurement record's 2.571 s for
+    # `load_codex_quota_observations` is a cProfile total instead, so putting an
+    # un-profiled numerator over it reads about 8% and understates the share.
+    # Either way the site is well under the threshold that would have required a
+    # superset fix, which is why the design conclusion above stands. The
+    # doctor's read is about 73% of the un-profiled total and this memo never
+    # sees it.
     quota_observations = _cached_codex_quota_observations(
         source_root_keys=active_roots,
         cache_conn=context.cache_conn,
+        stats_conn=context.stats_conn,
+        stats_identity=context.stats_identity,
+        # A key carrying the tick instant cannot match a retained entry, so the
+        # memo is bypassed rather than asked. On the share path
+        # `stats_identity` is None as well, and establishing an identity for an
+        # unreachable key cost 35 ms of stats.db work per render.
+        memoize=False,
         captured_at_or_after=(
             context.now_utc - dt.timedelta(days=DASHBOARD_QUOTA_RECENT_DAYS)
         ),
@@ -5050,12 +5385,64 @@ def _build_codex_source_state(
     budget_events_by_account: dict[str, tuple[tuple[dt.datetime, float], ...]] = {}
     if _codex_decorated:
         try:
+            # #583 S5 change 2: ONE population the cards are partitioned from,
+            # in place of one accounting read per card. The PUBLISHED accounting
+            # range is unchanged -- widening it would move the envelope.
+            #
+            # This derivation population starts earlier than the published range
+            # on purpose. On the dashboard path `accounting_start` is already a
+            # superset of every card's own range, because it is the 30-day
+            # shared range and a live cycle's `start_at` is inside
+            # `(now - 7d, now)` by the two filters in
+            # `_resolve_codex_weekly_cycle`. On the SHARE path it is not:
+            # `bin/_cctally_dashboard_share.py` passes a user-selected
+            # `range_start` verbatim, so a one-day custom share would truncate a
+            # card whose cycle began six days earlier -- silently, with no error
+            # and no moved golden.
+            card_population_start = min(
+                context.range_start,
+                context.now_utc - dt.timedelta(
+                    minutes=ACCOUNT_WEEKLY_WINDOW_MINUTES),
+                accounting_start,
+            )
+            if card_population_start == accounting_start:
+                # The build already holds this exact population, so reading it
+                # again would be one extra full-range pass over every retained
+                # Codex accounting row, per tick. The equality is the ordinary
+                # dashboard case rather than an edge: `card_population_start` is
+                # a `min` that includes `accounting_start`, so it can only be
+                # earlier or equal, and it is equal whenever `accounting_start`
+                # is already at or before both `range_start` and `now - 7d` --
+                # which the 30-day shared range always is. Only a custom share
+                # narrower than one native cycle takes the other branch.
+                #
+                # `accounting_entries` is `QualifiedCodexEntry` on the normal
+                # path and `RootedCodexAccountingEntry` on the
+                # `metadata_incomplete` fallback. Both carry the three
+                # attributes `_slice` reads (`account_key`, `timestamp`,
+                # `source_root_key`), both normalize a NULL or empty stored
+                # account to the sentinel, both price through
+                # `_calculate_codex_entry_cost` at this `speed`, and both are
+                # ordered by (timestamp, source_root_key, conversation_key, id)
+                # over the same half-open range -- the qualified read adds only
+                # a LEFT JOIN onto `codex_conversation_threads`, whose
+                # `conversation_key` is that table's PRIMARY KEY and so cannot
+                # duplicate a row.
+                card_population = accounting_entries
+            else:
+                card_population = load_cached_rooted_codex_accounting_entries(
+                    card_population_start,
+                    accounting_end,
+                    speed=context.speed,
+                    cache_conn=context.cache_conn,
+                )
             accounts_wire, hero_cycles_wire = _codex_accounts_wire(
                 context,
                 quota_observations=quota_observations,
                 cycles=cycles_all,
                 accounting_start=accounting_start,
                 accounting_end=accounting_end,
+                population=card_population,
             )
             # #416 §5.3: the per-account CHILDREN beside the merged parent. The
             # scope set is exactly the card set, so every chip the client can
@@ -5305,8 +5692,8 @@ def _build_codex_source_state(
             # while nothing about the accounting changed. The percent age is
             # already carried by `quota` below and by the additive hero-local
             # `cycle_freshness` field. `_resolve_codex_weekly_cycle` retains
-            # only boundaries with `resets_at > now`, so a resolved cycle is
-            # never expired at build time; the idle clock owns expiry.
+            # only boundaries with `start_at < now < resets_at`, so a resolved
+            # cycle is never expired at build time; the idle clock owns expiry.
             "hero": "stale" if hero_failure else "fresh",
             "quota": (
                 "stale"

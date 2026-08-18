@@ -13,11 +13,16 @@ from conftest import load_script  # type: ignore
 
 
 def _drain(q):
+    """The published SNAPSHOTS currently queued, in order.
+
+    #583 S3 §5 wrapped each publication in a `_SSEDelivery`; `publish`'s
+    queueing behaviour, which is what this file pins, was not modified.
+    """
     import queue as _queue
     out = []
     while True:
         try:
-            out.append(q.get_nowait())
+            out.append(q.get_nowait().snapshot)
         except _queue.Empty:
             break
     return out

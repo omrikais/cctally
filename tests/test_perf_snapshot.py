@@ -1,9 +1,9 @@
 """_tui_build_snapshot phase-tree shape (issue #276, Session A).
 
 Structural (never golden) assertions on the dashboard-snapshot spine's phase
-tree: the root is ``snapshot`` with the named seam children, and each
-``reconcile.*`` phase surfaces its ``use_*_cache`` hit boolean as meta (the
-only place those build-time locals are observable, per the Codex P2 finding).
+tree: the root is ``snapshot`` with the named seam children, each cache
+reconciliation surfaces its ``use_*_cache`` hit boolean as meta, and the
+short-lived reconcile connection open is attributed separately.
 """
 import datetime as dt
 
@@ -35,7 +35,13 @@ def test_snapshot_phase_tree_shape(monkeypatch, tmp_path):
         assert {"sync", "signature"} <= names
         assert any(n.startswith("build.") for n in names)
         assert {"doctor", "envelope.precompute"} <= names
-        recon = [c for c in children if c["name"].startswith("reconcile.")]
+        cache_open = [c for c in children
+                      if c["name"] == "reconcile.cache_open"]
+        assert len(cache_open) == 1
+        assert cache_open[0].get("meta", {}) == {}
+        recon = [c for c in children
+                 if (c["name"].startswith("reconcile.")
+                     and c["name"] != "reconcile.cache_open")]
         assert recon, "expected reconcile.* phases on the first (non-idle) build"
         # use_*_cache surfaced as meta on every reconcile phase
         assert all("hit" in c.get("meta", {}) for c in recon)

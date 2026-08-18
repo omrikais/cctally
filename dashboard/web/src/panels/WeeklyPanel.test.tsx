@@ -377,3 +377,34 @@ describe('#556 S2 QA — the Weekly composition is off the h2', () => {
       .toContain('model split');
   });
 });
+
+// #583 S2 §6.3 — a rebuild in flight is NOT hydration. `sync_activity.rebuilding`
+// says a rebuild is running over data the panel already has; `hydrating` says the
+// data is still being assembled. Folding the first into the second would put a
+// skeleton over a panel roughly a quarter to a half of the time on a healthy
+// dashboard, which is exactly the flicker §6.3 forbids.
+//
+// The empty panel is the discriminating case. With rows present the skeleton
+// branch is unreachable whatever the predicate says, so a populated panel would
+// pass this test even if `rebuilding` had been wired into `hydrating`.
+describe('#583 S2 — a rebuild never turns a panel into a skeleton', () => {
+  it('renders the empty state, not a skeleton, while the server is rebuilding', () => {
+    const env = {
+      ...baseEnvelope(),
+      weekly: { rows: [], total_cost_usd: 0 },
+      sync_activity: {
+        server_epoch: 'a1b2c3d4e5f60718',
+        rebuilding: true,
+        requested_id: 3,
+        started_id: 3,
+        settled_id: 2,
+        settled_status: 'ok',
+        settled_warnings: [],
+      },
+    } as unknown as Envelope;
+    updateSnapshot(env);
+    const { container } = render(<WeeklyPanel />);
+    expect(container.querySelector('.panel-empty')!.textContent)
+      .toBe('No usage history yet.');
+  });
+});

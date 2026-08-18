@@ -6,7 +6,7 @@ Writes one pair of (stats.db, cache.db) per scenario under
 All schema/seeding goes through ``bin/_fixture_builders.py`` — do not
 duplicate schema here. Idempotent: each builder overwrites existing DBs.
 
-Twelve scenarios:
+Sixteen scenarios:
   * ``ok``         — current week at ~40% with 8 weeks of history; forecast
                      verdict ``"ok"`` (renders as GOOD in the browser).
   * ``warn``       — current week at ~67% with a heavy recent-24h burn that
@@ -53,6 +53,15 @@ Twelve scenarios:
   * ``cache-report-qa`` — production-shaped Claude cache activity with six
                      baseline days, an amber cache-drop today, and both
                      positive/negative net days for real-browser QA (#452).
+  * ``all-combined`` — both providers populated and undecorated, so the All
+                     headline publishes the provider-compatible total (#556).
+  * ``all-combined-decorated`` — the same accounting with Claude decoration,
+                     which withholds the All combined headline (#556).
+  * ``all-budget-account-focus`` — two focusable Codex accounts with distinct
+                     provider/account budgets, spend, and quota (#556 S5).
+  * ``codex-account-fallback`` — two real Codex accounts where only one owns a
+                     live weekly cycle, plus the unattributed sentinel and
+                     spend on both sides of the trailing-cycle boundary (#591).
 
 Each scenario writes ``input.env`` containing a single line
 ``AS_OF=<iso-utc>`` consumed by the dashboard harness via
@@ -2494,6 +2503,167 @@ def build_all_budget_account_focus(as_of: dt.datetime) -> None:
     _assert_ac_display_zone(scenario_dir)
 
 
+# === #591 — decorated Codex fallback-window golden ==========================
+#
+# This scenario is intentionally narrower than `all-budget-account-focus`.
+# Only account F owns a live weekly cycle. Account 9 retains an expired weekly
+# observation and therefore falls back to the trailing native-cycle window;
+# the unattributed sentinel does the same. Their accounting rows straddle the
+# seven-day boundary so the golden distinguishes the bounded totals from the
+# older rows that must remain excluded.
+_CAF_ACCOUNT_LIVE = "f" * 32
+_CAF_ACCOUNT_FALLBACK = "9" * 32
+_CAF_ROOT_KEY = "fixture-codex-account-fallback-root"
+_CAF_ROOT_PATH = "/fake/codex-account-fallback"
+_CAF_CWD = "/fake/repos/codex-account-fallback"
+
+
+def _seed_codex_account_fallback_file(
+    cache_conn: sqlite3.Connection,
+    *,
+    account_key: str,
+    suffix: str,
+    rows: tuple[tuple[dt.datetime, int, int, int, int], ...],
+) -> None:
+    """Seed one rooted Codex session with explicit account ownership."""
+    session_id = f"fixture-account-fallback-{suffix}-000000000001"
+    conversation_key = f"v1.{_CAF_ROOT_KEY}.{session_id}"
+    file_path = f"{_CAF_ROOT_PATH}/sessions/{session_id}.jsonl"
+    seed_codex_session_file(
+        cache_conn,
+        path=file_path,
+        last_session_id=session_id,
+        last_model="gpt-5",
+        source_root_key=_CAF_ROOT_KEY,
+        last_native_thread_id=session_id,
+        last_conversation_key=conversation_key,
+    )
+    seed_codex_conversation_thread(
+        cache_conn,
+        conversation_key=conversation_key,
+        source_root_key=_CAF_ROOT_KEY,
+        native_thread_id=session_id,
+        source_path=file_path,
+        cwd=_CAF_CWD,
+    )
+    for line_offset, (timestamp, inp, cached, out, reasoning) in enumerate(rows):
+        seed_codex_session_entry(
+            cache_conn,
+            source_path=file_path,
+            line_offset=line_offset,
+            timestamp_utc=timestamp,
+            session_id=session_id,
+            model="gpt-5",
+            input_tokens=inp,
+            cached_input_tokens=cached,
+            output_tokens=out,
+            reasoning_output_tokens=reasoning,
+            total_tokens=inp + out,
+            source_root_key=_CAF_ROOT_KEY,
+            conversation_key=conversation_key,
+            account_key=account_key,
+        )
+
+
+def build_codex_account_fallback(as_of: dt.datetime) -> None:
+    """Decorated Codex fixture with one live cycle and two fallback cards."""
+    scenario_dir, app_dir = _scenario_dirs("codex-account-fallback")
+    stats_path = app_dir / "stats.db"
+    cache_path = app_dir / "cache.db"
+    create_stats_db(stats_path)
+    create_cache_db(cache_path)
+    stats_conn = sqlite3.connect(stats_path)
+    cache_conn = sqlite3.connect(cache_path)
+    try:
+        seed_codex_source_root(
+            cache_conn,
+            source_root_key=_CAF_ROOT_KEY,
+            canonical_root_path=_CAF_ROOT_PATH,
+        )
+        for key, natural, email, label, plan in (
+            (_CAF_ACCOUNT_LIVE, "uuid-caf-live", "live@example.com", "live", "pro"),
+            (_CAF_ACCOUNT_FALLBACK, "uuid-caf-fallback", "fallback@example.com", "fallback", "plus"),
+        ):
+            seed_account(
+                stats_conn,
+                account_key=key,
+                provider="codex",
+                natural_id=natural,
+                email=email,
+                label=label,
+                plan_type=plan,
+                label_source="user",
+                first_seen_utc=_iso(as_of - dt.timedelta(days=20)),
+                last_seen_utc=_iso(as_of),
+            )
+
+        _seed_codex_account_fallback_file(
+            cache_conn,
+            account_key=_CAF_ACCOUNT_LIVE,
+            suffix="live",
+            rows=((as_of - dt.timedelta(days=2), 100_000, 20_000, 10_000, 1_000),),
+        )
+        _seed_codex_account_fallback_file(
+            cache_conn,
+            account_key=_CAF_ACCOUNT_FALLBACK,
+            suffix="fallback",
+            rows=(
+                (as_of - dt.timedelta(days=1), 200_000, 40_000, 20_000, 2_000),
+                (as_of - dt.timedelta(days=8), 400_000, 80_000, 40_000, 4_000),
+            ),
+        )
+        _seed_codex_account_fallback_file(
+            cache_conn,
+            account_key="unattributed",
+            suffix="unattributed",
+            rows=(
+                (as_of - dt.timedelta(days=7), 300_000, 60_000, 30_000, 3_000),
+                (
+                    as_of - dt.timedelta(days=7, seconds=1),
+                    500_000,
+                    100_000,
+                    50_000,
+                    5_000,
+                ),
+            ),
+        )
+
+        # Account F is live. Account 9's retained weekly observation expired an
+        # hour before the snapshot, so its card has no cycle and must disclose
+        # the trailing-cycle fallback period.
+        for line_offset, (account_key, reset, used_percent) in enumerate((
+            (_CAF_ACCOUNT_LIVE, as_of + dt.timedelta(days=4), 61.0),
+            (_CAF_ACCOUNT_FALLBACK, as_of - dt.timedelta(hours=1), 47.0),
+        )):
+            seed_codex_quota_snapshot(
+                cache_conn,
+                source_root_key=_CAF_ROOT_KEY,
+                source_path=(
+                    f"{_CAF_ROOT_PATH}/sessions/weekly-quota-{line_offset}.jsonl"
+                ),
+                line_offset=line_offset,
+                captured_at_utc=_iso(as_of - dt.timedelta(minutes=20)),
+                logical_limit_key="fixture-account-fallback-weekly",
+                window_minutes=10_080,
+                used_percent=used_percent,
+                resets_at_utc=_iso(reset),
+                limit_name="Fixture weekly quota",
+                account_key=account_key,
+            )
+        bump_codex_physical_mutation_seq(cache_conn)
+        _stamp_and_verify(stats_conn)
+        stats_conn.commit()
+        cache_conn.commit()
+    finally:
+        stats_conn.close()
+        cache_conn.close()
+
+    _reconcile_fixture_quota_projection(
+        app_dir, root_key=_CAF_ROOT_KEY, now=as_of,
+    )
+    (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+
+
 SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "ok": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
@@ -2554,6 +2724,10 @@ SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "all-budget-account-focus": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
         build_all_budget_account_focus,
+    ),
+    "codex-account-fallback": (
+        dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
+        build_codex_account_fallback,
     ),
 }
 

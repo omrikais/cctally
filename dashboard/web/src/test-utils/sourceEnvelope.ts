@@ -350,8 +350,13 @@ export const FALLBACK_SPEND_WINDOW = {
   endAt: '2026-04-24T13:00:00Z',
 } as const;
 
-function accountCard(over: Partial<AccountCard> & { accountKey: string }): AccountCard {
+export function accountCard(over: Partial<AccountCard> & { accountKey: string }): AccountCard {
+  const { unattributed, spendWindow, ...wireFields } = over;
   return {
+    // Preserve every additive wire field carried by the override. Keeping a
+    // hand-maintained property list here silently drops the next AccountCard
+    // field while leaving the fixture structurally valid.
+    ...wireFields,
     accountKey: over.accountKey,
     label: over.label ?? over.accountKey.slice(0, 4),
     plan: over.plan ?? 'pro',
@@ -365,8 +370,8 @@ function accountCard(over: Partial<AccountCard> & { accountKey: string }): Accou
     outputTokens: over.outputTokens ?? 0,
     reasoningOutputTokens: over.reasoningOutputTokens ?? 0,
     totalTokens: over.totalTokens ?? 0,
-    ...(over.unattributed ? { unattributed: true as const } : {}),
-    ...(over.spendWindow ? { spendWindow: over.spendWindow } : {}),
+    ...(unattributed ? { unattributed: true as const } : {}),
+    ...(spendWindow ? { spendWindow } : {}),
   };
 }
 
@@ -1160,8 +1165,11 @@ export function makeClaudeSourceEntry(
 // ---- All --------------------------------------------------------------
 
 // Compose an `all` entry from a Claude + Codex entry (mirrors the Python
-// compose_all_state): combined = provider hero cost/total-token sums; the
-// providers block references each source's own `data`.
+// compose_all_state): combined = provider hero cost/total-token sums.
+// #583 S3 §4 — the `providers` block publishes NULL for both members since
+// source schema 10. The provider data is carried once, on the physical
+// `sources.claude` / `sources.codex` entries, and every All consumer resolves
+// it through `presentationProviders`' fallback.
 export function makeAllSourceEntry(
   claude: SourceEntry<ClaudeSourceData> = makeClaudeSourceEntry(),
   codex: SourceEntry<CodexSourceData> = makeCodexSourceEntry(),
@@ -1176,7 +1184,19 @@ export function makeAllSourceEntry(
   const codexLeg = codexHero == null ? null : combinedLeg(
     codexHero.cost_usd, codexHero.total_tokens, codexPeriod(codexHero.cycle),
   );
-  const combined: AllCombined | null = claudeLeg && codexLeg
+  // This is server-fixture composition, not a client disclosure decision. The
+  // conditional accounts array proves the fixture is already in the resolved
+  // decorated shape; production consumers must continue to use the published
+  // combined/combined_unavailable outcome rather than infer decoration here.
+  const decoratedProviders = ([
+    ['claude', claude.data],
+    ['codex', codex.data],
+  ] as const).flatMap(([provider, data]) => {
+    const accountCount = data?.accounts?.filter((card) => !card.unattributed).length ?? 0;
+    return accountCount > 1 ? [{ provider, accountCount }] : [];
+  });
+  const combined: AllCombined | null = decoratedProviders.length === 0
+    && claudeLeg && codexLeg
     ? {
         cost_usd: claudeLeg.cost_usd + codexLeg.cost_usd,
         total_tokens: claudeLeg.total_tokens + codexLeg.total_tokens,
@@ -1185,11 +1205,25 @@ export function makeAllSourceEntry(
     : null;
   // #556 S1 §3.5 — `combined_unavailable` is emitted IF AND ONLY IF the figure
   // is withheld, so the factory must not carry it beside a published number.
-  const unavailable: CombinedUnavailable | null = combined != null ? null : {
-    code: 'claude_cycle_unresolved',
-    message: "Claude's current subscription week could not be resolved.",
-    causes: [{ provider: 'claude', code: 'claude_cycle_unresolved' }],
-  };
+  const unavailable: CombinedUnavailable | null = combined != null
+    ? null
+    : decoratedProviders.length > 0
+      ? {
+          code: 'multi_account_unsupported',
+          message: `${decoratedProviders[0].provider === 'claude' ? 'Claude' : 'Codex'} has `
+            + `${decoratedProviders[0].accountCount} accounts on separate cycles, so a `
+            + 'combined total is not published; see the per-account cards.',
+          causes: decoratedProviders.map(({ provider, accountCount }) => ({
+            provider,
+            code: 'multi_account_unsupported',
+            detail: { account_count: accountCount },
+          })),
+        }
+      : {
+          code: 'claude_cycle_unresolved',
+          message: "Claude's current subscription week could not be resolved.",
+          causes: [{ provider: 'claude', code: 'claude_cycle_unresolved' }],
+        };
   // The `all` alert union mirrors the Python `_combined_alert_rows`: each
   // provider's OWN rows (filtered to `source === provider`) concatenated in
   // declared source order, then sorted by the canonical FIRING instant,
@@ -1238,7 +1272,7 @@ export function makeAllSourceEntry(
       combined,
       ...(unavailable == null ? {} : { combined_unavailable: unavailable }),
       alerts: { rows: unionAlertRows },
-      providers: { claude: claude.data, codex: codex.data },
+      providers: { claude: null, codex: null },
       // #556 S2 §3.5.1 — the ONE public copy of the shared range and of both
       // aggregate outcomes. Two range rules coexist deliberately: `combined`
       // above sums provider-native CYCLES, this ranges over one shared
@@ -1384,7 +1418,7 @@ export function makeSourceEnvelope(
   return {
     // #556 S2 §3.9 — tracks the server's current `SOURCE_SCHEMA_VERSION`. No
     // production client branches on it; the number is a signal, not a gate.
-    source_schema_version: 9,
+    source_schema_version: 10,
     default_source: 'claude',
     source_order: ['claude', 'codex', 'all'],
     sources: makeSourcesMap(),

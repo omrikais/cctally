@@ -9,8 +9,14 @@ import { ExpandButton } from '../components/ExpandButton';
 import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
 import { applyTableSort } from '../lib/tableSort';
-import { TREND_COLUMNS, type TrendTableRow } from '../lib/trendColumns';
+import { trendColumns, type TrendTableRow } from '../lib/trendColumns';
 import type { TrendChartDatum } from '../store/selectors';
+import {
+  trendRelativeLabel,
+  trendUnitCount,
+  trendVocabulary,
+  type TrendVocabulary,
+} from '../lib/trendVocabulary';
 import { PeriodAccountChips } from '../components/PeriodAccountChips';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
@@ -30,12 +36,15 @@ import {
 // modal in an older build, or hand-edited localStorage) can't sort the panel by
 // a hidden column: applyTableSort returns rows unsorted when the override id
 // isn't in the passed set (`columns.find(...) === undefined → return rows`).
-const PANEL_TREND_COLUMNS = TREND_COLUMNS.filter((c) => c.id !== 'cost_usd');
+const PANEL_TREND_COLUMNS = {
+  week: trendColumns('week').filter((c) => c.id !== 'cost_usd'),
+  cycle: trendColumns('cycle').filter((c) => c.id !== 'cost_usd'),
+};
 
 // A5 — accessible summary for the role="img" sparkline. Describes the
 // series span, the latest $/1% value, and its direction vs the prior week
 // (mirrors the table's delta read) without needing the visual bars.
-function buildSparkLabel(data: TrendChartDatum[]): string {
+function buildSparkLabel(data: TrendChartDatum[], vocabulary: TrendVocabulary): string {
   if (data.length === 0) return '$/1% trend: no data';
   const last = data[data.length - 1];
   const prev = data.length > 1 ? data[data.length - 2] : null;
@@ -46,12 +55,13 @@ function buildSparkLabel(data: TrendChartDatum[]): string {
     const d = last.dollar_per_pct - prev.dollar_per_pct;
     dir =
       Math.abs(d) < 0.005
-        ? ', flat vs prior week'
+        ? `, flat vs prior ${vocabulary.unit}`
         : d > 0
-          ? ', up vs prior week'
-          : ', down vs prior week';
+          ? `, up vs prior ${vocabulary.unit}`
+          : `, down vs prior ${vocabulary.unit}`;
   }
-  return `$/1% trend over ${data.length} weeks; latest ${latest}${dir}`;
+  const units = data.length === 1 ? vocabulary.unit : vocabulary.plural;
+  return `$/1% trend over ${data.length} ${units}; latest ${latest}${dir}`;
 }
 
 function TrendSection({
@@ -67,15 +77,16 @@ function TrendSection({
     ...row,
     spark_height: row.dollar_per_pct ?? 0,
   }));
+  const vocabulary = trendVocabulary(section.source);
   const decorated: TrendTableRow[] = data.map((r, i) => ({ ...r, _chronoIdx: i }));
-  const columns = PANEL_TREND_COLUMNS;
+  const columns = PANEL_TREND_COLUMNS[vocabulary.unit];
   const tableData = trendOverride
     ? applyTableSort(decorated, columns, trendOverride)
     : decorated;
   // A5 — text summary for the sparkline (a multi-point series, so role="img"
   // on the grid wrapper, not progressbar). Covers the weeks span + the
   // latest $/1% value and its direction vs the prior week.
-  const sparkLabel = buildSparkLabel(data);
+  const sparkLabel = buildSparkLabel(data, vocabulary);
   const sparkId = composed ? `trend-spark-${section.source}` : 'trend-spark';
   return (
     <>
@@ -114,7 +125,9 @@ function TrendSection({
                 <tr key={`${section.source}:${w.label}`} className={w.is_current ? 'current' : undefined}>
                   <td>
                     <PeriodAccountChips labels={w.account_labels} />
-                    {w.label}
+                    {section.source === 'codex'
+                      ? trendRelativeLabel(w.label, data.length - 1 - w._chronoIdx, vocabulary)
+                      : w.label}
                   </td>
                   <td className="num">{fmt.pct0(w.used_pct)}</td>
                   <td className={'num' + (w.is_current ? '' : ' dollar')}>
@@ -146,9 +159,10 @@ export function TrendPanel() {
   const totalRows = presentation.sections.reduce((sum, section) => sum + section.rows.length, 0);
   const hydratingEmpty = presentationProviders(env, activeSource).hydrating && totalRows === 0;
   const single = presentation.sections[0];
+  const singleVocabulary = trendVocabulary(single?.source ?? 'claude');
   const sub = activeSource === 'all'
     ? `(Claude ${presentation.sections[0]?.rows.length ?? 0}w · Codex ${presentation.sections[1]?.rows.length ?? 0}c)`
-    : `(${single?.rows.length ?? 0} week${single?.rows.length === 1 ? '' : 's'})`;
+    : `(${trendUnitCount(single?.rows.length ?? 0, singleVocabulary)})`;
 
   return (
     <section

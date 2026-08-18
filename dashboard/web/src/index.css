@@ -513,7 +513,15 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 }
 
 /* spent zone — SPENT THIS WEEK whole-$ hero + $/1% sub. */
-.hero-spent { display: flex; flex-direction: column; justify-content: center; }
+.hero-spent {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  /* #596 — the mobile spend zone owns a half-width track. Make that actual
+     content box available to the figure's character-aware fit formula instead
+     of sizing from the viewport and silently clipping a plausible amount. */
+  container-type: inline-size;
+}
 .hs-label {
   font-size: var(--fs-eyebrow);
   font-weight: 700;
@@ -732,6 +740,14 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
    .daily-cal-grid. The Daily modal and other panels are untouched. */
 @media (min-width: 900px) {
   .bento-row #panel-daily-body { display: flex; flex-direction: column; min-height: 0; }
+  /* #593 — retain the panel body as the one scrollport, but compact the
+     desktop-card footer chrome enough for the 176px five-week grid plus legend
+     and totals to fit at scrollTop 0. The unscoped modal/mobile footer keeps
+     its roomier 18px/14px spacing. */
+  .bento-row #panel-daily-body .daily-foot {
+    margin-top: var(--space-2);
+    padding-top: var(--space-2);
+  }
   .bento-row #panel-daily-body .daily-cal-grid {
     flex: 1 1 auto;
     /* #265 — per-row 32px floor is the hard no-clip guarantee: the S4-A4 cell
@@ -2921,11 +2937,52 @@ mark.current {
    user sees an affirmative milestone (otherwise "synced 0s ago" is
    visually identical to the prior "synced Xs ago"). */
 .sync-chip.sync-success { color: var(--accent-green); }
+/* A refused refresh is informational, not a failure. Indigo matches the
+   design system's informational tier and stays distinct from stale amber/red;
+   on mobile the text is sr-only, so the icon mirrors the same state. */
+.topbar-sync .sync-chip.sync-busy-notice { color: var(--accent-indigo); }
 /* S7 SYNC-1: freshness color escalation on the sync chip. Fresh keeps the
-   muted default; aging→amber, stale→red. Only the default (env-driven)
-   branch emits a bucket class — busy/error/success keep their own colors. */
+   muted default; aging→amber, stale→red. The bucket describes the DATA and the
+   chip's label describes the ACTIVITY, so the busy, queued, rebuilding and
+   default branches all emit a bucket class (#583 S2). The three that do not are
+   the error floor, the success flash and the standing server failure: each of
+   those states carries its own color, and that color is the message. */
 .sync-chip--aging { color: var(--accent-amber); }
 .sync-chip--stale { color: var(--accent-red); }
+/* #583 S2 browser gate: the siblings of the chip must not move while it cycles
+   through its routine labels. The chip is the last child of the right-anchored
+   .topbar-actions cluster, so its width sets the left edge of the doctor chip,
+   the source chip and all three action buttons; without a reservation the
+   cluster jumped 48.77px between "syncing…" and "synced 12s ago" and 8.13px at
+   every digit boundary. The body font is monospace so one character measures
+   one ch, and the 12px covers this rule's own horizontal padding under
+   border-box.
+
+   14ch is what the chip can reach in any state where it alternates, NOT the
+   widest label the age formatter can produce. The seconds tier tops out at
+   "synced 59s ago" and the minutes tier at "synced 59m ago", both exactly 14
+   characters; the hour tier reaches "synced 23h 59m ago" at 18 and the day tier
+   is unbounded. Neither of those two is reachable while the chip alternates.
+   The server refreshes `last_sync_at` on every clean tick including an idle
+   one, and a tick that errors sets `last_sync_error`, which routes to the chip's
+   server-failure branch instead of to an age — so a healthy dashboard and a
+   failing dashboard both stay inside the minutes tier. Only a publisher that
+   stops publishing while the EventSource stays open reaches an hour-tier age,
+   and there the envelope is frozen, so the chip holds whichever branch the last
+   frame chose. The residual shift is therefore monotonic, at most once a
+   minute, and only in a state that is already an incident. An error label is
+   likewise allowed to exceed the reservation and shift the cluster.
+
+   The reservation depends on `.topbar-sync` being `inline-flex`: `min-width`
+   does not apply to a non-replaced inline element, and it takes effect here
+   only because a flex item is blockified. Scoped to the viewport where the chip
+   text is visible: at 640px and below the chip is sr-only and occupies no row
+   space. */
+@media (min-width: 641px) {
+  .topbar-sync .sync-chip {
+    min-width: calc(14ch + 12px);
+  }
+}
 @keyframes sync-pulse { 0%, 100% { opacity: 0.6 } 50% { opacity: 1 } }
 
 /* ----- Refresh icon: state-driven animations ----- */
@@ -2964,6 +3021,10 @@ mark.current {
   /* Same idiom for error: snap red, fade back over 1s when the 3s
      error-floor expires. */
   color: var(--accent-red);
+  transition: color 0s;
+}
+.topbar-sync:has(.sync-chip.sync-busy-notice) .icon {
+  color: var(--accent-indigo);
   transition: color 0s;
 }
 @keyframes cctally-icon-spin { to { transform: rotate(360deg); } }
@@ -5029,7 +5090,12 @@ mark.current {
      stacked. Two hero numbers (Week% + $ spent) share row 1 (5h paired under the
      week %); the support zone becomes a wrapped meta strip on row 2. ~<=160px. */
   .hero-strip {
-    grid-template-columns: 1fr 1fr;
+    /* #590 — `1fr` carries an automatic min-content floor. The decorated
+       Codex usage zone's inner grid raised that floor to 200px at 320px,
+       squeezing the spend track to 102px and its content box to 78px while
+       the figure needed 102px. Explicit zero minima preserve the authored
+       equal split even when one zone's descendants have a wider minimum. */
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     grid-template-areas:
       "usage spent"
       "support support";
@@ -5044,7 +5110,15 @@ mark.current {
      (34px) are kept; only spacing shrinks. Dashboard-only (the hero mounts
      only on the dashboard branch), so the conversations view is unaffected. */
   .hero-zone { padding: var(--space-2) var(--space-3); }   /* was space-3 space-4 */
-  .hu-num, .hs-big { font-size: 34px; }
+  .hu-num { font-size: 34px; }
+  /* #596 — preserve 34px for ordinary figures, shrinking only when the
+     formatted glyph run would exceed this spend zone's real content width.
+     The 0.62 monospace advance leaves a small rounding/font-rendering margin;
+     --hs-chars is set by the shared Claude/Codex/All figure component. */
+  .hs-big {
+    font-size: min(34px, calc(100cqw / (var(--hs-chars, 1) * 0.62)));
+    white-space: nowrap;
+  }
   .hu-num--sm { font-size: var(--fs-kpi); }
   /* support zone → a horizontal wrapped meta strip on mobile (was 3 stacked rows).
      #293 S1 (MOBILE-2) — tighter row/column gap so on the narrowest phones the
@@ -6377,6 +6451,16 @@ mark.current {
   /* #249 C6 — the inline model-split legend clears the 14px mobile data floor
      (desktop renders it at 11px). #root outranks the bare-class rule above. */
   #root .model-legend { font-size: var(--fs-data); }
+}
+
+/* #587 — a decorated Codex account row is useful in the clean 480px+ header,
+   but at phone widths it has no shrink path: its nowrap chip label, the
+   condensed readout and the action cluster exceed the scrolled topbar's
+   single-line content box. Treat it like the other secondary switchers only
+   in the measured crowded band; account scope returns as soon as the header
+   expands at the top of the page, and remains present at 480px and 640px. */
+@media (max-width: 420px) {
+  .topbar.is-scrolled > .account-chip-row { display: none; }
 }
 
 /* #293 S4 §4c — sub-360px topbar compaction. Hide the "Doctor" WORD (the status
@@ -7806,8 +7890,13 @@ mark.current {
   flex-wrap: wrap;
   gap: var(--space-3);
   margin-top: var(--space-3);
+  /* #562 — this is the row UNDER the three hero zones, so it owns the full
+     hero width. Without an explicit placement the grid auto-placed it in the
+     first 1fr phone cell (186px at 390px), forcing every 200px card to stack. */
+  grid-column: 1 / -1;
 }
 .account-hero-provider-group { display: contents; }
+.account-hero-card-row { display: contents; }
 .account-hero-card {
   flex: 1 1 220px;
   min-width: 200px;
@@ -7902,6 +7991,50 @@ mark.current {
   font-size: var(--fs-meta);
   color: var(--text-dim);
   font-style: italic;
+}
+
+/* #561 — the canonical Claude/Codex usage pair cannot share the 150px phone
+   content box at 320px: the 110px primary track left 4px for the 5h metric and
+   the grid itself overflowed by 15px. Stack only on the narrowest phones; the
+   established side-by-side treatment remains intact from 361px upward. */
+@media (max-width: 360px) {
+  .hero-strip:not([data-source="all"]) .hero-usage {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: var(--space-2);
+    align-items: start;
+  }
+}
+
+/* #562 — decorated accounts remain one compact disclosure row on phones.
+   Each provider owns a labelled, non-wrapping card row inside one horizontal
+   snap rail; desktop keeps the original wrapping/display-contents layout. */
+@media (max-width: 640px) {
+  .account-hero-cards {
+    flex-wrap: nowrap;
+    align-items: flex-start;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    scroll-snap-type: x proximity;
+    scroll-padding-inline: var(--space-1);
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: var(--space-1);
+  }
+  .account-hero-provider-group {
+    display: flex;
+    flex: 0 0 auto;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .account-hero-card-row {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: var(--space-3);
+  }
+  .account-hero-card {
+    flex: 0 0 200px;
+    scroll-snap-align: start;
+  }
+  .account-hero-caption { white-space: nowrap; }
 }
 
 /* Active-source status chip (§6.8) — distinct from the global SyncChip. Reuses

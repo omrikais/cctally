@@ -23,4 +23,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 55 OK · 6 WARN · 0 FAIL
+Summary: 56 OK · 6 WARN · 0 FAIL

@@ -5,12 +5,44 @@ export type Verdict = 'ok' | 'cap' | 'capped';
 
 export interface SyncFailure {
   // `quota_projection_incomplete` is #496 S5b's refusal to serve a quota view
-  // published over an interrupted cache recovery. Type-only: SyncChip renders
+  // published over an interrupted cache recovery. `cache_busy` is #583 S2's
+  // typed SQLITE_BUSY/SQLITE_LOCKED branch. Type-only: SyncChip renders
   // `label` and joins `detail` + `action`, and nothing switches on `kind`.
-  kind: 'cache_corruption' | 'stats_corruption' | 'maintenance_active' | 'maintenance_stale' | 'quota_projection_incomplete' | 'server_sync';
+  kind: 'cache_corruption' | 'stats_corruption' | 'cache_busy' | 'maintenance_active' | 'maintenance_stale' | 'quota_projection_incomplete' | 'server_sync';
   label: string;
   detail: string;
   action: string | null;
+}
+
+// #583 S2 §6.2 — the server's refresh queue / rebuild activity state, published
+// unconditionally at the envelope top level beside `hydrating`.
+//
+// The fields are monotonic counters rather than a boolean because `SSEHub`
+// publishes latest-wins: a frame proving one request finished may be dropped,
+// so a boolean "a sync is pending" can be lost between its set and its clear.
+// Any surviving frame carries the whole truth, because the client compares its
+// own outstanding identifier against `settled_id`.
+//
+// `server_epoch` scopes every identifier to one server process. It is the empty
+// string when the snapshot never passed through `_SnapshotRef`, and never null.
+// Identifiers restart at zero after a restart, so a client MUST compare epochs
+// before comparing numbers.
+//
+// A frame may carry a `rebuilding` delta and NOTHING else: a rebuild nobody
+// requested marks the flag without advancing any counter, because a batch that
+// never existed must never settle.
+//
+// `settled_status` / `settled_warnings` describe the most recently settled
+// batch and are RETAINED across later ordinary frames — the queued contract
+// removed the HTTP response that used to carry warnings.
+export interface SyncActivity {
+  server_epoch: string;
+  rebuilding: boolean;
+  requested_id: number;
+  started_id: number;
+  settled_id: number;
+  settled_status: 'ok' | 'failed' | null;
+  settled_warnings: Array<{ code: string }>;
 }
 
 export interface Envelope {
@@ -112,6 +144,14 @@ export interface Envelope {
   // partial data as-is. False/absent on every complete snapshot. Additive-
   // optional — a Python without the field leaves it absent → treat as false.
   hydrating?: boolean;
+  // #583 S2 §6.2 — the refresh queue / rebuild activity state. Emitted
+  // UNCONDITIONALLY by a server that has the feature, so the optional marker is
+  // a rollout allowance only: an older Python (or a fixture built before the
+  // field landed) omits it, and `syncActivityOrIdle` treats absence as idle.
+  // Distinct from `hydrating`, which keeps meaning "data is still being
+  // assembled" — a rebuild running over warm rows is NOT hydrating and must
+  // never make a populated panel fall back to a skeleton.
+  sync_activity?: SyncActivity;
   // #294 S5 — the S4 source-aware read model. The server's
   // `_source_bundle_to_envelope` (bin/_cctally_dashboard_envelope.py) SPREADS
   // its four fields at the envelope TOP LEVEL via `envelope.update(...)`, so
@@ -1116,7 +1156,7 @@ export interface CodexProjectedBudgetRow {
 // this alias is what non-Codex code should refer to.
 export type ProviderBudgetStatus = CodexBudgetStatus;
 
-// #556 S5 §3.5 — the five dispositions the server can express. The client must
+// #556 S5 §3.5 / #586 — the dispositions the server can express. The client must
 // be able to tell them apart, because rendering "No budget set." to a user who
 // has one set is a lie.
 //
@@ -1130,7 +1170,8 @@ export type BudgetUnavailableReason =
 
 export type BudgetNotConfiguredDisposition =
   | 'provider_budget_unset'
-  | 'account_budgets_only';
+  | 'account_budgets_only'
+  | 'account_budget_unset';
 
 // Every client-facing position below is a BARE `string`, not the union. This is
 // S2's shape for the same rule (`CombinedUnavailableCause.code`, `:1663`), and
@@ -1159,12 +1200,21 @@ export interface BudgetStatusUnavailable {
 export interface BudgetNotConfigured {
   /** One of `BudgetNotConfiguredDisposition`, or a newer server's addition. */
   disposition: string;
+  /** #586 — focused Codex account whose per-account budget is unset. */
+  account_key?: string;
+  /** #586 — existing map entries the replacement-style CLI set must preserve. */
+  configured_accounts?: Record<string, number>;
 }
 
 // The adapted presentation `presentationBudgetComposition` produces.
 export type BudgetPresentation =
   | { state: 'configured'; status: ProviderBudgetStatus }
-  | { state: 'not_configured'; disposition: string }
+  | {
+      state: 'not_configured';
+      disposition: string;
+      accountKey?: string;
+      configuredAccounts?: Record<string, number>;
+    }
   // `unavailable` carries the WHOLE server object rather than a copy of its
   // code, because §4.6 renders three of its fields — the human `message`, the
   // configured `budget_usd` and the configured `period`. `reason` stays as the
@@ -1182,9 +1232,9 @@ export interface CodexBudgetDomain {
   /** #556 S5 §3.5 — present only when a configured computation failed. */
   status_unavailable?: BudgetStatusUnavailable;
   /**
-   * #556 S5 Unit 2 review F1 — present only for `account_budgets_only`, the
-   * vendor-wide read of a per-account-only configuration. Codex still emits
-   * `status: null` beside it, which is the asymmetry documented above.
+   * #556 S5 / #586 — names either the vendor-wide read of a per-account-only
+   * configuration or a focused account whose own budget is unset. Codex still
+   * emits `status: null` beside it, which is the asymmetry documented above.
    */
   not_configured?: BudgetNotConfigured;
   milestones: CodexBudgetMilestoneRow[];
@@ -1801,6 +1851,15 @@ export interface AllSourceData {
   // carrying `source`) so a typed provider-row array assigns without an
   // index-signature mismatch.
   alerts: { rows: unknown[] };
+  // #583 S3 §4 — both members are published NULL since source schema 10. This
+  // block used to carry the two provider data objects a second time, about
+  // 1.56 MB of a 3.25 MB envelope. Consumers read the physical
+  // `sources.claude` / `sources.codex` entries instead; the key itself is
+  // retained so a still-loaded v9 bundle, which reads `data?.providers.claude`
+  // with the optional chain on `data` alone, does not throw across an in-place
+  // `execvp` update. The declaration is unchanged because it was already
+  // nullable, which is what made null a legal v9 value. Every reader must keep
+  // the `?? sources.<provider>.data` fallback: this block carries no data.
   providers: {
     claude: ClaudeSourceData | null;
     codex: CodexSourceData | null;

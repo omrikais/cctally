@@ -716,6 +716,11 @@ def _refresh_usage_inproc_locked(
             *({"fiveHour"} if five_pct is not None else set()),
         },
         lock_held=True,
+        # #583 S2 §5.3: the dashboard calls this INSIDE its own `sync_lock`
+        # while servicing a `refresh=1`, so an inner nudge would enqueue a
+        # second rebuild for work already underway. `cmd_refresh_usage`
+        # already nudges once on its own after this returns.
+        nudge_dashboard=False,
     )
     if authoritative.status != "ok":
         return _RefreshUsageResult(
@@ -761,6 +766,25 @@ def _refresh_usage_inproc_locked(
     return _RefreshUsageResult(status="ok", payload=payload, warnings=warnings)
 
 
+def _resolve_dashboard_api_token() -> "str | None":
+    """Return the bearer token a running dashboard would require, if known.
+
+    #583 S2 §4. `_require_api_auth` admits an unauthenticated `/api/*` request
+    only when `cctally_api_token` is None, and the dashboard mints that token
+    with `secrets.token_urlsafe(32)` at startup for a non-loopback bind. It is
+    printed once ("dashboard: LAN access token: …") and placed in the startup
+    URL's fragment; it is never written to `config.json` and never persisted.
+    So there is NO configured token for a separate `refresh-usage` process to
+    read, and this environment variable is the only mechanism available today:
+    export the printed token and the nudge authenticates. Without it a
+    LAN-bound, token-configured dashboard answers 401 and the helper's
+    swallow-everything contract discards the nudge, which is a pre-existing
+    defect rather than a regression.
+    """
+    token = (os.environ.get("CCTALLY_DASHBOARD_API_TOKEN") or "").strip()
+    return token or None
+
+
 def _nudge_dashboard_repaint(port: int = 8789, timeout_seconds: float = 3.0) -> None:
     """Best-effort: tell a locally-running dashboard to rebuild+broadcast NOW.
 
@@ -776,20 +800,28 @@ def _nudge_dashboard_repaint(port: int = 8789, timeout_seconds: float = 3.0) -> 
 
     CSRF: the dashboard's _check_origin_csrf requires Origin/Host authority
     parity. urllib auto-sets Host from the URL; we set Origin to the
-    byte-identical authority so the POST is accepted (not 403). The timeout
-    is 3.0s — comfortably above the server's _DASHBOARD_SYNC_LOCK_TIMEOUT_
-    SECONDS (2.0s) bounded lock-wait — so the client stays connected until
-    the 204 lands and never leaves a broken-pipe log line in the dashboard's
-    terminal. In the common case (lock free) it returns in single-digit ms.
+    byte-identical authority so the POST is accepted (not 403).
+
+    #583 S2 §4. The URL carries `queue=1`, which marks this as a MACHINE
+    NUDGE: the handler enqueues it even when `sync_lock` is free, because this
+    fires at Claude Code's status-line cadence and a synchronous rebuild at
+    that frequency would reopen the #313 peg. The response is therefore a
+    202 that arrives as soon as the request is queued, not a 204 that waits
+    for a rebuild — the 3.0s timeout is now generous rather than tuned to a
+    server-side lock-wait. A bearer header is sent when a token is
+    resolvable; see `_resolve_dashboard_api_token`.
     """
     # Whole body (incl. Request construction) inside the try so the
     # "swallows EVERY error" contract holds structurally, not just because
     # Request() happens to be total for the hardcoded loopback URL.
     try:
-        url = f"http://127.0.0.1:{port}/api/sync?refresh=0"
+        url = f"http://127.0.0.1:{port}/api/sync?refresh=0&queue=1"
+        headers = {"Origin": f"http://127.0.0.1:{port}"}
+        token = _cctally()._resolve_dashboard_api_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(
-            url, data=b"", method="POST",
-            headers={"Origin": f"http://127.0.0.1:{port}"},
+            url, data=b"", method="POST", headers=headers,
         )
         with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
             resp.read()
@@ -922,16 +954,28 @@ def _hook_tick_oauth_refresh(
     # its suppression conditions.  A concurrent publisher can otherwise make
     # this tick issue an unnecessary OAuth request between the initial gate
     # and the request itself.
+    # #583 S2: the nudge is deferred out of the critical section. This frame
+    # owns the lock across the OAuth fetch AND the authoritative record, so
+    # `_authoritative_record_usage` cannot release it — the deferral has to
+    # reach the frame that acquired it. The nudge is a loopback POST with a
+    # multi-second timeout and this lock is an `fcntl.flock` every cctally
+    # process contends on, so one unresponsive listener would otherwise stall
+    # every other process's selected-state writes at status-line cadence.
+    deferred = []
     try:
         with c._selected_state_lock():
-            return _hook_tick_oauth_refresh_locked(
+            out = _hook_tick_oauth_refresh_locked(
                 c,
                 token=token,
                 timeout_seconds=timeout_seconds,
                 throttle_seconds=throttle_seconds,
+                nudge_sink=lambda: deferred.append(1),
             )
     except OSError:
         return "err(record-usage=exc)", None
+    if deferred:
+        c._nudge_dashboard_repaint()
+    return out
 
 
 def _hook_tick_oauth_refresh_locked(
@@ -940,8 +984,13 @@ def _hook_tick_oauth_refresh_locked(
     token: str,
     timeout_seconds: float,
     throttle_seconds: float,
+    nudge_sink=None,
 ) -> tuple[str, dict | None]:
-    """Automatic OAuth path with the selected-state lock already held."""
+    """Automatic OAuth path with the selected-state lock already held.
+
+    ``nudge_sink`` records that a dashboard nudge is warranted; the caller
+    fires it after releasing the lock (#583 S2).
+    """
     # Backfill gate: an inflight/invalid tombstone bypasses only selected-age
     # suppression so a later authoritative result can repair it.  The normal
     # throttle and 429 deadline continue to bound OAuth traffic.
@@ -997,6 +1046,7 @@ def _hook_tick_oauth_refresh_locked(
         record_args,
         {"sevenDay", *({"fiveHour"} if five_pct is not None else set())},
         lock_held=True,
+        nudge_sink=nudge_sink,
     )
     if authoritative.status != "ok":
         reason = authoritative.reason or ""

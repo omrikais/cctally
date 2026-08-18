@@ -1,4 +1,4 @@
-import { useEffect, useRef, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useSyncExternalStore, type CSSProperties } from 'react';
 import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useDisplayTz } from '../hooks/useDisplayTz';
@@ -132,6 +132,24 @@ const HERO_REGION_NAME: Record<DashboardSelection, string> = {
   claude: 'Claude week usage summary',
   codex: 'Codex cycle usage summary',
 };
+
+function HeroSpendFigure({
+  amount,
+  dimWhenBlank = false,
+}: {
+  amount: number | null | undefined;
+  dimWhenBlank?: boolean;
+}) {
+  const text = fmt.usd0(amount);
+  return (
+    <div
+      className={amount == null && dimWhenBlank ? 'hs-big is-blank' : 'hs-big'}
+      style={{ '--hs-chars': text.length } as CSSProperties}
+    >
+      {text}
+    </div>
+  );
+}
 
 export function HeroStrip() {
   const env = useScopedSnapshot();
@@ -501,12 +519,25 @@ function SharedHero({
   // states. The panels stay unscoped for Claude, because Claude publishes no
   // `account_scopes`.
   const codexPerAccount = codexDecorated && codexScope.accountKey == null;
+  // #589 — under an All-tab account focus the combined figure stays withheld,
+  // so its provider legs are intentionally absent. The support row is a
+  // provider-native surface, though, and must read the same server-published
+  // account card as the quota slots and the card strip. Keep null as "no
+  // focus" and preserve zero as a real focused value.
+  const codexFocusedSpendUsd = codexScope.accountKey == null
+    ? null
+    : codexScope.card?.spendUsd ?? null;
   const claudeEntry = resolveSourceView(env, 'claude').entry;
   const claudeAccounts = sourceAccounts(claudeEntry);
   const claudeFocusedCard = claudeScope.requestedKey == null
     ? null
     : claudeAccounts?.find((card) => card.accountKey === claudeScope.requestedKey) ?? null;
   const claudePerAccount = claudeAccounts != null && claudeFocusedCard == null;
+  // #588 — mirror the focused Codex leg above. The combined legs stay absent
+  // under account decoration, but this provider-native row can read the same
+  // server-published card as the focused headline and card strip. A resolved
+  // zero is data, so pass it through instead of falling back to `no data`.
+  const claudeFocusedSpendUsd = claudeFocusedCard?.spendUsd ?? null;
   // #556 S5 round-2 QA P1 — the focused card answers, including when its answer
   // is "no figure". Falling through to `h.used_pct` published the PROVIDER-WIDE
   // weekly percentage as one account's own, so two accounts that had consumed
@@ -591,9 +622,7 @@ function SharedHero({
         title={withheldReason?.message}
       >
         <div className="hs-label" data-testid="hero-combined-heading">{heading}</div>
-        <div className={figure == null ? 'hs-big is-blank' : 'hs-big'}>
-          {figure == null ? '—' : fmt.usd0(figure.costUsd)}
-        </div>
+        <HeroSpendFigure amount={figure?.costUsd} dimWhenBlank />
         <div className="hs-sub">
           {withheldReason != null
             ? (
@@ -643,13 +672,23 @@ function SharedHero({
         <div className="sup-row">
           <span className="sup-l">Claude · week to date</span>
           <span className="sup-v" data-testid="hero-leg-claude">
-            <LegAmount leg={claudeLeg} perAccount={claudePerAccount} provider="claude" />
+            <LegAmount
+              leg={claudeLeg}
+              perAccount={claudePerAccount}
+              provider="claude"
+              focusedCostUsd={claudeFocusedSpendUsd}
+            />
           </span>
         </div>
         <div className="sup-row">
           <span className="sup-l">Codex · cycle to date</span>
           <span className="sup-v" data-testid="hero-leg-codex">
-            <LegAmount leg={codexLeg} perAccount={codexPerAccount} provider="codex" />
+            <LegAmount
+              leg={codexLeg}
+              perAccount={codexPerAccount}
+              provider="codex"
+              focusedCostUsd={codexFocusedSpendUsd}
+            />
           </span>
         </div>
       </div>
@@ -734,10 +773,12 @@ function LegAmount({
   leg,
   perAccount,
   provider,
+  focusedCostUsd = null,
 }: {
   leg: AllCombinedLeg | null;
   perAccount: boolean;
   provider: SourceName;
+  focusedCostUsd?: number | null;
 }) {
   if (perAccount) {
     return (
@@ -749,6 +790,9 @@ function LegAmount({
         per account
       </span>
     );
+  }
+  if (focusedCostUsd != null) {
+    return <>{fmt.usd2(focusedCostUsd)}</>;
   }
   if (leg == null || leg.state === 'empty') {
     return <span className="hero-leg-no-data">no data</span>;
@@ -933,7 +977,7 @@ function CanonicalHero({
         })()}
       >
         <div className="hs-label">{spentLabel}</div>
-        <div className="hs-big">{fmt.usd0(spentUsd)}</div>
+        <HeroSpendFigure amount={spentUsd} />
         <div className="hs-sub">
           {perAccountValue == null
             ? <><span>{fmt.usd2(dollarPerPct)}</span> / 1% used</>

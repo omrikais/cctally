@@ -318,6 +318,64 @@ describe('empty-stream block keeps the navigator mounted (P1)', () => {
     fireEvent.click(screen.getByLabelText('Older block'));
     await screen.findByText(/Block 1 of 2/);
   });
+
+  it('keeps the current block navigator mounted while lazy detail is loading', async () => {
+    let resolveDetail!: (value: unknown) => void;
+    const pendingDetail = new Promise<unknown>((resolve) => { resolveDetail = resolve; });
+    global.fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => pendingDetail,
+    })) as unknown as typeof fetch;
+
+    const env = makeEnv([
+      idxEntry('milestone_cycle:current', {
+        is_current: true,
+        segment_count: 1,
+        block_count: 2,
+      }),
+      INDEX[1],
+    ]);
+    env.current_week!.five_hour_block = {
+      block_start_at: '2026-05-16T05:00:00Z',
+      five_hour_window_key: 901,
+      seven_day_pct_at_block_start: 40,
+      seven_day_pct_delta_pp: 2,
+      crossed_seven_day_reset: false,
+      credits: [],
+    };
+    env.current_week!.five_hour_milestones = [{
+      percent_threshold: 20,
+      reset_event_id: 0,
+      captured_at_utc: '2026-05-16T06:00:00Z',
+      block_cost_usd: 1,
+      marginal_cost_usd: 1,
+      seven_day_pct_at_crossing: 42,
+    }];
+    updateSnapshot(env);
+    render(<CurrentWeekModal />);
+
+    expect(screen.getByText(/Block 2 of 2/)).toBeTruthy();
+    expect(document.querySelector('#mcw-5h-table')).toBeTruthy();
+    fireEvent.click(screen.getByLabelText('Older block'));
+
+    expect(screen.getByText(/Block 2 of 2/)).toBeTruthy();
+    expect(screen.getByLabelText('Older block')).toBeTruthy();
+    expect(screen.getByRole('status')).toHaveTextContent('Loading block detail…');
+    expect(document.querySelector('#mcw-5h-table')).toBeNull();
+
+    resolveDetail({
+      source: 'claude', key: 'milestone_cycle:current', label: 'Jul 18–Jul 25',
+      start_at_utc: '2026-05-15T00:00:00Z', end_at_utc: '2026-05-22T00:00:00Z',
+      is_current: true, detail_stamp: 'st-milestone_cycle:current',
+      segments: [{ key: 'milestone_segment:current', milestones: [] }],
+      dividers: [],
+      blocks: [
+        { five_hour_window_key: 900, block_start_at: '2026-05-16T00:00:00Z', five_hour_resets_at: '2026-05-16T05:00:00Z', final_five_hour_percent: 10, total_cost_usd: 1, crossed_seven_day_reset: false, is_closed: true, milestones: [], credits: [] },
+        { five_hour_window_key: 901, block_start_at: '2026-05-16T05:00:00Z', five_hour_resets_at: '2026-05-16T10:00:00Z', final_five_hour_percent: 20, total_cost_usd: 1, crossed_seven_day_reset: false, is_closed: false, milestones: [], credits: [] },
+      ],
+    });
+    await screen.findByText(/Block 1 of 2/);
+  });
 });
 
 // P2-A (spec Q2-A) — every week view, current included, gets a block
@@ -341,6 +399,38 @@ describe('Codex current-cycle block navigator (P2-A)', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     dispatch({ type: 'OPEN_MODAL', kind: 'current-week' });
   }
+
+  it('keeps the compact navigator mounted while lazy block detail is loading', async () => {
+    let resolveDetail!: (value: unknown) => void;
+    const pendingDetail = new Promise<unknown>((resolve) => { resolveDetail = resolve; });
+    global.fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => pendingDetail,
+    })) as unknown as typeof fetch;
+    openCodex();
+    updateSnapshot(codexEnvWithIndex(CODEX_IDX));
+    render(<CurrentWeekModal />);
+
+    fireEvent.click(screen.getByLabelText('Older block'));
+
+    expect(screen.getByText(/Block 3 of 3/)).toBeTruthy();
+    expect(screen.getByLabelText('Older block')).toBeTruthy();
+    expect(screen.getByRole('status')).toHaveTextContent('Loading block detail…');
+
+    resolveDetail({
+      source: 'codex', key: 'milestone_cycle:codex-current', label: 'Cyc current',
+      start_at_utc: '2026-04-23T00:00:00Z', end_at_utc: '2026-04-30T00:00:00Z',
+      resets_at_utc: '2026-04-30T00:00:00Z', is_current: true, detail_stamp: 'st-cur',
+      segments: [{ key: 'milestone_segment:codex-current', milestones: [] }],
+      dividers: [],
+      blocks: [
+        { key: 'blk-1', block_start_at: '2026-04-24T00:00:00Z', five_hour_resets_at: '2026-04-24T05:00:00Z', final_five_hour_percent: 10, total_cost_usd: 1, crossed_seven_day_reset: false, is_closed: true, milestones: [] },
+        { key: 'blk-2', block_start_at: '2026-04-24T05:00:00Z', five_hour_resets_at: '2026-04-24T10:00:00Z', final_five_hour_percent: 20, total_cost_usd: 1, crossed_seven_day_reset: false, is_closed: true, milestones: [] },
+        { key: 'blk-3', block_start_at: '2026-04-24T10:00:00Z', five_hour_resets_at: '2026-04-24T15:00:00Z', final_five_hour_percent: 30, total_cost_usd: 1, crossed_seven_day_reset: false, is_closed: false, milestones: [] },
+      ],
+    });
+    await screen.findByText(/Block 2 of 3/);
+  });
 
   it('shows the block-nav affordance and one click fetches then lands on the immediately older block', async () => {
     const payload = {

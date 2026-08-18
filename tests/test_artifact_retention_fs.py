@@ -1282,7 +1282,10 @@ def test_a_skipped_referrer_leaves_its_referent_untouched(
     # Replace the incident directory's inode between planning and marking.
     (incident / "manifest.json").unlink()
     incident.rmdir()
-    _plant_dir(root, "quarantine/stats.db-x")
+    _recreate_dir_with_different_inode(
+        incident, device=targets[0].device, inode=targets[0].inode,
+    )
+    (incident / "manifest.json").write_text("{}", encoding="utf-8")
 
     with ret.retention_exclusive():
         result = ret.mark_reclaim_plan(targets, plan_id="p1", root=root)
@@ -1334,7 +1337,10 @@ def test_a_skip_in_one_root_does_not_abandon_another_root(
     ) + _group(ret, root, "quarantine/cache.db-z", "quarantine/cache.db-z")
     (doomed / "manifest.json").unlink()
     doomed.rmdir()
-    _plant_dir(root, "quarantine/stats.db-x")
+    _recreate_dir_with_different_inode(
+        doomed, device=targets[0].device, inode=targets[0].inode,
+    )
+    (doomed / "manifest.json").write_text("{}", encoding="utf-8")
 
     with ret.retention_exclusive():
         result = ret.mark_reclaim_plan(targets, plan_id="p1", root=root)
@@ -1368,7 +1374,10 @@ def test_a_resume_does_not_rename_a_referent_whose_referrer_stayed(
     # The referrer's inode moved while the worker was away.
     (incident / "manifest.json").unlink()
     incident.rmdir()
-    _plant_dir(root, "quarantine/stats.db-x")
+    _recreate_dir_with_different_inode(
+        incident, device=targets[0].device, inode=targets[0].inode,
+    )
+    (incident / "manifest.json").write_text("{}", encoding="utf-8")
 
     outcome = ret.resume_reclaim(root=root)
 
@@ -1499,7 +1508,10 @@ def test_every_skip_reason_reaches_the_reclaim_outcome(
         targets = _targets(ret, root, "quarantine/a")
         (planted / "manifest.json").unlink()
         planted.rmdir()
-        _plant_dir(root, "quarantine/a")
+        _recreate_dir_with_different_inode(
+            planted, device=targets[0].device, inode=targets[0].inode,
+        )
+        (planted / "manifest.json").write_text("{}", encoding="utf-8")
     else:
         _plant_dir(root, "outside-target")
         (root / "quarantine" / "a").symlink_to(root / "outside-target")
@@ -1790,7 +1802,10 @@ def test_the_sanctioned_target_builder_keeps_a_referent_safe(
     targets = ret.targets_for_plan(plan, root=root)
     (incident / "manifest.json").unlink()
     incident.rmdir()
-    _plant_dir(root, "quarantine/stats.db-x")
+    _recreate_dir_with_different_inode(
+        incident, device=targets[0].device, inode=targets[0].inode,
+    )
+    (incident / "manifest.json").write_text("{}", encoding="utf-8")
 
     outcome = ret.reclaim_artifacts(targets, plan_id="p1", root=root)
 

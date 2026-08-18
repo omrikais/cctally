@@ -155,16 +155,6 @@ def test_aggregate_sessions_is_byte_identical_under_a_scope(agg, tmp_path, monke
     assert without == within
 
 
-def test_the_dashboard_source_build_opens_a_scope(agg, monkeypatch):
-    """Non-vacuity: the production caller really enters the scope."""
-    import inspect
-
-    import _cctally_dashboard_sources as ds
-
-    src = inspect.getsource(ds.build_codex_source_state)
-    assert "codex_path_scope" in src
-
-
 def test_the_memo_is_independent_of_the_speed_tier(agg, tmp_path, monkeypatch):
     """Speed feeds cost, not identity, so it is deliberately not a memo key."""
     import datetime as dt

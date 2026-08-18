@@ -54,8 +54,12 @@ def _stub_fetch_raises(monkeypatch, ns, exc):
 
 
 def _stub_record_ok(monkeypatch, ns, capture=None):
-    def fake(record_args, observed_axes, *, lock_held=False):
+    def fake(record_args, observed_axes, *, lock_held=False,
+             nudge_dashboard=True):
         assert lock_held is True
+        # #583 S2 §5.3: the refresh-origin record must not nudge; the
+        # command nudges once itself after this returns.
+        assert nudge_dashboard is False
         if capture is not None:
             capture["args"] = record_args
             capture["axes"] = observed_axes
@@ -64,8 +68,10 @@ def _stub_record_ok(monkeypatch, ns, capture=None):
 
 
 def _stub_record_raises(monkeypatch, ns, exc):
-    def boom(record_args, observed_axes, *, lock_held=False):
+    def boom(record_args, observed_axes, *, lock_held=False,
+             nudge_dashboard=True):
         assert lock_held is True
+        assert nudge_dashboard is False
         return types.SimpleNamespace(status="record_failed", reason=str(exc))
     monkeypatch.setitem(ns, "_authoritative_record_usage", boom)
 

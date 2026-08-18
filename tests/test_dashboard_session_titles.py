@@ -330,16 +330,19 @@ def _built_snapshot(ns):
 
 
 def _claude_source_row_lists(env):
-    """The two SOURCE-scoped Claude session row lists the All tab reads."""
+    """The SOURCE-scoped Claude session row lists the All tab reads.
+
+    #583 S3 §4: there is now exactly ONE. `sources.all.data.providers`
+    publishes null for both members, so the All tab reads the physical
+    `sources.claude` entry — which was always the same list object the mirror
+    exposed. The mirror is asserted null here so this helper cannot go vacuous
+    by silently losing a list it was supposed to return.
+    """
     sources = env.get("sources") or {}
     claude = ((sources.get("claude") or {}).get("data") or {})
-    providers = (((sources.get("all") or {}).get("data") or {})
-                 .get("providers") or {})
-    return [
-        ((claude.get("sessions") or {}).get("rows") or []),
-        (((providers.get("claude") or {}).get("sessions") or {})
-         .get("rows") or []),
-    ]
+    assert (((sources.get("all") or {}).get("data") or {})
+            .get("providers")) == {"claude": None, "codex": None}
+    return [((claude.get("sessions") or {}).get("rows") or [])]
 
 
 def test_envelope_carries_the_session_title_end_to_end(tmp_path, monkeypatch):
@@ -380,7 +383,8 @@ def test_source_scoped_claude_rows_carry_the_title_behind_the_same_gate(
     )
 
     open_lists = _claude_source_row_lists(open_env)
-    assert all(rows for rows in open_lists), "expected both source row lists"
+    assert open_lists and all(rows for rows in open_lists), (
+        "expected the source row list to be populated")
     for rows in open_lists:
         assert [r.get("title") for r in rows] == ["Fix the flaky test"]
     # Same snapshot, gate closed -> the key is absent everywhere, exactly as the

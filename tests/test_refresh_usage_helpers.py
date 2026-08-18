@@ -432,14 +432,17 @@ def test_fetch_uses_override_user_agent(monkeypatch):
 def test_nudge_dashboard_repaint_swallows_no_listener(capsys):
     """Best-effort contract: against a port with nothing listening, the
     helper must NOT raise, must print nothing, and must return None."""
-    import socket
     ns = load_script()
-    # Reserve a port then close it, so the connect is guaranteed refused.
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    closed_port = s.getsockname()[1]
-    s.close()
-    assert ns["_nudge_dashboard_repaint"](port=closed_port, timeout_seconds=0.5) is None
+    # An ephemeral port released before the call is not guaranteed to stay
+    # unclaimed while the full suite runs many HTTP-server tests in parallel.
+    # Inject the network outcome this contract owns instead of racing the OS.
+    refused = ConnectionRefusedError("no dashboard listener")
+    with patch.object(ns["urllib"].request, "urlopen", side_effect=refused) as open_mock:
+        assert ns["_nudge_dashboard_repaint"](
+            port=18789, timeout_seconds=0.5,
+        ) is None
+    open_mock.assert_called_once()
+    assert open_mock.call_args.kwargs["timeout"] == 0.5
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""

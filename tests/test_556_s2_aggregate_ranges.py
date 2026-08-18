@@ -982,7 +982,12 @@ def test_the_tz_override_fixture_publishes_an_undrillable_row():
         pathlib.Path(__file__).resolve().parent
         / "fixtures" / "dashboard" / "tz-override" / "golden-data.json"
     ).read_text())
-    claude = golden["sources"]["all"]["data"]["providers"]["claude"]
+    # #583 S3 §4: the All provider mirror publishes null, so the Claude domain
+    # is read from the physical entry — the one place it is now published.
+    assert golden["sources"]["all"]["data"]["providers"] == {
+        "claude": None, "codex": None,
+    }
+    claude = golden["sources"]["claude"]["data"]
     published = claude["projects"]["aggregate"]["rows"]
 
     assert len(published) == 1
@@ -1853,6 +1858,24 @@ def test_both_range_rules_hold_at_once():
     assert dict(combined.data["aggregates"]["range"]) == _RANGE
 
 
+def test_all_providers_mirror_is_nulled_not_removed():
+    """#583 S3 §4. The key stays so a still-open v9 bundle does not throw.
+
+    `dashboardPresentation.ts` reads `data?.providers.claude`, guarding `data`
+    and not `providers`, so an absent key throws a TypeError in an already
+    loaded bundle after an in-place `execvp` update. Both members are declared
+    nullable in `types/envelope.ts`, so null is a legal v9 value.
+    """
+    claude = _state("claude")
+    codex = _state("codex")
+    composed = lds.compose_all_state(claude, codex)
+
+    assert "providers" in composed.data
+    assert composed.data["providers"] == {"claude": None, "codex": None}
+    # The physical entries are untouched and remain the only copies.
+    assert claude.data is not None and codex.data is not None
+
+
 def test_a_day_rollover_with_a_failed_source_keeps_the_retained_calendar(
     dashboard_harness,
 ):
@@ -1925,10 +1948,11 @@ def test_the_committed_golden_states_the_boundary_by_value():
 
     golden = json.loads(_GOLDEN.read_text())
     # #556 S5 bumped this to 8 (the Claude budget capability detail changed
-    # meaning) and #564 to 9 (a decorated Codex fallback card's totals
-    # changed value). The assertion is kept rather than deleted: it is what
-    # tells a reader which wire version this golden was captured against.
-    assert golden["source_schema_version"] == 9
+    # meaning), #564 to 9 (a decorated Codex fallback card's totals changed
+    # value) and #583 S3 to 10 (the All provider mirror publishes null). The
+    # assertion is kept rather than deleted: it is what tells a reader which
+    # wire version this golden was captured against.
+    assert golden["source_schema_version"] == 10
     aggregates = golden["sources"]["all"]["data"]["aggregates"]
     assert aggregates["range"] == {
         "kind": "absolute_range",

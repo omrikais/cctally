@@ -62,6 +62,7 @@ pool-machinery-failed
 pytest-collected-nothing
 pytest-failed
 pytest-internal
+pytest-no-failing-node-ids
 pytest-unavailable
 regeneration-enabled
 summary-unreadable
@@ -867,9 +868,13 @@ contract_classify_harness() {  # <name> <logfile> <exitfile> <min_cases>
 # `${3-0}`, not `${3:-0}`: an EMPTY third argument is the caller saying it read
 # no count at all, and collapsing that to 0 is exactly the confusion this
 # sentinel exists to prevent. An omitted argument still means 0, because a
-# caller that passes none never tried to measure.
-contract_classify_pytest() {  # <rc> [subject] [passed_items]
-    local rc=$1 subject=${2:-pytest} passed=${3-0}
+# caller that passes none never tried to measure. The optional fourth argument
+# is the caller's node-id parse result for a status-1 leg: `present`, `none`, or
+# omitted/`unknown`. A status-1 run that identifies no FAILED/ERROR node is an
+# infrastructure failure, not evidence of defective product code. `unknown`
+# preserves the historical exit-code-only behavior for other callers.
+contract_classify_pytest() {  # <rc> [subject] [passed_items] [node_ids]
+    local rc=$1 subject=${2:-pytest} passed=${3-0} node_ids=${4:-unknown}
     case "$passed" in
         ''|*[!0-9]*)
             CONTRACT_PYTEST_UNPARSED=1
@@ -879,7 +884,11 @@ contract_classify_pytest() {  # <rc> [subject] [passed_items]
     CONTRACT_PYTEST_PASSED=$((CONTRACT_PYTEST_PASSED + passed))
     case "$rc" in
         0)     return 0 ;;
-        1)     contract_fail product pytest-failed "$subject" pytest ;;
+        1)     if [ "$node_ids" = none ]; then
+                   contract_fail infrastructure pytest-no-failing-node-ids "$subject" pytest
+               else
+                   contract_fail product pytest-failed "$subject" pytest
+               fi ;;
         5)     contract_fail incomplete pytest-collected-nothing "$subject" pytest ;;
         2|3|4) contract_fail infrastructure pytest-internal "$subject" pytest ;;
         *)     contract_fail infrastructure pytest-internal "$subject" pytest ;;

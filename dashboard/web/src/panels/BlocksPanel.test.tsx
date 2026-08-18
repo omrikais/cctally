@@ -141,8 +141,8 @@ describe('BlocksPanel source-bound detail routing (#319 Task 1)', () => {
       ...codex.quota.blocks[0],
       account_key: ACCOUNT_A,
     }];
+    // #583 S3 §4: physical entry only — the All mirror publishes null.
     env.sources!.codex.data = codex;
-    env.sources!.all.data!.providers.codex = codex;
     updateSnapshot(env);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
 

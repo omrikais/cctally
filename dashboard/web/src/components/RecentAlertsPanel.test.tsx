@@ -9,6 +9,13 @@ import { act, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RecentAlertsPanel } from './RecentAlertsPanel';
 import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
+import { collectToastAlertRows } from '../lib/alertIdentity';
+import {
+  makeAllSourceEntry,
+  makeClaudeSourceEntry,
+  makeCodexSourceEntry,
+  makeSourceEnvelope,
+} from '../test-utils/sourceEnvelope';
 import type { AlertEntry, Envelope } from '../types/envelope';
 import type { AlertsConfig } from '../store/store';
 
@@ -22,14 +29,29 @@ const CONFIG: AlertsConfig = {
   weekly_usd: null,
 };
 
-function ingest(alerts: AlertEntry[]) {
+function ingest(
+  alerts: AlertEntry[],
+  options: {
+    usedPct?: number | null;
+    legacyAlerts?: AlertEntry[];
+    alertsSettings?: AlertsConfig;
+  } = {},
+) {
+  const snap = alertEnv(
+    options.usedPct ?? null,
+    alerts,
+    options.legacyAlerts ?? [],
+    options.alertsSettings ?? CONFIG,
+  );
   act(() => {
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts,
-      alertsSettings: CONFIG,
-      isFirstTick: true, // cold-start: no toast side effects
-    });
+    if (updateSnapshot(snap)) {
+      dispatch({
+        type: 'INGEST_SOURCE_ALERTS',
+        rows: collectToastAlertRows(snap),
+        alertsSettings: snap.alerts_settings ?? CONFIG,
+        isFirstTick: true, // cold-start: no toast side effects
+      });
+    }
   });
 }
 
@@ -45,7 +67,30 @@ function entry(partial: Partial<AlertEntry>): AlertEntry {
   };
 }
 
-function emptyEnv(usedPct: number | null): Envelope {
+function alertEnv(
+  usedPct: number | null,
+  alerts: AlertEntry[],
+  legacyAlerts: AlertEntry[],
+  alertsSettings: AlertsConfig,
+): Envelope {
+  const sourceRows = alerts.map((alert) => ({
+    ...alert,
+    source: 'claude' as const,
+    key: `alert:claude:${alert.id}`,
+  }));
+  const sourceSlice = makeSourceEnvelope();
+  const claude = makeClaudeSourceEntry({
+    data: {
+      ...sourceSlice.sources.claude.data!,
+      alerts: { rows: sourceRows },
+    },
+  });
+  const codex = makeCodexSourceEntry({
+    data: {
+      ...sourceSlice.sources.codex.data!,
+      alerts: { rows: [] },
+    },
+  });
   return {
     envelope_version: 2,
     generated_at: '2026-06-30T10:00:00Z',
@@ -61,8 +106,11 @@ function emptyEnv(usedPct: number | null): Envelope {
     sessions: { total: 0, sort_key: 'started_desc', rows: [] },
     projects: null,
     display: { tz: 'local', resolved_tz: 'Etc/UTC', offset_label: 'UTC', offset_seconds: 0 },
-    alerts: [],
-    alerts_settings: { enabled: true, weekly_thresholds: [90, 95], five_hour_thresholds: [90, 95], budget_thresholds: [90, 95] },
+    alerts: legacyAlerts,
+    alerts_settings: alertsSettings,
+    ...makeSourceEnvelope({
+      sources: { claude, codex, all: makeAllSourceEntry(claude, codex) },
+    }),
   };
 }
 
@@ -102,15 +150,7 @@ describe('RecentAlertsPanel severity', () => {
 // so "you're at 42%, alerts fire at 90/95" is SHOWN, not just told.
 describe('RecentAlertsPanel empty-state teaching gauge (#264 S1)', () => {
   function seed(usedPct: number | null) {
-    act(() => {
-      updateSnapshot(emptyEnv(usedPct));
-      dispatch({
-        type: 'INGEST_SNAPSHOT_ALERTS',
-        alerts: [],
-        alertsSettings: CONFIG,
-        isFirstTick: true,
-      });
-    });
+    ingest([], { usedPct });
   }
 
   it('renders a gauge filled to used_pct with one tick per weekly threshold', () => {
@@ -151,6 +191,16 @@ describe('RecentAlertsPanel firing instant (#574)', () => {
 
   const whenCells = (container: HTMLElement): HTMLElement[] =>
     [...container.querySelectorAll<HTMLElement>('.alert-when')];
+
+  it('renders the source-qualified bundle when the legacy top-level row disagrees', () => {
+    ingest(
+      [entry({ id: 'source-row', threshold: 73 })],
+      { legacyAlerts: [entry({ id: 'legacy-row', threshold: 99 })] },
+    );
+    render(<RecentAlertsPanel />);
+    expect(screen.getByText('73%')).toBeInTheDocument();
+    expect(screen.queryByText('99%')).toBeNull();
+  });
 
   it('titles an absolute-branch row with the instant, including its calendar year', () => {
     ingest([entry({ id: 'when:abs', alerted_at: '2026-04-16T13:56:00Z' })]);

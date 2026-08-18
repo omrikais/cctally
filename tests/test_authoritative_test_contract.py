@@ -757,7 +757,7 @@ def test_bench_update_baseline_refuses_under_the_authoritative_marker(tmp_path):
 # `failed == 0`, and `passed + failed >= minCases`.
 
 
-def _pytest_rc_shim(est, rc):
+def _pytest_rc_shim(est, rc, output=""):
     """A python3 on PATH whose BULK pytest run exits with `rc`. `--version`
     still succeeds, so the capability probe is unaffected and the run reaches
     phase 3."""
@@ -768,6 +768,7 @@ def _pytest_rc_shim(est, rc):
         "#!/usr/bin/env bash\n"
         'if [ "${1:-}" = "-m" ] && [ "${2:-}" = "pytest" ]; then\n'
         '  if [ "${3:-}" = "--version" ]; then exit 0; fi\n'
+        f"  printf '%s\\n' {output!r}\n"
         f"  exit {rc}\n"
         "fi\n"
         f'exec {shutil.which("python3")} "$@"\n',
@@ -943,13 +944,32 @@ def test_multi_cause_run_retains_every_reason(tmp_path):
 # ----------------------------------------------------------------- pytest phase
 
 
-def test_pytest_failure_is_product(tmp_path):
+def test_pytest_failure_with_a_node_id_is_product(tmp_path):
     est = _estate(tmp_path)
-    r = _drive(est, env=_pytest_rc_shim(est, 1))
+    (est / "tests" / "test_scratch_smoke.py").write_text(
+        "def test_bad():\n    assert False\n", encoding="utf-8"
+    )
+    r = _drive(est)
     assert r.returncode == 1, r.stdout + r.stderr
     out = _outcome(r)
     assert out["failureClass"] == "product"
     assert "pytest-failed" in {x["code"] for x in out["reasons"]}
+
+
+def test_pytest_status_one_without_a_node_id_is_infrastructure(tmp_path):
+    """An xdist worker crash can exit 1 while reporting no failed test node.
+
+    Calling that a product failure sends the maintainer looking for a test that
+    the run never identified and hides the retry-worthy infrastructure shape.
+    """
+    est = _estate(tmp_path)
+    r = _drive(est, env=_pytest_rc_shim(est, 1, "FAILED worker::crashed"))
+    assert r.returncode == 3, r.stdout + r.stderr
+    out = _outcome(r)
+    assert out["failureClass"] == "infrastructure"
+    codes = {x["code"] for x in out["reasons"]}
+    assert "pytest-no-failing-node-ids" in codes
+    assert "pytest-failed" not in codes
 
 
 def test_pytest_collecting_nothing_is_incomplete(tmp_path):
@@ -993,8 +1013,8 @@ def test_the_benchmark_leg_is_inside_the_verdict(tmp_path):
 # ------------------------------------------------ the pytest passed-item count
 #
 # The count is the denominator half of the normalized metric (#529 S5 §4.6).
-# It is additive: `contract_classify_pytest` keeps classifying by exit code
-# alone, and the count changes no classification.
+# It is additive: the passed-item count changes no classification. The
+# independent node-id shape can refine status 1 into an infrastructure failure.
 
 
 def test_the_pytest_passed_item_count_is_recorded(tmp_path):

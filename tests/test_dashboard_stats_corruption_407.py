@@ -352,7 +352,12 @@ def test_every_stats_reporting_surface_is_classified(env):
         "_debug_stats_fault": "attribution-only",
     }
     inventory = {
-        ("_cctally_tui.py", "_tui_build_snapshot"): "heal",
+        # #583 S1 split `_tui_build_snapshot` into a thin boundary that
+        # opens the standalone tick context and this body, which is where
+        # the post-query stats heal and its degraded frames now live. The
+        # boundary reports no stats fault of its own, so the classified
+        # surface MOVED rather than gaining a second entry.
+        ("_cctally_tui.py", "_tui_build_snapshot_impl"): "heal",
         ("_cctally_tui.py", "_tui_build_snapshot_once"): "heal",
         ("_cctally_tui.py", "capture_failure"): "heal",
         ("_cctally_tui.py", "_tui_capture_sync_failure"): "heal",

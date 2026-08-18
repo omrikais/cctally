@@ -189,17 +189,19 @@ export function AccountHeroCards() {
                 {group.source === 'claude' ? 'Claude' : 'Codex'} accounts — each has its own quota cycle.
               </p>
             )}
-            {visible.map((card) => {
-              const idx = group.accounts.findIndex((item) => item.accountKey === card.accountKey);
-              return (
-                <AccountHeroCard
-                  key={card.accountKey}
-                  card={card}
-                  color={ACCOUNT_COLORS[(idx < 0 ? 0 : idx) % ACCOUNT_COLORS.length]}
-                  focused={groupFocused === card.accountKey}
-                />
-              );
-            })}
+            <div className="account-hero-card-row">
+              {visible.map((card) => {
+                const idx = group.accounts.findIndex((item) => item.accountKey === card.accountKey);
+                return (
+                  <AccountHeroCard
+                    key={card.accountKey}
+                    card={card}
+                    color={ACCOUNT_COLORS[(idx < 0 ? 0 : idx) % ACCOUNT_COLORS.length]}
+                    focused={groupFocused === card.accountKey}
+                  />
+                );
+              })}
+            </div>
           </div>
         );
       })}

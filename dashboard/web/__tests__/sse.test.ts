@@ -32,10 +32,19 @@ function snap(generated_at: string, used_pct = 10) {
   };
 }
 
+// #583 S3 §7 — the bootstrap `fetch('/api/data')` is gone. `startSSE` opens the
+// EventSource alone and the FIRST accepted update IS the bootstrap, so every
+// test that used to seed cold-start state through the fetch stub seeds it
+// through the stream instead. The stub stays in place and stays unused, so a
+// reintroduced fetch is observable rather than silent.
+function seed(env: unknown = snap('2026-04-24T10:00:00Z', 5)): void {
+  MockEventSource.instances[0].emit('update', env);
+}
+
 beforeEach(() => {
   MockEventSource.instances = [];
   (globalThis as any).EventSource = MockEventSource;
-  (globalThis as any).fetch = vi.fn().mockResolvedValue({ json: () => Promise.resolve(snap('2026-04-24T10:00:00Z', 5)) });
+  (globalThis as any).fetch = vi.fn();
   _resetStore();
   _resetSSE();
   localStorage.clear();
@@ -46,10 +55,16 @@ afterEach(() => {
 });
 
 describe('startSSE', () => {
-  it('calls fetch("/api/data") for bootstrap and feeds updateSnapshot', async () => {
+  it('bootstraps from the first SSE update with no /api/data fetch', async () => {
+    // A cold load used to transfer and parse the envelope TWICE: once through
+    // `/api/data` and again as the hub's subscribe seed. The hub publishes
+    // before the server binds, so `_last` is never empty when a client
+    // connects and the seed alone is a sufficient bootstrap.
     startSSE();
     await Promise.resolve(); await Promise.resolve();
-    expect((globalThis as any).fetch).toHaveBeenCalledWith('/api/data');
+    expect((globalThis as any).fetch).not.toHaveBeenCalled();
+    expect(getState().snapshot).toBeNull();
+    seed();
     expect(getState().snapshot?.header.used_pct).toBe(5);
   });
 
@@ -99,11 +114,12 @@ describe('startSSE', () => {
     spy.mockRestore();
   });
 
-  it('fires onConnect after bootstrap', async () => {
+  it('fires onConnect on the first accepted update, which IS the bootstrap', () => {
     const spy = vi.fn();
     startSSE({ onConnect: spy });
-    await Promise.resolve(); await Promise.resolve();
-    expect(spy).toHaveBeenCalled();
+    expect(spy).not.toHaveBeenCalled();
+    seed();
+    expect(spy).toHaveBeenCalledTimes(1);
   });
 
   it('fires onDisconnect on error', () => {
@@ -125,8 +141,8 @@ describe('startSSE', () => {
   it('does NOT fire onConnect on every update — only on reconnect transition', async () => {
     const spy = vi.fn();
     startSSE({ onConnect: spy });
-    await Promise.resolve(); await Promise.resolve();
-    const bootstrapCalls = spy.mock.calls.length;  // 1 from bootstrap
+    seed();
+    const bootstrapCalls = spy.mock.calls.length;  // 1 from the first update
     MockEventSource.instances[0].emit('update', snap('2026-04-24T10:00:05Z'));
     MockEventSource.instances[0].emit('update', snap('2026-04-24T10:00:06Z'));
     MockEventSource.instances[0].emit('update', snap('2026-04-24T10:00:07Z'));
@@ -188,20 +204,17 @@ function snapWithAlerts(generated_at: string, alerts: ReturnType<typeof alert>[]
 }
 
 describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
-  it('cold-start: bootstrap snapshot populates seenAlertIds without surfacing toast', async () => {
-    (globalThis as any).fetch = vi.fn().mockResolvedValue({
-      json: () => Promise.resolve(snapWithAlerts('2026-04-24T10:00:00Z', [alert('weekly:2026-04-27:90')])),
-    });
+  it('cold-start: the FIRST update populates seenAlertIds without surfacing toast', () => {
     startSSE();
-    await Promise.resolve(); await Promise.resolve();
+    seed(snapWithAlerts('2026-04-24T10:00:00Z', [alert('weekly:2026-04-27:90')]));
     expect(getState().seenAlertIds.has('weekly:2026-04-27:90')).toBe(true);
     expect(getState().toast).toBeNull();
   });
 
-  it('subsequent update with new alert surfaces toast', async () => {
+  it('subsequent update with new alert surfaces toast', () => {
     startSSE();
-    await Promise.resolve(); await Promise.resolve();
-    // Bootstrap consumed the cold-start tick; this update is post-cold-start.
+    seed();
+    // The first update consumed the cold-start tick; this one is after it.
     MockEventSource.instances[0].emit(
       'update',
       snapWithAlerts('2026-04-24T10:00:05Z', [alert('weekly:2026-04-27:95')]),
@@ -209,9 +222,9 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
     expect(getState().toast?.kind).toBe('alert');
   });
 
-  it('reconnect after onerror re-arms cold-start (next update does not toast)', async () => {
+  it('reconnect after onerror re-arms cold-start (next update does not toast)', () => {
     startSSE();
-    await Promise.resolve(); await Promise.resolve();
+    seed();
     // Drop connection.
     MockEventSource.instances[0].triggerError();
     expect(isDisconnected()).toBe(true);
@@ -236,7 +249,7 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
     // backend / partial envelope. Should not throw, should still empty
     // out alerts in state.
     startSSE();
-    await Promise.resolve(); await Promise.resolve();
+    seed();
     expect(getState().alerts).toEqual([]);
     // And the dispatch did run (cold-start true → no toast either way).
     expect(getState().toast).toBeNull();
@@ -254,16 +267,8 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
       budget_thresholds: [90, 100],
       budget_enabled: true,
     };
-    (globalThis as any).fetch = vi.fn().mockResolvedValue({
-      json: () =>
-        Promise.resolve({
-          ...snap('2026-04-24T10:00:00Z'),
-          alerts: [],
-          alerts_settings: envelopeSettings,
-        }),
-    });
     startSSE();
-    await Promise.resolve(); await Promise.resolve();
+    seed({ ...snap('2026-04-24T10:00:00Z'), alerts: [], alerts_settings: envelopeSettings });
     // #513 S2 §5.1: the seam feeds the store's normalizer, which turns the
     // absent `weekly_usd` leaf into the canonical null.
     expect(getState().alertsConfig).toEqual({ ...envelopeSettings, weekly_usd: null });
@@ -274,61 +279,52 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
     // block through wholesale and defaults only when the WHOLE block is
     // absent, so a server predating the mirror yields `undefined` unless the
     // store normalizes. `undefined` and `null` are distinguishable here.
-    (globalThis as any).fetch = vi.fn().mockResolvedValue({
-      json: () =>
-        Promise.resolve({
-          ...snap('2026-04-24T10:00:00Z'),
-          alerts: [],
-          alerts_settings: {
-            enabled: false,
-            weekly_thresholds: [90, 95],
-            five_hour_thresholds: [90, 95],
-            budget_thresholds: [],
-          },
-        }),
-    });
     startSSE();
-    await Promise.resolve(); await Promise.resolve();
+    seed({
+      ...snap('2026-04-24T10:00:00Z'),
+      alerts: [],
+      alerts_settings: {
+        enabled: false,
+        weekly_thresholds: [90, 95],
+        five_hour_thresholds: [90, 95],
+        budget_thresholds: [],
+      },
+    });
     expect(getState().alertsConfig.weekly_usd).toBeNull();
     expect('weekly_usd' in getState().alertsConfig).toBe(true);
   });
 
   it('carries a mirrored weekly_usd amount through the seam (#513 S2 §5.1)', async () => {
-    (globalThis as any).fetch = vi.fn().mockResolvedValue({
-      json: () =>
-        Promise.resolve({
-          ...snap('2026-04-24T10:00:00Z'),
-          alerts: [],
-          alerts_settings: {
-            enabled: false,
-            weekly_thresholds: [90, 95],
-            five_hour_thresholds: [90, 95],
-            budget_thresholds: [],
-            weekly_usd: 250,
-          },
-        }),
-    });
     startSSE();
-    await Promise.resolve(); await Promise.resolve();
+    seed({
+      ...snap('2026-04-24T10:00:00Z'),
+      alerts: [],
+      alerts_settings: {
+        enabled: false,
+        weekly_thresholds: [90, 95],
+        five_hour_thresholds: [90, 95],
+        budget_thresholds: [],
+        weekly_usd: 250,
+      },
+    });
     expect(getState().alertsConfig.weekly_usd).toBe(250);
   });
 
   it('falls back to a null amount when the whole block is absent (#513 S2 §5.1)', async () => {
-    (globalThis as any).fetch = vi.fn().mockResolvedValue({
-      json: () => Promise.resolve({ ...snap('2026-04-24T10:00:00Z'), alerts: [] }),
-    });
     startSSE();
-    await Promise.resolve(); await Promise.resolve();
+    seed({ ...snap('2026-04-24T10:00:00Z'), alerts: [] });
     expect(getState().alertsConfig.weekly_usd).toBeNull();
   });
 
-  it('out-of-order bootstrap is dropped — alerts/alertsConfig/seenAlertIds untouched', async () => {
-    // Regression: ingestAlerts used to run unconditionally on both
-    // bootstrap and SSE updates, even when updateSnapshot rejected the
-    // envelope as out-of-order. A late bootstrap could replace
-    // state.alerts with stale rows and pollute seenAlertIds with stale
+  it('an out-of-order update is dropped — alerts/alertsConfig/seenAlertIds untouched', () => {
+    // Regression: ingestAlerts used to run unconditionally on every envelope,
+    // even when updateSnapshot rejected it as out-of-order, so a stale
+    // envelope could replace state.alerts and pollute seenAlertIds with stale
     // ids. The fix gates ingestAlerts on updateSnapshot's accept/reject
     // return so out-of-order envelopes leave alerts state untouched.
+    // #583 S3 §7: the late BOOTSTRAP that used to arrive out of order is gone
+    // with the fetch, but the gate it exposed governs every stream frame and a
+    // suspended tab's resume seed can still arrive behind the retained one.
     const freshSettings = {
       enabled: true,
       weekly_thresholds: [80, 90],
@@ -337,17 +333,13 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
       budget_enabled: true,
     };
     const freshAlert = alert('weekly:2026-04-27:90');
-    // Bootstrap initially returns the fresh snapshot.
-    (globalThis as any).fetch = vi.fn().mockResolvedValue({
-      json: () =>
-        Promise.resolve({
-          ...snap('2026-04-24T10:00:00Z'),
-          alerts: [freshAlert],
-          alerts_settings: freshSettings,
-        }),
-    });
+    // The FIRST update carries the fresh snapshot.
     startSSE();
-    await Promise.resolve(); await Promise.resolve();
+    seed(withSources({
+      ...snap('2026-04-24T10:00:00Z'),
+      alerts: [freshAlert],
+      alerts_settings: freshSettings,
+    }, [freshAlert]));
     // Apply a NEWER SSE update so subsequent older snapshots are
     // out-of-order. The newer envelope carries an empty alerts list
     // and the same alertsConfig.
@@ -363,10 +355,7 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
     const seenBefore = new Set(getState().seenAlertIds);
     expect(seenBefore.has(newerAlert.id)).toBe(true);
 
-    // Now simulate a LATE-arriving bootstrap with an OLDER generated_at,
-    // an empty alerts list, and a different (stale) alertsConfig. We
-    // synthesize this by emitting an out-of-order SSE update using the
-    // same code path (the gate is in updateSnapshot, not the source).
+    // Now an OLDER generated_at with a different (stale) alertsConfig.
     const staleSettings = {
       enabled: false,
       weekly_thresholds: [50],
@@ -382,7 +371,7 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
     }, [staleAlert]));
     // updateSnapshot rejected the older envelope; ingestAlerts MUST NOT have
     // run, so alertsConfig / seenAlertIds are exactly as they were after the
-    // post-bootstrap update (the stale alert never got seeded).
+    // newer update (the stale alert never got seeded).
     expect(getState().alertsConfig).toEqual({ ...freshSettings, weekly_usd: null });
     expect(getState().seenAlertIds.has(staleAlert.id)).toBe(false);
   });

@@ -172,7 +172,7 @@ describe('<SettingsOverlay /> discards uncommitted edits on reopen (review P2)',
 import { REGISTRY } from './settings/registry';
 import {
   GROUP_OWNERS,
-  classifyIgnored,
+  mismatchedIgnoredPaths,
   resolveIssueTarget,
 } from './settings/issues';
 
@@ -245,26 +245,27 @@ describe('issue routing (#513 S2 §3.1)', () => {
   });
 });
 
-describe('ignored_fields has two treatments (#513 S2 §3.5)', () => {
-  it('treats an accepted-then-discarded path as expected', () => {
-    expect(classifyIgnored(['budget.period'])).toEqual({
-      expected: ['budget.period'],
-      mismatched: [],
-    });
+describe('ignored_fields only interrupts a promise this overlay made (#557)', () => {
+  it('proves the accepted-then-discarded paths are disclosure-only and unsendable', () => {
+    const sentPaths = new Set(
+      REGISTRY.filter((field) => field.kind === 'server').map(
+        (field) => (field as { path: string }).path,
+      ),
+    );
+    const disclosureOnly = SETTINGS_MANIFEST.filter(
+      (entry) => entry.acceptedThenDiscarded,
+    ).map((entry) => entry.key);
+    expect(disclosureOnly).toHaveLength(4);
+    expect(disclosureOnly.every((path) => !sentPaths.has(path))).toBe(true);
+    expect(mismatchedIgnoredPaths(disclosureOnly)).toEqual([]);
   });
 
   it('treats a path this client declared writable as a contract mismatch', () => {
-    expect(classifyIgnored(['alerts.notifier'])).toEqual({
-      expected: [],
-      mismatched: ['alerts.notifier'],
-    });
+    expect(mismatchedIgnoredPaths(['alerts.notifier'])).toEqual(['alerts.notifier']);
   });
 
   it('ignores a path this client neither sends nor declares', () => {
-    expect(classifyIgnored(['cache_report.anomaly_threshold_pp'])).toEqual({
-      expected: [],
-      mismatched: [],
-    });
+    expect(mismatchedIgnoredPaths(['cache_report.anomaly_threshold_pp'])).toEqual([]);
   });
 });
 
@@ -425,6 +426,21 @@ describe('routed server errors (#513 S2 §3.4)', () => {
     await waitFor(() => {
       expect(document.getElementById('settings-root')).toBeNull(); // closed = saved
     });
+  });
+
+  it('an immediate reopen after a save stays clean while the server tick is pending', async () => {
+    respondWith(200, {});
+    render(<SettingsOverlay />);
+    openSettings();
+    fireEvent.click(screen.getByRole('radio', { name: /^UTC/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
+    await waitFor(() => expect(document.getElementById('settings-root')).toBeNull());
+
+    openSettings();
+    const save = screen.getByRole('button', { name: /^Save/ }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(document.querySelectorAll('.settings-fs.is-changed')).toHaveLength(0);
+    expect(document.querySelectorAll('.settings-rail-link .fs-changed')).toHaveLength(0);
   });
 
   it('a 200 ignoring a leaf this client declared writable keeps the form open', async () => {
@@ -628,13 +644,33 @@ describe('the section rail and the filter (#513 S2 §2.1, §2.2)', () => {
     expect(screen.getByRole('button', { name: /show all settings/i })).toBeTruthy();
   });
 
-  it('reports the result count in its own polite region', () => {
+  it('updates the visible result count immediately but announces only after it settles', () => {
+    vi.useFakeTimers();
+    try {
+      render(<SettingsOverlay />);
+      openSettings();
+      const count = document.querySelector('.settings-filter-count')!;
+      const announcement = document.querySelector('.settings-filter-announcement')!;
+      expect(count.textContent ?? '').toMatch(/\d+ settings/);
+      expect(count.getAttribute('aria-live')).toBeNull();
+      const initialAnnouncement = announcement.textContent;
+
+      typeFilter('timezone');
+      expect(count.textContent ?? '').toMatch(/of \d+ settings match/);
+      expect(announcement.textContent).toBe(initialAnnouncement);
+      act(() => vi.advanceTimersByTime(299));
+      expect(announcement.textContent).toBe(initialAnnouncement);
+      act(() => vi.advanceTimersByTime(1));
+      expect(announcement.textContent).toMatch(/of \d+ settings match/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not carry a no-op settings-row class on ordinary field labels', () => {
     render(<SettingsOverlay />);
     openSettings();
-    const count = () => document.querySelector('.settings-filter-count')!.textContent ?? '';
-    expect(count()).toMatch(/\d+ settings/);
-    typeFilter('timezone');
-    expect(count()).toMatch(/of \d+ settings match/);
+    expect(document.querySelectorAll('.settings-row')).toHaveLength(0);
   });
 
   it('keeps a filtered-out dirty field in the change count AND in the POST body', async () => {

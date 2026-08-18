@@ -150,14 +150,21 @@ def test_all_source_publishes_exactly_one_aggregates_object():
 
 
 def test_no_provider_domain_carries_an_aggregate_range():
-    """The serializer emits `claude.data` under BOTH `sources.claude.data` and
-    `sources.all.data.providers.claude`, so a range inside a provider domain
-    would be published three times over."""
+    """The shared range is published ONCE, on `sources.all.data.aggregates`.
+
+    #583 S3 §4 removed the second copy of each provider domain: the All state's
+    `providers` block now publishes null and the domains travel only on the
+    physical `sources.claude` / `sources.codex` entries. The rule this test
+    pins is unchanged — a range inside a provider domain would still be a
+    second published copy of the one on `aggregates` — so it is asserted over
+    the physical states, which is where the domains actually are.
+    """
     claude, codex = _aggregating_pair()
     combined = source_kernel.compose_all_state(claude, codex)
 
-    for provider in ("claude", "codex"):
-        domain = combined.data["providers"][provider]
+    assert combined.data["providers"] == {"claude": None, "codex": None}
+    for provider, state in (("claude", claude), ("codex", codex)):
+        domain = state.data
         assert "range" not in domain, provider
         for section in domain.values():
             if isinstance(section, dict):
@@ -369,8 +376,12 @@ def test_all_composition_sums_only_compatible_cost_and_tokens():
     assert combined.freshness == "fresh"
     assert combined.data["combined"]["cost_usd"] == 6.25
     assert combined.data["combined"]["total_tokens"] == 100
-    assert combined.data["providers"]["claude"]["quota"]["label"] == "claude native quota"
-    assert combined.data["providers"]["codex"]["budget"]["label"] == "codex calendar budget"
+    # #583 S3 §4: the provider domains travel on the physical entries only; the
+    # All mirror publishes null, which is asserted here so this pair of reads
+    # cannot silently start describing a reconstructed copy.
+    assert combined.data["providers"] == {"claude": None, "codex": None}
+    assert claude.data["quota"]["label"] == "claude native quota"
+    assert codex.data["budget"]["label"] == "codex calendar budget"
     assert "quota" not in combined.data["combined"]
     assert "budget" not in combined.data["combined"]
     assert dict(combined.domain_freshness) == {
@@ -521,7 +532,9 @@ def test_a_stale_provider_cycle_no_longer_qualifies_the_combined_figure():
     # The Codex envelope itself is NOT degraded by All composition.
     assert (codex.availability, codex.freshness, codex.warnings) == ("ok", "fresh", ())
     assert source_kernel.source_domain_freshness(codex, "sessions") == "fresh"
-    assert combined.data["providers"]["codex"]["hero"]["cost_usd"] == 3.75
+    # #583 S3 §4: read the physical entry — the All mirror publishes null.
+    assert combined.data["providers"] == {"claude": None, "codex": None}
+    assert codex.data["hero"]["cost_usd"] == 3.75
 
 
 def test_all_composition_is_unchanged_when_the_codex_cycle_is_fresh():
@@ -1344,8 +1357,15 @@ def test_all_budget_capability_stays_not_applicable():
     )
 
 
-def test_source_schema_version_is_eight():
-    """#556 S5 §3.6. The Claude budget capability detail changed MEANING — it
-    names the CONFIGURED period rather than a constant — and
-    `docs/cli-contract.md:58` bumps on a changed value or meaning."""
-    assert SOURCE_SCHEMA_VERSION == 9
+def test_source_schema_version_is_ten():
+    """#583 S3 §4. `sources.all.data.providers` stopped carrying the two
+    provider data objects and now publishes null for both, so consumers read
+    the physical `sources.claude` / `sources.codex` entries.
+
+    This is the ledger's first DESTRUCTIVE entry rather than an additive one:
+    the mirror duplicated about 1.56 MB of a 3.25 MB envelope by reference, and
+    removing it is what `docs/cli-contract.md:58` calls a changed value. The
+    key itself is retained with null members so a still-loaded v9 bundle does
+    not throw across an in-place `execvp` update.
+    """
+    assert SOURCE_SCHEMA_VERSION == 10

@@ -502,6 +502,16 @@ def _reset_snapshot_dispatch_state():
             # #271 M4: the projects-envelope current-week accumulator slot —
             # driven directly by the accumulator unit tests, so isolate it.
             "reset_projects_env_current_state",
+            # #279 S5 F6.3: the owner-thread tripwire. Any test that runs the
+            # real locked rebuild body arms it, and an arming that happened on
+            # a server request thread that has since exited makes every LATER
+            # test raise "mutation from non-owner thread" the moment it touches
+            # the snapshot cache. Resetting it here makes that discipline
+            # structural rather than a per-test `finally` somebody has to
+            # remember. The tests that assert the tripwire stays armed
+            # (tests/test_snapshot_cache_owner_thread.py) arm it INSIDE the
+            # test, and this fixture runs between tests, so they are unaffected.
+            "reset_owner_thread",
         ):
             _fn = getattr(_sc, _name, None)
             if _fn is not None:
@@ -921,3 +931,113 @@ def _reset_outline_derivation_cache():
     _reset()
     yield
     _reset()
+
+
+# ── #583 S1: the shared bench corpus ──────────────────────────────────────
+
+
+def _load_bench_generator():
+    import importlib.machinery
+    import importlib.util
+
+    bin_dir = pathlib.Path(__file__).resolve().parents[1] / "bin"
+    if str(bin_dir) not in sys.path:
+        sys.path.insert(0, str(bin_dir))
+    loader = importlib.machinery.SourceFileLoader(
+        "build_bench_fixtures", str(bin_dir / "build-bench-fixtures.py"))
+    spec = importlib.util.spec_from_loader("build_bench_fixtures", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def corpus_lock_path(corpus_root, scale):
+    """The flock file serialising one scale's build. Public so a test that
+    rebuilds the shared corpus takes the SAME lock the fixture takes."""
+    return pathlib.Path(corpus_root) / f".build-{scale}.lock"
+
+
+@pytest.fixture(scope="session")
+def corpus_root(tmp_path_factory):
+    """One shared bench-corpus root per RUN, in both execution modes.
+
+    Under xdist `getbasetemp()` is `<numbered>/popen-gwN`, so the run's own
+    numbered directory is its parent and every worker resolves to the same
+    place. Serially there is no worker directory and `getbasetemp()` IS the
+    numbered directory. Taking the parent unconditionally was wrong in the
+    serial mode reachable through `CCTALLY_PYTEST_JOBS=1`, `CCTALLY_TEST_JOBS=1`
+    or a checkout without pytest-xdist: it resolved to `<tmp>/pytest-of-<user>`,
+    which pytest never rotates, so the corpus persisted across runs and two
+    concurrent runs shared it.
+    """
+    base = tmp_path_factory.getbasetemp()
+    numbered = base.parent if base.name.startswith("popen-gw") else base
+    root = numbered / "s1-bench-corpus"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+@pytest.fixture(scope="session")
+def shared_corpus(corpus_root):
+    """Build (or reuse) a bench corpus by scale. FAILS on error; never skips.
+
+    F28 is the worked example of the alternative: a gate that skips when its
+    fixture is absent, whose fixture nothing builds, is silently inert forever.
+
+    `build_fixture` now takes its OWN flock, on `build_lock_path(root)`, which
+    is a sibling of the corpus root. This fixture's lock is a DIFFERENT file
+    (`<corpus_root>/.build-<scale>.lock`), so the two never deadlock — and the
+    outer one is still wanted, for a reason the inner one cannot serve. The
+    inner lock is taken only AFTER `build_fixture` has re-checked its marker
+    and decided to rebuild, so it serialises rebuilds; the outer lock also
+    serialises the marker check itself and the `open_fixture_db` reads this
+    fixture's callers make immediately afterwards, against a concurrent
+    worker's `_clear_previous_corpus`. Without it a reader can open `cache.db`
+    in the window between another worker deleting the corpus and rebuilding it.
+
+    A per-test tmp_path would be safe but would discard reuse, so every gate
+    would pay a full production ingest. The flock gives one build per scale per
+    run instead — the first worker in builds, the rest block briefly and then
+    hit the marker.
+
+    `build_fixture_isolated` restores the pinned environment on return;
+    `build_fixture` itself deliberately leaves the process pinned.
+    """
+    import fcntl
+
+    generator = _load_bench_generator()
+    built = {}
+
+    def _build(scale):
+        if scale in built:
+            return built[scale]
+        root = corpus_root / scale
+        root.mkdir(parents=True, exist_ok=True)
+        with open(corpus_lock_path(corpus_root, scale), "w") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                built[scale] = generator.build_fixture_isolated(
+                    scale=scale, seed=42, root=root)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        return built[scale]
+
+    return _build
+
+
+@pytest.fixture(scope="session")
+def small_corpus(shared_corpus):
+    """The built `small` corpus data dir — the larger half of the >=10x pair."""
+    return shared_corpus("small")
+
+
+@pytest.fixture(scope="session")
+def tiny_corpus(shared_corpus):
+    """The built `tiny` corpus data dir — the cheap half of the >=10x pair.
+
+    Spec §7.1 needs one tick over two corpora whose Claude AND Codex row counts
+    differ by at least 10x. `tiny` and `small` differ by 14.3x and 12.5x and
+    both build in the ordinary suite; `large` is the maintainer receipt and is
+    far too slow for a gate under the pytest phase's --timeout=120.
+    """
+    return shared_corpus("tiny")

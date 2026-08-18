@@ -159,6 +159,7 @@ def test_build_block_detail_cache_hit_pct_includes_cache_creation():
 
 import json
 import pathlib
+import socket
 import sys
 import threading
 import urllib.parse
@@ -267,6 +268,86 @@ def test_api_block_endpoint_400_malformed_start_at(tmp_path, monkeypatch):
         assert r.status == 400
     finally:
         srv.shutdown()
+
+
+def _raw_get(port, path):
+    chunks = []
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        sock.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            "Connection: close\r\n\r\n".encode()
+        )
+        while True:
+            block = sock.recv(65536)
+            if not block:
+                break
+            chunks.append(block)
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    return b"".join(chunks)
+
+
+def test_api_block_preparation_failure_returns_one_500(tmp_path, monkeypatch):
+    ns = load_script()
+    monkeypatch.setitem(
+        ns, "_load_recorded_five_hour_windows",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("prepare boom")
+        ),
+    )
+    srv = _start_dashboard_server(ns, tmp_path, monkeypatch)
+    encoded = urllib.parse.quote("2026-04-22T14:00:00+00:00", safe="")
+    try:
+        raw = _raw_get(srv.server_address[1], f"/api/block/{encoded}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert raw.count(b"HTTP/1.") == 1, raw[:400]
+    assert raw.split(b"\r\n", 1)[0].split()[1:2] == [b"500"], raw[:200]
+
+
+def test_api_block_committed_404_failure_never_appends_a_second_response(
+        tmp_path, monkeypatch):
+    """The not-found body is already committed when its write fails."""
+    ns = load_script()
+    handler = ns["DashboardHTTPHandler"]
+    real_block = handler._handle_get_block_detail
+    fired = []
+
+    def fail_first_body_write(self, path):
+        real_write = self.wfile.write
+
+        def write(data):
+            if data[:1] == b"{" and not fired:
+                fired.append(bytes(data))
+                raise BrokenPipeError("simulated peer gone mid-body")
+            return real_write(data)
+
+        self.wfile.write = write
+        try:
+            return real_block(self, path)
+        finally:
+            self.wfile.write = real_write
+
+    monkeypatch.setattr(handler, "_handle_get_block_detail", fail_first_body_write)
+    srv = _start_dashboard_server(ns, tmp_path, monkeypatch)
+    encoded = urllib.parse.quote("2030-01-01T00:00:00+00:00", safe="")
+    try:
+        raw = _raw_get(srv.server_address[1], f"/api/block/{encoded}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert fired, "the injected block 404 body failure never fired"
+    assert raw.split(b"\r\n", 1)[0].split()[1:2] == [b"404"], raw[:200]
+    assert raw.count(b"HTTP/1.") == 1, (
+        "a second HTTP response followed the committed block response: %r"
+        % (raw[:400],)
+    )
 
 
 def _start_dashboard_server_with_neighbour_block(ns, tmp_path, monkeypatch):

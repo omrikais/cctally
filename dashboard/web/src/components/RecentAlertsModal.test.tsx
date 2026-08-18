@@ -10,6 +10,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, render } from '@testing-library/react';
 import { RecentAlertsModal } from './RecentAlertsModal';
 import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
+import { collectToastAlertRows } from '../lib/alertIdentity';
+import {
+  makeAllSourceEntry,
+  makeClaudeSourceEntry,
+  makeCodexSourceEntry,
+  makeSourceEnvelope,
+} from '../test-utils/sourceEnvelope';
 import type { AlertsConfig } from '../store/store';
 import type { AlertEntry, Envelope } from '../types/envelope';
 
@@ -25,20 +32,59 @@ function config(weekly_thresholds: number[]): AlertsConfig {
   };
 }
 
-function envWith(usedPct: number | null): Envelope {
-  return { header: { used_pct: usedPct } } as unknown as Envelope;
+function envWith(
+  usedPct: number | null,
+  alerts: AlertEntry[],
+  alertsSettings: AlertsConfig,
+): Envelope {
+  const sourceRows = alerts.map((alert) => ({
+    ...alert,
+    source: 'claude' as const,
+    key: `alert:claude:${alert.id}`,
+  }));
+  const sourceSlice = makeSourceEnvelope();
+  const claude = makeClaudeSourceEntry({
+    data: {
+      ...sourceSlice.sources.claude.data!,
+      alerts: { rows: sourceRows },
+    },
+  });
+  const codex = makeCodexSourceEntry({
+    data: {
+      ...sourceSlice.sources.codex.data!,
+      alerts: { rows: [] },
+    },
+  });
+  return {
+    header: { used_pct: usedPct },
+    alerts: [],
+    alerts_settings: alertsSettings,
+    ...makeSourceEnvelope({
+      sources: { claude, codex, all: makeAllSourceEntry(claude, codex) },
+    }),
+  } as unknown as Envelope;
+}
+
+function seedAlerts(
+  alerts: AlertEntry[],
+  usedPct: number | null,
+  weekly: number[],
+): void {
+  const snap = envWith(usedPct, alerts, config(weekly));
+  act(() => {
+    if (updateSnapshot(snap)) {
+      dispatch({
+        type: 'INGEST_SOURCE_ALERTS',
+        rows: collectToastAlertRows(snap),
+        alertsSettings: snap.alerts_settings ?? config(weekly),
+        isFirstTick: true,
+      });
+    }
+  });
 }
 
 function seed(usedPct: number | null, weekly: number[]): void {
-  act(() => {
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts: [],
-      alertsSettings: config(weekly),
-      isFirstTick: true,
-    });
-    updateSnapshot(envWith(usedPct));
-  });
+  seedAlerts([], usedPct, weekly);
 }
 
 beforeEach(() => {
@@ -127,17 +173,6 @@ describe('RecentAlertsModal firing instant (#574)', () => {
     };
   }
 
-  function seedAlerts(alerts: AlertEntry[]): void {
-    act(() => {
-      dispatch({
-        type: 'INGEST_SNAPSHOT_ALERTS',
-        alerts,
-        alertsSettings: config([90, 95]),
-        isFirstTick: true,
-      });
-    });
-  }
-
   // Only the "recent" fixture pins the clock; see the panel test for why that
   // pinning is mandatory rather than tidy.
   afterEach(() => {
@@ -148,7 +183,7 @@ describe('RecentAlertsModal firing instant (#574)', () => {
     [...container.querySelectorAll<HTMLElement>('.alert-cell-when')];
 
   it('titles an absolute-branch row with the instant, including its calendar year', () => {
-    seedAlerts([alert({ id: 'when:abs' })]);
+    seedAlerts([alert({ id: 'when:abs' })], null, [90, 95]);
     const { container } = render(<RecentAlertsModal />);
     expect(whenCells(container)[0].getAttribute('title')).toBe('2026-04-16 13:56 UTC');
   });
@@ -157,7 +192,7 @@ describe('RecentAlertsModal firing instant (#574)', () => {
     seedAlerts([
       alert({ id: 'when:first', alerted_at: '2026-04-16T13:56:00Z' }),
       alert({ id: 'when:last', alerted_at: '2026-04-16T13:59:00Z' }),
-    ]);
+    ], null, [90, 95]);
     const { container } = render(<RecentAlertsModal />);
     expect(whenCells(container).map((c) => c.textContent))
       .toEqual(['Apr 16 13:56 UTC', 'Apr 16 13:59 UTC']);
@@ -166,7 +201,7 @@ describe('RecentAlertsModal firing instant (#574)', () => {
   it('titles a relative-branch row too, with the clock pinned so the row stays recent', () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(new Date('2026-04-16T14:00:00Z'));
-    seedAlerts([alert({ id: 'when:recent' })]);
+    seedAlerts([alert({ id: 'when:recent' })], null, [90, 95]);
     const { container } = render(<RecentAlertsModal />);
     const cell = whenCells(container)[0];
     expect(cell.textContent).toBe('4m ago');
@@ -177,7 +212,7 @@ describe('RecentAlertsModal firing instant (#574)', () => {
     seedAlerts([alert({
       id: 'when:null',
       alerted_at: undefined as unknown as string,
-    })]);
+    })], null, [90, 95]);
     const { container } = render(<RecentAlertsModal />);
     const cell = whenCells(container)[0];
     expect(cell.textContent).toBe('—');
@@ -185,7 +220,7 @@ describe('RecentAlertsModal firing instant (#574)', () => {
   });
 
   it('carries no title attribute when the instant is a non-empty string that does not parse', () => {
-    seedAlerts([alert({ id: 'when:bad', alerted_at: 'not-a-date' })]);
+    seedAlerts([alert({ id: 'when:bad', alerted_at: 'not-a-date' })], null, [90, 95]);
     const { container } = render(<RecentAlertsModal />);
     const cell = whenCells(container)[0];
     expect(cell.textContent).toBe('—');

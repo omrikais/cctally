@@ -253,14 +253,26 @@ PROJECTION_READ_SITE_ACTIONS: "dict[str, str]" = {
 #: an unnamed caller reduces `gate_at_caller` to an assertion nothing tests, and
 #: that is how the first version of this map came to claim a gating caller that
 #: neither called the kernel nor called the gate.
+#:
+#: `_cctally_dashboard_sources.py::_codex_quota_reuse_identity` joined the list
+#: with #583 S5. It derives `codex_stats_digest` when its caller cannot supply
+#: one, which is the share path and the per-request cycle-detail route — neither
+#: of which computes a build signature, so neither had already gated. It gates
+#: and, uniquely among the named callers, returns `None` on
+#: `QuotaProjectionIncomplete` rather than propagating: it produces a cache KEY,
+#: and the fail-safe for an identity that cannot be established is a cold read.
+#: The retry signal is not lost, because its callers reach a `gate`-classified
+#: projection read within a few statements.
 PROJECTION_GATE_CALLERS: "dict[str, tuple[str, ...]]" = {
     "_lib_dashboard_sources.py::<module>::quota_projection_state": (
         "_cctally_tui.py::_tui_build_source_bundle",
         "_cctally_tui.py::_tui_compute_dispatch_signature",
+        "_cctally_dashboard_sources.py::_codex_quota_reuse_identity",
     ),
     "_lib_dashboard_sources.py::<module>::quota_window_blocks": (
         "_cctally_tui.py::_tui_build_source_bundle",
         "_cctally_tui.py::_tui_compute_dispatch_signature",
+        "_cctally_dashboard_sources.py::_codex_quota_reuse_identity",
     ),
 }
 
@@ -1908,13 +1920,14 @@ def load_codex_quota_observations(
     because SQL compares seconds while ``physical_order_key`` compares full
     datetimes and then breaks ties on the reset anchor and physical position.
 
-    The residual difference is a malformed row. Rows whose required text is
-    blank, or whose capture or reset instant SQLite cannot read as a time, are
-    excluded in SQL exactly as the loop below excludes them; a row that survives
-    those predicates but still fails a Python parse can, on this path, hide an
-    older valid capture of the same window that the full load would have
-    reported. That trade is confined to a store already carrying corrupt quota
-    rows, and it is the only behavioural difference between the two paths.
+    The residual differences are malformed or non-canonical instants. A row
+    that survives SQLite's predicates but still fails Python parsing can hide
+    an older valid capture of the same window. In the reverse direction,
+    ``datetime.fromisoformat`` accepts basic-format ISO instants such as
+    ``20260814T120000Z`` that SQLite's ``unixepoch`` rejects, so the SQL path
+    drops that row and may let an older capture win. Neither shape is emitted
+    by ``_utc_iso``; both are confined to a store carrying hand-written or
+    corrupt quota rows.
     """
     for name, value in (
         ("captured_at_or_after", captured_at_or_after), ("active_at", active_at),
@@ -2079,23 +2092,29 @@ def load_codex_quota_observations(
             else:
                 sql += " AND unixepoch(captured_at_utc) >= unixepoch(?)"
                 params.append(_utc_iso(captured_at_or_after))
-        if sql_bounded and max_rows is not None:
-            if active_at is not None:
-                sql += (
-                    " ORDER BY (unixepoch(resets_at_utc) > unixepoch(?)) DESC, "
-                    "unixepoch(captured_at_utc) DESC, unixepoch(resets_at_utc) DESC, "
-                    "source_path DESC, line_offset DESC"
-                )
-                params.append(_utc_iso(active_at))
+        # ``latest_per_identity`` replaces the base query wholesale below, so
+        # assembling its ORDER BY here would be dead work.
+        if not latest_per_identity:
+            if sql_bounded and max_rows is not None:
+                if active_at is not None:
+                    sql += (
+                        " ORDER BY (unixepoch(resets_at_utc) > unixepoch(?)) DESC, "
+                        "unixepoch(captured_at_utc) DESC, unixepoch(resets_at_utc) DESC, "
+                        "source_path DESC, line_offset DESC"
+                    )
+                    params.append(_utc_iso(active_at))
+                else:
+                    sql += (
+                        " ORDER BY unixepoch(captured_at_utc) DESC, "
+                        "unixepoch(resets_at_utc) DESC, source_path DESC, line_offset DESC"
+                    )
+                sql += " LIMIT ?"
+                params.append(max_rows)
             else:
                 sql += (
-                    " ORDER BY unixepoch(captured_at_utc) DESC, "
-                    "unixepoch(resets_at_utc) DESC, source_path DESC, line_offset DESC"
+                    " ORDER BY source_root_key, captured_at_utc, resets_at_utc, "
+                    "source_path, line_offset"
                 )
-            sql += " LIMIT ?"
-            params.append(max_rows)
-        else:
-            sql += " ORDER BY source_root_key, captured_at_utc, resets_at_utc, source_path, line_offset"
         # ONE SHARD PER GROUP (public #5), not one disjunction over all of them.
         # Measured on a 211K-row / 608-group store: an OR over the five-member
         # equality gives up and SCANs the table (2 groups 45.7ms, 3 groups

@@ -3213,7 +3213,7 @@ def _build_db_parser(subparsers, name, *, help_text, xref=None):
     )
     db_checkpoint.add_argument(
         "--db",
-        choices=("cache", "stats"),
+        choices=("cache", "conversations", "stats"),
         default="cache",
         help="Which DB to checkpoint (default: cache)",
     )
@@ -3242,6 +3242,74 @@ def _build_db_parser(subparsers, name, *, help_text, xref=None):
         help="Which DB to VACUUM (default: cache)",
     )
     db_vacuum.set_defaults(func=c.cmd_db_vacuum)
+
+
+def _build_dashboard_perf_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `dashboard-perf` parser (#583 S1 §3.3).
+
+    Follows the `_build_doctor_parser` shape: `c = _cctally()` is resolved
+    INSIDE the function, and the parser finishes with `set_defaults`.
+    """
+    c = _cctally()
+    p = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Read a running dashboard's tick cost, and arm its phase trace.
+
+            Reports the publish period SEPARATELY for the Codex-active and
+            Codex-idle regimes (median plus the observed range, with an
+            explicit "no samples yet" for a regime that has none), the
+            tick-cost breakdown with the mutually exclusive ingest and builder
+            halves named, the dispatch mix, any silent Group A cache-open
+            failures, and the trace state.
+
+            --trace on/off arms or disarms the deep phase trace on the running
+            process. The flip takes effect at the dashboard's next
+            authoritative build, which is why the report states the requested
+            and the applied state separately.
+
+            Connects only to an IP-literal loopback host and never to a LAN
+            address. A hostname is refused, `localhost` included, which is
+            stricter than the endpoint itself: the server treats `localhost`
+            as a loopback name and would serve it. The client refuses a name
+            because it cannot verify that the resolver's answer is this
+            machine.
+
+            Exit codes: 0 on a decoded HTTP 200, 2 on argument validation
+            including a non-loopback target or an out-of-range port, 3 on a
+            connection, HTTP, authentication, timeout or malformed-response
+            failure — including "no dashboard is running".
+
+            See docs/commands/dashboard-perf.md.
+            """
+        ),
+    )
+    p.add_argument(
+        "--host", default="127.0.0.1",
+        help="Loopback IP literal of the running dashboard (default 127.0.0.1)",
+    )
+    p.add_argument(
+        "--port", type=int, default=None,
+        help="Dashboard port (default: the same default `cctally dashboard` uses)",
+    )
+    p.add_argument(
+        "--token", default=None,
+        help="Bearer token, when the dashboard minted one for LAN access",
+    )
+    p.add_argument(
+        "--trace", choices=("on", "off"), default=None,
+        help="Arm or disarm the deep phase trace on the running process",
+    )
+    p.add_argument(
+        "--json", action="store_true",
+        help="Emit machine-readable JSON to stdout (schemaVersion: 1)",
+    )
+    p.set_defaults(func=c.cmd_dashboard_perf)
+    return p
+
 
 def _build_doctor_parser(subparsers, name, *, help_text, xref=None):
     """Build the `doctor` parser (registered via _REGISTRATION; #279 S6 W3).
@@ -3676,6 +3744,7 @@ _REGISTRATION = (
     _Reg('setup', _build_setup_parser, "Install provider hooks/handlers + symlinks", None, None),
     _Reg('db', _build_db_parser, "Migration / DB management (status, skip, unskip)", None, None),
     _Reg('doctor', _build_doctor_parser, "Diagnose data freshness and install state", None, None),
+    _Reg('dashboard-perf', _build_dashboard_perf_parser, "Read a running dashboard's tick cost; arm its phase trace", None, None),
     _Reg('pricing-check', _build_pricing_check_parser, "Detect stale or missing embedded model pricing", None, None),
     _Reg('hook-tick', _build_hook_tick_parser, argparse.SUPPRESS, None, None),
     _Reg('__preview', _build_preview_parser, argparse.SUPPRESS, None, lambda c: getattr(c, "cmd_preview", None) is not None),

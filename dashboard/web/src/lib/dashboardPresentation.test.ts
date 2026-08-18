@@ -428,6 +428,31 @@ describe('provider-neutral dashboard presentation adapters', () => {
     expect(providers.codex).toBe(env.sources!.codex.data);
   });
 
+  // #583 S3 §4 — the server publishes `sources.all.data.providers` with null
+  // members since source schema 10. The provider data is carried once, on the
+  // physical `sources.claude` / `sources.codex` entries.
+  it('resolves both providers from the physical entries when the mirror is null', () => {
+    const env = cloneFixture();
+    (env.sources!.all.data as unknown as {
+      providers: { claude: unknown; codex: unknown };
+    }).providers = { claude: null, codex: null };
+    const p = presentationProviders(env, 'all');
+    expect(p.claude).toBe(env.sources!.claude.data);
+    expect(p.codex).toBe(env.sources!.codex.data);
+  });
+
+  it('does not throw when the mirror key is absent entirely', () => {
+    // A later session removes the null stub once no v9 bundle can be live.
+    // The optional chain must guard `providers`, not only `data`, or this
+    // throws a TypeError inside a render that feeds many panels and modals.
+    const env = cloneFixture();
+    delete (env.sources!.all.data as unknown as Record<string, unknown>).providers;
+    expect(() => presentationProviders(env, 'all')).not.toThrow();
+    const p = presentationProviders(env, 'all');
+    expect(p.claude).toBe(env.sources!.claude.data);
+    expect(p.codex).toBe(env.sources!.codex.data);
+  });
+
   it('Codex weekly periods preserve provider-native quota usage and $/1%', () => {
     const env = cloneFixture();
     Object.assign(env.sources!.codex.data!.periods.weekly.rows[0], {

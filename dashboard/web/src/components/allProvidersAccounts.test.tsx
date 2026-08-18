@@ -132,12 +132,15 @@ describe('All providers — a decorated Codex provider is never one account', ()
     expect(screen.getByTestId('account-hero-caption').textContent).toMatch(/Codex/);
   });
 
-  it('keeps the merged combined spend and tokens as the headline', () => {
+  it('withholds the combined headline for a decorated provider', () => {
     renderAll(makeDecoratedCodexSourceData());
     const spent = screen.getByTestId('shared-hero-spent');
-    // claude 8.4 + codex 12.3 (itself the sum of the cards) = 20.7.
-    expect(spent.textContent).toContain('$20.70');
-    expect(spent.textContent).toContain('total tokens');
+    expect(spent.textContent).not.toContain('$20.70');
+    expect(spent.textContent).toContain('Combined withheld');
+    expect(spent.getAttribute('title')).toBe(
+      'Codex has 3 accounts on separate cycles, so a combined total is not '
+      + 'published; see the per-account cards.',
+    );
   });
 
   // #556 S5 §5.10 — the ASSERTION is kept and its RATIONALE is replaced. The
@@ -181,6 +184,22 @@ describe('All providers — a decorated Codex provider is never one account', ()
     expect(usage.textContent).toMatch(/Codex resets in \d/);
   });
 
+  it.each([
+    [ACCOUNT_A, '$8.00'],
+    [ACCOUNT_B, '$4.30'],
+    [ACCOUNT_EMPTY, '$0.00'],
+  ])('reads the focused Codex account spend in the cycle leg for %s', (account, spend) => {
+    updateSnapshot(envWith(makeDecoratedCodexSourceData()));
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'all', account });
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    const focusedCard = screen.getAllByTestId('account-hero-card')
+      .find((card) => card.className.includes('is-focused'));
+    expect(focusedCard).toHaveTextContent(spend);
+    expect(codexLegRow().textContent).toBe(`Codex · cycle to date${spend}`);
+  });
+
   it('keeps every account card visible under an All Codex focus', () => {
     updateSnapshot(envWith(makeDecoratedCodexSourceData()));
     dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'all', account: ACCOUNT_A });
@@ -194,15 +213,19 @@ describe('All providers — a decorated Codex provider is never one account', ()
     expect(focused.map((el) => el.getAttribute('data-account'))).toEqual([ACCOUNT_A]);
   });
 
-  it('keeps the combined spend UNCHANGED under an All Codex focus', () => {
+  it('keeps the combined figure withheld under an All Codex focus', () => {
     updateSnapshot(envWith(makeDecoratedCodexSourceData()));
-    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'all', account: ACCOUNT_A });
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const first = render(<HeroStrip />);
+    const unfocused = screen.getByTestId('shared-hero-spent').textContent;
+    first.unmount();
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'all', account: ACCOUNT_A });
     render(<HeroStrip />);
     // Provider-native quota surfaces consume the scoped child; combined SPEND
-    // consumes the unscoped `sources.all.data.combined` outcome and is never
-    // recomputed from a focused child.
-    expect(screen.getByTestId('shared-hero-spent').textContent).toContain('$20.70');
+    // consumes the unscoped withheld outcome and is never recomputed from a
+    // focused child.
+    const spent = screen.getByTestId('shared-hero-spent');
+    expect(spent.textContent).toBe(unfocused);
   });
 });
 
@@ -312,6 +335,42 @@ describe('All providers — a decorated CLAUDE provider under focus (#556 S5)', 
     // Dimmed, so the blank reads as a deliberate absence rather than a pending
     // load (the #416 QA P3-C vocabulary the per-account blank already uses).
     expect(num.className).toContain('is-blank');
+  });
+
+  it.each([
+    [CLAUDE_ACCOUNT_MAIN, '$88.20'],
+    [CLAUDE_ACCOUNT_ALT, '$19.40'],
+  ])('reads the focused Claude account spend in the week leg for %s', (account, spend) => {
+    updateSnapshot(decoratedClaudeEnv());
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'claude', slot: 'all', account });
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    const focusedCard = screen.getAllByTestId('account-hero-card')
+      .find((card) => card.className.includes('is-focused'));
+    expect(focusedCard).toHaveTextContent(spend);
+    expect(screen.getByTestId('hero-leg-claude').textContent).toBe(spend);
+  });
+
+  it('renders a resolved zero from the focused Claude card as $0.00', () => {
+    const data = makeDecoratedClaudeSourceData();
+    const zeroData = {
+      ...data,
+      accounts: (data.accounts ?? []).map((card) => (
+        card.accountKey === CLAUDE_ACCOUNT_ALT ? { ...card, spendUsd: 0 } : card
+      )),
+    };
+    updateSnapshot(decoratedClaudeEnv(zeroData));
+    dispatch({
+      type: 'SET_ACCOUNT_FOCUS', source: 'claude', slot: 'all', account: CLAUDE_ACCOUNT_ALT,
+    });
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    const focusedCard = screen.getAllByTestId('account-hero-card')
+      .find((card) => card.className.includes('is-focused'));
+    expect(focusedCard).toHaveTextContent('$0.00');
+    expect(screen.getByTestId('hero-leg-claude').textContent).toBe('$0.00');
   });
 
   it('does not print one figure for two different focused accounts', () => {

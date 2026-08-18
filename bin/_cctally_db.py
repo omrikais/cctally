@@ -11084,7 +11084,7 @@ def cmd_db_backup(args: argparse.Namespace) -> int:
 
 
 def cmd_db_checkpoint(args: argparse.Namespace) -> int:
-    """Fast, non-destructive WAL drain (TRUNCATE checkpoint) for cache.db.
+    """Fast, non-destructive WAL drain (TRUNCATE checkpoint) for a WAL store.
 
     Opens a RAW existing-file-only connection — NOT open_cache_db()/open_db(),
     which apply schema, run the migration dispatcher, can DELETE Codex rows on a
@@ -11095,14 +11095,16 @@ def cmd_db_checkpoint(args: argparse.Namespace) -> int:
 
     A cache checkpoint takes the same global writer flock as both provider
     syncs, using the command's timeout as one bounded wait, so it cannot overlap
-    a cache write or another cache checkpoint. Exit 0 when drained /
-    already-small / the DB is absent; 3 (staged) if the target stayed busy or
-    was not fully truncated through the timeout — an actionable "something is
-    still holding it" signal.
+    a cache write or another cache checkpoint. A conversations checkpoint takes
+    a THREE-lock plan instead, because that store has two independently writable
+    provider domains rather than cache.db's single global writer flock (#583
+    S4). Exit 0 when drained / already-small / the DB is absent; 3 (staged) if
+    the target stayed busy or was not fully truncated through the timeout — an
+    actionable "something is still holding it" signal.
     """
     from _lib_json_envelope import stamp_schema_version
 
-    which = args.db  # "cache" | "stats"
+    which = args.db  # "cache" | "conversations" | "stats"
     as_json = bool(getattr(args, "json", False))
     if which == "stats":
         reason = (
@@ -11120,7 +11122,26 @@ def cmd_db_checkpoint(args: argparse.Namespace) -> int:
 
     import _cctally_cache
 
-    path, label = _cctally_core.CACHE_DB_PATH, "cache.db"
+    if which == "conversations":
+        path, label = _cctally_core.CONVERSATIONS_DB_PATH, "conversations.db"
+        # conversations.db has TWO independently writable provider domains,
+        # unlike cache.db's single global writer flock, so a checkpoint must
+        # exclude both. The order is the documented lock-order law: maintenance
+        # flocks before the conversation provider flocks (Claude, then Codex),
+        # and checkpoint work takes maintenance SHARED — only mutating
+        # maintenance takes it exclusive, and retention's exclusive hold is an
+        # admission gate it downgrades to shared for the mutating pass itself.
+        lock_plan = [
+            (_cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
+            (_cctally_core.CONVERSATIONS_LOCK_PATH, fcntl.LOCK_EX),
+            (_cctally_core.CONVERSATIONS_LOCK_CODEX_PATH, fcntl.LOCK_EX),
+        ]
+    else:
+        path, label = _cctally_core.CACHE_DB_PATH, "cache.db"
+        lock_plan = [
+            (_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
+            (_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
+        ]
     timeout = int(getattr(args, "busy_timeout_ms", None)
                   or _cctally_cache.CHECKPOINT_CMD_BUSY_TIMEOUT_MS)
 
@@ -11137,16 +11158,11 @@ def cmd_db_checkpoint(args: argparse.Namespace) -> int:
             print(f"cctally: no {label} database file present; nothing to drain.")
         return 0
 
-    from _lib_cache_writer_lock import acquire_ordered_flocks
-
-    lock_plan = [
-        (_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
-        (_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
-    ]
+    import _lib_cache_writer_lock
 
     held: list[int] = []
     try:
-        acquired = acquire_ordered_flocks(
+        acquired = _lib_cache_writer_lock.acquire_ordered_flocks(
             lock_plan, timeout=max(timeout, 0) / 1000
         )
         if acquired is None:

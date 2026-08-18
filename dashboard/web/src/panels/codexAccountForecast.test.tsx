@@ -645,4 +645,30 @@ describe('#556 S5 — the Codex budget block under an account focus', () => {
     expect(block.textContent).toContain('No budget set.');
     expect(block.textContent).not.toContain('$100');
   });
+
+  it('points a missing account budget at the per-account config path (#586)', () => {
+    const data = makeDecoratedCodexSourceData();
+    const child = data.account_scopes![ACCOUNT_A];
+    data.account_scopes![ACCOUNT_A] = {
+      ...child,
+      budget: {
+        ...child.budget,
+        status: null,
+        not_configured: {
+          disposition: 'account_budget_unset',
+          account_key: ACCOUNT_A,
+          configured_accounts: { [ACCOUNT_B]: 77 },
+        },
+      },
+    } as unknown as typeof child;
+
+    const { container } = renderPanel(data, ACCOUNT_A);
+    const block = container.querySelector('[data-budget-section="codex"]') as HTMLElement;
+    expect(block.textContent).toContain('No budget set for this account.');
+    expect(block.textContent).toContain('cctally config set budget.codex.accounts');
+    expect(block.textContent).toContain(ACCOUNT_A);
+    expect(block.textContent).toContain(ACCOUNT_B);
+    expect(block.textContent).toContain('77');
+    expect(block.textContent).not.toContain('cctally budget set <amount> --vendor codex');
+  });
 });

@@ -4172,6 +4172,8 @@ def cmd_record_usage(
     args: argparse.Namespace, *,
     ingest_mode: str = "authoritative",
     writer: str = "record-usage",
+    nudge_dashboard: bool = True,
+    nudge_sink=None,
 ) -> int:
     """Record usage from the Claude Code status line rate_limits — DB journal
     redesign reroute (Appendix A).
@@ -4187,7 +4189,23 @@ def cmd_record_usage(
     observes its own write synchronously; "opportunistic" (hook-tick OAuth /
     dedup ticks) skips a busy ingest lock and lets the winner consume the line.
     ``writer`` is the obs line ``src``. Returns 0 on a recorded/deduped tick, 2
-    on an implausible weekly resets_at."""
+    on an implausible weekly resets_at.
+
+    ``nudge_dashboard`` (#583 S2 §5.3) enqueues a rebuild on a locally running
+    dashboard when — and only when — the ingest emitted events. Pass False
+    from `_refresh_usage_inproc`, which runs inside the dashboard's own
+    ``sync_lock`` while servicing a ``refresh=1`` and whose caller
+    ``cmd_refresh_usage`` already nudges once itself.
+
+    ``nudge_sink`` is for callers that hold a cross-process lock across this
+    call. When supplied it is invoked INSTEAD of the nudge, and that caller
+    fires the real nudge once its critical section has ended. The nudge is a
+    loopback POST with a multi-second timeout, so a stalled nudge inside such a
+    section stalls every other process contending on the same lock. There are
+    two such locks and both supply a sink: ``_selected_state_lock`` (the OAuth
+    refresh and the authoritative statusline publication) and the statusline
+    persist flock (``_statusline_reduce_and_publish``, reached from the forked
+    persist child and from the ``sync_for_test`` foreground path)."""
 
     # ULP-noise sanitization is applied at the cmd_record_usage ingress
     # boundary so every downstream consumer (HWM files, DB rows,
@@ -4310,7 +4328,24 @@ def cmd_record_usage(
         account=obs_account))
     # authoritative observes its own write synchronously; opportunistic skips a
     # busy ingest lock and lets the current holder consume the appended line.
-    _jr.run_stats_ingest(mode=ingest_mode)
+    result = _jr.run_stats_ingest(mode=ingest_mode)
+    # #583 S2 §5.3. Nudge only on a MATERIAL change. This runs at Claude
+    # Code's status-line cadence, so an unconditional nudge would queue a
+    # rebuild for work that changed nothing displayed. `consumed` is the wrong
+    # signal — unchanged observations advance ingestion without changing
+    # anything the dashboard shows — and `alerts` is the wrong signal, because
+    # it covers only a subset of material events: a new 5-hour window changes
+    # the dashboard without necessarily firing an alert. The nudge happens
+    # after `run_stats_ingest` returns, which is already after post-commit
+    # alert dispatch, so the alerts ordering is untouched.
+    if (nudge_dashboard
+            and getattr(result, "ran", False)
+            and getattr(result, "error", None) is None
+            and int(getattr(result, "events_emitted", 0)) > 0):
+        # A caller holding the selected-state lock supplies a sink and fires
+        # the real nudge after releasing it — a network call has no business
+        # inside that critical section.
+        (nudge_sink or _cctally()._nudge_dashboard_repaint)()
     return 0
 
 

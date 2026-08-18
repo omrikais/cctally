@@ -15,6 +15,7 @@ and fields may change without a version bump.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import threading
@@ -29,13 +30,114 @@ def enabled() -> bool:
 
 
 def set_enabled(value: bool) -> None:
-    """Flip tracing at runtime (tests; not used by the dashboard, which reads
-    the env at import time)."""
+    """Flip tracing immediately (tests, and ``apply_pending`` below).
+
+    Runtime arming goes through ``request_enabled`` + ``apply_pending`` instead
+    (#583 S1 §2.2), which defers the flip to a rebuild boundary. This entry
+    point stays for tests.
+
+    It deliberately does NOT clear a captured root arm: an already-open root is
+    wholly traced or wholly untraced whatever the global does, and that is the
+    property the per-root capture exists to give. Every caller that wants the
+    new value to take effect calls ``reset_thread()`` afterwards, which is what
+    both production root sites already do.
+    """
     global _ENABLED
     _ENABLED = bool(value)
 
 
 _tls = threading.local()
+
+
+# ── runtime arming: an atomic mailbox, applied per root (#583 S1 §2.2) ──────
+# `request_enabled` records the latest desired state and `apply_pending`
+# consumes it, both under one lock performing a LATEST-VALUE EXCHANGE — read
+# and clear inside one critical section. An unsynchronised test-and-clear loses
+# a request arriving between the two steps, which is the race
+# `_SnapshotRef.take_sync_request` already documents in this repository.
+_UNSET = object()
+_MAILBOX_LOCK = threading.Lock()
+_PENDING = _UNSET
+
+
+def request_enabled(value: bool) -> None:
+    """Record the desired tracing state. Applies at the next boundary."""
+    global _PENDING
+    with _MAILBOX_LOCK:
+        _PENDING = bool(value)
+
+
+def apply_pending() -> bool:
+    """Consume any pending request and apply it. Returns whether it changed.
+
+    Called ONLY from `_make_run_sync_now_locked._locked`, after the cache
+    connection closes and immediately before the authoritative build, so a
+    request arriving mid-ingest cannot split one ingest across two tracing
+    states. A2 partial builds never consume it.
+    """
+    global _PENDING
+    with _MAILBOX_LOCK:
+        value, _PENDING = _PENDING, _UNSET
+    if value is _UNSET:
+        return False
+    changed = bool(value) != _ENABLED
+    set_enabled(bool(value))
+    return changed
+
+
+def pending_state() -> "tuple[bool, bool]":
+    """``(requested, applied)``. Equal once the request has taken effect."""
+    with _MAILBOX_LOCK:
+        pending = _PENDING
+    applied = _ENABLED
+    return (applied if pending is _UNSET else bool(pending), applied)
+
+
+def applies_at() -> str:
+    """When a pending request takes effect. Names the boundary, not a clock.
+
+    Without this the operator cannot tell a request from its effect, and
+    ``--trace off`` appears to succeed while tracing is still applied until the
+    next authoritative build.
+    """
+    requested, applied = pending_state()
+    return "next_authoritative_build" if requested != applied else "none"
+
+
+def root_armed() -> "bool | None":
+    """The tracing state this thread's open root captured, or None if no root
+    scope is open on this thread."""
+    return getattr(_tls, "root_armed", None)
+
+
+@contextlib.contextmanager
+def isolated_thread_state():
+    """Run a nested build against empty, private phase state (#583 S1 §2.1).
+
+    ``_make_a2_progress_cb`` calls ``build_partial()`` synchronously from
+    inside ``sync_cache``'s still-open ``walk`` phase, and that build reaches
+    ``_tui_build_snapshot_once``'s unconditional ``reset_thread()``. Each
+    ``Phase`` retains its original list in ``Phase._stack`` while
+    ``reset_thread()`` rebinds ``_tls.stack`` and clears ``_tls.root``, so
+    without isolation the later phases attach to a different list and the outer
+    phase closes into a detached or fragmented root.
+
+    Saves the EXACT stack and root object references — by identity, because
+    the open phases hold that same list — and restores them in ``finally``,
+    including when the body raises.
+    """
+    saved_stack = getattr(_tls, "stack", None)
+    saved_root = getattr(_tls, "root", None)
+    saved_armed = getattr(_tls, "root_armed", None)
+    _tls.stack = []
+    _tls.root = None
+    _tls.root_armed = None
+    try:
+        yield
+    finally:
+        _tls.stack = saved_stack
+        _tls.root = saved_root
+        _tls.root_armed = saved_armed
 
 
 def _stack():
@@ -90,6 +192,9 @@ class Phase:
             stack[-1].children.append(self)
         else:
             _tls.root = self          # outermost phase closed -> the build root
+            # The root scope ends with its root, so a later phase on this
+            # thread reads the global again rather than a stale capture.
+            _tls.root_armed = None
         return False
 
     def to_dict(self):
@@ -123,7 +228,14 @@ _NULL_PHASE = _NullPhase()
 
 
 def phase(name):
-    if not _ENABLED:
+    # Per-root capture (#583 S1 §2.2). `_ENABLED` is process-global and HTTP
+    # handlers open their own roots on their own threads, so a flip landing
+    # mid-request would otherwise create traced phases beneath an untraced root
+    # or drop later children from a traced one. A root captures the armed state
+    # at its own creation and every phase under it consults that value; a
+    # thread with no root scope open falls back to the global.
+    armed = getattr(_tls, "root_armed", None)
+    if not (_ENABLED if armed is None else armed):
         return _NULL_PHASE
     return Phase(name, _stack())
 
@@ -133,8 +245,25 @@ def current_root():
 
 
 def reset_thread():
+    """Start a fresh root scope on this thread, capturing the armed state.
+
+    Every root in this tree is opened immediately after a `reset_thread()` —
+    `_tui_build_snapshot_once` and the dashboard's `_perf_scope` are the two
+    sites — so this is where a root's tracing decision is taken. The scope ends
+    when the outermost phase closes, or when the next `reset_thread()` recaptures.
+
+    KNOWN LIMIT, recorded rather than fixed. A DISARMED capture is not cleared
+    by the closing phase, because no `Phase` is created to close: a thread that
+    captures `False` and then never calls `reset_thread()` again keeps reading
+    that stale value and stays untraced. Unreachable today — the dashboard
+    threads per request and resets at the top of every build — but it would
+    bite a thread-POOLED server, where a worker outlives many requests. Fixing
+    it needs an explicit root scope that exists when tracing is off, not a
+    smarter capture point.
+    """
     _tls.stack = []
     _tls.root = None
+    _tls.root_armed = _ENABLED
 
 
 def flush_stderr(root):

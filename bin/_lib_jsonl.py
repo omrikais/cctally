@@ -65,12 +65,14 @@ class UsageEntry:
                        # crashes loudly at construction instead).
 
 
-@dataclass
+@dataclass(frozen=True)
 class CodexEntry:
     """One emitted Codex `token_count` event row.
 
     Mirrors the columns of codex_session_entries. `last_token_usage` fields
-    are used (per-turn deltas), not the cumulative totals.
+    are used (per-turn deltas), not the cumulative totals. Instances are
+    immutable because dashboard folds intentionally alias one entry between
+    the merged parent and its account partition.
     """
     timestamp: dt.datetime
     session_id: str

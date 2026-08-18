@@ -22,6 +22,10 @@ def _serve(ns, token):
     handler.hub = ns["SSEHub"]()
     snapshot = ns["_empty_dashboard_snapshot"]()
     handler.snapshot_ref = ns["_SnapshotRef"](snapshot)
+    # #583 S3 §7: `/api/data` serves the most recently PUBLISHED state,
+    # so a bare reference is not enough — seed the hub exactly as
+    # `cmd_dashboard` does before the HTTP server binds.
+    handler.hub.publish(handler.snapshot_ref.get())
     handler.static_dir = ns["STATIC_DIR"]
     handler.sync_lock = threading.Lock()
     handler.run_sync_now = staticmethod(lambda: None)

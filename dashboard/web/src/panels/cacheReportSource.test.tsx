@@ -36,8 +36,10 @@ function env(): Envelope {
   codexReport.anomaly_predicates = ['cache_drop'];
   codexReport.days[0].cached_input_percent = 42;
   codexReport.days[0].net_usd = 12.5;
+  // #583 S3 §4: the All provider mirror publishes null on the wire. Assigning
+  // the physical data into it here would exercise a mirror-preferred branch no
+  // v10 server produces; All reads the physical entry through the fallback.
   result.sources!.codex.data!.cache_report = codexReport;
-  result.sources!.all.data!.providers.codex = result.sources!.codex.data;
   return result;
 }
 

@@ -29,7 +29,7 @@ cctally-dashboard [...same flags...]
 | `--host H` | `127.0.0.1` (loopback) | Interface to bind. `127.0.0.1` binds loopback only (this machine); `0.0.0.0` binds all interfaces (LAN-accessible). Resolution order: `--host` flag > `dashboard.bind` config > default. See [LAN access](#lan-access) and [Threat model](#threat-model) below. |
 | `--port N` | `8789` | TCP port to bind. Change if 8789 is taken. |
 | `--no-browser` | off | Skip auto-opening the browser (useful for SSH tunnels). |
-| `--sync-interval SEC` | `5` | Background snapshot-rebuild cadence in seconds. |
+| `--sync-interval SEC` | `5` | Floor on the cooldown between background snapshot rebuilds, in seconds. This is not the publish period — see [Background sync cadence](#background-sync-cadence). |
 | `--no-sync` | off | Freeze data to snapshot at startup (for debugging / fixtures). |
 | `--tz TZ` | config | Display timezone for this call (`local`, `utc`, or IANA, e.g. `America/New_York`). Overrides config `display.tz`. See [Display timezone](config.md#how-displaytz-interacts-with-subcommands) for the full contract (parsing scope, JSON UTC invariant). |
 
@@ -82,6 +82,8 @@ Every non-loopback dashboard requires a fresh per-run bearer token on all
 explicit malformed/wrong `Authorization` header is never rescued by a valid
 cookie. Origin/Host parity remains an additional CSRF gate on state-changing
 browser requests.
+
+The token is minted per process and is never written to disk, so a separate cctally process cannot read it. That matters for one caller: `record-usage` nudges a running dashboard to repaint, and on a token-protected run that nudge is rejected with `401` and discarded silently. Export `CCTALLY_DASHBOARD_API_TOKEN` with the run's token if you want the nudge to authenticate; without it the dashboard still picks the change up on its next ordinary rebuild, so the nudge is a promptness optimization rather than a correctness requirement.
 
 This is bearer authentication over plain HTTP, not transport encryption. A
 party able to observe LAN traffic can steal the credential, and anyone who can
@@ -178,16 +180,19 @@ record-usage error): the chip flashes red for 3 seconds. The console
 shows the warning code; check `cctally refresh-usage` from the CLI for
 details.
 
-The periodic background sync runs every 5 seconds (configurable via
-`--sync-interval`) and only does a snapshot rebuild — it never calls
-the OAuth API, so Anthropic's rate limit is not affected by background
-ticks. A usage observation selected by the statusline reducer appears in the
-next normal rebuild and is sent over the existing SSE stream; no dashboard
-action or dashboard-owned OAuth request is involved. The separate 30-second
-Claude status-line timer may perform one account-wide, detached OAuth
-confirmation when selected usage is stale; it shares the hook throttle and
-`429` backoff. Within the dashboard itself, only chip clicks / `r` presses
-trigger OAuth fetches.
+The periodic background sync only does a snapshot rebuild — it never calls the OAuth API, so Anthropic's rate limit is not affected by background ticks. It does not run on a fixed 5-second period; [Background sync cadence](#background-sync-cadence) below states the real rule. A usage observation selected by the statusline reducer appears in the next normal rebuild and is sent over the existing SSE stream; no dashboard action or dashboard-owned OAuth request is involved. The separate 30-second Claude status-line timer may perform one account-wide, detached OAuth confirmation when selected usage is stale; it shares the hook throttle and `429` backoff. Within the dashboard itself, only chip clicks / `r` presses trigger OAuth fetches.
+
+### Background sync cadence
+
+The loop rebuilds the snapshot, then cools down before starting the next rebuild. The cooldown is `max(--sync-interval, work)`, where `work` is how long the rebuild it just finished actually took. The publish period is therefore:
+
+```
+period = work + max(--sync-interval, work)
+```
+
+Two consequences follow, and both differ from what a flag described as a cadence in seconds suggests. First, the period is never shorter than twice the rebuild, because when a rebuild is slower than the interval the cooldown grows to match it. That is what holds the loop's CPU use at or below 50% of one core no matter how large the store grows. Second, `--sync-interval` is a floor on the cooldown rather than the period: raising it slows publication, and lowering it below `work` changes nothing.
+
+A manual refresh does not escape this bound. The earliest a queued request can start a rebuild is `2 * work` after the start of the rebuild that was running when the request arrived. That floor is never later than the automatic deadline, so a queued request is always served at or before the tick it would otherwise have waited for.
 
 ## Startup sync
 
@@ -200,6 +205,14 @@ append-only journal, and reconnects automatically. When a rebuild is not safe
 the server continues serving a degraded snapshot and the sync chip points to
 `cctally db repair --db stats --yes`. Cache corruption keeps its separate
 `cctally cache-sync --rebuild` action.
+
+## Transcript sync cadence
+
+The dashboard's independent conversation sync thread is bounded at 50% of one core, the same property the main snapshot loop has had since #313. Each pass measures its own whole cost — the store open, both provider syncs, the retention prune and the close — and the next pass starts no earlier than `(start + work) + max(interval, work)`. So once a pass costs more than `--sync-interval`, the period is twice that pass's cost and the thread's CPU share cannot grow with the size of `conversations.db`. Below the interval the cadence is unchanged, so a small install behaves exactly as before.
+
+On a large store where a pass already costs more than the interval, the consequence is that transcript backfill into the conversations rail lands up to about twice as late as it did. An open conversation is unaffected while the per-conversation live-tail is working, because that stream drives its own targeted sync and never waits for this thread. When `dashboard.live_tail` is `false`, or the stream is unavailable, the periodic tick is the documented fallback for that conversation, so it inherits the same increase.
+
+`cctally dashboard-perf` reports the loop's measured wall cost, thread CPU, pass period and one-core share; see [`dashboard-perf.md`](dashboard-perf.md). Under `--no-sync` the thread is never started at all.
 
 ## Transcript retention
 
@@ -245,13 +258,14 @@ Before merging or releasing v2 changes, run through:
 | `GET /` | The dashboard HTML |
 | `GET /static/*` | CSS / JS / SVG sprite |
 | `POST /api/auth` | Exchange the startup URL's bearer token for an HttpOnly, `SameSite=Strict`, `/api`-scoped session cookie. Available only on an authenticated non-loopback run; success is 204. |
-| `GET /api/data` | One-shot JSON snapshot (curl-friendly). It retains the legacy Claude fields and appends source-aware backend fields (`source_schema_version`, `default_source`, `source_order`, `sources`). |
-| `GET /api/events` | SSE stream — full snapshot on every sync tick |
+| `GET /api/data` | One-shot JSON snapshot (curl-friendly). It retains the legacy Claude fields and appends source-aware backend fields (`source_schema_version`, `default_source`, `source_order`, `sources`). It serves the **most recently published** snapshot — the same state the SSE stream last sent. The dashboard mutates its snapshot reference through several operations that publish separately, so this endpoint deliberately reports published state rather than the reference, and it therefore always agrees with the stream about whether a rebuild is still filling in data. Before the first publication it answers `503`. Compressed when the client negotiates gzip (see [Wire compression](#wire-compression)). |
+| `GET /api/events` | SSE stream — full snapshot on every sync tick. Compressed when the client negotiates gzip (see [Wire compression](#wire-compression)). |
 | `GET /api/session/:id` | Per-session detail (v2) — powers the Sessions modal |
 | `GET /api/source/<source>/<resource>/<opaque-key>` | Bounded provider-owned detail for `source ∈ {claude,codex}` and `resource ∈ {session,project,block}`. Codex reads are relational and `sync=False`; they expose native model/token, project/session, and quota observation/milestone/forecast data without walking rollout files. `all` has no physical details. Invalid/unavailable pairs return `400 source_capability_unavailable`; a valid missing key returns `404 source_resource_not_found`; a Codex block detail asked for while the published quota projection is marked incomplete returns `503 quota_projection_incomplete` with `error: "quota view reconciling"` and `action: "cctally cache-sync"`; none of these responses exposes raw provider identities or exception text. |
 | `POST /api/share/render`, `POST /api/share/compose` | Server-rendered share artifact/composition. Optional backend `source ∈ {claude,codex,all}` is source-bearing in the digest and response; omission remains the legacy Claude contract. Codex report panels use the native share vocabulary and configured calendar-week boundary. `all` composes labelled provider sections rather than blending quota. |
 | `GET`/`POST` `/api/share/presets`, `GET`/`POST`/`DELETE` `/api/share/history` | Saved share recipes persist the backend source; legacy source-less records resolve to Claude on read without being rewritten. |
 | `GET /api/debug/backend` | Loopback-only diagnostic with safe per-source table counts, availability, and opaque data versions. It never returns paths, roots, logical limits, conversation keys, or raw exceptions. |
+| `POST /api/debug/backend/trace` | Loopback-only. Body `{"enabled": true\|false}` arms or disarms the deep phase trace on the running process; the flip applies at the next authoritative build. Gated by the bearer, the loopback/IP-literal-`Host` check and Origin/Host parity, in that order. Read both through `cctally dashboard-perf` rather than by hand — see `docs/commands/dashboard-perf.md`. |
 | `GET /api/conversations` | Conversation-viewer browse rail — all-history per-session rows with per-session cost. `?sort=` (#217 S4) ∈ `{recent (default), oldest, cost, messages, project}` orders the list; an unknown value falls back to `recent` (the endpoint stays lenient). Optional server-side filter params (`date_from`/`date_to`/`projects`/`cost_min`/`cost_max`/`rebuild_min`); a malformed value is `400`. The `page` object carries an additive `sort_degraded: true` when a `cost`/`project` sort fell back to `recent` order during the brief non-authoritative indexing window (beside `filter_degraded`). See [Rail sort](#rail-sort) and [Browse filters](#browse-filters). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). |
 | `GET /api/conversations/facets` | Conversation-viewer filter facets — sorted distinct project labels with per-label conversation counts, plus per-model-family session counts (fold-then-count), for the Filters popover's project + model multi-selects. Project counts are a rollup GROUP BY; the model-family counts are an index-only scan of `conversation_messages(model, session_id)` (#301). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Browse filters](#browse-filters). |
 | `GET /api/conversation/<id>` | Conversation-viewer reader — one session's deduped, turn-grouped messages with cost-once. Pages with `?after=<id>` (forward), `?before=<id>` (backward), or `?tail=1` (open at the bottom — the last page in one request), plus `?limit=N` (default `500`, clamped `1`–`1000`); the three cursors are mutually exclusive (supplying more than one is `400`). The `page` object carries `next_after`/`has_more` (more newer turns) and the additive `prev_before`/`has_prev` (more older turns), so a client can page both directions; a stale cursor yields an empty page (never a head/tail re-serve). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Reader pagination](#reader-pagination-217-s2). |
@@ -272,7 +286,7 @@ Omitting it is the merged all-account path and retains the existing response
 shape. The dashboard sends the qualifier only for a decorated multi-account
 provider with a focused account; it also stores it in the conversation identity
 and permalink, so a reopened link cannot drift with the global account chip.
-| `POST /api/sync` | OAuth refresh + snapshot rebuild (chip / `r`). 204 on clean success; 200 + `{warnings:[{code: ...}]}` when refresh-usage returned a non-`ok` status (`rate_limited`, `no_oauth_token`, `fetch_failed`, `parse_failed`, `record_failed`); 503 if another sync is in flight. Origin-vs-Host parity CSRF (see [Threat model](#threat-model)). |
+| `POST /api/sync` | OAuth refresh + snapshot rebuild (chip / `r`). When no sync is in flight the rebuild runs synchronously as before: `204` on clean success, or `200` + `{warnings:[{code: ...}]}` when refresh-usage returned a non-`ok` status (`rate_limited`, `no_oauth_token`, `fetch_failed`, `parse_failed`, `record_failed`). When another sync **is** in flight the request is queued rather than refused — `202` + `{"status": "queued", "request_id": N, "server_epoch": E}` — and is coalesced into the next rebuild. This endpoint no longer returns `503` at all, and a queued request's outcome and warnings arrive on the envelope's `sync_activity` rather than in this response. Under `--no-sync` a manual request waits for the lock and answers `200` + `{"code": "refresh_skipped_no_sync"}`, while a machine nudge (`?queue=1`) is refused with `204`. Origin-vs-Host parity CSRF (see [Threat model](#threat-model)). |
 
 > `/api/conversation/search`, `/api/conversation/<id>/payload`,
 > `/api/conversation/<id>/media`, `/api/conversation/<id>/find`,
@@ -355,7 +369,7 @@ Alerts are source-aware. The Recent-alerts panel and modal show the active sourc
 
 **The Forecast panel and its modal carry a configured-budget block, on All and on both provider tabs.** It is a different quantity from the forecast beside it: the forecast projects quota usage toward the 100% cap and reads `ok` / `cap` / `capped`, while the budget block measures spend against the amount you set with `cctally budget set` over the period you configured, and reads `ok` / `warn` / `over`. The two verdicts never appear in each other's region. The block states the provider, the configured period, spend against the budget, a consumption bar with its percent, the verdict and the daily budget pace; the modal adds remaining, the projection band, the trailing-24h rate, the alert thresholds and the resolved period bounds. `Budget pace` moved out of the forecast footer into this block and is rendered exactly once. The two Claude quota-ceiling rows (`Budget ≤100%`, `Budget ≤90%`) and the Codex `Confidence` row stay in the forecast footer, because they qualify the projection.
 
-Under All the two provider cards sit side by side at desktop widths and stack in order, Claude first, on a phone. **Nothing is composed across providers**: there is no combined budget figure, because two budgets over two different periods against two independently configured amounts do not add. A provider with no budget configured reads `No budget set.` with the command that sets one — `cctally budget set <amount>` for Claude, `cctally budget set <amount> --vendor codex` for Codex. A provider that has only per-account budgets reads `No provider-wide budget set.` and points at the account cards, because telling you that you have no budget when you have several would be false. A configured budget whose window cannot be resolved yet, or whose computation failed, states the amount and the period you configured with the window named as unresolved, and says why — never a fabricated percentage or verdict.
+Under All the two provider cards sit side by side at desktop widths and stack in order, Claude first, on a phone. **Nothing is composed across providers**: there is no combined budget figure, because two budgets over two different periods against two independently configured amounts do not add. A provider with no budget configured reads `No budget set.` with the command that sets one — `cctally budget set <amount>` for Claude, `cctally budget set <amount> --vendor codex` for Codex. A provider that has only per-account budgets reads `No provider-wide budget set.` and points at the account cards, because telling you that you have no budget when you have several would be false. Under a Codex account focus, an account with no budget of its own reads `No budget set for this account.` and points at that immutable key in `budget.codex.accounts`; it never offers the vendor-wide command, which changes a different axis. A configured budget whose window cannot be resolved yet, or whose computation failed, states the amount and the period you configured with the window named as unresolved, and says why — never a fabricated percentage or verdict.
 
 **Account focus works under All, one chip row per decorated provider.** Each row does exactly what it does on that provider's own tab and says so on screen: the Codex row reads *filters every panel*, the Claude row reads *hero and alerts only*. The difference is real — only Codex publishes per-account projections, so only a Codex focus can narrow a panel; a Claude focus substitutes the Claude hero leg and filters Claude alert rows, and leaves the panels showing every account. `a` cycles the Codex row under All, or the Claude row when Codex has a single account.
 
@@ -393,6 +407,44 @@ side-by-side provider-specific values and duration is marked unavailable when
 the providers differ. The comparison copy action fetches each whole export and
 emits separate `Run A · <source>` and `Run B · <source>` sections, never a
 combined transcript body.
+
+## Wire compression
+
+`GET /api/events` and `GET /api/data` compress their bodies with gzip when the
+client asks for it, and send `Vary: Accept-Encoding` either way. A browser
+negotiates this automatically; `curl` needs `--compressed`. A client that sends
+no `Accept-Encoding`, or that explicitly refuses gzip with `gzip;q=0`, receives
+the identical uncompressed JSON it received before. The header is parsed on
+token boundaries and honours quality values, so `notgzip` and `x-gzip` are not
+mistaken for an acceptance and a malformed quality value falls back to
+uncompressed rather than failing the request.
+
+On the SSE stream the compressor is per connection and stateful, and every byte
+after the response headers passes through it, including the `: keep-alive`
+comments sent while the stream is idle. `X-Accel-Buffering: no` is still sent,
+because it tells an intermediary proxy not to buffer and is unrelated to
+compression.
+
+This matters most for what the dashboard costs while a tab is simply left open.
+The envelope is a complete state replacement on every sync tick, so an
+uncompressed stream re-sends the whole thing each time. Measured over the
+project's own bench corpus, one update frame is 166,877 bytes uncompressed and
+26,155 bytes compressed. On a production-scale store the reduction is larger:
+the same release also stopped publishing each provider's data a second time
+under `sources.all.data.providers`, which was about 1.56 MB of a 3.25 MB
+envelope, and the two reductions compound rather than overlap.
+
+Compressing costs the dashboard process CPU on each frame it sends, and that
+cost is per connected client — roughly 1.8 ms per frame per client on the bench
+corpus. A dashboard left open in several tabs pays compression once per tab,
+but the complete uncompressed SSE frame is assembled and UTF-8 encoded once per
+published variant and shared across those tabs.
+
+A tab that is hidden for more than thirty seconds disconnects its dashboard
+stream and stops receiving updates until you return to it, so a backgrounded tab
+costs nothing. Switching away and back inside that grace period does not
+reconnect. The conversation viewer's live-tail and the update-progress stream
+are independent and keep running while the tab is hidden.
 
 ## Conversation viewer endpoints (Plan 2)
 
@@ -587,13 +639,13 @@ The conversation reader reflects its state into the URL hash: `#/conversations/<
 
 ### Live-tail
 
-When you have a conversation open and fully paged to its end, the reader follows the live session in near-real time. Instead of waiting for the periodic 5-second dashboard snapshot tick (configurable via `--sync-interval`), the open reader keeps a dedicated per-conversation SSE stream to `GET /api/conversation/<id>/events` that watches only that session's JSONL file(s) and pings the client within about a second of the file growing. On a ping the reader fetches just the new turns (`event: tail`), and the server emits `: keep-alive` comments while the session is idle so proxies don't drop the stream. The 5-second snapshot tick remains a slow backstop, so even with the live-tail stream unavailable new turns still surface on the next tick.
+When you have a conversation open and fully paged to its end, the reader follows the live session in near-real time. Instead of waiting for the periodic dashboard snapshot tick (whose period is given under [Background sync cadence](#background-sync-cadence)), the open reader keeps a dedicated per-conversation SSE stream to `GET /api/conversation/<id>/events` that watches only that session's JSONL file(s) and pings the client within about a second of the file growing. On a ping the reader fetches just the new turns (`event: tail`), and the server emits `: keep-alive` comments while the session is idle so proxies don't drop the stream. The periodic snapshot tick remains a slow backstop, so even with the live-tail stream unavailable new turns still surface on the next tick.
 
 The watch loop runs a targeted single-file cache ingest scoped to only the open session's file(s) — it never triggers a full project-tree walk — so following a live conversation stays cheap. It is fail-closed behind the same [transcript privacy gate](#conversation-viewer-endpoints-plan-2) as the other conversation routes: loopback by default, LAN only under `dashboard.expose_transcripts`, and an IP-literal `Host` only (a spoofed/rebinding `Host` is `403`).
 
 `--no-sync` makes the stream **passive**: the dashboard was started to freeze data at the startup snapshot, so the live-tail endpoint sends keep-alives only and performs no ingest and no `tail` emit, leaving the frozen snapshot untouched.
 
-To opt out of the live-tail entirely, set `dashboard.live_tail` to `false` (via `cctally config set dashboard.live_tail false` or the dashboard Settings overlay). The reader then falls back to the 5-second snapshot tick for new turns. The default is `true` (absence is ON); see [`config.md`](config.md#allowed-keys).
+To opt out of the live-tail entirely, set `dashboard.live_tail` to `false` (via `cctally config set dashboard.live_tail false` or the dashboard Settings overlay). The reader then falls back to the periodic snapshot tick for new turns. The default is `true` (absence is ON); see [`config.md`](config.md#allowed-keys).
 
 ### Cache rebuilds in the session modal
 

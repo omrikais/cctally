@@ -232,6 +232,11 @@ class DoctorState:
     # DOCTOR_WAL_WARN_BYTES (2x the WAL cap) — only when the journal_size_limit
     # + forced-checkpoint machinery has genuinely failed to contain the WAL.
     cache_db_wal_bytes: Optional[int] = None
+    # #583 S4 (F39): size in bytes of conversations.db-wal, gathered the same
+    # read-only way as cache_db_wal_bytes above (absent -> 0, OSError -> None).
+    # STORE_POLICY gives conversations.db the same 128 MiB journal_size_limit,
+    # so it warns above the SAME DOCTOR_WAL_WARN_BYTES threshold.
+    conversations_db_wal_bytes: Optional[int] = None
     # #496 S5b: the durable incomplete-quota-projection flag carried inside the
     # published stats generation. True = every quota-projection read is refused
     # until a reconciliation runs; False = the generation is complete; None =
@@ -2294,6 +2299,37 @@ def _check_db_wal_size(s: DoctorState) -> CheckResult:
     )
 
 
+def _check_db_conversations_wal_size(s: DoctorState) -> CheckResult:
+    """Read-only backstop for the transcript store's WAL (#583 S4 / F39).
+
+    Sibling of `_check_db_wal_size`, sharing DOCTOR_WAL_WARN_BYTES because
+    STORE_POLICY gives conversations.db the same 128 MiB journal_size_limit as
+    cache.db — so the same "only fires when containment has genuinely failed"
+    reasoning applies. Same fingerprint discipline: the exact byte count lives
+    ONLY in the excluded details block and the summary is a stable string, so
+    below-threshold drift cannot flip the fingerprint while an OK<->WARN
+    crossing does.
+    """
+    wal = s.conversations_db_wal_bytes
+    details = {"conversations_db_wal_bytes": wal}
+    if isinstance(wal, int) and wal > DOCTOR_WAL_WARN_BYTES:
+        return CheckResult(
+            id="db.conversations_wal_size",
+            title="conversations.db WAL size", severity="warn",
+            summary="oversized — conversations.db WAL far above its cap",
+            remediation=(
+                "Run `cctally db checkpoint --db conversations` "
+                "to drain the WAL."
+            ),
+            details=details,
+        )
+    return CheckResult(
+        id="db.conversations_wal_size",
+        title="conversations.db WAL size", severity="ok",
+        summary="within limit", remediation=None, details=details,
+    )
+
+
 # #315: conservative advisory threshold. A quarter of cache.db being free is
 # large enough to make an explicit, guarded VACUUM useful without nagging for
 # ordinary page churn. This is a ratio, so it remains page-size independent.
@@ -3449,6 +3485,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("db.migrations.pending", "_check_db_migrations_pending"),
         ("db.lock_state", "_check_db_lock_state"),
         ("db.wal_size", "_check_db_wal_size"),
+        ("db.conversations_wal_size", "_check_db_conversations_wal_size"),
         ("db.reclaimable", "_check_db_reclaimable"),
         ("db.conversations_reclaimable", "_check_db_conversations_reclaimable"),
         ("db.retained_artifacts", "_check_db_retained_artifacts"),

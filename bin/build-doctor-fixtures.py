@@ -75,6 +75,10 @@ SCENARIOS = {
     "32-retained-artifacts-protected":   "retained_artifacts_protected",
     "33-heal-repeated-shape":            "heal_repeated_shape",
     "34-retention-policy-malformed":     "retention_policy_malformed",
+    # #583 S4 (F39): the only fixture that reaches the new
+    # `db.conversations_wal_size` WARN branch. Every other scenario leaves the
+    # sidecar absent, which the check reports as OK.
+    "35-conversations-wal-oversized":    "conversations_wal_oversized",
 }
 
 # user_version sentinel bumped well past either registry head so the
@@ -321,6 +325,21 @@ def _scenario_body(slug: str) -> str:
             freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
             assert page_count > 0 and freelist_count / page_count >= 0.25
             conn.close()
+            PY
+        """)
+    if slug == "conversations_wal_oversized":
+        # #583 S4 (F39). The check reads ONLY the size of the
+        # `conversations.db-wal` sidecar, so the sidecar alone is what this
+        # scenario creates: adding a conversations.db as well would move other
+        # conversations checks and make the golden diff wider than the one row
+        # under test. The file is created SPARSE — `truncate` extends the
+        # length without allocating blocks, so it costs no repository bytes
+        # (nothing here is committed) and no measurable build time.
+        return _scenario_body("all_ok") + textwrap.dedent("""\
+            python3 - "$HARNESS_FAKE_HOME/.local/share/cctally/conversations.db-wal" <<'PY'
+            import sys
+            with open(sys.argv[1], "wb") as fh:
+                fh.truncate(256 * 1024 * 1024 + 4096)   # sparse; > DOCTOR_WAL_WARN_BYTES
             PY
         """)
     if slug == "legacy_hooks_detected":

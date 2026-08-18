@@ -94,6 +94,10 @@ def _http_snapshot(ns, snapshot) -> dict:
     handler = ns["DashboardHTTPHandler"]
     handler.hub = ns["SSEHub"]()
     handler.snapshot_ref = ns["_SnapshotRef"](snapshot)
+    # #583 S3 §7: `/api/data` serves the most recently PUBLISHED state,
+    # so a bare reference is not enough — seed the hub exactly as
+    # `cmd_dashboard` does before the HTTP server binds.
+    handler.hub.publish(handler.snapshot_ref.get())
     server = ns["ThreadingHTTPServer"](("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

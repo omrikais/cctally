@@ -221,8 +221,8 @@ def _totals(entries: Iterable[QualifiedCodexEntry]) -> TokenTotals:
     # `build_codex_project_result`, over the complete population, before any
     # subset is taken -- which is the only place it can be correct. Guarding
     # this call on "the subset holds more than one project identity" would
-    # have kept nearly all of the cost, because the expensive callers are the
-    # per-block totals over a population spanning every project.
+    # have kept roughly three-quarters of the cost, because the expensive
+    # callers are the per-block totals over a population spanning every project.
     values = tuple(entries)
     return TokenTotals(
         input_tokens=sum(entry.input_tokens for entry in values),

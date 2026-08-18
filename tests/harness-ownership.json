@@ -25,7 +25,9 @@
       "sourcePaths": []
     },
     "bench": {
-      "fixturePaths": [],
+      "fixturePaths": [
+        "bin/build-bench-fixtures.py"
+      ],
       "sourcePaths": []
     },
     "blocks": {

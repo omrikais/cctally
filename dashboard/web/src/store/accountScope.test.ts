@@ -205,8 +205,12 @@ const DECORATED = envelope(codexData({
 const UNDECORATED = envelope(codexData({}));
 
 // #556 S5 §5.4 — the SAME decorated Codex data, plus the `all` entry the server
-// composes: `providers` MIRRORS the provider data objects, and `combined` and
-// `aggregates` are deliberately unscoped outcomes that a focus must not touch.
+// composes. `combined` and `aggregates` are deliberately unscoped outcomes that
+// a focus must not touch.
+// #583 S3 §4 — `providers` no longer mirrors the provider data objects. The
+// server publishes null for both members and every All panel reads the physical
+// `sources.claude` / `sources.codex` entries through `presentationProviders`'
+// fallback, so this fixture states the null stub the wire actually carries.
 const COMBINED_MARKER = { state: 'available', spend_usd: 999 };
 const AGGREGATES_MARKER = { range: { kind: 'shared', start_at: 'x', end_at: 'y' } };
 const DECORATED_ALL = (() => {
@@ -217,7 +221,6 @@ const DECORATED_ALL = (() => {
     ],
     scopes: { [A]: scope({ marker: 'A' }), [B]: scope({ marker: 'B' }) },
   }));
-  const codexData_ = env.sources!.codex!.data;
   return {
     ...env,
     sources: {
@@ -230,7 +233,7 @@ const DECORATED_ALL = (() => {
         last_success_at: '2026-07-28T00:00:00Z',
         capabilities: {},
         data: {
-          providers: { claude: null, codex: codexData_ },
+          providers: { claude: null, codex: null },
           combined: COMBINED_MARKER,
           aggregates: AGGREGATES_MARKER,
         },
@@ -367,20 +370,21 @@ describe('scopeEnvelope', () => {
     expect(scopeEnvelope(DECORATED, 'codex', B)).not.toBe(first);
   });
 
-  // #556 S5 §5.4 — under All the SERVER mirrors each provider's data object
-  // under `sources.all.data.providers`, and `presentationProviders` PREFERS
-  // that mirror. Rewriting only the physical source would leave most All panels
-  // reading unscoped data while the chip claimed to be filtering.
-  it('an All Codex focus rewrites both the physical source and the All provider mirror', () => {
+  // #583 S3 §4 — there is now ONE copy. `sources.all.data.providers` publishes
+  // null for both providers, so rewriting it would reconstruct client-side the
+  // duplication the wire change removed. Every All panel reads the physical
+  // entry through `presentationProviders`' fallback, which is what makes
+  // narrowing only `sources.codex.data` sufficient.
+  it('rewrites only the physical codex entry under All focus', () => {
     const scoped = scopeEnvelope(DECORATED_ALL, 'all', A)!;
     expect(scoped).not.toBe(DECORATED_ALL);
     const physical = scoped.sources!.codex!.data as CodexSourceData;
-    const mirrored = (scoped.sources!.all!.data as unknown as {
-      providers: { codex: CodexSourceData };
-    }).providers.codex;
+    expect(physical).not.toBe(DECORATED_ALL.sources!.codex!.data);
     expect(physical.periods.daily.rows[0].label).toBe('A-daily');
-    // The mirror is the SAME rewritten object, not a second independent one.
-    expect(mirrored).toBe(physical);
+    // The mirror is NOT reconstructed client-side.
+    expect((scoped.sources!.all!.data as unknown as {
+      providers: unknown;
+    }).providers).toEqual({ claude: null, codex: null });
   });
 
   it('an All Codex focus leaves all.data.combined and the aggregates untouched', () => {
@@ -398,12 +402,16 @@ describe('scopeEnvelope', () => {
     const underAll = scopeEnvelope(DECORATED_ALL, 'all', A);
     const underTab = scopeEnvelope(DECORATED_ALL, 'codex', A);
     expect(underAll).not.toBe(underTab);
-    // Only the All rewrite touches the mirror.
-    const tabMirror = (underTab!.sources!.all!.data as unknown as {
-      providers: { codex: CodexSourceData };
-    }).providers.codex;
-    expect(tabMirror.periods.daily.rows[0].label).toBe('parent-daily');
+    // #583 S3 §4 — neither view touches the mirror any more; the view stays in
+    // the memo key so the two selections keep independent reference identity,
+    // which `useSyncExternalStore` requires of every getSnapshot result.
+    for (const scoped of [underAll, underTab]) {
+      expect((scoped!.sources!.all!.data as unknown as {
+        providers: unknown;
+      }).providers).toEqual({ claude: null, codex: null });
+    }
     expect(scopeEnvelope(DECORATED_ALL, 'all', A)).toBe(underAll);
+    expect(scopeEnvelope(DECORATED_ALL, 'codex', A)).toBe(underTab);
   });
 
   it('identity is preserved when no focus resolves under All', () => {

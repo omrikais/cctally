@@ -27,6 +27,14 @@ import {
 } from './selectors';
 import { DEFAULT_PANEL_ORDER, CARD_LAYOUT, type GridPanelId } from '../lib/panelIds';
 import {
+  isFatalSyncWarning,
+  syncWarningCodes,
+  BUSY_SYNC_WARNINGS,
+  SYNC_BUSY_NOTICE_MS,
+  SYNC_ERROR_FLOOR_MS,
+  SYNC_SUCCESS_FLASH_MS,
+} from '../lib/syncActivity';
+import {
   applyPanelOrderMigration,
   CURRENT_PANEL_ORDER_SCHEMA_VERSION,
   reconcilePanelOrder,
@@ -512,6 +520,21 @@ export interface UIState {
   // "✓ updated" + .sync-success class. 0 means no active flash.
   // Mirror of syncErrorFloorUntil; set by `triggerSync()` on success.
   syncSuccessFlashUntil: number;
+  // Epoch ms through which a refused manual refresh renders "refresh busy".
+  // This is informational rather than an error: the bounded --no-sync lock
+  // acquire expired, so no work ran and the user can retry later.
+  syncBusyNoticeUntil: number;
+  // #583 S2 §6.2 — the QUEUED refresh this tab is still waiting on: the
+  // `request_id` the server returned with its 202, and the `server_epoch` that
+  // identifier belongs to. Both null when nothing is outstanding.
+  //
+  // The pair is meaningful only together. Identifiers are monotonic WITHIN one
+  // server process and restart at zero after a restart, so a frame from a
+  // different epoch discards the pair rather than comparing numbers minted by
+  // two different counter runs. Written by REGISTER_SYNC_REQUEST and cleared by
+  // `reconcileOutstandingSync`, which is the ONLY place either is resolved.
+  outstandingSyncId: number | null;
+  syncEpoch: string | null;
   // Transient toast surfaced by the <Toast /> component. null when no
   // toast active. Tagged-union: `status` (legacy short message; 2.5s
   // auto-dismiss) vs `alert` (rich percent-crossing alert; 8s
@@ -819,6 +842,12 @@ function loadInitial(): UIState {
     syncErrorFloorUntil: 0,
     syncBusy: false,
     syncSuccessFlashUntil: 0,
+    syncBusyNoticeUntil: 0,
+    // #583 S2 — nothing outstanding on a fresh load. Deliberately NOT
+    // persisted: an identifier is scoped to one server process, and a reload
+    // cannot know whether that process is still the one running.
+    outstandingSyncId: null,
+    syncEpoch: null,
     toast: null,
     alerts: [],
     seenAlertIds: new Set<string>(),
@@ -1017,12 +1046,92 @@ function _recomputeSearch(s: UIState): Pick<UIState, 'searchMatches' | 'searchIn
 // seenAlertIds) in sync with the snapshot — see sse.ts's `ingestAlerts`
 // — gate their follow-up dispatches on this return value so a late
 // bootstrap can't replace fresh post-update state with stale rows.
+// #583 S2 §6.2 — the ONE place an outstanding queued refresh is resolved
+// against the server's published activity state. Both entry points call it:
+// REGISTER_SYNC_REQUEST (so registration and reconciliation are one atomic
+// operation) and `updateSnapshot` (so every later frame gets the same
+// treatment). Pure: it reads the passed state and returns the fields to change.
+//
+// Returning `{}` means "keep waiting" and is the correct answer whenever the
+// frame says nothing authoritative about our identifier. That matters because
+// the wrong kind of certainty here is what strands a request: settling on a
+// frame that never covered our batch reports success for work that has not
+// run, and discarding on a frame that merely lacks the object throws away a
+// live request.
+function reconcileOutstandingSync(s: UIState): Partial<UIState> {
+  const id = s.outstandingSyncId;
+  const epoch = s.syncEpoch;
+  if (id == null || epoch == null) return {};
+  const activity = s.snapshot?.sync_activity;
+  // An absent object is a server without the feature. An empty `server_epoch`
+  // is a snapshot that never passed through `_SnapshotRef`. Neither is
+  // authoritative about our identifier, so neither settles nor discards.
+  if (!activity || !activity.server_epoch) return {};
+  if (activity.server_epoch !== epoch) {
+    // The server process restarted. Its counters restart at zero, so comparing
+    // them against an identifier minted by the dead process would either
+    // mistake a fresh counter for progress or wait forever on one that can
+    // never reach our number. Discard — and discarding is NOT settling, so no
+    // success flash fires for work that never ran.
+    return { outstandingSyncId: null, syncEpoch: null };
+  }
+  // `settled_id` is a retained high-water mark, so a frame carrying a LATER
+  // batch still proves ours settled. That is exactly why these are counters
+  // rather than a boolean: any surviving frame carries the whole truth, and a
+  // latest-wins hub may drop the frame that settled our own batch.
+  if (activity.settled_id < id) return {};
+  const cleared = { outstandingSyncId: null, syncEpoch: null };
+  const codes = syncWarningCodes(activity.settled_warnings);
+  // The same triage the synchronous 200 path applies — §4 removed the HTTP
+  // response that used to carry these warnings, so this is now the only place
+  // a deferred refresh's outcome reaches the user.
+  if (activity.settled_status === 'failed' || codes.some(isFatalSyncWarning)) {
+    return { ...cleared, syncErrorFloorUntil: Date.now() + SYNC_ERROR_FLOOR_MS };
+  }
+  if (codes.some((c) => BUSY_SYNC_WARNINGS.has(c))) {
+    return {
+      ...cleared,
+      syncBusyNoticeUntil: Date.now() + SYNC_BUSY_NOTICE_MS,
+    };
+  }
+  return { ...cleared, syncSuccessFlashUntil: Date.now() + SYNC_SUCCESS_FLASH_MS };
+}
+
+// #583 S3 §8. Whether this frame comes from a DIFFERENT server process than the
+// one that produced the frame currently held.
+//
+// The two clauses it declines to answer on are taken from
+// `reconcileOutstandingSync`, which already reasons about this field: an absent
+// `sync_activity` is a server without the feature, and an empty `server_epoch`
+// is a snapshot that never passed through `_SnapshotRef`. Neither says anything
+// authoritative about process identity, so neither may suspend the time-order
+// guard.
+function _serverEpochChanged(snap: Envelope | null): boolean {
+  const incoming = snap?.sync_activity?.server_epoch;
+  const held = state.snapshot?.sync_activity?.server_epoch;
+  if (!incoming || !held) return false;
+  return incoming !== held;
+}
+
 export function updateSnapshot(snap: Envelope | null): boolean {
   const ga = snap?.generated_at ?? '';
-  if (ga && lastGeneratedAt && ga < lastGeneratedAt) return false;
+  // #583 S3 §8. Resolve a changed epoch BEFORE the ordering rejection. Two
+  // processes' wall clocks are not comparable, so a restarted server whose
+  // clock is behind the dead one's publishes a frame that looks stale and is
+  // not. Rejecting it on time order discarded the seed, which meant
+  // `reconcileOutstandingSync` never ran, the changed epoch was never
+  // reconciled, a dead outstanding sync identifier survived and freshness
+  // stayed stuck — for a tab that was merely hidden while the server restarted.
+  const epochChanged = _serverEpochChanged(snap);
+  if (!epochChanged && ga && lastGeneratedAt && ga < lastGeneratedAt) return false;
+  if (epochChanged) lastGeneratedAt = '';
   if (ga) lastGeneratedAt = ga;
   const next = { ...state, snapshot: snap };
-  state = { ...next, ..._recomputeSearch(next) };
+  // Reconcile BEFORE the search recompute so both run against one coherent
+  // state object, and so a settlement lands in the same emit as the frame that
+  // proved it rather than one render later.
+  const reconciled = { ...next, ...reconcileOutstandingSync(next) };
+  state = { ...reconciled, ..._recomputeSearch(reconciled) };
   emit();
   return true;
 }
@@ -1136,6 +1245,11 @@ export type Action =
   | { type: 'SET_SYNC_ERROR_FLOOR'; untilMs: number }
   | { type: 'SET_SYNC_BUSY'; busy: boolean }
   | { type: 'SET_SYNC_SUCCESS_FLASH'; untilMs: number }
+  | { type: 'SET_SYNC_BUSY_NOTICE'; untilMs: number }
+  // #583 S2 §6.2 — record the `request_id` / `server_epoch` pair a `202`
+  // returned. The reducer stores AND reconciles in one step; see
+  // `reconcileOutstandingSync` for why splitting them strands the request.
+  | { type: 'REGISTER_SYNC_REQUEST'; id: number; epoch: string }
   // Toast variant pattern (T8). SHOW_STATUS_TOAST replaces the legacy
   // SHOW_TOAST (string-message); SHOW_ALERT_TOAST surfaces a rich
   // AlertEntry. HIDE_TOAST clears either kind. INGEST_SNAPSHOT_ALERTS
@@ -1880,6 +1994,31 @@ export function dispatch(action: Action): void {
     case 'SET_SYNC_SUCCESS_FLASH':
       state = { ...state, syncSuccessFlashUntil: action.untilMs };
       break;
+    case 'SET_SYNC_BUSY_NOTICE':
+      state = { ...state, syncBusyNoticeUntil: action.untilMs };
+      break;
+    case 'REGISTER_SYNC_REQUEST': {
+      // Store and reconcile as ONE operation. The settlement frame can be
+      // applied before `triggerSync` finishes parsing the 202 that named this
+      // identifier, and a latest-wins hub promises no later frame, so a
+      // register-then-wait would show `queued…` forever.
+      //
+      // KNOWN TRADE-OFF, deliberately left as is. Reconciling immediately means
+      // a registration made just after a server restart is DISCARDED rather than
+      // kept, because the snapshot already in the store may still carry the dead
+      // process's epoch while the 202 carries the live one. The consequence is
+      // mild — no `queued…`, no flash — and the server still services the
+      // request, so nothing stalls. A "keep on epoch mismatch" rule is not
+      // obviously better: the reverse ordering is equally possible, and keeping
+      // would then strand an identifier minted by a process that is gone.
+      const registered = {
+        ...state,
+        outstandingSyncId: action.id,
+        syncEpoch: action.epoch,
+      };
+      state = { ...registered, ...reconcileOutstandingSync(registered) };
+      break;
+    }
     case 'SHOW_STATUS_TOAST':
       state = { ...state, toast: { kind: 'status', text: action.text } };
       break;

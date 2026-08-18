@@ -8,7 +8,7 @@ the committed advisory baseline. A dev / maintainer tool (like
 and is never wired into ``cctally-test-all`` (the self-test
 ``bin/cctally-bench-test`` is; it asserts structure only, never timings).
 
-Six benchmark families (14 benchmarks) exercise the #268-#275 perf wins:
+Six benchmark families (15 benchmarks) exercise the #268-#275 perf wins:
   1. snapshot spine  — _tui_build_snapshot cold / warm / idle (precompute_envelope)
   2. ingest          — sync_cache no-op over many files + a one-file delta
   3. conversations   — list_conversations page1 / sorted / filtered
@@ -156,7 +156,7 @@ def _capture_phases(name, body, perf, has_own_root):
 
 # ── benchmark registry ───────────────────────────────────────────────────
 
-def _make_benchmarks(cctally, perf):
+def _make_benchmarks(cctally, perf, now_utc=None):
     """Build the registry. Returns ``(benchmarks, cleanup)`` where each
     benchmark is ``(name, body, has_own_root, count_of)`` and ``cleanup`` closes
     the shared read connection."""
@@ -189,8 +189,17 @@ def _make_benchmarks(cctally, perf):
 
     # ── family 1: snapshot spine ──
     def _snapshot():
+        # `now_utc` EXPLICITLY. `_tui_build_snapshot_once` resolves
+        # `now_utc or dt.datetime.now(...)` and never reads CCTALLY_AS_OF —
+        # that variable is translated at `cmd_dashboard`'s entry point, which
+        # this tool bypasses. Setting the variable and not passing the value
+        # left the whole Codex weekly cycle unresolvable at the real clock, so
+        # `build_codex_source_state` returned early and the snapshot family
+        # measured the SHORT branch. Measured on `small`: 94.2 ms at the wall
+        # clock against 451.9 ms at the corpus clock — 4.8x the work.
         return cctally._tui_build_snapshot(
-            skip_sync=True, precompute_envelope=True, runtime_bind=None
+            skip_sync=True, precompute_envelope=True, runtime_bind=None,
+            now_utc=now_utc,
         )
 
     def _reset_cold():
@@ -380,6 +389,10 @@ def run_all(*, scale, seed, iterations, trace, root=None,
             "realism mode needs BOTH --data-dir and --claude-dir — the "
             "cache/stats dir and the JSONL source are independent axes; "
             "passing only one would silently fall back to the synthetic fixture")
+    # #583 S1: the corpus fingerprint is meaningful only over the SYNTHETIC
+    # corpus, whose content the generator owns. Hashing a real store would be
+    # slow and would key the contract to one machine's private data.
+    synthetic = data_dir is None and claude_dir is None
     if data_dir is not None and claude_dir is not None:
         data_dir = pathlib.Path(data_dir)
         claude_dir = pathlib.Path(claude_dir)
@@ -389,15 +402,40 @@ def run_all(*, scale, seed, iterations, trace, root=None,
         data_dir = gen.build_fixture(scale=scale, seed=seed, root=root)
         claude_dir = pathlib.Path(root) / "claude"
 
+    # #583 S1: the corpus is anchored at a fixed reference epoch, so measuring
+    # it against the real wall clock describes a store already months stale at
+    # recording and growing staler, and --compare / --gate then compare across
+    # that drift. The clock is PASSED to the builder, not exported: setting
+    # CCTALLY_AS_OF alone changed nothing here, because the benchmark bodies
+    # call `_tui_build_snapshot` directly and only `cmd_dashboard` translates
+    # that variable.
+    bench_now = gen.CORPUS_CLOCK_UTC if synthetic else None
+    if synthetic:
+        # Still exported, for the paths that DO read it (anything reached
+        # through a command entry point rather than the builder directly).
+        os.environ["CCTALLY_AS_OF"] = gen.CORPUS_CLOCK_UTC.isoformat(
+        ).replace("+00:00", "Z")
     cctally, perf = _pin_and_import(data_dir, claude_dir)
 
     conn = cctally.open_conversations_db()
     try:
-        dcounts = gen.dataset_counts(conn)
+        if synthetic:
+            # Spec §5: the receipt validates EXACT counts and every realised
+            # discriminator before it measures anything, so a receipt can never
+            # be recorded over a corpus that is not the one it names.
+            dcounts = gen.validate_corpus(conn, scale)
+        else:
+            dcounts = gen.dataset_counts(conn)
     finally:
         conn.close()
 
-    benchmarks, cleanup = _make_benchmarks(cctally, perf)
+    if synthetic:
+        # The gate that would have caught the clock defect above. Asserts the
+        # RENDERED tick at exactly the instant the benchmarks are about to use,
+        # which is the one thing `validate_corpus` structurally cannot check.
+        gen.assert_tick_renders_the_codex_cycle(cctally, bench_now)
+
+    benchmarks, cleanup = _make_benchmarks(cctally, perf, bench_now)
     results = {}
     try:
         for name, body, has_own_root, count_of in benchmarks:
@@ -424,6 +462,19 @@ def run_all(*, scale, seed, iterations, trace, root=None,
         _reset_perf(perf)
         cleanup()
 
+    # AFTER the benchmarks, deliberately. `semantic_hash` reads every row of
+    # every table, which warms the OS page cache for exactly the tables
+    # `snapshot.cold` then measures. The counts and discriminators above are
+    # aggregate queries and were already read pre-benchmark before #583 S1;
+    # full-content hashing was not, and must not be.
+    fingerprint = None
+    if synthetic:
+        conn = cctally.open_conversations_db()
+        try:
+            fingerprint = gen.semantic_hash(conn)
+        finally:
+            conn.close()
+
     return {
         "schemaVersion": SCHEMA_VERSION,
         "cctally_version": _bench_version(cctally),
@@ -431,6 +482,8 @@ def run_all(*, scale, seed, iterations, trace, root=None,
         "scale": scale,
         "seed": seed,
         "dataset_counts": dcounts,
+        "corpus_fingerprint": fingerprint,
+        "generator_version": getattr(gen, "GENERATOR_VERSION", None),
         "benchmarks": results,
     }
 
@@ -624,6 +677,23 @@ def render_table(result) -> str:
 
 # ── compare / gate ───────────────────────────────────────────────────────
 
+def _baseline_blocks(baseline):
+    """Return (benchmarks_dict, machine_label) for either baseline shape.
+
+    #583 S1 split the file into `contract` (structural, asserted) and `receipt`
+    (advisory timings). The pre-S1 flat shape is still accepted so a baseline
+    from an older checkout compares rather than reading as malformed.
+    """
+    if not isinstance(baseline, dict):
+        return None, None
+    receipt = baseline.get("receipt")
+    if isinstance(receipt, dict) and "benchmarks" in receipt:
+        return receipt["benchmarks"], receipt.get("machine_label")
+    if "benchmarks" in baseline:
+        return baseline["benchmarks"], baseline.get("machine_label")
+    return None, None
+
+
 def classify(baseline, current, *, pct, floor_ms):
     """Total per-benchmark status taxonomy (spec §4.3). Returns a dict keyed by
     benchmark name plus a ``_meta`` entry. Statuses: ``OK`` / ``REGRESSED`` /
@@ -631,13 +701,13 @@ def classify(baseline, current, *, pct, floor_ms):
     from baseline). ``REGRESSED`` iff ``current - baseline > max(pct*baseline,
     floor_ms)`` — the floor stops sub-ms benches flapping and cleanly handles a
     zero/near-zero baseline. A non-dict / keyless baseline is ``malformed``."""
-    if not isinstance(baseline, dict) or "benchmarks" not in baseline:
+    b, machine = _baseline_blocks(baseline)
+    if b is None:
         return {"_meta": {"malformed": True, "machine_mismatch": False}}
-    b = baseline["benchmarks"]
     c = current["benchmarks"]
     out = {"_meta": {
         "malformed": False,
-        "machine_mismatch": baseline.get("machine_label") != current.get("machine_label"),
+        "machine_mismatch": machine != current.get("machine_label"),
     }}
     for name, bv in b.items():
         if name not in c:
@@ -709,8 +779,35 @@ def render_compare(classified) -> str:
 
 
 def _write_baseline(result):
+    """Write the contract/receipt baseline (#583 S1).
+
+    The contract block is what `cctally-bench-test` asserts without running the
+    benchmark; the receipt block is advisory and never asserted. Writing the raw
+    run result here would erase the contract on every --update-baseline.
+    """
+    if result.get("corpus_fingerprint") in (None, ""):
+        # Realism mode (--data-dir/--claude-dir) computes no fingerprint, so a
+        # baseline recorded there cannot satisfy the contract the harness
+        # asserts. Refuse at WRITE time: deferring it to the gate means the
+        # operator learns about it from an unrelated harness failure later.
+        raise SystemExit(
+            "refusing to write a baseline with no corpus fingerprint; "
+            "--update-baseline needs the synthetic corpus, not --data-dir/"
+            "--claude-dir realism mode")
+    payload = {
+        "schemaVersion": 2,
+        "contract": {
+            "benchmark_names": sorted(result["benchmarks"]),
+            "scale": result.get("scale"),
+            "seed": result.get("seed"),
+            "dataset_counts": result.get("dataset_counts"),
+            "corpus_fingerprint": result.get("corpus_fingerprint"),
+            "generator_version": result.get("generator_version"),
+        },
+        "receipt": {k: v for k, v in result.items() if k != "schemaVersion"},
+    }
     BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    BASELINE_PATH.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    BASELINE_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def _resolve_root(args):
@@ -737,11 +834,21 @@ def _resolve_assembly_root(args):
             / f"{scale}-seed{DEFAULT_SEED}")
 
 
+def _uniform_scales():
+    """Every non-ladder scale the generator defines, in ascending order."""
+    gen = _load_gen()
+    names = [n for n, p in gen.SCALES.items() if "ladder" not in p]
+    return tuple(sorted(names, key=lambda n: gen.SCALES[n].get("sessions", 0)))
+
+
 def _build_parser():
     ap = argparse.ArgumentParser(
         description="In-process backend benchmark runner (issue #276, M3)."
     )
-    ap.add_argument("--scale", choices=("small", "large"), default=DEFAULT_SCALE)
+    # The uniform profiles, read from the generator so a new one is usable
+    # here the day it is added. The ladder scales are driven by
+    # --assembly-scan and are deliberately not offered.
+    ap.add_argument("--scale", choices=_uniform_scales(), default=DEFAULT_SCALE)
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS)
     ap.add_argument("--trace", action="store_true",

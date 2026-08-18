@@ -108,14 +108,20 @@ def _conn():
 
 @pytest.fixture(autouse=True)
 def _isolate_assembly_env():
-    """The assembly fixture builder pins CCTALLY_DATA_DIR + CLAUDE_CONFIG_DIR via
-    os.environ directly (so a freshly-loaded cctally targets the scratch dir) and
-    leaves them set. Snapshot + restore them so a build in a Task-3 test can't
-    leak an override into a sibling test on the same pytest-xdist worker (mirrors
-    tests/test_bench.py::_isolate_bench_env). Also resets the perf collector so a
-    tracing-on Task-1/2 test never leaks state into a neighbor."""
+    """The assembly fixture builder pins CCTALLY_DATA_DIR, CLAUDE_CONFIG_DIR,
+    CODEX_HOME and HOME via os.environ directly (so a freshly-loaded cctally
+    targets the scratch dirs) and leaves them set. Snapshot + restore them so a
+    build in a Task-3 test can't leak an override into a sibling test on the
+    same pytest-xdist worker (mirrors tests/test_bench.py::_isolate_bench_env).
+
+    #583 S1 widened this from two keys to the generator's own
+    PINNED_ENV_KEYS, which is READ rather than restated so the two fixtures
+    cannot drift apart. It was measured leaking HOME:
+    `build_fixture` gained a HOME pin, `_build_small_assembly_fixture` calls it
+    directly, and the two keys here did not cover it. Also resets the perf
+    collector so a tracing-on Task-1/2 test never leaks state into a neighbor."""
     import os as _os
-    keys = ("CCTALLY_DATA_DIR", "CLAUDE_CONFIG_DIR")
+    keys = _load_build_bench().PINNED_ENV_KEYS
     saved = {k: _os.environ.get(k) for k in keys}
     yield
     for k, v in saved.items():
@@ -147,11 +153,10 @@ def _load_build_bench():
 
 
 def _build_small_assembly_fixture(tmp_path):
-    import os
-    os.environ["CCTALLY_DATA_DIR"] = str(tmp_path / "data")
-    os.environ["CLAUDE_CONFIG_DIR"] = str(tmp_path / "claude")
+    """Build the ladder fixture WITHOUT leaving the process pinned (#583 S1)."""
     gen = _load_build_bench()
-    data_dir = gen.build_fixture(scale="assembly-small", seed=1, root=tmp_path)
+    data_dir = gen.build_fixture_isolated(
+        scale="assembly-small", seed=1, root=tmp_path)
     return gen, data_dir
 
 
@@ -302,18 +307,25 @@ def test_assembly_fixture_shape_deterministic(tmp_path):
         cb.close()
 
 
-def test_assembly_marker_carries_params_hash_only_for_ladder(tmp_path):
-    """Codex F5: the assembly marker carries a params_hash; the small/large
-    markers stay {seed, scale, pricing_date} (Session B untouched)."""
+def test_assembly_marker_params_hash_separates_the_two_ladders(tmp_path):
+    """Codex F5's ladder axis, under the #583 S1 rule that every scale hashes.
+
+    The original form of this test asserted the CARVE-OUT — that `small` and
+    `large` carried no `params_hash` and stayed `{seed, scale, pricing_date}`.
+    #583 S1 removed that carve-out deliberately: `build_fixture` returns
+    immediately on a marker match, so a profile whose marker cannot see its own
+    cardinality or provider content silently reuses a stale corpus, which is
+    exactly what would have happened when S1 gave both profiles Codex material.
+    What Codex F5 actually requires — that a ladder edit busts the ladder
+    scales — is unchanged and is what this test still asserts.
+    """
     gen = _load_build_bench()
     cctally = gen._pin_env(tmp_path / "d", tmp_path / "c")
-    small = gen._marker_payload(cctally, seed=42, scale="small")
-    large = gen._marker_payload(cctally, seed=42, scale="large")
     asm = gen._marker_payload(cctally, seed=1, scale="assembly")
     asm_small = gen._marker_payload(cctally, seed=1, scale="assembly-small")
-    assert "params_hash" not in small
-    assert "params_hash" not in large
-    assert set(small) == {"seed", "scale", "pricing_date"}
     assert "params_hash" in asm and "params_hash" in asm_small
     # a ladder edit changes the hash (distinct ladders => distinct hashes).
     assert asm["params_hash"] != asm_small["params_hash"]
+    for scale in sorted(gen.SCALES):
+        assert "params_hash" in gen._marker_payload(cctally, seed=42, scale=scale), (
+            f"{scale} must be able to detect its own profile change")

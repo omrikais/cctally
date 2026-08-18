@@ -34,3 +34,11 @@ export const TREND_COLUMNS: TableColumn<TrendTableRow>[] = [
     className: 'c-delta',
   },
 ];
+
+const CYCLE_TREND_COLUMNS: TableColumn<TrendTableRow>[] = TREND_COLUMNS.map((column) =>
+  column.id === 'week' ? { ...column, label: 'Cycle' } : column,
+);
+
+export function trendColumns(unit: 'week' | 'cycle'): TableColumn<TrendTableRow>[] {
+  return unit === 'week' ? TREND_COLUMNS : CYCLE_TREND_COLUMNS;
+}

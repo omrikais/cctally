@@ -52,7 +52,7 @@ export function App() {
   // bootstrap), or the live grid with a stale banner + dim overlay when a
   // post-first-data connection drops.
   const env = useSnapshot();
-  const { disconnected, bootstrapError } = useConnectionStatus();
+  const { disconnected, bootstrapError, bootstrapMessage } = useConnectionStatus();
   const appState = deriveAppState(env, bootstrapError);
   // #293 S1 — resolve the responsive board mode ONCE here and thread it into
   // both the live grid (PanelHost data-span) and the loading skeleton, so we
@@ -97,7 +97,7 @@ export function App() {
         ) : appState === 'loading' ? (
           <SkeletonGrid mode={boardModeValue} />
         ) : appState === 'error' ? (
-          <ConnectionBanner kind="error" />
+          <ConnectionBanner kind="error" message={bootstrapMessage} />
         ) : (
           <>
             {disconnected && <ConnectionBanner kind="stale" />}

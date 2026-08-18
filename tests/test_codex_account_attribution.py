@@ -15,6 +15,8 @@ import pathlib
 import shutil
 import sys
 
+import pytest
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BIN_DIR = REPO_ROOT / "bin"
 if str(BIN_DIR) not in sys.path:
@@ -85,6 +87,60 @@ def _journal_records(ns, *, live_only=False):
             if line:
                 recs.append(json.loads(line))
     return recs
+
+
+@pytest.mark.parametrize("identified", (True, False))
+def test_ingest_writes_only_canonical_account_and_timestamp_values(
+    tmp_path, monkeypatch, identified,
+):
+    """The two stored shapes the Codex account cards' in-memory filters rely on.
+
+    #583 S5 change 2 replaced the per-card accounting SQL with filters over an
+    already-loaded population. The filters' comparisons differ from the SQL's
+    for exactly two row shapes:
+
+    * the card query's sentinel predicate was `account_key IS NULL OR
+      account_key = 'unattributed'`, which EXCLUDED a row stored as the empty
+      string from every card, while the reader normalizes `''` to the sentinel
+      and the in-memory filter therefore includes it; and
+    * the reader bounds `timestamp_utc` by comparing ISO TEXT in SQLite, while
+      the filter compares parsed UTC datetimes; the two disagree for a stamp
+      carrying an offset other than `+00:00`.
+
+    Neither shape is produced by ingest, which is what makes the two
+    comparisons equivalent on every store a shipped writer can create. Asserted
+    at the PRODUCER rather than over hand-built rows, because a consumer-side
+    fixture would encode the very convention it is meant to check. Run over both
+    attribution outcomes, so it covers the stamped-key write and the NULL one.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    provider_root, _rollout = _setup_root(tmp_path)
+    if identified:
+        (provider_root / "auth.json").write_text(
+            _auth_json("acct-red", "red@x.com"))
+    monkeypatch.setenv("CODEX_HOME", str(provider_root))
+
+    cache = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](cache)
+        rows = cache.execute(
+            "SELECT account_key, timestamp_utc FROM codex_session_entries"
+        ).fetchall()
+        assert rows, "non-vacuity: the ingest must have written rows"
+        assert [row for row in rows if row[0] == ""] == [], (
+            "an empty-string account_key lands on the unattributed card under "
+            "the in-memory filter and on no card at all under the SQL it "
+            "replaced"
+        )
+        assert [
+            row for row in rows if not str(row[1]).endswith("+00:00")
+        ] == [], (
+            "a stored offset other than +00:00 makes SQLite's TEXT comparison "
+            "and the filter's datetime comparison disagree at a card boundary"
+        )
+    finally:
+        cache.close()
 
 
 def test_identified_root_stamps_account_key(tmp_path, monkeypatch):

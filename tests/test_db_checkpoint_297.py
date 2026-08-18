@@ -33,6 +33,34 @@ def _load(n):
 
 
 @pytest.fixture(autouse=True)
+def _pin_the_conversations_locks(tmp_path, monkeypatch):
+    """Pin the three flocks a conversations checkpoint takes (#583 S4).
+
+    Same reasoning as ``_pin_the_cache_locks`` below: without this the
+    conversations tests would open the maintainer's real
+    ``~/.local/share/cctally`` lock files.
+    """
+    core = _load("_cctally_core")
+    monkeypatch.setattr(
+        core,
+        "CONVERSATIONS_LOCK_MAINTENANCE_PATH",
+        tmp_path / "conversations.db.maintenance.lock",
+    )
+    monkeypatch.setattr(
+        core, "CONVERSATIONS_LOCK_PATH", tmp_path / "conversations.db.lock"
+    )
+    monkeypatch.setattr(
+        core,
+        "CONVERSATIONS_LOCK_CODEX_PATH",
+        tmp_path / "conversations.db.codex.lock",
+    )
+    monkeypatch.setattr(
+        core, "CONVERSATIONS_DB_PATH", tmp_path / "absent-conversations.db"
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _pin_the_cache_locks(tmp_path, monkeypatch):
     """Pin the two flocks ``cmd_db_checkpoint`` takes besides the database.
 
@@ -237,3 +265,244 @@ def test_stats_checkpoint_json_is_stamped_not_applicable(
             "stats.db uses rollback journaling; no WAL checkpoint is applicable"
         ),
     }
+
+
+# --------------------------------------------------------------------------
+# `--db conversations` (#583 S4 / O-2)
+#
+# conversations.db carries the same 128 MiB journal_size_limit as cache.db but
+# has TWO independently writable provider domains, so its checkpoint must
+# exclude both provider flocks as well as taking maintenance shared.
+# --------------------------------------------------------------------------
+
+
+def _pin_conversations(tmp_path, monkeypatch, *, grow=True):
+    """Point CONVERSATIONS_DB_PATH at a WAL-backed DB; return the open writer."""
+    core = _load("_cctally_core")
+    db = tmp_path / "conversations.db"
+    monkeypatch.setattr(core, "CONVERSATIONS_DB_PATH", db)
+    return _grow(db) if grow else None
+
+
+def _wal_size(db):
+    wal = str(db) + "-wal"
+    return os.path.getsize(wal) if os.path.exists(wal) else 0
+
+
+def test_conversations_is_an_accepted_db_choice(cctally_module):
+    """--db conversations must parse; before #583 S4 argparse exits 2."""
+    parser = cctally_module.build_parser()
+    args = parser.parse_args(["db", "checkpoint", "--db", "conversations"])
+    assert args.db == "conversations"
+
+
+def test_conversations_checkpoint_holds_all_three_flocks_in_order(
+    tmp_path, monkeypatch
+):
+    """maintenance-SH, Claude-EX and Codex-EX, held SIMULTANEOUSLY, in order.
+
+    Per-lock contention tests alone are insufficient: an implementation that
+    acquired and released each lock separately before opening SQLite would pass
+    every one of them while holding none during the checkpoint. So this probes
+    the real flock state from INSIDE the truncate callback — a fresh open of the
+    same path conflicts with a flock held on another descriptor in the same
+    process, which is what makes the probe meaningful.
+    """
+    core = _load("_cctally_core")
+    dbmod = _load("_cctally_db")
+    cache = _load("_cctally_cache")
+    lockmod = _load("_lib_cache_writer_lock")
+    writer = _pin_conversations(tmp_path, monkeypatch)
+
+    observed_plan = []
+    real_acquire = lockmod.acquire_ordered_flocks
+
+    def spy_acquire(locks, *, timeout=None):
+        observed_plan.extend(locks)
+        return real_acquire(locks, timeout=timeout)
+
+    monkeypatch.setattr(lockmod, "acquire_ordered_flocks", spy_acquire)
+
+    def _probe(path, mode):
+        """True when a fresh ``mode`` flock on ``path`` CONFLICTS (is held)."""
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, mode | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+
+    held_during_checkpoint = {}
+    real_truncate = cache._run_wal_truncate
+
+    def spy_truncate(conn, path, *, db_label):
+        held_during_checkpoint["maintenance_shared"] = (
+            _probe(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH, fcntl.LOCK_EX)
+            and not _probe(
+                core.CONVERSATIONS_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH
+            )
+        )
+        held_during_checkpoint["claude_exclusive"] = _probe(
+            core.CONVERSATIONS_LOCK_PATH, fcntl.LOCK_SH
+        )
+        held_during_checkpoint["codex_exclusive"] = _probe(
+            core.CONVERSATIONS_LOCK_CODEX_PATH, fcntl.LOCK_SH
+        )
+        return real_truncate(conn, path, db_label=db_label)
+
+    monkeypatch.setattr(cache, "_run_wal_truncate", spy_truncate)
+
+    try:
+        rc = dbmod.cmd_db_checkpoint(
+            _args(db="conversations", busy_timeout_ms=2000)
+        )
+    finally:
+        writer.close()
+
+    assert rc == 0
+    assert [str(p) for p, _ in observed_plan] == [
+        str(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH),
+        str(core.CONVERSATIONS_LOCK_PATH),
+        str(core.CONVERSATIONS_LOCK_CODEX_PATH),
+    ]
+    assert [m for _, m in observed_plan] == [
+        fcntl.LOCK_SH,
+        fcntl.LOCK_EX,
+        fcntl.LOCK_EX,
+    ]
+    assert held_during_checkpoint == {
+        "maintenance_shared": True,
+        "claude_exclusive": True,
+        "codex_exclusive": True,
+    }, "the checkpoint ran without all three flocks still held"
+
+
+def test_conversations_checkpoint_shrinks_a_real_wal(tmp_path, monkeypatch):
+    """Relative shrinkage, never an absolute byte ceiling (D-1)."""
+    core = _load("_cctally_core")
+    dbmod = _load("_cctally_db")
+    writer = _pin_conversations(tmp_path, monkeypatch)
+    try:
+        before = _wal_size(core.CONVERSATIONS_DB_PATH)
+        assert before > 0, "precondition: the fixture must leave a non-empty WAL"
+        rc = dbmod.cmd_db_checkpoint(
+            _args(db="conversations", busy_timeout_ms=2000)
+        )
+        assert rc == 0
+        assert _wal_size(core.CONVERSATIONS_DB_PATH) < before
+    finally:
+        writer.close()
+
+
+def test_absent_conversations_db_exits_zero_and_is_not_created(
+    tmp_path, monkeypatch, capsys
+):
+    core = _load("_cctally_core")
+    dbmod = _load("_cctally_db")
+    _pin_conversations(tmp_path, monkeypatch, grow=False)
+    assert not core.CONVERSATIONS_DB_PATH.exists()
+    assert dbmod.cmd_db_checkpoint(_args(db="conversations")) == 0
+    # Naming the store keeps this from passing against cache's own absent-file
+    # early return, which is what the pre-#583-S4 handler would have hit.
+    assert "no conversations.db database file present" in capsys.readouterr().out
+    assert not core.CONVERSATIONS_DB_PATH.exists(), (
+        "a checkpoint must never create the store"
+    )
+
+
+def test_contended_conversations_checkpoint_exits_three_without_truncating(
+    tmp_path, monkeypatch
+):
+    """A held Codex provider flock is enough — cache's plan would miss it."""
+    core = _load("_cctally_core")
+    dbmod = _load("_cctally_db")
+    writer = _pin_conversations(tmp_path, monkeypatch)
+    before = _wal_size(core.CONVERSATIONS_DB_PATH)
+    held = os.open(
+        str(core.CONVERSATIONS_LOCK_CODEX_PATH), os.O_RDWR | os.O_CREAT, 0o600
+    )
+    fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        rc = dbmod.cmd_db_checkpoint(
+            _args(db="conversations", busy_timeout_ms=100)
+        )
+        assert rc == 3
+        assert _wal_size(core.CONVERSATIONS_DB_PATH) == before
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+        writer.close()
+
+
+def test_conversations_checkpoint_defers_during_exclusive_maintenance(
+    tmp_path, monkeypatch
+):
+    core = _load("_cctally_core")
+    dbmod = _load("_cctally_db")
+    writer = _pin_conversations(tmp_path, monkeypatch)
+    held = os.open(
+        str(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH),
+        os.O_RDWR | os.O_CREAT,
+        0o600,
+    )
+    fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        rc = dbmod.cmd_db_checkpoint(
+            _args(db="conversations", busy_timeout_ms=100)
+        )
+        assert rc == 3
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+        writer.close()
+
+
+def test_conversations_checkpoint_runs_no_schema_or_migration(
+    tmp_path, monkeypatch
+):
+    """The raw mode=rw connect must bypass open_conversations_db()."""
+    core = _load("_cctally_core")
+    dbmod = _load("_cctally_db")
+    cache = _load("_cctally_cache")
+    writer = _pin_conversations(tmp_path, monkeypatch)
+    called = []
+    monkeypatch.setattr(
+        cache,
+        "open_conversations_db",
+        lambda *a, **k: called.append("open"),
+    )
+    monkeypatch.setattr(
+        dbmod, "_run_pending_migrations", lambda *a, **k: called.append("migrate")
+    )
+    try:
+        assert dbmod.cmd_db_checkpoint(
+            _args(db="conversations", busy_timeout_ms=2000)
+        ) == 0
+        # Prove the checkpoint actually ran against conversations.db, so this
+        # cannot pass vacuously through cache's absent-file early return.
+        assert _wal_size(core.CONVERSATIONS_DB_PATH) == 0
+    finally:
+        writer.close()
+    assert called == []
+
+
+def test_conversations_checkpoint_json_labels_the_store(
+    tmp_path, monkeypatch, capsys
+):
+    core = _load("_cctally_core")
+    dbmod = _load("_cctally_db")
+    writer = _pin_conversations(tmp_path, monkeypatch)
+    try:
+        assert dbmod.cmd_db_checkpoint(
+            _args(db="conversations", json=True, busy_timeout_ms=2000)
+        ) == 0
+    finally:
+        writer.close()
+    obj = json.loads(capsys.readouterr().out)
+    assert list(obj)[0] == "schemaVersion"
+    assert obj["db"] == "conversations.db"
+    assert obj["present"] is True
+    assert obj["truncated"] is True

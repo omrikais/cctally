@@ -582,6 +582,15 @@
                 },
                 {
                     "details": {
+                        "conversations_db_wal_bytes": 0
+                    },
+                    "id": "db.conversations_wal_size",
+                    "severity": "ok",
+                    "summary": "within limit",
+                    "title": "conversations.db WAL size"
+                },
+                {
+                    "details": {
                         "cache_db_free_ratio": null,
                         "cache_db_freelist_count": null,
                         "cache_db_page_count": null,
@@ -1067,7 +1076,7 @@
     "overall": {
         "counts": {
             "fail": 3,
-            "ok": 50,
+            "ok": 51,
             "warn": 8
         },
         "severity": "fail"

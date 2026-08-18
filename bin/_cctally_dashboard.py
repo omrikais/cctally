@@ -191,11 +191,10 @@ What stays in bin/cctally:
 ``ns["_build_current_week_share_panel_data"]``,
 ``ns["_build_daily_share_panel_data"]``,
 ``ns["_build_monthly_share_panel_data"]``,
-``ns["_build_blocks_share_panel_data"]``, ``ns["STATIC_DIR"]``,
-``ns["_DASHBOARD_SYNC_LOCK_TIMEOUT_SECONDS"]``, plus
+``ns["_build_blocks_share_panel_data"]``, ``ns["STATIC_DIR"]``, plus
 ``monkeypatch.setitem`` mutations on
-``_dashboard_build_weekly_periods``, ``_dashboard_build_blocks_panel``,
-and ``_DASHBOARD_SYNC_LOCK_TIMEOUT_SECONDS``). Forces the **eager
+``_dashboard_build_weekly_periods`` and
+``_dashboard_build_blocks_panel``). Forces the **eager
 re-export** carve-out per spec §4.8 (same precedent as Phase E
 #19/#20 + Phase F #21):
 
@@ -266,6 +265,7 @@ import copy
 import contextlib
 import dataclasses
 import datetime as dt
+import gzip
 import hmac
 import io
 import json
@@ -285,6 +285,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser as _wb
+import zlib
 from dataclasses import dataclass, field, replace
 from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -419,7 +420,8 @@ from _lib_dashboard_settings_contract import (
 from _cctally_config import save_config, _load_config_unlocked
 from _cctally_db import _render_migration_error_banner
 from _cctally_cache import (
-    get_entries, iter_entries, iter_entries_with_id, open_cache_db,
+    get_entries, iter_entries, iter_entries_with_id,
+    open_cache_db as _raw_open_cache_db,
     open_conversations_db, sync_cache, sync_claude_conversations,
     sync_codex_conversations,
     _prune_orphaned_cache_entries,
@@ -439,6 +441,65 @@ from _lib_snapshot_cache import (
     _max_id as _snapshot_max_id,
     _reset_sig as _snapshot_reset_sig,
 )
+import _lib_tick_stats
+
+
+# === F22a: count the silent Group A cache-open failures (#583 S1 §1.6) =====
+# `_group_a_daily_buckets`, `_group_a_weekly_buckets` and
+# `_group_a_monthly_buckets` each wrap their `open_cache_db()` in
+# `try: … except Exception: return None`, where `None` means "fall back to the
+# wide from-scratch fetch". Output stays byte-identical, so no golden moves and
+# nothing surfaces — the failure is invisible even to `doctor`.
+#
+# The count is taken from OUTSIDE those three functions, for two reasons. From
+# outside them a `None` return cannot distinguish a disabled cache, an open
+# failure and a later fallback, so this wrapper is the only place the open
+# failure is observable as itself. And session S5 owns those three helpers, so
+# counting here leaves all three byte-for-byte unchanged and leaves no
+# overlapping hunk to merge.
+
+_GROUP_A_CACHE_OPENERS = (
+    ("_group_a_daily_buckets", "daily"),
+    ("_group_a_weekly_buckets", "weekly"),
+    ("_group_a_monthly_buckets", "monthly"),
+)
+
+
+def _group_a_cache_failure_kind(code):
+    """Which Group A bucket builder owns this code object, or None.
+
+    Matched by ``__code__`` IDENTITY, never by ``co_name``: a name match can be
+    satisfied by an unrelated function of the same name, and a diagnostic that
+    credits the wrong counter is worse than one that credits none. Resolved
+    against the live module globals rather than a memo so it cannot go stale.
+    """
+    for name, kind in _GROUP_A_CACHE_OPENERS:
+        if getattr(globals().get(name), "__code__", None) is code:
+            return kind
+    return None
+
+
+def open_cache_db(*args, **kwargs):
+    """``_cctally_cache.open_cache_db``, plus the Group A failure count.
+
+    Behaviour-preserving. On an exception it identifies the caller, increments
+    the matching fixed counter, and re-raises the ORIGINAL exception unchanged.
+
+    It fails open in both directions: on no caller match, or on any failure of
+    the frame introspection itself, it increments nothing and still re-raises.
+    A diagnostic must never replace the error it was observing. Introspection
+    runs only on the already-exceptional path, so the steady-state cost is nil.
+    """
+    try:
+        return _raw_open_cache_db(*args, **kwargs)
+    except Exception:
+        try:
+            kind = _group_a_cache_failure_kind(sys._getframe(1).f_code)
+            if kind is not None:
+                _lib_tick_stats.note_cache_open_failure(kind)
+        except Exception:  # noqa: BLE001 — never mask the original failure
+            pass
+        raise
 
 
 # === #279 S5: consumer-only dashboard siblings ============================
@@ -1477,33 +1538,222 @@ def _next_deadline(t0: float, interval: float, work: float) -> float:
     return (t0 + work) + max(interval, work)
 
 
+def _conversation_next_deadline(
+    t0: float, interval: float, work: float
+) -> float:
+    """Monotonic deadline for the next conversation sync pass (#583 S4 / F5).
+
+    Same algebra as `_next_deadline`, and deliberately a SEPARATE function. The
+    two loops' bounds are independent regressions: sharing one helper would let
+    a later change to the main loop's scheduling silently remove this thread's
+    duty bound, which is the defect F5 exists to fix. A test asserts the two
+    currently agree, so a divergence has to be a deliberate act.
+
+    work >= interval -> period = 2*work -> duty capped at 50% of one core,
+    scale-independently. work < interval -> period = work + interval, which is
+    the fixed-sleep cadence this replaced, so a small install sees no
+    behavioural change.
+    """
+    return (t0 + work) + max(interval, work)
+
+
+def _log_sync_iteration_failure() -> None:
+    """Route an escaped sync-iteration exception through the log chokepoint.
+
+    The traceback is the operator signal; the loop deliberately continues, so
+    without this the failure would be entirely silent.
+    """
+    import traceback
+    try:
+        _lib_log.get_logger("dashboard").error(
+            "sync iteration failed:\n%s", traceback.format_exc(),
+        )
+    except Exception:  # noqa: BLE001 — logging must never kill the drainer
+        pass
+
+
+def _make_dashboard_run_iteration(
+    *, sync_lock, run_sync_now, run_sync_now_locked, skip_sync,
+    monotonic=time.monotonic, heal_interval_seconds=60.0,
+):
+    """Return the dashboard sync thread's whole-iteration callable.
+
+    Module-level for the same reason ``_make_run_sync_now_locked`` is: the
+    body is the only place the #583 S2 §4 contract "one OAuth refresh
+    immediately before one rebuild, holding ``sync_lock`` across both" exists,
+    and as a closure inside ``cmd_dashboard`` no test could reach it.
+
+    ``run_iteration`` performs one WHOLE iteration — the rebuild plus the
+    orphan self-heal maintenance — so the loop's measured duration drives the
+    cooldown deadline (#313 P2 / F10), not just the rebuild.
+
+    The refresh leg runs only for a batch carrying the refresh bit, and never
+    under ``skip_sync``: ``--no-sync`` freezes the data and performs no network
+    calls. Preserve 9's rule applies here rather than in the handler, so the
+    periodic path cannot fire a redundant rebuild between the two steps, and
+    many queued ``refresh=1`` requests collapse to one OAuth call because
+    ``capture_batch`` ORs their intents.
+
+    ``_refresh_usage_inproc`` and ``_dashboard_self_heal_orphans`` are called
+    by bare name on purpose, so a test patching either on this module (or on
+    the ``cctally`` namespace the shim delegates to) reaches this body.
+    """
+    last_heal = [monotonic()]
+
+    def run_iteration(batch=None) -> dict:
+        warnings: list = []
+        if batch is not None and batch[1] and not skip_sync:
+            with sync_lock:
+                result = _refresh_usage_inproc()
+                if result.status != "ok":
+                    warnings.append({"code": result.status})
+                run_sync_now_locked(skip_sync=skip_sync)
+        else:
+            run_sync_now(skip_sync=skip_sync)
+        # Self-heal removed-worktree orphans on a ~60s cadence (far rarer than
+        # the sync tick — a deleted worktree is not urgent). Non-blocking on
+        # the flock, so a contended tick just retries next cadence; gated off
+        # under --no-sync.
+        if (not skip_sync
+                and monotonic() - last_heal[0] >= heal_interval_seconds):
+            last_heal[0] = monotonic()
+            _dashboard_self_heal_orphans(skip_sync=skip_sync)
+        # A queued request has no HTTP response, so a deferred refresh's
+        # warnings ride the settlement frame instead.
+        return {"warnings": warnings}
+
+    return run_iteration
+
+
+def _make_sync_loop_collaborators(*, ref, hub) -> dict:
+    """Bind a `_SnapshotRef` to an `SSEHub` for `_dashboard_sync_loop`.
+
+    Returns the loop's collaborator keyword arguments, which are the three
+    publication points of #583 S2 spec §6.2 that the loop owns: point 2
+    (``rebuilding=true`` with ``started_id`` advanced, immediately before work
+    begins), point 4 (``rebuilding=false`` plus the settled fields), and the
+    batchless equivalent of both. The reference re-stamps its held snapshot on
+    every mutation, so ``ref.get()`` already carries the new counters.
+
+    Extracted to module level so a test can drive the loop through the SAME
+    wiring the dashboard's sync thread uses. A test that rebuilt these three
+    closures itself would assert only that its own copy publishes.
+    """
+    def capture_batch():
+        batch = ref.capture_batch()
+        hub.publish(ref.get())
+        return batch
+
+    def settle(batch_id, status, warnings=()) -> None:
+        ref.settle(batch_id, status, warnings)
+        hub.publish(ref.get())
+
+    def mark_rebuilding(value) -> None:
+        # Publish only on a real transition. A requested tick has already
+        # published through capture_batch/settle, which set the same flag.
+        if ref.mark_rebuilding(value):
+            hub.publish(ref.get())
+
+    return {
+        "pending_request": ref.pending_request,
+        "capture_batch": capture_batch,
+        "settle": settle,
+        "mark_rebuilding": mark_rebuilding,
+    }
+
+
 def _dashboard_sync_loop(
     *,
     stop,
     interval: float,
     run_iteration,
-    take_sync_request,
+    take_sync_request=None,
     monotonic=time.monotonic,
     sleep=time.sleep,
+    pending_request=None,
+    capture_batch=None,
+    settle=None,
+    mark_rebuilding=None,
 ) -> None:
-    """Run the dashboard's automatic sync loop with a work-proportional cooldown.
+    """Periodic rebuild loop with a #313-preserving request floor (#583 S2).
 
     ``run_iteration`` performs one whole automatic iteration (rebuild plus any
     orphan self-heal / retention maintenance the thread does), so its measured
-    duration — not just the rebuild — drives the deadline (F10). The manual
-    ``POST /api/sync`` refresh is a separate synchronous path under ``sync_lock``
-    and is unaffected; ``take_sync_request`` is the TUI force-refresh flag that
-    breaks the cooldown early.
+    duration — not just the rebuild — drives the deadline (F10).
+
+    Automatic cadence is unchanged: ``_next_deadline(t0, interval, work)``. A
+    queued request may start a batch earlier, but never before ``t0 + 2*work``,
+    which is exactly the ``period >= 2*work`` that caps CPU duty at 50% of one
+    core, scale-independently. When ``work >= interval`` the automatic deadline
+    already equals ``t0 + 2*work``, so the floor coincides with it and a request
+    changes nothing; the floor binds only when ``work < interval``, where it
+    turns a 5.5 s wait into a 1.0 s one for a 0.5 s rebuild.
+
+    The floor is never later than the deadline, so a pending request is always
+    serviced at or before the automatic tick it would otherwise wait for.
+
+    ``pending_request`` PEEKS and never consumes: a poll firing before the floor
+    is met must not discard the request (spec §5.2). ``capture_batch`` claims
+    every outstanding request atomically at the moment work starts, and
+    ``settle`` records the batch's terminal state. ``take_sync_request`` is the
+    legacy test-and-clear flag and is left injectable for callers that still
+    drive the loop that way.
+
+    ``mark_rebuilding`` publishes the in-flight flag for EVERY iteration,
+    requested or automatic, and clears it on every exit path. It is separate
+    from ``capture_batch``/``settle`` on purpose: those two also move the
+    settlement counters, which must not advance for a batch that never existed.
     """
     while not stop.is_set():
+        batch = None
+        if (pending_request is not None and capture_batch is not None
+                and pending_request()):
+            batch = capture_batch()
+        if mark_rebuilding is not None:
+            # BEFORE t0: the publish is a non-blocking queue put, and keeping
+            # it outside the measured span leaves the #313 bound's algebra
+            # exactly as it is. An automatic tick reaches this with no batch
+            # captured, which is the whole point — `rebuilding` describes the
+            # iteration, not the request that may or may not have started it.
+            mark_rebuilding(True)
         t0 = monotonic()
-        run_iteration()
-        work = monotonic() - t0
+        status, warnings = "ok", ()
+        try:
+            result = (run_iteration(batch=batch) if batch is not None
+                      else run_iteration())
+            if isinstance(result, dict):
+                warnings = tuple(result.get("warnings") or ())
+        except Exception:  # noqa: BLE001 — see below
+            # An escaped exception must not kill the only drainer: an accepted
+            # 202 would then never reach a terminal state, and the client would
+            # hold `queued…` forever waiting for a settlement no surviving
+            # thread can publish.
+            status = "failed"
+            _log_sync_iteration_failure()
+        finally:
+            # Failure time is charged to the cooldown exactly like success
+            # time, so a crash loop cannot busy-spin.
+            work = monotonic() - t0
+            if batch is not None and settle is not None:
+                settle(batch[0], status, warnings)
+            if mark_rebuilding is not None:
+                # Every exit path, including an escaped exception: a flag left
+                # set would pin the client's chip at `syncing…` for the life of
+                # the process. `settle` has already cleared it on a requested
+                # tick, so this publishes nothing extra there.
+                mark_rebuilding(False)
+
         deadline = _next_deadline(t0, interval, work)
-        while not stop.is_set() and monotonic() < deadline:
-            if take_sync_request():
+        floor = t0 + 2.0 * work
+        while not stop.is_set():
+            now = monotonic()
+            ready = (pending_request is not None and capture_batch is not None
+                     and now >= floor and pending_request())
+            if ready or now >= deadline:
                 break
-            sleep(min(0.1, max(0.0, deadline - monotonic())))
+            if take_sync_request is not None and take_sync_request():
+                break            # legacy test-and-clear path, unchanged
+            sleep(min(0.1, max(0.0, deadline - now)))
 
 
 def _dashboard_maybe_prune_retention() -> None:
@@ -1530,6 +1780,147 @@ def _dashboard_maybe_prune_retention() -> None:
             conn.close()
     except Exception:
         pass
+
+
+def _conversation_sync_pass() -> str:
+    """One WHOLE transcript-ingest pass (#583 S4 / F5).
+
+    Store open, both provider syncs, the retention prune and the close. The
+    loop measures this callable's duration as `work`, so anything left outside
+    it would be work outside the duty denominator — exactly the F5 defect.
+
+    Returns a status from `_lib_tick_stats.CONVERSATION_STATUSES`. The prune is
+    attempted whenever the store OPENED, including after a failing sync: the
+    documented contract is a throttled prune driven by this thread, not a prune
+    conditional on a successful ingest.
+
+    The returned status describes the OPEN and the two SYNCS, and nothing else.
+    `_dashboard_maybe_prune_retention`'s outcome is discarded here and that
+    function ends in `except Exception: pass`, so a pass that ingested cleanly
+    and then failed only in the prune reports `ok`. Widening the status to
+    cover the prune would mean widening `CONVERSATION_STATUSES`, which is a
+    closed set by design.
+
+    When the primary open FAILS the pass must not prune, and this is a
+    constraint rather than a detail. `_dashboard_maybe_prune_retention` opens
+    its own conversations connection and reaches the retention due/throttle
+    check only after that open, so an unconditional prune would attempt a
+    second open of the same unopenable store on every pass, swallow the
+    failure, and repeat. The duty bound would cap CPU share while doing nothing
+    about the duplicated migration, recovery and I/O pressure. The invariant is
+    therefore NO SECOND OPEN ATTEMPT AFTER A FAILED OPEN — stated that narrowly
+    because a successful pass opens the store twice by design, once here and
+    once inside the prune.
+    """
+    try:
+        conn = open_conversations_db()
+    except (OSError, sqlite3.DatabaseError) as exc:
+        eprint(f"[conversations] background sync unavailable: {exc}")
+        return "store_unavailable"
+    status = "ok"
+    try:
+        sync_claude_conversations(conn)
+        sync_codex_conversations(conn)
+    except (OSError, sqlite3.DatabaseError) as exc:
+        eprint(f"[conversations] background sync unavailable: {exc}")
+        status = "store_unavailable"
+    except Exception as exc:  # noqa: BLE001
+        # Transcript parsing/normalization is deliberately outside the core
+        # freshness loop. Keep this worker alive so a later clean tick can
+        # self-heal instead of permanently stopping after one malformed
+        # provider record.
+        eprint(
+            "[conversations] background sync failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        status = "error"
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _dashboard_maybe_prune_retention()
+    return status
+
+
+def _conversation_sync_loop(
+    *,
+    stop,
+    interval: float,
+    run_iteration,
+    monotonic=time.monotonic,
+    thread_time_ns=None,
+    wait=None,
+    record=None,
+) -> None:
+    """Transcript ingest loop, bounded like the main one (#583 S4 / F5).
+
+    Extracted from a closure inside `cmd_dashboard` so the duty property can be
+    driven by a virtual clock rather than merely asserted. `run_iteration`
+    performs one WHOLE pass, so its measured duration is what drives the
+    deadline.
+
+    The previous fixed `wait(interval)` prevented literal 100% duty for finite
+    work but provided no scale-independent ceiling below it: a 30 s pass ran
+    30-on/5-off, about 86% duty, and nothing bounded that as the store grew.
+    """
+    if thread_time_ns is None:
+        thread_time_ns = time.thread_time_ns
+    if wait is None:
+        wait = stop.wait
+    seq = 0
+    while not stop.is_set():
+        t0 = monotonic()
+        cpu0 = thread_time_ns()
+        try:
+            status = run_iteration() or "ok"
+        except Exception:  # noqa: BLE001 — the worker must outlive one bad pass
+            _log_sync_iteration_failure()
+            status = "error"
+        work = max(0.0, monotonic() - t0)
+        cpu_ns = max(0, thread_time_ns() - cpu0)
+        seq += 1
+        if record is not None:
+            record(
+                seq=seq,
+                started_ns=int(t0 * 1e9),
+                ended_ns=int((t0 + work) * 1e9),
+                duration_ns=int(work * 1e9),
+                cpu_ns=cpu_ns,
+                # No period is passed: `period_ns` is the FORWARD interval, so
+                # the recorder stamps it onto the PREVIOUS record when this
+                # pass's start closes it. Pairing a pass's CPU with the
+                # interval that preceded it would shift the denominator by one
+                # pass and publish a share with no upper bound.
+                status=status,
+            )
+        deadline = _conversation_next_deadline(t0, interval, work)
+        remaining = deadline - monotonic()
+        if remaining > 0:
+            wait(remaining)
+
+
+def _make_conversation_sync_thread(*, stop, sync_interval, no_sync):
+    """Build the bounded conversation-sync thread, or None under --no-sync.
+
+    #320: transcript/search ingestion runs on its own thread and SQLite file, so
+    a multi-GB first rebuild or a contended conversations.db cannot delay
+    `_run_sync_now`, its `last_sync_at` stamp, or core SSE publication. #583 S4
+    gives that thread the main loop's 50%-duty bound and publishes each pass
+    into the second `_lib_tick_stats` ring.
+    """
+    if no_sync:
+        return None
+    return threading.Thread(
+        target=lambda: _conversation_sync_loop(
+            stop=stop,
+            interval=max(5.0, float(sync_interval)),
+            run_iteration=_conversation_sync_pass,
+            record=_lib_tick_stats.record_conversation_pass,
+        ),
+        daemon=True,
+        name="dashboard-conversations-sync",
+    )
 
 
 def _make_run_sync_now(*args, **kwargs):
@@ -1897,10 +2288,9 @@ def __getattr__(name):  # pylint: disable=invalid-name
 # are pure constants / read-only objects whose identity is stable across
 # the process lifetime; binding them once at load time keeps bare-name
 # reads in moved bodies working without per-call attribute lookups.
-# Path constants and tunables that tests monkeypatch (STATIC_DIR,
-# _DASHBOARD_SYNC_LOCK_TIMEOUT_SECONDS) are eager-re-exported FROM the
-# sibling at bin/cctally so monkeypatches propagate; this block carries
-# things that are NEVER patched at runtime.
+# Path constants and tunables that tests monkeypatch (STATIC_DIR) are
+# eager-re-exported FROM the sibling at bin/cctally so monkeypatches
+# propagate; this block carries things that are NEVER patched at runtime.
 BLOCK_DURATION = sys.modules["cctally"].BLOCK_DURATION
 
 
@@ -1958,25 +2348,177 @@ def _resolve_dashboard_bind_for_runtime(stored: str) -> str:
 # Pre-extract location: bin/cctally L16265.
 
 class _SnapshotRef:
-    """Thread-safe holder for the current DataSnapshot."""
+    """Thread-safe holder for the current DataSnapshot and the sync queue.
+
+    #583 S2. This object is the SINGLE authority for queue and activity
+    state. Builders must never construct activity counters themselves: A2
+    and the final publish both replace the snapshot wholesale, so a request
+    accepted mid-build would otherwise have its counter overwritten by the
+    older snapshot the builder had already assembled. Every mutator below
+    re-stamps the held snapshot, and ``set()`` merges the authoritative
+    activity in and RETURNS the merged object so a publish site can send
+    exactly what the reference now holds.
+
+    The legacy ``_sync_requested`` flag and ``take_sync_request()`` are the
+    TUI's mechanism (bin/_cctally_tui.py:5581 and :5832) and keep their
+    exact test-and-clear semantics. The dashboard uses the counters.
+    """
 
     def __init__(self, initial: DataSnapshot) -> None:
         import threading
+        import uuid
         self._lock = threading.Lock()
-        self._snap = initial
         self._sync_requested = False
+        # Fixed 16 chars: the envelope's byte count must stay deterministic
+        # for bench/baselines/envelope-oracle.json to remain comparable.
+        self.server_epoch = uuid.uuid4().hex[:16]
+        self._requested_id = 0
+        self._requested_refresh = False
+        self._started_id = 0
+        self._settled_id = 0
+        self._settled_status = None
+        self._settled_warnings = ()
+        # OWNER-SCOPED, not a single process-wide boolean. Two independent
+        # rebuilders write this state — the periodic sync loop and any HTTP
+        # handler thread that wins the non-blocking `sync_lock` acquire — and a
+        # boolean gives neither of them a way to know who set it. A clear must
+        # therefore remove only the clearing thread's own claim; `rebuilding`
+        # is then true exactly while at least one rebuilder holds one.
+        #
+        # Owner scoping made a LEAKED CLAIM strictly worse than the boolean it
+        # replaced, so do not record the opposite. Under the boolean a leaked
+        # `True` was cleared by whichever rebuilder next reached `set_final`, so
+        # it self-healed on the following rebuild. Every clear site here discards
+        # `threading.get_ident()`, so a claim left behind by a thread that has
+        # exited can be discarded by NO other thread, and `rebuilding` would stay
+        # true — pinning every client's chip at `syncing…` for the life of the
+        # process.
+        #
+        # No leak is reachable today, but the argument splits by CALLER, not by
+        # add site. `mark_rebuilding` below is reached from both routes — the
+        # sync loop through `_make_sync_loop_collaborators` and an HTTP handler
+        # thread through `DashboardHTTPHandler.mark_rebuilding` — so reading one
+        # add site answers for neither. Four callers add a claim.
+        #
+        # Two of the four are bracketed: `_handle_post_sync` and
+        # `_handle_post_settings` each mark inside a `try` whose `finally`
+        # clears, so nothing between the two can leak the claim.
+        #
+        # The other two are the sync loop's `capture_batch()` and its
+        # `mark_rebuilding(True)`, and they are NOT bracketed. Both run before
+        # `t0` and therefore before the `try:` whose `finally` clears them; the
+        # loop's own comment at `mark_rebuilding(True)` gives the #313
+        # duty-algebra reason for that one's placement. `_dashboard_sync_loop`'s
+        # `while` has no outer handler, so a raise in that gap would kill the
+        # drainer and leak the claim together. The gap is safe because nothing
+        # in it raises: the `_restamp_locked()` each add performs is a
+        # `dataclasses.replace` over `DataSnapshot`, a plain dataclass with no
+        # `__post_init__`, no `init=False` field and no `InitVar`;
+        # `SSEHub.publish` holds its own lock and swallows
+        # `queue.Full`/`queue.Empty`; `ref.get()` is a lock-and-return; and what
+        # remains is a clock read and two local assignments.
+        #
+        # A new `add` must therefore satisfy one of the two: a same-thread
+        # `finally` that clears it, or a proven non-raising path to one. There
+        # is no self-healing path behind either.
+        self._rebuilding_owners: set[int] = set()
+        self._snap = self._stamped_locked(initial)
+
+    def _activity_locked(self) -> dict:
+        return {
+            "server_epoch": self.server_epoch,
+            "rebuilding": bool(self._rebuilding_owners),
+            "requested_id": self._requested_id,
+            "started_id": self._started_id,
+            "settled_id": self._settled_id,
+            "settled_status": self._settled_status,
+            "settled_warnings": self._settled_warnings,
+        }
+
+    def _stamped_locked(self, snap: DataSnapshot) -> DataSnapshot:
+        import dataclasses
+        return dataclasses.replace(snap, sync_activity=self._activity_locked())
+
+    def _restamp_locked(self) -> None:
+        self._snap = self._stamped_locked(self._snap)
+
+    def activity(self) -> dict:
+        with self._lock:
+            return self._activity_locked()
 
     def get(self) -> DataSnapshot:
         with self._lock:
             return self._snap
 
-    def set(self, snap: DataSnapshot) -> None:
-        with self._lock:
-            self._snap = snap
+    def set(self, snap: DataSnapshot) -> DataSnapshot:
+        """Store ``snap`` with the authoritative activity merged in.
 
-    def request_sync(self) -> None:
+        Returns the merged object. Publish sites must send the RETURN value,
+        not their local build result, or a request accepted mid-build has its
+        counter erased by the older snapshot the builder assembled.
+        """
+        with self._lock:
+            self._snap = self._stamped_locked(snap)
+            return self._snap
+
+    def replace_fields(self, **changes) -> DataSnapshot:
+        """Atomically apply narrow field changes to the latest snapshot.
+
+        Out-of-band publishers compute small derived fields independently of
+        the main snapshot builder. They must not read a whole snapshot, do
+        that work, then call ``set()``: a sync can publish in between and the
+        stale whole-object write would erase its newer data. This method keeps
+        the read/replace/write sequence under the reference lock and re-stamps
+        the authoritative activity state before returning the publishable
+        object.
+        """
+        import dataclasses
+        with self._lock:
+            self._snap = self._stamped_locked(
+                dataclasses.replace(self._snap, **changes)
+            )
+            return self._snap
+
+    def set_final(self, snap: DataSnapshot) -> DataSnapshot:
+        """Store ``snap`` as the iteration's TERMINAL state: the merge of
+        ``set()`` plus dropping THIS thread's claim on ``_rebuilding_owners``,
+        under one lock acquisition.
+
+        Without this a rebuild costs three published frames — the flag going
+        up, the build's own final publish, and the flag coming back down — and
+        the third exists only because the loop clears the flag after the
+        rebuild has already published. Each extra frame is one shared
+        ``snapshot_to_envelope`` plus one byte-ready JSON frame per variant,
+        and one whole-store replacement in each connected browser, which is
+        the opposite of what a dashboard-performance session is for.
+
+        Storing and clearing through two calls would not help: the frame
+        published between them would carry ``rebuilding: true`` and the third
+        frame would come back. The clear has to be part of the same store.
+
+        The clear drops THIS thread's claim only. Clearing outright would end
+        one rebuilder's build by declaring every rebuilder idle: a handler
+        thread that finished first would publish ``rebuilding: false`` over a
+        periodic rebuild that had already marked itself and was still blocked on
+        ``sync_lock``, and nothing would correct that until the next tick.
+        """
+        with self._lock:
+            self._rebuilding_owners.discard(threading.get_ident())
+            self._snap = self._stamped_locked(snap)
+            return self._snap
+
+    def request_sync(self, refresh: bool = False) -> int:
+        """Enqueue a coalescing sync request; returns its identifier.
+
+        ``refresh`` defaults False so the TUI's argument-less call site is
+        unchanged.
+        """
         with self._lock:
             self._sync_requested = True
+            self._requested_id += 1
+            self._requested_refresh = self._requested_refresh or bool(refresh)
+            self._restamp_locked()
+            return self._requested_id
 
     def take_sync_request(self) -> bool:
         # Atomic test-and-clear — threading.Event's is_set()/clear() pair
@@ -1984,6 +2526,261 @@ class _SnapshotRef:
         with self._lock:
             taken, self._sync_requested = self._sync_requested, False
             return taken
+
+    def pending_request(self) -> bool:
+        """Peek, never consume. A poll firing before the service floor must
+        not clear the request (#583 S2 spec 5.2)."""
+        with self._lock:
+            return self._requested_id > self._started_id
+
+    def capture_batch(self) -> tuple:
+        """Atomically claim every outstanding request as one batch."""
+        with self._lock:
+            self._started_id = self._requested_id
+            refresh = self._requested_refresh
+            self._requested_refresh = False
+            self._rebuilding_owners.add(threading.get_ident())
+            self._restamp_locked()
+            return (self._started_id, refresh)
+
+    def mark_rebuilding(self, value: bool) -> bool:
+        """Set the in-flight flag alone; return True iff it CHANGED.
+
+        Deliberately narrow. ``rebuilding`` must be true for the duration of
+        every sync iteration, but ``capture_batch``/``settle`` run only when a
+        request is pending, so an automatic tick — the normal case on a
+        dashboard nobody is clicking — left the flag permanently false.
+        Widening those two to batchless ticks is the wrong fix: ``settle``
+        would advance ``settled_id``/``settled_status``/``settled_warnings``
+        for a batch that never existed, and spec §6.2 says those three
+        describe the most recently SETTLED batch.
+
+        The changed/unchanged return lets the loop's collaborator publish
+        exactly once per transition: on a requested tick ``capture_batch`` has
+        already set the flag and published, so this reports no change and adds
+        no duplicate frame.
+
+        A mark adds or drops the CALLING thread's claim, and the transition is
+        the emptiness of the owner set changing. Publish-on-transition is
+        preserved exactly, because a transition is now empty-to-nonempty or
+        nonempty-to-empty. The set is not a counter, so a claim is idempotent
+        per thread and one thread cannot hold two nested claims.
+        """
+        with self._lock:
+            ident = threading.get_ident()
+            before = bool(self._rebuilding_owners)
+            if value:
+                self._rebuilding_owners.add(ident)
+            else:
+                self._rebuilding_owners.discard(ident)
+            after = bool(self._rebuilding_owners)
+            if before == after:
+                return False
+            self._restamp_locked()
+            return True
+
+    def settle(self, batch_id: int, status: str, warnings=()) -> None:
+        """Record a batch's terminal state.
+
+        ``settled_status`` and ``settled_warnings`` describe the most recently
+        settled batch and are retained across subsequent automatic frames:
+        clearing them on the next ordinary tick would tell a client its request
+        settled while destroying the warnings explaining how, and the queued
+        contract removed the HTTP response that used to carry them.
+        """
+        with self._lock:
+            self._settled_id = max(self._settled_id, int(batch_id))
+            self._settled_status = status
+            self._settled_warnings = tuple(warnings)
+            # This thread's claim only — `capture_batch` added it, and another
+            # rebuilder's concurrent claim is not this batch's to end.
+            self._rebuilding_owners.discard(threading.get_ident())
+            self._restamp_locked()
+
+
+class _SSEDelivery:
+    """One publication, projected and encoded at most once per variant.
+
+    #583 S3 §5. ``_serve_api_events`` used to call ``snapshot_to_envelope`` plus
+    ``encode_dashboard_json`` inside its per-connection loop, so N connected
+    clients projected and encoded the same data N times per tick — about
+    3.4 MB each on a production-scale store.
+
+    The clock is pinned HERE, once, so every client served from this delivery
+    agrees on the age fields instead of differing by the fan-out latency.
+    ``SSEHub.subscribe`` deliberately builds a FRESH delivery for its seed
+    rather than handing out a stored one, because a client connecting between
+    ticks would otherwise render an age frozen at the previous publication.
+
+    The cache lock is PER DELIVERY. The hub's own lock must never be held
+    across a multi-megabyte projection.
+
+    Sharing is only sound when the projection is a function of the snapshot
+    plus the variant key. ``_serve_api_events`` therefore refuses to share a
+    snapshot that carries no ``envelope_precompute``: ``snapshot_to_envelope``
+    then reads configuration inline and runs the real doctor gather per call,
+    neither of which is keyed. It also captures ``_channel_env_fragment``'s
+    preview-channel process state, which is process-global rather than
+    connection-specific — stated so the "function of its key" claim is
+    complete.
+    """
+
+    __slots__ = ("snapshot", "pinned_now_utc", "pinned_monotonic",
+                 "_cache", "_lock")
+
+    def __init__(self, snapshot, pinned_now_utc, pinned_monotonic) -> None:
+        self.snapshot = snapshot
+        self.pinned_now_utc = pinned_now_utc
+        self.pinned_monotonic = pinned_monotonic
+        self._cache: dict = {}
+        self._lock = threading.Lock()
+
+    def encoded(self, variant_key, project_fn) -> bytes:
+        """Return complete SSE frame bytes for ``variant_key``, building once.
+
+        Double-checked: the fast path is a lock-free dict read, and the slow
+        path re-checks under the lock so two threads racing on the same missing
+        variant produce one projection, JSON encoding and frame assembly. The
+        cached value is byte-ready so fan-out never repeats UTF-8 encoding for
+        each connection. A MISS for any valid variant computes that variant —
+        normalizing an INVALID privacy input to False is the CALLER's job, done
+        before the key is built. Those are different situations and conflating
+        them either leaks or breaks the gate.
+        """
+        hit = self._cache.get(variant_key)
+        if hit is not None:
+            return hit
+        with self._lock:
+            hit = self._cache.get(variant_key)
+            if hit is not None:
+                return hit
+            built = project_fn(variant_key)
+            self._cache[variant_key] = built
+            return built
+
+
+# #583 S3 §5. A distinct slot for "no oauth_usage configuration at all", so it
+# cannot collide with an EMPTY configuration. Both used to canonicalize to `()`.
+_OAUTH_CFG_ABSENT = ("\x00cctally:oauth-usage-absent",)
+
+
+def _canonical_oauth_key(cfg):
+    """A hashable canonical form of the oauth_usage config block.
+
+    #583 S3 §5. The delivery cache is keyed by a tuple, and the resolved
+    ``oauth_usage`` config is a dict, which is unhashable. Sorted items give a
+    stable key for two connections that resolved the same configuration, which
+    is the normal case — every connection reads the same file.
+
+    An ABSENT configuration and an EMPTY one are different configurations and
+    get different keys. Collapsing them is unreachable today, because
+    ``_get_oauth_usage_config`` is defaults-filled and never returns an empty
+    mapping — which is precisely why it would go unnoticed if a later change
+    made it reachable, inside a key whose entire job is keeping two
+    configurations apart. Callers pass a mapping or ``None``.
+    """
+    if cfg is None:
+        return _OAUTH_CFG_ABSENT
+    return tuple(sorted((str(k), repr(v)) for k, v in cfg.items()))
+
+
+# #583 S3 §6. The SSE keep-alive interval, as a module constant so a test can
+# drive the keep-alive path without waiting fifteen seconds. It matters that
+# the path is testable: under compression a raw `wfile.write` of the keep-alive
+# comment corrupts everything after it, and the failure is silent for one
+# interval and then permanent for that connection.
+_SSE_KEEPALIVE_SECONDS = 15
+
+
+def _accepts_gzip(header_value: "str | None") -> bool:
+    """Whether this client accepts gzip, parsed on token boundaries.
+
+    #583 S3 §6. A substring test for "gzip" compresses for a client sending
+    ``gzip;q=0``, which is an explicit refusal, and for an unrelated token such
+    as ``notgzip`` or ``x-gzip``. A malformed quality value falls back to
+    identity rather than raising, because this runs on the publish path and
+    must never take a connection down.
+
+    ``*`` is honoured as a wildcard, but an explicit ``gzip`` entry wins over
+    it in either direction: ``gzip;q=0, *`` is a refusal even though the
+    wildcard would otherwise accept.
+    """
+    if not header_value:
+        return False
+    wildcard = None
+    for part in header_value.split(","):
+        token, _, params = part.strip().partition(";")
+        token = token.strip().lower()
+        if token not in ("gzip", "*"):
+            continue
+        q = 1.0
+        malformed = False
+        for param in params.split(";"):
+            name, _, value = param.strip().partition("=")
+            if name.strip().lower() != "q":
+                continue
+            try:
+                q = float(value.strip())
+            except ValueError:
+                malformed = True
+                break
+        if malformed:
+            return False
+        if token == "gzip":
+            return q > 0.0
+        if wildcard is None:
+            wildcard = q
+    return bool(wildcard is not None and wildcard > 0.0)
+
+
+def _delivery_is_shareable(snapshot) -> bool:
+    """Whether one projection of ``snapshot`` may be shared across clients.
+
+    #583 S3 §5. Sharing is sound only when the projection is a function of the
+    snapshot plus the stated variant key. The gate keys on ONE field,
+    ``envelope_precompute``: without it ``snapshot_to_envelope`` reads
+    ``config.json`` inline (``bin/_cctally_dashboard_envelope.py:1194``), so two
+    calls with the same key can differ and the result is not cacheable. Those
+    snapshots are fixtures, the initial empty snapshot and positionally-
+    constructed ones — never a live tick.
+
+    The doctor block is NOT part of this gate, and saying it was would misstate
+    what the predicate reads. It is guarded separately by ``doctor_payload``
+    (``:1627``), which is set independently of ``envelope_precompute`` because
+    each catches its own failure, so a snapshot can carry the precompute and
+    still run the real gather. That is sound to share anyway: the gather is
+    process-global rather than connection-specific, and both of its inputs —
+    ``now_utc`` and ``runtime_bind`` — are already fixed by the delivery's pin
+    and by the variant key.
+    """
+    return getattr(snapshot, "envelope_precompute", None) is not None
+
+
+def _drain_to_newest(q, first):
+    """Return the newest delivery queued on ``q``, discarding older ones.
+
+    #583 S3 §5. ``SSEHub`` uses a four-slot queue and ``publish`` discards only
+    ONE oldest entry when full, so a client that falls behind holds a backlog
+    of up to four deliveries. Each delivery pins its clock at publication, so
+    replaying that backlog would render ages several publish periods stale — a
+    regression against the present behaviour, where each frame is projected at
+    consumption time and its ages are therefore current.
+
+    The fix is on the CONSUMER side deliberately: ``SSEHub.publish`` is
+    governed by Preserve 4 and the A2 publication tests depend on its
+    behaviour, so it is not modified. Draining here is the latest-wins
+    behaviour the hub's own docstring already describes.
+
+    ``first`` is the item the caller already took off the queue with its own
+    blocking ``get``, so the ``queue.Empty`` keep-alive path stays where it is.
+    """
+    import queue as _queue
+    newest = first
+    while True:
+        try:
+            newest = q.get_nowait()
+        except _queue.Empty:
+            return newest
 
 
 class SSEHub:
@@ -1993,6 +2790,12 @@ class SSEHub:
     client queues so a slow browser cannot back-pressure the sync thread.
     Consumers call `subscribe()` to obtain a `queue.Queue`, then read
     with a timeout; call `unsubscribe()` on disconnect or at teardown.
+
+    #583 S3 §5: what the queues carry is a `_SSEDelivery` wrapping the
+    published snapshot, not the snapshot itself, so one tick projects and
+    encodes once per variant instead of once per connected client. The
+    queueing behaviour below — size, latest-wins discard, lock discipline — is
+    unchanged and is governed by Preserve 4.
     """
 
     def __init__(self, maxsize: int = 4) -> None:
@@ -2012,11 +2815,31 @@ class SSEHub:
             self._queues.append(q)
             if self._last is not None:
                 # Seed the new subscriber so it renders immediately.
+                # #583 S3 §5: a FRESH delivery over the same snapshot, with the
+                # clock sampled NOW. Handing out `self._last` would render this
+                # client's ages frozen at the previous publication, which for a
+                # tab opened late in a publish period is visibly wrong.
+                seed = _SSEDelivery(
+                    snapshot=self._last.snapshot,
+                    pinned_now_utc=dt.datetime.now(dt.timezone.utc),
+                    pinned_monotonic=time.monotonic(),
+                )
                 try:
-                    q.put_nowait(self._last)
+                    q.put_nowait(seed)
                 except _queue.Full:
                     pass
         return q
+
+    def latest(self):
+        """The most recently published delivery, or None before the first.
+
+        #583 S3 §7: `/api/data` serves the most recently PUBLISHED state. The
+        snapshot reference is mutated by four operations that publish
+        separately, so reading the reference could report a `hydrating` flag no
+        client was ever sent (#600).
+        """
+        with self._lock:
+            return self._last
 
     def unsubscribe(self, q) -> None:
         with self._lock:
@@ -2027,8 +2850,16 @@ class SSEHub:
 
     def publish(self, snapshot) -> None:
         import queue as _queue
+        # #583 S3 §5: wrap ONCE, outside the hub lock, so every queue and
+        # `_last` share one projection cache for this tick. Built before the
+        # lock because construction must not run under it.
+        delivery = _SSEDelivery(
+            snapshot=snapshot,
+            pinned_now_utc=dt.datetime.now(dt.timezone.utc),
+            pinned_monotonic=time.monotonic(),
+        )
         with self._lock:
-            self._last = snapshot
+            self._last = delivery
             # Latest-wins coalescing (#278 §2.6): every published snapshot is a
             # COMPLETE state replacement, so a client only ever needs the
             # newest. On a full queue drop the STALE queued frame and enqueue
@@ -2045,14 +2876,14 @@ class SSEHub:
             # re-put cannot lose to it.
             for q in self._queues:
                 try:
-                    q.put_nowait(snapshot)
+                    q.put_nowait(delivery)
                 except _queue.Full:
                     try:
                         q.get_nowait()  # discard the oldest, stale frame
                     except _queue.Empty:
                         pass
                     try:
-                        q.put_nowait(snapshot)
+                        q.put_nowait(delivery)
                     except _queue.Full:
                         # Defensive: a consumer racing between our get and put
                         # could only have removed items, so this is unreachable
@@ -5301,14 +6132,31 @@ def _channel_env_fragment() -> dict:
     return {}
 
 
-# Bounded wait for /api/sync's lock acquisition. The periodic background
-# sync thread holds sync_lock during sync_cache + snapshot build (often
-# 100-1500ms under active CC sessions); a non-blocking try_acquire would
-# 503 the user's click whenever it lands inside that window, silently
-# dropping their refresh-usage intent. 2s is generous enough to span a
-# normal periodic tick yet short enough to surface a stuck rebuild as
-# 503 instead of hanging the request indefinitely.
-_DASHBOARD_SYNC_LOCK_TIMEOUT_SECONDS = 2.0
+
+# Upper bound on the ONE blocking `sync_lock` acquire left in the tree: a
+# manual `POST /api/sync` under `--no-sync`. Every other path either acquires
+# non-blocking or enqueues. #583 S2 removed the old bounded acquire along with
+# its 503, which left this one bare — and a bare acquire pins an HTTP handler
+# thread forever when a rebuild wedges (a `cache.db` read that never returns, a
+# hung builder), with no diagnostic at all.
+#
+# 30s rather than the old 2s because the holder in this mode is a whole
+# synchronous rebuild (measured 1.9-6.3 s), not a periodic tick, so the bound
+# has to be a wedge detector rather than a contention timeout. On expiry the
+# endpoint answers 200 with a `sync_busy` warning: that stays inside its
+# declared status vocabulary, does NOT reintroduce 503, and does not strand the
+# client the way a 202 would in a mode where nothing drains the queue.
+#
+# Recorded, not resolved: 30 s also outlives any plausible browser fetch
+# timeout, so on a real wedge the client aborts first and this handler writes
+# its 200 to a socket nobody is reading — broken-pipe noise in the dashboard's
+# terminal. That interaction is exactly why the earlier 2.0 s bound was chosen
+# against a 3.0 s client timeout
+# (docs/superpowers/specs/2026-06-13-refresh-usage-dashboard-nudge-design.md,
+# the "Timeout chosen above the server's lock-wait" bullet). Deciding between
+# the two needs the client-side timeout in view as well, which is out of scope
+# here; a later session should pick one with both numbers in front of it.
+_DASHBOARD_NO_SYNC_LOCK_TIMEOUT_SECONDS = 30.0
 
 
 # === DashboardHTTPHandler (the /api/* + static surface) ===================
@@ -5671,6 +6519,8 @@ _POST_ROUTES = (
     ("exact", "/api/share/presets/rename", "_handle_share_presets_rename_post",
      None, False),
     ("exact", "/api/share/history", "_handle_share_history_post", None, False),
+    ("exact", "/api/debug/backend/trace", "_handle_post_debug_backend_trace",
+     None, False),
 )
 
 _DELETE_ROUTES = (
@@ -5950,15 +6800,54 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         )
         self.end_headers()
 
+    @classmethod
+    def publish_activity(cls) -> None:
+        """Republish the held snapshot so a new counter reaches clients now.
+
+        #583 S2 spec 6.2 publication point 1: acknowledge an accepted request
+        without waiting for a rebuild. The reference re-stamps its held
+        snapshot on every mutation, so ``get()`` already carries the new
+        ``requested_id``.
+        """
+        ref = getattr(cls, "snapshot_ref", None)
+        hub = getattr(cls, "hub", None)
+        if ref is None or hub is None:
+            return
+        hub.publish(ref.get())
+
+    @classmethod
+    def mark_rebuilding(cls, value: bool) -> None:
+        """Publish the in-flight flag for a HANDLER-driven rebuild.
+
+        #583 S2 §6.3. `rebuilding` describes the rebuild, not the thread that
+        started it, and an UNCONTENDED manual refresh rebuilds synchronously
+        right here — `202 queued` is only the contended branch. Without this
+        pair a user clicking the sync chip ran a multi-second rebuild during
+        which every other connected tab published `rebuilding: false` and could
+        not tell a busy dashboard from a wedged one.
+
+        Publishes only on a real transition, exactly like the sync loop's
+        collaborator, so the rebuild's own terminal publish (`set_final`) leaves
+        the trailing mark with nothing to say.
+        """
+        ref = getattr(cls, "snapshot_ref", None)
+        hub = getattr(cls, "hub", None)
+        if ref is None or hub is None:
+            return
+        if ref.mark_rebuilding(value):
+            hub.publish(ref.get())
+
     def _handle_post_sync(self) -> None:
         """Trigger refresh-usage + snapshot rebuild on user demand.
 
         Flow:
           1. Origin/Host CSRF check.
-          2. acquire(timeout=_DASHBOARD_SYNC_LOCK_TIMEOUT_SECONDS) -> 503
-             only on truly degenerate contention beyond the timeout.
-          3. With lock held: under --no-sync skip refresh; otherwise call
-             _refresh_usage_inproc(); always call run_sync_now_locked.
+          2. Non-blocking acquire. A machine nudge, or a held lock, enqueues
+             on ``_SnapshotRef`` and answers 202 with the request identifier
+             and this process's server epoch.
+          3. Lock free, human click: exactly the pre-#583 path — under
+             --no-sync skip refresh; otherwise call ``_refresh_usage_inproc()``;
+             always call run_sync_now_locked.
           4. Return 204 on clean success, 200 + JSON warnings on
              non-ok refresh status, 500 on unexpected exception.
 
@@ -5967,17 +6856,36 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         run_sync_now_locked assumes the caller holds sync_lock - that's the
         whole point of the Task 0 lock split.
 
-        Bounded wait (vs. earlier non-blocking try_acquire): the periodic
-        background thread holds the lock for hundreds of ms each tick, and
-        a non-blocking acquire would 503 any click that landed inside that
-        window — silently dropping the user's force-refresh intent (the
-        periodic thread doesn't run refresh-usage). Waiting up to ~2s lets
-        the click span a normal periodic tick while still 503-ing on
-        truly stuck contention.
+        #583 S2. The bounded acquire and its 503 are gone. A click landing
+        inside the periodic thread's lock-hold used to wait up to ~2s and then
+        503 on stuck contention, which silently dropped the user's intent; it
+        now queues, is serviced by the sync loop under the duty floor, and its
+        settlement arrives on the published frame. This endpoint's status
+        vocabulary is 403 / 202 / 200 / 204 / 500. The two other 503 sites
+        (quota_projection_incomplete) are untouched.
+
+        A MACHINE NUDGE always queues, even when the lock is free. This is
+        load-bearing: cmd_record_usage fires at Claude Code's status-line
+        cadence, so a nudge taking the synchronous path would rebuild at that
+        frequency and reopen the #313 peg, bypassing the loop's floor. The
+        nudge is identified by an explicit ``queue=1``; an older refresh-usage
+        binary posting without it takes the synchronous path, which is today's
+        behaviour.
 
         --no-sync mode: refresh skipped (frozen mode preserves "no network
         calls"), rebuild still runs with skip_sync=True (the wired
-        staticmethod closes over args.no_sync, so the no-arg call DTRT).
+        staticmethod closes over args.no_sync, so the no-arg call DTRT). A
+        manual request there acquires sync_lock BLOCKING rather than
+        non-blocking, because nothing would drain a queue in that mode —
+        bounded by ``_DASHBOARD_NO_SYNC_LOCK_TIMEOUT_SECONDS``, past which it
+        answers 200 with a ``sync_busy`` warning rather than pinning the
+        handler thread on a wedged rebuild. A
+        machine nudge is REFUSED there with 204 and enqueues nothing: the
+        documented contract freezes data to the startup snapshot, and a queued
+        nudge serviced by a skip_sync rebuild would read newly persisted rows
+        and unfreeze it. A manual refresh=1 states the skip with a
+        ``refresh_skipped_no_sync`` warning instead of performing no refresh
+        silently.
 
         Refresh failures DO NOT cause 500 - they surface as warnings in the
         200 envelope and the rebuild still runs so the snapshot stays
@@ -5985,28 +6893,87 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         """
         if not self._check_origin_csrf():
             return
-        sync_lock = type(self).sync_lock
-        if not sync_lock.acquire(
-                timeout=sys.modules["cctally"]._DASHBOARD_SYNC_LOCK_TIMEOUT_SECONDS):
-            self.send_error(503, "sync in progress")
+        cls = type(self)
+        sync_lock = cls.sync_lock
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        do_refresh = query.get("refresh", ["1"])[0] != "0"
+        is_machine_nudge = query.get("queue", ["0"])[0] == "1"
+
+        if is_machine_nudge and cls.no_sync:
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        # Under --no-sync a manual request WAITS for the lock rather than
+        # queueing. Nothing drains a queue in that mode (`sync_thread` is None),
+        # and the lock is not always free there: POST /api/settings calls
+        # `run_sync_now()`, which takes it blocking precisely so a config change
+        # propagates in a mode whose periodic thread never runs. A click landing
+        # inside that hold used to answer 202 for a batch nobody could capture,
+        # leaving `requested_id > started_id` true forever. The holder in that
+        # mode is always another short synchronous rebuild, so the wait is
+        # bounded. The machine-nudge refusal above is unaffected.
+        if cls.no_sync and not is_machine_nudge:
+            if not sync_lock.acquire(
+                    timeout=_DASHBOARD_NO_SYNC_LOCK_TIMEOUT_SECONDS):
+                # A wedged rebuild, not ordinary contention: the holder in this
+                # mode is one short synchronous rebuild. Say so instead of
+                # pinning this thread for the life of the process.
+                self._respond_json(200, {
+                    "status": "ok",
+                    "warnings": [{"code": "sync_busy"}],
+                })
+                return
+            acquired = True
+        else:
+            acquired = not is_machine_nudge and sync_lock.acquire(blocking=False)
+        if not acquired:
+            # `cls.no_sync` is UNREACHABLE-false here today, so the guard never
+            # subtracts anything: a manual request under --no-sync took the
+            # bounded blocking acquire above and either holds the lock or has
+            # already answered, and a machine nudge under --no-sync answered 204
+            # before either branch. The guard is kept because it states the
+            # invariant the queue depends on — nothing drains a queue under
+            # --no-sync, so a queued batch there must never carry an OAuth
+            # intent — and a future queueing path in that mode would silently
+            # violate it if this were dropped as dead code.
+            request_id = cls.snapshot_ref.request_sync(
+                refresh=do_refresh and not cls.no_sync
+            )
+            cls.publish_activity()          # acknowledge before responding
+            self._respond_json(202, {
+                "status": "queued",
+                "request_id": request_id,
+                "server_epoch": cls.snapshot_ref.server_epoch,
+            })
             return
         try:
-            do_refresh = (
-                urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-                .get("refresh", ["1"])[0] != "0"
-            )
+            # The locked section is a REBUILD, and this is the path an
+            # uncontended manual refresh actually takes, so it reports itself
+            # like every other rebuild does.
+            cls.mark_rebuilding(True)
             warnings: list = []
-            if do_refresh and not type(self).no_sync:
-                result = _refresh_usage_inproc()
-                if result.status != "ok":
-                    warnings.append({"code": result.status})
+            if do_refresh:
+                if cls.no_sync:
+                    warnings.append({"code": "refresh_skipped_no_sync"})
+                else:
+                    result = _refresh_usage_inproc()
+                    if result.status != "ok":
+                        warnings.append({"code": result.status})
             try:
-                type(self).run_sync_now_locked()
+                cls.run_sync_now_locked()
             except Exception as exc:
                 self.log_error("/api/sync rebuild failed: %r", exc)
                 self.send_error(500, "sync failed")
                 return
         finally:
+            # Drops THIS thread's claim only, so the ordering against the lock
+            # release is not what makes it safe: a concurrent rebuilder's claim
+            # is a different set member and this call cannot touch it, whichever
+            # side of the release it runs on. On the success path the rebuild's
+            # terminal publish has already dropped this thread's claim and this
+            # adds no frame; the exception path is what needs it.
+            cls.mark_rebuilding(False)
             sync_lock.release()
 
         if warnings:
@@ -6177,12 +7144,44 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 conn.close()
         except Exception:  # noqa: BLE001 -- a diagnostic must not expose raw errors.
             cache_state = {"status": "unavailable"}
+        perf = self._perf_gate()
+        tick_state = _lib_tick_stats.snapshot()
+        requested, applied = perf.pending_state()
         body = {
             "schemaVersion": 1,
             "version": _debug_tool_version(),
             "generated_at": (last or {}).get("generated_at"),
             "dataset": dataset,
             "phases": (last or {}).get("phases"),
+            # #583 S1 §3.1 asked for the stored tree's instant beside
+            # `phases`, so a GET after `--trace off` cannot present an old tree
+            # as current — disabling tracing does not clear the stored tree.
+            # It was already there: the top-level `generated_at` above IS the
+            # tree's instant, read from the same slot. A `phases_generated_at`
+            # key was added and measured byte-identical to it on a live
+            # endpoint, so it is not repeated here.
+            "tick": {
+                "dispatch_counts": dict(tick_state.dispatch_counts),
+                "cache_open_failures": dict(tick_state.cache_open_failures),
+                "tick_seq": tick_state.tick_seq,
+                "records": [r.as_wire() for r in tick_state.records],
+                "standalone": (
+                    tick_state.standalone.as_wire()
+                    if tick_state.standalone is not None else None
+                ),
+                # #583 S4: the SECOND work loop's ring, published under the
+                # same object and behind the same loopback gate. An empty list
+                # is a reachable steady state (`--no-sync` never starts the
+                # thread), so the key is always present.
+                "conversation_sync": [
+                    r.as_wire() for r in tick_state.conversation_records
+                ],
+            },
+            "tracing": {
+                "requested": requested,
+                "applied": applied,
+                "applies_at": perf.applies_at(),
+            },
             "cache_state": cache_state,
             "sources": sources,
             # Additive, and named rather than folded into `cache_state`: a
@@ -6194,6 +7193,60 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         if body["phases"] is None:
             body["note"] = "tracing_disabled"
         self._respond_json(200, body)
+
+    def _handle_post_debug_backend_trace(self) -> None:
+        """POST ``/api/debug/backend/trace`` — arm the deep phase trace (§3.2).
+
+        Body ``{"enabled": true|false}``; any other shape is 400.
+
+        Gated in three layers, in this order. ``_require_api_auth`` runs first,
+        automatically for any ``/api/*`` path in ``do_POST``, and enforces the
+        bearer whenever the dashboard minted a token. ``_require_debug_backend_
+        allowed`` then applies the loopback TCP peer plus the IP-literal
+        ``Host``. ``_check_origin_csrf`` applies Origin/Host parity last.
+
+        Retaining the CSRF layer matters even though the peer is already known
+        to be loopback: the loopback and anti-rebinding checks do not stop a
+        malicious page aiming a simple form POST straight at
+        ``http://127.0.0.1:8789``. It is also why a command-line client must
+        send an ``Origin`` matching the ``Host`` it calls — `_check_origin_csrf`
+        rejects a request with none. That is not a weakening, because a
+        non-browser client can set arbitrary headers regardless; the check
+        exists to stop a page making the BROWSER issue the request.
+
+        The flip itself happens at the rebuild boundary in `_lib_perf.
+        apply_pending`, not here, which is why the response reports `applied`
+        as it is now and `applies_at` names when the request takes effect.
+        """
+        if not self._require_debug_backend_allowed():
+            return
+        if not self._check_origin_csrf():
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 4096:
+            self._respond_json(400, {"error": "body required (<=4 KB)"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._respond_json(400, {"error": "malformed JSON body"})
+            return
+        if (not isinstance(body, dict) or set(body) != {"enabled"}
+                or not isinstance(body.get("enabled"), bool)):
+            self._respond_json(
+                400, {"error": 'body must be {"enabled": true|false}'})
+            return
+        perf = self._perf_gate()
+        perf.request_enabled(body["enabled"])
+        requested, applied = perf.pending_state()
+        self._respond_json(200, {
+            "requested": requested,
+            "applied": applied,
+            "applies_at": perf.applies_at(),
+        })
 
     def _handle_post_settings(self) -> None:
         """Persist a settings update and trigger an immediate SSE broadcast.
@@ -6933,10 +7986,18 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         # under --no-sync). run_sync_now is the same path POST /api/sync
         # uses; under skip_sync=True it still rebuilds + publishes via
         # hub.publish, which is what each SSE listener pulls.
+        #
+        # #583 S2 §6.3: this rebuild is the same multi-second locked rebuild
+        # POST /api/sync runs, so it reports itself the same way. The mark is
+        # outside the acquire because `run_sync_now` takes `sync_lock` itself;
+        # a wait for a rebuild already in flight is honestly in-flight too.
         try:
+            type(self).mark_rebuilding(True)
             type(self).run_sync_now()
         except Exception as exc:
             eprint(f"warning: settings broadcast failed: {exc!r}")
+        finally:
+            type(self).mark_rebuilding(False)
 
         self._respond_json(200, out)
 
@@ -7206,8 +8267,41 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_api_data(self) -> None:
+        # #583 S3 §6/§7. TWO phases. Preparation may answer a JSON 500 because
+        # nothing has been sent yet. Commit may NOT: once `send_response` has
+        # run, a second `_respond_json` writes another HTTP response onto an
+        # already-committed stream. The old handler wrapped both in one `try`
+        # and did exactly that on any partial write.
+        # #600 / §7: the LAST PUBLISHED state, not the reference. The dashboard
+        # mutates the reference through four operations — `set`,
+        # `capture_batch`, `settle`, `mark_rebuilding` — and publication is a
+        # separate call in every case, so reading the reference can report a
+        # `hydrating` flag no client was ever sent. There is no atomic boundary
+        # to read instead, and creating one would mean editing `_SnapshotRef`
+        # and the sync loop, so this endpoint is DEFINED as serving the most
+        # recently published state. Deliberately no silent fallback to the
+        # reference: that fallback is the disagreement this fixes.
+        #
+        # #583 S3 §6: `hub.latest()` gets its own guard, and the 503 is answered
+        # OUTSIDE the preparation `try` below. Writing the 503 inside that `try`
+        # meant a failure part-way through it was caught by the same `except`
+        # that answers a JSON 500, appending a SECOND HTTP response onto a
+        # stream this handler had already committed — the very defect the
+        # prepare/commit split exists to remove, on the one path it did not
+        # cover. The duplicated 500 arm below is the price of that separation.
         try:
-            snap = self.snapshot_ref.get()
+            delivery = self.hub.latest()
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("api/data failed before commit: %r", exc)
+            self._respond_json(500, {"error": "internal error"})
+            return
+        if delivery is None:
+            self._respond_json(503, {"error": "no snapshot published yet"})
+            return
+
+        try:
+            # ---- preparation ---------------------------------------------
+            snap = delivery.snapshot
             # Resolve oauth_usage cfg out here so snapshot_to_envelope stays
             # pure (no per-request FS read on the dashboard hot path).
             # Tolerate user config typos -- fall back to defaults rather than
@@ -7243,18 +8337,34 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # finding) — one predicate, two consumers, desync impossible.
             env["transcriptsEnabled"] = visible
             body = encode_dashboard_json_bytes(env, ensure_ascii=False)
+            gzip_on = _accepts_gzip(self.headers.get("Accept-Encoding"))
+            if gzip_on:
+                body = gzip.compress(body, 6)
+        except Exception as exc:  # noqa: BLE001
+            # #279 S5 F6.1 (spec §8): a snapshot/envelope/dumps failure used to
+            # escape to _QuietThreadingHTTPServer.handle_error (stdlib traceback +
+            # dropped socket, no 500). Mirror _handle_get_doctor: log + JSON 500.
+            self.log_error("api/data failed before commit: %r", exc)
+            self._respond_json(500, {"error": "internal error"})
+            return
+
+        # ---- commit ------------------------------------------------------
+        try:
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            if gzip_on:
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:  # noqa: BLE001
-            # #279 S5 F6.1 (spec §8): a snapshot/envelope/dumps failure used to
-            # escape to _QuietThreadingHTTPServer.handle_error (stdlib traceback +
-            # dropped socket, no 500). Mirror _handle_get_doctor: log + JSON 500.
-            self.log_error("api/data failed: %r", exc)
-            self._respond_json(500, {"error": "internal error"})
+            # Headers are committed, so no status code is available. Log and
+            # close; NEVER `_respond_json` here — that appends a second HTTP
+            # response onto a stream the client is already reading as one.
+            self.log_error("api/data failed after commit: %r", exc)
+            self.close_connection = True
 
     def _handle_get_doctor(self) -> None:
         """`GET /api/doctor` — full kernel-serialized doctor report (spec §5.6).
@@ -7271,6 +8381,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         dashboard's default bind; no CSRF gating here (mirrors
         `/api/data`, `/api/session/:id`, `/api/block/:start_at`).
         """
+        # Preparation and commit are separate. Before headers, a failure can
+        # still become a JSON 500. After headers, another response would
+        # corrupt the stream, so the only valid recovery is log + close.
         try:
             _ld = sys.modules["cctally"]._load_sibling("_lib_doctor")
             state = doctor_gather_state(
@@ -7280,6 +8393,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             body = encode_dashboard_json_bytes(
                 _ld.serialize_json(report), ensure_ascii=False,
             )
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("/api/doctor failed before commit: %r", exc)
+            self._respond_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+            return
+
+        try:
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -7287,8 +8406,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:  # noqa: BLE001
-            self.log_error("/api/doctor failed: %r", exc)
-            self._respond_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+            self.log_error("/api/doctor failed after commit: %r", exc)
+            self.close_connection = True
 
     def _handle_get_session_detail(self, path: str) -> None:
         """Return TuiSessionDetail JSON for the given session id (spec §3.2).
@@ -7621,43 +8740,46 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 None,
             )
             if target is None:
+                status = 404
                 body = encode_dashboard_json_bytes({"error": "block not found"})
-                self.send_response(404)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            block_entries = [
-                e for e in entries_in_window
-                if target.start_time <= e.timestamp < target.end_time
-            ]
-            # Resolve display tz once per request so the block detail's
-            # `label` matches the snapshot envelope's blocks panel.
-            # Shared resolver -- same warn-once semantics as
-            # `_compute_display_block` and `_tui_build_snapshot`. F3:
-            # honor the dashboard's `--tz` override (set as a class attr
-            # by cmd_dashboard) so the block-detail label speaks the
-            # same zone the rest of the envelope speaks.
-            _detail_tz = _resolve_display_tz_obj(
-                _apply_display_tz_override(
-                    load_config(), type(self).display_tz_pref_override
+            else:
+                block_entries = [
+                    e for e in entries_in_window
+                    if target.start_time <= e.timestamp < target.end_time
+                ]
+                # Resolve display tz once per request so the block detail's
+                # `label` matches the snapshot envelope's blocks panel.
+                # Shared resolver -- same warn-once semantics as
+                # `_compute_display_block` and `_tui_build_snapshot`. F3:
+                # honor the dashboard's `--tz` override (set as a class attr
+                # by cmd_dashboard) so the block-detail label speaks the
+                # same zone the rest of the envelope speaks.
+                _detail_tz = _resolve_display_tz_obj(
+                    _apply_display_tz_override(
+                        load_config(), type(self).display_tz_pref_override
+                    )
                 )
-            )
-            detail = _build_block_detail(
-                target, block_entries, display_tz=_detail_tz,
-            )
+                detail = _build_block_detail(
+                    target, block_entries, display_tz=_detail_tz,
+                )
+                status = 200
+                body = encode_dashboard_json_bytes(detail, ensure_ascii=False)
         except Exception as exc:
-            self.log_error("/api/block failed: %r", exc)
+            self.log_error("/api/block failed before commit: %r", exc)
             self.send_error(500, "block detail failed")
             return
-        body = encode_dashboard_json_bytes(detail, ensure_ascii=False)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(body)
+
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            if status == 200:
+                self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("/api/block failed after commit: %r", exc)
+            self.close_connection = True
 
     def _send_milestones_json(self, status: int, body: dict) -> None:
         payload = encode_dashboard_json_bytes(body, ensure_ascii=False)
@@ -7786,7 +8908,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 # reset and never resolves as current.
                 identity = resolve_codex_cycle_detail_identity(
                     cache_conn, source_root_keys=roots, now_utc=now_utc,
-                    account_key=account_key,
+                    account_key=account_key, stats_conn=stats_conn,
                 )
                 result = c.build_codex_cycle_detail(
                     stats_conn, cache_conn, identity=identity, key=key,
@@ -7827,13 +8949,45 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 
     def _serve_api_events(self) -> None:
         import queue as _queue
+        gzip_on = _accepts_gzip(self.headers.get("Accept-Encoding"))
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         # Nginx/proxies: disable buffering so events flow immediately.
+        # #583 S3 §6: this STAYS under compression. It addresses an
+        # intermediary proxy, not our own buffering, and is orthogonal.
         self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Vary", "Accept-Encoding")
+        if gzip_on:
+            self.send_header("Content-Encoding", "gzip")
         self.end_headers()
+
+        # #583 S3 §6. ONE stateful compressor per connection. EVERY byte after
+        # the headers goes through it — updates AND the keep-alive comment. A
+        # raw write of even two bytes corrupts the whole remainder of the
+        # stream, and the failure is silent until the next frame.
+        #
+        # One compressor per CONNECTION rather than one per tick, deliberately:
+        # sharing compressed bytes across clients requires each frame to be an
+        # independent gzip member, and cross-browser support for incrementally
+        # decoding a concatenated multi-member stream under `Content-Encoding`
+        # is not established. The saving would be proportional to connected
+        # clients minus one — exactly zero at one open tab. Filed as a residual.
+        _comp = (zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+                 if gzip_on else None)
+
+        def _emit(raw: bytes) -> None:
+            if _comp is None:
+                self.wfile.write(raw)
+            else:
+                # Z_SYNC_FLUSH, not a bare compress(): zlib buffers a small
+                # frame entirely, so without the flush the client receives
+                # nothing at all until some later write happens to spill it.
+                chunk = _comp.compress(raw) + _comp.flush(zlib.Z_SYNC_FLUSH)
+                if chunk:
+                    self.wfile.write(chunk)
+            self.wfile.flush()
 
         # Resolve oauth_usage cfg once per SSE connection so the per-tick
         # envelope build stays free of FS reads. A config edit during the
@@ -7854,37 +9008,74 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         # ~15s after bootstrap). Mirrors `/api/data`'s per-request injection.
         transcripts_enabled = self._transcripts_visible_to_request()
 
+        # #583 S3 §5. Normalize the privacy input BEFORE it becomes a cache
+        # key: an unresolvable value is the RESTRICTIVE one. An ordinary cache
+        # MISS for the `true` variant still computes `true` — that is a
+        # different situation, and conflating the two either leaks transcript
+        # content or breaks the gate.
+        visible = bool(transcripts_enabled)
+        # Only `visible` and the oauth config can differ between two
+        # connections in this process today. The two process constants stay in
+        # the key so a later change making either per-connection cannot
+        # silently serve one client another client's payload.
+        variant = (
+            visible,
+            _canonical_oauth_key(cfg_oauth),
+            type(self).display_tz_pref_override,
+            type(self).cctally_host,
+        )
+
         q = self.hub.subscribe()
         try:
             while True:
                 try:
-                    snap = q.get(timeout=15)
+                    delivery = q.get(timeout=_SSE_KEEPALIVE_SECONDS)
                 except _queue.Empty:
                     # Keep-alive. Comment lines are ignored by EventSource
-                    # but stop idle-proxy timeouts.
-                    self.wfile.write(b": keep-alive\n\n")
-                    self.wfile.flush()
+                    # but stop idle-proxy timeouts. #583 S3 §6: through
+                    # `_emit`, never a raw `wfile.write` — under compression a
+                    # raw write here corrupts every byte after it.
+                    _emit(b": keep-alive\n\n")
                     continue
-                env = snapshot_to_envelope(
-                    snap,
-                    now_utc=dt.datetime.now(dt.timezone.utc),
-                    monotonic_now=time.monotonic(),
-                    oauth_usage_cfg=cfg_oauth,
-                    display_tz_pref_override=type(self).display_tz_pref_override,
-                    runtime_bind=type(self).cctally_host,
-                    # #264 S3: gate the in-envelope session `title` on the same
-                    # connection-scoped predicate that drives transcriptsEnabled.
-                    transcripts_visible=transcripts_enabled,
-                )
-                env["transcriptsEnabled"] = transcripts_enabled
-                msg = (
-                    "event: update\n"
-                    + "data: "
-                    + encode_dashboard_json(env, ensure_ascii=False)
-                    + "\n\n"
-                )
-                self.wfile.write(msg.encode("utf-8"))
-                self.wfile.flush()
+                # #583 S3 §5: skip to the newest queued delivery. The queue
+                # holds four and `publish` discards only one oldest, so a
+                # lagging client would otherwise replay a backlog whose clocks
+                # were pinned several publish periods ago. The blocking `get`
+                # above keeps its own `queue.Empty` keep-alive path.
+                delivery = _drain_to_newest(q, delivery)
+
+                def _project(_key, _d=delivery, _v=visible):
+                    env = snapshot_to_envelope(
+                        _d.snapshot,
+                        now_utc=_d.pinned_now_utc,
+                        monotonic_now=_d.pinned_monotonic,
+                        oauth_usage_cfg=cfg_oauth,
+                        display_tz_pref_override=type(self).display_tz_pref_override,
+                        runtime_bind=type(self).cctally_host,
+                        # #264 S3: gate the in-envelope session `title` on the
+                        # same connection-scoped predicate that drives
+                        # transcriptsEnabled.
+                        transcripts_visible=_v,
+                    )
+                    # Part of the CACHED variant, not a post-projection
+                    # mutation: the payload is shared across every client
+                    # holding this delivery, so mutating it here would apply
+                    # to all of them.
+                    env["transcriptsEnabled"] = _v
+                    payload = encode_dashboard_json_bytes(
+                        env, ensure_ascii=False,
+                    )
+                    return b"event: update\ndata: " + payload + b"\n\n"
+
+                if _delivery_is_shareable(delivery.snapshot):
+                    frame = delivery.encoded(variant, _project)
+                else:
+                    # #583 S3 §5: this snapshot's projection is NOT a function
+                    # of the snapshot plus the key — `snapshot_to_envelope`
+                    # reads configuration inline and runs the real doctor
+                    # gather per call — so it must not be cached and shared.
+                    frame = _project(variant)
+                _emit(frame)
         except (BrokenPipeError, ConnectionResetError,
                 ConnectionAbortedError, socket.timeout):
             # #279 S1 F3: a stalled send past the handler timeout raises
@@ -7898,7 +9089,17 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # traceback. Headers are already committed — no 500 is possible; the
             # win is routing the operator signal through the _lib_log chokepoint
             # (self.log_error) + a deliberate clean close via the finally below.
+            #
+            # #583 S3 §6: under compression this path must add NOTHING to the
+            # stream. Do not append plaintext, another gzip member, or a
+            # trailer to a truncated stream; do not call `Z_FINISH` here,
+            # because the stateful compressor may have advanced even though its
+            # output was not fully written; and do not skip the frame and carry
+            # on, for the same reason. The browser's own EventSource reconnect
+            # opens a fresh response with a fresh compressor, which is the
+            # correct recovery.
             self.log_error("api/events stream failed: %r", exc)
+            self.close_connection = True
         finally:
             self.hub.unsubscribe(q)
 
@@ -8269,7 +9470,10 @@ def _dashboard_stats_deferred_snapshot(args, *, pinned_now, exc):
         "fingerprint": "sha1:" + ("0" * 40),
     }
     replacements = {
-        "last_sync_at": _time.monotonic(),
+        # #583 S2 §6.1: this frame is degraded by construction — it carries a
+        # `stats-open` error and no successful build ran, so it must not stamp
+        # a fresh success. There is no earlier success to preserve either.
+        "last_sync_at": None,
         "last_sync_error": "; ".join(errors),
         "sync_failures": (
             tui.SyncFailureAttribution(
@@ -8412,7 +9616,10 @@ def _dashboard_initial_snapshot_once(
         current_week=cw,
         forecast=fc,
         forecast_view=fc_view,
-        last_sync_at=_time.monotonic(),
+        # #583 S2 §6.1: a build that failed does not stamp a success. This is
+        # the FIRST build, so a failure retains None rather than becoming
+        # freshly successful — there is no earlier success to preserve.
+        last_sync_at=(None if errors else _time.monotonic()),
         last_sync_error=("; ".join(errors) if errors else None),
         sync_failures=tuple(sync_failures),
         doctor_payload=doctor_payload,
@@ -8640,16 +9847,23 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
     ref = _SnapshotRef(initial)
     hub = SSEHub()
-    hub.publish(initial)  # seed for early subscribers
+    # #583 S2: seed for early subscribers, published from the reference so the
+    # very first frame already carries the process's `server_epoch`. A seed
+    # published without it would make the client discard its (empty) outstanding
+    # set on the next frame's epoch change — harmless, but it would also mean
+    # the first frame a client ever sees disagrees with every later one.
+    hub.publish(ref.get())
 
     # sync_lock serializes sync-work between the periodic sync thread and
     # the POST /api/sync handler. Held only around _tui_build_snapshot +
     # ref.set + hub.publish — NOT around the handler's response path.
-    # The handler uses acquire(timeout=…) so a click that lands inside
-    # the periodic thread's lock-hold waits briefly rather than 503-ing
-    # and silently dropping the user's force-refresh intent; only stuck
-    # contention beyond the timeout produces 503. The lock inside
-    # _run_sync_now is what actually prevents overlap.
+    # The handler acquires it NON-BLOCKING (#583 S2): a click that lands
+    # inside the periodic thread's lock-hold is queued on _SnapshotRef and
+    # answered 202, and the sync loop services it under the duty floor. The
+    # bounded acquire and its 503 are gone. The one exception is --no-sync,
+    # where nothing would drain that queue, so a manual request there waits on
+    # a blocking acquire instead. The lock inside _run_sync_now is what
+    # actually prevents overlap.
     sync_lock = threading.Lock()
 
     # Build the two variants up front. The locked variant is exposed on the
@@ -8706,32 +9920,27 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
     class _DashboardSyncThread(_c_for_subclass._TuiSyncThread):
         def _run(self) -> None:
-            last_heal = [_time.monotonic()]
-
-            def run_iteration() -> None:
-                _run_sync_now(skip_sync=self._skip_sync)
-                # Self-heal removed-worktree orphans on a ~60s cadence (far
-                # rarer than the sync tick — a deleted worktree is not urgent).
-                # Non-blocking on the flock, so a contended tick just retries
-                # next cadence; gated off under --no-sync. Runs INSIDE the
-                # measured iteration so its cost counts toward the cooldown
-                # deadline (#313 P2 / F10).
-                if (not self._skip_sync
-                        and _time.monotonic() - last_heal[0] >= 60.0):
-                    last_heal[0] = _time.monotonic()
-                    _dashboard_self_heal_orphans(skip_sync=self._skip_sync)
+            run_iteration = _make_dashboard_run_iteration(
+                sync_lock=sync_lock,
+                run_sync_now=_run_sync_now,
+                run_sync_now_locked=_run_sync_now_locked,
+                skip_sync=self._skip_sync,
+                monotonic=_time.monotonic,
+            )
 
             # Work-proportional cooldown (F10): sleep to t0 + max(interval, work)
-            # so a slow rebuild cannot peg a full core. The manual POST /api/sync
-            # refresh runs synchronously under sync_lock, independent of this
-            # cooldown, so a user force-refresh is always immediate.
+            # so a slow rebuild cannot peg a full core. #583 S2 adds the
+            # request-driven start, floored at t0 + 2*work so a queued refresh
+            # cannot drive the duty above the same #313 bound. The dashboard no
+            # longer passes the legacy test-and-clear flag: under a floor a poll
+            # firing early would clear the request and discard it.
             _dashboard_sync_loop(
                 stop=self._stop,
                 interval=self._interval,
                 run_iteration=run_iteration,
-                take_sync_request=self._ref.take_sync_request,
                 monotonic=_time.monotonic,
                 sleep=_time.sleep,
+                **_make_sync_loop_collaborators(ref=ref, hub=hub),
             )
 
     sync_thread = (
@@ -8743,43 +9952,14 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     if sync_thread is not None:
         sync_thread.start()
 
-    # #320: transcript/search ingestion runs on its own thread and SQLite file.
-    # A multi-GB first rebuild or a contended conversations.db therefore cannot
-    # delay `_run_sync_now`, its `last_sync_at` stamp, or core SSE publication.
+    # The loop, the pass and this thread's construction are module-level (see
+    # `_conversation_sync_loop`): the extraction is what lets the duty bound be
+    # proven on a virtual clock instead of asserted.
     conversation_sync_stop = threading.Event()
-
-    def _conversation_sync_loop() -> None:
-        interval = max(5.0, float(args.sync_interval))
-        while not conversation_sync_stop.is_set():
-            conn = None
-            try:
-                conn = open_conversations_db()
-                sync_claude_conversations(conn)
-                sync_codex_conversations(conn)
-                _dashboard_maybe_prune_retention()
-            except (OSError, sqlite3.DatabaseError) as exc:
-                eprint(f"[conversations] background sync unavailable: {exc}")
-            except Exception as exc:  # noqa: BLE001
-                # Transcript parsing/normalization is deliberately outside the
-                # core freshness loop. Keep this worker alive so a later clean
-                # tick can self-heal instead of permanently stopping after one
-                # malformed provider record.
-                eprint(
-                    "[conversations] background sync failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-            finally:
-                if conn is not None:
-                    conn.close()
-            conversation_sync_stop.wait(interval)
-
-    conversation_sync_thread = (
-        None if args.no_sync
-        else threading.Thread(
-            target=_conversation_sync_loop,
-            daemon=True,
-            name="dashboard-conversations-sync",
-        )
+    conversation_sync_thread = _make_conversation_sync_thread(
+        stop=conversation_sync_stop,
+        sync_interval=args.sync_interval,
+        no_sync=args.no_sync,
     )
     if conversation_sync_thread is not None:
         conversation_sync_thread.start()
@@ -8790,7 +9970,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     # relying on the data-sync thread's lifecycle.
     update_check_stop = threading.Event()
     update_check_thread = _DashboardUpdateCheckThread(
-        update_check_stop, hub=hub, snapshot_ref=ref,
+        update_check_stop, hub=hub, snapshot_ref=ref, runtime_bind=args.host,
     )
     update_check_thread.start()
 

@@ -906,6 +906,7 @@ def _sync_failure_envelope(
 
     def attributed(
         database: str, *, corruption: bool = False, leg: str | None = None,
+        sqlite_busy: bool = False,
     ) -> bool:
         for item in attributions or ():
             item_database = (
@@ -920,9 +921,15 @@ def _sync_failure_envelope(
                 item.get("leg") if isinstance(item, dict)
                 else getattr(item, "leg", None)
             )
+            item_busy = (
+                item.get("sqlite_busy") if isinstance(item, dict)
+                else getattr(item, "sqlite_busy", False)
+            )
             if item_database == database and (
                 not corruption or bool(item_corruption)
-            ) and (leg is None or item_leg == leg):
+            ) and (leg is None or item_leg == leg) and (
+                not sqlite_busy or bool(item_busy)
+            ):
                 return True
         return False
 
@@ -977,6 +984,34 @@ def _sync_failure_envelope(
             "action": None,
         }
 
+    # #583 S2 §7. A locked cache.db is named rather than left in the generic
+    # bucket. Typed attribution only — a blanket uncorrupted-cache branch
+    # would be too broad, because ANY exception raised while reading cache.db
+    # produces that attribution and every one would then be told to
+    # checkpoint. `database="stats_or_cache"` deliberately does NOT reach here:
+    # that value means ownership was not established, and a guess would
+    # produce a confidently wrong remedy.
+    # Corruption outranks busy, and the gate is required rather than implied by
+    # branch order: `attributed(...)` scans the WHOLE attribution list, so
+    # without it a tick carrying a corruption-shaped cache attribution AND a
+    # separate busy one rendered "cache database busy" and dropped the
+    # corruption message — the more urgent of the two, whose remedy is not
+    # interchangeable with a checkpoint. The gate names the TYPED corruption
+    # attribution only: a busy attribution still outranks the legacy raw-text
+    # corruption legs below, which is what Preserve 10 asks for.
+    if attributed("cache", sqlite_busy=True) and not attributed(
+        "cache", corruption=True
+    ):
+        return {
+            "kind": "cache_busy",
+            "label": "⚠ cache database busy",
+            "detail": (
+                "The dashboard could not complete sync because cache.db "
+                "stayed locked."
+            ),
+            "action": "cctally db checkpoint",
+        }
+
     text = error.casefold()
     if (
         "stale maintenance marker" in text
@@ -1015,6 +1050,43 @@ def _sync_failure_envelope(
         "label": "⚠ server sync error",
         "detail": "The server could not complete its background sync.",
         "action": None,
+    }
+
+
+def _sync_activity_envelope(activity: "dict | None") -> dict:
+    """Serialize `_SnapshotRef`'s queue/activity state (#583 S2 spec 6.2).
+
+    Always returns a complete object: a snapshot built before the reference
+    stamped one carries ``None``, and an absent object must read as idle
+    rather than as a missing key the client has to special-case.
+
+    ``server_epoch`` is a fixed-length, per-process token with no data content.
+    It is excluded from `bin/cctally-snapshot-measure`'s stable digest and
+    sentinelized by `bin/cctally-dashboard-test`, the same treatment
+    ``data_version`` and ``doctor`` already get. Everything else here is real
+    published content and stays in the digest.
+    """
+    act = activity or {}
+    return {
+        "server_epoch": act.get("server_epoch") or "",
+        "rebuilding": bool(act.get("rebuilding", False)),
+        "requested_id": int(act.get("requested_id", 0)),
+        "started_id": int(act.get("started_id", 0)),
+        "settled_id": int(act.get("settled_id", 0)),
+        "settled_status": act.get("settled_status"),
+        # Tuples are not JSON. Convert here rather than relying on the encoder
+        # rendering one as an array by luck. The isinstance filter is a
+        # fail-open guard: `dict(w)` raises on a non-mapping, and this
+        # serializer runs on every published frame, so one malformed warning
+        # would take down the whole envelope rather than drop one entry. The
+        # test is `Mapping`, not `dict`, because the thing that raises is a
+        # NON-mapping; a mapping that is merely not a `dict` converts fine, and
+        # rejecting it would silently drop a good warning — and this field is
+        # the only place a queued request's deferred outcome is reported.
+        "settled_warnings": [
+            dict(w) for w in (act.get("settled_warnings") or ())
+            if isinstance(w, Mapping)
+        ],
     }
 
 
@@ -1588,6 +1660,14 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # assembled); False on every complete/stable snapshot. ``getattr``
         # default keeps positionally-constructed fixture snapshots serializing.
         "hydrating":        bool(getattr(snap, "hydrating", False)),
+        # #583 S2: queue / activity state, owned by `_SnapshotRef`. Published
+        # unconditionally so a client can always read it; an absent or empty
+        # dict renders as the idle object. Monotonic identifiers rather than a
+        # boolean, because `SSEHub.publish` is latest-wins and the frame that
+        # would prove a particular request finished may never be delivered.
+        "sync_activity":    _sync_activity_envelope(
+            getattr(snap, "sync_activity", None)
+        ),
         "generated_at":     _iso_z(snap.generated_at),
         # #300: the all-inputs data-version string at build time (changes iff any
         # DB leg the detail endpoints read changed; flat on an idle tick). The
@@ -1858,9 +1938,18 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
 
 
 def _claude_source_session_rows(envelope: dict) -> list:
-    """The SOURCE-scoped Claude session row lists, both of the places the All
-    tab may read them from (``sourceRows.ts::collectSourceSessionRows`` prefers
-    the nested provider payload and falls back to the sibling source entry)."""
+    """The SOURCE-scoped Claude session row lists the overlay must cover.
+
+    Since source schema 10 (#583 S3 §4) there is exactly ONE such list, on the
+    physical ``sources.claude`` entry. ``sources.all.data.providers.claude`` is
+    published null, so the mirror candidate below is a no-op that the
+    ``isinstance(data, Mapping)`` guard drops; it is retained because
+    ``sourceRows.ts::collectSourceSessionRows`` still reads
+    ``providers?.claude ?? env.sources.claude.data``, and a tab still running a
+    version 9 bundle after an in-place ``execvp`` update would otherwise get an
+    ungated row list. Removing the null stub and this candidate together is
+    filed as a residual.
+    """
     sources = envelope.get("sources")
     if not isinstance(sources, Mapping):
         return []
@@ -1930,6 +2019,11 @@ def _codex_source_session_rows(envelope: dict) -> list:
     carries one ``account_scopes[*].sessions`` child per account. The client
     swaps that child into view when an account chip is focused, so the private
     label overlay must cover it under the same per-request transcript gate.
+
+    Since source schema 10 (#583 S3 §4) those lists all live on the physical
+    ``sources.codex`` entry. ``sources.all.data.providers.codex`` is published
+    null, so the mirror candidate below is a no-op the ``isinstance`` guard
+    drops; it is retained for the same version 9 reason as the Claude twin.
     """
     sources = envelope.get("sources")
     if not isinstance(sources, Mapping):

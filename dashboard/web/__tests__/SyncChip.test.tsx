@@ -189,12 +189,28 @@ describe('<SyncChip /> render priority', () => {
 });
 
 describe('<SyncChip /> aria-live', () => {
-  it('every render branch carries aria-live="polite"', () => {
+  // #583 S2, after the browser gate: a branch announces when its text settles
+  // and then holds. The default branch's age text does not — the server
+  // refreshes `last_sync_at` on every clean tick, so it changes about once a
+  // second for as long as the tab stays open — so that one text is silent while
+  // `sync paused` and `disconnected`, the branch's other two texts, still
+  // announce.
+  it('the branches whose text holds carry aria-live="polite"', () => {
     updateSnapshot(mkEnvelopeWithSyncAge(3));
     const { rerender } = render(<SyncChip />);
 
-    // Default branch.
+    // Default branch, rendering the ticking age.
     let chip = document.getElementById('sync-chip')!;
+    expect(chip.textContent).toMatch(/^synced \d+s ago$/);
+    expect(chip.getAttribute('aria-live')).toBeNull();
+
+    // Default branch, rendering a text that settles.
+    act(() => {
+      updateSnapshot({ ...mkEnvelopeWithSyncAge(3), sync_age_s: null });
+    });
+    rerender(<SyncChip />);
+    chip = document.getElementById('sync-chip')!;
+    expect(chip.textContent).toBe('sync paused');
     expect(chip.getAttribute('aria-live')).toBe('polite');
 
     // Busy branch.

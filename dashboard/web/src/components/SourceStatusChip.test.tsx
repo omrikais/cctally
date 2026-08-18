@@ -192,9 +192,43 @@ describe('SourceStatusChip (§6.8)', () => {
     const chip = screen.getByTestId('source-status-chip');
     expect(chip).toHaveTextContent('Projects partial');
     expect(chip.querySelector('.source-status-label--full')).toHaveTextContent('Projects partial');
-    expect(chip.querySelector('.source-status-label--compact')).toHaveTextContent('Projects');
+    expect(chip.querySelector('.source-status-label--compact')).toHaveTextContent('Partial');
     expect(chip).toHaveAttribute('title', '47 Codex accounting rows lack project metadata; rebuild the cache.');
     expect(chip).toHaveAttribute('aria-label', expect.stringContaining('47 Codex accounting rows'));
+  });
+
+  it.each([
+    ['hero', 'Hero unavailable'],
+    ['daily', 'Daily unavailable'],
+    ['weekly', 'Weekly unavailable'],
+    ['monthly', 'Monthly unavailable'],
+    ['sessions', 'Sessions unavailable'],
+    ['projects', 'Projects unavailable'],
+    ['quota', 'Quota unavailable'],
+    ['budget', 'Budget unavailable'],
+    ['forensics', 'Forensics unavailable'],
+    ['alerts', 'Alerts unavailable'],
+  ])('keeps an explicit Unavailable state in the compact %s warning', (domain, fullLabel) => {
+    updateSnapshot(
+      envWith((b) => {
+        b.sources.codex = {
+          ...b.sources.codex,
+          availability: 'partial',
+          warnings: [{
+            code: `${domain}_unavailable`,
+            message: `${fullLabel}.`,
+            domain,
+          }],
+        };
+      }),
+    );
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<SourceStatusChip />);
+
+    const chip = screen.getByTestId('source-status-chip');
+    expect(chip.querySelector('.source-status-label--full')).toHaveTextContent(fullLabel);
+    expect(chip.querySelector('.source-status-label--compact')).toHaveTextContent('Unavailable');
+    expect(chip).toHaveAttribute('aria-label', `codex source status: ${fullLabel}.`);
   });
 
   it('prefers a source-wide warning and uses generic visible copy for unknown domains', () => {

@@ -186,6 +186,7 @@ describe('TrendPanel source seam — no Claude leak under Codex (#294 S5)', () =
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     const { container } = render(<TrendPanel />);
     expect(container.querySelector('#panel-trend[data-source="codex"]')).not.toBeNull();
+    expect(container.querySelector('#panel-trend .sub')?.textContent).toBe('(1 cycle)');
     expect(container.querySelector('.trend-chart')).not.toBeNull();
     expect(container.querySelectorAll('.trend-table tbody tr').length).toBeGreaterThan(0);
   });
@@ -218,7 +219,7 @@ describe('TrendPanel source seam — no Claude leak under Codex (#294 S5)', () =
     const cells = Array.from(container.querySelectorAll('.trend-table tbody tr:last-child td'))
       .map((cell) => cell.textContent);
     expect(headers).toEqual(['week', 'used_pct', 'dollar_per_pct', 'delta']);
-    expect(cells).toEqual(['07-18 06:24', '30%', '$21.31', '+3.12 ↑']);
+    expect(cells).toEqual(['Now · 07-18 06:24', '30%', '$21.31', '+3.12 ↑']);
   });
 
   // #556 S4 F8 — see WeeklyPanel.test.tsx for the rule this asserts: an h3
@@ -259,6 +260,37 @@ describe('TrendPanel source seam — no Claude leak under Codex (#294 S5)', () =
     expect(sections[1].querySelectorAll('.trend-spark')).toHaveLength(1);
     expect(Array.from(container.querySelectorAll('.trend-table tbody')).map((body) => body.id))
       .toEqual(['trend-rows-claude', 'trend-rows-codex']);
+  });
+
+  it('uses cycle vocabulary for the Codex series without changing Claude (#576)', () => {
+    const env = trendLeakEnv();
+    const template = env.sources!.codex.data!.periods.weekly.rows[0];
+    env.sources!.codex.data!.periods.weekly.rows = [
+      { ...template, label: '08-01', dollar_per_pct: 3 },
+      { ...template, label: '07-25', dollar_per_pct: 2 },
+      { ...template, label: '07-18', dollar_per_pct: 1 },
+    ];
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<TrendPanel />);
+
+    const claude = container.querySelector('[data-provider-section="claude"]')!;
+    const codex = container.querySelector('[data-provider-section="codex"]')!;
+
+    expect(claude.querySelector('[data-col="week"]')?.textContent).toContain('Week');
+    expect(claude.querySelector('[role="img"]')?.getAttribute('aria-label')).toMatch(
+      /3 weeks.*prior week/,
+    );
+
+    expect(codex.querySelector('[data-col="week"]')?.textContent).toContain('Cycle');
+    expect(codex.querySelector('[role="img"]')?.getAttribute('aria-label')).toMatch(
+      /3 cycles.*prior cycle/,
+    );
+    expect(
+      Array.from(codex.querySelectorAll('tbody td:first-child')).map((cell) => cell.textContent),
+    ).toEqual(['C−2 · 07-18', 'C−1 · 07-25', 'Now · 08-01']);
+    expect(codex.textContent).not.toMatch(/\bweek/i);
+    expect(codex.textContent).not.toContain('W−');
   });
 
   it('Claude mode still renders the trend table through the wrap (transparent)', () => {

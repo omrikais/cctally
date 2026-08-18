@@ -22,16 +22,35 @@ import pytest
 
 BIN = pathlib.Path(__file__).resolve().parent.parent / "bin"
 
+# Set by `bin/cctally-bench.run_all` itself, not by the generator's `_pin_env`,
+# so it is absent from PINNED_ENV_KEYS and has to be named separately here.
+# `run_all` exports the corpus clock for the command entry points that read it
+# and deliberately does not restore it, which is correct for the real CLI and a
+# leak in-process: a sibling test on the same pytest-xdist worker then resolves
+# "now" as 2026-01-07T00:00:00Z. Measured on the runner, that made
+# `record-usage` reject a `--resets-at` row as outside its plausibility band and
+# left `current_week` None in `tests/test_dashboard_api_events.py`.
+_RUNNER_ENV_KEYS = ("CCTALLY_AS_OF",)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_bench_env():
-    """The generator + runner pin CCTALLY_DATA_DIR + CLAUDE_CONFIG_DIR via
-    os.environ directly (so a freshly-loaded cctally targets the scratch dir),
-    and leave them set. Snapshot + restore them here so the mutation can't leak
-    into a sibling test on the same pytest-xdist worker — a leaked
-    CCTALLY_DATA_DIR override otherwise wins over that test's HOME-based path
-    resolution and points APP_DIR at this test's since-deleted tmp dir."""
-    keys = ("CCTALLY_DATA_DIR", "CLAUDE_CONFIG_DIR")
+    """The generator + runner pin CCTALLY_DATA_DIR, CLAUDE_CONFIG_DIR,
+    CODEX_HOME and HOME via os.environ directly (so a freshly-loaded cctally
+    targets the scratch dirs), and leave them set. Snapshot + restore them here
+    so the mutation can't leak into a sibling test on the same pytest-xdist
+    worker — a leaked CCTALLY_DATA_DIR override otherwise wins over that test's
+    HOME-based path resolution and points APP_DIR at this test's since-deleted
+    tmp dir, and a leaked HOME/CODEX_HOME resolves that test's user state
+    through a deleted scratch home.
+
+    The pinned half of the key list is READ from
+    `build_bench_fixtures.PINNED_ENV_KEYS` rather than restated. Four
+    hand-maintained copies of "the pinned axes" had already drifted to lengths
+    5, 5, 4 and 5 with nothing comparing them, which is the drift class that
+    constant was introduced to end. `_RUNNER_ENV_KEYS` covers the axes the
+    RUNNER sets on its own, which that constant does not describe."""
+    keys = tuple(_load_build_bench().PINNED_ENV_KEYS) + _RUNNER_ENV_KEYS
     saved = {k: os.environ.get(k) for k in keys}
     yield
     for k, v in saved.items():
@@ -72,8 +91,8 @@ def _load_bin(name):
 
 def test_generator_deterministic(tmp_path):
     gen = _load_build_bench()
-    a = gen.build_fixture(scale="small", seed=42, root=tmp_path / "a")
-    b = gen.build_fixture(scale="small", seed=42, root=tmp_path / "b")
+    a = gen.build_fixture_isolated(scale="small", seed=42, root=tmp_path / "a")
+    b = gen.build_fixture_isolated(scale="small", seed=42, root=tmp_path / "b")
     ca = gen.open_fixture_db(a)
     cb = gen.open_fixture_db(b)
     try:
@@ -86,7 +105,7 @@ def test_generator_deterministic(tmp_path):
 
 def test_corpus_shapes(tmp_path):
     gen = _load_build_bench()
-    data = gen.build_fixture(scale="small", seed=42, root=tmp_path)
+    data = gen.build_fixture_isolated(scale="small", seed=42, root=tmp_path)
     conn = gen.open_fixture_db(data)
     try:
         counts = gen.dataset_counts(conn)
@@ -106,9 +125,105 @@ def test_corpus_shapes(tmp_path):
         conn.close()
 
 
+def test_pinned_env_restores_every_pinned_axis(tmp_path):
+    """pinned_env restores every variable it sets, including on exception.
+
+    The key list is READ from `PINNED_ENV_KEYS`. It used to be a fourth
+    hand-written copy, and it was short by one: `CCTALLY_DISABLE_DEV_AUTODETECT`
+    is set by `_pin_env` via `setdefault` and promised by `pinned_env`'s
+    docstring, and nothing asserted its restoration.
+    """
+    bbf = _load_build_bench()
+
+    keys = bbf.PINNED_ENV_KEYS
+    before = {k: os.environ.get(k) for k in keys}
+
+    with bbf.pinned_env(
+        tmp_path / "data", tmp_path / "claude",
+        tmp_path / "codex", tmp_path / "home",
+    ):
+        assert os.environ["CCTALLY_DATA_DIR"] == str(tmp_path / "data")
+        assert os.environ["CODEX_HOME"] == str(tmp_path / "codex")
+        assert os.environ["HOME"] == str(tmp_path / "home")
+
+    assert {k: os.environ.get(k) for k in keys} == before
+
+    try:
+        with bbf.pinned_env(
+            tmp_path / "d2", tmp_path / "c2", tmp_path / "x2", tmp_path / "h2",
+        ):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert {k: os.environ.get(k) for k in keys} == before, (
+        "an exception inside the block must not leak the pins")
+
+
+def test_building_a_fixture_from_a_test_restores_every_pinned_axis(
+    tmp_path, monkeypatch
+):
+    """No test caller of the builder may change the process it runs in.
+
+    `build_fixture` pins five environment keys and deliberately leaves them
+    pinned, which is right for `_main` and `bin/cctally-bench` and wrong for a
+    gate: the next test on this pytest-xdist worker would resolve HOME through
+    a scratch directory that no longer exists. Measured on the runner before
+    this fix, via `tests/test_conversation_assembly_perf.py`: HOME became
+    that test's per-test scratch home and left replaced after it finished.
+    """
+    bbf = _load_build_bench()
+    # ESTABLISH the absence rather than assuming it: a maintainer with
+    # CODEX_HOME exported would otherwise fail this test for a reason that has
+    # nothing to do with the property under test.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    before = {k: os.environ.get(k) for k in bbf.PINNED_ENV_KEYS}
+    assert before.get("CODEX_HOME") is None, (
+        "precondition: CODEX_HOME is ABSENT here, so this test also proves "
+        "absence is restored as absence rather than as an empty string")
+
+    bbf.build_fixture_isolated(scale="small", seed=42, root=tmp_path / "iso")
+
+    after = {k: os.environ.get(k) for k in bbf.PINNED_ENV_KEYS}
+    assert after == before, (
+        "build_fixture_isolated changed the process: "
+        + repr({k: (before[k], after[k]) for k in before if before[k] != after[k]}))
+
+    # Non-vacuity: the RAW primitive really does leak, so the wrapper above is
+    # not asserting a property the primitive already had. This file's autouse
+    # `_isolate_bench_env` restores it at teardown.
+    bbf.build_fixture(scale="small", seed=42, root=tmp_path / "raw")
+    leaked = {k: (before[k], os.environ.get(k))
+              for k in bbf.PINNED_ENV_KEYS if os.environ.get(k) != before[k]}
+    assert leaked, (
+        "the raw builder no longer leaks, so build_fixture_isolated is a no-op "
+        "and this test proves nothing")
+
+
+def test_marker_params_hash_covers_every_scale(tmp_path):
+    """A profile-shape change must bust the cached fixture for any scale."""
+    bbf = _load_build_bench()
+
+    with bbf.pinned_env(tmp_path / "d", tmp_path / "c",
+                        tmp_path / "x", tmp_path / "h") as cctally:
+        for scale in sorted(bbf.SCALES):
+            payload = bbf._marker_payload(cctally, seed=42, scale=scale)
+            assert "params_hash" in payload, (
+                f"{scale} marker cannot detect a profile change")
+
+        base = bbf._marker_payload(cctally, seed=42, scale="small")
+        original = dict(bbf.SCALES["small"])
+        try:
+            bbf.SCALES["small"] = {**original, "sessions": original["sessions"] + 1}
+            changed = bbf._marker_payload(cctally, seed=42, scale="small")
+        finally:
+            bbf.SCALES["small"] = original
+        assert changed["params_hash"] != base["params_hash"], (
+            "changing a profile's cardinality must change its marker")
+
+
 # ── Task 2: runner JSON schema ────────────────────────────────────────────
 
-# The 14 registered benchmark families (spec §4.2), asserted here and in the
+# The 15 registered benchmark families (spec §4.2), asserted here and in the
 # bin/cctally-bench-test self-test.
 _EXPECTED_BENCHMARKS = {
     "snapshot.cold", "snapshot.warm", "snapshot.idle",
@@ -263,3 +378,96 @@ def test_assembly_scan_incompatible_with_default_baseline_flags():
         with pytest.raises(SystemExit) as ei:
             bench.main(["--assembly-scan", flag])
         assert ei.value.code == 2   # argparse parser.error exit code
+
+
+# ── Task 6 (#583 S1): the contract/receipt baseline ───────────────────────
+
+
+def test_classify_reads_the_contract_shaped_baseline():
+    """classify() must not report a contract-shaped baseline as malformed."""
+    bench = _load_bin("cctally-bench")
+    baseline = {
+        "contract": {
+            "benchmark_names": ["snapshot.warm"],
+            "corpus_fingerprint": "abc123",
+            "dataset_counts": {"entries": 10},
+        },
+        "receipt": {
+            "cctally_version": "1.99.0",
+            "machine_label": "test-machine",
+            "benchmarks": {"snapshot.warm": {"median_ms": 10.0}},
+        },
+    }
+    current = {
+        "machine_label": "test-machine",
+        "benchmarks": {"snapshot.warm": {"median_ms": 10.5}},
+    }
+    out = bench.classify(baseline, current, pct=0.2, floor_ms=5.0)
+    assert out["_meta"]["malformed"] is False
+    assert out["_meta"]["machine_mismatch"] is False
+    assert out["snapshot.warm"]["status"] == "OK"
+
+
+def test_update_baseline_preserves_the_contract_block(tmp_path, monkeypatch):
+    """--update-baseline must re-record the receipt, not flatten the file."""
+    import json as _json
+    bench = _load_bin("cctally-bench")
+    target = tmp_path / "backend.json"
+    monkeypatch.setattr(bench, "BASELINE_PATH", target)
+    bench._write_baseline({
+        "cctally_version": "1.99.0",
+        "machine_label": "m",
+        "benchmarks": {"snapshot.warm": {"median_ms": 1.0}},
+        "dataset_counts": {"entries": 1},
+        "corpus_fingerprint": "abc123",
+        "generator_version": 4,
+        "scale": "large",
+        "seed": 42,
+    })
+    written = _json.loads(target.read_text())
+    assert "contract" in written and "receipt" in written
+    assert "benchmark_names" in written["contract"]
+    # The two blocks duplicate these; the harness asserts they agree, so a
+    # writer that let them diverge would put the contract out of date silently.
+    for key in ("scale", "seed", "dataset_counts", "corpus_fingerprint",
+                "generator_version"):
+        assert written["contract"][key] == written["receipt"][key], key
+
+
+def test_write_baseline_refuses_a_run_with_no_corpus_fingerprint(
+    tmp_path, monkeypatch
+):
+    """Realism mode computes no fingerprint, so its baseline cannot satisfy the
+    contract the harness asserts. Refuse at WRITE time rather than deferring the
+    failure to an unrelated harness run later."""
+    bench = _load_bin("cctally-bench")
+    target = tmp_path / "backend.json"
+    monkeypatch.setattr(bench, "BASELINE_PATH", target)
+    with pytest.raises(SystemExit, match="no corpus fingerprint"):
+        bench._write_baseline({
+            "cctally_version": "1.99.0",
+            "machine_label": "m",
+            "benchmarks": {"snapshot.warm": {"median_ms": 1.0}},
+            "dataset_counts": {"entries": 1},
+            "corpus_fingerprint": None,
+        })
+    assert not target.exists(), "the refusal must not leave a partial file"
+
+
+def test_the_committed_baseline_is_contract_shaped():
+    """The file in the tree must be the shape every reader now expects."""
+    import json as _json
+    bench = _load_bin("cctally-bench")
+    written = _json.loads(bench.BASELINE_PATH.read_text())
+    assert set(written) >= {"contract", "receipt"}, sorted(written)
+    contract = written["contract"]
+    assert set(contract["benchmark_names"]) == _EXPECTED_BENCHMARKS
+    assert contract["corpus_fingerprint"]
+    assert contract["generator_version"]
+    assert contract["scale"] == "large"
+    for key in ("entries", "codex_entries", "codex_files", "quota_windows"):
+        assert contract["dataset_counts"].get(key), key
+    # The receipt is advisory and must never be asserted on value; assert only
+    # that it is present and carries the run's identity.
+    assert written["receipt"]["cctally_version"]
+    assert written["receipt"]["machine_label"]

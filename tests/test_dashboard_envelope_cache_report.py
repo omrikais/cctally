@@ -872,9 +872,14 @@ def test_source_schema_version_moves_with_the_retired_s2_transition():
     weekly cycle now totals one native cycle width ending at `now` instead of
     the whole accounting range, so `accounts[].spendUsd`, its token siblings
     and the decorated hero totals summed from them changed value.
+
+    #583 S3 takes it to 10: `sources.all.data.providers` no longer carries the
+    two provider data objects. It publishes null for both, and consumers read
+    the physical `sources.claude` / `sources.codex` entries. This is the first
+    DESTRUCTIVE entry rather than an additive one.
     """
     from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION
-    assert SOURCE_SCHEMA_VERSION == 9
+    assert SOURCE_SCHEMA_VERSION == 10
 
 
 # Spec §5 also asked for Codex "field-survival assertions" HERE. They live

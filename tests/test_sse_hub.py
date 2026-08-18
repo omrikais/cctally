@@ -1,4 +1,11 @@
-"""Exercise SSEHub without spinning up an HTTP server."""
+"""Exercise SSEHub without spinning up an HTTP server.
+
+#583 S3 §5: `publish` wraps each publication in a `_SSEDelivery` so one tick
+projects and encodes once per variant instead of once per connected client.
+The queues therefore carry deliveries, and these tests read `.snapshot` off
+them. What they pin — fan-out, unsubscribe, bounded queues, thread safety — is
+unchanged; `publish`'s queueing behaviour was deliberately not modified.
+"""
 import queue
 import threading
 import time
@@ -12,8 +19,8 @@ def test_publish_fans_out_to_all_subscribers():
     q1 = hub.subscribe()
     q2 = hub.subscribe()
     hub.publish({"v": 1})
-    assert q1.get(timeout=0.5) == {"v": 1}
-    assert q2.get(timeout=0.5) == {"v": 1}
+    assert q1.get(timeout=0.5).snapshot == {"v": 1}
+    assert q2.get(timeout=0.5).snapshot == {"v": 1}
 
 
 def test_unsubscribe_stops_delivery():
@@ -40,7 +47,7 @@ def test_publish_drops_on_full_queue():
     delivered = []
     while True:
         try:
-            delivered.append(q.get_nowait())
+            delivered.append(q.get_nowait().snapshot)
         except queue.Empty:
             break
     assert len(delivered) <= 2

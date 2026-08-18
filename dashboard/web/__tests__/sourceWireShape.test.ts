@@ -25,12 +25,11 @@ describe('S4 source envelope wire shape (guard)', () => {
     const env = fixture as Record<string, unknown>;
 
     // The four bundle fields are TOP-LEVEL siblings, not nested under `sources`.
-    // #556 S2 §3.9 — the fixture tracks the CURRENT server version (8 -> 9 for
-    // #556 S5's Claude budget status and its changed budget capability detail;
-    // 6 -> 7 was S3's canonical `alerted_at` on every Codex alert row). The
-    // assertion is about placement, not about the number: no production client
-    // branches on it, which is exactly why every wire change here is additive.
-    expect(env.source_schema_version).toBe(9);
+    // #556 S2 §3.9 — the fixture tracks the CURRENT server version (9 -> 10 for
+    // #583 S3's nulled All provider mirror; 8 -> 9 was #564's decorated Codex
+    // fallback totals). The assertion is about placement, not about the
+    // number: no production client branches on it.
+    expect(env.source_schema_version).toBe(10);
     expect(env.default_source).toBe('claude');
     expect(env.source_order).toEqual(['claude', 'codex', 'all']);
   });
@@ -87,7 +86,7 @@ describe('S4 source envelope wire shape (guard)', () => {
     // #556 S2 §3.9 — tracks the server's current version, exactly as the JSON
     // fixture above does. Keeping the two in step is the invariant; the
     // number is not.
-    expect(slice.source_schema_version).toBe(9);
+    expect(slice.source_schema_version).toBe(10);
     expect(slice.default_source).toBe('claude');
     expect(slice.source_order).toEqual(['claude', 'codex', 'all']);
 
@@ -189,5 +188,76 @@ describe('v5 combined wire shape (guard)', () => {
     expect(data.combined_unavailable?.causes.map((cause) => cause.code)).toEqual([
       'codex_projection_incoherent', 'codex_cycle_unavailable',
     ]);
+  });
+});
+
+// #583 S3 §9 — the DECODED half of the payload reduction. Compression cannot
+// touch what the browser allocates after parsing; only removing the duplicated
+// subtree can, which is why this is measured apart from the wire-byte gate.
+describe('#583 S3 — each provider domain is published exactly once', () => {
+  const nodes = (v: unknown): number => (
+    v === null || typeof v !== 'object'
+      ? 1
+      : 1 + Object.values(v as object).reduce<number>((n, x) => n + nodes(x), 0)
+  );
+
+  it('publishes each provider domain exactly once and nulls the mirror', () => {
+    const env = structuredClone(fixture) as unknown as {
+      sources: {
+        all: { data: Record<string, unknown> & { providers: unknown } };
+        claude: { data: unknown };
+        codex: { data: unknown };
+      };
+    };
+    expect(env.sources.all.data.providers).toEqual({ claude: null, codex: null });
+    // Acceptance criterion 6 has two halves. The node counts below carry the
+    // "the duplicated subtree was removed" half; this carries the "and nothing
+    // else was" half, which no count can express. A mirror reintroduced under
+    // ANY other name — `provider_data`, `claude`, a debug copy — adds a key
+    // here and fails, where a count-only guard would simply read a larger
+    // envelope and go on passing.
+    expect(Object.keys(env.sources.all.data).sort()).toEqual(
+      ['aggregates', 'alerts', 'combined', 'providers'],
+    );
+    // Non-vacuous: the physical entries must actually carry the domains, or
+    // the node-count comparison below would compare two empty subtrees.
+    expect(env.sources.claude.data).not.toBeNull();
+    expect(env.sources.codex.data).not.toBeNull();
+
+    const legacy = structuredClone(env);
+    legacy.sources.all.data.providers = {
+      claude: legacy.sources.claude.data,
+      codex: legacy.sources.codex.data,
+    };
+
+    const removed = nodes(legacy) - nodes(env);
+    const duplicated = nodes(legacy.sources.claude.data)
+                     + nodes(legacy.sources.codex.data) - 2;
+
+    // DO NOT restore `expect(removed).toBe(duplicated)`. That equality held BY
+    // CONSTRUCTION and could not fail: `nodes` traverses references, so
+    // replacing a `null` leaf (1 node) with a subtree of N nodes changes the
+    // total by exactly N - 1, twice over — which is the definition of
+    // `duplicated`. It asserted arithmetic, not the envelope.
+    //
+    // What discriminates is MATERIALITY: the duplication is measured against
+    // the size of the envelope that carries it. Reconstructing the v9 shape
+    // costs 34.0% more nodes than the whole v10 envelope on the committed
+    // fixture (453 duplicated against 1331 total), so the pinned floor is 25%
+    // — comfortably below the measurement and far above anything a fixture
+    // that had stopped exercising the removal could reach.
+    //
+    // BOTH forms are present because they fail for different reasons. The ratio
+    // states the claim the criterion actually makes — the duplication is large
+    // relative to the envelope carrying it — but it couples two quantities that
+    // move independently: `removed` is fixed by the provider subtree, while
+    // `nodes(env)` grows with every unrelated addition to the fixture, so about
+    // 36% of ordinary fixture growth would trip the ratio with nothing
+    // regressed. The absolute floor carries the same materiality claim with no
+    // such coupling, so it survives fixture growth and is what still fails if a
+    // future edit relaxes the ratio to accommodate a larger fixture.
+    expect(removed).toBeGreaterThan(nodes(env) * 0.25);
+    expect(removed).toBeGreaterThan(300);
+    expect(duplicated).toBeGreaterThan(100);
   });
 });

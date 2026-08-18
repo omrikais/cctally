@@ -92,6 +92,13 @@ def test_api_data_recursively_normalizes_nonfinite_values(monkeypatch):
     ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](
         ns["_empty_dashboard_snapshot"]()
     )
+    # #583 S3 §7: `/api/data` serves the most recently PUBLISHED state, so a
+    # bare reference is not enough — seed the hub exactly as `cmd_dashboard`
+    # does before the HTTP server binds.
+    ns["DashboardHTTPHandler"].hub = ns["SSEHub"]()
+    ns["DashboardHTTPHandler"].hub.publish(
+        ns["DashboardHTTPHandler"].snapshot_ref.get()
+    )
     monkeypatch.setattr(
         dash,
         "snapshot_to_envelope",
@@ -214,3 +221,33 @@ def test_dashboard_modules_have_no_permissive_json_dumps_calls():
                 None,
             )
             assert isinstance(allow_nan, ast.Constant) and allow_nan.value is False
+
+
+# --- #583 S3 §6: Accept-Encoding negotiation --------------------------------
+
+
+@pytest.mark.parametrize("header,expected", [
+    (None, False),
+    ("", False),
+    ("gzip", True),
+    ("gzip, deflate, br", True),
+    ("GZIP", True),
+    ("gzip;q=0", False),                 # an explicit refusal
+    ("gzip;q=0.0", False),
+    ("gzip;q=0.001", True),
+    ("deflate, gzip;q=0.5", True),
+    ("identity", False),
+    ("*", True),
+    ("*;q=0", False),
+    ("notgzip", False),                  # a substring match would say True
+    ("x-gzip", False),
+    ("gzip;q=bogus", False),             # malformed -> identity, never raise
+])
+def test_accepts_gzip(header, expected):
+    """A substring test for "gzip" compresses for a client that explicitly
+    refused it with `gzip;q=0`, and for an unrelated token like `notgzip`. A
+    malformed quality value must fall back to identity rather than raise,
+    because this runs on the publish path and must never take a connection
+    down."""
+    ns = load_script()
+    assert ns["_accepts_gzip"](header) is expected

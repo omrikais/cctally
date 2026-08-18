@@ -2,8 +2,13 @@
 """Generate a deterministic, scrubbed envelope.json fixture for dashboard/web tests.
 
 Run this from the repo root to rebuild dashboard/web/__tests__/fixtures/envelope.json.
-The output matches the Envelope shape emitted by snapshot_to_envelope() but
-with placeholder project names and predictable session IDs — no real user data.
+Every field this generator emits mirrors the same field in the Envelope that
+snapshot_to_envelope() publishes, but with placeholder project names and
+predictable session IDs — no real user data.
+
+The committed fixture has been hand-extended and carries keys this generator
+does not produce. The generator refuses to remove existing top-level keys unless
+the caller explicitly supplies ``--allow-key-removal``.
 """
 
 import argparse
@@ -109,12 +114,29 @@ def build_envelope() -> dict:
         "rows": session_rows,
     }
 
+    # #583 S2 §6.2 — the refresh queue / rebuild activity state, published
+    # unconditionally beside `hydrating`. The fixture pins the IDLE object: a
+    # queued or in-flight request is a temporal transition, proven by pytest and
+    # vitest rather than by a static fixture. `server_epoch` is a real per-process
+    # uuid4 prefix on the wire, so the fixture uses a fixed 16-hex literal to stay
+    # deterministic — its VALUE carries no meaning, only its length and stability.
+    sync_activity = {
+        "server_epoch": "00000000583520f5",
+        "rebuilding": False,
+        "requested_id": 0,
+        "started_id": 0,
+        "settled_id": 0,
+        "settled_status": None,
+        "settled_warnings": [],
+    }
+
     return {
         "envelope_version": 2,
         "generated_at": "2026-04-24T13:07:00Z",
         "last_sync_at": "2026-04-24T13:06:55Z",
         "sync_age_s": 5,
         "last_sync_error": None,
+        "sync_activity": sync_activity,
         "header": header,
         "current_week": current_week,
         "forecast": forecast,
@@ -135,9 +157,30 @@ def main() -> int:
             f"(default: {DEFAULT_FIXTURE_PATH})."
         ),
     )
+    parser.add_argument(
+        "--allow-key-removal",
+        action="store_true",
+        help="permit overwriting an existing fixture while removing top-level keys",
+    )
     args = parser.parse_args()
     output_path = Path(args.out)
     env = build_envelope()
+    if output_path.exists() and not args.allow_key_removal:
+        try:
+            existing = json.loads(output_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            parser.error(f"cannot inspect existing fixture safely: {exc}")
+        if not isinstance(existing, dict):
+            parser.error(
+                "cannot inspect existing fixture safely: top level is not an object"
+            )
+        removed = sorted(set(existing) - set(env))
+        if removed:
+            parser.error(
+                "refusing to remove existing top-level keys: "
+                + ", ".join(removed)
+                + "; rerun with --allow-key-removal only if that loss is intentional"
+            )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(env, indent=2) + "\n")
     print(f"Wrote {output_path} ({output_path.stat().st_size} bytes)")

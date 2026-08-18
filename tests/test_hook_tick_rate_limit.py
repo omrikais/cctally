@@ -56,7 +56,7 @@ def test_hook_tick_fetches_when_snapshot_older_than_throttle(ns, monkeypatch, tm
     monkeypatch.setitem(ns, "load_config", lambda: {})
     monkeypatch.setitem(ns, "_resolve_oauth_token", lambda *a, **kw: "tok")
     monkeypatch.setitem(ns, "_newest_snapshot_age_seconds", lambda: 30.0)
-    monkeypatch.setitem(ns, "cmd_record_usage", lambda args: 0)
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda args, **kw: 0)
 
     api = {
         "seven_day": {"utilization": 22.0, "resets_at": "2026-05-02T12:00:00Z"},
@@ -81,7 +81,7 @@ def test_hook_tick_five_hour_inactive_null_resets(ns, monkeypatch, tmp_path):
 
     captured = {}
     monkeypatch.setitem(ns, "cmd_record_usage",
-                        lambda args: captured.update(vars(args)) or 0)
+                        lambda args, **kw: captured.update(vars(args)) or 0)
 
     api = {
         "seven_day": {"utilization": 22.0, "resets_at": "2026-05-02T12:00:00Z"},
@@ -104,7 +104,7 @@ def test_hook_tick_fetches_when_no_snapshot_exists(ns, monkeypatch, tmp_path):
     monkeypatch.setitem(ns, "load_config", lambda: {})
     monkeypatch.setitem(ns, "_resolve_oauth_token", lambda *a, **kw: "tok")
     monkeypatch.setitem(ns, "_newest_snapshot_age_seconds", lambda: None)
-    monkeypatch.setitem(ns, "cmd_record_usage", lambda args: 0)
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda args, **kw: 0)
 
     api = {"seven_day": {"utilization": 1.0, "resets_at": "2026-05-02T12:00:00Z"}}
     monkeypatch.setitem(ns, "_fetch_oauth_usage",

@@ -16,7 +16,7 @@ cctally db journal-repair [--violation <fingerprint> ...] [--yes] [--json]
 cctally db recover --db cache [--yes]   # --db stats is retired (see below)
 cctally db repair --db stats --yes
 cctally db backup --db {cache,stats} [--output <path>]
-cctally db checkpoint [--db {cache,stats}] [--json]
+cctally db checkpoint [--db {cache,conversations,stats}] [--json]
 cctally db prune [--yes] [--include-backups] [--json]
 cctally db vacuum [--db {cache,conversations,stats,all}]
 ```
@@ -490,7 +490,7 @@ command is designed to prevent. Stop cctally before restoring a backup.
 parent is absent; `3` SQLite backup/integrity or filesystem failure. If stats.db
 is already malformed, the error points to `cctally db repair --db stats --yes`.
 
-## `cctally db checkpoint [--db {cache,stats}] [--json]`
+## `cctally db checkpoint [--db {cache,conversations,stats}] [--json]`
 
 Fast, non-destructive WAL drain (issue #297). Runs a single `PRAGMA
 wal_checkpoint(TRUNCATE)` to flush the write-ahead-log frames into the
@@ -506,6 +506,18 @@ every write crawl past the busy timeout so `cctally` commands fail with
 (`PRAGMA journal_size_limit`) plus a forced end-of-sync checkpoint keep
 the WAL contained; this command is the manual escape hatch and the
 `doctor` `cache.db WAL size` remediation for a pathological case.
+
+`--db conversations` applies the same drain to the transcript store, and is
+the `doctor` `conversations.db WAL size` remediation. Its lock plan differs
+from cache's because that store has **two** independently writable provider
+domains rather than one global writer flock: the checkpoint takes
+`conversations.db.maintenance.lock` **shared**, then `conversations.db.lock`
+**exclusive**, then `conversations.db.codex.lock` **exclusive**, in that order
+and before SQLite is opened. Maintenance is shared because the lock-order law
+assigns shared maintenance to routine, admin and checkpoint work; only mutating
+maintenance takes it exclusive. Everything else — the raw connect, the
+best-effort busy handling, the exit codes and the JSON shape — is identical to
+the cache path.
 
 `stats.db` no longer has a WAL to drain: it uses `DELETE` / `FULL` rollback
 journaling. `--db stats` is retained only as an explicit retired-command
@@ -531,7 +543,7 @@ the dev data dir; the installed binary drains prod).
 
 | Flag | Description |
 | --- | --- |
-| `--db {cache,stats}` | Which target to request. Default **`cache`**. `stats` is a retired target that returns exit 2; there is no `--db all`. |
+| `--db {cache,conversations,stats}` | Which target to request. Default **`cache`**. `conversations` drains the transcript store. `stats` is a retired target that returns exit 2; there is no `--db all`. |
 | `--json` | Emit a `schemaVersion: 1` envelope instead of text. |
 
 - **`truncated`** = the checkpoint reset the WAL (`busy=0`) **and** the

@@ -30,6 +30,7 @@ Database
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
+  ✓ conversations.db WAL size within limit
   ✓ Reclaimable cache space  below threshold
   ✓ Reclaimable transcript space below threshold
   ✓ Retained evidence        0 B retained, within policy
@@ -78,4 +79,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 54 OK · 6 WARN · 1 FAIL
+Summary: 55 OK · 6 WARN · 1 FAIL

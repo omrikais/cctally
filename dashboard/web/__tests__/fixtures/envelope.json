@@ -4,6 +4,15 @@
   "last_sync_at": "2026-04-24T13:06:55Z",
   "sync_age_s": 5,
   "last_sync_error": null,
+  "sync_activity": {
+    "server_epoch": "00000000583520f5",
+    "rebuilding": false,
+    "requested_id": 0,
+    "started_id": 0,
+    "settled_id": 0,
+    "settled_status": null,
+    "settled_warnings": []
+  },
   "header": {
     "week_label": "Apr 21\u201328",
     "used_pct": 17.4,
@@ -807,7 +816,7 @@
       }
     ]
   },
-  "source_schema_version": 9,
+  "source_schema_version": 10,
   "default_source": "claude",
   "source_order": [
     "claude",

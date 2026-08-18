@@ -11,6 +11,27 @@ export interface SyncFreshness {
   bucket: SyncBucket;
 }
 
+// Escalation order over the buckets, '' being "no bucket at all". Lives here
+// rather than at the call site because it orders the type declared above.
+const SYNC_BUCKET_RANK: Record<SyncBucket | '', number> = {
+  '': 0,
+  fresh: 1,
+  aging: 2,
+  stale: 3,
+};
+
+// A caller holding two readings of the same freshness must not prefer one
+// unconditionally: either can be the later one. The chip's ticked bucket is
+// ahead of the envelope's between frames, and the envelope is ahead of a bucket
+// the error floor held back. The more severe reading is the later one in both
+// directions, because age only increases within one sync.
+export function moreSevereBucket(
+  a: SyncBucket | '',
+  b: SyncBucket | '',
+): SyncBucket | '' {
+  return SYNC_BUCKET_RANK[a] >= SYNC_BUCKET_RANK[b] ? a : b;
+}
+
 export const SYNC_AGING_S = 5 * 60;    // 300 — aging at/after 5 minutes
 export const SYNC_STALE_S = 30 * 60;   // 1800 — stale at/after 30 minutes
 

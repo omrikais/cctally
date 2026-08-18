@@ -507,7 +507,14 @@ function AllForecastSection({
             </div>
           </div>
           <h4 className="m-sec sec-range">Range vs. caps</h4>
-          <div className="mfc-rangewrap provider-range-summary" aria-label={`${section.label} projected usage against caps`}>
+          <div
+            className="mfc-rangewrap provider-range-summary"
+            // #578 — this visual range is a named, non-landmark composition.
+            // `group` exposes that relationship without adding another region
+            // inside the already-labelled provider detail region.
+            role="group"
+            aria-label={`${section.label} projected usage against caps`}
+          >
             <div className="mfc-rangetrack">
               <div className="mfc-zone safe" />
               <div className="mfc-zone warn" />

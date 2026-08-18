@@ -1421,6 +1421,50 @@ def test_codex_vendor_wide_budget_does_not_claim_account_budgets_only(codex_env)
     assert "not_configured" not in budget
 
 
+def test_codex_missing_account_budget_names_the_account_configuration(codex_env):
+    """#586: a focused account with no budget must name the configuration
+    axis that can change that account's card, not the vendor-wide budget axis.
+
+    Adding the missing account to ``budget.codex.accounts`` must replace the
+    disposition with that same account's configured status.
+    """
+    ns, cache, stats, source_module, _root = codex_env
+    _decorate(stats)
+
+    def _build(accounts):
+        config = {
+            "collector": {"week_start": "sunday"},
+            "budget": {"codex": {
+                "period": "calendar-month",
+                "alert_thresholds": [90, 100],
+                "accounts": accounts,
+            }},
+        }
+        context = DashboardReadContext(
+            cache_conn=cache, stats_conn=stats, range_start=START,
+            now_utc=NOW, display_tz_name="UTC", week_start_idx=6,
+            week_start_name="sunday",
+            codex_budget=ns["_get_budget_config"](config)["codex"],
+        )
+        return source_module.build_codex_source_state(
+            context, data_version=f"586-{len(accounts)}-accounts-v1",
+        )
+
+    missing = _build({_ACCT_A: 25.0})
+    missing_budget = missing.data["account_scopes"][_ACCT_B]["budget"]
+    assert missing_budget["status"] is None
+    assert missing_budget["not_configured"] == {
+        "disposition": "account_budget_unset",
+        "account_key": _ACCT_B,
+        "configured_accounts": {_ACCT_A: 25.0},
+    }
+
+    configured = _build({_ACCT_A: 25.0, _ACCT_B: 40.0})
+    configured_budget = configured.data["account_scopes"][_ACCT_B]["budget"]
+    assert configured_budget["status"]["budget_usd"] == 40.0
+    assert "not_configured" not in configured_budget
+
+
 def test_codex_budget_cost_event_window_failure_does_not_fail_the_provider(
     codex_env, monkeypatch,
 ):

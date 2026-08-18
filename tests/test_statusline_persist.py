@@ -250,6 +250,70 @@ def test_candidate_artifacts_stay_in_redirected_app_dir(app, tmp_path):
     assert app.STATUSLINE_SELECTED_PATH.is_relative_to(tmp_path)
 
 
+def test_the_statusline_persist_nudge_fires_outside_the_persist_lock(
+        app, monkeypatch):
+    """#583 S2 — the statusline's own record call must defer its nudge.
+
+    `_statusline_reduce_and_publish` calls `cmd_record_usage` with
+    `nudge_dashboard` defaulting true and NO sink, and every caller runs it
+    inside the statusline persist flock. The nudge is a loopback POST with a
+    multi-second timeout, so one unresponsive listener would stall every
+    statusline render on this machine at status-line cadence.
+
+    The path is reachable rather than theoretical: opportunistic ingest emits
+    events in the uncontended common case, which is exactly the nudge gate. The
+    first assertion below is what proves that, so a change that stopped
+    nudging here would fail this test rather than pass it vacuously.
+    """
+    observed = []
+
+    def _fake_nudge(*args, **kwargs):
+        fd = app._try_acquire_persist_lock()
+        observed.append(fd is not None)
+        app._release_persist_lock(fd)
+
+    monkeypatch.setitem(app.__dict__, "_nudge_dashboard_repaint", _fake_nudge)
+    parsed = _status_input(
+        app, session_id="nudge", seven_pct=41, seven_resets_epoch=_future_week()
+    )
+    app._statusline_persist(parsed, sync_for_test=True)
+
+    assert observed, (
+        "the opportunistic ingest emitted events, so the nudge gate opened — "
+        "if this fails the nudge no longer fires from this path at all"
+    )
+    assert observed == [True], (
+        "the nudge fired while the statusline persist lock was still held"
+    )
+
+
+def test_the_forked_persist_child_nudges_outside_its_own_lock(
+        app, monkeypatch, tmp_path):
+    """The same property on the path production actually takes.
+
+    `sync_for_test=True` is the test hatch; a real statusline render forks, and
+    the child takes the persist lock BLOCKING for the whole reduce-and-publish.
+    """
+    probe = tmp_path / "fork-nudge-probe"
+
+    def _fake_nudge(*args, **kwargs):
+        fd = app._try_acquire_persist_lock()
+        probe.write_text("free" if fd is not None else "held")
+        app._release_persist_lock(fd)
+
+    monkeypatch.setitem(app.__dict__, "_nudge_dashboard_repaint", _fake_nudge)
+    parsed = _status_input(
+        app, session_id="fork", seven_pct=42, seven_resets_epoch=_future_week()
+    )
+    app._statusline_persist(parsed)          # the real, forking path
+
+    deadline = time.time() + 20.0
+    while time.time() < deadline and not probe.exists():
+        time.sleep(0.05)
+    assert probe.exists(), "the forked child never reached its nudge"
+    assert probe.read_text() == "free"
+
+
 def test_reducer_ignores_incomplete_candidate_temp(app):
     app.STATUSLINE_CANDIDATE_DIR.mkdir(mode=0o700)
     temp = app.STATUSLINE_CANDIDATE_DIR / (
@@ -352,9 +416,11 @@ def test_missing_control_reconciles_db_once_then_unchanged_tick_is_child_free(ap
     calls = []
     real_reduce = app._cctally_statusline._statusline_reduce_and_publish
 
-    def counted_reduce():
+    def counted_reduce(**kwargs):
+        # #583 S2 added a keyword-only `nudge_sink`; the double forwards it
+        # rather than pinning a signature it does not care about.
         calls.append(True)
-        return real_reduce()
+        return real_reduce(**kwargs)
 
     monkeypatch.setattr(app._cctally_statusline, "_statusline_reduce_and_publish", counted_reduce)
     app._statusline_persist(parsed, sync_for_test=True)
@@ -380,9 +446,11 @@ def test_legacy_db_write_forces_one_control_only_reconciliation_child(app, monke
     calls = []
     real_reduce = app._cctally_statusline._statusline_reduce_and_publish
 
-    def counted_reduce():
+    def counted_reduce(**kwargs):
+        # #583 S2 added a keyword-only `nudge_sink`; the double forwards it
+        # rather than pinning a signature it does not care about.
         calls.append(True)
-        return real_reduce()
+        return real_reduce(**kwargs)
 
     monkeypatch.setattr(app._cctally_statusline, "_statusline_reduce_and_publish", counted_reduce)
     app._statusline_persist(parsed, sync_for_test=True)

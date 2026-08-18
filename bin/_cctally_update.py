@@ -196,7 +196,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Callable
 
 
@@ -2368,10 +2368,12 @@ class _DashboardUpdateCheckThread(threading.Thread):
     ``envelope_precompute`` rather than re-reading the state file per
     envelope build, so a BARE publish of the held snapshot would surface
     the stale precompute. The republish therefore rebuilds
-    ``envelope_precompute`` (small config/state JSON I/O, no DB, no
-    module-cache mutation — see :meth:`_republish_with_fresh_envelope`)
-    on a fresh ``dataclasses.replace`` snapshot before publishing, and
-    persists it to the snapshot ref so the held snapshot stays current.
+    ``envelope_precompute`` and the doctor summary on a fresh
+    ``dataclasses.replace`` snapshot before publishing, and persists it to
+    the snapshot ref so the held snapshot stays current. The doctor refresh
+    matters because ``safety.update_state`` reads the file this thread just
+    changed; retaining the old payload made ``/api/data`` disagree with the
+    live ``/api/doctor`` endpoint until a later data rebuild.
     Under ``--no-sync`` this thread is the ONLY refresher of that
     precompute (the data-sync thread that otherwise rebuilds it is
     disabled).
@@ -2385,11 +2387,13 @@ class _DashboardUpdateCheckThread(threading.Thread):
         *,
         hub: "SSEHub | None" = None,
         snapshot_ref: "_SnapshotRef | None" = None,
+        runtime_bind: "str | None" = None,
     ) -> None:
         super().__init__(name="cctally-update-check")
         self._stop_event = stop_event
         self._hub = hub
         self._ref = snapshot_ref
+        self._runtime_bind = runtime_bind
 
     def run(self) -> None:
         c = _cctally()
@@ -2412,16 +2416,12 @@ class _DashboardUpdateCheckThread(threading.Thread):
                     and self._hub is not None
                     and self._ref is not None
                 ):
-                    snap = self._ref.get()
-                    if snap is not None:
-                        self._republish_with_fresh_envelope(snap)
+                    self._republish_with_fresh_envelope()
                 config = load_config()
                 if c._is_update_check_due(config):
                     c._do_update_check()
                     if self._hub is not None and self._ref is not None:
-                        snap = self._ref.get()
-                        if snap is not None:
-                            self._republish_with_fresh_envelope(snap)
+                        self._republish_with_fresh_envelope()
             except Exception as e:
                 # Log but never propagate — this thread must keep
                 # ticking so a transient registry hiccup doesn't
@@ -2437,8 +2437,8 @@ class _DashboardUpdateCheckThread(threading.Thread):
                     pass
             self._stop_event.wait(c.UPDATE_DASHBOARD_CHECK_POLL_S)
 
-    def _republish_with_fresh_envelope(self, snap) -> None:
-        """Republish ``snap`` with a freshly-rebuilt ``envelope_precompute``.
+    def _republish_with_fresh_envelope(self) -> None:
+        """Patch the latest snapshot with fresh config and doctor precomputes.
 
         Since M4 (#268) the SSE envelope reads update-state / update-suppress
         off ``snap.envelope_precompute`` rather than re-reading the JSON files
@@ -2450,26 +2450,32 @@ class _DashboardUpdateCheckThread(threading.Thread):
         precompute refresher) is disabled.
 
         ``_tui_precompute_envelope_config`` reads only the config / update-state
-        / update-suppress files and mutates NO module cache, so calling it from
-        this thread is safe (no shared-cache-mutation / Codex F7 hazard).
-        ``dataclasses.replace`` yields a NEW snapshot sharing ``prior``'s
-        immutable rows, so an SSE client serializing the previously-published
-        snapshot can't observe a torn value. The fresh snapshot is persisted to
-        the ref so the held snapshot stays current for the next reader.
+        / update-suppress files and mutates NO module cache. The doctor memo is
+        invalidated deliberately before recomputation: the update-state write
+        changed an input to ``safety.update_state``, so the ordinary 30-second
+        memo would otherwise hand this republish the stale summary again.
+        ``_SnapshotRef.replace_fields`` applies only these three narrow fields
+        to the latest held object under its lock. That atomic patch matters
+        because a full sync can publish while the precomputes above are being
+        gathered; writing a whole snapshot read before that sync would regress
+        every data field and can restore a partial hydration seed.
         """
         c = _cctally()
-        fresh = replace(
-            snap,
+        c._load_sibling("_lib_snapshot_cache").reset_doctor_memo()
+        doctor_payload = c._cctally_tui._tui_precompute_doctor_payload(
+            _now_utc(), self._runtime_bind,
+        )
+        fresh = self._ref.replace_fields(
             envelope_precompute=(
                 c._cctally_tui._tui_precompute_envelope_config(load_config())
             ),
+            doctor_payload=doctor_payload,
             # #278 §1.4.1: a version-banner refresh republishes complete data;
             # force the hydration latch clear so a republish that happens to
             # carry a prior hydrating seed/partial doesn't freeze the client's
             # loading skeletons.
             hydrating=False,
         )
-        self._ref.set(fresh)
         self._hub.publish(fresh)
 
 

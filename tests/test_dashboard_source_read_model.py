@@ -535,6 +535,34 @@ def test_one_fresh_plus_one_stale_boundary_prefers_the_fresh_one():
     assert cycles[0].evidence_stale is False
 
 
+def test_future_start_boundary_is_skipped_before_fresh_first_ranking():
+    """A provider reset more than one window ahead cannot describe ``now``.
+
+    The anomalous boundary is fresh while the viable current boundary is stale,
+    so freshness ranking would otherwise select the future-start range and hand
+    the accounting reader ``end <= start``.
+    """
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    viable_reset = NOW + dt.timedelta(days=1)
+
+    cycles = source_module._resolve_codex_weekly_cycle((
+        _quota_observation(
+            root="root-anomalous", window_minutes=10_080,
+            resets_at=NOW + dt.timedelta(days=8),
+            logical_limit_key="limit-anomalous",
+        ),
+        _stale_weekly_observation(
+            root="root-viable", resets_at=viable_reset,
+            logical_limit_key="limit-viable",
+        ),
+    ), NOW)
+
+    assert len(cycles) == 1
+    assert cycles[0].resets_at == viable_reset
+    assert cycles[0].start_at < NOW
+    assert cycles[0].evidence_stale is True
+
+
 def test_two_stale_boundaries_with_no_fresh_is_conflicting():
     source_module = sys.modules["_cctally_dashboard_sources"]
 
@@ -1742,6 +1770,49 @@ def _seeded_context(tmp_path, monkeypatch):
     finally:
         conversations.close()
     return ns, cache, stats
+
+
+def test_future_start_boundary_does_not_break_repeated_source_builds(
+    tmp_path, monkeypatch,
+):
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    root_key = _cache_root_key(cache)
+    viable_reset = NOW + dt.timedelta(days=1)
+    monkeypatch.setattr(
+        source_module,
+        "load_codex_quota_observations",
+        lambda **_kwargs: (
+            _quota_observation(
+                root=root_key, window_minutes=10_080,
+                resets_at=NOW + dt.timedelta(days=8),
+                logical_limit_key="limit-anomalous",
+            ),
+            _stale_weekly_observation(
+                root=root_key, resets_at=viable_reset,
+                logical_limit_key="limit-viable",
+            ),
+        ),
+    )
+    context = DashboardReadContext(
+        cache_conn=cache, stats_conn=stats, range_start=START,
+        now_utc=NOW, display_tz_name="UTC",
+    )
+    try:
+        states = tuple(
+            source_module.build_codex_source_state(
+                context, data_version=f"future-start-{generation}",
+            )
+            for generation in range(2)
+        )
+
+        assert [state.data["hero"]["cycle"]["resets_at"] for state in states] == [
+            viable_reset.isoformat(), viable_reset.isoformat(),
+        ]
+        assert all(state.data["hero"]["total_tokens"] > 0 for state in states)
+    finally:
+        cache.close()
+        stats.close()
 
 
 def test_codex_session_name_stays_private_normalized_and_out_of_source_rows(
@@ -4839,11 +4910,13 @@ def test_claude_budget_stays_current_when_reused_during_a_codex_only_rebuild(
     reused = after.data["budget"]["status"]
     assert reused["pace"]["daily_usd"] != built["pace"]["daily_usd"]
     assert reused["spent_usd"] == built["spent_usd"]
-    # And the composed All mirror carries the same refreshed object.
-    assert (
-        second.sources["all"].data["providers"]["claude"]["budget"]["status"]
-        == reused
-    )
+    # #583 S3 §4: composition no longer mirrors the provider data under All.
+    # `after` IS the object `sources.claude` publishes, and the All mirror is
+    # the null stub — asserted here so this leg cannot go silently vacuous.
+    assert second.sources["claude"].data["budget"]["status"] == reused
+    assert second.sources["all"].data["providers"] == {
+        "claude": None, "codex": None,
+    }
 
 
 # -------------------------------------------------------------------------
@@ -4869,10 +4942,12 @@ ALLOWED_DELTAS = {
 #
 # Gated on the PATH, not the leaf name: `observed` and `anomaly_unevaluated`
 # ALSO exist on the Claude cache report, so allowing them by bare name would
-# blind this oracle to a Claude-side change under
-# `sources.all.data.providers.claude.cache_report` — which
-# `test_claude_source_state_is_unchanged` does NOT cover, since it pins only
-# `after["sources"]["claude"]`.
+# blind this oracle to a Claude-side change anywhere the walk reaches it.
+# Before #583 S3 that reach included `sources.all.data.providers.claude`, which
+# `test_claude_source_state_is_unchanged` does NOT cover because it pins only
+# `after["sources"]["claude"]`; the mirror is null now, so the physical entry
+# is the only Claude subtree the walk visits and the path gate still matters
+# for every leaf under it.
 CODEX_SCOPED_DELTAS = {
     "cached_input_percent", "cache_hit_percent", "wasted_usd",
     "fourteen_day_efficiency_ratio", "not_applicable", "anomaly_predicates",
@@ -4915,10 +4990,14 @@ S1_556_SCOPED_DELTAS = frozenset({
 # `aggregates` object with a range and two outcomes, and two rows-only provider
 # siblings. Prefix matching is what keeps every leaf beneath them out of the
 # oracle without also un-watching `rows`, `range` or `state` anywhere else.
+#
+# The two `sources.all.data.providers.claude.*` entries this set carried were
+# REMOVED by #583 S3: the All provider mirror publishes null, so no delta can
+# ever match them again and a prefix that matches nothing is a permanently
+# vacuous widening of the oracle. The physical `sources.claude.*` twins below
+# are the surviving — and now only — copies of those subtrees.
 S2_556_SCOPED_DELTA_PREFIXES = (
     "sources.all.data.aggregates",
-    "sources.all.data.providers.claude.projects.aggregate",
-    "sources.all.data.providers.claude.periods.daily_aggregate",
     "sources.claude.data.projects.aggregate",
     "sources.claude.data.periods.daily_aggregate",
 )
@@ -4929,9 +5008,10 @@ S2_556_SCOPED_DELTA_PREFIXES = (
 # `budget` or `status` are FORBIDDEN: they would mask an unrelated change to the
 # Codex budget domain or to any other object that happens to have a `status`.
 #
-#   * the Claude provider's own status, and the SAME object as composition
-#     mirrors it under All — two paths, because the oracle walks both subtrees
-#     and neither implies the other.
+#   * the Claude provider's own status. Before #583 S3 this was TWO paths,
+#     because composition mirrored the same object under All and the oracle
+#     walked both subtrees. The mirror publishes null now, so the second path
+#     can never match and was removed rather than left asserting nothing.
 #   * the Claude budget capability's `semantics`, which changed from the
 #     constant `subscription-week` to the configured period.
 #   * the bundle-level version field.
@@ -4942,10 +5022,20 @@ S2_556_SCOPED_DELTA_PREFIXES = (
 # for states this artifact cannot reach.
 S5_556_SCOPED_DELTA_PREFIXES = (
     "sources.claude.data.budget.status",
-    "sources.all.data.providers.claude.budget.status",
     "sources.claude.capabilities.budget.semantics",
     "source_schema_version",
 )
+
+
+# #583 S3 — the v10 wire. `sources.all.data.providers` stopped carrying the two
+# provider data objects and publishes null for both. EXACT paths, not a prefix:
+# `_deep_diff` reports a dict replaced by a scalar as ONE delta at the parent,
+# so these two entries are the whole intentional change, and a prefix would
+# additionally un-watch anything a later session put back underneath them.
+S3_583_SCOPED_DELTAS = frozenset({
+    "sources.all.data.providers.claude",
+    "sources.all.data.providers.codex",
+})
 
 
 def _is_s2_556_delta(path):
@@ -4970,7 +5060,7 @@ def _is_allowed_delta(path):
         return True
     if path in S1_556_SCOPED_DELTAS or _is_s2_556_delta(path):
         return True
-    if _is_s5_556_delta(path):
+    if _is_s5_556_delta(path) or path in S3_583_SCOPED_DELTAS:
         return True
     return segments[-1] in CODEX_SCOPED_DELTAS and "codex" in segments
 # NOT a wire semantic: `data_version` embeds `current_generation()`, a
@@ -5158,13 +5248,14 @@ _S5_ORACLE_BUDGET_CONFIG = {
     "budget": {"weekly_usd": 150.0, "period": "calendar-month"},
 }
 
-# The two prefixes whose whole purpose is to admit a published budget status.
-# The capability-detail and version prefixes are deliberately excluded: the
+# The prefix whose whole purpose is to admit a published budget status. The
+# capability-detail and version prefixes are deliberately excluded: the
 # capture's configured period is the DEFAULT, so the capability value does not
 # move, and the version is a scalar the general check already admits by name.
+# #583 S3 removed the `sources.all.data.providers.claude.budget.status` twin
+# along with the mirror that carried it.
 _S5_STATUS_PREFIXES = (
     "sources.claude.data.budget.status",
-    "sources.all.data.providers.claude.budget.status",
 )
 
 
@@ -5236,12 +5327,22 @@ def test_s5_delta_prefixes_are_non_vacuous(tmp_path, monkeypatch):
     assert unexpected == [], f"unintended envelope changes: {unexpected}"
 
 
+def test_s3_583_delta_set_admits_only_the_two_nulled_members():
+    """#583 S3 §4. The set REJECTS something — admitting the mirror's parent or
+    any descendant would un-watch a subtree the oracle still has to see."""
+    assert _is_allowed_delta("sources.all.data.providers.claude")
+    assert _is_allowed_delta("sources.all.data.providers.codex")
+    assert not _is_allowed_delta("sources.all.data.providers")
+    assert not _is_allowed_delta("sources.all.data.providers.claude.hero")
+    assert not _is_allowed_delta("sources.claude.data.hero")
+
+
 def test_s5_delta_predicate_reports_a_path_it_does_not_name():
     """The matcher REJECTS something — the test above passing does not show
     that, since a predicate admitting everything would also pass it."""
     assert _is_s5_556_delta("sources.claude.data.budget.status")
     assert _is_s5_556_delta("sources.claude.data.budget.status.verdict")
-    assert _is_s5_556_delta("sources.all.data.providers.claude.budget.status.pace.daily_usd")
+    assert _is_s5_556_delta("sources.claude.data.budget.status.pace.daily_usd")
     assert _is_s5_556_delta("sources.claude.capabilities.budget.semantics")
     assert _is_s5_556_delta("source_schema_version")
     # Neighbours that must NOT be admitted. A broad `budget` or `status` prefix
@@ -5249,6 +5350,9 @@ def test_s5_delta_predicate_reports_a_path_it_does_not_name():
     assert not _is_s5_556_delta("sources.claude.data.budget.settings")
     assert not _is_s5_556_delta("sources.claude.data.budget.forecast.verdict")
     assert not _is_s5_556_delta("sources.codex.data.budget.status")
+    # #583 S3 nulled the All provider mirror, so its budget status is no longer
+    # an admitted path in EITHER direction. The Claude twin went with it.
     assert not _is_s5_556_delta("sources.all.data.providers.codex.budget.status")
+    assert not _is_s5_556_delta("sources.all.data.providers.claude.budget.status")
     assert not _is_s5_556_delta("sources.claude.capabilities.budget.status")
     assert not _is_s5_556_delta("sources.claude.capabilities.quota.semantics")

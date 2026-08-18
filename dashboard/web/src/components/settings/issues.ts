@@ -78,34 +78,11 @@ export function resolveIssueTarget(field: string): IssueTarget {
   return { kind: 'form' };
 }
 
-// #143 and #134: four paths the endpoint deliberately ACCEPTS and does not
-// persist. A 200 that lists one of these is the documented outcome, not a
-// failure — `budget.period` has a regression test pinning exactly that.
-export const KNOWN_IGNORED_PATHS: ReadonlySet<string> = new Set([
-  'budget.period',
-  'budget.codex.amount_usd',
-  'budget.codex.period',
-  'budget.codex.alert_thresholds',
-]);
-
-export interface IgnoredClassification {
-  // Paths whose being ignored is expected. A polite notice, and the save
-  // succeeded.
-  expected: string[];
-  // Paths this client declared WRITABLE that came back ignored. That is a
-  // contract mismatch between client and server: the form stays open and dirty
-  // and the mismatch enters the error summary.
-  mismatched: string[];
-}
-
-export function classifyIgnored(paths: readonly string[]): IgnoredClassification {
-  const expected: string[] = [];
-  const mismatched: string[] = [];
-  for (const path of paths) {
-    if (LEAF_BY_PATH.has(path)) mismatched.push(path);
-    else if (KNOWN_IGNORED_PATHS.has(path)) expected.push(path);
-    // A path we never sent and never declared is neither: it cannot describe a
-    // promise this client made, so it is not worth interrupting a save for.
-  }
-  return { expected, mismatched };
+// #557: only an ignored path this overlay could actually submit can describe a
+// broken promise. The endpoint's four accepted-then-discarded paths are
+// disclosure-only rows: none is in REGISTRY, so buildBody() cannot send one.
+// The manifest/static contract tests pin that disjointness. If a response lists
+// an unsent path anyway, it says nothing about this save and needs no UI.
+export function mismatchedIgnoredPaths(paths: readonly string[]): string[] {
+  return paths.filter((path) => LEAF_BY_PATH.has(path));
 }

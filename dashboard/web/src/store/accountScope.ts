@@ -32,7 +32,6 @@
 import { resolveAccountFocus, sourceAccounts } from './accountFocus';
 import type {
   AccountCard,
-  AllSourceData,
   CodexAccountScope,
   CodexHero,
   CodexSourceData,
@@ -241,13 +240,11 @@ const memo = new WeakMap<object, Map<string, Envelope>>();
 // resolves to "All accounts" (or the source cannot scope), so an undecorated /
 // unfocused dashboard is byte-identical to today and every existing consumer,
 // test and golden is untouched.
-// #556 S5 §5.4 — BOTH MIRRORS are rewritten.
-//
-// Server composition stores the provider data objects AGAIN under
-// `sources.all.data.providers` (`bin/_lib_dashboard_sources.py`), and under All
-// `presentationProviders` PREFERS those mirrored children over the physical
-// entries. Rewriting only `sources.codex.data` would therefore leave most All
-// panels reading the unscoped mirror while the chip claimed to be filtering.
+// #583 S3 §4 — there is now ONE copy. `sources.all.data.providers` publishes
+// null for both providers, so rewriting it would reconstruct client-side the
+// duplication the wire change removed. Only the physical `sources.codex.data`
+// is narrowed, and every All panel reads the physical entry through
+// `presentationProviders`' fallback.
 // `sources.all.data.combined`, the aggregates and every other deliberately
 // unscoped outcome are left intact: a combined figure is never recomputed from
 // a focused child.
@@ -272,9 +269,12 @@ export function scopeEnvelope(
   if (sourceEntry?.data == null || accountScopesOf(sourceEntry) == null) return env;
   const focusKey = resolveAccountFocus(env, SCOPED_SOURCE, stored);
   if (focusKey == null) return env;
-  // The VIEW is part of the memo key, not just the focus: All and the Codex tab
-  // produce different envelopes from the same focus (All also rewrites the
-  // mirror), so collapsing them would serve one view the other's rewrite.
+  // The VIEW stays part of the memo key, not just the focus. Since #583 S3 the
+  // two selections produce structurally identical envelopes, so the key is no
+  // longer separating two different rewrites — it keeps each selection's
+  // getSnapshot result on its own stable object identity, which is what
+  // `useSyncExternalStore` requires, and it means a later per-view rewrite
+  // cannot silently serve one view the other's result.
   const cacheKey = `${source}\u0000${focusKey}`;
   let perEnv = memo.get(env as unknown as object);
   if (perEnv == null) {
@@ -289,19 +289,6 @@ export function scopeEnvelope(
     ...env.sources,
     [SCOPED_SOURCE]: { ...sourceEntry, data: resolved.data },
   } as SourcesMap;
-  if (source === 'all') {
-    const allEntry = sources.all ?? null;
-    const allData = (allEntry?.data ?? null) as AllSourceData | null;
-    if (allEntry != null && allData?.providers != null) {
-      sources.all = {
-        ...allEntry,
-        data: {
-          ...allData,
-          providers: { ...allData.providers, codex: resolved.data },
-        },
-      };
-    }
-  }
   const scoped = { ...env, sources } as Envelope;
   perEnv.set(cacheKey, scoped);
   return scoped;

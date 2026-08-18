@@ -38,7 +38,7 @@ import {
   type SectionId,
 } from './settings/registry';
 import {
-  classifyIgnored,
+  mismatchedIgnoredPaths,
   resolveIssueTarget,
   type IssueTarget,
 } from './settings/issues';
@@ -238,9 +238,6 @@ export function SettingsOverlay() {
   // from live typing — and by a routed server rejection. An entry clears when
   // its field changes or validates.
   const [issues, setIssues] = useState<SurfacedIssue[]>([]);
-  // A polite notice for a path the endpoint accepted and deliberately did not
-  // persist. The save succeeded; this only says what happened to it.
-  const [notice, setNotice] = useState<string | null>(null);
   // Whole seconds a submit has been in flight. Counted from ticks rather than
   // from a wall-clock delta so the behaviour is the same under fake timers.
   const [elapsed, setElapsed] = useState(0);
@@ -261,6 +258,10 @@ export function SettingsOverlay() {
   // emptied sections from the DOM rather than hiding them, so a screen reader
   // and the tab order see the same list a sighted user does.
   const [query, setQuery] = useState('');
+  // The visible result set follows every keystroke, while the polite region
+  // speaks only after the user pauses. Announcing every intermediate count
+  // made quick typing read as a burst of obsolete results (#557).
+  const [settledQuery, setSettledQuery] = useState('');
   // Set when an error-summary entry asks for a filtered-away control: clear the
   // filter, wait for the remount, then focus (§2.3 protocol 2). Focusing a node
   // that is not mounted is exactly the failure this exists to avoid.
@@ -278,11 +279,16 @@ export function SettingsOverlay() {
       setLanAuthRestartSaved(false);
       setConfirmDiscard(false);
       setIssues([]);
-      setNotice(null);
       setQuery('');
+      setSettledQuery('');
     }
     wasOpen.current = open;
   }, [open]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSettledQuery(query), 300);
+    return () => window.clearTimeout(timer);
+  }, [query]);
 
   // §3.6 — nothing extra below three seconds. Past it the status region names
   // the elapsed wall time. There is no cancel and no AbortController timeout:
@@ -582,7 +588,6 @@ export function SettingsOverlay() {
     const parseIssues = form.issues;
     const invalid = REGISTRY.filter((field) => parseIssues[field.id] !== undefined);
     if (invalid.length > 0) {
-      setNotice(null);
       setIssues(
         invalid.map((field) => ({
           key: field.id,
@@ -594,7 +599,6 @@ export function SettingsOverlay() {
       return;
     }
     setIssues([]);
-    setNotice(null);
 
     // 1. If any server-persisted leaf is dirty, commit it via POST
     //    /api/settings BEFORE dispatching local prefs. The body is assembled
@@ -630,15 +634,14 @@ export function SettingsOverlay() {
           focusIssue(target);
           return;
         }
-        // §3.5 — `ignored_fields` has two treatments. A path the client
-        // declares accepted-then-discarded is expected and the save succeeds.
-        // A path the client declared WRITABLE coming back ignored is a
-        // contract mismatch between client and server, so the form stays open
-        // and dirty and the mismatch enters the error summary.
-        const classified = classifyIgnored(saved.ignored_fields ?? []);
-        if (classified.mismatched.length > 0) {
+        // #557 — only a path this overlay submitted can describe a broken
+        // promise. Accepted-then-discarded keys are disclosure-only and never
+        // enter buildBody(); an ignored writable registry leaf is a contract
+        // mismatch, so the form stays open and dirty.
+        const mismatched = mismatchedIgnoredPaths(saved.ignored_fields ?? []);
+        if (mismatched.length > 0) {
           setIssues(
-            classified.mismatched.map((path) => {
+            mismatched.map((path) => {
               const target = resolveIssueTarget(path);
               return {
                 key: path,
@@ -652,15 +655,8 @@ export function SettingsOverlay() {
             }),
           );
           setSubmitting(false);
-          focusIssue(resolveIssueTarget(classified.mismatched[0]));
+          focusIssue(resolveIssueTarget(mismatched[0]));
           return;
-        }
-        if (classified.expected.length > 0) {
-          setNotice(
-            `Saved. ${classified.expected.join(', ')} ` +
-            `${classified.expected.length === 1 ? 'is' : 'are'} accepted here but ` +
-            'kept in the configuration file rather than written by the dashboard.',
-          );
         }
         if (saved.dashboard) {
           dispatch({ type: 'INGEST_DASHBOARD_PREFS', prefs: saved.dashboard });
@@ -805,10 +801,9 @@ export function SettingsOverlay() {
       ? `Still saving and refreshing… ${elapsed}s elapsed. A large history can ` +
         'make this take a while; the dashboard is not stuck.'
       : ''
-    : (notice ??
-      (dirtyCount === 0
-        ? ''
-        : `${dirtyCount} unsaved change${dirtyCount === 1 ? '' : 's'}.`));
+    : (dirtyCount === 0
+      ? ''
+      : `${dirtyCount} unsaved change${dirtyCount === 1 ? '' : 's'}.`);
 
   // §2.8 — every row exposes its scope to assistive technology and to the
   // filter index; VISIBLE scope text renders on per-browser rows only, and the
@@ -878,12 +873,18 @@ export function SettingsOverlay() {
   // §2.3 — the change count counts every draft, including drafts the filter is
   // hiding, and a persistent line says how many and offers a way back.
   const hiddenDirty = form.dirtyIds.filter((id) => !visibleRows.has(id));
-  const matchCount = visibleRows.size;
   const totalRows = rowIndex.length;
-  const filterCountText =
-    query_ === ''
+  const countTextFor = (rawQuery: string) => {
+    const normalized = rawQuery.trim().toLowerCase();
+    const count = rowIndex.filter(
+      (row) => normalized === '' || row.index.toLowerCase().includes(normalized),
+    ).length;
+    return normalized === ''
       ? `${totalRows} settings`
-      : `${matchCount} of ${totalRows} settings match “${query.trim()}”`;
+      : `${count} of ${totalRows} settings match “${rawQuery.trim()}”`;
+  };
+  const filterCountText = countTextFor(query);
+  const settledFilterCountText = countTextFor(settledQuery);
 
   return (
     <div id="settings-root">
@@ -933,17 +934,21 @@ export function SettingsOverlay() {
               onChange={(e) => changeQuery(e.target.value)}
             />
           </div>
-          {/* §4.1 — the third live region: a polite result count of its own.
-              `aria-live` rather than `role="status"`, because the form status
-              already claims that role and two elements with it would leave a
-              reader unable to tell which one just spoke. */}
+          {/* The visible count is immediate and still describes the searchbox.
+              A separate visually-hidden live region below is debounced, so
+              assistive technology hears only the settled result (#557). */}
           <p
             className="settings-filter-count"
             id="settings-filter-count"
+          >
+            {filterCountText}
+          </p>
+          <p
+            className="settings-filter-announcement sr-only"
             aria-live="polite"
             aria-atomic="true"
           >
-            {filterCountText}
+            {settledFilterCountText}
           </p>
           {hiddenDirty.length > 0 && (
             <p className="settings-hidden-dirty">
@@ -1035,7 +1040,7 @@ export function SettingsOverlay() {
                         that names the Custom radio, which made that radio's
                         accessible name read "Custom: America/New_York" and left
                         the input itself unnamed. */}
-                    <label className="settings-row" htmlFor="settings-tz-custom">
+                    <label htmlFor="settings-tz-custom">
                       Custom zone
                     </label>
                     {/* §3.2's "first invalid control" is THIS input and no
@@ -1099,7 +1104,7 @@ export function SettingsOverlay() {
                     </legend>
                     {/* §4.3 — named by a real label rather than by its
                         placeholder, which assistive technology need not read. */}
-                    <label className="settings-row" htmlFor="settings-filter-term">
+                    <label htmlFor="settings-filter-term">
                       Remembered filter term
                     </label>
                     <input
@@ -1118,7 +1123,7 @@ export function SettingsOverlay() {
                       Sessions per page{scopeNote('browser')}
                       {changedMark(perPageDirty)}
                     </legend>
-                    <label className="settings-row" htmlFor="settings-per-page">
+                    <label htmlFor="settings-per-page">
                       Sessions per page
                     </label>
                     {/* §3.7 — the draft is a STRING, parsed only at commit, so
@@ -1156,7 +1161,7 @@ export function SettingsOverlay() {
                         reports a configured `command_template`: the raw template
                         never reaches the client, so the dashboard can SELECT the
                         command notifier but not author it. */}
-                    <label className="settings-row">
+                    <label>
                       Notifier{' '}
                       <select
                         className="settings-btn settings-select"
@@ -1260,7 +1265,7 @@ export function SettingsOverlay() {
                         {show('budget.weekly_usd') && (
                           <>
                             {/* §5.2 — the one new editor. */}
-                            <label className="settings-row" htmlFor="settings-weekly-budget">
+                            <label htmlFor="settings-weekly-budget">
                               Weekly budget (equivalent $) {keyTag('budget.weekly_usd')}
                               {scopeNote('machine')}
                             </label>

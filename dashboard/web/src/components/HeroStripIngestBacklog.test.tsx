@@ -377,7 +377,7 @@ describe('<HeroStrip /> ingest-backlog disclosure — visibility', () => {
 
 describe('<HeroStrip /> ingest-backlog disclosure — Combined hero (#556 §4.3)', () => {
   it('qualifies the Combined spend from combined.qualifications', () => {
-    const { spent } = renderAll(withBacklog(makeDecoratedCodexSourceData()), {
+    const { spent } = renderAll(withBacklog(makeCodexSourceData()), {
       qualifications: [BACKLOG_QUALIFICATION],
     });
 
@@ -397,7 +397,7 @@ describe('<HeroStrip /> ingest-backlog disclosure — Combined hero (#556 §4.3)
   // Codex tab's own use, so a test that only checks the happy path cannot tell
   // which of the two sources All is actually reading.
   it('follows combined.qualifications even when the provider field disagrees', () => {
-    const { spent } = renderAll(makeDecoratedCodexSourceData(), {
+    const { spent } = renderAll(makeCodexSourceData(), {
       qualifications: [BACKLOG_QUALIFICATION],
     });
 
@@ -405,7 +405,7 @@ describe('<HeroStrip /> ingest-backlog disclosure — Combined hero (#556 §4.3)
   });
 
   it('renders no qualification carried only by the provider field', () => {
-    const { spent } = renderAll(withBacklog(makeDecoratedCodexSourceData()), {
+    const { spent } = renderAll(withBacklog(makeCodexSourceData()), {
       qualifications: [],
     });
 
@@ -414,14 +414,14 @@ describe('<HeroStrip /> ingest-backlog disclosure — Combined hero (#556 §4.3)
   });
 
   it('omits every qualification channel when no work is owed', () => {
-    const { spent } = renderAll(makeDecoratedCodexSourceData());
+    const { spent } = renderAll(makeCodexSourceData());
 
     expect(qualificationsIn(spent)).toEqual([]);
     expect(spent.getAttribute('title')).toBeNull();
   });
 
   it('shows the withheld reason rather than a qualification when there is no number', () => {
-    const { spent } = renderAll(withBacklog(makeDecoratedCodexSourceData()), {
+    const { spent } = renderAll(withBacklog(makeCodexSourceData()), {
       combinedAvailable: false,
     });
 

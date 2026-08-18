@@ -38,6 +38,12 @@
 # validated against cannot be read, because a plan for a set that cannot be run
 # is not a plan. CCTALLY_TEST_ALL_FAKE_NCPU pins the core count for
 # deterministic plan tests.
+#
+# CCTALLY_LINUX_MATRIX_RUN=1 selects the release gate's Linux profile. It is a
+# full platform gate rather than an arbitrary subset: the complete pytest phase
+# and every declared harness run except `test-remote`, whose subject is the
+# macOS/Homebrew LAN-runner wrapper Gate 0 already owns. Non-plan use is
+# admitted only on a non-root GitHub-shaped Linux lane.
 
 set -uo pipefail
 
@@ -165,6 +171,11 @@ COVERAGE_PYTEST=full
 # selection carries none rather than describing one it does not have.
 COVERAGE_RESOLVED=0
 _with_pytest_seen=0
+LINUX_MATRIX_MODE=${CCTALLY_LINUX_MATRIX_RUN:-0}
+case "$LINUX_MATRIX_MODE" in
+    0|1) ;;
+    *) contract_usage_abort "CCTALLY_LINUX_MATRIX_RUN must be 1 or unset" CCTALLY_LINUX_MATRIX_RUN ;;
+esac
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -222,6 +233,24 @@ done
 
 if [ "$_with_pytest_seen" = 1 ] && [ "$SUBSET_MODE" = 0 ]; then
     contract_usage_abort "--with-pytest requires at least one --harness; it is not a way to run the full suite" --with-pytest
+fi
+
+if [ "$LINUX_MATRIX_MODE" = 1 ]; then
+    if [ "$SUBSET_MODE" = 1 ]; then
+        contract_usage_abort "CCTALLY_LINUX_MATRIX_RUN cannot accompany --harness; the Linux profile owns its exact platform selection" CCTALLY_LINUX_MATRIX_RUN
+    fi
+    if [ "$CONTRACT_PROFILE" != private ]; then
+        contract_usage_abort "CCTALLY_LINUX_MATRIX_RUN is a private pre-release profile" CCTALLY_LINUX_MATRIX_RUN
+    fi
+    if [ "${CCTALLY_TEST_ALL_PLAN:-}" != 1 ]; then
+        [ "${GITHUB_ACTIONS:-}" = true ] \
+            || contract_usage_abort "CCTALLY_LINUX_MATRIX_RUN requires GITHUB_ACTIONS=true" CCTALLY_LINUX_MATRIX_RUN
+        [ "$(uname -s)" = Linux ] \
+            || contract_usage_abort "CCTALLY_LINUX_MATRIX_RUN requires Linux" CCTALLY_LINUX_MATRIX_RUN
+        [ "$(id -u)" -ne 0 ] \
+            || contract_usage_abort "CCTALLY_LINUX_MATRIX_RUN refuses root" CCTALLY_LINUX_MATRIX_RUN
+    fi
+    COVERAGE_MODE=linux-matrix
 fi
 
 if [ "$SUBSET_MODE" = 1 ]; then
@@ -313,6 +342,25 @@ done
 # describe. `parallel_harnesses` is empty for an estate carrying no pool
 # harness at all.
 all_harnesses=(${parallel_harnesses[@]+"${parallel_harnesses[@]}"} "${final_harnesses[@]}")
+
+# `test-remote` verifies the macOS/Homebrew LAN execution wrapper itself. It is
+# deliberately outside the Linux/Python/filesystem compatibility profile and
+# remains mandatory in Gate 0. No caller-provided name is accepted here: this
+# fixed one-harness omission is the profile's entire definition.
+if [ "$LINUX_MATRIX_MODE" = 1 ]; then
+    linux_harnesses=()
+    linux_omitted=0
+    for h in ${all_harnesses[@]+"${all_harnesses[@]}"}; do
+        if [ "$h" = test-remote ]; then
+            linux_omitted=$((linux_omitted + 1))
+        else
+            linux_harnesses+=("$h")
+        fi
+    done
+    [ "$linux_omitted" = 1 ] \
+        || contract_usage_abort "the Linux matrix profile expected exactly one test-remote harness, found $linux_omitted" CCTALLY_LINUX_MATRIX_RUN
+    all_harnesses=(${linux_harnesses[@]+"${linux_harnesses[@]}"})
+fi
 
 # A subset narrows the EXECUTED set only, in manifest order. A selected name
 # that has no file on disk (or lost its executable bit) leaves nothing here,
@@ -1082,8 +1130,25 @@ contract_manifest_load "$REPO_ROOT/tests/authoritative-test-manifest.json" || co
 # rather than before plan mode, so plan mode still exits without parsing the
 # manifest; a subset resolved its own coverage earlier and is left alone.
 if [ "$COVERAGE_RESOLVED" != 1 ]; then
-    COVERAGE_SELECTED=$(contract_manifest_harness_names "$CONTRACT_PROFILE" | tr '\n' ' ')
-    COVERAGE_SELECTED=${COVERAGE_SELECTED% }
+    if [ "$LINUX_MATRIX_MODE" = 1 ]; then
+        COVERAGE_SELECTED=""
+        COVERAGE_OMITTED=""
+        while IFS= read -r _n; do
+            [ -n "$_n" ] || continue
+            if [ "$_n" = test-remote ]; then
+                COVERAGE_OMITTED="$COVERAGE_OMITTED$_n "
+            else
+                COVERAGE_SELECTED="$COVERAGE_SELECTED$_n "
+            fi
+        done <<EOF
+$(contract_manifest_harness_names "$CONTRACT_PROFILE")
+EOF
+        COVERAGE_SELECTED=${COVERAGE_SELECTED% }
+        COVERAGE_OMITTED=${COVERAGE_OMITTED% }
+    else
+        COVERAGE_SELECTED=$(contract_manifest_harness_names "$CONTRACT_PROFILE" | tr '\n' ' ')
+        COVERAGE_SELECTED=${COVERAGE_SELECTED% }
+    fi
     COVERAGE_RESOLVED=1
 fi
 contract_admit_harnesses "$REPO_ROOT" "$CONTRACT_PROFILE" || contract_abort
@@ -1645,6 +1710,15 @@ print(match.group(1).decode() if match else "0")
 PY
 }
 
+# Parse only node IDs the authoritative estate can actually own. Both pytest
+# invocations collect repository tests under tests/, whose node IDs are Python
+# paths followed by `::...`; accepting arbitrary `FAILED worker::crashed` prose
+# would turn an infrastructure message into a product failure.
+_parse_pytest_failed_nodes() {   # <logfile>
+    grep -E '^(FAILED|ERROR) tests/[[:alnum:]_./-]+\.py::[^[:space:]]+' \
+        "$1" || true
+}
+
 if [ "$COVERAGE_PYTEST" = "skipped" ]; then
     # A subset run skips the pytest phase, and the serial benchmark leg with
     # it, unless --with-pytest was given (section 4.3). Nothing is recorded
@@ -1710,12 +1784,21 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
     # Read for MEANING, not as a boolean: 1 is product, 5 (nothing collected)
     # is incomplete, 2/3/4 (interrupted, internal error, usage) are
     # infrastructure.
-    contract_classify_pytest "$pytest_rc" "pytest" "$(_parse_pytest_passed "$pytest_log")"
     if [ "$pytest_rc" -ne 0 ]; then
         pytest_status="FAIL"
         pytest_dump_main=1
-        pytest_failed_nodes=$(grep -E '^(FAILED|ERROR) ' "$pytest_log" || true)
+        pytest_failed_nodes=$(_parse_pytest_failed_nodes "$pytest_log")
     fi
+    pytest_node_state=unknown
+    if [ "$pytest_rc" -eq 1 ]; then
+        if [ -n "$pytest_failed_nodes" ]; then
+            pytest_node_state=present
+        else
+            pytest_node_state=none
+        fi
+    fi
+    contract_classify_pytest "$pytest_rc" "pytest" \
+        "$(_parse_pytest_passed "$pytest_log")" "$pytest_node_state"
     if [ "${#pytest_serial_targets[@]}" -gt 0 ]; then
         printf '[cctally-test-all] benchmark phase started — serial targets: %s\n' \
             "${#pytest_serial_targets[@]}" >&2
@@ -1732,12 +1815,10 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
         wait "$PHASE_PID"
         pytest_benchmark_rc=$?
         PHASE_PID=""
-        contract_classify_pytest "$pytest_benchmark_rc" "benchmark" \
-            "$(_parse_pytest_passed "$pytest_benchmark_log")"
         if [ "$pytest_benchmark_rc" -ne 0 ]; then
             pytest_status="FAIL"
             pytest_dump_benchmark=1
-            benchmark_failed_nodes=$(grep -E '^(FAILED|ERROR) ' "$pytest_benchmark_log" || true)
+            benchmark_failed_nodes=$(_parse_pytest_failed_nodes "$pytest_benchmark_log")
             if [ -n "$benchmark_failed_nodes" ]; then
                 if [ -n "$pytest_failed_nodes" ]; then
                     pytest_failed_nodes+=$'\n'
@@ -1745,6 +1826,16 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
                 pytest_failed_nodes+="$benchmark_failed_nodes"
             fi
         fi
+        benchmark_node_state=unknown
+        if [ "$pytest_benchmark_rc" -eq 1 ]; then
+            if [ -n "$benchmark_failed_nodes" ]; then
+                benchmark_node_state=present
+            else
+                benchmark_node_state=none
+            fi
+        fi
+        contract_classify_pytest "$pytest_benchmark_rc" "benchmark" \
+            "$(_parse_pytest_passed "$pytest_benchmark_log")" "$benchmark_node_state"
     fi
     pytest_wall=$((SECONDS - pytest_start))
     # Both dumps are DEFERRED until the reporter has been joined, so the
@@ -1779,7 +1870,7 @@ if [ "$pytest_status" = "FAIL" ]; then
         echo "pytest failing node ids:"
         while IFS= read -r node; do echo "  $node"; done <<< "$pytest_failed_nodes"
     else
-        echo "pytest failing node ids: (none parsed — likely a pytest INTERNALERROR or a truncated/missing log; see '---- pytest FAIL details ----' on stderr)"
+        echo "pytest failing node ids: (none parsed — see the Verdict below for its infrastructure or incomplete classification; likely a pytest INTERNALERROR, worker crash, empty collection, or truncated/missing log; see '---- pytest FAIL details ----' on stderr)"
     fi
 fi
 echo "Total: passed=$total_pass   failed=$total_fail   pytest=$pytest_status   (outer=$OUTER inner=$INNER pytest=$PYTEST)"

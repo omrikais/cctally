@@ -238,8 +238,10 @@ export function presentationProviders(
   const data = entry?.data ?? null;
   return {
     selection,
-    claude: data?.providers.claude ?? env?.sources?.claude?.data ?? null,
-    codex: data?.providers.codex ?? env?.sources?.codex?.data ?? null,
+    // #583 S3 §4 — `?.` on BOTH links. The mirror is published null and may one
+    // day be absent; guarding only `data` threw a TypeError inside this render.
+    claude: data?.providers?.claude ?? env?.sources?.claude?.data ?? null,
+    codex: data?.providers?.codex ?? env?.sources?.codex?.data ?? null,
     hydrating: env == null || (data == null && entry?.last_success_at == null && (entry?.warnings.length ?? 0) === 0),
     warnings: entry?.warnings ?? [],
   };
@@ -878,7 +880,16 @@ function budgetPresentationOf(
   }
   const notConfigured = domain.not_configured;
   if (notConfigured != null) {
-    return { state: 'not_configured', disposition: notConfigured.disposition };
+    return {
+      state: 'not_configured',
+      disposition: notConfigured.disposition,
+      ...(notConfigured.account_key == null
+        ? {}
+        : { accountKey: notConfigured.account_key }),
+      ...(notConfigured.configured_accounts == null
+        ? {}
+        : { configuredAccounts: notConfigured.configured_accounts }),
+    };
   }
   return { state: 'not_configured', disposition: 'provider_budget_unset' };
 }

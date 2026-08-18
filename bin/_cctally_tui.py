@@ -228,6 +228,7 @@ from _lib_fmt import stable_sum
 # shared no-op singleton), so the _tui_build_snapshot seam wraps below cost
 # nothing on the default path.
 import _lib_perf as _perf
+import _lib_tick_stats as _tick_stats
 import _lib_log
 
 import importlib.util as _ilu
@@ -1064,6 +1065,12 @@ class SyncFailureAttribution:
     leg: str
     database: str
     corruption: bool
+    # #583 S2 §7. True only when the exception's PRIMARY SQLite code is
+    # SQLITE_BUSY or SQLITE_LOCKED. Defaulted so every existing construction
+    # site is unchanged and no current input reaches the new classifier
+    # branch; `_tui_capture_sync_failure` is the one normal site that supplies
+    # the real value, and it already receives the exception.
+    sqlite_busy: bool = False
 
 
 class _StatsSnapshotCorruption(Exception):
@@ -1120,10 +1127,24 @@ def _tui_capture_sync_failure(
     attributed_database, corruption = _tui_attribute_corruption(
         conn, exc, database=database
     )
+    # #583 S2 §7. Mask the primary code out of the extended one: SQLite
+    # reports extended codes such as SQLITE_BUSY_SNAPSHOT (517), which this
+    # repository already contends with in its multi-writer cache and
+    # conversations locking, and an unmasked comparison would miss the most
+    # likely case. Numeric only — a string-only hop carrying "database is
+    # locked" must not set the flag, because Preserve 10 forbids widening raw
+    # text matching. `_is_sqlite_corruption_error` is the precedent for
+    # reading the code and is untouched.
+    code = getattr(exc, "sqlite_errorcode", None)
+    sqlite_busy = bool(
+        isinstance(code, int)
+        and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    )
     failure = SyncFailureAttribution(
         leg=leg,
         database=attributed_database,
         corruption=corruption,
+        sqlite_busy=sqlite_busy,
     )
     if (
         failure.database == "stats"
@@ -1299,6 +1320,15 @@ class DataSnapshot:
     # Placed LAST with a default so positional fixture constructors keep
     # working.
     hydrating: bool = False
+    # ---- #583 S2: queue / activity state ----
+    # Owned by ``_SnapshotRef`` and merged in at ``set()`` / mutation time.
+    # Builders never populate it: A2 and the final publish both replace the
+    # snapshot wholesale, so a request accepted mid-build would have its
+    # counter overwritten by the older object the builder had assembled.
+    # ``None`` means "no activity known yet"; the envelope renders that as an
+    # idle object. Trailing default so positional fixture constructors keep
+    # working; appears in NO ``--json``/CLI surface.
+    sync_activity: dict | None = None
     # ---- #300: change-signal for the dashboard's lazy detail fetchers ----
     # A compact, deterministic string derived from the whole DB dispatch
     # signature (``_snapshot_data_version(dispatch_sig)``): it changes iff ANY
@@ -3264,6 +3294,28 @@ def _tui_claude_data_with_budget(
     return merged
 
 
+def _tui_note_codex_regime(value: str) -> None:
+    """Stamp the REALISED Codex source-leg decision on the open tick (§1.5).
+
+    Read from what the leg actually did, not from ``CodexIngestStats.
+    rows_changed``. ``_write_codex_file_batch`` can leave ``rows_changed == 0``
+    while unconditionally advancing ``codex_physical_mutation_seq`` after a
+    quota, thread, root, cursor or metadata write; that sequence reaches
+    ``codex_version`` through ``compute_signature``, ``reuse_coherent_source_
+    state`` requires exact version equality, and the mismatch therefore drives
+    a genuinely expensive Codex rebuild that ``rows_changed`` would stamp as
+    idle. The repository already reached this conclusion for the #313 F4
+    reconcile gate, in two comments in ``bin/_cctally_cache.py``.
+
+    Aggregated over the refresh by ``TickContext.set_codex_regime``: several
+    builds can run inside one refresh and disagree, and last-write
+    classification would move an expensive tick into the idle population.
+    """
+    tick = _tick_stats.current()
+    if tick is not None:
+        tick.set_codex_regime(value)
+
+
 def _tui_build_source_bundle(
     *,
     stats_conn,
@@ -3290,6 +3342,27 @@ def _tui_build_source_bundle(
     c = _cctally()
     cache_conn = c.open_cache_db()
     cache_read_tx = False
+    pin_started_ns: "int | None" = None
+
+    def _record_cache_pin() -> None:
+        """Stamp the elapsed hold exactly once, on whichever path ends it.
+
+        Called immediately before BOTH rollbacks — the normal one after the
+        bundle is composed, and the `finally` one that runs when the build
+        raises. A build that crashed still held the pin for however long it
+        ran, and omitting that would bias the published figure toward the
+        cheap ticks. `pin_started_ns` is cleared here so the second call on
+        the exception path, where both rollbacks are reachable, is a no-op.
+        """
+        nonlocal pin_started_ns
+        if pin_started_ns is None:
+            return
+        elapsed = time.monotonic_ns() - pin_started_ns
+        pin_started_ns = None
+        tick = _tick_stats.current()
+        if tick is not None:
+            tick.mark_cache_pin(elapsed)
+
     try:
         # Keep cache.db on one stable snapshot, but leave stats.db in
         # statement-scoped autocommit.  A dashboard source build can spend
@@ -3302,6 +3375,12 @@ def _tui_build_source_bundle(
         if not cache_conn.in_transaction:
             cache_conn.execute("BEGIN")
             cache_read_tx = True
+            # #583 S5 §2.4 / acceptance criterion 16: the hold is stamped at
+            # the BEGIN and ROLLBACK boundaries themselves. This function's
+            # cumulative duration also counts the work before BEGIN and after
+            # ROLLBACK, so it is an upper bound on the hold rather than the
+            # hold, and no document may quote it as one.
+            pin_started_ns = time.monotonic_ns()
         if common_range_start is None:
             # Resolved through the SAME helper the callers use, with no daily
             # panel. A bare `now_utc - 30 days` here is a microsecond-precise
@@ -3671,6 +3750,11 @@ def _tui_build_source_bundle(
             # inherits it.
             if codex is not None and aggregate_scope_failed(codex):
                 codex = None
+            # #583 S1 §1.5: the realised decision, read at the `codex is None`
+            # predicate this branch has just settled. Stamped only here, so a
+            # tick whose Codex leg degraded on ingest failure or contention
+            # stays `not_observed` — no build reached the decision at all.
+            _tui_note_codex_regime("active" if codex is None else "idle")
         if codex is None:
             try:
                 codex = build_codex_source_state(
@@ -3687,6 +3771,15 @@ def _tui_build_source_bundle(
                         codex_quota_actual_thresholds=semantics.codex_quota_actual_thresholds,
                         codex_quota_projected_thresholds=semantics.codex_quota_projected_thresholds,
                         cache_report_anomaly_threshold_pp=semantics.cache_report_anomaly_threshold_pp,
+                        # #583 S5: the three digests this function already
+                        # computed above, handed to the quota memo's reuse
+                        # identity instead of being derived a second time per
+                        # memo call. Same values, same order, same connection,
+                        # and taken under the `assert_projection_readable` gate
+                        # already run at the top of this build.
+                        stats_identity=(
+                            stats_digest, accounts_digest, claude_digest,
+                        ),
                     ),
                     data_version=codex_version,
                 )
@@ -3750,7 +3843,23 @@ def _tui_build_source_bundle(
         # whose statement-scoped autocommit reads may have mixed generations.
         # Rejecting ordinary cache advancement starves publication whenever
         # active Claude/Codex sessions append faster than this build completes.
+        #
+        # ONE EXCEPTION since #583 S5, stated here because a narrowing of this
+        # transaction has to account for it. Every cache read this build ISSUES
+        # runs on the pinned connection and sees the frozen generation, but the
+        # Codex quota memo `_CODEX_QUOTA_OBSERVATION_CACHE` now survives across
+        # builds, so a five-hour correlation read can be answered from a value
+        # another caller loaded -- the share render or the cycle-detail route,
+        # on an unpinned connection at a different generation. That value is
+        # served only while its key is unmoved, and the key covers the ledger
+        # sequence, the attribution revision, the database path and the three
+        # digests taken above, so the evidence behind it provably has not
+        # changed. The full argument is at `_cached_codex_quota_observations`
+        # in `bin/_cctally_dashboard_sources.py`. The dashboard's own bounded
+        # quota read is NOT in that class: it passes `memoize=False` and is
+        # always physically issued on the pinned connection.
         if cache_read_tx:
+            _record_cache_pin()
             cache_conn.rollback()
             cache_read_tx = False
         post_stats_digest = codex_stats_digest(stats_conn)
@@ -3778,6 +3887,7 @@ def _tui_build_source_bundle(
             raise RuntimeError("source read generation moved during build")
         return bundle
     finally:
+        _record_cache_pin()
         if cache_read_tx:
             cache_conn.rollback()
         cache_conn.close()
@@ -3874,6 +3984,26 @@ def _tui_common_source_range_start(
     return start
 
 
+def _tui_publish_final(tick, hub, snap, *, publication="final",
+                       monotonic_ns=None, utcnow=None):
+    """Publish a tick's closing frame, then close its record (#583 S1 §1.2).
+
+    The order is the contract and it is asserted by spec §7.3: the record is
+    written AFTER ``hub.publish`` returns, so a reader that sees a ring entry
+    knows the frame reached the hub rather than merely having been built. The
+    two clocks are injectable for that gate; production passes neither.
+
+    ``tick`` may be None so a caller outside a tick boundary still publishes.
+    """
+    hub.publish(snap)
+    if tick is None:
+        return
+    monotonic_ns = monotonic_ns or time.monotonic_ns
+    utcnow = utcnow or (lambda: dt.datetime.now(dt.timezone.utc))
+    tick.set_publication(publication)
+    tick.finish(published_ns=monotonic_ns(), published_at=utcnow().isoformat())
+
+
 def _tui_build_snapshot(
     *,
     now_utc: dt.datetime | None = None,
@@ -3882,7 +4012,60 @@ def _tui_build_snapshot(
     precompute_envelope: bool = False,
     runtime_bind: "str | None" = None,
 ) -> DataSnapshot:
-    """Build once, then perform at most one post-query stats heal/reopen."""
+    """Build once, then perform at most one post-query stats heal/reopen.
+
+    #583 S1 §1.2/§1.3: opens a STANDALONE tick context only when no dashboard
+    tick is already open on this thread, so a build made outside a refresh is
+    recorded while an A2 partial build nested inside a live refresh is not
+    double-counted as a second tick. THREE callers reach it that way — ``tui
+    --render-once``, ``cctally-snapshot-measure``, and the dashboard's own
+    pre-bind seed on the ``--no-sync`` branch of
+    ``_dashboard_initial_snapshot_once``. The spec names only the first two and
+    says the A1 seed is outside the tick boundary because "it bypasses
+    ``_tui_build_snapshot``"; that is true of the ingesting branch and false of
+    the ``--no-sync`` one, which calls straight through here. Recording it is
+    right — it is a real build with a real cost — so the surface names the
+    class rather than enumerating callers. The
+    builder span is installed here as well as at the dashboard's own ``_build``
+    wrapper, because those two standalone callers never reach that wrapper and
+    would otherwise carry a total duration with no split.
+    """
+    if _tick_stats.current() is not None:
+        return _tui_build_snapshot_impl(
+            now_utc=now_utc, skip_sync=skip_sync,
+            display_tz_pref_override=display_tz_pref_override,
+            precompute_envelope=precompute_envelope,
+            runtime_bind=runtime_bind,
+        )
+    tick = _tick_stats.begin_tick(standalone=True)
+    try:
+        with tick.build_span():
+            snap = _tui_build_snapshot_impl(
+                now_utc=now_utc, skip_sync=skip_sync,
+                display_tz_pref_override=display_tz_pref_override,
+                precompute_envelope=precompute_envelope,
+                runtime_bind=runtime_bind,
+            )
+    except BaseException:
+        tick.mark_degraded()
+        raise
+    finally:
+        tick.finish(
+            published_ns=time.monotonic_ns(),
+            published_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
+    return snap
+
+
+def _tui_build_snapshot_impl(
+    *,
+    now_utc: dt.datetime | None = None,
+    skip_sync: bool = False,
+    display_tz_pref_override: "str | None" = None,
+    precompute_envelope: bool = False,
+    runtime_bind: "str | None" = None,
+) -> DataSnapshot:
+    """The build-and-heal body. See ``_tui_build_snapshot`` for the boundary."""
 
     try:
         return _tui_build_snapshot_once(
@@ -4040,9 +4223,19 @@ def _tui_build_snapshot_once(
         claude_ingest_failed = False
         codex_ingest_contended = False
         codex_ingest_failed = False
+        _tick = _tick_stats.current()
         with _perf.phase("sync") as _p_sync:
             _p_sync.set_meta(ingest=do_ingest)
             if do_ingest:
+                # #583 S1 §1.3: the internal-sync ingest span, for the direct
+                # build path (`tui --render-once`, `cctally-snapshot-measure`).
+                # Bracketed rather than a `with` block so the body below is not
+                # reindented; a leaked span is closed by `TickContext.finish`.
+                _ingest_span = (
+                    _tick.ingest_span() if _tick is not None else None
+                )
+                if _ingest_span is not None:
+                    _ingest_span.__enter__()
                 try:
                     cache_conn = _cctally().open_cache_db()
                     cache_mod = _cctally()._load_sibling("_cctally_cache")
@@ -4112,6 +4305,8 @@ def _tui_build_snapshot_once(
                     if precompute_envelope:
                         codex_ingest_failed = True
                     capture_failure("sync-cache-open", "cache", exc)
+                if _ingest_span is not None:
+                    _ingest_span.__exit__(None, None, None)
         # Force pure reads for every view builder below, independent of the
         # caller's flag: the single ingest above is the only glob per tick.
         skip_sync = True
@@ -4177,6 +4372,12 @@ def _tui_build_snapshot_once(
             try:
                 _sc = _cctally()._load_sibling("_lib_snapshot_cache")
                 prior_key, prior_snap = _sc.dispatch_state()
+                # #583 S1 §1.1: cold versus warm. A build with no prior
+                # dispatch memo has nothing to reuse, so it pays the whole
+                # source construction; the flag is sticky across the refresh,
+                # because one cold build makes the tick a cold tick.
+                if _tick is not None:
+                    _tick.set_cold(prior_snap is None)
                 if prior_snap is not None:
                     prior_source_bundle = getattr(prior_snap, "source_bundle", None)
             except Exception as exc:
@@ -4247,6 +4448,8 @@ def _tui_build_snapshot_once(
                         )
                         assert _sc is not None
                         _sc.store_dispatch_state(dispatch_key, idle_snap)
+                    if _tick is not None:
+                        _tick.set_dispatch("idle")   # §1.4: the reuse branch
                     _p_snapshot.__exit__(None, None, None)
                     if _perf.enabled():
                         _perf.stash_last(
@@ -4265,7 +4468,8 @@ def _tui_build_snapshot_once(
                 # `use_weekref_cost_cache=True`; any failure leaves the flag OFF
                 # (safe direct-compute fallback, byte-identical output).
                 try:
-                    _rc_cache_conn = _cctally().open_cache_db()
+                    with _perf.phase("reconcile.cache_open"):
+                        _rc_cache_conn = _cctally().open_cache_db()
                     try:
                         with _perf.phase("reconcile.weekref") as _pr:
                             _pr.set_meta(hit=False)
@@ -4863,6 +5067,11 @@ def _tui_build_snapshot_once(
         # into the process-global slot for the loopback /api/debug/backend
         # endpoint. Whole-dict atomic assignment; never mutated after. No-op
         # when tracing is off.
+        if _tick is not None:
+            # §1.4: the full branch. `full` outranks a later `idle` inside the
+            # same refresh, because a refresh containing one full build cost
+            # what a full build costs.
+            _tick.set_dispatch("full")
         _p_snapshot.__exit__(None, None, None)
         if _perf.enabled():
             _perf.stash_last(
@@ -4898,8 +5107,11 @@ def _tui_precompute_doctor_payload(
     def _compute(now: dt.datetime, bind: "str | None") -> dict:
         _ld = c._load_sibling("_lib_doctor")
         try:
-            _doc_state = c.doctor_gather_state(now_utc=now, runtime_bind=bind)
-            _doc_report = _ld.run_checks(_doc_state)
+            with _perf.phase("doctor.gather"):
+                _doc_state = c.doctor_gather_state(
+                    now_utc=now, runtime_bind=bind)
+            with _perf.phase("doctor.checks"):
+                _doc_report = _ld.run_checks(_doc_state)
             return {
                 "severity": _doc_report.overall_severity,
                 "counts": dict(_doc_report.counts),
@@ -5198,7 +5410,13 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
     return dataclasses.replace(
         prior,
         generated_at=now_utc,
-        last_sync_at=time.monotonic(),
+        # #583 S2 §6.1: `last_sync_at` means "last SUCCESSFUL validation". A
+        # clean idle tick IS one — it re-verified through four independent
+        # gates that nothing changed, so the reused rows are genuinely
+        # current. A tick that recorded an error retains the prior stamp
+        # rather than reporting itself as a fresh success.
+        last_sync_at=(time.monotonic() if not errors
+                      else getattr(prior, "last_sync_at", None)),
         last_sync_error=("; ".join(errors) if errors else None),
         sync_failures=tuple(idle_failures),
         doctor_payload=doctor_payload,
@@ -5253,7 +5471,9 @@ def _tui_stats_retry_degraded_snapshot(
             errors.append(f"doctor-precompute: {doctor_exc}")
     return dataclasses.replace(
         _tui_empty_snapshot(now_utc),
-        last_sync_at=time.monotonic(),
+        # #583 S2 §6.1: this produced no successful snapshot, and it builds
+        # from the empty snapshot, so there is no earlier success to preserve.
+        last_sync_at=None,
         last_sync_error="; ".join(errors),
         sync_failures=(
             SyncFailureAttribution(
@@ -7490,7 +7710,7 @@ class _A2ThrottleClock:
 def _make_a2_progress_cb(*, ref, hub, build_partial, throttle, monotonic,
                          perf=_perf):
     """Build the A2 throttled ``sync_cache`` progress callback (extracted so the
-    throttle + suppression logic is unit-testable with injected deps).
+    throttle + isolation logic is unit-testable with injected deps).
 
     On proceed it builds a partial via ``build_partial()`` (a fresh, complete
     ``skip_sync=True`` snapshot over the current committed cache — NOT nested in
@@ -7499,19 +7719,28 @@ def _make_a2_progress_cb(*, ref, hub, build_partial, throttle, monotonic,
     only the publish carries the latch, so the memo's retained object stays
     clean). The dispatch-memo write itself happens inside ``build_partial()`` /
     ``_tui_build_snapshot`` (its snapshot-cache reconcile step), NOT in this cb.
-    Suppressed entirely while perf tracing is
-    active (spec §2.2): progressive fill is a UX nicety, and a partial build's
-    ``_perf.reset_thread`` would clobber the standalone ``sync_cache``'s
-    in-flight trace phases. Trace-off (all normal use) is unaffected.
+
+    #583 S1 §2.1: this used to return early whenever perf tracing was active,
+    which meant arming the trace silently switched progressive fill off. The
+    hazard that justified the suppression is real but narrower than a blanket
+    skip — the partial build's unconditional ``_perf.reset_thread()`` rebinds
+    ``_tls.stack`` while the enclosing ``sync_cache`` still holds its ``walk``
+    phase, whose ``Phase._stack`` is the original list, so the outer phase
+    would later close into a detached or fragmented root. Isolating the partial
+    build's thread state addresses exactly that, and the publication now
+    happens whether or not tracing is on.
     """
     def cb(_stats) -> None:
-        if perf.enabled():
-            return
         now = monotonic()
         if not throttle.should_fire(now):
             return
-        snap = build_partial()
-        ref.set(snap)
+        with perf.isolated_thread_state():
+            snap = build_partial()
+        # #583 S2 §6.2 publication point 3: publish what the reference now
+        # HOLDS, not the local build. A request accepted while `build_partial`
+        # ran is on the reference and absent from `snap`, so publishing `snap`
+        # would erase its counter and the client would never settle.
+        snap = ref.set(snap)
         hub.publish(dataclasses.replace(snap, hydrating=True))
         throttle.mark_done(monotonic())
     return cb
@@ -7552,11 +7781,24 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
         # re-export AND ``monkeypatch.setitem(ns, "_tui_build_snapshot", spy)``
         # in tests propagate into this closure body (a bare-name lookup would
         # resolve in this sibling's __dict__ and miss the cctally-side patch).
-        return sys.modules["cctally"]._tui_build_snapshot(
-            now_utc=pinned_now, skip_sync=skip_sync,
-            display_tz_pref_override=display_tz_pref_override,
-            precompute_envelope=True, runtime_bind=runtime_bind,
-        )
+        #
+        # #583 S1 §1.3: one of the TWO builder-span sites. This wrapper is
+        # dashboard-local, so `tui --render-once` and `cctally-snapshot-measure`
+        # never reach it and take the span at `_tui_build_snapshot`'s standalone
+        # boundary instead. The span subtracts any ingest nested inside it.
+        tick = _tick_stats.current()
+        if tick is None:
+            return sys.modules["cctally"]._tui_build_snapshot(
+                now_utc=pinned_now, skip_sync=skip_sync,
+                display_tz_pref_override=display_tz_pref_override,
+                precompute_envelope=True, runtime_bind=runtime_bind,
+            )
+        with tick.build_span():
+            return sys.modules["cctally"]._tui_build_snapshot(
+                now_utc=pinned_now, skip_sync=skip_sync,
+                display_tz_pref_override=display_tz_pref_override,
+                precompute_envelope=True, runtime_bind=runtime_bind,
+            )
 
     def _locked(skip_sync: bool) -> None:
         # #279 S5 F6.3 (gate P1-1): arm the snapshot-cache owner-thread tripwire
@@ -7565,11 +7807,19 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
         # on-call, so ownership transfers to the current rebuilder; the guards in
         # _lib_snapshot_cache then catch a lock-bypassing foreign-thread mutation.
         _cctally()._load_sibling("_lib_snapshot_cache").mark_owner_thread()
+        # #583 S1 §1.2: the tick opens here and closes after the final publish,
+        # so the progressive, final, deferred and crash publication paths are
+        # all inside it. The A1 pre-bind seed is deliberately outside, because
+        # it bypasses `_tui_build_snapshot` and writes no dispatch state.
+        tick = _tick_stats.begin_tick()
         try:
             if not skip_sync:
                 # ── Decoupled ingest + build (§2.1) ─────────────────────────
                 import time as _time
                 sync_error = None
+                # #583 S2 §6.1: the last SUCCESSFUL validation, read before
+                # A2's partial republishes can overwrite the held snapshot.
+                prior_sync_at = ref.get().last_sync_at
                 start = _time.monotonic()
                 throttle = _A2ThrottleClock(_A2_PARTIAL_THROTTLE_S, start=start)
                 cb = _make_a2_progress_cb(
@@ -7579,6 +7829,18 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 )
                 cache_conn = _cctally().open_cache_db()
                 cache_mod = _cctally()._load_sibling("_cctally_cache")
+                # #583 S1 §1.3: the ingest span, opened through the
+                # contextmanager protocol rather than a `with` block so the
+                # long try/except/finally below is not reindented. The A2
+                # progress callback runs `build_partial()` SYNCHRONOUSLY inside
+                # this region, so the builder spans it opens nest here and
+                # their time is subtracted — without that, every progress build
+                # is counted once as ingest and again as builder and
+                # `ingest_ns + builder_ns` can exceed `duration_ns`. A span
+                # left open by an escaping exception is closed by
+                # `TickContext.finish`, so no try/finally is needed to bound it.
+                _ingest = tick.ingest_span()
+                _ingest.__enter__()
                 try:
                     # Under CCTALLY_PERF_TRACE the phase tree this standalone
                     # sync_cache builds is intentionally NOT surfaced in the live
@@ -7608,6 +7870,13 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                     sync_error = f"sync-cache: {exc}"
                 finally:
                     cache_conn.close()
+                _ingest.__exit__(None, None, None)
+                # #583 S1 §2.2: the ONE place a pending trace-arm request is
+                # consumed. After the cache connection closes and immediately
+                # before the authoritative build, so a request landing
+                # mid-ingest cannot split one ingest across two tracing states,
+                # and A2 partial builds never consume it.
+                _perf.apply_pending()
                 snap = _build(skip_sync=True)  # final: hydrating=False (default)
                 if sync_error is not None:
                     # Thread the standalone sync error into last_sync_error, sync
@@ -7617,10 +7886,27 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                     merged = (sync_error if not existing
                               else f"{sync_error}; {existing}")
                     snap = dataclasses.replace(snap, last_sync_error=merged)
-                ref.set(snap)
-                hub.publish(snap)
+                # #583 S2 §6.1: `last_sync_at` means "last SUCCESSFUL
+                # validation", and `_tui_build_snapshot` stamps it
+                # unconditionally. A build that recorded any failure carries
+                # the prior successful value forward instead of reporting
+                # itself as freshly synced.
+                if snap.last_sync_error:
+                    snap = dataclasses.replace(snap, last_sync_at=prior_sync_at)
+                # #583 S2 §6.2 publication point 4: publish what the reference
+                # holds, so a request accepted during the build is not erased.
+                # `set_final` also clears `rebuilding` in the same acquisition,
+                # so this ONE frame reports the rebuild finished; the loop's
+                # trailing `mark_rebuilding(False)` then finds no transition and
+                # publishes nothing. That is what keeps an automatic tick at two
+                # frames instead of three, PLUS one per A2 progress publish that
+                # cleared the throttle above — several on a cold first-run
+                # ingest, none on a warm one.
+                snap = ref.set_final(snap)
+                _tui_publish_final(tick, hub, snap)
                 return
             # ── skip_sync=True: single-build path (POST /api/settings) ──────
+            _perf.apply_pending()   # §2.2: the no-ingest build's arm boundary
             snap = _build(skip_sync=True)
             # Mirror the startup override: suppress the monotonic sync stamp so
             # the envelope keeps emitting sync_age_s=None and the client keeps
@@ -7629,8 +7915,10 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
             # from _tui_build_snapshot, restated here since this is a replace()
             # clone site).
             snap = dataclasses.replace(snap, last_sync_at=None, hydrating=False)
-            ref.set(snap)
-            hub.publish(snap)
+            # Terminal for this branch too, for the same reason: POST
+            # /api/settings brackets its rebuild with the same flag pair.
+            snap = ref.set_final(snap)
+            _tui_publish_final(tick, hub, snap)
         except _cctally().StatsRebuildDeferred as exc:
             # #453: the first periodic tick runs before HTTP bind. Preserve the
             # initial hydrating/degraded frame while the dedicated replay owns
@@ -7656,8 +7944,9 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 generated_at=dt.datetime.now(dt.timezone.utc),
                 hydrating=True,
             )
-            ref.set(pending)
-            hub.publish(pending)
+            pending = ref.set(pending)   # #583 S2 §6.2: publish what is held
+            tick.mark_degraded()
+            _tui_publish_final(tick, hub, pending, publication="degraded")
         except Exception as exc:
             prev = ref.get()
             crashed = dataclasses.replace(
@@ -7673,8 +7962,19 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 # seed/partial, so the client doesn't stay stuck in skeletons.
                 hydrating=False,
             )
-            ref.set(crashed)
-            hub.publish(crashed)
+            crashed = ref.set(crashed)   # #583 S2 §6.2: publish what is held
+            tick.mark_degraded()
+            _tui_publish_final(tick, hub, crashed, publication="degraded")
+        finally:
+            # A tick always closes. Every publication path above finishes it,
+            # and `finish` is idempotent, so this only catches an escape none
+            # of them handled — a BaseException such as KeyboardInterrupt.
+            if not tick.finished:
+                tick.mark_degraded()
+                tick.finish(
+                    published_ns=time.monotonic_ns(),
+                    published_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                )
     return _locked
 
 

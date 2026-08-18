@@ -120,5 +120,5 @@ def test_scale_evidence_is_structural_and_non_vacuous():
 
     bench = (ROOT / "bench" / "README.md").read_text(encoding="utf-8")
     assert "~300K-entry-class corpus" in bench
-    assert "14 benchmarks" in bench
+    assert "15 benchmarks" in bench
     assert "--scale large" in bench

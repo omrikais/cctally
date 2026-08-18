@@ -181,14 +181,20 @@ def test_codex_labels_are_injected_per_request_into_parent_and_account_rows():
     )
 
     def codex_rows(env):
+        # #583 S3 §4: `sources.all.data.providers` publishes null for both
+        # members, so the physical `sources.codex` entry is the ONE place the
+        # All tab reads these rows from. The mirrored pair this used to check
+        # was the SAME list object, so dropping it removes a duplicate
+        # assertion rather than coverage — the mirror's own nulling is
+        # asserted immediately below.
         sources = env["sources"]
         direct = sources["codex"]["data"]
-        nested = sources["all"]["data"]["providers"]["codex"]
+        assert sources["all"]["data"]["providers"] == {
+            "claude": None, "codex": None,
+        }
         return (
             direct["sessions"]["rows"],
             direct["account_scopes"]["account-a"]["sessions"]["rows"],
-            nested["sessions"]["rows"],
-            nested["account_scopes"]["account-a"]["sessions"]["rows"],
         )
 
     for env in (open_first, open_again):
@@ -245,6 +251,12 @@ def test_api_data_returns_json_200():
     ns["DashboardHTTPHandler"].hub = ns["SSEHub"]()
     ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](
         ns["_empty_dashboard_snapshot"]()
+    )
+    # #583 S3 §7: `/api/data` serves the most recently PUBLISHED state, so a
+    # bare reference is not enough — seed the hub exactly as `cmd_dashboard`
+    # does before the HTTP server binds.
+    ns["DashboardHTTPHandler"].hub.publish(
+        ns["DashboardHTTPHandler"].snapshot_ref.get()
     )
     srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
     t = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -560,3 +572,371 @@ def test_header_vs_last_week_delta_uses_is_current_row():
     env = ns["snapshot_to_envelope"](
         snap, now_utc=dt.datetime(2026, 4, 20, 12, 0, tzinfo=dt.timezone.utc))
     assert env["header"]["vs_last_week_delta"] == -0.07
+
+
+# --- #583 S3 §6/§7: /api/data serves the last PUBLISHED state, compressed ----
+
+
+def _boot(ns, hub, ref):
+    ns["DashboardHTTPHandler"].hub = hub
+    ns["DashboardHTTPHandler"].snapshot_ref = ref
+    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
+    srv.handle_error = lambda request, client_address: None
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return srv, t
+
+
+def _fetch(port, *, accept_encoding=None, path="/api/data"):
+    """GET `path`, controlling `Accept-Encoding` exactly.
+
+    `http.client` sends `Accept-Encoding: identity` unless told not to, so the
+    gzip case has to be requested deliberately.
+    """
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.putrequest("GET", path, skip_accept_encoding=True)
+    c.putheader("Host", f"127.0.0.1:{port}")
+    if accept_encoding is not None:
+        c.putheader("Accept-Encoding", accept_encoding)
+    c.endheaders()
+    r = c.getresponse()
+    body = r.read()
+    headers = {k.lower(): v for k, v in r.getheaders()}
+    c.close()
+    return r.status, headers, body
+
+
+def _hydrating(snap, value):
+    import dataclasses
+    return dataclasses.replace(snap, hydrating=value)
+
+
+def test_api_data_agrees_with_the_stream_on_hydrating_during_a_progressive_fill():
+    """#600. The A2 callback sets the reference to a snapshot whose `hydrating`
+    flag differs from the one it publishes, so reading the REFERENCE labelled
+    partial data complete — measured at +2.6s while the build finished at
+    +105.6s. `/api/data` now reports the last PUBLISHED state, which is by
+    construction what the stream last sent.
+    """
+    ns = load_script()
+    base = ns["_empty_dashboard_snapshot"]()
+    hub = ns["SSEHub"]()
+    ref = ns["_SnapshotRef"](_hydrating(base, True))
+    hub.publish(ref.get())
+    # The builder assembles a NON-hydrating snapshot into the reference while
+    # the fill is still running, and has not published it.
+    ref.set(_hydrating(base, False))
+    srv, t = _boot(ns, hub, ref)
+    try:
+        status, _headers, body = _fetch(srv.server_address[1])
+        assert status == 200
+        env = json.loads(body)
+        assert env["hydrating"] is True, (
+            "/api/data reported a snapshot as complete that no client was sent")
+        assert ref.get().hydrating is False, "precondition: the two disagree"
+    finally:
+        srv.shutdown()
+        t.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    "mutator", ["set", "capture_batch", "settle", "mark_rebuilding"])
+def test_api_data_serves_the_last_published_state_for_every_mutator(mutator):
+    """The reference is mutated by FOUR operations that publish separately, so
+    `/api/data` is DEFINED as the last published state rather than as the
+    reference. Exercising only `set` would miss three of the four windows in
+    which the two can disagree."""
+    ns = load_script()
+    base = ns["_empty_dashboard_snapshot"]()
+    hub = ns["SSEHub"]()
+    ref = ns["_SnapshotRef"](_hydrating(base, True))
+    hub.publish(ref.get())
+
+    if mutator == "set":
+        ref.set(_hydrating(base, False))
+    elif mutator == "capture_batch":
+        ref.set(_hydrating(base, False))
+        ref.capture_batch()
+    elif mutator == "settle":
+        ref.set(_hydrating(base, False))
+        batch_id, _refresh = ref.capture_batch()
+        ref.settle(batch_id, "ok")
+    else:
+        ref.set(_hydrating(base, False))
+        ref.mark_rebuilding(True)
+
+    srv, t = _boot(ns, hub, ref)
+    try:
+        status, _headers, body = _fetch(srv.server_address[1])
+        assert status == 200
+        assert json.loads(body)["hydrating"] is True, mutator
+    finally:
+        srv.shutdown()
+        t.join(timeout=2)
+
+
+def test_api_data_503s_before_the_first_publication():
+    """No silent fallback to the reference: that is exactly the disagreement
+    this endpoint's contract removes."""
+    ns = load_script()
+    hub = ns["SSEHub"]()
+    ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+    srv, t = _boot(ns, hub, ref)
+    try:
+        status, _headers, body = _fetch(srv.server_address[1])
+        assert status == 503
+        assert "error" in json.loads(body)
+    finally:
+        srv.shutdown()
+        t.join(timeout=2)
+
+
+def test_api_data_is_gzip_when_negotiated_and_decodes_to_the_identity_body():
+    import gzip as _gzip
+    ns = load_script()
+    hub = ns["SSEHub"]()
+    snap = ns["_empty_dashboard_snapshot"]()
+    ref = ns["_SnapshotRef"](snap)
+    hub.publish(snap)
+    srv, t = _boot(ns, hub, ref)
+    port = srv.server_address[1]
+    try:
+        st_id, h_id, body_id = _fetch(port, accept_encoding="identity")
+        st_gz, h_gz, body_gz = _fetch(port, accept_encoding="gzip")
+        assert st_id == st_gz == 200
+        assert h_id.get("content-encoding") is None
+        assert h_gz.get("content-encoding") == "gzip"
+        assert h_id.get("vary") == h_gz.get("vary") == "Accept-Encoding"
+        # Content-Length describes the bytes actually on the wire.
+        assert int(h_gz["content-length"]) == len(body_gz)
+        assert int(h_id["content-length"]) == len(body_id)
+        decoded = _gzip.decompress(body_gz)
+        # Byte-for-byte the identity serialization, modulo the wall-clock
+        # fields that legitimately advance between two requests.
+        assert json.loads(decoded)["header"] == json.loads(body_id)["header"]
+        assert len(body_gz) < len(body_id)
+        # And the strict JSON contract holds through compression.
+        assert json.loads(decoded)["source_schema_version"] == SOURCE_SCHEMA_VERSION
+    finally:
+        srv.shutdown()
+        t.join(timeout=2)
+
+
+def test_api_data_never_appends_a_second_response_after_committing():
+    """#583 S3 §6. The handler used to wrap the header commit AND the body
+    write in one `try` whose `except` called `_respond_json(500, ...)`, which
+    writes a SECOND HTTP response onto an already-committed stream. Fail the
+    body write and assert no JSON error body follows the partial body.
+    """
+    ns = load_script()
+    hub = ns["SSEHub"]()
+    snap = ns["_empty_dashboard_snapshot"]()
+    ref = ns["_SnapshotRef"](snap)
+    hub.publish(snap)
+    handler = ns["DashboardHTTPHandler"]
+    responded = []
+    real_respond = handler._respond_json
+
+    def recording(self, status, payload):
+        responded.append(status)
+        return real_respond(self, status, payload)
+
+    handler._respond_json = recording
+    real_data = handler._serve_api_data
+
+    fired = []
+
+    def failing_write(self):
+        real_write = self.wfile.write
+
+        def write(data):
+            # The BODY, not the header block: `BaseHTTPRequestHandler` flushes
+            # its buffered headers through this same `write`, and failing on
+            # those would exercise the PRE-commit path this test is not about.
+            if len(data) > 1000:
+                fired.append(len(data))
+                raise BrokenPipeError("simulated peer gone mid-body")
+            return real_write(data)
+
+        self.wfile.write = write
+        try:
+            return real_data(self)
+        finally:
+            self.wfile.write = real_write
+
+    handler._serve_api_data = failing_write
+    srv, t = _boot(ns, hub, ref)
+    try:
+        try:
+            _fetch(srv.server_address[1])
+        except Exception:
+            pass    # a truncated response is the expected client-side outcome
+        assert fired, "the injected write failure never fired — test is vacuous"
+        assert responded == [], (
+            f"a second HTTP response was appended after commit: {responded}")
+    finally:
+        handler._respond_json = real_respond
+        handler._serve_api_data = real_data
+        srv.shutdown()
+        t.join(timeout=2)
+
+
+def _raw_get(port, path="/api/data"):
+    """Every byte the server wrote for one request, unparsed.
+
+    `http.client` stops reading at the end of the FIRST response, so it cannot
+    observe a second HTTP response appended onto an already-committed stream.
+    Reading the socket to EOF can, and counting `HTTP/1.` status lines is the
+    discriminating assertion.
+    """
+    import socket
+    chunks = []
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        s.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            "Accept-Encoding: identity\r\nConnection: close\r\n\r\n".encode())
+        while True:
+            block = s.recv(65536)
+            if not block:
+                break
+            chunks.append(block)
+    except OSError:
+        pass
+    finally:
+        s.close()
+    return b"".join(chunks)
+
+
+def test_api_data_never_appends_a_second_response_when_the_503_write_fails():
+    """#583 S3 §6, on the one path the prepare/commit split did not enumerate.
+
+    The not-yet-published 503 was written INSIDE the preparation `try` whose
+    `except` answers a JSON 500. So a failure part-way through writing the 503
+    was caught by that `except`, which appended a SECOND HTTP response onto a
+    stream the handler had already committed — exactly the defect the split
+    exists to remove. The CHANGELOG already tells users this cannot happen, so
+    it must actually not happen.
+    """
+    ns = load_script()
+    # Nothing published, so the handler takes the 503 path.
+    hub = ns["SSEHub"]()
+    ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+    handler = ns["DashboardHTTPHandler"]
+    real_data = handler._serve_api_data
+    fired = []
+
+    def failing_body_write(self):
+        real_write = self.wfile.write
+
+        def write(data):
+            # The JSON body, not the header block: `BaseHTTPRequestHandler`
+            # flushes its buffered headers through this same `write` and those
+            # start with `HTTP/1.`. Failing the body leaves the response
+            # COMMITTED, which is the state the handler must not answer twice.
+            if data[:1] == b"{":
+                fired.append(bytes(data))
+                raise BrokenPipeError("simulated peer gone mid-body")
+            return real_write(data)
+
+        self.wfile.write = write
+        try:
+            return real_data(self)
+        finally:
+            self.wfile.write = real_write
+
+    handler._serve_api_data = failing_body_write
+    srv, t = _boot(ns, hub, ref)
+    try:
+        raw = _raw_get(srv.server_address[1])
+        assert fired, "the injected write failure never fired — test is vacuous"
+        assert raw.split(b"\r\n", 1)[0].split()[1:2] == [b"503"], raw[:200]
+        assert raw.count(b"HTTP/1.") == 1, (
+            "a second HTTP response was appended after commit: %r" % (raw[:400],))
+    finally:
+        handler._serve_api_data = real_data
+        srv.shutdown()
+        t.join(timeout=2)
+
+
+def test_api_data_projects_with_a_freshly_sampled_clock_not_the_publication_pin():
+    """#583 S3 §5, acceptance criterion 8, second half.
+
+    A delivery pins its clock at publication so every SSE client served from one
+    tick agrees on the age fields. `/api/data` answers NOW, so reusing that pin
+    would report ages frozen at the last publication: a poll long after the last
+    tick would claim the data had just been synced.
+
+    Two OBSERVED events are compared — the pin the hub stored at publication and
+    the clock the handler passed into the projection — never a wall-clock
+    ceiling.
+
+    The comparison is made on `time.monotonic()` alone. The handler samples its
+    UTC through `_now_utc()`, which honours `CCTALLY_AS_OF`, while the hub pins
+    `dt.datetime.now(dt.timezone.utc)`, which does not. A worker that leaked
+    `CCTALLY_AS_OF` into `os.environ` would therefore fail a UTC comparison for
+    a reason that has nothing to do with the mechanism under test, and this
+    repository has already lost a session to exactly that leak. The monotonic
+    pair carries the whole claim: `mono1 > pinned.pinned_monotonic` proves the
+    handler sampled rather than reused the pin, and `mono2 > mono1` proves it
+    samples per request. `utc2 >= utc1` is kept because both sides come from
+    `_now_utc()`, so a pin makes them equal instead of making them disagree.
+    """
+    ns = load_script()
+    hub = ns["SSEHub"]()
+    snap = ns["_empty_dashboard_snapshot"]()
+    ref = ns["_SnapshotRef"](snap)
+    hub.publish(snap)
+    pinned = hub.latest()
+    dashboard = ns["_cctally_dashboard"]
+    real = dashboard.snapshot_to_envelope
+    seen = []
+
+    def recording(snapshot, **kw):
+        seen.append((kw.get("now_utc"), kw.get("monotonic_now")))
+        return real(snapshot, **kw)
+
+    dashboard.snapshot_to_envelope = recording
+    srv, t = _boot(ns, hub, ref)
+    try:
+        assert _fetch(srv.server_address[1])[0] == 200
+        assert _fetch(srv.server_address[1])[0] == 200
+    finally:
+        dashboard.snapshot_to_envelope = real
+        srv.shutdown()
+        t.join(timeout=2)
+
+    assert len(seen) == 2, seen
+    (utc1, mono1), (utc2, mono2) = seen
+    assert mono1 > pinned.pinned_monotonic, (
+        "/api/data reused the publication pin instead of sampling now")
+    # And each request samples again rather than caching the first sample.
+    assert mono2 > mono1
+    assert utc2 >= utc1
+
+
+def test_api_data_still_500s_when_projection_fails_before_commit():
+    """Preparation-phase failures must still answer a JSON 500 — nothing has
+    been sent yet, so a status code is still available."""
+    ns = load_script()
+    hub = ns["SSEHub"]()
+    snap = ns["_empty_dashboard_snapshot"]()
+    ref = ns["_SnapshotRef"](snap)
+    hub.publish(snap)
+    dashboard = ns["_cctally_dashboard"]
+    real = dashboard.snapshot_to_envelope
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("projection exploded")
+
+    dashboard.snapshot_to_envelope = boom
+    srv, t = _boot(ns, hub, ref)
+    try:
+        status, headers, body = _fetch(srv.server_address[1])
+        assert status == 500
+        assert headers.get("content-type", "").startswith("application/json")
+        assert json.loads(body) == {"error": "internal error"}
+    finally:
+        dashboard.snapshot_to_envelope = real
+        srv.shutdown()
+        t.join(timeout=2)

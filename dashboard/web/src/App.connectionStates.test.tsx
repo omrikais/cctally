@@ -7,8 +7,11 @@ import type { Envelope } from './types/envelope';
 
 const ENV = { header: {}, sessions: { total: 0, rows: [], sort_key: 'started_desc' } } as unknown as Envelope;
 
-function stubConn(disconnected: boolean, bootstrapError: boolean) {
-  vi.spyOn(conn, 'useConnectionStatus').mockReturnValue({ disconnected, bootstrapError });
+function stubConn(
+  disconnected: boolean, bootstrapError: boolean, bootstrapMessage: string | null = null,
+) {
+  vi.spyOn(conn, 'useConnectionStatus')
+    .mockReturnValue({ disconnected, bootstrapError, bootstrapMessage });
 }
 
 beforeEach(() => { localStorage.clear(); _resetStore(); vi.restoreAllMocks(); });
@@ -26,6 +29,18 @@ describe('App connection states (B2/B3)', () => {
     const { container } = render(<App />);
     expect(container.querySelector('.stale-banner-error')).not.toBeNull();
     expect(container.querySelector('.panel.is-skeleton')).toBeNull();
+  });
+
+  // #583 S3 §7 — the first-frame watchdog raises the error view for a stream
+  // that connected and then said nothing. "Couldn't load dashboard data" points
+  // the reader at a server that is answering, so the raiser supplies its own
+  // sentence and it has to reach the banner.
+  it('error: a raiser-supplied message replaces the default sentence', () => {
+    stubConn(false, true, 'The dashboard’s update stream is open but has sent no data.');
+    const { container } = render(<App />);
+    const banner = container.querySelector('.stale-banner-error')!;
+    expect(banner.textContent).toContain('update stream');
+    expect(banner.textContent).not.toContain('Couldn’t load dashboard data');
   });
 
   it('ready + disconnected: live grid dimmed + stale banner', () => {

@@ -10,10 +10,31 @@
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Page } from '@playwright/test';
+import type { APIResponse, Page, Route } from '@playwright/test';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUNTIME = resolve(HERE, '.runtime');
+
+// #583 S3 §7 — fulfil a mutated `/api/data` body without contradicting itself.
+//
+// `e2e/serve.sh` runs the real server, and `/api/data` compresses when the
+// client negotiates gzip. Playwright's `route.fetch()` sends
+// `accept-encoding: gzip,deflate,br` and transparently decompresses what comes
+// back, but `APIResponse.headers()` still carries the ORIGINAL
+// `Content-Encoding: gzip` and the COMPRESSED `Content-Length`. Passing
+// `{ response, json }` to `route.fulfill` copies those headers verbatim onto a
+// plain-JSON body, which Chromium may reject with
+// `ERR_CONTENT_DECODING_FAILED`. Fulfilling explicitly keeps the real status
+// and states only headers that are true of the body actually being sent.
+export async function fulfilJson(
+  route: Route, response: APIResponse, payload: unknown,
+): Promise<void> {
+  await route.fulfill({
+    status: response.status(),
+    contentType: 'application/json',
+    body: JSON.stringify(payload),
+  });
+}
 
 export interface Manifest {
   long_session_id: string;

@@ -988,21 +988,42 @@ def _authoritative_record_usage(
     observed_axes,
     *,
     lock_held: bool = False,
+    nudge_dashboard: bool = True,
+    nudge_sink=None,
 ) -> _AuthoritativeRecordResult:
     """Record OAuth authority under write-ahead tombstones and reconcile it.
 
     ``lock_held`` is for OAuth refresh callers that already hold the selected
     lock across their fetch, authoritative publication, and matching backoff
     transition. All other callers acquire the same blocking lock here.
+
+    ``nudge_dashboard`` (#583 S2 §5.3) is passed straight through to
+    ``cmd_record_usage``. It defaults on, so the statusline / hook path keeps
+    nudging; ``_refresh_usage_inproc`` passes False.
+
+    ``nudge_sink`` defers the nudge out of the selected-state critical section.
+    The nudge is a loopback POST with a multi-second timeout, and this lock is
+    an ``fcntl.flock`` every cctally process contends on, so firing it here
+    would let one unresponsive listener stall every other process's
+    selected-state writes. This frame owns the lock only on the
+    ``lock_held=False`` path, so that is the only path that can fire the
+    deferred nudge itself; a caller passing ``lock_held=True`` owns the lock
+    and must supply its own sink, or the nudge stays inside its section.
     """
     if not lock_held:
+        deferred = []
         try:
             with _selected_state_lock():
-                return _authoritative_record_usage(
-                    args, observed_axes, lock_held=True
+                result = _authoritative_record_usage(
+                    args, observed_axes, lock_held=True,
+                    nudge_dashboard=nudge_dashboard,
+                    nudge_sink=(nudge_sink or (lambda: deferred.append(1))),
                 )
         except OSError as exc:
             return _AuthoritativeRecordResult("record_failed", str(exc))
+        if deferred:
+            _cctally()._nudge_dashboard_repaint()
+        return result
 
     now_epoch = int(time.time())
     try:
@@ -1011,7 +1032,8 @@ def _authoritative_record_usage(
         return _AuthoritativeRecordResult("record_failed", str(exc))
 
     try:
-        rc = _cctally().cmd_record_usage(args)
+        rc = _cctally().cmd_record_usage(
+            args, nudge_dashboard=nudge_dashboard, nudge_sink=nudge_sink)
     except _cctally().StatsRebuildDeferred as exc:
         return _AuthoritativeRecordResult("record_failed", str(exc))
     except Exception as exc:
@@ -1109,7 +1131,18 @@ def _projection_changed(before: "_candidates.DbProjection", after: "_candidates.
     return before.five_hour != after.five_hour or before.seven_day != after.seven_day
 
 
-def _statusline_reduce_and_publish() -> "_candidates.ReductionDecision | None":
+def _statusline_reduce_and_publish(
+        *, nudge_sink=None) -> "_candidates.ReductionDecision | None":
+    """Reduce the candidate spool and publish the winner.
+
+    ``nudge_sink`` (#583 S2) is threaded to ``cmd_record_usage``. EVERY caller
+    of this function runs it inside the statusline persist flock — the forked
+    child takes it blocking, and the ``sync_for_test`` path runs under the
+    parent's hold — and the dashboard nudge is a loopback POST with a
+    multi-second timeout. Firing it in here would let one unresponsive listener
+    stall every statusline render on this machine, at status-line cadence. The
+    caller that acquired the lock fires the real nudge once it has released.
+    """
     now_epoch = int(time.time())
     candidates = _load_candidate_spool(now_epoch=now_epoch)
     if not candidates:
@@ -1170,7 +1203,7 @@ def _statusline_reduce_and_publish() -> "_candidates.ReductionDecision | None":
     # "record_failed".
     try:
         record_rc = _cctally().cmd_record_usage(
-            args, ingest_mode="opportunistic"
+            args, ingest_mode="opportunistic", nudge_sink=nudge_sink
         )
     except _cctally().StatsRebuildDeferred:
         return decision
@@ -1255,9 +1288,14 @@ def _fork_persist(parent_lock_fd: int) -> None:
             fcntl.flock(child_fd, fcntl.LOCK_EX)
         except OSError:
             child_fd = -1
+        # #583 S2: the dashboard nudge fires AFTER this lock is released. This
+        # is the path a real statusline render takes, and the nudge is a
+        # loopback POST with a multi-second timeout.
+        deferred = []
         try:
             if child_fd >= 0:
-                _statusline_reduce_and_publish()
+                _statusline_reduce_and_publish(
+                    nudge_sink=lambda: deferred.append(1))
         finally:
             if child_fd >= 0:
                 try:
@@ -1268,6 +1306,8 @@ def _fork_persist(parent_lock_fd: int) -> None:
                     os.close(child_fd)
                 except OSError:
                     pass
+            if deferred:
+                _cctally()._nudge_dashboard_repaint()
     except BaseException:
         pass
     finally:
@@ -1288,16 +1328,22 @@ def _statusline_persist(parsed, *, sync_for_test: bool = False) -> None:
     lock_fd = c._try_acquire_persist_lock()
     if lock_fd is None:
         return
+    # #583 S2: same deferral as the forked child. This frame owns the lock, so
+    # it is the frame that must fire the nudge once it has released it.
+    deferred = []
     try:
         preliminary = _preliminary_decision()
         if preliminary is None or preliminary.action == "NOOP":
             return
         if sync_for_test:
-            _statusline_reduce_and_publish()
+            _statusline_reduce_and_publish(
+                nudge_sink=lambda: deferred.append(1))
             return
         _fork_persist(lock_fd)
     finally:
         c._release_persist_lock(lock_fd)
+        if deferred:
+            c._nudge_dashboard_repaint()
 
 
 def _try_acquire_statusline_oauth_lock() -> "int | None":

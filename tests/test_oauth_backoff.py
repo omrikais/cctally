@@ -151,7 +151,7 @@ def test_ok_via_hook_resets_backoff_state(monkeypatch, tmp_path):
     what proves the success path called the reset."""
     ns = _load(monkeypatch, tmp_path)
     _prime_hook(ns, monkeypatch)
-    monkeypatch.setitem(ns, "cmd_record_usage", lambda args: 0)
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda args, **kw: 0)
 
     # A prior 429 streak that has since expired: deadline in the past, count>0.
     ns["_oauth_backoff_register_429"](
@@ -175,7 +175,7 @@ def test_hook_record_failure_keeps_backoff_state(monkeypatch, tmp_path):
     authoritative writer protocol succeeds, rather than merely after fetch."""
     ns = _load(monkeypatch, tmp_path)
     _prime_hook(ns, monkeypatch)
-    monkeypatch.setitem(ns, "cmd_record_usage", lambda args: 7)
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda args, **kw: 7)
     ns["_oauth_backoff_register_429"](
         retry_after_deadline=time.time() - 10, now=time.time() - 70
     )
@@ -280,7 +280,7 @@ def test_backfill_attempts_when_statusline_stale(monkeypatch, tmp_path):
 
     ns = _load(monkeypatch, tmp_path)
     _prime_hook(ns, monkeypatch)
-    monkeypatch.setitem(ns, "cmd_record_usage", lambda args: 0)
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda args, **kw: 0)
 
     called = {"n": 0}
 
@@ -302,7 +302,7 @@ def test_backfill_attempts_when_marker_absent(monkeypatch, tmp_path):
     """No observation marker at all → infinitely stale → backfill proceeds."""
     ns = _load(monkeypatch, tmp_path)
     _prime_hook(ns, monkeypatch)
-    monkeypatch.setitem(ns, "cmd_record_usage", lambda args: 0)
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda args, **kw: 0)
 
     called = {"n": 0}
 
@@ -341,7 +341,7 @@ def test_force_refresh_bypasses_backoff_gate_and_clears_on_ok(monkeypatch, tmp_p
     (bypasses the gate); a successful response clears the shared deadline."""
     ns = _load(monkeypatch, tmp_path)
     monkeypatch.setitem(ns, "_resolve_oauth_token", lambda: "tok")
-    monkeypatch.setitem(ns, "cmd_record_usage", lambda args: 0)
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda args, **kw: 0)
     monkeypatch.setitem(ns, "_bust_statusline_cache", lambda: "absent")
 
     ns["_oauth_backoff_set"](time.time() + 300)  # pending cooldown
@@ -471,7 +471,8 @@ def test_earlier_force_success_cannot_clear_later_hook_429(monkeypatch, tmp_path
     automatic_started = threading.Event()
     automatic_registered = threading.Event()
 
-    def authoritative_record(args, observed_axes, *, lock_held=False):
+    def authoritative_record(args, observed_axes, *, lock_held=False,
+                             nudge_dashboard=True):
         def finish():
             force_authority_entered.set()
             assert automatic_started.wait(timeout=2)
@@ -547,7 +548,7 @@ def test_later_force_success_clears_earlier_hook_429(monkeypatch, tmp_path):
     clear the earlier automatic-refresh cooldown."""
     ns = _load(monkeypatch, tmp_path)
     _prime_hook(ns, monkeypatch)
-    monkeypatch.setitem(ns, "cmd_record_usage", lambda args: 0)
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda args, **kw: 0)
     monkeypatch.setitem(ns, "_bust_statusline_cache", lambda: "absent")
     calls = {"count": 0}
 

@@ -39,6 +39,7 @@ import sys
 import _cctally_core
 import _lib_changelog
 import _lib_journal_router
+import _lib_perf
 from _cctally_core import _now_utc, eprint, now_utc_iso, parse_iso_datetime
 from _lib_dashboard_json import encode_dashboard_json
 
@@ -892,11 +893,140 @@ def _gather_accounts_state(now_utc: "dt.datetime") -> dict:
     return state
 
 
+# ── The quota-observation input memo (#583 S5 §2.3) ─────────────────────────
+# Task 4's attribution measured `doctor.quota_summary` at a 1,197.7 ms median
+# against a copy of the real store (five fresh samples after one untimed
+# warm-up, range 1,157.3-1,319.8) -- 69% of the doctor's own 1,731.2 ms median
+# and 20% of the BUILDER. The 5,907.1 ms denominator behind that share is the
+# wall time of `_tui_build_snapshot`, which the harness calls with
+# `skip_sync=True` and which runs entirely inside `tick.build_span()`, so it
+# contains no ingest and is not a whole tick; a whole tick is ingest plus
+# builder, and the builder is 70.5% of one measured live. Against a whole tick
+# the same probe is therefore 14%. It is one all-history
+# `load_codex_quota_observations` call whose SQL runs a `MAX(...) OVER
+# (PARTITION BY ...)` across every retained row (277,207 on that store) to
+# return one row per identity (16).
+#
+# Only the ROWS are retained, and only while their evidence is unmoved. Every
+# `now`-derived interpretation over them is recomputed on every gather:
+# `quota_freshness` and therefore `latest_capture_at`, `freshness_state`,
+# `age_seconds` and `stale_after_seconds`. Those move with the clock alone, and
+# retaining one would freeze a displayed health verdict at whatever instant the
+# population happened to be loaded. This is the whole of Preserve 14's room --
+# the memo caches a raw INPUT, never the payload, so the aggregate and its
+# `generated_at` are still recomputed at every `DOCTOR_MEMO_TTL_S` expiry and
+# `DoctorChip`'s rendered check time is never older than the TTL.
+#
+# At most ONE entry is retained: a moved signal replaces rather than
+# accumulates, so the bound is one row per retained quota identity (16 on that
+# store), not a multiple of anything. The dict is a plain module global with no
+# `_assert_owner`, because the doctor gathers on the CLI's main thread as well
+# as on the dashboard's rebuild thread and an owner assertion would refuse the
+# CLI. That is safe here for the same reason it is for the source build's memo:
+# a value is served only under an exactly-matching key, and the key IS the
+# invalidation basis, so a racing writer can only cause a redundant cold read,
+# never a stale answer.
+_QUOTA_OBSERVATION_MEMO: "dict[tuple, tuple]" = {}
+
+
+def _codex_quota_observation_signal() -> "tuple | None":
+    """The exact mutation stream that can change the quota probe's rows.
+
+    Returns ``None`` for "cannot establish identity", and every caller must
+    treat that as a cold read rather than as a cache hit. An absent or
+    unreadable change ledger is not an idle change ledger.
+
+    Four legs, all of them cache.db. ``quota_window_change_log``'s high-water
+    sequence covers every insert, delete and semantic update of
+    ``quota_window_snapshots``: the three ledger triggers in
+    ``bin/_cctally_db.py`` (``trg_qws_ledger_ins`` / ``_del`` / ``_upd``, the
+    last firing on the semantic column set the loader interprets) record each
+    one, and the sequence is read from ``sqlite_sequence`` so that
+    ``prune_ledger_through``'s ``DELETE`` cannot walk it backwards.
+    ``codex_window_attribution_revision`` covers the attribution overlay, which
+    the journal bumps in the same transaction as the rows it applies. The
+    database path and the file's identity together cover replacement: a
+    restored or repaired cache.db can carry a LOWER sequence than the one
+    already retained, so the path alone would serve rows from the superseded
+    file.
+
+    NO STATS.DB LEG, which is a deliberate difference from the source build's
+    six-leg ``_codex_quota_reuse_identity``. That identity carries three stats
+    digests because the build's quota consumers render account decoration. This
+    probe does not: every field it publishes -- the five identity coordinates
+    plus the freshness quadruple -- is derived from ``quota_window_snapshots``
+    and the clock, and ``load_codex_quota_observations`` is a cache.db
+    projection reader that is given no stats connection and opens none. Adding
+    the stats legs would be over-conservative rather than safer, and it would
+    surrender the reuse on every tick that publishes a new stats generation
+    while the quota evidence sat still. ``test_stats_side_decoration_does_not
+    _change_the_doctor_quota_probe`` is the executable form of that claim: if
+    the probe ever grows a stats-side dependency, that test fails rather than
+    this comment going quietly out of date.
+    """
+    path = _cctally_core.CACHE_DB_PATH
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='quota_window_change_log'"
+        ).fetchone()
+        if table is None:
+            return None
+        seq_row = conn.execute(
+            "SELECT seq FROM sqlite_sequence "
+            "WHERE name='quota_window_change_log'"
+        ).fetchone()
+        revision_row = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_window_attribution_revision'"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return (
+        str(path),
+        stat.st_dev,
+        stat.st_ino,
+        0 if seq_row is None else int(seq_row[0]),
+        "" if revision_row is None else str(revision_row[0]),
+    )
+
+
+def _load_codex_quota_observations_for_doctor(*, force_cold: bool = False):
+    """The probe's raw population, reused while its dependency signal holds."""
+    c = _cctally()
+    signal = None if force_cold else _codex_quota_observation_signal()
+    if signal is not None:
+        cached = _QUOTA_OBSERVATION_MEMO.get(signal)
+        if cached is not None:
+            return cached
+    loaded = tuple(
+        c._cctally_quota.load_codex_quota_observations(
+            latest_per_identity=True,
+        )
+    )
+    if signal is not None:
+        # Replace rather than accumulate: the bound is one entry.
+        _QUOTA_OBSERVATION_MEMO.clear()
+        _QUOTA_OBSERVATION_MEMO[signal] = loaded
+    return loaded
+
+
 def doctor_gather_state(
     *,
     now_utc: "dt.datetime | None" = None,
     runtime_bind: "str | None" = None,
     deep: bool = False,
+    force_cold_inputs: bool = False,
 ):
     """Gather doctor state while excluding cache-family replacement.
 
@@ -905,6 +1035,11 @@ def doctor_gather_state(
     through every cache probe.  A live/stale marker or a pending quarantine
     suppresses all raw SQLite cache opens; when a cache exists but its lock is
     absent, probes also degrade rather than racing a newly starting repair.
+
+    ``force_cold_inputs`` bypasses every reused raw input (#583 S5 §2.3), so a
+    caller can obtain a genuinely fresh gather at a chosen instant. It exists
+    for the equality gate that compares a reusing gather against a fresh one at
+    an identical ``now_utc``; production callers leave it false.
     """
     cache_lock = None
     cache_probe_allowed = not _cctally_core.CACHE_DB_PATH.exists()
@@ -914,40 +1049,41 @@ def doctor_gather_state(
         "reason": None,
     }
     try:
-        lock_path = _cctally_core.CACHE_LOCK_MAINTENANCE_PATH
-        if lock_path.exists():
-            cache_lock = open(lock_path, "r")
-            fcntl.flock(cache_lock, fcntl.LOCK_SH)
-            cache_probe_allowed = True
+        with _lib_perf.phase("doctor.gate"):
+            lock_path = _cctally_core.CACHE_LOCK_MAINTENANCE_PATH
+            if lock_path.exists():
+                cache_lock = open(lock_path, "r")
+                fcntl.flock(cache_lock, fcntl.LOCK_SH)
+                cache_probe_allowed = True
 
-        c = _cctally()
-        db_mod = c._load_sibling("_cctally_db")
-        repair_marker = db_mod._repair_marker_path(
-            _cctally_core.CACHE_DB_PATH
-        )
-        pending = db_mod._quarantine_pending_path(
-            _cctally_core.CACHE_DB_PATH
-        )
-        if repair_marker.exists():
-            live, reason = db_mod._repair_marker_is_live(repair_marker)
-            cache_repair_marker = {
-                "exists": True,
-                "live": live,
-                "reason": reason,
-            }
-            cache_probe_allowed = False
-        elif pending.exists():
-            cache_repair_marker = {
-                "exists": True,
-                "live": False,
-                "reason": "interrupted quarantine is pending",
-            }
-            cache_probe_allowed = False
+            c = _cctally()
+            db_mod = c._load_sibling("_cctally_db")
+            repair_marker = db_mod._repair_marker_path(
+                _cctally_core.CACHE_DB_PATH
+            )
+            pending = db_mod._quarantine_pending_path(
+                _cctally_core.CACHE_DB_PATH
+            )
+            if repair_marker.exists():
+                live, reason = db_mod._repair_marker_is_live(repair_marker)
+                cache_repair_marker = {
+                    "exists": True,
+                    "live": live,
+                    "reason": reason,
+                }
+                cache_probe_allowed = False
+            elif pending.exists():
+                cache_repair_marker = {
+                    "exists": True,
+                    "live": False,
+                    "reason": "interrupted quarantine is pending",
+                }
+                cache_probe_allowed = False
 
-        if not cache_probe_allowed and cache_lock is not None:
-            fcntl.flock(cache_lock, fcntl.LOCK_UN)
-            cache_lock.close()
-            cache_lock = None
+            if not cache_probe_allowed and cache_lock is not None:
+                fcntl.flock(cache_lock, fcntl.LOCK_UN)
+                cache_lock.close()
+                cache_lock = None
 
         import _cctally_store
 
@@ -958,6 +1094,7 @@ def doctor_gather_state(
                 deep=deep,
                 _cache_probe_allowed=cache_probe_allowed,
                 _cache_repair_marker=cache_repair_marker,
+                _force_cold_inputs=force_cold_inputs,
             )
     finally:
         if cache_lock is not None:
@@ -974,6 +1111,7 @@ def _doctor_gather_state_impl(
     deep: bool = False,
     _cache_probe_allowed: bool,
     _cache_repair_marker: dict,
+    _force_cold_inputs: bool = False,
 ):
     """I/O chokepoint for `cctally doctor` (spec §7.2).
 
@@ -992,1192 +1130,1236 @@ def _doctor_gather_state_impl(
     if now_utc is None:
         now_utc = _now_utc()
 
-    backup_sync_state = _gather_backup_sync_state(
-        _cctally_core.APP_DIR,
-        probe_time_machine=deep,
-    )
-
-    # ── Install ──────────────────────────────────────────────────────
-    # #279 S2 F5d: guard the only two unguarded statements in the
-    # otherwise fail-soft gather — an exception here would kill the whole
-    # report. Downstream consumers already degrade on None.
-    try:
-        repo_root = c._setup_resolve_repo_root()
-    except Exception:
-        repo_root = None
-    try:
-        dst_dir = c._setup_local_bin_dir()
-    except Exception:
-        dst_dir = None
-    try:
-        symlink_state = c._setup_compute_symlink_state(repo_root, dst_dir)
-    except Exception:
-        symlink_state = None
-    try:
-        path_includes = c._setup_path_includes_local_bin()
-    except Exception:
-        path_includes = None
-    # Issue #119: availability-aware install checks. Precomputed here (the
-    # I/O layer) so the kernel stays pure — `shutil.which` and the on-disk
-    # legacy-link probe never run in _lib_doctor.
-    #   * cctally_reachable_on_path — channel-agnostic "is the command on
-    #     $PATH at all?" (brew <prefix>/bin, npm prefix, source ~/.local/bin
-    #     all satisfy it). Lets install.path pass without a ~/.local/bin
-    #     membership check.
-    #   * symlinks_path_pinned — true iff cctally runs ONLY through a legacy
-    #     ~/.local/bin link to a retired/foreign install (live retired link
-    #     with no reachable_elsewhere fallback). Mirrors the pinned-only-path
-    #     predicate in _setup_install so doctor + setup agree on the fix.
-    try:
-        cctally_reachable_on_path = shutil.which("cctally") is not None
-    except Exception:
-        cctally_reachable_on_path = None
-    try:
-        symlinks_path_pinned = any(
-            s == "wrong"
-            and (dst_dir / n).is_symlink()
-            and c._setup_symlink_is_retired(dst_dir / n, n, repo_root)
-            and (dst_dir / n).resolve(strict=False).exists()
-            for n, s in (symlink_state or [])
+    with _lib_perf.phase("doctor.backup_sync"):
+        backup_sync_state = _gather_backup_sync_state(
+            _cctally_core.APP_DIR,
+            probe_time_machine=deep,
         )
-    except Exception:
-        symlinks_path_pinned = False
-    # install_is_brew — channel knowledge for the install.path WARN
-    # remediation. Brew kegs own no ~/.local/bin symlinks (#119), so the
-    # ~/.local/bin / `cctally setup` hint is wrong for them; the kernel
-    # can't derive this from repo_root (no I/O), so precompute it here.
-    try:
-        install_is_brew = c._setup_is_brew_install(repo_root)
-    except Exception:
-        install_is_brew = False
-    try:
-        legacy_snippet = c._setup_detect_legacy_snippet()
-    except Exception:
-        legacy_snippet = None
 
-    # ── Hooks ────────────────────────────────────────────────────────
-    try:
-        settings = c._load_claude_settings()
-    except c.SetupError:
-        settings = None
-    # #311: precompute the statusLine.refreshInterval state via the setup
-    # I/O-layer classifier (wrapper recognition does file scans), so the pure
-    # doctor kernel stays I/O-free. `settings is None` (SetupError) → the
-    # classifier's `unavailable`, matching the check's always-OK posture.
-    try:
-        statusline_refresh_state = c._classify_statusline_refresh(settings)[0]
-    except Exception:
-        statusline_refresh_state = "unavailable"
-    # Below: fail-soft posture for the diagnostic — any unexpected error
-    # in a sub-probe degrades that field to None rather than aborting the
-    # whole report.
-    try:
-        hook_counts = c._setup_count_hook_entries(settings or {})
-    except Exception:
-        hook_counts = None
-    try:
-        legacy_bespoke = c._setup_detect_legacy_bespoke_hooks(settings or {})
-    except Exception:
-        legacy_bespoke = None
-    try:
-        activity = c._setup_recent_log_stats()
-    except Exception:
-        activity = None
-
-    # ── Auth ─────────────────────────────────────────────────────────
-    try:
-        oauth_token_present = c._setup_oauth_token_present()
-    except OSError:
-        oauth_token_present = None
-
-    # ── DB ───────────────────────────────────────────────────────────
-    try:
-        import _cctally_store
-
-        interrupted = _cctally_store.stats_interrupted_rebuild_evidence(
-            _cctally_core.DB_PATH
-        )
-        if interrupted is not None and interrupted.get("live") is True:
-            stats_db_status = {
-                "path": str(_cctally_core.DB_PATH),
-                "user_version": 0,
-                "registry_size": len(c._STATS_MIGRATIONS),
-                "migrations": [],
-            }
-        else:
-            stats_db_status = c._db_status_for(
-                _cctally_core.DB_PATH,
-                c._STATS_MIGRATIONS,
-                "stats.db",
-                recover_interrupted_stats=False,
-            )
-        if not _cctally_core.DB_PATH.exists():
-            stats_db_status["_file_exists"] = False
-        if interrupted is not None:
-            stats_db_status["_interrupted_rebuild"] = interrupted
-    except sqlite3.Error as exc:
-        stats_db_status = {"path": str(_cctally_core.DB_PATH), "user_version": 0,
-                           "registry_size": len(c._STATS_MIGRATIONS),
-                           "migrations": [], "_open_error": str(exc)}
-    # stats.db is the epoch-versioned journal index (DB journal redesign §7.1):
-    # feed the epoch constant to the pure kernel so db.version_ahead classifies
-    # uv==1000 as HEALTHY (not a #145 version-ahead FAIL). registry_size stays the
-    # frozen legacy head (13) and serves as the legacy-range boundary.
-    stats_db_status["epoch"] = _cctally_core.STATS_INDEX_EPOCH
-    if _cache_probe_allowed:
+    with _lib_perf.phase("doctor.install"):
+        # ── Install ──────────────────────────────────────────────────────
+        # #279 S2 F5d: guard the only two unguarded statements in the
+        # otherwise fail-soft gather — an exception here would kill the whole
+        # report. Downstream consumers already degrade on None.
         try:
-            cache_db_status = c._db_status_for(
-                _cctally_core.CACHE_DB_PATH,
-                c._CACHE_MIGRATIONS,
-                "cache.db",
+            repo_root = c._setup_resolve_repo_root()
+        except Exception:
+            repo_root = None
+        try:
+            dst_dir = c._setup_local_bin_dir()
+        except Exception:
+            dst_dir = None
+        try:
+            symlink_state = c._setup_compute_symlink_state(repo_root, dst_dir)
+        except Exception:
+            symlink_state = None
+        try:
+            path_includes = c._setup_path_includes_local_bin()
+        except Exception:
+            path_includes = None
+        # Issue #119: availability-aware install checks. Precomputed here (the
+        # I/O layer) so the kernel stays pure — `shutil.which` and the on-disk
+        # legacy-link probe never run in _lib_doctor.
+        #   * cctally_reachable_on_path — channel-agnostic "is the command on
+        #     $PATH at all?" (brew <prefix>/bin, npm prefix, source ~/.local/bin
+        #     all satisfy it). Lets install.path pass without a ~/.local/bin
+        #     membership check.
+        #   * symlinks_path_pinned — true iff cctally runs ONLY through a legacy
+        #     ~/.local/bin link to a retired/foreign install (live retired link
+        #     with no reachable_elsewhere fallback). Mirrors the pinned-only-path
+        #     predicate in _setup_install so doctor + setup agree on the fix.
+        try:
+            cctally_reachable_on_path = shutil.which("cctally") is not None
+        except Exception:
+            cctally_reachable_on_path = None
+        try:
+            symlinks_path_pinned = any(
+                s == "wrong"
+                and (dst_dir / n).is_symlink()
+                and c._setup_symlink_is_retired(dst_dir / n, n, repo_root)
+                and (dst_dir / n).resolve(strict=False).exists()
+                for n, s in (symlink_state or [])
             )
-            if not _cctally_core.CACHE_DB_PATH.exists():
-                cache_db_status["_file_exists"] = False
+        except Exception:
+            symlinks_path_pinned = False
+        # install_is_brew — channel knowledge for the install.path WARN
+        # remediation. Brew kegs own no ~/.local/bin symlinks (#119), so the
+        # ~/.local/bin / `cctally setup` hint is wrong for them; the kernel
+        # can't derive this from repo_root (no I/O), so precompute it here.
+        try:
+            install_is_brew = c._setup_is_brew_install(repo_root)
+        except Exception:
+            install_is_brew = False
+        try:
+            legacy_snippet = c._setup_detect_legacy_snippet()
+        except Exception:
+            legacy_snippet = None
+
+    with _lib_perf.phase("doctor.hooks"):
+        # ── Hooks ────────────────────────────────────────────────────────
+        try:
+            settings = c._load_claude_settings()
+        except c.SetupError:
+            settings = None
+        # #311: precompute the statusLine.refreshInterval state via the setup
+        # I/O-layer classifier (wrapper recognition does file scans), so the pure
+        # doctor kernel stays I/O-free. `settings is None` (SetupError) → the
+        # classifier's `unavailable`, matching the check's always-OK posture.
+        try:
+            statusline_refresh_state = c._classify_statusline_refresh(settings)[0]
+        except Exception:
+            statusline_refresh_state = "unavailable"
+        # Below: fail-soft posture for the diagnostic — any unexpected error
+        # in a sub-probe degrades that field to None rather than aborting the
+        # whole report.
+        try:
+            hook_counts = c._setup_count_hook_entries(settings or {})
+        except Exception:
+            hook_counts = None
+        try:
+            legacy_bespoke = c._setup_detect_legacy_bespoke_hooks(settings or {})
+        except Exception:
+            legacy_bespoke = None
+        try:
+            activity = c._setup_recent_log_stats()
+        except Exception:
+            activity = None
+
+    with _lib_perf.phase("doctor.auth"):
+        # ── Auth ─────────────────────────────────────────────────────────
+        try:
+            oauth_token_present = c._setup_oauth_token_present()
+        except OSError:
+            oauth_token_present = None
+
+    with _lib_perf.phase("doctor.db_status"):
+        # ── DB ───────────────────────────────────────────────────────────
+        try:
+            import _cctally_store
+
+            interrupted = _cctally_store.stats_interrupted_rebuild_evidence(
+                _cctally_core.DB_PATH
+            )
+            if interrupted is not None and interrupted.get("live") is True:
+                stats_db_status = {
+                    "path": str(_cctally_core.DB_PATH),
+                    "user_version": 0,
+                    "registry_size": len(c._STATS_MIGRATIONS),
+                    "migrations": [],
+                }
+            else:
+                stats_db_status = c._db_status_for(
+                    _cctally_core.DB_PATH,
+                    c._STATS_MIGRATIONS,
+                    "stats.db",
+                    recover_interrupted_stats=False,
+                )
+            if not _cctally_core.DB_PATH.exists():
+                stats_db_status["_file_exists"] = False
+            if interrupted is not None:
+                stats_db_status["_interrupted_rebuild"] = interrupted
         except sqlite3.Error as exc:
+            stats_db_status = {"path": str(_cctally_core.DB_PATH), "user_version": 0,
+                               "registry_size": len(c._STATS_MIGRATIONS),
+                               "migrations": [], "_open_error": str(exc)}
+        # stats.db is the epoch-versioned journal index (DB journal redesign §7.1):
+        # feed the epoch constant to the pure kernel so db.version_ahead classifies
+        # uv==1000 as HEALTHY (not a #145 version-ahead FAIL). registry_size stays the
+        # frozen legacy head (13) and serves as the legacy-range boundary.
+        stats_db_status["epoch"] = _cctally_core.STATS_INDEX_EPOCH
+        if _cache_probe_allowed:
+            try:
+                cache_db_status = c._db_status_for(
+                    _cctally_core.CACHE_DB_PATH,
+                    c._CACHE_MIGRATIONS,
+                    "cache.db",
+                )
+                if not _cctally_core.CACHE_DB_PATH.exists():
+                    cache_db_status["_file_exists"] = False
+            except sqlite3.Error as exc:
+                cache_db_status = {
+                    "path": str(_cctally_core.CACHE_DB_PATH),
+                    "user_version": 0,
+                    "registry_size": len(c._CACHE_MIGRATIONS),
+                    "migrations": [],
+                    "_open_error": str(exc),
+                }
+        else:
             cache_db_status = {
                 "path": str(_cctally_core.CACHE_DB_PATH),
                 "user_version": 0,
                 "registry_size": len(c._CACHE_MIGRATIONS),
                 "migrations": [],
-                "_open_error": str(exc),
+                "_open_error": "cache maintenance excludes read probes",
             }
-    else:
-        cache_db_status = {
-            "path": str(_cctally_core.CACHE_DB_PATH),
-            "user_version": 0,
-            "registry_size": len(c._CACHE_MIGRATIONS),
-            "migrations": [],
-            "_open_error": "cache maintenance excludes read probes",
-        }
-    cache_repair_marker = _cache_repair_marker
+        cache_repair_marker = _cache_repair_marker
 
-    # ── Data freshness ───────────────────────────────────────────────
-    latest_snapshot_at = None
-    forked_bucket_counts: dict | None = None
-    credited_weeks: list[dict] | None = None
-    try:
-        if _cctally_core.DB_PATH.exists():
-            # #386 spec section 3.1, third clause: EVERY opener of the live stats
-            # family participates in the replacement protocol, read-only probes
-            # included. The open mode stays read-WRITE deliberately — switching a
-            # WAL DB whose `-shm` may be absent to `mode=ro` fails
-            # SQLITE_CANTOPEN, which is not corruption and has been misread as
-            # such on this project twice. Participation, not read-only-ness, is
-            # what the clause requires.
-            import _cctally_store as _store_mod
-            conn = _store_mod.stats_open_guarded(_cctally_core.DB_PATH)
-            try:
+    with _lib_perf.phase("doctor.stats_freshness"):
+        # ── Data freshness ───────────────────────────────────────────────
+        latest_snapshot_at = None
+        forked_bucket_counts: dict | None = None
+        credited_weeks: list[dict] | None = None
+        try:
+            if _cctally_core.DB_PATH.exists():
+                # #386 spec section 3.1, third clause: EVERY opener of the live stats
+                # family participates in the replacement protocol, read-only probes
+                # included. The open mode stays read-WRITE deliberately — switching a
+                # WAL DB whose `-shm` may be absent to `mode=ro` fails
+                # SQLITE_CANTOPEN, which is not corruption and has been misread as
+                # such on this project twice. Participation, not read-only-ness, is
+                # what the clause requires.
+                import _cctally_store as _store_mod
+                conn = _store_mod.stats_open_guarded(_cctally_core.DB_PATH)
                 try:
-                    row = conn.execute(
-                        "SELECT MAX(captured_at_utc) FROM weekly_usage_snapshots"
-                    ).fetchone()
-                    if row and row[0]:
-                        latest_snapshot_at = parse_iso_datetime(
-                            row[0], "weekly_usage_snapshots.captured_at_utc",
-                        ).astimezone(dt.timezone.utc)
-                except sqlite3.OperationalError:
-                    pass  # table missing — treat as no snapshots yet
-                # Forked-bucket invariant probe. Each fork count is
-                # a raw SELECT against the already-open connection —
-                # no bonus open_db() recursion. Tables missing →
-                # count 0 (legacy DBs without one of these tables
-                # are intact by definition for that table).
-                forked_bucket_counts = {}
-                for table, key in (
-                    ("weekly_usage_snapshots", "usage"),
-                    ("weekly_cost_snapshots", "cost"),
-                    ("percent_milestones", "milestones"),
-                ):
                     try:
                         row = conn.execute(
-                            f"SELECT COUNT(*) FROM {table} "
-                            f" WHERE week_start_at IS NOT NULL "
-                            f"   AND week_start_date != substr(week_start_at, 1, 10)"
-                        ).fetchone()
-                        forked_bucket_counts[key] = (
-                            int(row[0]) if row and row[0] else 0
-                        )
-                    except sqlite3.OperationalError:
-                        forked_bucket_counts[key] = 0
-                # v1.7.2 credited-week tracking. For each week with a
-                # past-effective ``week_reset_events`` row, gather the
-                # latest weekly_percent + count of post-credit milestones.
-                # The check warns when latest_percent >= 1.0 AND
-                # post_credit_milestone_count == 0.
-                # unixepoch() normalizes the cross-offset comparison.
-                try:
-                    credit_rows = conn.execute(
-                        """
-                        SELECT wre.id AS event_id,
-                               wre.new_week_end_at AS end_at,
-                               wre.effective_reset_at_utc AS effective
-                          FROM week_reset_events wre
-                         WHERE unixepoch(wre.effective_reset_at_utc)
-                               <= unixepoch(?)
-                        """,
-                        (now_utc_iso(),),
-                    ).fetchall()
-                    credited_weeks = []
-                    for cr in credit_rows:
-                        end_at = cr[1]
-                        evt_id = cr[0]
-                        latest = conn.execute(
-                            """
-                            SELECT week_start_date, weekly_percent
-                              FROM weekly_usage_snapshots
-                             WHERE week_end_at = ?
-                             ORDER BY captured_at_utc DESC, id DESC
-                             LIMIT 1
-                            """,
-                            (end_at,),
-                        ).fetchone()
-                        if latest is None or latest[0] is None:
-                            continue
-                        ws = latest[0]
-                        lp = float(latest[1] or 0.0)
-                        try:
-                            mc_row = conn.execute(
-                                "SELECT COUNT(*) FROM percent_milestones "
-                                "WHERE week_start_date = ? AND reset_event_id = ?",
-                                (ws, evt_id),
-                            ).fetchone()
-                            mc = int(mc_row[0]) if mc_row and mc_row[0] else 0
-                        except sqlite3.OperationalError:
-                            mc = 0
-                        credited_weeks.append({
-                            "week_start_date": ws,
-                            "latest_weekly_percent": lp,
-                            "post_credit_milestone_count": mc,
-                            "event_id": evt_id,
-                        })
-                except sqlite3.OperationalError:
-                    # week_reset_events table missing — treat as no
-                    # credited weeks (pre-feature DB).
-                    credited_weeks = []
-            finally:
-                conn.close()
-    except Exception:
-        pass
-
-    cache_entries_count = None
-    cache_last_entry_at = None
-    cache_db_page_count = None
-    cache_db_freelist_count = None
-    try:
-        if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
-            conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
-            try:
-                try:
-                    row = conn.execute("PRAGMA page_count").fetchone()
-                    if row and row[0] is not None:
-                        cache_db_page_count = int(row[0])
-                    row = conn.execute("PRAGMA freelist_count").fetchone()
-                    if row and row[0] is not None:
-                        cache_db_freelist_count = int(row[0])
-                except sqlite3.Error:
-                    pass
-                row = conn.execute(
-                    "SELECT COUNT(*), MAX(timestamp_utc) FROM session_entries"
-                ).fetchone()
-                if row:
-                    cache_entries_count = int(row[0]) if row[0] is not None else 0
-                    if row[1]:
-                        cache_last_entry_at = parse_iso_datetime(
-                            row[1], "session_entries.timestamp_utc",
-                        ).astimezone(dt.timezone.utc)
-            except sqlite3.OperationalError:
-                pass  # table missing — treat as zero
-            finally:
-                conn.close()
-    except Exception:
-        pass
-
-    # ── Statusline candidate arbitration (#318) ──────────────────────
-    # This inspection is deliberately independent of SQLite mutation: marker
-    # mtime, candidate/control files, and tombstones are all read fail-soft.
-    # In particular it uses the scan-only candidate helper, never the reducer
-    # loader that prunes expired or malformed spool files.
-    try:
-        statusline_pipeline = _gather_statusline_pipeline(c, now_utc=now_utc)
-    except Exception:
-        statusline_pipeline = None
-
-    # Conversation-sessions rollup consistency (#217 S1 / U9). Two cheap COUNTs
-    # (graceful None on a missing table / unreadable DB) + an in-progress signal
-    # so a transient mid-sync mismatch never WARNs. The in-progress signal is a
-    # NON-BLOCKING conversations flock probe (a writer mid-walk holds it) OR the
-    # presence of any pending reingest/split/backfill cache_meta flag — doctor
-    # stays read-only and never blocks on the lock.
-    conv_sessions_rollup_count = None
-    conv_messages_distinct_sessions = None
-    conv_rollup_sync_in_progress = False
-    conversations_db_page_count = None
-    conversations_db_freelist_count = None
-    codex_prune_refusals: list[dict] = []
-    try:
-        if _cctally_core.CONVERSATIONS_DB_PATH.exists():
-            # This gather also runs inside dashboard snapshot precompute. A
-            # transcript writer or recovery may hold an exclusive lock, so use
-            # the recovery-aware read-only zero-timeout probe: conversation
-            # health can degrade, but it must never delay core snapshot
-            # freshness (#320, #415).
-            with _conversation_ro_guarded(timeout=0.0) as conn:
-                if conn is None:
-                    raise sqlite3.OperationalError(
-                        "conversation store maintenance in progress"
-                    )
-                try:
-                    row = conn.execute("PRAGMA page_count").fetchone()
-                    if row and row[0] is not None:
-                        conversations_db_page_count = int(row[0])
-                    row = conn.execute("PRAGMA freelist_count").fetchone()
-                    if row and row[0] is not None:
-                        conversations_db_freelist_count = int(row[0])
-                except sqlite3.Error:
-                    pass
-                try:
-                    row = conn.execute(
-                        "SELECT COUNT(*) FROM conversation_sessions"
-                    ).fetchone()
-                    if row is not None:
-                        conv_sessions_rollup_count = int(row[0])
-                except sqlite3.OperationalError:
-                    pass  # table absent (pre-rollup) — leave None
-                try:
-                    row = conn.execute(
-                        "SELECT COUNT(DISTINCT session_id) "
-                        "FROM conversation_messages WHERE session_id IS NOT NULL"
-                    ).fetchone()
-                    if row is not None:
-                        conv_messages_distinct_sessions = int(row[0])
-                except sqlite3.OperationalError:
-                    pass
-                try:
-                    import _cctally_cache as _cc_sib
-                    row = conn.execute(
-                        "SELECT value FROM cache_meta WHERE key=?",
-                        (_cc_sib.CODEX_ORPHAN_PRUNE_REFUSED_KEY,),
-                    ).fetchone()
-                    if row and row[0]:
-                        record = json.loads(row[0])
-                        if isinstance(record, dict):
-                            codex_prune_refusals.append(record)
-                except (sqlite3.OperationalError, ValueError, TypeError):
-                    pass
-                # Pending reingest/split/backfill flags ⇒ a full sync hasn't yet
-                # reconciled the rollup. Read the canonical flag set from
-                # _cctally_cache so it stays in lockstep with the sync consumers.
-                try:
-                    import _cctally_cache as _cc_sib  # lazy sibling
-                    flags = tuple(_cc_sib._TARGETED_DECLINE_FLAGS)
-                    placeholders = ",".join("?" for _ in flags)
-                    pend = conn.execute(
-                        f"SELECT 1 FROM cache_meta WHERE key IN ({placeholders}) "
-                        "LIMIT 1", flags).fetchone()
-                    if pend is not None:
-                        conv_rollup_sync_in_progress = True
-                except Exception:
-                    pass
-        # Non-blocking flock probe: if a transcript writer/reingest holds the
-        # conversations.db lock, the rollup may be mid-recompute → in progress. We
-        # acquire LOCK_EX|LOCK_NB and immediately release; failure (held) is the
-        # signal. Never blocks (LOCK_NB), so doctor stays read-only + prompt.
-        if not conv_rollup_sync_in_progress:
-            lock_path = _cctally_core.CONVERSATIONS_LOCK_PATH
-            if lock_path is not None and pathlib.Path(lock_path).exists():
-                import fcntl as _fcntl
-                lock_fh = open(str(lock_path), "w")
-                try:
-                    _fcntl.flock(lock_fh, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-                    _fcntl.flock(lock_fh, _fcntl.LOCK_UN)  # acquired ⇒ quiescent
-                except (BlockingIOError, OSError):
-                    conv_rollup_sync_in_progress = True  # held ⇒ writer mid-flight
-                finally:
-                    lock_fh.close()
-    except Exception:
-        pass
-
-    claude_jsonl_present = False
-    try:
-        claude_dir = pathlib.Path.home() / ".claude" / "projects"
-        if claude_dir.exists():
-            claude_jsonl_present = next(claude_dir.glob("**/*.jsonl"), None) is not None
-    except Exception:
-        pass
-
-    codex_entries_count = None
-    codex_last_entry_at = None
-    codex_project_metadata_health = None
-    codex_project_metadata_error = None
-    codex_null_reset_anchors = 0
-    try:
-        if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
-            conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
-            try:
-                row = conn.execute(
-                    "SELECT COUNT(*), MAX(timestamp_utc) FROM codex_session_entries"
-                ).fetchone()
-                if row:
-                    codex_entries_count = int(row[0]) if row[0] is not None else 0
-                    if row[1]:
-                        codex_last_entry_at = parse_iso_datetime(
-                            row[1], "codex_session_entries.timestamp_utc",
-                        ).astimezone(dt.timezone.utc)
-                try:
-                    row = conn.execute(
-                        "SELECT COUNT(*) FROM quota_window_snapshots "
-                        "WHERE source = 'codex' "
-                        "AND canonical_resets_at_utc IS NULL"
-                    ).fetchone()
-                    if row and row[0] is not None:
-                        codex_null_reset_anchors = int(row[0])
-                except sqlite3.OperationalError:
-                    # Pre-anchor cache shapes have no column to inspect. Their
-                    # pending migration is reported by the DB checks instead.
-                    pass
-                # Keep the health probe on the existing read-only cache
-                # connection.  A failed probe is health evidence, not an
-                # empty corpus: the kernel renders it as a distinct FAIL.
-                try:
-                    import _cctally_source_analytics
-
-                    health = _cctally_source_analytics.load_codex_project_metadata_health(
-                        cache_conn=conn,
-                    )
-                    codex_project_metadata_health = {
-                        "total_rows": health.total_rows,
-                        "qualified_rows": health.qualified_rows,
-                        "missing_conversation_key_rows": health.missing_conversation_key_rows,
-                        "missing_thread_join_rows": health.missing_thread_join_rows,
-                    }
-                except Exception as exc:
-                    codex_project_metadata_error = type(exc).__name__
-            except sqlite3.OperationalError as exc:
-                # Pre-Codex cache shapes still produce the established Codex
-                # cache result, while the new health check fails explicitly.
-                codex_project_metadata_error = type(exc).__name__
-            finally:
-                conn.close()
-    except Exception as exc:
-        codex_project_metadata_error = type(exc).__name__
-
-    # Issue #109: probe every $CODEX_HOME session root (not the single
-    # hardcoded ~/.codex/sessions), matching the multi-root ingestion path
-    # from #108. _codex_session_roots() already applies the sessions/-subdir
-    # rule and filters to existing dirs, so a bare glob per root suffices.
-    codex_jsonl_present = False
-    try:
-        for codex_dir in c._codex_session_roots():
-            if next(codex_dir.glob("**/*.jsonl"), None) is not None:
-                codex_jsonl_present = True
-                break
-    except Exception:
-        pass
-
-    # ── Codex quota lifecycle (#294 S2) ──────────────────────────────
-    # All three probes are read-only and root-qualified.  The physical cache
-    # adapter preserves S1's per-window degradation, while setup's existing
-    # inspector supplies the exact owned-hook state without exposing paths.
-    codex_quota_windows: list[dict] = []
-    try:
-        # #566 §5.1 item 5: the population is unchanged — all history, every
-        # root, no row cap — but the read returns each identity's latest
-        # physical capture instead of every retained row, because that is the
-        # only thing this probe consumes. On the maintainer's store the former
-        # shape interpreted 266,337 rows to answer a question about 608 windows
-        # and cost about 2.7s of every dashboard build. Nothing here may bound
-        # the range: doing so would drop old and inactive-root identities and
-        # silently change `window_count`, the responsible identity and the
-        # WARN/OK verdict.
-        observations = (
-            c._cctally_quota.load_codex_quota_observations(
-                latest_per_identity=True,
-            )
-            if _cache_probe_allowed
-            else ()
-        )
-        by_identity: dict[object, list] = {}
-        for observation in observations:
-            by_identity.setdefault(observation.identity, []).append(observation)
-        for identity in sorted(
-            by_identity,
-            key=lambda item: (
-                item.source, item.source_root_key, item.logical_limit_key,
-                item.observed_slot, item.window_minutes,
-            ),
-        ):
-            freshness = c.quota_freshness(by_identity[identity], now_utc)
-            codex_quota_windows.append({
-                "identity": {
-                    "source": identity.source,
-                    "source_root_key": identity.source_root_key,
-                    "logical_limit_key": identity.logical_limit_key,
-                    "observed_slot": identity.observed_slot,
-                    "window_minutes": identity.window_minutes,
-                },
-                "latest_capture_at": freshness.captured_at,
-                "freshness_state": freshness.state,
-                "age_seconds": freshness.age_seconds,
-                "stale_after_seconds": freshness.stale_after_seconds,
-            })
-    except Exception:
-        codex_quota_windows = []
-
-    codex_hook_roots: list[dict] = []
-    try:
-        codex_binary = str(c._setup_resolve_hook_target(repo_root))
-        hook_rows = [
-            c._cctally_setup._codex_hook_row(root, codex_binary)
-            for root in c._setup_codex_hook_roots()
-        ]
-        codex_hook_roots = [
-            {"source_root_key": row["source_root_key"], "state": row["state"]}
-            for row in sorted(hook_rows, key=lambda row: row["source_root_key"])
-        ]
-    except Exception:
-        codex_hook_roots = []
-
-    try:
-        codex_lifecycle_activity_24h = _codex_lifecycle_activity_24h(
-            root_keys={row["source_root_key"] for row in codex_hook_roots},
-            now_utc=now_utc,
-        )
-    except Exception:
-        codex_lifecycle_activity_24h = {}
-
-    try:
-        codex_quota_verify_activity = _codex_quota_verify_activity_24h(
-            now_utc=now_utc)
-    except Exception:
-        codex_quota_verify_activity = None
-
-    # ── Parse health (#279 S2 F5a) ───────────────────────────────────
-    parse_health_claude = parse_health_codex = None
-    # #416 review B4: the durable record that a torn Codex `auth.json` halted
-    # ingest. Same cache_meta read, same degrade-to-None-on-anything contract.
-    codex_torn_deferred = None
-    # The byte-zero Codex replay stall signal. The marker itself is a bare "1";
-    # the sibling `blocked` record is the JSON one, so it is read through the
-    # same loop while the marker gets a plain existence probe. Key names come
-    # from the kernel constants, never inline literals.
-    codex_replay_pending = None
-    codex_replay_blocked = None
-    # public #5: the budgeted-decline record. Same JSON-dict contract as the
-    # blocked one, and the only signal a hook-only install produces when its
-    # Codex ingest is frozen behind an un-runnable replay.
-    codex_replay_deferred = None
-    # public #5 spec §5: the hook's budgeted-ingest backlog record. Absent means
-    # a zero backlog — a drained walk DELETES the row rather than zeroing it, so
-    # None and "nothing owed" are the same state by construction.
-    codex_ingest_backlog = None
-    try:
-        import _lib_codex_conversation as _codex_kern
-        _blocked_key = _codex_kern.CODEX_REPLAY_BLOCKED_KEY
-        _pending_key = _codex_kern.CODEX_REPLAY_FROM_ZERO_KEY
-        _deferred_key = _codex_kern.CODEX_REPLAY_DEFERRED_KEY
-    except Exception:
-        _blocked_key = "codex_replay_from_zero_blocked"
-        _pending_key = "codex_replay_from_zero_pending"
-        _deferred_key = "codex_replay_from_zero_deferred"
-    try:
-        if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
-            conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
-            try:
-                for _key in ("parse_health_claude", "parse_health_codex",
-                             "codex_torn_auth_deferred", _blocked_key,
-                             _deferred_key, "codex_ingest_backlog",
-                             "codex_orphan_prune_refused"):
-                    try:
-                        row = conn.execute(
-                            "SELECT value FROM cache_meta WHERE key = ?",
-                            (_key,),
+                            "SELECT MAX(captured_at_utc) FROM weekly_usage_snapshots"
                         ).fetchone()
                         if row and row[0]:
-                            _parsed = json.loads(row[0])
-                            if isinstance(_parsed, dict):
-                                if _key == "parse_health_claude":
-                                    parse_health_claude = _parsed
-                                elif _key == "parse_health_codex":
-                                    parse_health_codex = _parsed
-                                elif _key == _blocked_key:
-                                    codex_replay_blocked = _parsed
-                                elif _key == _deferred_key:
-                                    codex_replay_deferred = _parsed
-                                elif _key == "codex_ingest_backlog":
-                                    codex_ingest_backlog = _parsed
-                                elif _key == "codex_orphan_prune_refused":
-                                    codex_prune_refusals.append(_parsed)
-                                else:
-                                    codex_torn_deferred = _parsed
-                    except (sqlite3.OperationalError, ValueError):
-                        pass
-                try:
-                    codex_replay_pending = conn.execute(
-                        "SELECT 1 FROM cache_meta WHERE key = ?",
-                        (_pending_key,),
-                    ).fetchone() is not None
-                except sqlite3.OperationalError:
-                    pass
-            finally:
-                conn.close()
-    except Exception:
-        pass
-
-    # ── Integrity (deep only — #279 S2 F5b) ──────────────────────────
-    stats_db_quick_check = cache_db_quick_check = None
-    conversations_db_quick_check = None
-    if deep:
-        for _label, _path in (("stats", _cctally_core.DB_PATH),
-                              ("cache", _cctally_core.CACHE_DB_PATH),
-                              ("conversations",
-                               _cctally_core.CONVERSATIONS_DB_PATH)):
-            _result = None
-            try:
-                if (
-                    (
-                        _path.exists()
-                        or (
-                            _label == "conversations"
-                            and _path.with_name(
-                                f"{_path.name}.recovery.json"
-                            ).exists()
-                        )
-                    )
-                    and (_label != "cache" or _cache_probe_allowed)
-                ):
-                    # #386: the stats leg holds a read-write handle for the whole
-                    # of a full quick_check — the longest-lived stats handle any
-                    # diagnostic takes — so it participates in the replacement
-                    # protocol. The cache leg keeps its own opener.
-                    if _label == "stats":
-                        import _cctally_store as _store_mod
-                        _conn_ctx = contextlib.closing(
-                            _store_mod.stats_open_guarded(_path)
-                        )
-                    elif _label == "cache":
-                        _conn_ctx = contextlib.closing(
-                            sqlite3.connect(str(_path))
-                        )
-                    else:
-                        _conn_ctx = _conversation_ro_guarded(timeout=2.0)
-                    with _conn_ctx as _conn:
-                        if _conn is not None:
-                            _row = _conn.execute(
-                                "PRAGMA quick_check(1)").fetchone()
-                            _result = (
-                                str(_row[0])
-                                if _row and _row[0] is not None else None
+                            latest_snapshot_at = parse_iso_datetime(
+                                row[0], "weekly_usage_snapshots.captured_at_utc",
+                            ).astimezone(dt.timezone.utc)
+                    except sqlite3.OperationalError:
+                        pass  # table missing — treat as no snapshots yet
+                    # Forked-bucket invariant probe. Each fork count is
+                    # a raw SELECT against the already-open connection —
+                    # no bonus open_db() recursion. Tables missing →
+                    # count 0 (legacy DBs without one of these tables
+                    # are intact by definition for that table).
+                    forked_bucket_counts = {}
+                    for table, key in (
+                        ("weekly_usage_snapshots", "usage"),
+                        ("weekly_cost_snapshots", "cost"),
+                        ("percent_milestones", "milestones"),
+                    ):
+                        try:
+                            row = conn.execute(
+                                f"SELECT COUNT(*) FROM {table} "
+                                f" WHERE week_start_at IS NOT NULL "
+                                f"   AND week_start_date != substr(week_start_at, 1, 10)"
+                            ).fetchone()
+                            forked_bucket_counts[key] = (
+                                int(row[0]) if row and row[0] else 0
                             )
-                        elif (
-                            _label == "conversations"
-                            and _path.with_name(
-                                f"{_path.name}.recovery.json"
-                            ).exists()
-                        ):
-                            _result = "recovery in progress"
-            except sqlite3.DatabaseError as exc:
-                _result = f"open failed: {exc}"
-            except Exception:
-                _result = None
-            if _label == "stats":
-                stats_db_quick_check = _result
-            elif _label == "cache":
-                cache_db_quick_check = _result
-            else:
-                conversations_db_quick_check = _result
-
-    # ── Lock state (#279 S2 F5c) — read-only: never create files ─────
-    locks_held: "dict | None" = None
-    try:
-        locks_held = {}
-        for _name, _lp in (
-            ("cache.db.lock", _cctally_core.CACHE_LOCK_PATH),
-            ("cache.db.codex.lock", _cctally_core.CACHE_LOCK_CODEX_PATH),
-            ("conversations.db.lock", _cctally_core.CONVERSATIONS_LOCK_PATH),
-            (
-                "conversations.db.codex.lock",
-                _cctally_core.CONVERSATIONS_LOCK_CODEX_PATH,
-            ),
-            (
-                "conversations.db.maintenance.lock",
-                _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH,
-            ),
-        ):
-            if not _lp.exists():
-                locks_held[_name] = False
-                continue
-            try:
-                with open(_lp, "r") as _lf:
+                        except sqlite3.OperationalError:
+                            forked_bucket_counts[key] = 0
+                    # v1.7.2 credited-week tracking. For each week with a
+                    # past-effective ``week_reset_events`` row, gather the
+                    # latest weekly_percent + count of post-credit milestones.
+                    # The check warns when latest_percent >= 1.0 AND
+                    # post_credit_milestone_count == 0.
+                    # unixepoch() normalizes the cross-offset comparison.
                     try:
-                        fcntl.flock(_lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        fcntl.flock(_lf, fcntl.LOCK_UN)
-                        locks_held[_name] = False
-                    except OSError:
-                        locks_held[_name] = True
-            except OSError:
-                locks_held[_name] = None
-    except Exception:
-        locks_held = None
+                        credit_rows = conn.execute(
+                            """
+                            SELECT wre.id AS event_id,
+                                   wre.new_week_end_at AS end_at,
+                                   wre.effective_reset_at_utc AS effective
+                              FROM week_reset_events wre
+                             WHERE unixepoch(wre.effective_reset_at_utc)
+                                   <= unixepoch(?)
+                            """,
+                            (now_utc_iso(),),
+                        ).fetchall()
+                        credited_weeks = []
+                        for cr in credit_rows:
+                            end_at = cr[1]
+                            evt_id = cr[0]
+                            latest = conn.execute(
+                                """
+                                SELECT week_start_date, weekly_percent
+                                  FROM weekly_usage_snapshots
+                                 WHERE week_end_at = ?
+                                 ORDER BY captured_at_utc DESC, id DESC
+                                 LIMIT 1
+                                """,
+                                (end_at,),
+                            ).fetchone()
+                            if latest is None or latest[0] is None:
+                                continue
+                            ws = latest[0]
+                            lp = float(latest[1] or 0.0)
+                            try:
+                                mc_row = conn.execute(
+                                    "SELECT COUNT(*) FROM percent_milestones "
+                                    "WHERE week_start_date = ? AND reset_event_id = ?",
+                                    (ws, evt_id),
+                                ).fetchone()
+                                mc = int(mc_row[0]) if mc_row and mc_row[0] else 0
+                            except sqlite3.OperationalError:
+                                mc = 0
+                            credited_weeks.append({
+                                "week_start_date": ws,
+                                "latest_weekly_percent": lp,
+                                "post_credit_milestone_count": mc,
+                                "event_id": evt_id,
+                            })
+                    except sqlite3.OperationalError:
+                        # week_reset_events table missing — treat as no
+                        # credited weeks (pre-feature DB).
+                        credited_weeks = []
+                finally:
+                    conn.close()
+        except Exception:
+            pass
 
-    # ── cache.db WAL size (#297) — read-only backstop ────────────────
-    # Gathered OUTSIDE the deep/quick_check branch (above) so the WAL-size
-    # check runs in both shallow and deep gather modes. Best-effort getsize;
-    # None on OSError/race (doctor never blocks or raises), 0 when absent.
-    cache_db_wal_bytes: "int | None"
-    try:
-        _wal = pathlib.Path(f"{_cctally_core.CACHE_DB_PATH}-wal")
-        cache_db_wal_bytes = _wal.stat().st_size if _wal.exists() else 0
-    except OSError:
-        cache_db_wal_bytes = None
-
-    # ── Safety ───────────────────────────────────────────────────────
-    # `dashboard.bind` is read via the same chokepoint that powers
-    # `cctally config get dashboard.bind` — `_config_known_value`
-    # normalizes hand-edited junk back to "loopback", matching the
-    # value cmd_dashboard would actually bind to.
-    #
-    # Raw JSON read (NOT load_config or _load_config_unlocked): both
-    # call `ensure_dirs()`, which creates `~/.local/share/cctally/`
-    # and `logs/` on a fresh HOME. Doctor is a read-only diagnostic
-    # (H1 invariant) — it must never mutate user state, even by
-    # creating an empty directory tree. Corrupt JSON yields
-    # `dashboard_bind_stored = "loopback"` (the same fallback the
-    # original try/except gave); the dedicated `config_json_valid`
-    # check surfaces the corruption separately.
-    #
-    # `dashboard.expose_transcripts` (Plan 2, spec §5) is read off the same raw
-    # JSON via the same chokepoint (defaults False; hand-edited junk → False).
-    # `_check_safety_dashboard_bind` only consults it when the bind is LAN, so
-    # a loopback report is byte-identical whether or not it's set.
-    dashboard_bind_stored = "loopback"
-    expose_transcripts = False
-    try:
-        if _cctally_core.CONFIG_PATH.exists():
-            raw_cfg = json.loads(_cctally_core.CONFIG_PATH.read_text(encoding="utf-8"))
-            if isinstance(raw_cfg, dict):
-                dashboard_bind_stored = (
-                    c._config_known_value(raw_cfg, "dashboard.bind") or "loopback"
-                )
-                expose_transcripts = bool(
-                    c._config_known_value(raw_cfg, "dashboard.expose_transcripts")
-                )
-    except (json.JSONDecodeError, OSError):
-        pass
-
-    # ── Telemetry (anonymous install-count, spec 2026-07-07) ─────────
-    # Resolve the opt-out state via the pure kernel predicate — it reads env
-    # + config + the dev-checkout fact and NEVER mints an install_id / touches
-    # any marker (read-only H1 invariant). Uses the same raw config read as the
-    # safety block so doctor never auto-creates config.json; a missing/corrupt
-    # config degrades to `{}` (env/dev precedence still resolves correctly).
-    telemetry_enabled = True
-    telemetry_reason = "enabled"
-    try:
-        raw_tele_cfg: dict = {}
-        if _cctally_core.CONFIG_PATH.exists():
-            loaded = json.loads(_cctally_core.CONFIG_PATH.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                raw_tele_cfg = loaded
-        telemetry_enabled, telemetry_reason = c.resolve_telemetry_state(raw_tele_cfg)
-    except Exception:
-        # Fail-soft: any read/parse/resolution error degrades to the enabled
-        # default (the check renders OK regardless — it never FAILs/WARNs).
-        telemetry_enabled, telemetry_reason = (True, "enabled")
-
-    # config.json — RAW READ, never load_config(). load_config()
-    # auto-creates on first run AND silently falls back to defaults
-    # on corruption — both behaviors would hide diagnostic state
-    # (codex H1).
-    config_json_error = None
-    config_parsed: dict = {}
-    try:
-        if _cctally_core.CONFIG_PATH.exists():
-            config_parsed = json.loads(
-                _cctally_core.CONFIG_PATH.read_text(encoding="utf-8")
-            )
-    except json.JSONDecodeError as exc:
-        config_json_error = f"{type(exc).__name__}: {exc}"
-    except OSError as exc:
-        config_json_error = f"OSError: {exc}"
-
-    # Configured update (release) channel (beta-channel, spec 2026-07-21 §3):
-    # derived from the SAME raw read (never load_config, which auto-creates on
-    # first run). Fail-soft to "stable" — resolve_update_channel already
-    # tolerates a non-dict block / junk value.
-    try:
-        update_channel = c.resolve_update_channel(
-            config_parsed if isinstance(config_parsed, dict) else {}
-        )
-    except Exception:
-        update_channel = "stable"
-
-    update_state = None
-    update_state_error = None
-    try:
-        update_state = c._load_update_state()
-    except Exception as exc:
-        update_state_error = f"{type(exc).__name__}: {exc}"
-
-    update_suppress = None
-    update_suppress_error = None
-    try:
-        update_suppress = c._load_update_suppress()
-    except Exception as exc:
-        update_suppress_error = f"{type(exc).__name__}: {exc}"
-
-    # Same predicate the update banner uses; doctor must not warn about
-    # updates the user has already skipped or deferred.
-    effective_update_available, effective_update_reason = (
-        c._compute_effective_update_available(update_state, update_suppress, now_utc)
-    )
-
-    # ── Pricing coverage (spec §5.1) ─────────────────────────────────
-    # Read-only trailing-30d scan + classification via the pure-fn kernel.
-    # Any failure degrades to None so the check renders OK (never FAIL) and
-    # the rest of the report is unaffected — same posture as the cache reads
-    # above. `_pricing_observed_models` honors the no-mutation contract.
-    pricing_coverage = None
-    if _cache_probe_allowed:
+    with _lib_perf.phase("doctor.cache_probes"):
+        cache_entries_count = None
+        cache_last_entry_at = None
+        cache_db_page_count = None
+        cache_db_freelist_count = None
         try:
-            observed = c._pricing_observed_models(now_utc)
-            # Detection-only: pass warn=False so finding an unpriced model here
-            # does NOT fire the cost-engine's unknown-model warning.
-            pricing_coverage = c.classify_coverage(
-                observed,
-                lambda m: c._resolve_model_pricing(m, warn=False),
-                c._is_codex_fallback,
+            if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
+                conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+                try:
+                    try:
+                        row = conn.execute("PRAGMA page_count").fetchone()
+                        if row and row[0] is not None:
+                            cache_db_page_count = int(row[0])
+                        row = conn.execute("PRAGMA freelist_count").fetchone()
+                        if row and row[0] is not None:
+                            cache_db_freelist_count = int(row[0])
+                    except sqlite3.Error:
+                        pass
+                    row = conn.execute(
+                        "SELECT COUNT(*), MAX(timestamp_utc) FROM session_entries"
+                    ).fetchone()
+                    if row:
+                        cache_entries_count = int(row[0]) if row[0] is not None else 0
+                        if row[1]:
+                            cache_last_entry_at = parse_iso_datetime(
+                                row[1], "session_entries.timestamp_utc",
+                            ).astimezone(dt.timezone.utc)
+                except sqlite3.OperationalError:
+                    pass  # table missing — treat as zero
+                finally:
+                    conn.close()
+        except Exception:
+            pass
+
+    with _lib_perf.phase("doctor.statusline"):
+        # ── Statusline candidate arbitration (#318) ──────────────────────
+        # This inspection is deliberately independent of SQLite mutation: marker
+        # mtime, candidate/control files, and tombstones are all read fail-soft.
+        # In particular it uses the scan-only candidate helper, never the reducer
+        # loader that prunes expired or malformed spool files.
+        try:
+            statusline_pipeline = _gather_statusline_pipeline(c, now_utc=now_utc)
+        except Exception:
+            statusline_pipeline = None
+
+    with _lib_perf.phase("doctor.conversations"):
+        # Conversation-sessions rollup consistency (#217 S1 / U9). Two cheap COUNTs
+        # (graceful None on a missing table / unreadable DB) + an in-progress signal
+        # so a transient mid-sync mismatch never WARNs. The in-progress signal is a
+        # NON-BLOCKING conversations flock probe (a writer mid-walk holds it) OR the
+        # presence of any pending reingest/split/backfill cache_meta flag — doctor
+        # stays read-only and never blocks on the lock.
+        conv_sessions_rollup_count = None
+        conv_messages_distinct_sessions = None
+        conv_rollup_sync_in_progress = False
+        conversations_db_page_count = None
+        conversations_db_freelist_count = None
+        codex_prune_refusals: list[dict] = []
+        try:
+            if _cctally_core.CONVERSATIONS_DB_PATH.exists():
+                # This gather also runs inside dashboard snapshot precompute. A
+                # transcript writer or recovery may hold an exclusive lock, so use
+                # the recovery-aware read-only zero-timeout probe: conversation
+                # health can degrade, but it must never delay core snapshot
+                # freshness (#320, #415).
+                with _conversation_ro_guarded(timeout=0.0) as conn:
+                    if conn is None:
+                        raise sqlite3.OperationalError(
+                            "conversation store maintenance in progress"
+                        )
+                    try:
+                        row = conn.execute("PRAGMA page_count").fetchone()
+                        if row and row[0] is not None:
+                            conversations_db_page_count = int(row[0])
+                        row = conn.execute("PRAGMA freelist_count").fetchone()
+                        if row and row[0] is not None:
+                            conversations_db_freelist_count = int(row[0])
+                    except sqlite3.Error:
+                        pass
+                    try:
+                        row = conn.execute(
+                            "SELECT COUNT(*) FROM conversation_sessions"
+                        ).fetchone()
+                        if row is not None:
+                            conv_sessions_rollup_count = int(row[0])
+                    except sqlite3.OperationalError:
+                        pass  # table absent (pre-rollup) — leave None
+                    try:
+                        row = conn.execute(
+                            "SELECT COUNT(DISTINCT session_id) "
+                            "FROM conversation_messages WHERE session_id IS NOT NULL"
+                        ).fetchone()
+                        if row is not None:
+                            conv_messages_distinct_sessions = int(row[0])
+                    except sqlite3.OperationalError:
+                        pass
+                    try:
+                        import _cctally_cache as _cc_sib
+                        row = conn.execute(
+                            "SELECT value FROM cache_meta WHERE key=?",
+                            (_cc_sib.CODEX_ORPHAN_PRUNE_REFUSED_KEY,),
+                        ).fetchone()
+                        if row and row[0]:
+                            record = json.loads(row[0])
+                            if isinstance(record, dict):
+                                codex_prune_refusals.append(record)
+                    except (sqlite3.OperationalError, ValueError, TypeError):
+                        pass
+                    # Pending reingest/split/backfill flags ⇒ a full sync hasn't yet
+                    # reconciled the rollup. Read the canonical flag set from
+                    # _cctally_cache so it stays in lockstep with the sync consumers.
+                    try:
+                        import _cctally_cache as _cc_sib  # lazy sibling
+                        flags = tuple(_cc_sib._TARGETED_DECLINE_FLAGS)
+                        placeholders = ",".join("?" for _ in flags)
+                        pend = conn.execute(
+                            f"SELECT 1 FROM cache_meta WHERE key IN ({placeholders}) "
+                            "LIMIT 1", flags).fetchone()
+                        if pend is not None:
+                            conv_rollup_sync_in_progress = True
+                    except Exception:
+                        pass
+            # Non-blocking flock probe: if a transcript writer/reingest holds the
+            # conversations.db lock, the rollup may be mid-recompute → in progress. We
+            # acquire LOCK_EX|LOCK_NB and immediately release; failure (held) is the
+            # signal. Never blocks (LOCK_NB), so doctor stays read-only + prompt.
+            if not conv_rollup_sync_in_progress:
+                lock_path = _cctally_core.CONVERSATIONS_LOCK_PATH
+                if lock_path is not None and pathlib.Path(lock_path).exists():
+                    import fcntl as _fcntl
+                    lock_fh = open(str(lock_path), "w")
+                    try:
+                        _fcntl.flock(lock_fh, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                        _fcntl.flock(lock_fh, _fcntl.LOCK_UN)  # acquired ⇒ quiescent
+                    except (BlockingIOError, OSError):
+                        conv_rollup_sync_in_progress = True  # held ⇒ writer mid-flight
+                    finally:
+                        lock_fh.close()
+        except Exception:
+            pass
+
+    with _lib_perf.phase("doctor.claude_files"):
+        claude_jsonl_present = False
+        try:
+            claude_dir = pathlib.Path.home() / ".claude" / "projects"
+            if claude_dir.exists():
+                claude_jsonl_present = next(claude_dir.glob("**/*.jsonl"), None) is not None
+        except Exception:
+            pass
+
+    with _lib_perf.phase("doctor.codex_cache"):
+        codex_entries_count = None
+        codex_last_entry_at = None
+        codex_project_metadata_health = None
+        codex_project_metadata_error = None
+        codex_null_reset_anchors = 0
+        try:
+            if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
+                conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+                try:
+                    row = conn.execute(
+                        "SELECT COUNT(*), MAX(timestamp_utc) FROM codex_session_entries"
+                    ).fetchone()
+                    if row:
+                        codex_entries_count = int(row[0]) if row[0] is not None else 0
+                        if row[1]:
+                            codex_last_entry_at = parse_iso_datetime(
+                                row[1], "codex_session_entries.timestamp_utc",
+                            ).astimezone(dt.timezone.utc)
+                    try:
+                        row = conn.execute(
+                            "SELECT COUNT(*) FROM quota_window_snapshots "
+                            "WHERE source = 'codex' "
+                            "AND canonical_resets_at_utc IS NULL"
+                        ).fetchone()
+                        if row and row[0] is not None:
+                            codex_null_reset_anchors = int(row[0])
+                    except sqlite3.OperationalError:
+                        # Pre-anchor cache shapes have no column to inspect. Their
+                        # pending migration is reported by the DB checks instead.
+                        pass
+                    # Keep the health probe on the existing read-only cache
+                    # connection.  A failed probe is health evidence, not an
+                    # empty corpus: the kernel renders it as a distinct FAIL.
+                    try:
+                        import _cctally_source_analytics
+
+                        health = _cctally_source_analytics.load_codex_project_metadata_health(
+                            cache_conn=conn,
+                        )
+                        codex_project_metadata_health = {
+                            "total_rows": health.total_rows,
+                            "qualified_rows": health.qualified_rows,
+                            "missing_conversation_key_rows": health.missing_conversation_key_rows,
+                            "missing_thread_join_rows": health.missing_thread_join_rows,
+                        }
+                    except Exception as exc:
+                        codex_project_metadata_error = type(exc).__name__
+                except sqlite3.OperationalError as exc:
+                    # Pre-Codex cache shapes still produce the established Codex
+                    # cache result, while the new health check fails explicitly.
+                    codex_project_metadata_error = type(exc).__name__
+                finally:
+                    conn.close()
+        except Exception as exc:
+            codex_project_metadata_error = type(exc).__name__
+
+    with _lib_perf.phase("doctor.codex_files"):
+        # Issue #109: probe every $CODEX_HOME session root (not the single
+        # hardcoded ~/.codex/sessions), matching the multi-root ingestion path
+        # from #108. _codex_session_roots() already applies the sessions/-subdir
+        # rule and filters to existing dirs, so a bare glob per root suffices.
+        codex_jsonl_present = False
+        try:
+            for codex_dir in c._codex_session_roots():
+                if next(codex_dir.glob("**/*.jsonl"), None) is not None:
+                    codex_jsonl_present = True
+                    break
+        except Exception:
+            pass
+
+    with _lib_perf.phase("doctor.quota_summary"):
+        # ── Codex quota lifecycle (#294 S2) ──────────────────────────────
+        # All three probes are read-only and root-qualified.  The physical cache
+        # adapter preserves S1's per-window degradation, while setup's existing
+        # inspector supplies the exact owned-hook state without exposing paths.
+        codex_quota_windows: list[dict] = []
+        try:
+            # #566 §5.1 item 5: the population is unchanged — all history, every
+            # root, no row cap — but the read returns each identity's latest
+            # physical capture instead of every retained row, because that is the
+            # only thing this probe consumes. On the maintainer's store the former
+            # shape interpreted 266,337 rows to answer a question about 608 windows
+            # and cost about 2.7s of every dashboard build. Nothing here may bound
+            # the range: doing so would drop old and inactive-root identities and
+            # silently change `window_count`, the responsible identity and the
+            # WARN/OK verdict.
+            # #583 S5 §2.3: the population is reused while its dependency
+            # signal holds, and every `now`-derived interpretation below is
+            # recomputed regardless. A suppressed probe reads nothing and is
+            # never served from the memo, because `_cache_probe_allowed` gates
+            # the call rather than the load.
+            observations = (
+                _load_codex_quota_observations_for_doctor(
+                    force_cold=_force_cold_inputs,
+                )
+                if _cache_probe_allowed
+                else ()
+            )
+            by_identity: dict[object, list] = {}
+            for observation in observations:
+                by_identity.setdefault(observation.identity, []).append(observation)
+            for identity in sorted(
+                by_identity,
+                key=lambda item: (
+                    item.source, item.source_root_key, item.logical_limit_key,
+                    item.observed_slot, item.window_minutes,
+                ),
+            ):
+                freshness = c.quota_freshness(by_identity[identity], now_utc)
+                codex_quota_windows.append({
+                    "identity": {
+                        "source": identity.source,
+                        "source_root_key": identity.source_root_key,
+                        "logical_limit_key": identity.logical_limit_key,
+                        "observed_slot": identity.observed_slot,
+                        "window_minutes": identity.window_minutes,
+                    },
+                    "latest_capture_at": freshness.captured_at,
+                    "freshness_state": freshness.state,
+                    "age_seconds": freshness.age_seconds,
+                    "stale_after_seconds": freshness.stale_after_seconds,
+                })
+        except Exception:
+            codex_quota_windows = []
+
+    with _lib_perf.phase("doctor.codex_hooks"):
+        codex_hook_roots: list[dict] = []
+        try:
+            codex_binary = str(c._setup_resolve_hook_target(repo_root))
+            hook_rows = [
+                c._cctally_setup._codex_hook_row(root, codex_binary)
+                for root in c._setup_codex_hook_roots()
+            ]
+            codex_hook_roots = [
+                {"source_root_key": row["source_root_key"], "state": row["state"]}
+                for row in sorted(hook_rows, key=lambda row: row["source_root_key"])
+            ]
+        except Exception:
+            codex_hook_roots = []
+
+    with _lib_perf.phase("doctor.codex_lifecycle"):
+        try:
+            codex_lifecycle_activity_24h = _codex_lifecycle_activity_24h(
+                root_keys={row["source_root_key"] for row in codex_hook_roots},
+                now_utc=now_utc,
             )
         except Exception:
-            pricing_coverage = None
+            codex_lifecycle_activity_24h = {}
+
+        try:
+            codex_quota_verify_activity = _codex_quota_verify_activity_24h(
+                now_utc=now_utc)
+        except Exception:
+            codex_quota_verify_activity = None
+
+    with _lib_perf.phase("doctor.parse_health"):
+        # ── Parse health (#279 S2 F5a) ───────────────────────────────────
+        parse_health_claude = parse_health_codex = None
+        # #416 review B4: the durable record that a torn Codex `auth.json` halted
+        # ingest. Same cache_meta read, same degrade-to-None-on-anything contract.
+        codex_torn_deferred = None
+        # The byte-zero Codex replay stall signal. The marker itself is a bare "1";
+        # the sibling `blocked` record is the JSON one, so it is read through the
+        # same loop while the marker gets a plain existence probe. Key names come
+        # from the kernel constants, never inline literals.
+        codex_replay_pending = None
+        codex_replay_blocked = None
+        # public #5: the budgeted-decline record. Same JSON-dict contract as the
+        # blocked one, and the only signal a hook-only install produces when its
+        # Codex ingest is frozen behind an un-runnable replay.
+        codex_replay_deferred = None
+        # public #5 spec §5: the hook's budgeted-ingest backlog record. Absent means
+        # a zero backlog — a drained walk DELETES the row rather than zeroing it, so
+        # None and "nothing owed" are the same state by construction.
+        codex_ingest_backlog = None
+        try:
+            import _lib_codex_conversation as _codex_kern
+            _blocked_key = _codex_kern.CODEX_REPLAY_BLOCKED_KEY
+            _pending_key = _codex_kern.CODEX_REPLAY_FROM_ZERO_KEY
+            _deferred_key = _codex_kern.CODEX_REPLAY_DEFERRED_KEY
+        except Exception:
+            _blocked_key = "codex_replay_from_zero_blocked"
+            _pending_key = "codex_replay_from_zero_pending"
+            _deferred_key = "codex_replay_from_zero_deferred"
+        try:
+            if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
+                conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+                try:
+                    for _key in ("parse_health_claude", "parse_health_codex",
+                                 "codex_torn_auth_deferred", _blocked_key,
+                                 _deferred_key, "codex_ingest_backlog",
+                                 "codex_orphan_prune_refused"):
+                        try:
+                            row = conn.execute(
+                                "SELECT value FROM cache_meta WHERE key = ?",
+                                (_key,),
+                            ).fetchone()
+                            if row and row[0]:
+                                _parsed = json.loads(row[0])
+                                if isinstance(_parsed, dict):
+                                    if _key == "parse_health_claude":
+                                        parse_health_claude = _parsed
+                                    elif _key == "parse_health_codex":
+                                        parse_health_codex = _parsed
+                                    elif _key == _blocked_key:
+                                        codex_replay_blocked = _parsed
+                                    elif _key == _deferred_key:
+                                        codex_replay_deferred = _parsed
+                                    elif _key == "codex_ingest_backlog":
+                                        codex_ingest_backlog = _parsed
+                                    elif _key == "codex_orphan_prune_refused":
+                                        codex_prune_refusals.append(_parsed)
+                                    else:
+                                        codex_torn_deferred = _parsed
+                        except (sqlite3.OperationalError, ValueError):
+                            pass
+                    try:
+                        codex_replay_pending = conn.execute(
+                            "SELECT 1 FROM cache_meta WHERE key = ?",
+                            (_pending_key,),
+                        ).fetchone() is not None
+                    except sqlite3.OperationalError:
+                        pass
+                finally:
+                    conn.close()
+        except Exception:
+            pass
+
+    with _lib_perf.phase("doctor.integrity"):
+        # ── Integrity (deep only — #279 S2 F5b) ──────────────────────────
+        stats_db_quick_check = cache_db_quick_check = None
+        conversations_db_quick_check = None
+        if deep:
+            for _label, _path in (("stats", _cctally_core.DB_PATH),
+                                  ("cache", _cctally_core.CACHE_DB_PATH),
+                                  ("conversations",
+                                   _cctally_core.CONVERSATIONS_DB_PATH)):
+                _result = None
+                try:
+                    if (
+                        (
+                            _path.exists()
+                            or (
+                                _label == "conversations"
+                                and _path.with_name(
+                                    f"{_path.name}.recovery.json"
+                                ).exists()
+                            )
+                        )
+                        and (_label != "cache" or _cache_probe_allowed)
+                    ):
+                        # #386: the stats leg holds a read-write handle for the whole
+                        # of a full quick_check — the longest-lived stats handle any
+                        # diagnostic takes — so it participates in the replacement
+                        # protocol. The cache leg keeps its own opener.
+                        if _label == "stats":
+                            import _cctally_store as _store_mod
+                            _conn_ctx = contextlib.closing(
+                                _store_mod.stats_open_guarded(_path)
+                            )
+                        elif _label == "cache":
+                            _conn_ctx = contextlib.closing(
+                                sqlite3.connect(str(_path))
+                            )
+                        else:
+                            _conn_ctx = _conversation_ro_guarded(timeout=2.0)
+                        with _conn_ctx as _conn:
+                            if _conn is not None:
+                                _row = _conn.execute(
+                                    "PRAGMA quick_check(1)").fetchone()
+                                _result = (
+                                    str(_row[0])
+                                    if _row and _row[0] is not None else None
+                                )
+                            elif (
+                                _label == "conversations"
+                                and _path.with_name(
+                                    f"{_path.name}.recovery.json"
+                                ).exists()
+                            ):
+                                _result = "recovery in progress"
+                except sqlite3.DatabaseError as exc:
+                    _result = f"open failed: {exc}"
+                except Exception:
+                    _result = None
+                if _label == "stats":
+                    stats_db_quick_check = _result
+                elif _label == "cache":
+                    cache_db_quick_check = _result
+                else:
+                    conversations_db_quick_check = _result
+
+    with _lib_perf.phase("doctor.locks"):
+        # ── Lock state (#279 S2 F5c) — read-only: never create files ─────
+        locks_held: "dict | None" = None
+        try:
+            locks_held = {}
+            for _name, _lp in (
+                ("cache.db.lock", _cctally_core.CACHE_LOCK_PATH),
+                ("cache.db.codex.lock", _cctally_core.CACHE_LOCK_CODEX_PATH),
+                ("conversations.db.lock", _cctally_core.CONVERSATIONS_LOCK_PATH),
+                (
+                    "conversations.db.codex.lock",
+                    _cctally_core.CONVERSATIONS_LOCK_CODEX_PATH,
+                ),
+                (
+                    "conversations.db.maintenance.lock",
+                    _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH,
+                ),
+            ):
+                if not _lp.exists():
+                    locks_held[_name] = False
+                    continue
+                try:
+                    with open(_lp, "r") as _lf:
+                        try:
+                            fcntl.flock(_lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            fcntl.flock(_lf, fcntl.LOCK_UN)
+                            locks_held[_name] = False
+                        except OSError:
+                            locks_held[_name] = True
+                except OSError:
+                    locks_held[_name] = None
+        except Exception:
+            locks_held = None
+
+    with _lib_perf.phase("doctor.wal"):
+        # ── cache.db WAL size (#297) — read-only backstop ────────────────
+        # Gathered OUTSIDE the deep/quick_check branch (above) so the WAL-size
+        # check runs in both shallow and deep gather modes. Best-effort getsize;
+        # None on OSError/race (doctor never blocks or raises), 0 when absent.
+        cache_db_wal_bytes: "int | None"
+        try:
+            _wal = pathlib.Path(f"{_cctally_core.CACHE_DB_PATH}-wal")
+            cache_db_wal_bytes = _wal.stat().st_size if _wal.exists() else 0
+        except OSError:
+            cache_db_wal_bytes = None
+
+        # ── conversations.db WAL size (#583 S4 / F39) ────────────────────
+        # Same shallow/deep placement and the same best-effort contract as the
+        # cache leg above: 0 when the sidecar is absent, None when it cannot be
+        # stat'ed.
+        conversations_db_wal_bytes: "int | None"
+        try:
+            _cwal = pathlib.Path(f"{_cctally_core.CONVERSATIONS_DB_PATH}-wal")
+            conversations_db_wal_bytes = (
+                _cwal.stat().st_size if _cwal.exists() else 0
+            )
+        except OSError:
+            conversations_db_wal_bytes = None
+
+    with _lib_perf.phase("doctor.config"):
+        # ── Safety ───────────────────────────────────────────────────────
+        # `dashboard.bind` is read via the same chokepoint that powers
+        # `cctally config get dashboard.bind` — `_config_known_value`
+        # normalizes hand-edited junk back to "loopback", matching the
+        # value cmd_dashboard would actually bind to.
+        #
+        # Raw JSON read (NOT load_config or _load_config_unlocked): both
+        # call `ensure_dirs()`, which creates `~/.local/share/cctally/`
+        # and `logs/` on a fresh HOME. Doctor is a read-only diagnostic
+        # (H1 invariant) — it must never mutate user state, even by
+        # creating an empty directory tree. Corrupt JSON yields
+        # `dashboard_bind_stored = "loopback"` (the same fallback the
+        # original try/except gave); the dedicated `config_json_valid`
+        # check surfaces the corruption separately.
+        #
+        # `dashboard.expose_transcripts` (Plan 2, spec §5) is read off the same raw
+        # JSON via the same chokepoint (defaults False; hand-edited junk → False).
+        # `_check_safety_dashboard_bind` only consults it when the bind is LAN, so
+        # a loopback report is byte-identical whether or not it's set.
+        dashboard_bind_stored = "loopback"
+        expose_transcripts = False
+        try:
+            if _cctally_core.CONFIG_PATH.exists():
+                raw_cfg = json.loads(_cctally_core.CONFIG_PATH.read_text(encoding="utf-8"))
+                if isinstance(raw_cfg, dict):
+                    dashboard_bind_stored = (
+                        c._config_known_value(raw_cfg, "dashboard.bind") or "loopback"
+                    )
+                    expose_transcripts = bool(
+                        c._config_known_value(raw_cfg, "dashboard.expose_transcripts")
+                    )
+        except (json.JSONDecodeError, OSError):
+            pass
+
+        # ── Telemetry (anonymous install-count, spec 2026-07-07) ─────────
+        # Resolve the opt-out state via the pure kernel predicate — it reads env
+        # + config + the dev-checkout fact and NEVER mints an install_id / touches
+        # any marker (read-only H1 invariant). Uses the same raw config read as the
+        # safety block so doctor never auto-creates config.json; a missing/corrupt
+        # config degrades to `{}` (env/dev precedence still resolves correctly).
+        telemetry_enabled = True
+        telemetry_reason = "enabled"
+        try:
+            raw_tele_cfg: dict = {}
+            if _cctally_core.CONFIG_PATH.exists():
+                loaded = json.loads(_cctally_core.CONFIG_PATH.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    raw_tele_cfg = loaded
+            telemetry_enabled, telemetry_reason = c.resolve_telemetry_state(raw_tele_cfg)
+        except Exception:
+            # Fail-soft: any read/parse/resolution error degrades to the enabled
+            # default (the check renders OK regardless — it never FAILs/WARNs).
+            telemetry_enabled, telemetry_reason = (True, "enabled")
+
+        # config.json — RAW READ, never load_config(). load_config()
+        # auto-creates on first run AND silently falls back to defaults
+        # on corruption — both behaviors would hide diagnostic state
+        # (codex H1).
+        config_json_error = None
+        config_parsed: dict = {}
+        try:
+            if _cctally_core.CONFIG_PATH.exists():
+                config_parsed = json.loads(
+                    _cctally_core.CONFIG_PATH.read_text(encoding="utf-8")
+                )
+        except json.JSONDecodeError as exc:
+            config_json_error = f"{type(exc).__name__}: {exc}"
+        except OSError as exc:
+            config_json_error = f"OSError: {exc}"
+
+        # Configured update (release) channel (beta-channel, spec 2026-07-21 §3):
+        # derived from the SAME raw read (never load_config, which auto-creates on
+        # first run). Fail-soft to "stable" — resolve_update_channel already
+        # tolerates a non-dict block / junk value.
+        try:
+            update_channel = c.resolve_update_channel(
+                config_parsed if isinstance(config_parsed, dict) else {}
+            )
+        except Exception:
+            update_channel = "stable"
+
+    with _lib_perf.phase("doctor.update"):
+        update_state = None
+        update_state_error = None
+        try:
+            update_state = c._load_update_state()
+        except Exception as exc:
+            update_state_error = f"{type(exc).__name__}: {exc}"
+
+        update_suppress = None
+        update_suppress_error = None
+        try:
+            update_suppress = c._load_update_suppress()
+        except Exception as exc:
+            update_suppress_error = f"{type(exc).__name__}: {exc}"
+
+        # Same predicate the update banner uses; doctor must not warn about
+        # updates the user has already skipped or deferred.
+        effective_update_available, effective_update_reason = (
+            c._compute_effective_update_available(update_state, update_suppress, now_utc)
+        )
+
+    with _lib_perf.phase("doctor.pricing_coverage"):
+        # ── Pricing coverage (spec §5.1) ─────────────────────────────────
+        # Read-only trailing-30d scan + classification via the pure-fn kernel.
+        # Any failure degrades to None so the check renders OK (never FAIL) and
+        # the rest of the report is unaffected — same posture as the cache reads
+        # above. `_pricing_observed_models` honors the no-mutation contract.
+        pricing_coverage = None
+        if _cache_probe_allowed:
+            try:
+                observed = c._pricing_observed_models(now_utc)
+                # Detection-only: pass warn=False so finding an unpriced model here
+                # does NOT fire the cost-engine's unknown-model warning.
+                pricing_coverage = c.classify_coverage(
+                    observed,
+                    lambda m: c._resolve_model_pricing(m, warn=False),
+                    c._is_codex_fallback,
+                )
+            except Exception:
+                pricing_coverage = None
 
     # ── Meta ─────────────────────────────────────────────────────────
-    # ── Journal (DB journal redesign §9) ─────────────────────────────
-    # Read-only legs over the append-only journal: presence + appendability,
-    # torn-tail/malformed counts (deep-gated — reads whole segments), the ingest
-    # cursor lag vs. the high-water, and the auto-heal incident history. Every
-    # probe degrades to its always-OK posture on any error (the pure kernel then
-    # reports "no journal" / "not scanned").
-    import _lib_journal as _jl
-    journal_present = False
-    journal_appendable = None
-    journal_segment_count = 0
-    journal_has_bytes = False
-    journal_malformed_count = None
-    journal_torn_tail_count = None
-    journal_cursor_lag_bytes = None
-    journal_hw_segment = None
-    journal_cursor_segment = None
-    journal_conflicts = None
-    journal_protocol_violations = None
-    journal_protocol_acknowledged = None
-    journal_protocol_error = None
-    try:
-        jdir = _cctally_core.JOURNAL_DIR
-        journal_present = jdir.exists()
-        if journal_present:
-            try:
-                journal_appendable = os.access(str(jdir), os.W_OK)
-            except OSError:
-                journal_appendable = None
-            import _cctally_journal as _jr
-            try:
-                segs = _jr.list_segments()  # canonical (segment) order
-            except Exception:
-                segs = []
-            journal_segment_count = len(segs)
-            # #402: the disposable stats index persists the most recent complete
-            # selector result. Shallow Dashboard/TUI gathers read that bounded
-            # summary instead of rescanning a production-sized journal and
-            # therefore cannot turn known taint into a false OK.
-            try:
-                if _cctally_core.DB_PATH.exists():
-                    pc = _stats_ro_guarded()
-                    try:
-                        protocol_rows = [
-                            json.loads(str(row[0]))
-                            for row in pc.execute(
-                                "SELECT violation_json "
-                                "FROM journal_protocol_violations "
-                                "ORDER BY batch_id, kind, fingerprint"
-                            )
-                        ]
-                        journal_protocol_violations = [
-                            item for item in protocol_rows
-                            if not item.get("auditId")
-                        ]
-                        journal_protocol_acknowledged = [
-                            item for item in protocol_rows
-                            if item.get("auditId")
-                        ]
-                    finally:
-                        pc.close()
-            except (sqlite3.Error, ValueError, TypeError):
-                journal_protocol_violations = None
-                journal_protocol_acknowledged = None
-            sizes: dict = {}
-            for seg in segs:
+    with _lib_perf.phase("doctor.journal"):
+        # ── Journal (DB journal redesign §9) ─────────────────────────────
+        # Read-only legs over the append-only journal: presence + appendability,
+        # torn-tail/malformed counts (deep-gated — reads whole segments), the ingest
+        # cursor lag vs. the high-water, and the auto-heal incident history. Every
+        # probe degrades to its always-OK posture on any error (the pure kernel then
+        # reports "no journal" / "not scanned").
+        import _lib_journal as _jl
+        journal_present = False
+        journal_appendable = None
+        journal_segment_count = 0
+        journal_has_bytes = False
+        journal_malformed_count = None
+        journal_torn_tail_count = None
+        journal_cursor_lag_bytes = None
+        journal_hw_segment = None
+        journal_cursor_segment = None
+        journal_conflicts = None
+        journal_protocol_violations = None
+        journal_protocol_acknowledged = None
+        journal_protocol_error = None
+        try:
+            jdir = _cctally_core.JOURNAL_DIR
+            journal_present = jdir.exists()
+            if journal_present:
                 try:
-                    sizes[seg] = (jdir / seg).stat().st_size
+                    journal_appendable = os.access(str(jdir), os.W_OK)
                 except OSError:
-                    sizes[seg] = 0
-            if segs:
-                journal_hw_segment = segs[-1]
-                journal_has_bytes = _jr._has_retained_journal_bytes(
-                    sizes.values()
-                )
-            # deep-gated malformed / torn-tail scan (reads the whole journal;
-            # the dashboard's per-rebuild gather stays deep=False so it never
-            # pays this at the 10× envelope — mirrors the quick_check legs).
-            if deep and segs:
-                malformed = 0
-                torn = 0
-                decoded_records: list = []
-                protocol_evidence = []
-                prior_high_water = None
-                cutover_value = None
+                    journal_appendable = None
+                import _cctally_journal as _jr
+                try:
+                    segs = _jr.list_segments()  # canonical (segment) order
+                except Exception:
+                    segs = []
+                journal_segment_count = len(segs)
+                # #402: the disposable stats index persists the most recent complete
+                # selector result. Shallow Dashboard/TUI gathers read that bounded
+                # summary instead of rescanning a production-sized journal and
+                # therefore cannot turn known taint into a false OK.
+                try:
+                    if _cctally_core.DB_PATH.exists():
+                        pc = _stats_ro_guarded()
+                        try:
+                            protocol_rows = [
+                                json.loads(str(row[0]))
+                                for row in pc.execute(
+                                    "SELECT violation_json "
+                                    "FROM journal_protocol_violations "
+                                    "ORDER BY batch_id, kind, fingerprint"
+                                )
+                            ]
+                            journal_protocol_violations = [
+                                item for item in protocol_rows
+                                if not item.get("auditId")
+                            ]
+                            journal_protocol_acknowledged = [
+                                item for item in protocol_rows
+                                if item.get("auditId")
+                            ]
+                        finally:
+                            pc.close()
+                except (sqlite3.Error, ValueError, TypeError):
+                    journal_protocol_violations = None
+                    journal_protocol_acknowledged = None
+                sizes: dict = {}
                 for seg in segs:
                     try:
-                        data = (jdir / seg).read_bytes()
+                        sizes[seg] = (jdir / seg).stat().st_size
                     except OSError:
-                        continue
-                    if not data:
-                        continue
-                    if not data.endswith(b"\n"):
-                        torn += 1
-                    # every element except the last is a complete line; the last
-                    # is either "" (ended in \n) or the torn partial — not a
-                    # mid-file line, so it is never counted as malformed.
-                    offset = 0
-                    for raw in data.split(b"\n")[:-1]:
-                        if not raw:
-                            prior_high_water = (seg, offset + 1)
-                            offset += 1
+                        sizes[seg] = 0
+                if segs:
+                    journal_hw_segment = segs[-1]
+                    journal_has_bytes = _jr._has_retained_journal_bytes(
+                        sizes.values()
+                    )
+                # deep-gated malformed / torn-tail scan (reads the whole journal;
+                # the dashboard's per-rebuild gather stays deep=False so it never
+                # pays this at the 10× envelope — mirrors the quick_check legs).
+                if deep and segs:
+                    malformed = 0
+                    torn = 0
+                    decoded_records: list = []
+                    protocol_evidence = []
+                    prior_high_water = None
+                    cutover_value = None
+                    for seg in segs:
+                        try:
+                            data = (jdir / seg).read_bytes()
+                        except OSError:
                             continue
-                        record = _jl.decode_line(raw)
-                        if record is None:
-                            malformed += 1
+                        if not data:
+                            continue
+                        if not data.endswith(b"\n"):
+                            torn += 1
+                        # every element except the last is a complete line; the last
+                        # is either "" (ended in \n) or the torn partial — not a
+                        # mid-file line, so it is never counted as malformed.
+                        offset = 0
+                        for raw in data.split(b"\n")[:-1]:
+                            if not raw:
+                                prior_high_water = (seg, offset + 1)
+                                offset += 1
+                                continue
+                            record = _jl.decode_line(raw)
+                            if record is None:
+                                malformed += 1
+                                prior_high_water = (
+                                    seg,
+                                    offset + len(raw) + 1,
+                                )
+                                offset += len(raw) + 1
+                                continue
+                            _jr._capture_protocol_prefix_evidence(
+                                record,
+                                prior_high_water,
+                                protocol_evidence,
+                            )
+                            # first cutover op wins, exactly as
+                            # `find_accounts_cutover_op` scans — captured here so the
+                            # conflict scan does not decode the whole journal twice.
+                            if (cutover_value is None
+                                    and record.get("id") == _jr.CUTOVER_OP_ID):
+                                payload = record.get("payload")
+                                if isinstance(payload, dict):
+                                    cutover_value = payload.get(
+                                        "claude_legacy_account")
+                            # RETAIN ONLY what the selector consumes. `obs` lines are
+                            # ~97% of a real journal (984k of 1.02M) and
+                            # `resolve_effective_events` ignores them entirely —
+                            # keeping their dictionaries cost 4.3 GB of peak RSS for
+                            # an identical result (#374 review). They still consume a
+                            # lightweight slot because their physical sequence is
+                            # part of three durable violation fingerprints (#508).
+                            decoded_records.append(
+                                _lib_journal_router.selector_slot(record)
+                            )
                             prior_high_water = (
                                 seg,
                                 offset + len(raw) + 1,
                             )
                             offset += len(raw) + 1
-                            continue
-                        _jr._capture_protocol_prefix_evidence(
-                            record,
-                            prior_high_water,
-                            protocol_evidence,
-                        )
-                        # first cutover op wins, exactly as
-                        # `find_accounts_cutover_op` scans — captured here so the
-                        # conflict scan does not decode the whole journal twice.
-                        if (cutover_value is None
-                                and record.get("id") == _jr.CUTOVER_OP_ID):
-                            payload = record.get("payload")
-                            if isinstance(payload, dict):
-                                cutover_value = payload.get(
-                                    "claude_legacy_account")
-                        # RETAIN ONLY what the selector consumes. `obs` lines are
-                        # ~97% of a real journal (984k of 1.02M) and
-                        # `resolve_effective_events` ignores them entirely —
-                        # keeping their dictionaries cost 4.3 GB of peak RSS for
-                        # an identical result (#374 review). They still consume a
-                        # lightweight slot because their physical sequence is
-                        # part of three durable violation fingerprints (#508).
-                        decoded_records.append(
-                            _lib_journal_router.selector_slot(record)
-                        )
-                        prior_high_water = (
-                            seg,
-                            offset + len(raw) + 1,
-                        )
-                        offset += len(raw) + 1
-                journal_malformed_count = malformed
-                journal_torn_tail_count = torn
-                # #374: same-revision quarantine, via the SHARED selector over
-                # rebuild-equivalent input. Raw `(id, rev)` grouping would report
-                # lower-revision groups a completed rev-1 batch legitimately
-                # superseded, and false account conflicts that the rebuild's
-                # `_normalize_legacy_account_stamp` resolves — so normalize
-                # exactly as `rebuild_stats_index` does, then select.
-                try:
-                    cutover_claude = (
-                        cutover_value if cutover_value is not None
-                        else _jr.resolve_cutover_claude_account()
-                    )
-                    for record in decoded_records:
-                        if record is not None:
-                            _jr._normalize_legacy_account_stamp(
-                                record, cutover_claude)
-                    selection = _jl.resolve_effective_events(
-                        decoded_records,
-                        protocol_prefix_evidence=protocol_evidence,
-                    )
-                except _jl.JournalProtocolError as exc:
-                    # Out-of-scope malformed known record: selection did not
-                    # finish, so conflicts/tainted-batch results are unavailable.
-                    journal_protocol_error = str(exc)
-                    journal_conflicts = None
-                    journal_protocol_violations = None
-                    journal_protocol_acknowledged = None
-                except Exception:
-                    journal_conflicts = None
-                    journal_protocol_violations = None
-                    journal_protocol_acknowledged = None
-                else:
-                    journal_conflicts = [
-                        conflict.to_dict() for conflict in selection.conflicts
-                    ]
-                    journal_protocol_violations = [
-                        violation.to_dict()
-                        for violation in selection.protocol_violations
-                    ]
-                    journal_protocol_acknowledged = [
-                        violation.to_dict()
-                        for violation in (
-                            selection.acknowledged_protocol_violations
-                        )
-                    ]
-            # ingest cursor lag: unconsumed bytes between the stats index cursor
-            # and the journal high-water, in canonical (segment, offset) order.
-            cursor = None
-            try:
-                if _cctally_core.DB_PATH.exists():
-                    jc = _stats_ro_guarded()   # #386 opener protocol
+                    journal_malformed_count = malformed
+                    journal_torn_tail_count = torn
+                    # #374: same-revision quarantine, via the SHARED selector over
+                    # rebuild-equivalent input. Raw `(id, rev)` grouping would report
+                    # lower-revision groups a completed rev-1 batch legitimately
+                    # superseded, and false account conflicts that the rebuild's
+                    # `_normalize_legacy_account_stamp` resolves — so normalize
+                    # exactly as `rebuild_stats_index` does, then select.
                     try:
-                        cursor_columns = {
-                            str(row[1])
-                            for row in jc.execute(
-                                "PRAGMA table_info(journal_cursor)"
+                        cutover_claude = (
+                            cutover_value if cutover_value is not None
+                            else _jr.resolve_cutover_claude_account()
+                        )
+                        for record in decoded_records:
+                            if record is not None:
+                                _jr._normalize_legacy_account_stamp(
+                                    record, cutover_claude)
+                        selection = _jl.resolve_effective_events(
+                            decoded_records,
+                            protocol_prefix_evidence=protocol_evidence,
+                        )
+                    except _jl.JournalProtocolError as exc:
+                        # Out-of-scope malformed known record: selection did not
+                        # finish, so conflicts/tainted-batch results are unavailable.
+                        journal_protocol_error = str(exc)
+                        journal_conflicts = None
+                        journal_protocol_violations = None
+                        journal_protocol_acknowledged = None
+                    except Exception:
+                        journal_conflicts = None
+                        journal_protocol_violations = None
+                        journal_protocol_acknowledged = None
+                    else:
+                        journal_conflicts = [
+                            conflict.to_dict() for conflict in selection.conflicts
+                        ]
+                        journal_protocol_violations = [
+                            violation.to_dict()
+                            for violation in selection.protocol_violations
+                        ]
+                        journal_protocol_acknowledged = [
+                            violation.to_dict()
+                            for violation in (
+                                selection.acknowledged_protocol_violations
                             )
-                        }
-                        if {
-                            "applied_segment", "applied_offset"
-                        } <= cursor_columns:
-                            crow = jc.execute(
-                                "SELECT segment, offset, applied_segment, "
-                                "applied_offset FROM journal_cursor "
-                                "WHERE id = 1").fetchone()
-                            if (
-                                crow is not None
-                                and crow[2] is not None
-                                and crow[3] is not None
-                            ):
-                                cursor = (crow[2], int(crow[3]))
-                        else:
-                            legacy = jc.execute(
-                                "SELECT segment, offset FROM journal_cursor "
-                                "WHERE id = 1").fetchone()
-                            if legacy is not None:
-                                cursor = (legacy[0], int(legacy[1]))
-                    except sqlite3.OperationalError:
-                        pass  # pre-cutover DB has no journal_cursor table
-                    finally:
-                        jc.close()
-            except sqlite3.Error:
+                        ]
+                # ingest cursor lag: unconsumed bytes between the stats index cursor
+                # and the journal high-water, in canonical (segment, offset) order.
                 cursor = None
-            if cursor is not None and segs:
-                cseg, coff = cursor
-                journal_cursor_segment = cseg
-                order = {s: i for i, s in enumerate(segs)}
-                if cseg in order:
-                    ci = order[cseg]
-                    lag = max(0, sizes.get(segs[ci], 0) - coff)
-                    for s in segs[ci + 1:]:
-                        lag += sizes.get(s, 0)
-                    journal_cursor_lag_bytes = lag
-    except Exception:
-        pass
-    # #496 S5b: the durable incomplete-quota-projection flag carried inside the
-    # published stats generation. Read-only, and independent of journal presence
-    # because the flag describes the INDEX rather than the journal. None means
-    # "no epoch-1009 index to ask" (absent file, missing table, unreadable DB),
-    # which the pure kernel reports as not applicable rather than as a fault.
-    #
-    # This is a THIRD read-only stats open in this function, and folding it into
-    # the `jc` open above was considered and rejected: that open sits inside
-    # `if journal_present:`, so carrying this SELECT there would make the flag
-    # unreadable on an install whose journal directory is absent — exactly the
-    # independence the paragraph above states. One extra guarded open on the
-    # doctor path is the cheaper of the two.
-    stats_quota_projection_incomplete: "bool | None" = None
-    try:
-        if _cctally_core.DB_PATH.exists():
-            qp = _stats_ro_guarded()   # #386 opener protocol
-            try:
-                row = qp.execute(
-                    "SELECT incomplete FROM stats_quota_projection_state "
-                    "WHERE id = 1").fetchone()
-                if row is not None:
-                    stats_quota_projection_incomplete = bool(int(row[0] or 0))
-            except sqlite3.OperationalError:
-                pass  # pre-1009 index has no stats_quota_projection_state
-            finally:
-                qp.close()
-    except Exception:
-        stats_quota_projection_incomplete = None
+                try:
+                    if _cctally_core.DB_PATH.exists():
+                        jc = _stats_ro_guarded()   # #386 opener protocol
+                        try:
+                            cursor_columns = {
+                                str(row[1])
+                                for row in jc.execute(
+                                    "PRAGMA table_info(journal_cursor)"
+                                )
+                            }
+                            if {
+                                "applied_segment", "applied_offset"
+                            } <= cursor_columns:
+                                crow = jc.execute(
+                                    "SELECT segment, offset, applied_segment, "
+                                    "applied_offset FROM journal_cursor "
+                                    "WHERE id = 1").fetchone()
+                                if (
+                                    crow is not None
+                                    and crow[2] is not None
+                                    and crow[3] is not None
+                                ):
+                                    cursor = (crow[2], int(crow[3]))
+                            else:
+                                legacy = jc.execute(
+                                    "SELECT segment, offset FROM journal_cursor "
+                                    "WHERE id = 1").fetchone()
+                                if legacy is not None:
+                                    cursor = (legacy[0], int(legacy[1]))
+                        except sqlite3.OperationalError:
+                            pass  # pre-cutover DB has no journal_cursor table
+                        finally:
+                            jc.close()
+                except sqlite3.Error:
+                    cursor = None
+                if cursor is not None and segs:
+                    cseg, coff = cursor
+                    journal_cursor_segment = cseg
+                    order = {s: i for i, s in enumerate(segs)}
+                    if cseg in order:
+                        ci = order[cseg]
+                        lag = max(0, sizes.get(segs[ci], 0) - coff)
+                        for s in segs[ci + 1:]:
+                            lag += sizes.get(s, 0)
+                        journal_cursor_lag_bytes = lag
+        except Exception:
+            pass
+    with _lib_perf.phase("doctor.stats_projection"):
+        # #496 S5b: the durable incomplete-quota-projection flag carried inside the
+        # published stats generation. Read-only, and independent of journal presence
+        # because the flag describes the INDEX rather than the journal. None means
+        # "no epoch-1009 index to ask" (absent file, missing table, unreadable DB),
+        # which the pure kernel reports as not applicable rather than as a fault.
+        #
+        # This is a THIRD read-only stats open in this function, and folding it into
+        # the `jc` open above was considered and rejected: that open sits inside
+        # `if journal_present:`, so carrying this SELECT there would make the flag
+        # unreadable on an install whose journal directory is absent — exactly the
+        # independence the paragraph above states. One extra guarded open on the
+        # doctor path is the cheaper of the two.
+        stats_quota_projection_incomplete: "bool | None" = None
+        try:
+            if _cctally_core.DB_PATH.exists():
+                qp = _stats_ro_guarded()   # #386 opener protocol
+                try:
+                    row = qp.execute(
+                        "SELECT incomplete FROM stats_quota_projection_state "
+                        "WHERE id = 1").fetchone()
+                    if row is not None:
+                        stats_quota_projection_incomplete = bool(int(row[0] or 0))
+                except sqlite3.OperationalError:
+                    pass  # pre-1009 index has no stats_quota_projection_state
+                finally:
+                    qp.close()
+        except Exception:
+            stats_quota_projection_incomplete = None
 
-    # Auto-heal incident history — independent of journal presence (a corruption
-    # incident can predate cutover). None only if BOTH dirs were unreadable.
-    journal_heal_incidents = None
-    _incidents: list = []
-    _incident_read_ok = False
-    try:
-        qroot = _cctally_core.APP_DIR / "quarantine"
-        if qroot.exists():
-            _incident_read_ok = True
-            for entry in qroot.iterdir():
-                if entry.is_dir():
-                    record = _journal_heal_incident(
-                        "quarantine", entry.name, now_utc)
-                    # §7.2 escalates on a REPEATED damage shape, so the shape
-                    # has to travel with the incident it belongs to — counted
-                    # once per incident, never once per manifest read.
-                    record["shape"] = _incident_shape_token(entry)
-                    _incidents.append(record)
-    except OSError:
-        pass
-    try:
-        logdir = _cctally_core.LOG_DIR
-        if logdir.exists():
-            _incident_read_ok = True
-            for entry in logdir.iterdir():
-                n = entry.name
-                if "-corruption-forensics-" in n and n.endswith(".json"):
-                    _incidents.append(
-                        _journal_heal_incident("forensics", n, now_utc))
-    except OSError:
-        pass
-    if _incident_read_ok:
-        # most-recent first; unparseable ages (None) sort last.
-        _incidents.sort(key=lambda d: (d["age_s"] is None,
-                                       d["age_s"] if d["age_s"] is not None else 0))
-        journal_heal_incidents = _incidents
+    with _lib_perf.phase("doctor.heal"):
+        # Auto-heal incident history — independent of journal presence (a corruption
+        # incident can predate cutover). None only if BOTH dirs were unreadable.
+        journal_heal_incidents = None
+        _incidents: list = []
+        _incident_read_ok = False
+        try:
+            qroot = _cctally_core.APP_DIR / "quarantine"
+            if qroot.exists():
+                _incident_read_ok = True
+                for entry in qroot.iterdir():
+                    if entry.is_dir():
+                        record = _journal_heal_incident(
+                            "quarantine", entry.name, now_utc)
+                        # §7.2 escalates on a REPEATED damage shape, so the shape
+                        # has to travel with the incident it belongs to — counted
+                        # once per incident, never once per manifest read.
+                        record["shape"] = _incident_shape_token(entry)
+                        _incidents.append(record)
+        except OSError:
+            pass
+        try:
+            logdir = _cctally_core.LOG_DIR
+            if logdir.exists():
+                _incident_read_ok = True
+                for entry in logdir.iterdir():
+                    n = entry.name
+                    if "-corruption-forensics-" in n and n.endswith(".json"):
+                        _incidents.append(
+                            _journal_heal_incident("forensics", n, now_utc))
+        except OSError:
+            pass
+        if _incident_read_ok:
+            # most-recent first; unparseable ages (None) sort last.
+            _incidents.sort(key=lambda d: (d["age_s"] is None,
+                                           d["age_s"] if d["age_s"] is not None else 0))
+            journal_heal_incidents = _incidents
 
-    # #496 S6 §7.2 / §7.3. Both are read-only and take no lock; both degrade to
-    # None rather than failing the gather, because `doctor` is reached from the
-    # TUI and the dashboard snapshot precompute as well as from the CLI.
-    journal_heal_detections = _gather_heal_detections(now_utc)
-    retained_artifacts = _gather_retained_artifacts(now_utc, deep=deep)
+        # #496 S6 §7.2 / §7.3. Both are read-only and take no lock; both degrade to
+        # None rather than failing the gather, because `doctor` is reached from the
+        # TUI and the dashboard snapshot precompute as well as from the CLI.
+        journal_heal_detections = _gather_heal_detections(now_utc)
+        retained_artifacts = _gather_retained_artifacts(now_utc, deep=deep)
 
-    # #386/#389 stats sole-writer guard log (spec §6.4). Read-only, fail-soft: an
-    # absent log is the NORMAL state and must read as INFO, never as a gather
-    # failure. Read only the bounded tail; rotation and cross-process throttling
-    # bound the writer side independently.
-    journal_writer_guard = None
-    try:
-        journal_writer_guard = _gather_writer_guard_log(now_utc)
-    except (OSError, Exception):
+        # #386/#389 stats sole-writer guard log (spec §6.4). Read-only, fail-soft: an
+        # absent log is the NORMAL state and must read as INFO, never as a gather
+        # failure. Read only the bounded tail; rotation and cross-process throttling
+        # bound the writer side independently.
         journal_writer_guard = None
+        try:
+            journal_writer_guard = _gather_writer_guard_log(now_utc)
+        except (OSError, Exception):
+            journal_writer_guard = None
 
-    cctally_version_tuple = _lib_changelog._read_latest_changelog_version()
-    cctally_version = (
-        cctally_version_tuple[0] if cctally_version_tuple else "unknown"
-    )
-    accounts_state = _gather_accounts_state(now_utc)
-    accounts_state["codex_null_reset_anchors"] = codex_null_reset_anchors
-    accounts_state["codex_window_attribution"] = (
-        _gather_codex_window_attribution_state()
-        if _cache_probe_allowed else None)
+    with _lib_perf.phase("doctor.meta_accounts"):
+        cctally_version_tuple = _lib_changelog._read_latest_changelog_version()
+        cctally_version = (
+            cctally_version_tuple[0] if cctally_version_tuple else "unknown"
+        )
+        accounts_state = _gather_accounts_state(now_utc)
+        accounts_state["codex_null_reset_anchors"] = codex_null_reset_anchors
+        accounts_state["codex_window_attribution"] = (
+            _gather_codex_window_attribution_state()
+            if _cache_probe_allowed else None)
 
     return _lib_doctor.DoctorState(
         symlink_state=symlink_state,
@@ -2251,6 +2433,7 @@ def _doctor_gather_state_impl(
         locks_held=locks_held,
         # #297: cache.db WAL size backstop (gathered outside the deep branch).
         cache_db_wal_bytes=cache_db_wal_bytes,
+        conversations_db_wal_bytes=conversations_db_wal_bytes,
         # #374: quarantined same-revision groups + structural protocol violation.
         journal_conflicts=journal_conflicts,
         journal_protocol_violations=journal_protocol_violations,

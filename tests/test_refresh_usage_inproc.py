@@ -179,7 +179,7 @@ def test_refresh_inproc_ok(monkeypatch, tmp_path):
     }
     monkeypatch.setitem(ns, "_fetch_oauth_usage",
                         lambda token, timeout_seconds: fake_api)
-    monkeypatch.setitem(ns, "cmd_record_usage", lambda args: 0)
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda args, **kw: 0)
     monkeypatch.setitem(ns, "_bust_statusline_cache", lambda: None)
 
     result = ns["_refresh_usage_inproc"]()
@@ -246,7 +246,7 @@ def test_refresh_inproc_parse_failed_seven_day_fields(monkeypatch, tmp_path):
     bad_api = {"seven_day": {"utilization": "not-a-float", "resets_at": "x"}}
     monkeypatch.setitem(ns, "_fetch_oauth_usage",
                         lambda token, timeout_seconds: bad_api)
-    monkeypatch.setitem(ns, "cmd_record_usage", lambda args: 0)
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda args, **kw: 0)
     monkeypatch.setitem(ns, "_bust_statusline_cache", lambda: None)
 
     result = ns["_refresh_usage_inproc"]()
@@ -270,7 +270,7 @@ def test_refresh_inproc_five_hour_inactive_null_resets(monkeypatch, tmp_path):
     monkeypatch.setitem(ns, "_fetch_oauth_usage",
                         lambda token, timeout_seconds: fake_api)
     monkeypatch.setitem(ns, "cmd_record_usage",
-                        lambda args: captured.update(vars(args)) or 0)
+                        lambda args, **kw: captured.update(vars(args)) or 0)
     monkeypatch.setitem(ns, "_bust_statusline_cache", lambda: None)
 
     result = ns["_refresh_usage_inproc"]()

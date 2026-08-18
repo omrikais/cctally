@@ -93,7 +93,15 @@ CapabilityStatus = Literal[
 # optional `spendWindow` bounds, which a cycle-bounded card omits. No client
 # branches on this number; after an in-place `execvp` update a still-loaded old
 # client renders the new figures under old copy until it reloads.
-SOURCE_SCHEMA_VERSION = 9
+# 9 -> 10 (#583 S3): `sources.all.data.providers` no longer carries the two
+# provider data objects. They are published once, on the physical
+# `sources.claude` / `sources.codex` entries, which is where every production
+# consumer already falls back to. The key itself is RETAINED with both members
+# null so a still-loaded v9 bundle does not throw — this is the first
+# DESTRUCTIVE entry in this ledger rather than an additive one, and the null
+# stub is what makes it survivable across an in-place `execvp` update. Removing
+# the stub needs a separate change once no v9 bundle can be live.
+SOURCE_SCHEMA_VERSION = 10
 DEFAULT_SOURCE = "claude"
 SOURCE_ORDER = ("claude", "codex", "all")
 SOURCE_FRESHNESS_DOMAINS = ("hero", "quota", "sessions")
@@ -1217,13 +1225,24 @@ def compose_all_state(
                if combined is None else {}),
             "alerts": {"rows": combined_alerts},
             # #556 S2 §3.5.1: the ONE public copy of the shared range and of
-            # both aggregate outcomes. The rows stay on the provider domains
-            # under `providers` below, so nothing is published twice.
+            # both aggregate outcomes. The rows stay on the provider domains,
+            # published on the physical `sources.claude` / `sources.codex`
+            # entries since #583 S3, so nothing is published twice.
             "aggregates": aggregates,
-            "providers": {
-                "claude": claude.data,
-                "codex": codex.data,
-            },
+            # #583 S3 §4: the provider data is published ONCE, on the physical
+            # `sources.claude` / `sources.codex` entries. This mirror duplicated
+            # about 1.56 MB of a 3.25 MB envelope by reference.
+            #
+            # The key is RETAINED with null members rather than removed.
+            # `dashboard/web/src/lib/dashboardPresentation.ts` reads
+            # `data?.providers.claude` — the optional chain guards `data`, not
+            # `providers` — so an absent key throws a TypeError inside a render
+            # for any tab still running the v9 bundle when `cctally update`
+            # `execvp`s the server underneath it. Both members are declared
+            # nullable in `types/envelope.ts`, so null is a legal v9 value and
+            # every v9 consumer's `?? sources.<p>.data` fallback resolves.
+            # Retiring the stub is filed as a residual, not done here.
+            "providers": {"claude": None, "codex": None},
         },
         domain_freshness={
             domain: (

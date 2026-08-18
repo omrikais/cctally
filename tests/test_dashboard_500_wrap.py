@@ -41,6 +41,12 @@ def _boot(ns):
     dash.DashboardHTTPHandler.snapshot_ref = ns["_SnapshotRef"](
         ns["_empty_dashboard_snapshot"]()
     )
+    # #583 S3 §7: `/api/data` serves the most recently PUBLISHED state,
+    # so a bare reference is not enough — seed the hub exactly as
+    # `cmd_dashboard` does before the HTTP server binds.
+    dash.DashboardHTTPHandler.hub.publish(
+        dash.DashboardHTTPHandler.snapshot_ref.get()
+    )
     srv = dash._QuietThreadingHTTPServer(
         ("127.0.0.1", 0), dash.DashboardHTTPHandler
     )
