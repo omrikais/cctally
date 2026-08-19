@@ -23,6 +23,39 @@ if str(REPO_ROOT / "tests") not in sys.path:
 from conftest import load_script, redirect_paths  # noqa: E402
 
 
+def test_full_claude_discovery_is_sorted_within_each_configured_root(
+        tmp_path, monkeypatch):
+    """A fresh cache must not inherit APFS/ext4 directory enumeration order.
+
+    Rowids feed stable aggregate traversal and the snapshot measure's synthetic
+    dirty-row selection.  The same JSONL set therefore needs one ingest order
+    on every filesystem while preserving the configured root order.
+    """
+    ns = load_script()
+    import _cctally_cache as cache
+
+    claude = tmp_path / "claude"
+    projects = claude / "projects" / "project"
+    projects.mkdir(parents=True)
+    # Create in reverse lexical order so an unsorted directory walk is visible.
+    later = projects / "z-last.jsonl"
+    earlier = projects / "a-first.jsonl"
+    later.write_text("{}\n")
+    earlier.write_text("{}\n")
+    monkeypatch.setattr(cache, "_get_claude_data_dirs", lambda: [claude])
+    original_glob = pathlib.Path.glob
+
+    def unordered_glob(path, pattern):
+        if path == claude / "projects" and pattern == "**/*.jsonl":
+            return iter((later, earlier))
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(pathlib.Path, "glob", unordered_glob)
+
+    discovered = list(cache._iter_claude_jsonl_files())
+    assert discovered == [earlier, later]
+
+
 def _assistant_line(msg_id, req_id, out_tokens):
     # Fixed key order so two lines differ ONLY in the (equal-length) values.
     return json.dumps({

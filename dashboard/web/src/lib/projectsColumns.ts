@@ -74,8 +74,12 @@ export const PROJECTS_COLUMNS: TableColumn<ProjectsTableRow>[] = [
     compare: (a, b) => a.windowCost - b.windowCost,
   },
   {
+    // #620 S1 D2 (F7) — the header states what the figure IS. `Used pp` alone
+    // reads as one week's usage, and the only thing that said otherwise was a
+    // `title`, which never appears on touch. The id is the persisted sort key
+    // and stays `used_pct`; only the rendered label changes.
     id: 'used_pct',
-    label: 'Used pp',
+    label: 'Used pp (sum)',
     title: "Sum of each week's attributed usage-% over the selected window (percentage-points; can exceed 100 across multiple weeks).",
     defaultDirection: 'desc',
     numeric: true,
@@ -92,3 +96,24 @@ export const PROJECTS_COLUMNS: TableColumn<ProjectsTableRow>[] = [
     compare: (a, b) => a.shareOfWindow! - b.shareOfWindow!,
   },
 ];
+
+// #620 S1 D2 (F7) + D13 (F4) — the definitions, in rendered text.
+//
+// Both figures named here already carried a `title`, and a `title` never
+// appears on touch: there is no hover, and a long-press opens the platform's
+// own menu instead. The tooltips stay; this caption is what a touch user can
+// actually read. It sits UNDER the window selector because both definitions
+// are relative to the window that selector chooses.
+export const PROJECTS_WINDOW_CAPTION =
+  'Used pp (sum) adds each week\u2019s attributed usage percentage across the '
+  + 'selected window \u2014 a sum of percentage points, not a share of any one '
+  + 'week. Cost share is each project\u2019s share of total project spend in that '
+  + 'same window.';
+
+// #620 S1 D1 — the merged-fold clause, stated on the surface rather than only
+// enforced in the server arithmetic. Rendered ONLY when the provider has more
+// than one real account, because below that threshold nothing is merged and
+// the sentence would describe a fold that is not happening.
+export const PROJECTS_MERGED_ACCOUNTS_NOTE =
+  'Claude accounts are folded into one ranking here. Each account has its own '
+  + 'weekly quota, so those percentages are never added across accounts.';

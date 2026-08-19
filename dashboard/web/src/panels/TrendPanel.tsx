@@ -75,7 +75,11 @@ function TrendSection({
 }) {
   const data: TrendChartDatum[] = section.rows.map((row) => ({
     ...row,
-    spark_height: row.dollar_per_pct ?? 0,
+    // #620 S1 — no `?? 0`. A withheld rate has no height, and `Sparkline`
+    // renders it as a gap; substituting zero drew a bar on the axis that read
+    // as a measured collapse, which is the same defect
+    // `_optional_chart_points` exists to avoid in the shared artifact.
+    spark_height: row.dollar_per_pct,
   }));
   const vocabulary = trendVocabulary(section.source);
   const decorated: TrendTableRow[] = data.map((r, i) => ({ ...r, _chronoIdx: i }));

@@ -2,14 +2,61 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import contextvars
 import hashlib
 import json
+import os
 import re
 
 
 IDENTITY_VERSION = 1
 _SOURCES = frozenset(("claude", "codex"))
 _SOURCE_ROOT_KEY_RE = re.compile(r"[0-9a-f]{32}\Z")
+_IDENTITY_PATH_ALIAS = contextvars.ContextVar(
+    "cctally_identity_path_alias", default=None,
+)
+
+
+@contextlib.contextmanager
+def identity_path_alias(physical_root: object, logical_root: object):
+    """Temporarily map one physical fixture root to a stable logical root.
+
+    Production callers never enter this context.  The generated benchmark
+    corpus does so when a byte-stable cross-platform oracle needs provider and
+    file identities that do not change merely because macOS resolves ``/tmp``
+    through ``/private/tmp``.  The mapping is boundary-aware and scoped through
+    a ContextVar so nested callers restore the previous identity exactly.
+    """
+    physical = os.path.normpath(os.fspath(physical_root))
+    logical = os.path.normpath(os.fspath(logical_root))
+    if not os.path.isabs(physical) or not os.path.isabs(logical):
+        raise ValueError("identity path aliases must use absolute roots")
+    token = _IDENTITY_PATH_ALIAS.set((physical, logical))
+    try:
+        yield
+    finally:
+        _IDENTITY_PATH_ALIAS.reset(token)
+
+
+def identity_path(value: str) -> str:
+    """Return the active logical spelling for an identity-bearing path.
+
+    This is deliberately a no-op outside ``identity_path_alias``.  Oracle
+    renderers use it at the last path-bearing identity seam; ordinary runtime
+    callers therefore retain their existing physical-path identity contract.
+    """
+    alias = _IDENTITY_PATH_ALIAS.get()
+    if alias is None:
+        return value
+    physical, logical = alias
+    normalized = os.path.normpath(value)
+    if normalized == physical:
+        return logical
+    prefix = physical + os.sep
+    if normalized.startswith(prefix):
+        return logical + normalized[len(physical):]
+    return value
 
 
 def _required_string(value: object, name: str) -> str:
@@ -20,7 +67,7 @@ def _required_string(value: object, name: str) -> str:
 
 def source_root_key(canonical_root: str) -> str:
     """Return the non-reversible, domain-separated key for one source root."""
-    root = _required_string(canonical_root, "canonical_root")
+    root = identity_path(_required_string(canonical_root, "canonical_root"))
     digest = hashlib.sha256(b"cctally-source-root-v1\0" + root.encode("utf-8"))
     return digest.hexdigest()[:32]
 
@@ -41,7 +88,8 @@ def codex_file_key(root_key: str, canonical_physical_path: str) -> str:
     durable key never embeds an operator path.
     """
     root = _required_string(root_key, "root_key")
-    path = _required_string(canonical_physical_path, "canonical_physical_path")
+    path = identity_path(
+        _required_string(canonical_physical_path, "canonical_physical_path"))
     digest = hashlib.sha256(
         b"cctally-codex-file-v1\0" + root.encode("utf-8")
         + b"\0" + path.encode("utf-8")

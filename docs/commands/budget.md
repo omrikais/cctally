@@ -96,9 +96,7 @@ The header period label is the *display-tz civil* window: `(subscription week
 - `warn` (amber) — projected spend reaches the lowest alert threshold (default 90%) of the budget but not over.
 - `over` (red) — spend is already over budget, or the projection lands over it.
 
-When the week is very early (less than ~15% elapsed) or no spend has landed
-yet, the projection is annotated `(LOW CONF — early in week)` and never
-escalates to a spurious `over`.
+When the week is very early (less than ~15% elapsed) or no spend has landed yet, the projection is annotated `(LOW CONF — limited evidence)` and never escalates to a spurious `over`. The annotation is deliberately cause-neutral: the condition is a disjunction, so a fully elapsed period with no spend is low-confidence too, and the earlier wording (`early in week`) claimed something false about that case.
 
 ### No budget set
 

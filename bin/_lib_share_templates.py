@@ -199,6 +199,108 @@ def _kpi_strip(*items: tuple[str, str]) -> tuple:
     return tuple(_LS.Totalled(label=lbl, value=val) for lbl, val in items)
 
 
+def _optional_money(value, spec: str = ".2f") -> str:
+    """A dollar figure, or `n/a` when the value was withheld.
+
+    #620 S1 D5/A5. A KPI strip renders through an f-string, so a `None`
+    raises and a substituted zero prints `$0.000` — which is the fabrication
+    the contract removes. `n/a` is the same word `_build_forecast_snapshot`
+    already uses for an absent $/1%, so the two share surfaces say the same
+    thing about the same absence.
+    """
+    if value is None:
+        return "n/a"
+    return f"${value:{spec}}"
+
+
+def _optional_money_cell(value):
+    """A `MoneyCell`, or a `TextCell` reading `n/a` when the value was
+    withheld.
+
+    #620 S1 D5/A5, table half. `_optional_money` covers the KPI strip, which
+    is already a string; a table cell is a tagged-union member, and
+    `MoneyCell` takes a float. Forcing a withheld figure through `float(...)`
+    raises `TypeError`, and the dashboard share handler catches that and
+    returns a share FAILURE — so the coercion turned a fabricated `$0.000`
+    into no artifact at all. `n/a` is the word `_optional_money` and
+    `_build_forecast_snapshot` already use for the same absence.
+    """
+    if value is None:
+        return _LS.TextCell("n/a")
+    return _LS.MoneyCell(float(value))
+
+
+def _optional_pct(value, *, scale: float = 100.0, spec: str = ".1f") -> str:
+    """A percentage, or `n/a` when the value was withheld.
+
+    #620 S1. `TuiTrendRow.used_pct` and `WeeklyPeriodRow.used_pct` are both
+    `float | None` — `None` when the week carries a cost snapshot but no
+    usage snapshot. A KPI strip formats through an f-string, so a `None`
+    raises and the zero it replaced printed `0.0%`, which a reader cannot
+    tell from a week that really used nothing. `n/a` is the word the money
+    helpers above already use for the same absence.
+    """
+    if value is None:
+        return "n/a"
+    return f"{float(value) * scale:{spec}}%"
+
+
+def _optional_pct_cell(value, *, scale: float = 100.0):
+    """A `PercentCell`, or a `TextCell` reading `n/a` when withheld.
+
+    The table half of `_optional_pct`, mirroring `_optional_money_cell`:
+    `PercentCell` takes a float, so forcing a withheld percentage through
+    `float(...)` raises `TypeError`, which the dashboard share handler turns
+    into a share FAILURE rather than an artifact.
+    """
+    if value is None:
+        return _LS.TextCell("n/a")
+    return _LS.PercentCell(float(value) * scale)
+
+
+def _optional_days(value, spec: str = ".1f") -> str:
+    """A number of days, or `n/a` when the distance is not defined.
+
+    #620 S1. `days_to_90pct` / `days_to_100pct` are withheld when no rate was
+    observed, because a ceiling is not reachable on any timeline the data
+    describes. `float(... or 0.0)` printed `0.0`, which says the ceiling has
+    already been reached — the opposite fact.
+    """
+    if value is None:
+        return "n/a"
+    return f"{float(value):{spec}}"
+
+
+def _optional_signed_pct(value) -> str:
+    """A signed percentage change, or `n/a` when it could not be computed."""
+    if value is None:
+        return "n/a"
+    return f"{float(value) * 100:+.1f}%"
+
+
+def _optional_signed_money(value) -> str:
+    """A signed dollar change, or `n/a` when it could not be computed."""
+    if value is None:
+        return "n/a"
+    return f"${float(value):+,.2f}"
+
+
+def _optional_chart_points(items, *, x_label_key, y_key):
+    """Chart points for `items`, omitting any whose `y_key` was withheld.
+
+    A withheld value plotted at zero draws a cliff to the axis that reads as
+    a measured collapse. The x position stays the item's original index, so
+    the remaining points keep their spacing and the gap sits where the
+    missing week actually is.
+    """
+    return tuple(
+        _LS.ChartPoint(x_label=item[x_label_key], x_value=float(i),
+                       y_value=float(item[y_key]))
+        for i, item in enumerate(items)
+        if item.get(y_key) is not None
+    )
+
+
 def _top_projects_rows(top_projects, cap: int) -> tuple:
     """Build `Row` tuple with ProjectCell + MoneyCell from a list of
     `(project_path, cost_usd)` pairs.
@@ -499,8 +601,8 @@ def _build_weekly_recap(*, panel_data, options):
             "weeks": [
                 {"start_date": "YYYY-MM-DD",      # ISO date string
                  "cost_usd":    float,
-                 "pct_used":    float,            # fraction 0..1
-                 "dollar_per_pct": float,
+                 "pct_used":    float | None,      # fraction 0..1; None = withheld
+                 "dollar_per_pct": float | None,   # None = withheld
                  "top_projects":  [(path, cost), ...]},
                 ... up to 8 weeks, chronological ...
             ],
@@ -530,8 +632,8 @@ def _build_weekly_recap(*, panel_data, options):
         ),
         totals=_kpi_strip(
             ("$ spent",      f"${w['cost_usd']:.2f}"),
-            ("% used",       f"{w['pct_used']*100:.1f}%"),
-            ("$/% rate",     f"${w['dollar_per_pct']:.3f}"),
+            ("% used",       _optional_pct(w['pct_used'])),
+            ("$/% rate",     _optional_money(w['dollar_per_pct'], ".3f")),
         ),
         notes=(),
         generated_at=_utc_now(),
@@ -549,7 +651,7 @@ def _build_current_week_recap(*, panel_data, options):
         {
             "kpi_cost_usd":       float,
             "kpi_pct_used":      float,   # fraction 0..1
-            "kpi_dollar_per_pct": float,
+            "kpi_dollar_per_pct": float | None,   # None = withheld
             "kpi_days_remaining": float,
             "daily_progression":  [{"date": "YYYY-MM-DD",
                                      "cost_usd": float}, ...],   # ≤7
@@ -583,7 +685,8 @@ def _build_current_week_recap(*, panel_data, options):
         totals=_kpi_strip(
             ("$ spent",        f"${panel_data['kpi_cost_usd']:.2f}"),
             ("% used",         f"{panel_data['kpi_pct_used']*100:.1f}%"),
-            ("$/% rate",       f"${panel_data['kpi_dollar_per_pct']:.3f}"),
+            ("$/% rate",       _optional_money(
+                panel_data.get("kpi_dollar_per_pct"), ".3f")),
             ("Days remaining", f"{panel_data['kpi_days_remaining']:.1f}"),
         ),
         notes=(),
@@ -602,8 +705,8 @@ def _build_trend_recap(*, panel_data, options):
             "weeks": [
                 {"start_date": "YYYY-MM-DD",
                  "cost_usd":      float,
-                 "pct_used":      float,
-                 "dollar_per_pct": float}, ... 8 entries, chronological ...
+                 "pct_used":      float | None,   # None = withheld
+                 "dollar_per_pct": float | None}, ... 8 entries, chronological ...
             ],
             "delta_3_weeks": {
                 "dpp_change_pct": float,   # +ve = $/% trending up
@@ -631,24 +734,21 @@ def _build_trend_recap(*, panel_data, options):
         rows=tuple(
             _LS.Row(cells={
                 "week": _LS.TextCell(w["start_date"]),
-                "cost": _LS.MoneyCell(float(w["cost_usd"])),
-                "pct":  _LS.PercentCell(float(w["pct_used"]) * 100.0),
-                "dpp":  _LS.MoneyCell(float(w["dollar_per_pct"])),
+                "cost": _optional_money_cell(w["cost_usd"]),
+                "pct":  _optional_pct_cell(w["pct_used"]),
+                "dpp":  _optional_money_cell(w["dollar_per_pct"]),
             })
             for w in weeks
         ),
         chart=_LS.LineChart(
-            points=tuple(
-                _LS.ChartPoint(x_label=w["start_date"], x_value=float(i),
-                               y_value=float(w["dollar_per_pct"]))
-                for i, w in enumerate(weeks)
-            ),
+            points=_optional_chart_points(
+                weeks, x_label_key="start_date", y_key="dollar_per_pct"),
             y_label="$ / 1%",
             reference_lines=(),
         ) if weeks else None,
         totals=_kpi_strip(
-            ("Δ $/% (3wk)", f"{float(delta.get('dpp_change_pct') or 0.0)*100:+.1f}%"),
-            ("Δ $ (3wk)",   f"${float(delta.get('cost_change_usd') or 0.0):+,.2f}"),
+            ("Δ $/% (3wk)", _optional_signed_pct(delta.get('dpp_change_pct'))),
+            ("Δ $ (3wk)",   _optional_signed_money(delta.get('cost_change_usd'))),
         ),
         notes=(),
         generated_at=_utc_now(),
@@ -813,8 +913,8 @@ def _build_forecast_recap(*, panel_data, options):
     Expected panel_data shape:
         {
             "projected_end_pct":  float,   # fraction 0..1+
-            "days_to_100pct":     float,
-            "days_to_90pct":      float,
+            "days_to_100pct":     float | None,   # None = no rate observed
+            "days_to_90pct":      float | None,   # None = no rate observed
             "daily_budgets": {
                 "avg":           float,   # $/day to-date
                 "recent_24h":    float,
@@ -846,13 +946,13 @@ def _build_forecast_recap(*, panel_data, options):
         ),
         rows=(
             _LS.Row(cells={"metric": _LS.TextCell("Avg to-date"),
-                           "value":  _LS.MoneyCell(float(budgets.get("avg") or 0.0))}),
+                           "value":  _optional_money_cell(budgets.get("avg"))}),
             _LS.Row(cells={"metric": _LS.TextCell("Recent 24h"),
-                           "value":  _LS.MoneyCell(float(budgets.get("recent_24h") or 0.0))}),
+                           "value":  _optional_money_cell(budgets.get("recent_24h"))}),
             _LS.Row(cells={"metric": _LS.TextCell("Budget to 90%"),
-                           "value":  _LS.MoneyCell(float(budgets.get("until_90pct") or 0.0))}),
+                           "value":  _optional_money_cell(budgets.get("until_90pct"))}),
             _LS.Row(cells={"metric": _LS.TextCell("Budget to 100%"),
-                           "value":  _LS.MoneyCell(float(budgets.get("until_100pct") or 0.0))}),
+                           "value":  _optional_money_cell(budgets.get("until_100pct"))}),
         ),
         chart=_LS.LineChart(
             points=tuple(
@@ -867,8 +967,8 @@ def _build_forecast_recap(*, panel_data, options):
             ),
         ) if curve else None,
         totals=_kpi_strip(
-            ("Days→90%",  f"{float(panel_data.get('days_to_90pct') or 0.0):.1f}"),
-            ("Days→100%", f"{float(panel_data.get('days_to_100pct') or 0.0):.1f}"),
+            ("Days→90%",  _optional_days(panel_data.get('days_to_90pct'))),
+            ("Days→100%", _optional_days(panel_data.get('days_to_100pct'))),
             ("End %",     f"{float(panel_data.get('projected_end_pct') or 0.0)*100:.1f}%"),
         ),
         notes=notes,
@@ -978,7 +1078,7 @@ def _build_weekly_visual(*, panel_data, options):
         ),
         totals=_kpi_strip(
             ("$ spent",  f"${w['cost_usd']:.2f}"),
-            ("% used",   f"{w['pct_used']*100:.1f}%"),
+            ("% used",   _optional_pct(w['pct_used'])),
         ),
         notes=(),
         generated_at=_utc_now(),
@@ -1043,8 +1143,8 @@ def _build_weekly_detail(*, panel_data, options):
         ),
         totals=_kpi_strip(
             ("$ spent",      f"${w['cost_usd']:.2f}"),
-            ("% used",       f"{w['pct_used']*100:.1f}%"),
-            ("$/% rate",     f"${w['dollar_per_pct']:.3f}"),
+            ("% used",       _optional_pct(w['pct_used'])),
+            ("$/% rate",     _optional_money(w['dollar_per_pct'], ".3f")),
         ),
         notes=(),
         generated_at=_utc_now(),
@@ -1112,7 +1212,8 @@ def _build_current_week_detail(*, panel_data, options):
         totals=_kpi_strip(
             ("$ spent",        f"${panel_data['kpi_cost_usd']:.2f}"),
             ("% used",         f"{panel_data['kpi_pct_used']*100:.1f}%"),
-            ("$/% rate",       f"${panel_data['kpi_dollar_per_pct']:.3f}"),
+            ("$/% rate",       _optional_money(
+                panel_data.get("kpi_dollar_per_pct"), ".3f")),
             ("Days remaining", f"{panel_data['kpi_days_remaining']:.1f}"),
         ),
         notes=(),
@@ -1137,17 +1238,14 @@ def _build_trend_visual(*, panel_data, options):
         columns=(),
         rows=(),
         chart=_LS.LineChart(
-            points=tuple(
-                _LS.ChartPoint(x_label=w["start_date"], x_value=float(i),
-                               y_value=float(w["dollar_per_pct"]))
-                for i, w in enumerate(weeks)
-            ),
+            points=_optional_chart_points(
+                weeks, x_label_key="start_date", y_key="dollar_per_pct"),
             y_label="$ / 1%",
             reference_lines=(),
         ) if weeks else None,
         totals=_kpi_strip(
-            ("Δ $/% (3wk)", f"{float(delta.get('dpp_change_pct') or 0.0)*100:+.1f}%"),
-            ("Δ $ (3wk)",   f"${float(delta.get('cost_change_usd') or 0.0):+,.2f}"),
+            ("Δ $/% (3wk)", _optional_signed_pct(delta.get('dpp_change_pct'))),
+            ("Δ $ (3wk)",   _optional_signed_money(delta.get('cost_change_usd'))),
         ),
         notes=(),
         generated_at=_utc_now(),
@@ -1177,24 +1275,21 @@ def _build_trend_detail(*, panel_data, options):
         rows=tuple(
             _LS.Row(cells={
                 "week": _LS.TextCell(w["start_date"]),
-                "cost": _LS.MoneyCell(float(w["cost_usd"])),
-                "pct":  _LS.PercentCell(float(w["pct_used"]) * 100.0),
-                "dpp":  _LS.MoneyCell(float(w["dollar_per_pct"])),
+                "cost": _optional_money_cell(w["cost_usd"]),
+                "pct":  _optional_pct_cell(w["pct_used"]),
+                "dpp":  _optional_money_cell(w["dollar_per_pct"]),
             })
             for w in weeks
         ),
         chart=_LS.LineChart(
-            points=tuple(
-                _LS.ChartPoint(x_label=w["start_date"], x_value=float(i),
-                               y_value=float(w["dollar_per_pct"]))
-                for i, w in enumerate(weeks)
-            ),
+            points=_optional_chart_points(
+                weeks, x_label_key="start_date", y_key="dollar_per_pct"),
             y_label="$ / 1%",
             reference_lines=(),
         ) if weeks else None,
         totals=_kpi_strip(
-            ("Δ $/% (3wk)", f"{float(delta.get('dpp_change_pct') or 0.0)*100:+.1f}%"),
-            ("Δ $ (3wk)",   f"${float(delta.get('cost_change_usd') or 0.0):+,.2f}"),
+            ("Δ $/% (3wk)", _optional_signed_pct(delta.get('dpp_change_pct'))),
+            ("Δ $ (3wk)",   _optional_signed_money(delta.get('cost_change_usd'))),
         ),
         notes=(),
         generated_at=_utc_now(),
@@ -1529,8 +1624,8 @@ def _build_forecast_visual(*, panel_data, options):
             ),
         ) if curve else None,
         totals=_kpi_strip(
-            ("Days→90%",  f"{float(panel_data.get('days_to_90pct') or 0.0):.1f}"),
-            ("Days→100%", f"{float(panel_data.get('days_to_100pct') or 0.0):.1f}"),
+            ("Days→90%",  _optional_days(panel_data.get('days_to_90pct'))),
+            ("Days→100%", _optional_days(panel_data.get('days_to_100pct'))),
             ("End %",     f"{float(panel_data.get('projected_end_pct') or 0.0)*100:.1f}%"),
         ),
         notes=notes,
@@ -1557,13 +1652,13 @@ def _build_forecast_detail(*, panel_data, options):
     # Budget metric rows + per-day projection rows, capped at top_n total.
     budget_rows = (
         _LS.Row(cells={"metric": _LS.TextCell("Avg to-date"),
-                       "value":  _LS.MoneyCell(float(budgets.get("avg") or 0.0))}),
+                       "value":  _optional_money_cell(budgets.get("avg"))}),
         _LS.Row(cells={"metric": _LS.TextCell("Recent 24h"),
-                       "value":  _LS.MoneyCell(float(budgets.get("recent_24h") or 0.0))}),
+                       "value":  _optional_money_cell(budgets.get("recent_24h"))}),
         _LS.Row(cells={"metric": _LS.TextCell("Budget to 90%"),
-                       "value":  _LS.MoneyCell(float(budgets.get("until_90pct") or 0.0))}),
+                       "value":  _optional_money_cell(budgets.get("until_90pct"))}),
         _LS.Row(cells={"metric": _LS.TextCell("Budget to 100%"),
-                       "value":  _LS.MoneyCell(float(budgets.get("until_100pct") or 0.0))}),
+                       "value":  _optional_money_cell(budgets.get("until_100pct"))}),
     )
     day_rows = tuple(
         _LS.Row(cells={
@@ -1597,8 +1692,8 @@ def _build_forecast_detail(*, panel_data, options):
             ),
         ) if curve else None,
         totals=_kpi_strip(
-            ("Days→90%",  f"{float(panel_data.get('days_to_90pct') or 0.0):.1f}"),
-            ("Days→100%", f"{float(panel_data.get('days_to_100pct') or 0.0):.1f}"),
+            ("Days→90%",  _optional_days(panel_data.get('days_to_90pct'))),
+            ("Days→100%", _optional_days(panel_data.get('days_to_100pct'))),
             ("End %",     f"{float(panel_data.get('projected_end_pct') or 0.0)*100:.1f}%"),
         ),
         notes=notes,

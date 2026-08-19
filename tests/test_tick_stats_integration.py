@@ -93,7 +93,14 @@ def _private_corpus(data_dir, tmp_path):
     """Copy every corpus axis so this test owns cache.db and its flock."""
     source_root = pathlib.Path(data_dir).parent
     private_root = tmp_path / "corpus"
-    shutil.copytree(source_root, private_root)
+    # SQLite readers can create and remove these sidecars between copytree's
+    # directory scan and its copy2 call.  The built corpus is checkpointed;
+    # transient sidecars are neither fixture inputs nor safe copy candidates.
+    shutil.copytree(
+        source_root,
+        private_root,
+        ignore=shutil.ignore_patterns("*.db-shm", "*.db-wal"),
+    )
     return private_root / pathlib.Path(data_dir).name
 
 

@@ -312,6 +312,81 @@ def test_claude_week_index_enumerates_newest_first_with_counts(ns):
     assert a["detail_stamp"]
 
 
+def test_claude_week_index_survives_a_milestone_only_week_with_no_boundaries(ns):
+    """A milestone row whose ``week_start_at`` is NULL must not take the whole
+    index down.
+
+    ``percent_milestones.week_start_at`` is nullable and post-dates the table,
+    and ``maybe_record_milestone`` reads it from ``saved.get("weekStartAt")``
+    where ``_canonicalize_optional_iso`` accepts ``None``, so a live install
+    can hold such a row. When that week also has no ``weekly_usage_snapshots``
+    row, ``_navigable_claude_refs`` synthesizes a ref with both boundaries
+    ``None`` and ``_claude_cycle_key`` passed the empty string to
+    ``dashboard_resource_key``, whose ``_nonempty_string`` guard raised. The
+    dashboard caught that at the top of the phase, emptied ``week_index``
+    entirely and set ``last_sync_error`` — so one boundary-less historical row
+    removed every OTHER week from the hero modal's history.
+
+    The detail leg is covered here too. ``build_claude_week_detail`` builds its
+    own ``milestone_segment`` key from the same ref, unconditionally and ahead
+    of the ``if rows`` guard, so a fix confined to the index restores the row to
+    the list and leaves it unopenable. ``_handle_get_milestones_week``'s
+    catch-all then turns the ``ValueError`` into a generic HTTP 500, not the
+    404 ``unknown_key`` body the client renders as a real state, so the failure
+    reaches the operator only as a server log line.
+    """
+    import _cctally_milestone_history as mh
+
+    conn = ns["open_db"]()
+    try:
+        _seed_full(conn)
+        # A milestone-only week: no usage snapshot, and the nullable instant
+        # columns left NULL, which is the shape of a pre-column row.
+        _seed_percent_milestone(
+            conn, week_start_date="2026-04-10", week_end_date="2026-04-17",
+            percent_threshold=100, captured_at_utc="2026-04-15T20:00:00+00:00",
+            cumulative_cost_usd=44.0, reset_event_id=0,
+        )
+        conn.commit()
+        idx = mh.build_claude_week_index(conn)
+        details = [
+            mh.build_claude_week_detail(conn, e["key"])
+            for e in idx
+            if e["start_at_utc"] is None
+        ]
+    finally:
+        conn.close()
+
+    starts = [e["start_at_utc"] for e in idx]
+    assert starts[:4] == [
+        "2026-05-15T00:00:00Z",
+        "2026-05-08T00:00:00Z",
+        "2026-05-04T12:00:00Z",
+        "2026-05-01T00:00:00Z",
+    ], "the boundary-carrying weeks must still be enumerated"
+
+    boundaryless = [e for e in idx if e["start_at_utc"] is None]
+    assert len(boundaryless) == 1, idx
+    entry = boundaryless[0]
+    assert entry["end_at_utc"] is None
+    assert entry["milestone_count"] == 1
+    assert entry["block_count"] == 0
+    assert entry["key"], "a boundary-less cycle still needs a stable key"
+    assert entry["label"], "a boundary-less cycle still needs a label"
+
+    assert len(details) == 1, details
+    detail = details[0]
+    assert detail is not None, "the listed boundary-less cycle must also open"
+    assert detail["key"] == entry["key"]
+    assert detail["start_at_utc"] is None
+    assert detail["end_at_utc"] is None
+    assert detail["blocks"] == [], "absent bounds select no five-hour blocks"
+    assert len(detail["segments"]) == 1, detail["segments"]
+    segment = detail["segments"][0]
+    assert segment["key"].startswith("milestone_segment:")
+    assert [m["percent"] for m in segment["milestones"]] == [100]
+
+
 def test_claude_week_index_usage_only_week_zero_milestones(ns):
     import _cctally_milestone_history as mh
 

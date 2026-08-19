@@ -49,6 +49,17 @@ cctally percent-breakdown --json
   line wasn't running for part of the week, you'll see gaps, and they
   cannot be retroactively reconstructed.
 - `report --detail` calls into the same renderer for the *current* week.
+- **After an in-place weekly credit, this view has a gap it cannot fill
+  (issue #213).** A partial credit lowers the reported weekly percentage
+  without re-anchoring the week, and `percent_milestones` is forward-only: no
+  new row is recorded until usage climbs back above the pre-credit peak. So
+  every percent between the post-credit level and that peak is missing here,
+  and so is the spend attributed to it. The rows that are present are correct;
+  the ones that are absent were never recorded, and no command reconstructs
+  them. Anything built on these rows — the alert next step that offers
+  `percent-breakdown`, `report --detail`, and the dashboard's per-percent
+  view — inherits the same gap. `cctally record-credit` documents the credit
+  model itself.
 
 ## See also
 

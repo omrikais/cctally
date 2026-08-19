@@ -875,10 +875,14 @@ def test_card_values_are_identical_from_either_accounting_reader(
             quota_observations=observations, cycles=cycles,
             accounting_start=START, accounting_end=accounting_end,
         )
-        qualified_cards, qualified_cycles = source_module._codex_accounts_wire(
+        qualified_cards, qualified_cycles, qualified_certificate = (
+            source_module._codex_accounts_wire(
             context, population=qualified, **wire)
-        rooted_cards, rooted_cycles = source_module._codex_accounts_wire(
+        )
+        rooted_cards, rooted_cycles, rooted_certificate = (
+            source_module._codex_accounts_wire(
             context, population=rooted, **wire)
+        )
 
         by_key = {card["accountKey"]: card for card in qualified_cards}
         live, fallback = by_key[_ACCT_A], by_key[_ACCT_B]
@@ -897,6 +901,31 @@ def test_card_values_are_identical_from_either_accounting_reader(
             "the two accounting readers produced different account cards")
         assert qualified_cycles == rooted_cycles, (
             "the two accounting readers produced different hero cycles")
+        assert qualified_certificate == rooted_certificate
+        assert qualified_certificate["status"] == "certified"
+        contributions = qualified_certificate["contributions"]
+        assert [item["account_key"] for item in contributions] == [
+            card["accountKey"] for card in qualified_cards
+        ]
+        contribution_by_key = {
+            item["account_key"]: item for item in contributions
+        }
+        for card in qualified_cards:
+            assert contribution_by_key[card["accountKey"]]["cost_usd"] == (
+                card["spendUsd"]
+            )
+        assert contribution_by_key[_ACCT_A]["period"] == {
+            "kind": "native_7_day_cycle",
+            "start_at": (NOW - dt.timedelta(days=6)).isoformat(),
+            "end_at": (NOW + dt.timedelta(days=1)).isoformat(),
+        }
+        fallback_period = {
+            "kind": "trailing_7_day_cycle",
+            "start_at": max(START, NOW - dt.timedelta(days=7)).isoformat(),
+            "end_at": NOW.isoformat(),
+        }
+        assert contribution_by_key[_ACCT_B]["period"] == fallback_period
+        assert contribution_by_key["unattributed"]["period"] == fallback_period
     finally:
         cache.close()
         stats.close()

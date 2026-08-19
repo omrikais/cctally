@@ -949,7 +949,7 @@ def _build_forecast_snapshot(
     projected_low_pct: float,
     projected_high_pct: float,
     days_remaining: float,
-    dollars_per_percent: float,
+    dollars_per_percent: "float | None",
     dollars_per_percent_source: str,
     low_conf: bool,
     notes: tuple[str, ...] = (),
@@ -1038,6 +1038,13 @@ def _build_forecast_snapshot(
             f"{projected_low_pct:.1f}% — {projected_high_pct:.1f}%"
         )
     dpp_source_label = dollars_per_percent_source.replace("_", " ")
+    # #620 S1 D5: a withheld rate renders as the same `n/a` the report trend
+    # table already uses for an absent $/1%. Forcing it through MoneyCell
+    # would print $0.00, which is the fabrication this contract removes.
+    dpp_cell = (
+        _lib_share.TextCell("n/a") if dollars_per_percent is None
+        else _lib_share.MoneyCell(float(dollars_per_percent))
+    )
     snap_rows = (
         _lib_share.Row(cells={
             "metric": _lib_share.TextCell("Current %"),
@@ -1053,7 +1060,7 @@ def _build_forecast_snapshot(
         }),
         _lib_share.Row(cells={
             "metric": _lib_share.TextCell(f"$ / 1% ({dpp_source_label})"),
-            "value": _lib_share.MoneyCell(float(dollars_per_percent)),
+            "value": dpp_cell,
         }),
     )
     # Caller-provided `notes` (e.g., empty-data path's clearer message)

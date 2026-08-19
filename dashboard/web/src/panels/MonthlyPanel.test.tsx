@@ -233,7 +233,7 @@ describe('#293 S3 — stacked summary window', () => {
 describe('#556 S2 — All-mode provider sections', () => {
   function allEnvelope(): Envelope {
     const env = baseEnvelope() as unknown as Record<string, unknown>;
-    env.source_schema_version = 10;
+    env.source_schema_version = 11;
     env.default_source = 'claude';
     env.source_order = ['claude', 'codex', 'all'];
     env.sources = {

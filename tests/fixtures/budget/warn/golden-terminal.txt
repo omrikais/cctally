@@ -7,3 +7,5 @@ Weekly budget: $300.00   (subscription week 2026-05-26 → 2026-06-02)
   Projected EOW   $245–$282   →   ⚠ WARN
 
   Alerts: on · thresholds 90% · 100% · (none crossed yet)
+
+  → Run `cctally project --since 2026-05-26 --until 2026-06-02` — claude · 2026-05-26 14:00 → 2026-06-02 14:00 UTC

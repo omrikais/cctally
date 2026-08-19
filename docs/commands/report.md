@@ -117,6 +117,23 @@ shortcut — it's exactly `report --sync-current "$@"`.
 - For Claude, `--detail` adds the `percent-breakdown` view for the *current*
   week only; for an older week, call `percent-breakdown --week-start <date>`
   directly. Codex `--detail` emits native quota-window attribution detail.
+- **`--source all` renders the same Claude report as `report` on its own.**
+  It previously reduced the Claude section to the literal `Data available.` —
+  no current-week table, no trend table, no `$ / 1%` column — because the
+  all-source path read a compatible-totals object the report payload does not
+  have. Both paths now call one renderer, so they cannot diverge. The two
+  sections stay separate and are still never summed, for the reason given
+  under [Provider-aware report routing](#provider-aware-report-routing).
+- **A week shorter than seven days is marked `~` in the `#` column.** An early
+  reset ends a cycle before its scheduled boundary, and a `$ / 1%` computed
+  over five days is not directly comparable with one computed over seven. A
+  row is marked when its span falls short of seven days by more than an hour;
+  the hour of tolerance absorbs the boundary normalisation applied to reset
+  jitter, so an ordinary week is never marked. A legend line explaining the
+  marker renders only when at least one row carries it, so a table of full
+  weeks is unchanged. A row that does not carry both exact bounds is not
+  marked, because its span is unknown. Weeks with no data at all stay omitted,
+  as before.
 
 ## See also
 

@@ -761,7 +761,7 @@
       ],
       "total_cost_usd": 0.63,
       "week_label": "wk Apr 13",
-      "week_start_at": "2026-04-13T00:00:00Z",
+      "week_start_at": "2026-04-13T14:00:00Z",
       "week_start_date": "2026-04-13"
     },
     "trend": {
@@ -818,7 +818,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 10,
+  "source_schema_version": 11,
   "sources": {
     "all": {
       "availability": "ok",
@@ -922,11 +922,13 @@
                 "label": "Claude subscription week",
                 "start_at": "2026-04-13T14:00:00Z"
               },
+              "scope": "provider_cycle",
               "state": "current",
               "total_tokens": 138000
             },
             "codex": {
               "cost_usd": 0.0,
+              "scope": "provider_cycle",
               "state": "empty",
               "total_tokens": 0
             }
@@ -2255,7 +2257,7 @@
             ],
             "total_cost_usd": 0.63,
             "week_label": "wk Apr 13",
-            "week_start_at": "2026-04-13T00:00:00Z",
+            "week_start_at": "2026-04-13T14:00:00Z",
             "week_start_date": "2026-04-13"
           },
           "rows": [

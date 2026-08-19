@@ -21,6 +21,10 @@ import {
 import type { Envelope, ForecastEnvelope, SourceName } from '../types/envelope';
 import { SourceChip } from '../panels/sourcePanel';
 import { providerAccentClass } from '../lib/providerAccent';
+import { dollarsPerPercentReason } from '../lib/withheldCopy';
+import { alertNavigation, envelopeNow, parseInstantMs } from '../lib/alertScope';
+import { followAlertTarget } from '../store/followAlertTarget';
+
 
 // The range bar (pills + leaders + 3-zone track + bounds) is built via
 // DOM-mutating layout in a ref effect; React manages only the container
@@ -30,6 +34,64 @@ import { providerAccentClass } from '../lib/providerAccent';
 interface ExplainWeek {
   elapsed_hours?: number | null;
   remaining_hours?: number | null;
+}
+
+// #620 S1 D12 — a `cap` or `capped` forecast is a live warning state, and the
+// surface that explains the week it warns about is `CurrentWeekModal`. The
+// route goes through the same kernel every alert row uses, over a weekly-axis
+// context built from the provider's own live window, so the forecast modal
+// cannot offer a week the alert rows would refuse.
+//
+// Claude's live window end is `current_week.reset_at_utc`; Codex's is its
+// native quota cycle's reset. A provider publishing neither has no addressable
+// week, and the affordance is simply absent — there is nothing to withhold a
+// reason about, because no warning was routed anywhere.
+function ForecastExplain({
+  env,
+  source,
+  verdict,
+}: {
+  env: Envelope | null;
+  source: SourceName;
+  verdict: string | null | undefined;
+}) {
+  if (verdict !== 'cap' && verdict !== 'capped') return null;
+  const liveEndIso = source === 'claude'
+    ? env?.current_week?.reset_at_utc ?? null
+    : env?.sources?.codex?.data?.hero?.cycle?.resets_at ?? null;
+  const liveEndMs = parseInstantMs(liveEndIso);
+  if (liveEndMs == null) return null;
+  const nav = alertNavigation(
+    {
+      id: '',
+      axis: 'weekly',
+      threshold: 0,
+      crossed_at: '',
+      alerted_at: '',
+      context: {
+        week_start_at: new Date(liveEndMs - 7 * 24 * 3600 * 1000).toISOString(),
+      },
+    },
+    // The weekly leg compares against `current_week.reset_at_utc`, which is
+    // Claude's window and not Codex's, so the Codex call is handed the
+    // envelope with that comparison removed rather than being measured
+    // against the other provider's week.
+    source === 'claude' ? env : ({ ...(env ?? {}), current_week: null } as Envelope),
+    envelopeNow(env),
+  );
+  if (!nav.available || nav.target == null) {
+    return <span className="alert-row-withheld">{nav.withheldReason}</span>;
+  }
+  const target = { ...nav.target, source };
+  return (
+    <button
+      type="button"
+      className="alert-row-open mfc-explain"
+      onClick={() => followAlertTarget(target)}
+    >
+      {target.label}
+    </button>
+  );
 }
 
 function fmtWeekDone(wk: ExplainWeek | null | undefined): string {
@@ -666,7 +728,20 @@ function CanonicalForecastModal({ source }: { source: SourceName }) {
         },
       };
   const explain = (fc?.explain ?? null) as
-    | { rates?: { dollars_per_percent?: number | null; week_average_pct_per_hour?: number | null; recent_24h_pct_per_hour?: number | null }; week?: ExplainWeek }
+    | {
+        rates?: {
+          dollars_per_percent?: number | null;
+          // #620 S1 D5 — the companion cause code the server already publishes
+          // beside a withheld rate. Typed as a bare `string`, per the #556
+          // client contract: the server owns the closed set, the client renders
+          // a known code specifically and everything else through a required
+          // fallback.
+          dollars_per_percent_source?: string | null;
+          week_average_pct_per_hour?: number | null;
+          recent_24h_pct_per_hour?: number | null;
+        };
+        week?: ExplainWeek;
+      }
     | null;
   const wrapRef = useRef<HTMLDivElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
@@ -751,6 +826,11 @@ function CanonicalForecastModal({ source }: { source: SourceName }) {
           <span className={confCls} id="mfc-confidence" hidden={confHidden}>
             {confText}
           </span>
+          <ForecastExplain
+            env={env}
+            source={source}
+            verdict={isClaude ? fc?.verdict : presented.verdict}
+          />
           {!isClaude && (
             <span className={`m-pill ${providerAccentClass('codex')}`}>
               Codex native quota
@@ -871,6 +951,16 @@ function CanonicalForecastModal({ source }: { source: SourceName }) {
             <span className="v" id="mfc-remain">{fmt.hours1(week?.remaining_hours)}</span>
           </div>
         </div>
+        {/* #620 S1 D5 — a withheld `$ / 1%` used to render as a bare dash, which
+            reads the same as a transport failure. The rate's own cause code
+            says why, so the modal states it. Outside the two-column
+            `.mfc-kvgrid` deliberately: a note inside it would take a grid cell
+            and shift every following row across the columns. */}
+        {rates?.dollars_per_percent == null && (
+          <p className="mfc-rate-note">
+            {dollarsPerPercentReason(rates?.dollars_per_percent_source)}
+          </p>
+        )}
 
         <h3 className="m-sec sec-bud">
           <svg className="icon" aria-hidden="true">

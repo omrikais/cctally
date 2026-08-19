@@ -127,8 +127,7 @@ describe('HeroStrip — Codex tiles (§6.1)', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
 
     expect(() => render(<HeroStrip />)).not.toThrow();
-    expect(screen.getAllByTestId('hero-per-account-value').length)
-      .toBeGreaterThan(0);
+    expect(screen.getByTestId('hero-leg-codex')).toHaveTextContent('$10.15 · 3 accounts');
   });
 
   it('uses Claude\'s exact hero structure and metric slots with Codex cycle data', () => {
@@ -343,6 +342,22 @@ describe('HeroStrip — All combined tiles (§6.1)', () => {
     expect(combined).not.toHaveTextContent('unavailable');
   });
 
+  it('keeps certified spend visible while omitting an uncertified token total', () => {
+    updateSnapshot(envWith((b) => {
+      const combined = b.sources.all.data!.combined!;
+      combined.total_tokens = null;
+      combined.legs.claude.total_tokens = null;
+    }));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    const combined = screen.getByTestId('shared-hero-spent');
+    expect(combined).toHaveTextContent('$20.70');
+    expect(combined).not.toHaveTextContent('total tokens');
+    expect(combined).not.toHaveTextContent('0 total tokens');
+    expect(combined).not.toHaveTextContent('no accounting in either current cycle');
+  });
+
   it('publishes an unqualified figure with BOTH percent clocks stale (#556 acceptance 5)', () => {
     // The state the issue is about. `domain_freshness.hero` used to mean
     // percent-observation age, so this combination kept a staleness marker
@@ -490,6 +505,46 @@ describe('HeroStrip — All combined tiles (§6.1)', () => {
     // The duplicated quota rows and the constant `Providers` row are gone.
     expect(support.textContent).not.toContain('Claude · Codex');
     expect(support.textContent).not.toContain('Claude quota');
+  });
+
+  it('shows a certified decorated provider subtotal and account count', () => {
+    updateSnapshot(envWith((b) => {
+      const combined = b.sources.all.data!.combined!;
+      combined.legs.claude = {
+        state: 'current',
+        scope: 'account_cycles',
+        cost_usd: 8.4,
+        total_tokens: null,
+        accounts: [
+          {
+            account_key: 'a'.repeat(32), cost_usd: 3.4,
+            period: {
+              kind: 'subscription_week',
+              start_at: '2026-04-21T00:00:00Z',
+              end_at: '2026-04-28T00:00:00Z',
+            },
+          },
+          {
+            account_key: 'b'.repeat(32), cost_usd: 5,
+            period: {
+              kind: 'subscription_week',
+              start_at: '2026-04-22T00:00:00Z',
+              end_at: '2026-04-29T00:00:00Z',
+            },
+          },
+        ],
+      };
+      combined.total_tokens = null;
+    }));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    expect(screen.getByTestId('hero-combined-heading'))
+      .toHaveTextContent('COMBINED · ACCOUNT CYCLES');
+    expect(screen.getByTestId('hero-leg-claude'))
+      .toHaveTextContent('$8.40 · 2 accounts');
+    expect(screen.getByTestId('shared-hero-support'))
+      .toHaveTextContent('Claude · account cycles');
   });
 
   it('names only the contributing provider when the other leg is empty', () => {

@@ -1140,6 +1140,14 @@ def _run_claude_json_adapter(args: object, command: str) -> SourceResult[dict[st
     captured: list[dict[str, object]] = []
     claude_args._source_result_sink = captured.append
     exit_code = handler(claude_args)
+    # Every Claude handler resolves the display zone onto its own namespace,
+    # and ``claude_args`` is a copy, so that resolution never reached the
+    # caller. The all-source terminal report needs the SAME zone the handler
+    # used or its week windows and capture timestamps would render in a
+    # different zone from `report --source claude` (#620 S1 D7). Reading it
+    # back off the copy is exact by construction; re-deriving it here would
+    # be a second resolution that can disagree with the first.
+    args._claude_resolved_tz = getattr(claude_args, "_resolved_tz", None)
     if exit_code != 0 or len(captured) != 1:
         return SourceResult("claude", "unavailable", None)
     payload = captured[0]
@@ -1951,8 +1959,15 @@ def _render_codex_terminal(
     return "\n".join(lines)
 
 
-def _render_claude_terminal(command: str, result: SourceResult) -> str:
-    """Render an all-source Claude section without changing legacy CLI paths."""
+def _render_claude_terminal(
+    command: str, result: SourceResult, *, tz: object = None,
+) -> str:
+    """Render an all-source Claude section without changing legacy CLI paths.
+
+    ``tz`` is the display zone the Claude handler itself resolved, captured
+    by ``_run_claude_json_adapter``; it reaches only the report renderer
+    (#620 S1 D7), which formats week windows and capture timestamps.
+    """
     title = _TERMINAL_TITLES.get(command, "Analytics Report")
     lines = [f"Claude {title}"]
     if result.status == "unavailable":
@@ -1962,11 +1977,29 @@ def _render_claude_terminal(command: str, result: SourceResult) -> str:
     if command == "diff" and isinstance(result.data, dict):
         _append_diff_terminal(lines, result.data)
         return "\n".join(lines)
+    if command == "report" and isinstance(result.data, dict):
+        # #620 S1 D7: render the real report. `_legacy_claude_totals` reads a
+        # `totals` object this payload does not have, so it returned (0, 0)
+        # and the section collapsed to `Data available.` — no current-week
+        # table, no trend table, no `$ / 1%` column — while `report` on its
+        # own printed all of it. The renderer is the SAME pure function
+        # `cmd_report` calls, so the two cannot diverge.
+        c = _cctally()
+        lines.append(c.render_report_terminal(result.data, tz=tz))
+        return "\n".join(lines)
     cost, tokens = _legacy_claude_totals(result.data)
     if cost or tokens:
         lines.append(f"Total: {_terminal_amount(cost)} · {_terminal_tokens(tokens)}")
     else:
-        lines.append("Data available.")
+        # #620 S1 D7: a POPULATED result whose compatible cost and token
+        # totals are both exactly zero. `Data available.` said nothing about
+        # what was available or where to see it. State what is absent, and
+        # name the command that shows the detail this section cannot.
+        lines.append(
+            "No compatible cost or token total for Claude in this result. "
+            f"Run `cctally {command} --source claude` for the full Claude "
+            "detail."
+        )
     return "\n".join(lines)
 
 
@@ -2055,7 +2088,10 @@ def _emit_source_result(
                 and result.status == "unavailable"
             )
             sections = [
-                _render_claude_terminal(command, claude),
+                _render_claude_terminal(
+                    command, claude,
+                    tz=getattr(args, "_claude_resolved_tz", None),
+                ),
                 _render_codex_terminal(
                     command, result, diff=diff,
                     include_unavailable_diagnostic=not project_degradation,

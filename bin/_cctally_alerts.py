@@ -77,12 +77,15 @@ _alert_text_project_budget = _lib_alerts_payload._alert_text_project_budget
 _alert_text_codex_budget = _lib_alerts_payload._alert_text_codex_budget
 _alert_text_projected = _lib_alerts_payload._alert_text_projected
 _escape_applescript_string = _lib_alerts_payload._escape_applescript_string
+_with_next_step = _lib_alerts_payload._with_next_step
+alert_next_step_line = _lib_alerts_payload.alert_next_step_line
 _build_alert_payload_weekly = _lib_alerts_payload._build_alert_payload_weekly
 _build_alert_payload_five_hour = _lib_alerts_payload._build_alert_payload_five_hour
 _build_alert_payload_budget = _lib_alerts_payload._build_alert_payload_budget
 _build_alert_payload_project_budget = _lib_alerts_payload._build_alert_payload_project_budget
 _build_alert_payload_codex_budget = _lib_alerts_payload._build_alert_payload_codex_budget
 _build_alert_payload_projected = _lib_alerts_payload._build_alert_payload_projected
+synthetic_preview_week_start = _lib_alerts_payload.synthetic_preview_week_start
 
 
 def _build_alert_payload_quota(
@@ -133,7 +136,9 @@ def _alert_text_quota(payload: dict, _tz) -> tuple[str, str, str]:
         body = f"Projected {float(context.get('projected_percent') or 0):.0f}% by reset"
     else:
         body = f"Actual usage {float(context.get('qualifying_percent') or 0):.0f}%"
-    return title, subtitle, body
+    # Seventh axis, same affordance (#620 S1): quota is absent from the
+    # dashboard alert envelope, so the CLI line is the only routing it gets.
+    return title, subtitle, _with_next_step(body, payload, _tz)
 
 # Phase B: severity policy + the cross-platform dispatch kernel. The kernel is
 # pure (parameterized on platform + which_on_path); this module is the I/O glue
@@ -424,10 +429,16 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
         )
         return 2
     if axis == "weekly":
+        # The preview must carry the reset INSTANT a real crossing carries;
+        # without it the body renders the day-granularity fallback a
+        # pre-column historical row degrades to, which is not what this
+        # command exists to show.
+        preview_week_start = synthetic_preview_week_start()
         payload = _build_alert_payload_weekly(
             threshold=threshold,
             crossed_at_utc=now_utc_iso(),
-            week_start_date=dt.date.today().isoformat(),
+            week_start_date=preview_week_start.date().isoformat(),
+            week_start_at=preview_week_start.isoformat().replace("+00:00", "Z"),
             cumulative_cost_usd=1.23,
             dollars_per_percent=0.01,
         )

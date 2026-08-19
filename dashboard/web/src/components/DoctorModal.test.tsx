@@ -44,6 +44,19 @@ describe('DoctorCheckRow non-OK fallback (#207 D3)', () => {
     expect(screen.getByText(/run db recover/)).toBeTruthy();
     expect(screen.queryByText(fallbackMatcher)).toBeNull();
   });
+  it('keeps every CLI flag as one protected token without changing the text', () => {
+    const remediation = 'Run `cctally db checkpoint --db conversations --dry-run`.';
+    const { container } = render(
+      <DoctorCheckRow c={{
+        id: 'db', title: 'DB', severity: 'warn', summary: 'large',
+        remediation, details: {},
+      }} />,
+    );
+    const paragraph = container.querySelector('.doctor-modal__remediation');
+    expect(paragraph?.textContent).toBe(`→ ${remediation}`);
+    expect(Array.from(paragraph?.querySelectorAll('.doctor-modal__flag') ?? [])
+      .map((flag) => flag.textContent)).toEqual(['--db', '--dry-run']);
+  });
 });
 
 describe('DoctorCheckRow humanizes Latest snapshot age (#259)', () => {

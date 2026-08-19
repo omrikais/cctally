@@ -26,10 +26,11 @@
 #     gate, not a broken route.
 #
 # Each JSON body is normalized (wall-clock fields → sentinels) and diffed
-# against tests/fixtures/conversation/<scenario>/golden-*.json. First run writes
-# each golden; steady-state is a byte-stable diff. Every compare routes through
-# bin/_lib-golden-diff.sh (NEVER inline `diff -u <(…)` — #106/#107). A trap
-# kills any stray server PID on exit / Ctrl-C.
+# against tests/fixtures/conversation/<scenario>/golden-*.json. A missing golden
+# fails unless CCTALLY_REGEN_GOLDENS=1 explicitly creates it; steady-state is a
+# byte-stable diff. Every decision routes through bin/_lib-golden-diff.sh
+# (NEVER inline `diff -u <(…)` — #106/#107). A trap kills any stray server PID
+# on exit / Ctrl-C.
 #
 # Single scenario, run sequentially (the gate truth-table is driven by Host
 # headers, not by separate fixture trees), so no xargs fan-out here.
@@ -139,12 +140,7 @@ fetch_and_diff () {
         fail "$label: JSON could not be normalized (raw: $raw)"
         return
     fi
-    if [ ! -f "$golden" ]; then
-        printf '%s\n' "$actual" > "$golden"
-        echo "WROTE $name golden: $golden"
-    else
-        _golden_diff_str "$label" "$golden" "$actual" 5000 || ok=0
-    fi
+    _golden_require_str "$label" "$golden" "$actual" 5000 || ok=0
 }
 
 run_scenario () {

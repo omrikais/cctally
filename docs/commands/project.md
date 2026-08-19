@@ -84,6 +84,33 @@ Codex cannot calculate Claude-style `--sort used`, so that value is rejected
 for Codex and all-source requests. Other project filters, grouping, ordering,
 breakdown, timezone, and share flags apply inside each source section.
 
+## Claude range resolution
+
+Without `--since`/`--until`, the Claude range is `weeksInRange` **real
+subscription intervals** ending with the one that contains now — the same
+intervals `_compute_subscription_weeks` derives from your retained reset
+anchors, and the same ones the dashboard Projects panel buckets into.
+`rangeStart` is therefore always an interval start, never a date part-way
+through one. On a multi-account merged read the intervals are the merged
+fragments the reset anchors of every account produce, and a fragment can be
+shorter than a week — so `--weeks N` spans N fragments, which together cover
+less calendar time than N weeks.
+
+This is a correction as of #620. `--weeks N` previously resolved its start by
+stepping back `7 * (N - 1)` days from the current interval's start, which is
+short of the truth by the accumulated shortfall of every drifted week inside
+the range — Anthropic's reset day moves, and a drifted cycle produces a
+genuinely short week. The gap was not empty: cost inside it was folded into
+`totals.costUsd`, the previous week's whole quota percentage was summed into
+`totals.usedPercent`, and the extra interval could carry no snapshot and
+therefore report `Used % unavailable for 1 week` about a week you never asked
+for. `rangeStart`, `weeksInRange`, `totals.costUsd` and `totals.usedPercent`
+can all move as a result, and the new values describe the window the command
+says it is describing.
+
+An explicit `--since` / `--until` range is unaffected: those instants are the
+ones you asked for and are used verbatim.
+
 ## Claude `Used %`
 
 For a single subscription week *W* and project *P*:
@@ -97,6 +124,14 @@ weeks of 20% → `60.0% (3wk)`. The `(Nwk)` suffix makes this explicit.
 `—` in the `Used %` column means the week had no
 `weekly_usage_snapshots` row (usually: very fresh install). `$/1%` is
 `cost / attributed_pct`.
+
+## Claude `Cost Share`
+
+`Cost Share` is each project's percentage of the total cost of the projects the table lists, and the table states that total and that project count in a line under it, because a terminal has no hover for the disclosure the dashboard makes in a tooltip.
+
+Its denominator is not the one `Used %` uses, and the two columns therefore answer different questions. `Cost Share` is a share of the listed spend and always sums to 100% across the parent rows. `Used %` is a share of the account's weekly quota, so it sums to the account's quota consumption instead. A `--project` or `--model` filter narrows the set of listed projects, and `Cost Share` is measured over that narrowed set, which is exactly what the line under the table names; `Used %` keeps the invariant all-entries denominator described above.
+
+Model rows under `--breakdown` leave `Cost Share` blank, for the same reason they leave `Used %` and `$/1%` blank: a model's share of its own project is a different denominator from the one the column names. `Cost Share` is a terminal column only; `--json` consumers compute the same figure from `projects[].costUsd`.
 
 ## Claude grouping
 
@@ -117,9 +152,9 @@ Claude terminal output is a ccusage-style ANSI table matching the shape of
 `session` / `daily`:
 
     Claude Token Usage Report - Projects (2026-04-13 — 2026-04-19)
-    ... (11 columns: Project, Sessions, First Seen, Last Seen,
+    ... (12 columns: Project, Sessions, First Seen, Last Seen,
          Input, Cache Create, Cache Read, Output, Cost (USD),
-         Used %, $/1%)
+         Cost Share, Used %, $/1%)
 
 `--json` emits a payload with `rangeStart`, `rangeEnd`, `weeksInRange`,
 `groupMode`, `totals.{costUsd,usedPercent,weeklyAttributionAvailable}`,

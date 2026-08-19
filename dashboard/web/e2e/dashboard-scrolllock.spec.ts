@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 
 // Scenario 6 (spec §4.6) — scroll-lock under trusted wheel. With a modal open,
 // a trusted `page.mouse.wheel` on the background leaves `window.scrollY ~ 0`
@@ -10,10 +10,10 @@ test.use({ viewport: { width: 1440, height: 500 } });
 
 const DOCTOR = '.doctor-modal-card';
 
-async function scrollY(page) {
+async function scrollY(page: Page) {
   return page.evaluate(() => Math.round(window.scrollY));
 }
-async function wheelBackground(page) {
+async function wheelBackground(page: Page) {
   // Wheel over the top-left background (away from a centered modal card).
   await page.mouse.move(20, 20);
   await page.mouse.wheel(0, 800);

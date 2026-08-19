@@ -13,10 +13,12 @@
 # that runs the bundle, so failing loudly is safe here.
 #
 # Five legs:
-#   1. hooks-lint — `npm run lint`, so react-hooks/rules-of-hooks is part of the
-#      authoritative local bundle rather than only the separate CI build job.
-#   1b. typecheck — `npx tsc --noEmit`. CI runs `npm run build`, which is
-#      `npm run lint && tsc --noEmit && vite build`, so before this leg the local
+#   1. hooks-lint — `npm run lint`, so react-hooks/rules-of-hooks covers both
+#      the application and Playwright sources in the authoritative local bundle
+#      rather than only the separate CI build job.
+#   1b. typecheck — `npm run typecheck`. CI runs `npm run build`, which is
+#      `npm run lint && npm run typecheck && vite build`, so before this leg the
+#      local
 #      and remote gate was strictly WEAKER than CI: a type error failed CI while
 #      the authoritative suite stayed green. Demonstrated on 2026-08-03 by #463
 #      S2, which merged a test whose `cost_usd` access did not type-check against
@@ -115,16 +117,17 @@ else
     tail -80 "$lint_log"
 fi
 
-# The CI-parity leg. `tsc --noEmit` is exactly the middle step of CI's
-# `npm run build`; running it here makes the authoritative local/remote gate at
-# least as strong as CI on the typing axis.
+# The CI-parity leg. `npm run typecheck` is exactly the middle step of CI's
+# `npm run build`; it checks the application config and the dedicated e2e
+# config without emitting a bundle, so Playwright specs cannot remain outside
+# the authoritative gate.
 typecheck_log="$GOLDEN_DIFF_TMPDIR/typecheck.log"
-if (cd "$WEB_DIR" && npx tsc --noEmit) >"$typecheck_log" 2>&1; then
+if (cd "$WEB_DIR" && npm run typecheck) >"$typecheck_log" 2>&1; then
     pass_count=$((pass_count + 1))
     echo "ok typecheck"
 else
     fail_count=$((fail_count + 1))
-    echo "FAIL typecheck: npx tsc --noEmit reported type errors"
+    echo "FAIL typecheck: npm run typecheck reported type errors"
     echo "  CI runs the same compiler through 'npm run build' — fix these or CI fails."
     tail -80 "$typecheck_log"
 fi

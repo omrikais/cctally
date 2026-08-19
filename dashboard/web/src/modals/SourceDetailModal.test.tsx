@@ -196,6 +196,8 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
             key: 'project:opaque',
             label: 'project-red',
             window_weeks: 4,
+            window_start_at: '2026-07-20T00:00:00Z',
+            window_end_at: '2026-08-17T00:00:00Z',
             window_cost_usd: 8.5,
             window_attributed_pct: 23.5,
             models: [{ model: 'claude-opus-4-8', cost_usd: 8.5, sessions_count: 3, tokens_input: 1000, tokens_output: 500 }],
@@ -221,11 +223,11 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     expect(fetchFn).toHaveBeenCalledWith(
       '/api/source/claude/project/project%3Aopaque?weeks=4',
     );
-    // #556 S2 (Task 0b) — this case seeds NO snapshot, so no current-week
-    // anchor is published and no span can be resolved. The header falls back
-    // to the unit count rather than stating a span nothing established. The
-    // resolved-date form is asserted below, on a case that seeds one.
-    expect(detail).toHaveTextContent('project-red · 3 sessions · $8.50 (4w)');
+    // #571 — the detail's own authoritative half-open bounds state its span;
+    // no retained or top-level projects anchor is needed on the client.
+    expect(detail).toHaveTextContent(
+      'project-red · 3 sessions · $8.50 · 4w · Jul 20 – Aug 16',
+    );
     expect(detail).toHaveTextContent('Models (this project)');
     expect(detail).toHaveTextContent('Recent sessions');
     expect(detail).toHaveTextContent('+2 more');
@@ -273,6 +275,8 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
             label: 'project-red',
             // The SERVER's effective window, not the 4 the client requested.
             window_weeks: 8,
+            window_start_at: '2026-03-03T00:00:00Z',
+            window_end_at: '2026-04-28T00:00:00Z',
             window_cost_usd: 12.25,
             window_attributed_pct: null,
             models: [],
@@ -296,9 +300,8 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     render(<SourceDetailModal />);
 
     const detail = await screen.findByTestId('claude-project-detail');
-    // week_start_at is 2026-04-21 in the fixture, so eight weeks back reaches
-    // 2026-03-03 and the window's own last covered day is 2026-04-27. The
-    // STATED end is Apr 24, because the fixture's `generated_at` is
+    // The server-published interval covers Mar 03 through Apr 27. The STATED
+    // end is Apr 24, because the fixture's `generated_at` is
     // 2026-04-24T13:07 and a stated span never names a day that has not
     // happened. This case previously asserted Apr 27 — a future Sunday.
     expect(detail).toHaveTextContent('8w · Mar 03 – Apr 24');

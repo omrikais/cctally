@@ -9,6 +9,8 @@ import {
   projectedContextText,
 } from '../lib/alertAxis';
 import { alertDisplay } from '../lib/alertIdentity';
+import { AlertFollowCell } from './AlertFollow';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import type { AlertEntry, CodexAlertRow, ClaudeAlertSourceRow, SourceAlertRow } from '../types/envelope';
 
 // Normalize a toast payload (a legacy AlertEntry from SHOW_ALERT_TOAST /
@@ -145,6 +147,7 @@ function CodexToastBody({ row }: { row: CodexAlertRow }): JSX.Element {
 
 export function Toast() {
   const toast = useSyncExternalStore(subscribeStore, () => getState().toast);
+  const env = useScopedSnapshot();
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
 
@@ -188,6 +191,19 @@ export function Toast() {
             <ClaudeToastBody alert={alertPayload} ctx={ctx} />
           ) : (
             <CodexToastBody row={alertPayload} />
+          )}
+          {/* #620 S1 D12 — the toast is the first place a warning is seen, so
+              it offers the same next step the alerts modal does. The click
+              handler on the container above dismisses; this one stops that
+              propagation, follows the target, and retires the toast itself. */}
+          {alertPayload.source === 'claude' && (
+            <div className="toast--alert-follow">
+              <AlertFollowCell
+                alert={alertPayload}
+                env={env}
+                onFollow={() => dispatch({ type: 'HIDE_TOAST' })}
+              />
+            </div>
           )}
         </div>
       )}

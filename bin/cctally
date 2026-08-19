@@ -484,6 +484,7 @@ _build_alert_payload_budget = _lib_alerts_payload._build_alert_payload_budget
 _build_alert_payload_project_budget = _lib_alerts_payload._build_alert_payload_project_budget
 _build_alert_payload_codex_budget = _lib_alerts_payload._build_alert_payload_codex_budget
 _build_alert_payload_projected = _lib_alerts_payload._build_alert_payload_projected
+synthetic_preview_week_start = _lib_alerts_payload.synthetic_preview_week_start
 
 _lib_alert_dispatch = _load_sibling("_lib_alert_dispatch")
 resolve_notifier = _lib_alert_dispatch.resolve_notifier
@@ -503,6 +504,8 @@ _clamp_end_ats_to_next_start = _lib_subscription_weeks._clamp_end_ats_to_next_st
 _apply_overlap_clamp_to_subweeks = _lib_subscription_weeks._apply_overlap_clamp_to_subweeks
 _apply_reset_events_to_subweeks = _lib_subscription_weeks._apply_reset_events_to_subweeks
 _compute_subscription_weeks = _lib_subscription_weeks._compute_subscription_weeks
+subscription_window_ending_at = _lib_subscription_weeks.subscription_window_ending_at
+subscription_window_probe_range = _lib_subscription_weeks.subscription_window_probe_range
 
 # Codex quota-pool classification (#373).  A pure leaf: stdlib only, no
 # cctally imports, so `_lib_jsonl` can consume it without dragging in the
@@ -1407,6 +1410,12 @@ legacy_project_labels = _cctally_dashboard.legacy_project_labels
 build_cached_claude_range_aggregates = (
     _cctally_dashboard.build_cached_claude_range_aggregates
 )
+capture_cached_claude_range_aggregates = (
+    _cctally_dashboard.capture_cached_claude_range_aggregates
+)
+build_cached_claude_range_aggregates_from_capture = (
+    _cctally_dashboard.build_cached_claude_range_aggregates_from_capture
+)
 reset_claude_range_aggregate_memo = (
     _cctally_dashboard.reset_claude_range_aggregate_memo
 )
@@ -1581,6 +1590,7 @@ cmd_range_cost = _cctally_reporting.cmd_range_cost   # parser: c.cmd_range_cost 
 # here.
 _cctally_forecast = _load_sibling("_cctally_forecast")
 cmd_report = _cctally_forecast.cmd_report
+render_report_terminal = _cctally_forecast.render_report_terminal
 cmd_forecast = _cctally_forecast.cmd_forecast
 cmd_budget = _cctally_forecast.cmd_budget
 ForecastInputs = _cctally_forecast.ForecastInputs

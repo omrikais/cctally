@@ -95,13 +95,12 @@ test('wildcard dashboard authenticates Fetch and both SSE streams per run', asyn
 
   // The already-running loopback dashboard remains credential-free.
   expect((await request.get('/api/data')).status()).toBe(200);
-  const loopbackEvents = page.waitForResponse((response) => (
-    new URL(response.url()).port === '8797'
-      && new URL(response.url()).pathname === '/api/events'
-      && response.status() === 200
-  ));
   await page.goto('/');
-  await loopbackEvents;
+  // The bootstrap Fetch was removed in #583, so the panel grid can mount only
+  // after the dashboard stream delivers a snapshot. SharedWorker requests are
+  // deliberately not attributed to a Playwright Page or BrowserContext network
+  // event; assert the user-visible delivery instead.
+  await expect(page.locator('#main-content .panel-host').first()).toBeVisible();
 
   execFileSync(CCTALLY, [
     'config', 'set', 'dashboard.expose_transcripts', 'true',
@@ -142,18 +141,15 @@ test('wildcard dashboard authenticates Fetch and both SSE streams per run', asyn
         apiOrder.push(`response:${responseUrl.pathname}:${response.status()}`);
       }
     });
-    const globalEvents = page.waitForResponse((response) => (
-      new URL(response.url()).port === String(port)
-        && new URL(response.url()).pathname === '/api/events'
-        && response.status() === 200
-    ));
     const navigation = page.goto(url);
     await sawAuth;
     const documentResponse = await navigation;
     expect(apiOrder).toEqual(['request:/api/auth']);
     releaseAuth();
     expect(documentResponse?.url()).not.toContain(token);
-    await globalEvents;
+    // As above, mounting the authenticated dashboard is the observable proof
+    // that its SharedWorker-owned SSE received a snapshot.
+    await expect(page.locator('#main-content .panel-host').first()).toBeVisible();
     expect(apiOrder.slice(0, 2)).toEqual([
       'request:/api/auth',
       'response:/api/auth:204',

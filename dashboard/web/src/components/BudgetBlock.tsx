@@ -5,6 +5,12 @@ import {
   type ProviderPresentationSection,
 } from '../lib/dashboardPresentation';
 import { SourceChip } from '../panels/sourcePanel';
+import {
+  alertNavigation,
+  envelopeNow,
+} from '../lib/alertScope';
+import { followAlertTarget } from '../store/followAlertTarget';
+
 import type {
   BudgetPresentation,
   DashboardSelection,
@@ -173,16 +179,71 @@ function BudgetUnavailable({
   );
 }
 
+// #620 S1 D12 — a warn or over budget is a live warning state, so it routes to
+// the surface that explains the period it measures. The scope is derived
+// through the SAME kernel the alert rows use, from a context built out of the
+// status's own retained `period` and `window_start_at`, so the budget block and
+// an alert about that budget cannot disagree about which window they mean.
+function BudgetExplain({
+  source,
+  status,
+  env,
+}: {
+  source: SourceName;
+  status: Extract<BudgetPresentation, { state: 'configured' }>['status'];
+  env: Envelope | null;
+}) {
+  if (status.verdict !== 'warn' && status.verdict !== 'over') return null;
+  const nav = alertNavigation(
+    {
+      // Not a real alert row: no id, no threshold crossing. The axis and the
+      // context are what the kernel reads, and they are exactly the axis and
+      // the window this block describes.
+      id: '',
+      axis: source === 'codex' ? 'codex_budget' : 'budget',
+      threshold: 0,
+      crossed_at: '',
+      alerted_at: '',
+      context: { period: status.period, period_start_at: status.window_start_at },
+    },
+    env,
+    envelopeNow(env),
+  );
+  if (!nav.available || nav.target == null) {
+    return (
+      <span className="alert-row-withheld" data-testid={`budget-withheld-${source}`}>
+        {nav.withheldReason}
+      </span>
+    );
+  }
+  const target = nav.target;
+  return (
+    <button
+      type="button"
+      className="alert-row-open budget-explain"
+      data-testid={`budget-explain-${source}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        followAlertTarget(target);
+      }}
+    >
+      {target.label}
+    </button>
+  );
+}
+
 function BudgetFigures({
   source,
   presentation,
   detailed,
   ctx,
+  env,
 }: {
   source: SourceName;
   presentation: Extract<BudgetPresentation, { state: 'configured' }>;
   detailed: boolean;
   ctx: FmtCtx;
+  env: Envelope | null;
 }) {
   const status = presentation.status;
   const cls = VERDICT_CLASS[status.verdict] ?? 'good';
@@ -218,6 +279,7 @@ function BudgetFigures({
             low confidence
           </span>
         )}
+        <BudgetExplain source={source} status={status} env={env} />
       </div>
       <div className="fc-budget-foot budget-foot">
         {/* #556 S5 §4.7 — `Budget pace` MOVED here from the forecast footer and
@@ -275,10 +337,12 @@ export function BudgetProviderSection({
   section,
   surface,
   ctx,
+  env = null,
 }: {
   section: ProviderPresentationSection<BudgetPresentation>;
   surface: 'panel' | 'modal';
   ctx: FmtCtx;
+  env?: Envelope | null;
 }) {
   // #556 S4's heading pattern, applied even when there is only one section: a
   // plain `<div>` takes no accessible name, so the region role is what makes
@@ -316,6 +380,7 @@ export function BudgetProviderSection({
           presentation={presentation}
           detailed={surface === 'modal'}
           ctx={ctx}
+          env={env}
         />
       ) : presentation.state === 'not_configured' ? (
         <BudgetUnconfigured
@@ -360,6 +425,7 @@ export function BudgetComposition({
           section={section}
           surface={surface}
           ctx={ctx}
+          env={env}
         />
       ))}
     </>

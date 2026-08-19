@@ -19,7 +19,7 @@ test('Codex shell and patch wires render as native cards without harness noise',
   await expect(terminals.first()).toContainText('/synthetic/root-a/project-red');
   await expect(terminals.filter({ hasText: '/synthetic/root-b/duplicated-conversation-copy' })).toHaveCount(1);
   await expect(terminals.first()).toContainText('alpha');
-  await expect(page.locator('.conv-term-badge--err')).toHaveCount(1);
+  await expect(terminals.locator('.conv-term-badge--err')).toHaveCount(1);
   await expect(page.locator('.conv-term').filter({ hasText: 'seq 1 25' })).not.toHaveAttribute('open', '');
 
   const patch = page.locator('.conv-native-patch').filter({ hasText: 'synthetic-added.txt' });

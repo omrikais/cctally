@@ -28,6 +28,7 @@ import { fetchWeekDetail, stepWeek } from './milestoneHistory';
 import type {
   CodexQuotaMilestoneRow,
   CodexSourceData,
+  AllCombinedLeg,
   AllSourceData,
   DashboardSelection,
   Envelope,
@@ -65,6 +66,23 @@ function formatCycleRange(entry: WeekIndexEntry, ctx: FmtCtx): string {
   const start = fmt.dateShort(entry.start_at_utc, ctx);
   const end = fmt.dateShort(entry.end_at_utc, ctx);
   return start && end ? `${start}–${end}` : entry.label;
+}
+
+// #620 S1 — a week whose exact bounds were never recorded.
+//
+// An install carrying a `week_start_at IS NULL` milestone with no matching
+// snapshot row produces an index entry with both bounds null. That row is now
+// reachable (the ValueError that used to empty the whole index for those
+// installs was fixed in this session), and every consumer below tolerates the
+// null — but tolerating it silently left the pill showing a bare date and the
+// reset cell showing a dash, with nothing saying why either was short. It
+// carries real milestones, so it must render them AND state what is missing.
+export const BOUNDS_MISSING_NOTE =
+  'This week\u2019s exact start and reset were never recorded, so its range and '
+  + 'reset time cannot be shown. The milestones below are unaffected.';
+
+export function hasNoRecordedBounds(entry: WeekIndexEntry | null): boolean {
+  return entry != null && entry.start_at_utc == null && entry.end_at_utc == null;
 }
 
 function hasDistinctNominalReset(entry: WeekIndexEntry): boolean {
@@ -951,6 +969,14 @@ function CodexCurrentCycleModal({
             <div className="s"><span className="k">$ / 1%</span><span className="v v-cyan">{fmt.usd3(dpp)}</span></div>
             <div className="s"><span className="k">{resetLabel}</span><span className="v">{fmt.datetimeShortZ(resetCell, ctx)}</span></div>
           </div>
+          {/* Outside `.mcw-mini`, matching the Claude leg. That element is a
+              wrapping flex row of stat cells, so a paragraph nested in it is
+              laid out as a fourth flex ITEM — beside the reset cell at wide
+              widths, on a second flex line at narrow ones, and taking the
+              row's 18px gap on top of its own margin. */}
+          {isHistoric && hasNoRecordedBounds(selectedEntry) && (
+            <p className="mcw-bounds-missing">{BOUNDS_MISSING_NOTE}</p>
+          )}
         </div>
 
         <SecTag className="m-sec sec-ms">
@@ -1282,6 +1308,9 @@ function ClaudeCurrentWeekModal({
               <span className="v" id={singleId('mcw-reset')}>{fmt.datetimeShortZ(resetCell, ctx)}</span>
             </div>
           </div>
+          {isHistoric && hasNoRecordedBounds(selectedEntry) && (
+            <p className="mcw-bounds-missing">{BOUNDS_MISSING_NOTE}</p>
+          )}
         </div>
 
         <SecTag className="m-sec sec-ms">
@@ -1495,6 +1524,48 @@ function providerReason(env: Envelope | null, source: 'claude' | 'codex'): strin
   return null;
 }
 
+function accountCycleRanges(
+  legs: { claude: AllCombinedLeg; codex: AllCombinedLeg } | null,
+) {
+  const ranges: Array<{
+    key: string;
+    provider: 'Claude' | 'Codex';
+    periodLabel: string;
+    startAt: string;
+    endAt: string;
+    count: number;
+  }> = [];
+  if (legs == null) return ranges;
+  for (const provider of ['claude', 'codex'] as const) {
+    const leg = legs[provider];
+    if (leg.scope !== 'account_cycles') continue;
+    const grouped = new Map<string, typeof ranges[number]>();
+    for (const account of leg.accounts ?? []) {
+      const period = account.period;
+      const key = `${period.kind}\0${period.start_at}\0${period.end_at}`;
+      const prior = grouped.get(key);
+      if (prior != null) {
+        prior.count += 1;
+        continue;
+      }
+      grouped.set(key, {
+        key: `${provider}\0${key}`,
+        provider: provider === 'claude' ? 'Claude' : 'Codex',
+        periodLabel: period.kind === 'subscription_week'
+          ? 'subscription week'
+          : period.kind === 'native_7_day_cycle'
+            ? 'native 7-day cycle'
+            : 'trailing 7-day cycle',
+        startAt: period.start_at,
+        endAt: period.end_at,
+        count: 1,
+      });
+    }
+    ranges.push(...grouped.values());
+  }
+  return ranges;
+}
+
 function AllCurrentWeekModal({
   env,
   ctx,
@@ -1515,6 +1586,7 @@ function AllCurrentWeekModal({
   // a published figure on any install whose Claude week failed to resolve.
   const allEntry = env?.sources?.all as SourceEntry<AllSourceData> | undefined;
   const combined = combinedPresentation(allEntry ?? null);
+  const certifiedRanges = accountCycleRanges(combined.legs);
   return (
     <Modal
       title="Current Usage — provider cycles"
@@ -1555,6 +1627,28 @@ function AllCurrentWeekModal({
           <span>{qualification.message}</span>
         </p>
       ))}
+      {certifiedRanges.length > 0 && (
+        <section
+          className="provider-section-reason all-account-cycle-ranges"
+          data-testid="all-account-cycle-ranges"
+          aria-labelledby="all-account-cycle-ranges-heading"
+        >
+          <h3 id="all-account-cycle-ranges-heading">Account cycles</h3>
+          <ul>
+            {certifiedRanges.map((range) => (
+              <li key={range.key}>
+                <strong>
+                  {range.provider} {range.periodLabel} · {range.count}{' '}
+                  {range.count === 1 ? 'account' : 'accounts'}
+                </strong>{' '}
+                <time dateTime={range.startAt}>{fmt.startedShort(range.startAt, ctx)}</time>
+                {' – '}
+                <time dateTime={range.endAt}>{fmt.startedShort(range.endAt, ctx)}</time>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
       <div className="provider-composition provider-composition--modal current-week-provider-composition">
         <section
           className="source-provider-section provider-composition-section current-week-provider-section"

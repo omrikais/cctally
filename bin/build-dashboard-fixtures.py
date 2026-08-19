@@ -6,7 +6,7 @@ Writes one pair of (stats.db, cache.db) per scenario under
 All schema/seeding goes through ``bin/_fixture_builders.py`` — do not
 duplicate schema here. Idempotent: each builder overwrites existing DBs.
 
-Sixteen scenarios:
+Seventeen scenarios:
   * ``ok``         — current week at ~40% with 8 weeks of history; forecast
                      verdict ``"ok"`` (renders as GOOD in the browser).
   * ``warn``       — current week at ~67% with a heavy recent-24h burn that
@@ -55,13 +55,24 @@ Sixteen scenarios:
                      positive/negative net days for real-browser QA (#452).
   * ``all-combined`` — both providers populated and undecorated, so the All
                      headline publishes the provider-compatible total (#556).
-  * ``all-combined-decorated`` — the same accounting with Claude decoration,
-                     which withholds the All combined headline (#556).
+  * ``all-combined-decorated`` — the same accounting with certified Claude
+                     account-cycle contributions, so All can publish (#565).
+  * ``all-combined-account-unresolved`` — decorated Claude with one missing
+                     account-cost row, so All withholds rather than inventing 0.
   * ``all-budget-account-focus`` — two focusable Codex accounts with distinct
                      provider/account budgets, spend, and quota (#556 S5).
   * ``codex-account-fallback`` — two real Codex accounts where only one owns a
                      live weekly cycle, plus the unattributed sentinel and
                      spend on both sides of the trailing-cycle boundary (#591).
+  * ``block-week-straddle`` — a native five-hour block crossing the
+                     subscription-week start with non-zero cost on both
+                     sides, plus a neighbouring block inside the widened
+                     fetch that does not overlap the week (#620 S1 A4).
+  * ``non-monday-anchor`` — a Thursday 09:00Z reset anchor with four
+                     subscription weeks (one of them short, from a reset-day
+                     shift), distinct per-week quota percentages, and project
+                     cost on both sides of every Monday 00:00Z boundary and
+                     every Thursday 09:00Z boundary (#620 S1 A1/A3).
 
 Each scenario writes ``input.env`` containing a single line
 ``AS_OF=<iso-utc>`` consumed by the dashboard harness via
@@ -160,6 +171,7 @@ def _insert_usage_snapshot(
     week_start: dt.datetime,
     week_end: dt.datetime,
     pct: float,
+    account_key: str = "unattributed",
 ) -> None:
     """Write one weekly_usage_snapshots row carrying both ISO-timestamp
     and date-only boundary columns so the production selector picks it
@@ -167,7 +179,7 @@ def _insert_usage_snapshot(
     stats_conn.execute(
         "INSERT INTO weekly_usage_snapshots(captured_at_utc, week_start_date, "
         "week_end_date, week_start_at, week_end_at, weekly_percent, source, "
-        "payload_json) VALUES (?,?,?,?,?,?,?,?)",
+        "payload_json, account_key) VALUES (?,?,?,?,?,?,?,?,?)",
         (
             _iso(captured_at),
             week_start.date().isoformat(),
@@ -177,6 +189,7 @@ def _insert_usage_snapshot(
             pct,
             "fixture",
             json.dumps({"fixture": True}),
+            account_key,
         ),
     )
 
@@ -188,6 +201,7 @@ def _insert_cost_snapshot(
     week_start: dt.datetime,
     week_end: dt.datetime,
     cost_usd: float,
+    account_key: str = "unattributed",
 ) -> None:
     """Write one weekly_cost_snapshots row. ``weekly`` ignores this for
     cost (recomputes from session_entries) but ``report`` joins on it,
@@ -195,8 +209,8 @@ def _insert_cost_snapshot(
     finding a cost row to compute $/1%."""
     stats_conn.execute(
         "INSERT INTO weekly_cost_snapshots(captured_at_utc, week_start_date, "
-        "week_end_date, week_start_at, week_end_at, cost_usd, source, mode) "
-        "VALUES (?,?,?,?,?,?,?,?)",
+        "week_end_date, week_start_at, week_end_at, cost_usd, source, mode, "
+        "account_key) VALUES (?,?,?,?,?,?,?,?,?)",
         (
             _iso(captured_at),
             week_start.date().isoformat(),
@@ -206,6 +220,7 @@ def _insert_cost_snapshot(
             cost_usd,
             "fixture",
             "auto",
+            account_key,
         ),
     )
 
@@ -356,6 +371,179 @@ def _seed_projected_milestone(
             int(threshold),
             float(projected_value),
             float(denominator),
+            _iso(crossed_at),
+            _iso(crossed_at) if alerted else None,
+        ),
+    )
+
+
+def _seed_percent_milestone(
+    stats_conn: sqlite3.Connection,
+    *,
+    week_start: dt.datetime,
+    week_end: dt.datetime,
+    threshold: int,
+    cumulative_cost_usd: float,
+    captured_at: dt.datetime,
+    alerted: bool = True,
+    account_key: str = "unattributed",
+    retain_week_start_at: bool = True,
+) -> None:
+    """Seed one alerted ``percent_milestones`` row — the WEEKLY alert axis.
+
+    F17 recorded that the weekly axis reached the dashboard envelope through
+    zero goldens, which is the axis a default install fires most. The envelope
+    leg selects `WHERE alerted_at IS NOT NULL` and renders both `week_start_at`
+    and `week_start_date` into the alert context, so the date columns, the
+    instant columns and `alerted_at` all matter.
+
+    ``retain_week_start_at=False`` writes NULL into the nullable
+    ``week_start_at`` column, which is the shape of a row written before that
+    column existed. It is the only way to reach the reader's day-granularity
+    fallback from a real envelope row.
+    """
+    stats_conn.execute(
+        """INSERT INTO percent_milestones
+           (captured_at_utc, week_start_date, week_end_date, week_start_at,
+            week_end_at, percent_threshold, cumulative_cost_usd,
+            marginal_cost_usd, usage_snapshot_id, cost_snapshot_id,
+            five_hour_percent_at_crossing, alerted_at, reset_event_id,
+            account_key)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            _iso(captured_at),
+            week_start.date().isoformat(),
+            week_end.date().isoformat(),
+            _iso(week_start) if retain_week_start_at else None,
+            _iso(week_end) if retain_week_start_at else None,
+            int(threshold),
+            float(cumulative_cost_usd),
+            None,
+            0,
+            0,
+            None,
+            _iso(captured_at) if alerted else None,
+            0,
+            str(account_key),
+        ),
+    )
+
+
+def _seed_five_hour_block(
+    stats_conn: sqlite3.Connection,
+    *,
+    window_key: int,
+    block_start: dt.datetime,
+    resets_at: dt.datetime,
+    final_pct: float,
+    total_cost_usd: float,
+    account_key: str = "unattributed",
+) -> int:
+    """Seed one ``five_hour_blocks`` row and return its id."""
+    cur = stats_conn.execute(
+        """INSERT INTO five_hour_blocks
+           (five_hour_window_key, five_hour_resets_at, block_start_at,
+            first_observed_at_utc, last_observed_at_utc,
+            final_five_hour_percent, seven_day_pct_at_block_start,
+            seven_day_pct_at_block_end, crossed_seven_day_reset,
+            total_input_tokens, total_output_tokens, total_cache_create_tokens,
+            total_cache_read_tokens, total_cost_usd, is_closed,
+            created_at_utc, last_updated_at_utc, account_key)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            int(window_key),
+            _iso(resets_at),
+            _iso(block_start),
+            _iso(block_start),
+            _iso(resets_at),
+            float(final_pct),
+            None,
+            None,
+            0,
+            120_000,
+            18_000,
+            0,
+            0,
+            float(total_cost_usd),
+            0,
+            _iso(block_start),
+            _iso(resets_at),
+            str(account_key),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def _seed_five_hour_milestone(
+    stats_conn: sqlite3.Connection,
+    *,
+    block_id: int,
+    window_key: int,
+    threshold: int,
+    captured_at: dt.datetime,
+    block_cost_usd: float,
+    alerted: bool = True,
+    account_key: str = "unattributed",
+) -> None:
+    """Seed one alerted ``five_hour_milestones`` row — the FIVE-HOUR axis."""
+    stats_conn.execute(
+        """INSERT INTO five_hour_milestones
+           (block_id, five_hour_window_key, percent_threshold, captured_at_utc,
+            usage_snapshot_id, block_input_tokens, block_output_tokens,
+            block_cache_create_tokens, block_cache_read_tokens, block_cost_usd,
+            marginal_cost_usd, seven_day_pct_at_crossing, alerted_at,
+            reset_event_id, account_key)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            int(block_id),
+            int(window_key),
+            int(threshold),
+            _iso(captured_at),
+            0,
+            120_000,
+            18_000,
+            0,
+            0,
+            float(block_cost_usd),
+            None,
+            None,
+            _iso(captured_at) if alerted else None,
+            0,
+            str(account_key),
+        ),
+    )
+
+
+def _seed_project_budget_milestone(
+    stats_conn: sqlite3.Connection,
+    *,
+    week_start: dt.datetime,
+    project_key: str,
+    threshold: int,
+    budget_usd: float,
+    spent_usd: float,
+    crossed_at: dt.datetime,
+    alerted: bool = True,
+) -> None:
+    """Seed one alerted ``project_budget_milestones`` row.
+
+    The table is deliberately account-blind and stamped `*`, so no
+    ``account_key`` argument is offered: a fixture that could narrow it would
+    invent an attribution the production write path never records.
+    """
+    consumption_pct = (spent_usd / budget_usd * 100.0) if budget_usd else 0.0
+    stats_conn.execute(
+        """INSERT INTO project_budget_milestones
+           (week_start_at, project_key, threshold, budget_usd, spent_usd,
+            consumption_pct, crossed_at_utc, alerted_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (
+            _iso(week_start),
+            str(project_key),
+            int(threshold),
+            float(budget_usd),
+            float(spent_usd),
+            float(consumption_pct),
             _iso(crossed_at),
             _iso(crossed_at) if alerted else None,
         ),
@@ -2247,14 +2435,67 @@ def build_all_combined(as_of: dt.datetime) -> None:
     _assert_ac_display_zone(scenario_dir)
 
 
-def build_all_combined_decorated(as_of: dt.datetime) -> None:
-    """The same install with TWO real Claude accounts.
+def _seed_all_combined_decorated_accounts(
+    stats_conn: sqlite3.Connection,
+    *,
+    as_of: dt.datetime,
+    missing_cost_key: str | None = None,
+) -> None:
+    """Seed distinct account cards whose certified spend sums to the hero."""
+    rows = (
+        ("a" * 32, "uuid-allcomb-work", "work@example.com", "work", "max", 17.0, 0.75),
+        ("b" * 32, "uuid-allcomb-home", "home@example.com", "home", "pro", 23.0, 0.90),
+    )
+    for key, natural, email, label, plan, pct, cost in rows:
+        seed_account(
+            stats_conn,
+            account_key=key,
+            provider="claude",
+            natural_id=natural,
+            email=email,
+            label=label,
+            plan_type=plan,
+            label_source="user",
+            first_seen_utc=_iso(_AC_CLAUDE_WEEK_START),
+            last_seen_utc=_iso(as_of),
+        )
+        _insert_usage_snapshot(
+            stats_conn,
+            captured_at=as_of - dt.timedelta(seconds=600),
+            week_start=_AC_CLAUDE_WEEK_START,
+            week_end=_AC_CLAUDE_WEEK_END,
+            pct=pct,
+            account_key=key,
+        )
+        if key != missing_cost_key:
+            _insert_cost_snapshot(
+                stats_conn,
+                captured_at=as_of - dt.timedelta(seconds=600),
+                week_start=_AC_CLAUDE_WEEK_START,
+                week_end=_AC_CLAUDE_WEEK_END,
+                cost_usd=cost,
+                account_key=key,
+            )
+    # The original aggregate snapshots use the unattributed sentinel. Its
+    # certified operand is included last, and the three exact values sum to the
+    # current-week hero's $2.0505.
+    _insert_cost_snapshot(
+        stats_conn,
+        captured_at=as_of - dt.timedelta(seconds=600),
+        week_start=_AC_CLAUDE_WEEK_START,
+        week_end=_AC_CLAUDE_WEEK_END,
+        cost_usd=0.4005,
+        account_key="unattributed",
+    )
 
-    Spec §3.2 withholds the combined figure under decoration rather than
-    publishing one it cannot make checkable, so the withholding path and its
-    named reason need a golden of their own.
-    """
-    scenario_dir, app_dir = _scenario_dirs("all-combined-decorated")
+
+def _build_all_combined_decorated(
+    as_of: dt.datetime,
+    *,
+    scenario: str,
+    missing_cost_key: str | None = None,
+) -> None:
+    scenario_dir, app_dir = _scenario_dirs(scenario)
     stats_path = app_dir / "stats.db"
     cache_path = app_dir / "cache.db"
     create_stats_db(stats_path)
@@ -2264,22 +2505,9 @@ def build_all_combined_decorated(as_of: dt.datetime) -> None:
     try:
         _seed_all_combined_claude(stats_conn, cache_conn, as_of)
         _seed_all_combined_codex(cache_conn, as_of)
-        for key, natural, email, label, plan in (
-            ("a" * 32, "uuid-allcomb-work", "work@example.com", "work", "max"),
-            ("b" * 32, "uuid-allcomb-home", "home@example.com", "home", "pro"),
-        ):
-            seed_account(
-                stats_conn,
-                account_key=key,
-                provider="claude",
-                natural_id=natural,
-                email=email,
-                label=label,
-                plan_type=plan,
-                label_source="user",
-                first_seen_utc=_iso(_AC_CLAUDE_WEEK_START),
-                last_seen_utc=_iso(as_of),
-            )
+        _seed_all_combined_decorated_accounts(
+            stats_conn, as_of=as_of, missing_cost_key=missing_cost_key,
+        )
         _stamp_and_verify(stats_conn)
         stats_conn.commit()
         cache_conn.commit()
@@ -2291,6 +2519,22 @@ def build_all_combined_decorated(as_of: dt.datetime) -> None:
     )
     (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
     _assert_ac_display_zone(scenario_dir)
+
+
+def build_all_combined_decorated(as_of: dt.datetime) -> None:
+    """Two real Claude accounts plus unattributed, all exactly certified."""
+    _build_all_combined_decorated(
+        as_of, scenario="all-combined-decorated",
+    )
+
+
+def build_all_combined_account_unresolved(as_of: dt.datetime) -> None:
+    """One visible account lacks cost evidence, so composition fails closed."""
+    _build_all_combined_decorated(
+        as_of,
+        scenario="all-combined-account-unresolved",
+        missing_cost_key="b" * 32,
+    )
 
 
 # === #556 S5 §6.2 — `all-budget-account-focus` ==============================
@@ -2664,6 +2908,400 @@ def build_codex_account_fallback(as_of: dt.datetime) -> None:
     (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
 
 
+# --- #620 S1: non-Monday subscription anchor ---------------------------
+#
+# Every other scenario in this file anchors its weeks at Monday 14:00Z, so a
+# Monday-00:00 snap and the real reset instant differ only by fourteen hours
+# and never by a weekday. This scenario differs on BOTH axes at once, and it
+# also carries a short week, so an implementation that assumes `start + 7d`
+# is caught as well as one that assumes Monday.
+#
+# Four subscription weeks, the earliest one short because the reset day
+# shifted from Friday to Thursday:
+#   W3  2026-03-27T09:00Z (Fri) -> 2026-04-02T09:00Z (Thu)   6 days, 19.0%
+#   W2  2026-04-02T09:00Z (Thu) -> 2026-04-09T09:00Z (Thu)   7 days, 27.0%
+#   W1  2026-04-09T09:00Z (Thu) -> 2026-04-16T09:00Z (Thu)   7 days, 33.0%
+#   W0  2026-04-16T09:00Z (Thu) -> 2026-04-23T09:00Z (Thu)   7 days, 41.0%
+# AS_OF is Wednesday 2026-04-22T12:00Z, so a Monday snap of `now` lands on
+# 2026-04-20T00:00Z — a different weekday AND a different wall clock from
+# the real current-week start.
+_NMA_WEEK_STARTS = [
+    dt.datetime(2026, 3, 27, 9, 0, 0, tzinfo=dt.timezone.utc),
+    dt.datetime(2026, 4, 2, 9, 0, 0, tzinfo=dt.timezone.utc),
+    dt.datetime(2026, 4, 9, 9, 0, 0, tzinfo=dt.timezone.utc),
+    dt.datetime(2026, 4, 16, 9, 0, 0, tzinfo=dt.timezone.utc),
+    dt.datetime(2026, 4, 23, 9, 0, 0, tzinfo=dt.timezone.utc),  # W0 end
+]
+_NMA_WEEK_PCTS = [19.0, 27.0, 33.0, 41.0]
+
+# (timestamp, project, input_tokens, output_tokens). Every week carries two
+# entries before its contained Monday 00:00Z boundary and two after it, and
+# the per-project amounts differ on each side, so a Monday-keyed fold and a
+# reset-keyed fold disagree on the numerator, the denominator AND which
+# project leads the week.
+_NMA_ENTRIES: list[tuple[dt.datetime, str, int, int]] = [
+    # W3 [03-27T09 .. 04-02T09) — Monday boundary at 03-30T00:00Z
+    (dt.datetime(2026, 3, 27, 12, 0, tzinfo=dt.timezone.utc), "gamma", 210_000, 31_000),
+    (dt.datetime(2026, 3, 29, 15, 0, tzinfo=dt.timezone.utc), "alpha", 140_000, 19_000),
+    (dt.datetime(2026, 3, 30, 10, 0, tzinfo=dt.timezone.utc), "beta", 320_000, 47_000),
+    (dt.datetime(2026, 4, 1, 19, 0, tzinfo=dt.timezone.utc), "gamma", 95_000, 12_000),
+    # W2 [04-02T09 .. 04-09T09) — Monday boundary at 04-06T00:00Z
+    (dt.datetime(2026, 4, 2, 13, 0, tzinfo=dt.timezone.utc), "alpha", 260_000, 38_000),
+    (dt.datetime(2026, 4, 4, 9, 0, tzinfo=dt.timezone.utc), "gamma", 175_000, 24_000),
+    (dt.datetime(2026, 4, 6, 11, 0, tzinfo=dt.timezone.utc), "beta", 410_000, 61_000),
+    (dt.datetime(2026, 4, 8, 17, 0, tzinfo=dt.timezone.utc), "alpha", 88_000, 11_000),
+    # W1 [04-09T09 .. 04-16T09) — Monday boundary at 04-13T00:00Z
+    (dt.datetime(2026, 4, 9, 20, 0, tzinfo=dt.timezone.utc), "beta", 305_000, 44_000),
+    (dt.datetime(2026, 4, 11, 14, 0, tzinfo=dt.timezone.utc), "gamma", 128_000, 17_000),
+    (dt.datetime(2026, 4, 13, 9, 0, tzinfo=dt.timezone.utc), "alpha", 480_000, 72_000),
+    (dt.datetime(2026, 4, 15, 16, 0, tzinfo=dt.timezone.utc), "beta", 66_000, 9_000),
+    # W0 [04-16T09 .. 04-23T09) — Monday boundary at 04-20T00:00Z
+    (dt.datetime(2026, 4, 16, 15, 0, tzinfo=dt.timezone.utc), "alpha", 355_000, 52_000),
+    (dt.datetime(2026, 4, 17, 11, 0, tzinfo=dt.timezone.utc), "beta", 240_000, 33_000),
+    (dt.datetime(2026, 4, 20, 10, 0, tzinfo=dt.timezone.utc), "alpha", 115_000, 16_000),
+    (dt.datetime(2026, 4, 21, 18, 0, tzinfo=dt.timezone.utc), "gamma", 395_000, 58_000),
+]
+
+
+def build_non_monday_anchor(as_of: dt.datetime) -> None:
+    """Thursday-anchored subscription weeks with a short week and
+    Monday-straddling project cost (#620 S1 A1/A3).
+
+    Discriminates a Monday-00:00-keyed projects fold from a reset-anchored
+    one on every axis the panel publishes: which week an entry belongs to,
+    each week's cost denominator, each week's quota percentage, and the
+    resulting ``attributed_pct``.
+    """
+    scenario_dir, app_dir = _scenario_dirs("non-monday-anchor")
+    stats_path = app_dir / "stats.db"
+    cache_path = app_dir / "cache.db"
+    create_stats_db(stats_path)
+    create_cache_db(cache_path)
+
+    stats_conn = sqlite3.connect(stats_path)
+    cache_conn = sqlite3.connect(cache_path)
+    try:
+        for i, pct in enumerate(_NMA_WEEK_PCTS):
+            ws = _NMA_WEEK_STARTS[i]
+            we = _NMA_WEEK_STARTS[i + 1]
+            span = we - ws
+            # Three captures per week so the week looks plausibly sampled;
+            # the last one carries the week's final percentage. Captures are
+            # placed by FRACTION of the real span, so the short week's
+            # captures stay inside it, and every one is clamped to `as_of`.
+            #
+            # The clamp is not cosmetic. `ws + span` for the LIVE week is
+            # 2026-04-23T09:00Z, twenty-one hours after this fixture's
+            # `AS_OF`, and a store cannot hold a capture from its own future.
+            # The Projects panel takes the latest capture per week with no
+            # `now` bound while `current_week.used_pct` and the `weekly` row
+            # take the latest capture at or before `now`, so the future row
+            # made one dashboard publish two different quota percentages for
+            # one week — 41.0% on the Projects panel against 24.6% on the
+            # other two. Closed weeks are unaffected: their spans end before
+            # `as_of`, so the clamp never binds there.
+            for frac, scale in ((0.15, 0.2), (0.55, 0.6), (1.0, 1.0)):
+                _insert_usage_snapshot(
+                    stats_conn,
+                    captured_at=min(ws + span * frac, as_of),
+                    week_start=ws, week_end=we, pct=pct * scale,
+                )
+            _insert_cost_snapshot(
+                stats_conn, captured_at=min(ws + span, as_of),
+                week_start=ws, week_end=we, cost_usd=round(4.0 + i * 1.5, 2),
+            )
+
+        # One session per (project, subscription week) so a project's two
+        # entries inside one week share a session id and the sessions_count
+        # column stays legible.
+        next_off = 0
+        grouped: dict[tuple[str, int], list[tuple[dt.datetime, int, int]]] = {}
+        for ts, proj, inp, out in _NMA_ENTRIES:
+            widx = max(
+                i for i in range(len(_NMA_WEEK_PCTS))
+                if _NMA_WEEK_STARTS[i] <= ts
+            )
+            grouped.setdefault((proj, widx), []).append((ts, inp, out))
+        for (proj, widx), rows in sorted(grouped.items()):
+            next_off = _seed_session(
+                cache_conn,
+                session_id=f"nma-{proj}-w{widx}-0000-0000-0000-000000000000",
+                project_path=f"/fake/repos/{proj}",
+                model="claude-sonnet-4-6",
+                entries=[(ts, inp, out, 0, 0) for ts, inp, out in rows],
+                line_offset_start=next_off,
+            )
+
+        _stamp_and_verify(stats_conn)
+        stats_conn.commit()
+        cache_conn.commit()
+    finally:
+        stats_conn.close()
+        cache_conn.close()
+
+    (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+
+
+# --- #620 S1: a native 5h block straddling the week boundary ------------
+#
+# `_dashboard_build_blocks_view` used to filter entries to
+# [week_start_at, week_end_at) BEFORE grouping, while `/api/block/<iso>`
+# fetches the block's own native window and applies no week clip. A block
+# straddling the boundary was therefore reported at two different totals by
+# the panel and its own drilldown, and the panel's was permanently short.
+#
+# Week: [2026-04-13T14:00Z, 2026-04-20T14:00Z).  AS_OF 2026-04-19T12:00Z.
+# Three recorded 5h anchors, each seeded as one `five_hour_resets_at`:
+#   [07:00, 12:00) on 04-13  — adjacent: inside the widened fetch, and it
+#                              does NOT overlap the week, so omitting the
+#                              post-group overlap filter cannot pass.
+#   [12:00, 17:00) on 04-13  — STRADDLES the week start, with non-zero cost
+#                              on both sides of it.
+#   [05:00, 10:00) on 04-15  — fully inside the week, the control.
+_BWS_WEEK_START = dt.datetime(2026, 4, 13, 14, 0, 0, tzinfo=dt.timezone.utc)
+_BWS_WEEK_END = _BWS_WEEK_START + dt.timedelta(days=7)
+_BWS_RESETS = [
+    # (five_hour_resets_at, weekly_percent at capture)
+    (dt.datetime(2026, 4, 13, 12, 0, 0, tzinfo=dt.timezone.utc), 4.0),
+    (dt.datetime(2026, 4, 13, 17, 0, 0, tzinfo=dt.timezone.utc), 9.0),
+    (dt.datetime(2026, 4, 15, 10, 0, 0, tzinfo=dt.timezone.utc), 23.0),
+]
+_BWS_ENTRIES = [
+    # (timestamp, project, session, input, output)
+    (dt.datetime(2026, 4, 13, 10, 0, tzinfo=dt.timezone.utc),
+     "adjacent", "bws-adjacent", 180_000, 26_000),
+    (dt.datetime(2026, 4, 13, 13, 0, tzinfo=dt.timezone.utc),
+     "straddle", "bws-straddle", 240_000, 35_000),
+    (dt.datetime(2026, 4, 13, 15, 0, tzinfo=dt.timezone.utc),
+     "straddle", "bws-straddle", 310_000, 44_000),
+    (dt.datetime(2026, 4, 15, 7, 0, tzinfo=dt.timezone.utc),
+     "inweek", "bws-inweek", 150_000, 21_000),
+]
+
+
+def build_block_week_straddle(as_of: dt.datetime) -> None:
+    """A native five-hour block that crosses the subscription-week start,
+    with non-zero cost on both sides, plus a neighbouring block inside the
+    widened fetch that does not overlap the week (#620 S1 A4)."""
+    scenario_dir, app_dir = _scenario_dirs("block-week-straddle")
+    stats_path = app_dir / "stats.db"
+    cache_path = app_dir / "cache.db"
+    create_stats_db(stats_path)
+    create_cache_db(cache_path)
+
+    stats_conn = sqlite3.connect(stats_path)
+    cache_conn = sqlite3.connect(cache_path)
+    try:
+        for resets_at, pct in _BWS_RESETS:
+            stats_conn.execute(
+                "INSERT INTO weekly_usage_snapshots(captured_at_utc, "
+                "week_start_date, week_end_date, week_start_at, week_end_at, "
+                "weekly_percent, source, payload_json, five_hour_percent, "
+                "five_hour_resets_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    _iso(resets_at - dt.timedelta(minutes=30)),
+                    _BWS_WEEK_START.date().isoformat(),
+                    _BWS_WEEK_END.date().isoformat(),
+                    _iso(_BWS_WEEK_START),
+                    _iso(_BWS_WEEK_END),
+                    pct, "fixture", json.dumps({"fixture": True}),
+                    18.0, _iso(resets_at),
+                ),
+            )
+        next_off = 0
+        by_session: dict[tuple[str, str], list] = {}
+        for ts, proj, sid, inp, out in _BWS_ENTRIES:
+            by_session.setdefault((sid, proj), []).append((ts, inp, out, 0, 0))
+        for (sid, proj), rows in sorted(by_session.items()):
+            next_off = _seed_session(
+                cache_conn,
+                session_id=f"{sid}-0000-0000-0000-000000000000",
+                project_path=f"/fake/repos/{proj}",
+                model="claude-sonnet-4-6",
+                entries=rows,
+                line_offset_start=next_off,
+            )
+        _stamp_and_verify(stats_conn)
+        stats_conn.commit()
+        cache_conn.commit()
+    finally:
+        stats_conn.close()
+        cache_conn.close()
+
+    (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+
+
+def _alerts_axis_world(name: str, as_of: dt.datetime):
+    """Open the minimal world the three #620 alert-axis scenarios share.
+
+    Each exists to lock ONE alert axis onto the dashboard envelope, not to
+    depict a panel, so the world is one live week of snapshots plus one
+    session — the same shape `projected-alerts` uses.
+    """
+    scenario_dir, app_dir = _scenario_dirs(name)
+    stats_path = app_dir / "stats.db"
+    cache_path = app_dir / "cache.db"
+    create_stats_db(stats_path)
+    create_cache_db(cache_path)
+    week_start = dt.datetime(2026, 4, 13, 14, 0, 0, tzinfo=dt.timezone.utc)
+    week_end = week_start + dt.timedelta(days=7)
+    stats_conn = sqlite3.connect(stats_path)
+    cache_conn = sqlite3.connect(cache_path)
+    for hrs_in, pct in [(6, 5.0), (36, 25.0), (72, 50.0)]:
+        _insert_usage_snapshot(
+            stats_conn,
+            captured_at=week_start + dt.timedelta(hours=hrs_in),
+            week_start=week_start, week_end=week_end, pct=pct,
+        )
+    _seed_session(
+        cache_conn,
+        session_id=f"{name}-session-000000000000000000",
+        project_path="/fake/repos/fixture-alerts",
+        model="claude-sonnet-4-6",
+        entries=[(week_start + dt.timedelta(hours=70), 120_000, 18_000, 0, 0)],
+    )
+    return scenario_dir, stats_conn, cache_conn, week_start, week_end
+
+
+def _close_alerts_axis_world(scenario_dir, stats_conn, cache_conn, as_of):
+    _stamp_and_verify(stats_conn)
+    stats_conn.commit()
+    cache_conn.commit()
+    stats_conn.close()
+    cache_conn.close()
+    (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+
+
+def build_alerts_weekly(as_of: dt.datetime) -> None:
+    """The WEEKLY alert axis on the dashboard envelope (#620 S1 Task 15).
+
+    F17 recorded that `weekly`, `five_hour` and `project_budget` reached the
+    envelope through zero goldens, and the first two are the axes a default
+    install actually fires. This scenario seeds three alerted weekly
+    crossings: one in the LIVE week, which a client may follow; one in the
+    PRECEDING week, whose window has closed and which therefore exercises the
+    branch that must state why it cannot be explained rather than substituting
+    the live week; and one two weeks back whose `week_start_at` is NULL, which
+    is the shape of a row written before that column existed and the only way
+    to reach the reader's day-granularity fallback from a real envelope row.
+    """
+    scenario_dir, stats_conn, cache_conn, week_start, week_end = (
+        _alerts_axis_world("alerts-weekly", as_of)
+    )
+    try:
+        prior_start = week_start - dt.timedelta(days=7)
+        historical_start = week_start - dt.timedelta(days=14)
+        _seed_percent_milestone(
+            stats_conn,
+            week_start=historical_start, week_end=prior_start,
+            threshold=100, cumulative_cost_usd=44.00,
+            captured_at=historical_start + dt.timedelta(hours=150),
+            retain_week_start_at=False,
+        )
+        _seed_percent_milestone(
+            stats_conn,
+            week_start=prior_start, week_end=week_start,
+            threshold=95, cumulative_cost_usd=41.80,
+            captured_at=prior_start + dt.timedelta(hours=140),
+        )
+        _seed_percent_milestone(
+            stats_conn,
+            week_start=week_start, week_end=week_end,
+            threshold=90, cumulative_cost_usd=38.25,
+            captured_at=week_start + dt.timedelta(hours=71),
+        )
+    finally:
+        _close_alerts_axis_world(scenario_dir, stats_conn, cache_conn, as_of)
+
+
+def build_alerts_five_hour(as_of: dt.datetime) -> None:
+    """The FIVE-HOUR alert axis on the dashboard envelope (#620 S1 Task 15).
+
+    Two alerted crossings. The first belongs to a block that is still
+    recorded, so the envelope's LEFT JOIN resolves `block_start_at` and the
+    exact half-open window derives. The second belongs to a block that has
+    been purged, which is the real shape of "a five-hour block no longer
+    retained": the join misses, the context carries an EMPTY `block_start_at`,
+    and the window is genuinely underivable. That second row is the fixture
+    the withheld branch needs, and no generated corpus produces it.
+    """
+    scenario_dir, stats_conn, cache_conn, week_start, week_end = (
+        _alerts_axis_world("alerts-five-hour", as_of)
+    )
+    try:
+        live_start = dt.datetime(2026, 4, 16, 9, 30, 0, tzinfo=dt.timezone.utc)
+        live_resets = live_start + dt.timedelta(hours=5)
+        live_key = int(live_resets.timestamp())
+        live_block = _seed_five_hour_block(
+            stats_conn,
+            window_key=live_key, block_start=live_start,
+            resets_at=live_resets, final_pct=92.0, total_cost_usd=3.87,
+        )
+        _seed_five_hour_milestone(
+            stats_conn,
+            block_id=live_block, window_key=live_key, threshold=90,
+            captured_at=live_start + dt.timedelta(hours=4),
+            block_cost_usd=3.87,
+        )
+
+        purged_start = dt.datetime(2026, 4, 14, 6, 0, 0, tzinfo=dt.timezone.utc)
+        purged_resets = purged_start + dt.timedelta(hours=5)
+        purged_key = int(purged_resets.timestamp())
+        purged_block = _seed_five_hour_block(
+            stats_conn,
+            window_key=purged_key, block_start=purged_start,
+            resets_at=purged_resets, final_pct=96.0, total_cost_usd=2.15,
+        )
+        _seed_five_hour_milestone(
+            stats_conn,
+            block_id=purged_block, window_key=purged_key, threshold=95,
+            captured_at=purged_start + dt.timedelta(hours=3),
+            block_cost_usd=2.15,
+        )
+        # Purge the block the second milestone points at. The milestone is
+        # retained, the block is not — exactly what retention does to an old
+        # block, and the state no generated corpus reaches.
+        stats_conn.execute(
+            "DELETE FROM five_hour_blocks WHERE id = ?", (purged_block,)
+        )
+    finally:
+        _close_alerts_axis_world(scenario_dir, stats_conn, cache_conn, as_of)
+
+
+def build_alerts_project_budget(as_of: dt.datetime) -> None:
+    """The PROJECT-BUDGET alert axis on the dashboard envelope (#620 S1 Task
+    15).
+
+    Two alerted crossings for two different projects, one in the live week and
+    one in the preceding, closed week. Both rows carry the table's `*` account
+    stamp, because `project_budget_milestones` is account-blind: the scope any
+    reader derives from these rows must be vendor-wide, and a fixture that
+    offered a real account key would make it possible for a wrong
+    implementation to pass.
+    """
+    scenario_dir, stats_conn, cache_conn, week_start, week_end = (
+        _alerts_axis_world("alerts-project-budget", as_of)
+    )
+    try:
+        prior_start = week_start - dt.timedelta(days=7)
+        _seed_project_budget_milestone(
+            stats_conn,
+            week_start=prior_start,
+            project_key="/fake/repos/fixture-alerts-prior",
+            threshold=100, budget_usd=20.0, spent_usd=23.0,
+            crossed_at=prior_start + dt.timedelta(hours=130),
+        )
+        _seed_project_budget_milestone(
+            stats_conn,
+            week_start=week_start,
+            project_key="/fake/repos/fixture-alerts",
+            threshold=90, budget_usd=25.0, spent_usd=23.5,
+            crossed_at=week_start + dt.timedelta(hours=69),
+        )
+    finally:
+        _close_alerts_axis_world(scenario_dir, stats_conn, cache_conn, as_of)
+
+
 SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "ok": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
@@ -2721,6 +3359,10 @@ SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
         build_all_combined_decorated,
     ),
+    "all-combined-account-unresolved": (
+        dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
+        build_all_combined_account_unresolved,
+    ),
     "all-budget-account-focus": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
         build_all_budget_account_focus,
@@ -2728,6 +3370,26 @@ SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "codex-account-fallback": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
         build_codex_account_fallback,
+    ),
+    "non-monday-anchor": (
+        dt.datetime(2026, 4, 22, 12, 0, 0, tzinfo=dt.timezone.utc),
+        build_non_monday_anchor,
+    ),
+    "block-week-straddle": (
+        dt.datetime(2026, 4, 19, 12, 0, 0, tzinfo=dt.timezone.utc),
+        build_block_week_straddle,
+    ),
+    "alerts-weekly": (
+        dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
+        build_alerts_weekly,
+    ),
+    "alerts-five-hour": (
+        dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
+        build_alerts_five_hour,
+    ),
+    "alerts-project-budget": (
+        dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
+        build_alerts_project_budget,
     ),
 }
 
@@ -2740,11 +3402,17 @@ if __name__ == "__main__":
         "--out", type=Path, default=None,
         help="Override the output directory (defaults to tests/fixtures/dashboard/). Harnesses build into a per-run scratch dir so the committed fixtures stay byte-stable and a test run leaves the tracked tree unchanged.",
     )
+    _parser.add_argument(
+        "--scenario", action="append", default=None, choices=sorted(SCENARIOS),
+        help="Build only the named scenario (repeatable). Default: all. The harness always builds all of them; this exists so a single scenario can be regenerated without rewriting the other seventeen committed DB files.",
+    )
     _args = _parser.parse_args()
     if _args.out is not None:
         FIXTURES_DIR = _args.out
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
-    for name, (as_of, fn) in SCENARIOS.items():
+    _selected = _args.scenario or list(SCENARIOS)
+    for name in _selected:
+        as_of, fn = SCENARIOS[name]
         fn(as_of)
         print(f"built: {name}")
     print(f"Built fixtures under {FIXTURES_DIR}")

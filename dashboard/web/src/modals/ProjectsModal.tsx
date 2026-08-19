@@ -37,7 +37,13 @@ import { openShareModal } from '../store/shareSlice';
 import { fmt } from '../lib/fmt';
 import { costClass } from '../lib/cost';
 import { applyTableSort } from '../lib/tableSort';
-import { PROJECTS_COLUMNS, type ProjectsTableRow } from '../lib/projectsColumns';
+import {
+  PROJECTS_COLUMNS,
+  PROJECTS_MERGED_ACCOUNTS_NOTE,
+  PROJECTS_WINDOW_CAPTION,
+  type ProjectsTableRow,
+} from '../lib/projectsColumns';
+import { providerIsDecorated } from '../store/accountFocus';
 import { presentationProjects } from '../lib/dashboardPresentation';
 import { withheldMessage } from '../lib/withheldCopy';
 import type { DashboardSelection, SourceName } from '../types/envelope';
@@ -437,6 +443,20 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
             $ absolute
           </button>
         </div>
+
+        {/* #620 S1 D2/D13 — the definitions in rendered text, under the
+            selector whose window both of them are relative to. */}
+        <p className="projects-caption">{PROJECTS_WINDOW_CAPTION}</p>
+        {/* #620 S1 D1 — the merged-fold clause, gated on the SELECTION as well
+            as on the R8 decoration signal. The sentence names a Claude fold,
+            so on the Codex tab it would describe a population this table's
+            figures are not computed over. Under All the ranking does fold
+            every Claude account into one row set, so it stays there. */}
+        {source !== 'codex' && providerIsDecorated(env, 'claude') && (
+          <p className="projects-caption projects-merged-note">
+            {PROJECTS_MERGED_ACCOUNTS_NOTE}
+          </p>
+        )}
 
         {actual > 0 && actual < requested && (
           <div className="projects-notice">

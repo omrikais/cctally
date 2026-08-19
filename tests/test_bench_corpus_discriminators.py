@@ -357,39 +357,38 @@ def test_the_corpus_resolves_a_live_codex_weekly_cycle(scale, shared_corpus):
 
 
 @pytest.mark.parametrize("scale", ["tiny", "small"])
-def test_the_cycle_accounting_read_is_actually_executed(scale, shared_corpus,
+def test_the_cycle_accounting_fold_is_actually_executed(scale, shared_corpus,
                                                         monkeypatch):
-    """Count the ROWS, not the calls.
+    """Count the cycle ROWS at the post-capture consumption seam.
 
-    `calls["n"] > 0` discriminates nothing and is kept only as a precondition:
-    measured with the cycle unresolvable, the loader was still called 3 times
-    and returned 0 rows, so a corpus taking the short branch passes that
-    assertion. `calls["rows"] > 0` is the one doing the work — do not trim it
-    as redundant.
+    #617 deliberately removed the cycle-specific SQLite read when the captured
+    accounting population already covers that cycle. The discriminating branch
+    is now the dedicated pure cycle-accounting kernel that consumes those
+    sliced rows for the hero; account-card totals cannot reach that seam.
     """
     bbf = _load_build_bench()
     shared_corpus(scale)  # ensure the module and corpus are loaded first
     import _cctally_dashboard_sources as sources_mod
 
     calls = {"n": 0, "rows": 0}
-    real = sources_mod.load_cached_rooted_codex_accounting_entries
+    real = getattr(sources_mod, "_build_codex_cycle_accounting", None)
+    assert real is not None, (
+        "the cycle carrier has no dedicated observable consumption seam")
 
-    def counting(*args, **kwargs):
+    def counting(entries, *args, **kwargs):
+        rows = tuple(entries)
         calls["n"] += 1
-        out = real(*args, **kwargs)
-        calls["rows"] += len(out or ())
-        return out
+        calls["rows"] += len(rows)
+        return real(rows, *args, **kwargs)
 
-    monkeypatch.setattr(
-        sources_mod, "load_cached_rooted_codex_accounting_entries", counting)
+    monkeypatch.setattr(sources_mod, "_build_codex_cycle_accounting", counting)
     _codex_source_state(shared_corpus(scale), bbf)
 
     assert calls["n"] > 0, (
-        "precondition: the loader was never called at all")
+        "the resolved cycle never reached its post-capture pricing fold")
     assert calls["rows"] > 0, (
-        f"the cycle read ran {calls['n']} time(s) and returned NO rows. That is "
-        "the degraded shape, not the absence of a call: the cycle did not "
-        "resolve, or the corpus's Codex entries lie outside its window")
+        f"the cycle fold ran {calls['n']} time(s) with NO rows. The cycle did "
+        "not resolve, or the corpus's Codex entries lie outside its window")
 
 
 # ── The benchmark set must not perturb the corpus fingerprint ──────────────

@@ -982,6 +982,8 @@ def _source_safe_claude_project_detail(
         "key": key,
         "label": label,
         "window_weeks": detail.get("window_weeks"),
+        "window_start_at": detail.get("window_start_at"),
+        "window_end_at": detail.get("window_end_at"),
         "window_cost_usd": detail.get("window_cost_usd"),
         "window_attributed_pct": detail.get("window_attributed_pct"),
         "models": detail.get("models", []),
@@ -2015,6 +2017,10 @@ def _build_forecast_json_payload(*args, **kwargs):
 
 def _build_alert_payload_weekly(*args, **kwargs):
     return sys.modules["cctally"]._build_alert_payload_weekly(*args, **kwargs)
+
+
+def synthetic_preview_week_start(*args, **kwargs):
+    return sys.modules["cctally"].synthetic_preview_week_start(*args, **kwargs)
 
 
 def _build_alert_payload_five_hour(*args, **kwargs):
@@ -3770,7 +3776,22 @@ def _dashboard_build_blocks_view(conn: "sqlite3.Connection",
        recorded-windows-widening trick (loads reset windows from
        ``[start - BLOCK_DURATION, end + BLOCK_DURATION]`` so a recorded
        reset just outside the visible window can still anchor blocks
-       inside it) and the strict-window entry filter.
+       inside it) and the post-group block-overlap filter.
+
+    #620 S1 D8: the entry set is grouped into native blocks FIRST and the
+    week filter is then applied to whole blocks, retaining every block whose
+    interval overlaps ``[week_start_at, week_end_at)`` with its full native
+    totals. It used to filter ENTRIES to the week before grouping, so a
+    block straddling a week boundary was folded from only the part of itself
+    that fell inside the week — while ``/api/block/<iso>`` fetches the
+    block's own native window and applies no week clip, so the panel and its
+    own drilldown reported different totals for the same ``start_at`` and
+    the panel's was permanently short. Selecting a block that overlaps the
+    week is the deliberate part of the contract and stays; clipping a
+    selected block's contents was the defect.
+
+    The fetch already read one block duration on each side, so this needs no
+    additional query.
 
     Returning the full ``BlocksView`` (rows + totals) lets the sync
     thread populate ``DataSnapshot.blocks_total_cost_usd`` /
@@ -3781,13 +3802,12 @@ def _dashboard_build_blocks_view(conn: "sqlite3.Connection",
     fetch_start = week_start_at - BLOCK_DURATION
     fetch_end = week_end_at + BLOCK_DURATION
     entries = get_entries(fetch_start, fetch_end, skip_sync=skip_sync)
-    entries = [e for e in entries if week_start_at <= e.timestamp < week_end_at]
 
     recorded_windows, block_start_overrides, canonical_intervals = (
         _load_recorded_five_hour_windows(fetch_start, fetch_end)
     )
     c = _cctally()
-    return c.build_blocks_view(
+    view = c.build_blocks_view(
         entries,
         now_utc=now_utc,
         recorded_windows=recorded_windows,
@@ -3797,6 +3817,60 @@ def _dashboard_build_blocks_view(conn: "sqlite3.Connection",
         range_end=week_end_at,
         display_tz=display_tz,
         mode="auto",
+    )
+    return _blocks_view_overlapping_week(
+        view, week_start_at=week_start_at, week_end_at=week_end_at,
+    )
+
+
+def _blocks_view_overlapping_week(view, *, week_start_at, week_end_at):
+    """Retain only the blocks whose interval overlaps
+    ``[week_start_at, week_end_at)``, keeping each retained block's FULL
+    native totals (#620 S1 D8).
+
+    Overlap is the standard half-open test ``start < week_end and end >
+    week_start``: a block that merely touches a bound (its end exactly at
+    ``week_start_at``, or its start exactly at ``week_end_at``) shares no
+    instant with the week and is not retained.
+
+    Totals are re-derived from the retained non-gap blocks so the React
+    panel's ``footer total == sum(visible rows)`` invariant still holds, and
+    ``aggregated`` is filtered in lockstep so no consumer can read a block
+    set that disagrees with ``rows``.
+    """
+    kept_blocks = []
+    total_cost = 0.0
+    total_tokens = 0
+    kept_starts = set()
+    for b in view.aggregated:
+        start = getattr(b, "start_time", None)
+        end = getattr(b, "end_time", None)
+        if start is None or end is None:
+            # API-anchored views carry dicts, not Blocks. This adapter only
+            # ever sees the heuristic path, but degrade by retaining rather
+            # than silently dropping a shape we cannot classify.
+            kept_blocks.append(b)
+            continue
+        if not (start < week_end_at and end > week_start_at):
+            continue
+        kept_blocks.append(b)
+        if getattr(b, "is_gap", False):
+            continue
+        # Plain `+=` rather than `stable_sum`, deliberately: this mirrors
+        # `build_blocks_view`'s own accumulation (`bin/_lib_view_models.py`),
+        # and this function exists to publish the SAME totals that view
+        # publishes. A different fold here could disagree with it in the last
+        # ULP, which is the divergence the function was written to remove.
+        total_cost += b.cost_usd
+        total_tokens += b.total_tokens
+        kept_starts.add(start.astimezone(dt.timezone.utc).isoformat())
+    rows = tuple(r for r in view.rows if r.start_at in kept_starts)
+    return dataclasses.replace(
+        view,
+        rows=rows,
+        aggregated=tuple(kept_blocks),
+        total_cost_usd=total_cost,
+        total_tokens=total_tokens,
     )
 
 
@@ -4152,6 +4226,158 @@ def _projects_week_start_monday_utc(ts: "dt.datetime") -> "dt.datetime":
     )
 
 
+class _ProjectsWeekGrid:
+    """The ordered half-open subscription intervals the Projects panel
+    attributes cost into (#620 S1 D1).
+
+    ``_projects_week_start_monday_utc`` above is the fallback used when no
+    snapshot anchor is available; this is what replaces it when one IS
+    available. Intervals come from ``_compute_subscription_weeks``, the same
+    kernel ``cmd_project`` buckets by, so the panel and the CLI describe one
+    set of weeks rather than two.
+
+    Intervals are half-open ``[start, end)`` and are NOT assumed to be seven
+    days long: Anthropic's reset day drifts, and a drifted cycle produces a
+    genuinely short week. ``end_for`` therefore returns the interval's own
+    end, never ``start + 7d``.
+    """
+
+    __slots__ = ("starts", "ends", "_end_by_start", "_start_by_date")
+
+    def __init__(self, bounds: "list[tuple[dt.datetime, dt.datetime]]"):
+        ordered = sorted(bounds, key=lambda b: b[0])
+        self.starts = [b[0] for b in ordered]
+        self.ends = [b[1] for b in ordered]
+        self._end_by_start = {s: e for s, e in ordered}
+        # `weekly_usage_snapshots.week_start_date` is the date-only lookup
+        # key a legacy row carries when it has no `week_start_at`. Later
+        # intervals win a collision, matching the "last capture per week
+        # wins" rule the percentage read already applies.
+        self._start_by_date = {s.date(): s for s in self.starts}
+
+    def __bool__(self) -> bool:
+        return bool(self.starts)
+
+    def week_for(self, ts: "dt.datetime") -> "dt.datetime | None":
+        """The start of the interval containing ``ts``, or None when ``ts``
+        falls outside every interval.
+
+        First-match-wins on the reset-day-drift overlap the clamp can leave
+        behind — the same walk-back `cmd_project._week_start_for` performs,
+        so an entry near a drifted boundary lands in the same week on both
+        surfaces.
+        """
+        ts_utc = ts.astimezone(dt.timezone.utc)
+        idx = bisect.bisect_right(self.starts, ts_utc) - 1
+        if idx < 0:
+            return None
+        while idx > 0 and self.starts[idx - 1] <= ts_utc < self.ends[idx - 1]:
+            idx -= 1
+        if self.starts[idx] <= ts_utc < self.ends[idx]:
+            return self.starts[idx]
+        return None
+
+    def start_for_date(self, day: "dt.date") -> "dt.datetime | None":
+        """The interval start whose own date is ``day``, for a legacy
+        snapshot row that carries ``week_start_date`` but no
+        ``week_start_at``."""
+        return self._start_by_date.get(day)
+
+    def end_for(self, start: "dt.datetime") -> "dt.datetime":
+        """The interval's real end. Falls back to ``start + 7d`` only for a
+        start this grid does not know, which the padding below produces."""
+        return self._end_by_start.get(start, start + dt.timedelta(days=7))
+
+    def window_ending_at(
+        self, cw_start: "dt.datetime", weeks_back: int,
+    ) -> "list[tuple[dt.datetime, dt.datetime]]":
+        """The last ``weeks_back`` intervals up to and including the one
+        starting at ``cw_start``, oldest first.
+
+        When the grid holds fewer than ``weeks_back`` intervals at or before
+        ``cw_start``, the head is padded backwards in seven-day steps. The
+        padding is a genuine no-anchor tail — history older than any snapshot
+        — so the seven-day assumption is the right one there.
+
+        The walk itself lives in ``_lib_subscription_weeks`` because
+        ``cmd_project`` performs the same one; a copy here is how the two
+        surfaces drifted apart in the first place.
+        """
+        return _cctally().subscription_window_ending_at(
+            list(zip(self.starts, self.ends)), cw_start, weeks_back,
+        )
+
+
+def _projects_week_grid(
+    conn: "sqlite3.Connection",
+    *,
+    anchor_utc: "dt.datetime",
+    weeks_back: int,
+    account_key: "str | None" = None,
+) -> "_ProjectsWeekGrid | None":
+    """Build the panel's subscription-week grid, or None when no snapshot
+    row carries an anchor.
+
+    Returning None is the deliberate no-anchor path: the caller then keeps
+    ``_projects_week_start_monday_utc`` throughout, which is what that
+    function was written for and what every anchorless fixture already
+    exercises byte-identically.
+
+    Cost: one grouped read of ``weekly_usage_snapshots`` plus the reset-event
+    join `_compute_subscription_weeks` already performs. It adds no walk over
+    ``session_entries`` and nothing per entry, so this does not re-open the
+    per-tick rescan #583 owns.
+    """
+    acct_pred = "" if account_key is None else " AND account_key = ?"
+    acct_params: tuple = () if account_key is None else (account_key,)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE week_start_at IS NOT NULL "
+            "  AND week_end_at IS NOT NULL "
+            "  AND week_start_date IS NOT NULL"
+            f"{acct_pred}",
+            acct_params,
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row or not row[0]:
+        return None
+
+    # A generous provisional range, defined once in `_lib_subscription_weeks`
+    # because `cmd_project` needs the identical range: the extrapolation
+    # anchor `_compute_subscription_weeks` picks is relative to `range_start`,
+    # so two callers asking the same question over different ranges can be
+    # handed differently-phased intervals for the same history.
+    range_start, range_end = _cctally().subscription_window_probe_range(
+        anchor_utc, weeks_back,
+    )
+    try:
+        subweeks = _cctally()._compute_subscription_weeks(
+            conn, range_start, range_end, account_key=account_key,
+        )
+    except Exception:
+        # A malformed anchor must not take the panel down; the Monday
+        # fallback still renders a coherent (if approximate) window.
+        return None
+    bounds: "list[tuple[dt.datetime, dt.datetime]]" = []
+    for sw in subweeks:
+        try:
+            s = parse_iso_datetime(
+                sw.start_ts, "projects week.start_ts",
+            ).astimezone(dt.timezone.utc)
+            e = parse_iso_datetime(
+                sw.end_ts, "projects week.end_ts",
+            ).astimezone(dt.timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        if e > s:
+            bounds.append((s, e))
+    if not bounds:
+        return None
+    return _ProjectsWeekGrid(bounds)
+
+
 def _projects_week_label(week_start: "dt.datetime") -> str:
     """Render a `wk Mon DD` label for the trend chart x-axis.
 
@@ -4200,9 +4426,25 @@ def _projects_iter_session_entries(conn: "sqlite3.Connection",
     downstream. An ``EXPLAIN QUERY PLAN`` regression asserts the mutation_seq
     index seek (``tests/test_projects_envelope.py``).
     """
-    since_iso = since.astimezone(dt.timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+    # The SQL bounds are an outward-widened CANDIDATE filter; the real
+    # membership test is the Python one every caller applies
+    # (`_fold_projects_entry`'s interval gate, `_week_for`, or
+    # `_fetch_delta_rows`' own pre-filter). #620 S1: the lower bound is
+    # widened by one second because ingestion stores
+    # `timestamp.astimezone(utc).isoformat()`, which keeps a `+00:00`
+    # offset, while this predicate spells its bound `Z` — and SQLite
+    # compares the column lexically, where `+` (0x2B) sorts BELOW `Z`
+    # (0x5A). An entry stored at exactly `since`, or in the first second
+    # after it, therefore sorts below the bound and is dropped before any
+    # Python gate runs. That was unreachable while a week always started at
+    # Monday 00:00 UTC, which carries no entries; a real subscription week
+    # starts at the reset instant, and an entry lands on it routinely. The
+    # widening admits at most one extra second of candidates, which the
+    # Python gate then rejects, so no caller's result changes except the one
+    # that was silently losing the boundary entry.
+    since_iso = (
+        since.astimezone(dt.timezone.utc) - dt.timedelta(seconds=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
     until_iso = until.astimezone(dt.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
@@ -4393,6 +4635,25 @@ def _shared_range_row_to_usage_entry(row):
     )
 
 
+def _shared_range_row_to_priced_usage_entry(row):
+    """Prepare one shared row's effective cost once for both range folds."""
+    entry = _shared_range_row_to_usage_entry(row)
+    if entry.model == "<synthetic>":
+        return entry
+    return _cctally().UsageEntry(
+        timestamp=entry.timestamp,
+        model=entry.model,
+        usage=entry.usage,
+        cost_usd=_calculate_entry_cost(
+            entry.model,
+            entry.usage,
+            mode="auto",
+            cost_usd=entry.cost_usd,
+        ),
+        source_path=entry.source_path,
+    )
+
+
 def _fold_prepared_daily_entries(
     accumulators, entries, *, display_tz=None, mode: str = "auto",
 ):
@@ -4512,7 +4773,9 @@ def _fold_projects_entry(
     *,
     resolver_cache: dict,
     week_start: "dt.datetime | None",
+    week_end: "dt.datetime | None" = None,
     prepared_daily_entries: "list | None" = None,
+    priced_entry=None,
 ) -> "float | None":
     """Fold ONE ``_projects_iter_session_entries`` row onto ``mut`` (the shared
     per-row body, #271 §20 Codex-P1a).
@@ -4523,6 +4786,15 @@ def _fold_projects_entry(
     byte-identical BY CONSTRUCTION. Returns the entry cost, or ``None`` when the
     row is filtered out (``<synthetic>`` model, or its Monday-anchored week ≠
     ``week_start``) — the caller then skips ``week_total`` / ``tail`` advance.
+
+    The membership gate is the half-open interval ``[week_start, week_end)``
+    (#620 S1 D1). It was a ``_projects_week_start_monday_utc(ts) ==
+    week_start`` equality, which is the SAME predicate whenever ``week_start``
+    is a Monday 00:00 UTC and ``week_end`` is ``week_start + 7d`` — so every
+    Monday-anchored caller is byte-unchanged — but the interval form also
+    admits a real subscription week that neither starts on a Monday nor runs
+    a full seven days. ``week_end`` defaults to ``week_start + 7d`` for a
+    caller that has not been threaded through yet.
 
     ``mut[bp]`` is the running mutable dict ``{"cost_usd": float,
     "sessions": set, "first_seen": dt, "last_seen": dt, "first_order": ts_iso,
@@ -4546,32 +4818,43 @@ def _fold_projects_entry(
     if model == "<synthetic>":
         return None
     ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
-    if week_start is not None and _projects_week_start_monday_utc(ts) != week_start:
-        return None
-    usage = claude_usage_dict(   # #195 chokepoint
-        input_tokens=input_tok,
-        output_tokens=output_tok,
-        cache_creation_tokens=cache_create,
-        cache_read_tokens=cache_read,
-        cache_1h_tokens=cache_1h,
-        speed=speed,
-    )
-    entry_cost = _calculate_entry_cost(
-        model,
-        usage,
-        mode="auto",
-        cost_usd=cost_raw,
-    )
+    if week_start is not None:
+        w_end = (
+            week_end if week_end is not None
+            else week_start + dt.timedelta(days=7)
+        )
+        if not (week_start <= ts < w_end):
+            return None
+    if priced_entry is None:
+        usage = claude_usage_dict(   # #195 chokepoint
+            input_tokens=input_tok,
+            output_tokens=output_tok,
+            cache_creation_tokens=cache_create,
+            cache_read_tokens=cache_read,
+            cache_1h_tokens=cache_1h,
+            speed=speed,
+        )
+        entry_cost = _calculate_entry_cost(
+            model,
+            usage,
+            mode="auto",
+            cost_usd=cost_raw,
+        )
+    else:
+        usage = priced_entry.usage
+        entry_cost = priced_entry.cost_usd
     if prepared_daily_entries is not None:
         # #567: preserve the canonical daily entry and aggregator while
         # handing off the effective cost this pass already computed.
-        prepared_daily_entries.append(c.UsageEntry(
-            timestamp=dt.datetime.fromisoformat(ts_iso),
-            model=model,
-            usage=usage,
-            cost_usd=entry_cost,
-            source_path=source_path,
-        ))
+        prepared_daily_entries.append(
+            priced_entry if priced_entry is not None else c.UsageEntry(
+                timestamp=dt.datetime.fromisoformat(ts_iso),
+                model=model,
+                usage=usage,
+                cost_usd=entry_cost,
+                source_path=source_path,
+            )
+        )
     pkey = c._resolve_project_key(project_path, "git-root", resolver_cache)
     bp = pkey.bucket_path
     a = mut.get(bp)
@@ -4600,6 +4883,7 @@ def _fold_projects_entry(
 
 def fold_projects_over_range(
     rows, *, resolver_cache=None, prepared_daily_entries=None,
+    priced_entries=None,
 ) -> "dict[str, dict]":
     """Fold an ALREADY-MATERIALISED candidate stream into per-bucket totals.
 
@@ -4622,13 +4906,17 @@ def fold_projects_over_range(
     """
     mut: "dict[str, dict]" = {}
     cache = {} if resolver_cache is None else resolver_cache
-    for row in rows:
+    if priced_entries is not None and len(priced_entries) != len(rows):
+        raise ValueError("priced shared-range entries do not match source rows")
+    for index, row in enumerate(rows):
         _fold_projects_entry(
             mut,
             row,
             resolver_cache=cache,
             week_start=None,
             prepared_daily_entries=prepared_daily_entries,
+            priced_entry=(
+                priced_entries[index] if priced_entries is not None else None),
         )
     return mut
 
@@ -4900,25 +5188,35 @@ def _shared_range_cache_payload(
     }
 
 
-def build_cached_claude_range_aggregates(
+@dataclass(frozen=True)
+class ClaudeRangeAggregateCapture:
+    """Cache-owned inputs for one post-transaction Claude range fold."""
+
+    base: tuple
+    max_entry_id: int
+    entry_mutation_seq: int
+    shared_end_exclusive: object
+    prior: object
+    delta_rows: tuple
+    full_rows: tuple | None
+
+
+def capture_cached_claude_range_aggregates(
     conn,
     *,
     shared_start,
     shared_end_exclusive,
-    now_utc,
     display_tz,
-    legacy_labels,
     max_entry_id: "int | None" = None,
     entry_mutation_seq: "int | None" = None,
     generation: int = 0,
 ):
-    """Build or increment the one-snapshot Claude range folds (#567).
+    """Capture only cache-backed inputs for the #567 append accumulator.
 
-    Pure appends are folded onto the cached raw accumulators.  A shifted range
-    floor, backwards clock, generation or session-file identity change,
-    non-monotone signature, or an id-stable mutation of an already-folded row
-    falls back to one full ordered pass.  The cache stores no public labels, so
-    the current legacy population is reapplied on every publication.
+    This half may run under `_tui_build_source_bundle`'s pinned transaction. It
+    performs no deepcopy, pricing, project fold, daily fold, payload assembly,
+    or memo mutation. The returned rows are ordinary immutable SQLite tuples,
+    so the caller can end the read transaction before consuming them.
     """
     if max_entry_id is None or entry_mutation_seq is None:
         observed_id, observed_seq = _shared_range_entry_signature(conn)
@@ -4935,7 +5233,8 @@ def build_cached_claude_range_aggregates(
         generation=generation,
     )
     prior = _CLAUDE_RANGE_AGGREGATE_MEMO.get("state")
-    state = None
+    delta_rows: tuple = ()
+    full_rows: tuple | None = None
     if isinstance(prior, dict) and prior.get("base") == base:
         monotone = (
             max_entry_id >= prior["max_entry_id"]
@@ -4951,9 +5250,6 @@ def build_cached_claude_range_aggregates(
             )
         )
         if monotone and not old_row_changed:
-            project_mut = copy.deepcopy(prior["project_mut"])
-            daily_accumulators = copy.deepcopy(prior["daily_accumulators"])
-            resolver_cache = dict(prior["resolver_cache"])
             delta_by_id = {}
             for row in _shared_range_entries_after_id(
                 conn, prior["max_entry_id"],
@@ -4971,85 +5267,198 @@ def build_cached_claude_range_aggregates(
                 ):
                     if row[0] <= prior["max_entry_id"]:
                         delta_by_id[row[0]] = row
-            delta_rows = sorted(
+            delta_rows = tuple(sorted(
                 delta_by_id.values(),
                 key=lambda row: (row[1], row[0]),
-            )
+            ))
             prior_tail = prior["tail"]
-            if prior_tail is None or all(
+            if not (prior_tail is None or all(
                 (row[1], row[0]) > prior_tail
                 for row in delta_rows
                 if row[2] != "<synthetic>"
-            ):
-                prepared = []
-                for row in delta_rows:
-                    _fold_projects_entry(
-                        project_mut,
-                        row,
-                        resolver_cache=resolver_cache,
-                        week_start=None,
-                        prepared_daily_entries=prepared,
-                    )
-                _fold_prepared_daily_entries(
-                    daily_accumulators,
-                    prepared,
-                    display_tz=display_tz,
-                )
-                tail = prior_tail
-                real_delta = [
-                    row for row in delta_rows if row[2] != "<synthetic>"
-                ]
-                if real_delta:
-                    last = real_delta[-1]
-                    tail = (last[1], last[0])
-                state = {
-                    "base": base,
-                    "max_entry_id": max_entry_id,
-                    "entry_mutation_seq": entry_mutation_seq,
-                    "end_exclusive": shared_end_exclusive,
-                    "tail": tail,
-                    "project_mut": project_mut,
-                    "daily_accumulators": daily_accumulators,
-                    "resolver_cache": resolver_cache,
-                }
-    if state is None:
-        rows = tuple(iter_shared_range_entries(
+            )):
+                # An out-of-order append cannot be folded onto the accumulator.
+                # Capture the cold carrier while the same snapshot is pinned;
+                # discovering this after rollback would require a second read
+                # generation.
+                full_rows = tuple(iter_shared_range_entries(
+                    conn, start=shared_start,
+                    end_exclusive=shared_end_exclusive,
+                ))
+                delta_rows = ()
+        else:
+            full_rows = tuple(iter_shared_range_entries(
+                conn, start=shared_start,
+                end_exclusive=shared_end_exclusive,
+            ))
+    else:
+        full_rows = tuple(iter_shared_range_entries(
             conn, start=shared_start, end_exclusive=shared_end_exclusive,
         ))
-        prepared = []
-        resolver_cache = {}
-        project_mut = fold_projects_over_range(
-            rows,
-            resolver_cache=resolver_cache,
-            prepared_daily_entries=prepared,
+    return ClaudeRangeAggregateCapture(
+        base=base,
+        max_entry_id=max_entry_id,
+        entry_mutation_seq=entry_mutation_seq,
+        shared_end_exclusive=shared_end_exclusive,
+        prior=prior,
+        delta_rows=delta_rows,
+        full_rows=full_rows,
+    )
+
+
+def build_cached_claude_range_aggregates_from_capture(
+    capture: ClaudeRangeAggregateCapture,
+    *,
+    now_utc,
+    display_tz,
+    legacy_labels,
+    tolerate_leg_failures: bool = False,
+):
+    """Fold and publish one captured Claude range accumulator outside the pin.
+
+    ``tolerate_leg_failures`` is the source-bundle path's typed degradation
+    seam. Project identity resolution and the daily calendar are independent
+    folds over the same captured rows, so a project-only fault must not discard
+    a valid daily result. The one-shot compatibility wrapper keeps the legacy
+    raise-on-any-fault contract by leaving it false.
+    """
+    prior = capture.prior
+    incremental = capture.full_rows is None and isinstance(prior, dict)
+    rows = capture.delta_rows if incremental else (capture.full_rows or ())
+    payload: dict[str, object] = {}
+    outcomes = {
+        "projects": {"state": "ok"},
+        "daily": {"state": "ok"},
+    }
+    failures: dict[str, Exception] = {}
+    project_mut = None
+    resolver_cache = None
+    daily_accumulators = None
+
+    try:
+        prepared = tuple(
+            _shared_range_row_to_priced_usage_entry(row) for row in rows)
+    except Exception as exc:
+        prepared = ()
+        failures["projects"] = exc
+        failures["daily"] = exc
+        outcomes["projects"] = {
+            "state": "failed", "code": "claude_fold_failed"}
+        outcomes["daily"] = {
+            "state": "failed", "code": "claude_fold_failed"}
+
+    try:
+        if "projects" in failures:
+            raise failures["projects"]
+        if incremental:
+            project_mut = copy.deepcopy(prior["project_mut"])
+            resolver_cache = dict(prior["resolver_cache"])
+            for row, priced_entry in zip(rows, prepared):
+                _fold_projects_entry(
+                    project_mut,
+                    row,
+                    resolver_cache=resolver_cache,
+                    week_start=None,
+                    priced_entry=priced_entry,
+                )
+        else:
+            resolver_cache = {}
+            project_mut = fold_projects_over_range(
+                rows,
+                resolver_cache=resolver_cache,
+                priced_entries=prepared,
+            )
+        payload["projects"] = _project_aggregate_rows_from_folded(
+            project_mut, legacy_labels)
+    except Exception as exc:
+        failures["projects"] = exc
+        outcomes["projects"] = {
+            "state": "failed", "code": "claude_fold_failed"}
+
+    try:
+        if "daily" in failures:
+            raise failures["daily"]
+        daily_accumulators = (
+            copy.deepcopy(prior["daily_accumulators"])
+            if incremental else {}
         )
-        daily_accumulators = {}
         _fold_prepared_daily_entries(
-            daily_accumulators, prepared, display_tz=display_tz,
-        )
+            daily_accumulators, prepared, display_tz=display_tz)
+        daily_buckets = _finalize_daily_accumulators(daily_accumulators)
+        daily_rows = _build_daily_aggregate_rows_from_buckets(
+            daily_buckets, now_utc=now_utc, display_tz=display_tz)
+        c = _cctally()
+        payload["daily"] = [
+            c.daily_panel_row_to_wire(row) for row in daily_rows]
+    except Exception as exc:
+        failures["daily"] = exc
+        outcomes["daily"] = {
+            "state": "failed", "code": "claude_fold_failed"}
+
+    if incremental:
+        tail = prior["tail"]
+        real_delta = [
+            row for row in capture.delta_rows if row[2] != "<synthetic>"
+        ]
+        if real_delta:
+            last = real_delta[-1]
+            tail = (last[1], last[0])
+    else:
         real_rows = [row for row in rows if row[2] != "<synthetic>"]
         tail = None
         if real_rows:
             last = real_rows[-1]
             tail = (last[1], last[0])
+
+    if not failures:
         state = {
-            "base": base,
-            "max_entry_id": max_entry_id,
-            "entry_mutation_seq": entry_mutation_seq,
-            "end_exclusive": shared_end_exclusive,
+            "base": capture.base,
+            "max_entry_id": capture.max_entry_id,
+            "entry_mutation_seq": capture.entry_mutation_seq,
+            "end_exclusive": capture.shared_end_exclusive,
             "tail": tail,
             "project_mut": project_mut,
             "daily_accumulators": daily_accumulators,
             "resolver_cache": resolver_cache,
         }
-    payload = _shared_range_cache_payload(
-        state,
-        legacy_labels=legacy_labels,
+        _cctally()._load_sibling("_lib_snapshot_cache")._assert_owner()
+        _CLAUDE_RANGE_AGGREGATE_MEMO["state"] = state
+
+    if failures and not tolerate_leg_failures:
+        raise next(iter(failures.values()))
+    if tolerate_leg_failures:
+        return payload, outcomes
+    return payload
+
+
+def build_cached_claude_range_aggregates(
+    conn,
+    *,
+    shared_start,
+    shared_end_exclusive,
+    now_utc,
+    display_tz,
+    legacy_labels,
+    max_entry_id: "int | None" = None,
+    entry_mutation_seq: "int | None" = None,
+    generation: int = 0,
+):
+    """One-shot compatibility wrapper for non-pinned focused callers."""
+    capture = capture_cached_claude_range_aggregates(
+        conn,
+        shared_start=shared_start,
+        shared_end_exclusive=shared_end_exclusive,
+        display_tz=display_tz,
+        max_entry_id=max_entry_id,
+        entry_mutation_seq=entry_mutation_seq,
+        generation=generation,
+    )
+    return build_cached_claude_range_aggregates_from_capture(
+        capture,
         now_utc=now_utc,
         display_tz=display_tz,
+        legacy_labels=legacy_labels,
     )
-    _CLAUDE_RANGE_AGGREGATE_MEMO["state"] = state
-    return payload
 
 
 def _aggregate_projects_week_raw(
@@ -5080,7 +5489,8 @@ def _aggregate_projects_week_raw(
         conn, since=week_start, until=week_end,
     ):
         entry_cost = _fold_projects_entry(
-            mut, row, resolver_cache=resolver_cache, week_start=week_start,
+            mut, row, resolver_cache=resolver_cache,
+            week_start=week_start, week_end=week_end,
         )
         if entry_cost is None:
             continue
@@ -5143,7 +5553,7 @@ def _aggregate_projects_week(
 def _assemble_projects_via_cache(
     conn: "sqlite3.Connection",
     *,
-    weeks_full: "list[dt.datetime]",
+    week_bounds: "list[tuple[dt.datetime, dt.datetime]]",
     cw_start: "dt.datetime",
     cw_end: "dt.datetime",
     cur_max_id: int,
@@ -5218,33 +5628,47 @@ def _assemble_projects_via_cache(
             if r[2] == "<synthetic>":  # r[2] = model
                 continue
             ts = parse_iso_datetime(r[1], "session_entries.timestamp_utc")
-            if _projects_week_start_monday_utc(ts) != cw_start:
+            if not (cw_start <= ts < cw_end):
                 continue
             out.append(r)
         out.sort(key=lambda r: (r[1], r[0]))  # (ts_iso, id)
         return out
 
-    for w in weeks_full:
+    # The cache identity below is `(start, end)`, while the spec named
+    # "account, exact start, exact end". The account axis is omitted
+    # deliberately, not by oversight: this panel always folds merged
+    # (`_projects_week_grid` is called here with `account_key=None`), so
+    # every entry in this cache was produced by the one merged read and two
+    # scopes cannot collide in it. Adding a constant third component would
+    # be a key that never varies. If the panel ever gains an account scope,
+    # the axis has to be added at the same time — an account-scoped fold
+    # served from a merged slot is a wrong answer, not a stale one.
+    for w, w_end in week_bounds:
         if w == cw_start:
             week_buckets, week_total = sc.accumulate_projects_current_week(
-                week_key=sc.projects_env_week_key(cw_start),
+                # #620 S1: the accumulator's identity is the INTERVAL. An
+                # early reset that moves the current week's bounds must
+                # cold-refold the slot rather than keep appending to a
+                # running aggregate folded over the old window.
+                week_key=sc.projects_env_week_key(cw_start, cw_end),
                 cur_max_id=cur_max_id,
                 cur_max_seq=cur_max_seq,
                 fetch_all_raw=_fetch_all_raw,
                 fetch_delta_rows=_fetch_delta_rows,
                 finalize=_finalize_projects_mut,
                 fold=lambda mut, row: _fold_projects_entry(
-                    mut, row, resolver_cache=resolver_cache, week_start=cw_start,
+                    mut, row, resolver_cache=resolver_cache,
+                    week_start=cw_start, week_end=cw_end,
                 ),
             )
         else:
-            week_iso = sc.projects_env_week_key(w)
+            week_iso = sc.projects_env_week_key(w, w_end)
             hit = sc.projects_env_week_get(week_iso)
             if hit is not None:
                 week_buckets, week_total = hit
             else:
                 week_buckets, week_total = _aggregate_projects_week(
-                    conn, week_start=w, week_end=w + dt.timedelta(days=7),
+                    conn, week_start=w, week_end=w_end,
                     resolver_cache=resolver_cache,
                 )
                 sc.projects_env_week_put(week_iso, week_buckets, week_total)
@@ -5268,14 +5692,21 @@ def _build_projects_envelope(
     shape from spec §5.2 (no per-model breakdowns, no first/last seen
     per session, no per-row $/1%; just cost / attributed_pct / sessions).
 
-    Week boundaries follow ``cmd_project``'s Monday-anchored UTC
-    fallback (``bin/cctally:4711``); ``weekly_usage_snapshots`` rows are
-    matched by ``week_start_date`` (date-only) for ``attributed_pct``.
+    Week boundaries are the real subscription intervals (#620 S1 D1):
+    ``_projects_week_grid`` derives them from ``_compute_subscription_weeks``,
+    the same kernel ``cmd_project`` buckets by, so the two surfaces attribute
+    the same projects over the same weeks. A ``weekly_usage_snapshots`` row
+    is matched onto an interval by its ``week_start_at`` anchor, falling back
+    to ``week_start_date`` for a legacy row that carries no anchor; a row
+    that matches no interval contributes nothing, leaving ``attributed_pct``
+    None rather than attributing over a mismatched population. Only a store
+    with no anchored snapshot at all falls back to
+    ``_projects_week_start_monday_utc``, which is what that function was
+    written for.
 
-    ``current_week`` is passed through opaquely — if non-None and
-    carrying a ``.week_start_at`` UTC datetime, that boundary supplants
-    the Monday fallback for the current week's bucket. None (the
-    default) preserves the fallback.
+    ``current_week`` is passed through opaquely — if non-None and carrying a
+    ``.week_start_at`` UTC datetime, that instant selects which interval is
+    the current week. None (the default) uses ``now_utc``.
 
     Determinism: same conn + same ``now_utc`` ⇒ byte-identical JSON
     (R-PROJ5 invariant). Per-tick memoized on
@@ -5330,33 +5761,51 @@ def _build_projects_envelope(
         return cached
 
     # ---- Week-start anchor (current subscription week) ------------------
-    # ``TuiCurrentWeek.week_start_at`` is NOT a valid Monday lookup key
-    # after ``_apply_midweek_reset_override`` — it is shifted to the
-    # in-week reset instant (e.g. Friday 13:00 UTC) while the bucket
-    # aggregator below snaps every entry to its containing ISO-Monday
-    # via ``_week_for``. Using ``cw_key`` directly as the bucket-lookup
-    # key strands all current-week activity in an empty bucket and emits
-    # ``rows: []`` with ``total_cost_usd: 0.0``. Snap to the canonical
-    # Monday-UTC week anchor here so the lookup keys align — same
-    # invariant the weekly handling notes call out for
-    # ``weekly_usage_snapshots``/``percent_milestones`` cross-table
-    # joins. Regression: ``tests/fixtures/dashboard/reset-week/`` +
+    # #620 S1 D1. The panel buckets cost into the REAL subscription
+    # intervals — the ones `_compute_subscription_weeks` derives from the
+    # retained reset anchors, and the ones `cmd_project` already buckets by.
+    # `_projects_week_start_monday_utc` remains what its own docstring says
+    # it is: the fallback for when no anchor is available. It used to be
+    # applied to the anchor itself, which discarded the very thing it was
+    # written to defer to, so the cost window and the quota window described
+    # different intervals for every account whose reset is not exactly
+    # Monday midnight UTC — in practice almost all of them.
+    #
+    # ``TuiCurrentWeek.week_start_at`` after ``_apply_midweek_reset_override``
+    # is the in-week reset instant rather than the week's start. It is used
+    # here only to locate the containing interval, never as a bucket key, so
+    # a shifted value resolves to the same week the entry walk uses and no
+    # activity is stranded. Regression:
+    # ``tests/fixtures/dashboard/reset-week/`` +
     # ``test_current_week_rows_populated_after_midweek_reset``.
-    if cw_key is not None:
-        cw_start = _projects_week_start_monday_utc(cw_key)
+    anchor_instant = cw_key if cw_key is not None else now_utc
+    grid = _projects_week_grid(
+        conn, anchor_utc=anchor_instant, weeks_back=weeks_back,
+    )
+    cw_start = grid.week_for(anchor_instant) if grid is not None else None
+    if cw_start is None:
+        # No anchor covers `now` — the genuine fallback path, byte-identical
+        # to the pre-#620 behaviour for a store with no anchored snapshots.
+        grid = None
+        cw_start = _projects_week_start_monday_utc(anchor_instant)
+        cw_end = cw_start + dt.timedelta(days=7)
+        week_bounds = [
+            (
+                cw_start - dt.timedelta(days=7 * (weeks_back - 1 - i)),
+                cw_start - dt.timedelta(days=7 * (weeks_back - 2 - i)),
+            )
+            for i in range(weeks_back)
+        ]
     else:
-        cw_start = _projects_week_start_monday_utc(now_utc)
+        cw_end = grid.end_for(cw_start)
+        week_bounds = grid.window_ending_at(cw_start, weeks_back)
 
-    # Build a list of canonical Monday-anchored week starts ending with
-    # cw_start, oldest → newest, of length ``weeks_back``. Clamping to
+    # Week starts, oldest → newest, of length ``weeks_back``. Clamping to
     # actual history happens after the entry walk reveals what weeks
     # have any activity.
-    weeks_full = [
-        cw_start - dt.timedelta(days=7 * (weeks_back - 1 - i))
-        for i in range(weeks_back)
-    ]
-    cw_end = cw_start + dt.timedelta(days=7)
-    since_dt = weeks_full[0]
+    weeks_full = [b[0] for b in week_bounds]
+    end_by_week = {s: e for s, e in week_bounds}
+    since_dt = week_bounds[0][0]
     until_dt = cw_end  # exclusive end; SQL is `>= since AND <= until`
 
     # ---- Bucket entries per (ProjectKey, week_start) --------------------
@@ -5371,7 +5820,7 @@ def _build_projects_envelope(
     # HTTP-drill): the original single full-window walk, byte-unchanged.
     if use_projects_env_cache:
         buckets, total_cost_by_week, key_by_bucket = _assemble_projects_via_cache(
-            conn, weeks_full=weeks_full, cw_start=cw_start, cw_end=cw_end,
+            conn, week_bounds=week_bounds, cw_start=cw_start, cw_end=cw_end,
             cur_max_id=max_id, cur_max_seq=entry_mutation_seq,
         )
     else:
@@ -5387,8 +5836,13 @@ def _build_projects_envelope(
         key_by_bucket = {}
 
         def _week_for(ts: dt.datetime) -> "dt.datetime | None":
-            wstart = _projects_week_start_monday_utc(ts)
-            if wstart < weeks_full[0] or wstart > weeks_full[-1]:
+            if grid is not None:
+                wstart = grid.week_for(ts)
+                if wstart is None:
+                    return None
+            else:
+                wstart = _projects_week_start_monday_utc(ts)
+            if wstart not in end_by_week:
                 return None
             return wstart
 
@@ -5484,7 +5938,7 @@ def _build_projects_envelope(
     weekly_pct_by_week: dict[dt.datetime, float] = {}
     try:
         cur = conn.execute(
-            "SELECT week_start_date, weekly_percent "
+            "SELECT week_start_date, week_start_at, weekly_percent "
             "FROM weekly_usage_snapshots "
             "ORDER BY captured_at_utc ASC, id ASC"
         )
@@ -5493,19 +5947,40 @@ def _build_projects_envelope(
         # No weekly_usage_snapshots table — leaves attributed_pct = None
         # throughout (acceptable per spec §2.7).
         rows = []
-    for week_date_str, weekly_pct in rows:
+    for week_date_str, week_start_at, weekly_pct in rows:
         try:
             wd = dt.date.fromisoformat(week_date_str)
         except (TypeError, ValueError):
             continue
-        # Snap the date to UTC Monday 00:00 (matches the bucketing key).
-        wstart = dt.datetime.combine(
-            wd, dt.time(0, 0, 0), tzinfo=dt.timezone.utc,
-        )
-        # Snap to Monday (snapshot rows that captured a non-Monday week
-        # boundary still align to the same canonical bucket as the entry
-        # walk, since the bucketing is Monday-anchored).
-        wstart = _projects_week_start_monday_utc(wstart)
+        wstart: "dt.datetime | None" = None
+        if grid is not None:
+            # #620 S1 D1. Resolve the row onto the SAME interval the entry
+            # walk buckets into, so the numerator, the denominator and this
+            # percentage are all taken from one half-open window before the
+            # multiplication below.
+            if week_start_at:
+                try:
+                    anchor = parse_iso_datetime(
+                        week_start_at, "weekly_usage_snapshots.week_start_at",
+                    ).astimezone(dt.timezone.utc)
+                except (TypeError, ValueError):
+                    anchor = None
+                if anchor is not None:
+                    wstart = grid.week_for(anchor)
+            if wstart is None:
+                # A legacy row carrying only the date-only boundary. One
+                # shared interval still serves both the cost and the
+                # percentage; taking them from different intervals is never
+                # acceptable, so an unresolvable row contributes nothing and
+                # `attributed_pct` stays None (#620 S1 A3).
+                wstart = grid.start_for_date(wd)
+            if wstart is None:
+                continue
+        else:
+            # No anchor anywhere in the store: the genuine Monday fallback.
+            wstart = _projects_week_start_monday_utc(dt.datetime.combine(
+                wd, dt.time(0, 0, 0), tzinfo=dt.timezone.utc,
+            ))
         if weekly_pct is not None:
             weekly_pct_by_week[wstart] = float(weekly_pct)
 
@@ -5532,12 +6007,11 @@ def _build_projects_envelope(
     if weeks_with_activity:
         # Window = inclusive [oldest_active_week, cw_start]. Always emits
         # cw_start (panel + trend share the same current_week column).
+        # Keyed by the SAME rule as the current week (#620 S1 D1) — the
+        # subscription intervals themselves, not a seven-day walk, because
+        # a mixed keying inside one panel is the defect restated.
         oldest = min(weeks_with_activity[0], cw_start)
-        trend_weeks = []
-        w = oldest
-        while w <= cw_start:
-            trend_weeks.append(w)
-            w += dt.timedelta(days=7)
+        trend_weeks = [w for w in weeks_full if oldest <= w <= cw_start]
     else:
         trend_weeks = [cw_start]
 
@@ -5729,13 +6203,74 @@ def _project_detail_for_window(
     if bucket_path is None:
         return None
 
-    # ---- Window bounds (Monday-anchored UTC fallback, like the builder) -
+    # ---- Window bounds, from the envelope's own current-week anchor ----
+    # That anchor is the account's real subscription week start; the
+    # Monday-midnight snap is only the no-anchor fallback (#620).
     cw_start = parse_iso_datetime(
         env["current_week"]["week_start_at"],
         "projects.current_week.week_start_at",
+    ).astimezone(dt.timezone.utc)
+
+    # The drill resolves the SAME interval its panel resolved, by rebuilding
+    # the panel's grid rather than stepping back in seven-day multiples.
+    # `_ProjectsWeekGrid` exists because a drifted reset day produces a
+    # genuinely short week: on `non-monday-anchor` at `weeks_back=4` the grid
+    # starts the window at 2026-03-27T09:00Z while a seven-day walk yields
+    # 2026-03-26T09:00Z, and an early reset that shortens the current week
+    # would likewise leave a `cw_start + 7d` end counting cost past the
+    # week's real end. `window_start_at` / `window_end_at` publish these
+    # bounds to the client as authoritative, so a divergence here renders a
+    # window the panel never computed.
+    #
+    # The grid is rebuilt from the PANEL'S OWN anchor, not from `cw_start`.
+    # `_projects_week_grid` derives its provisional range from an ISO-Monday
+    # snap of whatever anchor it is handed, and `cw_start` is the interval
+    # START while the panel anchors on `current_week.week_start_at` — which
+    # after `_apply_midweek_reset_override` is the in-week reset instant and
+    # can sit up to a week later. The two therefore snap to different Mondays
+    # and `_compute_subscription_weeks` can pick a different extrapolation
+    # anchor for each, so window equality would rest on a coincidence rather
+    # than on the two surfaces asking the same question. `cw_start` remains
+    # the anchor `window_ending_at` walks back from, because that walk needs
+    # an interval start.
+    panel_anchor = getattr(current_week, "week_start_at", None)
+    if not isinstance(panel_anchor, dt.datetime):
+        panel_anchor = now_utc
+    detail_grid = _projects_week_grid(
+        conn, anchor_utc=panel_anchor, weeks_back=weeks_back,
     )
-    since_dt = cw_start - dt.timedelta(days=7 * (weeks_back - 1))
-    until_dt = cw_start + dt.timedelta(days=7)
+    detail_bounds = (
+        detail_grid.window_ending_at(cw_start, weeks_back)
+        if detail_grid is not None else []
+    )
+    if detail_bounds:
+        since_dt = detail_bounds[0][0]
+        until_dt = detail_bounds[-1][1]
+    else:
+        # No anchor covers this start — the same no-anchor tail the panel
+        # falls back to, where the seven-day assumption is the right one.
+        since_dt = cw_start - dt.timedelta(days=7 * (weeks_back - 1))
+        until_dt = cw_start + dt.timedelta(days=7)
+    since_iso = since_dt.astimezone(dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    until_iso = until_dt.astimezone(dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    # SQL candidate bound, NOT the published one. Ingestion stores
+    # `timestamp_utc` as `…+00:00` while these bounds are spelled `…Z`, and
+    # SQLite compares that column lexically with `+` (0x2B) below `Z` (0x5A).
+    # So the lower bound drops an entry sitting exactly on it and the upper
+    # bound admits one sitting exactly on it — an asymmetry in both
+    # directions. Widening the lower bound by a second makes SQL an outward
+    # candidate filter at both ends; the half-open membership test is then
+    # enforced on the PARSED datetime in the entry loop, which is the only
+    # place it can be stated honestly.
+    since_sql_iso = (
+        since_dt.astimezone(dt.timezone.utc) - dt.timedelta(seconds=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    until_dt_utc = until_dt.astimezone(dt.timezone.utc)
+    since_dt_utc = since_dt.astimezone(dt.timezone.utc)
 
     # ---- Build bucket → source_paths map for SQL-side scoping ----------
     # Walk session_files (~8k rows) once instead of session_entries
@@ -5787,6 +6322,8 @@ def _project_detail_for_window(
             "key":                    project_key,
             "bucket_path":            bucket_path,
             "window_weeks":           weeks_back,
+            "window_start_at":        since_iso,
+            "window_end_at":          until_iso,
             "window_cost_usd":        0.0,
             "window_attributed_pct":  None,
             "models":                 [],
@@ -5810,13 +6347,6 @@ def _project_detail_for_window(
         [(p,) for p in bucket_source_paths],
     )
 
-    since_iso = since_dt.astimezone(dt.timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
-    until_iso = until_dt.astimezone(dt.timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
-
     # ---- Walk session_entries (project-scoped) once -------------------
     # INNER JOIN to _drill_paths drops every row whose source_path
     # doesn't belong to this bucket. The Python-side filter that
@@ -5832,7 +6362,7 @@ def _project_detail_for_window(
         "LEFT JOIN session_files sf ON sf.path = e.source_path "
         "WHERE e.timestamp_utc >= ? AND e.timestamp_utc <= ? "
         "ORDER BY e.timestamp_utc ASC, e.id ASC",
-        (since_iso, until_iso),
+        (since_sql_iso, until_iso),
     )
 
     # Per-model rollup: {model -> {cost_usd, sessions, in, out, cache_*}}
@@ -5855,6 +6385,14 @@ def _project_detail_for_window(
         # on _drill_paths already restricted the result set to entries
         # whose source_path belongs to this bucket.
         ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
+        # The half-open membership test. The SQL bounds above are a widened
+        # candidate filter that admits a second on each side, because the
+        # column's stored offset spelling and the bound's spelling do not
+        # compare the way the interval means; this is where the interval is
+        # actually decided.
+        ts_utc = ts.astimezone(dt.timezone.utc)
+        if not (since_dt_utc <= ts_utc < until_dt_utc):
+            continue
         entry_cost = _calculate_entry_cost(
             model,
             claude_usage_dict(   # #195 chokepoint
@@ -5977,6 +6515,8 @@ def _project_detail_for_window(
         "key":                    project_key,
         "bucket_path":            bucket_path,
         "window_weeks":           weeks_back,
+        "window_start_at":        since_iso,
+        "window_end_at":          until_iso,
         "window_cost_usd":        window_cost,
         "window_attributed_pct":  win_pct,
         "models":                 models_out,
@@ -8098,10 +8638,17 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             return
 
         if axis == "weekly":
+            # Mirrors the CLI `alerts test --axis weekly` branch: the preview
+            # carries the reset INSTANT a real crossing carries, so it renders
+            # the instant form rather than the day-granularity fallback.
+            preview_week_start = synthetic_preview_week_start()
             payload = _build_alert_payload_weekly(
                 threshold=threshold,
                 crossed_at_utc=now_utc_iso(),
-                week_start_date=dt.date.today().isoformat(),
+                week_start_date=preview_week_start.date().isoformat(),
+                week_start_at=preview_week_start.isoformat().replace(
+                    "+00:00", "Z"
+                ),
                 cumulative_cost_usd=1.23,
                 dollars_per_percent=0.01,
             )

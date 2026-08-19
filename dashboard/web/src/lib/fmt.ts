@@ -299,6 +299,7 @@ export function roundIsoToTenMinutes(iso: string): string {
 // bounds fall back to the full-cycle wording rather than rendering `last NaN
 // days`. The three surfaces that disclose the window share this one derivation.
 export function spendWindowLabel(w: SpendWindow): string {
+  if (w.kind === 'subscription-week') return 'subscription week';
   const start = Date.parse(w.startAt);
   const end = Date.parse(w.endAt);
   if (Number.isNaN(start) || Number.isNaN(end)) return 'last 7 days';

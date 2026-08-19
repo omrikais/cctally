@@ -292,6 +292,30 @@ def _mixed_boundary_current_week(stats_conn, cache_conn):
     ])
 
 
+# --- Scenario: no-usage-observed ----------------------------------------
+# #620 S1 D5/A5. Every snapshot this week reports 0% used, while real money
+# was spent. `_select_dollars_per_percent` falls past Path 1 (needs
+# p_now >= 10) and Path 2 (needs four eligible prior weeks, and there are
+# none) to Path 3, which cannot divide by p_now == 0.
+#
+# The spend must be NON-ZERO: a fixture with zero spend as well cannot tell
+# "we have no usage signal" apart from "nothing happened", which is exactly
+# the distinction the null contract exists to publish.
+def _no_usage_observed(stats_conn, cache_conn):
+    week_start = dt.datetime(2026, 4, 13, 14, 0, 0, tzinfo=dt.timezone.utc)
+    week_end = dt.datetime(2026, 4, 20, 14, 0, 0, tzinfo=dt.timezone.utc)
+    _insert_snapshots(
+        stats_conn, week_start, week_end,
+        [(h, 0.0) for h in (12, 24, 36, 48, 60, 72, 78)],
+    )
+    _insert_entries(cache_conn, [
+        (week_start + dt.timedelta(hours=30), "claude-sonnet-4-6",
+         900_000, 180_000, 0, 0),
+        (week_start + dt.timedelta(hours=54), "claude-sonnet-4-6",
+         640_000, 120_000, 0, 0),
+    ])
+
+
 SCENARIOS = {
     "midweek-safe": (
         dt.datetime(2026, 4, 16, 20, 0, 0, tzinfo=dt.timezone.utc),  # day 4, 78h elapsed
@@ -324,6 +348,10 @@ SCENARIOS = {
     "date-only-current-week": (
         dt.datetime(2026, 4, 16, 20, 0, 0, tzinfo=dt.timezone.utc),
         _date_only_current_week,
+    ),
+    "no-usage-observed": (
+        dt.datetime(2026, 4, 16, 20, 0, 0, tzinfo=dt.timezone.utc),
+        _no_usage_observed,
     ),
     "mixed-boundary-current-week": (
         dt.datetime(2026, 4, 16, 20, 0, 0, tzinfo=dt.timezone.utc),

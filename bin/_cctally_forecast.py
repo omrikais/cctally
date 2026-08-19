@@ -91,6 +91,10 @@ from _lib_forecast import ForecastInputs, BudgetRow, ForecastOutput, _compute_fo
 _ensure_sibling_loaded("_lib_json_envelope")
 from _lib_json_envelope import _iso_z
 
+# #620 S1 D11: the one affordance shape every warning state renders.
+_ensure_sibling_loaded("_lib_alert_scope")
+import _lib_alert_scope
+
 
 def _cctally():
     """Resolve the current `cctally` module at call-time (§2)."""
@@ -368,8 +372,15 @@ def _select_dollars_per_percent(
     skip_sync: bool = False,
     use_weekref_cost_cache: bool = False,
     account_key: "str | None" = None,
-) -> tuple[float, str]:
+) -> "tuple[float | None, str]":
     """Return (dollars_per_percent, source_label). See spec §1 selection rule.
+
+    #620 S1 D5: the rate is ``None`` when no usage has been observed. It used
+    to be ``0.0`` paired with the ``this_week_sparse`` label, which published
+    a rate of exactly $0.00 per percent and blamed a sparse week — a
+    fabricated answer with a false cause, on a week that may carry real
+    spend. Absence is now typed, and the cause travels on the existing
+    companion source field rather than a new key.
 
     Eligible prior week: week_end_at < now_utc AND final_weekly_percent >= 1.
     Uses the existing `_sum_cost_for_range` helper (which opens the cache DB
@@ -466,8 +477,11 @@ def _select_dollars_per_percent(
     # Path 3: fall back to current week even if sparse.
     if p_now > 0:
         return spent_usd / p_now, "this_week_sparse"
-    # p_now == 0: no signal. Return 0; math layer guards against div-by-zero.
-    return 0.0, "this_week_sparse"
+    # p_now == 0: there is no signal to divide by. Withhold the rate and say
+    # why (#620 S1 D5). Every dollar figure derived from it becomes
+    # unavailable; percent projections are unaffected because they never
+    # depended on it.
+    return None, "no_usage_observed"
 
 
 def _assess_forecast_confidence(
@@ -643,7 +657,10 @@ def _build_forecast_json_payload(out: ForecastOutput) -> dict:
             "week_average_pct_per_hour":   round(out.r_avg, 6),
             "recent_24h_pct_per_hour":     (None if out.r_recent is None
                                             else round(out.r_recent, 6)),
-            "dollars_per_percent":         round(i.dollars_per_percent, 6),
+            "dollars_per_percent":         (
+                None if i.dollars_per_percent is None
+                else round(i.dollars_per_percent, 6)
+            ),
             "dollars_per_percent_source":  i.dollars_per_percent_source,
         },
         "forecast": {
@@ -814,6 +831,62 @@ def _render_forecast_progress_bar(
     return [label_str, axis_str, bar_line, cap_str]
 
 
+# #620 S1 D10: the four reason codes `_assess_forecast_confidence` and
+# `_load_forecast_inputs` emit are a wire contract that `--json` consumers
+# read, so they are unchanged. What changed is that the terminal used to
+# print them verbatim into a line a person reads. The mapping is a render
+# step, and it stays in this I/O layer; moving cause classification beside
+# the predicate in `_lib_forecast.py` buys nothing without a cause enum,
+# which is S2's.
+_FORECAST_CONFIDENCE_WORDING = {
+    "elapsed_hours<24": "less than 24 hours into the week",
+    "percent<2": "under 2% of quota used so far",
+    "snapshots<3": "fewer than 3 usage snapshots",
+    "no_sample_ge_24h": "no snapshot at least 24 hours old",
+}
+
+
+def _forecast_confidence_wording(reasons) -> str:
+    """Render low-confidence reason codes as human wording.
+
+    An unrecognised code falls back to the code itself rather than being
+    dropped. Dropping it would render an empty parenthetical that states no
+    cause at all, which is worse than an unfamiliar token: a code nobody
+    recognises is still a fact about why the forecast is thin.
+    """
+    return ", ".join(
+        _FORECAST_CONFIDENCE_WORDING.get(code, code) for code in reasons
+    )
+
+
+def _wrap_panel_text(text: str, width: int, indent: str = "  ") -> list[str]:
+    """Break one statement into panel rows of at most ``width`` characters.
+
+    ``_render_forecast_terminal``'s ``_row`` pads to a fixed width and never
+    truncates, so a statement longer than the row runs past the frame's right
+    border. Human confidence wording is longer than the machine codes it
+    replaced and up to four reasons can fire at once, so the statement is laid
+    across as many rows as it needs. Nothing is dropped and nothing is
+    truncated: a single word longer than the row still gets its own row and
+    overruns, which is the honest outcome for an unrecognised reason code.
+    """
+    words = text.split(" ")
+    rows: list[str] = []
+    current = ""
+    prefix = ""
+    for word in words:
+        candidate = f"{current} {word}" if current else f"{prefix}{word}"
+        if current and len(candidate) > width:
+            rows.append(current)
+            prefix = indent
+            current = f"{prefix}{word}"
+        else:
+            current = candidate
+    if current:
+        rows.append(current)
+    return rows or [text]
+
+
 def _render_forecast_terminal(out: "ForecastOutput", args, color: bool) -> str:
     """Full box-frame terminal render (spec §4)."""
     c = _cctally()
@@ -865,14 +938,24 @@ def _render_forecast_terminal(out: "ForecastOutput", args, color: bool) -> str:
 
     # ── Panel 2: used / forecast / bar
     used_line = f"Used     {i.p_now:.1f}%   ${i.spent_usd:.2f}"
+    # Only the low-confidence branch can need continuation rows.
+    forecast_extra_lines: list[str] = []
     if out.already_capped:
         forecast_line = c._style_ansi(
             f"\u26a0 CAPPED at {i.p_now:.1f}% \u2014 reset {fmt_dt(i.week_end_at)} "
             f"({i.remaining_days:.1f}d)", "31", color)
     elif i.confidence == "low":
-        reasons = ", ".join(i.low_confidence_reasons)
-        forecast_line = c._style_ansi(
-            f"\u26a0 LOW CONF \u2014 insufficient data ({reasons})", "33", color)
+        reasons = _forecast_confidence_wording(i.low_confidence_reasons)
+        # `_row` fits `inner_w - 1` characters; one short of that keeps the
+        # single trailing space every other row in the panel has.
+        conf_rows = _wrap_panel_text(
+            f"\u26a0 LOW CONF \u2014 insufficient data ({reasons})",
+            inner_w - 2,
+        )
+        forecast_line = c._style_ansi(conf_rows[0], "33", color)
+        forecast_extra_lines = [
+            c._style_ansi(row, "33", color) for row in conf_rows[1:]
+        ]
     else:
         low, high = out.final_percent_low, out.final_percent_high
         low_rnd = round(low)
@@ -901,6 +984,10 @@ def _render_forecast_terminal(out: "ForecastOutput", args, color: bool) -> str:
     budget_rows = []
     for b in out.budgets:
         if b.dollars_per_day is None:
+            # `past target` is the only cause reachable here. The other cause
+            # of a `None` budget — no rate observed — cannot arrive: this
+            # panel renders only when `confidence != "low"`, and `p_now == 0`
+            # always sets `percent<2`, which is a low-confidence input.
             budget_rows.append(f"  to {b.target_percent:>3}%    \u2014 past target")
         else:
             budget_rows.append(
@@ -927,6 +1014,8 @@ def _render_forecast_terminal(out: "ForecastOutput", args, color: bool) -> str:
     lines.append(_box_mid())
     lines.append(_row(used_line))
     lines.append(_row(forecast_line))
+    for extra_line in forecast_extra_lines:
+        lines.append(_row(extra_line))
     lines.append(_row(""))
     for bl in bar_lines:
         lines.append(_row(bl))
@@ -948,6 +1037,153 @@ def _render_forecast_terminal(out: "ForecastOutput", args, color: bool) -> str:
             "2", color))
 
     return "\n".join(lines)
+
+
+# A trend row is marked partial when its span falls short of the nominal
+# subscription week by more than this. The tolerance absorbs the
+# hour-boundary normalisation applied to Anthropic's reset jitter, so an
+# ordinary week normalised by up to an hour is never marked (#620 S1 D9).
+_REPORT_PARTIAL_WEEK_TOLERANCE = dt.timedelta(hours=1)
+_REPORT_NOMINAL_WEEK = dt.timedelta(days=7)
+_REPORT_PARTIAL_MARK = "~"
+_REPORT_PARTIAL_LEGEND = (
+    "~ marks a week shorter than the nominal 7 days, so its $ / 1% is not "
+    "directly comparable with a full week's."
+)
+
+
+def _report_row_is_partial_week(row: "dict") -> bool:
+    """True when this trend row's `[start, end)` span is short of a full
+    subscription week by more than the jitter tolerance (#620 S1 D9).
+
+    A row that does not carry both exact bounds is NOT marked: the span is
+    unknown, and marking on a guess would assert something the data does not
+    support. Absent weeks stay omitted, exactly as before.
+    """
+    start_iso = row.get("weekStartAt")
+    end_iso = row.get("weekEndAt")
+    if not start_iso or not end_iso:
+        return False
+    try:
+        start = parse_iso_datetime(start_iso, "report row weekStartAt")
+        end = parse_iso_datetime(end_iso, "report row weekEndAt")
+    except (TypeError, ValueError):
+        return False
+    return (end - start) < (_REPORT_NOMINAL_WEEK - _REPORT_PARTIAL_WEEK_TOLERANCE)
+
+
+def render_report_terminal(payload: "dict", *, tz) -> str:
+    """Render the report's current-week and trend tables (#620 S1 D7).
+
+    A pure function over the report's own JSON payload — the exact object
+    `cmd_report` emits under `--json`. It was inline in `cmd_report`, which
+    meant the all-source path had no way to reach it: `_render_claude_terminal`
+    fell back to `_legacy_claude_totals`, which reads a `totals` object this
+    payload does not have, so `report --source all` printed two lines and the
+    literal `Data available.` while `report` alone printed the whole report.
+
+    Teaching `_legacy_claude_totals` this payload's shape was rejected: it
+    would reduce a rich two-table report to a misleading one-line total.
+    """
+    c = _cctally()
+    current_row = payload.get("current")
+    trend = payload.get("trend") or []
+    blocks: "list[str]" = []
+
+    if current_row is not None:
+        week_window = c._format_week_window(
+            current_row.get("weekStartDate"),
+            current_row.get("weekEndDate"),
+            current_row.get("weekStartAt"),
+            current_row.get("weekEndAt"),
+            tz=tz,
+        )
+        wp = current_row["weeklyPercent"]
+        wc = current_row["weeklyCostUSD"]
+        dpp = current_row["dollarsPerPercent"]
+        blocks.append(
+            c._boxed_table(
+                ["Week Window", "Usage %", "Cost USD", "$ / 1%"],
+                [[
+                    week_window,
+                    f"{wp:.2f}%" if wp is not None else "n/a",
+                    f"${wc:.6f}" if wc is not None else "n/a",
+                    f"${dpp:.6f}" if dpp is not None else "n/a",
+                ]],
+                ["left", "right", "right", "right"],
+            )
+        )
+        blocks.append("")
+
+    blocks.append("Trend:")
+    headers = [
+        "#",
+        "Week Window",
+        "Usage %",
+        "Cost USD",
+        "$ / 1%",
+        "As Of",
+        "Usage Captured",
+        "Cost Captured",
+    ]
+    display_trend = sorted(
+        trend,
+        key=c._trend_row_recency_seconds,
+        reverse=True,
+    )
+    table_rows: list[list[str]] = []
+    any_partial = False
+    for idx, row in enumerate(display_trend, start=1):
+        percent = "n/a" if row["weeklyPercent"] is None else f"{row['weeklyPercent']:.2f}%"
+        cost = "n/a" if row["weeklyCostUSD"] is None else f"${row['weeklyCostUSD']:.6f}"
+        dpp = "n/a" if row["dollarsPerPercent"] is None else f"${row['dollarsPerPercent']:.6f}"
+        week_window = c._format_week_window(
+            row.get("weekStartDate"),
+            row.get("weekEndDate"),
+            row.get("weekStartAt"),
+            row.get("weekEndAt"),
+            tz=tz,
+        )
+        # The marker rides in the `#` column so no new column is added and a
+        # table of full weeks keeps its bytes apart from that column's width.
+        partial = _report_row_is_partial_week(row)
+        any_partial = any_partial or partial
+        index_cell = f"{_REPORT_PARTIAL_MARK}{idx}" if partial else str(idx)
+        table_rows.append(
+            [
+                index_cell,
+                week_window,
+                percent,
+                cost,
+                dpp,
+                c._format_ts_compact(row.get("asOf"), tz=tz),
+                c._format_ts_compact(row.get("usageCapturedAt"), tz=tz),
+                c._format_ts_compact(row.get("costCapturedAt"), tz=tz),
+            ]
+        )
+
+    blocks.append(
+        c._boxed_table(
+            headers,
+            table_rows,
+            aligns=[
+                "right",
+                "left",
+                "right",
+                "right",
+                "right",
+                "left",
+                "left",
+                "left",
+            ],
+            color_header=True,
+        )
+    )
+    # The legend renders only when a marked row exists, so a full-week table
+    # gains no line at all.
+    if any_partial:
+        blocks.append(_REPORT_PARTIAL_LEGEND)
+    return "\n".join(blocks)
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -1266,89 +1502,7 @@ def cmd_report(args: argparse.Namespace) -> int:
                 print(json.dumps(payload, indent=2))
             return 0
 
-        if current_row is not None:
-            week_window = c._format_week_window(
-                current_row.get("weekStartDate"),
-                current_row.get("weekEndDate"),
-                current_row.get("weekStartAt"),
-                current_row.get("weekEndAt"),
-                tz=tz,
-            )
-            wp = current_row["weeklyPercent"]
-            wc = current_row["weeklyCostUSD"]
-            dpp = current_row["dollarsPerPercent"]
-            print(
-                c._boxed_table(
-                    ["Week Window", "Usage %", "Cost USD", "$ / 1%"],
-                    [[
-                        week_window,
-                        f"{wp:.2f}%" if wp is not None else "n/a",
-                        f"${wc:.6f}" if wc is not None else "n/a",
-                        f"${dpp:.6f}" if dpp is not None else "n/a",
-                    ]],
-                    ["left", "right", "right", "right"],
-                )
-            )
-            print()
-
-        print("Trend:")
-        headers = [
-            "#",
-            "Week Window",
-            "Usage %",
-            "Cost USD",
-            "$ / 1%",
-            "As Of",
-            "Usage Captured",
-            "Cost Captured",
-        ]
-        display_trend = sorted(
-            trend,
-            key=c._trend_row_recency_seconds,
-            reverse=True,
-        )
-        table_rows: list[list[str]] = []
-        for idx, row in enumerate(display_trend, start=1):
-            percent = "n/a" if row["weeklyPercent"] is None else f"{row['weeklyPercent']:.2f}%"
-            cost = "n/a" if row["weeklyCostUSD"] is None else f"${row['weeklyCostUSD']:.6f}"
-            dpp = "n/a" if row["dollarsPerPercent"] is None else f"${row['dollarsPerPercent']:.6f}"
-            week_window = c._format_week_window(
-                row.get("weekStartDate"),
-                row.get("weekEndDate"),
-                row.get("weekStartAt"),
-                row.get("weekEndAt"),
-                tz=tz,
-            )
-            table_rows.append(
-                [
-                    str(idx),
-                    week_window,
-                    percent,
-                    cost,
-                    dpp,
-                    c._format_ts_compact(row.get("asOf"), tz=tz),
-                    c._format_ts_compact(row.get("usageCapturedAt"), tz=tz),
-                    c._format_ts_compact(row.get("costCapturedAt"), tz=tz),
-                ]
-            )
-
-        print(
-            c._boxed_table(
-                headers,
-                table_rows,
-                aligns=[
-                    "right",
-                    "left",
-                    "right",
-                    "right",
-                    "right",
-                    "left",
-                    "left",
-                    "left",
-                ],
-                color_header=True,
-            )
-        )
+        print(render_report_terminal(output, tz=tz))
 
         if args.detail:
             milestone_rows = c.get_milestones_for_week(
@@ -1460,7 +1614,12 @@ def cmd_forecast(args: argparse.Namespace) -> int:
                 projected_low_pct=0.0,
                 projected_high_pct=0.0,
                 days_remaining=0.0,
-                dollars_per_percent=0.0,
+                # #620 S1 D5/A5: with no snapshot recorded this week there is
+                # no rate, and zero would render `$0.00` in the artifact's
+                # `$ / 1% (this week)` row — a fabricated answer on the one
+                # path whose whole message is that nothing was measured.
+                # `_build_forecast_snapshot` renders `None` as `n/a`.
+                dollars_per_percent=None,
                 dollars_per_percent_source="this_week",
                 low_conf=False,
                 notes=(
@@ -1564,7 +1723,12 @@ def cmd_forecast(args: argparse.Namespace) -> int:
             projected_low_pct=float(output.final_percent_low),
             projected_high_pct=float(output.final_percent_high),
             days_remaining=float(i.remaining_days),
-            dollars_per_percent=float(i.dollars_per_percent),
+            # #620 S1 D5: no `float(...)` coercion — that would turn a
+            # withheld rate back into $0.00 one layer below the fix.
+            dollars_per_percent=(
+                None if i.dollars_per_percent is None
+                else float(i.dollars_per_percent)
+            ),
             dollars_per_percent_source=i.dollars_per_percent_source,
             low_conf=(i.confidence == "low"),
         )
@@ -1586,6 +1750,19 @@ def cmd_forecast(args: argparse.Namespace) -> int:
 
     color = _forecast_color_enabled(args.color, sys.stdout)
     print(_render_forecast_terminal(output, args, color))
+    # #620 S1 D11: a capped or low-confidence forecast routes to the command
+    # that explains the week it is about. The line sits under the panel rather
+    # than inside it, because the panel is width-fixed and a wrapped command
+    # is not one a reader can copy.
+    if output.already_capped or output.inputs.confidence == "low":
+        i = output.inputs
+        print(_lib_alert_scope.next_step_line(
+            f"cctally percent-breakdown --week-start {i.week_start_at:%Y-%m-%d}",
+            provider="claude",
+            window_start=i.week_start_at,
+            window_end=i.week_end_at,
+            tz=getattr(args, "_resolved_tz", None),
+        ))
     return 0
 
 
@@ -2573,13 +2750,18 @@ def _budget_verdict_ansi_code(verdict: str) -> str:
 
 
 def _budget_block_lines(
-    inputs, status, *, header_label, alerts_line, color
+    inputs, status, *, header_label, alerts_line, color, provider="claude",
+    tz=None,
 ) -> list:
     """Render one budget block (header + spent/remaining/pace/projected + the
     alerts footer) as a list of lines. Shared by the Claude top block and the
     Codex sibling so their layout is identical (spec §5). ``header_label`` is
     the fully-formed first line (already carries the period/equivalent-$ cue);
-    ``alerts_line`` is the pre-rendered footer."""
+    ``alerts_line`` is the pre-rendered footer.
+
+    ``tz`` is the resolved display zone, the same one ``header_label`` was
+    built from. ``None`` means ``display.tz = local``, which is what
+    ``format_display_dt`` already treats it as."""
     c = _cctally()
     total_seconds = (inputs.week_end_at - inputs.week_start_at).total_seconds()
     elapsed_days = status.elapsed_fraction * total_seconds / 86400.0
@@ -2614,10 +2796,32 @@ def _budget_block_lines(
         f"–${status.projected_eow_high_usd:,.0f}   →   {verdict_text}"
     )
     if status.low_confidence:
-        proj_line += "   (LOW CONF — early in week)"
+        # #620 S1 D10: `low_confidence` fires when the period is barely
+        # elapsed OR nothing has been spent. On a fully elapsed period with
+        # zero spend the second disjunct fires and a claim about the first is
+        # simply false. Cause-neutral rather than a cause enum: naming the
+        # disjunct is new vocabulary and belongs to S2.
+        proj_line += "   (LOW CONF — limited evidence)"
     lines.append(proj_line)
     lines.append("")
     lines.append(alerts_line)
+    # #620 S1 D11: a warn or over verdict routes to the command that explains
+    # where the spend went, over this block's OWN vendor and period. `--until`
+    # is inclusive while the period is half-open, so it names the last day
+    # inside the window.
+    if status.verdict in ("warn", "over"):
+        since = inputs.week_start_at
+        until = _lib_alert_scope.inclusive_last_day(inputs.week_end_at)
+        selector = "" if provider == "claude" else f" --source {provider}"
+        lines.append("")
+        lines.append("  " + _lib_alert_scope.next_step_line(
+            f"cctally project{selector} --since {since:%Y-%m-%d} "
+            f"--until {until:%Y-%m-%d}",
+            provider=provider,
+            window_start=inputs.week_start_at,
+            window_end=inputs.week_end_at,
+            tz=tz,
+        ))
     return lines
 
 
@@ -2654,6 +2858,7 @@ def _budget_render_terminal(
         header_label=header,
         alerts_line=_budget_alerts_line(budget_cfg, status),
         color=color,
+        tz=tz,
     )
     print("\n".join(lines))
     return 0
@@ -2687,6 +2892,7 @@ def _print_codex_section(codex_cfg, codex_inputs, codex_status, tz, args) -> Non
     lines = _budget_block_lines(
         codex_inputs, codex_status,
         header_label=header, alerts_line=alerts_line, color=color,
+        provider="codex", tz=tz,
     )
     print("\n" + "\n".join(lines))
 
@@ -3073,7 +3279,9 @@ def _build_budget_snapshot(
         _lib_share.Row(cells={"metric": _lib_share.TextCell("Projected EOW (high)"),
                               "value": _lib_share.MoneyCell(status.projected_eow_high_usd)}),
     )
-    notes = ("LOW CONF — early in week",) if status.low_confidence else ()
+    # #620 S1 D10 — the same neutral string the terminal renders, because the
+    # shared artifact and the terminal describe one status.
+    notes = ("LOW CONF — limited evidence",) if status.low_confidence else ()
     return _lib_share.ShareSnapshot(
         cmd="budget",
         title=title,

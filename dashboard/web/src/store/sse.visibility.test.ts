@@ -10,7 +10,9 @@
 // task switch. Switching away and back inside it produces no reconnect at all;
 // a longer cycle produces at most one reconnect per hidden interval.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { startSSE, closeSSE, _resetForTests as _resetSSE } from './sse';
+import {
+  startSSE, closeSSE, connectionState, _resetForTests as _resetSSE,
+} from './sse';
 import {
   _resetForTests as _resetStore, dispatch, getState, updateSnapshot,
 } from './store';
@@ -60,7 +62,7 @@ function alertRow(id: string) {
 function withAlerts(genAt: string, ids: string[]): Envelope {
   const rows = ids.map(alertRow);
   return envelope(genAt, 10, {
-    source_schema_version: 10,
+    source_schema_version: 11,
     default_source: 'claude',
     source_order: ['claude', 'codex', 'all'],
     sources: {
@@ -132,6 +134,30 @@ afterEach(() => {
 });
 
 describe('#583 S3 §8 — the hidden-tab grace period', () => {
+  it('reports a deliberate hidden-tab suspension instead of connected', () => {
+    startSSE();
+    currentMain().emitUpdate(envelope('2026-04-20T12:00:10Z'));
+
+    setVisibility('hidden');
+    vi.advanceTimersByTime(GRACE_MS);
+
+    expect(connectionState()).toBe('suspended');
+  });
+
+  it('reports resuming until the returning tab accepts a fresh seed', () => {
+    startSSE();
+    currentMain().emitUpdate(envelope('2026-04-20T12:00:10Z'));
+    expect(connectionState()).toBe('connected');
+
+    setVisibility('hidden');
+    vi.advanceTimersByTime(GRACE_MS);
+    setVisibility('visible');
+
+    expect(connectionState()).toBe('resuming');
+    currentMain().emitUpdate(envelope('2026-04-20T12:01:00Z'));
+    expect(connectionState()).toBe('connected');
+  });
+
   it('does not reconnect when the tab is hidden and restored inside the grace', () => {
     startSSE();
     currentMain().emitUpdate(envelope('2026-04-20T12:00:10Z'));
@@ -163,12 +189,15 @@ describe('#583 S3 §8 — the hidden-tab grace period', () => {
   });
 
   it('retains the last snapshot and the ordering state across a suspend', () => {
-    startSSE();
+    const onConnect = vi.fn();
+    startSSE({ onConnect });
     currentMain().emitUpdate(envelope('2026-04-20T12:00:10Z', 7));
+    expect(onConnect).toHaveBeenCalledTimes(1);
 
     setVisibility('hidden');
     vi.advanceTimersByTime(GRACE_MS);
     setVisibility('visible');
+    expect(connectionState()).toBe('resuming');
 
     // The snapshot survives: suspension is not a teardown.
     expect(getState().snapshot?.header.used_pct).toBe(7);
@@ -177,6 +206,12 @@ describe('#583 S3 §8 — the hidden-tab grace period', () => {
     // the suspend path must not, or a stale replay would repaint the board.
     currentMain().emitUpdate(envelope('2026-04-20T12:00:05Z', 99));
     expect(getState().snapshot?.header.used_pct).toBe(7);
+    expect(connectionState()).toBe('resuming');
+    expect(onConnect).toHaveBeenCalledTimes(1);
+
+    currentMain().emitUpdate(envelope('2026-04-20T12:01:00Z', 42));
+    expect(connectionState()).toBe('connected');
+    expect(onConnect).toHaveBeenCalledTimes(2);
   });
 
   it('increments the generation when the grace timer closes the stream', () => {

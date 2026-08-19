@@ -10,6 +10,7 @@ import { ForecastModal } from './ForecastModal';
 import { CurrentWeekModal } from './CurrentWeekModal';
 import { WeeklyModal } from './WeeklyModal';
 import { MonthlyModal } from './MonthlyModal';
+import { makeAllCombined } from '../test-utils/sourceEnvelope';
 
 const envelope = fixture as unknown as Envelope;
 
@@ -723,6 +724,57 @@ describe('All provider sections are named by their own heading (#556 S4)', () =>
       /^(Claude subscription week|Codex native 7-day quota)$/,
       false,
     );
+  });
+
+  it('lists each distinct certified account-cycle range without inventing one shared period', () => {
+    const composed = structuredClone(envelope);
+    composed.sources!.all.data!.combined = makeAllCombined();
+    const combined = composed.sources!.all.data!.combined;
+    combined.legs.claude = {
+      state: 'current', scope: 'account_cycles', cost_usd: 8.4, total_tokens: null,
+      accounts: [
+        {
+          account_key: 'a'.repeat(32), cost_usd: 3.4,
+          period: {
+            kind: 'subscription_week',
+            start_at: '2026-04-21T00:00:00Z', end_at: '2026-04-28T00:00:00Z',
+          },
+        },
+        {
+          account_key: 'b'.repeat(32), cost_usd: 5,
+          period: {
+            kind: 'subscription_week',
+            start_at: '2026-04-21T00:00:00Z', end_at: '2026-04-28T00:00:00Z',
+          },
+        },
+      ],
+    };
+    combined.legs.codex = {
+      state: 'current', scope: 'account_cycles', cost_usd: 12.3, total_tokens: null,
+      accounts: [{
+        account_key: 'c'.repeat(32), cost_usd: 12.3,
+        period: {
+          kind: 'native_7_day_cycle',
+          start_at: '2026-04-23T00:00:00Z', end_at: '2026-04-30T00:00:00Z',
+        },
+      }],
+    };
+    act(() => {
+      updateSnapshot(composed);
+      dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    });
+
+    const { container } = render(<CurrentWeekModal />);
+    const ranges = container.querySelector('[data-testid="all-account-cycle-ranges"]')!;
+    expect(ranges).not.toBeNull();
+    expect(ranges.textContent).toContain('Claude subscription week · 2 accounts');
+    expect(ranges.textContent).toContain('Codex native 7-day cycle · 1 account');
+    expect(ranges.querySelectorAll('li')).toHaveLength(2);
+    expect([...ranges.querySelectorAll('time')].map((node) => node.dateTime)).toEqual([
+      '2026-04-21T00:00:00Z', '2026-04-28T00:00:00Z',
+      '2026-04-23T00:00:00Z', '2026-04-30T00:00:00Z',
+    ]);
+    expect(ranges.textContent).not.toContain('shared period');
   });
 
   it('drops embedded subsection headings to h4 so they are not peers of their provider', () => {

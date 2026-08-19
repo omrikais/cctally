@@ -21,6 +21,8 @@ import sqlite3
 import sys
 
 import _lib_diff_kernel as dk
+# #620 S1 D11: the one affordance shape every warning state renders.
+import _lib_alert_scope
 
 from _cctally_core import _command_as_of, eprint
 
@@ -279,4 +281,22 @@ def cmd_diff(args: argparse.Namespace) -> int:
         result, color=color, width=width, raw_aggregates=result.raw_totals,
         tz=tz_obj, compact=args.compact,
     ))
+    # #620 S1 D11: when the two windows are of different lengths the absolute
+    # dollars on screen are per-day normalizations, so route to the command
+    # that reports window A's real, un-normalized total.
+    if result.mismatched_length and not result.auto_normalized:
+        source = getattr(args, "source", None) or "claude"
+        a = result.window_a
+        # Full UTC instants, not bare dates: `range-cost -s/-e` are parsed by
+        # `parse_iso_datetime`, which reads a naive value as host-local and
+        # never extends a date to end-of-day, so a date-only selector would
+        # drop every hour after midnight from the window the line states.
+        print(_lib_alert_scope.next_step_line(
+            f"cctally range-cost -s {a.start_utc:%Y-%m-%dT%H:%M:%SZ} "
+            f"-e {a.end_utc:%Y-%m-%dT%H:%M:%SZ} -b --source {source}",
+            provider=source,
+            window_start=a.start_utc,
+            window_end=a.end_utc,
+            tz=tz_obj,
+        ))
     return 0

@@ -42,6 +42,7 @@ from _lib_dashboard_sources import (
     canonical_alerted_at,
     canonical_alerted_at_sql,
     claude_stats_digest,
+    combined_accounting_version,
     codex_stats_digest,
     dashboard_resource_key,
 )
@@ -72,6 +73,7 @@ from _lib_source_analytics import (
     build_codex_project_result,
     collision_safe_project_label_map,
 )
+from _lib_source_identity import identity_path
 from _lib_view_models import (
     CodexWeeklyView,
     build_codex_daily_view,
@@ -2258,7 +2260,9 @@ def _session_wire(
         # session paths from distinct $CODEX_HOME roots.  The opaque detail
         # key must use that same grouping identity or two visible rows route
         # to one another's detail payload.
-        root_identity = row.codex_root or "single-root"
+        root_identity = (
+            identity_path(row.codex_root) if row.codex_root else "single-root"
+        )
         row_metadata = (metadata or {}).get((str(row.codex_root or ""), str(row.session_id_path)))
         if row_metadata is None and metadata is not None:
             row_metadata = next((
@@ -2705,6 +2709,86 @@ def _codex_account_admits(scope_key: str | None, row_key: object) -> bool:
     return key in (scope_key, _lib_accounts.UNATTRIBUTED)
 
 
+def _quota_breakdown_capture_key(
+    account_key: str | None,
+    identity: QuotaWindowIdentity,
+    resets_at: dt.datetime,
+) -> tuple[object, ...]:
+    return (
+        account_key,
+        identity.source_root_key,
+        identity.logical_limit_key,
+        identity.observed_slot,
+        identity.window_minutes,
+        identity.account_key,
+        resets_at.astimezone(UTC).isoformat(),
+    )
+
+
+def _capture_quota_breakdown_evidence(
+    context: DashboardReadContext,
+    observations: Iterable[object],
+) -> Mapping[tuple[object, ...], tuple[tuple, tuple]]:
+    """Capture every fold-dependent weekly read from one cache generation.
+
+    The account partitions and `build_blocks` fold are intentionally cheap and
+    may run inside the pin: their only purpose is to enumerate the bounded
+    identity set whose durable breakdown and 5h-correlation reads cannot be
+    issued after rollback. Expensive row aggregation remains in
+    `_quota_read_model` and consumes these values later.
+    """
+    values = tuple(observations)
+    partitions: list[tuple[str | None, tuple[object, ...]]] = [(None, values)]
+    account_keys = sorted({
+        str(observation.identity.account_key) for observation in values
+    })
+    partitions.extend((key, tuple(
+        observation for observation in values
+        if str(observation.identity.account_key) == key
+    )) for key in account_keys)
+    captured: dict[tuple[object, ...], tuple[tuple, tuple]] = {}
+    for account_key, partition in partitions:
+        for block in build_blocks(partition):
+            identity = block.identity
+            if identity.window_minutes != 10_080 or block.resets_at <= context.now_utc:
+                continue
+            key = _quota_breakdown_capture_key(
+                account_key, identity, block.resets_at)
+            try:
+                canonical_rows = codex_quota_breakdown(
+                    identity,
+                    block.resets_at,
+                    speed=context.speed,
+                    cache_conn=context.cache_conn,
+                    stats_conn=context.stats_conn,
+                    account_key=account_key,
+                )
+            except sqlite3.Error:
+                canonical_rows = ()
+            correlated_five_hour: tuple = ()
+            if canonical_rows:
+                try:
+                    correlated_five_hour = tuple(
+                        observation
+                        for observation in _cached_codex_quota_observations(
+                            source_root_keys={identity.source_root_key},
+                            cache_conn=context.cache_conn,
+                            stats_conn=context.stats_conn,
+                            stats_identity=context.stats_identity,
+                            captured_at_or_after=block.nominal_start_at,
+                        )
+                        if observation.identity.window_minutes == 300
+                        and observation.identity.observed_slot == identity.observed_slot
+                        and observation.identity.limit_id == identity.limit_id
+                        and _codex_account_admits(
+                            account_key, observation.identity.account_key)
+                    )
+                except sqlite3.Error:
+                    correlated_five_hour = ()
+            captured[key] = (tuple(canonical_rows), correlated_five_hour)
+    return MappingProxyType(captured)
+
+
 def _quota_read_model(
     context: DashboardReadContext,
     observations: Iterable[object],
@@ -2712,6 +2796,7 @@ def _quota_read_model(
     accounting_entries: Iterable[object] = (),
     account_key: str | None = None,
     decorated: bool,
+    captured_breakdowns: "Mapping[tuple[object, ...], tuple[tuple, tuple]] | None" = None,
 ) -> dict[str, object]:
     """Use S2's pure history/block/forecast kernels over cache evidence.
 
@@ -2824,43 +2909,52 @@ def _quota_read_model(
             < block.resets_at
         )
         canonical_rows = ()
+        correlated_five_hour = ()
         if identity.window_minutes == 10_080 and block.resets_at > context.now_utc:
-            try:
-                canonical_rows = codex_quota_breakdown(
-                    identity,
-                    block.resets_at,
-                    speed=context.speed,
-                    cache_conn=context.cache_conn,
-                    stats_conn=context.stats_conn,
-                    account_key=account_key,
+            if captured_breakdowns is not None:
+                canonical_rows, correlated_five_hour = captured_breakdowns.get(
+                    _quota_breakdown_capture_key(
+                        account_key, identity, block.resets_at),
+                    ((), ()),
                 )
-            except sqlite3.Error:
-                # Older or partially migrated stores retain the bounded
-                # observation-derived fallback below.  A coherent current
-                # store always has the durable projection used by the CLI.
-                canonical_rows = ()
-        if canonical_rows:
-            try:
-                # #416 Slice 3A review F4: this load is bounded by root, slot
-                # and `limit_id` only, so under focus the crossing was annotated
-                # with whichever ACCOUNT's 5h observation happened to sort last.
-                correlated_five_hour = tuple(
-                    observation
-                    for observation in _cached_codex_quota_observations(
-                        source_root_keys={identity.source_root_key},
+            else:
+                try:
+                    canonical_rows = codex_quota_breakdown(
+                        identity,
+                        block.resets_at,
+                        speed=context.speed,
                         cache_conn=context.cache_conn,
                         stats_conn=context.stats_conn,
-                        stats_identity=context.stats_identity,
-                        captured_at_or_after=block.nominal_start_at,
+                        account_key=account_key,
                     )
-                    if observation.identity.window_minutes == 300
-                    and observation.identity.observed_slot == identity.observed_slot
-                    and observation.identity.limit_id == identity.limit_id
-                    and _codex_account_admits(
-                        account_key, observation.identity.account_key)
-                )
-            except sqlite3.Error:
-                correlated_five_hour = ()
+                except sqlite3.Error:
+                    # Older or partially migrated stores retain the bounded
+                    # observation-derived fallback below.  A coherent current
+                    # store always has the durable projection used by the CLI.
+                    canonical_rows = ()
+        if canonical_rows:
+            if captured_breakdowns is None:
+                try:
+                    # #416 Slice 3A review F4: this load is bounded by root,
+                    # slot and `limit_id` only, so under focus the crossing was
+                    # once annotated with whichever account sorted last.
+                    correlated_five_hour = tuple(
+                        observation
+                        for observation in _cached_codex_quota_observations(
+                            source_root_keys={identity.source_root_key},
+                            cache_conn=context.cache_conn,
+                            stats_conn=context.stats_conn,
+                            stats_identity=context.stats_identity,
+                            captured_at_or_after=block.nominal_start_at,
+                        )
+                        if observation.identity.window_minutes == 300
+                        and observation.identity.observed_slot == identity.observed_slot
+                        and observation.identity.limit_id == identity.limit_id
+                        and _codex_account_admits(
+                            account_key, observation.identity.account_key)
+                    )
+                except sqlite3.Error:
+                    correlated_five_hour = ()
 
             for row in canonical_rows:
                 milestone_rows.append({
@@ -3359,6 +3453,7 @@ def refresh_codex_source_clock(
         # omission silently drops the authoritative account count and makes the
         # combined figure fail closed on an idle tick that changed nothing else.
         account_scope=state.account_scope,
+        combined_accounting=state.combined_accounting,
         private_session_labels=state.private_session_labels,
         # #556 S2 §3.6: the aggregate carrier travels with the rows it
         # describes. This clock refreshes presentation axes only and publishes
@@ -4103,8 +4198,10 @@ def _codex_accounts_wire(
     accounting_start: dt.datetime,
     accounting_end: dt.datetime,
     population: tuple[object, ...],
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Return ``(accounts_wire, hero_cycles_wire)`` for a decorated Codex source.
+) -> tuple[
+    list[dict[str, object]], list[dict[str, object]], dict[str, object]
+]:
+    """Return cards, hero cycles, and their server-only spend certificate.
 
     ``population`` is the merged, encounter-ordered accounting read every card
     is derived from (#583 S5 change 2). This function issues no accounting SQL
@@ -4270,6 +4367,7 @@ def _codex_accounts_wire(
 
     accounts_wire: list[dict[str, object]] = []
     hero_cycles_wire: list[dict[str, object]] = []
+    contributions: list[dict[str, object]] = []
     for key in ordered_keys:
         cyc = cycle_by_account.get(key)
         is_unattributed = key == _lib_accounts.UNATTRIBUTED
@@ -4320,6 +4418,23 @@ def _codex_accounts_wire(
             card["spendWindow"] = fallback_window
         accounts_wire.append(card)
         if cyc is not None and not is_unattributed:
+            contribution_period = {
+                "kind": "native_7_day_cycle",
+                "start_at": cyc.start_at.astimezone(UTC).isoformat(),
+                "end_at": cyc.resets_at.astimezone(UTC).isoformat(),
+            }
+        else:
+            contribution_period = {
+                "kind": "trailing_7_day_cycle",
+                "start_at": fallback_start.astimezone(UTC).isoformat(),
+                "end_at": context.now_utc.astimezone(UTC).isoformat(),
+            }
+        contributions.append({
+            "account_key": key,
+            "cost_usd": totals["spendUsd"],
+            "period": contribution_period,
+        })
+        if cyc is not None and not is_unattributed:
             hero_cycles_wire.append({
                 "accountKey": key,
                 "window_minutes": cyc.window_minutes,
@@ -4329,7 +4444,11 @@ def _codex_accounts_wire(
                 "cost_usd": totals["spendUsd"],
                 "total_tokens": totals["totalTokens"],
             })
-    return accounts_wire, hero_cycles_wire
+    return accounts_wire, hero_cycles_wire, {
+        "scope": "account_cycles",
+        "status": "certified",
+        "contributions": tuple(contributions),
+    }
 
 
 def _codex_partition_by_account(
@@ -4447,6 +4566,7 @@ def _codex_account_scopes_wire(
     changed_new_by_account: Mapping[str, tuple[CodexEntry, ...]] | None = None,
     changed_old_rows_by_account: Mapping[str, tuple[object, ...]] | None = None,
     changed_new_rows_by_account: Mapping[str, tuple[object, ...]] | None = None,
+    captured_breakdowns: "Mapping[tuple[object, ...], tuple[tuple, tuple]] | None" = None,
 ) -> dict[str, dict[str, object]]:
     """The per-account CHILDREN of the merged Codex read model (spec §5.3).
 
@@ -4526,6 +4646,7 @@ def _codex_account_scopes_wire(
             # #429 §4.4: this wire is only ever reached under decoration — the
             # caller gates the whole `account_scopes` surface on it.
             decorated=True,
+            captured_breakdowns=captured_breakdowns,
         )
         # Each decorated child owns the only honest cycle index for that
         # account. Reusing a merged parent index here would render account A's
@@ -4755,7 +4876,7 @@ def _claude_accounts_wire(
     stats_conn: sqlite3.Connection,
     *,
     now_utc: dt.datetime,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], dict[str, object]]:
     """Per-account Claude hero cards (#341 Task 4, Ruling C).
 
     Symmetric with ``_codex_accounts_wire``: the caller gates on
@@ -4784,13 +4905,38 @@ def _claude_accounts_wire(
             (key,),
         ).fetchone()
 
-    def _latest_cost(key: str) -> float:
+    def _latest_cost(key: str):
         row = stats_conn.execute(
-            "SELECT cost_usd FROM weekly_cost_snapshots WHERE account_key=? "
+            "SELECT cost_usd, week_start_at, week_end_at "
+            "FROM weekly_cost_snapshots WHERE account_key=? "
             "ORDER BY captured_at_utc DESC LIMIT 1",
             (key,),
         ).fetchone()
-        return float(row[0]) if row is not None and row[0] is not None else 0.0
+        if row is None or row[0] is None:
+            return 0.0, None, "account_cost_unresolved"
+        try:
+            start = dt.datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+            end = dt.datetime.fromisoformat(str(row[2]).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return float(row[0]), None, "account_cycle_unresolved"
+        if (
+            start.tzinfo is None or start.utcoffset() is None
+            or end.tzinfo is None or end.utcoffset() is None
+            or start >= end
+        ):
+            return float(row[0]), None, "account_cycle_unresolved"
+        start_at = start.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        end_at = end.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        contribution = {
+            "account_key": key,
+            "cost_usd": float(row[0]),
+            "period": {
+                "kind": "subscription_week",
+                "start_at": start_at,
+                "end_at": end_at,
+            },
+        }
+        return float(row[0]), contribution, None
 
     _claude_label_map = _cctally_account.display_label_map(stats_conn, "claude")
 
@@ -4804,12 +4950,20 @@ def _claude_accounts_wire(
         ordered_keys.append(_lib_accounts.UNATTRIBUTED)
 
     cards: list[dict[str, object]] = []
+    contributions: list[dict[str, object]] = []
+    unresolved_causes: set[str] = set()
     for key in ordered_keys:
         is_unattributed = key == _lib_accounts.UNATTRIBUTED
         usage = _latest_usage(key)
         weekly_pct = usage[0] if usage is not None else None
         five_hour_pct = usage[1] if usage is not None else None
         resets_at = usage[2] if usage is not None else None
+        spend_usd, contribution, unresolved_cause = _latest_cost(key)
+        if contribution is None:
+            unresolved_causes.add(
+                unresolved_cause or "account_reconciliation_failed")
+        else:
+            contributions.append(contribution)
         card: dict[str, object] = {
             "accountKey": key,
             "label": _claude_label_map.get(key) or _cctally_account.account_label(stats_conn, key),
@@ -4818,12 +4972,30 @@ def _claude_accounts_wire(
             "weeklyPercent": None if is_unattributed else weekly_pct,
             "fiveHourPercent": None if is_unattributed else five_hour_pct,
             "resetsAt": None if is_unattributed else resets_at,
-            "spendUsd": _latest_cost(key),
+            "spendUsd": spend_usd,
         }
         if is_unattributed:
             card["unattributed"] = True
+        if contribution is not None:
+            period = contribution["period"]
+            card["spendWindow"] = {
+                "kind": "subscription-week",
+                "startAt": period["start_at"],
+                "endAt": period["end_at"],
+            }
         cards.append(card)
-    return cards
+    certificate: dict[str, object] = {
+        "scope": "account_cycles",
+        "status": "unresolved" if unresolved_causes else "certified",
+        "contributions": tuple(contributions),
+    }
+    if unresolved_causes:
+        certificate["cause"] = (
+            "account_cost_unresolved"
+            if "account_cost_unresolved" in unresolved_causes
+            else "account_cycle_unresolved"
+        )
+    return cards, certificate
 
 
 def _codex_ingest_backlog_wire(
@@ -4904,151 +5076,30 @@ def reset_codex_source_caches() -> None:
     _lib_snapshot_cache.reset_codex_accounting_cache_state()
 
 
-def build_codex_source_state(
+@dataclass(frozen=True)
+class _CodexAccountingCapture:
+    qualified_entries: tuple[object, ...]
+    dirty_accounts: tuple[str, ...]
+    changed_old: tuple[object, ...]
+    changed_new: tuple[object, ...]
+    entries: tuple[object, ...]
+    metadata_incomplete: bool
+
+
+def _capture_codex_accounting(
     context: DashboardReadContext,
     *,
-    data_version: str,
-) -> SourceDashboardState:
-    """Build Codex data strictly from the coordinated cache/stats reads.
-
-    No sync, rollout scan, CLI parser, or fallback is reachable from this
-    adapter.  Period and session arithmetic remains delegated to the shipped
-    S3 view kernels, preserving the CLI's inclusive-token vocabulary.
-
-    The whole read runs under ONE ``codex_path_scope`` (#566 §5.1 item 1), so
-    the merged parent view and every per-account child share a single session
-    root resolution and a single parse per distinct session file. The scope is
-    opened here rather than further out because this is the boundary that owns
-    every Codex session view in the build, and it is discarded when the read
-    returns.
-    """
-    # #583 S5: this memo now survives across builds. It may do so ONLY because
-    # its key carries the stats-side identity as well as the cache legs -- see
-    # `_codex_quota_reuse_identity`. The clear that used to stand here existed
-    # because a decoration or account-registry change advances no cache.db leg
-    # and so could not move a cache-only key. Do not narrow that identity.
-    caches = _codex_source_caches()
-    cache_checkpoint = tuple(dict(cache) for cache in caches)
-    accounting_checkpoint = (
-        _lib_snapshot_cache.checkpoint_codex_accounting_cache_state()
-    )
-    try:
-        with codex_path_scope() as path_scope:
-            return _build_codex_source_state(
-                context, data_version=data_version, path_scope=path_scope,
-            )
-    except Exception:
-        for cache, prior in zip(caches, cache_checkpoint):
-            cache.clear()
-            cache.update(prior)
-        _lib_snapshot_cache.restore_codex_accounting_cache_state(
-            accounting_checkpoint)
-        raise
-
-
-def _build_codex_source_state(
-    context: DashboardReadContext,
-    *,
-    data_version: str,
+    accounting_start: dt.datetime,
+    accounting_end: dt.datetime,
+    active_roots: tuple[str, ...],
     path_scope: object,
-) -> SourceDashboardState:
-    active_roots = tuple(sorted(
-        str(row[0]) for row in context.cache_conn.execute(
-            "SELECT source_root_key FROM codex_source_roots"
-        )
-    ))
-    # This read is a function of the tick instant, so it does NOT reuse across
-    # ticks and the cross-build memo above cannot help it. Both bounds move
-    # with `context.now_utc`, which in production is the tick's wall clock
-    # (`bin/_cctally_tui.py`: `now_utc or dt.datetime.now(dt.timezone.utc)`).
-    #
-    # It cannot be made reusable by loading a memoizable superset and filtering
-    # in memory, and the reason is a property of the loader rather than of this
-    # call: `max_rows` is a SQL `LIMIT` under an `ORDER BY` whose leading term
-    # is `resets_at_utc > active_at`, so a superset truncates a DIFFERENT set of
-    # rows; and `_apply_codex_window_attribution_overlay` plus
-    # `adopt_unidentified_observations` are population-dependent folds run after
-    # the bound, so a wider population can change the account a retained
-    # observation carries. Filtering a superset would therefore change the
-    # published answer, not just its cost.
-    #
-    # Measured on a copy of the real store (276,391 retained Codex quota rows),
-    # warm, five samples after one untimed warm-up: 222.5 ms median per tick,
-    # range 210.7-231.3 ms.
-    #
-    # As a share, that is 13.9% of 1.60 s, and the denominator has to be named:
-    # 1.60 s is the sum of the three quota call sites when each is timed ALONE
-    # and UN-profiled on that store (this bounded read 222.5 ms, the five-hour
-    # correlation read 209.6 ms, the doctor's all-history `latest_per_identity`
-    # read 1,164.7 ms). The S5 measurement record's 2.571 s for
-    # `load_codex_quota_observations` is a cProfile total instead, so putting an
-    # un-profiled numerator over it reads about 8% and understates the share.
-    # Either way the site is well under the threshold that would have required a
-    # superset fix, which is why the design conclusion above stands. The
-    # doctor's read is about 73% of the un-profiled total and this memo never
-    # sees it.
-    quota_observations = _cached_codex_quota_observations(
-        source_root_keys=active_roots,
-        cache_conn=context.cache_conn,
-        stats_conn=context.stats_conn,
-        stats_identity=context.stats_identity,
-        # A key carrying the tick instant cannot match a retained entry, so the
-        # memo is bypassed rather than asked. On the share path
-        # `stats_identity` is None as well, and establishing an identity for an
-        # unreachable key cost 35 ms of stats.db work per render.
-        memoize=False,
-        captured_at_or_after=(
-            context.now_utc - dt.timedelta(days=DASHBOARD_QUOTA_RECENT_DAYS)
-        ),
-        active_at=context.now_utc,
-        max_rows=DASHBOARD_QUOTA_OBSERVATION_LIMIT,
-    )
-    coherence = codex_projection_coherence(
-        context,
-    )
-    projection_incoherent = not coherence.coherent
-    ingest_backlog = _codex_ingest_backlog_wire(context.cache_conn)
-    # The cache reader's established report surface treats the ``now`` instant
-    # as inclusive.  The qualified adapter is half-open, so extend only its
-    # query/result boundary by one microsecond and keep all live budget sums
-    # explicitly half-open at ``now`` below.
-    accounting_end = context.now_utc + dt.timedelta(microseconds=1)
-    accounting_start = context.range_start
-    if context.codex_budget is not None:
-        # #556 S5 Unit 2 (Unit 1 review R6, widened) — this is the SECOND
-        # unguarded call to the window resolver, and unlike
-        # `_codex_budget_cost_events` it had no boundary of its own. It sits
-        # outside every other `try` in this function, so an unresolvable window
-        # escaped into `_tui_build_source_bundle`'s `source_build_failed`
-        # handler and destroyed the entire Codex provider's data — the exact
-        # failure §3.5 exists to prevent, reached from a different line.
-        #
-        # Degrading to the un-widened accounting range cannot publish a false
-        # figure: the same failure reaches `_codex_budget_status_domain`, which
-        # nulls the status and names `budget_compute_failed`.
-        try:
-            _period, budget_start, _budget_end = _configured_codex_budget_window(context)
-        except Exception:
-            _warn_codex_budget_window_once("accounting_range")
-        else:
-            accounting_start = min(accounting_start, budget_start)
-    health = load_codex_project_metadata_health(
-        cache_conn=context.cache_conn,
-        start=accounting_start,
-        end=accounting_end,
-    )
-    metadata_incomplete = health.incomplete_rows > 0
-    metadata_warning_message = (
-        f"{health.incomplete_rows} Codex accounting row(s) lack project metadata; "
-        "run `cctally cache-sync --source codex --rebuild`."
-        if metadata_incomplete
-        else "Codex project metadata could not be read; "
-        "run `cctally cache-sync --source codex --rebuild`."
-    )
+    metadata_incomplete: bool,
+) -> _CodexAccountingCapture:
+    """Read the incremental accounting carrier without folding public views."""
     qualified_entries: tuple[object, ...] = ()
-    accounting_dirty_accounts: tuple[str, ...] = ()
-    accounting_changed_old: tuple[object, ...] = ()
-    accounting_changed_new: tuple[object, ...] = ()
+    dirty_accounts: tuple[str, ...] = ()
+    changed_old: tuple[object, ...] = ()
+    changed_new: tuple[object, ...] = ()
     if not metadata_incomplete:
         try:
             cached_accounting = _lib_snapshot_cache.build_cached_codex_accounting(
@@ -5088,42 +5139,425 @@ def _build_codex_source_state(
                 identity_of=lambda entry: int(entry.cache_entry_id),
             )
             qualified_entries = cached_accounting.entries
-            accounting_dirty_accounts = cached_accounting.dirty_accounts
-            accounting_changed_old = cached_accounting.changed_old
-            accounting_changed_new = cached_accounting.changed_new
-            accounting_entries: tuple[object, ...] = qualified_entries
+            dirty_accounts = cached_accounting.dirty_accounts
+            changed_old = cached_accounting.changed_old
+            changed_new = cached_accounting.changed_new
+            entries: tuple[object, ...] = qualified_entries
         except QualifiedMetadataUnavailable:
-            # A cached read must be internally coherent, but retain accounting
-            # once if a defensive race or malformed row violates that premise.
             _lib_log.get_logger("dashboard").warning(
                 "Codex qualified metadata read became unavailable; using cache-only accounting fallback"
             )
             metadata_incomplete = True
             _lib_snapshot_cache.reset_codex_accounting_cache_state()
-            accounting_entries = load_cached_rooted_codex_accounting_entries(
+            entries = load_cached_rooted_codex_accounting_entries(
                 accounting_start,
                 accounting_end,
                 speed=context.speed,
                 cache_conn=context.cache_conn,
             )
-            accounting_dirty_accounts = tuple(sorted({
+            dirty_accounts = tuple(sorted({
                 str(getattr(entry, "account_key", "") or
                     _lib_accounts.UNATTRIBUTED)
-                for entry in accounting_entries
+                for entry in entries
             }))
     else:
         _lib_snapshot_cache.reset_codex_accounting_cache_state()
-        accounting_entries = load_cached_rooted_codex_accounting_entries(
+        entries = load_cached_rooted_codex_accounting_entries(
             accounting_start,
             accounting_end,
             speed=context.speed,
             cache_conn=context.cache_conn,
         )
-        accounting_dirty_accounts = tuple(sorted({
+        dirty_accounts = tuple(sorted({
             str(getattr(entry, "account_key", "") or
                 _lib_accounts.UNATTRIBUTED)
-            for entry in accounting_entries
+            for entry in entries
         }))
+    return _CodexAccountingCapture(
+        qualified_entries=qualified_entries,
+        dirty_accounts=dirty_accounts,
+        changed_old=changed_old,
+        changed_new=changed_new,
+        entries=tuple(entries),
+        metadata_incomplete=metadata_incomplete,
+    )
+
+
+@dataclass(frozen=True)
+class CodexSourceCapture:
+    """Every cache-backed input for a post-transaction Codex source build."""
+
+    context: DashboardReadContext
+    active_roots: tuple[str, ...]
+    quota_observations: tuple[object, ...]
+    projection_incoherent: bool
+    ingest_backlog: object
+    accounting_start: dt.datetime
+    accounting_end: dt.datetime
+    health: object
+    accounting: _CodexAccountingCapture
+    accounting_exists: bool
+    accounting_exists_error: Exception | None
+    conversation_metadata: Mapping
+    decorated: bool
+    card_population: tuple[object, ...]
+    breakdowns: Mapping
+    cache_checkpoint: tuple[dict, ...]
+    accounting_checkpoint: object
+
+
+def _restore_codex_source_capture(capture: CodexSourceCapture) -> None:
+    for cache, prior in zip(_codex_source_caches(), capture.cache_checkpoint):
+        cache.clear()
+        cache.update(prior)
+    _lib_snapshot_cache.restore_codex_accounting_cache_state(
+        capture.accounting_checkpoint)
+
+
+def capture_codex_source_state(
+    context: DashboardReadContext,
+    *,
+    path_scope: object,
+) -> CodexSourceCapture:
+    """Capture Codex cache evidence without constructing public view models."""
+    caches = _codex_source_caches()
+    cache_checkpoint = tuple(dict(cache) for cache in caches)
+    accounting_checkpoint = (
+        _lib_snapshot_cache.checkpoint_codex_accounting_cache_state()
+    )
+    try:
+        active_roots = tuple(sorted(
+            str(row[0]) for row in context.cache_conn.execute(
+                "SELECT source_root_key FROM codex_source_roots"
+            )
+        ))
+        quota_observations = tuple(_cached_codex_quota_observations(
+            source_root_keys=active_roots,
+            cache_conn=context.cache_conn,
+            stats_conn=context.stats_conn,
+            stats_identity=context.stats_identity,
+            memoize=False,
+            captured_at_or_after=(
+                context.now_utc - dt.timedelta(days=DASHBOARD_QUOTA_RECENT_DAYS)
+            ),
+            active_at=context.now_utc,
+            max_rows=DASHBOARD_QUOTA_OBSERVATION_LIMIT,
+        ))
+        projection_incoherent = not codex_projection_coherence(context).coherent
+        ingest_backlog = _codex_ingest_backlog_wire(context.cache_conn)
+        accounting_end = context.now_utc + dt.timedelta(microseconds=1)
+        accounting_start = context.range_start
+        if context.codex_budget is not None:
+            try:
+                _period, budget_start, _budget_end = (
+                    _configured_codex_budget_window(context)
+                )
+            except Exception:
+                _warn_codex_budget_window_once("accounting_range")
+            else:
+                accounting_start = min(accounting_start, budget_start)
+        health = load_codex_project_metadata_health(
+            cache_conn=context.cache_conn,
+            start=accounting_start,
+            end=accounting_end,
+        )
+        accounting = _capture_codex_accounting(
+            context,
+            accounting_start=accounting_start,
+            accounting_end=accounting_end,
+            active_roots=active_roots,
+            path_scope=path_scope,
+            metadata_incomplete=health.incomplete_rows > 0,
+        )
+        try:
+            accounting_exists = has_cached_codex_accounting_entries(
+                cache_conn=context.cache_conn)
+            accounting_exists_error = None
+        except Exception as exc:
+            # This probe is semantically relevant only when quota evidence
+            # cannot resolve a native cycle. Capture the fault beside the
+            # value, then defer it until the build knows that branch is live.
+            accounting_exists = False
+            accounting_exists_error = exc
+        conversation_metadata = MappingProxyType(
+            _codex_conversation_metadata(context.cache_conn))
+        try:
+            import _cctally_account
+            decorated = _cctally_account.provider_is_decorated(
+                context.stats_conn, "codex")
+        except Exception:
+            decorated = False
+        card_population_start = accounting_start
+        if decorated:
+            card_population_start = min(
+                context.range_start,
+                context.now_utc - dt.timedelta(
+                    minutes=ACCOUNT_WEEKLY_WINDOW_MINUTES),
+                accounting_start,
+            )
+        else:
+            # The undecorated parent has no account cards. It needs an earlier
+            # population only when a healthy representative cycle actually
+            # resolves; an unresolved narrow share must not pay for a seven-day
+            # read whose rows no published domain can consume.
+            try:
+                captured_cycles = _resolve_codex_weekly_cycle(
+                    quota_observations, context.now_utc)
+            except CodexCycleUnavailable:
+                captured_cycles = ()
+            if captured_cycles:
+                card_population_start = min(
+                    accounting_start, captured_cycles[0].start_at)
+        card_population = (
+            accounting.entries
+            if card_population_start == accounting_start
+            else load_cached_rooted_codex_accounting_entries(
+                card_population_start,
+                accounting_end,
+                speed=context.speed,
+                cache_conn=context.cache_conn,
+            )
+        )
+        breakdowns = _capture_quota_breakdown_evidence(
+            context, quota_observations)
+        return CodexSourceCapture(
+            context=context,
+            active_roots=active_roots,
+            quota_observations=quota_observations,
+            projection_incoherent=projection_incoherent,
+            ingest_backlog=ingest_backlog,
+            accounting_start=accounting_start,
+            accounting_end=accounting_end,
+            health=health,
+            accounting=accounting,
+            accounting_exists=accounting_exists,
+            accounting_exists_error=accounting_exists_error,
+            conversation_metadata=conversation_metadata,
+            decorated=decorated,
+            card_population=tuple(card_population),
+            breakdowns=breakdowns,
+            cache_checkpoint=cache_checkpoint,
+            accounting_checkpoint=accounting_checkpoint,
+        )
+    except Exception:
+        for cache, prior in zip(caches, cache_checkpoint):
+            cache.clear()
+            cache.update(prior)
+        _lib_snapshot_cache.restore_codex_accounting_cache_state(
+            accounting_checkpoint)
+        raise
+
+
+def build_codex_source_state_from_capture(
+    capture: CodexSourceCapture,
+    *,
+    data_version: str,
+    path_scope: object,
+) -> SourceDashboardState:
+    """Fold one captured Codex generation without issuing cache SQL."""
+    try:
+        return _build_codex_source_state(
+            capture.context,
+            data_version=data_version,
+            path_scope=path_scope,
+            capture=capture,
+        )
+    except Exception:
+        _restore_codex_source_capture(capture)
+        raise
+
+
+def build_codex_source_state(
+    context: DashboardReadContext,
+    *,
+    data_version: str,
+) -> SourceDashboardState:
+    """Build Codex data strictly from the coordinated cache/stats reads.
+
+    No sync, rollout scan, CLI parser, or fallback is reachable from this
+    adapter.  Period and session arithmetic remains delegated to the shipped
+    S3 view kernels, preserving the CLI's inclusive-token vocabulary.
+
+    The whole read runs under ONE ``codex_path_scope`` (#566 §5.1 item 1), so
+    the merged parent view and every per-account child share a single session
+    root resolution and a single parse per distinct session file. The scope is
+    opened here rather than further out because this is the boundary that owns
+    every Codex session view in the build, and it is discarded when the read
+    returns.
+    """
+    # #583 S5: this memo now survives across builds. It may do so ONLY because
+    # its key carries the stats-side identity as well as the cache legs -- see
+    # `_codex_quota_reuse_identity`. The clear that used to stand here existed
+    # because a decoration or account-registry change advances no cache.db leg
+    # and so could not move a cache-only key. Do not narrow that identity.
+    with codex_path_scope() as path_scope:
+        capture = capture_codex_source_state(
+            context, path_scope=path_scope)
+        return build_codex_source_state_from_capture(
+            capture, data_version=data_version, path_scope=path_scope)
+
+
+def _build_codex_cycle_accounting(
+    rows: Iterable[object],
+    *,
+    now_utc: dt.datetime,
+    display_tz_name: str | None,
+    speed: str,
+) -> tuple[list[CodexEntry], float]:
+    """Price the hero's already-captured native-cycle accounting rows."""
+    entries = _codex_entries_from_accounting(rows)
+    cost_usd = build_codex_daily_view(
+        entries,
+        now_utc=now_utc,
+        tz_name=display_tz_name,
+        speed=speed,
+    ).total_cost_usd
+    return entries, cost_usd
+
+
+def _build_codex_source_state(
+    context: DashboardReadContext,
+    *,
+    data_version: str,
+    path_scope: object,
+    capture: "CodexSourceCapture | None" = None,
+) -> SourceDashboardState:
+    active_roots = (
+        capture.active_roots
+        if capture is not None
+        else tuple(sorted(
+            str(row[0]) for row in context.cache_conn.execute(
+                "SELECT source_root_key FROM codex_source_roots"
+            )
+        ))
+    )
+    # This read is a function of the tick instant, so it does NOT reuse across
+    # ticks and the cross-build memo above cannot help it. Both bounds move
+    # with `context.now_utc`, which in production is the tick's wall clock
+    # (`bin/_cctally_tui.py`: `now_utc or dt.datetime.now(dt.timezone.utc)`).
+    #
+    # It cannot be made reusable by loading a memoizable superset and filtering
+    # in memory, and the reason is a property of the loader rather than of this
+    # call: `max_rows` is a SQL `LIMIT` under an `ORDER BY` whose leading term
+    # is `resets_at_utc > active_at`, so a superset truncates a DIFFERENT set of
+    # rows; and `_apply_codex_window_attribution_overlay` plus
+    # `adopt_unidentified_observations` are population-dependent folds run after
+    # the bound, so a wider population can change the account a retained
+    # observation carries. Filtering a superset would therefore change the
+    # published answer, not just its cost.
+    #
+    # Measured on a copy of the real store (276,391 retained Codex quota rows),
+    # warm, five samples after one untimed warm-up: 222.5 ms median per tick,
+    # range 210.7-231.3 ms.
+    #
+    # As a share, that is 13.9% of 1.60 s, and the denominator has to be named:
+    # 1.60 s is the sum of the three quota call sites when each is timed ALONE
+    # and UN-profiled on that store (this bounded read 222.5 ms, the five-hour
+    # correlation read 209.6 ms, the doctor's all-history `latest_per_identity`
+    # read 1,164.7 ms). The S5 measurement record's 2.571 s for
+    # `load_codex_quota_observations` is a cProfile total instead, so putting an
+    # un-profiled numerator over it reads about 8% and understates the share.
+    # Either way the site is well under the threshold that would have required a
+    # superset fix, which is why the design conclusion above stands. The
+    # doctor's read is about 73% of the un-profiled total and this memo never
+    # sees it.
+    quota_observations = (
+        capture.quota_observations
+        if capture is not None
+        else _cached_codex_quota_observations(
+            source_root_keys=active_roots,
+            cache_conn=context.cache_conn,
+            stats_conn=context.stats_conn,
+            stats_identity=context.stats_identity,
+            # A key carrying the tick instant cannot match a retained entry, so the
+            # memo is bypassed rather than asked. On the share path
+            # `stats_identity` is None as well, and establishing an identity for an
+            # unreachable key cost 35 ms of stats.db work per render.
+            memoize=False,
+            captured_at_or_after=(
+                context.now_utc - dt.timedelta(days=DASHBOARD_QUOTA_RECENT_DAYS)
+            ),
+            active_at=context.now_utc,
+            max_rows=DASHBOARD_QUOTA_OBSERVATION_LIMIT,
+        )
+    )
+    projection_incoherent = (
+        capture.projection_incoherent
+        if capture is not None
+        else not codex_projection_coherence(context).coherent
+    )
+    ingest_backlog = (
+        capture.ingest_backlog
+        if capture is not None
+        else _codex_ingest_backlog_wire(context.cache_conn)
+    )
+    # The cache reader's established report surface treats the ``now`` instant
+    # as inclusive.  The qualified adapter is half-open, so extend only its
+    # query/result boundary by one microsecond and keep all live budget sums
+    # explicitly half-open at ``now`` below.
+    accounting_end = (
+        capture.accounting_end
+        if capture is not None
+        else context.now_utc + dt.timedelta(microseconds=1)
+    )
+    accounting_start = (
+        capture.accounting_start
+        if capture is not None
+        else context.range_start
+    )
+    if capture is None and context.codex_budget is not None:
+        # #556 S5 Unit 2 (Unit 1 review R6, widened) — this is the SECOND
+        # unguarded call to the window resolver, and unlike
+        # `_codex_budget_cost_events` it had no boundary of its own. It sits
+        # outside every other `try` in this function, so an unresolvable window
+        # escaped into `_tui_build_source_bundle`'s `source_build_failed`
+        # handler and destroyed the entire Codex provider's data — the exact
+        # failure §3.5 exists to prevent, reached from a different line.
+        #
+        # Degrading to the un-widened accounting range cannot publish a false
+        # figure: the same failure reaches `_codex_budget_status_domain`, which
+        # nulls the status and names `budget_compute_failed`.
+        try:
+            _period, budget_start, _budget_end = _configured_codex_budget_window(context)
+        except Exception:
+            _warn_codex_budget_window_once("accounting_range")
+        else:
+            accounting_start = min(accounting_start, budget_start)
+    health = (
+        capture.health
+        if capture is not None
+        else load_codex_project_metadata_health(
+            cache_conn=context.cache_conn,
+            start=accounting_start,
+            end=accounting_end,
+        )
+    )
+    metadata_incomplete = health.incomplete_rows > 0
+    metadata_warning_message = (
+        f"{health.incomplete_rows} Codex accounting row(s) lack project metadata; "
+        "run `cctally cache-sync --source codex --rebuild`."
+        if metadata_incomplete
+        else "Codex project metadata could not be read; "
+        "run `cctally cache-sync --source codex --rebuild`."
+    )
+    accounting_capture = (
+        capture.accounting
+        if capture is not None
+        else _capture_codex_accounting(
+            context,
+            accounting_start=accounting_start,
+            accounting_end=accounting_end,
+            active_roots=active_roots,
+            path_scope=path_scope,
+            metadata_incomplete=metadata_incomplete,
+        )
+    )
+    qualified_entries = accounting_capture.qualified_entries
+    accounting_dirty_accounts = accounting_capture.dirty_accounts
+    accounting_changed_old = accounting_capture.changed_old
+    accounting_changed_new = accounting_capture.changed_new
+    accounting_entries = accounting_capture.entries
+    metadata_incomplete = accounting_capture.metadata_incomplete
     budget_entries = _codex_entries_from_accounting(accounting_entries)
     cycles_all: list[CodexCycleBoundary] = []
     try:
@@ -5141,29 +5575,43 @@ def _build_codex_source_state(
         # here leaves `cycle` unresolved, which `cycle_failure` below turns
         # into the hero failure the accounting axis actually reports.
         cycle = None
-    cycle_failure = cycle is None and has_cached_codex_accounting_entries(
-        cache_conn=context.cache_conn,
-    )
+    if cycle is None and capture is not None:
+        if capture.accounting_exists_error is not None:
+            raise capture.accounting_exists_error
+        accounting_exists = capture.accounting_exists
+    elif cycle is None:
+        accounting_exists = has_cached_codex_accounting_entries(
+            cache_conn=context.cache_conn)
+    else:
+        accounting_exists = False
+    cycle_failure = cycle is None and accounting_exists
     hero_failure = projection_incoherent or cycle_failure
     if cycle is None or hero_failure:
         cycle_entries: list[CodexEntry] = []
         cycle_cost_usd: float | None = None if hero_failure else 0.0
     else:
         cycle_end = min(accounting_end, cycle.resets_at)
-        cycle_rows = load_cached_rooted_codex_accounting_entries(
-            cycle.start_at,
-            cycle_end,
-            speed=context.speed,
-            cache_conn=context.cache_conn,
-            source_root_keys=cycle.source_root_keys,
+        cycle_rows = (
+            tuple(
+                row for row in capture.card_population
+                if cycle.start_at <= row.timestamp.astimezone(UTC) < cycle_end
+                and str(row.source_root_key) in cycle.source_root_keys
+            )
+            if capture is not None
+            else load_cached_rooted_codex_accounting_entries(
+                cycle.start_at,
+                cycle_end,
+                speed=context.speed,
+                cache_conn=context.cache_conn,
+                source_root_keys=cycle.source_root_keys,
+            )
         )
-        cycle_entries = _codex_entries_from_accounting(cycle_rows)
-        cycle_cost_usd = build_codex_daily_view(
-            cycle_entries,
+        cycle_entries, cycle_cost_usd = _build_codex_cycle_accounting(
+            cycle_rows,
             now_utc=context.now_utc,
-            tz_name=context.display_tz_name,
+            display_tz_name=context.display_tz_name,
             speed=context.speed,
-        ).total_cost_usd
+        )
     visible_accounting_entries = tuple(
         entry for entry in accounting_entries
         if context.range_start <= getattr(entry, "timestamp").astimezone(UTC) < accounting_end
@@ -5232,12 +5680,15 @@ def _build_codex_source_state(
     # R8 gate, resolved once before the parent weekly projection so that only
     # a decorated merged row gains the additive account axis. Focused children
     # and <=1-real-account providers remain byte-identical.
-    try:
-        import _cctally_account
-        _codex_decorated = _cctally_account.provider_is_decorated(
-            context.stats_conn, "codex")
-    except Exception:
-        _codex_decorated = False
+    if capture is not None:
+        _codex_decorated = capture.decorated
+    else:
+        try:
+            import _cctally_account
+            _codex_decorated = _cctally_account.provider_is_decorated(
+                context.stats_conn, "codex")
+        except Exception:
+            _codex_decorated = False
     weekly = _cached_codex_native_weekly_view(
         context.stats_conn,
         visible_accounting_entries,
@@ -5271,6 +5722,8 @@ def _build_codex_source_state(
         quota_observations,
         accounting_entries=visible_accounting_entries,
         decorated=_codex_decorated,
+        captured_breakdowns=(
+            capture.breakdowns if capture is not None else None),
     )
     # R8 gate, resolved ONCE and threaded (#341 Task 4 / #416 §5.8). Every
     # per-account decoration below — block/alert/budget `account_key`, the
@@ -5309,7 +5762,11 @@ def _build_codex_source_state(
         context, budget_entries, cost_events=budget_cost_events,
     )
     configured_budget = configured_budget_domain["status"]
-    conversation_metadata = _codex_conversation_metadata(context.cache_conn)
+    conversation_metadata = (
+        capture.conversation_metadata
+        if capture is not None
+        else _codex_conversation_metadata(context.cache_conn)
+    )
     cache_report = _codex_cache_report_wire(
         visible_accounting_entries,
         metadata=conversation_metadata,
@@ -5379,6 +5836,7 @@ def _build_codex_source_state(
     # projection (client-side chip filter); the hero renders per-account cards.
     accounts_wire: list[dict[str, object]] = []
     hero_cycles_wire: list[dict[str, object]] = []
+    combined_accounting: dict[str, object] | None = None
     account_scopes: dict[str, dict[str, object]] = {}
     # #556 S5 §3.8: bound OUTSIDE the try, because the degrade path below has to
     # be able to clear it, and the retained `clock_data` reads it either way.
@@ -5405,7 +5863,9 @@ def _build_codex_source_state(
                     minutes=ACCOUNT_WEEKLY_WINDOW_MINUTES),
                 accounting_start,
             )
-            if card_population_start == accounting_start:
+            if capture is not None:
+                card_population = capture.card_population
+            elif card_population_start == accounting_start:
                 # The build already holds this exact population, so reading it
                 # again would be one extra full-range pass over every retained
                 # Codex accounting row, per tick. The equality is the ordinary
@@ -5436,7 +5896,7 @@ def _build_codex_source_state(
                     speed=context.speed,
                     cache_conn=context.cache_conn,
                 )
-            accounts_wire, hero_cycles_wire = _codex_accounts_wire(
+            accounts_wire, hero_cycles_wire, combined_accounting = _codex_accounts_wire(
                 context,
                 quota_observations=quota_observations,
                 cycles=cycles_all,
@@ -5490,6 +5950,8 @@ def _build_codex_source_state(
                 changed_new_by_account=changed_new_by_account,
                 changed_old_rows_by_account=changed_old_rows_by_account,
                 changed_new_rows_by_account=changed_new_rows_by_account,
+                captured_breakdowns=(
+                    capture.breakdowns if capture is not None else None),
                 # Quota/stat generations are already represented by each
                 # child's quota observations, cycle and alert/budget rows in
                 # `_codex_account_scopes_wire`'s outer signature. Reuse the
@@ -5557,6 +6019,12 @@ def _build_codex_source_state(
             # degrade to the byte-stable undecorated shape.
             accounts_wire = []
             hero_cycles_wire = []
+            combined_accounting = {
+                "scope": "account_cycles",
+                "status": "unresolved",
+                "cause": "account_cost_unresolved",
+                "contributions": (),
+            }
             account_scopes = {}
             budget_events_by_account = {}
     # #416 QA P0-A — the "All accounts" headline is the MERGED spend and tokens
@@ -5593,7 +6061,9 @@ def _build_codex_source_state(
         # observation age and weekly-cycle evidence live on their own axes.
         freshness="fresh",
         warnings=tuple(warnings),
-        data_version=data_version,
+        data_version=combined_accounting_version(
+            data_version, combined_accounting,
+        ),
         last_success_at=context.now_utc,
         capabilities={
             "hero": (
@@ -5717,4 +6187,5 @@ def _build_codex_source_state(
             ),
         },
         private_session_labels=private_session_labels,
+        combined_accounting=combined_accounting,
     )

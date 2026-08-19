@@ -8,6 +8,14 @@ import { spendWindowLabel } from './fmt';
 const KIND = 'trailing-cycle' as const;
 
 describe('spendWindowLabel', () => {
+  it('names a certified Claude period as a subscription week', () => {
+    expect(spendWindowLabel({
+      kind: 'subscription-week',
+      startAt: '2026-04-20T00:00:00Z',
+      endAt: '2026-04-27T00:00:00Z',
+    })).toBe('subscription week');
+  });
+
   it('names a full native cycle as the operator-chosen phrase', () => {
     expect(spendWindowLabel({
       kind: KIND,

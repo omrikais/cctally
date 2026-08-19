@@ -153,6 +153,20 @@ model breakdown + recent sessions. Clicking a session in the drill
 opens the Session modal (replaces, not stacks). The modal's share
 affordance routes through the same `_build_project_snapshot` kernel as
 the panel and carries the active `windowWeeks` into the share flow.
+Project drill responses include the exact half-open bounds queried by the
+server, and the modal renders those provider-native bounds rather than
+reconstructing them in the browser. An `All` project ranking may therefore
+open a wider Claude drill than the selected legacy pill, while a Codex drill
+continues to state its independently retained range.
+
+A caption under the window selector writes out what the two percentage columns
+mean, because the terminal-style tooltips they used to rely on never appear on
+touch: `Used pp (sum)` adds each week's attributed usage percentage across the
+selected window, so it is a sum of percentage points rather than a share of any
+one week, and `Cost share` is measured against total project spend in that same
+window. On an installation with more than one Claude account, the panel and the
+modal also state that accounts are folded into one ranking and that their
+independent weekly quota percentages are never added together.
 
 The panel sits at index 4 of `DEFAULT_PANEL_ORDER` and is reachable via
 keyboard shortcut `5` (or the position-N digit if you have reordered
@@ -164,6 +178,30 @@ window-scoped trend points + drill payload (top models, recent
 sessions). Mirrors the SessionModal stale-while-revalidate pattern —
 the modal renders from the envelope's top-N summary first, then
 hydrates the full drill on demand.
+
+## Following a warning to its explanation
+
+Four warning states carry a button that opens the surface explaining that warning: the rows of the Recent-alerts modal, the alert toast, the budget block's `warn` and `over` verdicts, and the forecast modal's `cap` or `capped` verdict. Each is an ordinary `<button>`, so Tab reaches it and Enter or Space activates it; no keybinding is claimed for it.
+
+Where the button leads, by alert axis:
+
+| Axis | Opens |
+|---|---|
+| `weekly` | the Current Week modal, live week only |
+| `five_hour` | that block's detail, addressed by its recorded start — historical blocks included, while the block is still retained |
+| `budget` | the Current Week modal for a subscription-week period, or that month's period view for a calendar-month period |
+| `codex_budget` | that month's Codex period view for a calendar-month period |
+| `project_budget` | that project's drill in the Projects modal |
+| `projected` | the Forecast modal on the metric's own provider |
+
+**Following an alert re-measures the window it fired against, with current data and current pricing.** It is not a reconstruction of the dashboard as it looked when the alert fired, and it never substitutes the current window for the alert's own. Where the alert's window cannot be opened, the row says so in place of the button and opens nothing:
+
+- the window has closed, and the surface that would explain it only ever shows the live one;
+- the five-hour block has been purged, so its detail no longer exists;
+- the alert is a `project_budget` crossing on an installation with more than one account, where the crossing is recorded across all of them and cannot be narrowed to one account's projects;
+- the budget runs on a calendar week, for which the dashboard publishes no matching view — its weekly views are keyed by subscription week (Claude) and by quota cycle (Codex), and neither is a civil week.
+
+The clock this uses is the envelope's own `generated_at`, not your browser's, so a tab left open does not declare a window closed while the figures beside it still describe it.
 
 ## Sync chip / 'r' shortcut
 
@@ -349,7 +387,7 @@ is recorded only in the private `cctally.dashboard` log.
 
 The Header hosts a three-state `Claude | Codex | All` selector (a radiogroup — Arrow keys move focus and selection, Home/End jump to the ends; the `v` shortcut cycles Claude → Codex → All). The choice persists in `localStorage` under `cctally:dashboard:source` (default `claude`) and is a pure client re-selection over the already-delivered `sources` bundle — the store never waits for or reconciles it against an envelope, and panel subtrees re-key on switch so no mixed-source frame is ever shown. This control is visible in the dashboard workspace; Conversations exposes the persisted selection through its own rail control.
 
-Claude and Codex use one canonical hero composition and metric order. Under Codex, the active native **seven-day (10,080-minute) reset cycle** supplies Week Usage, the reset countdown, cycle spend, `$ / 1%`, forecast-at-reset, the `$ / 1%` delta against the previous retained native cycle, and snapshot age; the independent five-hour (300-minute) limit fills the same optional 5-Hour slot. The values are derived only from retained Codex quota and cycle-bounded accounting. If the cache has accounting but no single coherent active seven-day boundary, those accounting slots render unavailable rather than showing a misleading zero. `All` remains a separate composition: it shows the bundle's combined USD and total-token tiles only when the server publishes a coherent `combined` object, with quota always rendered side by side and never as a blended gauge. **The combined figure is the sum of each provider's own current billing period** — Claude's subscription week and Codex's native seven-day cycle, each accumulated since that provider's own last reset. The two legs are deliberately not one shared range, so each leg reconciles with its provider tab and the headline names the cycles it covers; the figure therefore steps down twice a week, at two different reset instants, and is not comparable against itself across a reset. The heading names its actual contributors, so a provider with no accounting in its current cycle is not counted and not named. **The figure is published only on a single-account install.** When either provider has more than one real account, the combined total is withheld with a named reason stating which provider has several accounts on separate cycles, and the per-account cards below carry each account's own spend — the sum is withheld rather than published as a number that could not be reconciled against any tab.
+Claude and Codex use one canonical hero composition and metric order. Under Codex, the active native **seven-day (10,080-minute) reset cycle** supplies Week Usage, the reset countdown, cycle spend, `$ / 1%`, forecast-at-reset, the `$ / 1%` delta against the previous retained native cycle, and snapshot age; the independent five-hour (300-minute) limit fills the same optional 5-Hour slot. The values are derived only from retained Codex quota and cycle-bounded accounting. If the cache has accounting but no single coherent active seven-day boundary, those accounting slots render unavailable rather than showing a misleading zero. `All` remains a separate composition: it shows the bundle's combined USD and total-token tiles only when the server publishes a coherent `combined` object, with quota always rendered side by side and never as a blended gauge. **The combined figure is the sum of each provider's own current billing period** — Claude's subscription week and Codex's native seven-day cycle, each accumulated since that provider's own last reset. The two legs are deliberately not one shared range, so each leg reconciles with its provider tab and the headline names the cycles it covers; the figure therefore steps down twice a week, at two different reset instants, and is not comparable against itself across a reset. The heading names its actual contributors, so a provider with no accounting in its current cycle is not counted and not named. On a multi-account install, the server publishes the figure only when every visible account card has a certified native-cycle spend and exact period and those operands reconcile with the provider subtotal within `1e-9`. The hero then names `ACCOUNT CYCLES`, shows each provider subtotal and account count, and the Current Usage modal lists every distinct certified range instead of inventing one common reset. Missing cost or cycle evidence keeps the number withheld and names the reason; an uncertified token total is omitted.
 
 **On a Codex install with more than one real account, every card feeding the headline covers at most one native cycle width.** The decorated Codex headline is the sum of the per-account cards beneath it, so the period it claims is only as honest as the widest addend. An account with a live weekly cycle is read over that cycle. An account with no live cycle — an expired boundary, no weekly observation at all, or a within-account conflict — and the unattributed bucket are read over one native cycle width ending now, rather than over the whole accounting range the dashboard loads, which is roughly thirty days. A card totalled that way publishes the exact window it covers and names it in the interface: the card captions itself, the aggregate hero notes that it includes accounts with no live cycle, the focused hero labels its figure with the window instead of the week, and the Current Cycle modal marks the same rows and qualifies the same focused figure. The unattributed bucket keeps its card whenever it holds any retained spend in the accounting range, so an install whose unattributed spend is all older than a week sees an honest `$0.00` for the window rather than a card that disappeared.
 
@@ -373,7 +411,7 @@ Under All the two provider cards sit side by side at desktop widths and stack in
 
 **Account focus works under All, one chip row per decorated provider.** Each row does exactly what it does on that provider's own tab and says so on screen: the Codex row reads *filters every panel*, the Claude row reads *hero and alerts only*. The difference is real — only Codex publishes per-account projections, so only a Codex focus can narrow a panel; a Claude focus substitutes the Claude hero leg and filters Claude alert rows, and leaves the panels showing every account. `a` cycles the Codex row under All, or the Claude row when Codex has a single account.
 
-**A focus under All and a focus on that provider's own tab are independent.** They are stored separately (`cctally:dashboard:account:all:<provider>` beside the existing `cctally:dashboard:account:<provider>`) and never write to each other, so focusing an account under All never narrows the provider tab and a focus set on the provider tab never narrows All. Switching between them therefore shows each view's own selection, commonly "All accounts" on the one you have not used. Under a Codex focus in All, the combined spend headline stays withheld and the per-account cards stay fully visible: the focus highlights the selected card rather than hiding its siblings, because that strip is the evidence the withheld headline points at.
+**A focus under All and a focus on that provider's own tab are independent.** They are stored separately (`cctally:dashboard:account:all:<provider>` beside the existing `cctally:dashboard:account:<provider>`) and never write to each other, so focusing an account under All never narrows the provider tab and a focus set on the provider tab never narrows All. Switching between them therefore shows each view's own selection, commonly "All accounts" on the one you have not used. Under a Codex focus in All, a certified combined spend headline remains the unscoped total and every per-account card stays visible: the focus highlights the selected card rather than recomputing the headline from a scoped child. When certification is withheld, those same visible cards are the evidence the typed reason points at.
 
 ### Conversation source selector and mixed-source reader (S8)
 
@@ -435,16 +473,26 @@ under `sources.all.data.providers`, which was about 1.56 MB of a 3.25 MB
 envelope, and the two reductions compound rather than overlap.
 
 Compressing costs the dashboard process CPU on each frame it sends, and that
-cost is per connected client — roughly 1.8 ms per frame per client on the bench
-corpus. A dashboard left open in several tabs pays compression once per tab,
-but the complete uncompressed SSE frame is assembled and UTF-8 encoded once per
-published variant and shared across those tabs.
+cost is per connected stream — roughly 1.8 ms per frame per stream on the bench
+corpus. Tabs in the same browser and origin share one `SharedWorker` stream, so
+the server compresses once and the worker parses each update once before
+structured-cloning the parsed snapshot to active tabs. Browsers without
+`SharedWorker`, or a worker that cannot complete its versioned startup
+handshake, use one direct `EventSource` per tab instead. Fallback is allowed only
+before an accepted shared snapshot; an error after that point reports a real
+disconnect and never opens a parallel direct stream.
 
-A tab that is hidden for more than thirty seconds disconnects its dashboard
-stream and stops receiving updates until you return to it, so a backgrounded tab
-costs nothing. Switching away and back inside that grace period does not
-reconnect. The conversation viewer's live-tail and the update-progress stream
-are independent and keep running while the tab is hidden.
+A tab that is hidden for more than thirty seconds suspends its own dashboard
+delivery and stops receiving updates until you return to it. Another visible tab
+keeps the shared stream open; when every tab is suspended, the worker closes it.
+Returning requests the worker's retained newest snapshot before live updates,
+while the existing server-epoch and timestamp rules still decide whether that
+seed is current. Switching away and back inside the grace period changes
+nothing. The connection chip distinguishes `Updates paused while hidden`,
+`Resuming updates…`, and a real disconnection; its age continues from wall-clock
+time rather than freezing at the last render. The conversation viewer's
+live-tail and the update-progress stream are independent and keep running while
+the tab is hidden.
 
 ## Conversation viewer endpoints (Plan 2)
 

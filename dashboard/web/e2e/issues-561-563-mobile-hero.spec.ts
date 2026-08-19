@@ -80,6 +80,7 @@ async function freezeEventStream(page: Page) {
       dispatchEvent() { return true; }
       close() { this.readyState = StableEventSource.CLOSED; }
     }
+    Object.defineProperty(window, 'SharedWorker', { configurable: true, value: undefined });
     Object.defineProperty(window, 'EventSource', { configurable: true, value: StableEventSource });
   });
 }
@@ -190,7 +191,7 @@ for (const viewport of [
 test('#563 — every 390px domain warning keeps a visible state word', async ({ page }) => {
   await freezeEventStream(page);
   await page.setViewportSize({ width: 390, height: 844 });
-  let activeWarning = WARNING_DOMAINS[0];
+  let activeWarning: (typeof WARNING_DOMAINS)[number] = WARNING_DOMAINS[0];
   await page.route('**/api/data', async (route) => {
     const response = await route.fetch();
     const envelope = await response.json() as Record<string, any>;

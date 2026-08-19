@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Literal, NamedTuple, Optional
+from typing import (
+    Any, Callable, Iterable, Literal, NamedTuple, Optional, Sequence,
+)
 from zoneinfo import ZoneInfo
 
 
@@ -851,6 +853,113 @@ def _compute_baseline_median(
     if len(values) < min_samples:
         return None
     return statistics.median(values)
+
+
+class CacheRowVerdict(NamedTuple):
+    """One row's four-state Cache Report verdict (#620 S1 D6).
+
+    ``observed`` travels beside ``state`` rather than inside it: a day with
+    no activity is still ``unevaluated``, and whether anything happened is a
+    separate fact from whether the predicates ran.
+    """
+    state: str          # "anomalous" | "clean" | "partial" | "unevaluated"
+    triggered: bool
+    unevaluated: "tuple[CacheAnomalyReason, ...]"
+    observed: bool
+
+
+# The worded terminal labels. The dashboard renders glyph + CSS class from
+# `cacheRowFlagGlyph` / `cacheRowFlagClass`; the terminal has no CSS and a
+# bare glyph cannot say which of the three non-anomalous states a row is in,
+# which is exactly the defect: an unmarked tick meant "evaluated and clean",
+# "one predicate skipped" and "nothing evaluated at all" alike.
+#
+# WIDTH IS A HARD CONSTRAINT, and it is why these read `not eval` rather than
+# the spec's `· not evaluated`. `_layout_cache_table` gives a left-aligned,
+# non-expandable column a compact floor of 8 characters, and at the shipped
+# 120-column default the daily table has EXACTLY 8 columns of slack for a
+# twelfth column once the ultra-compact fallback has run:
+#     120 - 34 border - 10 Date - 12 Models - 56 (8 numeric x 7) = 8.
+# A 15-character `· not evaluated` cannot be rendered there; it truncates to
+# `· not e…`, which is unreadable and is the overflow class the plan refuses
+# to re-take a golden over. The glyph is dropped from the label rather than
+# the word, because an anomalous row already carries the red anomaly glyph on
+# its first cell — so no state loses its marker, and every state gains a word
+# that fits.
+_CACHE_ROW_VERDICT_LABELS: "dict[str, str]" = {
+    "anomalous":   "anomaly",
+    "clean":       "clear",
+    "partial":     "partial",
+    "unevaluated": "not eval",
+}
+
+
+def cache_row_verdict(
+    *,
+    triggered: bool,
+    reasons: "Sequence[CacheAnomalyReason] | None" = None,
+    unevaluated: "Sequence[CacheAnomalyReason] | None" = None,
+    predicates: "Sequence[CacheAnomalyReason] | None" = None,
+    observed: "bool | None" = None,
+) -> CacheRowVerdict:
+    """Classify one row into the four Cache Report states (#620 S1 D6).
+
+    Mirrors ``cacheRowVerdict`` in
+    ``dashboard/web/src/lib/cacheReportVerdict.ts`` exactly, including
+    triggered precedence. The two are separate implementations — one literal
+    classifier is not possible across the language boundary without code
+    generation — and they are pinned to each other by a single shared
+    truth-table fixture, ``tests/fixtures/cache-report-verdict-vectors.json``,
+    which both ``tests/test_620_cache_report_verdict.py`` and
+    ``dashboard/web/__tests__/cacheReportVerdictParity.test.ts`` read.
+
+    ``predicates`` is the set the PROVIDER can evaluate at all, defaulting to
+    ``CACHE_ANOMALY_PREDICATES`` (Claude's pair). Codex can only ever
+    evaluate ``cache_drop``, so a Codex row carrying it alone is FULLY
+    unevaluated; resolving it against the Claude pair would call it
+    ``partial``, which claims some other predicate ran when none exists.
+    Not applicable is not unevaluated.
+
+    ``observed=None`` means observed, so a row from a producer that does not
+    publish the field reads as it does today.
+
+    ``reasons`` is accepted and deliberately unused in the classification:
+    the state is a function of ``triggered`` and the unevaluated set. It is
+    part of the signature because the truth table carries it and a caller
+    should not have to know which half the rule reads.
+    """
+    unevaluated_t = tuple(unevaluated or ())
+    predicate_t = tuple(
+        predicates if predicates is not None else CACHE_ANOMALY_PREDICATES
+    )
+    # Triggered wins first. A thin-baseline cache_drop beside a real
+    # net_negative is still a real anomaly, and the unevaluated presentation
+    # must never swallow it.
+    if triggered:
+        state = "anomalous"
+    elif not unevaluated_t:
+        state = "clean"
+    elif len(unevaluated_t) >= len(predicate_t):
+        state = "unevaluated"
+    else:
+        state = "partial"
+    return CacheRowVerdict(
+        state=state,
+        triggered=bool(triggered),
+        unevaluated=unevaluated_t,
+        observed=observed is not False,
+    )
+
+
+def cache_row_verdict_label(state: str) -> str:
+    """The worded terminal label for one verdict state.
+
+    There is no `unicode_ok` axis: every label above is pure ASCII, so an
+    ASCII-fallback table would be a verbatim copy and the parameter would
+    select between two identical results while every caller still had to
+    pass it. A future label that does need a glyph adds the axis then.
+    """
+    return _CACHE_ROW_VERDICT_LABELS[state]
 
 
 def _classify_anomalies(

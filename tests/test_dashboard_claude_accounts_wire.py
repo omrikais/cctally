@@ -77,11 +77,15 @@ def _seed_two_real_accounts(conn: sqlite3.Connection) -> None:
     )
     seed_weekly_cost_snapshot(
         conn, captured_at_utc="2026-07-15T11:00:00Z", week_start_date="2026-07-13",
-        week_end_date="2026-07-20", cost_usd=12.50, account_key=ACCT_WORK,
+        week_end_date="2026-07-20", week_start_at="2026-07-13T00:00:00Z",
+        week_end_at="2026-07-20T00:00:00Z", cost_usd=12.50,
+        account_key=ACCT_WORK,
     )
     seed_weekly_cost_snapshot(
         conn, captured_at_utc="2026-07-15T11:00:00Z", week_start_date="2026-07-13",
-        week_end_date="2026-07-20", cost_usd=1.25, account_key=ACCT_PERSONAL,
+        week_end_date="2026-07-20", week_start_at="2026-07-13T00:00:00Z",
+        week_end_at="2026-07-20T00:00:00Z", cost_usd=1.25,
+        account_key=ACCT_PERSONAL,
     )
     conn.commit()
 
@@ -98,7 +102,9 @@ def test_decorated_claude_emits_per_account_cards(monkeypatch):
     with tempfile.TemporaryDirectory() as td, closing(_stats_conn(Path(td))) as conn:
         _seed_two_real_accounts(conn)
         assert _cctally_account.provider_is_decorated(conn, "claude") is True
-        cards = _claude_accounts_wire(conn, now_utc=NOW)
+        result = _claude_accounts_wire(conn, now_utc=NOW)
+    assert isinstance(result, tuple) and len(result) == 2
+    cards, certificate = result
     by_key = {c["accountKey"]: c for c in cards}
     assert set(by_key) == {ACCT_WORK, ACCT_PERSONAL}
     work = by_key[ACCT_WORK]
@@ -114,6 +120,30 @@ def test_decorated_claude_emits_per_account_cards(monkeypatch):
     assert personal["active"] is False
     assert personal["weeklyPercent"] == 8.0  # NOT work's 42 — proves per-account
     assert personal["spendUsd"] == 1.25
+    assert certificate == {
+        "scope": "account_cycles",
+        "status": "certified",
+        "contributions": (
+            {
+                "account_key": ACCT_WORK,
+                "cost_usd": 12.5,
+                "period": {
+                    "kind": "subscription_week",
+                    "start_at": "2026-07-13T00:00:00Z",
+                    "end_at": "2026-07-20T00:00:00Z",
+                },
+            },
+            {
+                "account_key": ACCT_PERSONAL,
+                "cost_usd": 1.25,
+                "period": {
+                    "kind": "subscription_week",
+                    "start_at": "2026-07-13T00:00:00Z",
+                    "end_at": "2026-07-20T00:00:00Z",
+                },
+            },
+        ),
+    }
 
 
 def test_single_real_account_is_undecorated_no_wire():
@@ -127,6 +157,39 @@ def test_single_real_account_is_undecorated_no_wire():
         assert _cctally_account.provider_is_decorated(conn, "claude") is False
 
 
+def test_missing_cost_row_keeps_card_zero_but_refuses_to_certify_it(monkeypatch):
+    """A compatibility zero is not evidence that the account spent zero."""
+    monkeypatch.setattr(
+        "_cctally_account.resolve_active_account_keys", lambda: set(),
+    )
+    with tempfile.TemporaryDirectory() as td, closing(_stats_conn(Path(td))) as conn:
+        _seed_two_real_accounts(conn)
+        conn.execute(
+            "DELETE FROM weekly_cost_snapshots WHERE account_key=?",
+            (ACCT_PERSONAL,),
+        )
+        conn.commit()
+
+        cards, certificate = _claude_accounts_wire(conn, now_utc=NOW)
+
+    by_key = {card["accountKey"]: card for card in cards}
+    assert by_key[ACCT_PERSONAL]["spendUsd"] == 0.0
+    assert certificate == {
+        "scope": "account_cycles",
+        "status": "unresolved",
+        "cause": "account_cost_unresolved",
+        "contributions": ({
+            "account_key": ACCT_WORK,
+            "cost_usd": 12.5,
+            "period": {
+                "kind": "subscription_week",
+                "start_at": "2026-07-13T00:00:00Z",
+                "end_at": "2026-07-20T00:00:00Z",
+            },
+        },),
+    }
+
+
 def test_unattributed_bucket_appended_when_it_has_a_snapshot(monkeypatch):
     monkeypatch.setattr(
         "_cctally_account.resolve_active_account_keys", lambda: set(),
@@ -136,13 +199,46 @@ def test_unattributed_bucket_appended_when_it_has_a_snapshot(monkeypatch):
         seed_weekly_cost_snapshot(
             conn, captured_at_utc="2026-07-15T11:00:00Z",
             week_start_date="2026-07-13", week_end_date="2026-07-20",
+            week_start_at="2026-07-13T00:00:00Z",
+            week_end_at="2026-07-20T00:00:00Z",
             cost_usd=0.75, account_key=UNATTR,
         )
         conn.commit()
-        cards = _claude_accounts_wire(conn, now_utc=NOW)
+        cards, certificate = _claude_accounts_wire(conn, now_utc=NOW)
     assert cards[-1]["accountKey"] == UNATTR
     assert cards[-1]["unattributed"] is True
     # dimmed / totals-only: no live weekly/5h bars, but the spend total shows.
     assert cards[-1]["weeklyPercent"] is None
     assert cards[-1]["fiveHourPercent"] is None
     assert cards[-1]["spendUsd"] == 0.75
+    assert certificate["contributions"][-1] == {
+        "account_key": UNATTR,
+        "cost_usd": 0.75,
+        "period": {
+            "kind": "subscription_week",
+            "start_at": "2026-07-13T00:00:00Z",
+            "end_at": "2026-07-20T00:00:00Z",
+        },
+    }
+
+
+def test_invalid_cost_period_refuses_certification(monkeypatch):
+    """A present value with non-aware or reversed bounds is still unresolved."""
+    monkeypatch.setattr(
+        "_cctally_account.resolve_active_account_keys", lambda: set(),
+    )
+    with tempfile.TemporaryDirectory() as td, closing(_stats_conn(Path(td))) as conn:
+        _seed_two_real_accounts(conn)
+        conn.execute(
+            "UPDATE weekly_cost_snapshots "
+            "SET week_start_at=?, week_end_at=? WHERE account_key=?",
+            ("2026-07-20T00:00:00", "2026-07-13T00:00:00Z", ACCT_PERSONAL),
+        )
+        conn.commit()
+
+        cards, certificate = _claude_accounts_wire(conn, now_utc=NOW)
+
+    assert {card["accountKey"] for card in cards} == {ACCT_WORK, ACCT_PERSONAL}
+    assert certificate["status"] == "unresolved"
+    assert certificate["cause"] == "account_cycle_unresolved"
+    assert [item["account_key"] for item in certificate["contributions"]] == [ACCT_WORK]

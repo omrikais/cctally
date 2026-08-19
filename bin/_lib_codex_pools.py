@@ -38,18 +38,30 @@ def is_model_scoped_codex_quota(logical_limit_key: object, limit_name: object) -
     return codex_model_scoped_quota_pool(limit_name) is not None
 
 
-def _key_has_model_pool(logical_limit_key: object) -> bool:
+def codex_key_model_pool(logical_limit_key: object) -> str | None:
+    """Return the ``modelPool`` an interpreted quota key names, else ``None``.
+
+    The name axis of the same classification ``is_model_scoped_codex_quota``
+    answers as a boolean.  Callers that need to PRESENT the pool (#620 S1's
+    alert scope) read it here rather than parsing the key themselves, so pool
+    classification keeps exactly one home.
+    """
     if not isinstance(logical_limit_key, str):
-        return False
+        return None
     try:
         payload = json.loads(logical_limit_key)
     except (json.JSONDecodeError, TypeError, ValueError):
-        return False
-    return (
-        isinstance(payload, dict)
-        and isinstance(payload.get("modelPool"), str)
-        and bool(payload["modelPool"].strip())
-    )
+        return None
+    if not isinstance(payload, dict):
+        return None
+    pool = payload.get("modelPool")
+    if not isinstance(pool, str) or not pool.strip():
+        return None
+    return pool.strip().lower()
+
+
+def _key_has_model_pool(logical_limit_key: object) -> bool:
+    return codex_key_model_pool(logical_limit_key) is not None
 
 
 def codex_history_is_model_scoped(history, *, baseline=None) -> bool:

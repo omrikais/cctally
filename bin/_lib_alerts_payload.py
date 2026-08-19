@@ -63,6 +63,100 @@ _lib_accounts = _load_lib("_lib_accounts")
 _UNATTRIBUTED = _lib_accounts.UNATTRIBUTED
 _VENDOR_WIDE = _lib_accounts.VENDOR_WIDE
 
+# Next-step routing (#620 S1, D11): every axis offers the command that explains
+# it, scoped to that alert's own provider and window. The scope is derived from
+# the retained context by `_lib_alert_scope`; nothing here parses an alert id.
+_lib_alert_scope = _load_lib("_lib_alert_scope")
+derive_alert_scope = _lib_alert_scope.derive_alert_scope
+format_next_step = _lib_alert_scope.format_next_step
+alert_next_step_command = _lib_alert_scope.alert_next_step_command
+
+
+next_step_line = _lib_alert_scope.next_step_line
+
+
+def alert_next_step_line(
+    payload: dict, tz: "ZoneInfo | None", now: "dt.datetime | None" = None,
+) -> str:
+    """The one affordance line an alert body ends with.
+
+    The command's own arguments stay in UTC, because that is what the
+    selectors they feed accept (``--block-start`` is documented naive-is-UTC);
+    the trailing scope statement is what renders in the display zone.
+
+    ``now`` is the instant the liveness test compares against; it defaults to
+    the current UTC instant. The clock read lives here rather than in
+    ``_lib_alert_scope`` so that kernel stays a pure leaf.
+    """
+    axis = payload.get("axis")
+    ctx = payload.get("context") or {}
+    scope = derive_alert_scope(axis, ctx, payload.get("account_key"))
+    command = alert_next_step_command(axis, ctx, scope)
+    if command is None:
+        return format_next_step(
+            None,
+            unavailable_reason=_lib_alert_scope.alert_target_unavailable_reason(
+                axis, ctx, scope
+            ),
+        )
+    # A command that reports only the live window cannot address one that has
+    # already closed. Offering it anyway would report the current window under
+    # a line naming the closed one, so the navigation is withheld with its
+    # cause — the same treatment a purged five-hour block already gets.
+    if (
+        _lib_alert_scope.command_reports_the_live_period_only(command)
+        and scope.window_end is not None
+    ):
+        if now is None:
+            now = dt.datetime.now(dt.timezone.utc)
+        if scope.window_end <= now:
+            return format_next_step(
+                None,
+                unavailable_reason=_lib_alert_scope.closed_window_reason(command),
+            )
+    if scope.available:
+        return next_step_line(
+            command,
+            provider=scope.provider,
+            window_start=scope.window_start,
+            window_end=scope.window_end,
+            tz=tz,
+            granularity=scope.window_granularity,
+        )
+    # A live-window command with no derivable length: name the provider and
+    # say what is missing, never a window the alert did not describe.
+    detail = (
+        f"{scope.provider} · {scope.withheld_reason}"
+        if scope.provider else scope.withheld_reason
+    )
+    return format_next_step(command, detail=detail)
+
+
+def synthetic_preview_week_start(
+    now: "dt.datetime | None" = None,
+) -> dt.datetime:
+    """The week start the two `alerts test --axis weekly` previews use.
+
+    A real crossing carries `percent_milestones.week_start_at`, the week's
+    reset instant, and a preview that omitted it rendered the day-granularity
+    fallback — two bare dates with no reset hour and no zone — which is not
+    what a real crossing produces. The instant is hour-aligned and one day
+    back so its reset hour is a real clock reading rather than the midnight
+    that would render identically to the fallback it replaces.
+    """
+    if now is None:
+        now = dt.datetime.now(dt.timezone.utc)
+    return (now - dt.timedelta(days=1)).replace(
+        minute=0, second=0, microsecond=0
+    )
+
+
+def _with_next_step(body: str, payload: dict, tz: "ZoneInfo | None") -> str:
+    """Append the affordance as its own line. AppleScript collapses the
+    newline to a space (``_escape_applescript_string``) and ``notify-send``
+    keeps it, so both notifiers render the whole sentence."""
+    return f"{body}\n{alert_next_step_line(payload, tz)}"
+
 
 def _alert_text_weekly(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, str]:
     """Build (title, subtitle, body) for a weekly threshold alert.
@@ -96,7 +190,7 @@ def _alert_text_weekly(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, 
         body = f"${cumulative:.2f} spent so far - ${float(dpp):.2f} per 1%"
     else:
         body = f"${cumulative:.2f} spent so far"
-    return title, subtitle, body
+    return title, subtitle, _with_next_step(body, payload, tz)
 
 
 def _alert_text_five_hour(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, str]:
@@ -121,7 +215,7 @@ def _alert_text_five_hour(payload: dict, tz: "ZoneInfo | None") -> tuple[str, st
         body = f"${cost:.2f} spent in this block - current model: {model}"
     else:
         body = f"${cost:.2f} spent in this block"
-    return title, subtitle, body
+    return title, subtitle, _with_next_step(body, payload, tz)
 
 
 def _escape_applescript_string(s: str) -> str:
@@ -147,6 +241,7 @@ def _build_alert_payload_weekly(
     cumulative_cost_usd: float,
     dollars_per_percent: "float | None",
     account_key: str = _UNATTRIBUTED,
+    week_start_at: "str | None" = None,
 ) -> dict:
     """Build the alert payload for a weekly threshold crossing.
 
@@ -155,7 +250,16 @@ def _build_alert_payload_weekly(
     (set-then-dispatch invariant, spec §3.2). Consumers (envelope builders,
     test inspectors) read the ``alerted_at`` field as the authoritative
     "alert was attempted" timestamp. ``account_key`` (#341) is the real account
-    the crossing wrote under (per-account family)."""
+    the crossing wrote under (per-account family).
+
+    ``week_start_at`` is the week's RESET INSTANT, retained on the milestone
+    row and already a declared ``AlertEntry.context`` key. Without it a reader
+    can only fall back to ``week_start_date``, which names the right week but
+    places both bounds at UTC midnight — wrong by the whole reset-hour offset
+    for every account whose week does not reset at midnight. Empty string when
+    the row predates the column, matching the five-hour axis's
+    ``block_start_at``: the key stays on the wire and the reader degrades to
+    day granularity rather than inventing a clock reading."""
     return {
         "id": f"weekly:{week_start_date}:{threshold}",
         "axis": "weekly",
@@ -165,6 +269,7 @@ def _build_alert_payload_weekly(
         "account_key": str(account_key),
         "context": {
             "week_start_date": week_start_date,
+            "week_start_at": week_start_at or "",
             "cumulative_cost_usd": float(cumulative_cost_usd),
             "dollars_per_percent": (
                 float(dollars_per_percent) if dollars_per_percent is not None else None
@@ -224,7 +329,7 @@ def _alert_text_budget(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, 
     budget = float(ctx.get("budget_usd") or 0.0)
     consumption = float(ctx.get("consumption_pct") or 0.0)
     body = f"${spent:,.2f} of ${budget:,.2f} ({consumption:.0f}% of budget)"
-    return title, subtitle, body
+    return title, subtitle, _with_next_step(body, payload, tz)
 
 
 def _build_alert_payload_budget(
@@ -298,7 +403,7 @@ def _alert_text_project_budget(
         f"Project {project} - ${spent:,.2f} of ${budget:,.2f} "
         f"({consumption:.0f}% of budget)"
     )
-    return title, subtitle, body
+    return title, subtitle, _with_next_step(body, payload, tz)
 
 
 def _build_alert_payload_project_budget(
@@ -374,7 +479,7 @@ def _alert_text_codex_budget(
         f"Codex - ${spent:,.2f} of ${budget:,.2f} "
         f"({consumption:.0f}% of budget)"
     )
-    return title, subtitle, body
+    return title, subtitle, _with_next_step(body, payload, tz)
 
 
 def _build_alert_payload_codex_budget(
@@ -451,7 +556,7 @@ def _alert_text_projected(payload: dict, tz: "ZoneInfo | None") -> tuple[str, st
             f"Projected ${proj:,.2f} of ${denom:,.2f} budget "
             f"(week-average pace)"
         )
-    return title, subtitle, body
+    return title, subtitle, _with_next_step(body, payload, tz)
 
 
 def _build_alert_payload_projected(

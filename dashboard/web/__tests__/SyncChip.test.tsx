@@ -8,6 +8,13 @@ import {
 } from '../src/store/store';
 import type { Envelope } from '../src/types/envelope';
 
+vi.mock('../src/hooks/useConnectionStatus', () => ({
+  useConnectionStatus: () => ({
+    state: 'connected', disconnected: false,
+    bootstrapError: false, bootstrapErrorMessage: null,
+  }),
+}));
+
 // Regression: the sync-error floor must survive the SyncChip's own
 // 1-second setInterval. Previously `sync.ts` wrote `chip.textContent`
 // and added `.sync-error` directly; the chip's next tick re-rendered

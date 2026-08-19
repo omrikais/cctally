@@ -121,7 +121,9 @@ export interface TrendChartDatum {
   dollar_per_pct: number | null;
   delta: number | null;
   is_current: boolean;
-  spark_height?: number;
+  // #620 S1 — nullable: a week whose `$/1%` was withheld carries no height,
+  // and fabricating a zero here is the cliff-to-the-axis defect one layer up.
+  spark_height?: number | null;
   cost_usd?: number | null;   // S3 (#264): weekly cost, for the modal Cost column
   account_labels?: string[];
 }

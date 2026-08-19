@@ -1246,7 +1246,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 10,
+  "source_schema_version": 11,
   "sources": {
     "all": {
       "availability": "ok",
@@ -1297,11 +1297,13 @@
                 "label": "Claude subscription week",
                 "start_at": "2026-04-17T13:00:00Z"
               },
+              "scope": "provider_cycle",
               "state": "current",
               "total_tokens": 1522000
             },
             "codex": {
               "cost_usd": 0.0,
+              "scope": "provider_cycle",
               "state": "empty",
               "total_tokens": 0
             }

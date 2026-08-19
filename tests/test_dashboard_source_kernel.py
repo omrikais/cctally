@@ -62,6 +62,8 @@ def _provider_state(
     ingest_backlog: dict[str, object] | None = None,
     last_success_at: dt.datetime | None = dt.datetime(2026, 7, 16, tzinfo=UTC),
     aggregate_scope: dict[str, object] | None = None,
+    combined_accounting: dict[str, object] | None = None,
+    accounts: tuple[dict[str, object], ...] = (),
 ) -> SourceDashboardState:
     """One provider state in the #556 S1 v5 shape.
 
@@ -103,10 +105,12 @@ def _provider_state(
             "quota": {"label": f"{source} native quota"},
             "budget": {"label": f"{source} calendar budget"},
             "alerts": {"rows": alerts},
+            **({"accounts": accounts} if accounts else {}),
             **({"ingest_backlog": ingest_backlog} if ingest_backlog else {}),
         },
         account_scope=account_scope,
         aggregate_scope=aggregate_scope,
+        combined_accounting=combined_accounting,
     )
 
 
@@ -766,6 +770,55 @@ def test_account_scope_never_reaches_the_published_envelope():
     assert "4242" not in serialized
 
 
+def test_combined_accounting_is_frozen_and_server_only():
+    carrier = {
+        "scope": "account_cycles",
+        "status": "certified",
+        "contributions": ({
+            "account_key": "a" * 32,
+            "cost_usd": 2.5,
+            "period": {
+                "kind": "subscription_week",
+                "start_at": CLAUDE_WEEK_START,
+                "end_at": CLAUDE_WEEK_END,
+            },
+        },),
+    }
+    state = _provider_state("claude", combined_accounting=carrier)
+
+    assert state.combined_accounting["status"] == "certified"
+    with pytest.raises(TypeError):
+        state.combined_accounting["status"] = "unresolved"
+    with pytest.raises(TypeError):
+        state.combined_accounting["contributions"][0]["cost_usd"] = 9.0
+
+    from _cctally_dashboard_envelope import _source_state_to_wire
+    wire = _source_state_to_wire(state)
+    assert "combined_accounting" not in wire
+    assert "account_cycles" not in json.dumps(wire)
+
+
+def test_degrade_and_reuse_preserve_combined_accounting():
+    carrier = {
+        "scope": "account_cycles",
+        "status": "unresolved",
+        "cause": "account_cost_unresolved",
+        "contributions": (),
+    }
+    prior = _provider_state("claude", combined_accounting=carrier)
+
+    degraded = source_kernel.degrade_source_state(
+        prior, SourceDashboardWarning("source_ingest_failed", "Source ingest failed."),
+    )
+    reused = source_kernel.reuse_coherent_source_state(
+        prior, data_version=prior.data_version,
+    )
+
+    assert degraded.combined_accounting is prior.combined_accounting
+    assert reused is prior
+    assert reused.combined_accounting is prior.combined_accounting
+
+
 def test_unchanged_coherent_provider_state_is_reused_by_identity():
     prior = _provider_state("codex", cost_usd=3.75, total_tokens=70)
 
@@ -934,6 +987,39 @@ def _combined_pair(*, claude_kwargs=None, codex_kwargs=None):
     )
 
 
+def _decorated_account_kwargs(
+    provider: str,
+    *,
+    carrier_overrides: dict[str, object] | None = None,
+) -> dict[str, object]:
+    keys = ("a" * 32, "b" * 32)
+    kind = "subscription_week" if provider == "claude" else "native_7_day_cycle"
+    start_at, end_at = (
+        (CLAUDE_WEEK_START, CLAUDE_WEEK_END)
+        if provider == "claude"
+        else (CODEX_CYCLE_START, CODEX_CYCLE_END)
+    )
+    contributions = tuple({
+        "account_key": key,
+        "cost_usd": cost,
+        "period": {"kind": kind, "start_at": start_at, "end_at": end_at},
+    } for key, cost in zip(keys, (1.0, 1.5)))
+    carrier = {
+        "scope": "account_cycles",
+        "status": "certified",
+        "contributions": contributions,
+        **(carrier_overrides or {}),
+    }
+    return {
+        "account_scope": {"real_account_count": 2},
+        "accounts": tuple(
+            {"accountKey": key, "spendUsd": cost}
+            for key, cost in zip(keys, (1.0, 1.5))
+        ),
+        "combined_accounting": carrier,
+    }
+
+
 _CODEX_PROJECTION_WARNING = SourceDashboardWarning(
     "codex_projection_incoherent", "Codex quota projection is unavailable.", "hero",
 )
@@ -955,6 +1041,7 @@ def test_combined_publishes_both_legs_with_their_own_named_periods():
     assert payload["total_tokens"] == 100
     assert dict(payload["legs"]["claude"]) == {
         "state": "current",
+        "scope": "provider_cycle",
         "cost_usd": 2.5,
         "total_tokens": 30,
         "period": {
@@ -966,6 +1053,7 @@ def test_combined_publishes_both_legs_with_their_own_named_periods():
     }
     assert dict(payload["legs"]["codex"]) == {
         "state": "current",
+        "scope": "provider_cycle",
         "cost_usd": 3.75,
         "total_tokens": 70,
         "period": {
@@ -985,6 +1073,229 @@ def test_combined_publishes_both_legs_with_their_own_named_periods():
     assert "empty_providers" not in payload
 
 
+def test_decorated_provider_publishes_certified_account_cycle_leg():
+    combined = _combined_pair(
+        claude_kwargs=_decorated_account_kwargs("claude"),
+    )
+
+    payload = combined.data["combined"]
+    assert "combined_unavailable" not in combined.data
+    assert payload["cost_usd"] == 6.25
+    assert payload["total_tokens"] is None
+    assert dict(payload["legs"]["claude"]) == {
+        "state": "current",
+        "scope": "account_cycles",
+        "cost_usd": 2.5,
+        "total_tokens": None,
+        "accounts": (
+            {
+                "account_key": "a" * 32,
+                "cost_usd": 1.0,
+                "period": {
+                    "kind": "subscription_week",
+                    "start_at": CLAUDE_WEEK_START,
+                    "end_at": CLAUDE_WEEK_END,
+                },
+            },
+            {
+                "account_key": "b" * 32,
+                "cost_usd": 1.5,
+                "period": {
+                    "kind": "subscription_week",
+                    "start_at": CLAUDE_WEEK_START,
+                    "end_at": CLAUDE_WEEK_END,
+                },
+            },
+        ),
+    }
+    assert payload["legs"]["codex"]["scope"] == "provider_cycle"
+
+
+def test_decorated_unresolved_certificate_withholds_exact_cause():
+    combined = _combined_pair(claude_kwargs=_decorated_account_kwargs(
+        "claude",
+        carrier_overrides={
+            "status": "unresolved",
+            "cause": "account_cost_unresolved",
+            "contributions": (),
+        },
+    ))
+
+    assert combined.data["combined"] is None
+    assert combined.data["combined_unavailable"]["code"] == (
+        "account_cost_unresolved"
+    )
+
+
+@pytest.mark.parametrize(
+    "carrier_overrides,expected_code",
+    (
+        ({"contributions": ()}, "account_reconciliation_failed"),
+        ({"contributions": (
+            {
+                "account_key": "a" * 32,
+                "cost_usd": 1.0,
+                "period": {
+                    "kind": "subscription_week",
+                    "start_at": "2026-07-13T14:00:00",
+                    "end_at": CLAUDE_WEEK_END,
+                },
+            },
+            {
+                "account_key": "b" * 32,
+                "cost_usd": 1.5,
+                "period": {
+                    "kind": "subscription_week",
+                    "start_at": CLAUDE_WEEK_START,
+                    "end_at": CLAUDE_WEEK_END,
+                },
+            },)}, "account_cycle_unresolved"),
+        ({"contributions": (
+            {
+                "account_key": "a" * 32,
+                "cost_usd": True,
+                "period": {
+                    "kind": "subscription_week",
+                    "start_at": CLAUDE_WEEK_START,
+                    "end_at": CLAUDE_WEEK_END,
+                },
+            },
+            {
+                "account_key": "b" * 32,
+                "cost_usd": 1.5,
+                "period": {
+                    "kind": "subscription_week",
+                    "start_at": CLAUDE_WEEK_START,
+                    "end_at": CLAUDE_WEEK_END,
+                },
+            },)}, "account_reconciliation_failed"),
+    ),
+)
+def test_decorated_certificate_validation_fails_closed(
+    carrier_overrides, expected_code,
+):
+    combined = _combined_pair(claude_kwargs=_decorated_account_kwargs(
+        "claude", carrier_overrides=carrier_overrides,
+    ))
+
+    assert combined.data["combined"] is None
+    assert combined.data["combined_unavailable"]["code"] == expected_code
+
+
+@pytest.mark.parametrize(
+    "contributions",
+    (
+        # Duplicate/missing key: membership no longer matches the cards.
+        (
+            {
+                "account_key": "a" * 32, "cost_usd": 1.0,
+                "period": {
+                    "kind": "subscription_week",
+                    "start_at": CLAUDE_WEEK_START, "end_at": CLAUDE_WEEK_END,
+                },
+            },
+            {
+                "account_key": "a" * 32, "cost_usd": 1.5,
+                "period": {
+                    "kind": "subscription_week",
+                    "start_at": CLAUDE_WEEK_START, "end_at": CLAUDE_WEEK_END,
+                },
+            },
+        ),
+        # Exact membership in the wrong order is also not the certified list.
+        tuple(reversed(_decorated_account_kwargs("claude")[
+            "combined_accounting"]["contributions"])),
+        # An extra contribution cannot be reconciled to a public card.
+        _decorated_account_kwargs("claude")["combined_accounting"][
+            "contributions"] + ({
+                "account_key": "c" * 32, "cost_usd": 0.0,
+                "period": {
+                    "kind": "subscription_week",
+                    "start_at": CLAUDE_WEEK_START, "end_at": CLAUDE_WEEK_END,
+                },
+            },),
+    ),
+    ids=("duplicate-missing", "wrong-order", "extra"),
+)
+def test_decorated_certificate_requires_exact_ordered_membership(contributions):
+    combined = _combined_pair(claude_kwargs=_decorated_account_kwargs(
+        "claude", carrier_overrides={"contributions": contributions},
+    ))
+
+    assert combined.data["combined_unavailable"]["code"] == (
+        "account_reconciliation_failed"
+    )
+
+
+@pytest.mark.parametrize(
+    "delta,published",
+    ((0.5e-9, True), (2e-9, False)),
+    ids=("within-tolerance", "outside-tolerance"),
+)
+def test_decorated_certificate_cost_tolerance_is_one_e_minus_nine(
+    delta: float, published: bool,
+):
+    kwargs = _decorated_account_kwargs("claude")
+    contributions = list(kwargs["combined_accounting"]["contributions"])
+    contributions[0] = {**contributions[0], "cost_usd": 1.0 + delta}
+    kwargs["combined_accounting"] = {
+        **kwargs["combined_accounting"], "contributions": tuple(contributions),
+    }
+
+    combined = _combined_pair(claude_kwargs=kwargs)
+
+    assert (combined.data["combined"] is not None) is published
+    if not published:
+        assert combined.data["combined_unavailable"]["code"] == (
+            "account_reconciliation_failed"
+        )
+
+
+@pytest.mark.parametrize("cost", (-1.0, float("nan"), float("inf")))
+def test_decorated_certificate_rejects_invalid_account_costs(cost: float):
+    kwargs = _decorated_account_kwargs("claude")
+    contributions = list(kwargs["combined_accounting"]["contributions"])
+    contributions[0] = {**contributions[0], "cost_usd": cost}
+    kwargs["combined_accounting"] = {
+        **kwargs["combined_accounting"], "contributions": tuple(contributions),
+    }
+
+    combined = _combined_pair(claude_kwargs=kwargs)
+
+    assert combined.data["combined_unavailable"]["code"] == (
+        "account_reconciliation_failed"
+    )
+
+
+@pytest.mark.parametrize(
+    "period",
+    (
+        {
+            "kind": "native_7_day_cycle",
+            "start_at": CLAUDE_WEEK_START, "end_at": CLAUDE_WEEK_END,
+        },
+        {
+            "kind": "subscription_week",
+            "start_at": CLAUDE_WEEK_END, "end_at": CLAUDE_WEEK_START,
+        },
+    ),
+    ids=("unsupported-kind", "reversed-bounds"),
+)
+def test_decorated_certificate_rejects_unsupported_or_reversed_periods(period):
+    kwargs = _decorated_account_kwargs("claude")
+    contributions = list(kwargs["combined_accounting"]["contributions"])
+    contributions[0] = {**contributions[0], "period": period}
+    kwargs["combined_accounting"] = {
+        **kwargs["combined_accounting"], "contributions": tuple(contributions),
+    }
+
+    combined = _combined_pair(claude_kwargs=kwargs)
+
+    assert combined.data["combined_unavailable"]["code"] == (
+        "account_cycle_unresolved"
+    )
+
+
 def test_retired_stale_cycle_machinery_is_gone():
     """§4.2 — `combined_totals_stale` and its two helpers leave the kernel."""
     assert not hasattr(source_kernel, "_hero_cycle_is_stale")
@@ -998,12 +1309,12 @@ _MATRIX = (
     (
         "claude decorated",
         {"account_scope": {"real_account_count": 2}}, {},
-        "multi_account_unsupported",
+        "account_reconciliation_failed",
     ),
     (
         "codex decorated",
         {}, {"account_scope": {"real_account_count": 3}},
-        "multi_account_unsupported",
+        "account_reconciliation_failed",
     ),
     (
         "provider incoherent",
@@ -1094,16 +1405,15 @@ def test_combined_withholding_matrix_resolves_one_winning_code(
     ), label
 
 
-def test_multi_account_cause_carries_the_provider_and_its_count():
+def test_decorated_source_without_certificate_fails_reconciliation():
     combined = _combined_pair(
         codex_kwargs={"account_scope": {"real_account_count": 4}})
 
     unavailable = combined.data["combined_unavailable"]
-    assert unavailable["code"] == "multi_account_unsupported"
+    assert unavailable["code"] == "account_reconciliation_failed"
     assert [dict(cause) for cause in unavailable["causes"]] == [{
         "provider": "codex",
-        "code": "multi_account_unsupported",
-        "detail": {"account_count": 4},
+        "code": "account_reconciliation_failed",
     }]
 
 
@@ -1179,7 +1489,7 @@ def test_a_lone_codex_hero_failure_lists_only_itself():
 
 
 def test_incoherent_generation_beats_decoration_on_the_same_provider():
-    """§3.7 — precedence 1 beats precedence 3."""
+    """§6.5 — an incoherent generation is never inspected as account truth."""
     combined = _combined_pair(codex_kwargs={
         "availability": "partial",
         "freshness": "stale",
@@ -1189,7 +1499,7 @@ def test_incoherent_generation_beats_decoration_on_the_same_provider():
     unavailable = combined.data["combined_unavailable"]
     assert unavailable["code"] == "provider_incoherent"
     assert [cause["code"] for cause in unavailable["causes"]] == [
-        "provider_incoherent", "multi_account_unsupported",
+        "provider_incoherent",
     ]
     assert (combined.availability, combined.freshness) == ("partial", "stale")
 
@@ -1202,7 +1512,9 @@ def test_claude_causes_are_listed_before_codex_causes_at_the_same_precedence():
 
     causes = combined.data["combined_unavailable"]["causes"]
     assert [cause["provider"] for cause in causes] == ["claude", "codex"]
-    assert [cause["detail"]["account_count"] for cause in causes] == [2, 5]
+    assert [cause["code"] for cause in causes] == [
+        "account_reconciliation_failed", "account_reconciliation_failed",
+    ]
 
 
 # --- published-but-qualified states ----------------------------------------
@@ -1244,7 +1556,8 @@ def test_an_empty_leg_is_explicit_and_qualifies_the_published_figure():
     assert payload["cost_usd"] == 2.5
     assert payload["total_tokens"] == 30
     assert dict(payload["legs"]["codex"]) == {
-        "state": "empty", "cost_usd": 0.0, "total_tokens": 0,
+        "state": "empty", "scope": "provider_cycle",
+        "cost_usd": 0.0, "total_tokens": 0,
     }
     assert [q["code"] for q in payload["qualifications"]] == ["provider_empty"]
     assert payload["qualifications"][0]["provider"] == "codex"
@@ -1357,8 +1670,10 @@ def test_all_budget_capability_stays_not_applicable():
     )
 
 
-def test_source_schema_version_is_ten():
-    """#583 S3 §4. `sources.all.data.providers` stopped carrying the two
+def test_source_schema_version_is_eleven():
+    """#565. Decorated All spend now composes certified account-cycle legs.
+
+    #583 S3 §4 previously stopped `sources.all.data.providers` from carrying the two
     provider data objects and now publishes null for both, so consumers read
     the physical `sources.claude` / `sources.codex` entries.
 
@@ -1368,4 +1683,4 @@ def test_source_schema_version_is_ten():
     key itself is retained with null members so a still-loaded v9 bundle does
     not throw across an in-place `execvp` update.
     """
-    assert SOURCE_SCHEMA_VERSION == 10
+    assert SOURCE_SCHEMA_VERSION == 11

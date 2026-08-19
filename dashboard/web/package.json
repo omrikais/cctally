@@ -7,8 +7,11 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "npm run lint && tsc --noEmit && vite build",
-    "lint": "eslint \"src/**/*.{ts,tsx}\"",
+    "build": "npm run lint && npm run typecheck && vite build",
+    "lint": "eslint \"src/**/*.{ts,tsx}\" && npm run lint:e2e",
+    "lint:e2e": "eslint \"e2e/**/*.ts\" playwright.config.ts",
+    "typecheck": "tsc --noEmit && npm run typecheck:e2e",
+    "typecheck:e2e": "tsc -p tsconfig.e2e.json --noEmit",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest"

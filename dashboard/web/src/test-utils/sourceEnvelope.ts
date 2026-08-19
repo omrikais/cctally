@@ -1117,6 +1117,11 @@ export function makeDecoratedClaudeSourceData(): ClaudeSourceData {
         fiveHourPercent: 37,
         resetsAt: '2026-04-30T00:00:00Z',
         spendUsd: 88.2,
+        spendWindow: {
+          kind: 'subscription-week',
+          startAt: '2026-04-21T00:00:00Z',
+          endAt: '2026-04-28T00:00:00Z',
+        },
       }),
       accountCard({
         accountKey: CLAUDE_ACCOUNT_ALT,
@@ -1126,6 +1131,11 @@ export function makeDecoratedClaudeSourceData(): ClaudeSourceData {
         fiveHourPercent: 8,
         resetsAt: '2026-04-30T00:00:00Z',
         spendUsd: 19.4,
+        spendWindow: {
+          kind: 'subscription-week',
+          startAt: '2026-04-21T00:00:00Z',
+          endAt: '2026-04-28T00:00:00Z',
+        },
       }),
     ],
   } satisfies ClaudeSourceData;
@@ -1184,46 +1194,118 @@ export function makeAllSourceEntry(
   const codexLeg = codexHero == null ? null : combinedLeg(
     codexHero.cost_usd, codexHero.total_tokens, codexPeriod(codexHero.cycle),
   );
-  // This is server-fixture composition, not a client disclosure decision. The
-  // conditional accounts array proves the fixture is already in the resolved
-  // decorated shape; production consumers must continue to use the published
-  // combined/combined_unavailable outcome rather than infer decoration here.
-  const decoratedProviders = ([
-    ['claude', claude.data],
-    ['codex', codex.data],
-  ] as const).flatMap(([provider, data]) => {
-    const accountCount = data?.accounts?.filter((card) => !card.unattributed).length ?? 0;
-    return accountCount > 1 ? [{ provider, accountCount }] : [];
-  });
-  const combined: AllCombined | null = decoratedProviders.length === 0
-    && claudeLeg && codexLeg
+  // Fixture-only server emulation: production clients never infer accounting
+  // scope from public cards. Here the factory has to synthesize the private
+  // certificate that the Python composer validates before publishing a
+  // decorated leg, so decorated UI fixtures exercise the v11 wire shape.
+  const decoratedLeg = (
+    provider: 'claude' | 'codex',
+    data: ClaudeSourceData | CodexSourceData | null,
+  ): {
+    decorated: boolean;
+    leg: AllCombinedLeg | null;
+    unavailable: CombinedUnavailable | null;
+  } => {
+    const accounts = data?.accounts ?? [];
+    if (accounts.filter((card) => !card.unattributed).length <= 1) {
+      return { decorated: false, leg: null, unavailable: null };
+    }
+    let failure: 'account_cost_unresolved' | 'account_cycle_unresolved' | null = null;
+    const contributions = accounts.map((card) => {
+      if (typeof card.spendUsd !== 'number' || !Number.isFinite(card.spendUsd)
+          || card.spendUsd < 0) {
+        failure = 'account_cost_unresolved';
+        return null;
+      }
+      const cycle = provider === 'codex'
+        ? (data as CodexSourceData).hero.cycles?.find(
+            (candidate) => candidate.accountKey === card.accountKey,
+          )
+        : undefined;
+      const period: AllCombinedPeriod | null = cycle != null
+        ? {
+            kind: 'native_7_day_cycle',
+            start_at: cycle.start_at,
+            end_at: cycle.resets_at,
+          }
+        : card.spendWindow != null
+          ? {
+              kind: card.spendWindow.kind === 'subscription-week'
+                ? 'subscription_week'
+                : 'trailing_7_day_cycle',
+              start_at: card.spendWindow.startAt,
+              end_at: card.spendWindow.endAt,
+            }
+          : null;
+      const allowed = provider === 'claude'
+        ? period?.kind === 'subscription_week'
+        : period?.kind === 'native_7_day_cycle' || period?.kind === 'trailing_7_day_cycle';
+      const start = Date.parse(period?.start_at ?? '');
+      const end = Date.parse(period?.end_at ?? '');
+      if (!allowed || !Number.isFinite(start) || !Number.isFinite(end) || start >= end) {
+        if (failure == null) failure = 'account_cycle_unresolved';
+        return null;
+      }
+      return {
+        account_key: card.accountKey,
+        cost_usd: card.spendUsd,
+        period: period!,
+      };
+    });
+    if (failure != null || contributions.some((row) => row == null)) {
+      const code = (failure as
+        | 'account_cost_unresolved'
+        | 'account_cycle_unresolved'
+        | null) ?? 'account_cycle_unresolved';
+      const label = provider === 'claude' ? 'Claude' : 'Codex';
+      return {
+        decorated: true,
+        leg: null,
+        unavailable: {
+          code,
+          message: code === 'account_cost_unresolved'
+            ? `${label} account spend could not be certified.`
+            : `${label} account cycle bounds could not be certified.`,
+          causes: [{ provider, code }],
+        },
+      };
+    }
+    return {
+      decorated: true,
+      unavailable: null,
+      leg: {
+        state: 'current',
+        scope: 'account_cycles',
+        cost_usd: contributions.reduce((sum, row) => sum + row!.cost_usd, 0),
+        total_tokens: null,
+        accounts: contributions as NonNullable<typeof contributions[number]>[],
+      },
+    };
+  };
+  const decoratedClaude = decoratedLeg('claude', claude.data);
+  const decoratedCodex = decoratedLeg('codex', codex.data);
+  const resolvedClaudeLeg = decoratedClaude.decorated ? decoratedClaude.leg : claudeLeg;
+  const resolvedCodexLeg = decoratedCodex.decorated ? decoratedCodex.leg : codexLeg;
+  const decoratedUnavailable = decoratedClaude.unavailable ?? decoratedCodex.unavailable;
+  const combined: AllCombined | null = resolvedClaudeLeg && resolvedCodexLeg
     ? {
-        cost_usd: claudeLeg.cost_usd + codexLeg.cost_usd,
-        total_tokens: claudeLeg.total_tokens + codexLeg.total_tokens,
-        legs: { claude: claudeLeg, codex: codexLeg },
+        cost_usd: resolvedClaudeLeg.cost_usd + resolvedCodexLeg.cost_usd,
+        total_tokens: resolvedClaudeLeg.total_tokens != null
+          && resolvedCodexLeg.total_tokens != null
+          ? resolvedClaudeLeg.total_tokens + resolvedCodexLeg.total_tokens
+          : null,
+        legs: { claude: resolvedClaudeLeg, codex: resolvedCodexLeg },
       }
     : null;
   // #556 S1 §3.5 — `combined_unavailable` is emitted IF AND ONLY IF the figure
   // is withheld, so the factory must not carry it beside a published number.
-  const unavailable: CombinedUnavailable | null = combined != null
+  const unavailable: CombinedUnavailable | null = decoratedUnavailable ?? (combined != null
     ? null
-    : decoratedProviders.length > 0
-      ? {
-          code: 'multi_account_unsupported',
-          message: `${decoratedProviders[0].provider === 'claude' ? 'Claude' : 'Codex'} has `
-            + `${decoratedProviders[0].accountCount} accounts on separate cycles, so a `
-            + 'combined total is not published; see the per-account cards.',
-          causes: decoratedProviders.map(({ provider, accountCount }) => ({
-            provider,
-            code: 'multi_account_unsupported',
-            detail: { account_count: accountCount },
-          })),
-        }
-      : {
+    : {
           code: 'claude_cycle_unresolved',
           message: "Claude's current subscription week could not be resolved.",
           causes: [{ provider: 'claude', code: 'claude_cycle_unresolved' }],
-        };
+      });
   // The `all` alert union mirrors the Python `_combined_alert_rows`: each
   // provider's OWN rows (filtered to `source === provider`) concatenated in
   // declared source order, then sorted by the canonical FIRING instant,
@@ -1365,9 +1447,14 @@ export function makeAllCombined(
       end_at: '2026-04-30T00:00:00Z',
     })!,
   };
+  const totalTokens = (
+    legs.claude.total_tokens == null || legs.codex.total_tokens == null
+      ? null
+      : legs.claude.total_tokens + legs.codex.total_tokens
+  );
   return {
     cost_usd: legs.claude.cost_usd + legs.codex.cost_usd,
-    total_tokens: legs.claude.total_tokens + legs.codex.total_tokens,
+    total_tokens: totalTokens,
     legs,
     ...overrides,
   };
@@ -1418,7 +1505,7 @@ export function makeSourceEnvelope(
   return {
     // #556 S2 §3.9 — tracks the server's current `SOURCE_SCHEMA_VERSION`. No
     // production client branches on it; the number is a signal, not a gate.
-    source_schema_version: 10,
+    source_schema_version: 11,
     default_source: 'claude',
     source_order: ['claude', 'codex', 'all'],
     sources: makeSourcesMap(),

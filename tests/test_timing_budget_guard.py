@@ -176,6 +176,10 @@ RECORDED = {
         "keep — a fail-fast claim: the alternative behaviour is blocking until a lock is released, so the ceiling separates bounded from unbounded rather than fast from slow"),
     ("tests/test_stats_corruption_epic_e2e_496.py",
      "test_the_epic_scenario_end_to_end",
+     "elapsed-ceiling", 30.0): (
+        "keep — two fail-fast claims while maintenance is deliberately held: statusline and dashboard must answer rather than wait for the holder, so the fixed ceiling distinguishes bounded from blocked; scaling it with xdist width would hide that product contract"),
+    ("tests/test_stats_corruption_epic_e2e_496.py",
+     "test_the_epic_scenario_end_to_end",
      "composed", 270.0): (
         "keep — sequential hang detectors, not expected durations. Only one of them can be reached by a hang, so the worst-case sum over-states what any run can spend; lowering each to fit the sum is how a passing test is made flaky"),
     ("tests/test_stats_writer_storm_386.py",
@@ -769,11 +773,66 @@ def _is_elapsed(node, derived: set, bare: set = frozenset()) -> bool:
     return False
 
 
-def _numeric(node):
+def _function_bound_names(func) -> set:
+    """Names whose function scope shadows a same-named module constant."""
+    if func is None:
+        return set()
+    arguments = func.args
+    names = {
+        arg.arg for arg in
+        list(arguments.posonlyargs) + list(arguments.args)
+        + list(arguments.kwonlyargs)
+    }
+    if arguments.vararg is not None:
+        names.add(arguments.vararg.arg)
+    if arguments.kwarg is not None:
+        names.add(arguments.kwarg.arg)
+
+    class Bindings(ast.NodeVisitor):
+        def visit_Name(self, node):
+            if isinstance(node.ctx, ast.Store):
+                names.add(node.id)
+
+        def visit_FunctionDef(self, node):
+            names.add(node.name)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, node):
+            names.add(node.name)
+
+        def visit_Lambda(self, node):
+            return
+
+        def visit_Import(self, node):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".", 1)[0])
+
+        def visit_ImportFrom(self, node):
+            for alias in node.names:
+                names.add(alias.asname or alias.name)
+
+        def visit_ExceptHandler(self, node):
+            if node.name:
+                names.add(node.name)
+            for statement in node.body:
+                self.visit(statement)
+
+    visitor = Bindings()
+    for statement in func.body:
+        visitor.visit(statement)
+    return names
+
+
+def _numeric(node, module_constants, shadowed=frozenset()):
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return float(node.value)
+    if isinstance(node, ast.Name):
+        if node.id in shadowed:
+            return None
+        return module_constants.get(node.id)
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        inner = _numeric(node.operand)
+        inner = _numeric(node.operand, module_constants, shadowed)
         return None if inner is None else -inner
     return None
 
@@ -789,20 +848,27 @@ def collect_elapsed_assertions(path, source=None) -> list:
         if pathlib.Path(path).is_absolute() else str(path)
     text = source if source is not None else pathlib.Path(path).read_text(encoding="utf-8")
     tree = ast.parse(text)
+    module_constants = _module_constants(tree)
     derived, bare = _clock_derived_names(tree), _clock_bare_names(tree)
 
     enclosing = {}
     for func in ast.walk(tree):
         if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for node in ast.walk(func):
-                enclosing[id(node)] = func.name
+                enclosing[id(node)] = func
 
     findings = []
+    shadowed_by_function = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assert):
             continue
-        if (relative, enclosing.get(id(node))) in ALLOWLIST:
+        func = enclosing.get(id(node))
+        function = func.name if func is not None else ""
+        if (relative, function) in ALLOWLIST:
             continue
+        if func not in shadowed_by_function:
+            shadowed_by_function[func] = _function_bound_names(func)
+        shadowed = shadowed_by_function[func]
         for compare in ast.walk(node.test):
             if not isinstance(compare, ast.Compare):
                 continue
@@ -815,14 +881,15 @@ def collect_elapsed_assertions(path, source=None) -> list:
                     measured, bound = right, left
                 else:
                     continue
-                if _is_elapsed(measured, derived, bare) and _numeric(bound) is not None:
+                seconds = _numeric(bound, module_constants, shadowed)
+                if _is_elapsed(measured, derived, bare) and seconds is not None:
                     findings.append(Finding(
                         relative, compare.lineno, "elapsed-ceiling",
-                        _numeric(bound),
+                        seconds,
                         "an assertion bounds a measured duration above by %g "
                         "seconds, which measures the machine rather than the "
-                        "mechanism" % _numeric(bound),
-                        enclosing.get(id(node), "")))
+                        "mechanism" % seconds,
+                        function))
     return _deduplicate(findings)
 
 
@@ -1373,6 +1440,34 @@ def test_an_elapsed_ceiling_is_reported():
     )
     assert _kinds(findings) == ["elapsed-ceiling"], findings
     assert findings[0].seconds == 5.0
+
+
+def test_an_elapsed_ceiling_bound_to_a_module_constant_is_reported():
+    """#544: spelling the same ceiling as a Name must not blind the guard."""
+    findings = _elapsed(
+        "import time\n"
+        "CLI_BUDGET_S = 30.0\n"
+        "def test_x(run):\n"
+        "    started = time.monotonic()\n"
+        "    run()\n"
+        "    elapsed = time.monotonic() - started\n"
+        "    assert elapsed < CLI_BUDGET_S\n"
+    )
+    assert _kinds(findings) == ["elapsed-ceiling"], findings
+    assert findings[0].seconds == 30.0
+
+
+def test_a_function_binding_does_not_resolve_through_a_shadowed_module_constant():
+    findings = _elapsed(
+        "import time\n"
+        "CLI_BUDGET_S = 30.0\n"
+        "def test_x(run, CLI_BUDGET_S):\n"
+        "    started = time.monotonic()\n"
+        "    run()\n"
+        "    elapsed = time.monotonic() - started\n"
+        "    assert elapsed < CLI_BUDGET_S\n"
+    )
+    assert findings == [], findings
 
 
 def test_an_elapsed_FLOOR_is_left_alone():

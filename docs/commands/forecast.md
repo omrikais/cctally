@@ -29,9 +29,20 @@ $ or % of quota per day keeps you under 100%.
   `cap_at` timestamp in the footer.
 - **Already capped** (`p_now >= 100`): red `⚠ CAPPED` banner; budget
   section omitted.
-- **Low confidence**: shown when the week is <24h old, `p_now < 2`, or
-  there are fewer than 3 snapshots yet. Terminal shows the forecast range
-  dimmed with a `LOW CONF` label; status line reduces to `tracking…`.
+- **Low confidence**: shown when any of four triggers fires. Terminal shows the forecast range dimmed with a `LOW CONF` label followed by the reasons in plain words; status line reduces to `tracking…`. The four triggers, with the reason code each one emits in `--json` and the wording the terminal renders for it:
+
+  | Trigger | `--json` code | Terminal wording |
+  |---|---|---|
+  | Fewer than 24 hours have elapsed since the week started | `elapsed_hours<24` | less than 24 hours into the week |
+  | The account has used under 2% of its weekly quota so far | `percent<2` | under 2% of quota used so far |
+  | Fewer than 3 usage snapshots have been recorded this week | `snapshots<3` | fewer than 3 usage snapshots |
+  | No usage snapshot is at least 24 hours old, so no rate can be measured over a full day | `no_sample_ge_24h` | no snapshot at least 24 hours old |
+
+  More than one trigger can fire at once, and every one that fired is
+  named. The `--json` codes are the stable surface and are unchanged; the
+  terminal wording is a render step over them. An unrecognised code — one a
+  newer binary emits and this render does not know — is printed verbatim
+  rather than dropped.
 
 ## Data source
 

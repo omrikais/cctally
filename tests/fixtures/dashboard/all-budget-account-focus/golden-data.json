@@ -905,30 +905,30 @@
     "current_week": {
       "rows": [
         {
-          "attributed_pct": 30.04782464297576,
+          "attributed_pct": 26.613283674736188,
           "bucket_path": "/fake/repos/all-combined-claude",
-          "cost_usd": 3.9915000000000003,
+          "cost_usd": 1.8915,
           "key": "all-combined-claude",
-          "sessions_count": 3
+          "sessions_count": 2
         },
         {
-          "attributed_pct": 2.7552308203254734,
+          "attributed_pct": 5.149596523898199,
           "bucket_path": "/fake/repos/allcomb-at-end",
           "cost_usd": 0.366,
           "key": "allcomb-at-end",
           "sessions_count": 1
         },
         {
-          "attributed_pct": 1.1969445366987712,
+          "attributed_pct": 2.2371198013656115,
           "bucket_path": "/fake/repos/allcomb-at-now",
           "cost_usd": 0.159,
           "key": "allcomb-at-now",
           "sessions_count": 1
         }
       ],
-      "total_cost_usd": 4.5165,
+      "total_cost_usd": 2.4165,
       "week_label": "wk Apr 13",
-      "week_start_at": "2026-04-13T00:00:00Z",
+      "week_start_at": "2026-04-13T14:00:00Z",
       "week_start_date": "2026-04-13"
     },
     "trend": {
@@ -939,37 +939,37 @@
             null,
             null,
             null,
-            null,
-            "2026-04-13T08:00:00Z"
+            "2026-04-13T08:00:00Z",
+            "2026-04-13T18:00:00Z"
           ],
           "key": "all-combined-claude",
           "last_seen_per_week": [
             null,
             null,
             null,
-            null,
+            "2026-04-13T08:00:00Z",
             "2026-04-16T09:00:00Z"
           ],
           "sessions_per_week": [
             0,
             0,
             0,
-            0,
-            3
+            1,
+            2
           ],
           "weekly_cost": [
             0.0,
             0.0,
             0.0,
-            0.0,
-            3.9915000000000003
+            2.1,
+            1.8915
           ],
           "weekly_pct": [
             null,
             null,
             null,
             null,
-            30.04782464297576
+            26.613283674736188
           ]
         },
         {
@@ -1047,7 +1047,7 @@
             null,
             null,
             null,
-            2.7552308203254734
+            5.149596523898199
           ]
         },
         {
@@ -1242,7 +1242,7 @@
             null,
             null,
             null,
-            1.1969445366987712
+            2.2371198013656115
           ]
         }
       ],
@@ -1266,13 +1266,13 @@
           "week_start_date": "2026-03-30"
         },
         {
-          "total_cost_usd": 0.864,
+          "total_cost_usd": 2.964,
           "total_pct": null,
           "week_label": "wk Apr 06",
           "week_start_date": "2026-04-06"
         },
         {
-          "total_cost_usd": 4.5165,
+          "total_cost_usd": 2.4165,
           "total_pct": 34.0,
           "week_label": "wk Apr 13",
           "week_start_date": "2026-04-13"
@@ -1382,10 +1382,10 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 10,
+  "source_schema_version": 11,
   "sources": {
     "all": {
-      "availability": "partial",
+      "availability": "ok",
       "capabilities": {
         "alerts": {
           "semantics": "provider-native-union",
@@ -1422,19 +1422,49 @@
         "alerts": {
           "rows": []
         },
-        "combined": null,
-        "combined_unavailable": {
-          "causes": [
-            {
-              "code": "multi_account_unsupported",
-              "detail": {
-                "account_count": 2
+        "combined": {
+          "cost_usd": 2.934875,
+          "legs": {
+            "claude": {
+              "cost_usd": 2.0505,
+              "period": {
+                "end_at": "2026-04-20T14:00:00Z",
+                "kind": "subscription_week",
+                "label": "Claude subscription week",
+                "start_at": "2026-04-13T14:00:00Z"
               },
-              "provider": "codex"
+              "scope": "provider_cycle",
+              "state": "current",
+              "total_tokens": 511000
+            },
+            "codex": {
+              "accounts": [
+                {
+                  "account_key": "dddddddddddddddddddddddddddddddd",
+                  "cost_usd": 0.62975,
+                  "period": {
+                    "end_at": "2026-04-20T16:00:00Z",
+                    "kind": "native_7_day_cycle",
+                    "start_at": "2026-04-13T16:00:00Z"
+                  }
+                },
+                {
+                  "account_key": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                  "cost_usd": 0.25462500000000005,
+                  "period": {
+                    "end_at": "2026-04-18T19:00:00Z",
+                    "kind": "native_7_day_cycle",
+                    "start_at": "2026-04-11T19:00:00Z"
+                  }
+                }
+              ],
+              "cost_usd": 0.8843750000000001,
+              "scope": "account_cycles",
+              "state": "current",
+              "total_tokens": null
             }
-          ],
-          "code": "multi_account_unsupported",
-          "message": "Codex has 2 accounts on separate cycles, so a combined total is not published; see the per-account cards."
+          },
+          "total_tokens": null
         },
         "providers": {
           "claude": null,
@@ -2877,49 +2907,49 @@
           "current_week": {
             "rows": [
               {
-                "attributed_pct": 30.04782464297576,
-                "cost_usd": 3.9915000000000003,
+                "attributed_pct": 26.613283674736188,
+                "cost_usd": 1.8915,
                 "key": "project:NQdKxXp6-vtBXGwSDcKmY6qoTm_0RapcN2HFBygzTls",
-                "sessions_count": 3,
+                "sessions_count": 2,
                 "source": "claude"
               },
               {
-                "attributed_pct": 2.7552308203254734,
+                "attributed_pct": 5.149596523898199,
                 "cost_usd": 0.366,
                 "key": "project:mHNIgiLcwjKWaA8l7jGhdIpLPYJ40C-jPnv87thQpv4",
                 "sessions_count": 1,
                 "source": "claude"
               },
               {
-                "attributed_pct": 1.1969445366987712,
+                "attributed_pct": 2.2371198013656115,
                 "cost_usd": 0.159,
                 "key": "project:EOfQpM-wWNwYOQD_cHJ7SceBP1y6ZoDvtHpwwbYB998",
                 "sessions_count": 1,
                 "source": "claude"
               }
             ],
-            "total_cost_usd": 4.5165,
+            "total_cost_usd": 2.4165,
             "week_label": "wk Apr 13",
-            "week_start_at": "2026-04-13T00:00:00Z",
+            "week_start_at": "2026-04-13T14:00:00Z",
             "week_start_date": "2026-04-13"
           },
           "rows": [
             {
-              "attributed_pct": 30.04782464297576,
-              "cost_usd": 3.9915000000000003,
+              "attributed_pct": 26.613283674736188,
+              "cost_usd": 1.8915,
               "key": "project:NQdKxXp6-vtBXGwSDcKmY6qoTm_0RapcN2HFBygzTls",
-              "sessions_count": 3,
+              "sessions_count": 2,
               "source": "claude"
             },
             {
-              "attributed_pct": 2.7552308203254734,
+              "attributed_pct": 5.149596523898199,
               "cost_usd": 0.366,
               "key": "project:mHNIgiLcwjKWaA8l7jGhdIpLPYJ40C-jPnv87thQpv4",
               "sessions_count": 1,
               "source": "claude"
             },
             {
-              "attributed_pct": 1.1969445366987712,
+              "attributed_pct": 2.2371198013656115,
               "cost_usd": 0.159,
               "key": "project:EOfQpM-wWNwYOQD_cHJ7SceBP1y6ZoDvtHpwwbYB998",
               "sessions_count": 1,
@@ -2933,38 +2963,38 @@
                   null,
                   null,
                   null,
-                  null,
-                  "2026-04-13T08:00:00Z"
+                  "2026-04-13T08:00:00Z",
+                  "2026-04-13T18:00:00Z"
                 ],
                 "key": "project:NQdKxXp6-vtBXGwSDcKmY6qoTm_0RapcN2HFBygzTls",
                 "last_seen_per_week": [
                   null,
                   null,
                   null,
-                  null,
+                  "2026-04-13T08:00:00Z",
                   "2026-04-16T09:00:00Z"
                 ],
                 "sessions_per_week": [
                   0,
                   0,
                   0,
-                  0,
-                  3
+                  1,
+                  2
                 ],
                 "source": "claude",
                 "weekly_cost": [
                   0.0,
                   0.0,
                   0.0,
-                  0.0,
-                  3.9915000000000003
+                  2.1,
+                  1.8915
                 ],
                 "weekly_pct": [
                   null,
                   null,
                   null,
                   null,
-                  30.04782464297576
+                  26.613283674736188
                 ]
               },
               {
@@ -3042,7 +3072,7 @@
                   null,
                   null,
                   null,
-                  2.7552308203254734
+                  5.149596523898199
                 ]
               },
               {
@@ -3237,7 +3267,7 @@
                   null,
                   null,
                   null,
-                  1.1969445366987712
+                  2.2371198013656115
                 ]
               }
             ],
@@ -3261,13 +3291,13 @@
                 "week_start_date": "2026-03-30"
               },
               {
-                "total_cost_usd": 0.864,
+                "total_cost_usd": 2.964,
                 "total_pct": null,
                 "week_label": "wk Apr 06",
                 "week_start_date": "2026-04-06"
               },
               {
-                "total_cost_usd": 4.5165,
+                "total_cost_usd": 2.4165,
                 "total_pct": 34.0,
                 "week_label": "wk Apr 13",
                 "week_start_date": "2026-04-13"

@@ -385,8 +385,9 @@ def _envelope_rows_weekly(
     # key uniqueness invariant matters.
     rows = conn.execute(
         f"""
-        SELECT week_start_date, percent_threshold, captured_at_utc,
-               alerted_at, cumulative_cost_usd, reset_event_id, account_key
+        SELECT week_start_date, week_start_at, percent_threshold,
+               captured_at_utc, alerted_at, cumulative_cost_usd,
+               reset_event_id, account_key
         FROM {descriptor.milestone_table}
         WHERE alerted_at IS NOT NULL
         ORDER BY {_CANON_ALERTED_AT} DESC
@@ -409,6 +410,16 @@ def _envelope_rows_weekly(
             **account_fields("claude", r["account_key"]),
             "context": {
                 "week_start_date":     r["week_start_date"],
+                # The subscription week's RESET INSTANT, which the milestone
+                # row retains and `AlertEntry.context` already declares. A
+                # reader given only `week_start_date` can place the window no
+                # better than UTC midnight, which is wrong by the whole
+                # reset-hour offset for every account that does not reset at
+                # midnight. Empty string on a row that predates the column,
+                # mirroring `block_start_at` on the five-hour axis below: the
+                # key stays on the wire and the reader degrades to day
+                # granularity instead of inventing a clock reading.
+                "week_start_at":       r["week_start_at"] or "",
                 "cumulative_cost_usd": cumulative,
                 "dollars_per_percent": dpp,
                 # Round-3: parallel to the 5h context block below — both
@@ -1941,35 +1952,21 @@ def _claude_source_session_rows(envelope: dict) -> list:
     """The SOURCE-scoped Claude session row lists the overlay must cover.
 
     Since source schema 10 (#583 S3 §4) there is exactly ONE such list, on the
-    physical ``sources.claude`` entry. ``sources.all.data.providers.claude`` is
-    published null, so the mirror candidate below is a no-op that the
-    ``isinstance(data, Mapping)`` guard drops; it is retained because
-    ``sourceRows.ts::collectSourceSessionRows`` still reads
-    ``providers?.claude ?? env.sources.claude.data``, and a tab still running a
-    version 9 bundle after an in-place ``execvp`` update would otherwise get an
-    ungated row list. Removing the null stub and this candidate together is
-    filed as a residual.
+    physical ``sources.claude`` entry. The null
+    ``sources.all.data.providers.claude`` compatibility stub is not a second
+    row owner and must not receive request-local transcript data.
     """
     sources = envelope.get("sources")
     if not isinstance(sources, Mapping):
         return []
-    out = []
-    candidates = [(sources.get("claude") or {}).get("data")]
-    all_data = (sources.get("all") or {}).get("data")
-    if isinstance(all_data, Mapping):
-        providers = all_data.get("providers")
-        if isinstance(providers, Mapping):
-            candidates.append(providers.get("claude"))
-    for data in candidates:
-        if not isinstance(data, Mapping):
-            continue
-        sessions = data.get("sessions")
-        if not isinstance(sessions, Mapping):
-            continue
-        rows = sessions.get("rows")
-        if isinstance(rows, list):
-            out.append(rows)
-    return out
+    data = (sources.get("claude") or {}).get("data")
+    if not isinstance(data, Mapping):
+        return []
+    sessions = data.get("sessions")
+    if not isinstance(sessions, Mapping):
+        return []
+    rows = sessions.get("rows")
+    return [rows] if isinstance(rows, list) else []
 
 
 def _overlay_claude_source_session_titles(
@@ -2021,9 +2018,9 @@ def _codex_source_session_rows(envelope: dict) -> list:
     label overlay must cover it under the same per-request transcript gate.
 
     Since source schema 10 (#583 S3 §4) those lists all live on the physical
-    ``sources.codex`` entry. ``sources.all.data.providers.codex`` is published
-    null, so the mirror candidate below is a no-op the ``isinstance`` guard
-    drops; it is retained for the same version 9 reason as the Claude twin.
+    ``sources.codex`` entry. The null ``sources.all.data.providers.codex``
+    compatibility stub is not a second row owner and must not receive
+    request-local transcript data.
     """
     sources = envelope.get("sources")
     if not isinstance(sources, Mapping):
@@ -2051,14 +2048,7 @@ def _codex_source_session_rows(envelope: dict) -> list:
             if isinstance(rows, list):
                 out.append(rows)
 
-    candidates = [(sources.get("codex") or {}).get("data")]
-    all_data = (sources.get("all") or {}).get("data")
-    if isinstance(all_data, Mapping):
-        providers = all_data.get("providers")
-        if isinstance(providers, Mapping):
-            candidates.append(providers.get("codex"))
-    for data in candidates:
-        append_rows(data)
+    append_rows((sources.get("codex") or {}).get("data"))
     return out
 
 

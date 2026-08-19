@@ -235,15 +235,24 @@ and **verify a tree against it with `bin/cctally-snapshot-measure --corpus small
 corpus fingerprint, reports all three axes, and exits 3 on any mismatch. A
 fingerprint mismatch is reported first and separately, because it means the two
 captures describe different corpora and their hashes were never comparable — the
-generator changed, not the envelope. The pytest estate deliberately does not own
-this check: the corpus root is part of the capture contract, so a pytest
-temporary directory reproduces a different hash by construction.
+generator changed, not the envelope. Pytest deliberately does not own this
+check: the corpus root is part of the capture contract, so a pytest temporary
+directory reproduces a different hash by construction. The authoritative suite
+owns the canonical-root verification through the private
+`bin/cctally-envelope-oracle-test` harness.
 The full record, including the corpus fingerprint the hashes are keyed to, lives
-in `bench/baselines/envelope-oracle.json`. The current capture is 164,743 bytes
+in `bench/baselines/envelope-oracle.json`. The current capture is 164,619 bytes
 — read the sidecar for the exact figure — with rebuild-stable SHA-256
-`ca63029af9bae0ce50072c0d9bef8d899b01422633ca889d30b0784e90181ad2` over corpus
+`68a35bfd3605ff49d340d7917cd2755341e62d9292eca7fb110334369fa6b525` over corpus
 fingerprint `6d5d8358e1765415c40da93f3644b66e64fe4a81a253809248bde641b3a9082d`
-at generator version 6. #583 S3 moved that capture from 300,411 bytes and
+at generator version 6. #565 moved that capture from 164,743 bytes and
+`ca63029af9bae0ce50072c0d9bef8d899b01422633ca889d30b0784e90181ad2`:
+the source schema moved from 10 to 11, and the generated corpus's decorated
+Codex provider no longer contributes the obsolete `multi_account_unsupported`
+cause. Claude's cycle is unresolved in this corpus, so the fail-closed result
+now reports only `claude_cycle_unresolved`. A normalized structural diff found
+exactly those changes, while the corpus fingerprint stayed fixed. #583 S3 had
+moved the earlier capture from 300,411 bytes and
 `e733e922d30942f9eb0a1b4cde798f69a4903879eb6686f276e0a33186369421`; the corpus
 fingerprint did not move, which is what makes the two figures comparable, and
 the structural difference between the two captures contains exactly three
@@ -397,15 +406,16 @@ replaces `_last`; and a snapshot without `envelope_precompute` is never shared
 and therefore never cached at all. The current exchange is one held byte frame
 for N avoided per-connection frame assemblies and UTF-8 encodes.
 
-**The hidden-tab suspend trades transferred bytes for server CPU, and the trade
-is measured.** `SSEHub.subscribe` builds a fresh delivery with its own
-projection cache, so every reconnect costs one dedicated projection and encode
-of the roughly 1.9 MB frame that no other client shares, where a steadily
-connected client's marginal cost after the shared-delivery change above is close
-to zero. The client suspends at most once per hidden interval, so a tab that
-keeps hiding and returning across the thirty-second grace costs at worst about
-two dedicated projections per minute, against roughly nine shared-cost frames
-per minute it no longer receives at the measured 6.5-second publish period. The
-feature still wins on both sides of that comparison, and the cost is recorded
-here so a later change to the grace, to the publish period, or to
-`SSEHub.subscribe`'s fresh-delivery rule is made against the real number.
+**The hidden-tab suspend no longer necessarily reconnects the server stream.**
+Tabs in one browser/origin share a `SharedWorker` that retains the newest parsed
+snapshot and its delivery generation. Suspending one tab only stops deliveries
+to that port while another tab remains active; returning receives the retained
+seed without a new `SSEHub.subscribe` projection. A server reconnect and its
+dedicated projection happen only when all worker ports were suspended (so the
+worker closed its `EventSource`) or when the browser is using the direct
+fallback. The older worst-case calculation still applies to that all-suspended
+or fallback case: at most two dedicated projections per minute for repeated
+thirty-second hide/return cycles, versus roughly nine frames per minute avoided
+at the measured 6.5-second publish period. The ordinary multi-tab case is
+cheaper: one server stream, one JSON parse per frame, and structured clones to
+the active tabs.

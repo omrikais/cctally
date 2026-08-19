@@ -21,6 +21,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from _cctally_core import eprint, now_utc_iso, parse_iso_datetime, _command_as_of
 from _lib_fmt import stable_sum
 import _lib_cache_report as crk
+# #620 S1 D11: the one affordance shape every warning state renders.
+import _lib_alert_scope
 
 
 def _cctally():
@@ -130,6 +132,16 @@ def _layout_cache_table(
 
     content_widths = [len(h) for h in headers]
     for cells, _rt in raw_rows:
+        # An over-long row is a caller defect that no padding can repair, and
+        # it is reached here first — `content_widths[i]` would raise a bare
+        # `IndexError`. Report it as the module's own `ValueError`, which
+        # `main()` already handles (#620 S1: a short row is padded in
+        # `make_row`; only the surplus-cell case is refused).
+        if len(cells) > num_cols:
+            raise ValueError(
+                f"cache-report row has {len(cells)} cells, table has "
+                f"{num_cols}"
+            )
         for i, (text, _c) in enumerate(cells):
             content_widths[i] = max(content_widths[i], _max_line_width(text))
 
@@ -299,6 +311,21 @@ def _layout_cache_table(
         return text + " " * pad_needed
 
     def make_row(cells: list[str]) -> str:
+        # #620 S1 D6. A short row used to render silently: `enumerate(cells)`
+        # simply stopped early, so the row closed its border after however
+        # many cells it was given and the table lost a column on that line
+        # alone. That made the "every row type supplies the twelfth cell"
+        # invariant live only in a test.
+        #
+        # The guard pads rather than asserts. A bare `assert` is elided under
+        # `python -O`, which would restore the unclosed border on exactly the
+        # interpreter flag that removes it, and when it does fire it raises an
+        # uncaught `AssertionError` outside the documented exit taxonomy. A
+        # padded row closes its border under every flag. The OVER-long row is
+        # refused earlier, at the column-width scan, because that loop reaches
+        # the surplus cell first.
+        if len(cells) < num_cols:
+            cells = list(cells) + [""] * (num_cols - len(cells))
         parts: list[str] = []
         for i, cell_text in enumerate(cells):
             padded = padcell(cell_text, col_widths[i], aligns[i])
@@ -364,13 +391,37 @@ def _layout_cache_table(
     return "\n".join(lines)
 
 
+def _verdict_cell(row, *, red):
+    """The ``Evaluation`` cell for one data row (#620 S1 D6).
+
+    Both terminal render paths marked ONLY triggered rows, so an unmarked row
+    could mean three different things — evaluated and clean, one predicate
+    skipped, or nothing evaluated at all — and the reader had no way to tell
+    which. The dashboard has distinguished all four since #443 S2; this is the
+    terminal saying the same thing in words.
+
+    The classification itself comes from the shared kernel, never re-derived
+    here. The thin-baseline skip is unchanged: the unmarked tick over it was
+    the defect, not the skip.
+    """
+    verdict = crk.cache_row_verdict(
+        triggered=bool(row.anomaly_triggered),
+        reasons=list(row.anomaly_reasons or []),
+        unevaluated=list(row.anomaly_unevaluated or []),
+    )
+    label = crk.cache_row_verdict_label(verdict.state)
+    # Colour stays on the anomalous state only, matching the row's existing
+    # red treatment; the other three are informational, not warnings.
+    return (label, red if verdict.state == "anomalous" else None)
+
+
 def _render_cache_day_rows(
     rows: list["crk.CacheRow"], title: str, *, compact: bool = False,
 ) -> str:
     """Render daily-mode cache report.
 
     Columns: Date, Models, Cache %, Input, Cache Create, Cache Read,
-    Total Tokens, Cost (USD), $ Saved, $ Wasted, Net $.
+    Total Tokens, Cost (USD), $ Saved, $ Wasted, Net $, Eval.
     """
     c = _cctally()
     color = c._supports_color_stdout()
@@ -394,11 +445,11 @@ def _render_cache_day_rows(
     headers = [
         "Date", "Models", "Cache %", "Input",
         "Cache Create", "Cache Read", "Total Tokens", "Cost (USD)",
-        "$ Saved", "$ Wasted", "Net $",
+        "$ Saved", "$ Wasted", "Net $", "Eval",
     ]
     aligns = [
         "left", "left", "right", "right", "right", "right", "right", "right",
-        "right", "right", "right",
+        "right", "right", "right", "left",
     ]
 
     arrow = "  └─" if unicode_ok else "  |_"
@@ -421,10 +472,11 @@ def _render_cache_day_rows(
             (f"${row.saved_usd:.2f}", None),
             (f"${row.wasted_usd:.2f}", None),
             (f"${row.net_usd:+.2f}", None),
+            _verdict_cell(row, red=_red),
         ]
         # Anomaly visual treatment (data rows only — never breakdown/footer).
         # Cell-index map (daily): 0=Date, 1=Models, 2=Cache%, 3=Input, 4=CC,
-        # 5=CR, 6=Total, 7=Cost, 8=Saved, 9=Wasted, 10=Net $.
+        # 5=CR, 6=Total, 7=Cost, 8=Saved, 9=Wasted, 10=Net $, 11=Evaluation.
         if row.anomaly_triggered:
             first_text, first_style = data_cells[0]
             data_cells[0] = (
@@ -460,6 +512,12 @@ def _render_cache_day_rows(
                 (f"${mb.saved_usd:.2f}", _gray),
                 (f"${mb.wasted_usd:.2f}", _gray),
                 (f"${mb.net_usd:+.2f}", _gray),
+                # The verdict is classified per day, not per model, so a
+                # child row leaves it blank — as the project table's model
+                # rows leave Cost Share blank. The cell is still supplied:
+                # `make_row` pads nothing, so a short row renders one column
+                # narrow and its right border never closes.
+                ("", None),
             ]
             raw_rows.append((bd_cells, ROW_BREAKDOWN))
 
@@ -484,6 +542,10 @@ def _render_cache_day_rows(
         (f"${tot_saved:.2f}", _yellow),
         (f"${tot_wasted:.2f}", _yellow),
         (f"${tot_net:+.2f}", _yellow),
+        # A verdict describes one row's predicate run; there is no such
+        # thing as the total of several, so the footer leaves it blank —
+        # but it must still supply the cell (see the breakdown note above).
+        ("", None),
     ]
     raw_rows.append((footer_cells, ROW_FOOTER))
 
@@ -507,7 +569,7 @@ def _render_cache_session_rows(
 
     Columns: SessionId, Last Activity, Project, Cache %, Input,
     Cache Create, Cache Read, Total Tokens, Cost (USD), $ Saved,
-    $ Wasted, Net $.
+    $ Wasted, Net $, Eval.
 
     ``tz`` is the resolved display zone (None = host local). Last-Activity
     cells are rendered in this zone.
@@ -535,11 +597,13 @@ def _render_cache_session_rows(
         "SessionId", "Last Activity", "Project",
         "Cache %", "Input", "Cache Create", "Cache Read",
         "Total Tokens", "Cost (USD)", "$ Saved", "$ Wasted", "Net $",
+        "Eval",
     ]
     aligns = [
         "left", "left", "left",
         "right", "right", "right", "right",
         "right", "right", "right", "right", "right",
+        "left",
     ]
 
     arrow = "  └─" if unicode_ok else "  |_"
@@ -570,11 +634,12 @@ def _render_cache_session_rows(
             (f"${row.saved_usd:.2f}", None),
             (f"${row.wasted_usd:.2f}", None),
             (f"${row.net_usd:+.2f}", None),
+            _verdict_cell(row, red=_red),
         ]
         # Anomaly visual treatment (data rows only — never breakdown/footer).
         # Cell-index map (session): 0=SessionId, 1=Last Activity, 2=Project,
         # 3=Cache%, 4=Input, 5=CC, 6=CR, 7=Total, 8=Cost, 9=Saved, 10=Wasted,
-        # 11=Net $.
+        # 11=Net $, 12=Evaluation.
         if row.anomaly_triggered:
             first_text, first_style = data_cells[0]
             data_cells[0] = (
@@ -608,6 +673,9 @@ def _render_cache_session_rows(
                 (f"${mb.saved_usd:.2f}", _gray),
                 (f"${mb.wasted_usd:.2f}", _gray),
                 (f"${mb.net_usd:+.2f}", _gray),
+                # Blank for the same reason as the daily table's child rows;
+                # the cell is still supplied because `make_row` pads nothing.
+                ("", None),
             ]
             raw_rows.append((bd_cells, ROW_BREAKDOWN))
 
@@ -634,6 +702,8 @@ def _render_cache_session_rows(
         (f"${tot_saved:.2f}", _yellow),
         (f"${tot_wasted:.2f}", _yellow),
         (f"${tot_net:+.2f}", _yellow),
+        # Blank for the same reason as the daily table's footer.
+        ("", None),
     ]
     raw_rows.append((footer_cells, ROW_FOOTER))
 
@@ -1238,4 +1308,31 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
 
     title = _build_cache_report_title(args, mode)
     print(_render_cache_report_table(rows, title, mode=mode, tz=tz, compact=args.compact))
+    # #620 S1 D11: an anomalous row routes to the command that shows what the
+    # flagged window was actually made of, over the same window and provider.
+    if any(getattr(r, "anomaly_triggered", False) for r in rows):
+        source = getattr(args, "source", None) or "claude"
+        # `range-cost -s/-e` are ISO-8601 INSTANTS, not inclusive days:
+        # `parse_iso_datetime` never extends a bare date to end-of-day and
+        # reads a naive value as HOST-LOCAL. A date-only selector therefore
+        # names a different, shorter window than the line states, so both
+        # bounds are emitted as full UTC instants.
+        #
+        # `_resolve_cache_report_window` returns both bounds aware in the
+        # DISPLAY zone (host-local when `display.tz` is `local`), and
+        # `strftime` formats the datetime's own fields while appending the
+        # `Z` as a literal character. Converting to UTC first is what makes
+        # the suffix true; without it the selector is a local wall clock
+        # labelled UTC.
+        since_utc = since.astimezone(dt.timezone.utc)
+        until_utc = until.astimezone(dt.timezone.utc)
+        print(_lib_alert_scope.next_step_line(
+            f"cctally range-cost -s {since_utc:%Y-%m-%dT%H:%M:%SZ} "
+            f"-e {until_utc:%Y-%m-%dT%H:%M:%SZ} "
+            f"-b --source {source}",
+            provider=source,
+            window_start=since,
+            window_end=until,
+            tz=tz,
+        ))
     return 0

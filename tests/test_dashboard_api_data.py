@@ -110,8 +110,14 @@ def test_envelope_appends_frozen_source_bundle_without_changing_legacy_values():
         "cost_usd": 1.25,
         "total_tokens": 42,
         "legs": {
-            "claude": {"state": "current", "cost_usd": 1.25, "total_tokens": 42},
-            "codex": {"state": "empty", "cost_usd": 0.0, "total_tokens": 0},
+            "claude": {
+                "state": "current", "scope": "provider_cycle",
+                "cost_usd": 1.25, "total_tokens": 42,
+            },
+            "codex": {
+                "state": "empty", "scope": "provider_cycle",
+                "cost_usd": 0.0, "total_tokens": 0,
+            },
         },
         "qualifications": [
             {

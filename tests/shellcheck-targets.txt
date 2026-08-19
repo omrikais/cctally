@@ -10,6 +10,7 @@ public bin/_lib-fts5-probe.sh
 public bin/_lib-golden-diff.sh
 public bin/_lib-harness-env.sh
 public bin/_lib-kill-server.sh
+public bin/_lib-linux-matrix-manifest.sh
 public bin/_lib-test-contract.sh
 public bin/build-readme-screenshots.sh
 public bin/cctally-5h-canonical-test
@@ -38,6 +39,7 @@ public bin/cctally-diff-test
 public bin/cctally-doc-lint-test
 public bin/cctally-doctor-test
 public bin/cctally-dollar-per-percent
+private bin/cctally-envelope-oracle-test
 public bin/cctally-five-hour-blocks
 public bin/cctally-five-hour-blocks-test
 public bin/cctally-five-hour-breakdown

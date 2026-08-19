@@ -373,6 +373,10 @@ export interface DashboardPrefs {
 
 export interface UIState {
   snapshot: Envelope | null;
+  // #611: local receipt instant for the accepted snapshot. The server supplies
+  // the age at projection time; this clock lets consumers add real elapsed
+  // wall time even when the browser throttles their one-second wake-up timer.
+  snapshotObservedAtMs: number | null;
   // #294 S5 — the global Claude / Codex / All source selection. Seeded from
   // localStorage (`cctally:dashboard:source`) in loadInitial and persisted on
   // every SET_ACTIVE_SOURCE that changes it. Purely a client re-selection over
@@ -794,6 +798,7 @@ function loadInitial(): UIState {
   const railPrefs = loadRailPrefs();
   return {
     snapshot: null,
+    snapshotObservedAtMs: null,
     // #294 S5 — seed the persisted source selection (invalid/missing → claude).
     activeSource: loadActiveSource(),
     // #341 Task 4 — seed the per-source account focus (invalid/missing → All).
@@ -1126,7 +1131,11 @@ export function updateSnapshot(snap: Envelope | null): boolean {
   if (!epochChanged && ga && lastGeneratedAt && ga < lastGeneratedAt) return false;
   if (epochChanged) lastGeneratedAt = '';
   if (ga) lastGeneratedAt = ga;
-  const next = { ...state, snapshot: snap };
+  const next = {
+    ...state,
+    snapshot: snap,
+    snapshotObservedAtMs: snap == null ? null : Date.now(),
+  };
   // Reconcile BEFORE the search recompute so both run against one coherent
   // state object, and so a settlement lands in the same emit as the frame that
   // proved it rather than one render later.
@@ -1137,6 +1146,17 @@ export function updateSnapshot(snap: Envelope | null): boolean {
 }
 
 export function resetSnapshotOrdering(): void { lastGeneratedAt = ''; }
+
+export function effectiveSnapshotAge(
+  baseAgeSeconds: number | null,
+  observedAtMs: number | null,
+  nowMs: number,
+): number | null {
+  if (baseAgeSeconds == null) return null;
+  if (observedAtMs == null) return baseAgeSeconds;
+  const elapsedSeconds = Math.max(0, Math.floor((nowMs - observedAtMs) / 1000));
+  return baseAgeSeconds + elapsedSeconds;
+}
 
 // ----- Actions -----
 export type Action =

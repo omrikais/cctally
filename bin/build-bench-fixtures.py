@@ -763,7 +763,8 @@ def pinned_env(data_dir, claude_dir, codex_dir=None, home_dir=None):
                 pass
 
 
-def build_fixture_isolated(*, scale: str, seed: int, root):
+def build_fixture_isolated(*, scale: str, seed: int, root,
+                           identity_root=None):
     """``build_fixture`` for a caller that must not change the process.
 
     `build_fixture` pins four environment axes and LEAVES them pinned, which is
@@ -781,7 +782,8 @@ def build_fixture_isolated(*, scale: str, seed: int, root):
     codex_roots = codex_root_dirs(root, SCALES.get(scale, {}))
     codex_pin = ",".join(str(p) for p in codex_roots) if codex_roots else None
     with pinned_env(root / "data", root / "claude", codex_pin, root / "home"):
-        return build_fixture(scale=scale, seed=seed, root=root)
+        return build_fixture(
+            scale=scale, seed=seed, root=root, identity_root=identity_root)
 
 
 def _marker_matches(marker: pathlib.Path, want: dict,
@@ -801,7 +803,7 @@ def _marker_path(data_dir: pathlib.Path) -> pathlib.Path:
     return data_dir / ".bench-fixture.json"
 
 
-def _marker_payload(cctally, *, seed, scale) -> dict:
+def _marker_payload(cctally, *, seed, scale, identity_root=None) -> dict:
     try:
         pricing_date = cctally._lib_pricing.PRICING_SNAPSHOT_DATE
     except Exception:
@@ -817,8 +819,11 @@ def _marker_payload(cctally, *, seed, scale) -> dict:
     # left the marker identical and build_fixture reused the stale corpus.
     # GENERATOR_VERSION is folded in so a change to _emit_corpus itself — which
     # no params value reflects — also busts the cache.
-    shape = json.dumps(
-        {"params": params, "generator": GENERATOR_VERSION}, sort_keys=True)
+    shape = json.dumps({
+        "params": params,
+        "generator": GENERATOR_VERSION,
+        "identity_root": None if identity_root is None else str(identity_root),
+    }, sort_keys=True)
     payload["params_hash"] = hashlib.sha256(shape.encode()).hexdigest()[:16]
     return payload
 
@@ -947,7 +952,31 @@ def _clear_previous_corpus(root: pathlib.Path, data_dir: pathlib.Path) -> None:
     (root / "claude" / "projects").mkdir(parents=True, exist_ok=True)
 
 
-def build_fixture(*, scale: str, seed: int, root) -> pathlib.Path:
+def build_fixture(*, scale: str, seed: int, root,
+                  identity_root=None) -> pathlib.Path:
+    """Build under an optional location-independent identity namespace.
+
+    The physical root still owns every read, write and containment decision;
+    only opaque provider/file identity hashing sees ``identity_root``.  Ordinary
+    benchmark and product callers leave it unset.  The envelope oracle supplies
+    it so ``/tmp`` and macOS's ``/private/tmp`` realpath describe one corpus.
+    """
+    root = pathlib.Path(root)
+    if identity_root is None:
+        identity_context = contextlib.nullcontext()
+    else:
+        import _lib_source_identity
+        identity_context = _lib_source_identity.identity_path_alias(
+            root.expanduser().resolve(),
+            pathlib.Path(identity_root).expanduser().absolute(),
+        )
+    with identity_context:
+        return _build_fixture(
+            scale=scale, seed=seed, root=root, identity_root=identity_root)
+
+
+def _build_fixture(*, scale: str, seed: int, root,
+                   identity_root=None) -> pathlib.Path:
     """Build (or reuse) the deterministic synthetic fixture under ``root``.
 
     Writes JSONL under ``root/claude/projects/**``, pins ``CCTALLY_DATA_DIR`` =
@@ -989,7 +1018,8 @@ def build_fixture(*, scale: str, seed: int, root) -> pathlib.Path:
         os.environ["CODEX_HOME"] = ",".join(str(p) for p in codex_roots)
     os.environ["HOME"] = str(home_dir)
     cctally._cctally_core._init_paths_from_env()
-    want = _marker_payload(cctally, seed=seed, scale=scale)
+    want = _marker_payload(
+        cctally, seed=seed, scale=scale, identity_root=identity_root)
     marker = _marker_path(data_dir)
     if _marker_matches(marker, want, data_dir):
         return data_dir               # cached hit — nothing to rebuild

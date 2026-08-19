@@ -671,3 +671,154 @@ describe('provider-specific navigator vocabulary (#556 S4)', () => {
     expect(within(claude).queryByLabelText('Older cycle')).toBeNull();
   });
 });
+
+// #620 S1 — the boundary-less week row.
+//
+// An install carrying a `week_start_at IS NULL` milestone with no matching
+// snapshot row produces an index entry whose `start_at_utc` and `end_at_utc`
+// are both null. Block I2 fixed the ValueError that had been emptying the whole
+// index for those installs, so the row is now REACHABLE — and its three client
+// consumers (`formatCycleRange`, `hasDistinctNominalReset`, `fmtDateShort`) were
+// null-tolerant only INCIDENTALLY, because `null` happens to be the default in
+// this file's own `idxEntry` helper. These tests select the row and assert what
+// it renders, which incidental coverage never did.
+const BOUNDARYLESS_PAYLOAD = {
+  source: 'claude',
+  key: 'milestone_cycle:no-bounds',
+  // `_week_label` falls back to `ref.week_start.strftime("%b %d")` for a
+  // boundary-less ref, so the label is one bare date and not a range.
+  label: 'Mar 01',
+  start_at_utc: null,
+  end_at_utc: null,
+  is_current: false,
+  detail_stamp: 'st-milestone_cycle:no-bounds',
+  segments: [
+    {
+      key: 'milestone_segment:no-bounds',
+      milestones: [{
+        percent: 3,
+        crossed_at_utc: '2026-03-01T10:00:00Z',
+        cumulative_usd: 2,
+        marginal_usd: 2,
+        five_hour_pct_at_cross: null,
+      }],
+    },
+  ],
+  dividers: [],
+  blocks: [],
+};
+
+const BOUNDARYLESS_INDEX: WeekIndexEntry[] = [
+  idxEntry('milestone_cycle:current', {
+    is_current: true,
+    label: 'Jul 18–Jul 25',
+    start_at_utc: '2026-07-18T05:00:00Z',
+    end_at_utc: '2026-07-25T05:00:00Z',
+  }),
+  idxEntry('milestone_cycle:no-bounds', {
+    start_at_utc: null,
+    end_at_utc: null,
+    resets_at_utc: null,
+    label: 'Mar 01',
+    block_count: 0,
+    milestone_count: 1,
+    segment_count: 1,
+  }),
+];
+
+describe('#620 S1 — a week with no recorded boundaries', () => {
+  it('is reachable in the index and selectable', async () => {
+    mockFetch(BOUNDARYLESS_PAYLOAD);
+    updateSnapshot(makeEnv(BOUNDARYLESS_INDEX));
+    render(<CurrentWeekModal />);
+    // Precondition asserted unconditionally: the current week DOES carry
+    // bounds, so what follows is about this row and not about an index whose
+    // every row is boundary-less.
+    expect(BOUNDARYLESS_INDEX[0].start_at_utc).not.toBeNull();
+    fireEvent.click(screen.getByLabelText('Older week'));
+    await screen.findByText('Mar 01');
+  });
+
+  it('renders its label rather than an empty range, and says the bounds are missing', async () => {
+    mockFetch(BOUNDARYLESS_PAYLOAD);
+    updateSnapshot(makeEnv(BOUNDARYLESS_INDEX));
+    const { container } = render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older week'));
+    await screen.findByText('Mar 01');
+
+    // The pill falls back to the bare label — no `–` range, and certainly no
+    // "Invalid Date".
+    expect(container.textContent).not.toContain('Invalid');
+    expect(container.textContent).not.toContain('NaN');
+
+    // A dash where the reset should be states nothing. The row says why the
+    // range and the reset are absent, in the same voice the rest of #620 uses.
+    const note = container.querySelector('.mcw-bounds-missing');
+    expect(note).not.toBeNull();
+    expect((note?.textContent ?? '').toLowerCase()).toContain('reset');
+
+    // `.mcw-mini` is a wrapping flex row of stat cells, so a paragraph placed
+    // inside it becomes a flex ITEM: it sits beside the reset cell at wide
+    // widths and takes `gap: 18px` on top of its own `margin-top`. The note is
+    // a block sibling under the row instead, which is what the governing CSS
+    // comment ("under the mini bar") describes.
+    const mini = document.getElementById('mcw-mini');
+    expect(mini).not.toBeNull();
+    expect(mini!.contains(note!)).toBe(false);
+  });
+
+  it('still renders the milestones it does have', async () => {
+    mockFetch(BOUNDARYLESS_PAYLOAD);
+    updateSnapshot(makeEnv(BOUNDARYLESS_INDEX));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older week'));
+    await screen.findByText('Mar 01');
+    // The week has one 3% milestone; a missing boundary must not hide it.
+    // `splitBigNum` renders the hero as two spans, so match the element rather
+    // than a single text node.
+    expect(document.getElementById('mcw-bignum')?.textContent).toBe('3.0%');
+    expect(document.getElementById('mcw-ms-count')?.textContent).toContain('1 crossed');
+  });
+
+  it('places the note outside the stat row on the Codex leg too', async () => {
+    const boundaryless = {
+      ...CODEX_IDX[1],
+      start_at_utc: null,
+      end_at_utc: null,
+      resets_at_utc: null,
+      label: 'Cyc no-bounds',
+    };
+    mockFetch({
+      source: 'codex',
+      ...boundaryless,
+      segments: [{ key: 'nb', milestones: [] }],
+      dividers: [],
+      blocks: [],
+    });
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'current-week' });
+    updateSnapshot(codexEnvWithIndex([CODEX_IDX[0], boundaryless]));
+
+    const { container } = render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await screen.findByText('Cyc no-bounds');
+
+    const note = container.querySelector('.mcw-bounds-missing');
+    expect(note).not.toBeNull();
+    // Same placement rule as the Claude leg above, and for the same reason:
+    // `.mcw-mini` is a wrapping flex row, so a child paragraph is laid out as
+    // a flex item beside the stat cells rather than as a line beneath them.
+    const mini = document.getElementById('mcw-mini');
+    expect(mini).not.toBeNull();
+    expect(mini!.contains(note!)).toBe(false);
+  });
+
+  it('a boundary-carrying week shows no such note', async () => {
+    mockFetch(HISTORIC_CYCLE_PAYLOAD);
+    updateSnapshot(makeEnv(INDEX));
+    const { container } = render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older week'));
+    await screen.findByText('Jul 16–Jul 18');
+    expect(container.querySelector('.mcw-bounds-missing')).toBeNull();
+  });
+});

@@ -816,7 +816,7 @@
       }
     ]
   },
-  "source_schema_version": 10,
+  "source_schema_version": 11,
   "default_source": "claude",
   "source_order": [
     "claude",

@@ -28,7 +28,13 @@ function snap(generated_at: string, used_pct = 10) {
     header: { week_label: null, used_pct, five_hour_pct: null, dollar_per_pct: null,
               forecast_pct: null, forecast_verdict: 'ok' as const, vs_last_week_delta: null },
     current_week: null, forecast: null, trend: null,
+    weekly: { rows: [] }, monthly: { rows: [] }, blocks: { rows: [] },
+    daily: { rows: [] },
     sessions: { total: 0, sort_key: 'started_desc', rows: [] },
+    projects: null,
+    display: {},
+    alerts: [],
+    alerts_settings: {},
   };
 }
 

@@ -161,6 +161,8 @@ function buildProjectDetail(key: string): ProjectDetail {
     key,
     bucket_path: `/repos/${key}`,
     window_weeks: 4,
+    window_start_at: '2026-04-20T00:00:00Z',
+    window_end_at: '2026-05-18T00:00:00Z',
     window_cost_usd: 42.0,
     window_attributed_pct: 12.5,
     models: [

@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "week": {
+    "start_at": "2026-04-13T14:00:00Z",
+    "end_at": "2026-04-20T14:00:00Z",
+    "elapsed_hours": 78.0,
+    "elapsed_fraction": 0.4643,
+    "remaining_hours": 90.0,
+    "remaining_days": 3.75
+  },
+  "current": {
+    "weekly_percent": 0.0,
+    "five_hour_percent": null,
+    "spent_usd": 9.12,
+    "snapshot_count": 7,
+    "latest_snapshot_at": "2026-04-16T20:00:00Z"
+  },
+  "rates": {
+    "week_average_pct_per_hour": 0.0,
+    "recent_24h_pct_per_hour": 0.0,
+    "dollars_per_percent": null,
+    "dollars_per_percent_source": "no_usage_observed"
+  },
+  "forecast": {
+    "final_percent_low": 0.0,
+    "final_percent_high": 0.0,
+    "week_avg_projection_pct": 0.0,
+    "projected_cap": false,
+    "cap_at": null,
+    "already_capped": false,
+    "confidence": "low",
+    "low_confidence_reasons": [
+      "percent<2"
+    ]
+  },
+  "budget": [
+    {
+      "target_percent": 100,
+      "pct_headroom": 100.0,
+      "dollars_per_day": null,
+      "percent_per_day": 26.667
+    },
+    {
+      "target_percent": 90,
+      "pct_headroom": 90.0,
+      "dollars_per_day": null,
+      "percent_per_day": 24.0
+    }
+  ],
+  "meta": {
+    "generated_at": "2026-04-16T20:00:00Z",
+    "tool_version": "forecast-v1"
+  }
+}

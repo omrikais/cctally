@@ -176,6 +176,64 @@ platform — set the template to take over dispatch regardless of OS. An
 explicitly-selected native notifier that is unavailable on this host
 downgrades to `none` (it is never spawned-and-failed).
 
+## Next step on every alert
+
+Every alert body ends with one line naming the command that explains that
+alert, scoped to its own provider and window:
+
+```
+→ Run `cctally percent-breakdown --week-start 2026-04-27` — claude · 2026-04-27 00:00 → 2026-05-04 00:00 UTC
+```
+
+The command's arguments are UTC, because that is what the selectors they feed
+accept; the scope statement after the em dash renders in your `display.tz`.
+The line is part of the message body, so `alerts.log` is unchanged.
+
+| Axis | Command it offers |
+|---|---|
+| `weekly` | `cctally percent-breakdown --week-start <week>` |
+| `five_hour` | `cctally five-hour-breakdown --block-start <block>` |
+| `budget` | `cctally budget` |
+| `codex_budget` | `cctally budget` |
+| `project_budget` | `cctally project --since <start> --until <last day> --project <name>` |
+| `projected` | `cctally forecast --explain`, or `cctally budget` for a budget metric |
+| `quota` | `cctally codex quota breakdown --reset-at <reset>` |
+
+`cctally budget` and `cctally forecast` take no window selector: each reports
+whichever window is live when you run it. An alert whose window has already
+closed therefore offers nothing and says why, rather than sending you to a
+different window than the one the line names. That covers the budget family,
+and the `projected` axis on both its budget metrics and its weekly-percent
+metric.
+
+The window an alert names is the window it fired against, re-measured with
+current data and current pricing. It is not a reconstruction of what the
+numbers looked like at firing time, and the current window is never
+substituted for it.
+
+A weekly window states the reset instant your subscription week actually runs
+from, which is normally not midnight. Where the crossing predates the column
+that records it, the window is stated as two calendar dates with no clock
+reading and no zone, because the recorded row does not carry the reset hour:
+
+```
+→ Run `cctally percent-breakdown --week-start 2026-03-30` — claude · 2026-03-30 → 2026-04-06
+```
+
+Where the alert did not retain enough to derive a window, the line says so and
+offers nothing:
+
+```
+→ No scoped explanation: the projected alert retains no period for metric 'budget_usd', so its window length is unknown
+```
+
+The same line appears on the CLI warning states of `forecast`, `budget`,
+`cache-report`, `project` and `diff`, so the form is learned once. Note that a
+`percent-breakdown` offered by a weekly alert inherits the issue #213 gap
+described in [`percent-breakdown`](percent-breakdown.md): after an in-place
+weekly credit, no milestone is recorded until usage passes the pre-credit
+peak.
+
 ## Limitations
 
 - **No popup exit-code detection.** `Popen` is fire-and-forget;

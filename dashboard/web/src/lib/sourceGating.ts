@@ -109,7 +109,7 @@ export function sourceDomainFreshness(
 
 export interface CombinedValue {
   costUsd: number;
-  totalTokens: number;
+  totalTokens: number | null;
 }
 
 export interface CombinedPresentation {

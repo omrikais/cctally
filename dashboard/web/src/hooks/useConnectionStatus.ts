@@ -1,13 +1,16 @@
 import { useSyncExternalStore } from 'react';
 import {
-  isDisconnected, isBootstrapError, bootstrapErrorMessage, subscribeConnectionStatus,
+  connectionState, isDisconnected, isBootstrapError, bootstrapErrorMessage,
+  subscribeConnectionStatus, type ConnectionState,
 } from '../store/sse';
 
 export function useConnectionStatus(): {
+  state: ConnectionState;
   disconnected: boolean;
   bootstrapError: boolean;
   bootstrapMessage: string | null;
 } {
+  const state = useSyncExternalStore(subscribeConnectionStatus, () => connectionState());
   const disconnected = useSyncExternalStore(subscribeConnectionStatus, () => isDisconnected());
   const bootstrapError = useSyncExternalStore(subscribeConnectionStatus, () => isBootstrapError());
   // #583 S3 §7: null for the ordinary stream error, whose wording the banner
@@ -17,5 +20,5 @@ export function useConnectionStatus(): {
   const bootstrapMessage = useSyncExternalStore(
     subscribeConnectionStatus, () => bootstrapErrorMessage(),
   );
-  return { disconnected, bootstrapError, bootstrapMessage };
+  return { state, disconnected, bootstrapError, bootstrapMessage };
 }

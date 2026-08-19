@@ -345,6 +345,43 @@ def _claude_source_row_lists(env):
     return [((claude.get("sessions") or {}).get("rows") or [])]
 
 
+def test_source_row_collectors_ignore_the_retired_all_provider_mirror():
+    """Schema 10 keeps the All-provider members null for compatibility.
+
+    If malformed or stale data populates either retired member, the request-
+    local transcript overlay must still touch only the physical source domain
+    the current client reads.
+    """
+    load_script()
+    envelope_module = sys.modules["_cctally_dashboard_envelope"]
+    claude_physical = [{"key": "session:claude-physical"}]
+    claude_mirror = [{"key": "session:claude-mirror"}]
+    codex_physical = [{"key": "session:codex-physical"}]
+    codex_account = [{"key": "session:codex-account"}]
+    codex_mirror = [{"key": "session:codex-mirror"}]
+    env = {
+        "sources": {
+            "claude": {"data": {"sessions": {"rows": claude_physical}}},
+            "codex": {"data": {
+                "sessions": {"rows": codex_physical},
+                "account_scopes": {
+                    "account-a": {"sessions": {"rows": codex_account}},
+                },
+            }},
+            "all": {"data": {"providers": {
+                "claude": {"sessions": {"rows": claude_mirror}},
+                "codex": {"sessions": {"rows": codex_mirror}},
+            }}},
+        },
+    }
+
+    assert envelope_module._claude_source_session_rows(env) == [claude_physical]
+    assert envelope_module._codex_source_session_rows(env) == [
+        codex_physical,
+        codex_account,
+    ]
+
+
 def test_envelope_carries_the_session_title_end_to_end(tmp_path, monkeypatch):
     """The whole chain the regression broke: cache.db + conversations.db ->
     ``_tui_build_snapshot`` (dashboard build) -> envelope ``sessions.rows``."""

@@ -2988,6 +2988,42 @@ def test_codex_session_resource_keys_include_the_root_qualified_grouping_id():
     assert "/private/root-b" not in repr(wire)
 
 
+def test_codex_session_resource_key_honors_oracle_path_alias():
+    """A fixture realpath spelling must not leak into the opaque row key."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    from _lib_source_identity import identity_path_alias
+
+    shared = {
+        "session_id": "same-inner-session",
+        "session_id_path": "2026/08/19/rollout-shared",
+        "session_file": "rollout-shared",
+        "directory": "2026/08/19",
+        "input_tokens": 1,
+        "cached_input_tokens": 0,
+        "output_tokens": 1,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 2,
+        "cost_usd": 0.1,
+        "models": ("gpt-5",),
+        "last_activity": NOW,
+    }
+
+    def key_for(root: str) -> str:
+        view = SimpleNamespace(
+            rows=(SimpleNamespace(**shared, codex_root=root),),
+            total_sessions=1,
+            total_cost_usd=0.1,
+            total_tokens=2,
+        )
+        return source_module._session_wire(view)["rows"][0]["key"]
+
+    logical_root = "/tmp/cctally-oracle-small-seed42/codex-0"
+    physical_root = "/private" + logical_root
+    with identity_path_alias("/private/tmp/cctally-oracle-small-seed42",
+                             "/tmp/cctally-oracle-small-seed42"):
+        assert key_for(physical_root) == key_for(logical_root)
+
+
 def test_quota_hero_summary_uses_the_active_baseline_not_a_historical_high_watermark():
     source_module = sys.modules["_cctally_dashboard_sources"]
     cache = sqlite3.connect(":memory:")

@@ -273,9 +273,15 @@ def _current_claude_week_key(conn: sqlite3.Connection) -> "str | None":
 
 
 def _claude_cycle_key(ref) -> str:
+    # A milestone-only week whose rows predate `percent_milestones.week_start_at`
+    # carries no boundaries at all, and `_synthesize_milestone_only_ref` returns
+    # that ref rather than dropping the week. `dashboard_resource_key` rejects
+    # the empty string as an identity part but accepts `None` as its own typed
+    # part, so the absent boundary is passed as the absence it is. Every ref
+    # that does carry both boundaries keys exactly as before.
     return dashboard_resource_key(
         "milestone_cycle", "claude", ref.key,
-        ref.week_start_at or "", ref.week_end_at or "",
+        ref.week_start_at or None, ref.week_end_at or None,
     )
 
 
@@ -440,9 +446,11 @@ def build_claude_week_detail(conn: sqlite3.Connection, key: str) -> "dict | None
         return None
     entry = next(e for e in build_claude_week_index(conn) if e["key"] == key)
     rows = _claude_cycle_rows(conn, ref)
+    # Same absent-boundary case `_claude_cycle_key` handles, and this call runs
+    # unconditionally, ahead of the `if rows` guard below.
     segment_key = dashboard_resource_key(
         "milestone_segment", "claude", ref.key,
-        ref.week_start_at or "", ref.week_end_at or "",
+        ref.week_start_at or None, ref.week_end_at or None,
     )
     segments = ([{"key": segment_key,
                   "milestones": [_shape_weekly_milestone(r) for r in rows]}]

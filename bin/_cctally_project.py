@@ -24,6 +24,7 @@ import bisect
 import datetime as dt
 import json
 import os
+import sqlite3
 import sys
 
 from _cctally_core import (
@@ -35,6 +36,9 @@ from _cctally_core import (
 )
 from _lib_fmt import stable_sum
 
+# #620 S1 D11: the one affordance shape every warning state renders.
+import _lib_alert_scope
+
 
 def _cctally():
     """Resolve the current `cctally` module at call-time (spec §3.1)."""
@@ -42,7 +46,8 @@ def _cctally():
 
 
 def _load_week_snapshots(
-    since: dt.datetime, until: dt.datetime
+    since: dt.datetime, until: dt.datetime, *,
+    account_key: "str | None" = None,
 ) -> dict[dt.datetime, float]:
     """Return {week_start_utc -> max(weekly_percent)} for weeks intersecting
     the [since, until] range.
@@ -68,20 +73,43 @@ def _load_week_snapshots(
     helper apply (spec §4a, test S15). The floor compare uses `unixepoch()` on
     both sides (mixed `Z` / `+00:00` offset spellings).
 
+    ``account_key`` (#620 S1): scopes the read to one account's snapshots.
+    ``None`` — the default and every unfiltered invocation — is the merged
+    all-accounts read, byte-identical to before. A real key is required under
+    ``--account``: two accounts hold independent weekly quotas, so summing
+    another account's percentage into an account-filtered total reports a
+    figure that describes neither account. Percentages across accounts are
+    never summed for the same reason the dashboard never sums them.
+
     Returns an empty dict if the stats DB has no relevant rows.
     """
+    acct_pred = "" if account_key is None else " AND account_key = ?"
+    acct_params: tuple = () if account_key is None else (account_key,)
     conn = open_db()
     try:
-        cur = conn.execute(
-            "SELECT week_start_date, week_start_at, week_end_at, "
-            "       captured_at_utc, weekly_percent "
-            "FROM weekly_usage_snapshots "
-            "WHERE week_start_at IS NOT NULL "
-            "AND week_end_at IS NOT NULL "
-            "AND datetime(week_start_at) < datetime(?) "
-            "AND datetime(week_end_at) > datetime(?)",
-            (until.isoformat(), since.isoformat()),
-        )
+        try:
+            cur = conn.execute(
+                "SELECT week_start_date, week_start_at, week_end_at, "
+                "       captured_at_utc, weekly_percent "
+                "FROM weekly_usage_snapshots "
+                "WHERE week_start_at IS NOT NULL "
+                "AND week_end_at IS NOT NULL "
+                "AND datetime(week_start_at) < datetime(?) "
+                "AND datetime(week_end_at) > datetime(?)"
+                f"{acct_pred}",
+                (until.isoformat(), since.isoformat(), *acct_params),
+            )
+        except sqlite3.OperationalError:
+            # A stats.db predating the `account_key` column — an install
+            # whose migrations have not run, or a dev binary that refused
+            # the prod forward-migration (#142). `_projects_week_grid`
+            # carries the same guard for the same predicate.
+            #
+            # Withholding is the degradation, not dropping the predicate:
+            # retrying unscoped would sum another account's weekly
+            # percentage into an account-filtered total, which is the
+            # figure describing neither account that #620 S1 removed.
+            return {}
         rows_in = []
         for wsd, ws_iso, we_iso, cap_iso, pct in cur.fetchall():
             if ws_iso is None or pct is None:
@@ -402,46 +430,115 @@ def cmd_project(args: argparse.Namespace) -> int:
     now = _command_as_of()
     conn = open_db()
 
-    # Resolve [since_dt, until_dt] in UTC.  All-provider project dispatch
-    # resolves its calendar range once, then injects it here so Claude and
-    # Codex describe precisely the same interval.  The normal Claude parser
-    # remains unchanged for every user-facing legacy invocation.
+    # #341 --account: resolve the render filter (provider=claude; fail closed
+    # with exit 3 when the entry cache is unavailable). None = merged.
+    #
+    # #620 S1 D1: resolved BEFORE the subscription-week walk below, not after
+    # it. `_compute_subscription_weeks` takes an account context precisely so
+    # one account's resets cannot re-anchor another's week walk, and passing
+    # `None` while `--account` was in force bucketed one account's dollars
+    # against the merged boundary set — which, when two accounts reset on
+    # different weekdays, is neither account's. An invocation WITHOUT
+    # `--account` still passes `None` and keeps today's merged boundaries.
+    # Argument VALIDATION runs first. Task 4 moved `resolve_account_filter`
+    # ahead of the range resolution because `_compute_subscription_weeks`
+    # needs the account context to build the default window, and that
+    # reordering also moved which error a user sees when both are wrong: a
+    # malformed `--since` with an unavailable entry cache started exiting 3
+    # instead of 2. Exit codes are contract (`docs/cli-contract.md`), and a
+    # native-usage error outranks a staged environment failure because it is
+    # the one the user can act on. Only the parse moves back in front; the
+    # resolved account still precedes interval construction below.
     source_range = getattr(args, "_source_analytics_range", None)
-    if source_range is not None:
-        since_dt, until_dt = source_range
-    elif args.since or args.until:
+    parsed_explicit_range = None
+    if source_range is None and (args.since or args.until):
         parsed = c._parse_cli_date_range(args, now_utc=now)
         if isinstance(parsed, int):
             # Translate the ccusage-parity helper's exit 1 into project's own
             # native usage code 2 — project is cctally-native, not a ccusage
             # drop-in (docs/cli-contract.md; #279 S6 W2).
             return 2
-        since_dt, until_dt = parsed
+        parsed_explicit_range = parsed
+
+    acct_key, acct_exit = c.resolve_account_filter(
+        args, "claude", needs_cache=True)
+    if acct_exit is not None:
+        return acct_exit
+
+    # Resolve [since_dt, until_dt] in UTC.  All-provider project dispatch
+    # resolves its calendar range once, then injects it here so Claude and
+    # Codex describe precisely the same interval.  The normal Claude parser
+    # remains unchanged for every user-facing legacy invocation.
+    if source_range is not None:
+        since_dt, until_dt = source_range
+    elif parsed_explicit_range is not None:
+        since_dt, until_dt = parsed_explicit_range
         since_dt = since_dt.astimezone(dt.timezone.utc)
         until_dt = until_dt.astimezone(dt.timezone.utc)
     else:
-        # Default to the current subscription week; --weeks N extends backwards.
+        # Default to the current subscription week; --weeks N extends
+        # backwards over the REAL intervals.
+        #
+        # #620 S1. `since_dt = cw_start - 7 * (weeks - 1)` was short of the
+        # truth by the accumulated shortfall of every drifted week in the
+        # window — one day per six-day week, several days over `--weeks 12`.
+        # `_compute_subscription_weeks` emits a leading extrapolated slice
+        # covering whatever `since_dt` it is given, so that deficit was not
+        # empty: every entry inside it was read and bucketed into a week the
+        # panel does not have, `_load_week_snapshots` admitted the prior real
+        # week (it selects every week OVERLAPPING the range) and summed its
+        # whole percentage into `totals.usedPercent`, and the extra week with
+        # no snapshot drove the rendered line "Used % unavailable for 1 week".
+        #
+        # The window is resolved the way the dashboard Projects panel
+        # resolves it: one walk over one shared probe range, locate the
+        # interval containing `now`, then take the `weeks` intervals ending
+        # there. `rangeStart` and `weeksInRange` move as a result, which is
+        # the point — a figure computed over the wrong population is what
+        # this correction removes.
+        weeks_back = args.weeks if args.weeks is not None else 1
+        probe_start, _probe_end = c.subscription_window_probe_range(
+            now, weeks_back,
+        )
         # Widen by 1us so the emit loop fires when `now` is exactly at a reset
         # boundary (zero-width [now, now] makes Case A's `current < range_end`
         # false, which would otherwise wrongly fall through to the Monday
         # fallback for non-Monday-reset accounts).
-        current_weeks = c._compute_subscription_weeks(
-            conn, now, now + dt.timedelta(microseconds=1), config=config,
-            account_key=None,  # #341: merged (all-accounts) analytics read
+        probe_weeks = c._compute_subscription_weeks(
+            conn, probe_start, now + dt.timedelta(microseconds=1),
+            config=config,
+            # #341/#620 S1: the resolved `--account` scope, or None for the
+            # merged (all-accounts) analytics read.
+            account_key=acct_key,
         )
-        if current_weeks:
-            cw_start = parse_iso_datetime(
-                current_weeks[0].start_ts, "week.start_ts"
-            ).astimezone(dt.timezone.utc)
+        probe_bounds: list[tuple[dt.datetime, dt.datetime]] = []
+        for sw in probe_weeks:
+            probe_bounds.append((
+                parse_iso_datetime(sw.start_ts, "week.start_ts").astimezone(
+                    dt.timezone.utc),
+                parse_iso_datetime(sw.end_ts, "week.end_ts").astimezone(
+                    dt.timezone.utc),
+            ))
+        cw_start = None
+        for s_dt, e_dt in reversed(probe_bounds):
+            if s_dt <= now < e_dt:
+                cw_start = s_dt
+        window = (
+            c.subscription_window_ending_at(probe_bounds, cw_start, weeks_back)
+            if cw_start is not None else []
+        )
+        if window:
+            since_dt = window[0][0]
         else:
-            # No snapshots available: fall back to a Monday-anchored week.
-            cw_start = (now - dt.timedelta(days=now.weekday())).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-        if args.weeks is not None:
-            since_dt = cw_start - dt.timedelta(days=7 * (args.weeks - 1))
-        else:
-            since_dt = cw_start
+            # No interval covers `now` — the genuine no-anchor path. A
+            # Monday-anchored week stepped back in seven-day multiples is
+            # what that history actually looks like, and it is what the
+            # panel falls back to as well.
+            if cw_start is None:
+                cw_start = (now - dt.timedelta(days=now.weekday())).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+            since_dt = cw_start - dt.timedelta(days=7 * (weeks_back - 1))
         until_dt = now
 
     # Pre-compute subscription-week bounds for the query window so each entry
@@ -449,7 +546,9 @@ def cmd_project(args: argparse.Namespace) -> int:
     # `_aggregate_weekly`'s bisect pattern (first-match-wins on overlap).
     subweeks = c._compute_subscription_weeks(
         conn, since_dt, until_dt, config=config,
-        account_key=None,  # #341: merged (all-accounts) analytics read
+        # #341/#620 S1: the resolved `--account` scope, or None for the merged
+        # (all-accounts) analytics read.
+        account_key=acct_key,
     )
     parsed_bounds: list[tuple[dt.datetime, dt.datetime]] = []
     for sw in subweeks:
@@ -494,13 +593,6 @@ def cmd_project(args: argparse.Namespace) -> int:
         scan_end = max(until_dt, parsed_bounds[-1][1])
     else:
         scan_start, scan_end = since_dt, until_dt
-
-    # #341 --account: resolve the render filter (provider=claude; fail closed
-    # with exit 3 when the entry cache is unavailable). None = merged.
-    acct_key, acct_exit = c.resolve_account_filter(
-        args, "claude", needs_cache=True)
-    if acct_exit is not None:
-        return acct_exit
 
     resolver_cache: dict[str, ProjectKey] = {}
     buckets: dict[tuple[ProjectKey, dt.datetime], dict] = {}
@@ -622,16 +714,32 @@ def cmd_project(args: argparse.Namespace) -> int:
             buckets[bkey] = b
         _accumulate_entry_into_bucket(b, entry, pre_computed_cost=entry_cost)
 
+    # The remediation moved OUT of these two sentences and into the shared
+    # affordance line below (#620 S1 D11), so the terminal states the problem
+    # once and the fix once. The `warnings` list the JSON payload carries is a
+    # separate wire surface and keeps its own wording unchanged.
     if unknown_entry_count > 0:
         eprint(
-            f"Warning: {unknown_entry_count} entries lacked project_path — "
-            f"run `cache-sync` to backfill."
+            f"Warning: {unknown_entry_count} entries lacked project_path."
         )
     if missing_sid_count > 0:
         eprint(
             f"Warning: {missing_sid_count} entries lacked session_files "
-            f"session_id — run `cache-sync` to backfill."
+            f"session_id."
         )
+    # #620 S1 D11: state the remediation in the one shape every warning uses,
+    # scoped to the provider whose cache is short and the range that was read.
+    # The `warnings` list the JSON payload carries is deliberately untouched;
+    # it is a wire surface, and this is the terminal affordance.
+    resolved_source = getattr(args, "source", None) or "claude"
+    if unknown_entry_count > 0 or missing_sid_count > 0:
+        eprint(_lib_alert_scope.next_step_line(
+            f"cctally cache-sync --source {resolved_source}",
+            provider=resolved_source,
+            window_start=since_dt,
+            window_end=until_dt,
+            tz=getattr(args, "_resolved_tz", None),
+        ))
 
     # --- Attribution math (Task 5) -----------------------------------------
     # Load per-week `weekly_percent` (max within window) for every week that
@@ -639,7 +747,7 @@ def cmd_project(args: argparse.Namespace) -> int:
     # can surface `weeksMissingSnapshot` in the output — those weeks can't
     # contribute to attributed %.
     week_snapshots: dict[dt.datetime, float] = _load_week_snapshots(
-        since_dt, until_dt
+        since_dt, until_dt, account_key=acct_key,
     )
 
     # Set of every week the user asked about (from the computed SubWeek

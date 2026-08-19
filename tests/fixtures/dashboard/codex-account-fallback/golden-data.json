@@ -133,10 +133,10 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 10,
+  "source_schema_version": 11,
   "sources": {
     "all": {
-      "availability": "partial",
+      "availability": "ok",
       "capabilities": {
         "alerts": {
           "semantics": "provider-native-union",
@@ -173,19 +173,59 @@
         "alerts": {
           "rows": []
         },
-        "combined": null,
-        "combined_unavailable": {
-          "causes": [
+        "combined": {
+          "cost_usd": 1.2150000000000003,
+          "legs": {
+            "claude": {
+              "cost_usd": 0.0,
+              "scope": "provider_cycle",
+              "state": "empty",
+              "total_tokens": 0
+            },
+            "codex": {
+              "accounts": [
+                {
+                  "account_key": "99999999999999999999999999999999",
+                  "cost_usd": 0.405,
+                  "period": {
+                    "end_at": "2026-04-16T14:00:00Z",
+                    "kind": "trailing_7_day_cycle",
+                    "start_at": "2026-04-09T14:00:00Z"
+                  }
+                },
+                {
+                  "account_key": "ffffffffffffffffffffffffffffffff",
+                  "cost_usd": 0.2025,
+                  "period": {
+                    "end_at": "2026-04-20T14:00:00Z",
+                    "kind": "native_7_day_cycle",
+                    "start_at": "2026-04-13T14:00:00Z"
+                  }
+                },
+                {
+                  "account_key": "unattributed",
+                  "cost_usd": 0.6075000000000002,
+                  "period": {
+                    "end_at": "2026-04-16T14:00:00Z",
+                    "kind": "trailing_7_day_cycle",
+                    "start_at": "2026-04-09T14:00:00Z"
+                  }
+                }
+              ],
+              "cost_usd": 1.2150000000000003,
+              "scope": "account_cycles",
+              "state": "current",
+              "total_tokens": null
+            }
+          },
+          "qualifications": [
             {
-              "code": "multi_account_unsupported",
-              "detail": {
-                "account_count": 2
-              },
-              "provider": "codex"
+              "code": "provider_empty",
+              "message": "Claude has no accounting in its current cycle.",
+              "provider": "claude"
             }
           ],
-          "code": "multi_account_unsupported",
-          "message": "Codex has 2 accounts on separate cycles, so a combined total is not published; see the per-account cards."
+          "total_tokens": null
         },
         "providers": {
           "claude": null,

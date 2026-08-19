@@ -81,6 +81,29 @@ _golden_diff_str () {
     return "$rc"
 }
 
+# _golden_require_str <label> <golden_file> <actual_string> [max_lines]
+#   String variant of _golden_require. The actual bytes are first materialized
+#   under the harness scratch directory, with every write checked, then passed
+#   through the one missing/regenerate/diff decision below.
+_golden_require_str () {
+    local label="$1" golden="$2" actual="$3" max="${4:-200}"
+    local dir tmp rc
+    dir="${GOLDEN_DIFF_TMPDIR:-${TMPDIR:-/tmp}}"
+    tmp=$(mktemp "$dir/golden-require.XXXXXX") || {
+        echo "FAIL ${name:-?}: could not materialize $label under $dir"
+        return 1
+    }
+    if ! printf '%s\n' "$actual" > "$tmp"; then
+        rm "$tmp"
+        echo "FAIL ${name:-?}: could not materialize $label under $dir"
+        return 1
+    fi
+    _golden_require "$label" "$golden" "$tmp" "$max"
+    rc=$?
+    rm "$tmp"
+    return "$rc"
+}
+
 # _golden_diff_two_str <label> <golden_string> <actual_string> [max_lines]
 #   Both sides are in-memory strings (e.g. normalized JSON), compared
 #   WITHOUT an added trailing newline (printf '%s'), matching the prior
@@ -126,8 +149,11 @@ _golden_require () {
     local label="$1" golden="$2" actual="$3" max="${4:-200}"
     if [ ! -f "$golden" ]; then
         if [ "${CCTALLY_REGEN_GOLDENS:-}" = "1" ]; then
-            mkdir -p "$(dirname "$golden")"
-            cp "$actual" "$golden"
+            if ! mkdir -p "$(dirname "$golden")" \
+                    || ! cp "$actual" "$golden"; then
+                echo "FAIL ${name:-?}: could not regenerate $label at $golden"
+                return 1
+            fi
             echo "[REGEN] ${name:-?}: created $golden"
             return 0
         fi
@@ -138,7 +164,10 @@ _golden_require () {
     fi
     if [ "${CCTALLY_REGEN_GOLDENS:-}" = "1" ]; then
         if ! cmp -s "$golden" "$actual"; then
-            cp "$actual" "$golden"
+            if ! cp "$actual" "$golden"; then
+                echo "FAIL ${name:-?}: could not regenerate $label at $golden"
+                return 1
+            fi
             echo "[REGEN] ${name:-?}: updated $golden"
         fi
         return 0

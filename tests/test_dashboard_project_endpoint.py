@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import pathlib
+import shutil
 import sqlite3
 import sys
 
@@ -46,6 +47,11 @@ def test_detail_for_known_key():
     assert detail is not None
     assert detail["key"] == "cctally-dev"
     assert detail["window_weeks"] == 4
+    # #571 — these are the authoritative half-open bounds the SQL walk uses.
+    # Publishing them keeps the client from reimplementing the server's
+    # subscription-window arithmetic in TypeScript.
+    assert detail["window_start_at"] == "2026-04-27T00:00:00Z"
+    assert detail["window_end_at"] == "2026-05-25T00:00:00Z"
     assert isinstance(detail["models"], list)
     assert isinstance(detail["sessions"], list)
     assert len(detail["sessions"]) <= 5  # top-5 cap per spec §5.3
@@ -96,6 +102,52 @@ def test_detail_window_cost_matches_trend_per_project():
     assert detail is not None
     target_sum = sum(target["weekly_cost"])
     assert abs(detail["window_cost_usd"] - target_sum) < 1e-9
+
+
+def test_detail_excludes_an_entry_exactly_at_the_published_end(tmp_path):
+    """The published end is exclusive, matching the subscription interval."""
+    fixture = tmp_path / "multi-week.db"
+    shutil.copy2(FIXTURE_DIR / "multi-week.db", fixture)
+    conn = _open(fixture)
+    env = _build_projects_envelope(
+        conn, now_utc=NOW_UTC, current_week=None, weeks_back=4,
+    )
+    baseline = _project_detail_for_window(
+        conn,
+        project_key="cctally-dev",
+        weeks_back=4,
+        now_utc=NOW_UTC,
+        current_week=None,
+        projects_envelope=env,
+    )
+    assert baseline is not None
+    conn.execute(
+        "INSERT INTO session_entries "
+        "(source_path, line_offset, timestamp_utc, model, input_tokens, "
+        " output_tokens, cost_usd_raw, mutation_seq) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "/jsonl/cctally-dev/w00.jsonl",
+            999_999,
+            "2026-05-25T00:00:00Z",
+            "claude-sonnet-4-5-20250929",
+            1,
+            1,
+            999.0,
+            999_999,
+        ),
+    )
+
+    with_boundary = _project_detail_for_window(
+        conn,
+        project_key="cctally-dev",
+        weeks_back=4,
+        now_utc=NOW_UTC,
+        current_week=None,
+        projects_envelope=env,
+    )
+    assert with_boundary is not None
+    assert with_boundary["window_cost_usd"] == baseline["window_cost_usd"]
 
 
 def test_detail_disambiguated_key_round_trips():

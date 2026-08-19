@@ -54,6 +54,22 @@ assert_contains() {
     esac
 }
 
+assert_not_contains() {
+    local label="$1" needle="$2" haystack="$3"
+    case "$haystack" in
+        *"$needle"*)
+            echo "FAIL: $label"
+            echo "  expected NOT to contain: $needle"
+            echo "  actual: $haystack"
+            fail_count=$((fail_count + 1))
+            ;;
+        *)
+            echo "PASS: $label"
+            pass_count=$((pass_count + 1))
+            ;;
+    esac
+}
+
 # All checks happen inside a single Python heredoc; the script prints
 # "MARKER:<label>:<value>" lines that the bash side reads back.
 out=$(TZ=Etc/UTC python3 - <<'PY' 2>&1
@@ -71,7 +87,10 @@ sys.modules['cctally'] = m
 loader.exec_module(m)
 
 def emit(label, value):
-    print(f"MARKER:{label}:{value}")
+    # The marker protocol is one line per label, and a body now carries the
+    # #620 next-step affordance on a second line. Flatten it so the whole
+    # value stays readable through get_marker.
+    print(f"MARKER:{label}:{str(value).replace(chr(10), ' ')}")
 
 # ---------------------------------------------------------------- weekly text
 weekly_payload = {
@@ -80,6 +99,12 @@ weekly_payload = {
     "crossed_at": "2026-04-29T14:32:11Z",
     "context": {
         "week_start_date": "2026-04-27",
+        # The subscription week's RESET INSTANT, which the milestone row
+        # retains and both write paths publish. A week runs reset-to-reset,
+        # so a payload carrying only the calendar date would place the
+        # window at midnight — the shape the day-granularity payload below
+        # covers deliberately.
+        "week_start_at": "2026-04-27T14:00:00Z",
         "cumulative_cost_usd": 47.32,
         "dollars_per_percent": 0.53,
     },
@@ -88,6 +113,23 @@ title, subtitle, body = m._alert_text_weekly(weekly_payload, tz=None)
 emit("weekly.title", title)
 emit("weekly.subtitle", subtitle)
 emit("weekly.body", body)
+
+# A row written before `percent_milestones.week_start_at` existed carries the
+# week's calendar date and no reset hour, so the window renders as two bare
+# dates rather than a midnight instant the row never recorded.
+weekly_dateonly = {
+    "axis": "weekly",
+    "threshold": 90,
+    "crossed_at": "2026-04-29T14:32:11Z",
+    "context": {
+        "week_start_date": "2026-04-27",
+        "week_start_at": "",
+        "cumulative_cost_usd": 47.32,
+        "dollars_per_percent": 0.53,
+    },
+}
+_, _, dateonly_body = m._alert_text_weekly(weekly_dateonly, tz=None)
+emit("weekly.body.dateonly", dateonly_body)
 
 # Regression: weekly subtitle's `week_start_date` is a CALENDAR DAY,
 # not a clock instant. Tagging it as UTC-midnight and routing through
@@ -204,6 +246,25 @@ esac
 assert_contains "weekly body contains \$47.32" "\$47.32" "$weekly_body"
 assert_contains "weekly body contains \$0.53" "\$0.53" "$weekly_body"
 
+# #620 S1: every axis routes to the command that explains its own window.
+# The weekly payload's week starts 2026-04-27, so the offered breakdown must
+# select that week and no other, and the trailing statement must name the
+# provider and both bounds of the half-open window.
+assert_contains "weekly body offers the scoped next step" \
+    "→ Run \`cctally percent-breakdown --week-start 2026-04-27\`" "$weekly_body"
+assert_contains "weekly next step states provider and window" \
+    "claude · 2026-04-27 14:00 → 2026-05-04 14:00 UTC" "$weekly_body"
+assert_not_contains "weekly next step does not state a midnight it never saw" \
+    "2026-04-27 00:00" "$weekly_body"
+
+# A crossing recorded before the reset instant was retained states the week at
+# DAY granularity: no clock reading, no zone label.
+weekly_body_dateonly=$(get_marker "weekly.body.dateonly")
+assert_contains "weekly date-only next step states bare dates" \
+    "claude · 2026-04-27 → 2026-05-04" "$weekly_body_dateonly"
+assert_not_contains "weekly date-only next step invents no clock reading" \
+    "00:00" "$weekly_body_dateonly"
+
 # Calendar-day stability: 2026-04-27 is a Monday. Subtitle MUST render
 # "Mon, Apr 27" under both UTC and a west-of-UTC display tz; the prior
 # UTC-tag-then-format_display_dt pattern shifted to "Sun, Apr 26" for
@@ -222,6 +283,10 @@ fh_title_lower=$(echo "$fh_title" | tr '[:upper:]' '[:lower:]')
 assert_contains "5h title contains 5h-block (case-insensitive)" "5h-block" "$fh_title_lower"
 assert_contains "5h body contains \$3.87" "\$3.87" "$fh_body"
 assert_contains "5h body contains claude-sonnet-4-6" "claude-sonnet-4-6" "$fh_body"
+assert_contains "5h body offers the scoped next step" \
+    "→ Run \`cctally five-hour-breakdown --block-start 2026-04-29T14:32\`" "$fh_body"
+assert_contains "5h next step states provider and window" \
+    "claude · 2026-04-29 14:32 → 2026-04-29 19:32 UTC" "$fh_body"
 
 dispatch_ok=$(get_marker "dispatch.queued.status")
 dispatch_err=$(get_marker "dispatch.spawn_error.status")

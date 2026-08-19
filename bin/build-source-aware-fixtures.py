@@ -270,7 +270,12 @@ def _legacy_fixture_dependencies(module, command: str, *, populated: bool):
         )
         replace(module, "_compute_subscription_weeks", lambda *_args, **_kwargs: (subweek,))
         replace(module._cctally_project, "open_db", _fixture_db)
-        replace(module._cctally_project, "_load_week_snapshots", lambda *_args: {})
+        # `**_kwargs` absorbs `account_key` (#620 S1), the same shape the
+        # `_compute_subscription_weeks` stub above already uses.
+        replace(
+            module._cctally_project, "_load_week_snapshots",
+            lambda *_args, **_kwargs: {},
+        )
     elif command == "report":
         week_ref = module.make_week_ref(
             week_start_date="2026-06-29", week_end_date="2026-07-05",

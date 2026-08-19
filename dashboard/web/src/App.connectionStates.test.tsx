@@ -11,7 +11,10 @@ function stubConn(
   disconnected: boolean, bootstrapError: boolean, bootstrapMessage: string | null = null,
 ) {
   vi.spyOn(conn, 'useConnectionStatus')
-    .mockReturnValue({ disconnected, bootstrapError, bootstrapMessage });
+    .mockReturnValue({
+      state: disconnected ? 'disconnected' : 'connected',
+      disconnected, bootstrapError, bootstrapMessage,
+    });
 }
 
 beforeEach(() => { localStorage.clear(); _resetStore(); vi.restoreAllMocks(); });
@@ -41,6 +44,10 @@ describe('App connection states (B2/B3)', () => {
     const banner = container.querySelector('.stale-banner-error')!;
     expect(banner.textContent).toContain('update stream');
     expect(banner.textContent).not.toContain('Couldn’t load dashboard data');
+    // #611: this specific diagnosis proves the server answered and the stream
+    // opened. Appending the generic "is the dashboard running?" hint makes the
+    // same banner contradict itself.
+    expect(banner.textContent).not.toContain('Check that cctally dashboard is running');
   });
 
   it('ready + disconnected: live grid dimmed + stale banner', () => {

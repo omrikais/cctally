@@ -3,6 +3,8 @@ name: pricing-freshness
 # Weekly proactive pricing-drift check (spec 2026-05-29 §5.4). Runs
 # `cctally pricing-check --json` and maintains exactly one auto-managed
 # `pricing-drift`-labeled tracking issue (create / update / close-on-clean).
+# A durable marker in the issue body is the ownership contract; the label alone
+# never authorizes the workflow to rewrite or close a manually filed issue.
 #
 # The zero-lag `/v1/models` existence leg is NEVER exercised here — the
 # cron has no OAuth bearer, so it auto-degrades to LiteLLM value-drift +

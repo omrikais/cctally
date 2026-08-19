@@ -101,7 +101,14 @@ CapabilityStatus = Literal[
 # DESTRUCTIVE entry in this ledger rather than an additive one, and the null
 # stub is what makes it survivable across an in-place `execvp` update. Removing
 # the stub needs a separate change once no v9 bundle can be live.
-SOURCE_SCHEMA_VERSION = 10
+# 10 -> 11 (#565): decorated providers now contribute certified per-account
+# cycle legs to `sources.all.data.combined` instead of forcing
+# `multi_account_unsupported`. Combined and leg `total_tokens` may be null when
+# spend is certified but an equivalent account-scoped token operand is not;
+# each leg gains `scope`, and account-cycle legs publish their exact account
+# contribution periods. These fields change both shape and meaning, so the
+# version moves even though undecorated arithmetic remains unchanged.
+SOURCE_SCHEMA_VERSION = 11
 DEFAULT_SOURCE = "claude"
 SOURCE_ORDER = ("claude", "codex", "all")
 SOURCE_FRESHNESS_DOMAINS = ("hero", "quota", "sessions")
@@ -212,6 +219,10 @@ class SourceDashboardState:
     # would present as single-account and publish the one number §3.2 forbids,
     # on precisely the install where it is wrong.
     account_scope: Mapping[str, object] | None = None
+    # Server-only evidence used to compose decorated providers without
+    # re-deriving account truth from the public card shape. The carrier travels
+    # with the exact generation whose card operands it certifies.
+    combined_accounting: Mapping[str, object] | None = None
     # Request-gated transcript content. This mapping is frozen with the source
     # generation but is deliberately outside ``data``: source serialization
     # publishes only ``data``, then the HTTP/SSE envelope layer injects a label
@@ -280,6 +291,10 @@ class SourceDashboardState:
             object.__setattr__(self, "clock_data", _freeze(self.clock_data))
         if self.account_scope is not None:
             object.__setattr__(self, "account_scope", _freeze(self.account_scope))
+        if self.combined_accounting is not None:
+            object.__setattr__(
+                self, "combined_accounting", _freeze(self.combined_accounting),
+            )
         if self.aggregate_scope is not None:
             object.__setattr__(
                 self, "aggregate_scope", _freeze(self.aggregate_scope),
@@ -402,6 +417,7 @@ def degrade_source_state(
         # it here would turn a transient provider failure into
         # `account_scope_unresolved` on an install whose count read fine.
         account_scope=prior.account_scope,
+        combined_accounting=prior.combined_accounting,
         private_session_labels=prior.private_session_labels,
         # #556 S2 §3.6: the carrier travels with the rows it describes. A
         # degraded generation retains `prior.data`, so it must retain the range
@@ -520,12 +536,12 @@ def _cause_message(cause: _CombinedCause) -> str:
             f"{provider}'s account count could not be read, so a combined "
             "total is withheld."
         )
-    if cause.code == "multi_account_unsupported":
-        count = detail.get("account_count")
-        return (
-            f"{provider} has {count} accounts on separate cycles, so a "
-            "combined total is not published; see the per-account cards."
-        )
+    if cause.code == "account_cost_unresolved":
+        return f"{provider} account spend could not be certified."
+    if cause.code == "account_cycle_unresolved":
+        return f"{provider} account cycle bounds could not be certified."
+    if cause.code == "account_reconciliation_failed":
+        return f"{provider} account cards did not reconcile with accounting."
     if cause.code == "claude_cycle_unresolved":
         return "Claude's current subscription week could not be resolved."
     if cause.code == "codex_projection_incoherent":
@@ -602,6 +618,149 @@ def _period_instant(value: object) -> str | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _aware_period_instant(value: object) -> str | None:
+    """Canonicalize an explicitly aware bound; naive values fail closed."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+_ACCOUNT_PERIOD_KINDS: Mapping[PhysicalSource, frozenset[str]] = MappingProxyType({
+    "claude": frozenset({"subscription_week"}),
+    "codex": frozenset({"native_7_day_cycle", "trailing_7_day_cycle"}),
+})
+
+
+def _decorated_combined_leg(
+    state: SourceDashboardState,
+    provider: PhysicalSource,
+) -> tuple[Mapping[str, object] | None, tuple[_CombinedCause, ...]]:
+    """Validate a decorated provider's frozen card certificate at composition."""
+    carrier = state.combined_accounting
+    if not isinstance(carrier, Mapping):
+        return None, (_CombinedCause(
+            5, provider, "account_reconciliation_failed"),)
+    if carrier.get("scope") != "account_cycles":
+        return None, (_CombinedCause(
+            5, provider, "account_reconciliation_failed"),)
+    status = carrier.get("status")
+    if status == "unresolved":
+        cause = carrier.get("cause")
+        if cause == "account_cost_unresolved":
+            return None, (_CombinedCause(3, provider, cause),)
+        if cause == "account_cycle_unresolved":
+            return None, (_CombinedCause(4, provider, cause),)
+        return None, (_CombinedCause(
+            5, provider, "account_reconciliation_failed"),)
+    if status != "certified":
+        return None, (_CombinedCause(
+            5, provider, "account_reconciliation_failed"),)
+
+    data = state.data
+    cards = data.get("accounts") if isinstance(data, Mapping) else None
+    contributions = carrier.get("contributions")
+    if not isinstance(cards, (tuple, list)) or not isinstance(
+        contributions, (tuple, list)
+    ):
+        return None, (_CombinedCause(
+            5, provider, "account_reconciliation_failed"),)
+
+    card_rows: list[tuple[str, float]] = []
+    for card in cards:
+        if not isinstance(card, Mapping):
+            return None, (_CombinedCause(
+                5, provider, "account_reconciliation_failed"),)
+        key = card.get("accountKey")
+        cost = card.get("spendUsd")
+        if (
+            not isinstance(key, str) or not key
+            or _counter_reason(cost, integral=False) is not None
+        ):
+            return None, (_CombinedCause(
+                5, provider, "account_reconciliation_failed"),)
+        card_rows.append((key, float(cost)))
+    card_keys = [key for key, _cost in card_rows]
+    if len(card_keys) != len(set(card_keys)):
+        return None, (_CombinedCause(
+            5, provider, "account_reconciliation_failed"),)
+
+    public_rows: list[dict[str, object]] = []
+    contribution_keys: list[str] = []
+    for index, contribution in enumerate(contributions):
+        if not isinstance(contribution, Mapping):
+            return None, (_CombinedCause(
+                5, provider, "account_reconciliation_failed"),)
+        key = contribution.get("account_key")
+        cost = contribution.get("cost_usd")
+        if (
+            not isinstance(key, str) or not key
+            or _counter_reason(cost, integral=False) is not None
+        ):
+            return None, (_CombinedCause(
+                5, provider, "account_reconciliation_failed"),)
+        contribution_keys.append(key)
+        period = contribution.get("period")
+        if not isinstance(period, Mapping):
+            return None, (_CombinedCause(4, provider, "account_cycle_unresolved"),)
+        kind = period.get("kind")
+        start_at = _aware_period_instant(period.get("start_at"))
+        end_at = _aware_period_instant(period.get("end_at"))
+        start_instant = (
+            dt.datetime.fromisoformat(start_at.replace("Z", "+00:00"))
+            if start_at is not None else None
+        )
+        end_instant = (
+            dt.datetime.fromisoformat(end_at.replace("Z", "+00:00"))
+            if end_at is not None else None
+        )
+        if (
+            kind not in _ACCOUNT_PERIOD_KINDS[provider]
+            or start_instant is None or end_instant is None
+            or start_instant >= end_instant
+        ):
+            return None, (_CombinedCause(4, provider, "account_cycle_unresolved"),)
+        if index >= len(card_rows):
+            return None, (_CombinedCause(
+                5, provider, "account_reconciliation_failed"),)
+        card_key, card_cost = card_rows[index]
+        if key != card_key or abs(float(cost) - card_cost) > 1e-9:
+            return None, (_CombinedCause(
+                5, provider, "account_reconciliation_failed"),)
+        public_rows.append({
+            "account_key": key,
+            "cost_usd": card_cost,
+            "period": {
+                "kind": kind, "start_at": start_at, "end_at": end_at,
+            },
+        })
+    if contribution_keys != card_keys:
+        return None, (_CombinedCause(
+            5, provider, "account_reconciliation_failed"),)
+
+    total = math.fsum(cost for _key, cost in card_rows)
+    hero = _combined_hero(state)
+    hero_cost = hero.get("cost_usd") if hero is not None else None
+    if (
+        _counter_reason(hero_cost, integral=False) is not None
+        or abs(float(hero_cost) - total) > 1e-9
+    ):
+        return None, (_CombinedCause(
+            5, provider, "account_reconciliation_failed"),)
+    return {
+        "state": "current",
+        "scope": "account_cycles",
+        "cost_usd": total,
+        "total_tokens": None,
+        "accounts": tuple(public_rows),
+    }, ()
 
 
 def canonical_alerted_at(value: object) -> str:
@@ -710,7 +869,7 @@ def _combined_leg(
             else ("claude_cycle_unresolved",)
         )
         return None, tuple(
-            _CombinedCause(4, provider, code) for code in codes
+            _CombinedCause(6, provider, code) for code in codes
         )
     cost = hero.get("cost_usd") if hero is not None else None
     tokens = hero.get("total_tokens") if hero is not None else None
@@ -718,15 +877,18 @@ def _combined_leg(
     if period is None and state.availability == "empty":
         # Numeric zeros and no period, so nothing presents `$0` as observed
         # spend inside a named cycle.
-        return {"state": "empty", "cost_usd": 0.0, "total_tokens": 0}, ()
+        return {
+            "state": "empty", "scope": "provider_cycle",
+            "cost_usd": 0.0, "total_tokens": 0,
+        }, ()
     if provider == "claude" and cost is None and tokens is None:
         # Accounting exists but no subscription week resolved. Claude's hero
         # capability stays `supported` in that state, so this is its own
         # detection rather than the capability branch above.
-        return None, (_CombinedCause(4, provider, "claude_cycle_unresolved"),)
+        return None, (_CombinedCause(6, provider, "claude_cycle_unresolved"),)
     causes = tuple(
         _CombinedCause(
-            5, provider, "invalid_counter", {"field": field, "reason": reason},
+            7, provider, "invalid_counter", {"field": field, "reason": reason},
         )
         for field, reason in (
             ("cost_usd", _counter_reason(cost, integral=False)),
@@ -738,6 +900,7 @@ def _combined_leg(
         return None, causes
     return {
         "state": "current",
+        "scope": "provider_cycle",
         "cost_usd": float(cost),
         "total_tokens": int(tokens),
         **({"period": period} if period is not None else {}),
@@ -782,11 +945,10 @@ def _combined_outcome(
 ) -> tuple[Mapping[str, object] | None, Mapping[str, object] | None]:
     """Return ``(combined, combined_unavailable)`` — exactly one is not None.
 
-    Cause precedence (§3.7), first match wins, Claude before Codex at equal
-    precedence: provider incoherence, unresolved account scope, decoration, a
-    hero capability outside {supported, derived} reported as the provider's own
-    reason, then an invalid counter. Every cause found is listed, ordered so
-    that `causes[0]` is always the winner.
+    Cause precedence (§6.5), first match wins, Claude before Codex at equal
+    precedence: provider incoherence, unresolved account scope, unresolved
+    account spend, unresolved account periods, reconciliation, provider-cycle
+    capability, then invalid counters.
     """
     pairs: tuple[tuple[PhysicalSource, SourceDashboardState], ...] = (
         ("claude", claude), ("codex", codex),
@@ -800,18 +962,18 @@ def _combined_outcome(
         if count is None:
             causes.append(
                 _CombinedCause(2, provider, "account_scope_unresolved"))
-        elif count > 1:
-            causes.append(_CombinedCause(
-                3, provider, "multi_account_unsupported",
-                {"account_count": count},
-            ))
     legs: dict[str, Mapping[str, object]] = {}
     for provider, state in pairs:
         if not _coherent_provider(state):
             # An incoherent generation's data cannot be trusted to yield a leg
             # OR a leg-level cause; precedence 1 already withholds the figure.
             continue
-        leg, leg_causes = _combined_leg(state, provider)
+        count = _real_account_count(state)
+        leg, leg_causes = (
+            _decorated_combined_leg(state, provider)
+            if count is not None and count > 1
+            else _combined_leg(state, provider)
+        )
         causes.extend(leg_causes)
         if leg is not None:
             legs[provider] = leg
@@ -835,9 +997,15 @@ def _combined_outcome(
             ),
         }
     qualifications = _combined_qualifications(legs, claude, codex)
+    token_values = tuple(legs[provider]["total_tokens"] for provider in ("claude", "codex"))
     return {
-        "cost_usd": float(legs["claude"]["cost_usd"]) + float(legs["codex"]["cost_usd"]),
-        "total_tokens": int(legs["claude"]["total_tokens"]) + int(legs["codex"]["total_tokens"]),
+        "cost_usd": math.fsum(
+            float(legs[provider]["cost_usd"]) for provider in ("claude", "codex")
+        ),
+        "total_tokens": (
+            None if any(value is None for value in token_values)
+            else sum(int(value) for value in token_values)
+        ),
         "legs": legs,
         **({"qualifications": qualifications} if qualifications else {}),
     }, None
@@ -978,6 +1146,26 @@ def aggregate_scope_identity(scope: object) -> str:
         code = entry.get("code") if isinstance(entry, Mapping) else None
         parts.append(f"{name}:{state or 'unknown'}" + (f":{code}" if code else ""))
     return "|".join(parts)
+
+
+def combined_accounting_version(
+    base_version: str, carrier: Mapping[str, object] | None,
+) -> str:
+    """Bind a decorated source version to its frozen account certificate."""
+    if carrier is None:
+        return base_version
+
+    def _plain(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {str(key): _plain(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [_plain(item) for item in value]
+        return value
+
+    material = json.dumps(
+        _plain(carrier), sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return f"{base_version}:c{hashlib.sha256(material).hexdigest()[:16]}"
 
 
 def _aggregate_scope_range(state: SourceDashboardState) -> dict | None:

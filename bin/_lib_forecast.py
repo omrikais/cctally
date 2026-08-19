@@ -42,9 +42,11 @@ class ForecastInputs:
     # Rate inputs
     p_24h_ago: float | None
     t_24h_actual_hours: float | None
-    # $/1% selection
-    dollars_per_percent: float
-    dollars_per_percent_source: str  # "this_week" | "trailing_4wk_median" | "this_week_sparse"
+    # $/1% selection. `None` when no usage has been observed (#620 S1 D5) —
+    # every dollar-derived output is then unavailable rather than zero, and
+    # `dollars_per_percent_source` carries the cause.
+    dollars_per_percent: "float | None"
+    dollars_per_percent_source: str  # "this_week" | "trailing_4wk_median" | "this_week_sparse" | "no_usage_observed"
     # Confidence
     confidence: str  # "high" | "low"
     low_confidence_reasons: list[str]
@@ -121,7 +123,13 @@ def _compute_forecast(inputs: ForecastInputs, targets: list[int]) -> ForecastOut
                 budgets.append(BudgetRow(target_percent=t, pct_headroom=None,
                                          dollars_per_day=None, percent_per_day=None))
                 continue
-            dollars_day = (headroom * inputs.dollars_per_percent) / inputs.remaining_days
+            # #620 S1 D5: with no observed usage there is no rate, so the
+            # dollar budget is unavailable. The percent budget does not
+            # depend on the rate and is still published.
+            dollars_day = (
+                None if inputs.dollars_per_percent is None
+                else (headroom * inputs.dollars_per_percent) / inputs.remaining_days
+            )
             pct_day = headroom / inputs.remaining_days
             budgets.append(BudgetRow(
                 target_percent=t,

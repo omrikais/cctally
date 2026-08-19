@@ -18,6 +18,7 @@ import {
   toastAlertId,
   type AlertAccountFocus,
 } from '../lib/alertIdentity';
+import { AlertFollowCell } from './AlertFollow';
 import { resolveSourceView } from '../store/sourceView';
 import { resolveViewAccountFocus } from '../store/accountFocus';
 import { AlertsEmptyGauge } from './AlertsEmptyGauge';
@@ -295,6 +296,7 @@ export function RecentAlertsModal(): JSX.Element {
                   </td>
                   <td className="alert-cell-context">
                     {isClaude ? <ContextCell alert={row} ctx={ctx} /> : <CodexContextCell row={row} />}
+                    {isClaude && <AlertFollowCell alert={row} env={env} />}
                   </td>
                   <td
                     className="alert-cell-when alert-when"

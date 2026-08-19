@@ -2,9 +2,14 @@ import type { Envelope } from '../types/envelope';
 import { dispatch, updateSnapshot, resetSnapshotOrdering, getState } from './store';
 import { coerceUpdateState, coerceUpdateSuppress } from './update';
 import { collectToastAlertRows } from '../lib/alertIdentity';
+import {
+  createDashboardStreamTransport,
+  type DashboardStreamTransport,
+} from './dashboardStreamTransport';
 
-let es: EventSource | null = null;
-let disconnected = false;
+let es: DashboardStreamTransport | null = null;
+export type ConnectionState = 'connected' | 'suspended' | 'resuming' | 'disconnected';
+let currentConnectionState: ConnectionState = 'disconnected';
 // B2/B3 (#207): no snapshot has landed from any source yet — i.e. cold-start
 // with no data. Distinct from `disconnected` (which is a drop AFTER first
 // data).
@@ -44,7 +49,9 @@ let isFirstTick = true;
 // #583 S3 §8. A connected client costs the server one projection and the
 // browser one full parse on every tick, for as long as the tab is open, whether
 // or not anyone is looking at it. A tab hidden beyond this grace disconnects the
-// main dashboard stream; returning reopens it.
+// main dashboard delivery for this tab; returning resumes it. The direct
+// fallback closes/reopens its EventSource, while the SharedWorker path keeps
+// the port and suspends only this subscriber.
 //
 // Thirty seconds spans two of the server's fifteen-second keep-alive intervals
 // and several publish periods, while absorbing an ordinary task switch: hiding
@@ -79,7 +86,11 @@ export interface SSECallbacks {
   onDisconnect?: () => void;
 }
 
-export function isDisconnected(): boolean { return disconnected; }
+export function connectionState(): ConnectionState { return currentConnectionState; }
+
+export function isDisconnected(): boolean {
+  return currentConnectionState === 'disconnected';
+}
 
 export function isBootstrapError(): boolean { return bootstrapError; }
 
@@ -117,9 +128,15 @@ function emitStatus(): void {
   });
 }
 
+function setConnectionState(next: ConnectionState): void {
+  if (currentConnectionState === next) return;
+  currentConnectionState = next;
+  emitStatus();
+}
+
 export function startSSE(cb: SSECallbacks = {}): void {
   if (es) { es.close(); es = null; }
-  disconnected = false;
+  setConnectionState('disconnected');
   // B2/B3: re-arm the bootstrap-error flag on every fresh start, and bump the
   // start-generation token so a callback queued by a superseded EventSource
   // cannot raise the error view after recovery.
@@ -161,15 +178,11 @@ export function startSSE(cb: SSECallbacks = {}): void {
 // #583 S3 §8. Suspension is NOT `closeSSE()`. `closeSSE()` calls
 // `resetSnapshotOrdering()`, which would discard the ordering state a returning
 // tab is required to retain, and it would clear the retained snapshot's claim on
-// the board. Suspension closes the stream and keeps everything else.
+// the board. Suspension deactivates this transport and keeps everything else.
 function suspendForHidden(): void {
   if (!es) return;
-  // Invalidate every callback of the stream being closed, for the WHOLE hidden
-  // interval rather than only until a new stream opens. A callback already
-  // queued at close time would otherwise write into the store minutes later.
-  startGeneration += 1;
-  es.close();
-  es = null;
+  es.suspend();
+  setConnectionState('suspended');
   // No stream, no first frame to wait for.
   disarmFirstFrameWatchdog();
   // Re-arm the cold-start rule. The accepted consequence, recorded in §8: an
@@ -197,7 +210,12 @@ function onVisibilityChange(cb: SSECallbacks): void {
   if (hiddenTimer != null) { clearTimeout(hiddenTimer); hiddenTimer = null; }
   // Stream only. There is no bootstrap fetch to repeat: the returning tab
   // renders from the hub's subscribe seed exactly as a cold load does.
-  if (es == null) openStream(cb);
+  if (currentConnectionState === 'suspended' && es != null) {
+    setConnectionState('resuming');
+    es.resume();
+  } else if (es == null) {
+    openStream(cb);
+  }
 }
 
 function armVisibility(cb: SSECallbacks): void {
@@ -217,58 +235,49 @@ function disarmVisibility(): void {
   visibilityHandler = null;
 }
 
-// The EventSource and its two callbacks, factored out so a resume from a hidden
-// tab (§8) reopens the stream WITHOUT re-running the cold-start reset above:
+// The transport and its callbacks are factored out so a resume from a hidden
+// tab (§8) reactivates delivery WITHOUT re-running the cold-start reset above:
 // the retained snapshot and the ordering state are exactly what a returning tab
 // must keep.
 function openStream(cb: SSECallbacks): void {
-  // Captured, not read live: this stream's callbacks are valid only while this
-  // generation is current. `suspendForHidden` bumps the counter when it closes
-  // the stream, so a callback queued before the close is a no-op for the whole
-  // hidden interval rather than only until a new stream opens.
+  // Captured, not read live: this top-level transport's callbacks are valid
+  // until closeSSE()/startSSE() replaces it. Hidden-tab staleness is guarded by
+  // the transport-local per-port generation, while a deliberate top-level
+  // teardown advances startGeneration.
   const myGen = startGeneration;
-  es = new EventSource('/api/events');
-  armFirstFrameWatchdog();
-  es.addEventListener('update', (ev: MessageEvent) => {
-    if (myGen !== startGeneration) return;
-    try {
-      const snap = JSON.parse(ev.data) as Envelope;
-      let connectFired = false;
-      if (updateSnapshot(snap)) {
-        // The stream delivered. Whatever this stream was going to be accused
-        // of, it is not silence.
-        disarmFirstFrameWatchdog();
-        // A snapshot landed — clear any cold-start error view so a start that
-        // recovers through the stream self-heals (B2/B3).
-        if (bootstrapError) {
-          bootstrapError = false;
-          bootstrapErrorMsg = null;
-          emitStatus();
-        }
-        ingestAlerts(snap);
-        ingestUpdate(snap);
-        ingestDoctor(snap);
-        ingestDashboardPrefs(snap);
-        if (!bootstrapped) {
-          // #583 S3 §7: the first ACCEPTED snapshot of this start is the
-          // bootstrap, so it fires `onConnect`. Gating on acceptance matters:
-          // an out-of-order frame is not a bootstrap.
-          bootstrapped = true;
-          cb.onConnect?.();
-          connectFired = true;
-        }
-      }
-      if (disconnected) {
-        disconnected = false;
+  let errorReported = false;
+  es = createDashboardStreamTransport({
+    onReady: () => {
+      if (myGen !== startGeneration) return;
+      armFirstFrameWatchdog();
+    },
+    onSnapshot: (snap) => {
+      if (myGen !== startGeneration || !updateSnapshot(snap)) return false;
+      errorReported = false;
+      // The stream delivered an accepted current-generation snapshot.
+      disarmFirstFrameWatchdog();
+      if (bootstrapError) {
+        bootstrapError = false;
+        bootstrapErrorMsg = null;
         emitStatus();
-        // Only on the reconnect transition, and never twice for one event.
+      }
+      ingestAlerts(snap);
+      ingestUpdate(snap);
+      ingestDoctor(snap);
+      ingestDashboardPrefs(snap);
+      let connectFired = false;
+      if (!bootstrapped) {
+        bootstrapped = true;
+        cb.onConnect?.();
+        connectFired = true;
+      }
+      if (currentConnectionState !== 'connected') {
+        setConnectionState('connected');
         if (!connectFired) cb.onConnect?.();
       }
-    } catch (err) {
-      console.error('SSE parse failed:', err);
-    }
-  });
-  es.onerror = () => {
+      return true;
+    },
+    onError: () => {
     if (myGen !== startGeneration) return;
     // #583 S3 §7: with the bootstrap fetch gone, a stream error before any
     // snapshot has landed IS the cold-start failure the error view exists for.
@@ -277,17 +286,21 @@ function openStream(cb: SSECallbacks): void {
       bootstrapError = true;
       emitStatus();
     }
-    if (!disconnected) {
-      disconnected = true;
+    if (currentConnectionState !== 'disconnected') {
+      setConnectionState('disconnected');
       // Re-arm cold-start: the next successful update (post-reconnect)
       // should populate seenAlertIds without surfacing toasts, so a
       // network drop doesn't replay every alert that fired meanwhile.
       // Spec §4.3 / §8.7 ("post-reconnect after a drop").
       isFirstTick = true;
-      emitStatus();
+    }
+    if (!errorReported) {
+      errorReported = true;
+      isFirstTick = true;
       cb.onDisconnect?.();
     }
-  };
+    },
+  });
 }
 
 // #556 S3 §7 — this said "Dispatches INGEST_SNAPSHOT_ALERTS for the
@@ -393,17 +406,16 @@ function ingestDashboardPrefs(snap: Envelope): void {
 export function closeSSE(): void {
   disarmVisibility();
   disarmFirstFrameWatchdog();
-  // #583 S3 §7/§8: invalidate every callback of the stream being torn down,
-  // exactly as `suspendForHidden` does. `closeSSE()` is a DELIBERATE teardown —
-  // the caller has decided this client is finished — and without the bump a
-  // callback already queued when it ran still matches the current generation
-  // and writes into the store afterwards. The ordering guard does not cover
-  // this: `resetSnapshotOrdering()` below clears `lastGeneratedAt`, so any
-  // frame would be accepted.
+  // #583 S3 §7/§8: invalidate every callback of the transport being torn
+  // down. `closeSSE()` is a DELIBERATE top-level teardown; hidden suspension
+  // instead advances the transport-local per-port generation and keeps this
+  // callback generation intact. The ordering guard does not cover teardown:
+  // `resetSnapshotOrdering()` below clears `lastGeneratedAt`, so any late frame
+  // would otherwise be accepted.
   startGeneration += 1;
   if (es) { es.close(); es = null; }
   // disconnected=false here models a clean teardown, not a retry-in-progress.
-  disconnected = false;
+  setConnectionState('disconnected');
   // Re-arm the bootstrap-error flag too (B2/B3) — a clean teardown clears
   // any cold-start error so the next startSSE begins fresh.
   bootstrapError = false;
@@ -420,7 +432,7 @@ export function _resetForTests(): void {
   disarmVisibility();
   disarmFirstFrameWatchdog();
   if (es) { es.close(); es = null; }
-  disconnected = false;
+  currentConnectionState = 'disconnected';
   bootstrapError = false;
   bootstrapErrorMsg = null;
   bootstrapped = false;

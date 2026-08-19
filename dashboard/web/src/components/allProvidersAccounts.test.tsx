@@ -72,10 +72,7 @@ function renderAll(codexData?: CodexSourceData) {
 // carries one spend row per provider, which is the per-leg breakdown of the
 // figure beside it.
 function codexLegRow(): HTMLElement {
-  const support = screen.getByTestId('shared-hero-support');
-  const row = [...support.querySelectorAll('.sup-row')].find(
-    (el) => (el.textContent ?? '').startsWith('Codex · cycle to date'),
-  );
+  const row = screen.getByTestId('hero-leg-codex').closest('.sup-row');
   if (row == null) throw new Error('no Codex leg row');
   return row as HTMLElement;
 }
@@ -106,11 +103,10 @@ describe('All providers — a decorated Codex provider is never one account', ()
       .toContain('per account');
   });
 
-  it('does not publish the representative account spend as the Codex leg row', () => {
+  it('publishes the certified Codex account subtotal rather than one representative', () => {
     renderAll(makeDecoratedCodexSourceData());
     const row = codexLegRow();
-    expect(row.textContent).not.toContain('$12.30');
-    expect(row.textContent).toContain('per account');
+    expect(row.textContent).toBe('Codex · account cycles$12.30 · 3 accounts');
   });
 
   it('renders the Codex per-account strip so nothing is merely blanked', () => {
@@ -132,15 +128,12 @@ describe('All providers — a decorated Codex provider is never one account', ()
     expect(screen.getByTestId('account-hero-caption').textContent).toMatch(/Codex/);
   });
 
-  it('withholds the combined headline for a decorated provider', () => {
+  it('publishes the combined headline from certified decorated account cycles', () => {
     renderAll(makeDecoratedCodexSourceData());
     const spent = screen.getByTestId('shared-hero-spent');
-    expect(spent.textContent).not.toContain('$20.70');
-    expect(spent.textContent).toContain('Combined withheld');
-    expect(spent.getAttribute('title')).toBe(
-      'Codex has 3 accounts on separate cycles, so a combined total is not '
-      + 'published; see the per-account cards.',
-    );
+    expect(spent.textContent).toContain('$20.70');
+    expect(spent.textContent).not.toContain('Combined withheld');
+    expect(spent.getAttribute('title')).toBeNull();
   });
 
   // #556 S5 §5.10 — the ASSERTION is kept and its RATIONALE is replaced. The
@@ -197,7 +190,7 @@ describe('All providers — a decorated Codex provider is never one account', ()
     const focusedCard = screen.getAllByTestId('account-hero-card')
       .find((card) => card.className.includes('is-focused'));
     expect(focusedCard).toHaveTextContent(spend);
-    expect(codexLegRow().textContent).toBe(`Codex · cycle to date${spend}`);
+    expect(codexLegRow().textContent).toBe(`Codex · account cycles${spend}`);
   });
 
   it('keeps every account card visible under an All Codex focus', () => {
@@ -205,15 +198,15 @@ describe('All providers — a decorated Codex provider is never one account', ()
     dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'all', account: ACCOUNT_A });
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     render(<HeroStrip />);
-    // §5.7 — the strip HIGHLIGHTS and never filters. It is the disclosure that
-    // makes a blanked headline honest; filtering it would hide the evidence.
+    // The strip highlights and never filters. Every certified operand remains
+    // visible even while one provider account is focused.
     const cards = screen.getAllByTestId('account-hero-card');
     expect(cards).toHaveLength(3);
     const focused = cards.filter((el) => el.className.includes('is-focused'));
     expect(focused.map((el) => el.getAttribute('data-account'))).toEqual([ACCOUNT_A]);
   });
 
-  it('keeps the combined figure withheld under an All Codex focus', () => {
+  it('keeps the certified combined figure unchanged under an All Codex focus', () => {
     updateSnapshot(envWith(makeDecoratedCodexSourceData()));
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     const first = render(<HeroStrip />);
@@ -221,9 +214,9 @@ describe('All providers — a decorated Codex provider is never one account', ()
     first.unmount();
     dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'all', account: ACCOUNT_A });
     render(<HeroStrip />);
-    // Provider-native quota surfaces consume the scoped child; combined SPEND
-    // consumes the unscoped withheld outcome and is never recomputed from a
-    // focused child.
+    // Provider-native quota surfaces consume the scoped child; combined spend
+    // consumes the server-certified unscoped composition and is never
+    // recomputed from a focused child.
     const spent = screen.getByTestId('shared-hero-spent');
     expect(spent.textContent).toBe(unfocused);
   });

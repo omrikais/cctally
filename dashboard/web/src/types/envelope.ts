@@ -712,6 +712,8 @@ export interface ProjectDetail {
   key: string;
   bucket_path: string;
   window_weeks: number;
+  window_start_at: string;
+  window_end_at: string;
   window_cost_usd: number;
   window_attributed_pct: number | null;
   models: ProjectDetailModelRow[];
@@ -1255,7 +1257,7 @@ export interface CodexCycle {
 // names a span must be derived from these bounds, because the clamp can make
 // the real span shorter than a full cycle.
 export interface SpendWindow {
-  kind: 'trailing-cycle';
+  kind: 'trailing-cycle' | 'subscription-week';
   startAt: string;
   endAt: string;
 }
@@ -1729,10 +1731,16 @@ export interface ClaudeSourceData {
 // Claude's `_iso_z` spelling and Codex's `isoformat()` spelling to one
 // canonical UTC form, so one parser suffices.
 export interface AllCombinedPeriod {
-  kind: 'subscription_week' | 'native_7_day_cycle';
-  label: string;
+  kind: 'subscription_week' | 'native_7_day_cycle' | 'trailing_7_day_cycle';
+  label?: string;
   start_at: string;
   end_at: string;
+}
+
+export interface AllCombinedAccount {
+  account_key: string;
+  cost_usd: number;
+  period: AllCombinedPeriod;
 }
 
 // `period` is OPTIONAL on every state, including `current`. A leg whose counters
@@ -1740,9 +1748,11 @@ export interface AllCombinedPeriod {
 // still named in the heading; only its reset line is suppressed.
 export interface AllCombinedLeg {
   state: 'current' | 'empty';
+  scope?: 'provider_cycle' | 'account_cycles';
   cost_usd: number;
-  total_tokens: number;
+  total_tokens: number | null;
   period?: AllCombinedPeriod;
+  accounts?: AllCombinedAccount[];
 }
 
 // A note that qualifies a PUBLISHED figure. Launch codes: `codex_ingest_backlog`
@@ -1755,9 +1765,8 @@ export interface AllCombinedQualification {
   provider?: 'claude' | 'codex';
 }
 
-// One reason the figure is withheld. `detail` never echoes a rejected value:
-// `invalid_counter` carries `{field, reason}`, `multi_account_unsupported`
-// carries `{account_count}`.
+// One reason the figure is withheld. `detail` never echoes a rejected value;
+// `invalid_counter` carries `{field, reason}`.
 export interface CombinedUnavailableCause {
   provider: 'claude' | 'codex';
   code: string;
@@ -1776,7 +1785,7 @@ export interface CombinedUnavailable {
 
 export interface AllCombined {
   cost_usd: number;
-  total_tokens: number;
+  total_tokens: number | null;
   // Both providers are always present on a published figure: a leg that cannot
   // be built contributes a cause instead, and any cause withholds the figure.
   legs: { claude: AllCombinedLeg; codex: AllCombinedLeg };
@@ -1941,6 +1950,8 @@ export interface ClaudeProjectDetailBody {
   key: string;
   label: string;
   window_weeks: number;
+  window_start_at: string;
+  window_end_at: string;
   window_cost_usd: number;
   window_attributed_pct: number | null;
   models: ProjectDetailModelRow[];

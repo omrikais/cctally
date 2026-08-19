@@ -967,14 +967,27 @@ def test_a_row_is_undrillable_when_no_legacy_population_is_supplied(
     assert all(row["drillable"] is False for row in rows)
 
 
-def test_the_tz_override_fixture_publishes_an_undrillable_row():
-    """The committed shape that proves the gap is real, not hypothetical.
+def test_the_tz_override_fixture_now_routes_its_ranked_row():
+    """#620 S1 closed the gap this test was written to record.
 
-    `tz-override` prices exactly one project at `now`, which the legacy
-    envelope's Monday-anchored window cannot see, so the row is ranked at a
-    real dollar figure while `current_week.rows`, `trend.projects` and the
-    flat route-lookup `rows` are all empty. The row stays published — the
-    ranking is complete — and states that it does not route.
+    It previously asserted the opposite. `tz-override` prices exactly one
+    project at `now`, and the legacy envelope's Monday-anchored window could
+    not see it: the entry at 2026-04-20T12:00Z snapped to the Monday week
+    starting 2026-04-20T00:00Z, which fell outside the twelve-week window
+    ending at 2026-04-13T00:00Z, so the cost vanished from
+    `current_week.rows`, `trend.projects` and the flat route-lookup `rows`
+    while the ranking still published the dollar figure. The row was
+    therefore ranked but not routable.
+
+    #620 S1 D1 anchors the panel on the real subscription interval
+    [2026-04-13T14:00Z, 2026-04-20T14:00Z), which contains that entry, so the
+    same row is now attributed and routable. The undrillable state itself is
+    unchanged and still covered by the kernel tests above, which reach it
+    through a store where nothing established that any key routes.
+
+    The precondition assertions are kept and inverted for the same reason
+    they were written: a future change that re-opens the gap must fail here
+    loudly rather than turn this test vacuous.
     """
     import json
 
@@ -994,13 +1007,28 @@ def test_the_tz_override_fixture_publishes_an_undrillable_row():
     row = published[0]
     assert row["label"] == "fixture-tz-override"
     assert row["cost_usd"] == pytest.approx(0.48, abs=1e-9)
-    assert row["drillable"] is False
+    assert row["drillable"] is True
 
-    # The precondition, asserted here so a fixture change that closes the gap
-    # fails loudly instead of turning this test vacuous.
-    assert claude["projects"]["current_week"]["rows"] == []
-    assert claude["projects"]["trend"]["projects"] == []
-    assert claude["projects"]["rows"] == []
+    # The ranked dollar figure and the attributed week now describe the same
+    # entry, which is what makes the row routable.
+    cw = claude["projects"]["current_week"]
+    assert cw["week_start_at"] == "2026-04-13T14:00:00Z"
+    # The per-source Claude domain publishes anonymized `project:<hash>`
+    # keys, so identity is asserted by cost and cardinality here; the
+    # human-readable key is asserted on the top-level block below.
+    assert len(cw["rows"]) == 1
+    assert cw["rows"][0]["cost_usd"] == pytest.approx(0.48, abs=1e-9)
+    assert len(claude["projects"]["trend"]["projects"]) == 1
+    assert claude["projects"]["rows"]
+
+    top = golden["projects"]
+    assert top["current_week"]["week_start_at"] == "2026-04-13T14:00:00Z"
+    assert [r["key"] for r in top["current_week"]["rows"]] == [
+        "fixture-tz-override",
+    ]
+    assert top["current_week"]["rows"][0]["attributed_pct"] == pytest.approx(
+        12.0, abs=1e-9,
+    )
 
 
 def test_project_aggregate_rows_rank_by_cost(three_week_store):
@@ -1949,10 +1977,11 @@ def test_the_committed_golden_states_the_boundary_by_value():
     golden = json.loads(_GOLDEN.read_text())
     # #556 S5 bumped this to 8 (the Claude budget capability detail changed
     # meaning), #564 to 9 (a decorated Codex fallback card's totals changed
-    # value) and #583 S3 to 10 (the All provider mirror publishes null). The
+    # value), #583 S3 to 10 (the All provider mirror publishes null), and #565
+    # to 11 (certified decorated account-cycle legs). The
     # assertion is kept rather than deleted: it is what tells a reader which
     # wire version this golden was captured against.
-    assert golden["source_schema_version"] == 10
+    assert golden["source_schema_version"] == 11
     aggregates = golden["sources"]["all"]["data"]["aggregates"]
     assert aggregates["range"] == {
         "kind": "absolute_range",

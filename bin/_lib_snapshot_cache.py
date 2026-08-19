@@ -1549,14 +1549,58 @@ _PROJECTS_ENV_LAST_SEEN: dict = {}    # {"max_id", "max_wus_id", "sf_sig"}
 _PROJECTS_ENV_CURRENT: dict = {"state": None}  # single-slot current-week fold
 
 
-def projects_env_week_key(week_start):
-    """Canonical UTC-ISO key for a Monday-anchored subscription week start.
+_PROJECTS_ENV_KEY_SEP = "|"
 
-    The dashboard resolves week starts as aware-UTC datetimes; normalizing to
+
+def projects_env_week_key(week_start, week_end=None):
+    """Canonical UTC-ISO identity for one subscription-week INTERVAL.
+
+    #620 S1: the key carries both bounds, not the start alone. This cache was
+    structurally seven-day — the start was the whole identity and
+    ``reconcile_projects_env_cache`` reconstructed the end as ``start + 7d``
+    — which was sound only while a week could not move. Once the Projects
+    panel follows real reset instants, an early reset delivered mid-week ends
+    a week sooner without moving its start, so a start-keyed entry answers
+    with an aggregate folded over a window that no longer exists. Carrying
+    the end makes that a MISS, which is the invalidation: the week is
+    recomputed over its new interval and re-stored under its new identity.
+
+    ``week_end=None`` means the nominal seven-day week, so every pre-existing
+    single-argument caller keeps its exact meaning.
+
+    The dashboard resolves week bounds as aware-UTC datetimes; normalizing to
     UTC before serializing keeps the key stable and parseable back by
-    ``reconcile_projects_env_cache`` (for the ``week_end`` watermark compare).
+    ``projects_env_week_bounds`` (for the watermark compare).
     """
-    return week_start.astimezone(dt.timezone.utc).isoformat()
+    start = week_start.astimezone(dt.timezone.utc)
+    end = (
+        start + dt.timedelta(days=7) if week_end is None
+        else week_end.astimezone(dt.timezone.utc)
+    )
+    return f"{start.isoformat()}{_PROJECTS_ENV_KEY_SEP}{end.isoformat()}"
+
+
+def projects_env_week_bounds(week_iso):
+    """Parse a key produced by ``projects_env_week_key`` back to
+    ``(start, end)``, or ``None`` when it is not one.
+
+    Returning ``None`` rather than raising is deliberate: the watermark
+    eviction below treats an unparseable key as dirty, and over-eviction is
+    byte-safe (the week is simply recomputed) while a raised exception on the
+    sync thread is not.
+    """
+    if not isinstance(week_iso, str):
+        return None
+    start_s, sep, end_s = week_iso.partition(_PROJECTS_ENV_KEY_SEP)
+    if not sep:
+        return None
+    try:
+        return (
+            dt.datetime.fromisoformat(start_s),
+            dt.datetime.fromisoformat(end_s),
+        )
+    except ValueError:
+        return None
 
 
 def reset_projects_env_state():
@@ -1819,11 +1863,20 @@ def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_mutation_seq,
     ):
         # NOTE (#271 §9): max_wus_id is deliberately NOT a full-clear trigger. The
         # cached per-(project, week) aggregates are session_entries-only; a WUS
-        # bump (a `record-usage` write) changes only the attribution denominator,
+        # bump (a `record-usage` write) changes the attribution denominator,
         # which the whole-envelope memo (_PROJECTS_ENV_MEMO, still keyed on
-        # max_wus_id) recomputes fresh on its own miss. Reusing this cost cache
-        # across a WUS bump is byte-identical. Do NOT re-add
+        # max_wus_id) recomputes fresh on its own miss. Do NOT re-add
         # `max_wus_id != ls["max_wus_id"]` here.
+        #
+        # #620 S1 amends the REASON, not the decision. A WUS bump can now also
+        # move a week BOUNDARY, because the Projects panel follows real reset
+        # instants — so the old justification ("a WUS bump changes only the
+        # denominator") is no longer true. A full clear is still unnecessary,
+        # because the cache identity now carries the interval: a moved
+        # boundary produces a different key, which misses and recomputes,
+        # while every week whose interval did not move stays a legitimate hit.
+        # That is a strictly narrower invalidation than a full clear and is
+        # what keeps a `record-usage` write from re-folding twelve weeks.
         _PROJECTS_ENV_WEEK_CACHE.clear()
         _PROJECTS_ENV_WEEK_TOTALS.clear()
         # #271 M4 (spec §20): the current-week accumulator rides the SAME
@@ -1838,11 +1891,16 @@ def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_mutation_seq,
     if max_mutation_seq > ls["max_seq"]:
         wm = changed_min_timestamp(cache_conn, ls["max_seq"])
         if wm is not None:
-            dirty = [
-                wk
-                for wk in list(_PROJECTS_ENV_WEEK_TOTALS)
-                if dt.datetime.fromisoformat(wk) + dt.timedelta(days=7) >= wm
-            ]
+            # #620 S1: the week's real end comes off the key rather than being
+            # reconstructed as `start + 7d`, because a drifted reset day makes
+            # a genuinely short week and a `+7d` reconstruction would compare
+            # the wrong instant. An unparseable key is treated as dirty;
+            # over-eviction is byte-safe (the week is recomputed).
+            dirty = []
+            for wk in list(_PROJECTS_ENV_WEEK_TOTALS):
+                bounds = projects_env_week_bounds(wk)
+                if bounds is None or bounds[1] >= wm:
+                    dirty.append(wk)
             for wk in dirty:
                 _PROJECTS_ENV_WEEK_TOTALS.pop(wk, None)
                 for key in [k for k in _PROJECTS_ENV_WEEK_CACHE if k[1] == wk]:

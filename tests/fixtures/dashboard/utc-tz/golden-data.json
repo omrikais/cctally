@@ -133,7 +133,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 10,
+  "source_schema_version": 11,
   "sources": {
     "all": {
       "availability": "empty",
@@ -178,11 +178,13 @@
           "legs": {
             "claude": {
               "cost_usd": 0.0,
+              "scope": "provider_cycle",
               "state": "empty",
               "total_tokens": 0
             },
             "codex": {
               "cost_usd": 0.0,
+              "scope": "provider_cycle",
               "state": "empty",
               "total_tokens": 0
             }

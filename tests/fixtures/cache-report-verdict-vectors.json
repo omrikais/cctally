@@ -1,0 +1,116 @@
+{
+  "_comment": [
+    "#620 S1 D6 / A6 — the single truth table for the Cache Report four-state",
+    "verdict, consumed by BOTH tests/test_620_cache_report_verdict.py (the",
+    "Python kernel `cache_row_verdict`) and",
+    "dashboard/web/__tests__/cacheReportVerdictParity.test.ts (the TypeScript",
+    "`cacheRowVerdict`).",
+    "",
+    "One file, two readers. A duplicated vector list would be two truths, not",
+    "a parity test: each side would keep passing against its own copy while",
+    "the two algorithms drifted apart. Python and TypeScript remain two",
+    "implementations — one literal classifier is not possible across the",
+    "language boundary without code generation — so what is asserted is that",
+    "they agree on every vector, not that they share code.",
+    "",
+    "`predicates` is the set the PROVIDER can evaluate at all. Claude can run",
+    "both; Codex can only ever run cache_drop, so a Codex row carrying",
+    "cache_drop alone is FULLY unevaluated rather than partial. Not applicable",
+    "is not unevaluated."
+  ],
+  "vectors": [
+    {
+      "name": "claude-clean",
+      "why": "nothing unevaluated and nothing triggered is the ordinary state",
+      "predicates": ["net_negative", "cache_drop"],
+      "input": {"anomaly_triggered": false, "anomaly_reasons": [], "anomaly_unevaluated": []},
+      "expected": "clean"
+    },
+    {
+      "name": "claude-triggered-both-evaluated",
+      "why": "a plain anomaly",
+      "predicates": ["net_negative", "cache_drop"],
+      "input": {"anomaly_triggered": true, "anomaly_reasons": ["net_negative"], "anomaly_unevaluated": []},
+      "expected": "anomalous"
+    },
+    {
+      "name": "claude-triggered-wins-over-partial",
+      "why": "triggered precedence: a thin-baseline cache_drop beside a real net_negative must not soften the verdict",
+      "predicates": ["net_negative", "cache_drop"],
+      "input": {"anomaly_triggered": true, "anomaly_reasons": ["net_negative"], "anomaly_unevaluated": ["cache_drop"]},
+      "expected": "anomalous"
+    },
+    {
+      "name": "claude-triggered-wins-over-fully-unevaluated",
+      "why": "triggered precedence over EVERY other state, including the all-unevaluated one",
+      "predicates": ["net_negative", "cache_drop"],
+      "input": {"anomaly_triggered": true, "anomaly_reasons": ["net_negative"], "anomaly_unevaluated": ["net_negative", "cache_drop"]},
+      "expected": "anomalous"
+    },
+    {
+      "name": "claude-partial-one-of-two",
+      "why": "some predicates ran and one did not",
+      "predicates": ["net_negative", "cache_drop"],
+      "input": {"anomaly_triggered": false, "anomaly_reasons": [], "anomaly_unevaluated": ["cache_drop"]},
+      "expected": "partial"
+    },
+    {
+      "name": "claude-partial-other-predicate",
+      "why": "the partial state is not tied to which predicate was skipped",
+      "predicates": ["net_negative", "cache_drop"],
+      "input": {"anomaly_triggered": false, "anomaly_reasons": [], "anomaly_unevaluated": ["net_negative"]},
+      "expected": "partial"
+    },
+    {
+      "name": "claude-fully-unevaluated",
+      "why": "all predicates skipped: nothing was evaluated at all",
+      "predicates": ["net_negative", "cache_drop"],
+      "input": {"anomaly_triggered": false, "anomaly_reasons": [], "anomaly_unevaluated": ["net_negative", "cache_drop"]},
+      "expected": "unevaluated"
+    },
+    {
+      "name": "codex-cache-drop-alone-is-fully-unevaluated",
+      "why": "Codex can only ever evaluate cache_drop, so that one predicate skipped IS everything skipped; calling it partial would claim some other predicate ran",
+      "predicates": ["cache_drop"],
+      "input": {"anomaly_triggered": false, "anomaly_reasons": [], "anomaly_unevaluated": ["cache_drop"]},
+      "expected": "unevaluated"
+    },
+    {
+      "name": "codex-clean",
+      "why": "the same clean state on the single-predicate provider",
+      "predicates": ["cache_drop"],
+      "input": {"anomaly_triggered": false, "anomaly_reasons": [], "anomaly_unevaluated": []},
+      "expected": "clean"
+    },
+    {
+      "name": "codex-triggered",
+      "why": "triggered precedence holds on the single-predicate provider too",
+      "predicates": ["cache_drop"],
+      "input": {"anomaly_triggered": true, "anomaly_reasons": ["cache_drop"], "anomaly_unevaluated": []},
+      "expected": "anomalous"
+    },
+    {
+      "name": "observed-false-with-nothing-evaluated",
+      "why": "the observed state travels separately from the verdict: a day with no activity is still `unevaluated` and reports observed=false",
+      "predicates": ["net_negative", "cache_drop"],
+      "input": {"anomaly_triggered": false, "anomaly_reasons": [], "anomaly_unevaluated": ["net_negative", "cache_drop"], "observed": false},
+      "expected": "unevaluated",
+      "expected_observed": false
+    },
+    {
+      "name": "observed-absent-means-observed",
+      "why": "an older envelope publishes no `observed` key and must read as observed",
+      "predicates": ["net_negative", "cache_drop"],
+      "input": {"anomaly_triggered": false, "anomaly_reasons": [], "anomaly_unevaluated": []},
+      "expected": "clean",
+      "expected_observed": true
+    },
+    {
+      "name": "unevaluated-absent-means-fully-evaluated",
+      "why": "an older envelope publishes no `anomaly_unevaluated` key and must read as clean, not as unevaluated",
+      "predicates": ["net_negative", "cache_drop"],
+      "input": {"anomaly_triggered": false, "anomaly_reasons": []},
+      "expected": "clean"
+    }
+  ]
+}

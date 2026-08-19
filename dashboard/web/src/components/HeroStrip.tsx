@@ -477,6 +477,8 @@ function SharedHero({
   const withheldReason = published ? null : combined.unavailable;
   const claudeLeg = combined.legs?.claude ?? null;
   const codexLeg = combined.legs?.codex ?? null;
+  const hasAccountCycles = claudeLeg?.scope === 'account_cycles'
+    || codexLeg?.scope === 'account_cycles';
   // A WITHHELD figure is not "no data". Under decoration both providers have
   // accounting and the composition declines to sum it, pointing at the
   // per-account cards instead; telling the reader there is no data would be
@@ -484,7 +486,9 @@ function SharedHero({
   // state, where the answer really is that nothing was spent and nothing is
   // known.
   const heading = published
-    ? combinedHeading(combined.contributors)
+    ? hasAccountCycles
+      ? 'COMBINED · ACCOUNT CYCLES'
+      : combinedHeading(combined.contributors)
     : 'COMBINED · CURRENT CYCLES';
   // A resolved zero is DATA. Both legs empty is the one state that publishes a
   // number the reader must not see as observed spend, so the figure blanks
@@ -575,9 +579,11 @@ function SharedHero({
     : claudeLeg?.state === 'current'
       ? periodResetSeconds(claudeLeg.period, nowMs)
       : cw?.reset_in_sec ?? null;
-  const codexResetSeconds = codexLeg?.state === 'current'
-    ? periodResetSeconds(codexLeg.period, nowMs)
-    : resetSeconds;
+  const codexResetSeconds = codexScope.accountKey != null
+    ? resetSeconds
+    : codexLeg?.state === 'current'
+      ? periodResetSeconds(codexLeg.period, nowMs)
+      : resetSeconds;
 
   return (
     <>
@@ -636,7 +642,9 @@ function SharedHero({
               </span>
             )
             : figure != null
-              ? <><span>{fmt.tokens(figure.totalTokens)}</span> total tokens</>
+              ? figure.totalTokens != null
+                ? <><span>{fmt.tokens(figure.totalTokens)}</span> total tokens</>
+                : null
               : published
                 ? (
                   <span data-testid="hero-combined-no-data">
@@ -670,7 +678,9 @@ function SharedHero({
 
       <div className="hero-zone hero-support" data-testid="shared-hero-support">
         <div className="sup-row">
-          <span className="sup-l">Claude · week to date</span>
+          <span className="sup-l">
+            Claude · {claudeLeg?.scope === 'account_cycles' ? 'account cycles' : 'week to date'}
+          </span>
           <span className="sup-v" data-testid="hero-leg-claude">
             <LegAmount
               leg={claudeLeg}
@@ -681,7 +691,9 @@ function SharedHero({
           </span>
         </div>
         <div className="sup-row">
-          <span className="sup-l">Codex · cycle to date</span>
+          <span className="sup-l">
+            Codex · {codexLeg?.scope === 'account_cycles' ? 'account cycles' : 'cycle to date'}
+          </span>
           <span className="sup-v" data-testid="hero-leg-codex">
             <LegAmount
               leg={codexLeg}
@@ -780,6 +792,20 @@ function LegAmount({
   provider: SourceName;
   focusedCostUsd?: number | null;
 }) {
+  // A focus narrows this provider-native support row even though the combined
+  // headline remains the unscoped certified total.
+  if (focusedCostUsd != null) {
+    return <>{fmt.usd2(focusedCostUsd)}</>;
+  }
+  if (leg?.scope === 'account_cycles') {
+    const accountCount = leg.accounts?.length ?? 0;
+    return (
+      <>
+        {fmt.usd2(leg.cost_usd)} · {accountCount}{' '}
+        {accountCount === 1 ? 'account' : 'accounts'}
+      </>
+    );
+  }
   if (perAccount) {
     return (
       <span
@@ -790,9 +816,6 @@ function LegAmount({
         per account
       </span>
     );
-  }
-  if (focusedCostUsd != null) {
-    return <>{fmt.usd2(focusedCostUsd)}</>;
   }
   if (leg == null || leg.state === 'empty') {
     return <span className="hero-leg-no-data">no data</span>;

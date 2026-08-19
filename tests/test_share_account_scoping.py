@@ -101,7 +101,10 @@ def test_share_wire_cards_never_carry_email(monkeypatch):
                 )
             conn.commit()
             import datetime as dt
-            cards = _claude_accounts_wire(conn, now_utc=dt.datetime(2026, 7, 15, 12, tzinfo=dt.timezone.utc))
+            cards, _certificate = _claude_accounts_wire(
+                conn,
+                now_utc=dt.datetime(2026, 7, 15, 12, tzinfo=dt.timezone.utc),
+            )
     assert cards, "expected decorated cards"
     for c in cards:
         assert "email" not in c, f"account card leaked an email field: {c}"

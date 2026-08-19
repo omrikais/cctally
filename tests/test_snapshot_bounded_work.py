@@ -1476,7 +1476,7 @@ def _population_walks_for_account_count(cache, stats, module, count):
             speed="standard", cache_conn=cache,
         )
     )
-    cards, _cycles = module._codex_accounts_wire(
+    cards, _cycles, _certificate = module._codex_accounts_wire(
         _context(module, cache, stats),
         quota_observations=(),
         cycles=[],
@@ -1519,6 +1519,150 @@ def test_the_card_population_is_walked_independently_of_account_count(
         f"the 20-account build walked the population {large_walks} times; the "
         "work must not grow with the account count"
     )
+
+
+def test_undecorated_narrow_build_does_not_read_unused_card_population(
+    source_env, monkeypatch,
+):
+    """An undecorated provider has no account cards, so it needs no wide read."""
+    from test_dashboard_accounts_wire import _complete_codex_thread_metadata
+
+    _ns, cache, stats, module = source_env
+    _complete_codex_thread_metadata(cache)
+    narrow_start = NOW - dt.timedelta(days=1)
+    real_load = module.load_cached_rooted_codex_accounting_entries
+
+    def reject_unused_wide_read(start, *args, **kwargs):
+        if start < narrow_start:
+            raise AssertionError("unused account-card population was loaded")
+        return real_load(start, *args, **kwargs)
+
+    monkeypatch.setattr(
+        module, "load_cached_rooted_codex_accounting_entries",
+        reject_unused_wide_read,
+    )
+    state = module.build_codex_source_state(
+        module.DashboardReadContext(
+            cache_conn=cache,
+            stats_conn=stats,
+            range_start=narrow_start,
+            now_utc=NOW,
+            display_tz_name="UTC",
+        ),
+        data_version="undecorated-narrow",
+    )
+
+    assert state.availability != "unavailable"
+    assert "accounts" not in state.data
+
+
+def test_healthy_codex_cycle_does_not_depend_on_accounting_existence_probe(
+    source_env, monkeypatch,
+):
+    """The existence probe is relevant only when no native cycle resolves."""
+    _ns, cache, stats, module = source_env
+    root = str(cache.execute(
+        "SELECT source_root_key FROM codex_source_roots ORDER BY 1 LIMIT 1"
+    ).fetchone()[0])
+    cycle = module.CodexCycleBoundary(
+        window_minutes=10_080,
+        start_at=NOW - dt.timedelta(days=7),
+        resets_at=NOW + dt.timedelta(days=1),
+        source_root_keys=(root,),
+    )
+    monkeypatch.setattr(
+        module, "_resolve_codex_weekly_cycle", lambda *_args: [cycle])
+    rooted_starts: list[dt.datetime] = []
+    real_rooted = module.load_cached_rooted_codex_accounting_entries
+
+    def recording_rooted(start, *args, **kwargs):
+        rooted_starts.append(start)
+        return real_rooted(start, *args, **kwargs)
+
+    monkeypatch.setattr(
+        module, "load_cached_rooted_codex_accounting_entries",
+        recording_rooted,
+    )
+    narrow_context = module.DashboardReadContext(
+        cache_conn=cache,
+        stats_conn=stats,
+        range_start=NOW - dt.timedelta(days=1),
+        now_utc=NOW,
+        display_tz_name="UTC",
+    )
+    baseline = module.build_codex_source_state(
+        narrow_context, data_version="healthy-cycle-baseline")
+    assert baseline.data["hero"]["cycle"] is not None, (
+        "non-vacuity: the fixture must resolve a healthy native cycle")
+    assert cycle.start_at in rooted_starts, (
+        "non-vacuity: a healthy cycle earlier than the requested range must "
+        "capture its exact accounting prefix")
+
+    def fail_unused_probe(**_kwargs):
+        raise AssertionError("healthy cycle consulted accounting existence")
+
+    monkeypatch.setattr(
+        module, "has_cached_codex_accounting_entries", fail_unused_probe)
+    state = module.build_codex_source_state(
+        narrow_context, data_version="healthy-cycle-probe")
+
+    assert state.data["hero"]["cycle"] is not None
+
+
+def test_unresolved_codex_cycle_still_surfaces_accounting_probe_failure(
+    source_env, monkeypatch,
+):
+    """Deferral must not swallow the probe fault on its live branch."""
+    _ns, cache, stats, module = source_env
+    monkeypatch.setattr(
+        module, "_resolve_codex_weekly_cycle", lambda *_args: [])
+
+    def fail_live_probe(**_kwargs):
+        raise AssertionError("live unresolved-cycle accounting probe failed")
+
+    monkeypatch.setattr(
+        module, "has_cached_codex_accounting_entries", fail_live_probe)
+    with pytest.raises(AssertionError, match="live unresolved-cycle"):
+        module.build_codex_source_state(
+            _context(module, cache, stats), data_version="unresolved-probe")
+
+
+def test_optimized_claude_project_failure_keeps_daily_leg_available(
+    source_env, monkeypatch,
+):
+    """Captured rows remain sufficient for daily when only projects fail."""
+    ns, cache, _stats, _module = source_env
+    dashboard = sys.modules["_cctally_dashboard"]
+    tui = ns["_cctally_tui"]
+    dashboard.reset_claude_range_aggregate_memo()
+    max_id, mutation_seq = dashboard._shared_range_entry_signature(cache)
+    capture = dashboard.capture_cached_claude_range_aggregates(
+        cache,
+        shared_start=START,
+        shared_end_exclusive=NOW + dt.timedelta(microseconds=1),
+        display_tz=dt.timezone.utc,
+        max_entry_id=max_id,
+        entry_mutation_seq=mutation_seq,
+    )
+
+    def fail_projects(*_args, **_kwargs):
+        raise RuntimeError("project-only fold fault")
+
+    monkeypatch.setattr(dashboard, "fold_projects_over_range", fail_projects)
+    payload, outcomes = tui._tui_build_claude_aggregates_from_capture(
+        tui._ClaudeAggregateCapture(optimized=capture),
+        now_utc=NOW,
+        display_tz_name="UTC",
+        legacy_labels={},
+    )
+
+    assert outcomes["projects"] == {
+        "state": "failed", "code": "claude_fold_failed"}
+    assert outcomes["daily"] == {"state": "ok"}
+    assert payload["daily"]
+    assert "projects" not in payload
+    assert dashboard._CLAUDE_RANGE_AGGREGATE_MEMO["state"] is None, (
+        "a partial fold must not publish a half-valid incremental memo")
 
 
 def test_a_clock_bearing_quota_read_establishes_no_identity(
@@ -2038,49 +2182,44 @@ def test_the_enumerated_folds_are_all_reachable_as_patch_targets(source_env):
     )
 
 
-#: The members of `IN_TRANSACTION_FORBIDDEN` that this driver observes running
-#: INSIDE the pin today. Change 4 is not implemented, so criterion 6 is recorded
-#: as an equality against the measured set rather than asserted as an empty one.
-#:
-#: `fold_projects_over_range` is absent because this gate drives
-#: `build_codex_source_state`, which never reaches it -- it is a CLAUDE fold,
-#: called from `build_cached_claude_range_aggregates`. An earlier revision of
-#: this file said it "already runs outside" the pin, and that is false: measured
-#: on a copy of the real store through the whole `_tui_build_source_bundle`, it
-#: runs INSIDE the pin for 286.2 ms (median of five samples after one untimed
-#: warm-up, range 277.3-485.3). Its absence here is a property of the driver, not
-#: of the code, which is exactly the confusion this comment exists to prevent.
-FOLDS_MEASURED_INSIDE_THE_PIN = (
-    "_aggregate_codex_buckets",
-    "_build_codex_native_weekly_view",
-    "_codex_entries_from_accounting",
-    "_codex_fold_visible_rows",
-    "build_codex_daily_view",
-)
+def _build_source_bundle(ns, stats):
+    return ns["_cctally_tui"]._tui_build_source_bundle(
+        projects_envelope={},
+        stats_conn=stats,
+        now_utc=NOW,
+        display_tz_name="UTC",
+        codex_ingest_contended=False,
+        claude_cost_usd=0.0,
+        claude_total_tokens=0,
+        common_range_start=START,
+    )
 
 
 def test_which_enumerated_folds_run_inside_the_pinned_transaction(
     source_env, monkeypatch,
 ):
-    """Criterion 6, pinned as an equality rather than marked xfail.
+    """Criterion 6: every enumerated row fold runs after the one cache pin.
 
-    The plan's sketch drove `build_codex_source_state` on the fixture
-    connection without opening a transaction. `cache.in_transaction` is then
-    false for the whole build, every guard records nothing, and the assertion
-    `violations == []` passes no matter where the folds run. So this opens the
-    pin first, exactly as `_tui_build_source_bundle` does, and asserts the pin
-    really was held.
-
-    It was then marked `xfail(strict=True)` with a long reason naming the exact
-    violation set. That marker could not hold the reason it recorded: xfail is
-    satisfied by ANY failure, including its own non-vacuity guards, a typo in
-    the enumeration or an import error, so the recorded reason and the observed
-    failure were never compared. The equality below fails in both directions --
-    a fold that leaves the pin and a fold that enters it are both a red test --
-    and it states which folds moved.
+    Drive the whole source-bundle boundary so the Claude fold is reachable too.
+    The connection factory records the real `BEGIN`; without that non-vacuity
+    fact an implementation that silently removed the transaction would satisfy
+    the fold-location assertion.
     """
     ns, cache, stats, module = source_env
     violations: list[str] = []
+    observed: list[str] = []
+    opened = []
+    counter = {"rows": 0, "begins": 0}
+    cctally_module = sys.modules["cctally"]
+    real_open_cache = ns["open_cache_db"]
+
+    def open_counted_cache():
+        conn = _counting_cache_connection(
+            ns, counter, open_cache=real_open_cache)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(cctally_module, "open_cache_db", open_counted_cache)
 
     for mod_name, name in IN_TRANSACTION_FORBIDDEN:
         owner = sys.modules.get(mod_name)
@@ -2089,35 +2228,29 @@ def test_which_enumerated_folds_run_inside_the_pinned_transaction(
         assert real is not None, f"unreachable fold in the bound: {name}"
 
         def guard(*a, _name=name, _real=real, **k):
-            if cache.in_transaction:
+            observed.append(_name)
+            if any(conn.in_transaction for conn in opened):
                 violations.append(_name)
             return _real(*a, **k)
 
         monkeypatch.setattr(owner, name, guard)
 
-    cache.execute("BEGIN")
-    assert cache.in_transaction, (
-        "non-vacuity: the pin must be OPEN, or every guard below records "
-        "nothing and this gate asserts nothing at all")
-    try:
-        module.build_codex_source_state(
-            _context(module, cache, stats), data_version="folds")
-        assert cache.in_transaction, (
-            "non-vacuity: the build ended the caller's transaction, so the "
-            "guards stopped observing partway through")
-    finally:
-        cache.rollback()
+    _build_source_bundle(ns, stats)
 
-    assert sorted(set(violations)) == sorted(FOLDS_MEASURED_INSIDE_THE_PIN), (
-        f"the set of enumerated folds running inside the pin moved: observed "
-        f"{sorted(set(violations))}, recorded "
-        f"{sorted(FOLDS_MEASURED_INSIDE_THE_PIN)}. If change 4 landed, empty "
-        "the recorded tuple deliberately and say so; if a new fold entered the "
-        "pin, that is a regression."
+    assert counter["begins"] == 1, (
+        "non-vacuity: the whole source build must open exactly one cache pin")
+    expected = {name for _module, name in IN_TRANSACTION_FORBIDDEN}
+    assert set(observed) == expected, (
+        "non-vacuity: the whole build did not invoke every enumerated fold; "
+        f"missing={sorted(expected - set(observed))}, observed={observed}"
+    )
+    assert violations == [], (
+        f"row folds still ran inside the pinned cache transaction: "
+        f"{sorted(set(violations))}"
     )
 
 
-def _counting_cache_connection(ns, counter):
+def _counting_cache_connection(ns, counter, *, open_cache=None):
     """A cache connection opened through the production path that counts rows.
 
     The fixture's connection is a plain `sqlite3.Connection`, and a C-type
@@ -2131,15 +2264,19 @@ def _counting_cache_connection(ns, counter):
     import sqlite3
 
     class _Cursor(sqlite3.Cursor):
+        def _count(self, amount):
+            if self.connection.in_transaction:
+                counter["rows"] += amount
+
         def fetchone(self):
             row = super().fetchone()
             if row is not None:
-                counter["rows"] += 1
+                self._count(1)
             return row
 
         def fetchall(self):
             rows = super().fetchall()
-            counter["rows"] += len(rows)
+            self._count(len(rows))
             return rows
 
         def fetchmany(self, size=None):
@@ -2147,12 +2284,12 @@ def _counting_cache_connection(ns, counter):
                 super().fetchmany() if size is None
                 else super().fetchmany(size)
             )
-            counter["rows"] += len(rows)
+            self._count(len(rows))
             return rows
 
         def __next__(self):
             row = super().__next__()
-            counter["rows"] += 1
+            self._count(1)
             return row
 
     class _Connection(sqlite3.Connection):
@@ -2160,6 +2297,8 @@ def _counting_cache_connection(ns, counter):
             return super().cursor(factory or _Cursor)
 
         def execute(self, sql, parameters=()):
+            if str(sql).strip().upper() == "BEGIN":
+                counter["begins"] = counter.get("begins", 0) + 1
             return self.cursor().execute(sql, parameters)
 
     real_connect = sqlite3.connect
@@ -2167,7 +2306,7 @@ def _counting_cache_connection(ns, counter):
         lambda *a, **k: real_connect(*a, **{**k, "factory": _Connection})
     )
     try:
-        return ns["open_cache_db"]()
+        return (open_cache or ns["open_cache_db"])()
     finally:
         sqlite3.connect = real_connect
 
@@ -2175,30 +2314,13 @@ def _counting_cache_connection(ns, counter):
 def test_the_rows_materialised_inside_the_pin_scale_with_the_population(
     source_env, monkeypatch,
 ):
-    """Criterion 7, as a recorded gate, because change 4 is not implemented.
+    """Criterion 7: a warm pin captures changes, not the retained population.
 
-    Criterion 7 exists to catch a change 4 that satisfies criterion 6 while
-    leaving the hold intact: the folds leave the pin, and the carriers loaded
-    inside it stay large enough that the transaction is held just as long. It
-    was the only criterion in the spec with no executable form at all --
-    criterion 6 got a marker and criterion 7 got nothing -- which is why it is
-    added here rather than left as prose.
-
-    What it asserts is the negation of the bound criterion 7 asks for. Change
-    4's design loads a BOUNDED carrier inside the pin and folds it outside, so
-    the rows crossing the cursor boundary inside the transaction stop depending
-    on how many rows the store holds. Today they depend on it directly, which
-    this states over a population ladder of at least ten times, per the
-    measurement discipline in spec section 4.1. When change 4 lands the ratio
-    collapses toward one and this gate goes red; rewrite it then as the bound,
-    do not delete it.
-
-    Counted in rows crossing the cursor boundary, never in elapsed time.
-    Measured on this fixture: 117 rows materialised inside the pin over 13
-    stored Codex rows, and 1,717 over 1,613 -- a population multiplied by 124
-    and a row count multiplied by 14.7, growing one for one with the rows
-    added. The threshold below is five, so the gate has margin and still fails
-    long before the ratio reaches one.
+    Count rows crossing the real bundle's cache cursor while the transaction is
+    open. Each population is warmed once before measurement so the test names
+    the production steady state and exercises the same append carriers the live
+    dashboard uses. The retained population grows by at least ten times; pinned
+    rows may grow modestly with file metadata, but not one-for-one with entries.
 
     The measurement this records, taken over a copy of the real store through
     the whole `_tui_build_source_bundle`, five samples after one untimed
@@ -2209,56 +2331,121 @@ def test_the_rows_materialised_inside_the_pin_scale_with_the_population(
     would leave two thirds of the movable work inside the pin -- which is
     exactly the outcome criterion 7 was written to detect.
     """
-    import _lib_snapshot_cache
-
     ns, cache, stats, module = source_env
+    cctally_module = sys.modules["cctally"]
+    real_open_cache = ns["open_cache_db"]
 
     def rows_inside_the_pin():
-        counter = {"rows": 0}
-        # Both builds must be cold, or the second reads a delta against the
-        # first and the ladder measures the memo rather than the population.
-        _lib_snapshot_cache.reset_codex_accounting_cache_state()
-        module.reset_codex_quota_observation_cache()
-        pinned = _counting_cache_connection(ns, counter)
-        try:
-            pinned.execute("BEGIN")
-            assert pinned.in_transaction, (
-                "non-vacuity: the pin must be OPEN, or the count below is not "
-                "a count of work done inside a transaction at all")
-            counter["rows"] = 0
-            try:
-                module.build_codex_source_state(
-                    _context(module, pinned, stats), data_version="rows")
-                assert pinned.in_transaction, (
-                    "non-vacuity: the build ended the caller's transaction, so "
-                    "the tail of the count was taken outside the pin")
-            finally:
-                pinned.rollback()
-        finally:
-            pinned.close()
+        counter = {"rows": 0, "begins": 0}
+
+        def open_counted_cache():
+            return _counting_cache_connection(
+                ns, counter, open_cache=real_open_cache)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                cctally_module, "open_cache_db", open_counted_cache)
+            _build_source_bundle(ns, stats)
+        assert counter["begins"] == 1
         return counter["rows"]
 
     def population():
         return cache.execute(
             "SELECT COUNT(*) FROM codex_session_entries").fetchone()[0]
 
+    def append_dirty_row(offset):
+        row = cache.execute(
+            "SELECT source_path, timestamp_utc, session_id, model, "
+            "input_tokens, cached_input_tokens, output_tokens, "
+            "reasoning_output_tokens, total_tokens, source_root_key, "
+            "conversation_key, account_key "
+            "FROM codex_session_entries ORDER BY id LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        cache.execute(
+            "INSERT INTO codex_session_entries "
+            "(source_path, line_offset, timestamp_utc, session_id, model, "
+            " input_tokens, cached_input_tokens, output_tokens, "
+            " reasoning_output_tokens, total_tokens, source_root_key, "
+            " conversation_key, account_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (row[0], offset, *row[1:]),
+        )
+        cache.commit()
+
     small_rows_in_store = population()
+    _build_source_bundle(ns, stats)
+    append_dirty_row(900_001)
     small = rows_inside_the_pin()
     _widen_corpus(
         cache, files=40, per_file=40, prefix="ladder", offset_base=100_000)
     big_rows_in_store = population()
+    _build_source_bundle(ns, stats)
+    append_dirty_row(900_002)
     big = rows_inside_the_pin()
 
     assert big_rows_in_store >= 10 * small_rows_in_store, (
         f"non-vacuity: the ladder must vary the causal dimension by at least "
         f"ten times, and this one went {small_rows_in_store} -> "
         f"{big_rows_in_store}")
-    assert small > 0, (
+    assert small > 0 and big > 0, (
         "non-vacuity: the pin materialised no rows at all, so there is no row "
         "work here for the ladder to be about")
-    assert big >= 5 * small, (
-        f"the rows materialised inside the pin stopped scaling with the "
-        f"population: {small} rows over {small_rows_in_store} stored rows, "
-        f"{big} over {big_rows_in_store}. If change 4 landed and the pin now "
-        "loads a bounded carrier, replace this recorded gate with criterion "
-        "7's bound on that carrier rather than deleting it.")
+    assert big <= 3 * small, (
+        f"pinned carrier rows still scale with retained history: {small} rows "
+        f"over {small_rows_in_store} stored rows, {big} over "
+        f"{big_rows_in_store}")
+
+
+def test_commit_after_capture_waits_for_the_next_source_generation(
+    source_env, monkeypatch,
+):
+    """F21 barrier: a commit between capture and fold cannot mix generations.
+
+    The injected row is generation B. The first build has already rolled back
+    generation A before this seam runs, so its post-transaction fold must use
+    only the captured A rows. The next build must then publish B.
+    """
+    ns, cache, stats, _module = source_env
+    tui = ns["_cctally_tui"]
+    real_build = tui._tui_build_claude_aggregates_from_capture
+    inserted = False
+
+    def commit_b_then_build(capture, **kwargs):
+        nonlocal inserted
+        if not inserted:
+            inserted = True
+            source_path = "/cached/barrier-claude.jsonl"
+            cache.execute(
+                "INSERT OR IGNORE INTO session_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, "
+                " last_ingested_at, session_id, project_path) "
+                "VALUES (?, 0, 0, 0, ?, 'barrier', '/fake/barrier')",
+                (source_path, NOW.isoformat()),
+            )
+            cache.execute(
+                "INSERT INTO session_entries "
+                "(source_path, line_offset, timestamp_utc, model, "
+                " input_tokens, output_tokens, cache_create_tokens, "
+                " cache_read_tokens, mutation_seq) "
+                "VALUES (?, 1, ?, 'claude-sonnet-4-6', 1000, 100, 0, 0, 0)",
+                (source_path, (NOW - dt.timedelta(hours=1)).isoformat()),
+            )
+            cache.commit()
+        return real_build(capture, **kwargs)
+
+    monkeypatch.setattr(
+        tui, "_tui_build_claude_aggregates_from_capture", commit_b_then_build)
+    generation_a = _build_source_bundle(ns, stats)
+    generation_b = _build_source_bundle(ns, stats)
+
+    def aggregate_tokens(bundle):
+        return sum(
+            int(row["total_tokens"])
+            for row in bundle.sources["claude"].data["periods"][
+                "daily_aggregate"
+            ]["rows"]
+        )
+
+    assert aggregate_tokens(generation_a) == 0
+    assert aggregate_tokens(generation_b) == 1100

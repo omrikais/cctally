@@ -29,7 +29,7 @@ describe('S4 source envelope wire shape (guard)', () => {
     // #583 S3's nulled All provider mirror; 8 -> 9 was #564's decorated Codex
     // fallback totals). The assertion is about placement, not about the
     // number: no production client branches on it.
-    expect(env.source_schema_version).toBe(10);
+    expect(env.source_schema_version).toBe(11);
     expect(env.default_source).toBe('claude');
     expect(env.source_order).toEqual(['claude', 'codex', 'all']);
   });
@@ -86,7 +86,7 @@ describe('S4 source envelope wire shape (guard)', () => {
     // #556 S2 §3.9 — tracks the server's current version, exactly as the JSON
     // fixture above does. Keeping the two in step is the invariant; the
     // number is not.
-    expect(slice.source_schema_version).toBe(10);
+    expect(slice.source_schema_version).toBe(11);
     expect(slice.default_source).toBe('claude');
     expect(slice.source_order).toEqual(['claude', 'codex', 'all']);
 
@@ -154,7 +154,7 @@ describe('v5 combined wire shape (guard)', () => {
     expect(combined.cost_usd).toBeCloseTo(
       combined.legs.claude.cost_usd + combined.legs.codex.cost_usd, 9);
     expect(combined.total_tokens).toBe(
-      combined.legs.claude.total_tokens + combined.legs.codex.total_tokens);
+      combined.legs.claude.total_tokens! + combined.legs.codex.total_tokens!);
   });
 
   it('omits qualifications and combined_unavailable when inapplicable', () => {
@@ -165,20 +165,30 @@ describe('v5 combined wire shape (guard)', () => {
     expect('qualifications' in (data.combined as object)).toBe(false);
   });
 
-  it('a withheld combined is null BESIDE a typed, ordered cause list', () => {
+  it('a decorated provider publishes certified account-cycle contributions', () => {
     const data = allSourceData('all-combined-decorated');
 
-    // `combined` stays PRESENT as null; only `combined_unavailable` is
-    // omitted-when-inapplicable.
-    expect('combined' in data).toBe(true);
+    expect(data.combined?.total_tokens).toBeNull();
+    const claude = data.combined?.legs.claude;
+    expect(claude?.scope).toBe('account_cycles');
+    expect(claude?.total_tokens).toBeNull();
+    expect(claude?.accounts?.map((row) => row.account_key)).toEqual([
+      'a'.repeat(32), 'b'.repeat(32), 'unattributed',
+    ]);
+    expect(claude?.cost_usd).toBeCloseTo(
+      claude!.accounts!.reduce((sum, row) => sum + row.cost_usd, 0), 9,
+    );
+    expect(data.combined_unavailable).toBeUndefined();
+  });
+
+  it('withholds a decorated provider when one account cost is unresolved', () => {
+    const data = allSourceData('all-combined-account-unresolved');
+
     expect(data.combined).toBeNull();
-    const unavailable = data.combined_unavailable;
-    expect(unavailable?.code).toBe('multi_account_unsupported');
-    expect(typeof unavailable?.message).toBe('string');
-    // The list is precedence-ordered, so `causes[0]` always equals the winner.
-    expect(unavailable?.causes[0].code).toBe(unavailable?.code);
-    expect(unavailable?.causes[0].provider).toBe('claude');
-    expect(unavailable?.causes[0].detail).toEqual({ account_count: 2 });
+    expect(data.combined_unavailable?.code).toBe('account_cost_unresolved');
+    expect(data.combined_unavailable?.causes).toEqual([{
+      provider: 'claude', code: 'account_cost_unresolved',
+    }]);
   });
 
   it('lists EVERY co-occurring cause, not just the winner', () => {

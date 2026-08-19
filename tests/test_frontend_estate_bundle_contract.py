@@ -18,6 +18,7 @@ exists because the frontend estate sat outside the authoritative bundle, and a
 lane where it silently does not sit inside it re-creates a weaker form of the
 same hole. "The bundle passed" must mean one thing on every lane.
 """
+import json
 import re
 from pathlib import Path
 
@@ -88,6 +89,33 @@ def test_the_frontend_harness_runs_hooks_lint_and_fails_loudly() -> None:
     assert "npm run lint" in text
     assert "FAIL hooks-lint: eslint is not installed" in text
     assert "FAIL hooks-lint: npm run lint failed" in text
+
+
+def test_playwright_sources_are_owned_by_the_build_static_checks() -> None:
+    """The e2e estate must not fall back outside both lint and typecheck.
+
+    Running the commands catches today's errors; pinning their declared inputs
+    prevents a future include/glob edit from making those green runs vacuous.
+    """
+    web = ROOT / "dashboard" / "web"
+    scripts = json.loads((web / "package.json").read_text())["scripts"]
+    e2e_config = json.loads((web / "tsconfig.e2e.json").read_text())
+
+    assert "npm run lint" in scripts["build"]
+    assert "npm run typecheck" in scripts["build"]
+    assert "npm run lint:e2e" in scripts["lint"]
+    assert "e2e/**/*.ts" in scripts["lint:e2e"]
+    assert "playwright.config.ts" in scripts["lint:e2e"]
+    assert "npm run typecheck:e2e" in scripts["typecheck"]
+    assert "tsconfig.e2e.json" in scripts["typecheck:e2e"]
+    assert "e2e" in e2e_config["include"]
+    assert "playwright.config.ts" in e2e_config["include"]
+
+
+def test_the_frontend_harness_executes_the_build_typecheck_script() -> None:
+    text = (ROOT / "bin" / "cctally-frontend-test").read_text()
+    assert "npm run typecheck" in text
+    assert "FAIL typecheck: npm run typecheck reported type errors" in text
 
 
 def test_every_bundle_ci_job_provisions_the_frontend_estate() -> None:

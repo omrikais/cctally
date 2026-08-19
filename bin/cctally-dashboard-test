@@ -17,17 +17,18 @@
 #     `event: update` envelope shape.
 #   - For non-empty scenarios (FIXED_SESSION_ID set in input.env):
 #     fetches /api/session/<fixed-id>, normalizes, and diffs against
-#     golden-session.json (first run writes the golden).
+#     golden-session.json (missing fails unless regeneration is explicit).
 #   - Kills the server.
 #
-# First-run writes each scenario's golden; steady-state is a byte-stable diff.
-# Exits non-zero if any scenario fails. A trap ensures stray server PIDs die
-# on harness exit / Ctrl-C.
+# Missing goldens fail unless CCTALLY_REGEN_GOLDENS=1 explicitly creates them;
+# steady-state is a byte-stable diff. Exits non-zero if any scenario fails. A
+# trap ensures stray server PIDs die on harness exit / Ctrl-C.
 #
-# The fifteen fixture scenarios (ok, warn, over, reset-week, no-data,
+# The sixteen fixture scenarios (ok, warn, over, reset-week, no-data,
 # utc-tz, tz-override, projected-alerts, command-secret,
 # codex-cache-active, codex-cache-idle, all-combined,
-# all-combined-decorated, all-budget-account-focus,
+# all-combined-decorated, all-combined-account-unresolved,
+# all-budget-account-focus,
 # codex-account-fallback) run in parallel
 # via `xargs -P`
 # — each scenario
@@ -347,7 +348,7 @@ _run_scenario_inner () {
         fi
     done <<< "$asset_paths"
 
-    # /api/data: fetch + normalize + diff (or write golden on first run).
+    # /api/data: fetch + normalize + require/diff the committed golden.
     local raw actual
     raw=$(curl -s --max-time 5 "$base/api/data")
     if [ -z "$raw" ]; then
@@ -358,15 +359,10 @@ _run_scenario_inner () {
         if [ $? -ne 0 ] || [ -z "$actual" ]; then
             echo "FAIL $name: /api/data JSON could not be normalized"
             ok=0
-        elif [ ! -f "$golden" ]; then
-            printf '%s\n' "$actual" > "$golden"
-            echo "WROTE $name golden: $golden"
         else
-            # golden-data.json ends in \n (written via `printf '%s\n'`); the
-            # helper materializes the actual the same way. 5000-line cap keeps
-            # the prior effectively-unlimited full-diff behavior (largest
-            # golden is ~2.5k lines) while still surfacing the whole divergence.
-            _golden_diff_str "/api/data" "$golden" "$actual" 5000 || ok=0
+            # Missing goldens fail unless explicit regeneration is requested;
+            # the helper checks both materialization and regeneration writes.
+            _golden_require_str "/api/data" "$golden" "$actual" 5000 || ok=0
         fi
     fi
 
@@ -434,8 +430,8 @@ def need(cond, msg):
     if not cond:
         errs.append(msg)
 
-need(d.get("source_schema_version") == 10,
-     "source_schema_version != 10: %r" % (d.get("source_schema_version"),))
+need(d.get("source_schema_version") == 11,
+     "source_schema_version != 11: %r" % (d.get("source_schema_version"),))
 
 sources = d.get("sources") or {}
 claude = sources.get("claude") or {}
@@ -963,8 +959,8 @@ print("ok")
     fi
 
     # GET /api/session/:id (Task 3.2): fetch the fixture-seeded session,
-    # normalize, diff against golden-session.json (or write on first
-    # run). Skipped for no-data since there's no session to seed.
+    # normalize, require/diff against golden-session.json. Skipped for no-data
+    # since there's no session to seed.
     if [ -n "$fixed_sid" ]; then
         local session_golden="$GOLDEN_ROOT/$name/golden-session.json"
         local sess_raw sess_actual
@@ -977,13 +973,8 @@ print("ok")
             if [ $? -ne 0 ] || [ -z "$sess_actual" ]; then
                 echo "FAIL $name: /api/session JSON could not be normalized"
                 ok=0
-            elif [ ! -f "$session_golden" ]; then
-                printf '%s\n' "$sess_actual" > "$session_golden"
-                echo "WROTE $name session golden: $session_golden"
             else
-                # golden-session.json ends in \n (written via `printf '%s\n'`);
-                # the helper materializes the actual the same way.
-                _golden_diff_str "/api/session" "$session_golden" "$sess_actual" 5000 || ok=0
+                _golden_require_str "/api/session" "$session_golden" "$sess_actual" 5000 || ok=0
             fi
         fi
     fi
@@ -1087,7 +1078,7 @@ if d.get("code") != "unknown_key":
     # scenarios built for it. A golden diff alone would go green again if a
     # future rebaseline regenerated both sides from a broken build.
     case "$name" in
-      all-combined|all-combined-decorated)
+      all-combined|all-combined-decorated|all-combined-account-unresolved)
         if [ -n "${raw:-}" ]; then
             local combined_check
             combined_check=$(printf '%s' "$raw" | CCTALLY_SCENARIO="$name" python3 -c '
@@ -1097,20 +1088,13 @@ env = json.load(sys.stdin)
 data = ((env.get("sources") or {}).get("all") or {}).get("data") or {}
 combined = data.get("combined")
 errs = []
-if scenario == "all-combined-decorated":
-    # Spec 3.2: decoration withholds the figure with a NAMED reason.
+if scenario == "all-combined-account-unresolved":
+    # #565: a missing card operand is unresolved, never a synthetic zero.
     if combined is not None:
-        errs.append("decorated scenario published a combined figure")
+        errs.append("unresolved scenario published a combined figure")
     unavailable = data.get("combined_unavailable") or {}
-    if unavailable.get("code") != "multi_account_unsupported":
+    if unavailable.get("code") != "account_cost_unresolved":
         errs.append("combined_unavailable.code == %r" % (unavailable.get("code"),))
-    causes = unavailable.get("causes") or []
-    if not any(
-        c.get("provider") == "claude"
-        and (c.get("detail") or {}).get("account_count") == 2
-        for c in causes
-    ):
-        errs.append("no claude cause naming 2 accounts: %r" % (causes,))
 else:
     if not isinstance(combined, dict):
         errs.append("combined withheld: %r" % (data.get("combined_unavailable"),))
@@ -1126,12 +1110,20 @@ else:
                 errs.append("%s leg state == %r" % (name, leg.get("state")))
             if not leg.get("cost_usd"):
                 errs.append("%s leg cost_usd is zero/absent" % (name,))
-            if not (leg.get("period") or {}).get("start_at"):
+            if (leg.get("scope") == "provider_cycle"
+                    and not (leg.get("period") or {}).get("start_at")):
                 errs.append("%s leg names no period" % (name,))
+            if leg.get("scope") == "account_cycles":
+                accounts = leg.get("accounts") or []
+                if not accounts or any(not (row.get("period") or {}).get("start_at")
+                                       for row in accounts):
+                    errs.append("%s account leg has no exact account periods" % (name,))
         # Each leg names its OWN cycle: the two periods must differ.
         claude_period = (legs.get("claude") or {}).get("period") or {}
         codex_period = (legs.get("codex") or {}).get("period") or {}
-        if claude_period.get("start_at") == codex_period.get("start_at"):
+        if (legs.get("claude") or {}).get("scope") == "provider_cycle" \
+                and (legs.get("codex") or {}).get("scope") == "provider_cycle" \
+                and claude_period.get("start_at") == codex_period.get("start_at"):
             errs.append("both legs claim the same start_at")
         # Unequal, non-zero totals, so a swapped leg moves the golden.
         if (legs.get("claude") or {}).get("cost_usd") == (
@@ -1269,15 +1261,16 @@ run_scenario () {
     fi
 }
 
-# Dispatch the fourteen fixture scenarios in parallel. Each scenario's
+# Dispatch the fixture scenarios in parallel. Each scenario's
 # output goes to its own _output.log; the loop after `xargs` flushes
 # them in fixed scenario order so the harness output reads identically
 # to the old sequential version.
-fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts command-secret codex-cache-active codex-cache-idle all-combined all-combined-decorated all-budget-account-focus codex-account-fallback)
+fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts command-secret codex-cache-active codex-cache-idle all-combined all-combined-decorated all-combined-account-unresolved all-budget-account-focus codex-account-fallback non-monday-anchor block-week-straddle alerts-weekly alerts-five-hour alerts-project-budget)
 export -f _run_scenario_inner run_scenario normalize_json normalize_session_json
 export -f kill_server_bounded
 # Golden-diff helpers must reach the xargs `bash -c` subshells too.
 export -f _golden_diff_files _golden_diff_str _golden_diff_two_str
+export -f _golden_require _golden_require_str
 export FIX_DIR GOLDEN_ROOT BIN SCRATCH_ROOT
 
 printf '%s\n' "${fixture_scenarios[@]}" \

@@ -1,8 +1,7 @@
 import { fmt } from './fmt';
 import type { FmtCtx } from './fmt';
-import type { Envelope } from '../types/envelope';
 
-// #556 S2 — the resolved spans two Projects surfaces have to state.
+// #556 S2 / #571 — the resolved spans two Projects surfaces have to state.
 //
 // Two different windows meet in the All Projects experience and neither
 // contains the other, which is why both now name resolved dates instead of a
@@ -10,10 +9,8 @@ import type { Envelope } from '../types/envelope';
 //
 //   - The RANKING is the shared absolute range, thirty calendar days ending
 //     today, published once at `sources.all.data.aggregates.range`.
-//   - The DRILL is `weeks_back` whole weeks anchored at the CURRENT Monday.
-//     `_project_detail_for_window` walks `[cw_start - 7 * (weeks_back - 1),
-//     cw_start + 7d]`, and the server widens `weeks_back` for an
-//     All-originated row so the drill reaches the ranking's own start.
+//   - The DRILL is the authoritative half-open interval published on the
+//     detail response as `window_start_at` / `window_end_at`.
 //
 // So a row ranked over thirty days opens a detail reporting fifty-six, and
 // `window_cost_usd >= ` the ranked figure with nothing reconciling them. Naming
@@ -24,73 +21,27 @@ export interface ResolvedSpan {
   endAt: string;
 }
 
-const DAY_MS = 86_400_000;
-
 /**
- * The drill window a `window_weeks` detail actually reported.
+ * Convert one authoritative half-open server interval into a display span.
  *
- * Mirrors `_project_detail_for_window`'s bounds
- * (`bin/_cctally_dashboard.py`), which is the only place the arithmetic
- * lives on the server: `since = cw_start - 7 * (weeks - 1) days` and
- * `until = cw_start + 7 days`.
- *
- * `endAt` is `until - 1ms`, the LAST INSTANT the window covers, because
- * `until` is the following Monday's midnight and naming it would read as a
- * day the drill reports on. Every other bound here is passed through
- * unchanged.
- *
- * It is deliberately NOT `anchor + 6 days`, which is the last day's MIDNIGHT.
- * `formatSpan` renders each bound as the calendar day it falls on inside the
- * display timezone, and a midnight instant falls on the PREVIOUS local day in
- * every zone behind UTC — so that form named a day one short of what the drill
- * actually reported for every user west of Greenwich.
- *
- * Returns `null` rather than guessing when the anchor is missing or
- * unparseable, or when `weeks` is not a positive integer — a span nothing
- * established is exactly what this helper exists to stop the modal from
- * stating.
+ * The server's end is exclusive. `formatSpan` names covered calendar days, so
+ * it receives the last covered millisecond rather than the next interval's
+ * first instant. No subscription-window arithmetic lives in the client.
  */
-export function claudeDrillWindow(
-  weekStartAt: string | null | undefined,
-  weeks: number | null | undefined,
+export function exclusiveWindowSpan(
+  startAt: string | null | undefined,
+  endExclusiveAt: string | null | undefined,
 ): ResolvedSpan | null {
-  if (weekStartAt == null || typeof weeks !== 'number') return null;
-  if (!Number.isInteger(weeks) || weeks < 1) return null;
-  const anchor = Date.parse(weekStartAt);
-  if (Number.isNaN(anchor)) return null;
-  const since = anchor - 7 * (weeks - 1) * DAY_MS;
-  const lastInstant = anchor + 7 * DAY_MS - 1;
+  if (startAt == null || endExclusiveAt == null) return null;
+  const start = Date.parse(startAt);
+  const endExclusive = Date.parse(endExclusiveAt);
+  if (Number.isNaN(start) || Number.isNaN(endExclusive) || endExclusive <= start) {
+    return null;
+  }
   return {
-    startAt: new Date(since).toISOString(),
-    endAt: new Date(lastInstant).toISOString(),
+    startAt: new Date(start).toISOString(),
+    endAt: new Date(endExclusive - 1).toISOString(),
   };
-}
-
-/**
- * The Monday anchor the drill window is measured from.
- *
- * The server reads `env["current_week"]["week_start_at"]` off the projects
- * envelope, which reaches the wire in two places carrying the same value: the
- * legacy top-level envelope and the Claude source domain.
- *
- * THE TOP-LEVEL BLOCK WINS, and the order matters. `env.projects` is
- * `snap.projects_envelope` — the very object the drill-down route resolves
- * against, rebuilt on every tick. The source-domain copy lives inside a
- * provider state that is deliberately RETAINED across ticks, so at a week
- * rollover with a retained bundle it still carries the previous Monday, and
- * preferring it made the drill state a span one whole week behind what the
- * server reported. The earlier order was justified on the grounds that the
- * source copy is present under every selection; that is not a reason to
- * prefer it, because the top-level block is present in every payload too.
- */
-export function claudeCurrentWeekStartAt(
-  env: Envelope | null | undefined,
-): string | null {
-  const anchor = env?.projects?.current_week?.week_start_at
-    ?? env?.sources?.claude?.data?.projects?.current_week?.week_start_at
-    ?? env?.sources?.all?.data?.providers?.claude?.projects?.current_week
-      ?.week_start_at;
-  return typeof anchor === 'string' && anchor !== '' ? anchor : null;
 }
 
 export interface FormatSpanOptions {

@@ -902,8 +902,13 @@ def maybe_record_milestone(
                     # Filter by reset_event_id so a credited week's
                     # alert payload reads the post-credit row, not a
                     # stale pre-credit row at the same (week, threshold).
+                    # `week_start_at` comes from the row rather than the
+                    # local variable for the same reason `cumulative_cost_usd`
+                    # does: it is the value persisted on insert, so the alert
+                    # states the week the milestone actually recorded.
                     row = conn.execute(
-                        "SELECT cumulative_cost_usd FROM percent_milestones "
+                        "SELECT cumulative_cost_usd, week_start_at "
+                        "FROM percent_milestones "
                         "WHERE week_start_date = ? AND percent_threshold = ? "
                         "  AND reset_event_id = ? AND account_key = ?",
                         (week_start_date, pct, reset_event_id, account_key),
@@ -916,6 +921,7 @@ def maybe_record_milestone(
                             threshold=pct,
                             crossed_at_utc=crossed_at,
                             week_start_date=week_start_date,
+                            week_start_at=row["week_start_at"],
                             cumulative_cost_usd=cum,
                             dollars_per_percent=dpp,
                             account_key=account_key,

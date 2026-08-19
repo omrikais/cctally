@@ -736,15 +736,16 @@ _unknown_codex_model_warnings: set[str] = set()
 # directly comparable.
 CODEX_LEGACY_FALLBACK_MODEL = "gpt-5"
 
-# OpenAI's model catalog describes ``codex-auto-review`` as the hidden model
-# used by the Guardian approval-review subagent, not as a public billable model
-# with its own rate card.  The canonical ccusage Codex adapter resolves that
-# identifier to the model current when it appeared; its 2026-04-23-and-later
-# mapping is gpt-5.5, which covers every retained auto-review event observed for
-# issue #535.  Keep this as a normalization map rather than a duplicate pricing
-# row so pricing drift continues to have one source of truth per rate card.
+# Runtime identifiers without their own rate card normalize here so pricing
+# drift retains one source of truth per card. OpenAI's live pricing page states
+# that ``daybreak-blue-latest`` currently points to ``gpt-5.6-sol`` and inherits
+# the underlying model's pricing; Codex emits the prefixed runtime identifier
+# retained below. ``codex-auto-review`` is the hidden Guardian model and maps to
+# the model current when it appeared, covering every retained event observed
+# for issue #535.
 CODEX_MODEL_ALIASES: dict[str, str] = {
     "codex-auto-review": "gpt-5.5",
+    "gpt-daybreak-blue-latest": "gpt-5.6-sol",
 }
 
 # Per-model fast-tier price multipliers, ported from ryoppippi/ccusage

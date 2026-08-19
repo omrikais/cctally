@@ -19,7 +19,7 @@ export function ConnectionBanner({ kind, message }: Props) {
         <use href="/static/icons.svg#warn-triangle" />
       </svg>
       <span>{text}</span>
-      {kind === 'error' && (
+      {kind === 'error' && message == null && (
         <span className="stale-banner-hint">
           Check that <code>cctally dashboard</code> is running.
         </span>

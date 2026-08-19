@@ -72,6 +72,7 @@ async function freezeEventStream(page: Page) {
       dispatchEvent() { return true; }
       close() { this.readyState = StableEventSource.CLOSED; }
     }
+    Object.defineProperty(window, 'SharedWorker', { configurable: true, value: undefined });
     Object.defineProperty(window, 'EventSource', { configurable: true, value: StableEventSource });
   });
 }
@@ -197,4 +198,53 @@ test('#593 — the Daily footer is fully visible at the default panel scroll pos
   expect(geometry.scrollTop).toBe(0);
   expect(geometry.scrollHeight).toBeLessThanOrEqual(geometry.clientHeight + 1);
   expect(geometry.footerBottom).toBeLessThanOrEqual(geometry.bodyBottom + 1);
+});
+
+test('#573 — every All range note stays readable while Alerts recovers body height', async ({ page }) => {
+  await serveFixture(page, COMBINED_FIXTURE);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('/');
+  await selectSource(page, 'all');
+
+  const notes = page.locator('.panel-range-note');
+  await expect(notes).toHaveCount(7);
+  for (const note of await notes.all()) {
+    await expect(note).toBeVisible();
+    await expect(note).not.toHaveText('');
+  }
+
+  const desktop = await page.locator('#panel-alerts').evaluate((panel) => {
+    const body = panel.querySelector<HTMLElement>('#panel-alerts-body')!;
+    const note = panel.querySelector<HTMLElement>('.panel-range-note')!;
+    return {
+      bodyClientHeight: body.clientHeight,
+      noteHeight: note.getBoundingClientRect().height,
+      panelHeight: panel.getBoundingClientRect().height,
+    };
+  });
+  expect(desktop.panelHeight).toBe(200);
+  expect(desktop.bodyClientHeight).toBeGreaterThanOrEqual(84);
+  expect(desktop.noteHeight).toBeGreaterThanOrEqual(12);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const mobile = await notes.evaluateAll((elements) => ({
+    documentClientWidth: document.documentElement.clientWidth,
+    documentScrollWidth: document.documentElement.scrollWidth,
+    notes: elements.map((node) => {
+      const el = node as HTMLElement;
+      return {
+        text: el.textContent,
+        clientWidth: el.clientWidth,
+        scrollWidth: el.scrollWidth,
+        height: el.getBoundingClientRect().height,
+      };
+    }),
+  }));
+  expect(mobile.documentScrollWidth).toBeLessThanOrEqual(mobile.documentClientWidth);
+  expect(mobile.notes).toHaveLength(7);
+  for (const note of mobile.notes) {
+    expect(note.text?.trim()).not.toBe('');
+    expect(note.scrollWidth).toBeLessThanOrEqual(note.clientWidth + 1);
+    expect(note.height).toBeGreaterThanOrEqual(12);
+  }
 });

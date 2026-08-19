@@ -362,6 +362,17 @@ export function ConversationRail() {
         )}
         {source === 'all' && <div className="conv-rail-composed-note">Merged locally · source-specific filters and sort</div>}
         {accountKey && <div className="conv-rail-composed-note">Scoped to the selected account</div>}
+        {/* #620 S1 D3 (F8) — the message count on each row counts EVERY message
+            in the session, subagent sidechains included, and a row's last
+            activity can be a subagent outlasting the main thread. Stated
+            unconditionally, because that is unconditionally what the number
+            is. No second count is added: a main-thread count needs an
+            envelope field, and the complete predicate for a main-thread turn
+            is recorded in docs/dashboard-gotchas.md so S2 need not
+            re-derive it. */}
+        <div className="conv-rail-composed-note conv-rail-population-note">
+          Message counts include subagent sidechains.
+        </div>
         {chips.length > 0 && (
           <div className="conv-rail-filters-active">
             {chips.map((c) => (

@@ -498,7 +498,9 @@ def _iter_claude_jsonl_files():
     ``projects/`` tree. Shared by ``sync_cache`` and the conversation backfill
     so both ingest paths enumerate the IDENTICAL file set."""
     for claude_dir in _get_claude_data_dirs():
-        for jp in (claude_dir / "projects").glob("**/*.jsonl"):
+        for jp in sorted(
+            (claude_dir / "projects").glob("**/*.jsonl"), key=lambda path: str(path)
+        ):
             if jp.is_file():
                 yield jp
 

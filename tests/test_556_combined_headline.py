@@ -16,6 +16,8 @@ import pathlib
 import sqlite3
 from types import SimpleNamespace
 
+import pytest
+
 from _lib_dashboard_sources import CapabilityRecord, SourceDashboardState
 from conftest import load_script, redirect_paths
 
@@ -571,24 +573,48 @@ def test_all_combined_fixture_pins_the_state_that_kept_the_caveat_on():
     }
 
 
-def test_all_combined_decorated_fixture_withholds_with_a_named_reason():
-    """§3.2 / acceptance 3 — decoration names the provider and its count."""
+def test_all_combined_decorated_fixture_publishes_certified_account_cycles():
+    """#565 — visible cards, exact account periods, and All reconcile."""
     golden = json.loads(
         (_FIXTURE_ROOT.parent / "all-combined-decorated" / "golden-data.json")
         .read_text()
     )
     data = golden["sources"]["all"]["data"]
 
-    assert data["combined"] is None
-    assert data["combined_unavailable"]["code"] == "multi_account_unsupported"
-    assert data["combined_unavailable"]["causes"] == [{
-        "provider": "claude",
-        "code": "multi_account_unsupported",
-        "detail": {"account_count": 2},
-    }]
+    combined = data["combined"]
+    assert "combined_unavailable" not in data
+    assert combined["cost_usd"] == pytest.approx(2.461375)
+    assert combined["total_tokens"] is None
+    claude_leg = combined["legs"]["claude"]
+    assert claude_leg["scope"] == "account_cycles"
+    assert [row["account_key"] for row in claude_leg["accounts"]] == [
+        "a" * 32, "b" * 32, "unattributed",
+    ]
+    assert [row["cost_usd"] for row in claude_leg["accounts"]] == [
+        0.75, 0.9, 0.4005,
+    ]
+    assert sum(row["cost_usd"] for row in claude_leg["accounts"]) == pytest.approx(
+        claude_leg["cost_usd"]
+    )
+    assert all(row["period"]["kind"] == "subscription_week"
+               for row in claude_leg["accounts"])
     # No account CARDINALITY leaks into the provider envelopes themselves.
     assert "account_scope" not in golden["sources"]["claude"]
     assert "account_scope" not in golden["sources"]["codex"]
+
+
+def test_all_combined_unresolved_fixture_withholds_missing_account_cost():
+    golden = json.loads(
+        (_FIXTURE_ROOT.parent / "all-combined-account-unresolved" / "golden-data.json")
+        .read_text()
+    )
+    data = golden["sources"]["all"]["data"]
+
+    assert data["combined"] is None
+    assert data["combined_unavailable"]["code"] == "account_cost_unresolved"
+    assert data["combined_unavailable"]["causes"] == [{
+        "provider": "claude", "code": "account_cost_unresolved",
+    }]
 
 
 def test_a_decorated_provider_whose_account_read_failed_still_withholds(

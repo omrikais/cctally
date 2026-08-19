@@ -58,6 +58,25 @@ def _share_load_lib(*args, **kwargs):
     return sys.modules["cctally"]._share_load_lib(*args, **kwargs)
 
 
+def _optional_float(value):
+    """``float(value)`` when there is a value, ``None`` when there is not.
+
+    #620 S1 D5. The idiom this replaces — ``float(getattr(x, "f", 0.0) or
+    0.0)`` — collapses three distinct states (a real zero, an explicit
+    ``None``, and a missing attribute) onto one number, so a withheld
+    measurement leaves the builder indistinguishable from a measured zero.
+    Written as a helper rather than repeated inline because the reason is
+    the same at every site and the inline form reads as a default.
+    """
+    if value is None:
+        return None
+    # No `except (TypeError, ValueError): return None`. On a surface whose
+    # entire purpose is telling "absent" apart from "present", reporting a
+    # malformed value as withheld is the same conflation the helper removes.
+    # A malformed value is a defect and must surface as one (#620 S1).
+    return float(value)
+
+
 def _share_now_utc(*args, **kwargs):
     return sys.modules["cctally"]._share_now_utc(*args, **kwargs)
 
@@ -631,9 +650,19 @@ def _build_weekly_share_panel_data(options: dict,
         wsa = getattr(r, "week_start_at", "") or ""
         start_date = wsa[:10] if isinstance(wsa, str) and len(wsa) >= 10 else wsa
         cost = float(getattr(r, "cost_usd", 0.0) or 0.0)
-        used_pct_raw = getattr(r, "used_pct", None)
-        used_pct = (float(used_pct_raw) / 100.0) if used_pct_raw is not None else 0.0
-        dpp = float(getattr(r, "dollar_per_pct", 0.0) or 0.0)
+        # `WeeklyPeriodRow.used_pct` is `float | None` — `None` when the week
+        # has a cost snapshot but no usage snapshot. Coercing it to zero
+        # published `0.0%` for a week nothing measured, which reads as a real
+        # zero-usage week. Same defect as the rate below, same treatment.
+        used_pct_raw = _optional_float(getattr(r, "used_pct", None))
+        used_pct = None if used_pct_raw is None else used_pct_raw / 100.0
+        # `WeeklyPeriodRow.dollar_per_pct` is `float | None` — it is `None`
+        # whenever the week has no usage percentage to divide by. Coercing it
+        # to zero here published `$0.000` for a rate nothing measured, which
+        # is the same fabrication #620 S1 D5 removed on the current-week and
+        # trend panels. Pre-existing rather than introduced by D5, and swept
+        # with them because it is the same defect on the same surface.
+        dpp = _optional_float(getattr(r, "dollar_per_pct", None))
         # Per-week top_projects: WeeklyPeriodRow doesn't carry a
         # per-project rollup, but `week_start_at` / `week_end_at` give us
         # an exact range — aggregate session_entries once per week so the
@@ -682,7 +711,9 @@ def _build_current_week_share_panel_data(options: dict,
         return {
             "kpi_cost_usd":       0.0,
             "kpi_pct_used":       0.0,
-            "kpi_dollar_per_pct": 0.0,
+            # With no current week at all there is no rate to report, so
+            # this is withheld for the same reason as the populated path.
+            "kpi_dollar_per_pct": None,
             "kpi_days_remaining": 0.0,
             "daily_progression":  [],
             "top_projects":       [],
@@ -728,7 +759,13 @@ def _build_current_week_share_panel_data(options: dict,
     return {
         "kpi_cost_usd":       float(getattr(cw, "spent_usd", 0.0) or 0.0),
         "kpi_pct_used":       used_pct,
-        "kpi_dollar_per_pct": float(getattr(cw, "dollars_per_percent", 0.0) or 0.0),
+        # #620 S1 D5: `TuiCurrentWeek.dollars_per_percent` is `float | None`,
+        # and `float(... or 0.0)` turned both a missing attribute and an
+        # explicit None into $0.00 — the fabrication D5 removes, restored one
+        # layer below the fix. A withheld rate stays withheld; the template
+        # renders it as `n/a`.
+        "kpi_dollar_per_pct": _optional_float(
+            getattr(cw, "dollars_per_percent", None)),
         "kpi_days_remaining": days_remaining,
         "daily_progression":  progression,
         "top_projects":       top_projects,
@@ -751,25 +788,41 @@ def _build_trend_share_panel_data(options: dict,
             wsa.strftime("%Y-%m-%d") if isinstance(wsa, dt.datetime)
             else (str(wsa)[:10] if wsa else "")
         )
-        used_pct_raw = getattr(r, "used_pct", None)
-        used_pct = (float(used_pct_raw) / 100.0) if used_pct_raw is not None else 0.0
-        dpp = float(getattr(r, "dollars_per_percent", 0.0) or 0.0)
+        # `TuiTrendRow.used_pct` is `float | None` (phantom weeks — a cost
+        # snapshot with no usage snapshot). See the weekly builder above.
+        used_pct_raw = _optional_float(getattr(r, "used_pct", None))
+        used_pct = None if used_pct_raw is None else used_pct_raw / 100.0
+        # #620 S1 D5, as above. Here the fabricated zero propagated further
+        # than the KPI: `cost_usd` is derived from the rate, so a zeroed rate
+        # also published a zero weekly cost for a week whose cost is unknown.
+        dpp = _optional_float(getattr(r, "dollars_per_percent", None))
         weeks.append({
             "start_date":     start_date,
-            "cost_usd":       dpp * (used_pct * 100.0),  # ≈ row total
+            # A rate times a percentage is a cost only when both are known.
+            # With `used_pct` coerced to zero, a week with a real rate and no
+            # measured percentage published a $0.00 cost.
+            "cost_usd":       (
+                None if (dpp is None or used_pct is None)
+                else dpp * (used_pct * 100.0)
+            ),  # ≈ row total
             "pct_used":       used_pct,
             "dollar_per_pct": dpp,
         })
     # Compute 3-week delta: compare last row vs row-4-from-end.
-    delta = {"dpp_change_pct": 0.0, "cost_change_usd": 0.0}
+    # A delta between two weeks is a fact only when both weeks are known.
+    # The previous default published `0.0`, which states "no change" — the
+    # same fabrication as a zeroed rate, one aggregate up (#620 S1 D5).
+    delta: dict = {"dpp_change_pct": None, "cost_change_usd": None}
     if len(weeks) >= 4:
         cur = weeks[-1]
         ref = weeks[-4]
-        if ref["dollar_per_pct"]:
+        if ref["dollar_per_pct"] and cur["dollar_per_pct"] is not None:
             delta["dpp_change_pct"] = (
                 (cur["dollar_per_pct"] - ref["dollar_per_pct"]) / ref["dollar_per_pct"]
             )
-        delta["cost_change_usd"] = cur["cost_usd"] - ref["cost_usd"]
+        # A delta between two costs is only a fact when both are known.
+        if cur["cost_usd"] is not None and ref["cost_usd"] is not None:
+            delta["cost_change_usd"] = cur["cost_usd"] - ref["cost_usd"]
     return {"weeks": weeks, "delta_3_weeks": delta}
 
 
@@ -923,8 +976,10 @@ def _build_forecast_share_panel_data(options: dict,
     if fc is None:
         return {
             "projected_end_pct":  0.0,
-            "days_to_100pct":     0.0,
-            "days_to_90pct":      0.0,
+            # With no forecast at all there is no rate, so neither ceiling has
+            # a distance — the same withholding the populated path performs.
+            "days_to_100pct":     None,
+            "days_to_90pct":      None,
             "daily_budgets": {
                 "avg": 0.0, "recent_24h": 0.0,
                 "until_90pct": 0.0, "until_100pct": 0.0,
@@ -943,10 +998,18 @@ def _build_forecast_share_panel_data(options: dict,
     r_recent = float(r_recent_raw) if r_recent_raw is not None else r_avg
     # End-of-week projected %
     projected_end_pct = (p_now + r_avg * remaining_hours) / 100.0
-    # Days to ceilings (simple inverse: hours-to-target / 24)
-    def _days_to_ceiling(target_pct: float) -> float:
-        if r_avg <= 0 or p_now >= target_pct:
+    # Days to ceilings (simple inverse: hours-to-target / 24).
+    # The two exit conditions are opposite facts and must not share a value.
+    # `p_now >= target_pct` means the target is already reached, and zero days
+    # to it is true. `r_avg <= 0` means no rate was observed, so the target is
+    # not reachable on any timeline this data describes — and in the no-usage
+    # state BOTH hold (`p_now == 0`, `r_avg == 0`), so the shared `0.0`
+    # rendered `Days->90% 0.0`, stating the opposite of the truth.
+    def _days_to_ceiling(target_pct: float) -> "float | None":
+        if p_now >= target_pct:
             return 0.0
+        if r_avg <= 0:
+            return None
         hours = (target_pct - p_now) / r_avg
         return max(0.0, hours / 24.0)
     days_to_100 = _days_to_ceiling(100.0)
@@ -954,27 +1017,36 @@ def _build_forecast_share_panel_data(options: dict,
     # Daily budgets — prefer ForecastView's pre-routed pair (issue #57)
     # when available; otherwise replay the legacy ``fc.budgets`` scan
     # inline so positionally-constructed fixture snapshots still work.
-    budgets: dict = {"avg": 0.0, "recent_24h": 0.0,
-                     "until_90pct": 0.0, "until_100pct": 0.0}
+    # Unknown until a branch below supplies one. A ceiling budget that no
+    # `BudgetRow` describes is not a $0.00/day budget.
+    budgets: dict = {"avg": None, "recent_24h": None,
+                     "until_90pct": None, "until_100pct": None}
+    # #620 S1 D5: no `or 0.0` on either branch. `ForecastView.budget_*_per_day_usd`
+    # and `BudgetRow.dollars_per_day` are both `None` whenever the rate is
+    # withheld, and coercing them republished $0.00 on exactly the surface
+    # whose message is that nothing was measured.
     if fc_view is not None:
-        budgets["until_100pct"] = float(
-            fc_view.budget_100_per_day_usd or 0.0,
-        )
-        budgets["until_90pct"] = float(
-            fc_view.budget_90_per_day_usd or 0.0,
-        )
+        budgets["until_100pct"] = _optional_float(
+            getattr(fc_view, "budget_100_per_day_usd", None))
+        budgets["until_90pct"] = _optional_float(
+            getattr(fc_view, "budget_90_per_day_usd", None))
     else:
         for b in getattr(fc, "budgets", None) or []:
             tp = getattr(b, "target_percent", None)
-            dpd = float(getattr(b, "dollars_per_day", 0.0) or 0.0)
+            dpd = _optional_float(getattr(b, "dollars_per_day", None))
             if tp == 100:
                 budgets["until_100pct"] = dpd
             elif tp == 90:
                 budgets["until_90pct"] = dpd
     # avg / recent_24h: derive from dollars-per-percent × r_avg/r_recent.
-    dpp = float(getattr(inputs, "dollars_per_percent", 0.0) or 0.0) if inputs else 0.0
-    budgets["avg"] = dpp * r_avg * 24.0
-    budgets["recent_24h"] = dpp * r_recent * 24.0
+    # #620 S1 D5: the `or 0.0` fabrication is REMOVED rather than moved. With
+    # no observed usage there is no rate, so a dollars-per-day figure derived
+    # from it is unavailable; substituting zero here would restore the same
+    # defect one layer below the fix.
+    _raw_dpp = getattr(inputs, "dollars_per_percent", None) if inputs else None
+    dpp = None if _raw_dpp is None else float(_raw_dpp)
+    budgets["avg"] = None if dpp is None else dpp * r_avg * 24.0
+    budgets["recent_24h"] = None if dpp is None else dpp * r_recent * 24.0
     # Projection curve — 7-day forward, using r_avg
     today = _share_now_utc().date()
     projection_curve: list[dict] = []

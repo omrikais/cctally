@@ -214,6 +214,21 @@ export function ForecastPanel() {
     );
   }
   const fc = presentationForecast(env, activeSource);
+  // #620 S1 D4 (F9) — the provider section for THIS tab. `compositionSources`
+  // returns exactly one source for a single-provider selection, so this is the
+  // same section object the All tab renders for that provider, folded by the
+  // same `providerSection` over the same source entry. The panel already
+  // computed the composition above and then used it only under All, so a stale
+  // or capability-limited provider disclosed nothing on its own tab while the
+  // All tab stated it — the two surfaces disagreeing about one source.
+  //
+  // The gating below is copied from `ForecastProviderSummary` rather than
+  // reinvented, so A14's field-for-field comparison holds: a section with no
+  // value renders a SUBSTITUTE derived from the canonical presenter, and the
+  // status chip describes `section.value`, so a substituted surface renders no
+  // chip while its reason survives.
+  const section = composition.sections[0] ?? null;
+  const sectionSubstituted = section == null || section.value == null;
   // #416 QA P0 — under "All accounts" the tile blanks: the verdict, the accent
   // edge and the escalation tint all describe ONE account's allowance, and this
   // tile sat ~40px under a hero that already reads `Forecast @ reset —
@@ -273,7 +288,13 @@ export function ForecastPanel() {
               {v.label}
             </span>
           )}
+          {section != null && section.status !== 'available' && !perAccount && !sectionSubstituted && (
+            <span className="provider-section-status">{section.status}</span>
+          )}
         </div>
+        {section?.reason && !perAccount && (
+          <div className="provider-section-reason">{section.reason}</div>
+        )}
         {/* #264 S1 (VOID-1) — pace bar: projection toward the 100% cap, sized
             to week_avg_projection_pct (clamped 0..100) and verdict-tinted, so
             the short-row tile fills its matched height instead of leaving a

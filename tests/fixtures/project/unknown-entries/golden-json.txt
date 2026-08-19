@@ -1,4 +1,5 @@
-Warning: 2 entries lacked project_path — run `cache-sync` to backfill.
+Warning: 2 entries lacked project_path.
+→ Run `cctally cache-sync --source claude` — claude · 2026-04-13 00:00 → 2026-04-15 15:00 UTC
 {
   "schemaVersion": 1,
   "rangeStart": "2026-04-13",

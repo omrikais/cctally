@@ -847,6 +847,84 @@ def test_issue_script_build_body_renders():
     assert "PRICING_SNAPSHOT_DATE" in body
 
 
+@pytest.mark.parametrize("findings_present", [False, True])
+def test_issue_script_never_mutates_a_manually_labeled_issue(
+    tmp_path, monkeypatch, findings_present,
+):
+    """A human issue carrying pricing-drift is not the automation ledger."""
+    pi = _load_issue_script()
+    payload = {
+        "drift": {
+            "value_drift": ([{"model": "gpt-example"}] if findings_present else []),
+            "missing_from_us": [],
+        },
+    }
+    payload_path = tmp_path / "payload.json"
+    payload_path.write_text(_json.dumps(payload))
+    calls = []
+
+    def fake_run_gh(args, *, capture=False):
+        calls.append(args)
+        if args[:2] == ["issue", "list"]:
+            return _json.dumps([{
+                "number": 606,
+                "body": "Manually filed pricing work; no automation marker.",
+            }])
+        return ""
+
+    monkeypatch.setattr(pi, "_run_gh", fake_run_gh)
+
+    assert pi.main([str(payload_path)]) == 0
+    assert not [
+        args for args in calls
+        if args[:2] in (["issue", "edit"], ["issue", "close"], ["issue", "comment"])
+    ]
+    if findings_present:
+        assert [args for args in calls if args[:2] == ["issue", "create"]]
+
+
+def test_issue_script_finds_only_the_explicitly_marked_ledger(monkeypatch):
+    pi = _load_issue_script()
+
+    def fake_run_gh(args, *, capture=False):
+        assert args[:2] == ["issue", "list"]
+        return _json.dumps([
+            {"number": 606, "body": "Manual issue with the shared label."},
+            {"number": 607, "body": f"{pi.ISSUE_MARKER}\nManaged ledger."},
+        ])
+
+    monkeypatch.setattr(pi, "_run_gh", fake_run_gh)
+
+    assert pi._find_open_issue() == 607
+
+
+def test_issue_script_body_carries_durable_ownership_marker():
+    pi = _load_issue_script()
+
+    body = pi._build_body({"drift": {}})
+
+    assert body.startswith(pi.ISSUE_MARKER + "\n")
+
+
+def test_issue_script_refuses_multiple_marked_ledgers(monkeypatch, capsys):
+    pi = _load_issue_script()
+
+    def fake_run_gh(args, *, capture=False):
+        assert args[:2] == ["issue", "list"]
+        return _json.dumps([
+            {"number": 607, "body": f"{pi.ISSUE_MARKER}\nFirst ledger."},
+            {"number": 608, "body": f"{pi.ISSUE_MARKER}\nSecond ledger."},
+        ])
+
+    monkeypatch.setattr(pi, "_run_gh", fake_run_gh)
+
+    with pytest.raises(SystemExit) as exc:
+        pi._find_open_issue()
+
+    assert exc.value.code == 2
+    assert "multiple marked pricing ledgers" in capsys.readouterr().err
+
+
 import subprocess as _sp  # noqa: E402
 
 

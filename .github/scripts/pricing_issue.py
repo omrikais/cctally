@@ -38,6 +38,7 @@ import _lib_pricing_check  # noqa: E402
 
 ISSUE_LABEL = "pricing-drift"
 ISSUE_TITLE = "Pricing drift: embedded tables diverge from LiteLLM"
+ISSUE_MARKER = "<!-- cctally-pricing-drift-ledger:v1 -->"
 
 
 def _findings_present(payload: dict) -> bool:
@@ -75,14 +76,29 @@ def _run_gh(args: list[str], *, capture: bool = False) -> str:
 
 
 def _find_open_issue() -> int | None:
-    """Return the number of the open `pricing-drift` issue, or None."""
+    """Return the explicitly owned open pricing ledger, or None.
+
+    The label is discovery metadata, not ownership: humans may use it on a
+    manually filed pricing issue. Only a body carrying our durable marker may
+    be rewritten or closed by this workflow.
+    """
     out = _run_gh(
         ["issue", "list", "--label", ISSUE_LABEL, "--state", "open",
-         "--json", "number", "--limit", "1"],
+         "--json", "number,body", "--limit", "1000"],
         capture=True,
     )
     rows = json.loads(out or "[]")
-    return rows[0]["number"] if rows else None
+    owned = [
+        row for row in rows
+        if (row.get("body") or "").startswith(ISSUE_MARKER + "\n")
+    ]
+    if len(owned) > 1:
+        sys.stderr.write(
+            "[pricing_issue] multiple marked pricing ledgers are open; "
+            "refusing to choose one\n"
+        )
+        raise SystemExit(2)
+    return owned[0]["number"] if owned else None
 
 
 def _today() -> str:
@@ -105,6 +121,7 @@ def _build_body(payload: dict) -> str:
     degraded = payload.get("degraded_components") or []
 
     lines: list[str] = []
+    lines.append(ISSUE_MARKER)
     lines.append(
         "cctally's embedded model pricing diverges from the LiteLLM "
         "snapshot. This issue is auto-managed by the weekly "

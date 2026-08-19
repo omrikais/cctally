@@ -294,7 +294,8 @@ function CanonicalTrendModal({
   const presentation = presentationTrend(env, source);
   const rows: TrendChartDatum[] = isClaude
     ? buildTrendHistoryData(env)
-    : presentation.rows.map((row) => ({ ...row, spark_height: row.dollar_per_pct ?? 0 }));
+    // #620 S1 — no `?? 0`; see `Sparkline`'s withheld rule.
+    : presentation.rows.map((row) => ({ ...row, spark_height: row.dollar_per_pct }));
   // TR-4: index of the week whose tooltip is showing (hover OR keyboard
   // focus). Declared before the empty-state early return to keep hook order
   // stable.

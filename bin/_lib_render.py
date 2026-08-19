@@ -2795,7 +2795,8 @@ def _render_project_table(
     """Render project rollup as a ccusage-style ANSI table.
 
     Columns: Project | Sessions | First Seen | Last Seen | Input |
-             Cache Create | Cache Read | Output | Cost (USD) | Used % | $/1%
+             Cache Create | Cache Read | Output | Cost (USD) |
+             Cost Share | Used % | $/1%
 
     Parent rows show all columns; breakdown child rows show per-model
     aggregates with blank Sessions/Used%/$/1% cells (those only make
@@ -2822,12 +2823,12 @@ def _render_project_table(
     headers = [
         "Project", "Sessions", "First Seen", "Last Seen",
         "Input", "Cache Create", "Cache Read", "Output",
-        "Cost (USD)", "Used %", "$/1%",
+        "Cost (USD)", "Cost Share", "Used %", "$/1%",
     ]
     aligns = [
         "left", "right", "left", "left",
         "right", "right", "right", "right",
-        "right", "right", "right",
+        "right", "right", "right", "right",
     ]
     num_cols = len(headers)
 
@@ -2891,6 +2892,19 @@ def _render_project_table(
             return ("\u2014", _gray)
         return (f"${cpp:.2f}", None)
 
+    # #620 S1 D13 (CLI half): each project's share of the cost of the
+    # projects this table lists. That denominator is NOT the quota
+    # percentage `Used %` reports, so the two columns are independent and
+    # the footer below names this one explicitly — the terminal has no
+    # hover, so the disclosure the dashboard makes in a tooltip has to be a
+    # rendered line here.
+    cost_share_total = stable_sum(float(r["cost_usd"]) for r in rows)
+
+    def _cost_share_cell(cost_usd: float) -> tuple[str, Any]:
+        if cost_share_total <= 0:
+            return ("\u2014", _gray)
+        return (f"{100.0 * float(cost_usd) / cost_share_total:.1f}%", None)
+
     arrow = "  \u2514\u2500" if unicode_ok else "  |_"
 
     ROW_DATA, ROW_BREAKDOWN = "data", "breakdown"
@@ -2910,6 +2924,7 @@ def _render_project_table(
             (_fmt_num(r["cache_read"]), None),
             (_fmt_num(r["output"]), None),
             (f"${r['cost_usd']:.2f}", None),
+            _cost_share_cell(r["cost_usd"]),
             (used_text, used_cfn),
             (cpp_text, cpp_cfn),
         ]
@@ -2928,6 +2943,10 @@ def _render_project_table(
                     (_fmt_num(mb["cache_read"]), _gray),
                     (_fmt_num(mb["output"]), _gray),
                     (f"${mb['cost_usd']:.2f}", _gray),
+                    # Cost Share is blank on a model row for the same reason
+                    # Used % and $/1% are: a model's share of its project is a
+                    # different denominator from the one the column names.
+                    ("", None),
                     ("", None),
                     ("", None),
                 ]
@@ -3061,6 +3080,15 @@ def _render_project_table(
                 f"week{plural} \u2014 no usage snapshots recorded."
             )
         )
+
+    project_plural = "s" if len(rows) != 1 else ""
+    out.append(
+        _dim(
+            f"Cost Share: each project's share of ${cost_share_total:,.2f} "
+            f"\u2014 the total cost of the {len(rows)} "
+            f"project{project_plural} listed."
+        )
+    )
 
     return "\n".join(out)
 

@@ -35,6 +35,7 @@ without relabeling it as Claude cache behavior.
 - **$ Wasted** — cache-write premium that did not yield enough reads
 - **Net $** — `Saved – Wasted`; more than `1e-9` USD below zero means caching is costing you
 - **Anomaly glyph (⚠)** — Net $ is more than `1e-9` USD below zero, or Cache % drops ≥15pp vs. the trailing median
+- **Eval** — which of the four evaluation states the row is in (see [Evaluation states](#evaluation-states))
 
 Claude financial fields use each retained response's effective
 `message.usage.speed`. Current Opus 5/4.8 fast rows use the 2x fast rate;
@@ -104,6 +105,44 @@ is also not a `cctally config set` key: it is absent from the
   residue between `-1e-9` and zero does not raise a warning. A value below
   `-1e-9` still does.
 
+### Evaluation states
+
+Every data row carries one of four states in the **Eval** column. Before this
+column existed the terminal marked only triggered rows, so an unmarked row
+could mean three different things and the reader had no way to tell which.
+
+| Eval | Meaning |
+|---|---|
+| `anomaly` | At least one predicate triggered. The row also keeps its red ⚠ glyph and its coloured reason cells. |
+| `clear` | Every applicable predicate ran and none triggered. |
+| `partial` | Some applicable predicates ran and at least one could not be evaluated — most often `cache_drop` on a thin baseline. |
+| `not eval` | No applicable predicate could be evaluated for this row. |
+
+`anomaly` takes precedence over the other three: a row whose `net_negative`
+triggered is reported as an anomaly even when `cache_drop` beside it could not
+be evaluated.
+
+Which predicates are *applicable* depends on the provider. Claude can evaluate
+both `net_negative` and `cache_drop`. Codex can only ever evaluate
+`cache_drop`, so a Codex row where that one predicate was skipped is
+`not eval` rather than `partial` — not applicable is not the same as
+unevaluated.
+
+The same four states drive the dashboard's Cache Report panel. The two
+implementations are pinned to each other by a shared truth table, so the
+terminal and the dashboard cannot disagree about a row.
+
+`--json` is unchanged: it has published `anomaly.triggered`,
+`anomaly.reasons` and `anomaly.unevaluated` since the state was first
+distinguished, and the column above is derived from exactly those fields.
+
+**Terminal width.** The **Eval** column is a twelfth column, and at the
+default 120-column width the daily table has no room for it alongside every
+existing column, so the layout's ultra-compact fallback drops the **Input**
+column — the same fallback the by-session table has always used at that width.
+Widen your terminal to see both, or read `--json`, which carries every field
+regardless of width.
+
 ### Codex token reuse, not a cache-hit rate
 
 `--source codex` is a **Codex Token Reuse Report**, not a Claude cache report.
@@ -130,10 +169,12 @@ requested filter.
 - **Anomaly baseline skips when samples are thin.** The
   `cache_drop` trigger needs ≥5 daily rows or ≥10 session rows in the
   trailing `--anomaly-window-days` window. With fewer samples, the trigger
-  is skipped in terminal output to avoid first-two-weeks false positives.
-  JSON distinguishes that state from an evaluated-clean row by listing
-  `cache_drop` under `anomaly.unevaluated`; widen `--days`, or inspect both
-  lists with `--days N --json | jq '.days[].anomaly | {reasons, unevaluated}'`.
+  is skipped to avoid first-two-weeks false positives. The skip itself has
+  not changed; what changed is that the terminal now says the skip happened
+  (`partial` or `not eval` in the **Eval** column) instead of leaving the row
+  indistinguishable from an evaluated-clean one. Widen `--days`, or inspect
+  both lists with
+  `--days N --json | jq '.days[].anomaly | {reasons, unevaluated}'`.
 - `--since` / `--until` accept either pure-date (`2026-04-10`) or
   full-ISO (`2026-04-10T10:00:00Z`). Mixed-format same-day windows
   collapse to empty (e.g. `--since 20260418 --until 2026-04-18`) — fix:

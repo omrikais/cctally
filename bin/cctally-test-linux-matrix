@@ -6,28 +6,144 @@ checkout, then runs the Linux platform profile as a non-root user in a fresh
 Linux/arm64 container for every supported Python minor. The profile is full
 pytest plus every harness except the macOS/Homebrew LAN-runner harness. It models
 the private ``ci-linux-matrix.yml`` lane without consuming Actions minutes.
+
+Provisioning lives in ``bin/cctally-test-linux-matrix.Dockerfile`` and is baked
+into a content-addressed image per Python minor, so a lane installs nothing.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
 import os
 import pathlib
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 
 PYTHON_VERSIONS = ("3.11", "3.12", "3.13")
 CONTAINER_PLATFORM = "linux/arm64"
 CONTAINER_CHECKOUT = "/workspace/cctally-dev"
 CONTAINER_DISTRO = "trixie"
+IMAGE_SCHEMA_VERSION = "1"
+IMAGE_TAG_PREFIX = "cctally-linux-matrix"
+IMAGE_INPUTS_LABEL = "cctally.image.inputs"
+IMAGE_EPOCH_LABEL = "cctally.image.apt-epoch"
+IMAGE_TOOLCHAIN_LABEL = "cctally.image.toolchain"
+DOCKERFILE_NAME = "cctally-test-linux-matrix.Dockerfile"
+MANIFEST_SCRIPT_NAME = "_lib-linux-matrix-manifest.sh"
+SAMPLER_SCRIPT_NAME = "cctally-test-linux-matrix-sampler.py"
+ANALYZER_SCRIPT_NAME = "cctally-test-linux-matrix-acceptance.py"
+SAMPLER_CONTAINER_PATH = "/opt/cctally-build/sampler.py"
+CONTAINER_METRICS_DIR = "/metrics"
+LANE_LABEL = "cctally.linux-matrix.head"
+CONTAINER_MANIFEST_DIGEST = "/opt/cctally/toolchain-manifest.sha256"
+# The schedule this driver actually runs. Three-way concurrency was implemented,
+# measured and falsified; the acceptance analyzer keeps both threshold sets and
+# this is what selects the one that applies.
+LANE_SCHEDULE = "sequential"
+# The current generation plus one prior, so a bad pin bump can be rolled back
+# without paying a rebuild. Anything older is orphaned by the weekly freshness
+# epoch and nothing else removes it.
+IMAGE_GENERATIONS_RETAINED = 2
+
+PYTHON_BASE_IMAGES = {
+    # Digest-pinned so an upstream rebuild cannot silently change what the gate
+    # tested between two cuts of the same commit. Bump deliberately.
+    "3.11": (
+        "python:3.11-trixie@sha256:"
+        "7bd2bbe2112147be4dbe68802d60eee6c5e46042f621ffdf2102264aeeba8716"
+    ),
+    "3.12": (
+        "python:3.12-trixie@sha256:"
+        "e5931cdb4a8cec0ad083277c16a39114f14123b8b6c858c8c9689b677789975c"
+    ),
+    "3.13": (
+        "python:3.13-trixie@sha256:"
+        "785ba3c54682e15fd75186dd1732d88389884e9b6f7311871674c18e5d32a1f1"
+    ),
+}
+
+APT_PACKAGES = (
+    "ca-certificates curl git jq bsdextrautils procps bc sqlite3 unzip "
+    "xz-utils locales rsync gcc libc6-dev"
+)
+SQLITE_URL = "https://sqlite.org/2026/sqlite-autoconf-3530300.tar.gz"
+SQLITE_VERSION = "3530300"
+SQLITE_SHA256 = "c917d7db16648ec95f714974ace5e5dcf46b7dc70e26600a0a102a3141125db0"
+SQLITE_FLAGS = (
+    "-O2 -DSQLITE_ENABLE_DBPAGE_VTAB -DSQLITE_ENABLE_DBNSTAT_VTAB "
+    "-DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DHAVE_READLINE=0"
+)
+CONTAINER_UID = "10001"
+CONTAINER_GID = "10001"
+
 _SCRIPT = pathlib.Path(__file__).resolve()
 
 
 class GateError(RuntimeError):
     """A local preflight or container-infrastructure refusal."""
+
+
+def _merge_lane_exit_codes(lane_exits: dict[str, int]) -> int:
+    """Merge per-lane exit codes into one gate verdict.
+
+    Infrastructure and incomplete outrank a product test failure, matching the
+    precedence `bin/_lib-test-contract.sh` and `docs/remote-testing.md` already
+    establish: an incomplete lane makes the product verdict unknowable, so
+    reporting 1 would claim more than the run established.
+    """
+    if not lane_exits:
+        raise ValueError("_merge_lane_exit_codes requires at least one lane result")
+    codes = list(lane_exits.values())
+    if all(code == 0 for code in codes):
+        return 0
+    if any(code not in (0, 1) for code in codes):
+        return 3
+    return 1
+
+
+def _compose_gate_exit(
+    merged: int, postcondition_failed: bool, diagnostic_selection: bool
+) -> int:
+    """Combine the merged lane verdict with the caller-tree postconditions.
+
+    A candidate that changed underneath the matrix invalidates every lane, so a
+    precondition refusal dominates whatever the lanes reported. A focused
+    ``--python`` selection can never discharge the gate.
+    """
+    if postcondition_failed:
+        return 2
+    if diagnostic_selection:
+        return 3
+    return merged
+
+
+def _image_input_digest(records: list[tuple[str, str]]) -> str:
+    """Hash framed name/value records into the image input digest.
+
+    Records are sorted by name so caller ordering cannot change the tag, and
+    every field is length-prefixed so two different record sets cannot
+    serialize to the same bytes.
+    """
+    digest = hashlib.sha256()
+    for name, value in sorted(records):
+        for field in (name, value):
+            encoded = field.encode("utf-8")
+            digest.update(str(len(encoded)).encode("ascii"))
+            digest.update(b":")
+            digest.update(encoded)
+            digest.update(b"|")
+    return digest.hexdigest()
 
 
 def _run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -68,47 +184,476 @@ def _git_status(root: pathlib.Path) -> str:
     )
 
 
-def _container_script(version: str, expected_head: str) -> str:
-    node_archive = 'node-v${node_version}-linux-arm64.tar.xz'
+def _freshness_epoch(now: datetime.datetime) -> str:
+    """Weekly UTC epoch, aligned with the public weekly matrix cron.
+
+    Without a time input the derived tag would stay valid indefinitely while the
+    Debian repository the image installs from moves underneath it. Today's gate
+    is ambient-fresh because every lane runs ``apt-get update``; this keeps that
+    freshness bounded rather than dropping it silently.
+    """
+    iso = now.astimezone(datetime.timezone.utc).isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def _image_records(
+    version: str, epoch: str, repo_root: pathlib.Path
+) -> list[tuple[str, str]]:
+    """Every input that can change what the lane image contains.
+
+    Change any one of these and the digest changes, the derived tag is missing,
+    and the build phase rebuilds. That is what makes automatic building safe: a
+    stale image cannot enter a release gate, because a stale image is a
+    different tag.
+    """
+    web = repo_root / "dashboard" / "web"
+    dockerfile = repo_root / "bin" / DOCKERFILE_NAME
+
+    def _sha(path: pathlib.Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    return [
+        ("schema", IMAGE_SCHEMA_VERSION),
+        ("python", version),
+        ("platform", CONTAINER_PLATFORM),
+        ("distro", CONTAINER_DISTRO),
+        ("base", PYTHON_BASE_IMAGES[version]),
+        ("dockerfile", _sha(dockerfile)),
+        ("manifest-script", _sha(repo_root / "bin" / MANIFEST_SCRIPT_NAME)),
+        ("sampler-script", _sha(repo_root / "bin" / SAMPLER_SCRIPT_NAME)),
+        ("requirements", _sha(repo_root / "tests" / "requirements-dev.txt")),
+        ("package-json", _sha(web / "package.json")),
+        ("package-lock", _sha(web / "package-lock.json")),
+        ("nvmrc", (web / ".nvmrc").read_text().strip()),
+        # The archive itself is verified against the official SHASUMS256.txt at
+        # build time, and the Node release it verifies is pinned by `nvmrc`
+        # above; this record states that the verification is part of the
+        # contract rather than restating a checksum the build derives.
+        ("node-archive-sha256", "verified-from-nodejs-shasums"),
+        ("apt-packages", APT_PACKAGES),
+        ("apt-epoch", epoch),
+        ("sqlite-url", SQLITE_URL),
+        ("sqlite-version", SQLITE_VERSION),
+        ("sqlite-sha256", SQLITE_SHA256),
+        ("sqlite-flags", SQLITE_FLAGS),
+        ("uid", CONTAINER_UID),
+        ("gid", CONTAINER_GID),
+        ("checkout", CONTAINER_CHECKOUT),
+    ]
+
+
+def _image_tag(version: str, digest: str) -> str:
+    return f"{IMAGE_TAG_PREFIX}:{version}-{digest[:16]}"
+
+
+def _prunable_image_tags(
+    ordered: list[tuple[str, str]],
+    keep_image_id: str,
+    retained: int = IMAGE_GENERATIONS_RETAINED,
+) -> list[str]:
+    """Which lane tags to remove from a newest-first `(tag, image id)` listing.
+
+    Identity is the image ID rather than the tag, because the ID is what the
+    lane actually runs and a tag stays mutable; every tag pointing at the
+    resolved image is therefore retained together with it, wherever those tags
+    sit in the listing. The newest other generation is retained as well.
+    """
+    kept_ids = [keep_image_id]
+    for _tag, image_id in ordered:
+        if len(kept_ids) >= retained:
+            break
+        if image_id not in kept_ids:
+            kept_ids.append(image_id)
+    return [tag for tag, image_id in ordered if image_id not in kept_ids]
+
+
+def _parse_created_at(text: str) -> float | None:
+    """Parse the engine's `CreatedAt` column, or return None."""
+    parts = (text or "").split()
+    if len(parts) < 3:
+        return None
+    try:
+        moment = datetime.datetime.strptime(
+            " ".join(parts[:3]), "%Y-%m-%d %H:%M:%S %z"
+        )
+    except ValueError:
+        return None
+    return moment.timestamp()
+
+
+def _order_tags_newest_first(rows: list[tuple[str, str]]) -> list[str]:
+    """Order `(tag, CreatedAt)` rows newest first.
+
+    `docker images` already lists newest first, and that is the fallback: if any
+    timestamp fails to parse, every row keeps the order the engine reported
+    rather than mixing two ranking schemes.
+    """
+    parsed: list[tuple[float, int, str]] = []
+    for index, (tag, created) in enumerate(rows):
+        moment = _parse_created_at(created)
+        if moment is None:
+            return [tag for tag, _created in rows]
+        parsed.append((moment, -index, tag))
+    parsed.sort(reverse=True)
+    return [tag for _moment, _index, tag in parsed]
+
+
+def _prune_stale_images(engine: str, version: str, keep_image_id: str) -> None:
+    """Remove superseded lane images for one interpreter.
+
+    The image key carries a weekly freshness epoch, so the first cut of every
+    new week mints a fresh three-image set and orphans the previous one — about
+    four gigabytes a week, indefinitely, with nothing removing it.
+
+    Every failure here is swallowed. Garbage collection must never refuse a
+    release: an image another container still references, or a layer a retained
+    tag shares, is a reason to leave it alone rather than to fail the gate.
+    """
+    try:
+        listed = _run(
+            [
+                engine,
+                "images",
+                "--no-trunc",
+                "--filter",
+                f"reference={IMAGE_TAG_PREFIX}:{version}-*",
+                "--format",
+                "{{.Repository}}:{{.Tag}}|{{.ID}}|{{.CreatedAt}}",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError:
+        return
+    if listed.returncode != 0:
+        return
+    rows: list[tuple[str, str]] = []
+    identities: dict[str, str] = {}
+    for line in (listed.stdout or "").splitlines():
+        fields = line.strip().split("|")
+        if len(fields) != 3 or not fields[0]:
+            continue
+        tag, image_id, created = fields
+        rows.append((tag, created))
+        identities[tag] = image_id
+    ordered = [(tag, identities[tag]) for tag in _order_tags_newest_first(rows)]
+    for tag in _prunable_image_tags(ordered, keep_image_id):
+        try:
+            _run(
+                [engine, "rmi", tag],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            return
+
+
+def _prune_first_pass_images(engine: str) -> None:
+    """Remove every dangling image on this host that carries the gate's label.
+
+    `_build_image` builds twice: the first pass produces the toolchain manifest
+    and the second records its digest in a label, which moves the tag onto a new
+    image id and orphans the first. The scope is deliberately the whole host
+    rather than this build's leftovers: earlier generations orphan first-pass
+    images too, nothing else on the host writes `cctally.image.inputs`, and an
+    image still referenced is one the engine refuses to remove. What the filter
+    guarantees is therefore the converse — a dangling image carrying no
+    `cctally.image.inputs` label belongs to something else and is left alone, so
+    a clean run does not imply the host has no dangling images left.
+    """
+    try:
+        listed = _run(
+            [
+                engine,
+                "images",
+                "--no-trunc",
+                "--filter",
+                "dangling=true",
+                "--filter",
+                f"label={IMAGE_INPUTS_LABEL}",
+                "--format",
+                "{{.ID}}",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError:
+        return
+    if listed.returncode != 0:
+        return
+    for line in (listed.stdout or "").splitlines():
+        image_id = line.strip()
+        if not image_id:
+            continue
+        try:
+            _run(
+                [engine, "rmi", image_id],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            return
+
+
+def _inspect_image(engine: str, reference: str) -> tuple[str, dict] | None:
+    """Return the image id and labels for a local image, or None when absent."""
+    result = _run(
+        [engine, "image", "inspect", reference, "--format", "{{json .}}"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        return None
+    lines = (result.stdout or "").strip().splitlines()
+    if not lines:
+        return None
+    try:
+        payload = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        raise GateError(
+            f"{engine} image inspect {reference}: unreadable output ({exc})"
+        ) from exc
+    image_id = payload.get("Id") or ""
+    if not image_id:
+        raise GateError(f"{engine} image inspect {reference}: no image id")
+    labels = (payload.get("Config") or {}).get("Labels") or {}
+    return image_id, labels
+
+
+def _capture_container_file(engine: str, image: str, path: str) -> str:
+    result = _run(
+        [
+            engine,
+            "run",
+            "--rm",
+            "--pull=never",
+            "--platform",
+            CONTAINER_PLATFORM,
+            "--entrypoint",
+            "cat",
+            image,
+            path,
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise GateError(f"could not read {path} from {image}: {detail}")
+    return result.stdout.strip()
+
+
+def _build_image(
+    engine: str,
+    version: str,
+    epoch: str,
+    repo_root: pathlib.Path,
+    digest: str,
+    tag: str,
+) -> None:
+    """Build the lane image, then stamp its own toolchain manifest digest.
+
+    The Dockerfile is built twice. A ``LABEL`` cannot carry a value the same
+    build computes, and BuildKit rejects a bare image id in ``FROM``, so a
+    second pass with the digest supplied as a build argument is what records it.
+    Every layer above the label is a cache hit, so the second pass costs seconds.
+    """
+    web = repo_root / "dashboard" / "web"
+    with tempfile.TemporaryDirectory(prefix="cctally-linux-matrix-build-") as raw:
+        context = pathlib.Path(raw)
+        staged = context / "context"
+        staged.mkdir()
+        for source, name in (
+            (web / ".nvmrc", ".nvmrc"),
+            (repo_root / "tests" / "requirements-dev.txt", "requirements-dev.txt"),
+            (web / "package.json", "package.json"),
+            (web / "package-lock.json", "package-lock.json"),
+            (repo_root / "bin" / MANIFEST_SCRIPT_NAME, "record-manifest.sh"),
+            (repo_root / "bin" / SAMPLER_SCRIPT_NAME, "sampler.py"),
+        ):
+            shutil.copyfile(source, staged / name)
+        (staged / "record-manifest.sh").chmod(0o755)
+        (staged / "sampler.py").chmod(0o755)
+
+        def _pass(toolchain: str) -> None:
+            build = _run(
+                [
+                    engine,
+                    "build",
+                    "--platform",
+                    CONTAINER_PLATFORM,
+                    "--file",
+                    str(repo_root / "bin" / DOCKERFILE_NAME),
+                    "--build-arg",
+                    f"CCTALLY_BASE_IMAGE={PYTHON_BASE_IMAGES[version]}",
+                    "--build-arg",
+                    f"CCTALLY_APT_EPOCH={epoch}",
+                    "--build-arg",
+                    f"CCTALLY_IMAGE_INPUTS={digest}",
+                    "--build-arg",
+                    f"CCTALLY_CHECKOUT={CONTAINER_CHECKOUT}",
+                    "--build-arg",
+                    f"CCTALLY_TOOLCHAIN={toolchain}",
+                    "--tag",
+                    tag,
+                    str(context),
+                ]
+            )
+            if build.returncode != 0:
+                raise GateError(f"could not build {tag} (exit {build.returncode})")
+
+        _pass("")
+        built = _inspect_image(engine, tag)
+        if built is None:
+            raise GateError(f"image {tag} is absent immediately after building it")
+        toolchain = _capture_container_file(
+            engine, built[0], CONTAINER_MANIFEST_DIGEST
+        )
+        if not toolchain:
+            raise GateError(f"image {tag} carries an empty toolchain manifest digest")
+        _pass(toolchain)
+
+
+def _resolve_image(
+    engine: str, version: str, epoch: str, repo_root: pathlib.Path
+) -> str:
+    """Return the immutable image id of the validated lane image.
+
+    The id rather than the tag, because a tag stays mutable between validation
+    and use: a concurrent invocation or a manual retag could otherwise
+    substitute an image that was never validated.
+    """
+    records = _image_records(version, epoch, repo_root)
+    digest = _image_input_digest(records)
+    tag = _image_tag(version, digest)
+    present = _inspect_image(engine, tag)
+    if present is None:
+        _build_image(engine, version, epoch, repo_root, digest, tag)
+        present = _inspect_image(engine, tag)
+        if present is None:
+            raise GateError(f"image {tag} is still absent after building it")
+    image_id, labels = present
+    recorded = labels.get(IMAGE_INPUTS_LABEL)
+    if recorded != digest:
+        raise GateError(
+            f"image {tag} records inputs {recorded!r} but this tree computes "
+            f"{digest!r}"
+        )
+    recorded_epoch = labels.get(IMAGE_EPOCH_LABEL)
+    if recorded_epoch != epoch:
+        raise GateError(
+            f"image {tag} carries apt freshness epoch {recorded_epoch!r}, outside "
+            f"the current bound {epoch!r}"
+        )
+    if not labels.get(IMAGE_TOOLCHAIN_LABEL):
+        raise GateError(
+            f"image {tag} records no toolchain manifest digest, so its build did "
+            "not complete; remove the tag and let the gate rebuild it"
+        )
+    return image_id
+
+
+def _container_script(
+    version: str, expected_head: str, acceptance: bool = False
+) -> str:
+    """Render the lane script.
+
+    ``acceptance`` is the ONLY thing that changes the container lifecycle. An
+    ordinary gate run renders exactly what it rendered before acceptance mode
+    existed, so the gate stays the thing the acceptance run measured.
+    """
+    sampler_start = ""
+    acceptance_env = ""
+    lane_prefix = ""
+    lane_suffix = ""
+    if acceptance:
+        sampler_start = (
+            f"mkdir -p {CONTAINER_METRICS_DIR}\n"
+            f"python3 {SAMPLER_CONTAINER_PATH} "
+            f"{CONTAINER_METRICS_DIR}/samples-{version}.jsonl &\n"
+            "cctally_sampler_pid=$!\n\n"
+        )
+        # --durations=0 has no route into the hard-coded pytest invocation in
+        # bin/cctally-test-all, so it is injected here rather than by editing
+        # the aggregator.
+        acceptance_env = "  PYTEST_ADDOPTS=--durations=0 \\\n"
+        lane_prefix = "set +e\n"
+        lane_suffix = (
+            "\ncctally_lane_status=$?\n"
+            "set -e\n"
+            'kill "$cctally_sampler_pid" 2>/dev/null || true\n'
+            'wait "$cctally_sampler_pid" 2>/dev/null || true\n'
+            'exit "$cctally_lane_status"'
+        )
     return f"""\
 set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
-export TMPDIR=/opt/cctally-setup-tmp
-mkdir -p "$TMPDIR"
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends ca-certificates curl git jq bsdextrautils procps bc sqlite3 unzip xz-utils locales rsync gcc libc6-dev
-localedef -i en_US -f UTF-8 en_US.UTF-8
+# The baked trees are DESTINATION-owned. Refuse a source that would collide with
+# either, because a detached clone cannot contain ignored untracked files but CAN
+# contain force-added tracked content under a protected root. `-e` alone would
+# accept a dangling symlink, so each root is checked with `-L` as well.
+test -z "$(git -C /source-repo ls-files -z -- .venv dashboard/web/node_modules | tr -d '\\0')"
+test ! -e /source-repo/.venv
+test ! -L /source-repo/.venv
+test ! -e /source-repo/dashboard/web/node_modules
+test ! -L /source-repo/dashboard/web/node_modules
 
-node_version=$(tr -d '\\r\\n' < /source-repo/dashboard/web/.nvmrc)
-node_archive="{node_archive}"
-curl -fsSL --retry 3 --retry-all-errors "https://nodejs.org/dist/v${{node_version}}/${{node_archive}}" -o "/opt/${{node_archive}}"
-curl -fsSL --retry 3 --retry-all-errors "https://nodejs.org/dist/v${{node_version}}/SHASUMS256.txt" -o /opt/node-shasums.txt
-(cd /opt && grep "  ${{node_archive}}$" node-shasums.txt | sha256sum -c -)
-tar -xJf "/opt/${{node_archive}}" -C /usr/local --strip-components=1
+before_venv=$(stat -c '%d:%i' {CONTAINER_CHECKOUT}/.venv)
+before_modules=$(stat -c '%d:%i' {CONTAINER_CHECKOUT}/dashboard/web/node_modules)
 
-sqlite_archive=/opt/sqlite-autoconf-3530300.tar.gz
-curl -fsSL --retry 3 --retry-all-errors "https://sqlite.org/2026/sqlite-autoconf-3530300.tar.gz" -o "$sqlite_archive"
-echo "c917d7db16648ec95f714974ace5e5dcf46b7dc70e26600a0a102a3141125db0  $sqlite_archive" | sha256sum -c -
-mkdir -p /opt/cctally-sqlite /opt/cctally-sqlite-src
-tar -xzf "$sqlite_archive" -C /opt/cctally-sqlite-src --strip-components=1
-gcc -O2 -DSQLITE_ENABLE_DBPAGE_VTAB -DSQLITE_ENABLE_DBNSTAT_VTAB -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DHAVE_READLINE=0 \
-  /opt/cctally-sqlite-src/shell.c /opt/cctally-sqlite-src/sqlite3.c \
-  -ldl -lpthread -lm -o /opt/cctally-sqlite/sqlite3
-/opt/cctally-sqlite/sqlite3 :memory: '.recover' >/dev/null
+cp -a /source-repo/. {CONTAINER_CHECKOUT}/
 
-groupadd --gid 10001 cctally
-useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash cctally
-chown cctally:cctally "$TMPDIR"
-mkdir -p /workspace/cctally-dev
-cp -a /source-repo/. /workspace/cctally-dev/
-chown -R cctally:cctally /workspace/cctally-dev /home/cctally
+# Repair ownership of the copied checkout while PRUNING the two baked trees. A
+# plain `chown -R` would walk and copy up every baked dependency file on every
+# run, which gives back most of the saving this change exists to produce.
+# `chown -h` is required rather than optional: `chown -R` defaults to -P and
+# never dereferences, but `find -exec chown` hands it a path, and the fixture
+# tree contains symlinks whose targets do not exist, so a dereferencing chown
+# fails the whole lane on the first one.
+find {CONTAINER_CHECKOUT} \
+     -path {CONTAINER_CHECKOUT}/.venv -prune -o \
+     -path {CONTAINER_CHECKOUT}/dashboard/web/node_modules -prune -o \
+     -exec chown -h {CONTAINER_UID}:{CONTAINER_GID} {{}} +
+
+# Both roots are still REAL DIRECTORIES, not symlinks, and the same objects.
+test -d {CONTAINER_CHECKOUT}/.venv
+test ! -L {CONTAINER_CHECKOUT}/.venv
+test -d {CONTAINER_CHECKOUT}/dashboard/web/node_modules
+test ! -L {CONTAINER_CHECKOUT}/dashboard/web/node_modules
+test "$(stat -c '%d:%i' {CONTAINER_CHECKOUT}/.venv)" = "$before_venv"
+test "$(stat -c '%d:%i' {CONTAINER_CHECKOUT}/dashboard/web/node_modules)" = "$before_modules"
+test -z "$(find {CONTAINER_CHECKOUT} ! -uid {CONTAINER_UID} -o ! -gid {CONTAINER_GID} | head -1)"
 
 if find /tmp -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
   echo "linux-matrix: /tmp is not clean before the non-root suite" >&2
   exit 3
 fi
 
-runuser -u cctally -- env \
+cat > /opt/cctally-lane.sh <<'CCTALLY_LANE_SCRIPT'
+set -euo pipefail
+cd {CONTAINER_CHECKOUT}
+test "$(id -u)" -ne 0
+test "$(basename "$PWD")" = cctally-dev
+test "$(git rev-parse HEAD)" = {expected_head}
+test -z "$(git status --porcelain --untracked-files=all)"
+. .venv/bin/activate
+python -c 'import sys; assert sys.prefix == "{CONTAINER_CHECKOUT}/.venv", sys.prefix; assert sys.base_prefix != sys.prefix'
+python -m pip check
+python -c 'import pytest, xdist, pytest_timeout, yaml, rich'
+test "v$(tr -d "\\r\\n" < dashboard/web/.nvmrc)" = "$(node --version)"
+test -x dashboard/web/node_modules/.bin/vitest
+test -x dashboard/web/node_modules/.bin/eslint
+test -x dashboard/web/node_modules/.bin/tsc
+sqlite3 :memory: '.recover' >/dev/null
+bash bin/_lib-fts5-probe.sh require python
+bin/cctally-test-all
+CCTALLY_LANE_SCRIPT
+chown {CONTAINER_UID}:{CONTAINER_GID} /opt/cctally-lane.sh
+
+{sampler_start}{lane_prefix}runuser -u cctally -- env \
   HOME=/home/cctally \
   TMPDIR=/opt/cctally-setup-tmp \
   PATH=/opt/cctally-sqlite:/usr/local/bin:/usr/bin:/bin \
@@ -119,24 +664,10 @@ runuser -u cctally -- env \
   CCTALLY_LINUX_MATRIX_RUN=1 \
   CCTALLY_OUTER_JOBS=2 \
   CCTALLY_PYTEST_JOBS=2 \
-  CCTALLY_TEST_MATRIX_ID={shlex.quote(version)} \
+{acceptance_env}  CCTALLY_TEST_MATRIX_ID={shlex.quote(version)} \
   LC_ALL=C.UTF-8 \
   TZ=Etc/UTC \
-  bash -c '
-    set -euo pipefail
-    cd /workspace/cctally-dev
-    test "$(id -u)" -ne 0
-    test "$(basename "$PWD")" = cctally-dev
-    test "$(git rev-parse HEAD)" = {shlex.quote(expected_head)}
-    test -z "$(git status --porcelain --untracked-files=all)"
-    python -m venv .venv
-    . .venv/bin/activate
-    python -m pip install --no-deps -r tests/requirements-dev.txt
-    python -m pip check
-    npm ci --prefix dashboard/web
-    bash bin/_lib-fts5-probe.sh require python
-    bin/cctally-test-all
-  '
+  bash /opt/cctally-lane.sh{lane_suffix}
 """
 
 
@@ -144,24 +675,386 @@ def _container_command(
     engine: str,
     version: str,
     source_checkout: pathlib.Path,
+    image: str,
     expected_head: str = "deadbeef" * 5,
+    acceptance: dict | None = None,
 ) -> list[str]:
-    return [
-        engine,
-        "run",
-        "--rm",
-        "--pull=always",
+    command = [engine, "run"]
+    if acceptance is None:
+        command.append("--rm")
+    else:
+        # `--rm` deletes the container the moment it exits, after which
+        # `docker inspect` can recover neither its exit code nor its OOM state,
+        # and a CID file does not help. Acceptance mode therefore retains the
+        # container and removes it in a guaranteed cleanup block instead.
+        command += ["--cidfile", str(acceptance["cidfile"])]
+    command += [
+        # The release runbook reaps lane containers by this label when it is
+        # interrupted. Scoped to the tested commit so an interrupt cannot remove
+        # a concurrent matrix run's containers.
+        "--label",
+        f"{LANE_LABEL}={expected_head}",
+        "--pull=never",
         "--platform",
         CONTAINER_PLATFORM,
         "--tmpfs",
         "/tmp:rw,exec,nosuid,size=4g,mode=1777",
         "--volume",
         f"{source_checkout}:/source-repo:ro",
-        f"python:{version}-{CONTAINER_DISTRO}",
+    ]
+    if acceptance is not None:
+        command += [
+            "--volume",
+            f"{acceptance['metrics']}:{CONTAINER_METRICS_DIR}",
+        ]
+    command += [
+        image,
         "bash",
         "-lc",
-        _container_script(version, expected_head),
+        _container_script(version, expected_head, acceptance=acceptance is not None),
     ]
+    return command
+
+
+def _run_lanes(
+    engine: str,
+    versions: tuple[str, ...],
+    image_ids: dict[str, str],
+    source_checkout: pathlib.Path,
+    expected_head: str,
+    outdir: pathlib.Path,
+    acceptance: dict[str, dict] | None = None,
+) -> dict[str, int]:
+    """Run one lane at a time, and never cancel a later lane.
+
+    Three-way concurrency was implemented, measured, and falsified. It met every
+    resource and wall-clock threshold — lanes started 2 ms apart, the phase took
+    39 minutes against a 60-minute ceiling, and the slowest pytest node was 23
+    seconds against a 100-second ceiling — but it did not produce a clean lane
+    exit. Two concurrent runs produced three and eight load-sensitive failures
+    in the dashboard and config HTTP tests, at least one of them a confirmed
+    loopback socket timeout, and two single-lane runs over the same images
+    produced none of that class. Peak simultaneous memory also reached 20.69 GiB
+    against a 22 GiB ceiling. The recorded fallback is sequential lanes over the
+    same prebuilt images while the Gate 0 overlap is retained, and this is it.
+
+    What concurrency was never responsible for is retained. Nothing is cancelled
+    when a lane fails: the previous loop returned inside itself on the first
+    failing lane, which discarded whatever the other two would have reported and
+    forced a blind rerun of all three, and the hosted equivalent sets
+    `fail-fast: false` for exactly that reason.
+
+    Each lane is TEED: its combined output is written to its own file, so the
+    deterministic footer can be rendered from version order afterwards, and
+    forwarded to this process's stdout as it arrives, so the operator watches
+    the suite live the way inheriting stdout used to allow. Three concurrent
+    suites through one pipe risked deadlock, which is why the file layer
+    replaced the inherited stream; with one writer at a time the reader drains
+    continuously and both properties hold.
+    """
+    lane_exits: dict[str, int] = {}
+    for version in versions:
+        print(
+            f"linux-matrix: Python {version} on {CONTAINER_PLATFORM} started",
+            flush=True,
+        )
+        with (outdir / f"{version}.log").open("wb") as handle:
+            process = subprocess.Popen(
+                _container_command(
+                    engine,
+                    version,
+                    source_checkout,
+                    image_ids[version],
+                    expected_head=expected_head,
+                    acceptance=None if acceptance is None else acceptance[version],
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                stream = process.stdout
+                if stream is not None:
+                    # The BYTE stream is forwarded. Decoding every chunk adds a
+                    # `UnicodeEncodeError` path on an operator stdout that cannot
+                    # represent the replacement character, and a text-layer
+                    # `BrokenPipeError`, to a gate that runs for over an hour —
+                    # and it rewrites bytes the lane emitted.
+                    sys.stdout.flush()
+                    for chunk in iter(stream.readline, b""):
+                        handle.write(chunk)
+                        handle.flush()
+                        sys.stdout.buffer.write(chunk)
+                        sys.stdout.buffer.flush()
+                    stream.close()
+                status = process.wait()
+            except BaseException:
+                # The SIGTERM handler raises, and it can raise here. Unwinding
+                # without waiting leaves a zombie behind and, outside acceptance
+                # mode, a lane container nothing else removes.
+                process.kill()
+                process.wait()
+                raise
+        lane_exits[version] = status
+        print(
+            f"linux-matrix: Python {version} finished (exit {status})",
+            flush=True,
+        )
+    return lane_exits
+
+
+def _render_lane_blocks(
+    versions: tuple[str, ...], outdir: pathlib.Path, lane_exits: dict[str, int]
+) -> None:
+    """Print one complete block per lane in PYTHON_VERSIONS order.
+
+    Version order rather than completion order, because the output is release
+    evidence and must read the same way on every cut.
+    """
+    for version in versions:
+        print(
+            f"===== linux-matrix: Python {version} on {CONTAINER_PLATFORM} =====",
+            flush=True,
+        )
+        try:
+            sys.stdout.write((outdir / f"{version}.log").read_text(errors="replace"))
+        except OSError as exc:
+            print(
+                f"linux-matrix: could not read the Python {version} lane log: {exc}",
+                file=sys.stderr,
+            )
+        status = lane_exits.get(version)
+        if status is None:
+            print(
+                f"===== linux-matrix: Python {version} produced no exit status =====",
+                flush=True,
+            )
+        else:
+            print(
+                f"===== linux-matrix: Python {version} completed with exit "
+                f"{status} =====",
+                flush=True,
+            )
+
+
+def _lane_evidence(engine: str, image_id: str) -> dict[str, str]:
+    """Read the image labels a passing lane reports as release evidence."""
+    try:
+        found = _inspect_image(engine, image_id)
+    except GateError:
+        found = None
+    labels = found[1] if found else {}
+    return {
+        "inputs": labels.get(IMAGE_INPUTS_LABEL, ""),
+        "toolchain": labels.get(IMAGE_TOOLCHAIN_LABEL, ""),
+        "aptEpoch": labels.get(IMAGE_EPOCH_LABEL, ""),
+    }
+
+
+def _acceptance_module():
+    """Load the pure threshold analyzer that sits beside this script.
+
+    Loaded by path rather than imported by name. A `bin/_lib_*.py` name is not
+    automatically public — `.mirror-allowlist` lists every such file
+    individually and carries no `bin/_lib_*.py` glob — but the route to public
+    is short and unwanted here: a public test that imported it by name would
+    need an explicit allowlist entry, and `_public_runtime_siblings()` then
+    requires any public `bin/_lib_*.py` to appear in the npm package `files[]`
+    unless it is exempted through `_PUBLIC_NON_RUNTIME_SIBLINGS`. This analyzer
+    is maintainer test tooling that the package has no reason to ship, so it
+    keeps a name that never enters that chain.
+    """
+    path = _SCRIPT.parent / ANALYZER_SCRIPT_NAME
+    loader = importlib.machinery.SourceFileLoader(
+        "_cctally_linux_matrix_acceptance", str(path)
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise GateError(f"could not load the acceptance analyzer at {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+def _read_cid_files(acceptance_specs: dict[str, dict]) -> dict[str, str]:
+    container_ids: dict[str, str] = {}
+    for version, spec in acceptance_specs.items():
+        try:
+            value = pathlib.Path(spec["cidfile"]).read_text().strip()
+        except OSError:
+            continue
+        if value:
+            container_ids[version] = value
+    return container_ids
+
+
+def _remove_containers(engine: str, container_ids: dict[str, str]) -> None:
+    """Remove every retained acceptance container.
+
+    Called from a cleanup block that runs even on an interrupt, so the mode that
+    drops ``--rm`` cannot leak containers.
+    """
+    ids = [value for value in container_ids.values() if value]
+    if not ids:
+        return
+    _run(
+        [engine, "kill", *ids],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    _run(
+        [engine, "rm", *ids],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _parse_docker_time(text: str | None) -> float | None:
+    if not text:
+        return None
+    cleaned = text.strip()
+    if cleaned.startswith("0001-01-01"):
+        return None
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    if "." in cleaned:
+        head, _, tail = cleaned.partition(".")
+        fraction = tail
+        offset = ""
+        for marker in ("+", "-"):
+            index = fraction.find(marker)
+            if index > 0:
+                fraction, offset = fraction[:index], fraction[index:]
+                break
+        cleaned = f"{head}.{fraction[:6]}{offset}"
+    try:
+        return datetime.datetime.fromisoformat(cleaned).timestamp()
+    except ValueError:
+        return None
+
+
+def _container_state(engine: str, container_id: str | None) -> dict:
+    if not container_id:
+        return {}
+    result = _run(
+        [engine, "inspect", container_id, "--format", "{{json .State}}"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        return {}
+    try:
+        state = json.loads(result.stdout.strip().splitlines()[0])
+    except json.JSONDecodeError:
+        return {}
+    return {
+        "startedAt": _parse_docker_time(state.get("StartedAt")),
+        "finishedAt": _parse_docker_time(state.get("FinishedAt")),
+        "exitCode": state.get("ExitCode"),
+        "oomKilled": bool(state.get("OOMKilled")),
+    }
+
+
+def _derive_lane_schedule(lanes: dict[str, dict]) -> str | None:
+    """Derive the schedule the lanes actually ran, from their measured intervals.
+
+    `LANE_SCHEDULE` selects which acceptance threshold set applies, and nothing
+    ties a module constant to what `_run_lanes` does. A concurrency re-attempt
+    that rewrites the loop and leaves the constant alone would evaluate
+    concurrent lanes under sequential thresholds, skipping the three checks that
+    exist only to police concurrency and loosening the phase ceiling threefold —
+    silently, because every remaining threshold would still pass.
+
+    Two lanes ran concurrently when their `[startedAt, finishedAt]` container
+    intervals intersect. Fewer than two lanes with both instants observe no
+    schedule at all, which is None rather than a guess: a single-lane diagnostic
+    and a run whose container state could not be read are both that case.
+    """
+    intervals: list[tuple[float, float]] = []
+    for lane in lanes.values():
+        started = lane.get("startedAt")
+        finished = lane.get("finishedAt")
+        if started is None or finished is None:
+            continue
+        intervals.append((float(started), float(finished)))
+    if len(intervals) < 2:
+        return None
+    intervals.sort()
+    # The running maximum, not the previous finish: one long lane can span
+    # several shorter ones that do not touch each other.
+    highest_finish = intervals[0][1]
+    for started, finished in intervals[1:]:
+        if started < highest_finish:
+            return "concurrent"
+        highest_finish = max(highest_finish, finished)
+    return "sequential"
+
+
+def _collect_acceptance_samples(
+    engine: str,
+    versions: tuple[str, ...],
+    container_ids: dict[str, str],
+    metrics_dir: pathlib.Path,
+    outdir: pathlib.Path,
+    lane_exits: dict[str, int],
+    image_build_seconds: float,
+) -> dict:
+    """Turn raw lane samples, container state and lane logs into analyzer input."""
+    analyzer = _acceptance_module()
+    lanes: dict[str, dict] = {}
+    durations: list[dict] = []
+    for version in versions:
+        samples: list[dict] = []
+        try:
+            raw = (metrics_dir / f"samples-{version}.jsonl").read_text(
+                errors="replace"
+            )
+        except OSError:
+            raw = ""
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                record = json.loads(stripped)
+            except json.JSONDecodeError:
+                # A killed sampler leaves a half-written final line. Dropping it
+                # is correct; refusing the whole stream over it would discard a
+                # complete measurement.
+                continue
+            parsed = analyzer.parse_memory_sample(record.get("cgroup") or {})
+            samples.append(
+                {
+                    "t": record.get("t"),
+                    "memoryBytes": parsed["currentBytes"],
+                    "tmpBytes": record.get("tmpUsedBytes"),
+                    "oomEvents": parsed["oomEvents"],
+                    "containerFsAvailableBytes": record.get(
+                        "containerFsAvailableBytes"
+                    ),
+                }
+            )
+        state = _container_state(engine, container_ids.get(version))
+        lanes[version] = {
+            "startedAt": state.get("startedAt"),
+            "finishedAt": state.get("finishedAt"),
+            "exitCode": state.get("exitCode", lane_exits.get(version)),
+            "oomKilled": state.get("oomKilled", False),
+            "samples": samples,
+        }
+        try:
+            log = (outdir / f"{version}.log").read_text(errors="replace")
+        except OSError:
+            log = ""
+        for entry in analyzer.parse_pytest_durations(log):
+            durations.append({"lane": version, **entry})
+    return {
+        "lanes": lanes,
+        "schedule": _derive_lane_schedule(lanes),
+        "imageBuildSeconds": image_build_seconds,
+        "pytestDurations": durations,
+    }
 
 
 def _materialize_clean_head(
@@ -203,13 +1096,51 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         dest="versions",
         help="Run one supported Python minor; repeat to select several",
     )
+    parser.add_argument(
+        "--acceptance",
+        action="store_true",
+        help=(
+            "Measurement run: retain each lane container so its exit and OOM "
+            "state can be inspected, sample resource use, and evaluate the "
+            "acceptance thresholds"
+        ),
+    )
+    parser.add_argument(
+        "--acceptance-output",
+        default=None,
+        help="Where to write the acceptance artifact (default: a temp path)",
+    )
     return parser.parse_args(argv)
+
+
+_UNSET = object()
+
+
+def _terminated(signum, _frame):
+    """Turn SIGTERM into an exception so the cleanup block unwinds.
+
+    The default disposition terminates the process without running `finally`,
+    which leaks every retained acceptance container whenever the gate is not
+    launched from the release runbook — the only thing that reaps lane
+    containers by label.
+    """
+    raise SystemExit(128 + signum)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     versions = tuple(args.versions or PYTHON_VERSIONS)
     diagnostic_selection = args.versions is not None
+    acceptance_mode = bool(getattr(args, "acceptance", False))
+    acceptance_specs: dict[str, dict] | None = None
+    container_ids: dict[str, str] = {}
+    collected: dict | None = None
+    # Restored in the cleanup block, so running the gate in-process never
+    # changes the signal behaviour of whatever called it.
+    try:
+        previous_term = signal.signal(signal.SIGTERM, _terminated)
+    except (ValueError, OSError):
+        previous_term = _UNSET
     try:
         root = _repo_root()
         head = _git_head(root)
@@ -231,26 +1162,93 @@ def main(argv: list[str] | None = None) -> int:
             raise GateError(f"container engine {args.engine!r} is unavailable")
 
         print(f"linux-matrix: testing {head}")
+        epoch = _freshness_epoch(datetime.datetime.now(datetime.timezone.utc))
         with tempfile.TemporaryDirectory(prefix="cctally-linux-matrix-") as raw:
-            source_checkout = pathlib.Path(raw) / "cctally-dev"
+            scratch = pathlib.Path(raw)
+            source_checkout = scratch / "cctally-dev"
             _materialize_clean_head(root, source_checkout, head)
+
+            # Phase 2. Image resolution is serialized ahead of every lane:
+            # three concurrent builds would contend for the daemon and the
+            # build cache, and a lane must never run against an image that has
+            # not been validated. Its cost is recorded separately from lane
+            # time, because the first cut after a pin change pays it and every
+            # later cut does not.
+            images: dict[str, str] = {}
+            build_started = time.monotonic()
             for version in versions:
-                print(
-                    f"linux-matrix: Python {version} on {CONTAINER_PLATFORM}",
-                    flush=True,
+                images[version] = _resolve_image(args.engine, version, epoch, root)
+            image_build_seconds = time.monotonic() - build_started
+            # Pruning runs after the measurement closes. It runs on every cut
+            # and a build runs on almost none, so charging garbage collection to
+            # `imageBuildSeconds` reports a rebuild cost no cut actually pays.
+            for version in versions:
+                _prune_stale_images(args.engine, version, images[version])
+            _prune_first_pass_images(args.engine)
+
+            # Phase 3. The lanes run one at a time, in PYTHON_VERSIONS order,
+            # and no lane is cancelled when an earlier one fails. The output
+            # directory lives in the temporary directory, which resolves
+            # outside the repository and must stay that way, or Gate 0's
+            # untracked-file selection would see it and the two gates would
+            # disagree about cleanliness.
+            outdir = scratch / "lanes"
+            outdir.mkdir()
+            metrics_dir = scratch / "metrics"
+            if acceptance_mode:
+                metrics_dir.mkdir()
+                os.chmod(metrics_dir, 0o777)
+                cid_dir = scratch / "cids"
+                cid_dir.mkdir()
+                acceptance_specs = {
+                    version: {
+                        "cidfile": cid_dir / f"{version}.cid",
+                        "metrics": metrics_dir,
+                    }
+                    for version in versions
+                }
+            try:
+                lane_exits = _run_lanes(
+                    args.engine,
+                    versions,
+                    images,
+                    source_checkout,
+                    head,
+                    outdir,
+                    acceptance=acceptance_specs,
                 )
-                result = _run(
-                    _container_command(
-                        args.engine, version, source_checkout, expected_head=head
-                    )
+            finally:
+                # Read the container ids while the temporary directory still
+                # exists, so the cleanup block outside it can still remove them.
+                if acceptance_specs is not None:
+                    container_ids = _read_cid_files(acceptance_specs)
+
+            # Phase 4. Collect and render before merging anything.
+            _render_lane_blocks(versions, outdir, lane_exits)
+            if acceptance_mode:
+                collected = _collect_acceptance_samples(
+                    args.engine,
+                    versions,
+                    container_ids,
+                    metrics_dir,
+                    outdir,
+                    lane_exits,
+                    image_build_seconds,
                 )
-                if result.returncode != 0:
-                    print(
-                        f"linux-matrix: Python {version} failed "
-                        f"(exit {result.returncode})",
-                        file=sys.stderr,
-                    )
-                    return 1 if result.returncode == 1 else 3
+
+        merged = _merge_lane_exit_codes(lane_exits)
+        if merged != 0:
+            failing = ", ".join(
+                f"Python {version} (exit {code})"
+                for version, code in sorted(lane_exits.items())
+                if code != 0
+            )
+            print(f"linux-matrix: failing lanes: {failing}", file=sys.stderr)
+
+        # The postconditions always run, even when a lane failed. The previous
+        # early return skipped them entirely, so a candidate that changed
+        # underneath a failing matrix went unreported.
+        postcondition_failed = False
         current_head = _git_head(root)
         if current_head != head:
             print(
@@ -258,22 +1256,88 @@ def main(argv: list[str] | None = None) -> int:
                 f"matrix ({head} -> {current_head})",
                 file=sys.stderr,
             )
-            return 2
-        if _git_status(root):
+            postcondition_failed = True
+        elif _git_status(root):
             print(
                 "linux-matrix: refusing success because the working tree "
                 "changed during matrix",
                 file=sys.stderr,
             )
-            return 2
+            postcondition_failed = True
         if diagnostic_selection:
             print(
-                "linux-matrix: INCOMPLETE diagnostic passed; the release gate "
-                "requires the fixed no-argument Python 3.11, 3.12, and 3.13 "
-                "matrix",
+                "linux-matrix: INCOMPLETE diagnostic; the release gate requires "
+                "the fixed no-argument Python 3.11, 3.12, and 3.13 matrix",
                 file=sys.stderr,
             )
-            return 3
+
+        exit_code = _compose_gate_exit(
+            merged, postcondition_failed, diagnostic_selection
+        )
+
+        if acceptance_mode:
+            observed_schedule = _derive_lane_schedule(
+                (collected or {}).get("lanes") or {}
+            )
+            if observed_schedule is not None and observed_schedule != LANE_SCHEDULE:
+                print(
+                    "linux-matrix: refusing an acceptance verdict because the "
+                    f"lanes ran {observed_schedule} while this driver declares "
+                    f"{LANE_SCHEDULE}; the two threshold sets are not "
+                    "interchangeable, so update LANE_SCHEDULE to match "
+                    "_run_lanes",
+                    file=sys.stderr,
+                )
+                return 3
+            analyzer = _acceptance_module()
+            verdict = analyzer.evaluate_acceptance(
+                collected or {"lanes": {}}, schedule=LANE_SCHEDULE
+            )
+            destination = pathlib.Path(
+                args.acceptance_output
+                or (
+                    pathlib.Path(tempfile.gettempdir())
+                    / "cctally-linux-matrix-acceptance.json"
+                )
+            )
+            destination.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "head": head,
+                        "aptEpoch": epoch,
+                        "schedule": LANE_SCHEDULE,
+                        **verdict,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            print(f"linux-matrix: acceptance artifact written to {destination}")
+            for violation in verdict["violations"]:
+                print(
+                    f"linux-matrix: acceptance violation {violation['code']}: "
+                    f"{violation['detail']}",
+                    file=sys.stderr,
+                )
+            if not verdict["passed"]:
+                print(
+                    "linux-matrix: the acceptance thresholds were not met",
+                    file=sys.stderr,
+                )
+                return exit_code if exit_code != 0 else 3
+
+        if exit_code != 0:
+            return exit_code
+
+        for version in versions:
+            evidence = _lane_evidence(args.engine, images[version])
+            print(
+                f"linux-matrix: Python {version} PASS image={images[version]} "
+                f"inputs={evidence['inputs']} toolchain={evidence['toolchain']} "
+                f"aptEpoch={evidence['aptEpoch']}"
+            )
         print(
             "linux-matrix: PASS "
             + ", ".join(f"Python {version}" for version in versions)
@@ -289,6 +1353,20 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 3
+    finally:
+        # The restore comes FIRST. While the handler is installed a second
+        # SIGTERM raises out of this block, which would truncate the removal
+        # below and then skip the restore entirely; with it already restored,
+        # the operator's second interrupt terminates the process the way a
+        # second interrupt should, and only the containers the first one left
+        # are at stake.
+        if previous_term is not _UNSET:
+            try:
+                signal.signal(signal.SIGTERM, previous_term)
+            except (ValueError, OSError):
+                pass
+        if acceptance_mode:
+            _remove_containers(args.engine, container_ids)
 
 
 if __name__ == "__main__":

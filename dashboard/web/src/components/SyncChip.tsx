@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { useConnectionStatus } from '../hooks/useConnectionStatus';
-import { getState, subscribeStore } from '../store/store';
+import {
+  effectiveSnapshotAge, getState, subscribeStore,
+} from '../store/store';
 import {
   moreSevereBucket,
   syncFreshness,
@@ -23,7 +25,11 @@ function bucketClass(bucket: SyncBucket | ''): string {
 
 export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
   const env = useSnapshot();
-  const { disconnected } = useConnectionStatus();
+  const { disconnected, state: connection } = useConnectionStatus();
+  const snapshotObservedAtMs = useSyncExternalStore(
+    subscribeStore,
+    () => getState().snapshotObservedAtMs,
+  );
   const floorUntil = useSyncExternalStore(
     subscribeStore,
     () => getState().syncErrorFloorUntil,
@@ -73,6 +79,11 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
   // IS the point (#583 F19): today nothing pulses at all, so a busy dashboard
   // and a wedged one look identical.
   const rebuilding = syncActivityOrIdle(env).rebuilding;
+  const effectiveAge = effectiveSnapshotAge(
+    env?.sync_age_s ?? null,
+    snapshotObservedAtMs,
+    now,
+  );
   // The freshness bucket describes the DATA; the label describes the ACTIVITY.
   // The two are independent axes, so an activity label must not suppress the
   // bucket: on mobile the chip text is sr-only and the bucket-driven dot is the
@@ -81,8 +92,8 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
   // than the default still has a value on its first paint, before the effect
   // below has run.
   const envBucket: SyncBucket | '' =
-    !disconnected && env && !env.last_sync_error && env.sync_age_s != null
-      ? syncFreshness(env.sync_age_s).bucket
+    !disconnected && env && !env.last_sync_error && effectiveAge != null
+      ? syncFreshness(effectiveAge).bucket
       : '';
   // Two readings of the same freshness, and neither may be preferred
   // unconditionally. The `bucket` state is computed from the age the chip is
@@ -114,13 +125,17 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
       return;
     }
     setColor('');
-    tickOffset.current = env.sync_age_s | 0;
+    tickOffset.current = effectiveSnapshotAge(
+      env.sync_age_s,
+      snapshotObservedAtMs,
+      Date.now(),
+    ) ?? 0;
     {
       const f = syncFreshness(tickOffset.current);
       setText(`synced ${f.text}`);
       setBucket(f.bucket);
     }
-  }, [env, disconnected, floorActive, successFlashActive]);
+  }, [env, disconnected, floorActive, snapshotObservedAtMs, successFlashActive]);
 
   // 1-second tick. Also suppressed while the error floor is active.
   useEffect(() => {
@@ -128,13 +143,17 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
       if (disconnected) return;
       if (Date.now() < getState().syncErrorFloorUntil) return;
       if (!env || env.sync_age_s == null || env.last_sync_error) return;
-      tickOffset.current += 1;
+      tickOffset.current = effectiveSnapshotAge(
+        env.sync_age_s,
+        snapshotObservedAtMs,
+        Date.now(),
+      ) ?? tickOffset.current;
       const f = syncFreshness(tickOffset.current);
       setText(`synced ${f.text}`);
       setBucket(f.bucket);
     }, 1000);
     return () => window.clearInterval(id);
-  }, [env, disconnected]);
+  }, [env, disconnected, snapshotObservedAtMs]);
 
   // Schedule a single re-render at the exact moment the floor expires,
   // so the chip stops showing "⚠ sync request failed" without waiting up to 1 s
@@ -296,6 +315,28 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
         title="Another rebuild is still running. Try again."
       >
         refresh busy
+      </span>
+    );
+  }
+  if (connection === 'suspended') {
+    return (
+      <span
+        className="sync-chip mute"
+        id={id}
+        aria-live="polite"
+      >
+        Updates paused while hidden
+      </span>
+    );
+  }
+  if (connection === 'resuming') {
+    return (
+      <span
+        className="sync-chip mute"
+        id={id}
+        aria-live="polite"
+      >
+        Resuming updates…
       </span>
     );
   }

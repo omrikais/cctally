@@ -947,6 +947,10 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   color: var(--text-dim);
   font-style: italic;
 }
+.doctor-modal__flag {
+  display: inline-block;
+  white-space: nowrap;
+}
 .doctor-modal__details-toggle {
   background: none; border: none; padding: 0;
   color: var(--accent-cyan); cursor: pointer;
@@ -1348,6 +1352,13 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
    the panel sets from the verdict class. */
 .fc-body { display: flex; flex-direction: column; gap: var(--space-3); }
 .fc-hero { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-1); }
+/* #620 S1 D4 (F9) — the single-provider tile renders the SAME two fields the
+   All-tab provider card does (`ForecastPanel`), so a stale or capability-
+   limited source discloses that on its own tab too. `.fc-hero` is a column
+   flex, where the base rule's `margin-left: auto` would shove the chip to the
+   tile's right edge, away from the verdict it qualifies. */
+.fc-hero .provider-section-status { margin-left: 0; }
+.fc-body > .provider-section-reason { margin-top: var(--space-1); }
 .fc-eyebrow {
   font-size: var(--fs-eyebrow); color: var(--text-dim);
   text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600;
@@ -1562,6 +1573,24 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   align-items: end; height: 72px; margin: 10px 0 6px;
 }
 .trend-spark .bar { background: var(--accent-purple); border-radius: 2px; } /* lint-allow: border-radius data-viz */
+/* #620 S1 — a withheld week keeps its grid slot and draws no bar, so the gap
+   lands on the week that is actually missing and the surviving bars keep their
+   spacing. A faint baseline tick marks the slot as present-but-unmeasured
+   rather than leaving an ambiguous blank.
+   The tick colour is the FOREGROUND token --text-faint, deliberately against
+   the ":root" rule that points borders at --surface-faint: WCAG 1.4.11 sets a
+   3:1 floor for a non-text graphical object, and on the trend panel's ground
+   (#0f1119) --surface-faint reaches only 2.998:1. The browser QA gate measured
+   the previous --border-soft tick at 1.05:1 and confirmed it was
+   indistinguishable from an empty slot. --text-faint reaches 4.89:1, above the
+   floor and below the 7.13:1 of a real --accent-purple bar, so the tick stays
+   readable as a marked absence rather than as a measured week. */
+.trend-spark .bar.is-withheld {
+  background: none;
+  align-self: end;
+  height: 2px;
+  border-top: 1px dotted var(--text-faint);
+}
 .trend-spark-legend {
   display: flex; align-items: center; gap: 10px;
   color: var(--text-dim); font-size: var(--fs-meta); font-family: var(--font-mono);
@@ -2433,6 +2462,15 @@ button.mcw-weeknav-btn:disabled, button.mcw-blocknav-btn:disabled {
 .mfc-krow .v.v-magenta { color: var(--accent-magenta); }
 .mfc-krow .v.v-green   { color: var(--accent-green); }
 .mfc-krow .v.v-blue    { color: var(--accent-blue); }
+/* #620 S1 D5 (F10) — why the `$ / 1%` row is withheld. Outside `.mfc-kvgrid`
+   deliberately: a note inside that two-column grid would consume a cell and
+   shift every following row into the wrong column. */
+.mfc-rate-note {
+  margin: 6px 0 0;
+  color: var(--text-dim);
+  font-size: var(--fs-meta);
+  line-height: 1.45;
+}
 
 /* =========================================================================
    Trend modal (.mtr-*)
@@ -6524,15 +6562,22 @@ mark.current {
  * `#panel-daily .panel-header h2 .sub { display: none }`.
  * The negative top margin pulls it up under the header's own 14px bottom
  * margin so it reads as part of the title block rather than as body content.
- * ONE class for all six panels: Projects introduced it, the other four
- * adopted it rather than growing a second mechanism beside it, and Recent
- * Sessions joined in #572. Weekly, Monthly and Sessions state a composition
- * and no range, so they gate on the selection alone; Daily and Projects
- * state a data-dependent range, so their notes vary by outcome. */
+ * ONE class for all seven panels: Projects introduced it, the other four
+ * adopted it rather than growing a second mechanism beside it, Recent
+ * Sessions joined in #572, and Recent Alerts joined in #556 S3. Weekly,
+ * Monthly, Sessions and Alerts state a composition and no range, so they gate
+ * on the selection alone; Daily and Projects state a data-dependent range,
+ * so their notes vary by outcome.
+ *
+ * #573: the first shared rule cost a fixed-height panel 15px because its
+ * -10px/+10px margins cancelled and left the whole 15.4px line box in flow.
+ * Keep the readable 11px text, pull it two pixels further into the header's
+ * reserved gap, and leave 4px before body content. The resulting ~5px net
+ * cost restores 10px to Alerts without relocating or hiding any disclosure. */
 .panel-range-note {
-  margin: -10px 0 10px;
+  margin: -12px 0 4px;
   font-size: 11px;
-  line-height: 1.4;
+  line-height: 1.2;
   color: var(--text-dim);
   white-space: normal;
   overflow-wrap: anywhere;
@@ -6727,6 +6772,22 @@ mark.current {
 .projects-notice {
   font-size: 11.5px; color: var(--text-dim); padding: 6px 2px 0;
 }
+
+/* #620 S1 D2 (F7) / D13 (F4) — the visible definitions under the window
+   selector. Wraps freely, because at 390px it is three lines and clipping it
+   would put the definition back out of reach on exactly the devices that have
+   no hover. */
+.projects-caption {
+  margin: 6px 2px 0;
+  color: var(--text-dim);
+  font-size: var(--fs-meta);
+  line-height: 1.45;
+  max-width: 68ch;
+}
+/* #620 S1 D1 — the merged-fold statement. Same treatment on the panel and in
+   the modal, so the two surfaces state one rule in one voice. */
+.projects-merged-note { color: var(--text-faint); }
+.panel-range-note.projects-merged-note { max-width: 68ch; line-height: 1.45; }
 
 .projects-trend { margin: 8px 0; }
 .projects-trend svg {
@@ -9575,6 +9636,20 @@ mark.current {
   color: var(--text-faint);
   font: 500 11px/1.4 var(--font-mono);
 }
+/* #620 S1 D3 (F8) — the rail's message-count population. Same treatment as the
+   other rail-level notes above, so it reads as one more statement about the
+   list rather than a warning about it. */
+.conv-rail-population-note { margin-top: 4px; }
+
+/* #620 S1 — the boundary-less historical week's explanation, under the mini
+   bar whose reset cell it accounts for. */
+.mcw-bounds-missing {
+  margin: 8px 0 0;
+  color: var(--text-faint);
+  font-size: var(--fs-meta);
+  line-height: 1.45;
+  max-width: 60ch;
+}
 .conv-source-badge {
   display: inline-flex;
   align-items: center;
@@ -9697,6 +9772,50 @@ mark.current {
   cursor: pointer;
 }
 .conv-rail-retry:hover { color: var(--text); border-color: var(--accent-blue); }
+
+/* #620 S1 D12 — the follow affordance and the sentence that replaces it.
+   One pair of rules for all four surfaces (alerts modal row, toast, budget
+   block, forecast modal), so the four cannot drift into four vocabularies.
+
+   A real `<button>`, because Tab must reach it and Enter or Space must
+   activate it without the panel-focus flow residual R7 records as absent. The
+   44px minimum touch target is the same floor `.conv-rail-chip` takes. */
+.alert-row-open {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  margin-top: 4px;
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--panel-bg);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  padding: 2px var(--space-2);
+  cursor: pointer;
+}
+.alert-row-open:hover { color: var(--text); border-color: var(--accent-blue); }
+.alert-row-open:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+/* Not a control: a closed window opens nothing, so nothing here is clickable.
+   It states the reason instead, which is what A11 requires. */
+.alert-row-withheld {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-faint);
+  font-size: var(--fs-meta);
+  line-height: 1.4;
+  max-width: 42ch;
+}
+.toast--alert-follow { margin-top: 6px; }
+@media (pointer: coarse) {
+  /* A touch target smaller than 44px is unusable, and the alerts table is one
+     of the surfaces #503 sized for a thumb. */
+  .alert-row-open { min-height: 44px; padding: var(--space-1) var(--space-3); }
+}
 .conv-rail-row {
   display: block;
   width: 100%;

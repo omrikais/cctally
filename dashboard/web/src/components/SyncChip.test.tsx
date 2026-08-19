@@ -1,6 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, render } from '@testing-library/react';
-import { _resetForTests, dispatch } from '../store/store';
+import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
+import type { Envelope } from '../types/envelope';
 
 const mocked = vi.hoisted(() => ({
   env: {
@@ -23,6 +24,7 @@ const mocked = vi.hoisted(() => ({
     },
   },
   disconnected: false,
+  connectionState: 'connected' as 'connected' | 'suspended' | 'resuming' | 'disconnected',
 }));
 
 function activity(over: { rebuilding?: boolean } = {}) {
@@ -40,7 +42,10 @@ function activity(over: { rebuilding?: boolean } = {}) {
 
 vi.mock('../hooks/useSnapshot', () => ({ useSnapshot: () => mocked.env }));
 vi.mock('../hooks/useConnectionStatus', () => ({
-  useConnectionStatus: () => ({ disconnected: mocked.disconnected }),
+  useConnectionStatus: () => ({
+    disconnected: mocked.disconnected,
+    state: mocked.connectionState,
+  }),
 }));
 
 import { SyncChip } from './SyncChip';
@@ -56,12 +61,45 @@ describe('SyncChip freshness (SYNC-1)', () => {
       sync_activity: undefined,
     };
     mocked.disconnected = false;
+    mocked.connectionState = 'connected';
+  });
+  afterEach(() => { vi.useRealTimers(); });
+  it('names deliberate suspension instead of claiming the retained stream is connected', () => {
+    mocked.connectionState = 'suspended';
+
+    const { container } = render(<SyncChip />);
+    const span = container.querySelector('#sync-chip')!;
+
+    expect(span.textContent).toBe('Updates paused while hidden');
+    expect(span.className).not.toContain('sync-error');
+  });
+  it('names the return handshake until a fresh snapshot is accepted', () => {
+    mocked.connectionState = 'resuming';
+
+    const { container } = render(<SyncChip />);
+    const span = container.querySelector('#sync-chip')!;
+
+    expect(span.textContent).toBe('Resuming updates…');
+    expect(span.className).not.toContain('sync-error');
   });
   it('humanizes the age and tags the aging bucket', () => {
     const { container } = render(<SyncChip />);
     const span = container.querySelector('#sync-chip')!;
     expect(span.textContent).toContain('8m ago');
     expect(span.className).toContain('sync-chip--aging');
+  });
+
+  it('adds real elapsed wall time even when no one-second timer callback ran', () => {
+    vi.useFakeTimers();
+    const observedAt = Date.parse('2026-08-18T10:00:00Z');
+    vi.setSystemTime(observedAt);
+    mocked.env = { ...mocked.env, sync_age_s: 60 };
+    updateSnapshot(mocked.env as unknown as Envelope);
+
+    vi.setSystemTime(observedAt + 3_600_000);
+    const { container } = render(<SyncChip />);
+
+    expect(container.querySelector('#sync-chip')!.textContent).toBe('synced 1h 1m ago');
   });
 
   it('renders an actionable server cache-corruption state', () => {

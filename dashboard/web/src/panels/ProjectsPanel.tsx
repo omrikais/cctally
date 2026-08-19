@@ -39,6 +39,8 @@ import { formatSpan } from '../lib/projectWindow';
 import { withheldMessage } from '../lib/withheldCopy';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { warningForDomain } from '../lib/sourceGating';
+import { providerIsDecorated } from '../store/accountFocus';
+import { PROJECTS_MERGED_ACCOUNTS_NOTE } from '../lib/projectsColumns';
 import { DegradedChip } from './sourcePanel';
 
 const TOP_N = 5;
@@ -206,6 +208,26 @@ export function ProjectsPanel() {
     ? null
     : <div className="panel-range-note">{noteParts.join(' · ')}</div>;
 
+  // #620 S1 D1 — where this panel remains a single merged fold across a
+  // provider's accounts, it says so. The dashboard publishes `account_scopes`
+  // for Codex only, so a Claude install with more than one real account has no
+  // way to narrow this ranking at all, and the rule was true, enforced in the
+  // server arithmetic, and stated nowhere a reader could see it. The gate is
+  // the R8 decoration signal: below two real accounts nothing is merged, and
+  // the sentence would describe a fold that is not happening.
+  //
+  // The SELECTION gates it too. The sentence names a Claude fold, and the
+  // Codex tab ranks Codex projects — so on that tab it would describe a
+  // population the figures beneath it are not computed over. Under All the
+  // ranking does fold every Claude account into one row set, so it stays.
+  const mergedNote = activeSource !== 'codex' && providerIsDecorated(env, 'claude')
+    ? (
+      <div className="panel-range-note projects-merged-note">
+        {PROJECTS_MERGED_ACCOUNTS_NOTE}
+      </div>
+    )
+    : null;
+
   const onPanelClick = () => {
     dispatch({ type: 'OPEN_MODAL', kind: 'projects' });
   };
@@ -246,6 +268,7 @@ export function ProjectsPanel() {
     >
       {header}
       {rangeNote}
+      {mergedNote}
       <div className="panel-body projects-body">
         {rows.length === 0 ? (
           hydrating ? (

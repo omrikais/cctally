@@ -221,7 +221,7 @@ from _lib_display_tz import (
     normalize_display_tz_value,
     _compute_display_block,
 )
-from _lib_aggregators import _aggregate_monthly
+from _lib_aggregators import _aggregate_monthly, codex_path_scope
 from _lib_fmt import stable_sum
 # Opt-in backend phase-instrumentation collector (issue #276, Session A). Pure
 # stdlib leaf; near-noop when CCTALLY_PERF_TRACE is unset (phase() returns a
@@ -268,7 +268,9 @@ from _cctally_dashboard_sources import (
     _claude_accounts_wire,
     _refresh_budget_status_clock,
     accounts_identity_digest,
+    build_codex_source_state_from_capture,
     build_codex_source_state,
+    capture_codex_source_state,
     codex_decision_deadline_passed,
     refresh_codex_source_clock,
     resolve_dashboard_source_semantics,
@@ -290,6 +292,7 @@ from _lib_dashboard_sources import (
     build_aggregate_scope,
     claude_stats_digest,
     codex_stats_digest,
+    combined_accounting_version,
     compose_all_state,
     dashboard_resource_key,
     degrade_source_state,
@@ -2839,7 +2842,14 @@ def _tui_with_account_scope(
 _AGGREGATE_FOLD_FAILED = {"state": "failed", "code": "claude_fold_failed"}
 
 
-def _tui_build_claude_aggregates(
+@dataclass(frozen=True)
+class _ClaudeAggregateCapture:
+    optimized: object | None = None
+    rows: tuple | None = None
+    read_failed: bool = False
+
+
+def _tui_capture_claude_aggregates(
     cache_conn,
     *,
     shared_start: dt.datetime,
@@ -2855,31 +2865,11 @@ def _tui_build_claude_aggregates(
     entry_mutation_seq: "int | None" = None,
     generation: int = 0,
 ):
-    """Both All-only Claude legs, from ONE candidate read (spec §3.3, §3.4).
-
-    Returns ``(payload, outcomes)`` where ``payload`` holds the published rows
-    for whichever legs succeeded and ``outcomes`` names each leg's state.
-
-    Runs on the caller's PINNED cache connection, beside the Codex read and on
-    the same snapshot. Both legacy paths stay untouched: the attached-cache
-    block continues to serve ``env.projects`` and the Group-A read continues to
-    serve ``env.daily``, for the Claude tab.
-
-    Each fold has its OWN error boundary, so one failure cannot take the bundle
-    or the other leg down. A failure of the shared read itself fails both, since
-    neither leg has rows. A failure is a typed withheld outcome rather than an
-    escaped exception: today an exception inside this helper is caught by the
-    outer handler, which publishes the prior bundle or none at all, so a
-    cold-start fold failure could never become the outcome §3.7 promises.
-    """
+    """Capture the one-snapshot Claude inputs without folding them."""
     from zoneinfo import ZoneInfo
 
     c = _cctally()
     display_tz = ZoneInfo(display_tz_name) if display_tz_name else None
-    payload: dict[str, object] = {}
-    outcomes: dict[str, object] = {
-        "projects": {"state": "ok"}, "daily": {"state": "ok"},
-    }
     dashboard_module = sys.modules["_cctally_dashboard"]
     cache_seams_unpatched = (
         c.build_project_aggregate_rows
@@ -2889,31 +2879,94 @@ def _tui_build_claude_aggregates(
     )
     if legacy_labels is not None and cache_seams_unpatched:
         try:
-            return c.build_cached_claude_range_aggregates(
-                cache_conn,
-                shared_start=shared_start,
-                shared_end_exclusive=shared_end_exclusive,
-                now_utc=now_utc,
-                display_tz=display_tz,
-                legacy_labels=legacy_labels,
-                max_entry_id=max_entry_id,
-                entry_mutation_seq=entry_mutation_seq,
-                generation=generation,
-            ), outcomes
+            return _ClaudeAggregateCapture(
+                optimized=c.capture_cached_claude_range_aggregates(
+                    cache_conn,
+                    shared_start=shared_start,
+                    shared_end_exclusive=shared_end_exclusive,
+                    display_tz=display_tz,
+                    max_entry_id=max_entry_id,
+                    entry_mutation_seq=entry_mutation_seq,
+                    generation=generation,
+                ),
+            )
         except Exception:
-            # The accumulator is only an optimization.  Its failure falls
-            # through to the original two independent fold boundaries below.
             _lib_log.get_logger("dashboard").error(
-                "claude range aggregate cache failed", exc_info=True,
+                "claude range aggregate capture failed", exc_info=True,
             )
     try:
         rows = tuple(c.iter_shared_range_entries(
-            cache_conn, start=shared_start, end_exclusive=shared_end_exclusive,
+            cache_conn, start=shared_start,
+            end_exclusive=shared_end_exclusive,
         ))
     except Exception:
         _lib_log.get_logger("dashboard").error(
             "claude shared-range candidate read failed", exc_info=True,
         )
+        return _ClaudeAggregateCapture(read_failed=True)
+    return _ClaudeAggregateCapture(rows=rows)
+
+
+def _tui_build_claude_aggregates_from_capture(
+    capture: _ClaudeAggregateCapture,
+    *,
+    now_utc: dt.datetime,
+    display_tz_name: str | None,
+    legacy_labels: "dict[str, str] | None" = None,
+):
+    """Build both All-only Claude legs after the cache pin closes.
+
+    Returns ``(payload, outcomes)`` where ``payload`` holds the published rows
+    for whichever legs succeeded and ``outcomes`` names each leg's state.
+
+    The capture came from the caller's pinned connection beside the Codex read;
+    this half consumes only that immutable carrier after rollback. Both legacy
+    paths stay untouched: the attached-cache block continues to serve
+    ``env.projects`` and the Group-A read continues to serve ``env.daily`` for
+    the Claude tab.
+
+    Each fold has its OWN error boundary, so one failure cannot take the bundle
+    or the other leg down. A failure of the shared read itself fails both, since
+    neither leg has rows. A failure is a typed withheld outcome rather than an
+    escaped exception: today an exception inside this helper is caught by the
+    outer handler, which publishes the prior bundle or none at all, so a
+    cold-start fold failure could never become the outcome §3.7 promises.
+    """
+    c = _cctally()
+    from zoneinfo import ZoneInfo
+    display_tz = ZoneInfo(display_tz_name) if display_tz_name else None
+    payload: dict[str, object] = {}
+    outcomes: dict[str, object] = {
+        "projects": {"state": "ok"}, "daily": {"state": "ok"},
+    }
+    if capture.read_failed:
+        return {}, {
+            "projects": dict(_AGGREGATE_FOLD_FAILED),
+            "daily": dict(_AGGREGATE_FOLD_FAILED),
+        }
+    if capture.optimized is not None:
+        try:
+            return c.build_cached_claude_range_aggregates_from_capture(
+                capture.optimized,
+                now_utc=now_utc,
+                display_tz=display_tz,
+                legacy_labels=legacy_labels,
+                tolerate_leg_failures=True,
+            )
+        except Exception:
+            # No second cache generation is opened for a fallback after the
+            # pin closes. A failed optimized fold is therefore withheld and
+            # retried on the next authoritative build rather than rebuilt from
+            # newer cache bytes under the old version.
+            _lib_log.get_logger("dashboard").error(
+                "claude range aggregate cache failed", exc_info=True,
+            )
+            return {}, {
+                "projects": dict(_AGGREGATE_FOLD_FAILED),
+                "daily": dict(_AGGREGATE_FOLD_FAILED),
+            }
+    rows = capture.rows or ()
+    if capture.rows is None:
         return {}, {
             "projects": dict(_AGGREGATE_FOLD_FAILED),
             "daily": dict(_AGGREGATE_FOLD_FAILED),
@@ -2962,6 +3015,38 @@ def _tui_build_claude_aggregates(
         )
         outcomes["daily"] = dict(_AGGREGATE_FOLD_FAILED)
     return payload, outcomes
+
+
+def _tui_build_claude_aggregates(
+    cache_conn,
+    *,
+    shared_start: dt.datetime,
+    shared_end_exclusive: dt.datetime,
+    now_utc: dt.datetime,
+    display_tz_name: str | None,
+    legacy_labels: "dict[str, str] | None" = None,
+    max_entry_id: "int | None" = None,
+    entry_mutation_seq: "int | None" = None,
+    generation: int = 0,
+):
+    """Compatibility wrapper for callers that do not split the cache pin."""
+    capture = _tui_capture_claude_aggregates(
+        cache_conn,
+        shared_start=shared_start,
+        shared_end_exclusive=shared_end_exclusive,
+        now_utc=now_utc,
+        display_tz_name=display_tz_name,
+        legacy_labels=legacy_labels,
+        max_entry_id=max_entry_id,
+        entry_mutation_seq=entry_mutation_seq,
+        generation=generation,
+    )
+    return _tui_build_claude_aggregates_from_capture(
+        capture,
+        now_utc=now_utc,
+        display_tz_name=display_tz_name,
+        legacy_labels=legacy_labels,
+    )
 
 
 def _tui_claude_data_with_aggregates(
@@ -3167,10 +3252,19 @@ def _tui_claude_budget_cost_events(
     the 1-hour cache-write portion correctly (#195).
     """
     c = _cctally()
-    events: list[tuple[dt.datetime, float]] = []
-    for row in c.iter_shared_range_entries(
+    rows = tuple(c.iter_shared_range_entries(
         cache_conn, start=start_at, end_exclusive=end_at,
-    ):
+    ))
+    return _tui_claude_budget_events_from_rows(rows)
+
+
+def _tui_claude_budget_events_from_rows(
+    rows: "Iterable[tuple]",
+) -> tuple[tuple[dt.datetime, float], ...]:
+    """Price already-captured Claude rows without touching cache.db."""
+    c = _cctally()
+    events: list[tuple[dt.datetime, float]] = []
+    for row in rows:
         entry = c._shared_range_row_to_usage_entry(row)
         timestamp = entry.timestamp
         if timestamp.tzinfo is None or timestamp.utcoffset() is None:
@@ -3182,6 +3276,124 @@ def _tui_claude_budget_cost_events(
             ),
         ))
     return tuple(events)
+
+
+@dataclass(frozen=True)
+class _ClaudeBudgetCapture:
+    config: object
+    target: object
+    period: str | None
+    window: tuple[dt.datetime, dt.datetime] | None = None
+    rows: tuple = ()
+    immediate_overlay: object | None = None
+
+
+def _tui_capture_claude_budget_domain(
+    cache_conn,
+    stats_conn,
+    *,
+    claude_budget: "Mapping[str, object] | None",
+    now_utc: dt.datetime,
+    display_tz_name: str | None,
+    week_start_name: str,
+) -> _ClaudeBudgetCapture:
+    """Capture the configured budget window's raw rows under the cache pin."""
+    config = claude_budget if isinstance(claude_budget, Mapping) else {}
+    target = config.get("weekly_usd")
+    if target is None:
+        overlay = (
+            {"not_configured": {"disposition": "account_budgets_only"}}
+            if config.get("accounts") else {}
+        )
+        return _ClaudeBudgetCapture(
+            config=config, target=target, period=None,
+            immediate_overlay=overlay,
+        )
+    period = _tui_claude_budget_period(config)
+    try:
+        window = _tui_claude_budget_window(
+            stats_conn,
+            period=period,
+            now_utc=now_utc,
+            display_tz_name=display_tz_name,
+            week_start_name=week_start_name,
+        )
+        if window is None:
+            return _ClaudeBudgetCapture(
+                config=config, target=target, period=period,
+                immediate_overlay={
+                    "status_unavailable": _tui_claude_budget_unavailable(
+                        "period_unresolved", budget_usd=target, period=period),
+                },
+            )
+        start_at, end_at = window
+        rows = tuple(_cctally().iter_shared_range_entries(
+            cache_conn, start=start_at, end_exclusive=end_at,
+        ))
+        return _ClaudeBudgetCapture(
+            config=config, target=target, period=period,
+            window=(start_at, end_at), rows=rows,
+        )
+    except Exception:
+        _lib_log.get_logger("dashboard").error(
+            "claude budget inputs could not be captured", exc_info=True,
+        )
+        return _ClaudeBudgetCapture(
+            config=config, target=target, period=period,
+            immediate_overlay={
+                "status_unavailable": _tui_claude_budget_unavailable(
+                    "budget_compute_failed", budget_usd=target, period=period),
+            },
+        )
+
+
+def _tui_build_claude_budget_domain_from_capture(
+    capture: _ClaudeBudgetCapture,
+    *,
+    now_utc: dt.datetime,
+) -> tuple[dict[str, object], tuple[tuple[dt.datetime, float], ...]]:
+    """Price and interpret a captured Claude budget after rollback."""
+    if capture.immediate_overlay is not None:
+        return dict(capture.immediate_overlay), ()
+    assert capture.window is not None and capture.period is not None
+    config = capture.config
+    target = capture.target
+    period = capture.period
+    start_at, end_at = capture.window
+    try:
+        c = _cctally()
+        events = _tui_claude_budget_events_from_rows(capture.rows)
+        recent_start = max(start_at, now_utc - dt.timedelta(hours=24))
+        status = c.budget_status_payload(
+            period=period,
+            window_start_at=start_at,
+            window_end_at=end_at,
+            target_usd=target,
+            spent_usd=stable_sum(
+                cost for timestamp, cost in events
+                if start_at <= timestamp < now_utc
+            ),
+            recent_24h_usd=stable_sum(
+                cost for timestamp, cost in events
+                if recent_start <= timestamp < now_utc
+            ),
+            now=now_utc,
+            alert_thresholds=config["alert_thresholds"],
+        )
+    except Exception:
+        _lib_log.get_logger("dashboard").error(
+            "claude budget status could not be computed", exc_info=True,
+        )
+        return {
+            "status_unavailable": _tui_claude_budget_unavailable(
+                "budget_compute_failed", budget_usd=target, period=period),
+        }, ()
+    reclock_floor = now_utc - dt.timedelta(hours=24)
+    retained = tuple(
+        (timestamp, cost) for timestamp, cost in events
+        if timestamp >= reclock_floor
+    )
+    return {"status": status}, retained
 
 
 def _tui_claude_budget_domain(
@@ -3205,78 +3417,17 @@ def _tui_claude_budget_domain(
     `source_build_failed` handler — so an escaping budget error would take the
     whole bundle down, not merely the provider.
     """
-    config = claude_budget if isinstance(claude_budget, Mapping) else {}
-    target = config.get("weekly_usd")
-    if target is None:
-        if config.get("accounts"):
-            return {"not_configured": {"disposition": "account_budgets_only"}}, ()
-        return {}, ()
-    # Resolved BEFORE the boundary so the `budget_compute_failed` payload can
-    # still name the configured period (#556 S5 Unit 2 review F5); the reader
-    # is a pure config lookup with no failure mode of its own.
-    period = _tui_claude_budget_period(config)
-    try:
-        c = _cctally()
-        window = _tui_claude_budget_window(
-            stats_conn,
-            period=period,
-            now_utc=now_utc,
-            display_tz_name=display_tz_name,
-            week_start_name=week_start_name,
-        )
-        if window is None:
-            return {
-                "status_unavailable": _tui_claude_budget_unavailable(
-                    "period_unresolved", budget_usd=target, period=period),
-            }, ()
-        start_at, end_at = window
-        events = _tui_claude_budget_cost_events(
-            cache_conn, start_at=start_at, end_at=end_at,
-        )
-        recent_start = max(start_at, now_utc - dt.timedelta(hours=24))
-        status = c.budget_status_payload(
-            period=period,
-            window_start_at=start_at,
-            window_end_at=end_at,
-            target_usd=target,
-            # stable_sum, not sum: both figures are published on the dashboard
-            # wire and byte-compared by the dashboard goldens, and the built-in
-            # sum() switched to Neumaier compensated summation for floats in
-            # CPython 3.12, so the same spend renders 49.20424485 on 3.12+ and
-            # 49.204244850000016 on 3.11.
-            spent_usd=stable_sum(
-                cost for timestamp, cost in events
-                if start_at <= timestamp < now_utc
-            ),
-            recent_24h_usd=stable_sum(
-                cost for timestamp, cost in events
-                if recent_start <= timestamp < now_utc
-            ),
-            now=now_utc,
-            alert_thresholds=config["alert_thresholds"],
-        )
-    except Exception:
-        _lib_log.get_logger("dashboard").error(
-            "claude budget status could not be computed", exc_info=True,
-        )
-        return {
-            "status_unavailable": _tui_claude_budget_unavailable(
-                "budget_compute_failed", budget_usd=target, period=period),
-        }, ()
-    # #556 S5 Unit 1 review R4 — retain ONLY the events a later reclock can
-    # read. `_refresh_budget_status_clock` consults the carrier for exactly one
-    # quantity, `recent_24h_usd` over `[max(window_start, now - 24h), now)`, and
-    # `now` advances monotonically, so an event older than `now_utc - 24h` is
-    # unreadable for the life of this retained state. `spent_usd` above is
-    # already summed from the FULL set, so nothing published is lost — while a
-    # `calendar-month` budget would otherwise pin up to 31 days of Claude
-    # `session_entries` and make every reclock tick walk all of them.
-    reclock_floor = now_utc - dt.timedelta(hours=24)
-    retained = tuple(
-        (timestamp, cost) for timestamp, cost in events
-        if timestamp >= reclock_floor
+    capture = _tui_capture_claude_budget_domain(
+        cache_conn,
+        stats_conn,
+        claude_budget=claude_budget,
+        now_utc=now_utc,
+        display_tz_name=display_tz_name,
+        week_start_name=week_start_name,
     )
-    return {"status": status}, retained
+    return _tui_build_claude_budget_domain_from_capture(
+        capture, now_utc=now_utc,
+    )
 
 
 def _tui_claude_data_with_budget(
@@ -3343,6 +3494,8 @@ def _tui_build_source_bundle(
     cache_conn = c.open_cache_db()
     cache_read_tx = False
     pin_started_ns: "int | None" = None
+    codex_scope_cm = None
+    codex_path_scope_value = None
 
     def _record_cache_pin() -> None:
         """Stamp the elapsed hold exactly once, on whichever path ends it.
@@ -3529,6 +3682,14 @@ def _tui_build_source_bundle(
             prior_bundle.sources.get("codex")
             if prior_bundle is not None else None
         )
+        claude_reuse_version = combined_accounting_version(
+            claude_version,
+            prior_claude.combined_accounting if prior_claude is not None else None,
+        )
+        codex_reuse_version = combined_accounting_version(
+            codex_version,
+            prior_codex.combined_accounting if prior_codex is not None else None,
+        )
         if claude_ingest_failed:
             warning = SourceDashboardWarning(
                 "source_ingest_failed", "Source ingest failed.", "ingest",
@@ -3549,7 +3710,7 @@ def _tui_build_source_bundle(
             )
         else:
             claude = reuse_coherent_source_state(
-                prior_claude, data_version=claude_version,
+                prior_claude, data_version=claude_reuse_version,
             )
             # #556 S2 §3.6, gate 2 of 2. The version fragment above already
             # rejects a failed generation, but this gate is stated explicitly
@@ -3559,6 +3720,111 @@ def _tui_build_source_bundle(
             # the life of the process. Gate 1 is the bundle-level idle guard.
             if claude is not None and aggregate_scope_failed(claude):
                 claude = None
+        if codex_ingest_failed:
+            warning = SourceDashboardWarning(
+                "source_ingest_failed", "Source ingest failed.", "ingest",
+            )
+            codex = (
+                degrade_source_state(prior_codex, warning)
+                if prior_codex is not None
+                else unavailable_source_state("codex", warning)
+            )
+        elif codex_ingest_contended:
+            warning = SourceDashboardWarning(
+                "source_ingest_contended", "Source ingest is in progress.", "ingest",
+            )
+            codex = (
+                degrade_source_state(prior_codex, warning)
+                if prior_codex is not None
+                else unavailable_source_state("codex", warning)
+            )
+        else:
+            codex = (
+                None if prior_codex is not None and (
+                    _codex_accounting_pending
+                    or any(
+                        warning.code == "codex_projection_incoherent"
+                        for warning in prior_codex.warnings
+                    )
+                    or codex_decision_deadline_passed(prior_codex, now_utc)
+                ) else reuse_coherent_source_state(
+                    prior_codex, data_version=codex_reuse_version,
+                )
+            )
+            if codex is not None and aggregate_scope_failed(codex):
+                codex = None
+            _tui_note_codex_regime("active" if codex is None else "idle")
+
+        # Capture every cache-backed carrier while one read transaction names
+        # the generation. Public view construction happens only after rollback.
+        legacy_labels = (
+            c.legacy_project_labels(projects_envelope)
+            if projects_envelope is not None else None
+        )
+        claude_aggregate_capture = None
+        claude_budget_capture = None
+        if claude is None:
+            claude_aggregate_capture = _tui_capture_claude_aggregates(
+                cache_conn,
+                shared_start=common_range_start,
+                shared_end_exclusive=shared_end_exclusive,
+                now_utc=now_utc,
+                display_tz_name=semantics.display_tz_name,
+                legacy_labels=legacy_labels,
+                max_entry_id=signature.max_entry_id,
+                entry_mutation_seq=signature.entry_mutation_seq,
+                generation=signature.generation,
+            )
+            claude_budget_capture = _tui_capture_claude_budget_domain(
+                cache_conn,
+                stats_conn,
+                claude_budget=semantics.claude_budget,
+                now_utc=now_utc,
+                display_tz_name=semantics.display_tz_name,
+                week_start_name=semantics.week_start_name,
+            )
+
+        codex_capture = None
+        codex_capture_failed = False
+        codex_context = None
+        codex_split_seams_unpatched = (
+            build_codex_source_state
+            is sys.modules["_cctally_dashboard_sources"].build_codex_source_state
+        )
+        if codex is None:
+            try:
+                codex_context = DashboardReadContext(
+                    cache_conn=cache_conn,
+                    stats_conn=stats_conn,
+                    range_start=common_range_start,
+                    now_utc=now_utc,
+                    display_tz_name=semantics.display_tz_name,
+                    week_start_idx=semantics.week_start_idx,
+                    week_start_name=semantics.week_start_name,
+                    speed=semantics.speed,
+                    codex_budget=semantics.codex_budget,
+                    codex_quota_actual_thresholds=semantics.codex_quota_actual_thresholds,
+                    codex_quota_projected_thresholds=semantics.codex_quota_projected_thresholds,
+                    cache_report_anomaly_threshold_pp=semantics.cache_report_anomaly_threshold_pp,
+                    stats_identity=(stats_digest, accounts_digest, claude_digest),
+                )
+                if codex_split_seams_unpatched:
+                    codex_scope_cm = codex_path_scope()
+                    codex_path_scope_value = codex_scope_cm.__enter__()
+                    codex_capture = capture_codex_source_state(
+                        codex_context, path_scope=codex_path_scope_value,
+                    )
+            except Exception:
+                codex_capture_failed = True
+                _lib_log.get_logger("dashboard").error(
+                    "codex_read_model source capture failed",
+                    exc_info=True,
+                )
+
+        if cache_read_tx:
+            _record_cache_pin()
+            cache_conn.rollback()
+            cache_read_tx = False
         if claude is None:
             claude_available = "ok" if (claude_cost_usd or claude_total_tokens) else "empty"
             # #341 Task 4 (Ruling C): the conditional per-account Claude wire,
@@ -3568,10 +3834,14 @@ def _tui_build_source_bundle(
             # chip row / hero cards light up automatically for a decorated Claude
             # source. A read failure degrades to the byte-stable undecorated shape.
             claude_accounts: list[dict[str, object]] = []
+            claude_combined_accounting: dict[str, object] | None = None
             try:
                 import _cctally_account
                 if _cctally_account.provider_is_decorated(stats_conn, "claude"):
-                    claude_accounts = _claude_accounts_wire(stats_conn, now_utc=now_utc)
+                    (
+                        claude_accounts,
+                        claude_combined_accounting,
+                    ) = _claude_accounts_wire(stats_conn, now_utc=now_utc)
             except Exception:
                 # #341 Task 4 P3 — degrade to no-accounts-wire on ANY read
                 # failure, symmetric with the Codex path. Beyond sqlite, the wire
@@ -3581,50 +3851,43 @@ def _tui_build_source_bundle(
                 # wire must never fail the whole dashboard tick — it just falls
                 # back to the byte-stable undecorated shape.
                 claude_accounts = []
-            # #556 S2 §3.3: both All-only Claude legs fold HERE, on the pinned
-            # cache connection, after BEGIN and beside the Codex read, so the
-            # two providers describe one snapshot. Folding them earlier — in
-            # the attached-cache block or through the Group-A daily read — runs
-            # against a different connection, and a cache commit in between
-            # would publish Claude generation A beside Codex generation B while
-            # the bundle's version names B.
-            aggregate_payload, aggregate_outcomes = _tui_build_claude_aggregates(
-                cache_conn,
-                shared_start=common_range_start,
-                shared_end_exclusive=shared_end_exclusive,
-                now_utc=now_utc,
-                display_tz_name=semantics.display_tz_name,
-                # The legacy display keys the drill-down route resolves
-                # against. Published rows adopt them wherever they exist, so
-                # the aggregate identity and the legacy one agree and the
-                # bounded rows stay routable. The raw envelope is required —
-                # `claude_data` has already replaced every legacy display key
-                # with an opaque key and dropped `bucket_path`, so the map
-                # cannot be recovered from it.
-                # `None` — not an empty map — when no envelope was built, so
-                # the fold can tell "the legacy population is empty" from "the
-                # legacy population is unknown" and withhold on the second.
-                legacy_labels=(
-                    c.legacy_project_labels(projects_envelope)
-                    if projects_envelope is not None else None
-                ),
-                max_entry_id=signature.max_entry_id,
-                entry_mutation_seq=signature.entry_mutation_seq,
-                generation=signature.generation,
+                claude_combined_accounting = {
+                    "scope": "account_cycles",
+                    "status": "unresolved",
+                    "cause": "account_cost_unresolved",
+                    "contributions": (),
+                }
+            if claude_aggregate_capture is None:
+                raise RuntimeError("Claude aggregate capture is missing")
+            aggregate_payload, aggregate_outcomes = (
+                _tui_build_claude_aggregates_from_capture(
+                    claude_aggregate_capture,
+                    now_utc=now_utc,
+                    display_tz_name=semantics.display_tz_name,
+                    # The legacy display keys the drill-down route resolves
+                    # against. Published rows adopt them wherever they exist,
+                    # so the aggregate identity and the legacy one agree and
+                    # the bounded rows stay routable. The raw envelope is
+                    # required — `claude_data` has already replaced every
+                    # legacy display key with an opaque key and dropped
+                    # `bucket_path`, so the map cannot be recovered from it.
+                    # `None` — not an empty map — when no envelope was built,
+                    # so the fold can tell "the legacy population is empty"
+                    # from "the legacy population is unknown" and withhold on
+                    # the second.
+                    legacy_labels=legacy_labels,
+                )
             )
-            # #556 S5 §3.2: the Claude budget fold runs HERE, on this
-            # function's own pinned cache snapshot — the same snapshot the S2
-            # folds and the Codex read use. That is the narrow, true claim: the
-            # legacy Claude envelope was constructed BEFORE this call, and
-            # stats.db deliberately stays in statement-scoped autocommit, so
-            # this is not coherence with every number in the envelope.
-            claude_budget_overlay, claude_budget_events = _tui_claude_budget_domain(
-                cache_conn,
-                stats_conn,
-                claude_budget=semantics.claude_budget,
-                now_utc=now_utc,
-                display_tz_name=semantics.display_tz_name,
-                week_start_name=semantics.week_start_name,
+            # #617: price and interpret the budget rows captured from this
+            # function's one cache generation. The legacy Claude envelope was
+            # constructed before this call, and stats.db deliberately stays in
+            # statement-scoped autocommit, so the claim remains cache-local.
+            if claude_budget_capture is None:
+                raise RuntimeError("Claude budget capture is missing")
+            claude_budget_overlay, claude_budget_events = (
+                _tui_build_claude_budget_domain_from_capture(
+                    claude_budget_capture, now_utc=now_utc,
+                )
             )
             claude_aggregate_scope = build_aggregate_scope(
                 published_range, aggregate_outcomes,
@@ -3644,7 +3907,9 @@ def _tui_build_source_bundle(
                 availability=claude_available,
                 freshness="fresh",
                 warnings=(),
-                data_version=claude_version,
+                data_version=combined_accounting_version(
+                    claude_version, claude_combined_accounting,
+                ),
                 last_success_at=now_utc,
                 capabilities={
                     "hero": CapabilityRecord("supported", "subscription-week"),
@@ -3698,91 +3963,25 @@ def _tui_build_source_bundle(
                 # recomputes trailing-24h spend by iterating individual events,
                 # which the status aggregate cannot supply.
                 clock_data={"claude_budget_cost_events": claude_budget_events},
+                combined_accounting=claude_combined_accounting,
                 aggregate_scope=claude_aggregate_scope,
             )
-        if codex_ingest_failed:
-            warning = SourceDashboardWarning(
-                "source_ingest_failed", "Source ingest failed.", "ingest",
-            )
-            codex = (
-                degrade_source_state(prior_codex, warning)
-                if prior_codex is not None
-                else unavailable_source_state("codex", warning)
-            )
-        elif codex_ingest_contended:
-            warning = SourceDashboardWarning(
-                "source_ingest_contended", "Source ingest is in progress.", "ingest",
-            )
-            codex = (
-                degrade_source_state(prior_codex, warning)
-                if prior_codex is not None
-                else unavailable_source_state("codex", warning)
-            )
-        else:
-            # Projection coherence can recover when S2 writes its certificate
-            # without changing physical accounting.  A current, hero-scoped
-            # incoherence generation is intentionally not retained through
-            # that repair opportunity; all other fresh partial states remain
-            # eligible for exact reuse.
-            # #350 spec §3.3: a passed cycle decision deadline forces an
-            # AUTHORITATIVE rebuild. Weekly-cycle resolution is time-dependent
-            # even on frozen evidence, and the reuse path would otherwise hand
-            # back the exact prior object with no re-check at all — so an idle
-            # dashboard would diverge from a freshly rebuilt one. Leaving
-            # ``codex = None`` routes to the existing build below. Bounded by
-            # construction: one rebuild per crossing, not one per tick.
-            codex = (
-                None if prior_codex is not None and (
-                    _codex_accounting_pending
-                    or any(
-                        warning.code == "codex_projection_incoherent"
-                        for warning in prior_codex.warnings
-                    )
-                    or codex_decision_deadline_passed(prior_codex, now_utc)
-                ) else reuse_coherent_source_state(
-                    prior_codex, data_version=codex_version,
-                )
-            )
-            # #556 S2 §3.6: symmetric with Claude. Codex's rows are already
-            # bounded by this same range, so its carrier records no fold of its
-            # own — but a retained failure state must never be reused, and the
-            # gate is stated on both providers so a future Codex-side fold
-            # inherits it.
-            if codex is not None and aggregate_scope_failed(codex):
-                codex = None
-            # #583 S1 §1.5: the realised decision, read at the `codex is None`
-            # predicate this branch has just settled. Stamped only here, so a
-            # tick whose Codex leg degraded on ingest failure or contention
-            # stays `not_observed` — no build reached the decision at all.
-            _tui_note_codex_regime("active" if codex is None else "idle")
         if codex is None:
             try:
-                codex = build_codex_source_state(
-                    DashboardReadContext(
-                        cache_conn=cache_conn,
-                        stats_conn=stats_conn,
-                        range_start=common_range_start,
-                        now_utc=now_utc,
-                        display_tz_name=semantics.display_tz_name,
-                        week_start_idx=semantics.week_start_idx,
-                        week_start_name=semantics.week_start_name,
-                        speed=semantics.speed,
-                        codex_budget=semantics.codex_budget,
-                        codex_quota_actual_thresholds=semantics.codex_quota_actual_thresholds,
-                        codex_quota_projected_thresholds=semantics.codex_quota_projected_thresholds,
-                        cache_report_anomaly_threshold_pp=semantics.cache_report_anomaly_threshold_pp,
-                        # #583 S5: the three digests this function already
-                        # computed above, handed to the quota memo's reuse
-                        # identity instead of being derived a second time per
-                        # memo call. Same values, same order, same connection,
-                        # and taken under the `assert_projection_readable` gate
-                        # already run at the top of this build.
-                        stats_identity=(
-                            stats_digest, accounts_digest, claude_digest,
-                        ),
-                    ),
-                    data_version=codex_version,
-                )
+                if codex_capture_failed or codex_context is None:
+                    raise RuntimeError("Codex source capture failed")
+                if codex_split_seams_unpatched:
+                    if codex_capture is None:
+                        raise RuntimeError("Codex source capture failed")
+                    codex = build_codex_source_state_from_capture(
+                        codex_capture,
+                        data_version=codex_version,
+                        path_scope=codex_path_scope_value,
+                    )
+                else:
+                    codex = build_codex_source_state(
+                        codex_context, data_version=codex_version,
+                    )
                 # Attached ONLY on a fresh build, never on the reuse or degrade
                 # paths: those carry rows this tick did not produce, and their
                 # own carrier already describes the range that bounds them.
@@ -3836,32 +4035,9 @@ def _tui_build_source_bundle(
             source_order=("claude", "codex", "all"),
             sources={"claude": claude, "codex": codex, "all": combined},
         )
-        # End the pinned cache snapshot before re-reading the cheap signatures.
-        # New cache commits after BEGIN do not make this bundle incoherent: all
-        # cache-backed reads above saw the same frozen generation, and its
-        # data_version names that generation. Reject only stats-side movement,
-        # whose statement-scoped autocommit reads may have mixed generations.
-        # Rejecting ordinary cache advancement starves publication whenever
-        # active Claude/Codex sessions append faster than this build completes.
-        #
-        # ONE EXCEPTION since #583 S5, stated here because a narrowing of this
-        # transaction has to account for it. Every cache read this build ISSUES
-        # runs on the pinned connection and sees the frozen generation, but the
-        # Codex quota memo `_CODEX_QUOTA_OBSERVATION_CACHE` now survives across
-        # builds, so a five-hour correlation read can be answered from a value
-        # another caller loaded -- the share render or the cycle-detail route,
-        # on an unpinned connection at a different generation. That value is
-        # served only while its key is unmoved, and the key covers the ledger
-        # sequence, the attribution revision, the database path and the three
-        # digests taken above, so the evidence behind it provably has not
-        # changed. The full argument is at `_cached_codex_quota_observations`
-        # in `bin/_cctally_dashboard_sources.py`. The dashboard's own bounded
-        # quota read is NOT in that class: it passes `memoize=False` and is
-        # always physically issued on the pinned connection.
-        if cache_read_tx:
-            _record_cache_pin()
-            cache_conn.rollback()
-            cache_read_tx = False
+        # The cache pin ended after carrier capture. These cheap post-build
+        # signatures intentionally reject only stats-side movement; a cache
+        # commit during the pure folds belongs to the next generation.
         post_stats_digest = codex_stats_digest(stats_conn)
         post_accounts_digest = accounts_identity_digest(stats_conn)
         post_claude_digest = claude_stats_digest(stats_conn)
@@ -3890,6 +4066,8 @@ def _tui_build_source_bundle(
         _record_cache_pin()
         if cache_read_tx:
             cache_conn.rollback()
+        if codex_scope_cm is not None:
+            codex_scope_cm.__exit__(None, None, None)
         cache_conn.close()
 
 
@@ -7388,13 +7566,20 @@ def _tui_modal_current_week(snap, runtime, width):
     if not milestones:
         return ("{accent.b}Current Week · per-percent{/}",
                 ["", "  {dim}No milestones yet — keep recording usage.{/}", ""])
-    avg_dpp = (cw.dollars_per_percent or 0.0)
+    # #620 S1 D5/A5: `TuiCurrentWeek.dollars_per_percent` is `None` when no
+    # usage has been observed. `or 0.0` printed `avg $/1% $0.00`, which is a
+    # measured-looking answer to a question nothing measured. Every other TUI
+    # site already renders that absence as an em dash; this one did not.
+    avg_dpp_str = (
+        f"${cw.dollars_per_percent:.2f}"
+        if cw.dollars_per_percent is not None else "—"
+    )
     cumul = cw.spent_usd
     header = [
         "",
         f"  {{dim}}Week{{/}} {{b}}{format_display_dt(cw.week_start_at, runtime.display_tz, fmt='%b %d', suffix=False)} – {format_display_dt(cw.week_end_at, runtime.display_tz, fmt='%b %d', suffix=False)}{{/}}   "
         f"{{dim}}milestones reached{{/}} {{warn.b}}{len(milestones)}{{/}}",
-        f"  {{dim}}avg $/1%{{/}} {{b}}${avg_dpp:.2f}{{/}}     {{dim}}cumulative{{/}} {{b}}${cumul:.2f}{{/}}",
+        f"  {{dim}}avg $/1%{{/}} {{b}}{avg_dpp_str}{{/}}     {{dim}}cumulative{{/}} {{b}}${cumul:.2f}{{/}}",
         "",
     ]
     bucket = _tui_width_bucket(width)
@@ -7469,8 +7654,14 @@ def _tui_modal_forecast(snap, runtime, width):
     for b in fc.budgets:
         if b.dollars_per_day is not None:
             lines.append(f"  {{dim}}  ≤{b.target_percent}%   {{/}}{{b}}${b.dollars_per_day:.2f}/day{{/}}")
-        else:
+        elif b.pct_headroom is None:
             lines.append(f"  {{dim}}  ≤{b.target_percent}%   {{/}}{{dim}}—  (already past){{/}}")
+        else:
+            # #620 S1 D5: `dollars_per_day` is also None when the $/1% rate
+            # itself is withheld, and there the target has NOT been passed —
+            # there is headroom and no rate to price it with. Naming the
+            # wrong cause is the defect this session removes.
+            lines.append(f"  {{dim}}  ≤{b.target_percent}%   {{/}}{{dim}}—  (no rate observed){{/}}")
     lines.append("")
     confidence = inp.confidence
     lines.append(f"  {{dim}}confidence: {confidence} · based on 7-day rate{{/}}")

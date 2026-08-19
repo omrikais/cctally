@@ -51,6 +51,20 @@ const GLYPH: Record<'ok' | 'warn' | 'fail', string> = {
   fail: '✗',   // ✗
 };
 
+const REMEDIATION_FLAG = /(--[A-Za-z0-9][A-Za-z0-9-]*)/g;
+
+function RemediationText({ text }: { text: string }): JSX.Element {
+  return (
+    <>
+      {text.split(REMEDIATION_FLAG).map((part, index) => (
+        part.startsWith('--')
+          ? <span className="doctor-modal__flag" key={`${part}-${index}`}>{part}</span>
+          : part
+      ))}
+    </>
+  );
+}
+
 export function DoctorModal(): JSX.Element | null {
   const open = useSyncExternalStore(
     subscribeStore,
@@ -245,7 +259,9 @@ export function DoctorCheckRow({ c }: { c: DoctorCheck }): JSX.Element {
         <strong>{c.title}</strong>: {summary}
       </p>
       {c.remediation && (
-        <p className="doctor-modal__remediation">→ {c.remediation}</p>
+        <p className="doctor-modal__remediation">
+          → <RemediationText text={c.remediation} />
+        </p>
       )}
       {c.severity !== 'ok' && !c.remediation && (
         <p className="doctor-modal__remediation">→ Run <code>cctally doctor</code> for the full report</p>

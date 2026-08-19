@@ -94,6 +94,7 @@ async function transformInitialEnvelope(
       dispatchEvent() { return true; }
       close() { this.readyState = StableEventSource.CLOSED; }
     }
+    Object.defineProperty(window, 'SharedWorker', { configurable: true, value: undefined });
     Object.defineProperty(window, 'EventSource', { configurable: true, value: StableEventSource });
   });
   await page.route('**/api/data', async (route) => {

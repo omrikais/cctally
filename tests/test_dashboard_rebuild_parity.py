@@ -2719,8 +2719,16 @@ def test_projects_env_reconstruction_picks_global_earliest_week_key():
     cur_max_seq = conn.execute(
         "SELECT COALESCE(MAX(mutation_seq), 0) FROM session_entries"
     ).fetchone()[0]
+    # #620 S1: the assembler takes half-open `(start, end)` bounds rather
+    # than bare starts, because a real subscription week is not always seven
+    # days long.
     _, _, key_by_bucket = d._assemble_projects_via_cache(
-        conn, weeks_full=[week1, week2, cw_start],
+        conn,
+        week_bounds=[
+            (week1, week1 + dt.timedelta(days=7)),
+            (week2, week2 + dt.timedelta(days=7)),
+            (cw_start, cw_start + dt.timedelta(days=7)),
+        ],
         cw_start=cw_start, cw_end=cw_start + dt.timedelta(days=7),
         cur_max_id=cur_max_id, cur_max_seq=cur_max_seq,
     )

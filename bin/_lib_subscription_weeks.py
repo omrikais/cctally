@@ -279,6 +279,71 @@ def _apply_reset_events_to_subweeks(
     return out
 
 
+def subscription_window_probe_range(
+    anchor_utc: "dt.datetime", weeks_back: int,
+) -> "tuple[dt.datetime, dt.datetime]":
+    """The generous ``[range_start, range_end)`` to compute subscription
+    weeks over when the caller wants ``weeks_back`` intervals ending at the
+    one containing ``anchor_utc``.
+
+    ONE definition, shared by the dashboard Projects panel and by
+    ``cctally project``. The range matters beyond covering the answer:
+    ``_compute_subscription_weeks`` picks its extrapolation anchor relative
+    to ``range_start``, so two callers asking the same question over
+    different ranges can receive differently-phased intervals for the same
+    pre-snapshot history.
+
+    The lower bound allows one extra week because the anchor's own interval
+    can start up to a week before an ISO-Monday snap of it; the upper bound
+    allows two so the containing interval is always emitted whole.
+    """
+    base = anchor_utc.astimezone(dt.timezone.utc)
+    monday = (base - dt.timedelta(days=base.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    return (monday - dt.timedelta(days=7 * (weeks_back + 1)),
+            monday + dt.timedelta(days=14))
+
+
+def subscription_window_ending_at(
+    bounds: "list[tuple[dt.datetime, dt.datetime]]",
+    cw_start: "dt.datetime",
+    weeks_back: int,
+) -> "list[tuple[dt.datetime, dt.datetime]]":
+    """The last ``weeks_back`` intervals up to and including the one starting
+    at ``cw_start``, oldest first.
+
+    ONE definition, shared by the dashboard Projects panel
+    (``_ProjectsWeekGrid.window_ending_at``) and by ``cctally project``, so
+    the two surfaces cannot resolve different windows for the same request.
+    ``cmd_project`` used to step back in seven-day multiples instead, which
+    is short of the truth by the accumulated shortfall of every drifted week
+    in the window — one day per six-day week — and the leading extrapolated
+    slice covering that deficit then carried real cost, moved the
+    ``usedPercent`` denominator by a whole extra week, and drove a rendered
+    note claiming a week had no usage snapshot.
+
+    ``bounds`` must be sorted by start. When fewer than ``weeks_back``
+    intervals sit at or before ``cw_start``, the head is padded backwards in
+    seven-day steps: that padding is a genuine no-anchor tail — history older
+    than any snapshot — so the seven-day assumption is the right one there.
+
+    Returns ``[]`` when ``cw_start`` is not itself an interval start in
+    ``bounds``; a caller that cannot locate its own anchor must not silently
+    receive a window anchored somewhere else.
+    """
+    starts = [b[0] for b in bounds]
+    idx = bisect.bisect_right(starts, cw_start) - 1
+    if idx < 0 or starts[idx] != cw_start:
+        return []
+    lo = max(0, idx + 1 - weeks_back)
+    window = [(bounds[i][0], bounds[i][1]) for i in range(lo, idx + 1)]
+    while len(window) < weeks_back:
+        s = window[0][0] - dt.timedelta(days=7)
+        window.insert(0, (s, window[0][0]))
+    return window
+
+
 def _compute_subscription_weeks(
     conn: sqlite3.Connection,
     range_start: dt.datetime,
