@@ -1,0 +1,310 @@
+[cost] unknown model, treating cost as $0: claude-from-the-future-0
+[cost] unknown model, treating cost as $0: claude-from-the-future-1
+[cost] unknown model, treating cost as $0: claude-from-the-future-2
+{
+  "schemaVersion": 1,
+  "contractVersion": 1,
+  "measuredAt": "2026-08-17T00:00:00Z",
+  "window": {
+    "startAt": "2026-08-10T00:00:00Z",
+    "endAt": "2026-08-17T00:00:00Z",
+    "tz": "Etc/UTC",
+    "label": "2026-08-10..2026-08-16"
+  },
+  "constants": {
+    "contributorShareFloor": 0.2,
+    "shareFloorEpsilon": 1e-09,
+    "tieEpsilonUsd": 1e-09,
+    "confidenceHighMinSupport": 20,
+    "confidenceMediumMinSupport": 5,
+    "confidenceMediumMinCoverage": 0.8,
+    "withholdMinCoverage": 0.5,
+    "withholdMinSupport": 2,
+    "shortConversationMaxHumanTurns": 3,
+    "largeContextMinWindowFraction": 0.8,
+    "minSubagentBuckets": 2,
+    "seedScanBudgetRows": 50000,
+    "conversationNormalizeBudgetRows": 2000,
+    "codexEventScanBudgetRows": 1048576,
+    "codexEventScanPerFileRows": 4096,
+    "gapCodes": [
+      "ambiguous_origin_category",
+      "scan_budget_exhausted",
+      "unknown_context_window",
+      "unresolved_subagent_attribution"
+    ],
+    "turnDefinition": "Turn definition: main-thread human messages only \u2014 non-sidechain, non-subagent, after command and meta normalisation; assistant replies associate with the nearest preceding human.",
+    "registry": [
+      {
+        "contributorClass": "model_mix",
+        "subjectKind": "model",
+        "label": "Expensive model mix",
+        "minDistinctSubjects": 2,
+        "minPricedEntries": 20
+      },
+      {
+        "contributorClass": "project_concentration",
+        "subjectKind": "project",
+        "label": "One project dominating",
+        "minDistinctSubjects": 2,
+        "minPricedEntries": 20
+      },
+      {
+        "contributorClass": "session_concentration",
+        "subjectKind": "session",
+        "label": "One session dominating",
+        "minDistinctSubjects": 2,
+        "minPricedEntries": 20
+      },
+      {
+        "contributorClass": "five_hour_bursts",
+        "subjectKind": "block",
+        "label": "Concentrated 5-hour bursts",
+        "minDistinctSubjects": 2,
+        "minPricedEntries": 20
+      },
+      {
+        "contributorClass": "cache_churn",
+        "subjectKind": "qualifying_set",
+        "label": "Prompt-cache churn",
+        "minDistinctSubjects": 1,
+        "minPricedEntries": 20,
+        "rule": {
+          "sentence": "Turns whose prompt cache was rebuilt: the cached prefix collapsed and was re-created in the same turn.",
+          "parameters": {
+            "collapseFraction": 0.5,
+            "recreateFraction": 0.75,
+            "cacheFloorTokens": 20000,
+            "createFloorTokens": 20000
+          }
+        }
+      },
+      {
+        "contributorClass": "short_high_context",
+        "subjectKind": "qualifying_set",
+        "label": "Short conversations carrying large context",
+        "minDistinctSubjects": 1,
+        "minPricedEntries": 20,
+        "rule": {
+          "sentence": "Conversations with at most 3 human turns where at least one request used at least 80% of that request's model context window. With several replies the largest single request fraction is used, never their sum.",
+          "parameters": {
+            "maxHumanTurns": 3,
+            "minWindowFraction": 0.8
+          }
+        }
+      },
+      {
+        "contributorClass": "subagent_fanout",
+        "subjectKind": "qualifying_set",
+        "label": "Subagent fan-out",
+        "minDistinctSubjects": 1,
+        "minPricedEntries": 20,
+        "rule": {
+          "sentence": "Cost attributable to delegated subagent work, grouped by parent. On Codex this is an identifiable subset of unknown completeness.",
+          "parameters": {
+            "minBuckets": 2
+          }
+        }
+      }
+    ]
+  },
+  "notes": {
+    "scope": "This explains locally retained cost and tokens, not quota percentage.",
+    "overlap": "The classes overlap \u2014 one session is also a project and a model \u2014 so shares do not sum to 100 percent."
+  },
+  "overallVerdict": "withheld",
+  "overallCode": "pricing_unavailable",
+  "applicableClassCount": 7,
+  "withheldClassCount": 7,
+  "results": [
+    {
+      "source": "claude",
+      "accountKey": null,
+      "effectiveSpeed": null,
+      "generation": {
+        "stats": "2e04ce0cba25b172a3a09eb784c8f9f19474cb9dd3da1cbfd6442e583d277a44",
+        "cache": "77c002032f8144eb1048246e68f2a2ed67a7b21ed8e337f40ad16bc0f7692fd0",
+        "configuration": "7eb9e1ec6c9a432be5de325fbb53aabd8a981eae2e4527d4195f17a3f70b760e",
+        "generationId": "97d02bd5553a1af9dcf4e2a4354ce5cd858547bbab5b4392348fff14665ce3fd"
+      },
+      "denominator": {
+        "identity": "totalExplainedRetainedCost",
+        "source": "claude",
+        "accountKey": null,
+        "windowStart": "2026-08-10T00:00:00Z",
+        "windowEnd": "2026-08-17T00:00:00Z",
+        "populationDigest": "1728470b0ec584082737155c3cbd24fb",
+        "usd": {
+          "state": "withheld",
+          "value": null,
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T18:45:00Z",
+            "supportUnits": 40,
+            "gapCodes": [],
+            "countCoverage": 1.0,
+            "identityCoverage": 1.0,
+            "retentionCoverage": 1.0,
+            "pricingCoverage": 0.0
+          },
+          "qualifications": [],
+          "code": "pricing_unavailable"
+        }
+      },
+      "coverage": {
+        "requestedStart": "2026-08-10T00:00:00Z",
+        "requestedEnd": "2026-08-17T00:00:00Z",
+        "observedStart": "2026-08-10T00:00:00Z",
+        "observedEnd": "2026-08-10T18:45:00Z",
+        "supportUnits": 40,
+        "gapCodes": [],
+        "countCoverage": 1.0,
+        "identityCoverage": 1.0,
+        "retentionCoverage": 1.0,
+        "pricingCoverage": 0.0
+      },
+      "verdict": "withheld",
+      "code": "pricing_unavailable",
+      "applicableClassCount": 7,
+      "withheldClassCount": 7,
+      "contributors": [],
+      "classes": [
+        {
+          "contributorClass": "model_mix",
+          "verdict": "withheld",
+          "code": "pricing_unavailable",
+          "supportShortfall": null,
+          "confidence": null,
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T18:45:00Z",
+            "supportUnits": null,
+            "gapCodes": [
+              "pricing_unavailable"
+            ],
+            "retentionCoverage": 1.0
+          },
+          "rows": []
+        },
+        {
+          "contributorClass": "project_concentration",
+          "verdict": "withheld",
+          "code": "pricing_unavailable",
+          "supportShortfall": null,
+          "confidence": null,
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T18:45:00Z",
+            "supportUnits": null,
+            "gapCodes": [
+              "pricing_unavailable"
+            ],
+            "retentionCoverage": 1.0
+          },
+          "rows": []
+        },
+        {
+          "contributorClass": "session_concentration",
+          "verdict": "withheld",
+          "code": "pricing_unavailable",
+          "supportShortfall": null,
+          "confidence": null,
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T18:45:00Z",
+            "supportUnits": null,
+            "gapCodes": [
+              "pricing_unavailable"
+            ],
+            "retentionCoverage": 1.0
+          },
+          "rows": []
+        },
+        {
+          "contributorClass": "five_hour_bursts",
+          "verdict": "withheld",
+          "code": "pricing_unavailable",
+          "supportShortfall": null,
+          "confidence": null,
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T18:45:00Z",
+            "supportUnits": null,
+            "gapCodes": [
+              "pricing_unavailable"
+            ],
+            "retentionCoverage": 1.0
+          },
+          "rows": []
+        },
+        {
+          "contributorClass": "cache_churn",
+          "verdict": "withheld",
+          "code": "pricing_unavailable",
+          "supportShortfall": null,
+          "confidence": null,
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T18:45:00Z",
+            "supportUnits": null,
+            "gapCodes": [
+              "pricing_unavailable"
+            ],
+            "retentionCoverage": 1.0
+          },
+          "rows": []
+        },
+        {
+          "contributorClass": "short_high_context",
+          "verdict": "withheld",
+          "code": "pricing_unavailable",
+          "supportShortfall": null,
+          "confidence": null,
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T18:45:00Z",
+            "supportUnits": null,
+            "gapCodes": [
+              "pricing_unavailable"
+            ],
+            "retentionCoverage": 1.0
+          },
+          "rows": []
+        },
+        {
+          "contributorClass": "subagent_fanout",
+          "verdict": "withheld",
+          "code": "pricing_unavailable",
+          "supportShortfall": null,
+          "confidence": null,
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T18:45:00Z",
+            "supportUnits": null,
+            "gapCodes": [
+              "pricing_unavailable"
+            ],
+            "retentionCoverage": 1.0
+          },
+          "rows": []
+        }
+      ]
+    }
+  ]
+}

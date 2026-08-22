@@ -19,6 +19,7 @@ import urllib.request
 import pytest
 
 from conftest import load_script, redirect_paths
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
 
 
 def _start_share_dashboard_server(ns, tmp_path, monkeypatch):
@@ -46,9 +47,7 @@ def _start_share_dashboard_server(ns, tmp_path, monkeypatch):
     HandlerCls.display_tz_pref_override = None
 
     srv = socketserver.TCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    srv._test_thread = start(srv)
     return srv
 
 
@@ -64,7 +63,7 @@ def dashboard_server(tmp_path, monkeypatch):
         port = srv.server_address[1]
         yield port, None
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ---------- M1.5 — GET /api/share/templates ----------
@@ -76,7 +75,7 @@ def test_share_templates_returns_panel_templates(dashboard_server):
         f"http://127.0.0.1:{port}/api/share/templates?panel=weekly",
         headers={"Host": f"127.0.0.1:{port}"},
     )
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
         body = json.loads(r.read())
     assert body["panel"] == "weekly"
     ids = [t["id"] for t in body["templates"]]
@@ -90,7 +89,7 @@ def test_share_templates_rejects_unknown_panel(dashboard_server):
         headers={"Host": f"127.0.0.1:{port}"},
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
     assert exc.value.code == 400
     body = json.loads(exc.value.read())
     assert "error" in body
@@ -123,7 +122,7 @@ def test_share_render_returns_body_and_snapshot(dashboard_server):
         data=req_body, method="POST",
         headers=_csrf_headers(port),
     )
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
         body = json.loads(r.read())
     assert body["content_type"] == "image/svg+xml"
     assert body["body"].startswith("<svg") or body["body"].lstrip().startswith("<svg")
@@ -150,7 +149,7 @@ def test_share_render_md_frontmatter_carries_template_id(dashboard_server):
         data=req_body, method="POST",
         headers=_csrf_headers(port),
     )
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
         body = json.loads(r.read())
     assert body["content_type"] == "text/markdown"
     assert "\ntemplate_id: weekly-recap\n" in body["body"]
@@ -168,7 +167,7 @@ def test_share_render_rejects_unknown_template(dashboard_server):
         headers=_csrf_headers(port),
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
     assert exc.value.code == 400
     err = json.loads(exc.value.read())
     assert "template" in err["error"].lower()
@@ -191,7 +190,7 @@ def test_share_render_accepts_null_top_n(dashboard_server):
         data=req_body, method="POST",
         headers=_csrf_headers(port),
     )
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
         body = json.loads(r.read())
     assert body["content_type"] == "text/markdown"
 
@@ -212,7 +211,7 @@ def test_share_render_rejects_invalid_top_n(dashboard_server):
             headers=_csrf_headers(port),
         )
         with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(req, timeout=5)
+            urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
         assert exc.value.code == 400, f"expected 400 for top_n={bad!r}"
         err = json.loads(exc.value.read())
         assert err["field"] == "options.top_n"
@@ -235,7 +234,7 @@ def test_share_render_show_chart_false_strips_chart(dashboard_server):
             data=json.dumps({**base, "options": {**common_opts,
                               "show_chart": True, "show_table": True}}).encode(),
             method="POST", headers=_csrf_headers(port),
-        ), timeout=5,
+        ), timeout=PRESENCE_BACKSTOP_SECONDS,
     ) as r:
         with_chart = json.loads(r.read())["body"]
     # Without chart.
@@ -245,7 +244,7 @@ def test_share_render_show_chart_false_strips_chart(dashboard_server):
             data=json.dumps({**base, "options": {**common_opts,
                               "show_chart": False, "show_table": True}}).encode(),
             method="POST", headers=_csrf_headers(port),
-        ), timeout=5,
+        ), timeout=PRESENCE_BACKSTOP_SECONDS,
     ) as r:
         without_chart = json.loads(r.read())["body"]
     # The SVG chart renderer emits `<polyline` for the LineChart trace.
@@ -269,7 +268,7 @@ def test_share_render_show_table_false_strips_table(dashboard_server):
             data=json.dumps({**base, "options": {**common_opts,
                               "show_chart": True, "show_table": True}}).encode(),
             method="POST", headers=_csrf_headers(port),
-        ), timeout=5,
+        ), timeout=PRESENCE_BACKSTOP_SECONDS,
     ) as r:
         with_table = json.loads(r.read())["body"]
     with urllib.request.urlopen(
@@ -278,7 +277,7 @@ def test_share_render_show_table_false_strips_table(dashboard_server):
             data=json.dumps({**base, "options": {**common_opts,
                               "show_chart": True, "show_table": False}}).encode(),
             method="POST", headers=_csrf_headers(port),
-        ), timeout=5,
+        ), timeout=PRESENCE_BACKSTOP_SECONDS,
     ) as r:
         without_table = json.loads(r.read())["body"]
     # MD table heading divider `| --- |` is the canonical signal.
@@ -303,7 +302,7 @@ def test_share_render_accepts_period_current(dashboard_server):
         f"http://127.0.0.1:{port}/api/share/render",
         data=req_body, method="POST", headers=_csrf_headers(port),
     )
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
         assert r.status == 200
 
 
@@ -318,7 +317,7 @@ def test_share_render_rejects_unknown_period_kind(dashboard_server):
         data=req_body, method="POST", headers=_csrf_headers(port),
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
     assert exc.value.code == 400
     err = json.loads(exc.value.read())
     assert err["field"] == "options.period.kind"
@@ -344,7 +343,7 @@ def test_share_render_rejects_period_override_for_forecast(dashboard_server):
                 data=req_body, method="POST", headers=_csrf_headers(port),
             )
             with pytest.raises(urllib.error.HTTPError) as exc:
-                urllib.request.urlopen(req, timeout=5)
+                urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
             assert exc.value.code == 400, (
                 f"expected 400 for panel={panel} kind={kind}"
             )
@@ -368,7 +367,7 @@ def test_share_render_rejects_custom_period_without_start_end(dashboard_server):
             data=req_body, method="POST", headers=_csrf_headers(port),
         )
         with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(req, timeout=5)
+            urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
         assert exc.value.code == 400, f"expected 400 for {bad_period!r}"
         err = json.loads(exc.value.read())
         assert err["field"].startswith("options.period")
@@ -388,7 +387,7 @@ def test_share_render_rejects_inverted_custom_range(dashboard_server):
         data=req_body, method="POST", headers=_csrf_headers(port),
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
     assert exc.value.code == 400
     err = json.loads(exc.value.read())
     assert "after start" in err["error"].lower() or "inverted" in err["error"].lower()
@@ -415,7 +414,7 @@ def test_share_render_previous_period_accepted_for_overridable_panels(dashboard_
             f"http://127.0.0.1:{port}/api/share/render",
             data=req_body, method="POST", headers=_csrf_headers(port),
         )
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
             assert r.status == 200, f"panel={panel}"
             body = json.loads(r.read())
             assert body["content_type"] == "text/markdown"
@@ -438,7 +437,7 @@ def test_share_render_custom_period_accepted_for_overridable_panels(dashboard_se
             f"http://127.0.0.1:{port}/api/share/render",
             data=req_body, method="POST", headers=_csrf_headers(port),
         )
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
             assert r.status == 200, f"panel={panel}"
 
 
@@ -456,7 +455,7 @@ def test_share_render_csrf_blocks_cross_origin(dashboard_server):
         data=req_body, method="POST", headers=bad_headers,
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
     assert exc.value.code == 403
 
 
@@ -466,7 +465,7 @@ def test_share_render_csrf_blocks_cross_origin(dashboard_server):
 def test_presets_initial_get_returns_empty(dashboard_server):
     port, _ = dashboard_server
     with urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/api/share/presets", timeout=5,
+        f"http://127.0.0.1:{port}/api/share/presets", timeout=PRESENCE_BACKSTOP_SECONDS,
     ) as r:
         body = json.loads(r.read())
     assert body == {"presets": {}}
@@ -486,14 +485,14 @@ def test_presets_post_roundtrip_then_get(dashboard_server):
         method="POST",
         headers={**_csrf_headers(port), "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
         post_body = json.loads(r.read())
     assert post_body["panel"] == "weekly"
     assert post_body["name"] == "team-monday"
     assert "saved_at" in post_body
 
     with urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/api/share/presets", timeout=5,
+        f"http://127.0.0.1:{port}/api/share/presets", timeout=PRESENCE_BACKSTOP_SECONDS,
     ) as r:
         get_body = json.loads(r.read())
     assert get_body["presets"]["weekly"]["team-monday"]["template_id"] == "weekly-recap"
@@ -518,10 +517,10 @@ def test_presets_post_overwrites_same_name(dashboard_server):
             method="POST",
             headers={**_csrf_headers(port), "Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=5):
+        with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS):
             pass
     with urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/api/share/presets", timeout=5,
+        f"http://127.0.0.1:{port}/api/share/presets", timeout=PRESENCE_BACKSTOP_SECONDS,
     ) as r:
         body = json.loads(r.read())
     presets = body["presets"]["weekly"]
@@ -540,17 +539,17 @@ def test_presets_delete_removes_entry(dashboard_server):
         method="POST",
         headers={**_csrf_headers(port), "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=5):
+    with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS):
         pass
     del_req = urllib.request.Request(
         f"http://127.0.0.1:{port}/api/share/presets/weekly/team-monday",
         method="DELETE",
         headers=_csrf_headers(port),
     )
-    with urllib.request.urlopen(del_req, timeout=5) as r:
+    with urllib.request.urlopen(del_req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
         assert r.status == 204
     with urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/api/share/presets", timeout=5,
+        f"http://127.0.0.1:{port}/api/share/presets", timeout=PRESENCE_BACKSTOP_SECONDS,
     ) as r:
         body = json.loads(r.read())
     assert body["presets"] == {}
@@ -573,7 +572,7 @@ def _presets_post(port, payload, path="/api/share/presets"):
         headers={**_csrf_headers(port), "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as exc:
         raw = exc.read()
@@ -582,7 +581,7 @@ def _presets_post(port, payload, path="/api/share/presets"):
 
 def _presets_get(port):
     with urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/api/share/presets", timeout=5,
+        f"http://127.0.0.1:{port}/api/share/presets", timeout=PRESENCE_BACKSTOP_SECONDS,
     ) as r:
         return json.loads(r.read())["presets"]
 
@@ -710,7 +709,7 @@ def test_presets_rename_csrf_gate(dashboard_server):
                  "Content-Type": "application/json"},
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
     assert exc.value.code == 403
 
 
@@ -797,7 +796,7 @@ def test_presets_post_csrf_gate(dashboard_server):
                  "Content-Type": "application/json"},
     )
     try:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
         raised = None
     except urllib.error.HTTPError as e:
         raised = e
@@ -815,7 +814,7 @@ def test_presets_post_rejects_unknown_panel(dashboard_server):
         headers={**_csrf_headers(port), "Content-Type": "application/json"},
     )
     try:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
         raised = None
     except urllib.error.HTTPError as e:
         raised = e
@@ -837,7 +836,7 @@ def test_presets_post_rejects_unknown_template_id(dashboard_server):
         headers={**_csrf_headers(port), "Content-Type": "application/json"},
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
     assert exc.value.code == 400
     err = json.loads(exc.value.read())
     assert err["field"] == "template_id"
@@ -858,7 +857,7 @@ def test_presets_post_rejects_wrong_panel_template(dashboard_server):
         headers={**_csrf_headers(port), "Content-Type": "application/json"},
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
     assert exc.value.code == 400
     err = json.loads(exc.value.read())
     assert err["field"] == "template_id"
@@ -988,7 +987,7 @@ def test_compose_rejects_invalid_template_in_section(dashboard_server):
         headers={**_csrf_headers(port), "Content-Type": "application/json"},
     )
     try:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
         raised = None
     except urllib.error.HTTPError as e:
         raised = e
@@ -1007,7 +1006,7 @@ def test_compose_csrf_gate(dashboard_server):
                  "Content-Type": "application/json"},
     )
     try:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
         raised = None
     except urllib.error.HTTPError as e:
         raised = e
@@ -1023,7 +1022,7 @@ def test_history_initial_get_returns_empty(dashboard_server):
     have to special-case missing keys."""
     port, _ = dashboard_server
     with urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/api/share/history", timeout=5,
+        f"http://127.0.0.1:{port}/api/share/history", timeout=PRESENCE_BACKSTOP_SECONDS,
     ) as r:
         body = json.loads(r.read())
     assert body == {"history": []}
@@ -1047,10 +1046,10 @@ def test_history_post_appends_and_trims_to_20(dashboard_server):
             method="POST",
             headers=_csrf_headers(port),
         )
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
             assert r.status == 200
     with urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/api/share/history", timeout=5,
+        f"http://127.0.0.1:{port}/api/share/history", timeout=PRESENCE_BACKSTOP_SECONDS,
     ) as r:
         body = json.loads(r.read())
     assert len(body["history"]) == 20
@@ -1076,7 +1075,7 @@ def test_history_post_returns_recipe_with_server_fields(dashboard_server):
         method="POST",
         headers=_csrf_headers(port),
     )
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
         body = json.loads(r.read())
     assert body["panel"] == "weekly"
     assert body["template_id"] == "weekly-recap"
@@ -1105,7 +1104,7 @@ def test_history_post_preserves_valid_account_and_omits_agnostic(dashboard_serve
             data=json.dumps(payload).encode(), method="POST",
             headers=_csrf_headers(port),
         )
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
             records.append(json.loads(r.read()))
     assert records[0]["account"] == account
     assert "account" not in records[1]
@@ -1199,7 +1198,7 @@ def _history_post(port, payload):
         headers={**_csrf_headers(port), "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as exc:
         raw = exc.read()
@@ -1208,7 +1207,7 @@ def _history_post(port, payload):
 
 def _history_get(port):
     with urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/api/share/history", timeout=5,
+        f"http://127.0.0.1:{port}/api/share/history", timeout=PRESENCE_BACKSTOP_SECONDS,
     ) as r:
         return json.loads(r.read())["history"]
 
@@ -1393,7 +1392,7 @@ def test_history_post_csrf_gate(dashboard_server):
                  "Content-Type": "application/json"},
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
     assert exc.value.code == 403
 
 
@@ -1414,7 +1413,7 @@ def test_history_delete_clears_buffer(dashboard_server):
         method="POST",
         headers=_csrf_headers(port),
     )
-    with urllib.request.urlopen(req, timeout=5):
+    with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS):
         pass
     del_req = urllib.request.Request(
         f"http://127.0.0.1:{port}/api/share/history",
@@ -1422,10 +1421,10 @@ def test_history_delete_clears_buffer(dashboard_server):
         headers={"Origin": f"http://127.0.0.1:{port}",
                  "Host": f"127.0.0.1:{port}"},
     )
-    with urllib.request.urlopen(del_req, timeout=5) as r:
+    with urllib.request.urlopen(del_req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
         assert r.status == 204
     with urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/api/share/history", timeout=5,
+        f"http://127.0.0.1:{port}/api/share/history", timeout=PRESENCE_BACKSTOP_SECONDS,
     ) as r:
         body = json.loads(r.read())
     assert body == {"history": []}
@@ -1440,7 +1439,7 @@ def test_history_delete_csrf_gate(dashboard_server):
         headers={"Origin": "http://evil.example.com"},
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
     assert exc.value.code == 403
 
 
@@ -1467,7 +1466,7 @@ def test_share_post_body_cap(dashboard_server, endpoint):
         data=big, method="POST", headers=_csrf_headers(port),
     )
     with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS)
     assert exc.value.code == 400
     body = json.loads(exc.value.read())
     assert "too large" in body["error"].lower()
@@ -1589,7 +1588,7 @@ def dashboard_server_with_projects(tmp_path, monkeypatch):
     try:
         yield srv.server_address[1], None
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_render_replaces_a_real_project_label_when_reveal_is_absent(

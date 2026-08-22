@@ -5,13 +5,7 @@ import time
 
 from conftest import load_script
 
-
-def _serve_once(ns, host="127.0.0.1", port=0):
-    """Start the server on an ephemeral port, return (srv, thread, port)."""
-    srv = ns["ThreadingHTTPServer"]((host, port), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    return srv, t, srv.server_address[1]
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, serve_dashboard, stop
 
 
 def test_static_placeholder_served_with_200():
@@ -21,17 +15,16 @@ def test_static_placeholder_served_with_200():
     ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](
         ns["_empty_dashboard_snapshot"]()
     )
-    srv, t, port = _serve_once(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/static/placeholder.txt")
         r = c.getresponse()
         body = r.read().decode()
         assert r.status == 200, f"status={r.status}"
         assert "placeholder" in body
     finally:
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_static_404_on_missing_file():
@@ -40,16 +33,15 @@ def test_static_404_on_missing_file():
     ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](
         ns["_empty_dashboard_snapshot"]()
     )
-    srv, t, port = _serve_once(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/static/does-not-exist.css")
         r = c.getresponse()
         r.read()
         assert r.status == 404
     finally:
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_static_denies_path_traversal():
@@ -59,16 +51,15 @@ def test_static_denies_path_traversal():
     ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](
         ns["_empty_dashboard_snapshot"]()
     )
-    srv, t, port = _serve_once(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/static/../../bin/cctally")
         r = c.getresponse()
         r.read()
         assert r.status == 400
     finally:
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_static_denies_percent_encoded_traversal():
@@ -78,9 +69,9 @@ def test_static_denies_percent_encoded_traversal():
     ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](
         ns["_empty_dashboard_snapshot"]()
     )
-    srv, t, port = _serve_once(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/static/%2e%2e/%2e%2e/bin/cctally")
         r = c.getresponse()
         r.read()
@@ -89,5 +80,4 @@ def test_static_denies_percent_encoded_traversal():
         # resolved path as outside STATIC_DIR.
         assert r.status in (403, 404)
     finally:
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)

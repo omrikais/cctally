@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Thin wrapper: `cctally-explain` → `cctally explain`.
+# Mirrors `cctally-forecast` / `cctally-project` pattern.
+set -euo pipefail
+exec "$(dirname "$0")/cctally" explain "$@"

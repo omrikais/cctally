@@ -6,24 +6,27 @@
     "corpus_scale": "small",
     "corpus_seed": 42,
     "corpus_root": "/tmp/cctally-oracle-small-seed42",
-    "generator_version": 6,
+    "generator_version": 7,
     "frozen_now": "2026-01-07T00:00:00Z",
     "tz": "Etc/UTC"
   },
   "corpus": {
-    "fingerprint": "6d5d8358e1765415c40da93f3644b66e64fe4a81a253809248bde641b3a9082d",
+    "fingerprint": "9886d7d6b4bdc119c1f800aff7866fe7d5e39e2915d1c151736e55ee74ccbbdf",
     "dataset_counts": {
       "sessions": 40,
       "entries": 4300,
       "messages": 8600,
+      "claude_sidechain_messages": 800,
       "codex_entries": 1500,
       "codex_files": 30,
+      "codex_conversation_events": 1590,
+      "codex_conversation_messages": 30,
       "quota_windows": 120
     }
   },
   "envelope": {
-    "bytes": 167976,
-    "stable_sha256": "2140ec6458d64d8c0194f2a31c21bfc0bec5297b42af9f95b6ce8e61bf91154f",
+    "bytes": 168315,
+    "stable_sha256": "bafac0457e24059ecb6197001d07d5b0af94ddfa406169c36f81db4c75b8804b",
     "stable_excludes": [
       "data_version",
       "doctor",
@@ -34,7 +37,9 @@
     "_codex_leg_is_asserted": "Every capture runs assert_snapshot_renders_the_codex_cycle over the measured snapshot, so a recorded envelope can never be the degraded short branch: availability ok, no codex_cycle_unavailable, a hero cycle with non-zero spend.",
     "_583_s3_retake": "#583 S3 moved BOTH values, and the corpus fingerprint deliberately did not: `sources.all.data.providers` stopped carrying the two provider data objects and now publishes null for both, and `source_schema_version` went 9 -> 10. The re-capture was reviewed rather than adopted. A structural difference between a capture taken with `bin/` at the branch point (af3886fcd) and one taken after contains exactly three entries \u2014 the version bump and the two nulled provider members \u2014 and nothing else, not even the three excluded field sets, because the tool freezes the clock and the corpus did not change. The pre-change capture was 300,411 bytes at stable_sha256 e733e922d30942f9eb0a1b4cde798f69a4903879eb6686f276e0a33186369421. NOTE that the values this file carried before the re-take (299,863 bytes, 9e9acd339e46bb4936555ae7e495c66d70f2bdce011b2d2e2c4ddfba58a59297) did NOT match that pre-change capture: the oracle had already drifted by 548 bytes against `main`, because nothing in the authoritative suite ran `--verify` at that point and a session between #583 S1 and S3 moved the envelope without re-taking it.",
     "_565_retake": "#565 moved BOTH envelope values while the corpus fingerprint remained fixed: source_schema_version changed 10 -> 11 and the generated corpus's decorated Codex provider stopped contributing the obsolete multi_account_unsupported cause. Its Claude cycle remains unresolved, so the fail-closed result now reports only claude_cycle_unresolved. A normalized structural diff between the base and current captures contained exactly those changes. The pre-change capture was 164,743 bytes at stable_sha256 ca63029af9bae0ce50072c0d9bef8d899b01422633ca889d30b0784e90181ad2.",
-    "_622_portability_retake": "#622 moved BOTH envelope values while the corpus fingerprint remained fixed by making the corpus identity and ingest order platform-independent. Before the fix, macOS used the logical /tmp spelling while the generator had persisted /private/tmp: the Codex containment check therefore withheld session metadata, and physical-path hashes changed every opaque provider/file identity. Linux also exposed filesystem-dependent Claude glob order, which changed cache rowids, the synthetic dirty-row selection and floating aggregate traversal. The pre-fix committed macOS capture was 164,619 bytes at stable_sha256 68a35bfd3605ff49d340d7917cd2755341e62d9292eca7fb110334369fa6b525; the pre-fix Linux matrix capture was 167,944 bytes at stable_sha256 ce5cf47798e378e92da4d8eaa8bca9b0e5c553ed2cd66f2cc85a7e01cd0ba7e4. The reviewed retake is identical at 167,976 bytes and stable_sha256 2140ec6458d64d8c0194f2a31c21bfc0bec5297b42af9f95b6ce8e61bf91154f on native macOS and the pinned Linux Python 3.11, 3.12 and 3.13 images."
+    "_622_portability_retake": "#622 moved BOTH envelope values while the corpus fingerprint remained fixed by making the corpus identity and ingest order platform-independent. Before the fix, macOS used the logical /tmp spelling while the generator had persisted /private/tmp: the Codex containment check therefore withheld session metadata, and physical-path hashes changed every opaque provider/file identity. Linux also exposed filesystem-dependent Claude glob order, which changed cache rowids, the synthetic dirty-row selection and floating aggregate traversal. The pre-fix committed macOS capture was 164,619 bytes at stable_sha256 68a35bfd3605ff49d340d7917cd2755341e62d9292eca7fb110334369fa6b525; the pre-fix Linux matrix capture was 167,944 bytes at stable_sha256 ce5cf47798e378e92da4d8eaa8bca9b0e5c553ed2cd66f2cc85a7e01cd0ba7e4. The reviewed retake is identical at 167,976 bytes and stable_sha256 2140ec6458d64d8c0194f2a31c21bfc0bec5297b42af9f95b6ce8e61bf91154f on native macOS and the pinned Linux Python 3.11, 3.12 and 3.13 images.",
+    "_631_633_retake": "#631 expanded the generated corpus with real Claude sidechain markers and materialized Codex conversation events/messages so the diagnosis benchmark cannot time empty conversation populations. The corpus fingerprint therefore moved, making the old and new envelope hashes intentionally incomparable; this is a corpus retake, not evidence of a dashboard contract change. The generator-owned counts are recorded above, and the capture still passed the existing Codex-cycle assertion before publication.",
+    "_634_retake": "#634 moved BOTH envelope values while the corpus fingerprint remained fixed by adding the server-deduplicated session_counts_by_window map to each Claude Projects trend row. A normalized structural diff between the pre-change and post-change captures contained exactly six additions: the field on each of the three top-level Projects rows and the same three rows under sources.claude. The pre-change capture was 167,919 bytes at stable_sha256 78b1cab350485ea7241fe4fa0c999f7bd65e62272b01235aa22e3e98c0d81284."
   },
   "reproducibility": {
     "stable_sha256": "The value to assert. sha256 over the envelope with three named field sets removed and NOTHING else \u2014 `data_version` at the top level and inside each `sources[*]` entry, the top-level `doctor` object, and the nested `sync_activity.server_epoch`. All three sets are pinned against literals by test so none can grow without a stated reason, and a unit test proves the digest ignores exactly those and still discriminates other content \u2014 including each of the six remaining `sync_activity` fields, so a trim that quietly dropped the whole subtree would fail rather than pass.",

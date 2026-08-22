@@ -23,6 +23,10 @@ import pytest
 
 from conftest import load_script
 
+from tests._support_http import (
+    PRESENCE_BACKSTOP_SECONDS, remaining, start, stop,
+)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_prod_dbs(monkeypatch, tmp_path):
@@ -50,8 +54,7 @@ def _boot(ns):
     srv = dash._QuietThreadingHTTPServer(
         ("127.0.0.1", 0), dash.DashboardHTTPHandler
     )
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    t = start(srv)
     return dash, srv, t
 
 
@@ -64,7 +67,7 @@ def test_api_data_500_wrap(monkeypatch):
 
     monkeypatch.setattr(dash, "snapshot_to_envelope", _boom)
     try:
-        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=3)
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/api/data")
         r = c.getresponse()
         body = r.read().decode()
@@ -73,8 +76,7 @@ def test_api_data_500_wrap(monkeypatch):
         import json
         assert json.loads(body) == {"error": "internal error"}
     finally:
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_api_events_stream_error_logs_and_closes(monkeypatch):
@@ -104,7 +106,14 @@ def test_api_events_stream_error_logs_and_closes(monkeypatch):
         snap = ns["_empty_dashboard_snapshot"]()
         hub.publish(snap)  # seed so the first loop frame builds immediately
 
-        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=3)
+        # ONE budget for the connect, both read loops and the log wait. Four
+        # separate `PRESENCE_BACKSTOP_SECONDS` waits summed to the whole
+        # 120-second pytest cap, so a stream that never closed spent the cap
+        # here and pytest-timeout killed the worker before any of the four
+        # could report what it had been waiting for.
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+        c = http.client.HTTPConnection(
+            "127.0.0.1", srv.server_address[1], timeout=remaining(deadline))
         c.request("GET", "/api/events")
         r = c.getresponse()
         assert r.status == 200
@@ -113,7 +122,6 @@ def test_api_events_stream_error_logs_and_closes(monkeypatch):
         # Read the first (GOOD) frame — synchronizes past the seeded envelope
         # build, so the following patch takes effect on the NEXT iteration.
         buf = b""
-        deadline = time.monotonic() + 3.0
         while b"\n\n" not in buf and time.monotonic() < deadline:
             try:
                 chunk = r.fp.read1(4096)
@@ -131,12 +139,12 @@ def test_api_events_stream_error_logs_and_closes(monkeypatch):
         hub.publish(snap)
 
         # The except-clause must log + close (not crash / leak a traceback).
-        assert logged_evt.wait(3.0), "stream-failed log_error never fired"
+        assert logged_evt.wait(remaining(deadline)), (
+            "stream-failed log_error never fired")
         assert any("stream failed" in m for m in logged)
 
         # The stream closes cleanly: read drains to EOF, no more frames.
         tail = b""
-        deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
             try:
                 chunk = r.fp.read1(4096)
@@ -149,5 +157,4 @@ def test_api_events_stream_error_logs_and_closes(monkeypatch):
         assert leaked == [], f"traceback leaked to handle_error: {leaked}"
     finally:
         srv.handle_error = orig_handle_error
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)

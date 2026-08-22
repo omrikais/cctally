@@ -1,5 +1,7 @@
 """Unit tests for _discover_lan_ip + _format_url."""
 import socket
+import sys
+import types
 from conftest import load_script
 
 
@@ -44,7 +46,12 @@ def test_discover_lan_ip_returns_none_on_oserror(monkeypatch):
         def getsockname(self): return ("0.0.0.0", 0)
         def close(self): pass
 
-    monkeypatch.setattr(socket, "socket", _Sock)
+    # #630 S2: rebind the module name on the IMPORTING module, never on
+    # the shared stdlib object.
+    dash = sys.modules["_cctally_dashboard"]
+    _iso_socket = types.SimpleNamespace(**vars(dash.socket))
+    _iso_socket.socket = _Sock
+    monkeypatch.setattr(dash, "socket", _iso_socket)
     ip = ns["_discover_lan_ip"]()
     assert ip is None
 

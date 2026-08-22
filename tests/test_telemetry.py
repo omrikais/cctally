@@ -15,6 +15,7 @@ import time
 import pytest
 
 from conftest import load_isolated_cctally_module
+from tests._support_http import start, stop
 
 
 def _ns(**kw):
@@ -164,7 +165,6 @@ def test_failed_beat_attempt_throttles_parent_gate(cc):
 def test_beat_sends_expected_payload(cc, monkeypatch):
     import http.server
     import json as _json
-    import threading
 
     captured = {}
 
@@ -179,7 +179,7 @@ def test_beat_sends_expected_payload(cc, monkeypatch):
             pass
 
     srv = http.server.HTTPServer(("127.0.0.1", 0), H)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    srv._test_thread = start(srv)
     ep = f"http://127.0.0.1:{srv.server_address[1]}/beat"
     cc.mark_first_seen()  # arm
     # Backdate first-seen so grace has elapsed:
@@ -190,7 +190,7 @@ def test_beat_sends_expected_payload(cc, monkeypatch):
     monkeypatch.setattr(cc, "resolve_client_version", lambda: "1.63.0")
     monkeypatch.setattr(cc, "resolve_os_family", lambda: "linux")
     assert cc.do_telemetry_beat({}, endpoint=ep) == "sent"
-    srv.shutdown()
+    stop(srv, srv._test_thread)
     assert set(captured) == {"t", "v", "os"} and captured["v"] == "1.63.0"
     assert captured["os"] == "linux"
 

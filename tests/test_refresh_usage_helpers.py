@@ -1,5 +1,7 @@
 """Unit tests for refresh-usage pure helpers."""
 from conftest import load_script
+import sys
+import types
 
 import pytest
 
@@ -358,7 +360,18 @@ def test_fetch_raises_rate_limit_on_http_429(monkeypatch):
             url=req.full_url, code=429, msg="Too Many Requests",
             hdrs={}, fp=io.BytesIO(b'{"error":{"type":"rate_limit_error"}}'),
         )
-    monkeypatch.setattr(ns["urllib"].request, "urlopen", boom)
+    # #630 S2: `ns["urllib"] is urllib`, so patching
+    # `ns["urllib"].request.urlopen` rebound stdlib urlopen for the
+    # whole process. Replace the namespace ENTRY with a local copy
+    # whose `request` is itself a local copy.
+    _iso_request = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib.request))
+    _iso_request.urlopen = boom
+    _iso_urllib = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib))
+    _iso_urllib.request = _iso_request
+    monkeypatch.setattr(
+        sys.modules["_cctally_refresh"], "urllib", _iso_urllib)
     with pytest.raises(ns["RefreshUsageRateLimitError"]):
         fn(token="tok", timeout_seconds=2.0)
 
@@ -373,7 +386,18 @@ def test_fetch_raises_network_error_on_http_500(monkeypatch):
             url=req.full_url, code=500, msg="Internal Server Error",
             hdrs={}, fp=io.BytesIO(b"oops"),
         )
-    monkeypatch.setattr(ns["urllib"].request, "urlopen", boom)
+    # #630 S2: `ns["urllib"] is urllib`, so patching
+    # `ns["urllib"].request.urlopen` rebound stdlib urlopen for the
+    # whole process. Replace the namespace ENTRY with a local copy
+    # whose `request` is itself a local copy.
+    _iso_request = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib.request))
+    _iso_request.urlopen = boom
+    _iso_urllib = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib))
+    _iso_urllib.request = _iso_request
+    monkeypatch.setattr(
+        sys.modules["_cctally_refresh"], "urllib", _iso_urllib)
     with pytest.raises(ns["RefreshUsageNetworkError"]) as exc:
         fn(token="tok", timeout_seconds=2.0)
     # Must NOT be the subclass.
@@ -397,7 +421,18 @@ def test_fetch_uses_claude_code_user_agent_default(monkeypatch):
     def fake_urlopen(req, timeout):
         captured["headers"] = dict(req.header_items())
         return FakeResponse()
-    monkeypatch.setattr(ns["urllib"].request, "urlopen", fake_urlopen)
+    # #630 S2: `ns["urllib"] is urllib`, so patching
+    # `ns["urllib"].request.urlopen` rebound stdlib urlopen for the
+    # whole process. Replace the namespace ENTRY with a local copy
+    # whose `request` is itself a local copy.
+    _iso_request = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib.request))
+    _iso_request.urlopen = fake_urlopen
+    _iso_urllib = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib))
+    _iso_urllib.request = _iso_request
+    monkeypatch.setattr(
+        sys.modules["_cctally_refresh"], "urllib", _iso_urllib)
     monkeypatch.setitem(ns, "_discover_cc_version", lambda: "2.1.116")
     # Default config (no override).
     monkeypatch.setitem(ns, "load_config", lambda: {})
@@ -420,7 +455,18 @@ def test_fetch_uses_override_user_agent(monkeypatch):
     def fake_urlopen(req, timeout):
         captured["headers"] = dict(req.header_items())
         return FakeResponse()
-    monkeypatch.setattr(ns["urllib"].request, "urlopen", fake_urlopen)
+    # #630 S2: `ns["urllib"] is urllib`, so patching
+    # `ns["urllib"].request.urlopen` rebound stdlib urlopen for the
+    # whole process. Replace the namespace ENTRY with a local copy
+    # whose `request` is itself a local copy.
+    _iso_request = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib.request))
+    _iso_request.urlopen = fake_urlopen
+    _iso_urllib = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib))
+    _iso_urllib.request = _iso_request
+    monkeypatch.setattr(
+        sys.modules["_cctally_refresh"], "urllib", _iso_urllib)
     monkeypatch.setitem(ns, "_discover_cc_version", lambda: "2.1.116")
     monkeypatch.setitem(ns, "load_config",
                         lambda: {"oauth_usage": {"user_agent": "cctally/0.1"}})

@@ -17,6 +17,7 @@ point at a temp data dir, NOT the developer's real ~/.local/share/cctally (the
 "HOME-only test loader reads prod DB" gotcha).
 """
 from __future__ import annotations
+import types
 
 import os
 import stat
@@ -126,7 +127,12 @@ def test_chmod_failure_is_swallowed(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise OSError("nope")
 
-    monkeypatch.setattr(os, "chmod", boom)
+    # #630 S2: rebind the module name on the IMPORTING module, never on
+    # the shared stdlib object that every other importer and every
+    # concurrent thread resolves through.
+    _iso_os = types.SimpleNamespace(**vars(sys.modules["_cctally_cache"].os))
+    _iso_os.chmod = boom
+    monkeypatch.setattr(sys.modules["_cctally_cache"], "os", _iso_os)
     # Must not raise — best-effort hardening logs + continues.
     conn = cache.open_cache_db()
     conn.close()
@@ -162,6 +168,11 @@ def test_ensure_dirs_chmod_failure_is_swallowed(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise OSError("nope")
 
-    monkeypatch.setattr(os, "chmod", boom)
+    # #630 S2: rebind the module name on the IMPORTING module, never on
+    # the shared stdlib object that every other importer and every
+    # concurrent thread resolves through.
+    _iso_os = types.SimpleNamespace(**vars(sys.modules["_cctally_cache"].os))
+    _iso_os.chmod = boom
+    monkeypatch.setattr(sys.modules["_cctally_cache"], "os", _iso_os)
     # Must not raise — best-effort hardening logs + continues.
     core.ensure_dirs()

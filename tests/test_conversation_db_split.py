@@ -8,6 +8,8 @@ import fcntl
 import pathlib
 import shutil
 import sqlite3
+import sys
+import types
 
 import pytest
 
@@ -53,20 +55,40 @@ def test_open_cache_db_never_opens_conversation_store(
 ):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
-    real_connect = sqlite3.connect
+    store = sys.modules["_cctally_store"]
+    real_connect = store.sqlite3.connect
     conversation_path = ns["_cctally_core"].CONVERSATIONS_DB_PATH
 
+    reached: list[str] = []
+
     def guarded_connect(database, *args, **kwargs):
+        reached.append(str(database))
         if str(database) == str(conversation_path):
             raise AssertionError("core cache opener touched conversations.db")
         return real_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(sqlite3, "connect", guarded_connect)
+    # #630 S2: rebind the module name on the IMPORTING module. Every
+    # store open — cache, conversations and stats alike — connects
+    # through `_cctally_store`, so a rebind there is the whole
+    # chokepoint, and `sqlite3.connect` itself is never mutated, so no
+    # unrelated caller of the stdlib module sees this at all. The residual
+    # is stated rather than implied: `_cctally_store.sqlite3` is shared by
+    # every thread in this worker, so a concurrent STORE open inside the
+    # window still reaches this trap. Narrower than patching
+    # `sqlite3.connect`, not closure.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(store.sqlite3))
+    _iso_sqlite3.connect = guarded_connect
+    monkeypatch.setattr(store, "sqlite3", _iso_sqlite3)
     conn = ns["open_cache_db"]()
     try:
         assert conn.execute("SELECT 1").fetchone() == (1,)
     finally:
         conn.close()
+    # This assertion is about a path NOT being opened, so a rebind that reaches
+    # nothing would pass it vacuously — including when the cache opener really
+    # does touch conversations.db.
+    assert reached, (
+        "the guarded connect never fired; the rebind missed the opener")
 
 
 def test_conversation_connection_owns_transcripts_and_reads_attached_core(
@@ -157,7 +179,8 @@ def test_conversation_connection_enables_uri_for_readonly_cache_attach(
     """
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
-    real_connect = sqlite3.connect
+    store = sys.modules["_cctally_store"]
+    real_connect = store.sqlite3.connect
     conversation_path = ns["_cctally_core"].CONVERSATIONS_DB_PATH
     calls = []
 
@@ -166,7 +189,18 @@ def test_conversation_connection_enables_uri_for_readonly_cache_attach(
             calls.append(kwargs.copy())
         return real_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(sqlite3, "connect", recording_connect)
+    # #630 S2: rebind the module name on the IMPORTING module. Every
+    # store open — cache, conversations and stats alike — connects
+    # through `_cctally_store`, so a rebind there is the whole
+    # chokepoint, and `sqlite3.connect` itself is never mutated, so no
+    # unrelated caller of the stdlib module sees this at all. The residual
+    # is stated rather than implied: `_cctally_store.sqlite3` is shared by
+    # every thread in this worker, so a concurrent STORE open inside the
+    # window still reaches this trap. Narrower than patching
+    # `sqlite3.connect`, not closure.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(store.sqlite3))
+    _iso_sqlite3.connect = recording_connect
+    monkeypatch.setattr(store, "sqlite3", _iso_sqlite3)
     conn = ns["open_conversations_db"]()
     conn.close()
 

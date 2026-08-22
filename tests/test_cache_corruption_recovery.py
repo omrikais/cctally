@@ -5,6 +5,7 @@ cache.db in place while another process still held a WAL reader.  The live
 reader then faulted in sqlite3.walFindFrame after the mapped file was shortened.
 """
 from __future__ import annotations
+import types
 
 import ast
 import hashlib
@@ -21,6 +22,7 @@ import time
 import pytest
 
 from conftest import load_script, redirect_paths
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -445,10 +447,12 @@ def test_non_ok_integrity_row_confirms_forensics_probe(tmp_path, monkeypatch):
         def close(self):
             return None
 
-    monkeypatch.setattr(
-        db_mod.sqlite3, "connect",
-        lambda *_args, **_kwargs: FakeIntegrityConnection(),
-    )
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(db_mod.sqlite3))
+    _iso_sqlite3.connect = lambda *_args, **_kwargs: FakeIntegrityConnection()
+    monkeypatch.setattr(db_mod, "sqlite3", _iso_sqlite3)
     result = db_mod.write_corruption_forensics(
         path,
         db_label="cache",
@@ -496,10 +500,12 @@ def test_empty_or_multiple_ok_integrity_rows_are_unconfirmed(
         def close(self):
             return None
 
-    monkeypatch.setattr(
-        db_mod.sqlite3, "connect",
-        lambda *_args, **_kwargs: FakeIntegrityConnection(),
-    )
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(db_mod.sqlite3))
+    _iso_sqlite3.connect = lambda *_args, **_kwargs: FakeIntegrityConnection()
+    monkeypatch.setattr(db_mod, "sqlite3", _iso_sqlite3)
     result = db_mod.write_corruption_forensics(
         path,
         db_label="cache",
@@ -593,7 +599,12 @@ def test_unrelated_probe_failure_declines_quarantine(tmp_path, monkeypatch):
     def unrelated_probe_failure(*_args, **_kwargs):
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(db_mod.sqlite3, "connect", unrelated_probe_failure)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(db_mod.sqlite3))
+    _iso_sqlite3.connect = unrelated_probe_failure
+    monkeypatch.setattr(db_mod, "sqlite3", _iso_sqlite3)
     assert cache_mod._recover_corrupt_cache(
         sqlite3.DatabaseError("database disk image is malformed"),
         origin="test.unrelated_probe_failure",
@@ -748,7 +759,14 @@ def test_partial_family_quarantine_fails_closed_then_resumes(
             raise OSError("injected sidecar move failure")
         return real_replace(src, dst)
 
-    monkeypatch.setattr(db_mod.os, "replace", fail_shm_once)
+    # #630 S2: patch the IMPORTER's reference, never the shared stdlib
+    # module object, which every other importer and every concurrent
+    # thread resolves through. The later line flips behaviour on the
+    # copy already installed, so the restore does not need a second
+    # setattr.
+    _iso_os = types.SimpleNamespace(**vars(db_mod.os))
+    _iso_os.replace = fail_shm_once
+    monkeypatch.setattr(db_mod, "os", _iso_os)
     with pytest.raises(
         sqlite3.DatabaseError, match="could not complete whole-family quarantine"
     ):
@@ -761,7 +779,7 @@ def test_partial_family_quarantine_fails_closed_then_resumes(
     assert pending.exists()
     assert path.exists(), "main DB must not be recreated after a partial move"
 
-    monkeypatch.setattr(db_mod.os, "replace", real_replace)
+    _iso_os.replace = real_replace
     conn = ns["open_cache_db"]()
     try:
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -1145,17 +1163,17 @@ def test_killed_cache_repair_converges_on_next_rebuild(
                 break
             time.sleep(0.02)
         if not pause_marker.exists():
-            stdout, stderr = victim.communicate(timeout=5)
+            stdout, stderr = victim.communicate(timeout=PRESENCE_BACKSTOP_SECONDS)
             pytest.fail(
                 f"victim never reached {pause_at}\n"
                 f"stdout:\n{stdout}\nstderr:\n{stderr}"
             )
         os.kill(victim.pid, signal.SIGKILL)
-        victim.communicate(timeout=5)
+        victim.communicate(timeout=PRESENCE_BACKSTOP_SECONDS)
     finally:
         if victim.poll() is None:
             victim.kill()
-            victim.communicate(timeout=5)
+            victim.communicate(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     survivor = subprocess.run(
         [

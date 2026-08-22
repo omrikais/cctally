@@ -10,10 +10,10 @@ Install
   ✓ Update channel           stable
       details:
         channel: stable
-  ✓ Symlinks                 15/15 available
+  ✓ Symlinks                 16/16 available
       details:
-        present: 15
-        total: 15
+        present: 16
+        total: 16
         missing: []
         stale: []
   ✓ PATH                     cctally reachable on $PATH

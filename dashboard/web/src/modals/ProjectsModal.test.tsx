@@ -261,6 +261,38 @@ describe('<ProjectsModal />', () => {
     expect(cells4[3].textContent).toBe(lastSeenCell12);
   });
 
+  it('uses the server-deduplicated session count for the selected window (#634)', () => {
+    vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
+    dispatch({ type: 'SAVE_PREFS', patch: { projectsWindowWeeks: 4 } });
+    const env = buildProjectsEnvelope({ windowWeeks: 4, projectCount: 1 });
+    const project = env.projects!.trend.projects[0] as ProjectsTrendProject & {
+      session_counts_by_window: Record<string, number>;
+    };
+    project.session_counts_by_window = { '1': 1, '4': 3, '8': 3, '12': 3 };
+    updateSnapshot(env);
+    render(<ProjectsModal />);
+
+    const row = screen.getByTestId('projects-table-row');
+    expect(row).toHaveAttribute('data-sessions', '3');
+    expect(row.querySelectorAll('td')[1]).toHaveTextContent('3');
+  });
+
+  it('discloses reset gaps inside the drill window (#634)', async () => {
+    const detail = buildProjectDetail('project-1') as ProjectDetail & {
+      window_intervals: Array<{ start_at: string; end_at: string }>;
+    };
+    detail.window_intervals = [
+      { start_at: '2026-04-20T00:00:00Z', end_at: '2026-05-04T00:00:00Z' },
+      { start_at: '2026-05-04T00:00:00Z', end_at: '2026-05-05T00:00:00Z' },
+      { start_at: '2026-05-06T00:00:00Z', end_at: '2026-05-18T00:00:00Z' },
+    ];
+    vi.stubGlobal('fetch', stubFetchOk(detail));
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 1 }));
+    render(<ProjectsModal />);
+
+    expect(await screen.findByText(/1 reset gap/)).toBeInTheDocument();
+  });
+
   it('renders window pills with the current selection (default 4w)', () => {
     vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
     updateSnapshot(buildProjectsEnvelope({ windowWeeks: 12 }));

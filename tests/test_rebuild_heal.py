@@ -21,6 +21,7 @@ Isolation mirrors tests/test_writer_reroute.py: load_script() drops cached
 _cctally_* siblings; fresh modules grabbed AFTER; redirect_paths pins the data dir.
 """
 from __future__ import annotations
+import types
 
 import datetime as dt
 import multiprocessing as mp
@@ -32,6 +33,8 @@ import time
 import pytest
 
 from conftest import load_script, redirect_paths
+
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 _BIN_DIR = str(pathlib.Path(__file__).resolve().parent.parent / "bin")
 # NOTE: appends use the DEFAULT real-now segment (no now_utc pin) so obs +
@@ -700,7 +703,7 @@ def test_admission_contender_receives_the_elected_identity_before_marker_reread(
         if path == st._stats_heal_marker_path() and first_marker_write:
             first_marker_write = False
             entered.set()
-            assert release.wait(5)
+            assert release.wait(PRESENCE_BACKSTOP_SECONDS)
         return real_write(path, payload)
 
     monkeypatch.setattr(_cctally_db, "_atomic_write_private_json", paused_write)
@@ -720,12 +723,14 @@ def test_admission_contender_receives_the_elected_identity_before_marker_reread(
     winner = threading.Thread(target=reserve, args=("winner",))
     loser = threading.Thread(target=reserve, args=("loser",))
     winner.start()
-    assert entered.wait(5)
+    assert entered.wait(PRESENCE_BACKSTOP_SECONDS)
     loser.start()
     time.sleep(0.05)
     release.set()
-    winner.join(5)
-    loser.join(5)
+    # timing-budget: the winning reservation thread has recorded its outcome in `results`
+    winner.join(timeout=PRESENCE_BACKSTOP_SECONDS)
+    # timing-budget: the losing reservation thread has recorded its outcome in `results`
+    loser.join(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     assert results["winner"][0] == "reserved"
     assert results["loser"][0] == "pending"
@@ -848,7 +853,7 @@ def test_spawn_failure_waits_for_a_coalescer_and_settles_its_final_count(
             and int(payload.get("coalescedDetections") or 0) == 1
         ):
             entered.set()
-            assert release.wait(5)
+            assert release.wait(PRESENCE_BACKSTOP_SECONDS)
         return real_write(path, payload)
 
     monkeypatch.setattr(_cctally_db, "_atomic_write_private_json", pause_coalescer)
@@ -866,13 +871,15 @@ def test_spawn_failure_waits_for_a_coalescer_and_settles_its_final_count(
     loser = threading.Thread(target=coalesce)
     finisher = threading.Thread(target=fail_spawn)
     loser.start()
-    assert entered.wait(5)
+    assert entered.wait(PRESENCE_BACKSTOP_SECONDS)
     started = time.monotonic()
     finisher.start()
     time.sleep(0.05)
     release.set()
-    loser.join(5)
-    finisher.join(5)
+    # timing-budget: the coalescing loser has recorded its outcome in `results`
+    loser.join(timeout=PRESENCE_BACKSTOP_SECONDS)
+    # timing-budget: the finishing rebuild thread has recorded its outcome in `results`
+    finisher.join(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     assert results["coalescer"][0] == "pending"
     assert results["coalescer"][1]["healId"] == "spawn-owner"
@@ -1037,11 +1044,12 @@ def test_locked_recheck_rejects_lazy_open_corruption(monkeypatch, tmp_path):
         def close(self):
             pass
 
-    monkeypatch.setattr(
-        st.sqlite3,
-        "connect",
-        lambda *_args, **_kwargs: LazyCorruptConnection(),
-    )
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(st.sqlite3))
+    _iso_sqlite3.connect = lambda *_args, **_kwargs: LazyCorruptConnection()
+    monkeypatch.setattr(st, "sqlite3", _iso_sqlite3)
 
     assert st._probe_stats_ok(path) is False
 
@@ -1468,10 +1476,12 @@ def _run_heal_child(target, tmp_path, *, timeout: float):
     alive = proc.is_alive()
     if alive:
         proc.terminate()
-        proc.join(timeout=15)
+        # timing-budget: the terminated child process has been reaped
+        proc.join(timeout=PRESENCE_BACKSTOP_SECONDS)
         if proc.is_alive():  # pragma: no cover
             proc.kill()
-            proc.join(timeout=15)
+            # timing-budget: the killed child process has been reaped
+            proc.join(timeout=PRESENCE_BACKSTOP_SECONDS)
         return None
     return q.get(timeout=10)
 
@@ -1789,7 +1799,7 @@ def test_foreign_page_storm_admits_once_before_shared_maintenance_drains(
     for detector in detectors:
         detector.start()
     marker = core.APP_DIR / "stats-corruption-heal.pending"
-    deadline = started + 2.0
+    deadline = started + PRESENCE_BACKSTOP_SECONDS
     while not marker.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     admitted_while_contended = marker.exists()
@@ -1799,11 +1809,13 @@ def test_foreign_page_storm_admits_once_before_shared_maintenance_drains(
         results = [q.get(timeout=20) for _ in detectors]
     release.set()
     for detector in detectors:
-        detector.join(timeout=20)
+        # timing-budget: this detector child has exited now that `release` is set
+        detector.join(timeout=PRESENCE_BACKSTOP_SECONDS)
         if detector.is_alive():
             detector.terminate()
             detector.join(timeout=10)
-    holder.join(timeout=20)
+    # timing-budget: the lock-holding child has exited now that `release` is set
+    holder.join(timeout=PRESENCE_BACKSTOP_SECONDS)
     if holder.is_alive():
         holder.terminate()
         holder.join(timeout=10)

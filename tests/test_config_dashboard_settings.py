@@ -34,12 +34,7 @@ if str(_BIN) not in sys.path:
 
 from conftest import load_script, redirect_paths  # noqa: E402
 
-
-def _serve(ns, host="127.0.0.1", port=0):
-    srv = ns["ThreadingHTTPServer"]((host, port), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    return srv, t, srv.server_address[1]
+from tests._support_http import post_json, serve_dashboard, stop  # noqa: E402
 
 
 def _wire_handlers(ns):
@@ -55,26 +50,6 @@ def _wire_handlers(ns):
     ns["DashboardHTTPHandler"].display_tz_pref_override = None
 
 
-def _post_json(host, port, path, body, *, origin_host=None):
-    c = http.client.HTTPConnection(host, port, timeout=2)
-    raw = json.dumps(body).encode()
-    host_header = f"{host}:{port}"
-    c.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
-    c.putheader("Content-Type", "application/json")
-    c.putheader("Content-Length", str(len(raw)))
-    c.putheader("Host", host_header)
-    c.putheader("Origin", f"http://{origin_host or host_header}")
-    c.endheaders()
-    c.send(raw)
-    r = c.getresponse()
-    payload = r.read().decode("utf-8", errors="replace")
-    try:
-        parsed = json.loads(payload) if payload else None
-    except json.JSONDecodeError:
-        parsed = payload
-    return r.status, parsed
-
-
 # ---------------------------------------------------------------------------
 # POST /api/settings — dashboard.cache_failure_markers round-trip
 # ---------------------------------------------------------------------------
@@ -83,10 +58,10 @@ def test_http_dashboard_cache_failure_markers_round_trip(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"dashboard": {"cache_failure_markers": False}},
         )
         assert status == 200, body
@@ -100,17 +75,17 @@ def test_http_dashboard_cache_failure_markers_round_trip(monkeypatch, tmp_path):
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg.get("dashboard", {}).get("cache_failure_markers") is False
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_dashboard_cache_failure_markers_true_round_trip(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"dashboard": {"cache_failure_markers": True}},
         )
         assert status == 200, body
@@ -120,7 +95,7 @@ def test_http_dashboard_cache_failure_markers_true_round_trip(monkeypatch, tmp_p
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg.get("dashboard", {}).get("cache_failure_markers") is True
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_dashboard_non_bool_marker_returns_400(monkeypatch, tmp_path):
@@ -128,11 +103,11 @@ def test_http_dashboard_non_bool_marker_returns_400(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         for bad in ("yes", 1, 0, "true"):
-            status, body = _post_json(
-                "127.0.0.1", port, "/api/settings",
+            status, body = post_json(
+                port, "/api/settings",
                 {"dashboard": {"cache_failure_markers": bad}},
             )
             assert status == 400, (bad, body)
@@ -143,7 +118,7 @@ def test_http_dashboard_non_bool_marker_returns_400(monkeypatch, tmp_path):
             ns["CONFIG_PATH"].read_text()
         )
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_dashboard_bind_rejected(monkeypatch, tmp_path):
@@ -151,17 +126,17 @@ def test_http_dashboard_bind_rejected(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"dashboard": {"bind": "lan"}},
         )
         assert status == 400, body
         assert body is not None
         assert body.get("field") == "dashboard.bind"
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_dashboard_expose_transcripts_rejected(monkeypatch, tmp_path):
@@ -169,59 +144,59 @@ def test_http_dashboard_expose_transcripts_rejected(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"dashboard": {"expose_transcripts": True}},
         )
         assert status == 400, body
         assert body is not None
         assert body.get("field") == "dashboard.expose_transcripts"
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_dashboard_unknown_inner_key_returns_400(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"dashboard": {"frobnicate": True}},
         )
         assert status == 400, body
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_dashboard_non_dict_block_returns_400(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"dashboard": "nope"},
         )
         assert status == 400, body
         assert body is not None
         assert body.get("field") == "dashboard"
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_dashboard_combined_save_with_display(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {
                 "dashboard": {"cache_failure_markers": False},
                 "display": {"tz": "Etc/UTC"},
@@ -233,7 +208,7 @@ def test_http_dashboard_combined_save_with_display(monkeypatch, tmp_path):
             "lan_auth": True}
         assert body["display"]["resolved_tz"] == "Etc/UTC"
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_dashboard_preserves_sibling_keys(monkeypatch, tmp_path):
@@ -245,10 +220,10 @@ def test_http_dashboard_preserves_sibling_keys(monkeypatch, tmp_path):
     ns["CONFIG_PATH"].write_text(json.dumps(
         {"dashboard": {"bind": "lan", "expose_transcripts": True}}
     ))
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"dashboard": {"cache_failure_markers": False}},
         )
         assert status == 200, body
@@ -257,7 +232,7 @@ def test_http_dashboard_preserves_sibling_keys(monkeypatch, tmp_path):
         assert cfg["bind"] == "lan"                 # sibling preserved
         assert cfg["expose_transcripts"] is True    # sibling preserved
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_dashboard_lan_auth_round_trip_requires_restart(monkeypatch, tmp_path):
@@ -265,10 +240,10 @@ def test_http_dashboard_lan_auth_round_trip_requires_restart(monkeypatch, tmp_pa
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"dashboard": {"lan_auth": False}},
         )
         assert status == 200, body
@@ -281,40 +256,40 @@ def test_http_dashboard_lan_auth_round_trip_requires_restart(monkeypatch, tmp_pa
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg["dashboard"]["lan_auth"] is False
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_dashboard_lan_auth_non_bool_returns_400(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         for bad in ("false", 0, 1, None):
-            status, body = _post_json(
-                "127.0.0.1", port, "/api/settings",
+            status, body = post_json(
+                port, "/api/settings",
                 {"dashboard": {"lan_auth": bad}},
             )
             assert status == 400, (bad, body)
             assert body.get("field") == "dashboard.lan_auth"
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_unrelated_dashboard_save_has_no_restart_marker(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"dashboard": {"live_tail": False}},
         )
         assert status == 200, body
         assert "restart_required" not in body
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_top_level_unknown_key_still_rejected(monkeypatch, tmp_path):
@@ -322,15 +297,15 @@ def test_http_top_level_unknown_key_still_rejected(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"frobnicate": {"x": 1}},
         )
         assert status == 400, body
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 # ---------------------------------------------------------------------------
@@ -367,10 +342,10 @@ def test_http_dashboard_live_tail_round_trip(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"dashboard": {"live_tail": False}},
         )
         assert status == 200, body
@@ -380,7 +355,7 @@ def test_http_dashboard_live_tail_round_trip(monkeypatch, tmp_path):
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg.get("dashboard", {}).get("live_tail") is False
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_dashboard_live_tail_non_bool_returns_400(monkeypatch, tmp_path):
@@ -388,11 +363,11 @@ def test_http_dashboard_live_tail_non_bool_returns_400(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         for bad in ("yes", 1, 0, "true"):
-            status, body = _post_json(
-                "127.0.0.1", port, "/api/settings",
+            status, body = post_json(
+                port, "/api/settings",
                 {"dashboard": {"live_tail": bad}},
             )
             assert status == 400, (bad, body)
@@ -402,7 +377,7 @@ def test_http_dashboard_live_tail_non_bool_returns_400(monkeypatch, tmp_path):
             ns["CONFIG_PATH"].read_text()
         )
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_dashboard_live_tail_preserves_markers_sibling(monkeypatch, tmp_path):
@@ -413,10 +388,10 @@ def test_http_dashboard_live_tail_preserves_markers_sibling(monkeypatch, tmp_pat
     ns["CONFIG_PATH"].write_text(json.dumps(
         {"dashboard": {"cache_failure_markers": False}}
     ))
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"dashboard": {"live_tail": False}},
         )
         assert status == 200, body
@@ -424,7 +399,7 @@ def test_http_dashboard_live_tail_preserves_markers_sibling(monkeypatch, tmp_pat
         assert cfg["live_tail"] is False
         assert cfg["cache_failure_markers"] is False    # sibling preserved
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_dashboard_both_leaves_in_one_save(monkeypatch, tmp_path):
@@ -432,10 +407,10 @@ def test_http_dashboard_both_leaves_in_one_save(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"dashboard": {"cache_failure_markers": False, "live_tail": False}},
         )
         assert status == 200, body
@@ -446,7 +421,7 @@ def test_http_dashboard_both_leaves_in_one_save(monkeypatch, tmp_path):
         assert cfg["cache_failure_markers"] is False
         assert cfg["live_tail"] is False
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 # ---------------------------------------------------------------------------

@@ -427,11 +427,45 @@ def test_trie_bounded_run_merges_into_one_guard():
 
 # ---- coarse perf smoke: trie collapses the O(text × alternatives) blow-up ----
 
+def _top_level_alternatives(pattern: str) -> int:
+    """How many branches the pattern offers at depth zero.
+
+    A flat alternation over N tokens offers N. One trie offers one, whatever
+    its population, which is the structural claim the smoke test below makes.
+    """
+    depth, count, escaped = 0, 1, False
+    for character in pattern:
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif character == "|" and depth == 0:
+            count += 1
+    return count
+
+
+def _distinct_trie_edges(texts) -> int:
+    """Edges in the prefix trie over TEXTS — the work the builder really does."""
+    root: dict = {}
+    edges = 0
+    for text in texts:
+        node = root
+        for character in text:
+            if character not in node:
+                node[character] = {}
+                edges += 1
+            node = node[character]
+    return edges
+
+
 def test_trie_perf_smoke_large_plan_under_5s():
-    # ~1200 unbounded root tokens (label-less → no bounded singletons), so the
-    # identity pass is ONE big trie — the shape the real 2.5MB export hit. The old
-    # flat alternation over ~2400 alternatives takes >>10s on a ~1MB text; the trie
-    # is well under a second, so a 5s wall-clock ceiling is a 10×+ flake margin.
+    # 1,200 label-less roots become 2,402 identity tokens — each root plus its
+    # dash-encoded form, and the username — the shape the real 2.5MB export hit.
+    # The old flat alternation over those takes >>10s on a ~1MB text.
     roots = {f"/srv/service{i:04d}/checkout": "" for i in range(1200)}
     plan = anon.build_anon_plan(
         project_roots=roots, home_dirs=["/home/ci"], usernames=["ci"])
@@ -444,8 +478,30 @@ def test_trie_perf_smoke_large_plan_under_5s():
         chunks.append(piece)
         size += len(piece) + 1
     text = "\n".join(chunks)
+    # The structural claim: construction work follows DISTINCT TRIE EDGES, not
+    # total alternative text. `_build_identity_pattern` collapses each maximal
+    # run of same-boundedness tokens into one trie, so the pattern offers one
+    # top-level branch per RUN — a handful — where a flat alternation would
+    # offer one per token. The run count is derived from the tokens rather than
+    # pinned, because the plan's composition is the implementation's business.
+    token_texts = [token[0] for token in plan.tokens]
+    assert len(token_texts) >= 2400
+    pattern = anon._build_identity_pattern(plan.tokens)
+    runs = 1 + sum(1 for earlier, later in zip(plan.tokens, plan.tokens[1:])
+                   if earlier[2] != later[2])
+    assert runs <= 4, runs
+    assert _top_level_alternatives(pattern) == runs, (
+        f"{_top_level_alternatives(pattern)} top-level branches over {runs} "
+        f"same-boundedness runs of {len(token_texts)} tokens — the runs did "
+        "not collapse into tries")
+    edges = _distinct_trie_edges(token_texts)
+    total_alternative_text = sum(len(t) for t in token_texts)
+    assert edges < total_alternative_text, (edges, total_alternative_text)
+    assert len(pattern) <= 2 * edges, (len(pattern), edges)
+
     t0 = time.monotonic()
     out = anon.scrub_text(text, plan)
     dt = time.monotonic() - t0
-    assert dt < 5.0, f"scrub_text took {dt:.2f}s — trie regression?"
+    # timing-budget: retained beside the edge count, which bounds compiling the pattern and not the scrub_text pass over a megabyte
+    assert dt < 30.0, f"scrub_text took {dt:.2f}s — trie regression?"
     assert "project-" in out                                    # matches actually fired

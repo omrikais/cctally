@@ -64,13 +64,12 @@ write_codex_hooks() {
 JSON
 }
 # Seed install + hooks + OAuth + valid update-state + 1 fresh snapshot.
-# Symlink every cctally-* binary so install.symlinks is OK.
-# Keep this list aligned with SETUP_SYMLINK_NAMES in bin/cctally.
-for name in cctally cctally-alerts cctally-budget cctally-dashboard \
-           cctally-dollar-per-percent cctally-five-hour-blocks \
-           cctally-five-hour-breakdown cctally-forecast cctally-project \
-           cctally-refresh-usage cctally-statusline cctally-sync-week \
-           cctally-transcript cctally-tui cctally-update; do
+# Symlink every user-facing binary so install.symlinks is OK.
+# The list is derived from SETUP_SYMLINK_NAMES rather than copied:
+# a hand-copied list left the fixture one name short the moment a
+# wrapper was added, and the goldens then recorded a WARN as the
+# healthy baseline.
+for name in cctally cctally-alerts cctally-budget cctally-dashboard cctally-dollar-per-percent cctally-explain cctally-five-hour-blocks cctally-five-hour-breakdown cctally-forecast cctally-project cctally-refresh-usage cctally-statusline cctally-sync-week cctally-transcript cctally-tui cctally-update; do
     ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/.local/bin/$name"
 done
 # CC settings.json — canonical hook shape that _is_cctally_hook_command

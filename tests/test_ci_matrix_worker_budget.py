@@ -93,6 +93,13 @@ def test_matrix_lane_does_not_collapse_solo_pytest_workers() -> None:
     )
 
 
+def test_matrix_lane_selects_the_hosted_linux_profile() -> None:
+    """The profile omits the macOS/Homebrew remote-runner harness."""
+    env = _job_env(WORKFLOW, JOB)
+
+    assert env.get("CCTALLY_LINUX_MATRIX_RUN") == "1", env
+
+
 def test_matrix_lane_leaves_inner_and_pytest_unpinned() -> None:
     """Inner derives to min(4, OUTER)=2; pytest auto-tunes to the hosted cores.
 

@@ -31,6 +31,8 @@ import pytest
 
 from conftest import load_script, redirect_paths
 
+from tests._support_http import post_json, start, stop
+
 
 # Subscription-week window the snapshot anchors. Tuesday 14:00 UTC, 7 days.
 WEEK_START = dt.datetime(2026, 5, 26, 14, 0, 0, tzinfo=dt.timezone.utc)
@@ -468,24 +470,6 @@ def _wire_dashboard_handlers(ns):
     ns["DashboardHTTPHandler"].display_tz_pref_override = None
 
 
-def _post_json(host, port, path, body):
-    """POST a JSON body with matched Host + Origin (loopback CSRF contract)."""
-    c = http.client.HTTPConnection(host, port, timeout=2)
-    raw = json.dumps(body).encode()
-    host_header = f"{host}:{port}"
-    c.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
-    c.putheader("Content-Type", "application/json")
-    c.putheader("Content-Length", str(len(raw)))
-    c.putheader("Host", host_header)
-    c.putheader("Origin", f"http://{host_header}")
-    c.endheaders()
-    c.send(raw)
-    r = c.getresponse()
-    payload = r.read().decode("utf-8", errors="replace")
-    parsed = json.loads(payload) if payload else None
-    return r.status, parsed
-
-
 def test_dashboard_post_settings_reconciles_forward_only(ns, monkeypatch):
     """`POST /api/settings {"budget": {weekly_usd:300, thresholds:[90,100]}}`
     while already at 95% spend records the crossed 90 threshold as
@@ -500,18 +484,17 @@ def test_dashboard_post_settings_reconciles_forward_only(ns, monkeypatch):
 
     _wire_dashboard_handlers(ns)
     srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    t = start(srv)
     port = srv.server_address[1]
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"budget": {"weekly_usd": 300, "alert_thresholds": [90, 100]}},
         )
         assert status == 200, body
         assert body["budget"]["weekly_usd"] == 300.0
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
     # Reconcile recorded 90 with alerted_at SET, NO dispatch (the 200 response
     # must not have triggered a retroactive popup).

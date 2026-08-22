@@ -133,6 +133,22 @@ export function Header() {
           the active physical source has >1 real account (byte-stable otherwise);
           renders under the source switcher. */}
       <AccountChipRow />
+      {/* #620 S2 D6 — the persistent, LABELLED entry point to the diagnosis,
+          beside the source and account selectors it is scoped by. A native
+          <button>, so Tab reaches it and Enter or Space activates it without
+          the panel-focus flow R7 records as absent, and labelled in words
+          rather than by an icon, because nothing about a glyph says which
+          question this answers. Dashboard-only, matching the `e` binding's own
+          view scope: the conversations view binds `e` to its reader. */}
+      {view === 'dashboard' ? (
+        <button
+          type="button"
+          className="topbar-explain"
+          onClick={() => dispatchKey('e')}
+        >
+          Explain
+        </button>
+      ) : null}
       {/* condensed readout: Task 7 — a mobile-only, dashboard-only condensed
           line, gated on view==='dashboard' && heroScrolled. Provider-native
           under Codex (native quota summary); hidden under All; Claude keeps the

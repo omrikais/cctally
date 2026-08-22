@@ -14,7 +14,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 import _cctally_db as db
 import _lib_conversation_query as cq
 import json as _json
-import time
 
 # A real model id from CLAUDE_MODEL_PRICING so token-derived cost is genuinely
 # non-zero (the plan's placeholder "opus" resolves to None -> $0, which can't
@@ -224,9 +223,19 @@ def test_outline_null_ts_tolerated():
     assert outline["stats"]["duration_seconds"] is None
 
 
-def test_outline_thousand_turn_session():
+#: `bin/_lib_conversation_query.py:1851` reads turn usage and cost in groups of
+#: this many keys and records the chunk count itself as `(n + 399) // 400`.
+_OUTLINE_CHUNK = 400
+
+#: The two chunked reads that law governs: `_turn_usage_map` and
+#: `_turn_cost_map`. Each issues one statement per chunk.
+_OUTLINE_CHUNKED_READS = 2
+
+
+def _outline_run(rows):
+    """`(connection, outline, statements)` for a session of ROWS messages."""
     c = _conn()
-    for i in range(1000):
+    for i in range(rows):
         ts = "2026-06-12T%02d:%02d:00Z" % (i // 60, i % 60)
         if i % 2 == 0:
             _msg(c, session_id="big", uuid="h%d" % i, source_path="a.jsonl",
@@ -238,10 +247,51 @@ def test_outline_thousand_turn_session():
                  text="reply %d" % i, model=_MODEL,
                  msg_id="m%d" % i, req_id="r%d" % i,
                  blocks_json=_json.dumps([{"kind": "text", "text": "reply %d" % i}]))
-    t0 = time.monotonic()
-    outline = cq.get_conversation_outline(c, "big")
-    elapsed = time.monotonic() - t0
-    assert elapsed < 5.0, elapsed
+    statements = []
+    c.set_trace_callback(statements.append)
+    try:
+        outline = cq.get_conversation_outline(c, "big")
+    finally:
+        c.set_trace_callback(None)
+    return c, outline, len(statements)
+
+
+def _outline_chunks(rows):
+    """The implementation's own chunk count for a session of ROWS messages.
+
+    Every second row is an assistant turn, and each assistant turn contributes
+    one usage-and-cost key.
+    """
+    keys = rows // 2
+    return (keys + _OUTLINE_CHUNK - 1) // _OUTLINE_CHUNK
+
+
+def test_outline_thousand_turn_session():
+    """The outline's database work follows the implementation's chunking law.
+
+    A wall-clock ceiling here measured the machine. The statement count does
+    bound the query work, so it replaces the ceiling outright rather than
+    sitting beside it — but it is not a CONSTANT: the reads chunk at 400 keys,
+    so a 1,000-message session crosses a boundary an 800-message one does not,
+    and pinning a constant would fail correct code. Both sizes are measured and
+    the step between them is asserted, which is the law rather than one point
+    on it.
+    """
+    assert _outline_chunks(800) == 1 and _outline_chunks(1000) == 2
+
+    under, _under_outline, under_statements = _outline_run(800)
+    under.close()
+    c, outline, statements = _outline_run(1000)
+
+    base = under_statements - _OUTLINE_CHUNKED_READS * _outline_chunks(800)
+    assert 0 < base <= 8, (
+        f"{under_statements} statements over one chunk leaves a base of "
+        f"{base}; the outline is doing unchunked per-turn work")
+    assert statements == base + _OUTLINE_CHUNKED_READS * _outline_chunks(1000), (
+        f"{statements} statements over {_outline_chunks(1000)} chunks; the law "
+        f"at `_lib_conversation_query.py:1851` says "
+        f"{base} + {_OUTLINE_CHUNKED_READS} x {_outline_chunks(1000)}")
+
     assert len(outline["turns"]) == 1000
     detail = cq.get_conversation(c, "big", limit=1000)
     assert [t["uuid"] for t in outline["turns"]] == \

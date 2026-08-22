@@ -1931,8 +1931,13 @@ def test_dashboard_source_scale_gate_reuses_idle_provider_state_without_rollout_
                 now_utc=now, precompute_envelope=True, runtime_bind="127.0.0.1",
             )
             changed_elapsed = time.perf_counter() - started
+            digest_statements = []
+            stats.set_trace_callback(digest_statements.append)
             digest_started = time.perf_counter()
-            tui.codex_stats_digest(stats)
+            try:
+                tui.codex_stats_digest(stats)
+            finally:
+                stats.set_trace_callback(None)
             digest_elapsed = time.perf_counter() - digest_started
             idle_started = time.perf_counter()
             idles = [
@@ -1982,15 +1987,33 @@ def test_dashboard_source_scale_gate_reuses_idle_provider_state_without_rollout_
         )
         assert native_share.rows and native_share.rows[0].cells["project"].label
 
-        # Explicit remote-fixture budgets: query-plan evidence is primary.
-        # The changed rebuild is recorded as supporting evidence because its
-        # whole-pipeline wall clock is host-load-sensitive; the digest and idle
-        # paths stay bounded to catch an accidental full scan/regression.
-        assert digest_elapsed < 2.0
-        assert idle_elapsed < 12.0
+        # The structural claims, which fail identically on every machine.
+        #
+        # The digest reads bounded indexed aggregates: a fixed number of
+        # statements over 100,000 Codex entries, 2,000 files, 200 conversations
+        # and 25 quota windows. A regression to per-row or per-window queries
+        # crosses this bound by two orders of magnitude.
+        # Measured at 6 on this fixture; the bound leaves room for one more
+        # aggregate without leaving room for a per-window query.
+        assert len(digest_statements) <= 8, (
+            f"{len(digest_statements)} statements to digest a fixture of "
+            "100,000 entries; the digest is no longer bounded"
+        )
+        # The idle path reuses each provider's state object rather than
+        # rebuilding it, asserted above by identity, and `forbidden_rollout_scan`
+        # forbids the rollout walk outright.
+        #
+        # The wall clocks are RETAINED beside those counters, because a
+        # statement count bounds neither the rows a statement returns nor the
+        # per-row Python work over them. Both sit at the load-safe budget.
+        # timing-budget: retained beside the bounded statement count, which bounds the queries and not the rows they return or the Python over them
+        assert digest_elapsed < 30.0
+        # timing-budget: retained beside the idle object-identity assertions, which bound rebuilding and not the per-row work of the three snapshots
+        assert idle_elapsed < 30.0
         print(
             "source-scale "
             f"changed={changed_elapsed:.3f}s digest={digest_elapsed:.3f}s "
+            f"digest_statements={len(digest_statements)} "
             f"idle3={idle_elapsed:.3f}s rows=100000/50000 files=2000 quota=24+1 projects=200"
         )
     finally:

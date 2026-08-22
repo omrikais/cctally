@@ -23,6 +23,7 @@ WRAPPER_ARGV = {
     "cctally-budget": "budget",
     "cctally-dashboard": "dashboard",
     "cctally-dollar-per-percent": "report --sync-current",
+    "cctally-explain": "explain",
     "cctally-five-hour-blocks": "five-hour-blocks",
     "cctally-five-hour-breakdown": "five-hour-breakdown",
     "cctally-forecast": "forecast",

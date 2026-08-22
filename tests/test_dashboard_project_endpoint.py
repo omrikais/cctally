@@ -32,6 +32,81 @@ def _open(path: pathlib.Path) -> sqlite3.Connection:
     return sqlite3.connect(path)
 
 
+def _noncontiguous_project_window(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> sqlite3.Connection:
+    """A real project store whose four subscription buckets have one gap.
+
+    The entry in the gap is deliberately expensive, while one real session
+    crosses the neighbouring bucket boundary.  This reproduces both #634
+    population defects without deriving expected values from the builders
+    under test.
+    """
+    fixture = tmp_path / "noncontiguous-project-window.db"
+    shutil.copy2(FIXTURE_DIR / "multi-week.db", fixture)
+    conn = _open(fixture)
+    conn.execute(
+        "INSERT INTO session_files(path, size_bytes, mtime_ns, "
+        "last_byte_offset, last_ingested_at, session_id, project_path) "
+        "VALUES (?, 0, 0, 0, ?, ?, ?)",
+        (
+            "/jsonl/cctally-dev/cross-week.jsonl",
+            "2026-05-19T12:00:00Z",
+            "cross-week-session",
+            "/repos/cctally-dev",
+        ),
+    )
+    conn.executemany(
+        "INSERT INTO session_entries(source_path, line_offset, timestamp_utc, "
+        "model, input_tokens, output_tokens, cost_usd_raw, mutation_seq) "
+        "VALUES (?, ?, ?, ?, 1, 1, ?, ?)",
+        [
+            (
+                "/jsonl/cctally-dev/cross-week.jsonl",
+                1,
+                "2026-05-09T12:00:00Z",
+                "claude-sonnet-4-5-20250929",
+                1.0,
+                900_001,
+            ),
+            (
+                "/jsonl/cctally-dev/cross-week.jsonl",
+                2,
+                "2026-05-11T12:00:00Z",
+                "claude-sonnet-4-5-20250929",
+                1.0,
+                900_002,
+            ),
+            (
+                "/jsonl/cctally-dev/w00.jsonl",
+                900_003,
+                "2026-05-10T12:00:00Z",
+                "claude-sonnet-4-5-20250929",
+                999.0,
+                900_003,
+            ),
+        ],
+    )
+    conn.commit()
+
+    utc = dt.timezone.utc
+    bounds = [
+        (dt.datetime(2026, 4, 27, tzinfo=utc), dt.datetime(2026, 5, 4, tzinfo=utc)),
+        (dt.datetime(2026, 5, 4, tzinfo=utc), dt.datetime(2026, 5, 10, tzinfo=utc)),
+        (dt.datetime(2026, 5, 11, tzinfo=utc), dt.datetime(2026, 5, 18, tzinfo=utc)),
+        (dt.datetime(2026, 5, 18, tzinfo=utc), dt.datetime(2026, 5, 25, tzinfo=utc)),
+    ]
+    grid = _cctally_dashboard._ProjectsWeekGrid(bounds)
+    monkeypatch.setattr(
+        _cctally_dashboard,
+        "_projects_week_grid",
+        lambda _conn, *, anchor_utc, weeks_back, account_key=None: grid,
+    )
+    _cctally_dashboard.reset_projects_env_state()
+    _cctally_dashboard._projects_reset_memo()
+    return conn
+
+
 # --- Unit-level tests of `_project_detail_for_window` ---------------------
 
 
@@ -102,6 +177,67 @@ def test_detail_window_cost_matches_trend_per_project():
     assert detail is not None
     target_sum = sum(target["weekly_cost"])
     assert abs(detail["window_cost_usd"] - target_sum) < 1e-9
+
+
+def test_detail_uses_the_same_noncontiguous_subscription_buckets_as_the_table(
+    tmp_path, monkeypatch,
+):
+    """A gap inside the bounding span is not part of either population."""
+    conn = _noncontiguous_project_window(tmp_path, monkeypatch)
+    env = _build_projects_envelope(
+        conn, now_utc=NOW_UTC, current_week=None, weeks_back=4,
+        use_projects_env_cache=True,
+    )
+    target = next(
+        row for row in env["trend"]["projects"]
+        if row["key"] == "cctally-dev"
+    )
+    detail = _project_detail_for_window(
+        conn,
+        project_key="cctally-dev",
+        weeks_back=4,
+        now_utc=NOW_UTC,
+        current_week=None,
+        projects_envelope=env,
+    )
+    assert detail is not None
+    assert abs(
+        detail["window_cost_usd"] - sum(target["weekly_cost"])
+    ) < 1e-9
+    assert detail["window_intervals"] == [
+        {"start_at": "2026-04-27T00:00:00Z", "end_at": "2026-05-04T00:00:00Z"},
+        {"start_at": "2026-05-04T00:00:00Z", "end_at": "2026-05-10T00:00:00Z"},
+        {"start_at": "2026-05-11T00:00:00Z", "end_at": "2026-05-18T00:00:00Z"},
+        {"start_at": "2026-05-18T00:00:00Z", "end_at": "2026-05-25T00:00:00Z"},
+    ]
+
+
+def test_table_session_total_deduplicates_across_subscription_buckets(
+    tmp_path, monkeypatch,
+):
+    """One session spanning two buckets is one session in the 4w total."""
+    conn = _noncontiguous_project_window(tmp_path, monkeypatch)
+    env = _build_projects_envelope(
+        conn, now_utc=NOW_UTC, current_week=None, weeks_back=4,
+        use_projects_env_cache=True,
+    )
+    target = next(
+        row for row in env["trend"]["projects"]
+        if row["key"] == "cctally-dev"
+    )
+    detail = _project_detail_for_window(
+        conn,
+        project_key="cctally-dev",
+        weeks_back=4,
+        now_utc=NOW_UTC,
+        current_week=None,
+        projects_envelope=env,
+    )
+    assert detail is not None
+    assert target["session_counts_by_window"]["4"] == detail["sessions_total"]
+    assert target["session_counts_by_window"]["4"] < sum(
+        target["sessions_per_week"]
+    )
 
 
 def test_detail_excludes_an_entry_exactly_at_the_published_end(tmp_path):

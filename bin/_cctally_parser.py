@@ -2385,6 +2385,89 @@ def _build_diff_parser(subparsers, name, *, help_text, xref=None, fixed_source=N
     _add_account_arg(diff_p)
     diff_p.set_defaults(func=c.cmd_diff)
 
+def _build_explain_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `explain` parser (registered via _REGISTRATION; #620 S2).
+
+    `explain` deliberately does NOT adopt the shareable-output surface
+    (`--format`/`--theme`/`--output`/`--copy`/`--open`). That surface is a
+    separate concern with its own render kernel and byte-stability gates;
+    only `--reveal-projects` is shared, because privacy is part of what the
+    diagnosis publishes rather than part of how it is shared.
+    """
+    c = _cctally()
+    explain_p = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Explain where locally retained usage went, over seven
+            contributor classes. Four are accounting-native: expensive model
+            mix, one project dominating, one session dominating, and
+            concentrated 5-hour bursts. Three are conversation-derived:
+            prompt-cache churn, short conversations carrying large context,
+            and subagent fan-out.
+
+            Each class reports a contributor when its top subject reaches the
+            classification floor of its named denominator, reports no
+            contributor when it is measured and nothing reaches the floor,
+            and withholds with a typed cause when it cannot be measured. The
+            classes overlap, so shares do not sum to 100 percent. Each class
+            states the rule in force, so a verdict can be reproduced rather
+            than inferred.
+
+            The three conversation-derived classes read the local transcript
+            store, so they are withheld where it is absent or unreadable.
+            Codex subagent attribution is derived from accounting metadata
+            and needs no transcript access.
+
+            Exit codes: 0 for a valid report, including a healthy one and one
+            whose fields are withheld; 2 for selector and usage errors; 3 for
+            a report-establishment failure.
+            """
+        ),
+    )
+    explain_p.add_argument(
+        # Defaulted to None rather than to the token itself, so the mutual
+        # exclusion below can tell "the user asked for a window" from "nobody
+        # said". `cmd_explain` resolves the absent case to `this-week`, which
+        # is what keeps the default behaviour and the --help text unchanged.
+        "--window", default=None,
+        help="Window token (this-week | last-week | Nw-ago | this-month | "
+             "last-month | Nm-ago | last-Nd | prev-Nd | "
+             "YYYY-MM-DD..YYYY-MM-DD). Default: this-week.",
+    )
+    # Exact instants, because date grammar cannot express the window a warning
+    # fired against: a five-hour block starts at an instant, not on a calendar
+    # day. This is the pair the dashboard route already accepts, and the pair
+    # every conversation-derived next step carries, so following one reproduces
+    # the population the row measured rather than a day that contains it.
+    explain_p.add_argument(
+        "--start-at", default=None, metavar="ISO",
+        help="Exact window start instant, inclusive (ISO 8601, e.g. "
+             "2026-08-10T00:00:00Z). Requires --end-at and cannot be "
+             "combined with --window.",
+    )
+    explain_p.add_argument(
+        "--end-at", default=None, metavar="ISO",
+        help="Exact window end instant, EXCLUSIVE (ISO 8601). Requires "
+             "--start-at and cannot be combined with --window.",
+    )
+    explain_p.add_argument("--json", dest="emit_json", action="store_true",
+        help="Emit the stamped JSON envelope instead of the terminal report.")
+    explain_p.add_argument(
+        "--reveal-projects", action="store_true", dest="reveal_projects",
+        help="Show derived project display labels instead of the default "
+             "project-1, project-2, ... anonymization. Never shows "
+             "filesystem paths, and never widens session identities.",
+    )
+    explain_p.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
+        help="Display timezone: local, utc, or IANA name. "
+             "Overrides config display.tz for this call.")
+    _add_source_args(explain_p, speed=True)
+    _add_account_arg(explain_p)
+    explain_p.set_defaults(func=c.cmd_explain)
+
 def _build_claude_parser(subparsers, name, *, help_text, xref=None):
     """Build the `claude` parser (registered via _REGISTRATION; #279 S6 W3).
 
@@ -3743,6 +3826,7 @@ _REGISTRATION = (
     _Reg('alerts', _build_alerts_parser, "Manage threshold alerts", None, None),
     _Reg('setup', _build_setup_parser, "Install provider hooks/handlers + symlinks", None, None),
     _Reg('db', _build_db_parser, "Migration / DB management (status, skip, unskip)", None, None),
+    _Reg('explain', _build_explain_parser, "Explain where locally retained usage went, ranked with evidence", None, None),
     _Reg('doctor', _build_doctor_parser, "Diagnose data freshness and install state", None, None),
     _Reg('dashboard-perf', _build_dashboard_perf_parser, "Read a running dashboard's tick cost; arm its phase trace", None, None),
     _Reg('pricing-check', _build_pricing_check_parser, "Detect stale or missing embedded model pricing", None, None),

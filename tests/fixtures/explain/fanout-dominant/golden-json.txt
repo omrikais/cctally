@@ -1,0 +1,848 @@
+{
+  "schemaVersion": 1,
+  "contractVersion": 1,
+  "measuredAt": "2026-08-17T00:00:00Z",
+  "window": {
+    "startAt": "2026-08-10T00:00:00Z",
+    "endAt": "2026-08-17T00:00:00Z",
+    "tz": "Etc/UTC",
+    "label": "2026-08-10..2026-08-16"
+  },
+  "constants": {
+    "contributorShareFloor": 0.2,
+    "shareFloorEpsilon": 1e-09,
+    "tieEpsilonUsd": 1e-09,
+    "confidenceHighMinSupport": 20,
+    "confidenceMediumMinSupport": 5,
+    "confidenceMediumMinCoverage": 0.8,
+    "withholdMinCoverage": 0.5,
+    "withholdMinSupport": 2,
+    "shortConversationMaxHumanTurns": 3,
+    "largeContextMinWindowFraction": 0.8,
+    "minSubagentBuckets": 2,
+    "seedScanBudgetRows": 50000,
+    "conversationNormalizeBudgetRows": 2000,
+    "codexEventScanBudgetRows": 1048576,
+    "codexEventScanPerFileRows": 4096,
+    "gapCodes": [
+      "ambiguous_origin_category",
+      "scan_budget_exhausted",
+      "unknown_context_window",
+      "unresolved_subagent_attribution"
+    ],
+    "turnDefinition": "Turn definition: main-thread human messages only \u2014 non-sidechain, non-subagent, after command and meta normalisation; assistant replies associate with the nearest preceding human.",
+    "registry": [
+      {
+        "contributorClass": "model_mix",
+        "subjectKind": "model",
+        "label": "Expensive model mix",
+        "minDistinctSubjects": 2,
+        "minPricedEntries": 20
+      },
+      {
+        "contributorClass": "project_concentration",
+        "subjectKind": "project",
+        "label": "One project dominating",
+        "minDistinctSubjects": 2,
+        "minPricedEntries": 20
+      },
+      {
+        "contributorClass": "session_concentration",
+        "subjectKind": "session",
+        "label": "One session dominating",
+        "minDistinctSubjects": 2,
+        "minPricedEntries": 20
+      },
+      {
+        "contributorClass": "five_hour_bursts",
+        "subjectKind": "block",
+        "label": "Concentrated 5-hour bursts",
+        "minDistinctSubjects": 2,
+        "minPricedEntries": 20
+      },
+      {
+        "contributorClass": "cache_churn",
+        "subjectKind": "qualifying_set",
+        "label": "Prompt-cache churn",
+        "minDistinctSubjects": 1,
+        "minPricedEntries": 20,
+        "rule": {
+          "sentence": "Turns whose prompt cache was rebuilt: the cached prefix collapsed and was re-created in the same turn.",
+          "parameters": {
+            "collapseFraction": 0.5,
+            "recreateFraction": 0.75,
+            "cacheFloorTokens": 20000,
+            "createFloorTokens": 20000
+          }
+        }
+      },
+      {
+        "contributorClass": "short_high_context",
+        "subjectKind": "qualifying_set",
+        "label": "Short conversations carrying large context",
+        "minDistinctSubjects": 1,
+        "minPricedEntries": 20,
+        "rule": {
+          "sentence": "Conversations with at most 3 human turns where at least one request used at least 80% of that request's model context window. With several replies the largest single request fraction is used, never their sum.",
+          "parameters": {
+            "maxHumanTurns": 3,
+            "minWindowFraction": 0.8
+          }
+        }
+      },
+      {
+        "contributorClass": "subagent_fanout",
+        "subjectKind": "qualifying_set",
+        "label": "Subagent fan-out",
+        "minDistinctSubjects": 1,
+        "minPricedEntries": 20,
+        "rule": {
+          "sentence": "Cost attributable to delegated subagent work, grouped by parent. On Codex this is an identifiable subset of unknown completeness.",
+          "parameters": {
+            "minBuckets": 2
+          }
+        }
+      }
+    ]
+  },
+  "notes": {
+    "scope": "This explains locally retained cost and tokens, not quota percentage.",
+    "overlap": "The classes overlap \u2014 one session is also a project and a model \u2014 so shares do not sum to 100 percent."
+  },
+  "overallVerdict": "contributor_detected",
+  "overallCode": null,
+  "applicableClassCount": 7,
+  "withheldClassCount": 3,
+  "results": [
+    {
+      "source": "claude",
+      "accountKey": null,
+      "effectiveSpeed": null,
+      "generation": {
+        "stats": "602b8a8edc683c3457868159ba3ffe5b6dabb5fbf99f5bc171b06250567eb790",
+        "cache": "ade79b4b702a59c7330e7c7d59679186c6565d3118aeb4b7189122747af81aeb",
+        "configuration": "7eb9e1ec6c9a432be5de325fbb53aabd8a981eae2e4527d4195f17a3f70b760e",
+        "conversations": "df9421af53da46723245ce78d729711b7f8e436bb35704b0661e9dcb8921f1a6",
+        "generationId": "9162d74703f5000fb28f9e1e1e48f748aea8c88394cc6d129fe1329e09f9aa79"
+      },
+      "denominator": {
+        "identity": "totalExplainedRetainedCost",
+        "source": "claude",
+        "accountKey": null,
+        "windowStart": "2026-08-10T00:00:00Z",
+        "windowEnd": "2026-08-17T00:00:00Z",
+        "populationDigest": "ec838d1ea3b52991e61fdd33997c3f0f",
+        "usd": {
+          "state": "available",
+          "value": 5.6208,
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T08:45:00Z",
+            "supportUnits": 32,
+            "gapCodes": [],
+            "countCoverage": 1.0,
+            "usdCoverage": 1.0,
+            "identityCoverage": 1.0,
+            "retentionCoverage": 1.0,
+            "pricingCoverage": 1.0
+          },
+          "qualifications": []
+        }
+      },
+      "coverage": {
+        "requestedStart": "2026-08-10T00:00:00Z",
+        "requestedEnd": "2026-08-17T00:00:00Z",
+        "observedStart": "2026-08-10T00:00:00Z",
+        "observedEnd": "2026-08-10T08:45:00Z",
+        "supportUnits": 32,
+        "gapCodes": [],
+        "countCoverage": 1.0,
+        "usdCoverage": 1.0,
+        "identityCoverage": 1.0,
+        "retentionCoverage": 1.0,
+        "pricingCoverage": 1.0
+      },
+      "verdict": "contributor_detected",
+      "code": null,
+      "applicableClassCount": 7,
+      "withheldClassCount": 3,
+      "contributors": [
+        {
+          "contributorClass": "five_hour_bursts",
+          "subjectKind": "block",
+          "subjectKey": "claude|standard|2026-08-10T05:00:00Z",
+          "subjectLabel": "2026-08-10T05:00:00Z",
+          "rank": 1,
+          "observedUsd": {
+            "state": "available",
+            "value": 5.1606,
+            "population": {
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "observedEnd": "2026-08-10T08:45:00Z",
+              "supportUnits": 32,
+              "gapCodes": [],
+              "countCoverage": 1.0,
+              "usdCoverage": 1.0,
+              "identityCoverage": 1.0,
+              "retentionCoverage": 1.0,
+              "pricingCoverage": 1.0
+            },
+            "qualifications": []
+          },
+          "share": {
+            "state": "available",
+            "value": 0.918125533731853,
+            "population": {
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "observedEnd": "2026-08-10T08:45:00Z",
+              "supportUnits": 32,
+              "gapCodes": [],
+              "countCoverage": 1.0,
+              "usdCoverage": 1.0,
+              "identityCoverage": 1.0,
+              "retentionCoverage": 1.0,
+              "pricingCoverage": 1.0
+            },
+            "qualifications": []
+          },
+          "baseline": {
+            "state": "withheld",
+            "value": null,
+            "population": {
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "observedEnd": "2026-08-10T08:45:00Z",
+              "supportUnits": 32,
+              "gapCodes": [],
+              "countCoverage": 1.0,
+              "usdCoverage": 1.0,
+              "identityCoverage": 1.0,
+              "retentionCoverage": 1.0,
+              "pricingCoverage": 1.0
+            },
+            "qualifications": [],
+            "code": "baseline_insufficient"
+          },
+          "confidence": "high",
+          "isFallbackPricing": false,
+          "nextStep": "cctally five-hour-breakdown --block-start 2026-08-10T05:00:00Z"
+        },
+        {
+          "contributorClass": "subagent_fanout",
+          "subjectKind": "qualifying_set",
+          "subjectKey": "qualifying-set/subagent-fanout",
+          "subjectLabel": "Delegated subagent work",
+          "rank": 2,
+          "observedUsd": {
+            "state": "available",
+            "value": 5.1606,
+            "population": {
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "observedEnd": "2026-08-10T08:45:00Z",
+              "supportUnits": 32,
+              "gapCodes": [],
+              "countCoverage": 1.0,
+              "usdCoverage": 1.0,
+              "identityCoverage": 1.0,
+              "retentionCoverage": 1.0,
+              "pricingCoverage": 1.0,
+              "evaluabilityCoverage": 1.0,
+              "dimensions": {
+                "countCoverage": "evaluated entries / all in-window provider entries",
+                "usdCoverage": "evaluated USD / all in-window provider USD",
+                "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+                "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+                "retentionCoverage": "the fraction of the requested window the store could answer for",
+                "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+                "supportUnits": "evaluated entries"
+              }
+            },
+            "qualifications": []
+          },
+          "share": {
+            "state": "available",
+            "value": 0.918125533731853,
+            "population": {
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "observedEnd": "2026-08-10T08:45:00Z",
+              "supportUnits": 32,
+              "gapCodes": [],
+              "countCoverage": 1.0,
+              "usdCoverage": 1.0,
+              "identityCoverage": 1.0,
+              "retentionCoverage": 1.0,
+              "pricingCoverage": 1.0,
+              "evaluabilityCoverage": 1.0,
+              "dimensions": {
+                "countCoverage": "evaluated entries / all in-window provider entries",
+                "usdCoverage": "evaluated USD / all in-window provider USD",
+                "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+                "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+                "retentionCoverage": "the fraction of the requested window the store could answer for",
+                "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+                "supportUnits": "evaluated entries"
+              }
+            },
+            "qualifications": []
+          },
+          "baseline": {
+            "state": "withheld",
+            "value": null,
+            "population": {
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "observedEnd": "2026-08-10T08:45:00Z",
+              "supportUnits": 32,
+              "gapCodes": [],
+              "countCoverage": 1.0,
+              "usdCoverage": 1.0,
+              "identityCoverage": 1.0,
+              "retentionCoverage": 1.0,
+              "pricingCoverage": 1.0,
+              "evaluabilityCoverage": 1.0,
+              "dimensions": {
+                "countCoverage": "evaluated entries / all in-window provider entries",
+                "usdCoverage": "evaluated USD / all in-window provider USD",
+                "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+                "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+                "retentionCoverage": "the fraction of the requested window the store could answer for",
+                "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+                "supportUnits": "evaluated entries"
+              }
+            },
+            "qualifications": [],
+            "code": "baseline_insufficient"
+          },
+          "confidence": "high",
+          "isFallbackPricing": false,
+          "nextStep": "cctally explain --source claude --start-at 2026-08-10T00:00:00Z --end-at 2026-08-17T00:00:00Z --json",
+          "evidence": {
+            "identifiedSubagentCount": {
+              "state": "available",
+              "value": 3,
+              "population": {
+                "requestedStart": "2026-08-10T00:00:00Z",
+                "requestedEnd": "2026-08-17T00:00:00Z",
+                "observedStart": "2026-08-10T00:00:00Z",
+                "observedEnd": "2026-08-10T08:45:00Z",
+                "supportUnits": 32,
+                "gapCodes": [],
+                "countCoverage": 1.0,
+                "usdCoverage": 1.0,
+                "identityCoverage": 1.0,
+                "retentionCoverage": 1.0,
+                "pricingCoverage": 1.0,
+                "evaluabilityCoverage": 1.0,
+                "dimensions": {
+                  "countCoverage": "evaluated entries / all in-window provider entries",
+                  "usdCoverage": "evaluated USD / all in-window provider USD",
+                  "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+                  "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+                  "retentionCoverage": "the fraction of the requested window the store could answer for",
+                  "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+                  "supportUnits": "evaluated entries"
+                }
+              },
+              "qualifications": []
+            },
+            "largestSubagentShare": {
+              "state": "available",
+              "value": 0.33333333333333337,
+              "population": {
+                "requestedStart": "2026-08-10T00:00:00Z",
+                "requestedEnd": "2026-08-17T00:00:00Z",
+                "observedStart": "2026-08-10T00:00:00Z",
+                "observedEnd": "2026-08-10T08:45:00Z",
+                "supportUnits": 32,
+                "gapCodes": [],
+                "countCoverage": 1.0,
+                "usdCoverage": 1.0,
+                "identityCoverage": 1.0,
+                "retentionCoverage": 1.0,
+                "pricingCoverage": 1.0,
+                "evaluabilityCoverage": 1.0,
+                "dimensions": {
+                  "countCoverage": "evaluated entries / all in-window provider entries",
+                  "usdCoverage": "evaluated USD / all in-window provider USD",
+                  "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+                  "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+                  "retentionCoverage": "the fraction of the requested window the store could answer for",
+                  "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+                  "supportUnits": "evaluated entries"
+                }
+              },
+              "qualifications": []
+            },
+            "unallocatedUsd": {
+              "state": "available",
+              "value": 0.0,
+              "population": {
+                "requestedStart": "2026-08-10T00:00:00Z",
+                "requestedEnd": "2026-08-17T00:00:00Z",
+                "observedStart": "2026-08-10T00:00:00Z",
+                "observedEnd": "2026-08-10T08:45:00Z",
+                "supportUnits": 32,
+                "gapCodes": [],
+                "countCoverage": 1.0,
+                "usdCoverage": 1.0,
+                "identityCoverage": 1.0,
+                "retentionCoverage": 1.0,
+                "pricingCoverage": 1.0,
+                "evaluabilityCoverage": 1.0,
+                "dimensions": {
+                  "countCoverage": "evaluated entries / all in-window provider entries",
+                  "usdCoverage": "evaluated USD / all in-window provider USD",
+                  "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+                  "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+                  "retentionCoverage": "the fraction of the requested window the store could answer for",
+                  "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+                  "supportUnits": "evaluated entries"
+                }
+              },
+              "qualifications": []
+            }
+          }
+        }
+      ],
+      "classes": [
+        {
+          "contributorClass": "model_mix",
+          "verdict": "withheld",
+          "code": "insufficient_population",
+          "supportShortfall": "min_distinct_subjects",
+          "confidence": null,
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T08:45:00Z",
+            "supportUnits": 32,
+            "gapCodes": [],
+            "countCoverage": 1.0,
+            "usdCoverage": 1.0,
+            "identityCoverage": 1.0,
+            "retentionCoverage": 1.0,
+            "pricingCoverage": 1.0
+          },
+          "rows": []
+        },
+        {
+          "contributorClass": "project_concentration",
+          "verdict": "withheld",
+          "code": "insufficient_population",
+          "supportShortfall": "min_distinct_subjects",
+          "confidence": null,
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T08:45:00Z",
+            "supportUnits": 32,
+            "gapCodes": [],
+            "countCoverage": 1.0,
+            "usdCoverage": 1.0,
+            "identityCoverage": 1.0,
+            "retentionCoverage": 1.0,
+            "pricingCoverage": 1.0
+          },
+          "rows": []
+        },
+        {
+          "contributorClass": "session_concentration",
+          "verdict": "withheld",
+          "code": "insufficient_population",
+          "supportShortfall": "min_distinct_subjects",
+          "confidence": null,
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T08:45:00Z",
+            "supportUnits": 32,
+            "gapCodes": [],
+            "countCoverage": 1.0,
+            "usdCoverage": 1.0,
+            "identityCoverage": 1.0,
+            "retentionCoverage": 1.0,
+            "pricingCoverage": 1.0
+          },
+          "rows": []
+        },
+        {
+          "contributorClass": "five_hour_bursts",
+          "verdict": "contributor",
+          "code": null,
+          "supportShortfall": null,
+          "confidence": "high",
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T08:45:00Z",
+            "supportUnits": 32,
+            "gapCodes": [],
+            "countCoverage": 1.0,
+            "usdCoverage": 1.0,
+            "identityCoverage": 1.0,
+            "retentionCoverage": 1.0,
+            "pricingCoverage": 1.0
+          },
+          "rows": [
+            {
+              "contributorClass": "five_hour_bursts",
+              "subjectKind": "block",
+              "subjectKey": "claude|standard|2026-08-10T05:00:00Z",
+              "subjectLabel": "2026-08-10T05:00:00Z",
+              "rank": 1,
+              "observedUsd": {
+                "state": "available",
+                "value": 5.1606,
+                "population": {
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "observedEnd": "2026-08-10T08:45:00Z",
+                  "supportUnits": 32,
+                  "gapCodes": [],
+                  "countCoverage": 1.0,
+                  "usdCoverage": 1.0,
+                  "identityCoverage": 1.0,
+                  "retentionCoverage": 1.0,
+                  "pricingCoverage": 1.0
+                },
+                "qualifications": []
+              },
+              "share": {
+                "state": "available",
+                "value": 0.918125533731853,
+                "population": {
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "observedEnd": "2026-08-10T08:45:00Z",
+                  "supportUnits": 32,
+                  "gapCodes": [],
+                  "countCoverage": 1.0,
+                  "usdCoverage": 1.0,
+                  "identityCoverage": 1.0,
+                  "retentionCoverage": 1.0,
+                  "pricingCoverage": 1.0
+                },
+                "qualifications": []
+              },
+              "baseline": {
+                "state": "withheld",
+                "value": null,
+                "population": {
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "observedEnd": "2026-08-10T08:45:00Z",
+                  "supportUnits": 32,
+                  "gapCodes": [],
+                  "countCoverage": 1.0,
+                  "usdCoverage": 1.0,
+                  "identityCoverage": 1.0,
+                  "retentionCoverage": 1.0,
+                  "pricingCoverage": 1.0
+                },
+                "qualifications": [],
+                "code": "baseline_insufficient"
+              },
+              "confidence": "high",
+              "isFallbackPricing": false,
+              "nextStep": "cctally five-hour-breakdown --block-start 2026-08-10T05:00:00Z"
+            }
+          ]
+        },
+        {
+          "contributorClass": "cache_churn",
+          "verdict": "no_contributor",
+          "code": null,
+          "supportShortfall": null,
+          "confidence": "high",
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T08:45:00Z",
+            "supportUnits": 32,
+            "gapCodes": [],
+            "countCoverage": 1.0,
+            "usdCoverage": 1.0,
+            "identityCoverage": 1.0,
+            "retentionCoverage": 1.0,
+            "pricingCoverage": 1.0,
+            "evaluabilityCoverage": 1.0,
+            "dimensions": {
+              "countCoverage": "evaluated entries / all in-window provider entries",
+              "usdCoverage": "evaluated USD / all in-window provider USD",
+              "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+              "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+              "retentionCoverage": "the fraction of the requested window the store could answer for",
+              "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+              "supportUnits": "evaluated entries"
+            }
+          },
+          "rows": []
+        },
+        {
+          "contributorClass": "short_high_context",
+          "verdict": "no_contributor",
+          "code": null,
+          "supportShortfall": null,
+          "confidence": "high",
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T08:45:00Z",
+            "supportUnits": 32,
+            "gapCodes": [],
+            "countCoverage": 1.0,
+            "usdCoverage": 1.0,
+            "identityCoverage": 1.0,
+            "retentionCoverage": 1.0,
+            "pricingCoverage": 1.0,
+            "evaluabilityCoverage": 1.0,
+            "dimensions": {
+              "countCoverage": "evaluated entries / all in-window provider entries",
+              "usdCoverage": "evaluated USD / all in-window provider USD",
+              "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+              "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+              "retentionCoverage": "the fraction of the requested window the store could answer for",
+              "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+              "supportUnits": "evaluated entries"
+            }
+          },
+          "rows": []
+        },
+        {
+          "contributorClass": "subagent_fanout",
+          "verdict": "contributor",
+          "code": null,
+          "supportShortfall": null,
+          "confidence": "high",
+          "population": {
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "observedEnd": "2026-08-10T08:45:00Z",
+            "supportUnits": 32,
+            "gapCodes": [],
+            "countCoverage": 1.0,
+            "usdCoverage": 1.0,
+            "identityCoverage": 1.0,
+            "retentionCoverage": 1.0,
+            "pricingCoverage": 1.0,
+            "evaluabilityCoverage": 1.0,
+            "dimensions": {
+              "countCoverage": "evaluated entries / all in-window provider entries",
+              "usdCoverage": "evaluated USD / all in-window provider USD",
+              "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+              "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+              "retentionCoverage": "the fraction of the requested window the store could answer for",
+              "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+              "supportUnits": "evaluated entries"
+            }
+          },
+          "rows": [
+            {
+              "contributorClass": "subagent_fanout",
+              "subjectKind": "qualifying_set",
+              "subjectKey": "qualifying-set/subagent-fanout",
+              "subjectLabel": "Delegated subagent work",
+              "rank": 2,
+              "observedUsd": {
+                "state": "available",
+                "value": 5.1606,
+                "population": {
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "observedEnd": "2026-08-10T08:45:00Z",
+                  "supportUnits": 32,
+                  "gapCodes": [],
+                  "countCoverage": 1.0,
+                  "usdCoverage": 1.0,
+                  "identityCoverage": 1.0,
+                  "retentionCoverage": 1.0,
+                  "pricingCoverage": 1.0,
+                  "evaluabilityCoverage": 1.0,
+                  "dimensions": {
+                    "countCoverage": "evaluated entries / all in-window provider entries",
+                    "usdCoverage": "evaluated USD / all in-window provider USD",
+                    "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+                    "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+                    "retentionCoverage": "the fraction of the requested window the store could answer for",
+                    "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+                    "supportUnits": "evaluated entries"
+                  }
+                },
+                "qualifications": []
+              },
+              "share": {
+                "state": "available",
+                "value": 0.918125533731853,
+                "population": {
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "observedEnd": "2026-08-10T08:45:00Z",
+                  "supportUnits": 32,
+                  "gapCodes": [],
+                  "countCoverage": 1.0,
+                  "usdCoverage": 1.0,
+                  "identityCoverage": 1.0,
+                  "retentionCoverage": 1.0,
+                  "pricingCoverage": 1.0,
+                  "evaluabilityCoverage": 1.0,
+                  "dimensions": {
+                    "countCoverage": "evaluated entries / all in-window provider entries",
+                    "usdCoverage": "evaluated USD / all in-window provider USD",
+                    "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+                    "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+                    "retentionCoverage": "the fraction of the requested window the store could answer for",
+                    "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+                    "supportUnits": "evaluated entries"
+                  }
+                },
+                "qualifications": []
+              },
+              "baseline": {
+                "state": "withheld",
+                "value": null,
+                "population": {
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "observedEnd": "2026-08-10T08:45:00Z",
+                  "supportUnits": 32,
+                  "gapCodes": [],
+                  "countCoverage": 1.0,
+                  "usdCoverage": 1.0,
+                  "identityCoverage": 1.0,
+                  "retentionCoverage": 1.0,
+                  "pricingCoverage": 1.0,
+                  "evaluabilityCoverage": 1.0,
+                  "dimensions": {
+                    "countCoverage": "evaluated entries / all in-window provider entries",
+                    "usdCoverage": "evaluated USD / all in-window provider USD",
+                    "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+                    "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+                    "retentionCoverage": "the fraction of the requested window the store could answer for",
+                    "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+                    "supportUnits": "evaluated entries"
+                  }
+                },
+                "qualifications": [],
+                "code": "baseline_insufficient"
+              },
+              "confidence": "high",
+              "isFallbackPricing": false,
+              "nextStep": "cctally explain --source claude --start-at 2026-08-10T00:00:00Z --end-at 2026-08-17T00:00:00Z --json",
+              "evidence": {
+                "identifiedSubagentCount": {
+                  "state": "available",
+                  "value": 3,
+                  "population": {
+                    "requestedStart": "2026-08-10T00:00:00Z",
+                    "requestedEnd": "2026-08-17T00:00:00Z",
+                    "observedStart": "2026-08-10T00:00:00Z",
+                    "observedEnd": "2026-08-10T08:45:00Z",
+                    "supportUnits": 32,
+                    "gapCodes": [],
+                    "countCoverage": 1.0,
+                    "usdCoverage": 1.0,
+                    "identityCoverage": 1.0,
+                    "retentionCoverage": 1.0,
+                    "pricingCoverage": 1.0,
+                    "evaluabilityCoverage": 1.0,
+                    "dimensions": {
+                      "countCoverage": "evaluated entries / all in-window provider entries",
+                      "usdCoverage": "evaluated USD / all in-window provider USD",
+                      "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+                      "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+                      "retentionCoverage": "the fraction of the requested window the store could answer for",
+                      "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+                      "supportUnits": "evaluated entries"
+                    }
+                  },
+                  "qualifications": []
+                },
+                "largestSubagentShare": {
+                  "state": "available",
+                  "value": 0.33333333333333337,
+                  "population": {
+                    "requestedStart": "2026-08-10T00:00:00Z",
+                    "requestedEnd": "2026-08-17T00:00:00Z",
+                    "observedStart": "2026-08-10T00:00:00Z",
+                    "observedEnd": "2026-08-10T08:45:00Z",
+                    "supportUnits": 32,
+                    "gapCodes": [],
+                    "countCoverage": 1.0,
+                    "usdCoverage": 1.0,
+                    "identityCoverage": 1.0,
+                    "retentionCoverage": 1.0,
+                    "pricingCoverage": 1.0,
+                    "evaluabilityCoverage": 1.0,
+                    "dimensions": {
+                      "countCoverage": "evaluated entries / all in-window provider entries",
+                      "usdCoverage": "evaluated USD / all in-window provider USD",
+                      "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+                      "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+                      "retentionCoverage": "the fraction of the requested window the store could answer for",
+                      "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+                      "supportUnits": "evaluated entries"
+                    }
+                  },
+                  "qualifications": []
+                },
+                "unallocatedUsd": {
+                  "state": "available",
+                  "value": 0.0,
+                  "population": {
+                    "requestedStart": "2026-08-10T00:00:00Z",
+                    "requestedEnd": "2026-08-17T00:00:00Z",
+                    "observedStart": "2026-08-10T00:00:00Z",
+                    "observedEnd": "2026-08-10T08:45:00Z",
+                    "supportUnits": 32,
+                    "gapCodes": [],
+                    "countCoverage": 1.0,
+                    "usdCoverage": 1.0,
+                    "identityCoverage": 1.0,
+                    "retentionCoverage": 1.0,
+                    "pricingCoverage": 1.0,
+                    "evaluabilityCoverage": 1.0,
+                    "dimensions": {
+                      "countCoverage": "evaluated entries / all in-window provider entries",
+                      "usdCoverage": "evaluated USD / all in-window provider USD",
+                      "identityCoverage": "evaluated entries whose subject identity resolved / evaluated entries",
+                      "pricingCoverage": "evaluated entries priced from their own row / evaluated entries",
+                      "retentionCoverage": "the fraction of the requested window the store could answer for",
+                      "evaluabilityCoverage": "entries whose predicate could be decided / entries eligible for an attempted evaluation",
+                      "supportUnits": "evaluated entries"
+                    }
+                  },
+                  "qualifications": []
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

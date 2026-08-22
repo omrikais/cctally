@@ -20,6 +20,7 @@ import urllib.request
 import pytest
 
 from conftest import load_script, redirect_paths
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
 
 
 # Real keys + paths to seed into the snapshot. These are the tokens the
@@ -116,9 +117,7 @@ def _start_share_server_with_projects(ns, tmp_path, monkeypatch):
     HandlerCls.display_tz_pref_override = None
 
     srv = socketserver.TCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    srv._test_thread = start(srv)
     return srv
 
 
@@ -129,7 +128,7 @@ def projects_share_server(tmp_path, monkeypatch):
     try:
         yield srv.server_address[1]
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def _csrf_headers(port: int) -> dict[str, str]:
@@ -161,7 +160,7 @@ def _render(port: int, fmt: str, reveal: bool, template_id: str) -> bytes:
         data=req_body, method="POST",
         headers=_csrf_headers(port),
     )
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with urllib.request.urlopen(req, timeout=PRESENCE_BACKSTOP_SECONDS) as r:
         body = json.loads(r.read())
     rendered = body["body"]
     if isinstance(rendered, str):

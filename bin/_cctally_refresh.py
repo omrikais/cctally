@@ -918,6 +918,58 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
 # Hook-tick OAuth refresh path
 # =========================================================================
 
+def _hook_tick_oauth_skip_status(c, *, throttle_seconds: float) -> str | None:
+    """Return the automatic-refresh suppression reason under selected lock."""
+    now_epoch = int(time.time())
+    needs_repair = c._authoritative_repair_required(now_epoch=now_epoch)
+    obs_age = c._statusline_observe_age_seconds()
+    if (not needs_repair
+            and obs_age < float(_cctally_core.OAUTH_BACKFILL_STALE_SECONDS)):
+        return f"skipped(statusline-fresh:{int(obs_age)}s)"
+    backoff_remaining = c._oauth_backoff_remaining_seconds()
+    if backoff_remaining > 0:
+        return f"skipped(backoff:{int(backoff_remaining)}s)"
+    age_s = c._newest_snapshot_age_seconds()
+    if age_s is not None and age_s < throttle_seconds:
+        return f"skipped(fresh:{int(age_s)}s)"
+    return None
+
+
+def _hook_tick_parse_oauth_payload(c, api):
+    """Validate one OAuth response outside the selected-state lock."""
+    try:
+        seven = api["seven_day"]
+        seven_pct = c._normalize_percent(float(seven["utilization"]))
+        seven_resets_epoch = _iso_to_epoch(seven["resets_at"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    five = api.get("five_hour") if isinstance(api.get("five_hour"), dict) else None
+    five_pct: float | None = None
+    five_resets_epoch: int | None = None
+    if (five is not None and "utilization" in five
+            and isinstance(five.get("resets_at"), str)):
+        try:
+            five_pct = c._normalize_percent(float(five["utilization"]))
+            five_resets_epoch = _iso_to_epoch(five["resets_at"])
+        except (TypeError, ValueError):
+            five_pct = None
+            five_resets_epoch = None
+    record_args = argparse.Namespace(
+        percent=seven_pct,
+        resets_at=str(seven_resets_epoch),
+        five_hour_percent=five_pct,
+        five_hour_resets_at=(
+            str(five_resets_epoch) if five_resets_epoch is not None else None
+        ),
+        source="api",
+    )
+    axes = {"sevenDay", *({"fiveHour"} if five_pct is not None else set())}
+    parts = [f"7d={int(round(seven_pct))}"]
+    if five_pct is not None:
+        parts.append(f"5h={int(round(five_pct))}")
+    return record_args, axes, parts
+
+
 def _hook_tick_oauth_refresh(
     timeout_seconds: float = 5.0,
     throttle_seconds: float | None = None,
@@ -950,115 +1002,75 @@ def _hook_tick_oauth_refresh(
             throttle_seconds = float(_get_oauth_usage_config(c.load_config())["throttle_seconds"])
         except OauthUsageConfigError:
             throttle_seconds = float(c.HOOK_TICK_DEFAULT_THROTTLE_SECONDS)
-    # The automatic writer takes the selected-state lock *before* rechecking
-    # its suppression conditions.  A concurrent publisher can otherwise make
-    # this tick issue an unnecessary OAuth request between the initial gate
-    # and the request itself.
-    # #583 S2: the nudge is deferred out of the critical section. This frame
-    # owns the lock across the OAuth fetch AND the authoritative record, so
-    # `_authoritative_record_usage` cannot release it — the deferral has to
-    # reach the frame that acquired it. The nudge is a loopback POST with a
-    # multi-second timeout and this lock is an `fcntl.flock` every cctally
-    # process contends on, so one unresponsive listener would otherwise stall
-    # every other process's selected-state writes at status-line cadence.
-    deferred = []
+    # Check freshness under the selected-state lock, release it for the
+    # potentially five-second network request, then recheck after reacquiring
+    # before publication. A concurrent winner can therefore suppress this
+    # response without the high-cadence hook holding the cross-process flock
+    # during network I/O.
     try:
         with c._selected_state_lock():
-            out = _hook_tick_oauth_refresh_locked(
-                c,
-                token=token,
-                timeout_seconds=timeout_seconds,
-                throttle_seconds=throttle_seconds,
-                nudge_sink=lambda: deferred.append(1),
+            skipped = _hook_tick_oauth_skip_status(
+                c, throttle_seconds=throttle_seconds,
             )
     except OSError:
         return "err(record-usage=exc)", None
-    if deferred:
-        c._nudge_dashboard_repaint()
-    return out
+    if skipped is not None:
+        return skipped, None
 
-
-def _hook_tick_oauth_refresh_locked(
-    c,
-    *,
-    token: str,
-    timeout_seconds: float,
-    throttle_seconds: float,
-    nudge_sink=None,
-) -> tuple[str, dict | None]:
-    """Automatic OAuth path with the selected-state lock already held.
-
-    ``nudge_sink`` records that a dashboard nudge is warranted; the caller
-    fires it after releasing the lock (#583 S2).
-    """
-    # Backfill gate: an inflight/invalid tombstone bypasses only selected-age
-    # suppression so a later authoritative result can repair it.  The normal
-    # throttle and 429 deadline continue to bound OAuth traffic.
-    now_epoch = int(time.time())
-    needs_repair = c._authoritative_repair_required(now_epoch=now_epoch)
-    obs_age = c._statusline_observe_age_seconds()
-    if (not needs_repair
-            and obs_age < float(_cctally_core.OAUTH_BACKFILL_STALE_SECONDS)):
-        return f"skipped(statusline-fresh:{int(obs_age)}s)", None
-    backoff_remaining = c._oauth_backoff_remaining_seconds()
-    if backoff_remaining > 0:
-        return f"skipped(backoff:{int(backoff_remaining)}s)", None
-    age_s = c._newest_snapshot_age_seconds()
-    if age_s is not None and age_s < throttle_seconds:
-        return f"skipped(fresh:{int(age_s)}s)", None
     try:
         api = c._fetch_oauth_usage(token=token, timeout_seconds=timeout_seconds)
     except RefreshUsageRateLimitError as exc:
-        c._oauth_backoff_register_429(
-            retry_after_deadline=getattr(exc, "retry_after_deadline", None),
-            now=time.time(),
-        )
+        try:
+            with c._selected_state_lock():
+                c._oauth_backoff_register_429(
+                    retry_after_deadline=getattr(
+                        exc, "retry_after_deadline", None,
+                    ),
+                    now=time.time(),
+                )
+        except OSError:
+            return "err(record-usage=exc)", None
         return "err(rate-limit)", None
     except RefreshUsageNetworkError:
         return "err(network)", None
     except RefreshUsageMalformedError:
         return "err(parse)", None
-    seven = api["seven_day"]
-    try:
-        seven_pct = c._normalize_percent(float(seven["utilization"]))
-        seven_resets_epoch = _iso_to_epoch(seven["resets_at"])
-    except (TypeError, ValueError, KeyError):
+
+    parsed = _hook_tick_parse_oauth_payload(c, api)
+    if parsed is None:
         return "err(parse)", None
-    five = api.get("five_hour") if isinstance(api.get("five_hour"), dict) else None
-    five_pct: float | None = None
-    five_resets_epoch: int | None = None
-    if (five is not None and "utilization" in five
-            and isinstance(five.get("resets_at"), str)):
-        try:
-            five_pct = c._normalize_percent(float(five["utilization"]))
-            five_resets_epoch = _iso_to_epoch(five["resets_at"])
-        except (TypeError, ValueError):
-            five_pct = None
-            five_resets_epoch = None
-    record_args = argparse.Namespace(
-        percent=seven_pct,
-        resets_at=str(seven_resets_epoch),
-        five_hour_percent=five_pct,
-        five_hour_resets_at=str(five_resets_epoch) if five_resets_epoch is not None else None,
-        source="api",
-    )
-    authoritative = c._authoritative_record_usage(
-        record_args,
-        {"sevenDay", *({"fiveHour"} if five_pct is not None else set())},
-        lock_held=True,
-        nudge_sink=nudge_sink,
-    )
-    if authoritative.status != "ok":
-        reason = authoritative.reason or ""
-        if reason.startswith("exit "):
-            return f"err(record-usage={reason[5:]})", None
+    record_args, axes, parts = parsed
+
+    # #583 S2: the nudge remains deferred until after the publication lock is
+    # released. The sink contract is now enforced by the authority kernel, so
+    # every lock-owning caller has to make the deferral explicit.
+    deferred = []
+    try:
+        with c._selected_state_lock():
+            skipped = _hook_tick_oauth_skip_status(
+                c,
+                throttle_seconds=throttle_seconds,
+            )
+            if skipped is not None:
+                return skipped, None
+            authoritative = c._authoritative_record_usage(
+                record_args,
+                axes,
+                lock_held=True,
+                nudge_sink=lambda: deferred.append(1),
+            )
+            if authoritative.status != "ok":
+                reason = authoritative.reason or ""
+                if reason.startswith("exit "):
+                    return f"err(record-usage={reason[5:]})", None
+                return "err(record-usage=exc)", None
+            # A success reaches shared backoff only after tombstones, control,
+            # and freshness are authoritative under this same lock.
+            c._oauth_backoff_reset()
+    except OSError:
         return "err(record-usage=exc)", None
-    # Success is acknowledged to the shared OAuth backoff only after the
-    # authoritative writer has published tombstones, control, and freshness.
-    c._oauth_backoff_reset()
-    parts = [f"7d={int(round(seven_pct))}"]
-    if five_pct is not None:
-        parts.append(f"5h={int(round(five_pct))}")
+    if deferred:
+        c._nudge_dashboard_repaint()
     return f"ok({','.join(parts)})", api
 
 

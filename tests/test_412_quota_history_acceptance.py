@@ -15,6 +15,8 @@ from _lib_dashboard_sources import (
     compose_all_state,
 )
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
+
 
 UTC = dt.timezone.utc
 NOW = dt.datetime(2026, 7, 20, 12, tzinfo=UTC)
@@ -99,11 +101,10 @@ def _http_snapshot(ns, snapshot) -> dict:
     # `cmd_dashboard` does before the HTTP server binds.
     handler.hub.publish(handler.snapshot_ref.get())
     server = ns["ThreadingHTTPServer"](("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    thread = start(server)
     try:
         connection = http.client.HTTPConnection(
-            "127.0.0.1", server.server_address[1], timeout=3,
+            "127.0.0.1", server.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS,
         )
         connection.request("GET", "/api/data")
         response = connection.getresponse()
@@ -115,9 +116,7 @@ def _http_snapshot(ns, snapshot) -> dict:
             connection.close()
         except UnboundLocalError:
             pass
-        server.shutdown()
-        thread.join(timeout=3)
-        server.server_close()
+        stop(server, thread)
 
 
 def test_http_snapshot_emits_singular_cycle_and_retained_independent_pool(

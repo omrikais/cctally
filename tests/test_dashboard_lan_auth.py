@@ -9,11 +9,14 @@ import pytest
 
 from conftest import load_script, redirect_paths
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, shorten_sse_keepalive, start, stop
+
 
 @pytest.fixture
 def ns(monkeypatch, tmp_path):
     loaded = load_script()
     redirect_paths(loaded, monkeypatch, tmp_path)
+    shorten_sse_keepalive(loaded, monkeypatch)
     return loaded
 
 
@@ -35,14 +38,13 @@ def _serve(ns, token):
     handler.cctally_api_token = token
     server = ns["ThreadingHTTPServer"](("127.0.0.1", 0), handler)
     server.handle_error = lambda request, client_address: None
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    thread = start(server)
     return server, thread
 
 
 def _request(server, method, path, *, headers=(), body=b"", stream=False):
     conn = http.client.HTTPConnection(
-        "127.0.0.1", server.server_address[1], timeout=3
+        "127.0.0.1", server.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS
     )
     conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
     supplied = list(headers.items()) if isinstance(headers, dict) else list(headers)
@@ -111,13 +113,12 @@ def test_token_enabled_api_rejects_before_route_dispatch(ns, method, path):
         if method != "HEAD":
             assert json.loads(payload) == {"error": "unauthorized"}
     finally:
-        server.shutdown()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_exact_bearer_bootstraps_cookie_then_cookie_reaches_data_and_sse(ns):
     server, thread = _serve(ns, "run-token")
-    stream_conn = None
+    stream_conn = events = None
     try:
         _, auth, payload = _request(
             server,
@@ -145,10 +146,11 @@ def test_exact_bearer_bootstraps_cookie_then_cookie_reaches_data_and_sse(ns):
         assert events.status == 200
         assert events.getheader("Content-Type").startswith("text/event-stream")
     finally:
-        if stream_conn is not None:
-            stream_conn.close()
-        server.shutdown()
-        thread.join(timeout=2)
+        # The response as well as the connection: `socket.makefile()` holds an
+        # io-reference, so closing the connection alone leaves the descriptor
+        # open and the SSE handler never learns its client has gone.
+        stop(server, thread,
+             connections=[c for c in (stream_conn, events) if c is not None])
 
 
 @pytest.mark.parametrize(
@@ -179,8 +181,7 @@ def test_wrong_malformed_or_explicitly_bad_credentials_reject(ns, headers):
         assert response.getheader("WWW-Authenticate") == "Bearer"
         assert json.loads(payload) == {"error": "unauthorized"}
     finally:
-        server.shutdown()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_authenticated_sync_still_applies_origin_csrf(ns):
@@ -198,8 +199,7 @@ def test_authenticated_sync_still_applies_origin_csrf(ns):
         )
         assert response.status == 403
     finally:
-        server.shutdown()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_token_null_preserves_loopback_api_and_hides_bootstrap_route(ns):
@@ -210,5 +210,4 @@ def test_token_null_preserves_loopback_api_and_hides_bootstrap_route(ns):
         _, auth, _ = _request(server, "POST", "/api/auth")
         assert auth.status == 404
     finally:
-        server.shutdown()
-        thread.join(timeout=2)
+        stop(server, thread)

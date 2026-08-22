@@ -1332,6 +1332,7 @@ def _build_claude_source_detail(
     recorded_windows, block_start_overrides, canonical_intervals = (
         _load_recorded_five_hour_windows(start_at - BLOCK_DURATION, end_at + BLOCK_DURATION)
     )
+    entry_membership: dict[int, list[UsageEntry]] = {}
     blocks = _group_entries_into_blocks(
         entries,
         mode="auto",
@@ -1339,6 +1340,7 @@ def _build_claude_source_detail(
         block_start_overrides=block_start_overrides,
         canonical_intervals=canonical_intervals,
         now=now_utc,
+        _entry_membership=entry_membership,
     )
     target = next(
         (block for block in blocks if not block.is_gap and block.start_time == start_at),
@@ -1346,9 +1348,7 @@ def _build_claude_source_detail(
     )
     if target is None:
         raise SourceResourceNotFound()
-    block_entries = [
-        entry for entry in entries if target.start_time <= entry.timestamp < target.end_time
-    ]
+    block_entries = entry_membership[id(target)]
     return _source_safe_claude_block_detail(
         _build_block_detail(target, block_entries), key=key,
     )
@@ -1664,6 +1664,28 @@ def _make_sync_loop_collaborators(*, ref, hub) -> dict:
     }
 
 
+@contextlib.contextmanager
+def _rebuilding_claim(mark_rebuilding, *, prepare=None):
+    """Bracket one owner-scoped rebuilding claim, including preparation.
+
+    ``prepare`` may itself publish/claim (``_SnapshotRef.capture_batch`` does),
+    so it belongs inside the same structural cleanup boundary as the explicit
+    mark.  This is the single guard used by the periodic loop and both
+    synchronous HTTP rebuild routes; a future exception between claim and work
+    therefore cannot strand ``rebuilding=true`` for the process lifetime.
+    """
+    prepared = None
+    try:
+        if prepare is not None:
+            prepared = prepare()
+        if mark_rebuilding is not None:
+            mark_rebuilding(True)
+        yield prepared
+    finally:
+        if mark_rebuilding is not None:
+            mark_rebuilding(False)
+
+
 def _dashboard_sync_loop(
     *,
     stop,
@@ -1707,43 +1729,32 @@ def _dashboard_sync_loop(
     settlement counters, which must not advance for a batch that never existed.
     """
     while not stop.is_set():
-        batch = None
+        prepare = None
         if (pending_request is not None and capture_batch is not None
                 and pending_request()):
-            batch = capture_batch()
-        if mark_rebuilding is not None:
-            # BEFORE t0: the publish is a non-blocking queue put, and keeping
-            # it outside the measured span leaves the #313 bound's algebra
-            # exactly as it is. An automatic tick reaches this with no batch
-            # captured, which is the whole point — `rebuilding` describes the
-            # iteration, not the request that may or may not have started it.
-            mark_rebuilding(True)
-        t0 = monotonic()
-        status, warnings = "ok", ()
-        try:
-            result = (run_iteration(batch=batch) if batch is not None
-                      else run_iteration())
-            if isinstance(result, dict):
-                warnings = tuple(result.get("warnings") or ())
-        except Exception:  # noqa: BLE001 — see below
-            # An escaped exception must not kill the only drainer: an accepted
-            # 202 would then never reach a terminal state, and the client would
-            # hold `queued…` forever waiting for a settlement no surviving
-            # thread can publish.
-            status = "failed"
-            _log_sync_iteration_failure()
-        finally:
-            # Failure time is charged to the cooldown exactly like success
-            # time, so a crash loop cannot busy-spin.
-            work = monotonic() - t0
-            if batch is not None and settle is not None:
-                settle(batch[0], status, warnings)
-            if mark_rebuilding is not None:
-                # Every exit path, including an escaped exception: a flag left
-                # set would pin the client's chip at `syncing…` for the life of
-                # the process. `settle` has already cleared it on a requested
-                # tick, so this publishes nothing extra there.
-                mark_rebuilding(False)
+            prepare = capture_batch
+        # Claim publication stays BEFORE t0, preserving #313's measured-work
+        # algebra, but the shared guard begins before capture_batch because that
+        # preparation also claims this thread's owner id.
+        with _rebuilding_claim(mark_rebuilding, prepare=prepare) as batch:
+            t0 = monotonic()
+            status, warnings = "ok", ()
+            try:
+                result = (run_iteration(batch=batch) if batch is not None
+                          else run_iteration())
+                if isinstance(result, dict):
+                    warnings = tuple(result.get("warnings") or ())
+            except Exception:  # noqa: BLE001 — see below
+                # An escaped exception must not kill the only drainer: an
+                # accepted 202 would then never reach a terminal state.
+                status = "failed"
+                _log_sync_iteration_failure()
+            finally:
+                # Failure time is charged to the cooldown exactly like success
+                # time, so a crash loop cannot busy-spin.
+                work = monotonic() - t0
+                if batch is not None and settle is not None:
+                    settle(batch[0], status, warnings)
 
         deadline = _next_deadline(t0, interval, work)
         floor = t0 + 2.0 * work
@@ -2391,42 +2402,10 @@ class _SnapshotRef:
         # therefore remove only the clearing thread's own claim; `rebuilding`
         # is then true exactly while at least one rebuilder holds one.
         #
-        # Owner scoping made a LEAKED CLAIM strictly worse than the boolean it
-        # replaced, so do not record the opposite. Under the boolean a leaked
-        # `True` was cleared by whichever rebuilder next reached `set_final`, so
-        # it self-healed on the following rebuild. Every clear site here discards
-        # `threading.get_ident()`, so a claim left behind by a thread that has
-        # exited can be discarded by NO other thread, and `rebuilding` would stay
-        # true — pinning every client's chip at `syncing…` for the life of the
-        # process.
-        #
-        # No leak is reachable today, but the argument splits by CALLER, not by
-        # add site. `mark_rebuilding` below is reached from both routes — the
-        # sync loop through `_make_sync_loop_collaborators` and an HTTP handler
-        # thread through `DashboardHTTPHandler.mark_rebuilding` — so reading one
-        # add site answers for neither. Four callers add a claim.
-        #
-        # Two of the four are bracketed: `_handle_post_sync` and
-        # `_handle_post_settings` each mark inside a `try` whose `finally`
-        # clears, so nothing between the two can leak the claim.
-        #
-        # The other two are the sync loop's `capture_batch()` and its
-        # `mark_rebuilding(True)`, and they are NOT bracketed. Both run before
-        # `t0` and therefore before the `try:` whose `finally` clears them; the
-        # loop's own comment at `mark_rebuilding(True)` gives the #313
-        # duty-algebra reason for that one's placement. `_dashboard_sync_loop`'s
-        # `while` has no outer handler, so a raise in that gap would kill the
-        # drainer and leak the claim together. The gap is safe because nothing
-        # in it raises: the `_restamp_locked()` each add performs is a
-        # `dataclasses.replace` over `DataSnapshot`, a plain dataclass with no
-        # `__post_init__`, no `init=False` field and no `InitVar`;
-        # `SSEHub.publish` holds its own lock and swallows
-        # `queue.Full`/`queue.Empty`; `ref.get()` is a lock-and-return; and what
-        # remains is a clock read and two local assignments.
-        #
-        # A new `add` must therefore satisfy one of the two: a same-thread
-        # `finally` that clears it, or a proven non-raising path to one. There
-        # is no self-healing path behind either.
+        # Owner scoping makes a leaked claim permanent: another thread cannot
+        # discard this thread's id. All three rebuilding routes therefore use
+        # `_rebuilding_claim`, whose boundary begins before any preparation
+        # that can claim and ends after the terminal publish.
         self._rebuilding_owners: set[int] = set()
         self._snap = self._stamped_locked(initial)
 
@@ -4765,6 +4744,10 @@ class _ProjWeekBucket(NamedTuple):
     first_order: str
     first_id: int
     first_key: "Any"
+    # Retained so selected-window totals can deduplicate a session that is
+    # active in more than one subscription bucket (#634). The default keeps
+    # older fixture constructors source-compatible.
+    session_ids: "frozenset[str]" = frozenset()
 
 
 def _fold_projects_entry(
@@ -5514,6 +5497,7 @@ def _finalize_projects_mut(mut: dict) -> "dict[str, _ProjWeekBucket]":
             first_order=a["first_order"],
             first_id=a["first_id"],
             first_key=a["first_key"],
+            session_ids=frozenset(a["sessions"]),
         )
         for bp, a in mut.items()
     }
@@ -5596,9 +5580,16 @@ def _assemble_projects_via_cache(
         for bp, wb in week_buckets.items():
             buckets[(bp, w)] = {
                 "cost_usd": wb.cost_usd,
-                # `sessions` is only ever `len()`-d downstream; a `range` of the
-                # cached count reproduces that without storing the id set.
-                "sessions": range(wb.sessions_count),
+                # Window totals union these identities so a resumed session
+                # crossing a reset is counted once. The range fallback serves
+                # test/legacy constructors that predate ``session_ids``.
+                "sessions": (
+                    wb.session_ids
+                    if wb.session_ids
+                    else frozenset(
+                        (w, index) for index in range(wb.sessions_count)
+                    )
+                ),
                 "first_seen": wb.first_seen,
                 "last_seen": wb.last_seen,
             }
@@ -5932,15 +5923,38 @@ def _build_projects_envelope(
     # (bin/cctally:1162-1168) and the doctor credited-week check
     # (bin/cctally:8706-8714).
     #
-    # Portable per-key-latest pattern: read rows ordered by capture-
-    # ascending and let later rows overwrite. The final value per key
-    # is the most-recent snapshot.
+    # Reduce to one latest NON-NULL row per candidate date in SQLite, then let
+    # Python resolve those bounded rows onto the anchored interval grid. NULL
+    # rows never erased the prior known value in the former ascending fold, so
+    # they are excluded before ranking. The outer capture order preserves the
+    # same final-overwrite behaviour if two legacy date keys resolve to one
+    # interval. The date bounds keep historical status-line ticks out of the
+    # scan, while the per-date ranking makes the rows crossing into Python
+    # proportional to candidate boundary dates rather than tick count. Do not
+    # LIMIT before Python resolves legacy date keys: an unresolvable key must
+    # not evict a valid rendered-week row (#620 S1 A3).
     weekly_pct_by_week: dict[dt.datetime, float] = {}
     try:
         cur = conn.execute(
-            "SELECT week_start_date, week_start_at, weekly_percent "
-            "FROM weekly_usage_snapshots "
-            "ORDER BY captured_at_utc ASC, id ASC"
+            "WITH ranked AS ("
+            " SELECT week_start_date, week_start_at, weekly_percent,"
+            " captured_at_utc, id,"
+            " ROW_NUMBER() OVER ("
+            "  PARTITION BY week_start_date"
+            "  ORDER BY captured_at_utc DESC, id DESC"
+            " ) AS latest_rank"
+            " FROM weekly_usage_snapshots"
+            " WHERE week_start_date >= ? AND week_start_date < ?"
+            " AND date(week_start_date) IS NOT NULL"
+            " AND weekly_percent IS NOT NULL"
+            ")"
+            " SELECT week_start_date, week_start_at, weekly_percent"
+            " FROM ranked WHERE latest_rank = 1"
+            " ORDER BY captured_at_utc ASC, id ASC",
+            (
+                since_dt.date().isoformat(),
+                cw_end.date().isoformat(),
+            ),
         )
         rows = cur.fetchall()
     except sqlite3.OperationalError:
@@ -6087,6 +6101,19 @@ def _build_projects_envelope(
             sessions_per_week.append(len(b["sessions"]))
             first_seen_per_week.append(_iso_z(b["first_seen"]))
             last_seen_per_week.append(_iso_z(b["last_seen"]))
+        session_counts_by_window: dict[str, int] = {}
+        for window_weeks in PROJECT_WINDOW_WEEKS_CHOICES:
+            selected_weeks = trend_weeks[-window_weeks:]
+            # Cached real buckets contribute string identities; the
+            # source-compatible fallback contributes opaque tuple identities.
+            window_sessions: set[object] = set()
+            for selected_week in selected_weeks:
+                selected_bucket = buckets.get((bp, selected_week))
+                if selected_bucket is not None:
+                    window_sessions.update(selected_bucket["sessions"])
+            session_counts_by_window[str(window_weeks)] = len(
+                window_sessions,
+            )
         # Skip projects with zero total cost across the entire window
         # (the bucket-loop only enters projects that have at least one
         # entry, so this is mainly a safety check).
@@ -6098,6 +6125,7 @@ def _build_projects_envelope(
             "weekly_cost":         weekly_cost,
             "weekly_pct":          weekly_pct_arr,
             "sessions_per_week":   sessions_per_week,
+            "session_counts_by_window": session_counts_by_window,
             "first_seen_per_week": first_seen_per_week,
             "last_seen_per_week":  last_seen_per_week,
         })
@@ -6211,8 +6239,11 @@ def _project_detail_for_window(
         "projects.current_week.week_start_at",
     ).astimezone(dt.timezone.utc)
 
-    # The drill resolves the SAME interval its panel resolved, by rebuilding
-    # the panel's grid rather than stepping back in seven-day multiples.
+    # The drill resolves the SAME interval union its panel resolved, by
+    # rebuilding the panel's grid rather than stepping back in seven-day
+    # multiples. Subscription reset shifts can leave gaps between buckets;
+    # the outer start/end pair is only a candidate-query bound, while
+    # ``window_intervals`` is the authoritative membership contract.
     # `_ProjectsWeekGrid` exists because a drifted reset day produces a
     # genuinely short week: on `non-monday-anchor` at `weeks_back=4` the grid
     # starts the window at 2026-03-27T09:00Z while a seven-day walk yields
@@ -6251,6 +6282,18 @@ def _project_detail_for_window(
         # falls back to, where the seven-day assumption is the right one.
         since_dt = cw_start - dt.timedelta(days=7 * (weeks_back - 1))
         until_dt = cw_start + dt.timedelta(days=7)
+        detail_bounds = [(since_dt, until_dt)]
+    detail_bounds_utc = [
+        (
+            start.astimezone(dt.timezone.utc),
+            end.astimezone(dt.timezone.utc),
+        )
+        for start, end in detail_bounds
+    ]
+    window_intervals = [
+        {"start_at": _iso_z(start), "end_at": _iso_z(end)}
+        for start, end in detail_bounds_utc
+    ]
     since_iso = since_dt.astimezone(dt.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
@@ -6269,9 +6312,6 @@ def _project_detail_for_window(
     since_sql_iso = (
         since_dt.astimezone(dt.timezone.utc) - dt.timedelta(seconds=1)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    until_dt_utc = until_dt.astimezone(dt.timezone.utc)
-    since_dt_utc = since_dt.astimezone(dt.timezone.utc)
-
     # ---- Build bucket → source_paths map for SQL-side scoping ----------
     # Walk session_files (~8k rows) once instead of session_entries
     # (~150k+ rows). _resolve_project_key gets called at most ~distinct-
@@ -6324,6 +6364,7 @@ def _project_detail_for_window(
             "window_weeks":           weeks_back,
             "window_start_at":        since_iso,
             "window_end_at":          until_iso,
+            "window_intervals":       window_intervals,
             "window_cost_usd":        0.0,
             "window_attributed_pct":  None,
             "models":                 [],
@@ -6391,7 +6432,10 @@ def _project_detail_for_window(
         # compare the way the interval means; this is where the interval is
         # actually decided.
         ts_utc = ts.astimezone(dt.timezone.utc)
-        if not (since_dt_utc <= ts_utc < until_dt_utc):
+        if not any(
+            interval_start <= ts_utc < interval_end
+            for interval_start, interval_end in detail_bounds_utc
+        ):
             continue
         entry_cost = _calculate_entry_cost(
             model,
@@ -6517,6 +6561,7 @@ def _project_detail_for_window(
         "window_weeks":           weeks_back,
         "window_start_at":        since_iso,
         "window_end_at":          until_iso,
+        "window_intervals":       window_intervals,
         "window_cost_usd":        window_cost,
         "window_attributed_pct":  win_pct,
         "models":                 models_out,
@@ -6729,6 +6774,36 @@ def _qs_str(q: dict, key: str, default: str | None) -> str | None:
     """
     vals = q.get(key, [default])
     return vals[0] if vals else default
+
+
+def _qs_flag(q: dict, key: str) -> bool:
+    """Parse a single query-string boolean.
+
+    A bare `?flag` and `?flag=1` are both true; `0`, `false` and `no` are
+    false. Written out rather than spelled `bool(_qs_str(...))`, because that
+    reads `?reveal_projects=0` as a REQUEST to reveal — the string "0" is
+    truthy — which is the wrong direction for a privacy switch.
+    """
+    raw = _qs_str(q, key, None)
+    if raw is None:
+        return False
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+class _DiagnosisSelectorError(Exception):
+    """A `/api/diagnosis` request whose selectors are wrong (#620 S2).
+
+    Distinct from `EstablishmentFailure`, whose codes are the closed
+    report-establishment enum. A selector this route rejects — an unknown
+    source, an account combined with `source=all` — never reached the point of
+    establishing a report, so it carries its own code rather than borrowing one
+    from that enum and claiming a stage it never got to.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 # ── /api/debug/backend on-demand cache-state helpers (issue #276, Session A) ──
@@ -7011,6 +7086,11 @@ _GET_ROUTES = (
     ("exact", "/api/share/presets", "_handle_share_presets_get", None, False),
     ("exact", "/api/share/history", "_handle_share_history_get", None, False),
     ("exact", "/api/doctor", "_handle_get_doctor", None, False),
+    # #620 S2 — the on-demand diagnosis. Exact, so it can neither shadow nor
+    # be shadowed by the parameterized conversation routes below (dispatch
+    # compares exact paths first, so the placement here is a convention).
+    ("exact", "/api/diagnosis", "_handle_get_diagnosis",
+     ("scope", "endpoint.diagnosis"), False),
     ("exact", "/api/debug/backend", "_handle_get_debug_backend", None, False),
     ("exact", "/api/conversations/facets", "_handle_get_conversations_facets",
      ("scope", "endpoint.conversations_facets"), False),
@@ -7488,32 +7568,22 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             })
             return
         try:
-            # The locked section is a REBUILD, and this is the path an
-            # uncontended manual refresh actually takes, so it reports itself
-            # like every other rebuild does.
-            cls.mark_rebuilding(True)
-            warnings: list = []
-            if do_refresh:
-                if cls.no_sync:
-                    warnings.append({"code": "refresh_skipped_no_sync"})
-                else:
-                    result = _refresh_usage_inproc()
-                    if result.status != "ok":
-                        warnings.append({"code": result.status})
-            try:
-                cls.run_sync_now_locked()
-            except Exception as exc:
-                self.log_error("/api/sync rebuild failed: %r", exc)
-                self.send_error(500, "sync failed")
-                return
+            with _rebuilding_claim(cls.mark_rebuilding):
+                warnings: list = []
+                if do_refresh:
+                    if cls.no_sync:
+                        warnings.append({"code": "refresh_skipped_no_sync"})
+                    else:
+                        result = _refresh_usage_inproc()
+                        if result.status != "ok":
+                            warnings.append({"code": result.status})
+                try:
+                    cls.run_sync_now_locked()
+                except Exception as exc:
+                    self.log_error("/api/sync rebuild failed: %r", exc)
+                    self.send_error(500, "sync failed")
+                    return
         finally:
-            # Drops THIS thread's claim only, so the ordering against the lock
-            # release is not what makes it safe: a concurrent rebuilder's claim
-            # is a different set member and this call cannot touch it, whichever
-            # side of the release it runs on. On the success path the rebuild's
-            # terminal publish has already dropped this thread's claim and this
-            # adds no frame; the exception path is what needs it.
-            cls.mark_rebuilding(False)
             sync_lock.release()
 
         if warnings:
@@ -8532,12 +8602,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         # outside the acquire because `run_sync_now` takes `sync_lock` itself;
         # a wait for a rebuild already in flight is honestly in-flight too.
         try:
-            type(self).mark_rebuilding(True)
-            type(self).run_sync_now()
+            with _rebuilding_claim(type(self).mark_rebuilding):
+                type(self).run_sync_now()
         except Exception as exc:
             eprint(f"warning: settings broadcast failed: {exc!r}")
-        finally:
-            type(self).mark_rebuilding(False)
 
         self._respond_json(200, out)
 
@@ -8956,6 +9024,250 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self.log_error("/api/doctor failed after commit: %r", exc)
             self.close_connection = True
 
+    # ── GET /api/diagnosis (#620 S2, spec §5) ───────────────────────────────
+    #
+    # The on-demand diagnosis. NOT an envelope key: an envelope key would pay
+    # #607's client per-frame cost on every tick for a surface most ticks never
+    # display, and would force a deliberate re-take of the byte-identity
+    # baseline at bench/baselines/envelope-oracle.json.
+
+    def _send_diagnosis_json(self, status: int, body: dict) -> None:
+        encoded = encode_dashboard_json_bytes(body, ensure_ascii=False)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _diagnosis_selectors(self, query):
+        """Resolve one request's selectors into a `DiagnosisScope`.
+
+        Raises `_DiagnosisSelectorError` for anything the caller got wrong and
+        `EstablishmentFailure` for anything that could not be established. Both
+        are 400 here; only `store_unavailable` and `generation_incoherent` are
+        503, because those two say the machine could not answer rather than
+        that the request was wrong.
+        """
+        c = _cctally()
+        diagnosis = c._load_sibling("_cctally_diagnosis")
+        sources = c._load_sibling("_cctally_diagnosis_sources")
+        kernel = c._load_sibling("_lib_diagnosis")
+
+        source = _qs_str(query, "source", "claude") or "claude"
+        if source not in ("claude", "codex", "all"):
+            raise _DiagnosisSelectorError(
+                "invalid_selector",
+                f"source must be claude, codex or all, not {source!r}")
+        account = _qs_str(query, "account", None)
+        if account is not None and source == "all":
+            # Account keys are provider-scoped, so one selector cannot address
+            # both providers. The CLI exits 2 on the same condition.
+            raise _DiagnosisSelectorError(
+                "invalid_selector",
+                "account cannot be combined with source=all "
+                "(account keys are provider-scoped)")
+        speed = _qs_str(query, "speed", None)
+        if speed in ("auto", ""):
+            speed = None
+        if speed is not None and speed not in ("standard", "fast"):
+            raise _DiagnosisSelectorError(
+                "invalid_selector",
+                f"speed must be auto, standard or fast, not {speed!r}")
+
+        raw_tz = _qs_str(query, "tz", None)
+        config = _apply_display_tz_override(
+            load_config(), type(self).display_tz_pref_override,
+        )
+        try:
+            tz_name = diagnosis.resolve_tz_name(
+                argparse.Namespace(tz=raw_tz), config,
+            )
+        except ValueError as exc:
+            raise _DiagnosisSelectorError("invalid_selector", str(exc)) from exc
+
+        now_utc = _command_as_of()
+        start_raw = _qs_str(query, "start_at", None)
+        end_raw = _qs_str(query, "end_at", None)
+        if start_raw or end_raw:
+            # The alert-follow path carries INSTANTS, not calendar days: a
+            # five-hour block start is not a date, so the window grammar's
+            # date-only form cannot reproduce the window a warning fired
+            # against. Explicit bounds are how that window reaches the route.
+            if not (start_raw and end_raw):
+                raise kernel.EstablishmentFailure(
+                    kernel.EstablishmentError.RANGE_UNRESOLVED.value,
+                    "start_at and end_at must be given together")
+            start_at = parse_iso_datetime(start_raw, "start_at")
+            end_at = parse_iso_datetime(end_raw, "end_at")
+            start_at = (start_at.replace(tzinfo=dt.timezone.utc)
+                        if start_at.tzinfo is None
+                        else start_at.astimezone(dt.timezone.utc))
+            end_at = (end_at.replace(tzinfo=dt.timezone.utc)
+                      if end_at.tzinfo is None
+                      else end_at.astimezone(dt.timezone.utc))
+            label = ""
+        else:
+            token = _qs_str(query, "window", "this-week") or "this-week"
+            diff_kernel = c._load_sibling("_lib_diff_kernel")
+            try:
+                parsed = diagnosis._resolve_window(
+                    argparse.Namespace(window=token), now_utc, tz_name,
+                )
+            except diff_kernel.NoAnchorError as exc:
+                # A week token this machine holds no anchor for is an
+                # unresolved RANGE. It is a `RuntimeError`, so without this it
+                # reached the outer handler and was served as 500 — an
+                # unexplained internal error for a request the server could
+                # perfectly well describe.
+                raise kernel.EstablishmentFailure(
+                    kernel.EstablishmentError.RANGE_UNRESOLVED.value,
+                    str(exc)) from exc
+            start_at, end_at, label = (parsed.start_utc, parsed.end_utc,
+                                       parsed.label)
+
+        account_key = None
+        if account is not None:
+            account_key = self._resolve_diagnosis_account(
+                sources, account,
+                source if source in ("claude", "codex") else "claude",
+            )
+        # DiagnosisScope's own __post_init__ raises `range_unresolved` for a
+        # naive or inverted window, so an out-of-order pair is rejected by the
+        # same rule the CLI applies rather than by a second one here.
+        return sources.DiagnosisScope(
+            source=source,
+            account_key=account_key,
+            window_start=start_at,
+            window_end=end_at,
+            effective_speed=speed,
+            display_tz=tz_name,
+            label=label,
+        ), now_utc, _qs_flag(query, "reveal_projects")
+
+    @staticmethod
+    def _resolve_diagnosis_account(sources, ref: str, provider: str):
+        """Resolve `?account=` over the diagnosis's own read-only open path.
+
+        `resolve_account_filter` reaches stats.db through the ordinary opener,
+        which migrates, repairs, imports and replays. This route reads and
+        never writes, so it resolves the ref over `mode=ro`, exactly as
+        `cmd_explain` does — and a ref that could not be resolved for ANY
+        reason, including a machine with no registry at all, is an unresolved
+        account rather than an unavailable store.
+        """
+        import _lib_accounts as accounts
+        kernel = _cctally()._load_sibling("_lib_diagnosis")
+        try:
+            conn = sources.open_read_only("stats")
+        except kernel.EstablishmentFailure as exc:
+            raise kernel.EstablishmentFailure(
+                kernel.EstablishmentError.ACCOUNT_UNRESOLVED.value,
+                f"account {ref!r} is ambiguous or unknown "
+                f"(this machine holds no account registry)") from exc
+        try:
+            return accounts.resolve_account_ref(conn, ref, provider)
+        except accounts.AccountRefError as exc:
+            raise kernel.EstablishmentFailure(
+                kernel.EstablishmentError.ACCOUNT_UNRESOLVED.value,
+                f"account {ref!r} is ambiguous or unknown") from exc
+        finally:
+            conn.close()
+
+    def _handle_get_diagnosis(self) -> None:
+        """`GET /api/diagnosis` — the on-demand diagnosis (#620 S2, spec §5).
+
+        Read-only and mutating nothing: the whole read goes through
+        `_cctally_diagnosis_sources`, whose only opener is a `mode=ro` connect
+        that performs no schema work, no migration, no legacy import and no
+        contract repair. It runs on the request thread, outside the snapshot
+        build and outside its pinned cache transaction.
+
+        `_require_api_auth` applies automatically, before dispatch. No CSRF
+        check: `_check_origin_csrf` is opt-in for the routes that mutate, and
+        this one does not.
+
+        Status codes: 200 for any valid coherently-generated report, including
+        a healthy one, an empty one and one whose fields are withheld; 400 for
+        a malformed selector and for an unresolved range or account; 503 for
+        `generation_incoherent`, for `store_unavailable`, and for a report the
+        kernel's `unreadable_store_is_terminal` holds over — that last one
+        publishes the withheld REPORT as the body, not an empty error, for the
+        same reason the CLI still prints it while exiting 3: a person needs to
+        read the typed cause. 500 for an unexpected invariant failure, which is
+        never converted into a healthy 200.
+        """
+        import urllib.parse as _urlparse
+
+        c = _cctally()
+        kernel = c._load_sibling("_lib_diagnosis")
+        diagnosis = c._load_sibling("_cctally_diagnosis")
+        sources = c._load_sibling("_cctally_diagnosis_sources")
+        query = _urlparse.parse_qs(_urlparse.urlparse(self.path).query)
+
+        # Preparation and commit are separate, as on every other JSON route:
+        # before headers a failure can still become a JSON 500; after them the
+        # only valid recovery is log + close.
+        try:
+            try:
+                scope, now_utc, reveal = self._diagnosis_selectors(query)
+                # Evaluated ONCE, before the plan is resolved, and threaded
+                # into plan stage 1. A class denied there is settled: the
+                # store it would have needed is never opened, probed or
+                # digested, and the identifier this response publishes
+                # describes what actually ran rather than what was intended.
+                # The predicate itself is untouched (D-E) — this composes it,
+                # it does not change it.
+                report = sources.build_diagnosis(
+                    scope, measured_at=now_utc,
+                    transcripts_visible=self._transcripts_visible_to_request(),
+                )
+            except _DiagnosisSelectorError as exc:
+                self._send_diagnosis_json(
+                    400, {"error": exc.message, "code": exc.code})
+                return
+            except ValueError as exc:
+                # A malformed instant from `parse_iso_datetime`.
+                self._send_diagnosis_json(400, {
+                    "error": str(exc),
+                    "code": kernel.EstablishmentError.RANGE_UNRESOLVED.value,
+                })
+                return
+            except kernel.EstablishmentFailure as exc:
+                # `store_unavailable` reaches this arm only from SELECTOR
+                # resolution — the week anchor, which reads stats.db through
+                # the ordinary opener. It can never arrive from
+                # `build_diagnosis`, which converts every store failure it
+                # meets into `_unavailable_provider_result` so the withheld
+                # report is published rather than lost; nor from
+                # `_resolve_diagnosis_account`, which re-codes an unopenable
+                # stats.db as `account_unresolved`. Both conversions are
+                # deliberate, so do not read the mapping as dead code.
+                status = 503 if exc.code in (
+                    kernel.EstablishmentError.STORE_UNAVAILABLE.value,
+                    kernel.EstablishmentError.GENERATION_INCOHERENT.value,
+                ) else 400
+                self._send_diagnosis_json(
+                    status, {"error": exc.message, "code": exc.code})
+                return
+
+            scopes = {result.source: diagnosis._scope_for(sources, scope,
+                                                          result.source)
+                      for result in report.results}
+            body = diagnosis.diagnosis_to_wire(report, scopes=scopes,
+                                               reveal_projects=reveal)
+            status = 503 if kernel.unreadable_store_is_terminal(report) else 200
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("/api/diagnosis failed before commit: %r", exc)
+            self._send_diagnosis_json(500, {"error": "internal error"})
+            return
+
+        try:
+            self._send_diagnosis_json(status, body)
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("/api/diagnosis failed after commit: %r", exc)
+            self.close_connection = True
+
     def _handle_get_session_detail(self, path: str) -> None:
         """Return TuiSessionDetail JSON for the given session id (spec §3.2).
 
@@ -9274,12 +9586,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             entries_in_window = list(get_entries(
                 start_at, end_at, skip_sync=self.no_sync,
             ))
+            entry_membership: dict[int, list[UsageEntry]] = {}
             blocks = _group_entries_into_blocks(
                 entries_in_window, mode="auto",
                 recorded_windows=recorded_windows,
                 block_start_overrides=block_start_overrides,
                 canonical_intervals=canonical_intervals,
                 now=now_utc,
+                _entry_membership=entry_membership,
             )
             target = next(
                 (b for b in blocks
@@ -9290,10 +9604,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 status = 404
                 body = encode_dashboard_json_bytes({"error": "block not found"})
             else:
-                block_entries = [
-                    e for e in entries_in_window
-                    if target.start_time <= e.timestamp < target.end_time
-                ]
+                block_entries = entry_membership[id(target)]
                 # Resolve display tz once per request so the block detail's
                 # `label` matches the snapshot envelope's blocks panel.
                 # Shared resolver -- same warn-once semantics as

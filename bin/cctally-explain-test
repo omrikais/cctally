@@ -1,0 +1,528 @@
+#!/usr/bin/env bash
+# Fixture-based validation harness for `explain`.
+#
+# Walks tests/fixtures/explain/*/input.env, runs two output modes (default
+# terminal and --json) via the shared run_mode helper
+# (bin/_lib-fixture-harness.sh), and diffs each against the corresponding
+# golden file through bin/_lib-golden-diff.sh. Exits 0 on all-pass, 1 on any
+# diff.
+#
+# It then runs a THIRD check per scenario that the goldens cannot make: the
+# report is compared against `oracle.json`, which
+# bin/build-explain-fixtures.py computes ARITHMETICALLY from the seeded raw
+# facts and never by importing diagnosis code. A golden proves the output has
+# not changed. The oracle proves the output is right. A gate that clones its
+# result to build its baseline is an arithmetic identity, and the goldens
+# alone would be exactly that.
+#
+# Uses CCTALLY_AS_OF (via the shared lib's TZ=Etc/UTC env block) so every
+# scenario measures at a pinned instant.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+HARNESS_SUBCOMMAND="explain"
+HARNESS_FIXTURES_DIR="$REPO_ROOT/tests/fixtures/explain"
+HARNESS_BIN="$REPO_ROOT/bin/cctally"
+
+# Per-run scratch dir for the regenerated fixture DBs and the oracle manifests.
+# Keeps the in-tree fixture tree free of binary .db files, which are not
+# byte-stable across hosts and sqlite versions.
+SCRATCH_DIR=$(mktemp -d -t cctally-explain-fixtures-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR"
+
+# This runs BEFORE `_lib-fixture-harness.sh` is sourced below, so it is the one
+# part of this script `bin/_lib-harness-env.sh`'s `unset CODEX_HOME` does not
+# cover. Nothing is wrong today: `build-explain-fixtures.py` seeds SQLite
+# directly and never resolves a Codex root, so an exported `$CODEX_HOME` cannot
+# reach it. A builder that started reading a real Codex store would need the
+# variable unset here.
+. "$REPO_ROOT/bin/_lib-fixture-cache.sh"
+build_fixtures_cached "$REPO_ROOT/bin/build-explain-fixtures.py" "$SCRATCH_DIR" || {
+    echo "FAIL: build-explain-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+# shellcheck disable=SC1091
+. "$REPO_ROOT/bin/_lib-fixture-harness.sh"
+
+pass_count=0
+fail_count=0
+
+for dir in "$HARNESS_FIXTURES_DIR"/*/; do
+    name=$(basename "$dir")
+    run_mode "$name" "terminal" ""       "terminal"
+    run_mode "$name" "json"     "--json" "json"
+done
+
+# ─── Oracle check: the report against independently computed expectations ──
+for dir in "$HARNESS_FIXTURES_DIR"/*/; do
+    name=$(basename "$dir")
+    oracle="$SCRATCH_DIR/$name/oracle.json"
+    if [ ! -s "$oracle" ]; then
+        echo "FAIL $name/oracle: oracle.json is missing or empty"
+        fail_count=$((fail_count + 1))
+        continue
+    fi
+    AS_OF=""
+    FLAGS=""
+    # shellcheck disable=SC1091
+    . "$dir/input.env"
+    # FLAGS carries several words from input.env and must word-split here,
+    # which is the same contract run_mode applies to it.
+    # `env -u CODEX_HOME` is REDUNDANT and kept only as a local statement of
+    # the requirement: the scratch HOME is what makes a fixture run hermetic,
+    # and `$CODEX_HOME` would override it for Codex root resolution. That
+    # hazard is already removed for every line below the `_lib-fixture-harness`
+    # source above, because that library sources `bin/_lib-harness-env.sh`,
+    # whose unconditional `unset CODEX_HOME` (added for #108) covers the whole
+    # rest of this script.
+    actual=$(env -u CODEX_HOME HOME="$SCRATCH_DIR/$name" NO_COLOR=1 TZ=Etc/UTC \
+             CCTALLY_AS_OF="$AS_OF" \
+             "$HARNESS_BIN" explain --json $FLAGS 2>/dev/null)
+    if ORACLE_PATH="$oracle" SCENARIO="$name" python3 - "$actual" <<'PY'
+import json, os, sys
+
+report = json.loads(sys.argv[1])
+oracle = json.loads(open(os.environ["ORACLE_PATH"]).read())
+scenario = os.environ["SCENARIO"]
+problems = []
+
+results = [r for r in report["results"] if r["source"] == oracle["source"]]
+if not results:
+    problems.append(f"no result for source {oracle['source']}")
+else:
+    result = results[0]
+    # The denominator is an EvidenceField, so its STATE is checked before its
+    # value: a withheld denominator must not publish a figure at all.
+    denominator = result["denominator"]["usd"]
+    if denominator["state"] != oracle["denominatorState"]:
+        problems.append(
+            f"denominator state {denominator['state']} "
+            f"!= {oracle['denominatorState']}"
+        )
+    if denominator.get("code") != oracle["denominatorCode"]:
+        problems.append(
+            f"denominator code {denominator.get('code')} "
+            f"!= {oracle['denominatorCode']}"
+        )
+    if oracle["denominatorUsd"] is None:
+        if denominator["value"] is not None:
+            problems.append(
+                f"denominator value {denominator['value']!r} should be absent"
+            )
+    elif abs(denominator["value"] - oracle["denominatorUsd"]) > 1e-9:
+        problems.append(
+            f"denominator {denominator['value']!r} "
+            f"!= oracle {oracle['denominatorUsd']!r}"
+        )
+    if result["withheldClassCount"] != oracle["withheldClassCount"]:
+        problems.append(
+            f"withheld class count {result['withheldClassCount']} "
+            f"!= oracle {oracle['withheldClassCount']}"
+        )
+    if result["applicableClassCount"] != oracle["applicableClassCount"]:
+        problems.append(
+            f"applicable class count {result['applicableClassCount']} "
+            f"!= oracle {oracle['applicableClassCount']}"
+        )
+    if result["verdict"] != oracle["providerVerdict"]:
+        problems.append(
+            f"provider verdict {result['verdict']} "
+            f"!= {oracle['providerVerdict']}"
+        )
+    if result["code"] != oracle["providerCode"]:
+        problems.append(
+            f"provider code {result['code']} != {oracle['providerCode']}"
+        )
+    # The report-level verdict folds every provider, so a single-provider
+    # oracle can only bind it when the report has one provider in it.
+    if len(report["results"]) == 1:
+        if report["overallVerdict"] != oracle["overallVerdict"]:
+            problems.append(
+                f"overall {report['overallVerdict']} "
+                f"!= {oracle['overallVerdict']}"
+            )
+        if report["overallCode"] != oracle["overallCode"]:
+            problems.append(
+                f"overall code {report['overallCode']} "
+                f"!= {oracle['overallCode']}"
+            )
+    by_class = {c["contributorClass"]: c for c in result["classes"]}
+    for expected in oracle["classes"]:
+        kind = expected["contributorClass"]
+        got = by_class.get(kind)
+        if got is None:
+            problems.append(f"{kind}: absent from the report")
+            continue
+        if got["verdict"] != expected["verdict"]:
+            problems.append(
+                f"{kind}: verdict {got['verdict']} != {expected['verdict']}"
+            )
+        if got["code"] != expected["code"]:
+            problems.append(
+                f"{kind}: code {got['code']} != {expected['code']}"
+            )
+        # B12 names coverage and rank, so the oracle states them and they are
+        # checked here. A golden is a recording of the implementation and can
+        # only prove a rank has not changed, never that it is right.
+        if got["population"]["supportUnits"] != expected["supportUnits"]:
+            problems.append(
+                f"{kind}: support {got['population']['supportUnits']} "
+                f"!= {expected['supportUnits']}"
+            )
+        actual_coverage = got["population"].get("usdCoverage")
+        if expected["usdCoverage"] is None:
+            if actual_coverage is not None:
+                problems.append(
+                    f"{kind}: usdCoverage {actual_coverage!r} should be absent"
+                )
+        elif (actual_coverage is None
+                or abs(actual_coverage - expected["usdCoverage"]) > 1e-12):
+            problems.append(
+                f"{kind}: usdCoverage {actual_coverage!r} "
+                f"!= {expected['usdCoverage']!r}"
+            )
+        if len(got["rows"]) != len(expected["subjects"]):
+            problems.append(
+                f"{kind}: {len(got['rows'])} rows != "
+                f"{len(expected['subjects'])} expected subjects"
+            )
+            continue
+        # Project and session keys are anonymized on the wire, so those
+        # classes are compared on their arithmetic rather than their keys.
+        # The three conversation-derived classes ARE compared on their keys:
+        # each contributes one aggregate subject whose key is a constant of
+        # the class and carries no member identity, so a key derived from a
+        # member instead would reach the wire unaliased and this is where that
+        # would show up.
+        compare_keys = kind in ("model_mix", "five_hour_bursts",
+                                "cache_churn", "short_high_context",
+                                "subagent_fanout")
+        for row, want in zip(got["rows"], expected["subjects"]):
+            if compare_keys and row["subjectKey"] != want["subjectKey"]:
+                problems.append(
+                    f"{kind}: subject {row['subjectKey']} != {want['subjectKey']}"
+                )
+            if abs(row["observedUsd"]["value"] - want["observedUsd"]) > 1e-9:
+                problems.append(
+                    f"{kind}/{want['subjectKey']}: usd "
+                    f"{row['observedUsd']['value']!r} != {want['observedUsd']!r}"
+                )
+            if abs(row["share"]["value"] - want["share"]) > 1e-12:
+                problems.append(
+                    f"{kind}/{want['subjectKey']}: share "
+                    f"{row['share']['value']!r} != {want['share']!r}"
+                )
+            if row["confidence"] != expected["confidence"]:
+                problems.append(
+                    f"{kind}/{want['subjectKey']}: confidence "
+                    f"{row['confidence']} != {expected['confidence']}"
+                )
+            if row["rank"] != want["rank"]:
+                problems.append(
+                    f"{kind}/{want['subjectKey']}: rank "
+                    f"{row['rank']} != {want['rank']}"
+                )
+            baseline = row["baseline"]
+            if want["baselineShare"] is None:
+                if baseline["state"] != "withheld":
+                    problems.append(
+                        f"{kind}/{want['subjectKey']}: baseline should be "
+                        f"withheld, got {baseline['state']}"
+                    )
+                elif baseline.get("code") != want["baselineCode"]:
+                    problems.append(
+                        f"{kind}/{want['subjectKey']}: baseline code "
+                        f"{baseline.get('code')} != {want['baselineCode']}"
+                    )
+            elif baseline["state"] != "available":
+                problems.append(
+                    f"{kind}/{want['subjectKey']}: baseline is "
+                    f"{baseline['state']}, expected available "
+                    f"{want['baselineShare']!r}"
+                )
+            elif abs(baseline["value"] - want["baselineShare"]) > 1e-12:
+                problems.append(
+                    f"{kind}/{want['subjectKey']}: baseline "
+                    f"{baseline['value']!r} != {want['baselineShare']!r}"
+                )
+
+if problems:
+    for line in problems:
+        print(f"  {scenario}: {line}")
+    sys.exit(1)
+PY
+    then
+        echo "PASS $name/oracle"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $name/oracle"
+        fail_count=$((fail_count + 1))
+    fi
+done
+
+# ─── Route goldens: the same report, served by `GET /api/diagnosis` ────────
+#
+# The dashboard's own golden scenarios cannot reach this route, because it is
+# not part of `/api/data`. So the scenarios that already seed the four states
+# worth serving — a ranked result, a no-contributor control, a withheld class
+# and an unattributed Codex population — each boot a server on their own
+# scratch HOME and diff the served body against `golden-route.json`.
+#
+# A scenario opts in by setting `ROUTE_QUERY` in its input.env. The rest skip
+# this leg silently: a server boot per scenario would triple the harness's wall
+# clock to re-serve reports the CLI goldens already pin.
+#
+# A scenario may ALSO carry `route-legs.tsv`, one leg per line:
+#
+#     <leg>\t<bind>\t<host-header>\t<expose-transcripts>\t<query>
+#
+# and each leg is served into `golden-route-<leg>.json`. That exists because
+# the Section 3 matrix is a matrix: the same store answers differently under a
+# loopback request, a request whose `Host` is a hostname (the DNS-rebinding
+# vector the transcript gate rejects), and a request under the
+# `dashboard.expose_transcripts` opt-in from a non-loopback bind. One store
+# with three served bodies is what makes those three cells RENDERED artifacts
+# rather than pytest legs over internal facts.
+. "$REPO_ROOT/bin/_lib-kill-server.sh"
+
+# Put back whatever `config.json` the shared harness seeded. A leg that only
+# READ the config must leave it alone: deleting it made the next leg's
+# `load_config` mint a fresh random collector token, and the `configuration`
+# component digests the whole config payload, so that leg's golden carried a
+# digest nothing could reproduce.
+_restore_route_config() {
+    local config="$1" backup="$2" expose="$3"
+    [ "$expose" = "true" ] || return 0
+    if [ -n "$backup" ] && [ -f "$backup" ]; then
+        mv "$backup" "$config"
+    else
+        rm -f "$config"
+    fi
+}
+
+# Serve one route leg into one golden. Every argument is explicit, because the
+# gate this exercises is decided by the bind, the `Host` header and the
+# `dashboard.expose_transcripts` config together, and a leg that inherited any
+# of them would be asserting a condition nobody stated.
+serve_route_leg() {
+    local name="$1" leg="$2" bind="$3" host_header="$4" expose="$5" query="$6"
+    local as_of="$7"
+    local golden home log pid port status body_file actual config
+    local config_backup
+    home="$SCRATCH_DIR/$name"
+    log="$SCRATCH_DIR/$name.$leg.dashboard.log"
+    if [ "$leg" = "default" ]; then
+        golden="$HARNESS_FIXTURES_DIR/$name/golden-route.json"
+    else
+        golden="$HARNESS_FIXTURES_DIR/$name/golden-route-$leg.json"
+    fi
+
+    # `dashboard.expose_transcripts` is read from the config at boot, so it is
+    # written here and removed afterwards — the CLI legs above must never see
+    # it, and they already ran.
+    # `dashboard.lan_auth` defaults to TRUE, so a non-loopback bind mints a
+    # per-run token and every `/api/*` request without it is 401. Turning it
+    # off beside the expose opt-in is exactly what "authentication disabled"
+    # names, and D-E requires exercising that configuration rather than
+    # inventing a denial.
+    #
+    # The shared harness seeds a DETERMINISTIC `config.json` — a fixed
+    # collector token and `display.tz` — precisely so the `configuration`
+    # generation component is reproducible; `load_config` would otherwise mint
+    # a random collector token on first run and every route golden would carry
+    # a digest that changed on every invocation. So this leg BACKS UP that file
+    # and restores it afterwards rather than deleting it, and the replacement
+    # it writes keeps the same deterministic collector and display blocks.
+    config="$home/.local/share/cctally/config.json"
+    config_backup=""
+    if [ "$expose" = "true" ]; then
+        mkdir -p "$(dirname "$config")"
+        if [ -f "$config" ]; then
+            config_backup="$config.route-leg-backup"
+            cp "$config" "$config_backup"
+        fi
+        printf '%s\n' '{"collector": {"host": "127.0.0.1", "port": 17321,
+ "token": "harness", "week_start": "monday"}, "display": {"tz": "utc"},
+ "dashboard": {"expose_transcripts": true, "lan_auth": false}}' > "$config"
+    fi
+
+    env -u CODEX_HOME CCTALLY_AS_OF="$as_of" HOME="$home" TZ=Etc/UTC \
+        "$HARNESS_BIN" dashboard --port 0 --no-browser --no-sync \
+        --sync-interval 9999 --host "$bind" >"$log" 2>&1 &
+    pid=$!
+
+    port=""
+    tries=0
+    while [ $tries -lt 150 ]; do
+        if [ -s "$log" ]; then
+            port=$(grep -Eo 'http://(127\.0\.0\.1|localhost):[0-9]+' "$log" \
+                   | head -1 | sed 's#.*:##')
+            [ -n "$port" ] && break
+        fi
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+
+    if [ -z "$port" ]; then
+        echo "FAIL $name/route-$leg: could not discover port (log: $log)"
+        sed 's/^/    /' "$log" || true
+        kill_server_bounded "$pid"
+        _restore_route_config "$config" "$config_backup" "$expose"
+        fail_count=$((fail_count + 1))
+        return 0
+    fi
+
+    body_file="$SCRATCH_DIR/$name.$leg.route.json"
+    status=$(curl -s -o "$body_file" -w '%{http_code}' --max-time 30 \
+             -H "Host: ${host_header/PORT/$port}" \
+             "http://127.0.0.1:$port/api/diagnosis?$query")
+    kill_server_bounded "$pid"
+    _restore_route_config "$config" "$config_backup" "$expose"
+
+    if [ "$status" != "200" ] && [ "$status" != "503" ]; then
+        echo "FAIL $name/route-$leg: GET /api/diagnosis returned $status"
+        sed 's/^/    /' "$body_file" 2>/dev/null | head -20 || true
+        fail_count=$((fail_count + 1))
+        return 0
+    fi
+
+    actual=$(python3 -c '
+import json, sys
+print(json.dumps(json.load(open(sys.argv[1])), indent=2, sort_keys=True))
+' "$body_file" 2>/dev/null) || {
+        echo "FAIL $name/route-$leg: response was not JSON"
+        sed 's/^/    /' "$body_file" 2>/dev/null | head -20 || true
+        fail_count=$((fail_count + 1))
+        return 0
+    }
+
+    if [ -n "${HARNESS_REGEN:-}" ]; then
+        printf '%s\n' "$actual" > "$golden"
+        echo "REGEN $name/route-$leg"
+        pass_count=$((pass_count + 1))
+        return 0
+    fi
+    if [ ! -s "$golden" ]; then
+        echo "FAIL $name/route-$leg: $(basename "$golden") is missing or empty"
+        fail_count=$((fail_count + 1))
+        return 0
+    fi
+    GOLDEN_DIFF_TMPDIR="$SCRATCH_DIR"
+    if ! _golden_diff_str "route-$leg" "$golden" "$actual" 200; then
+        fail_count=$((fail_count + 1))
+        return 0
+    fi
+    echo "PASS $name/route-$leg"
+    pass_count=$((pass_count + 1))
+}
+
+for dir in "$HARNESS_FIXTURES_DIR"/*/; do
+    name=$(basename "$dir")
+    AS_OF=""
+    ROUTE_QUERY=""
+    # shellcheck disable=SC1091
+    . "$dir/input.env"
+
+    if [ -s "$dir/route-legs.tsv" ]; then
+        while IFS=$'\t' read -r leg bind host_header expose query; do
+            case "$leg" in ""|\#*) continue ;; esac
+            serve_route_leg "$name" "$leg" "$bind" "$host_header" "$expose" \
+                            "$query" "$AS_OF"
+        done < "$dir/route-legs.tsv"
+    fi
+
+    [ -n "$ROUTE_QUERY" ] || continue
+
+    golden="$dir/golden-route.json"
+    home="$SCRATCH_DIR/$name"
+    log="$SCRATCH_DIR/$name.dashboard.log"
+    # `env -u CODEX_HOME` is redundant here too, for the reason stated at the
+    # oracle leg above. The dashboard does resolve Codex roots at boot, and the
+    # shared harness environment has already unset the variable.
+    env -u CODEX_HOME CCTALLY_AS_OF="$AS_OF" HOME="$home" TZ=Etc/UTC \
+        "$HARNESS_BIN" dashboard --port 0 --no-browser --no-sync \
+        --sync-interval 9999 --host 127.0.0.1 >"$log" 2>&1 &
+    pid=$!
+
+    port=""
+    tries=0
+    while [ $tries -lt 150 ]; do
+        if [ -s "$log" ]; then
+            port=$(grep -Eo 'http://(127\.0\.0\.1|localhost):[0-9]+' "$log" \
+                   | head -1 | sed 's#.*:##')
+            [ -n "$port" ] && break
+        fi
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+
+    if [ -z "$port" ]; then
+        echo "FAIL $name/route: could not discover port (log: $log)"
+        sed 's/^/    /' "$log" || true
+        kill_server_bounded "$pid"
+        fail_count=$((fail_count + 1))
+        continue
+    fi
+
+    # `--max-time` bounds a hung server; the status code is captured separately
+    # so a 503 body (a store that could not be read is published WITH its
+    # report) is diffed rather than mistaken for a transport failure.
+    body_file="$SCRATCH_DIR/$name.route.json"
+    status=$(curl -s -o "$body_file" -w '%{http_code}' --max-time 30 \
+             "http://127.0.0.1:$port/api/diagnosis?$ROUTE_QUERY")
+    kill_server_bounded "$pid"
+
+    if [ "$status" != "200" ] && [ "$status" != "503" ]; then
+        echo "FAIL $name/route: GET /api/diagnosis returned $status"
+        sed 's/^/    /' "$body_file" 2>/dev/null | head -20 || true
+        fail_count=$((fail_count + 1))
+        continue
+    fi
+
+    # Sorted keys and a stable indent, so the golden is a diffable document
+    # rather than one long line. Nothing is normalized away: `measuredAt` is
+    # pinned by CCTALLY_AS_OF and every generation digest is computed over the
+    # facts the fixture seeds, so the whole body is deterministic — and the
+    # digests are exactly what a mutation check needs to see move.
+    actual=$(python3 -c '
+import json, sys
+print(json.dumps(json.load(open(sys.argv[1])), indent=2, sort_keys=True))
+' "$body_file" 2>/dev/null) || {
+        echo "FAIL $name/route: response was not JSON"
+        sed 's/^/    /' "$body_file" 2>/dev/null | head -20 || true
+        fail_count=$((fail_count + 1))
+        continue
+    }
+
+    if [ -n "${HARNESS_REGEN:-}" ]; then
+        printf '%s\n' "$actual" > "$golden"
+        echo "REGEN $name/route"
+        pass_count=$((pass_count + 1))
+        continue
+    fi
+    # #625: a first-run golden write that fails leaves a harness reporting
+    # PASS over nothing. A missing or empty golden is a FAIL here, never a
+    # silent seed.
+    if [ ! -s "$golden" ]; then
+        echo "FAIL $name/route: golden-route.json is missing or empty"
+        fail_count=$((fail_count + 1))
+        continue
+    fi
+    GOLDEN_DIFF_TMPDIR="$SCRATCH_DIR"
+    if ! _golden_diff_str "route" "$golden" "$actual" 200; then
+        fail_count=$((fail_count + 1))
+        continue
+    fi
+    echo "PASS $name/route"
+    pass_count=$((pass_count + 1))
+done
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

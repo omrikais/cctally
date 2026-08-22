@@ -6,8 +6,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { BlockModal } from './BlockModal';
-import { _resetForTests, dispatch } from '../store/store';
-import type { BlockDetail } from '../types/envelope';
+import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
+import type { BlockDetail, Envelope } from '../types/envelope';
 
 const BLOCK_DETAIL: BlockDetail = {
   start_at: '2026-06-01T00:00:00Z',
@@ -45,6 +45,29 @@ describe('BlockModal projection unit suffix (BL-1)', () => {
     const kv = await screen.findByText(/min left/);
     expect(kv.textContent).toContain('191 min left');
     expect(kv.textContent).not.toContain('191m left');
+  });
+
+  it('names the resolved IANA zone in both the title and the window bounds', async () => {
+    updateSnapshot({
+      generated_at: '2026-06-01T00:30:00Z',
+      display: {
+        tz: 'Asia/Jerusalem', resolved_tz: 'Asia/Jerusalem',
+        offset_label: 'IDT', offset_seconds: 10800,
+      },
+    } as Envelope);
+    global.fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ ...BLOCK_DETAIL, label: '03:00 Jun 01 IDT' }),
+    } as Response)) as never;
+
+    render(<BlockModal />);
+
+    await screen.findByText(/03:00 Jun 01 IDT/);
+    expect(screen.getAllByText('[Asia/Jerusalem]')).toHaveLength(2);
+    expect(screen.getByRole('dialog')).toHaveAccessibleName(
+      'Block · 03:00 Jun 01 IDT [Asia/Jerusalem]',
+    );
   });
 });
 

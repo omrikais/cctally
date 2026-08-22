@@ -58,6 +58,26 @@ describe('BlocksPanel uncap (#264 S4 A2)', () => {
     render(<BlocksPanel />);
     expect(screen.getAllByText(/Block \d/)).toHaveLength(6);
   });
+
+  it('names the resolved IANA zone beside a block label that only has an abbreviation', () => {
+    const env = baseEnvelope();
+    env.display = {
+      tz: 'Asia/Jerusalem', resolved_tz: 'Asia/Jerusalem',
+      offset_label: 'IDT', offset_seconds: 10800,
+    };
+    env.blocks = {
+      rows: [blockRow({ label: '18:00 Aug 20 IDT' })],
+      total_cost_usd: 2,
+    };
+    updateSnapshot(env);
+
+    render(<BlocksPanel />);
+
+    expect(screen.getByText('[Asia/Jerusalem]')).toBeInTheDocument();
+    expect(screen.getByRole('button', {
+      name: 'Open detail for block starting 18:00 Aug 20 IDT [Asia/Jerusalem]',
+    })).toBeInTheDocument();
+  });
 });
 
 describe('BlocksPanel empty-week ⤢ (#265 D)', () => {
@@ -151,7 +171,7 @@ describe('BlocksPanel source-bound detail routing (#319 Task 1)', () => {
     expect(screen.getByTestId('block-account-chip'))
       .toHaveTextContent('work@example.com');
     expect(screen.getByRole('button', {
-      name: 'Open detail for work@example.com block starting 13:00 Apr 24 UTC',
+      name: 'Open detail for work@example.com block starting 13:00 Apr 24 UTC [Etc/UTC]',
     })).toBeInTheDocument();
   });
 
@@ -175,7 +195,7 @@ describe('BlocksPanel source-bound detail routing (#319 Task 1)', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     const { container } = render(<BlocksPanel />);
 
-    expect(screen.getByRole('button', { name: 'Open detail for block starting 08:00 Apr 24 UTC' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Open detail for block starting 08:00 Apr 24 UTC [Etc/UTC]' })).toBeInTheDocument();
     expect(container.querySelector('.source-chip--claude')).toHaveTextContent('Claude');
     expect(container.querySelector('.source-chip--codex')).toBeNull();
   });
@@ -198,7 +218,7 @@ describe('BlocksPanel source-bound detail routing (#319 Task 1)', () => {
     render(<BlocksPanel />);
 
     fireEvent.click(screen.getByRole('button', {
-      name: 'Open detail for block starting 08:00 Apr 24 UTC',
+      name: 'Open detail for block starting 08:00 Apr 24 UTC [Etc/UTC]',
     }));
 
     expect(getState().openModal).toBe('block');

@@ -1008,8 +1008,15 @@ def _authoritative_record_usage(
     selected-state writes. This frame owns the lock only on the
     ``lock_held=False`` path, so that is the only path that can fire the
     deferred nudge itself; a caller passing ``lock_held=True`` owns the lock
-    and must supply its own sink, or the nudge stays inside its section.
+    and must supply its own sink. The fail-closed guard below enforces that
+    contract before any tombstone or journal write begins.
     """
+    if lock_held and nudge_dashboard and nudge_sink is None:
+        return _AuthoritativeRecordResult(
+            "record_failed",
+            "lock_held authoritative record requires nudge_sink",
+        )
+
     if not lock_held:
         deferred = []
         try:

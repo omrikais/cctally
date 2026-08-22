@@ -12,6 +12,8 @@ import time
 
 from conftest import load_script
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
+
 
 def test_publish_fans_out_to_all_subscribers():
     ns = load_script()
@@ -71,5 +73,6 @@ def test_publish_is_threadsafe_under_concurrent_subscribe():
     for i in range(200):
         hub.publish({"i": i})
     stop.set()
-    t.join(timeout=1.0)
+    # timing-budget: the subscriber-churn thread has exited now that `stop` is set
+    t.join(timeout=PRESENCE_BACKSTOP_SECONDS)
     # If this completes without RuntimeError ("set changed size…") the lock works.

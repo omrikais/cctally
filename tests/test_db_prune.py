@@ -34,6 +34,11 @@ def _load(tmp_path, monkeypatch):
 
 
 def _set_policy(core, **block):
+    # Age/count/shape unit tests must not inherit the production 10 GiB
+    # emergency floor: available space is host state, and a loaded CI runner
+    # can legitimately cross it while the fixture is running.  Tests that own
+    # the free-disk rule pass min_free_mib explicitly.
+    block.setdefault("min_free_mib", None)
     core.CONFIG_PATH.write_text(
         json.dumps({"storage.artifact_retention": block}), encoding="utf-8",
     )
@@ -99,6 +104,30 @@ def test_a_no_op_apply_exits_zero(tmp_path, monkeypatch, capsys):
     code, out, _err = _run(ns, capsys, ["db", "prune", "--yes"])
     assert code == 0
     assert "Freed" in out
+
+
+def test_apply_fixture_does_not_inherit_the_hosts_free_disk_floor(
+    tmp_path, monkeypatch, capsys,
+):
+    """The host's current free space is not an input to age/count unit tests.
+
+    A partial policy inherits the production 10 GiB floor.  Loaded hosted
+    runners can fall below it, which correctly makes an apply exit 3 even when
+    the rule the test meant to exercise is satisfied.
+    """
+    ns, core, ret = _load(tmp_path, monkeypatch)
+    _set_policy(core, max_age_days=3650)
+    real_disk_usage = ret._disk_usage
+    monkeypatch.setattr(
+        ret,
+        "_disk_usage",
+        lambda path: real_disk_usage(path)._replace(free=1024),
+    )
+
+    code, out, err = _run(ns, capsys, ["db", "prune", "--yes", "--json"])
+
+    assert code == 0, f"stdout={out!r}\nstderr={err!r}"
+    assert json.loads(out)["unsatisfiedRules"] == []
 
 
 # --------------------------------------------------------------------------

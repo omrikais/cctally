@@ -7,8 +7,10 @@ durable rather than merely raised, both require killing a real process at a
 known seam and then observing what a LATER process finds on disk.
 """
 from __future__ import annotations
+import types
 
 import argparse
+import ast
 import datetime as dt
 import json
 import os
@@ -650,10 +652,29 @@ def test_unproven_wal_shape_is_preserved_without_sqlite_open(
     paths = [db, pathlib.Path(f"{db}-wal"), pathlib.Path(f"{db}-shm")]
     before = {path.name: path.read_bytes() for path in paths}
 
-    def forbidden_connect(*_args, **_kwargs):
-        raise AssertionError("unproven WAL-index shape reached sqlite3.connect")
+    # #630 S2: this was `monkeypatch.setattr(sqlite3, "connect", ...)` with a
+    # body that raised. That trap fired on ANY connect anywhere in the process,
+    # including one a concurrent handler thread made, so under `--dist load` it
+    # could turn an unrelated open into a red against this test. There is no
+    # importer-local form to move it to, because `_lib_stats_wal` has no route
+    # to sqlite3 at all. So the property is asserted over the module instead of
+    # trapped during one call, which is strictly more: a trap observes only the
+    # call it wraps, while this fails the moment the route is created.
+    imported = set()
+    tree = ast.parse(
+        pathlib.Path(_lib_stats_wal.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert imported, "parsed no imports out of _lib_stats_wal, so this proves nothing"
+    assert imported <= {"__future__", "os", "pathlib", "struct", "sys"}, (
+        f"_lib_stats_wal now imports {sorted(imported)}; it can no longer be "
+        f"proven by inspection to open no SQLite connection, so this test needs "
+        f"a real guard again"
+    )
 
-    monkeypatch.setattr(sqlite3, "connect", forbidden_connect)
     evidence = _lib_stats_wal.inspect_wal_index_family(db)
 
     assert evidence["verdict"] not in {"coherent", "wal_absent", "wal_empty"}

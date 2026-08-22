@@ -142,6 +142,13 @@
       ],
       "sourcePaths": []
     },
+    "explain": {
+      "fixturePaths": [
+        "bin/build-explain-fixtures.py",
+        "tests/fixtures/explain"
+      ],
+      "sourcePaths": []
+    },
     "five-hour-blocks": {
       "fixturePaths": [],
       "sourcePaths": []

@@ -995,35 +995,11 @@ def _sync_failure_envelope(
             "action": None,
         }
 
-    # #583 S2 §7. A locked cache.db is named rather than left in the generic
-    # bucket. Typed attribution only — a blanket uncorrupted-cache branch
-    # would be too broad, because ANY exception raised while reading cache.db
-    # produces that attribution and every one would then be told to
-    # checkpoint. `database="stats_or_cache"` deliberately does NOT reach here:
-    # that value means ownership was not established, and a guess would
-    # produce a confidently wrong remedy.
-    # Corruption outranks busy, and the gate is required rather than implied by
-    # branch order: `attributed(...)` scans the WHOLE attribution list, so
-    # without it a tick carrying a corruption-shaped cache attribution AND a
-    # separate busy one rendered "cache database busy" and dropped the
-    # corruption message — the more urgent of the two, whose remedy is not
-    # interchangeable with a checkpoint. The gate names the TYPED corruption
-    # attribution only: a busy attribution still outranks the legacy raw-text
-    # corruption legs below, which is what Preserve 10 asks for.
-    if attributed("cache", sqlite_busy=True) and not attributed(
-        "cache", corruption=True
-    ):
-        return {
-            "kind": "cache_busy",
-            "label": "⚠ cache database busy",
-            "detail": (
-                "The dashboard could not complete sync because cache.db "
-                "stayed locked."
-            ),
-            "action": "cctally db checkpoint",
-        }
-
     text = error.casefold()
+    # Maintenance ownership supplies a more specific recovery action than a
+    # secondary busy attribution from another leg in the same failed tick.
+    # Classify those markers before the typed busy fallback so a blocked stale
+    # owner is never told merely to checkpoint the WAL.
     if (
         "stale maintenance marker" in text
         or "stale repair marker" in text
@@ -1041,6 +1017,32 @@ def _sync_failure_envelope(
             "label": "cache repair in progress",
             "detail": "Another cctally process is repairing the server cache.",
             "action": None,
+        }
+
+    # #583 S2 §7. A locked cache.db is named rather than left in the generic
+    # bucket. Typed attribution only — a blanket uncorrupted-cache branch
+    # would be too broad, because ANY exception raised while reading cache.db
+    # produces that attribution and every one would then be told to
+    # checkpoint. `database="stats_or_cache"` deliberately does NOT reach here:
+    # that value means ownership was not established, and a guess would
+    # produce a confidently wrong remedy.
+    # Corruption outranks busy, and the gate is required rather than implied by
+    # branch order: `attributed(...)` scans the WHOLE attribution list, so
+    # without it a tick carrying a corruption-shaped cache attribution AND a
+    # separate busy one rendered "cache database busy" and dropped the
+    # corruption message — the more urgent of the two, whose remedy is not
+    # interchangeable with a checkpoint.
+    if attributed("cache", sqlite_busy=True) and not attributed(
+        "cache", corruption=True
+    ):
+        return {
+            "kind": "cache_busy",
+            "label": "⚠ cache database busy",
+            "detail": (
+                "The dashboard could not complete sync because cache.db "
+                "stayed locked."
+            ),
+            "action": "cctally db checkpoint",
         }
 
     c = sys.modules["cctally"]

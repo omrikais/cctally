@@ -115,6 +115,7 @@ the UI with either input.
 | `/` or `⌘F` / `Ctrl+F` | Open the conversation find bar when a reader is open; otherwise focus the rail / Sessions search input. `⌘F` / `Ctrl+F` suppresses the browser's native find bar only inside the Conversations workspace (and only when no modal/overlay/input is up) |
 | `n` / `N` | Next / previous search match — and, with the find bar open and its input blurred, step to the next / previous in-conversation match |
 | `s` | Open settings overlay |
+| `e` (dashboard) | Open the diagnosis of the current window — which subjects account for what it spent. View-scoped: in the Conversations reader `e` jumps to the next error turn instead (below). The persistent **Explain** button beside the source and account selectors opens the same modal |
 | `q` | Close the tab (best-effort) |
 | `?` | Toggle help overlay |
 | `v` (dashboard) | Cycle the source selector Claude → Codex → All. View-scoped — in the Conversations reader `v` cycles the focus mode instead (below) |
@@ -153,18 +154,21 @@ model breakdown + recent sessions. Clicking a session in the drill
 opens the Session modal (replaces, not stacks). The modal's share
 affordance routes through the same `_build_project_snapshot` kernel as
 the panel and carries the active `windowWeeks` into the share flow.
-Project drill responses include the exact half-open bounds queried by the
-server, and the modal renders those provider-native bounds rather than
-reconstructing them in the browser. An `All` project ranking may therefore
-open a wider Claude drill than the selected legacy pill, while a Codex drill
-continues to state its independently retained range.
+Project drill responses include the exact half-open bucket intervals queried
+by the server. Subscription-reset shifts can leave gaps between those buckets;
+the modal renders their provider-native outer span and states the number of
+reset gaps rather than implying that the span is continuous. An `All` project
+ranking may therefore open a wider Claude drill than the selected legacy pill,
+while a Codex drill continues to state its independently retained range.
 
 A caption under the window selector writes out what the two percentage columns
 mean, because the terminal-style tooltips they used to rely on never appear on
-touch: `Used pp (sum)` adds each week's attributed usage percentage across the
-selected window, so it is a sum of percentage points rather than a share of any
-one week, and `Cost share` is measured against total project spend in that same
-window. On an installation with more than one Claude account, the panel and the
+touch. It also states that each selection is a set of subscription-week buckets
+whose reset shifts can leave gaps, and that the table and drill use the same
+buckets. `Used pp (sum)` adds each bucket's attributed usage percentage, so it
+is a sum of percentage points rather than a share of any one week, and `Cost
+share` is measured against total project spend in that same window. On an
+installation with more than one Claude account, the panel and the
 modal also state that accounts are folded into one ranking and that their
 independent weekly quota percentages are never added together.
 
@@ -200,6 +204,12 @@ Where the button leads, by alert axis:
 - the five-hour block has been purged, so its detail no longer exists;
 - the alert is a `project_budget` crossing on an installation with more than one account, where the crossing is recorded across all of them and cannot be narrowed to one account's projects;
 - the budget runs on a calendar week, for which the dashboard publishes no matching view — its weekly views are keyed by subscription week (Claude) and by quota cycle (Codex), and neither is a civil week.
+
+Where the alert nonetheless fixes a window — every case above except a row that retained no window at all — an **Explain this window** button appears beside that sentence. It opens the diagnosis for the alert's own half-open bounds, which the surfaces above cannot render: the Current Week modal always shows the live week and the period views clamp to the current row, while `GET /api/diagnosis` is keyed by nothing but its bounds. The sentence stays, because the week, the block or the period genuinely is not opened; what is added is an account of where that window's cost went.
+
+Following a warning that way re-measures against live data, so the modal states **both** instants: when the alert fired and when the diagnosis measured. A `project_budget` crossing stamped vendor-wide is diagnosed across every account, because that is what the stamp means; the sentence about not narrowing it to one account's projects still applies to the project drill.
+
+The two ways in are scoped differently, on purpose. Following a warning diagnoses **that alert's own account**, because the alert was raised against one account's spend and re-measuring a wider population would answer a different question from the one that fired. The `e` shortcut and the **Explain** button diagnose **all accounts**, because neither names an account: the account chip beside the button filters the panels, not the diagnosis, and narrowing to the chip's account would silently drop spend the reader can see on the same screen. The modal header states which of the two it is, so the scope is never inferred from the chip.
 
 The clock this uses is the envelope's own `generated_at`, not your browser's, so a tab left open does not declare a window closed while the figures beside it still describe it.
 
@@ -302,6 +312,7 @@ Before merging or releasing v2 changes, run through:
 | `GET /api/source/<source>/<resource>/<opaque-key>` | Bounded provider-owned detail for `source ∈ {claude,codex}` and `resource ∈ {session,project,block}`. Codex reads are relational and `sync=False`; they expose native model/token, project/session, and quota observation/milestone/forecast data without walking rollout files. `all` has no physical details. Invalid/unavailable pairs return `400 source_capability_unavailable`; a valid missing key returns `404 source_resource_not_found`; a Codex block detail asked for while the published quota projection is marked incomplete returns `503 quota_projection_incomplete` with `error: "quota view reconciling"` and `action: "cctally cache-sync"`; none of these responses exposes raw provider identities or exception text. |
 | `POST /api/share/render`, `POST /api/share/compose` | Server-rendered share artifact/composition. Optional backend `source ∈ {claude,codex,all}` is source-bearing in the digest and response; omission remains the legacy Claude contract. Codex report panels use the native share vocabulary and configured calendar-week boundary. `all` composes labelled provider sections rather than blending quota. |
 | `GET`/`POST` `/api/share/presets`, `GET`/`POST`/`DELETE` `/api/share/history` | Saved share recipes persist the backend source; legacy source-less records resolve to Claude on read without being rewritten. |
+| `GET /api/diagnosis` | The on-demand diagnosis (#620 S2) — the same report `cctally explain --json` prints, through the same `diagnosis_to_wire` adapter, so the two surfaces cannot drift. Read-only: every store open is a `mode=ro` connect that performs no schema work, migration, legacy import or contract repair, and it runs on the request thread, outside the snapshot build's pinned cache transaction. Selectors: `?source=`, `?account=`, `?window=<token>` (the `cctally explain` grammar) **or** explicit half-open `?start_at=&end_at=` instants, `?speed=`, `?reveal_projects=`. Deliberately NOT an envelope key — an envelope key would pay the client's per-frame cost on every tick for a surface most ticks never display. `200` for any valid report, including a healthy one, an empty one and one whose every field is withheld; `400` for a malformed selector or an unresolved range or account; `503` for `generation_incoherent`, for `store_unavailable`, and for a report whose requested provider's store could not be read with no other provider answering — that last one publishes the withheld REPORT as its body, because the typed cause is what the reader needs. `Cache-Control: no-cache`. |
 | `GET /api/debug/backend` | Loopback-only diagnostic with safe per-source table counts, availability, and opaque data versions. It never returns paths, roots, logical limits, conversation keys, or raw exceptions. |
 | `POST /api/debug/backend/trace` | Loopback-only. Body `{"enabled": true\|false}` arms or disarms the deep phase trace on the running process; the flip applies at the next authoritative build. Gated by the bearer, the loopback/IP-literal-`Host` check and Origin/Host parity, in that order. Read both through `cctally dashboard-perf` rather than by hand — see `docs/commands/dashboard-perf.md`. |
 | `GET /api/conversations` | Conversation-viewer browse rail — all-history per-session rows with per-session cost. `?sort=` (#217 S4) ∈ `{recent (default), oldest, cost, messages, project}` orders the list; an unknown value falls back to `recent` (the endpoint stays lenient). Optional server-side filter params (`date_from`/`date_to`/`projects`/`cost_min`/`cost_max`/`rebuild_min`); a malformed value is `400`. The `page` object carries an additive `sort_degraded: true` when a `cost`/`project` sort fell back to `recent` order during the brief non-authoritative indexing window (beside `filter_degraded`). See [Rail sort](#rail-sort) and [Browse filters](#browse-filters). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). |

@@ -187,12 +187,17 @@ def test_a_standalone_build_is_recorded_without_a_dashboard_tick(small_corpus):
 # ── §7.4 regime aggregation ─────────────────────────────────────────────────
 
 
-def test_a_cold_refresh_realises_a_codex_rebuild(small_corpus, monkeypatch):
+def test_a_cold_refresh_realises_a_codex_rebuild(small_corpus, monkeypatch,
+                                                 tmp_path):
     """The precondition for the aggregation gate: a cold tick IS active."""
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
     ts.reset_for_tests()
-    _run_refresh(small_corpus, bbf, force_a2=True, monkeypatch=monkeypatch)
+    # #630 S2: this refresh omits `skip_sync=True`, so it runs a REAL ingest.
+    # Against the session-scoped corpus that writes ingest state and WAL into
+    # a store every other consumer is promised unchanged.
+    corpus = _private_corpus(small_corpus, tmp_path)
+    _run_refresh(corpus, bbf, force_a2=True, monkeypatch=monkeypatch)
     rec = ts.snapshot().records[-1]
     assert rec.codex_regime == "active", (
         f"a cold refresh did not realise a Codex rebuild: {rec.codex_regime}")
@@ -712,7 +717,7 @@ def test_a_refresh_applies_a_pending_trace_request(small_corpus):
 
 
 def test_the_cache_pin_hold_is_measured_at_its_own_boundaries(
-    small_corpus, monkeypatch,
+    small_corpus, monkeypatch, tmp_path,
 ):
     """The recorded hold is the BEGIN-to-ROLLBACK span, not the function's cost.
 
@@ -735,7 +740,9 @@ def test_the_cache_pin_hold_is_measured_at_its_own_boundaries(
     _lib_perf.set_enabled(True)
     try:
         _lib_perf.reset_thread()
-        _run_refresh(small_corpus, bbf, monkeypatch=monkeypatch)
+        # #630 S2: a real ingest (no `skip_sync`), so it owns its own copy.
+        _run_refresh(_private_corpus(small_corpus, tmp_path), bbf,
+                     monkeypatch=monkeypatch)
         root = _lib_perf.current_root()
         tree = root.to_dict() if root is not None else {}
     finally:

@@ -73,12 +73,16 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
   const successFlashActive = now < successFlashUntil;
   const busyNoticeActive = now < busyNoticeUntil;
   const queued = outstandingSyncId != null;
+  const activity = syncActivityOrIdle(env);
+  const queuedStarted = outstandingSyncId != null
+    && activity.requested_id >= outstandingSyncId
+    && activity.started_id >= outstandingSyncId;
   // A rebuild the SERVER is running, whether or not anyone asked for it. On a
   // healthy dashboard measured work is 1.9–6.3 s against a 6.9–12.7 s period,
   // so this is true roughly a quarter to a half of the time. That visible pulse
   // IS the point (#583 F19): today nothing pulses at all, so a busy dashboard
   // and a wedged one look identical.
-  const rebuilding = syncActivityOrIdle(env).rebuilding;
+  const rebuilding = activity.rebuilding;
   const effectiveAge = effectiveSnapshotAge(
     env?.sync_age_s ?? null,
     snapshotObservedAtMs,
@@ -255,9 +259,10 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
     );
   }
   if (queued && !disconnected) {
-    // The POST has already answered 202, so nothing is in flight locally — but
-    // the request is accepted and unserviced, and saying so is the whole
-    // difference between "the server took my click" and the old silent no-op.
+    // The POST has already answered 202, so nothing is in flight locally. The
+    // published high-water marks distinguish accepted-and-waiting (`queued…`)
+    // from this request's batch having started (`syncing…`) without relying on
+    // the process-wide rebuilding flag.
     // Reuses `.syncing` deliberately: same pulse, same `:has()` icon mirror, no
     // new CSS class to keep in step with the design system.
     //
@@ -278,7 +283,7 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
         aria-busy="true"
         aria-live="polite"
       >
-        queued…
+        {queuedStarted ? 'syncing…' : 'queued…'}
       </span>
     );
   }
@@ -391,7 +396,12 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
   // then hold, so they are announced. The age changes once a second for as long
   // as the tab stays open, which is a noisier live region than the `rebuilding`
   // flip this round silenced, so the age is not.
-  const settled = disconnected || env == null || env.sync_age_s == null;
+  const defaultText = disconnected
+    ? 'disconnected'
+    : env == null || env.sync_age_s == null
+      ? 'sync paused'
+      : text;
+  const settled = defaultText === 'disconnected' || defaultText === 'sync paused';
   return (
     <span
       className={
@@ -403,7 +413,7 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
       aria-live={settled ? 'polite' : undefined}
       style={{ color }}
     >
-      {text}
+      {defaultText}
     </span>
   );
 }

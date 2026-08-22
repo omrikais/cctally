@@ -64,11 +64,7 @@ write_codex_hooks() {
 JSON
 }
 mkdir -p "$HARNESS_FAKE_HOME/opt/homebrew/bin"
-for name in cctally cctally-alerts cctally-budget cctally-dashboard \
-           cctally-dollar-per-percent cctally-five-hour-blocks \
-           cctally-five-hour-breakdown cctally-forecast cctally-project \
-           cctally-refresh-usage cctally-statusline cctally-sync-week \
-           cctally-transcript cctally-tui cctally-update; do
+for name in cctally cctally-alerts cctally-budget cctally-dashboard cctally-dollar-per-percent cctally-explain cctally-five-hour-blocks cctally-five-hour-breakdown cctally-forecast cctally-project cctally-refresh-usage cctally-statusline cctally-sync-week cctally-transcript cctally-tui cctally-update; do
     ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/opt/homebrew/bin/$name"
 done
 write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"

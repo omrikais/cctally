@@ -76,6 +76,31 @@ def test_sync_failure_is_null_when_sync_is_healthy(ns):
     assert envelope["sync_failure"] is None
 
 
+def test_stale_maintenance_remedy_outranks_a_secondary_cache_busy_fault(ns):
+    """#605 item 2: a stale repair owner can also make a later leg busy.
+
+    The raw stale-marker evidence names the recovery action.  A typed busy
+    attribution from another leg in the same tick must not replace that with
+    the unrelated checkpoint remedy.
+    """
+    import _cctally_tui as tui
+    import _cctally_dashboard_envelope as dashboard_envelope
+
+    result = dashboard_envelope._sync_failure_envelope(
+        "sync-cache-open: stale repair marker blocks cache recovery",
+        (
+            tui.SyncFailureAttribution(
+                leg="source-build", database="cache", corruption=False,
+                sqlite_busy=True,
+            ),
+        ),
+    )
+
+    assert result is not None
+    assert result["kind"] == "maintenance_stale"
+    assert result["action"] == "cctally cache-sync --rebuild"
+
+
 def test_typed_conversations_corruption_never_becomes_cache_recovery(ns):
     """Typed transcript ownership wins over corruption-shaped raw text."""
     import _cctally_tui as tui

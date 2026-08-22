@@ -1,5 +1,6 @@
 """Issue #415 Task A: conversations.db diagnosis and crash-safe recovery."""
 from __future__ import annotations
+import types
 
 import fcntl
 import hashlib
@@ -590,15 +591,32 @@ def test_probe_snapshot_test_copy_seam_requires_pytest_guard(
     source.write_bytes(b"probe source")
     monkeypatch.setenv("CCTALLY_TEST_CONVERSATION_PROBE_COPY", "1")
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    monkeypatch.setattr(cache_mod.sys, "platform", "linux")
-    monkeypatch.setattr(cache_mod.shutil, "which", lambda _name: "/bin/cp")
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_sys = types.SimpleNamespace(**vars(cache_mod.sys))
+    _iso_sys.platform = "linux"
+    monkeypatch.setattr(cache_mod, "sys", _iso_sys)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_shutil = types.SimpleNamespace(**vars(cache_mod.shutil))
+    _iso_shutil.which = lambda _name: "/bin/cp"
+    monkeypatch.setattr(cache_mod, "shutil", _iso_shutil)
 
     def fail_clone(command, **_kwargs):
         return subprocess.CompletedProcess(
             command, 1, "", "clone support unavailable",
         )
 
-    monkeypatch.setattr(cache_mod.subprocess, "run", fail_clone)
+    # #630 S2: patch the IMPORTER's reference, never the shared stdlib
+    # module object, which every other importer and every concurrent
+    # thread resolves through. The later line flips behaviour on the
+    # copy already installed, so the restore does not need a second
+    # setattr.
+    _iso_subprocess = types.SimpleNamespace(**vars(cache_mod.subprocess))
+    _iso_subprocess.run = fail_clone
+    monkeypatch.setattr(cache_mod, "subprocess", _iso_subprocess)
     with pytest.raises(OSError, match="clone support unavailable"):
         cache_mod._clone_conversation_probe_member(source, destination)
     assert not destination.exists()
@@ -608,7 +626,7 @@ def test_probe_snapshot_test_copy_seam_requires_pytest_guard(
     def unexpected_subprocess(*_args, **_kwargs):
         raise AssertionError("pytest copy seam must not invoke cp")
 
-    monkeypatch.setattr(cache_mod.subprocess, "run", unexpected_subprocess)
+    _iso_subprocess.run = unexpected_subprocess
     cache_mod._clone_conversation_probe_member(source, destination)
     assert destination.read_bytes() == b"probe source"
 
@@ -635,9 +653,24 @@ def test_probe_snapshot_uses_bounded_cow_clone_and_cleans_stale_dirs(
         )
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(cache_mod.sys, "platform", "darwin")
-    monkeypatch.setattr(cache_mod.shutil, "which", lambda _name: "/bin/cp")
-    monkeypatch.setattr(cache_mod.subprocess, "run", fake_run)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_sys = types.SimpleNamespace(**vars(cache_mod.sys))
+    _iso_sys.platform = "darwin"
+    monkeypatch.setattr(cache_mod, "sys", _iso_sys)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_shutil = types.SimpleNamespace(**vars(cache_mod.shutil))
+    _iso_shutil.which = lambda _name: "/bin/cp"
+    monkeypatch.setattr(cache_mod, "shutil", _iso_shutil)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_subprocess = types.SimpleNamespace(**vars(cache_mod.subprocess))
+    _iso_subprocess.run = fake_run
+    monkeypatch.setattr(cache_mod, "subprocess", _iso_subprocess)
     with cache_mod._conversation_probe_snapshot(path) as snapshot:
         assert snapshot.read_bytes() == b"probe source"
         assert not stale.exists()

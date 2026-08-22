@@ -31,6 +31,7 @@ export interface ProjectDetailContentData {
   window_weeks: number;
   window_start_at: string;
   window_end_at: string;
+  window_intervals?: Array<{ start_at: string; end_at: string }>;
   window_cost_usd: number;
   models: ProjectDetailModelRow[];
   sessions: Array<{
@@ -138,6 +139,14 @@ export function ProjectDetailContent({
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   const remaining = Math.max(0, data.sessions_total - data.sessions.length);
   const windowSpan = useDrillWindowSpan(data.window_start_at, data.window_end_at);
+  const resetGapCount = (data.window_intervals ?? []).reduce(
+    (count, interval, index, intervals) => (
+      index > 0 && intervals[index - 1]!.end_at < interval.start_at
+        ? count + 1
+        : count
+    ),
+    0,
+  );
 
   return (
     <div className="projects-drill" data-testid={testId} aria-live="polite">
@@ -149,6 +158,9 @@ export function ProjectDetailContent({
           {windowSpan == null
             ? ` (${data.window_weeks}w)`
             : ` · ${data.window_weeks}w · ${windowSpan}`}
+          {resetGapCount > 0
+            ? ` · ${resetGapCount} reset gap${resetGapCount === 1 ? '' : 's'}`
+            : ''}
         </span>
       </div>
       <div className="projects-drill-grid">

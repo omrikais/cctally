@@ -105,6 +105,7 @@ def _group_entries_into_blocks(
         dt.datetime, tuple[dt.datetime, dt.datetime]
     ] | None = None,
     now: dt.datetime | None = None,
+    _entry_membership: dict[int, list[UsageEntry]] | None = None,
 ) -> list[Block]:
     """Group sorted UsageEntry objects into 5-hour blocks with gap detection.
 
@@ -138,6 +139,13 @@ def _group_entries_into_blocks(
 
     `now` pins the current instant (typically via `_command_as_of()`). When
     omitted, falls back to wall clock so existing callers are unaffected.
+
+    ``_entry_membership`` is an internal detail-route seam. When supplied,
+    each non-gap result object's identity maps to the exact entries assigned
+    by this grouping pass. That ownership is stricter than a later
+    ``start <= timestamp < end`` filter when adjacent recorded windows overlap
+    after a reset shift; consumers that render per-entry samples must use the
+    grouping decision rather than independently reconstructing it.
     """
     if not entries:
         return []
@@ -264,6 +272,8 @@ def _group_entries_into_blocks(
             anchor="recorded",
         )
         first_entry_ts_by_block[id(blk)] = bucket_sorted[0].timestamp
+        if _entry_membership is not None:
+            _entry_membership[id(blk)] = bucket_sorted
         recorded_block_objs.append(blk)
 
     # Phase 2: Build heuristic Block objects from raw_blocks using _aggregate_block
@@ -278,6 +288,8 @@ def _group_entries_into_blocks(
         )
         if block_entries:
             first_entry_ts_by_block[id(blk)] = block_entries[0].timestamp
+        if _entry_membership is not None:
+            _entry_membership[id(blk)] = block_entries
         heuristic_block_objs.append(blk)
 
     # Merge + sort by start_time

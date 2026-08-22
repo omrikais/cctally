@@ -241,11 +241,18 @@ directory reproduces a different hash by construction. The authoritative suite
 owns the canonical-root verification through the private
 `bin/cctally-envelope-oracle-test` harness.
 The full record, including the corpus fingerprint the hashes are keyed to, lives
-in `bench/baselines/envelope-oracle.json`. The current capture is 164,619 bytes
+in `bench/baselines/envelope-oracle.json`. The current capture is 168,315 bytes
 — read the sidecar for the exact figure — with rebuild-stable SHA-256
-`68a35bfd3605ff49d340d7917cd2755341e62d9292eca7fb110334369fa6b525` over corpus
-fingerprint `6d5d8358e1765415c40da93f3644b66e64fe4a81a253809248bde641b3a9082d`
-at generator version 6. #565 moved that capture from 164,743 bytes and
+`bafac0457e24059ecb6197001d07d5b0af94ddfa406169c36f81db4c75b8804b` over corpus
+fingerprint `9886d7d6b4bdc119c1f800aff7866fe7d5e39e2915d1c151736e55ee74ccbbdf`
+at generator version 7. #634 added the server-deduplicated
+`session_counts_by_window` map to the three Claude Projects rows (and their
+provider-scoped mirrors); the corpus fingerprint stayed fixed, and a normalized
+structural diff contained exactly those six additions. #631 expanded the corpus
+with real Claude sidechains and materialized Codex conversation rows, so this
+fingerprint intentionally supersedes the version-6 corpus rather than comparing
+its envelope hashes.
+#565 moved an earlier capture from 164,743 bytes and
 `ca63029af9bae0ce50072c0d9bef8d899b01422633ca889d30b0784e90181ad2`:
 the source schema moved from 10 to 11, and the generated corpus's decorated
 Codex provider no longer contributes the obsolete `multi_account_unsupported`

@@ -173,8 +173,8 @@ import re
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Iterable
 
 
 def _cctally():
@@ -1509,11 +1509,12 @@ def _weekly_pct_week_avg_projection(conn, now_utc):
     binds the fired value to forecast's ``week_avg_projection_pct`` within
     1e-9, so the two MUST share the formula by construction.
 
-    LOW CONF mirrors the displayed forecast confidence: the binary
-    ``_assess_forecast_confidence(elapsed_hours, p_now, len(samples))`` plus the
-    ``no_sample_ge_24h`` clause ``_load_forecast_inputs`` appends — so a thin
-    early-week window that forecast renders ``LOW CONF`` never fires a
-    projected alert.
+    LOW CONF mirrors the displayed forecast confidence: ONE call to
+    ``_assess_forecast_confidence(elapsed_hours, p_now, len(samples),
+    has_sample_ge_24h=…)``, whose fourth trigger ``no_sample_ge_24h`` moved
+    inside the predicate with #620 S2 E3 — so a thin early-week window that
+    forecast renders ``LOW CONF`` never fires a projected alert, and glue no
+    longer appends a reason of its own.
 
     Deliberately does NOT call ``_sum_cost_for_range`` (the weekly-% projection
     needs no spend; the forecast kernel's ``week_avg_projection_pct`` is also
@@ -1534,15 +1535,14 @@ def _weekly_pct_week_avg_projection(conn, now_utc):
     r_avg = p_now / elapsed_hours if elapsed_hours > 0 else 0.0
     projected_pct = p_now + r_avg * remaining_hours
 
-    # Confidence: same predicate + the same no_sample_ge_24h augmentation that
-    # _load_forecast_inputs applies, so this LOW CONF gate == forecast's.
-    confidence, _reasons = _assess_forecast_confidence(
-        elapsed_hours, p_now, len(samples)
-    )
+    # Confidence comes from the predicate in one call, fourth trigger
+    # included, so this LOW CONF gate == forecast's and glue no longer
+    # downgrades a confidence the predicate returned (#620 S2 E3).
     target_24h = now_utc - dt.timedelta(hours=24)
-    has_sample_ge_24h = any(s[0] <= target_24h for s in samples)
-    if not has_sample_ge_24h:
-        confidence = "low"
+    confidence, _reasons = _assess_forecast_confidence(
+        elapsed_hours, p_now, len(samples),
+        has_sample_ge_24h=any(s[0] <= target_24h for s in samples),
+    )
     return (projected_pct, confidence == "low")
 
 
@@ -1882,6 +1882,112 @@ def maybe_record_projected_alert(
                 eprint(f"[projected-alert] payload build failed: {build_exc}")
 
 
+@dataclass
+class PricedEntry:
+    """One accounting entry after pricing, as the block fold consumes it.
+
+    The canonical priced record: the fields `fold_block_totals` reads and
+    nothing else. `_compute_block_totals` builds these from
+    `_JoinedClaudeEntry` rows it has already priced; the diagnosis
+    (#620 S2) builds them from its own half-open account-scoped window.
+    """
+    model: str
+    project_path: str | None
+    input_tokens: int
+    output_tokens: int
+    cache_creation_tokens: int
+    cache_read_tokens: int
+    cost_usd: float
+
+
+@dataclass
+class BlockBucket:
+    """One model or project bucket inside a block's totals."""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_create_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost_usd: float = 0.0
+    entry_count: int = 0
+
+    def as_legacy_dict(self) -> dict[str, Any]:
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_create_tokens": self.cache_create_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cost_usd": self.cost_usd,
+            "entry_count": self.entry_count,
+        }
+
+
+@dataclass
+class BlockTotals:
+    """The summed result of `fold_block_totals`."""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_create_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost_usd: float = 0.0
+    entry_count: int = 0
+    by_model: dict[str, BlockBucket] = field(default_factory=dict)
+    by_project: dict[str, BlockBucket] = field(default_factory=dict)
+
+    def as_legacy_dict(self) -> dict[str, Any]:
+        """The exact dict `_compute_block_totals` has always returned.
+
+        Key order is preserved because callers and fixture builders read
+        this dict directly, and `entry_count` is deliberately absent at the
+        top level: it exists on the dataclass for the diagnosis, and adding
+        it here would change a shape every existing caller sees.
+        """
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_create_tokens": self.cache_create_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cost_usd": self.cost_usd,
+            "by_model": {k: v.as_legacy_dict() for k, v in self.by_model.items()},
+            "by_project": {k: v.as_legacy_dict() for k, v in self.by_project.items()},
+        }
+
+
+def fold_block_totals(entries: "Iterable[PricedEntry]") -> BlockTotals:
+    """Sum priced entries into block totals plus model and project buckets.
+
+    Pure: it opens nothing, prices nothing, and reads no clock. Summation
+    follows the iteration order of `entries`, and bucket insertion order
+    follows first appearance, both of which the callers observe.
+
+    A NULL `project_path` buckets under `(unknown)` so the reconcile
+    invariant `SUM(child.cost) == parent.total` continues to hold. The
+    JSONL-fallback loader always populates `project_path`, so `(unknown)`
+    only appears on the cache-backed path during the brief `session_files`
+    lazy-backfill window.
+    """
+    totals = BlockTotals()
+    for entry in entries:
+        totals.input_tokens += entry.input_tokens
+        totals.output_tokens += entry.output_tokens
+        totals.cache_create_tokens += entry.cache_creation_tokens
+        totals.cache_read_tokens += entry.cache_read_tokens
+        totals.cost_usd += entry.cost_usd
+        totals.entry_count += 1
+
+        for key, bucket_dict in (
+            (entry.model, totals.by_model),
+            (entry.project_path or "(unknown)", totals.by_project),
+        ):
+            b = bucket_dict.setdefault(key, BlockBucket())
+            b.input_tokens += entry.input_tokens
+            b.output_tokens += entry.output_tokens
+            b.cache_create_tokens += entry.cache_creation_tokens
+            b.cache_read_tokens += entry.cache_read_tokens
+            b.cost_usd += entry.cost_usd
+            b.entry_count += 1
+    return totals
+
+
 def _compute_block_totals(
     block_start_at: dt.datetime,
     range_end: dt.datetime,
@@ -1907,64 +2013,32 @@ def _compute_block_totals(
                                      cost_usd, entry_count}]
       by_project: dict[project_path_or_'(unknown)' -> same shape]
     """
-    totals: dict[str, Any] = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_create_tokens": 0,
-        "cache_read_tokens": 0,
-        "cost_usd": 0.0,
-        "by_model": {},
-        "by_project": {},
-    }
-    for entry in get_claude_session_entries(
-        block_start_at, range_end, skip_sync=skip_sync,
-    ):
-        usage = claude_usage_dict(   # #195 chokepoint
-            input_tokens=entry.input_tokens,
-            output_tokens=entry.output_tokens,
-            cache_creation_tokens=entry.cache_creation_tokens,
-            cache_read_tokens=entry.cache_read_tokens,
-            cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
-            speed=getattr(entry, "speed", None),
-        )
-        cost = _calculate_entry_cost(
-            entry.model, usage, mode="auto", cost_usd=entry.cost_usd,
-        )
-
-        totals["input_tokens"]        += entry.input_tokens
-        totals["output_tokens"]       += entry.output_tokens
-        totals["cache_create_tokens"] += entry.cache_creation_tokens
-        totals["cache_read_tokens"]   += entry.cache_read_tokens
-        totals["cost_usd"]            += cost
-
-        # Bucket by model and by project_path. NULL project_path → sentinel
-        # so reconcile invariant SUM(child.cost) == parent.total holds.
-        # Note: the JSONL-fallback path (_direct_parse_claude_session_entries)
-        # always populates project_path = cwd (never NULL); '(unknown)' only
-        # appears on the cache-backed path during the brief session_files
-        # lazy-backfill window.
-        for key, bucket_dict in (
-            (entry.model, totals["by_model"]),
-            (entry.project_path or "(unknown)", totals["by_project"]),
+    def _priced():
+        for entry in get_claude_session_entries(
+            block_start_at, range_end, skip_sync=skip_sync,
         ):
-            b = bucket_dict.setdefault(
-                key,
-                {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_create_tokens": 0,
-                    "cache_read_tokens": 0,
-                    "cost_usd": 0.0,
-                    "entry_count": 0,
-                },
+            usage = claude_usage_dict(   # #195 chokepoint
+                input_tokens=entry.input_tokens,
+                output_tokens=entry.output_tokens,
+                cache_creation_tokens=entry.cache_creation_tokens,
+                cache_read_tokens=entry.cache_read_tokens,
+                cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+                speed=getattr(entry, "speed", None),
             )
-            b["input_tokens"]        += entry.input_tokens
-            b["output_tokens"]       += entry.output_tokens
-            b["cache_create_tokens"] += entry.cache_creation_tokens
-            b["cache_read_tokens"]   += entry.cache_read_tokens
-            b["cost_usd"]            += cost
-            b["entry_count"]         += 1
-    return totals
+            cost = _calculate_entry_cost(
+                entry.model, usage, mode="auto", cost_usd=entry.cost_usd,
+            )
+            yield PricedEntry(
+                model=entry.model,
+                project_path=entry.project_path,
+                input_tokens=entry.input_tokens,
+                output_tokens=entry.output_tokens,
+                cache_creation_tokens=entry.cache_creation_tokens,
+                cache_read_tokens=entry.cache_read_tokens,
+                cost_usd=cost,
+            )
+
+    return fold_block_totals(_priced()).as_legacy_dict()
 
 
 def maybe_update_five_hour_block(

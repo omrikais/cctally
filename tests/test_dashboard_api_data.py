@@ -16,6 +16,8 @@ from _lib_dashboard_sources import (
     compose_all_state,
 )
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
+
 
 @pytest.fixture(autouse=True)
 def _isolate_prod_dbs(monkeypatch, tmp_path):
@@ -265,10 +267,9 @@ def test_api_data_returns_json_200():
         ns["DashboardHTTPHandler"].snapshot_ref.get()
     )
     srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    t = start(srv)
     try:
-        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=2)
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/api/data")
         r = c.getresponse()
         body = r.read().decode()
@@ -277,8 +278,7 @@ def test_api_data_returns_json_200():
         env = json.loads(body)
         assert "header" in env
     finally:
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_envelope_has_weekly_and_monthly_keys():
@@ -588,8 +588,7 @@ def _boot(ns, hub, ref):
     ns["DashboardHTTPHandler"].snapshot_ref = ref
     srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
     srv.handle_error = lambda request, client_address: None
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    t = start(srv)
     return srv, t
 
 
@@ -599,7 +598,7 @@ def _fetch(port, *, accept_encoding=None, path="/api/data"):
     `http.client` sends `Accept-Encoding: identity` unless told not to, so the
     gzip case has to be requested deliberately.
     """
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     c.putrequest("GET", path, skip_accept_encoding=True)
     c.putheader("Host", f"127.0.0.1:{port}")
     if accept_encoding is not None:
@@ -641,8 +640,7 @@ def test_api_data_agrees_with_the_stream_on_hydrating_during_a_progressive_fill(
             "/api/data reported a snapshot as complete that no client was sent")
         assert ref.get().hydrating is False, "precondition: the two disagree"
     finally:
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)
 
 
 @pytest.mark.parametrize(
@@ -677,8 +675,7 @@ def test_api_data_serves_the_last_published_state_for_every_mutator(mutator):
         assert status == 200
         assert json.loads(body)["hydrating"] is True, mutator
     finally:
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_api_data_503s_before_the_first_publication():
@@ -693,8 +690,7 @@ def test_api_data_503s_before_the_first_publication():
         assert status == 503
         assert "error" in json.loads(body)
     finally:
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_api_data_is_gzip_when_negotiated_and_decodes_to_the_identity_body():
@@ -724,8 +720,7 @@ def test_api_data_is_gzip_when_negotiated_and_decodes_to_the_identity_body():
         # And the strict JSON contract holds through compression.
         assert json.loads(decoded)["source_schema_version"] == SOURCE_SCHEMA_VERSION
     finally:
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_api_data_never_appends_a_second_response_after_committing():
@@ -783,8 +778,7 @@ def test_api_data_never_appends_a_second_response_after_committing():
     finally:
         handler._respond_json = real_respond
         handler._serve_api_data = real_data
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)
 
 
 def _raw_get(port, path="/api/data"):
@@ -797,7 +791,7 @@ def _raw_get(port, path="/api/data"):
     """
     import socket
     chunks = []
-    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s = socket.create_connection(("127.0.0.1", port), timeout=PRESENCE_BACKSTOP_SECONDS)
     try:
         s.sendall(
             f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
@@ -861,8 +855,7 @@ def test_api_data_never_appends_a_second_response_when_the_503_write_fails():
             "a second HTTP response was appended after commit: %r" % (raw[:400],))
     finally:
         handler._serve_api_data = real_data
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_api_data_projects_with_a_freshly_sampled_clock_not_the_publication_pin():
@@ -909,8 +902,7 @@ def test_api_data_projects_with_a_freshly_sampled_clock_not_the_publication_pin(
         assert _fetch(srv.server_address[1])[0] == 200
     finally:
         dashboard.snapshot_to_envelope = real
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)
 
     assert len(seen) == 2, seen
     (utc1, mono1), (utc2, mono2) = seen
@@ -944,5 +936,4 @@ def test_api_data_still_500s_when_projection_fails_before_commit():
         assert json.loads(body) == {"error": "internal error"}
     finally:
         dashboard.snapshot_to_envelope = real
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)

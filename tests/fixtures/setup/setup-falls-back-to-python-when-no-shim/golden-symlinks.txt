@@ -3,6 +3,7 @@ cctally-alerts -> /REPO/node_modules/cctally/bin/cctally-alerts
 cctally-budget -> /REPO/node_modules/cctally/bin/cctally-budget
 cctally-dashboard -> /REPO/node_modules/cctally/bin/cctally-dashboard
 cctally-dollar-per-percent -> /REPO/node_modules/cctally/bin/cctally-dollar-per-percent
+cctally-explain -> /REPO/node_modules/cctally/bin/cctally-explain
 cctally-five-hour-blocks -> /REPO/node_modules/cctally/bin/cctally-five-hour-blocks
 cctally-five-hour-breakdown -> /REPO/node_modules/cctally/bin/cctally-five-hour-breakdown
 cctally-forecast -> /REPO/node_modules/cctally/bin/cctally-forecast

@@ -20,6 +20,8 @@ data dir. Cutover runs OUTSIDE CCTALLY_MIGRATION_TEST_MODE, so the epoch gate is
 engaged (len(_STATS_MIGRATIONS) == 13).
 """
 from __future__ import annotations
+import sys
+import types
 
 import argparse
 import datetime as dt
@@ -64,7 +66,8 @@ class _TrackedConnection(sqlite3.Connection):
 
 
 def _track_connections(monkeypatch):
-    real_connect = sqlite3.connect
+    store = sys.modules["_cctally_store"]
+    real_connect = store.sqlite3.connect
     opened = []
 
     def tracked_connect(*args, **kwargs):
@@ -73,7 +76,18 @@ def _track_connections(monkeypatch):
         opened.append(conn)
         return conn
 
-    monkeypatch.setattr(sqlite3, "connect", tracked_connect)
+    # #630 S2: rebind the module name on the IMPORTING module. Every
+    # store open — cache, conversations and stats alike — connects
+    # through `_cctally_store`, so a rebind there is the whole
+    # chokepoint, and `sqlite3.connect` itself is never mutated, so no
+    # unrelated caller of the stdlib module sees this at all. The residual
+    # is stated rather than implied: `_cctally_store.sqlite3` is shared by
+    # every thread in this worker, so a concurrent STORE open inside the
+    # window still reaches this trap. Narrower than patching
+    # `sqlite3.connect`, not closure.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(store.sqlite3))
+    _iso_sqlite3.connect = tracked_connect
+    monkeypatch.setattr(store, "sqlite3", _iso_sqlite3)
     return opened
 
 
@@ -874,7 +888,12 @@ def test_the_reused_segment_is_made_durable_before_the_cursor_names_it(
         events.append(("write_cursor", None))
         return real_write_cursor(*a, **k)
 
-    monkeypatch.setattr(jr.os, "fsync", fsync)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_os = types.SimpleNamespace(**vars(jr.os))
+    _iso_os.fsync = fsync
+    monkeypatch.setattr(jr, "os", _iso_os)
     monkeypatch.setattr(jr, "_fsync_dir", fsync_dir)
     monkeypatch.setattr(jr, "_write_cursor", write_cursor)
     core.open_db().close()  # the retry, which reuses the orphan
@@ -1235,17 +1254,33 @@ def test_epoch_mismatch_without_journal_hard_errors(ns):
 
 def _trace_open(ns, monkeypatch, **kw):
     seen: list[str] = []
-    real_connect = sqlite3.connect
+    store = sys.modules["_cctally_store"]
+    real_sqlite3 = store.sqlite3
+    real_connect = real_sqlite3.connect
 
     def traced(*a, **k):
         conn = real_connect(*a, **k)
         conn.set_trace_callback(seen.append)
         return conn
 
-    monkeypatch.setattr(sqlite3, "connect", traced)
+    # #630 S2: rebind the module name on the IMPORTING module. Every
+    # store open — cache, conversations and stats alike — connects
+    # through `_cctally_store`, so a rebind there is the whole
+    # chokepoint, and `sqlite3.connect` itself is never mutated, so no
+    # unrelated caller of the stdlib module sees this at all. The residual
+    # is stated rather than implied: `_cctally_store.sqlite3` is shared by
+    # every thread in this worker, so a concurrent STORE open inside the
+    # window still reaches this trap. Narrower than patching
+    # `sqlite3.connect`, not closure.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(real_sqlite3))
+    _iso_sqlite3.connect = traced
+    monkeypatch.setattr(store, "sqlite3", _iso_sqlite3)
     conn = ns["open_db"](**kw)
     conn.close()
-    monkeypatch.setattr(sqlite3, "connect", real_connect)
+    monkeypatch.setattr(store, "sqlite3", real_sqlite3)
+    # A missed rebind returns an empty list, and every assertion built on this
+    # helper is about a statement being ABSENT, so it would pass vacuously.
+    assert seen, "the traced connect never fired; the rebind missed the opener"
     return seen
 
 

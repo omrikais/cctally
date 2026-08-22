@@ -5,6 +5,7 @@ import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
 import { ModelLegend } from '../components/ModelLegend';
+import { ZoneTag } from '../components/ZoneTag';
 import { fmt } from '../lib/fmt';
 import { modelChipStyle } from '../lib/model';
 import { dispatch, getState, subscribeStore } from '../store/store';
@@ -36,12 +37,14 @@ function Row({
   isFirstMount,
   showSource,
   accountLabel,
+  zone,
 }: {
   r: BlockPresentationRow;
   maxCost: number;
   isFirstMount: boolean;
   showSource: boolean;
   accountLabel: string | null;
+  zone: string;
 }) {
   const fillPct = maxCost > 0 ? (r.value / maxCost) * 100 : 0;
   const open = () => openBlockDetail(r);
@@ -52,8 +55,8 @@ function Row({
       tabIndex={0}
       aria-label={
         accountLabel == null
-          ? `Open detail for block starting ${r.label}`
-          : `Open detail for ${accountLabel} block starting ${r.label}`
+          ? `Open detail for block starting ${r.label} [${zone}]`
+          : `Open detail for ${accountLabel} block starting ${r.label} [${zone}]`
       }
       onClick={open}
       onKeyDown={(e) => {
@@ -84,7 +87,7 @@ function Row({
           {r.anchor === 'heuristic' && (
             <span className="anchor-marker" aria-label="approximate start">~</span>
           )}
-          {r.label}
+          {r.label}{' '}<ZoneTag tz={zone} />
           {r.is_active && <span className="pill-active">Active</span>}
         </span>
         <span className="cost">{r.valueLabel}</span>
@@ -290,6 +293,7 @@ export function BlocksPanel() {
               isFirstMount={!seenStarts.current.has(r.start_at)}
               showSource={activeSource === 'all'}
               accountLabel={accountLabelFor(r)}
+              zone={display.resolvedTz}
             />
           ))
         )}

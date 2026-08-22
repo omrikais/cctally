@@ -9,6 +9,8 @@ signal, because it covers only a subset of material events — a new 5-hour
 window changes the dashboard without necessarily firing an alert.
 """
 import argparse
+import sys
+import types
 import importlib
 import urllib.request
 
@@ -177,12 +179,7 @@ def test_the_nudge_fires_after_the_selected_state_lock_is_released(
 
 def test_the_hook_tick_nudge_fires_after_its_own_lock_is_released(
         mods, monkeypatch):
-    """The high-cadence path, whose lock is owned two frames above the record.
-
-    `_hook_tick_oauth_refresh` holds the lock across its OAuth fetch AND the
-    authoritative record, so `_authoritative_record_usage` cannot release it —
-    the deferral has to reach the frame that acquired it.
-    """
+    """The high-cadence path defers after both lock-bounded phases."""
     ns, journal = mods
     events = []
     monkeypatch.setitem(ns, "load_config", lambda: {})
@@ -203,7 +200,66 @@ def test_the_hook_tick_nudge_fires_after_its_own_lock_is_released(
     status, _payload = ns["_hook_tick_oauth_refresh"](throttle_seconds=0)
 
     assert status.startswith("ok("), status
-    assert events == ["lock", "unlock", "nudge"]
+    assert events == ["lock", "unlock", "lock", "unlock", "nudge"]
+
+
+def test_hook_tick_oauth_fetch_does_not_hold_the_selected_state_lock(
+        mods, monkeypatch):
+    """#605 item 5: the five-second network fetch is outside the flock."""
+    ns, journal = mods
+    held = {"value": False}
+
+    class SelectedLock:
+        def __enter__(self):
+            assert held["value"] is False
+            held["value"] = True
+            return self
+
+        def __exit__(self, *exc):
+            held["value"] = False
+            return False
+
+    monkeypatch.setitem(ns, "load_config", lambda: {})
+    monkeypatch.setitem(ns, "_resolve_oauth_token", lambda *a, **kw: "tok")
+    monkeypatch.setitem(ns, "_newest_snapshot_age_seconds", lambda: None)
+    monkeypatch.setitem(ns, "_statusline_observe_age_seconds", lambda: 10_000.0)
+    monkeypatch.setitem(ns, "_selected_state_lock", SelectedLock)
+
+    def fetch(**_kwargs):
+        assert held["value"] is False, "OAuth network I/O held selected-state flock"
+        return {
+            "seven_day": {
+                "utilization": 42.0,
+                "resets_at": "2026-08-20T00:00:00Z",
+            },
+        }
+
+    monkeypatch.setitem(ns, "_fetch_oauth_usage", fetch)
+    monkeypatch.setattr(
+        journal, "run_stats_ingest",
+        lambda **_: _result(journal, ran=True, error=None, events_emitted=0),
+    )
+
+    status, _ = ns["_hook_tick_oauth_refresh"](throttle_seconds=0)
+
+    assert status.startswith("ok("), status
+    assert held["value"] is False
+
+
+def test_lock_held_authoritative_record_requires_a_deferred_nudge_sink(
+        mods, monkeypatch):
+    """#605 item 6: a future lock owner cannot nudge inside its section."""
+    ns, _journal = mods
+    called = []
+    monkeypatch.setitem(ns, "cmd_record_usage", lambda *a, **kw: called.append(kw) or 0)
+
+    result = ns["_authoritative_record_usage"](
+        _args(source="api"), {"sevenDay"}, lock_held=True,
+    )
+
+    assert result.status == "record_failed"
+    assert "nudge_sink" in (result.reason or "")
+    assert called == [], "the fail-closed guard must run before any write"
 
 
 def test_nudge_sends_queue_one_and_the_resolved_bearer_token(mods, monkeypatch):
@@ -214,7 +270,17 @@ def test_nudge_sends_queue_one_and_the_resolved_bearer_token(mods, monkeypatch):
         captured["req"] = req
         return _Resp()
 
-    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    # #630 S2: rebind the module name on the IMPORTING module.
+    # Patching the shared `urllib.request.urlopen` rebound stdlib urlopen for
+    # the whole process; `_cctally_refresh` is the module that resolves it.
+    _iso_request = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib.request))
+    _iso_request.urlopen = _fake_urlopen
+    _iso_urllib = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib))
+    _iso_urllib.request = _iso_request
+    monkeypatch.setattr(
+        sys.modules["_cctally_refresh"], "urllib", _iso_urllib)
     monkeypatch.setitem(ns, "_resolve_dashboard_api_token", lambda: "s3cret")
     ns["_nudge_dashboard_repaint"](port=8789)
     req = captured["req"]
@@ -231,7 +297,17 @@ def test_nudge_omits_the_header_when_no_token_is_resolvable(mods, monkeypatch):
         captured["req"] = req
         return _Resp()
 
-    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    # #630 S2: rebind the module name on the IMPORTING module.
+    # Patching the shared `urllib.request.urlopen` rebound stdlib urlopen for
+    # the whole process; `_cctally_refresh` is the module that resolves it.
+    _iso_request = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib.request))
+    _iso_request.urlopen = _fake_urlopen
+    _iso_urllib = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib))
+    _iso_urllib.request = _iso_request
+    monkeypatch.setattr(
+        sys.modules["_cctally_refresh"], "urllib", _iso_urllib)
     monkeypatch.setitem(ns, "_resolve_dashboard_api_token", lambda: None)
     ns["_nudge_dashboard_repaint"](port=8789)
     assert captured["req"].get_header("Authorization") is None

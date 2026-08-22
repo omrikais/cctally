@@ -244,6 +244,18 @@ def current_root():
     return getattr(_tls, "root", None)
 
 
+def in_phase() -> bool:
+    """Whether a phase is currently OPEN on this thread.
+
+    `current_root()` answers a different question — it names the last root
+    that CLOSED — so a caller deciding whether to open a root of its own
+    cannot use it. A pure fold that opens child phases needs this one: with no
+    root open its children would be emitted into whatever phase happens to be
+    on the stack, or into none at all.
+    """
+    return bool(_stack())
+
+
 def reset_thread():
     """Start a fresh root scope on this thread, capturing the armed state.
 

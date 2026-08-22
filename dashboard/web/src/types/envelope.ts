@@ -676,6 +676,10 @@ export interface ProjectsTrendProject {
   // #71's full fix). Nulls for first/last mean the project had no
   // activity in that week.
   sessions_per_week: number[];
+  // Distinct sessions across each supported trailing window. Summing
+  // sessions_per_week double-counts sessions that cross a reset boundary.
+  // Optional for compatibility with stored/older envelopes.
+  session_counts_by_window?: Partial<Record<'1' | '4' | '8' | '12', number>>;
   first_seen_per_week: (string | null)[];
   last_seen_per_week: (string | null)[];
 }
@@ -714,6 +718,9 @@ export interface ProjectDetail {
   window_weeks: number;
   window_start_at: string;
   window_end_at: string;
+  // Authoritative half-open bucket union. Reset shifts can make this
+  // non-contiguous; start/end above remain the outer display span.
+  window_intervals?: Array<{ start_at: string; end_at: string }>;
   window_cost_usd: number;
   window_attributed_pct: number | null;
   models: ProjectDetailModelRow[];

@@ -21,7 +21,30 @@ export function AlertFollowCell({
 }): JSX.Element {
   const nav = alertNavigation(alert, env, envelopeNow(env));
   if (!nav.available || nav.target == null) {
-    return <span className="alert-row-withheld">{nav.withheldReason}</span>;
+    // #620 S2 — the sentence stays and stays true: the week, the block or the
+    // period is genuinely not opened here. What is added beside it is the
+    // diagnosis of the window this alert fixed, which `/api/diagnosis` can
+    // measure precisely because it is keyed by explicit bounds and not by a
+    // modal's own idea of which window is current.
+    const explain = nav.explainTarget;
+    return (
+      <span className="alert-row-unresolved">
+        <span className="alert-row-withheld">{nav.withheldReason}</span>
+        {explain != null ? (
+          <button
+            type="button"
+            className="alert-row-explain"
+            onClick={(e) => {
+              e.stopPropagation();
+              followAlertTarget(explain);
+              onFollow?.();
+            }}
+          >
+            {explain.label}
+          </button>
+        ) : null}
+      </span>
+    );
   }
   const target = nav.target;
   return (

@@ -34,6 +34,9 @@ jobs:
       # setup-python plus the pip install, setup-node plus `npm ci` — and FTS5
       # comes from Ubuntu's libsqlite3, which Debian builds with --enable-fts5.
       CCTALLY_AUTHORITATIVE_RUN: "1"
+      # Select the hosted Linux profile: it runs the complete platform estate
+      # except test-remote, whose SSH/macOS/Homebrew contract is owned by Gate 0.
+      CCTALLY_LINUX_MATRIX_RUN: "1"
       # Outer pool ONLY. The combined CCTALLY_TEST_JOBS knob set all three roles
       # at once, so pinning the pool to 2 also collapsed the later, otherwise-solo
       # pytest phase to 2 workers across all three matrix legs (#529 S5 §2.4).

@@ -140,12 +140,7 @@ import threading
 
 from conftest import load_script, redirect_paths
 
-
-def _serve(ns, host="127.0.0.1", port=0):
-    srv = ns["ThreadingHTTPServer"]((host, port), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    return srv, t, srv.server_address[1]
+from tests._support_http import post_json, serve_dashboard, stop  # noqa: E402
 
 
 def _wire_handlers(ns):
@@ -163,36 +158,15 @@ def _wire_handlers(ns):
     ns["DashboardHTTPHandler"].display_tz_pref_override = None
 
 
-def _post_json(host, port, path, body, *, origin_host=None):
-    """POST a JSON body with matched Host + Origin (loopback contract)."""
-    c = http.client.HTTPConnection(host, port, timeout=2)
-    raw = json.dumps(body).encode()
-    host_header = f"{host}:{port}"
-    c.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
-    c.putheader("Content-Type", "application/json")
-    c.putheader("Content-Length", str(len(raw)))
-    c.putheader("Host", host_header)
-    c.putheader("Origin", f"http://{origin_host or host_header}")
-    c.endheaders()
-    c.send(raw)
-    r = c.getresponse()
-    payload = r.read().decode("utf-8", errors="replace")
-    try:
-        parsed = json.loads(payload) if payload else None
-    except json.JSONDecodeError:
-        parsed = payload
-    return r.status, parsed
-
-
 def test_http_cache_report_valid_round_trip(monkeypatch, tmp_path):
     """Valid block returns 200 + the echoed cache_report block."""
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"cache_report": {"anomaly_threshold_pp": 25}},
         )
         assert status == 200
@@ -202,7 +176,7 @@ def test_http_cache_report_valid_round_trip(monkeypatch, tmp_path):
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg.get("cache_report", {}).get("anomaly_threshold_pp") == 25
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_cache_report_invalid_threshold_returns_400(monkeypatch, tmp_path):
@@ -218,17 +192,17 @@ def test_http_cache_report_invalid_threshold_returns_400(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"cache_report": {"anomaly_threshold_pp": -1}},
         )
         assert status == 400, body
         assert body is not None
         assert body.get("field") == "cache_report.anomaly_threshold_pp"
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_cache_report_unknown_inner_key_returns_400(monkeypatch, tmp_path):
@@ -236,10 +210,10 @@ def test_http_cache_report_unknown_inner_key_returns_400(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"cache_report": {
                 "anomaly_threshold_pp": 15,
                 "anomaly_window_days": 14,  # v1 rejects this
@@ -247,7 +221,7 @@ def test_http_cache_report_unknown_inner_key_returns_400(monkeypatch, tmp_path):
         )
         assert status == 400, body
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_cache_report_non_dict_block_returns_400(monkeypatch, tmp_path):
@@ -255,17 +229,17 @@ def test_http_cache_report_non_dict_block_returns_400(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"cache_report": "not-a-dict"},
         )
         assert status == 400, body
         assert body is not None
         assert body.get("field") == "cache_report"
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_top_level_unknown_key_still_rejected(monkeypatch, tmp_path):
@@ -274,15 +248,15 @@ def test_http_top_level_unknown_key_still_rejected(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"frobnicate": {"x": 1}},
         )
         assert status == 400, body
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_cache_report_combined_save_with_display(monkeypatch, tmp_path):
@@ -290,10 +264,10 @@ def test_http_cache_report_combined_save_with_display(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {
                 "cache_report": {"anomaly_threshold_pp": 20},
                 "display": {"tz": "Etc/UTC"},
@@ -303,7 +277,7 @@ def test_http_cache_report_combined_save_with_display(monkeypatch, tmp_path):
         assert body["cache_report"] == {"anomaly_threshold_pp": 20}
         assert body["display"]["resolved_tz"] == "Etc/UTC"
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_cache_report_empty_block_preserves_persisted(
@@ -326,12 +300,12 @@ def test_http_cache_report_empty_block_preserves_persisted(
     ns["CONFIG_PATH"].write_text(
         json.dumps({"cache_report": {"anomaly_threshold_pp": 42}}),
     )
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         # Empty cache_report block (representative of a combined save
         # whose UI hasn't touched the cache-report tab).
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"cache_report": {}},
         )
         assert status == 200, body
@@ -341,7 +315,7 @@ def test_http_cache_report_empty_block_preserves_persisted(
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg.get("cache_report", {}).get("anomaly_threshold_pp") == 42
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_cache_report_empty_block_with_no_persisted_uses_default(
@@ -354,10 +328,10 @@ def test_http_cache_report_empty_block_with_no_persisted_uses_default(
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"cache_report": {}},
         )
         assert status == 200, body
@@ -368,7 +342,7 @@ def test_http_cache_report_empty_block_with_no_persisted_uses_default(
         # it doesn't carry an explicit threshold yet.
         assert "anomaly_threshold_pp" not in cfg.get("cache_report", {})
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
 
 def test_http_cache_report_partial_save_overwrites_existing_value(
@@ -383,10 +357,10 @@ def test_http_cache_report_partial_save_overwrites_existing_value(
     ns["CONFIG_PATH"].write_text(
         json.dumps({"cache_report": {"anomaly_threshold_pp": 42}}),
     )
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"cache_report": {"anomaly_threshold_pp": 30}},
         )
         assert status == 200, body
@@ -394,4 +368,4 @@ def test_http_cache_report_partial_save_overwrites_existing_value(
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg["cache_report"]["anomaly_threshold_pp"] == 30
     finally:
-        srv.shutdown()
+        stop(srv, t)

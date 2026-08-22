@@ -121,6 +121,9 @@ def test_corpus_shapes(tmp_path):
             "SELECT COUNT(DISTINCT model) FROM cache_db.session_entries"
         ).fetchone()[0]
         assert models >= 2                        # model diversity for reconciles
+        assert counts["claude_sidechain_messages"] > 0
+        assert counts["codex_conversation_events"] > 0
+        assert counts["codex_conversation_messages"] > 0
     finally:
         conn.close()
 

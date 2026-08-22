@@ -28,6 +28,7 @@ prefix checks both fire on real on-disk paths, exercise the
 tiers including the subprocess-failure-returns-None path.
 """
 from __future__ import annotations
+import types
 
 import datetime as dt
 import json
@@ -41,6 +42,8 @@ import pytest
 
 from conftest import load_script
 import _cctally_core
+
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, serve_dashboard, stop
 
 # Every HOME-derived path constant resolves under a per-test directory
 # (#529 S4). The write detector caught this module creating the maintainer's
@@ -925,7 +928,14 @@ class TestNpmPrefixCaching:
                 "tier-C subprocess invoked despite tier-B cache hit"
             )
 
-        monkeypatch.setattr(ns["subprocess"], "run", _boom)
+        # #630 S2: rebind the module name on the IMPORTING module.
+        # `ns[...]` IS the shared stdlib object, so patching an attribute
+        # on it rebound that callable for the whole process.
+        _iso_subprocess = types.SimpleNamespace(
+            **vars(sys.modules["_cctally_update"].subprocess))
+        _iso_subprocess.run = _boom
+        monkeypatch.setattr(
+            sys.modules["_cctally_update"], "subprocess", _iso_subprocess)
         result = ns["_resolve_npm_prefix"]()
         assert result == "/cached/prefix"
 
@@ -944,7 +954,14 @@ class TestNpmPrefixCaching:
                 args=cmd, returncode=0, stdout="/usr/local\n", stderr=""
             )
 
-        monkeypatch.setattr(ns["subprocess"], "run", _fake_run)
+        # #630 S2: rebind the module name on the IMPORTING module.
+        # `ns[...]` IS the shared stdlib object, so patching an attribute
+        # on it rebound that callable for the whole process.
+        _iso_subprocess = types.SimpleNamespace(
+            **vars(sys.modules["_cctally_update"].subprocess))
+        _iso_subprocess.run = _fake_run
+        monkeypatch.setattr(
+            sys.modules["_cctally_update"], "subprocess", _iso_subprocess)
         result = ns["_resolve_npm_prefix"](mutate=True)
         assert result == "/usr/local"
         # The subprocess call wired through.
@@ -962,7 +979,14 @@ class TestNpmPrefixCaching:
                 args=cmd, returncode=1, stdout="", stderr="npm not found"
             )
 
-        monkeypatch.setattr(ns["subprocess"], "run", _fake_run)
+        # #630 S2: rebind the module name on the IMPORTING module.
+        # `ns[...]` IS the shared stdlib object, so patching an attribute
+        # on it rebound that callable for the whole process.
+        _iso_subprocess = types.SimpleNamespace(
+            **vars(sys.modules["_cctally_update"].subprocess))
+        _iso_subprocess.run = _fake_run
+        monkeypatch.setattr(
+            sys.modules["_cctally_update"], "subprocess", _iso_subprocess)
         result = ns["_resolve_npm_prefix"](mutate=True)
         assert result is None
         # No state was written for a failed lookup.
@@ -2457,7 +2481,14 @@ class TestPreflight:
             if str(path) == str(prefix / "bin") and mode == os.W_OK:
                 return False
             return real_access(path, mode)
-        monkeypatch.setattr(ns["os"], "access", fake_access)
+        # #630 S2: rebind the module name on the IMPORTING module.
+        # `ns[...]` IS the shared stdlib object, so patching an attribute
+        # on it rebound that callable for the whole process.
+        _iso_os = types.SimpleNamespace(
+            **vars(sys.modules["_cctally_update"].os))
+        _iso_os.access = fake_access
+        monkeypatch.setattr(
+            sys.modules["_cctally_update"], "os", _iso_os)
 
         with pytest.raises(ns["UpdateError"]) as exc:
             ns["_preflight_install"](method, None)
@@ -2479,9 +2510,14 @@ class TestPreflight:
 
         # Make os.access return False for everything to prove no
         # write-perm check is performed on brew.
+        # #630 S2: rebind the module name on the IMPORTING module.
+        # `ns["os"]` IS the shared stdlib object, so patching an attribute
+        # on it rebound that callable for the whole process.
+        _iso_os = types.SimpleNamespace(
+            **vars(sys.modules["_cctally_update"].os))
+        _iso_os.access = lambda *_a, **_kw: False
         monkeypatch.setattr(
-            ns["os"], "access", lambda *_a, **_kw: False
-        )
+            sys.modules["_cctally_update"], "os", _iso_os)
         # No raise.
         ns["_preflight_install"](method, None)
 
@@ -2660,21 +2696,28 @@ class TestUpdateWorker:
 
         def blocking_run_streaming(cmd, *, on_stdout, on_stderr, log_fd):
             gate.set()
-            unblock.wait(5)
+            unblock.wait(PRESENCE_BACKSTOP_SECONDS)
             return 0  # never reached if test unblocks; finishes via teardown
 
         monkeypatch.setitem(ns, "_run_streaming", blocking_run_streaming)
         # Block execvp so we don't replace the test process. Returning
         # None mirrors the real syscall's "never returns" contract well
         # enough for the worker thread to unwind cleanly.
-        monkeypatch.setattr(ns["os"], "execvp", lambda *_a, **_kw: None)
+        # #630 S2: rebind the module name on the IMPORTING module.
+        # `ns[...]` IS the shared stdlib object, so patching an attribute
+        # on it rebound that callable for the whole process.
+        _iso_os = types.SimpleNamespace(
+            **vars(sys.modules["_cctally_update"].os))
+        _iso_os.execvp = lambda *_a, **_kw: None
+        monkeypatch.setattr(
+            sys.modules["_cctally_update"], "os", _iso_os)
 
         worker = ns["UpdateWorker"]()
         ok_a, rid_a = worker.start(None)
         assert ok_a is True
         # Wait for the first run to actually be inside _run_streaming
         # (i.e. past preflight + lock acquisition).
-        assert gate.wait(5), "first run never reached the blocking step"
+        assert gate.wait(PRESENCE_BACKSTOP_SECONDS), "first run never reached the blocking step"
 
         ok_b, rid_b = worker.start(None)
         assert ok_b is False
@@ -2688,7 +2731,7 @@ class TestUpdateWorker:
         # return, leaking a real write into the developer's
         # ``~/.local/share/cctally/update-state.json``.
         unblock.set()
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
         while time.monotonic() < deadline:
             if worker.status()["current_run_id"] is None:
                 break
@@ -2739,7 +2782,7 @@ class TestUpdateWorker:
         worker = ns["UpdateWorker"]()
         ok, run_id = worker.start(None)
         assert ok is True
-        events = _drain_stream(worker, run_id, timeout_s=5.0)
+        events = _drain_stream(worker, run_id, timeout_s=PRESENCE_BACKSTOP_SECONDS)
 
         assert captured_commands == [
             ["npm", "install", "-g", "cctally@1.9.0"]
@@ -2784,19 +2827,23 @@ class TestUpdateWorker:
             lambda cmd, *, on_stdout, on_stderr, log_fd: 1,
         )
         execvp_calls: list[tuple] = []
+        # #630 S2: rebind the module name on the IMPORTING module.
+        # `ns["os"]` IS the shared stdlib object, so patching an attribute
+        # on it rebound that callable for the whole process.
+        _iso_os = types.SimpleNamespace(
+            **vars(sys.modules["_cctally_update"].os))
+        _iso_os.execvp = lambda *args, **kw: execvp_calls.append((args, kw))
         monkeypatch.setattr(
-            ns["os"], "execvp",
-            lambda *args, **kw: execvp_calls.append((args, kw)),
-        )
+            sys.modules["_cctally_update"], "os", _iso_os)
 
         worker = ns["UpdateWorker"]()
         ok, run_id = worker.start(None)
         assert ok is True
-        events = _drain_stream(worker, run_id, timeout_s=5.0)
+        events = _drain_stream(worker, run_id, timeout_s=PRESENCE_BACKSTOP_SECONDS)
 
-        types = [ev.get("type") for ev in events]
-        assert "step" in types
-        assert "exit" in types
+        event_types = [ev.get("type") for ev in events]
+        assert "step" in event_types
+        assert "exit" in event_types
         # Must end with done success=False.
         terminal = events[-1]
         assert terminal == {"type": "done", "success": False}
@@ -2805,7 +2852,7 @@ class TestUpdateWorker:
         # Lock release happens in the worker's finally clause AFTER the
         # final SSE event flush — wait for ``current_run_id`` to clear
         # rather than racing the assertion.
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
         while time.monotonic() < deadline:
             if worker.status()["current_run_id"] is None:
                 break
@@ -2853,18 +2900,32 @@ class TestUpdateWorker:
             captured.append((path, list(argv)))
             return None
 
-        monkeypatch.setattr(ns["os"], "execvp", fake_execvp)
+        # #630 S2: rebind the module name on the IMPORTING module.
+        # `ns[...]` IS the shared stdlib object, so patching an attribute
+        # on it rebound that callable for the whole process.
+        _iso_os = types.SimpleNamespace(
+            **vars(sys.modules["_cctally_update"].os))
+        _iso_os.execvp = fake_execvp
+        monkeypatch.setattr(
+            sys.modules["_cctally_update"], "os", _iso_os)
         # Drop the SSE-flush sleep so the test doesn't pay 500 ms.
-        monkeypatch.setattr(ns["time"], "sleep", lambda _s: None)
+        # #630 S2: rebind the module name on the IMPORTING module.
+        # `ns[...]` IS the shared stdlib object, so patching an attribute
+        # on it rebound that callable for the whole process.
+        _iso_time = types.SimpleNamespace(
+            **vars(sys.modules["_cctally_update"].time))
+        _iso_time.sleep = lambda _s: None
+        monkeypatch.setattr(
+            sys.modules["_cctally_update"], "time", _iso_time)
 
         worker = ns["UpdateWorker"]()
         ok, run_id = worker.start(None)
         assert ok is True
-        events = _drain_stream(worker, run_id, timeout_s=5.0)
+        events = _drain_stream(worker, run_id, timeout_s=PRESENCE_BACKSTOP_SECONDS)
 
-        types = [ev.get("type") for ev in events]
-        assert "step" in types
-        assert "exit" in types
+        event_types = [ev.get("type") for ev in events]
+        assert "step" in event_types
+        assert "exit" in event_types
         terminal = events[-1]
         assert terminal["type"] == "execvp"
         assert terminal["argv"] == [
@@ -2873,7 +2934,7 @@ class TestUpdateWorker:
         # The execvp event is emitted BEFORE the actual os.execvp call —
         # wait for the worker thread to clear current_run_id (which
         # happens in finally after fake_execvp's SystemExit unwinds).
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
         while time.monotonic() < deadline:
             if worker.status()["current_run_id"] is None:
                 break
@@ -2913,13 +2974,20 @@ class TestUpdateWorker:
             ns, "_run_streaming",
             lambda cmd, *, on_stdout, on_stderr, log_fd: 1,
         )
-        monkeypatch.setattr(ns["os"], "execvp", lambda *a, **kw: None)
+        # #630 S2: rebind the module name on the IMPORTING module.
+        # `ns[...]` IS the shared stdlib object, so patching an attribute
+        # on it rebound that callable for the whole process.
+        _iso_os = types.SimpleNamespace(
+            **vars(sys.modules["_cctally_update"].os))
+        _iso_os.execvp = lambda *a, **kw: None
+        monkeypatch.setattr(
+            sys.modules["_cctally_update"], "os", _iso_os)
 
         worker = ns["UpdateWorker"]()
         ok, run_id = worker.start(None)
         assert ok is True
 
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
         while time.monotonic() < deadline:
             if worker.status()["current_run_id"] is None:
                 break
@@ -2928,10 +2996,10 @@ class TestUpdateWorker:
             "worker thread did not finish within timeout"
         )
 
-        events = _drain_stream(worker, run_id, timeout_s=5.0)
-        types = [ev.get("type") for ev in events]
-        assert "step" in types
-        assert "exit" in types
+        events = _drain_stream(worker, run_id, timeout_s=PRESENCE_BACKSTOP_SECONDS)
+        event_types = [ev.get("type") for ev in events]
+        assert "step" in event_types
+        assert "exit" in event_types
         assert events[-1] == {"type": "done", "success": False}
 
     def test_streams_dict_swept_on_next_start_when_no_consumer(
@@ -2958,13 +3026,20 @@ class TestUpdateWorker:
             ns, "_run_streaming",
             lambda cmd, *, on_stdout, on_stderr, log_fd: 1,
         )
-        monkeypatch.setattr(ns["os"], "execvp", lambda *a, **kw: None)
+        # #630 S2: rebind the module name on the IMPORTING module.
+        # `ns[...]` IS the shared stdlib object, so patching an attribute
+        # on it rebound that callable for the whole process.
+        _iso_os = types.SimpleNamespace(
+            **vars(sys.modules["_cctally_update"].os))
+        _iso_os.execvp = lambda *a, **kw: None
+        monkeypatch.setattr(
+            sys.modules["_cctally_update"], "os", _iso_os)
 
         worker = ns["UpdateWorker"]()
 
         ok1, rid1 = worker.start(None)
         assert ok1
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
         while time.monotonic() < deadline:
             if worker.status()["current_run_id"] is None:
                 break
@@ -2977,7 +3052,7 @@ class TestUpdateWorker:
         assert rid1 not in worker._streams, "stale entry not swept on start()"
         assert rid2 in worker._streams
 
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
         while time.monotonic() < deadline:
             if worker.status()["current_run_id"] is None:
                 break
@@ -3026,10 +3101,12 @@ class TestDashboardUpdateCheckThread:
         t = ns["_DashboardUpdateCheckThread"](stop_event)
         t.start()
         try:
-            assert called.wait(2.0), "_do_update_check was not invoked"
+            assert called.wait(PRESENCE_BACKSTOP_SECONDS), (
+                "_do_update_check was not invoked")
         finally:
             stop_event.set()
-            t.join(timeout=2.0)
+            # timing-budget: the update-check thread has exited now that `stop_event` is set, so no further check can run
+            t.join(timeout=PRESENCE_BACKSTOP_SECONDS)
         assert not t.is_alive()
 
     def test_skips_when_not_due(self, tmp_path, monkeypatch):
@@ -3049,7 +3126,8 @@ class TestDashboardUpdateCheckThread:
         # Let it tick a couple of times.
         time.sleep(0.2)
         stop_event.set()
-        t.join(timeout=2.0)
+        # timing-budget: the update-check thread has exited now that `stop_event` is set, so `called` is final
+        t.join(timeout=PRESENCE_BACKSTOP_SECONDS)
         assert called == [], "check ran despite gate returning False"
 
     def test_publishes_snapshot_after_successful_check(
@@ -3087,12 +3165,13 @@ class TestDashboardUpdateCheckThread:
         )
         t.start()
         try:
-            assert published.wait(2.0), (
+            assert published.wait(PRESENCE_BACKSTOP_SECONDS), (
                 "thread did not publish after successful update check"
             )
         finally:
             stop_event.set()
-            t.join(timeout=2.0)
+            # timing-budget: the update-check thread has exited now that `stop_event` is set, so the published snapshot is final
+            t.join(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     def test_no_sync_republish_refreshes_envelope_precompute_on_update_due(
         self, tmp_path, monkeypatch
@@ -3195,12 +3274,13 @@ class TestDashboardUpdateCheckThread:
         )
         t.start()
         try:
-            deadline = time.monotonic() + 3.0
+            deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
             while time.monotonic() < deadline and not published:
                 time.sleep(0.01)
         finally:
             stop_event.set()
-            t.join(timeout=2.0)
+            # timing-budget: the update-due republish thread has exited now that `stop_event` is set, so `published` is final
+            t.join(timeout=PRESENCE_BACKSTOP_SECONDS)
 
         assert published, "update-due site never republished"
         got = published[0].envelope_precompute
@@ -3278,12 +3358,13 @@ class TestDashboardUpdateCheckThread:
         )
         t.start()
         try:
-            deadline = time.monotonic() + 3.0
+            deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
             while time.monotonic() < deadline and not published:
                 time.sleep(0.01)
         finally:
             stop_event.set()
-            t.join(timeout=2.0)
+            # timing-budget: the self-heal republish thread has exited now that `stop_event` is set, so `published` is final
+            t.join(timeout=PRESENCE_BACKSTOP_SECONDS)
 
         assert published, "self-heal site never republished"
         got = published[0].envelope_precompute
@@ -3324,15 +3405,12 @@ class TestUpdateAPI:
 
     @staticmethod
     def _serve(ns, host="127.0.0.1"):
-        srv = ns["ThreadingHTTPServer"]((host, 0), ns["DashboardHTTPHandler"])
-        t = threading.Thread(target=srv.serve_forever, daemon=True)
-        t.start()
-        return srv, t, srv.server_address[1]
+        return serve_dashboard(ns, host=host)
 
     @staticmethod
     def _post(host, port, path, body=b"{}", *, origin=None, host_header=None,
               content_type="application/json"):
-        c = http.client.HTTPConnection(host, port, timeout=2)
+        c = http.client.HTTPConnection(host, port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
         c.putheader("Content-Type", content_type)
         c.putheader("Content-Length", str(len(body)))
@@ -3389,9 +3467,7 @@ class TestUpdateAPI:
             assert payload == {"run_id": "rid-new"}
             assert stub.start_calls == [None]
         finally:
-            srv.shutdown()
-            t.join(timeout=2)
-            srv.server_close()
+            stop(srv, t)
 
     def test_post_update_treats_client_cached_version_as_auto_target(
         self, tmp_path, monkeypatch
@@ -3413,9 +3489,7 @@ class TestUpdateAPI:
             assert json.loads(r.read().decode("utf-8")) == {"run_id": "rid-new"}
             assert stub.start_calls == [None]
         finally:
-            srv.shutdown()
-            t.join(timeout=2)
-            srv.server_close()
+            stop(srv, t)
 
     def test_post_update_409_when_busy(self, tmp_path, monkeypatch):
         ns = load_script()
@@ -3435,8 +3509,7 @@ class TestUpdateAPI:
             payload = json.loads(r.read().decode("utf-8"))
             assert payload == {"run_id_in_progress": "rid-existing"}
         finally:
-            srv.shutdown()
-            t.join(timeout=2)
+            stop(srv, t)
 
     def test_post_update_403_on_bad_origin(self, tmp_path, monkeypatch):
         ns = load_script()
@@ -3454,8 +3527,7 @@ class TestUpdateAPI:
             )
             assert r.status == 403
         finally:
-            srv.shutdown()
-            t.join(timeout=2)
+            stop(srv, t)
 
     def test_post_update_dismiss_skip_writes_suppress_and_204(
         self, tmp_path, monkeypatch
@@ -3483,8 +3555,7 @@ class TestUpdateAPI:
             )
             assert r.status == 204, f"expected 204 got {r.status}"
         finally:
-            srv.shutdown()
-            t.join(timeout=2)
+            stop(srv, t)
 
         suppress = json.loads(ns["UPDATE_SUPPRESS_PATH"].read_text())
         assert "1.7.0" in suppress.get("skipped_versions", [])
@@ -3512,8 +3583,7 @@ class TestUpdateAPI:
             )
             assert r.status == 204
         finally:
-            srv.shutdown()
-            t.join(timeout=2)
+            stop(srv, t)
 
         suppress = json.loads(ns["UPDATE_SUPPRESS_PATH"].read_text())
         assert suppress["remind_after"]["version"] == "1.7.0"
@@ -3534,14 +3604,13 @@ class TestUpdateAPI:
 
         srv, t, port = self._serve(ns)
         try:
-            c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
             c.request("GET", "/api/update/status")
             r = c.getresponse()
             assert r.status == 200
             body = json.loads(r.read().decode("utf-8"))
         finally:
-            srv.shutdown()
-            t.join(timeout=2)
+            stop(srv, t)
         assert body["state"]["latest_version"] == "1.7.0"
         assert body["current_run_id"] == "rid-existing"
         assert "suppress" in body

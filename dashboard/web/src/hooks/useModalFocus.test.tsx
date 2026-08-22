@@ -41,6 +41,26 @@ function ContainerFocusHarness({ active, trapEnabled = true }: { active: boolean
   );
 }
 
+function LayeredHarness({ upperActive }: { upperActive: boolean }) {
+  const lowerRef = useRef<HTMLDivElement>(null);
+  const upperRef = useRef<HTMLDivElement>(null);
+  useModalFocus(lowerRef, { active: true });
+  useModalFocus(upperRef, { active: upperActive });
+  return (
+    <div>
+      <div ref={lowerRef} role="dialog" aria-label="lower dialog">
+        <button id="lower-first">lower first</button>
+      </div>
+      {upperActive && (
+        <div ref={upperRef} role="dialog" aria-label="upper dialog">
+          <button id="upper-first">upper first</button>
+          <button id="upper-last">upper last</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 describe('useModalFocus', () => {
   beforeEach(() => { document.body.innerHTML = ''; });
 
@@ -72,6 +92,40 @@ describe('useModalFocus', () => {
     document.getElementById('sel')!.focus();
     fireEvent.keyDown(document, { key: 'Tab' }); // no wrap because trap is off
     expect(document.activeElement?.id).toBe('sel');
+  });
+
+  it('recovers an orphaned forward Tab from document.body into the dialog', () => {
+    render(<Harness active={true} />);
+    document.getElementById('first')!.blur();
+    expect(document.activeElement).toBe(document.body);
+
+    fireEvent.keyDown(document, { key: 'Tab' });
+
+    expect(document.activeElement?.id).toBe('first');
+  });
+
+  it('recovers an orphaned Shift+Tab from document.body to the last focusable', () => {
+    render(<Harness active={true} />);
+    document.getElementById('first')!.blur();
+    expect(document.activeElement).toBe(document.body);
+
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true });
+
+    expect(document.activeElement?.id).toBe('sel');
+  });
+
+  it('lets only the newest active local overlay recover orphaned focus', () => {
+    render(<LayeredHarness upperActive />);
+    const focusOrder: string[] = [];
+    document.getElementById('lower-first')!.addEventListener('focus', () => focusOrder.push('lower'));
+    document.getElementById('upper-first')!.addEventListener('focus', () => focusOrder.push('upper'));
+    (document.activeElement as HTMLElement).blur();
+    expect(document.activeElement).toBe(document.body);
+
+    fireEvent.keyDown(document, { key: 'Tab' });
+
+    expect(document.activeElement?.id).toBe('upper-first');
+    expect(focusOrder).toEqual(['upper']);
   });
 
   it('toggling trapEnabled does not re-restore focus (only deactivation does)', () => {

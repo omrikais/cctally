@@ -2255,13 +2255,16 @@ def _counting_cache_connection(ns, counter, *, open_cache=None):
 
     The fixture's connection is a plain `sqlite3.Connection`, and a C-type
     instance takes neither an attribute nor a patched method, so the count has
-    to be installed at CONNECT time through a factory. `sqlite3.connect` is
-    swapped for exactly the duration of the open and restored immediately, so
-    nothing else in the process acquires the factory. Opening through
-    `open_cache_db` rather than a raw `sqlite3.connect` keeps every
-    connection-local pragma the build reads under.
+    to be installed at CONNECT time through a factory. `_cctally_store`'s
+    `sqlite3` name is swapped for exactly the duration of the open and restored
+    immediately, so nothing else in the process ever resolves the factory —
+    not even a thread connecting concurrently, which a swap on the shared
+    `sqlite3` module would have caught. Opening through `open_cache_db` rather
+    than a raw connect keeps every connection-local pragma the build reads
+    under.
     """
     import sqlite3
+    import types
 
     class _Cursor(sqlite3.Cursor):
         def _count(self, amount):
@@ -2301,14 +2304,22 @@ def _counting_cache_connection(ns, counter, *, open_cache=None):
                 counter["begins"] = counter.get("begins", 0) + 1
             return self.cursor().execute(sql, parameters)
 
-    real_connect = sqlite3.connect
-    sqlite3.connect = (
+    # #630 S2: rebind the module name on the IMPORTING module rather than the
+    # shared `sqlite3`. `open_cache_db` connects through `_cctally_store`, so
+    # that rebind still installs the factory on the connection under test while
+    # leaving every other thread in this process on the real callable.
+    store = sys.modules["_cctally_store"]
+    real_sqlite3 = store.sqlite3
+    real_connect = real_sqlite3.connect
+    iso_sqlite3 = types.SimpleNamespace(**vars(real_sqlite3))
+    iso_sqlite3.connect = (
         lambda *a, **k: real_connect(*a, **{**k, "factory": _Connection})
     )
+    store.sqlite3 = iso_sqlite3
     try:
         return (open_cache or ns["open_cache_db"])()
     finally:
-        sqlite3.connect = real_connect
+        store.sqlite3 = real_sqlite3
 
 
 def test_the_rows_materialised_inside_the_pin_scale_with_the_population(

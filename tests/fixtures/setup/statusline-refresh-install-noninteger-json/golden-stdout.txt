@@ -3,10 +3,10 @@
   "mode": "install",
   "result": "warn",
   "symlinks": {
-    "created": 15,
+    "created": 16,
     "already": 0,
     "replaced": 0,
-    "total": 15,
+    "total": 16,
     "destination": "/FAKE/.local/bin"
   },
   "hooks": {

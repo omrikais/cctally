@@ -764,6 +764,18 @@ def _run_conversation_events_stream(
         pass
     seen = cached_sigs(files)
 
+    # #630 S2: `ready` above means "this connection is live-tailing"; it fires
+    # BEFORE resolve() and ingest(), so it does not mean a baseline exists,
+    # which is why six tests used to sleep a second here. This frame means the
+    # baseline IS established, so any subsequent growth will be caught. The
+    # client listens only for `ready`, `tail` and `error`
+    # (dashboard/web/src/hooks/useConversationLiveTail.ts), and EventSource
+    # dispatches only event types something listens for, so this is inert for
+    # the browser by construction. It exists for tests; do not delete it as
+    # unread. Contract: docs/dashboard-gotchas.md.
+    handler.wfile.write(b"event: baselined\ndata: {}\n\n")
+    handler.wfile.flush()
+
     idle = 0.0
     cycles = 0
     while True:

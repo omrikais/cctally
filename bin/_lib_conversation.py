@@ -55,10 +55,13 @@ def _join_text_blocks(blocks):
     migration-011 consumer rebuilds the marker text from blocks_json to feed
     _extract_command_invocation, so this lives in the parser kernel (the one
     _cctally_cache already imports) to keep the two derivations identical."""
-    if not blocks:
+    if not isinstance(blocks, list) or not blocks:
         return ""
-    return "\n".join(b.get("text", "") or ""
-                     for b in blocks if b.get("kind") == "text")
+    return "\n".join(
+        text for b in blocks
+        if isinstance(b, dict) and b.get("kind") == "text"
+        and isinstance((text := b.get("text")), str)
+    )
 
 
 def _extract_command_invocation(blocks, text):

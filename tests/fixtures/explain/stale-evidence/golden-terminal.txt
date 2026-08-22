@@ -1,0 +1,27 @@
+Window 2026-08-10T00:00:00Z .. 2026-08-17T00:00:00Z [Etc/UTC] (half-open: the start is included, the end is not)
+Measured at 2026-08-17T00:00:00Z
+This explains locally retained cost and tokens, not quota percentage.
+The classes overlap — one session is also a project and a model — so shares do not sum to 100 percent.
+A subject is reported as a contributor at a share of 0.20 or more of its named denominator.
+
+Rules in force, by class:
+  Prompt-cache churn: Turns whose prompt cache was rebuilt: the cached prefix collapsed and was re-created in the same turn.
+  Short conversations carrying large context: Conversations with at most 3 human turns where at least one request used at least 80% of that request's model context window. With several replies the largest single request fraction is used, never their sum.
+  Subagent fan-out: Cost attributable to delegated subagent work, grouped by parent. On Codex this is an identifiable subset of unknown completeness.
+  Turn definition: main-thread human messages only — non-sidechain, non-subagent, after command and meta normalisation; assistant replies associate with the nearest preceding human.
+
+== claude · all accounts ==
+Denominator totalExplainedRetainedCost: withheld (stale_evidence)
+
+Classes with no measurement to report:
+  Expensive model mix — stale_evidence (support not measured)
+  One project dominating — stale_evidence (support not measured)
+  One session dominating — stale_evidence (support not measured)
+  Concentrated 5-hour bursts — stale_evidence (support not measured)
+  Prompt-cache churn — stale_evidence (support not measured)
+  Short conversations carrying large context — stale_evidence (support not measured)
+  Subagent fan-out — stale_evidence (support not measured)
+
+Verdict for claude: withheld (stale_evidence) [7 of 7 applicable classes withheld]
+
+Overall: withheld (stale_evidence) [7 of 7 applicable classes withheld]

@@ -1,10 +1,13 @@
 """#179 — resumable conversation-enrichment reingest + non-blocking dashboard sync."""
 import json
+import types
 import os
 import sqlite3
 import pytest
 
 from conftest import load_script, redirect_paths  # type: ignore
+
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
 
 
 def _asst_line(uuid, msg_id, req_id, text, *, ts="2026-06-01T00:00:00Z",
@@ -295,17 +298,15 @@ def test_real_server_binds_and_serves_before_sync_completes(tmp_path, monkeypatc
     # ThreadingHTTPServer construction.
     sync_thread = threading.Thread(target=blocking_sync, daemon=True)
     sync_thread.start()
-    assert sync_entered.wait(timeout=5), "sync thread did not start"
+    assert sync_entered.wait(timeout=PRESENCE_BACKSTOP_SECONDS), "sync thread did not start"
 
     srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
-    http_thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    http_thread.start()
+    http_thread = start(srv)
     try:
         port = srv.server_address[1]
         # The sync is STILL blocked — prove it, then prove the port answers.
         assert not sync_completed.is_set(), "sync should still be blocked"
-        c = HTTPConnection("127.0.0.1", port, timeout=5)
+        c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/api/data")
         r = c.getresponse()
         body = r.read()
@@ -317,9 +318,9 @@ def test_real_server_binds_and_serves_before_sync_completes(tmp_path, monkeypatc
         )
     finally:
         release_sync.set()
-        srv.shutdown()
-        http_thread.join(timeout=3)
-        sync_thread.join(timeout=3)
+        stop(srv, http_thread)
+        # timing-budget: the background sync thread has returned now that `release_sync` is set
+        sync_thread.join(timeout=PRESENCE_BACKSTOP_SECONDS)
 
 
 # --- #218 I-C.3: real cmd_dashboard bind-before-sync, at the production call site
@@ -378,7 +379,12 @@ def test_real_cmd_dashboard_binds_before_background_sync_completes(tmp_path, mon
             return _NoopThread()
         return real_thread(*args, **kwargs)
 
-    monkeypatch.setattr(dash.threading, "Thread", _thread_factory)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_threading = types.SimpleNamespace(**vars(dash.threading))
+    _iso_threading.Thread = _thread_factory
+    monkeypatch.setattr(dash, "threading", _iso_threading)
 
     # Record the REAL bind, then stop cmd_dashboard before serve_forever.
     bound: dict = {}
@@ -404,9 +410,11 @@ def test_real_cmd_dashboard_binds_before_background_sync_completes(tmp_path, mon
             rc["bind_reached"] = True
         except BaseException as exc:                # surface anything unexpected
             rc["err"] = repr(exc)
+    before_threads = set(threading.enumerate())
     worker = real_thread(target=run_it, daemon=True)
     worker.start()
-    worker.join(timeout=10)
+    # timing-budget: `cmd_dashboard` has raised `_BindReached` on its own thread, so `rc` and `bound` are final
+    worker.join(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     assert not worker.is_alive(), f"cmd_dashboard hung before the bind; rc={rc}"
     assert rc.get("err") is None, rc["err"]
@@ -416,7 +424,44 @@ def test_real_cmd_dashboard_binds_before_background_sync_completes(tmp_path, mon
     assert bound.get("port", 0) > 0, rc
     # Non-vacuity: the background sync seam was genuinely exercised and parked, so
     # the "blocked sync" premise is real (not a sync that was skipped entirely).
-    assert sync_entered.wait(timeout=2), "background sync seam was never exercised"
+    assert sync_entered.wait(timeout=PRESENCE_BACKSTOP_SECONDS), "background sync seam was never exercised"
+
+    # #630 S2: release the parked background sync and reap its thread. Leaving
+    # it parked leaked a live daemon into every later test on this worker, and
+    # the #630 S2 leaked-thread guard reports exactly that. "The daemon dies at
+    # exit" is true of the process, not of the run: the thread outlives this
+    # item by minutes and can observe a later test's patches while it does.
+    park_forever.set()
+    reaped = []
+    for parked in threading.enumerate():
+        if parked in before_threads or parked is threading.current_thread():
+            continue
+        # `cmd_dashboard` raised `_BindReached` before returning the sync
+        # thread it started, so the only handle on that thread's stop event is
+        # the bound method it runs. `_TuiSyncThread._run` polls `_stop` every
+        # 0.1 s, so setting it ends the loop promptly.
+        #
+        # A thread WITHOUT that shape was not started by `cmd_dashboard`, and
+        # this test owns neither its lifetime nor its failure. Joining every
+        # thread that merely appeared during the window cost thirty seconds and
+        # then failed this test for someone else's thread — which under
+        # `--dist load`, where an unrelated thread can start at any moment, is
+        # the load-fragile red this session removes.
+        owner = getattr(getattr(parked, "_target", None), "__self__", None)
+        stop_event = getattr(owner, "_stop", None)
+        if not isinstance(stop_event, threading.Event):
+            continue
+        stop_event.set()
+        # timing-budget: `_TuiSyncThread._run` polls the `_stop` event just set every 0.1 s
+        parked.join(timeout=PRESENCE_BACKSTOP_SECONDS)
+        reaped.append(parked)
+        assert not parked.is_alive(), (
+            f"thread {parked.name!r} started by cmd_dashboard did not exit "
+            f"after its stop event was set")
+    assert reaped, (
+        "no cmd_dashboard sync thread matched the stop-event shape, so this "
+        "loop reaped nothing; the background-sync assertion above says one was "
+        "started")
 
 
 # --- #217 S1 / U6: migration-017 nested-agent reingest end-to-end -------------

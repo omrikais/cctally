@@ -195,7 +195,26 @@ describe('RecentAlertsModal firing instant (#574)', () => {
     ], null, [90, 95]);
     const { container } = render(<RecentAlertsModal />);
     expect(whenCells(container).map((c) => c.textContent))
-      .toEqual(['Apr 16 13:56 UTC', 'Apr 16 13:59 UTC']);
+      .toEqual([
+        'Apr 16 13:56 UTC [Etc/UTC]',
+        'Apr 16 13:59 UTC [Etc/UTC]',
+      ]);
+  });
+
+  it('names the resolved IANA zone beside an absolute alert instant', () => {
+    const snap = envWith(null, [alert({
+      id: 'when:iana', alerted_at: '2026-04-16T13:56:00Z',
+    })], config([90, 95]));
+    snap.display = {
+      tz: 'Asia/Jerusalem', resolved_tz: 'Asia/Jerusalem',
+      offset_label: 'IDT', offset_seconds: 10800,
+    };
+    act(() => { updateSnapshot(snap); });
+
+    render(<RecentAlertsModal />);
+
+    expect(document.querySelector('.alert-cell-when .instant-zone')?.textContent)
+      .toBe('[Asia/Jerusalem]');
   });
 
   it('titles a relative-branch row too, with the clock pinned so the row stays recent', () => {
@@ -204,7 +223,7 @@ describe('RecentAlertsModal firing instant (#574)', () => {
     seedAlerts([alert({ id: 'when:recent' })], null, [90, 95]);
     const { container } = render(<RecentAlertsModal />);
     const cell = whenCells(container)[0];
-    expect(cell.textContent).toBe('4m ago');
+    expect(cell.textContent).toBe('4m ago [Etc/UTC]');
     expect(cell.getAttribute('title')).toBe('2026-04-16 13:56 UTC');
   });
 

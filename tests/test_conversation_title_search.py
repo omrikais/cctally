@@ -33,6 +33,7 @@ import _cctally_cache as cc  # noqa: E402
 import _lib_conversation_query as cq  # noqa: E402
 
 from conftest import load_script, redirect_paths  # noqa: E402
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
 
 _MODEL = "claude-opus-4-8"
 
@@ -329,14 +330,13 @@ def _boot(ns, tmp_path, monkeypatch):
     HandlerCls.cctally_host = "127.0.0.1"
     HandlerCls.cctally_expose_transcripts = False
     srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    srv._test_thread = start(srv)
     return srv
 
 
 def _get(port, path):
     from http.client import HTTPConnection
-    c = HTTPConnection("127.0.0.1", port, timeout=5)
+    c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     c.request("GET", path)
     r = c.getresponse()
     body = r.read()
@@ -360,7 +360,7 @@ def test_find_rejects_title_and_files_400_not_500(tmp_path, monkeypatch):
         status, _ = _get(port, "/api/conversation/s1/find?q=hi&kind=prompts")
         assert status == 200
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_search_accepts_title_kind_200(tmp_path, monkeypatch):
@@ -375,7 +375,7 @@ def test_search_accepts_title_kind_200(tmp_path, monkeypatch):
         assert out["hits"] and out["hits"][0]["session_id"] == "s1"
         assert out["hits"][0]["match_kinds"] == ["title"]
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_search_threads_browse_filters(tmp_path, monkeypatch):
@@ -396,4 +396,4 @@ def test_search_threads_browse_filters(tmp_path, monkeypatch):
             port, "/api/conversation/search?q=refactor&kind=title&cost_min=abc")
         assert status == 400, (status, body)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)

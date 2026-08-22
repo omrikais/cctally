@@ -25,7 +25,13 @@ import threading
 import time
 import types
 
+import pytest
+
 from conftest import load_script, redirect_paths  # type: ignore
+
+from tests._support_http import (
+    PRESENCE_BACKSTOP_SECONDS, shorten_sse_keepalive,
+)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 BIN = REPO / "bin" / "cctally"
@@ -351,10 +357,31 @@ def test_cache_report_qa_fixture_reaches_amber_and_mixed_signs(
     assert signs == {"negative", "positive"}
 
 
-#: One budget for the whole responsive-startup test, comfortably under the
-#: 120-second per-test ceiling `bin/cctally-test-all` applies to the pytest
-#: phase. Every wait in the test draws from it rather than declaring its own.
-_WHOLE_TEST_BUDGET_S = 100.0
+#: One budget for the body of the responsive-startup test. Every wait inside
+#: the body draws from this one.
+#:
+#: The teardown cannot draw from it, because the waits there exist precisely to
+#: outlast an exhausted budget, so it gets its own — and the two must fit
+#: together inside the 120-second per-test ceiling `bin/cctally-test-all`
+#: applies to the pytest phase. 75 plus 30 is 105, which leaves 15 seconds of
+#: margin.
+#:
+#: The margin is the point of the numbers, not an accident of them. An earlier
+#: pair summed to exactly 120.0 against a `total > CAP_SECONDS` test — a rule
+#: since corrected to reserve headroom, so that sum is now reported — and the
+#: guard reported nothing while the real worst case was 160: the guard could
+#: not see the two teardown deadlines, which were written inline as
+#: `time.monotonic() + N` and belonged to no local name. Both halves are fixed
+#: — `_clock_plus_constant` in `tests/test_timing_budget_guard.py` now counts an
+#: inline deadline, and the teardown here draws from one budget instead of
+#: three — and neither number is chosen to land on the boundary.
+_WHOLE_TEST_BUDGET_S = 75.0
+
+#: The teardown's own budget, shared by all three of its waits. Thirty is
+#: `PRESENCE_BACKSTOP_SECONDS`, the estate's one load-safe presence backstop:
+#: every wait here is a presence wait on a thread exiting, so it returns as
+#: soon as that happens and spends the budget only when something is wedged.
+_TEARDOWN_BUDGET_S = PRESENCE_BACKSTOP_SECONDS
 
 
 def _remaining(deadline: float) -> float:
@@ -401,7 +428,60 @@ def _load_with_corpus(monkeypatch, tmp_path, small_corpus):
     monkeypatch.setenv(
         "CCTALLY_AS_OF",
         _gen.CORPUS_CLOCK_UTC.isoformat().replace("+00:00", "Z"))
-    return load_script()
+    ns = load_script()
+    shorten_sse_keepalive(ns, monkeypatch)
+    return ns
+
+
+def _await_handler_exit(before, *, deadline, name_contains="process_request_thread"):
+    """Wait for a thread this test caused to be started to notice and exit.
+
+    `cmd_dashboard` runs a daemon-threaded server that joins no handler, and
+    the handler learns its client has gone only on the keep-alive write after
+    `_SSE_KEEPALIVE_SECONDS`, which `_load_with_corpus` shortens. This is a
+    presence wait on that exit, so it returns as soon as the thread is gone.
+    """
+    while True:
+        # Bound unconditionally, and probed at least once. Reading `alive`
+        # after the loop was legal only because the single caller happened to
+        # guarantee one iteration; an elapsed deadline raised UnboundLocalError
+        # in place of the named diagnostic.
+        alive = [
+            t for t in threading.enumerate()
+            if t not in before and name_contains in t.name
+        ]
+        if not alive:
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    raise AssertionError(
+        "a %r thread outlived this test: " % name_contains
+        + ", ".join(repr(t.name) for t in alive))
+
+
+def test_await_handler_exit_names_the_thread_on_an_already_elapsed_deadline():
+    """The diagnostic must survive a caller that arrives with no time left.
+
+    `alive` used to be bound only inside the `while`, so the single caller's
+    guarantee of one iteration was the only thing keeping the `raise` legal. A
+    caller passing an elapsed deadline got `UnboundLocalError` instead of the
+    named diagnostic this helper exists to produce.
+    """
+    before = set(threading.enumerate())
+    release = threading.Event()
+    probe = threading.Thread(
+        target=lambda: release.wait(60),
+        name="Thread-probe (process_request_thread)", daemon=True)
+    probe.start()
+    try:
+        with pytest.raises(AssertionError, match="process_request_thread"):
+            _await_handler_exit(before, deadline=time.monotonic() - 1.0)
+    finally:
+        release.set()
+        # timing-budget: cleanup join for a thread this test has just released
+        probe.join(timeout=PRESENCE_BACKSTOP_SECONDS)
+    assert not probe.is_alive()
 
 
 def _sse_frames(port, deadline):
@@ -453,6 +533,7 @@ def test_bind_precedes_the_full_build_and_hydration_clears(
     """
     ns = _load_with_corpus(monkeypatch, tmp_path, small_corpus)
     dash = _dash_mod()
+    before_handlers = set(threading.enumerate())
 
     deadline = time.monotonic() + _WHOLE_TEST_BUDGET_S
 
@@ -499,6 +580,7 @@ def test_bind_precedes_the_full_build_and_hydration_clears(
         target=lambda: outcome.append(dash.cmd_dashboard(args)),
         daemon=True, name="s1-dashboard-under-test")
     server_thread.start()
+    frames = None
     try:
         while "srv" not in bound and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -555,7 +637,36 @@ def test_bind_precedes_the_full_build_and_hydration_clears(
     finally:
         release.set()
         stop.set()
-        server_thread.join(timeout=10)
+        # The generator holds the SSE response open, and `cmd_dashboard` runs a
+        # daemon-threaded server that joins no handler. Closing it here runs the
+        # generator's own `finally`, which releases the socket; without that the
+        # `/api/events` handler stays blocked in `q.get` and outlives this item.
+        if frames is not None:
+            frames.close()
+        # None of these three may draw from the body's budget: by the time the
+        # test reaches its teardown that budget may be spent, and `_remaining`
+        # would then hand each of them one second. Under contention the server
+        # thread does not always exit inside that, and the leak guard then
+        # fails the item for a thread the teardown meant to reap.
+        #
+        # They draw from ONE teardown budget rather than three of their own,
+        # which is what keeps the test's worst case under the pytest cap. Three
+        # independent waits of 30, 10 and 30 put the worst case at 160 against
+        # a cap of 120, so a wedged product spent the whole budget and
+        # pytest-timeout killed the worker mid-teardown — the undiagnosable red
+        # #630 S1 removed — instead of one of these waits naming the thread it
+        # was waiting for.
+        teardown_deadline = time.monotonic() + _TEARDOWN_BUDGET_S
+        server_thread.join(timeout=_remaining(teardown_deadline))
+        _await_handler_exit(before_handlers, deadline=teardown_deadline)
+        # `cmd_dashboard` also starts the conversation-sync daemon, which
+        # `stop` above releases only between iterations. `bin/cctally-test-load-
+        # invariance` caught it mid-prune, holding a commit past this item's
+        # teardown, where a later test's process-global patch would have been
+        # visible to it.
+        _await_handler_exit(
+            before_handlers, deadline=teardown_deadline,
+            name_contains="dashboard-conversations-sync")
 
 
 # ---------------------------------------------------------------------------

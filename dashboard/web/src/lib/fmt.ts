@@ -320,6 +320,14 @@ export const fmt = {
   usd2(v: number | null | undefined): string {
     return v == null ? '—' : `$${(+v).toFixed(2)}`;
   },
+  // Currency sign belongs after the number's sign: `−$12.34`, never `$-12.34`.
+  // Kept separate from usd2 because most callers are known non-negative and
+  // retain their byte-stable formatter; budget remaining is deliberately signed.
+  usd2Accounting(v: number | null | undefined): string {
+    if (v == null) return '—';
+    const n = +v;
+    return `${n < 0 ? '−' : ''}$${Math.abs(n).toFixed(2)}`;
+  },
   // #423 item 25 — a money headline must not discard known cents. Exact
   // whole-dollar values keep the compact "$254" form; any fractional amount
   // keeps two decimals, and sub-cent values use the honest "<$0.01" convention.

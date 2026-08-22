@@ -3,7 +3,7 @@ setup: warning: settings.json at /FAKE/.claude/settings.json is not valid JSON: 
   "schema_version": 1,
   "install": {
     "symlinks_present": 0,
-    "symlinks_total": 15,
+    "symlinks_total": 16,
     "symlinks_stale": [],
     "path_includes": true
   },

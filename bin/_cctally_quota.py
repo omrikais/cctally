@@ -194,6 +194,7 @@ PROJECTION_READ_CHOKEPOINTS: "frozenset[str]" = frozenset({
     "_cctally_quota.py::_orphan_unseen::quota_window_blocks",
     "_cctally_quota.py::_orphan_unseen_scoped::quota_window_blocks",
     "_cctally_quota.py::_apply_quota_projection_rows::quota_projection_state",
+    "_cctally_diagnosis_sources.py::<module>::quota_window_blocks",
 })
 
 #: What each enumerated site does about the gate.
@@ -246,6 +247,10 @@ PROJECTION_READ_SITE_ACTIONS: "dict[str, str]" = {
         "projector",
     "_cctally_quota.py::_apply_quota_projection_rows::quota_projection_state":
         "projector",
+    # `cctally explain` holds its Codex block SQL as a module-level constant,
+    # so the function that executes it gates instead.
+    "_cctally_diagnosis_sources.py::<module>::quota_window_blocks":
+        "gate_at_caller",
 }
 
 #: For each `gate_at_caller` site, the `<file>::<function>` callers that run the
@@ -273,6 +278,15 @@ PROJECTION_GATE_CALLERS: "dict[str, tuple[str, ...]]" = {
         "_cctally_tui.py::_tui_build_source_bundle",
         "_cctally_tui.py::_tui_compute_dispatch_signature",
         "_cctally_dashboard_sources.py::_codex_quota_reuse_identity",
+    ),
+    # Two functions in that module execute module-level SQL against
+    # `quota_window_blocks` — the block read and the observation-horizon read —
+    # and the scanner sees both as the one `<module>` site. Both are named,
+    # because "the horizon read is safe today because of call order" is not a
+    # property this guard can check, and a reordering would not fail it.
+    "_cctally_diagnosis_sources.py::<module>::quota_window_blocks": (
+        "_cctally_diagnosis_sources.py::_read_codex_blocks",
+        "_cctally_diagnosis_sources.py::_read_store_horizon",
     ),
 }
 

@@ -1,5 +1,6 @@
 """Additive, fake-home-only Codex hooks.json management contracts for #294 S2."""
 from __future__ import annotations
+import types
 
 import argparse
 import fcntl
@@ -14,6 +15,8 @@ from types import SimpleNamespace
 import pytest
 
 from conftest import load_script, redirect_paths
+
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 
 def _owned_command(binary: str = "/opt/cctally/bin/cctally") -> str:
@@ -227,7 +230,12 @@ def test_codex_hook_write_waits_for_the_lock_before_creating_a_backup(
         backup_started.set()
         return original_copy(*args, **kwargs)
 
-    monkeypatch.setattr(hooks.shutil, "copy2", observe_copy)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_shutil = types.SimpleNamespace(**vars(hooks.shutil))
+    _iso_shutil.copy2 = observe_copy
+    monkeypatch.setattr(hooks, "shutil", _iso_shutil)
     done = threading.Event()
 
     def write() -> None:
@@ -241,7 +249,8 @@ def test_codex_hook_write_waits_for_the_lock_before_creating_a_backup(
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
-    worker.join(timeout=2)
+    # timing-budget: the hook writer has returned now that the flock is released, so `backup_started` is final
+    worker.join(timeout=PRESENCE_BACKSTOP_SECONDS)
     assert done.is_set()
     assert backup_started.is_set()
 
@@ -275,12 +284,13 @@ def test_codex_hook_install_rereads_and_plans_after_acquiring_root_lock(
     worker = threading.Thread(target=install)
     worker.start()
     try:
-        assert entered_writer.wait(1)
+        assert entered_writer.wait(PRESENCE_BACKSTOP_SECONDS)
         hooks_path.write_text(json.dumps({"keep": "intervening-user-edit"}))
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
-    worker.join(timeout=2)
+    # timing-budget: the hook writer has returned now that the flock is released, so the hooks file is final
+    worker.join(timeout=PRESENCE_BACKSTOP_SECONDS)
     assert done.is_set()
     final = json.loads(hooks_path.read_text())
     assert final["keep"] == "intervening-user-edit"

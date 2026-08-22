@@ -22,6 +22,7 @@ from _lib_dashboard_sources import (
     compose_all_state,
 )
 from conftest import load_script, redirect_paths  # type: ignore
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
 
 
 def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False):
@@ -35,14 +36,12 @@ def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False):
     H.cctally_host = bind
     H.cctally_expose_transcripts = expose
     srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), H)
-    srv.daemon_threads = True
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    srv._test_thread = start(srv)
     return srv
 
 
 def _get(port, path, *, host=None):
-    c = HTTPConnection("127.0.0.1", port, timeout=5)
+    c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     if host is None:
         c.request("GET", path)
     else:
@@ -100,8 +99,7 @@ def test_debug_backend_shape_over_loopback(monkeypatch, tmp_path):
         # dataset row counts are safe cache-table names against a known-empty DB
         assert payload["dataset"].get("session_entries") == 0
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_debug_backend_reports_safe_source_counts_and_never_raw_open_errors(
@@ -180,8 +178,7 @@ def test_debug_backend_reports_safe_source_counts_and_never_raw_open_errors(
         assert failure["cache_state"] == {"status": "unavailable"}
         assert "private/root" not in json.dumps(failure)
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_debug_backend_403_on_hostname_host(monkeypatch, tmp_path):
@@ -193,8 +190,7 @@ def test_debug_backend_403_on_hostname_host(monkeypatch, tmp_path):
         status, _ = _get(port, "/api/debug/backend", host="evil.example.com")
         assert status == 403
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_debug_backend_403_even_with_expose_transcripts(monkeypatch, tmp_path):
@@ -210,8 +206,7 @@ def test_debug_backend_403_even_with_expose_transcripts(monkeypatch, tmp_path):
         )
         assert status == 403
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 # ── #583 S1 §3.1/§3.2: the tick record and the runtime trace arm ────────────
@@ -220,7 +215,7 @@ def test_debug_backend_403_even_with_expose_transcripts(monkeypatch, tmp_path):
 def _post(port, path, body, *, host=None, origin=None, token=None,
           raw_body=None):
     """POST with full control over Host, Origin and the bearer."""
-    c = HTTPConnection("127.0.0.1", port, timeout=5)
+    c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     payload = raw_body if raw_body is not None else json.dumps(body).encode()
     c.putrequest("POST", path, skip_host=True)
     c.putheader("Host", host or f"127.0.0.1:{port}")
@@ -293,8 +288,7 @@ def test_debug_backend_reports_the_tick_record_with_tracing_off(
         assert payload["schemaVersion"] == 1, "both keys are additive"
     finally:
         ts.reset_for_tests()
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_the_tick_record_leaks_no_path_and_no_prose(monkeypatch, tmp_path):
@@ -316,8 +310,7 @@ def test_the_tick_record_leaks_no_path_and_no_prose(monkeypatch, tmp_path):
             assert isinstance(value, (int, bool, str, type(None)))
     finally:
         ts.reset_for_tests()
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_debug_backend_publishes_conversation_passes_via_the_real_recorder(
@@ -362,8 +355,7 @@ def test_debug_backend_publishes_conversation_passes_via_the_real_recorder(
         assert "/" not in encoded.replace("\\/", "")
     finally:
         ts.reset_for_tests()
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_an_empty_conversation_ring_publishes_an_empty_list_not_a_missing_key(
@@ -381,8 +373,7 @@ def test_an_empty_conversation_ring_publishes_an_empty_list_not_a_missing_key(
         assert json.loads(body)["tick"]["conversation_sync"] == []
     finally:
         ts.reset_for_tests()
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_trace_post_records_the_request_without_applying_it(
@@ -409,8 +400,7 @@ def test_trace_post_records_the_request_without_applying_it(
         perf.request_enabled(False)
         perf.apply_pending()
         perf.set_enabled(False)
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_trace_post_rejects_every_other_body_shape(monkeypatch, tmp_path):
@@ -425,8 +415,7 @@ def test_trace_post_rejects_every_other_body_shape(monkeypatch, tmp_path):
                                  origin=origin, raw_body=raw)
             assert status == 400, f"{raw!r} was accepted: {status} {body!r}"
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_trace_post_403s_without_an_origin(monkeypatch, tmp_path):
@@ -441,8 +430,7 @@ def test_trace_post_403s_without_an_origin(monkeypatch, tmp_path):
                           origin="http://evil.example.com")
         assert status == 403
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_trace_post_403s_on_a_hostname_host(monkeypatch, tmp_path):
@@ -455,8 +443,7 @@ def test_trace_post_403s_on_a_hostname_host(monkeypatch, tmp_path):
                           origin=f"http://evil.example.com:{port}")
         assert status == 403
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_trace_post_401s_when_the_bearer_is_required_and_absent(
@@ -488,5 +475,4 @@ def test_trace_post_401s_when_the_bearer_is_required_and_absent(
         assert status == 200, body
     finally:
         handler.cctally_api_token = None
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)

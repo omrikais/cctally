@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util as ilu
+import json
 import sqlite3
 import sys
+import types
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -160,7 +162,14 @@ def test_read_paths_do_not_parse_json(cctally_module, fixture_builders, tmp_path
     def _boom(*a, **k):
         raise AssertionError("read path parsed JSON — #181 regression")
 
-    monkeypatch.setattr(cache_mod.json, "loads", _boom)
+    cache_local_json = types.SimpleNamespace(**vars(json))
+    cache_local_json.loads = _boom
+    monkeypatch.setattr(cache_mod, "json", cache_local_json)
+    with pytest.raises(AssertionError, match="#181 regression"):
+        cache_mod.json.loads("{}")
+    assert json.loads('{"unrelated": true}') == {"unrelated": True}, (
+        "the cache-local trap must not replace stdlib json.loads process-wide"
+    )
     try:
         assert cc.iter_entries(conn, *RANGE)        # no JSON parse
         assert cc.get_claude_session_entries(*RANGE, skip_sync=True)

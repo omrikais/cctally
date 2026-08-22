@@ -39,6 +39,7 @@ import urllib.parse as _u
 from http.client import HTTPConnection
 
 from conftest import load_script, redirect_paths
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BIN_DIR = REPO_ROOT / "bin"
@@ -99,9 +100,8 @@ def _wire_handler(ns, *, no_sync=False, expose=False, bind="127.0.0.1"):
     HandlerCls.cctally_expose_transcripts = expose
     HandlerCls.no_sync = no_sync
     srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
     srv.handle_error = lambda request, client_address: None
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    srv._test_thread = start(srv)
     return srv
 
 
@@ -164,7 +164,7 @@ def _claude_key(sid="s1"):
 
 
 def _get(port, path, *, host=None):
-    c = HTTPConnection("127.0.0.1", port, timeout=8)
+    c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     if host is None:
         c.request("GET", path)
     else:
@@ -204,7 +204,7 @@ def test_detail_v1_codex_returns_neutral_envelope(tmp_path, monkeypatch):
         assert body["conversation_key"] == keys["modern-full"]
         assert "items" in body           # neutral detail shape
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_detail_v1_claude_returns_neutral_envelope(tmp_path, monkeypatch):
@@ -220,7 +220,7 @@ def test_detail_v1_claude_returns_neutral_envelope(tmp_path, monkeypatch):
         assert body["conversation_key"] == key
         assert "items" in body
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_detail_bare_uuid_is_legacy_path(tmp_path, monkeypatch):
@@ -236,7 +236,7 @@ def test_detail_bare_uuid_is_legacy_path(tmp_path, monkeypatch):
         # legacy send_error → text/html, not the neutral JSON envelope.
         assert b'"status"' not in body
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_detail_bare_non_uuid_id_stays_legacy(tmp_path, monkeypatch):
@@ -253,7 +253,7 @@ def test_detail_bare_non_uuid_id_stays_legacy(tmp_path, monkeypatch):
         assert body.get("session_id") == "s1"
         assert "conversation_key" not in body
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_malformed_v1_key_is_neutral_404(tmp_path, monkeypatch):
@@ -268,7 +268,7 @@ def test_malformed_v1_key_is_neutral_404(tmp_path, monkeypatch):
             assert "application/json" in ctype, suffix
             assert body["status"] == "not_found", suffix
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_outline_prompts_find_v1_codex(tmp_path, monkeypatch):
@@ -288,7 +288,7 @@ def test_outline_prompts_find_v1_codex(tmp_path, monkeypatch):
         assert f["semantics"] == "occurrence"
         assert "occurrences" in f["page"]
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_find_bad_kind_is_400_for_qualified(tmp_path, monkeypatch):
@@ -301,7 +301,7 @@ def test_find_bad_kind_is_400_for_qualified(tmp_path, monkeypatch):
             port, _entity_path(keys["modern-full"], "/find") + "?q=x&kind=title")
         assert s == 400
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_find_v1_codex_cursor_validation_and_staleness(tmp_path, monkeypatch):
@@ -344,7 +344,7 @@ def test_find_v1_codex_cursor_validation_and_staleness(tmp_path, monkeypatch):
         assert stale == 409
         assert body == {"error": "stale find cursor"}
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_find_paging_params_are_codex_only_and_claude_bytes_stay_frozen(
@@ -361,7 +361,7 @@ def test_find_paging_params_are_codex_only_and_claude_bytes_stay_frozen(
         assert _get(port, qualified + suffix) == _get(port, qualified + suffix + paging)
         assert _get(port, bare + suffix) == _get(port, bare + suffix + paging)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ── §2.3 transport: export markdown leg + scope rejection ────────────────────
@@ -377,7 +377,7 @@ def test_export_v1_codex_markdown_leg(tmp_path, monkeypatch):
         assert "text/markdown" in ctype
         assert body.startswith(b"#")            # markdown, not JSON
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_export_v1_codex_nondefault_scope_is_400(tmp_path, monkeypatch):
@@ -391,7 +391,7 @@ def test_export_v1_codex_nondefault_scope_is_400(tmp_path, monkeypatch):
         assert body["status"] == "validation_error"
         assert body["reason"] == "scope"
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_export_v1_claude_scopes_still_work(tmp_path, monkeypatch):
@@ -405,7 +405,7 @@ def test_export_v1_claude_scopes_still_work(tmp_path, monkeypatch):
         assert status == 200
         assert "text/markdown" in ctype
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ── §3.4 payload transport (route level) ─────────────────────────────────────
@@ -446,7 +446,7 @@ def test_payload_v1_codex_disambiguates_pairs(tmp_path, monkeypatch):
             + f"?block_key={_u.quote(ws_bk)}&which=output")
         assert s_ws == 404 and ws["status"] == "not_found"
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_payload_v1_codex_patch_event_is_full_and_structured(tmp_path, monkeypatch):
@@ -468,7 +468,7 @@ def test_payload_v1_codex_patch_event_is_full_and_structured(tmp_path, monkeypat
         assert body["card"]["files"][3]["move_path"] == "synthetic-new.txt"
         assert body["card"]["files"][0]["unified_diff"].startswith("--- /dev/null")
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_session_c_qualified_detail_and_payload_keep_exact_child_proof(
@@ -512,7 +512,7 @@ def test_session_c_qualified_detail_and_payload_keep_exact_child_proof(
         assert call_status == 200 and call["status"] == "ok"
         assert "synthetic web query" in call["content"]
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_session_d_qualified_wire_and_raw_marker_payload(
@@ -551,7 +551,7 @@ def test_session_d_qualified_wire_and_raw_marker_payload(
         assert export_status == 200
         assert "::git-create-branch" in export_bytes.decode("utf-8")
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_payload_gone_on_structural_mutation_is_410(tmp_path, monkeypatch):
@@ -577,7 +577,7 @@ def test_payload_gone_on_structural_mutation_is_410(tmp_path, monkeypatch):
         assert s == 410
         assert body["status"] == "gone"
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_payload_v1_claude_uses_legacy_selector(tmp_path, monkeypatch):
@@ -592,7 +592,7 @@ def test_payload_v1_claude_uses_legacy_selector(tmp_path, monkeypatch):
             port, _entity_path(key, "/payload") + "?tool_use_id=nope&which=result")
         assert s == 404
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ── §3.5 media capability gate ───────────────────────────────────────────────
@@ -611,7 +611,7 @@ def test_media_v1_codex_capability_unsupported(tmp_path, monkeypatch):
         assert body["status"] == "capability_unsupported"
         assert body["source"] == "codex"
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_media_privacy_gate_403_before_capability(tmp_path, monkeypatch):
@@ -626,7 +626,7 @@ def test_media_privacy_gate_403_before_capability(tmp_path, monkeypatch):
             host="evil.example.com")
         assert s == 403
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_media_v1_unresolvable_is_neutral_404(tmp_path, monkeypatch):
@@ -639,7 +639,7 @@ def test_media_v1_unresolvable_is_neutral_404(tmp_path, monkeypatch):
         assert s == 404
         assert body["status"] == "not_found"
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ── §2.5 privacy gate before capability for JSON entity routes ───────────────
@@ -656,7 +656,7 @@ def test_privacy_gate_403_before_qualified_answer(tmp_path, monkeypatch):
                 host="rebind.example.com")
             assert s == 403, suffix
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ── §2.2 strict ?source= on collection routes ────────────────────────────────
@@ -672,7 +672,7 @@ def test_browse_source_rejections(tmp_path, monkeypatch):
             s, _b, _c = _get(port, f"/api/conversations?{qs}")
             assert s == 400, qs
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_browse_legacy_axis_with_source_is_400(tmp_path, monkeypatch):
@@ -686,7 +686,7 @@ def test_browse_legacy_axis_with_source_is_400(tmp_path, monkeypatch):
             s, _b, _c = _get(port, f"/api/conversations?source=codex&{axis}")
             assert s == 400, axis
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_browse_limit_bounds(tmp_path, monkeypatch):
@@ -700,7 +700,7 @@ def test_browse_limit_bounds(tmp_path, monkeypatch):
         s, _b, _c = _get(port, "/api/conversations?source=codex&limit=500")
         assert s == 200
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_browse_malformed_cursor_is_400(tmp_path, monkeypatch):
@@ -712,7 +712,7 @@ def test_browse_malformed_cursor_is_400(tmp_path, monkeypatch):
             port, "/api/conversations?source=codex&cursor=" + _u.quote("has space"))
         assert s == 400
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_browse_source_absent_is_legacy(tmp_path, monkeypatch):
@@ -725,7 +725,7 @@ def test_browse_source_absent_is_legacy(tmp_path, monkeypatch):
         assert s == 200
         assert "conversations" in body      # legacy envelope key
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_facets_rejects_every_other_recognized_param(tmp_path, monkeypatch):
@@ -738,7 +738,7 @@ def test_facets_rejects_every_other_recognized_param(tmp_path, monkeypatch):
             s, _b, _c = _get(port, f"/api/conversations/facets?source=codex&{axis}")
             assert s == 400, axis
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_facets_qualified_status_tagged_both_providers(tmp_path, monkeypatch):
@@ -753,7 +753,7 @@ def test_facets_qualified_status_tagged_both_providers(tmp_path, monkeypatch):
             assert body["status"] == "ok", source
             assert set(body["facets"]) == {"projects", "models"}, source
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_search_offset_with_source_is_400(tmp_path, monkeypatch):
@@ -764,7 +764,7 @@ def test_search_offset_with_source_is_400(tmp_path, monkeypatch):
         s, _b, _c = _get(port, "/api/conversation/search?source=codex&q=x&offset=1")
         assert s == 400
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_search_malformed_cursor_is_400(tmp_path, monkeypatch):
@@ -778,7 +778,7 @@ def test_search_malformed_cursor_is_400(tmp_path, monkeypatch):
             + _u.quote("!!!bad"))
         assert s == 400
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_search_qualified_returns_neutral_envelope(tmp_path, monkeypatch):
@@ -792,7 +792,7 @@ def test_search_qualified_returns_neutral_envelope(tmp_path, monkeypatch):
         assert body["status"] == "ok"
         assert "hits" in body
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_account_qualifier_reaches_collection_and_entity_queries(
@@ -829,7 +829,7 @@ def test_account_qualifier_reaches_collection_and_entity_queries(
         assert s == 200
         assert detail["status"] == "ok"
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_account_scoped_browse_keeps_unscoped_codex_project_identity(
@@ -905,8 +905,7 @@ def test_account_scoped_browse_keeps_unscoped_codex_project_identity(
                 "count": 1,
             }]
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 # ── §6.1 two-page browse pagination over real HTTP (both providers) ──────────
@@ -936,7 +935,7 @@ def test_browse_two_page_codex_cursor_echoes(tmp_path, monkeypatch):
         assert len(p2["rows"]) == 1
         assert p1["rows"][0]["conversation_key"] != p2["rows"][0]["conversation_key"]
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_browse_two_page_claude_cursor_echoes(tmp_path, monkeypatch):
@@ -954,7 +953,7 @@ def test_browse_two_page_claude_cursor_echoes(tmp_path, monkeypatch):
         assert len(p2["rows"]) == 1
         assert p1["rows"][0]["conversation_key"] != p2["rows"][0]["conversation_key"]
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ── §4.3 search cursor round-trip over real HTTP (base64url external form) ────
@@ -986,7 +985,7 @@ def test_search_cursor_roundtrip_over_http(tmp_path, monkeypatch):
         assert (first["conversation_key"], first["item_key"]) != \
                (second["conversation_key"], second["item_key"])
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ── SSE preflight at the route (JSON before any SSE bytes) ────────────────────
@@ -1002,7 +1001,7 @@ def test_events_v1_unresolvable_is_json_404(tmp_path, monkeypatch):
         assert "application/json" in ctype       # JSON, not an SSE stream
         assert body["status"] == "not_found"
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ── §3.6 anonymization + mixed-database byte stability (route level) ─────────
@@ -1024,7 +1023,7 @@ def test_anon_map_v1_codex_includes_roots_and_scrubs(tmp_path, monkeypatch):
         flat = json.dumps(wire)
         assert "/synthetic/root-a/project-red" in flat or "project-red" in flat
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_scoped_claude_anon_map_excludes_other_account_file_path(
@@ -1068,7 +1067,7 @@ def test_scoped_claude_anon_map_excludes_other_account_file_path(
         assert s == 200 and "application/json" in ctype
         assert "/Users/bravo/private-project" not in json.dumps(wire)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_anon_privacy_gate_secret_canary(tmp_path, monkeypatch):
@@ -1103,7 +1102,7 @@ def test_anon_privacy_gate_secret_canary(tmp_path, monkeypatch):
         assert b"Bearer fixture-token" in raw_body
         assert b"Canary widget configuration prompt" in raw_body
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_mixed_db_bare_claude_export_bytes_unchanged(tmp_path, monkeypatch):
@@ -1118,7 +1117,7 @@ def test_mixed_db_bare_claude_export_bytes_unchanged(tmp_path, monkeypatch):
             port, _entity_path("s1", "/export") + "?anonymize=1")
         assert s == 200
     finally:
-        srv_a.shutdown()
+        stop(srv_a, srv_a._test_thread)
 
     ns_b = load_script()
     srv_b, _r, _k, _ro = _boot(ns_b, tmp_path / "b", monkeypatch,
@@ -1130,7 +1129,7 @@ def test_mixed_db_bare_claude_export_bytes_unchanged(tmp_path, monkeypatch):
             port, _entity_path("s1", "/export") + "?anonymize=1")
         assert s == 200
     finally:
-        srv_b.shutdown()
+        stop(srv_b, srv_b._test_thread)
 
     assert bytes_claude_only == bytes_mixed
 
@@ -1165,7 +1164,7 @@ def test_codex_export_golden_and_no_staling_trigger_leak(tmp_path, monkeypatch):
         finally:
             conn.close()
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
     assert env1["status"] == "ok"
     md = env1["markdown"]
     # Determinism: a fixed DB + speed renders byte-identically.
@@ -1233,7 +1232,7 @@ def test_page_hydration_miss_raises_and_the_route_answers_500(tmp_path, monkeypa
         assert "application/json" in (ctype or ""), ctype
         assert json.loads(body).get("error"), body
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ── #463 S3 — the export path is insensitive to the read-time enrichment ─────
@@ -1274,7 +1273,7 @@ def test_s3_export_is_unchanged_by_the_external_agent_marker(tmp_path, monkeypat
         finally:
             conn.close()
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
     assert env["status"] == "ok"
     md = env["markdown"]
     # Non-vacuity: the detail envelope really did detect the marker, so the
@@ -1443,7 +1442,7 @@ def test_s3_no_raw_session_id_reaches_any_served_route(tmp_path, monkeypatch):
         for line in hits:
             assert line.strip() in raw_lines, line
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_s3_patch_card_paths_are_covered_by_the_anon_plan(tmp_path, monkeypatch):
@@ -1479,4 +1478,4 @@ def test_s3_patch_card_paths_are_covered_by_the_anon_plan(tmp_path, monkeypatch)
             # the covering token is a prefix of the card path.
             assert any(path.startswith(token) for token in tokens), (path, sorted(tokens))
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)

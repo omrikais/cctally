@@ -26,6 +26,7 @@ import sys
 import threading
 
 from conftest import load_script, redirect_paths
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, shorten_sse_keepalive, start, stop
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +40,12 @@ def _start_handler(ns, tmp_path, monkeypatch, *, runtime_bind="127.0.0.1"):
     new `cctally_host` attribute that `_handle_get_doctor` reads.
     """
     redirect_paths(ns, monkeypatch, tmp_path)
+    # #630 S2: the /api/events handler blocks in `q.get(timeout=...)` and only
+    # learns its client has gone on the keep-alive write after that timeout —
+    # and on a socket the peer has closed the FIRST write still succeeds. At
+    # the shipped period that is two full timeouts, which is the whole
+    # presence backstop, so stop() could not reap the handler at all.
+    shorten_sse_keepalive(ns, monkeypatch)
     # Allow `import _lib_doctor` to resolve from bin/ (matches what
     # cmd_dashboard's import path does in the real process).
     sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
@@ -55,19 +62,47 @@ def _start_handler(ns, tmp_path, monkeypatch, *, runtime_bind="127.0.0.1"):
     HandlerCls.cctally_host = runtime_bind
 
     srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    srv._test_thread = start(srv)
     return srv, snap
 
 
+def _first_data_line(buf):
+    """The first `data:` line inside a COMPLETE frame of `buf`, or `None`.
+
+    Only complete frames are scanned. Splitting on the frame terminator and
+    dropping the last part is what excludes a partial trailing frame, and it is
+    also what skips a `:`-prefixed keep-alive comment frame without mistaking
+    its terminator for the data frame's.
+    """
+    text = buf.decode("utf-8", errors="ignore")
+    for frame in text.split("\n\n")[:-1]:
+        for line in frame.splitlines():
+            if line.startswith("data: "):
+                return line[len("data: "):]
+    return None
+
+
 def _read_first_sse_data_frame(response, *, deadline_s=2.0):
-    """Pull bytes off the SSE socket until we see a complete event frame
-    (terminated by `\\n\\n`), then return the parsed `data:` payload."""
+    """Pull bytes off the SSE socket until a complete frame carrying a `data:`
+    line arrives, then return that payload parsed.
+
+    #630 S2 shortens `_SSE_KEEPALIVE_SECONDS` to 0.5 s in this file, which turns
+    an interleaved `b": keep-alive\\n\\n"` comment frame from a theoretical
+    possibility into a real one. That comment frame is a complete
+    `\\n\\n`-terminated frame with no `data:` line, so stopping at the first
+    `\\n\\n` raised "no data frame in SSE buffer" on a perfectly healthy stream.
+    tests/test_dashboard_api_events.py carries the same guard for the same
+    reason.
+    """
     import time
     buf = b""
     deadline = time.monotonic() + deadline_s
-    while b"\n\n" not in buf and time.monotonic() < deadline:
+    while True:
+        line = _first_data_line(buf)
+        if line is not None:
+            return json.loads(line)
+        if time.monotonic() >= deadline:
+            break
         try:
             chunk = response.fp.read1(4096)
         except TimeoutError:
@@ -75,17 +110,44 @@ def _read_first_sse_data_frame(response, *, deadline_s=2.0):
         if not chunk:
             break
         buf += chunk
-    text = buf.decode("utf-8", errors="ignore")
-    for line in text.splitlines():
-        if line.startswith("data: "):
-            return json.loads(line[len("data: "):])
-    raise AssertionError(f"no data frame in SSE buffer: {text!r}")
+    line = _first_data_line(buf)
+    if line is not None:
+        return json.loads(line)
+    raise AssertionError(
+        f"no data frame in SSE buffer: "
+        f"{buf.decode('utf-8', errors='ignore')!r}")
+
+
+class _ScriptedSSEStream:
+    """A stand-in response whose `fp.read1` hands back pre-baked SSE chunks."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.fp = self
+
+    def read1(self, _size):
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+def test_read_first_sse_data_frame_reads_past_an_interleaved_keep_alive():
+    """A `: keep-alive` comment frame must not be mistaken for the data frame.
+
+    #630 S2 shortens `_SSE_KEEPALIVE_SECONDS` to 0.5 s in this file so an
+    abandoned `/api/events` handler notices its closed client inside `stop()`'s
+    backstop. The handler writes `b": keep-alive\\n\\n"`, which is a complete
+    `\\n\\n`-terminated frame carrying no `data:` line, so stopping at the first
+    `\\n\\n` reports "no data frame in SSE buffer" for a healthy stream.
+    tests/test_dashboard_api_events.py carries the same guard for the same
+    reason.
+    """
+    stream = _ScriptedSSEStream([b": keep-alive\n\n", b'data: {"ok": true}\n\n'])
+    assert _read_first_sse_data_frame(stream) == {"ok": True}
 
 
 def _raw_get(port, path):
     """Return every byte written for one close-delimited HTTP request."""
     chunks = []
-    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=PRESENCE_BACKSTOP_SECONDS)
     try:
         sock.sendall(
             f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
@@ -113,14 +175,14 @@ def test_api_doctor_get_returns_full_payload(tmp_path, monkeypatch):
     ns = load_script()
     srv, _snap = _start_handler(ns, tmp_path, monkeypatch)
     try:
-        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/api/doctor")
         r = c.getresponse()
         assert r.status == 200, r.status
         assert r.getheader("Content-Type", "").startswith("application/json")
         payload = json.loads(r.read())
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
     assert payload["schema_version"] == 1
     cats = {c["id"] for c in payload["categories"]}
@@ -140,13 +202,13 @@ def test_api_doctor_no_csrf_required(tmp_path, monkeypatch):
     ns = load_script()
     srv, _ = _start_handler(ns, tmp_path, monkeypatch)
     try:
-        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS)
         # No Origin header — same shape as `curl` from a terminal.
         c.request("GET", "/api/doctor")
         r = c.getresponse()
         assert r.status == 200, r.status
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_api_doctor_preparation_failure_returns_one_json_500(
@@ -161,8 +223,7 @@ def test_api_doctor_preparation_failure_returns_one_json_500(
     try:
         raw = _raw_get(srv.server_address[1], "/api/doctor")
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
     assert raw.count(b"HTTP/1.") == 1, raw[:400]
     assert raw.split(b"\r\n", 1)[0].split()[1:2] == [b"500"], raw[:200]
@@ -197,8 +258,7 @@ def test_api_doctor_committed_write_failure_never_appends_a_second_response(
     try:
         raw = _raw_get(srv.server_address[1], "/api/doctor")
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
     assert fired, "the injected doctor body failure never fired"
     assert raw.split(b"\r\n", 1)[0].split()[1:2] == [b"200"], raw[:200]
@@ -215,12 +275,12 @@ def test_api_doctor_safety_dashboard_bind_runtime_override(tmp_path, monkeypatch
     ns = load_script()
     srv, _ = _start_handler(ns, tmp_path, monkeypatch, runtime_bind="0.0.0.0")
     try:
-        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/api/doctor")
         r = c.getresponse()
         payload = json.loads(r.read())
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
     safety = next(c for c in payload["categories"] if c["id"] == "safety")
     bind_chk = next(c for c in safety["checks"] if c["id"] == "safety.dashboard_bind")
@@ -235,11 +295,11 @@ def test_api_doctor_runtime_bind_loopback_stays_ok(tmp_path, monkeypatch):
     ns = load_script()
     srv, _ = _start_handler(ns, tmp_path, monkeypatch, runtime_bind="127.0.0.1")
     try:
-        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/api/doctor")
         payload = json.loads(c.getresponse().read())
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
     safety = next(c for c in payload["categories"] if c["id"] == "safety")
     bind_chk = next(c for c in safety["checks"] if c["id"] == "safety.dashboard_bind")
@@ -258,18 +318,20 @@ def test_sse_envelope_includes_doctor_block(tmp_path, monkeypatch):
     ns = load_script()
     srv, snap = _start_handler(ns, tmp_path, monkeypatch)
     hub = ns["DashboardHTTPHandler"].hub
+    c = r = None
     try:
         # Seed one snapshot BEFORE the SSE client subscribes so the
-        # initial frame path emits immediately (no 15s keep-alive wait).
+        # initial frame path emits immediately (no keep-alive wait).
         hub.publish(snap)
 
-        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=3)
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/api/events")
         r = c.getresponse()
         assert r.status == 200
         payload = _read_first_sse_data_frame(r)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread,
+             connections=[x for x in (c, r) if x is not None])
 
     assert "doctor" in payload, "envelope missing `doctor` block"
     doc = payload["doctor"]
@@ -290,16 +352,18 @@ def test_sse_doctor_fingerprint_stable_across_age_drift(tmp_path, monkeypatch):
     ns = load_script()
     srv, snap = _start_handler(ns, tmp_path, monkeypatch)
     hub = ns["DashboardHTTPHandler"].hub
+    c = r = None
     try:
         hub.publish(snap)
-        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=3)
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/api/events")
         r = c.getresponse()
         payload_a = _read_first_sse_data_frame(r)
         hub.publish(snap)
         payload_b = _read_first_sse_data_frame(r)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread,
+             connections=[x for x in (c, r) if x is not None])
 
     fp_a = payload_a["doctor"]["fingerprint"]
     fp_b = payload_b["doctor"]["fingerprint"]
@@ -316,14 +380,16 @@ def test_sse_envelope_doctor_block_serializes_as_json(tmp_path, monkeypatch):
     ns = load_script()
     srv, snap = _start_handler(ns, tmp_path, monkeypatch)
     hub = ns["DashboardHTTPHandler"].hub
+    c = r = None
     try:
         hub.publish(snap)
-        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=3)
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/api/events")
         r = c.getresponse()
         payload = _read_first_sse_data_frame(r)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread,
+             connections=[x for x in (c, r) if x is not None])
 
     # If the frame parsed via json.loads above, the dict is by definition
     # JSON-serializable. Re-stringify to confirm round-trip stability.

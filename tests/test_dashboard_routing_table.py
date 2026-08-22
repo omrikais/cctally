@@ -64,7 +64,27 @@ def test_post_routes_have_no_settings_405_guard_entry():
 def test_conversation_perf_wraps_present():
     # gate P2-1: the per-route perf wraps survive as table entries (12 after
     # #281 S4 adds /anon-map with a scope wrap).
+    #
+    # Counted over the CONVERSATION routes rather than over every wrapped
+    # entry, because #620 S2 wrapped `/api/diagnosis` too. A bare total would
+    # have to move for a route this gate says nothing about, and the count is
+    # here to catch a conversation wrap going missing.
     dash = _dash()
     wrapped = [e for e in dash._GET_ROUTES if e[3] is not None]
-    assert len(wrapped) == 12
+    conversation = [e for e in wrapped
+                    if str(e[1][0] if isinstance(e[1], tuple) else e[1])
+                    .startswith("/api/conversation")]
+    assert len(conversation) == 12
     assert {e[3][0] for e in wrapped} == {"scope", "phase"}
+
+
+def test_the_diagnosis_route_is_perf_wrapped():
+    """#620 S2 — the on-demand diagnosis attributes its own cost.
+
+    Its wrap is a `_perf_scope`, whose clean-exit `stash_last` is what feeds
+    `/api/debug/backend`'s trace, so an unwrapped route would be invisible to
+    `cctally dashboard-perf` exactly when someone asks why it was slow.
+    """
+    dash = _dash()
+    entry = next(e for e in dash._GET_ROUTES if e[1] == "/api/diagnosis")
+    assert entry[3] == ("scope", "endpoint.diagnosis")

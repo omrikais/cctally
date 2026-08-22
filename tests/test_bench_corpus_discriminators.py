@@ -394,7 +394,7 @@ def test_the_cycle_accounting_fold_is_actually_executed(scale, shared_corpus,
 # ── The benchmark set must not perturb the corpus fingerprint ──────────────
 
 
-def test_the_benchmark_set_is_semantic_hash_neutral(small_corpus):
+def test_the_benchmark_set_is_semantic_hash_neutral(small_corpus, tmp_path):
     """The contract block describes two instants of the corpus; prove they agree.
 
     `bin/cctally-bench` reads `dataset_counts` and the discriminators BEFORE
@@ -406,7 +406,14 @@ def test_the_benchmark_set_is_semantic_hash_neutral(small_corpus):
     `last_ingested_at`. State the dependency here, or it breaks silently.
     """
     bbf = _load_build_bench()
-    conn = bbf.open_fixture_db(small_corpus)
+    # #630 S2: this test COMMITS an `UPDATE session_files SET
+    # last_ingested_at = '2099-01-01T00:00:00Z'` below. Run in place that hands
+    # every later consumer of the session-scoped corpus a store whose ingest
+    # metadata has moved to the year 2099, so it works on its own copy.
+    corpus = pathlib.Path(shutil.copytree(
+        small_corpus, tmp_path / "corpus",
+        ignore=shutil.ignore_patterns("*.db-shm", "*.db-wal")))
+    conn = bbf.open_fixture_db(corpus)
     try:
         before = bbf.semantic_hash(conn)
     finally:
@@ -414,7 +421,7 @@ def test_the_benchmark_set_is_semantic_hash_neutral(small_corpus):
 
     # Re-hash after the ingest-metadata write `sync.delta` performs.
     import sqlite3 as _sq
-    conn = _sq.connect(pathlib.Path(small_corpus) / "cache.db")
+    conn = _sq.connect(corpus / "cache.db")
     try:
         row = conn.execute(
             "SELECT path FROM session_files ORDER BY path LIMIT 1").fetchone()
@@ -426,7 +433,7 @@ def test_the_benchmark_set_is_semantic_hash_neutral(small_corpus):
     finally:
         conn.close()
 
-    conn = bbf.open_fixture_db(small_corpus)
+    conn = bbf.open_fixture_db(corpus)
     try:
         after = bbf.semantic_hash(conn)
     finally:
@@ -536,3 +543,70 @@ def test_every_codex_entry_is_placed_inside_the_live_cycle(scale):
     assert last < usable, (
         f"{scale}: the last Codex record lands {last} minutes after the epoch, "
         f"past the corpus clock at {usable}; the cycle would stop resolving")
+
+
+# ── #630 S2: the shared-corpus contamination reproduction ───────────────────
+#
+# One item, not a pair. This was a mutating test followed by an observing test
+# that relied on file order to run second on the same worker. Under
+# `--dist load` — which is exactly what `bin/cctally-test-load-invariance`
+# runs — the two land on arbitrary workers in arbitrary order, and an observer
+# scheduled first passes without observing anything, which is a vacuous green
+# on the one assertion the reproduction exists to make. Both halves are
+# asserted in the same item instead, so no scheduling can weaken either.
+#
+# `_CONTAMINATION_SENTINEL` is deliberately a value no builder ever produces,
+# so an assertion about it cannot be satisfied by ordinary corpus content.
+
+_CONTAMINATION_SENTINEL = "2099-12-31T23:59:59Z"
+
+
+def test_a_mutating_consumer_writes_only_to_its_own_copy(small_corpus, tmp_path):
+    """Mutating a private copy must leave the shared corpus byte-identical.
+
+    Red before the private copy: a consumer that writes in place puts the
+    sentinel into the session-scoped corpus every later consumer is handed.
+    Green after. `corpus_root` resolves to the same directory in every xdist
+    worker, so "shared" here means shared across the whole run, not merely
+    across one worker's items.
+    """
+    import sqlite3 as _sq
+
+    shared_db = pathlib.Path(small_corpus) / "cache.db"
+    private = pathlib.Path(shutil.copytree(
+        small_corpus, tmp_path / "corpus",
+        ignore=shutil.ignore_patterns("*.db-shm", "*.db-wal")))
+    conn = _sq.connect(private / "cache.db")
+    try:
+        changed = conn.execute(
+            "UPDATE session_files SET last_ingested_at = ?",
+            (_CONTAMINATION_SENTINEL,),
+        ).rowcount
+        conn.commit()
+        stamped = conn.execute(
+            "SELECT COUNT(*) FROM session_files WHERE last_ingested_at = ?",
+            (_CONTAMINATION_SENTINEL,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert changed > 0, (
+        "non-vacuity: the mutation matched no row, so the assertion below "
+        "would hold whether or not the copy did its job")
+    assert stamped == changed, (
+        "non-vacuity: the write did not land in the private copy either, so "
+        "nothing was actually mutated anywhere")
+
+    conn = _sq.connect(f"file:{shared_db}?mode=ro", uri=True)
+    try:
+        leaked = conn.execute(
+            "SELECT COUNT(*) FROM session_files WHERE last_ingested_at = ?",
+            (_CONTAMINATION_SENTINEL,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert leaked == 0, (
+        f"{leaked} row(s) in the SHARED session-scoped corpus carry the "
+        f"sentinel this test wrote into its private copy. A consumer that "
+        f"mutates or syncs into the shared corpus hands every later consumer "
+        f"a different store than the one it was promised; see "
+        f"docs/superpowers/plans/assets/2026-08-21-630-s2-corpus-consumers.md")

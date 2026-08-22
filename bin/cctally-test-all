@@ -429,6 +429,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zlib
 
 
 LOAD_ERROR = ""
@@ -460,8 +461,11 @@ def _load(path, name):
 # arguments.
 REQUIRED = (
     "DEFAULT_MAX_AGE_DAYS", "DEFAULT_MAX_BYTES", "RUN_STATES", "ScrubContext",
-    "allocate_budget", "bound_extract_lines", "build_scrubbed_extract",
-    "plan_evidence_evictions", "render_retention_notice",
+    "allocate_budget", "apply_validation_redactions",
+    "bound_extract_lines", "build_scrubbed_extract",
+    "_coverage_gaps",
+    "merge_duration_legs", "plan_evidence_evictions",
+    "render_retention_notice",
     "resolve_evidence_layout", "resolve_run_id", "select_failure_windows",
     "validate_export",
 )
@@ -583,6 +587,37 @@ def _context():
     )
 
 
+def _write_validator_sidecar(evidence_dir, redaction):
+    """The machine-readable record of what the validator removed.
+
+    Written whether or not anything was redacted, so a reader can tell "no
+    line was refused" from "this run predates the record". The manifest is
+    written from the EXIT trap, after the export mode has run, and reads it
+    back. It is a SIBLING of `export/`, not a member of it: only two files may
+    leave the runner, and `.github/workflows` is gated on exactly that pair.
+
+    Written BEFORE the refusal exits, not after. It used to sit past a
+    `SystemExit(1)`, so the one case where a machine-readable record matters
+    most — the whole export withheld — produced no record at all, and the
+    manifest then stated `exportRedactions: null`, which is byte-identical to
+    a passing run that wrote no extract.
+    """
+    _write_atomic(
+        os.path.join(evidence_dir, "validator-redactions.json"),
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "redacted": redaction["redacted"],
+                "total": redaction["total"],
+                "reasons": redaction["reasons"],
+                "refused": bool(redaction["refused"]),
+                "refusal": redaction.get("refusal"),
+            }
+        )
+        + "\n",
+    )
+
+
 def _write_atomic(path, text):
     tmp = "%s.tmp.%d" % (path, os.getpid())
     previous = os.umask(0o077)
@@ -592,6 +627,20 @@ def _write_atomic(path, text):
         os.replace(tmp, path)
     finally:
         os.umask(previous)
+
+
+def _read_json(path):
+    """One sidecar document, or None when it was never written or is junk.
+
+    None means "not recorded", which the manifest states as null rather than
+    inventing a zero for a quantity nothing measured.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 def _harness_table(logdir):
@@ -618,8 +667,10 @@ def _read_log(path):
 
     STRICT decoding. `errors="replace"` turned undecodable bytes into U+FFFD
     and let an export be published over content nothing had decoded, which
-    spec section 3 forbids in the same sentence as a parse error and a failed
-    validation: each of the three leaves no export file at all.
+    spec section 3 forbids in the same sentence as a parse error: both leave
+    no export file at all. A failed validation no longer always does — a
+    content reason still refuses the whole export, while the three structural
+    reasons replace their own line and publish the rest.
     """
     try:
         with open(path, encoding="utf-8") as handle:
@@ -686,12 +737,20 @@ if MODE == "scrub-log":
         body = body[1:]
     body, _stats = EV.bound_extract_lines(body)
     violations = EV.validate_export(body, _roots())
-    if violations:
+    # Per LINE for a structural leg, whole-block only when a CONTENT leg
+    # fired, exactly as the export path below degrades. The two used to differ
+    # — the console dropped one subject's block and the export dropped the
+    # file — and both were the same mistake at different scales.
+    body, redaction = EV.apply_validation_redactions(body, violations, _roots())
+    if redaction["refused"]:
         sys.stdout.write(
-            "[REDACTED: %s context refused by the validator, %d violations]\n"
-            % (subject, len(violations))
+            "[REDACTED: %s context refused by the validator, %d violations, "
+            "cause: %s]\n"
+            % (subject, len(violations), redaction.get("refusal") or "unknown")
         )
     elif body:
+        if redaction["notice"]:
+            body = body + [redaction["notice"]]
         sys.stdout.write("\n".join(body) + "\n")
     raise SystemExit(0)
 
@@ -760,13 +819,43 @@ if MODE == "export":
         ]
     out, _stats = EV.bound_extract_lines(header + body)
     violations = EV.validate_export(out, _roots())
-    if violations:
+    # DEGRADE PER LINE for a STRUCTURAL leg, refuse the whole export for a
+    # content one. A validator violation used to destroy the whole extract, so
+    # one false positive anywhere in the retained window cost the operator
+    # every byte of diagnostic evidence — the same failure this session exists
+    # to remove, reappearing at the file level. Three prescribed structural
+    # legs in this session alone would have triggered that outage, which is
+    # evidence enough that the design cannot depend on every future leg being
+    # perfect. A content violation still refuses everything, because that is
+    # the transformer leaking rather than a leg over-firing. The offending
+    # line's bytes never reach the file either way.
+    out, redaction = EV.apply_validation_redactions(out, violations, _roots())
+    _write_validator_sidecar(evidence_dir, redaction)
+    if redaction["refused"]:
         sys.stderr.write(
             "cctally-test-all: the sanitized extract was refused by the "
-            "validator (%d violations, first: %s); no export file was "
-            "written\n" % (len(violations), violations[0]["reason"])
+            "validator (%d of %d lines, cause: %s); no export file was "
+            "written\n"
+            % (
+                len(violations), redaction["total"],
+                redaction.get("refusal") or "unknown",
+            )
         )
         raise SystemExit(1)
+    if redaction["redacted"]:
+        # Never silent, on the operator's surface and in the machine-readable
+        # record alike: this file's own rule for eviction, applied to the
+        # other thing it removes without being asked.
+        sys.stderr.write(
+            "cctally-test-all: the validator refused %d of %d extract lines; "
+            "each was replaced with a placeholder and the rest of the extract "
+            "was published (reasons: %s)\n"
+            % (
+                redaction["redacted"], redaction["total"],
+                ", ".join(redaction["reasons"]) or "unknown",
+            )
+        )
+        out = out + [redaction["notice"]]
     _write_atomic(
         os.path.join(evidence_dir, "export", "failure-context.txt"),
         "\n".join(out) + "\n",
@@ -852,6 +941,15 @@ if MODE == "manifest":
         "secondsPerThousandCases": (
             None if not passed_cases else round(total_wall / passed_cases * 1000, 1)
         ),
+        # Null when the export mode never ran at all, which is a different
+        # answer from "the validator refused nothing" and from "the validator
+        # withheld the whole export". The export mode writes the sidecar
+        # unconditionally — before it publishes AND before it refuses — so a
+        # zero here is measured rather than assumed, and a refusal is recorded
+        # as `refused: true` rather than as an absence.
+        "exportRedactions": _read_json(
+            os.path.join(evidence_dir, "validator-redactions.json")
+        ),
         "harnesses": _harness_table(_env("EV_LOGDIR")),
     }
     _write_atomic(
@@ -915,6 +1013,81 @@ def _load_runs(root):
                 }
             )
     return runs
+
+
+# A run directory exists before its first manifest is written: the aggregator
+# runs `mkdir -p` for the run and its subdirectories, and only then writes
+# `manifest.json active`. That gap is sub-second even on a loaded runner, so
+# 120 seconds is two orders of magnitude of headroom. It exists because a
+# concurrent run caught inside that gap was counted as an ORPHAN, which
+# flipped the whole pass's coverage to `degraded` — a false alarm on a signal
+# whose only value is that an operator believes it. The window costs nothing
+# but reporting a genuinely orphaned directory one pass late, and a partial
+# `rmtree` leaves a recent mtime anyway because removing a child updates the
+# parent.
+ORPHAN_GRACE_SECONDS = 120
+
+
+def _orphan_dirs(root, now=None):
+    """`(orphans, unclassified_bytes)` for run directories `_load_runs` skips.
+
+    An ORPHAN is a directory with no readable manifest that is too old to be a
+    run still starting up. A partial `rmtree` can remove `manifest.json` while
+    leaving bytes behind, and `_load_runs` skips such a directory, so without
+    this its bytes are invisible to both the retained-run count and the cap
+    they are supposed to be measured against.
+
+    `unclassified_bytes` is everything else `_load_runs` also skipped and this
+    function does not condemn: a directory inside its startup grace window,
+    and a manifest that IS readable but carries a state this binary cannot
+    classify. Neither is an orphan — `_load_runs` leaves the unrecognised
+    state alone on purpose, and deleting evidence on the strength of an
+    unrecognised field is the one irreversible mistake here — but their bytes
+    are on disk, and under-stating `bytesAfter` is exactly the class the
+    rescan exists to close.
+
+    `now` is the retention pass's ONE clock sample, supplied by the caller so
+    the grace window and the age horizon are measured against the same
+    instant. It defaults to the current time for a direct caller.
+    """
+    now = time.time() if now is None else now
+    orphans, unclassified_bytes = [], 0
+    try:
+        remote_dirs = sorted(os.listdir(root))
+    except OSError:
+        return orphans, unclassified_bytes
+    for remote_dir in remote_dirs:
+        base = os.path.join(root, remote_dir)
+        if not os.path.isdir(base):
+            continue
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for run_id in entries:
+            run_dir = os.path.join(base, run_id)
+            if not os.path.isdir(run_dir):
+                continue
+            try:
+                with open(
+                    os.path.join(run_dir, "manifest.json"), encoding="utf-8"
+                ) as handle:
+                    doc = json.load(handle)
+            except (OSError, ValueError):
+                try:
+                    in_flight = (now - os.stat(run_dir).st_mtime) < ORPHAN_GRACE_SECONDS
+                except OSError:
+                    in_flight = False
+                if in_flight:
+                    unclassified_bytes += _dir_bytes(run_dir)
+                else:
+                    orphans.append({"run_id": run_id, "dir": run_dir,
+                                    "bytes": _dir_bytes(run_dir)})
+                continue
+            state = doc.get("state") if isinstance(doc, dict) else None
+            if state not in EV.RUN_STATES:
+                unclassified_bytes += _dir_bytes(run_dir)
+    return orphans, unclassified_bytes
 
 
 def _merge_intervals(gaps):
@@ -994,9 +1167,18 @@ def _retention_pass(root, current_run, record_path):
         pid = run.get("pid")
         if run.get("state") == "active" and pid:
             live[pid] = _process_start(pid)
+    # ONE clock sample for every RETENTION DECISION in this pass. The age
+    # horizon and the orphan grace window are both measured against it, so a
+    # long pass cannot age a directory past the grace window between the plan
+    # and the rescan and report a run it just planned around as an orphan.
+    # `updatedAt` on the record below is a second, later sample on purpose: it
+    # states when the record was written, not which instant the pass decided
+    # against, and re-using this one would date the artifact before its own
+    # contents.
+    now = int(time.time())
     plan = EV.plan_evidence_evictions(
         runs,
-        int(time.time()),
+        now,
         live_pids=live,
         max_age_days=_int("EV_MAX_AGE_DAYS", EV.DEFAULT_MAX_AGE_DAYS),
         max_bytes=_int("EV_MAX_BYTES", EV.DEFAULT_MAX_BYTES),
@@ -1015,19 +1197,60 @@ def _retention_pass(root, current_run, record_path):
             )
     plan["evict"] = removed
 
-    gaps = _merge_intervals(
-        list(previous.get("gaps") or []) + list(plan.get("gaps") or [])
+    # Everything below is rebuilt from what is ACTUALLY on disk after every
+    # deletion attempt, not from the planned set. `plan["evict"] = removed`
+    # already made the evicted-run count honest, but `gaps`, `bytesAfter`,
+    # `overCap` and `retainedRuns` still came from the plan, so a failed
+    # `rmtree` left the record claiming bytes were gone that were not — and
+    # the byte cap is enforced against exactly that number.
+    #
+    # The scan is a SAMPLE, not a transaction. The retention lock serializes
+    # retention passes but NOT other runs creating and growing their own
+    # evidence directories, and the current run is already protected from
+    # eviction. `bytesAfter` is therefore the post-pass state as observed, and
+    # no consumer may read it as exact.
+    removed_ids = {run["run_id"] for run in removed}
+    after_runs = _load_runs(root)
+    orphans, unclassified_bytes = _orphan_dirs(root, now)
+    bytes_after = (
+        sum(run.get("bytes", 0) for run in after_runs)
+        + sum(orphan.get("bytes", 0) for orphan in orphans)
+        + unclassified_bytes
     )
+    max_bytes = _int("EV_MAX_BYTES", EV.DEFAULT_MAX_BYTES)
+    # Recomputed from the runs that really went, so a run whose deletion
+    # failed does not have a hole reported where its evidence still sits.
+    pass_gaps = EV._coverage_gaps(runs, removed_ids)
+    gaps = _merge_intervals(
+        list(previous.get("gaps") or []) + list(pass_gaps)
+    )
+    by_reason = {
+        "age": {"runs": 0, "bytes": 0},
+        "cap": {"runs": 0, "bytes": 0},
+    }
+    for run in removed:
+        bucket = by_reason.setdefault(
+            run.get("reason") or "unknown", {"runs": 0, "bytes": 0}
+        )
+        bucket["runs"] += 1
+        bucket["bytes"] += int(run.get("bytes", 0))
     record = {
         "schemaVersion": 1,
         "updatedAt": int(time.time()),
         "passes": int(previous.get("passes") or 0) + 1,
-        "coverage": "degraded" if gaps else "complete",
+        # An orphan is not healthy retained evidence. Its interval cannot be
+        # recovered — the manifest that carried it is what went missing — so
+        # the coverage state is degraded and no interval is invented for it.
+        "coverage": "degraded" if (gaps or orphans) else "complete",
         "gaps": gaps,
-        "overCap": bool(plan.get("over_cap")),
-        "bytesAfter": int(plan.get("bytes_after") or 0),
-        "retainedRuns": len(plan.get("keep") or []),
+        "overCap": bytes_after > max_bytes,
+        "bytesAfter": bytes_after,
+        "retainedRuns": len(after_runs),
+        "orphanDirs": len(orphans),
+        "orphanBytes": sum(orphan.get("bytes", 0) for orphan in orphans),
         "lastEvictedRuns": len(removed),
+        "lastEvictedBytes": sum(int(run.get("bytes", 0)) for run in removed),
+        "lastEvictionByReason": by_reason,
         # The MECHANISM, not just the outcome. Age and cap eviction remove
         # runs identically from the outside, so a test that asserted only
         # "fewer runs survive" could pass on age eviction while claiming to
@@ -1041,18 +1264,58 @@ def _retention_pass(root, current_run, record_path):
     notice = EV.render_retention_notice(plan)
     if notice:
         sys.stderr.write(notice + "\n")
-    if gaps:
+    # Fired for an orphan too, not for gaps alone. The record above already
+    # degrades on `gaps or orphans`, so a pass that degraded ONLY because of an
+    # orphan wrote the degraded record and printed nothing — silent
+    # degradation, beside this file's own rule that eviction is never silent.
+    if gaps or orphans:
+        detail = []
+        if gaps:
+            detail.append("%d gaps" % len(gaps))
+        if orphans:
+            detail.append(
+                "%d orphan %s with no readable manifest"
+                % (len(orphans),
+                   "directory" if len(orphans) == 1 else "directories")
+            )
+        notice = (
+            "[cctally-test-all] evidence coverage is degraded: %s across "
+            "%d retained runs\n" % (" and ".join(detail), record["retainedRuns"])
+        )
         # Emitted on stdout so the caller can put the same sentence at the
         # head of the extract a CI artifact consumer is handed.
-        sys.stdout.write(
-            "[cctally-test-all] evidence coverage is degraded: %d gaps across "
-            "%d retained runs\n" % (len(gaps), record["retainedRuns"])
-        )
-        sys.stderr.write(
-            "[cctally-test-all] evidence coverage is degraded: %d gaps across "
-            "%d retained runs\n" % (len(gaps), record["retainedRuns"])
-        )
+        sys.stdout.write(notice)
+        sys.stderr.write(notice)
 
+
+if MODE == "merge-durations":
+    # ARGS[0] is the published artifact; the rest are the legs that RAN.
+    # Non-deciding, like every other evidence step: the caller reports a
+    # failure through a note and the artifact's own absence.
+    # A leg left by a killed process is a truncated gzip member, which raises
+    # `EOFError` or `zlib.error` — NEITHER of which is an `OSError`. Catching
+    # `OSError` alone let the bridge die with a traceback on exactly the
+    # failure mode the completeness contract exists for, publishing nothing
+    # at all instead of an artifact marked `complete: false`. The kernel now
+    # absorbs those inside the leg reader; this stays as the write-side
+    # backstop, because the same classes can surface from the publish.
+    try:
+        result = EV.merge_duration_legs(ARGS[1:], ARGS[0])
+    except (OSError, EOFError, zlib.error) as exc:
+        sys.stderr.write(
+            "cctally-test-all: the per-test durations artifact could not be "
+            "published (%s: %s)\n" % (exc.__class__.__name__, exc)
+        )
+        raise SystemExit(3)
+    sys.stdout.write(
+        "%d records across %d legs (%s)\n"
+        % (
+            result["records"],
+            len(result["legs"]),
+            "complete" if result["complete"] else "INCOMPLETE",
+        )
+    )
+    raise SystemExit(0)
 
 if MODE == "retention":
     root, current_run = ARGS[0], ARGS[1]
@@ -1738,6 +2001,22 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
     # node IDs on every run (issue #141: otherwise a Phase-3 flake under xdist
     # is undiagnosable once the interleaved stderr is rm -rf'd on EXIT).
     pytest_args=(tests/ -q -rfE)
+    # ---- per-test durations (#630 S1, F3) --------------------------------
+    # Authoritative runs with an evidence directory only. A standalone `-p`
+    # plugin rather than pytest.ini or conftest.py: both of those would change
+    # behaviour for anyone running pytest directly, and conftest.py belongs to
+    # another session. The two legs are separate PROCESSES, so each writes its
+    # own intermediate file under $PROGRESS_DIR — which is removed after the
+    # export — and the aggregator merges them into timings/ afterwards.
+    pytest_durations_main=""
+    pytest_durations_bench=""
+    pytest_durations_legs=()
+    if [ -n "$EVIDENCE_DIR" ] && contract_is_authoritative; then
+        pytest_durations_main="$PROGRESS_DIR/durations-pytest.jsonl.gz"
+        pytest_durations_bench="$PROGRESS_DIR/durations-benchmark.jsonl.gz"
+        pytest_args+=(-p tests._pytest_durations_plugin)
+        pytest_durations_legs+=("$pytest_durations_main")
+    fi
     if [ -f "$REPO_ROOT/$pytest_rebuild_benchmark" ]; then
         pytest_args+=(--ignore="$pytest_rebuild_benchmark")
         pytest_serial_targets+=("$pytest_rebuild_benchmark")
@@ -1768,7 +2047,10 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
     printf '[cctally-test-all] pytest phase started — %s xdist workers\n' "$PYTEST" >&2
     _reporter_start pytest
     set -m
-    { cd "$REPO_ROOT" && python3 -m pytest "${pytest_args[@]}" ; } \
+    { cd "$REPO_ROOT" \
+      && CCTALLY_DURATIONS_PATH="$pytest_durations_main" \
+         CCTALLY_DURATIONS_LEG=pytest \
+         python3 -m pytest "${pytest_args[@]}" ; } \
         > "$pytest_log" 2>&1 &
     PHASE_PID=$!
     set +m
@@ -1807,8 +2089,15 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
         pytest_benchmark_log="$LOGDIR/pytest-benchmark.log"
         pytest_benchmark_args=("${pytest_serial_targets[@]}" -q -rfE)
         pytest_benchmark_args+=(${pytest_timeout_args[@]+"${pytest_timeout_args[@]}"})
+        if [ -n "$pytest_durations_bench" ]; then
+            pytest_benchmark_args+=(-p tests._pytest_durations_plugin)
+            pytest_durations_legs+=("$pytest_durations_bench")
+        fi
         set -m
-        { cd "$REPO_ROOT" && python3 -m pytest "${pytest_benchmark_args[@]}" ; } \
+        { cd "$REPO_ROOT" \
+          && CCTALLY_DURATIONS_PATH="$pytest_durations_bench" \
+             CCTALLY_DURATIONS_LEG=benchmark \
+             python3 -m pytest "${pytest_benchmark_args[@]}" ; } \
             > "$pytest_benchmark_log" 2>&1 &
         PHASE_PID=$!
         set +m
@@ -1836,6 +2125,26 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
         fi
         contract_classify_pytest "$pytest_benchmark_rc" "benchmark" \
             "$(_parse_pytest_passed "$pytest_benchmark_log")" "$benchmark_node_state"
+    fi
+    # Both legs have completed here, which is the earliest point at which the
+    # merge can state completeness for either of them. Only legs that RAN are
+    # handed in: an absent benchmark leg is not incompleteness, a leg that ran
+    # and left no file is.
+    if [ "${#pytest_durations_legs[@]}" -gt 0 ]; then
+        # The merge's own summary is CAPTURED rather than discarded. An
+        # incomplete merge exits 0 — publishing a partial artifact is the
+        # correct outcome — so a note gated on the exit code alone left the
+        # completeness state visible only inside the artifact and never in the
+        # manifest, the outcome record, the extract or the operator's console.
+        durations_summary=$(_ev merge-durations \
+                "$EVIDENCE_DIR/timings/pytest-tests.jsonl.gz" \
+                "${pytest_durations_legs[@]}")
+        durations_rc=$?
+        if [ "$durations_rc" -ne 0 ]; then
+            contract_note "evidence: the per-test durations artifact was not published for run $RUN_ID"
+        elif [[ "$durations_summary" == *INCOMPLETE* ]]; then
+            contract_note "evidence: the per-test durations artifact for run $RUN_ID is INCOMPLETE ($durations_summary) — a pytest leg did not finish, so the artifact covers fewer tests than the run executed and no estate-wide conclusion may be drawn from it"
+        fi
     fi
     pytest_wall=$((SECONDS - pytest_start))
     # Both dumps are DEFERRED until the reporter has been joined, so the

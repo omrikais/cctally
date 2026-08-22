@@ -21,6 +21,7 @@ import sqlite3
 import threading
 
 from conftest import load_script, redirect_paths
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 
 def _dash():
@@ -419,7 +420,7 @@ def test_production_thread_target_is_the_extracted_loop(monkeypatch, tmp_path):
     monkeypatch.setattr(dash, "_QuietThreadingHTTPServer", _RecordingServer)
 
     def stop_after_conversation_thread_starts(*_args):
-        assert called.wait(timeout=5), (
+        assert called.wait(timeout=PRESENCE_BACKSTOP_SECONDS), (
             "cmd_dashboard never called _conversation_sync_loop"
         )
 

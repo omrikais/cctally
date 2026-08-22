@@ -210,9 +210,27 @@ function BudgetExplain({
     envelopeNow(env),
   );
   if (!nav.available || nav.target == null) {
+    // #620 S2 — the sentence stays; the diagnosis of this period's own window
+    // is offered beside it. See the same block in `AlertFollow.tsx`.
+    const explain = nav.explainTarget;
     return (
-      <span className="alert-row-withheld" data-testid={`budget-withheld-${source}`}>
-        {nav.withheldReason}
+      <span className="alert-row-unresolved">
+        <span className="alert-row-withheld" data-testid={`budget-withheld-${source}`}>
+          {nav.withheldReason}
+        </span>
+        {explain != null ? (
+          <button
+            type="button"
+            className="alert-row-explain"
+            data-testid={`budget-explain-window-${source}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              followAlertTarget(explain);
+            }}
+          >
+            {explain.label}
+          </button>
+        ) : null}
       </span>
     );
   }
@@ -296,7 +314,7 @@ function BudgetFigures({
           <>
             <div className="fc-foot-line">
               <span className="fc-foot-k">Remaining</span>
-              <span className="fc-foot-v">{fmt.usd2(status.remaining_usd)}</span>
+              <span className="fc-foot-v">{fmt.usd2Accounting(status.remaining_usd)}</span>
             </div>
             <div className="fc-foot-line">
               <span className="fc-foot-k">Projection</span>

@@ -38,6 +38,8 @@ import _cctally_store
 
 from conftest import load_script, redirect_paths
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
+
 
 def _thread_write_scope():
     """Re-declare the sanctioned stats-write scope inside a worker THREAD.
@@ -134,7 +136,8 @@ def test_open_db_write_waits_for_concurrent_holder(ns):
     time.sleep(0.5)
     holder.execute("COMMIT")
     holder.close()
-    th.join(timeout=15)
+    # timing-budget: the worker has completed the write it was blocked on, now that the holder committed and closed
+    th.join(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     assert not th.is_alive(), "worker never completed — busy_timeout may be too small or absent"
     assert "error" not in result, (

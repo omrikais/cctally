@@ -10,6 +10,7 @@ import { MonthlyModal } from './MonthlyModal';
 import { BlockModal } from './BlockModal';
 import { ProjectsModal } from './ProjectsModal';
 import { CacheReportModal } from './CacheReportModal';
+import { ExplainModal } from './ExplainModal';
 import { RecentAlertsModal } from '../components/RecentAlertsModal';
 
 export function ModalRoot() {
@@ -39,5 +40,9 @@ export function ModalRoot() {
       return <RecentAlertsModal />;
     case 'cache-report':
       return <CacheReportModal />;
+    // #620 S2 — the on-demand diagnosis. Reached by the persistent
+    // control in the top area, by `e`, and by following a warning.
+    case 'explain':
+      return <ExplainModal />;
   }
 }

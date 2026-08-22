@@ -18,6 +18,11 @@ import pytest
 
 import _cctally_core
 from conftest import load_isolated_cctally_module
+# `start` is aliased because this file also binds `start` as an ordinary
+# local in several tests, and a module-level name a function reassigns is a
+# local for that whole function.
+from tests._support_http import (
+    PRESENCE_BACKSTOP_SECONDS, start as start_accept_loop, stop)
 
 UTC = ZoneInfo("UTC")
 
@@ -565,11 +570,11 @@ def test_the_dashboard_test_alert_previews_the_same_instant(cc, monkeypatch):
     ns["DashboardHTTPHandler"].display_tz_pref_override = None
 
     srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    srv._test_thread = start_accept_loop(srv)
     port = srv.server_address[1]
     try:
         raw = json.dumps({"axis": "weekly", "threshold": 90}).encode()
-        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         conn.putrequest(
             "POST", "/api/alerts/test", skip_host=True,
             skip_accept_encoding=True,
@@ -585,7 +590,7 @@ def test_the_dashboard_test_alert_previews_the_same_instant(cc, monkeypatch):
         body = json.loads(resp.read().decode())
         conn.close()
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
     assert status == 200, body
     ctx = body["alert"]["context"]

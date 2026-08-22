@@ -80,7 +80,25 @@ function ForecastExplain({
     envelopeNow(env),
   );
   if (!nav.available || nav.target == null) {
-    return <span className="alert-row-withheld">{nav.withheldReason}</span>;
+    // #620 S2 — the sentence stays; the diagnosis of this week's own window is
+    // offered beside it. See the same block in `AlertFollow.tsx`.
+    const explain = nav.explainTarget == null
+      ? null
+      : { ...nav.explainTarget, source };
+    return (
+      <span className="alert-row-unresolved">
+        <span className="alert-row-withheld">{nav.withheldReason}</span>
+        {explain != null ? (
+          <button
+            type="button"
+            className="alert-row-explain"
+            onClick={() => followAlertTarget(explain)}
+          >
+            {explain.label}
+          </button>
+        ) : null}
+      </span>
+    );
   }
   const target = { ...nav.target, source };
   return (

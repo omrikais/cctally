@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "seededAt": "2026-08-08",
-  "minHarnessRows": 60,
+  "minHarnessRows": 61,
   "harnesses": [
     {
       "name": "5h-canonical",
@@ -140,6 +140,12 @@
       "name": "envelope-oracle",
       "visibility": "private",
       "minCases": 1,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "explain",
+      "visibility": "public",
+      "minCases": 103,
       "countPolicy": "fixed"
     },
     {

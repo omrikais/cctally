@@ -11,6 +11,8 @@ bypass is the hazard this session exists to close.
 """
 from __future__ import annotations
 
+import gzip
+import importlib.util
 import json
 import os
 import pathlib
@@ -23,6 +25,8 @@ import time
 
 import pytest
 import yaml
+
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, remaining
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 BIN = REPO / "bin"
@@ -101,9 +105,18 @@ def _estate(tmp_path, harnesses=None, exits=None, smoke=True, manifest_min=None)
         path.write_text("\n".join(body) + "\n", encoding="utf-8")
         path.chmod(0o755)
 
+    # The durations plugin is loaded with `-p tests._pytest_durations_plugin`
+    # on an authoritative evidence run, so an estate without it would fail to
+    # start pytest at all (#630 S1).
+    shutil.copy2(
+        REPO / "tests" / "_pytest_durations_plugin.py",
+        testsdir / "_pytest_durations_plugin.py",
+    )
     if smoke:
         (testsdir / "test_scratch_smoke.py").write_text(
-            "def test_ok():\n    assert True\n", encoding="utf-8"
+            "def test_ok():\n    assert True\n"
+            "def test_known():\n    assert True\n",
+            encoding="utf-8",
         )
     (testsdir / "authoritative-test-manifest.json").write_text(
         json.dumps(
@@ -855,6 +868,13 @@ def test_pytest_and_benchmark_phase_lines_have_authoritative_failure_reasons(tmp
 # ------------------------------------------------------------ ordered teardown
 
 
+#: One budget for a signalled run to exit AND for its pool to be reaped. Three
+#: presence backstops, because both halves are waits on a real `cctally-test-
+#: all` process tree rather than on an in-process object, and the reap cannot
+#: begin until the exit has happened.
+_ABORT_AND_REAP_BUDGET_S = 3 * PRESENCE_BACKSTOP_SECONDS
+
+
 def _wait_for(predicate, timeout=60.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -915,6 +935,51 @@ def _descendants_mentioning(needle):
     return [line for line in out.splitlines() if needle in line]
 
 
+def test_the_manifest_reads_back_the_validator_redaction_sidecar(tmp_path):
+    """`exportRedactions`, end to end through `_read_json`.
+
+    The two kernel-level cases read `validator-redactions.json` directly, so
+    the read-back — the part that can silently break, because an unreadable
+    sidecar degrades to `null` rather than raising — was asserted nowhere.
+    """
+    est, _canary = _canary_estate(tmp_path)
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
+    assert res.returncode == 1, res.stdout + res.stderr
+
+    run = _run_dirs(root)[0]
+    sidecar = json.loads((run / "validator-redactions.json").read_text())
+    manifest = json.loads((run / "manifest.json").read_text())
+    assert manifest["exportRedactions"] == sidecar, (manifest, sidecar)
+    assert sidecar["schemaVersion"] == 1, sidecar
+    assert sidecar["refused"] is False, sidecar
+    assert sidecar["refusal"] is None, sidecar
+    assert sidecar["redacted"] == 0, sidecar
+    assert sidecar["reasons"] == [], sidecar
+    # A measured zero rather than an assumed one: the export really had lines
+    # for the validator to judge.
+    assert sidecar["total"] > 0, sidecar
+    assert (run / "export" / "failure-context.txt").exists()
+
+
+def test_a_run_that_publishes_no_extract_records_a_null_not_a_zero(tmp_path):
+    """The other reading of the same field.
+
+    A passing run never reaches the export mode, so no sidecar exists and the
+    manifest states `null`. That is a different answer from a published
+    extract the validator refused nothing in, and the two must not collapse.
+    """
+    est = _estate(tmp_path)
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
+    assert res.returncode == 0, res.stdout + res.stderr
+
+    run = _run_dirs(root)[0]
+    assert not (run / "validator-redactions.json").exists()
+    manifest = json.loads((run / "manifest.json").read_text())
+    assert manifest["exportRedactions"] is None, manifest
+
+
 def test_a_normal_run_is_recorded_completed(tmp_path):
     est = _estate(tmp_path)
     root = tmp_path / "ev"
@@ -968,12 +1033,18 @@ def test_an_interrupted_run_is_recorded_aborted_and_reaps_its_pool(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    # ONE budget for the abort and the reap that follows it. Ninety seconds
+    # for the run to exit plus thirty for the pool to be reaped summed to the
+    # whole 120-second pytest cap, so a run that never aborted spent the cap
+    # and pytest-timeout killed the worker before the reap assertion below
+    # could name the descendants it was still seeing.
+    deadline = time.monotonic() + _ABORT_AND_REAP_BUDGET_S
     try:
         assert _wait_for(lambda: list(root.rglob("logs/alpha.started"))), (
             "the pool never started"
         )
         proc.send_signal(getattr(_signal, f"SIG{signal_name}"))
-        rc = proc.wait(timeout=90)
+        rc = proc.wait(timeout=remaining(deadline))
     finally:
         if proc.poll() is None:                      # pragma: no cover - safety
             proc.kill()
@@ -994,7 +1065,7 @@ def test_an_interrupted_run_is_recorded_aborted_and_reaps_its_pool(
     assert (_run_dirs(root)[0] / "logs" / "alpha.started").exists()
     assert _wait_for(
         lambda: not _descendants_mentioning(str(est / "bin" / "cctally-alpha-test")),
-        timeout=30,
+        timeout=remaining(deadline),
     ), _descendants_mentioning(str(est / "bin" / "cctally-alpha-test"))
 
 
@@ -1101,6 +1172,164 @@ def test_the_console_is_sanitized_when_an_evidence_root_exists(tmp_path):
     # produces no usable artifact at all.
     assert CANONICAL_FAILURE in res.stderr, res.stderr
     assert PRECEDING_DIAGNOSTIC in res.stderr, res.stderr
+
+
+# The console block's own glue — `scrub-log` — had no test of any kind while
+# its behaviour changed from "drop the whole block" to "replace the offending
+# line, publish the rest, state what went". The two branches are only
+# reachable when the validator flags an emitted line, which by design happens
+# only when the transformer is broken, so the kernel is loaded through a shim
+# that adds one violation. The shim re-exports the real kernel unchanged and
+# leaves `apply_validation_redactions` and its internal re-validation exactly
+# as shipped: the glue is what is under test, not the kernel.
+_VALIDATOR_SHIM = '''
+import importlib.util as _ilu
+import os as _os
+import sys as _sys
+
+_spec = _ilu.spec_from_file_location(
+    "_real_evidence_kernel", _os.environ["EV_SHIM_REAL_KERNEL"]
+)
+_real = _ilu.module_from_spec(_spec)
+_sys.modules["_real_evidence_kernel"] = _real
+_spec.loader.exec_module(_real)
+for _name in dir(_real):
+    if not _name.startswith("__"):
+        globals()[_name] = getattr(_real, _name)
+
+_REASON = _os.environ["EV_SHIM_REASON"]
+
+
+def validate_export(lines, roots=None):
+    """The real verdict, plus one violation on the LAST line.
+
+    Addressed by position rather than by content so the case does not depend
+    on which shapes the transformer happened to retain.
+    """
+    violations = list(_real.validate_export(lines, roots))
+    if _REASON and lines and not any(
+        v["index"] == len(lines) - 1 for v in violations
+    ):
+        violations.append(
+            {
+                "index": len(lines) - 1,
+                "reason": _REASON,
+                "excerpt": str(lines[-1])[:120],
+            }
+        )
+    violations.sort(key=lambda v: v["index"])
+    return violations
+'''
+
+
+def _scrub_log(tmp_path, log_lines, reason):
+    """Run the aggregator's embedded `scrub-log` mode over one subject log."""
+    source = RUNNER.read_text(encoding="utf-8")
+    marker = "python3 - \"$EVIDENCE_KERNEL\" \"$EVIDENCE_PRIVATE\" \"$@\" <<'EVPY'\n"
+    bridge = source.split(marker, 1)[1].split("\nEVPY\n", 1)[0]
+
+    shim = tmp_path / "_lib_test_evidence_shim.py"
+    shim.write_text(_VALIDATOR_SHIM, encoding="utf-8")
+    logfile = tmp_path / "alpha.log"
+    logfile.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+
+    env = dict(
+        os.environ,
+        LC_ALL="C",
+        TZ="Etc/UTC",
+        HOME=str(tmp_path / "home"),
+        EV_REPO_ROOT=str(tmp_path / "repo"),
+        EV_SHIM_REAL_KERNEL=str(EVIDENCE_KERNEL),
+        EV_SHIM_REASON=reason,
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            "-",
+            str(shim),
+            # The private disclosure producer is deliberately absent, which is
+            # the fail-closed context the public tree runs under.
+            os.devnull,
+            "scrub-log",
+            "alpha",
+            str(logfile),
+        ],
+        input=bridge,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+_SCRUB_LOG_LINES = (
+    "passed: 0   failed: 0",
+    PRECEDING_DIAGNOSTIC,
+    CANONICAL_FAILURE,
+    "Verdict: FAIL",
+    "passed: 1   failed: 1",
+)
+
+
+def test_the_console_replaces_a_structurally_refused_line_and_keeps_the_block(
+    tmp_path,
+):
+    """Per LINE on the console, exactly as in the export file.
+
+    The two used to differ: the console dropped the whole subject block on any
+    violation, which is the same over-redaction the sanitizer itself was
+    faulted for, one level up.
+    """
+    res = _scrub_log(tmp_path, _SCRUB_LOG_LINES, "unknown-counter-word")
+    assert res.returncode == 0, res.stdout + res.stderr
+    lines = res.stdout.splitlines()
+    # The offending line's own bytes are gone and the leg that refused it is
+    # named, so an operator can tell a sanitizer fault from a missing failure.
+    assert (
+        "[REDACTED: line refused by the validator: unknown-counter-word]"
+        in lines
+    ), lines
+    # The rest of the block really did survive.
+    assert "passed: 0 [REDACTED: unclassified detail]" in lines, lines
+    assert len(lines) == len(_SCRUB_LOG_LINES) + 1, lines
+    # Never silent: the count and the distinct reasons close the block.
+    assert lines[-1] == (
+        "[REDACTED: 1 of 5 lines were refused by the validator and replaced; "
+        "reasons: unknown-counter-word]"
+    ), lines
+    assert "context refused by the validator" not in res.stdout, res.stdout
+
+
+def test_the_console_withholds_the_block_when_a_content_leg_fires(tmp_path):
+    """The other branch, which names the CAUSE of the refusal.
+
+    A content violation means the transformer leaked rather than a leg
+    over-firing, so nothing around it can be trusted and the block is
+    withheld whole.
+    """
+    res = _scrub_log(tmp_path, _SCRUB_LOG_LINES, "free-form-text")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert res.stdout == (
+        "[REDACTED: alpha context refused by the validator, 1 violations, "
+        "cause: free-form-text]\n"
+    ), res.stdout
+    assert "passed: 0" not in res.stdout, res.stdout
+
+
+def test_the_console_scrub_shim_does_not_itself_manufacture_the_outcome(
+    tmp_path,
+):
+    """Non-vacuity for the two cases above.
+
+    Without the injected violation the same log publishes its whole block and
+    no notice at all, so both outcomes above are the glue reacting to the
+    violation rather than to the shim being present.
+    """
+    res = _scrub_log(tmp_path, _SCRUB_LOG_LINES, "")
+    assert res.returncode == 0, res.stdout + res.stderr
+    lines = res.stdout.splitlines()
+    assert len(lines) == len(_SCRUB_LOG_LINES), lines
+    assert not any("refused by the validator" in line for line in lines), lines
 
 
 def test_the_console_stays_raw_without_an_evidence_root(tmp_path):
@@ -1278,6 +1507,45 @@ def test_the_pytest_dump_is_sanitized(tmp_path):
     assert "<path>:2: AssertionError" in export, export
 
 
+@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="maintainer-local producer")
+def test_the_export_names_the_failing_node_and_its_exception_class(tmp_path):
+    """#630 S1 F1's exit criterion, asserted on the real retained artifact.
+
+    A kernel test can pass while the wiring is broken, so this drives the real
+    aggregator over a real pytest failure and reads the file an operator would
+    read. The published extract for the v1.101.0 failure was 95% repetitions of
+    `[REDACTED: unclassified line]`; what must survive now is the failing node
+    id, the exception class, the `E ` gutter and pytest's counters line — and
+    what must not survive is the exception message.
+    """
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    canary = f"{home}/{CANARY_TAIL}"
+    est = _estate(tmp_path)
+    (est / "tests" / "test_scratch_smoke.py").write_text(
+        "def test_boom():\n"
+        f"    raise TimeoutError({canary!r})\n",
+        encoding="utf-8",
+    )
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
+    assert res.returncode == 1, res.stdout + res.stderr
+    raw = (_run_dirs(root)[0] / "logs" / "pytest.log").read_text()
+    # Non-vacuity: the raw log really carries both the node id and the message,
+    # so the assertions below measure the sanitizer rather than an empty input.
+    assert "test_scratch_smoke.py::test_boom" in raw, raw
+    assert canary in raw, raw
+    export = (_run_dirs(root)[0] / "export" / "failure-context.txt").read_text()
+    assert "FAILED <path>::test_boom - TimeoutError: " in export, export
+    assert re.search(
+        r"^E\s+TimeoutError: \[REDACTED: exception message\]$", export, re.M
+    ), export
+    assert "<path>:2: TimeoutError" in export, export
+    assert re.search(r"^=*\s*\d+ failed in [\d.]+s", export, re.M), export
+    assert canary not in export, export
+    assert CANARY_TAIL not in export, export
+
+
 def test_an_undecodable_log_leaves_no_export_at_all(tmp_path):
     """Spec section 3: a parse error, undecodable input or failed validation
     leaves no export file at all.
@@ -1314,6 +1582,92 @@ def test_an_undecodable_log_leaves_no_export_at_all(tmp_path):
     # outage or a silence.
     assert (run / "logs" / "alpha.log").read_bytes().count(b"\xff") == 1
     assert "the complete unsanitized logs are retained" in res.stderr, res.stderr
+
+
+def _embedded_export(tmp_path, log_lines, extra_env=None):
+    """The aggregator's OWN export mode, over a log this test controls.
+
+    `EV_COVERAGE_NOTE` reaches the extract HEADER unscrubbed — it is the
+    aggregator's own sentence — and is validated rather than transformed, so
+    it is the one place a test can put a line the validator refuses without
+    also mutating the transformer.
+    """
+    source = RUNNER.read_text(encoding="utf-8")
+    marker = "python3 - \"$EVIDENCE_KERNEL\" \"$EVIDENCE_PRIVATE\" \"$@\" <<'EVPY'\n"
+    bridge = source.split(marker, 1)[1].split("\nEVPY\n", 1)[0]
+    evidence = tmp_path / "run"
+    (evidence / "export").mkdir(parents=True)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    log = logs / "alpha.log"
+    log.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+    listing = tmp_path / "failed-subjects"
+    listing.write_text("alpha\t%s\n" % log, encoding="utf-8")
+    env = dict(os.environ, LC_ALL="C", TZ="Etc/UTC")
+    env.update({
+        "EV_FAILED_LIST": str(listing),
+        "EV_RUN_ID": "r-1",
+        "EV_REPO_ROOT": str(tmp_path),
+        "EV_COVERAGE_NOTE": "",
+    })
+    env.update(extra_env or {})
+    result = subprocess.run(
+        [sys.executable, "-", str(EVIDENCE_KERNEL), os.devnull,
+         "export", str(evidence)],
+        input=bridge, env=env, capture_output=True, text=True, check=False,
+    )
+    return evidence, result
+
+
+# Refused by the validator's counters leg, and NOT produced by the
+# transformer: it reaches the extract through the header, which the aggregator
+# writes itself.
+REFUSED_HEADER_NOTE = "1 failed, 100 sprocketed in 45.67s"
+
+
+def test_a_refused_extract_line_is_replaced_and_the_rest_is_published(tmp_path):
+    """A validator violation degrades the extract per LINE, not to zero bytes.
+
+    Refusing the whole file meant one false positive anywhere in the retained
+    window cost the operator every byte of diagnostic evidence — the same
+    failure class as over-redaction, at the file level. Three validator legs
+    prescribed during this session alone would have triggered exactly that.
+    """
+    evidence, result = _embedded_export(
+        tmp_path,
+        ["FAIL alpha: stdout diverged"] + ["passed: 1   failed: 1"] * 12,
+        {"EV_COVERAGE_NOTE": REFUSED_HEADER_NOTE},
+    )
+    assert result.returncode == 0, result.stderr
+    export = evidence / "export" / "failure-context.txt"
+    assert export.exists(), result.stderr
+    text = export.read_text(encoding="utf-8")
+    # Fail-closed for the offending line: its bytes never reached the file.
+    assert "sprocketed" not in text, text
+    # The rest of the extract survived.
+    assert "cctally-test-all] run r-1" in text, text
+    # Never silent — in the file, on stderr, and in the machine record.
+    assert "refused by the validator" in text, text
+    assert "unknown-counter-word" in text, text
+    assert "the validator refused 1 of" in result.stderr, result.stderr
+    record = json.loads(
+        (evidence / "validator-redactions.json").read_text(encoding="utf-8"))
+    assert record["redacted"] == 1, record
+    assert record["reasons"] == ["unknown-counter-word"], record
+    # The sidecar is a SIBLING of export/, because only two files may leave
+    # the runner and the workflow gate is written against exactly that pair.
+    assert not (evidence / "export" / "validator-redactions.json").exists()
+
+
+def test_a_clean_extract_records_a_measured_zero_rather_than_nothing(tmp_path):
+    evidence, result = _embedded_export(
+        tmp_path, ["FAIL alpha: stdout diverged", "passed: 1   failed: 1"])
+    assert result.returncode == 0, result.stderr
+    record = json.loads(
+        (evidence / "validator-redactions.json").read_text(encoding="utf-8"))
+    assert record["redacted"] == 0 and record["reasons"] == [], record
+    assert "refused by the validator" not in (
+        evidence / "export" / "failure-context.txt").read_text(encoding="utf-8")
 
 
 def test_no_extract_is_written_for_a_passing_run(tmp_path):
@@ -1405,6 +1759,290 @@ def _retention(root):
     return json.loads((pathlib.Path(root) / ".retention.json").read_text())
 
 
+def _embedded_retention(root, current_run, extra_env=None):
+    """The aggregator's OWN retention pass, run exactly as the aggregator runs
+    it — the same extraction idiom `_embedded_pid_start` uses."""
+    source = RUNNER.read_text(encoding="utf-8")
+    marker = "python3 - \"$EVIDENCE_KERNEL\" \"$EVIDENCE_PRIVATE\" \"$@\" <<'EVPY'\n"
+    bridge = source.split(marker, 1)[1].split("\nEVPY\n", 1)[0]
+    env = dict(os.environ, LC_ALL="C", TZ="Etc/UTC")
+    env.update(extra_env or {})
+    result = subprocess.run(
+        [
+            sys.executable, "-",
+            str(EVIDENCE_KERNEL), os.devnull,
+            "retention", str(root), current_run,
+        ],
+        input=bridge,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads((pathlib.Path(root) / ".retention.json").read_text()), result
+
+
+def _tree_bytes(path):
+    total = 0
+    for base, _dirs, files in os.walk(path):
+        for name in files:
+            total += os.lstat(os.path.join(base, name)).st_size
+    return total
+
+
+def _store_bytes(root):
+    """Every run directory's bytes — what `bytesAfter` accounts for.
+
+    The record's own file and lock live at the root and are deliberately not
+    counted: `.retention.json` is written after the number is computed, so
+    including it would make the figure describe a store that did not yet exist.
+    """
+    total = 0
+    for remote in sorted(pathlib.Path(root).iterdir()):
+        if not remote.is_dir():
+            continue
+        for run in sorted(remote.iterdir()):
+            if run.is_dir():
+                total += _tree_bytes(run)
+    return total
+
+
+def test_record_is_rebuilt_from_disk_when_a_deletion_fails(tmp_path):
+    """A failed `rmtree` must not leave the record claiming the bytes are gone.
+
+    `plan["evict"] = removed` already made the evicted-run count honest, but
+    `bytesAfter`, `overCap`, `retainedRuns` and `gaps` still came from the
+    PLANNED set, so a deletion that failed left the record understating what
+    is actually on disk — and the byte cap is enforced against that number.
+    """
+    root = tmp_path / "ev"
+    now = int(time.time())
+    _seed_run(root, "doomed", started=now - 3600, size=400_000)
+    _seed_run(root, "kept", started=now - 60, size=400_000)
+    # `rmtree` unlinks each entry from the directory that holds it, so every
+    # directory ALONG the doomed run has to be read-only for the deletion to
+    # fail outright. Making only the top one read-only lets rmtree strip the
+    # contents and fail on the final rmdir, which is the partial-delete case
+    # the next test covers rather than this one.
+    parent = root / "cctally-dev"
+    doomed = parent / "doomed"
+    locked = [parent, doomed] + [d for d in doomed.iterdir() if d.is_dir()]
+    originals = [(d, stat.S_IMODE(d.stat().st_mode)) for d in locked]
+    for directory, _mode in reversed(originals):
+        os.chmod(directory, 0o555)
+    try:
+        record, result = _embedded_retention(
+            root, "kept", {"EV_MAX_BYTES": "1000", "EV_MAX_AGE_DAYS": "3650"}
+        )
+    finally:
+        for directory, mode in originals:
+            os.chmod(directory, mode)
+    # Non-vacuity: the deletion really did fail, and the run is really still
+    # on disk. Without this the test would pass on a successful eviction.
+    assert "could not evict" in result.stderr, result.stderr
+    assert (doomed / "manifest.json").exists()
+    assert record["bytesAfter"] == _store_bytes(root), (
+        record["bytesAfter"], _store_bytes(root))
+    assert record["retainedRuns"] == 2, record
+    assert record["orphanDirs"] == 0, record
+    # The eviction was PLANNED, so the pre-#630 record reported the run's
+    # bytes as reclaimed and a hole where its evidence still sits.
+    assert record["lastEvictedRuns"] == 0, record
+    assert record["gaps"] == [], record
+
+
+def _production_constant(name):
+    """One integer constant, read from the aggregator's own source.
+
+    Re-declaring the value here made the tests agree with themselves rather
+    than with production: raising the real window to 1,200 seconds would have
+    been caught by the backdating below, but lowering it to 1 second would
+    not, because every test backdated far past both.
+    """
+    match = re.search(
+        r"^%s\s*=\s*(\d+)\s*$" % re.escape(name),
+        RUNNER.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert match, "%s is not defined in %s" % (name, RUNNER)
+    return int(match.group(1))
+
+
+# A directory younger than this is a run still starting up, not an orphan.
+ORPHAN_GRACE_SECONDS = _production_constant("ORPHAN_GRACE_SECONDS")
+# Wide enough that the seconds a retention pass spends between `os.utime` here
+# and its `os.stat` in the subprocess cannot move a directory across the
+# boundary, and narrow enough that both brackets stay on their own side of it
+# for any plausible production value.
+ORPHAN_BOUNDARY_MARGIN_SECONDS = 15
+
+
+def _age_directory(path, seconds):
+    """Backdate a directory's mtime past the orphan grace window."""
+    when = time.time() - seconds
+    os.utime(path, (when, when))
+
+
+def test_a_partially_deleted_run_is_counted_as_an_orphan(tmp_path):
+    """manifest.json removed, other bytes left.
+
+    `_load_runs` skips a directory with no readable manifest, so without
+    orphan handling those bytes are invisible to both the retained-run count
+    and the cap they are supposed to be measured against.
+    """
+    root = tmp_path / "ev"
+    now = int(time.time())
+    _seed_run(root, "healthy", started=now - 60, size=100_000)
+    orphan = _seed_run(root, "halfgone", started=now - 120, size=300_000)
+    (orphan / "manifest.json").unlink()
+    # Older than the grace window, which is what separates a half-deleted run
+    # from one that has not written its first manifest yet.
+    _age_directory(orphan, ORPHAN_GRACE_SECONDS * 10)
+    record, _ = _embedded_retention(
+        root, "healthy", {"EV_MAX_BYTES": "100000000", "EV_MAX_AGE_DAYS": "3650"}
+    )
+    orphan_bytes = _tree_bytes(orphan)
+    assert orphan_bytes > 0
+    assert record["bytesAfter"] >= orphan_bytes, (record, orphan_bytes)
+    assert record["bytesAfter"] == _store_bytes(root), record
+    assert record["orphanDirs"] == 1, record
+    # An orphan is not healthy retained evidence, so its interval is a hole.
+    assert record["coverage"] == "degraded", record
+
+
+def test_a_run_that_has_not_written_its_manifest_yet_is_not_an_orphan(tmp_path):
+    """A concurrent run caught between `mkdir` and `_write_manifest active`.
+
+    Counting it as an orphan flipped this pass's coverage to `degraded` — a
+    false alarm on a signal whose only value is that an operator believes it.
+    Its bytes are still on disk and are still counted.
+    """
+    root = tmp_path / "ev"
+    now = int(time.time())
+    _seed_run(root, "healthy", started=now - 60, size=100_000)
+    starting = pathlib.Path(root) / "cctally-dev" / "just-started"
+    (starting / "logs").mkdir(parents=True)
+    (starting / "logs" / "partial.log").write_text("x" * 5_000, encoding="utf-8")
+    record, result = _embedded_retention(
+        root, "healthy", {"EV_MAX_BYTES": "100000000", "EV_MAX_AGE_DAYS": "3650"}
+    )
+    assert record["orphanDirs"] == 0, record
+    assert record["coverage"] == "complete", record
+    assert "coverage is degraded" not in result.stderr, result.stderr
+    # Its bytes are NOT invisible: understating `bytesAfter` is the class the
+    # rescan exists to close, and the cap is enforced against that number.
+    assert record["bytesAfter"] == _store_bytes(root), record
+    assert record["bytesAfter"] >= _tree_bytes(starting) > 0, record
+
+
+def test_the_orphan_grace_window_is_the_production_constant(tmp_path):
+    """Both sides of the REAL boundary, in one pass.
+
+    Every other orphan test backdates far past the window, so raising the
+    production constant to 1,200 seconds would have been caught and lowering
+    it to 1 second would not. These two directories sit fifteen seconds either
+    side of whatever `bin/cctally-test-all` actually declares, so a change in
+    either direction moves one of them across and fails here.
+    """
+    assert ORPHAN_GRACE_SECONDS > 2 * ORPHAN_BOUNDARY_MARGIN_SECONDS, (
+        "the brackets below would overlap zero")
+    root = tmp_path / "ev"
+    now = int(time.time())
+    _seed_run(root, "healthy", started=now - 60, size=100_000)
+    base = pathlib.Path(root) / "cctally-dev"
+    inside = base / "inside-grace"
+    outside = base / "outside-grace"
+    for directory in (inside, outside):
+        (directory / "logs").mkdir(parents=True)
+        (directory / "logs" / "partial.log").write_text("x" * 5_000, encoding="utf-8")
+    _age_directory(inside, ORPHAN_GRACE_SECONDS - ORPHAN_BOUNDARY_MARGIN_SECONDS)
+    _age_directory(outside, ORPHAN_GRACE_SECONDS + ORPHAN_BOUNDARY_MARGIN_SECONDS)
+    record, _ = _embedded_retention(
+        root, "healthy", {"EV_MAX_BYTES": "100000000", "EV_MAX_AGE_DAYS": "3650"}
+    )
+    # Exactly one of the two is condemned, and it is the older one.
+    assert record["orphanDirs"] == 1, record
+    assert record["orphanBytes"] == _tree_bytes(outside), record
+    # Neither one's bytes are invisible, whichever side of the line it is on.
+    assert record["bytesAfter"] == _store_bytes(root), record
+
+
+def test_a_manifest_with_an_unrecognised_state_still_has_its_bytes_counted(tmp_path):
+    """`_load_runs` deliberately leaves it alone and `_orphan_dirs` does not
+    condemn it, so before this its bytes were counted NOWHERE."""
+    root = tmp_path / "ev"
+    now = int(time.time())
+    _seed_run(root, "healthy", started=now - 60, size=100_000)
+    strange = _seed_run(root, "future-state", started=now - 120, size=300_000)
+    doc = json.loads((strange / "manifest.json").read_text())
+    doc["state"] = "quiesced-by-a-later-binary"
+    (strange / "manifest.json").write_text(json.dumps(doc), encoding="utf-8")
+    record, _ = _embedded_retention(
+        root, "healthy", {"EV_MAX_BYTES": "100000000", "EV_MAX_AGE_DAYS": "3650"}
+    )
+    # Not an orphan and not a retained run — but its bytes are real.
+    assert record["orphanDirs"] == 0, record
+    assert record["retainedRuns"] == 1, record
+    assert record["bytesAfter"] == _store_bytes(root), record
+    assert record["bytesAfter"] >= _tree_bytes(strange) > 0, record
+    assert (strange / "manifest.json").exists(), "never evicted on an unknown state"
+
+
+def test_an_orphan_alone_prints_the_operator_notice(tmp_path):
+    """A pass that degrades ONLY because of an orphan wrote the degraded
+    record and printed nothing, beside this file's own rule that eviction is
+    never silent."""
+    root = tmp_path / "ev"
+    now = int(time.time())
+    _seed_run(root, "healthy", started=now - 60, size=100_000)
+    orphan = _seed_run(root, "halfgone", started=now - 120, size=300_000)
+    (orphan / "manifest.json").unlink()
+    _age_directory(orphan, ORPHAN_GRACE_SECONDS * 10)
+    record, result = _embedded_retention(
+        root, "healthy", {"EV_MAX_BYTES": "100000000", "EV_MAX_AGE_DAYS": "3650"}
+    )
+    # Non-vacuity: nothing was evicted, so there is no gap and the notice can
+    # only be firing for the orphan.
+    assert record["gaps"] == [], record
+    assert record["orphanDirs"] == 1, record
+    assert record["coverage"] == "degraded", record
+    assert "coverage is degraded" in result.stderr, result.stderr
+    assert "1 orphan directory with no readable manifest" in result.stderr, (
+        result.stderr)
+    assert "coverage is degraded" in result.stdout, result.stdout
+
+
+def test_the_record_carries_the_exact_eviction_bytes_and_reasons(tmp_path):
+    root = tmp_path / "ev"
+    now = int(time.time())
+    sizes = {}
+    for name in ("a", "b"):
+        run = _seed_run(root, name, started=now - 40 * 86400, size=200_000)
+        sizes[name] = _tree_bytes(run)
+    _seed_run(root, "current", started=now, size=1000)
+    record, _ = _embedded_retention(
+        root, "current", {"EV_MAX_AGE_DAYS": "7", "EV_MAX_BYTES": "100000000"}
+    )
+    assert record["lastEvictedRuns"] == 2, record
+    assert record["lastEvictionReasons"] == ["age"], record
+    assert record["lastEvictedBytes"] == sizes["a"] + sizes["b"], record
+    assert record["lastEvictionByReason"]["age"] == {
+        "runs": 2, "bytes": sizes["a"] + sizes["b"]}, record
+
+
+def test_a_pass_that_evicts_nothing_records_zero_rather_than_omitting_it(tmp_path):
+    root = tmp_path / "ev"
+    _seed_run(root, "current", started=int(time.time()), size=1000)
+    record, _ = _embedded_retention(
+        root, "current", {"EV_MAX_AGE_DAYS": "3650", "EV_MAX_BYTES": "100000000"}
+    )
+    assert record["lastEvictedRuns"] == 0
+    assert record["lastEvictedBytes"] == 0
+    assert record["lastEvictionByReason"] == {"age": {"runs": 0, "bytes": 0},
+                                              "cap": {"runs": 0, "bytes": 0}}
+
+
 def test_cap_eviction_is_reported_and_recorded(tmp_path):
     est = _estate(tmp_path)
     root = tmp_path / "ev"
@@ -1431,6 +2069,43 @@ def test_cap_eviction_is_reported_and_recorded(tmp_path):
     assert record["coverage"] == "degraded", record
     assert record["gaps"], record
     assert stat.S_IMODE((root / ".retention.json").stat().st_mode) == 0o600
+
+
+def test_the_producer_writes_keyed_gaps_and_can_emit_an_open_ended_one(tmp_path):
+    """The gap shape the read surfaces must be written against (#630 S1, F2).
+
+    Both `cctally-test-remote --status` and `--report` indexed gaps
+    positionally and crashed with `KeyError: 0` on the live store, because the
+    only fixtures covering them hand-built `[[from, to]]` — a shape
+    `_merge_intervals` has never emitted. This pins the producer's real output
+    so a fixture can no longer disagree with it silently, and it pins the
+    open-ended case, which a naive key fix turns into a silently dropped gap.
+    """
+    est = _estate(tmp_path)
+    root = tmp_path / "ev"
+    now = int(time.time())
+    # Dated ahead of the current run, so evicting it leaves the store's newest
+    # interval unbounded. That is the only way the producer emits `toEpoch`
+    # null.
+    _seed_run(root, "ahead", started=now + 86400)
+    _seed_run(root, "behind", started=now - 3600)
+    res = _drive(
+        est,
+        tmp_path,
+        {
+            "CCTALLY_TEST_EVIDENCE_ROOT": str(root),
+            "CCTALLY_TEST_EVIDENCE_MAX_BYTES": "1000",
+        },
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    record = _retention(root)
+    assert record["gaps"], record
+    for gap in record["gaps"]:
+        assert isinstance(gap, dict), record
+        assert set(gap) == {"fromEpoch", "toEpoch"}, record
+        assert isinstance(gap["fromEpoch"], int), record
+        assert gap["toEpoch"] is None or isinstance(gap["toEpoch"], int), record
+    assert any(gap["toEpoch"] is None for gap in record["gaps"]), record
 
 
 def test_concurrent_runs_do_not_lose_each_other_s_retention_state(tmp_path):
@@ -1984,3 +2659,221 @@ def test_every_workflow_loads_as_a_yaml_mapping_with_jobs():
         loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
         assert isinstance(loaded, dict), path.name
         assert isinstance(loaded.get("jobs"), dict), path.name
+
+
+# ------------------------------------------------ per-test durations (#630 S1, F3)
+
+DURATIONS_ARTIFACT = ("timings", "pytest-tests.jsonl.gz")
+
+
+def _load_durations_plugin():
+    path = REPO / "tests" / "_pytest_durations_plugin.py"
+    spec = importlib.util.spec_from_file_location("_durations_plugin", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _read_jsonl_gz(path):
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+class _FakeConfig:
+    """Only what `pytest_configure` reaches for."""
+
+    def __init__(self, workerinput=None):
+        if workerinput is not None:
+            self.workerinput = workerinput
+        self.registered = []
+        self.pluginmanager = self
+
+    def register(self, plugin, name=None):
+        self.registered.append((plugin, name))
+
+
+def _authoritative_env(root, extra=None):
+    env = {
+        "CCTALLY_TEST_EVIDENCE_ROOT": str(root),
+        "CCTALLY_AUTHORITATIVE_RUN": "1",
+    }
+    env.update(extra or {})
+    return env
+
+
+def _durations_path(root):
+    return _run_dirs(root)[0].joinpath(*DURATIONS_ARTIFACT)
+
+
+def test_authoritative_run_writes_a_durations_artifact(tmp_path):
+    est = _estate(tmp_path)
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, _authoritative_env(root))
+    assert res.returncode == 0, res.stdout + res.stderr
+    path = _durations_path(root)
+    assert path.exists(), sorted(p.name for p in path.parent.iterdir())
+    records = _read_jsonl_gz(path)
+    assert any(r.get("phase") == "call" for r in records), records
+
+
+def test_non_authoritative_run_writes_no_durations_artifact(tmp_path):
+    est = _estate(tmp_path)
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert not _durations_path(root).exists()
+
+
+def test_every_phase_is_recorded_for_a_known_test(tmp_path):
+    est = _estate(tmp_path)
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, _authoritative_env(root))
+    assert res.returncode == 0, res.stdout + res.stderr
+    records = _read_jsonl_gz(_durations_path(root))
+    phases = {
+        r["phase"] for r in records
+        if r.get("nodeId", "").endswith("::test_known")
+    }
+    # Dropping setup and teardown would remove exactly the attribution a
+    # retirement or a tier decision needs.
+    assert phases == {"setup", "call", "teardown"}, records
+
+
+def test_both_legs_survive_the_merge(tmp_path):
+    est = _estate(tmp_path)
+    # A serial benchmark target makes the aggregator run its SECOND pytest
+    # process; the two are separate processes, so one shared output path would
+    # let the second overwrite the first.
+    (est / "tests" / "test_rebuild_benchmark.py").write_text(
+        "def test_bench():\n    assert True\n", encoding="utf-8"
+    )
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, _authoritative_env(root))
+    assert res.returncode == 0, res.stdout + res.stderr
+    records = _read_jsonl_gz(_durations_path(root))
+    assert {r["leg"] for r in records if "leg" in r} >= {"pytest", "benchmark"}
+
+
+def test_merged_artifact_is_deterministically_ordered(tmp_path):
+    est = _estate(tmp_path)
+    (est / "tests" / "test_rebuild_benchmark.py").write_text(
+        "def test_bench():\n    assert True\n", encoding="utf-8"
+    )
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, _authoritative_env(root))
+    assert res.returncode == 0, res.stdout + res.stderr
+    records = [r for r in _read_jsonl_gz(_durations_path(root)) if "nodeId" in r]
+    # Non-vacuity: an empty list is trivially sorted, so the ordering claim
+    # would hold over an artifact the plugin never wrote into.
+    assert len(records) > 1, records
+    keys = [(r["leg"], r["nodeId"], r["phase"]) for r in records]
+    assert keys == sorted(keys), keys
+
+
+def test_the_merged_artifact_states_its_own_completeness(tmp_path):
+    est = _estate(tmp_path)
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, _authoritative_env(root))
+    assert res.returncode == 0, res.stdout + res.stderr
+    footers = [r for r in _read_jsonl_gz(_durations_path(root)) if r.get("footer")]
+    assert len(footers) == 1, footers
+    assert footers[0]["complete"] is True, footers
+
+
+def test_an_incomplete_durations_artifact_is_reported_on_the_run(tmp_path):
+    # The completeness state used to exist ONLY inside the artifact. The merge
+    # was invoked with `>/dev/null` and its note fired on a non-zero exit,
+    # while an incomplete merge exits 0 — publishing a partial artifact is the
+    # correct outcome — so nothing in the manifest, the outcome record, the
+    # extract or the operator's console ever said so.
+    #
+    # The estate raises inside `pytest_collection_modifyitems`, which
+    # `wrap_session` turns into ExitCode.INTERNAL_ERROR while still calling
+    # `pytest_sessionfinish` from its `finally` block. That is the exact path
+    # the plugin's comment used to deny, so this drives it end to end.
+    est = _estate(tmp_path)
+    (est / "tests" / "conftest.py").write_text(
+        "def pytest_collection_modifyitems(config, items):\n"
+        "    raise RuntimeError('simulated internal error')\n",
+        encoding="utf-8",
+    )
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, _authoritative_env(root))
+    assert res.returncode != 0, res.stdout + res.stderr
+    assert "durations artifact for run" in res.stderr, res.stderr
+    assert "INCOMPLETE" in res.stderr, res.stderr
+    records = _read_jsonl_gz(_durations_path(root))
+    footer = [r for r in records if r.get("footer")][0]
+    assert footer["complete"] is False, footer
+    # The mechanism, not just the outcome: the hook DID run on the internal
+    # error path, so the footer exists and only its exit status separates it
+    # from an ordinary run.
+    legs = {leg["leg"]: leg for leg in footer["legs"]}
+    main_leg = legs.get("pytest") or next(iter(legs.values()))
+    assert main_leg["sessionFinished"] is True, footer
+    assert main_leg["exitStatus"] not in (0, 1, 5), footer
+
+
+def test_a_worker_never_opens_the_output(tmp_path):
+    # xdist propagates `-p` to every worker, so without this guard each worker
+    # would open the controller's output path and interleave into it.
+    plugin = _load_durations_plugin()
+    out = tmp_path / "durations.jsonl.gz"
+    os.environ["CCTALLY_DURATIONS_PATH"] = str(out)
+    try:
+        worker = _FakeConfig(workerinput={"workerid": "gw0"})
+        assert plugin._writer_is_disabled(worker)
+        plugin.pytest_configure(worker)
+        assert worker.registered == []
+        assert not out.exists()
+        # Non-vacuity: the controller, with the same environment, DOES open it.
+        controller = _FakeConfig()
+        assert not plugin._writer_is_disabled(controller)
+        plugin.pytest_configure(controller)
+        assert len(controller.registered) == 1
+        controller.registered[0][0].pytest_sessionfinish(None, 0)
+        assert out.exists()
+    finally:
+        os.environ.pop("CCTALLY_DURATIONS_PATH", None)
+
+
+def test_the_writer_is_disabled_without_an_output_path():
+    plugin = _load_durations_plugin()
+    # Restored in a `finally`: an in-process environment mutation with no
+    # restore leaks for the whole xdist worker, which has contaminated a run
+    # in this repository before.
+    previous = os.environ.pop("CCTALLY_DURATIONS_PATH", None)
+    try:
+        assert plugin._writer_is_disabled(_FakeConfig())
+    finally:
+        if previous is not None:
+            os.environ["CCTALLY_DURATIONS_PATH"] = previous
+
+
+@pytest.mark.parametrize("status", [0, 1, 2, 3, 4, 5])
+def test_the_footer_records_the_real_exit_status(tmp_path, status):
+    # `pytest_sessionfinish` used to write `"sessionFinished": True`
+    # unconditionally and discard the `exitstatus` it was handed, so a session
+    # that ended in an INTERNALERROR published `complete: true` over a
+    # truncated population. `_pytest.main.wrap_session` calls this hook from
+    # its `finally` block on every path where `initstate >= 2`, so the hook
+    # DOES run on those paths and the status is the only fact that separates
+    # them.
+    plugin = _load_durations_plugin()
+    out = tmp_path / "durations.jsonl.gz"
+    previous = os.environ.get("CCTALLY_DURATIONS_PATH")
+    os.environ["CCTALLY_DURATIONS_PATH"] = str(out)
+    try:
+        config = _FakeConfig()
+        plugin.pytest_configure(config)
+        config.registered[0][0].pytest_sessionfinish(None, status)
+    finally:
+        if previous is None:
+            os.environ.pop("CCTALLY_DURATIONS_PATH", None)
+        else:
+            os.environ["CCTALLY_DURATIONS_PATH"] = previous
+    footer = _read_jsonl_gz(out)[-1]
+    assert footer["footer"] is True, footer
+    assert footer["exitStatus"] == status, footer
+

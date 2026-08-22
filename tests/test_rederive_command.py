@@ -9,8 +9,17 @@ import os
 import pathlib
 import signal
 import subprocess
+import time
 
 import pytest
+
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, remaining
+
+#: One budget for the three child `db rederive` runs of the SIGKILL
+#: recovery test. Three presence backstops, because each run is a real
+#: child process rather than an in-process wait, and the three are
+#: sequential: the crash run cannot start until the preview has returned.
+_CHILD_RUNS_BUDGET_S = 3 * PRESENCE_BACKSTOP_SECONDS
 
 
 AT = "2026-07-25T12:00:00Z"
@@ -935,12 +944,20 @@ def test_real_sigkill_recovery_converges_without_duplicate_batch(
     preview_env = dict(env)
     preview_env.pop("CCTALLY_REDERIVE_TEST_CRASH_STAGE")
     preview_command = [arg for arg in command if arg != "--yes"]
+    # ONE budget for all three child runs, not one each. Thirty plus thirty
+    # plus sixty is the whole 120-second pytest cap, so a rederive that hung
+    # spent the cap across them and pytest-timeout killed the worker with a
+    # generic message instead of a `TimeoutExpired` naming the command. These
+    # are hang detectors rather than expected durations — each run finishes in
+    # seconds — so sharing one budget makes each of them MORE generous than it
+    # was while bounding what the three can spend together.
+    deadline = time.monotonic() + _CHILD_RUNS_BUDGET_S
     preview_run = subprocess.run(
         preview_command,
         env=preview_env,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=remaining(deadline),
         check=False,
     )
     assert preview_run.returncode == 0, preview_run.stderr
@@ -954,7 +971,7 @@ def test_real_sigkill_recovery_converges_without_duplicate_batch(
         env=env,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=remaining(deadline),
         check=False,
     )
     assert killed.returncode == -signal.SIGKILL
@@ -973,7 +990,7 @@ def test_real_sigkill_recovery_converges_without_duplicate_batch(
         env=retry_env,
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=remaining(deadline),
         check=False,
     )
     assert recovered.returncode == 0, recovered.stderr

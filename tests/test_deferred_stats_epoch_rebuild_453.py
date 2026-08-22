@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from conftest import load_script, redirect_paths
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -523,7 +524,7 @@ def test_statusline_renders_promptly_while_stats_epoch_worker_runs(runtime):
         text=True,
         capture_output=True,
         env=_subprocess_env(core),
-        timeout=5,
+        timeout=PRESENCE_BACKSTOP_SECONDS,
     )
     elapsed = time.monotonic() - started
 
@@ -555,7 +556,7 @@ def test_stats_commands_return_retry_guidance_instead_of_partial_output(
         text=True,
         capture_output=True,
         env=_subprocess_env(core),
-        timeout=5,
+        timeout=PRESENCE_BACKSTOP_SECONDS,
     )
     elapsed = time.monotonic() - started
 

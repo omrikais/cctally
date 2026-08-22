@@ -28,12 +28,7 @@ if str(_BIN) not in sys.path:
 
 from conftest import load_script, redirect_paths  # noqa: E402
 
-
-def _serve(ns, host="127.0.0.1", port=0):
-    srv = ns["ThreadingHTTPServer"]((host, port), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    return srv, t, srv.server_address[1]
+from tests._support_http import post_json, serve_dashboard, stop  # noqa: E402
 
 
 def _wire_handlers(ns):
@@ -47,27 +42,6 @@ def _wire_handlers(ns):
     ns["DashboardHTTPHandler"].run_sync_now_locked = staticmethod(lambda: None)
     ns["DashboardHTTPHandler"].no_sync = False
     ns["DashboardHTTPHandler"].display_tz_pref_override = None
-
-
-def _post_json(host, port, body):
-    c = http.client.HTTPConnection(host, port, timeout=5)
-    raw = json.dumps(body).encode()
-    host_header = f"{host}:{port}"
-    c.putrequest("POST", "/api/settings", skip_host=True,
-                 skip_accept_encoding=True)
-    c.putheader("Content-Type", "application/json")
-    c.putheader("Content-Length", str(len(raw)))
-    c.putheader("Host", host_header)
-    c.putheader("Origin", f"http://{host_header}")
-    c.endheaders()
-    c.send(raw)
-    r = c.getresponse()
-    payload = r.read().decode("utf-8", errors="replace")
-    c.close()
-    try:
-        return r.status, json.loads(payload)
-    except json.JSONDecodeError:
-        return r.status, None
 
 
 #: A stored Codex budget. Without it the fail-closed guard answers 400 before
@@ -91,11 +65,11 @@ def post(monkeypatch, tmp_path):
     def _do(body, seed=None):
         if seed is not None:
             ns["CONFIG_PATH"].write_text(json.dumps(seed))
-        srv, _t, port = _serve(ns)
+        srv, _t, port = serve_dashboard(ns)
         try:
-            status, out = _post_json("127.0.0.1", port, body)
+            status, out = post_json(port, "/api/settings", body)
         finally:
-            srv.shutdown()
+            stop(srv, _t)
         try:
             cfg = json.loads(ns["CONFIG_PATH"].read_text())
         except (OSError, json.JSONDecodeError):

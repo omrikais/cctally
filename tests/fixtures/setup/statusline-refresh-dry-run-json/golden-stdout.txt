@@ -2,11 +2,11 @@
   "schema_version": 1,
   "mode": "dry-run",
   "symlinks": {
-    "would_create": 15,
+    "would_create": 16,
     "already": 0,
     "blocked": [],
     "destination": "/FAKE/.local/bin",
-    "total": 15
+    "total": 16
   },
   "hooks": {
     "would_add": [

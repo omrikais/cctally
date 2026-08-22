@@ -10,12 +10,12 @@ Install
   ✓ Update channel           stable
       details:
         channel: stable
-  ⚠ Symlinks                 0/15 available; missing/broken cctally, cctally-alerts, cctally-budget, cctally-dashboard, cctally-dollar-per-percent, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-transcript, cctally-tui, cctally-update
+  ⚠ Symlinks                 0/16 available; missing/broken cctally, cctally-alerts, cctally-budget, cctally-dashboard, cctally-dollar-per-percent, cctally-explain, cctally-five-hour-blocks, cctally-five-hour-breakdown, cctally-forecast, cctally-project, cctally-refresh-usage, cctally-statusline, cctally-sync-week, cctally-transcript, cctally-tui, cctally-update
       → Run `cctally setup`
       details:
         present: 0
-        total: 15
-        missing: ['cctally', 'cctally-alerts', 'cctally-budget', 'cctally-dashboard', 'cctally-dollar-per-percent', 'cctally-five-hour-blocks', 'cctally-five-hour-breakdown', 'cctally-forecast', 'cctally-project', 'cctally-refresh-usage', 'cctally-statusline', 'cctally-sync-week', 'cctally-transcript', 'cctally-tui', 'cctally-update']
+        total: 16
+        missing: ['cctally', 'cctally-alerts', 'cctally-budget', 'cctally-dashboard', 'cctally-dollar-per-percent', 'cctally-explain', 'cctally-five-hour-blocks', 'cctally-five-hour-breakdown', 'cctally-forecast', 'cctally-project', 'cctally-refresh-usage', 'cctally-statusline', 'cctally-sync-week', 'cctally-transcript', 'cctally-tui', 'cctally-update']
         stale: []
   ⚠ PATH                     cctally not reachable on $PATH
       → Append `export PATH="$HOME/.local/bin:$PATH"` to your shell rc, or run `cctally setup`

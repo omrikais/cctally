@@ -16,6 +16,7 @@ test can't observe (it pins CCTALLY_DISABLE_UPDATE_CHECK=1, so the hook
 short-circuits regardless).
 """
 import os
+import types
 import pathlib
 import subprocess
 import sys
@@ -77,7 +78,12 @@ def test_broken_pipe_skips_post_command_hooks(tmp_path, monkeypatch):
     # fd 1 corrupts pytest's --capture=fd teardown (which is why the
     # pipeline test above is subprocess-level). The contract under test
     # here is control flow (rc 0 + hooks skipped), not the redirect.
-    monkeypatch.setattr(os, "dup2", lambda *a: None)
+    # #630 S2: rebind the module name on the IMPORTING module, never on
+    # the shared stdlib object that every other importer and every
+    # concurrent thread resolves through.
+    _iso_os = types.SimpleNamespace(**vars(mod.os))
+    _iso_os.dup2 = lambda *a: None
+    monkeypatch.setattr(mod, "os", _iso_os)
 
     rc = mod.main(["daily"])
 

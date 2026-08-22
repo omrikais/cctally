@@ -43,7 +43,7 @@ from _lib_conversation import _MARKER_TAGS, _MARKER_RE, _is_system_marker
 # present a legacy/ingested command-marker row carrying a real <command-args>
 # prompt as a "You" turn (text=args, command_name badge). Re-exported for the
 # back-compat import surface + the consumer in _cctally_cache.py.
-from _lib_conversation import _extract_command_invocation
+from _lib_conversation import _extract_command_invocation, _join_text_blocks
 # #186: read-time ANSI strip for rows already indexed with raw SGR (no forced
 # re-ingest). Scoped to prose/thinking/title/label — NEVER tool_result (Bash
 # AnsiText boundary). Shares the parser's regex so ingest and read-time agree.
@@ -158,16 +158,6 @@ def _skill_name_from_preamble(first_line) -> "str | None":
     _, _, rest = first_line.partition(":")
     path = rest.strip().rstrip("/")
     return os.path.basename(path) or None if path else None
-
-
-def _join_text_blocks(blocks) -> str:
-    """Rejoin a row's text-block bodies the way the parser's _blocks_and_text did
-    ('\\n'-joined). A true meta row carries text='' (parser) with the body here in
-    blocks; a not-yet-reingested human row carries the body in its text column —
-    _meta_classify reads whichever is populated."""
-    if not blocks:
-        return ""
-    return "\n".join(b.get("text", "") or "" for b in blocks if b.get("kind") == "text")
 
 
 def _reingest_pending(conn) -> bool:
@@ -767,8 +757,108 @@ def _stamp_cache_failures(items):
         }
 
 
+def parse_blocks_json(blocks_json):
+    """A normalized blocks list, or `[]` for anything that is not one.
+
+    Ingest writes a JSON array of block objects, but nothing in the schema
+    enforces the element shape. The shared text join skips malformed elements;
+    stricter semantic consumers validate separately. A bare string can still
+    make command-invocation normalization raise `AttributeError`, which the
+    diagnosis contains as `calculation_failed` (#620 S3 R1).
+    """
+    try:
+        parsed = _json.loads(blocks_json or "[]")
+    except (ValueError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def is_compaction_blocks(text, parsed_blocks):
+    """The ONE read-time compaction predicate, over parsed blocks.
+
+    Compaction leaves exactly one retained signal and it is not the flag:
+    `isCompactSummary` is consumed at ingest, sets `entry_type = META` and
+    blanks `text`, and is never persisted. What survives is the summary body
+    inside `blocks_json`, so detection is sentinel inference over the body
+    reconstructed from it — mirroring the assembly meta-classify, which
+    requires an all-text body that reads as a compaction summary and is not a
+    slash-command invocation.
+
+    The all-text guard is evaluated FIRST and rejects a malformed element,
+    which is what keeps a bare string in the array from raising through
+    `_join_text_blocks`.
+    """
+    blocks = parsed_blocks or []
+    if not all(isinstance(b, dict) and b.get("kind") == "text" for b in blocks):
+        return False
+    body = text or _join_text_blocks(blocks)
+    return bool(_is_compaction_body(body)
+                and _extract_command_invocation(blocks, body) is None)
+
+
+def is_compaction_row(text, blocks_json):
+    """`is_compaction_blocks` over a raw `blocks_json` column value."""
+    return is_compaction_blocks(text, parse_blocks_json(blocks_json))
+
+
+def _cache_failure_rows(conn, session_id):
+    """The narrow physical read the cache-churn stream is built from.
+
+    Enough to dedup, group turns, derive the subagent_key, detect compaction
+    and join the token row. No ``blocks_json`` body parse beyond the all-text
+    compaction guard. Returns None for an unknown session.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM conversation_messages WHERE session_id=? LIMIT 1",
+        (session_id,)).fetchone()
+    if exists is None:
+        return None
+    return conn.execute(
+        "SELECT id, uuid, entry_type, text, blocks_json, model, "
+        "       msg_id, req_id, source_path "
+        "FROM conversation_messages WHERE session_id=? "
+        "ORDER BY timestamp_utc, id", (session_id,)).fetchall()
+
+
+def _cache_failure_turn_keys(rows):
+    """The deduped assistant turn keys this stream will need tokens for.
+
+    The same list ``fold_claude_cache_failure_events`` builds internally, in
+    the same first-occurrence order, derived here so the wrapper can prefetch
+    the usage map.
+    """
+    seen_uuid = set()
+    seen_keys = set()
+    keys = []
+    for row in rows:
+        u = row[1]
+        if u in seen_uuid:
+            continue
+        seen_uuid.add(u)
+        if row[2] == "assistant" and row[6] is not None:
+            key = (row[6], row[7])
+            if key not in seen_keys:
+                seen_keys.add(key)
+                keys.append(key)
+    return keys
+
+
 def _lightweight_rebuild_events(conn, session_id):
-    """Build the document-ordered ``_CFEvent`` stream for a session WITHOUT a
+    """The document-ordered ``_CFEvent`` stream for one session (U1, #217 S1).
+
+    Since #620 S3 this is a thin wrapper over the pure
+    ``fold_claude_cache_failure_events``; it performs the two reads and
+    delegates. Its signature, return shape and every caller are unchanged.
+    """
+    rows = _cache_failure_rows(conn, session_id)
+    if rows is None:
+        return []
+    return fold_claude_cache_failure_events(
+        rows, _turn_usage_map(conn, _cache_failure_turn_keys(rows)))
+
+
+def fold_claude_cache_failure_events(rows, usage_map, *, with_sources=False):
+    """Build the document-ordered ``_CFEvent`` stream WITHOUT a
     full ``_assemble_session`` (U1, #217 S1). Skips the expensive assembly work
     (no ``blocks_json`` body parse, no tool-result folding, no meta-classify /
     ANSI strip, no subagent correlation) but faithfully reproduces the canonical
@@ -794,19 +884,6 @@ def _lightweight_rebuild_events(conn, session_id):
     fragment, and each meta/human row at its own position). That preserves the
     running-max walk the predicate requires.
     """
-    exists = conn.execute(
-        "SELECT 1 FROM conversation_messages WHERE session_id=? LIMIT 1",
-        (session_id,)).fetchone()
-    if exists is None:
-        return []
-    # Narrow column set: enough to dedup, group turns, derive the subagent_key,
-    # detect compaction, and join the token row. No blocks_json body parse beyond
-    # the all-text compaction guard (which needs text OR the text-block join).
-    rows = conn.execute(
-        "SELECT id, uuid, entry_type, text, blocks_json, model, "
-        "       msg_id, req_id, source_path "
-        "FROM conversation_messages WHERE session_id=? "
-        "ORDER BY timestamp_utc, id", (session_id,)).fetchall()
     seen_uuid = set()
     logical = []
     for row in rows:
@@ -824,7 +901,6 @@ def _lightweight_rebuild_events(conn, session_id):
     sources = []                # parallel: the turn key per assistant event
     turn_index = {}             # (msg_id, req_id) -> index into events
     turn_has_prose = {}         # (msg_id, req_id) -> bool (model promoted yet?)
-    turn_keys = []              # ordered list of grouped turn keys (for the token map)
     for (rid, u, etype, text, blocks, model, msg_id, req_id,
          source_path) in logical:
         if etype == "assistant" and msg_id is not None:
@@ -834,7 +910,6 @@ def _lightweight_rebuild_events(conn, session_id):
             if ev_idx is None:
                 ev_idx = len(events)
                 turn_index[key] = ev_idx
-                turn_keys.append(key)
                 ev = _CFEvent(key=(_subagent_key(source_path), model),
                               model=model)
                 events.append(ev)
@@ -861,15 +936,7 @@ def _lightweight_rebuild_events(conn, session_id):
             # BEFORE meta-classify, so a body carrying <command-args> never reads
             # as compaction; compaction bodies have no <command-args>, so in
             # practice the invocation check is a faithful belt-and-suspenders.
-            try:
-                parsed_blocks = _json.loads(blocks or "[]")
-            except (ValueError, TypeError):
-                parsed_blocks = []
-            body = text or _join_text_blocks(parsed_blocks)
-            all_text = all(b.get("kind") == "text"
-                           for b in (parsed_blocks or []))
-            if (all_text and _is_compaction_body(body)
-                    and _extract_command_invocation(parsed_blocks, body) is None):
+            if is_compaction_row(text, blocks):
                 events.append(_CFEvent(compaction=True))
                 sources.append(None)
         # tool_result rows and null-msg_id assistant rows carry no token event.
@@ -879,12 +946,14 @@ def _lightweight_rebuild_events(conn, session_id):
     # turn key absent from session_entries carries NO tokens, so its event is
     # dropped (neither flags nor moves the running-max) — parity with
     # _cache_failure_events_from_items's `tokens` skip.
-    usage = _turn_usage_map(conn, turn_keys)
+    usage = usage_map
     filtered = []
+    filtered_sources = []      # parallel: the turn key per emitted event
     si = 0
     for ev in events:
         if ev.compaction:
             filtered.append(ev)
+            filtered_sources.append(None)
             si += 1
             continue
         key = sources[si]
@@ -895,6 +964,14 @@ def _lightweight_rebuild_events(conn, session_id):
         ev.cc = tok.get("cache_creation", 0) or 0
         ev.cr = tok.get("cache_read", 0) or 0
         filtered.append(ev)
+        filtered_sources.append(key)
+    # `with_sources` mirrors `_cache_failure_events_from_items`, which has always
+    # returned `(events, sources)`. `_iter_cache_failures` yields the flagged
+    # event's INDEX, so without the parallel list a caller cannot say which turn
+    # was flagged — which is exactly what the diagnosis has to publish. Default
+    # off, so every existing caller keeps the bare list it always received.
+    if with_sources:
+        return filtered, filtered_sources
     return filtered
 
 
@@ -1678,14 +1755,68 @@ def _turn_usage_map(conn, turn_keys):
 _SPAWN_TOOL_NAMES = ("Agent", "Task")
 
 
+def _claude_canonical_rows(conn, session_id):
+    """The 18-column physical read a canonical assembly runs over.
+
+    Returns None for an unknown session. Split out of ``_assemble_session``
+    (#620 S3 X1) so the assembly fold can be pure over prefetched rows while
+    the wrapper keeps performing exactly the reads it always did.
+
+    #177: stop_reason / attribution_* are TAIL-APPENDED (indices 15/16/17)
+    AFTER source_tool_use_id so the existing positional reads (incl.
+    ``_latest(logical, 10/11)`` for cwd/git_branch, ``r[6]`` for model, ``[2]``
+    for ts) are all unchanged. Every unpacker downstream extends its tail in
+    lockstep.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM conversation_messages WHERE session_id=? LIMIT 1",
+        (session_id,)).fetchone()
+    if exists is None:
+        return None
+    return conn.execute(
+        "SELECT id, uuid, timestamp_utc, entry_type, text, blocks_json, model, "
+        "       msg_id, req_id, is_sidechain, cwd, git_branch, source_path, parent_uuid, "
+        "       source_tool_use_id, stop_reason, attribution_skill, attribution_plugin "
+        "FROM conversation_messages WHERE session_id=? "
+        "ORDER BY timestamp_utc, id", (session_id,)).fetchall()
+
+
+def _claude_turn_keys(rows):
+    """The deduped assistant turn keys, in first-occurrence document order.
+
+    Exactly the list ``fold_claude_canonical`` builds internally as
+    ``turn_index``, derived here so the wrapper can prefetch the cost and usage
+    maps the fold consumes. Dedup by uuid comes first, because a replay carries
+    the original uuid and its later occurrence is not canonical.
+    """
+    seen_uuid = set()
+    seen_keys = set()
+    keys = []
+    for row in rows:
+        u = row[1]
+        if u in seen_uuid:
+            continue
+        seen_uuid.add(u)
+        if row[3] == "assistant" and row[7] is not None:
+            key = (row[7], row[8])
+            if key not in seen_keys:
+                seen_keys.add(key)
+                keys.append(key)
+    return keys
+
+
 def _assemble_session(conn, session_id):
     """Shared assembly for get_conversation / get_conversation_outline (#177 S5).
 
-    Runs the full dedup → turn-grouping → fold → sweep → meta-classify →
+    Runs the full dedup -> turn-grouping -> fold -> sweep -> meta-classify ->
     cost/usage-stamp pipeline over the WHOLE session and returns the
     pre-pagination state, so the outline's turns match the reader's items 1:1
-    BY CONSTRUCTION (Codex F8 — one grouping pass, never two implementations).
+    BY CONSTRUCTION (Codex F8 - one grouping pass, never two implementations).
     Returns None for an unknown session.
+
+    Since #620 S3 this is a thin wrapper: it performs the three reads and
+    delegates to the pure ``fold_claude_canonical``. Its signature, return
+    shape and every caller are unchanged.
     """
     # Opt-in phase instrumentation (issue #276 M5): an outer `assemble` root
     # wrapping eight structural child seams. Explicit __enter__/__exit__ (not a
@@ -1696,38 +1827,94 @@ def _assemble_session(conn, session_id):
     sp = _perf()
     _root = sp.phase("assemble"); _root.__enter__()
     _ph = sp.phase("assemble.read"); _ph.__enter__()
-    exists = conn.execute(
-        "SELECT 1 FROM conversation_messages WHERE session_id=? LIMIT 1",
-        (session_id,)).fetchone()
-    if exists is None:
+    rows = _claude_canonical_rows(conn, session_id)
+    if rows is None:
         _ph.__exit__(None, None, None)
         _root.__exit__(None, None, None)
         return None
+    _ph.set_count(len(rows)); _ph.__exit__(None, None, None)
 
-    # Pull the session ordered; dedup logical messages by (session_id, uuid),
-    # canonical row = earliest (timestamp_utc, id). Replays carry the original
-    # uuid, so the first occurrence in ascending order is canonical.
-    # #177: stop_reason / attribution_* are TAIL-APPENDED (indices 15/16/17)
-    # AFTER source_tool_use_id so the existing positional reads (incl.
-    # _latest(logical, 10/11) for cwd/git_branch, r[6] for model, [2] for ts)
-    # are all unchanged. Every unpacker below extends its tail in lockstep.
-    raw = conn.execute(
-        "SELECT id, uuid, timestamp_utc, entry_type, text, blocks_json, model, "
-        "       msg_id, req_id, is_sidechain, cwd, git_branch, source_path, parent_uuid, "
-        "       source_tool_use_id, stop_reason, attribution_skill, attribution_plugin "
-        "FROM conversation_messages WHERE session_id=? "
-        "ORDER BY timestamp_utc, id", (session_id,)).fetchall()
-    _ph.set_count(len(raw)); _ph.__exit__(None, None, None)
+    # The three reads the fold would otherwise perform, hoisted here.
+    # `_turn_cost_map` and `_turn_usage_map` are SEPARATE maps over the same
+    # deduped session_entries row: cost may be a vendor-provided override, so
+    # the two are never arithmetically equal and neither can be derived from
+    # the other.
+    turn_keys = _claude_turn_keys(rows)
+    # #620 S3 R5: the two chunked `session_entries` reads are the database work
+    # `assemble.cost` was created to measure, and hoisting them out of the fold
+    # left that time attributed to the untraced remainder of the root. They get
+    # their own phase here, carrying the same chunking meta, so
+    # `dashboard-perf --trace on` still sees them. A DISTINCT name, because the
+    # fold keeps its own `assemble.cost` phase over the stamping it still does
+    # and two siblings sharing one name would collide in every by-name view.
+    _ph = sp.phase("assemble.cost_read"); _ph.__enter__()
+    _chunks = (len(turn_keys) + 399) // 400 if turn_keys else 0
+    _ph.set_meta(turn_keys=len(turn_keys), cost_chunks=_chunks,
+                 usage_chunks=_chunks)
+    _usage = _turn_usage_map(conn, turn_keys)
+    _costs = _turn_cost_map(conn, turn_keys)
+    _ph.__exit__(None, None, None)
+    result = fold_claude_canonical(
+        rows, _usage, _costs,
+        allow_human_fallback=_reingest_pending(conn),
+    )
+    _root.__exit__(None, None, None)
+    return result
 
-    _ph = sp.phase("assemble.dedup"); _ph.__enter__()
-    seen_uuid = set()
-    logical = []   # canonical physical rows, in order
-    for row in raw:
-        u = row[1]
-        if u in seen_uuid:
+
+def dedupe_claude_uuid_rows(rows, uuid_of=None):
+    """Keep the FIRST occurrence of each uuid, in the order given.
+
+    One statement of the rule, shared by ``fold_claude_canonical`` and by the
+    #620 S3 fan-out join. ``conversation_messages`` is unique on
+    ``(source_path, byte_offset)`` only, the dedicated ``idx_conv_session_uuid``
+    index exists precisely because the canonical reader dedupes on the logical
+    identity, and a ``--resume``d session replays its rows into a second file
+    carrying the ORIGINAL uuid. Callers pass ONE session's rows in
+    ``(timestamp_utc, id)`` order, which makes this the ``(session_id, uuid)``
+    deduplication the S3 spec names.
+
+    ``uuid_of`` reads the uuid out of a caller's row shape; it defaults to the
+    18-column physical tuple's index 1.
+    """
+    read = uuid_of if uuid_of is not None else (lambda row: row[1])
+    seen = set()
+    kept = []
+    for row in rows:
+        key = read(row)
+        if key in seen:
             continue
-        seen_uuid.add(u)
-        logical.append(row)
+        seen.add(key)
+        kept.append(row)
+    return kept
+
+
+def fold_claude_canonical(rows, token_map, cost_map, *,
+                          allow_human_fallback=False):
+    """The pure canonical assembly, over prefetched facts (#620 S3 X1).
+
+    THREE positional arguments, not two. ``_assemble_session`` consumes a
+    separately priced cost map alongside the token map, so a fold taking only
+    rows and tokens cannot reproduce it: cost may be the vendor-provided
+    ``cost_usd_raw`` override with the token math bypassed, and the contract
+    between the two maps is "same source row", never ``cost == f(tokens)``.
+
+    ``rows`` is the 18-column physical stream in (timestamp_utc, id) order;
+    ``token_map`` and ``cost_map`` are keyed by ``(msg_id, req_id)``;
+    ``allow_human_fallback`` is the read-time 005-reingest gate. This function
+    opens no database and returns the same dict ``_assemble_session`` has
+    always returned.
+    """
+    sp = _perf()
+    # #620 S3 R8: this fold opens CHILD phases, and `_assemble_session` is no
+    # longer its only caller — the diagnosis calls it directly. With no root
+    # open those children would be emitted into whatever phase happened to be
+    # on the stack, so open the `assemble` root here when nothing else has.
+    _own_root = None
+    if not sp.in_phase():
+        _own_root = sp.phase("assemble"); _own_root.__enter__()
+    _ph = sp.phase("assemble.dedup"); _ph.__enter__()
+    logical = dedupe_claude_uuid_rows(rows)   # canonical physical rows, in order
     _ph.set_count(len(logical)); _ph.__exit__(None, None, None)
 
     _ph = sp.phase("assemble.build"); _ph.__enter__()
@@ -1993,7 +2180,6 @@ def _assemble_session(conn, session_id):
     # + skill_name, so the client renders a collapsed skill/system-marker/context
     # disclosure instead of a "YOU" prompt. `text` is set to the rendered body
     # (the DB text column stays '' for FTS); genuine human turns are untouched.
-    allow_human_fallback = _reingest_pending(conn)
     for it in items:
         if it["kind"] in ("meta", "human"):
             # #188: a slash-command invocation carrying a real prompt in
@@ -2070,10 +2256,10 @@ def _assemble_session(conn, session_id):
     _cost_chunks = (_turn_keys + 399) // 400 if _turn_keys else 0
     _ph.set_meta(turn_keys=_turn_keys, cost_chunks=_cost_chunks,
                  usage_chunks=_cost_chunks)
-    costs = _turn_cost_map(conn, list(turn_index))
+    costs = cost_map
     # #177: per-turn token usage from the SAME deduped session_entries row cost
     # uses (a separate map; _turn_cost_map is unchanged for the search path).
-    usage = _turn_usage_map(conn, list(turn_index))
+    usage = token_map
     # Stamp per-item cost first, then derive the header from the SUM of the
     # ROUNDED per-item assistant costs (M2) — so the §6.5 invariant
     # sum(items.cost_usd) == header cost_usd holds EXACTLY to 1e-9 by
@@ -2256,7 +2442,8 @@ def _assemble_session(conn, session_id):
     for it in items:
         it.pop("_source_tool_use_id", None)
 
-    _root.__exit__(None, None, None)
+    if _own_root is not None:
+        _own_root.__exit__(None, None, None)
     return {"items": items, "logical": logical,
             "subagent_meta": subagent_meta, "header_cost": header_cost}
 

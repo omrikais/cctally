@@ -23,6 +23,7 @@ import time
 from http.client import HTTPConnection
 
 from conftest import load_script, redirect_paths
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, read_event, read_no_event, start, stop
 
 # A real model id from CLAUDE_MODEL_PRICING so token-derived cost is non-zero.
 _MODEL = "claude-opus-4-8"
@@ -105,7 +106,7 @@ def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False,
           no_sync=False, initial_jsonl=None):
     """Seed cache.db from a REAL JSONL file (session ``s1``) and start a
     server. Returns ``(srv, projects_dir, session_jsonl)``; caller must
-    ``srv.shutdown()``."""
+    ``stop(srv, srv._test_thread)``."""
     redirect_paths(ns, monkeypatch, tmp_path)
     sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
 
@@ -143,28 +144,45 @@ def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False,
     HandlerCls.cctally_expose_transcripts = expose
     HandlerCls.no_sync = no_sync
 
+    # #630 S2: a live-tail handler idles for `_LIVE_TAIL_KEEPALIVE` seconds
+    # between writes, and a write is the only thing that discovers the client
+    # has gone. At the shipped 15 s that made every abandoned handler outlive
+    # its test; at 1 s it exits within about two seconds of `s.close()`, which
+    # is what lets `stop()` reap it inside the presence backstop.
+    conv = sys.modules["_cctally_dashboard_conversation"]
+    monkeypatch.setattr(conv, "_LIVE_TAIL_KEEPALIVE", 1.0)
+
     srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
-    # #220: this is a long-lived SSE server whose handler thread we abandon at
-    # teardown — callers only `srv.shutdown()` (stops the accept loop); the
-    # in-flight watch-loop handler is never joined. After the test returns that
-    # daemon thread can still raise a NON-disconnect exception (its tmp_path
-    # JSONL / cache.db went away — the handler catches BrokenPipe/ConnectionReset
-    # but not these), which the stdlib default `handle_error` dumps as a
-    # traceback to sys.stderr, landing in a LATER test's capsys window under
-    # serial pytest. Production uses `_QuietThreadingHTTPServer`; here we just
-    # silence it — a throwaway test server's post-assertion handler errors are
-    # pure teardown noise, never the thing under test.
+    # #630 S2: `socketserver.ThreadingTCPServer` sets `daemon_threads = False`
+    # as its class default, so `start()` sets the flag on this instance and
+    # installs the holder that records the resulting daemon handlers. An
+    # earlier form assigned `daemon_threads = False` here on the belief that
+    # `block_on_close` is `not daemon_threads` and that the stdlib list is
+    # otherwise unusable; the first half is false — see `_TrackedHandlerThreads`
+    # — and the assignment only restated the class default. A live-tail handler
+    # that outlived `stop()`'s reap was therefore a non-daemon thread, and a
+    # non-daemon thread blocks its xdist worker's interpreter exit for its full
+    # remaining duration.
+    # #220, as amended by #630 S2: this server's in-flight watch-loop handler
+    # used to be abandoned at teardown, because callers only `srv.shutdown()`,
+    # which stops the accept loop and nothing else. That daemon thread could
+    # then raise a NON-disconnect exception after the test returned (its
+    # tmp_path JSONL / cache.db went away — the handler catches BrokenPipe and
+    # ConnectionReset but not these), and the stdlib default `handle_error`
+    # dumped the traceback into a LATER test's capsys window under serial
+    # pytest. `stop()` now joins the handler, so the abandonment is gone; the
+    # silencing stays, because a throwaway test server's teardown-window
+    # handler errors are noise either way and production uses
+    # `_QuietThreadingHTTPServer` for the same reason.
     srv.handle_error = lambda request, client_address: None
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    srv._test_thread = start(srv)
     return srv, projects, jsonl
 
 
 def _get(port, path, *, host=None):
     """Plain GET helper. With ``host`` set, send it as the literal Host header
     (skip_host=True) so the privacy gate sees a non-loopback authority."""
-    c = HTTPConnection("127.0.0.1", port, timeout=5)
+    c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     if host is None:
         c.request("GET", path)
     else:
@@ -182,7 +200,7 @@ def _open_sse(port, path, *, timeout=10.0):
     """Open an SSE stream over a raw socket and return the connected socket.
 
     The stream is a long-lived ``text/event-stream`` with no Content-Length,
-    so the caller reads frames via ``_read_event``.
+    so the caller reads frames via ``read_event``.
     """
     s = _socket.create_connection(("127.0.0.1", port), timeout=timeout)
     s.settimeout(timeout)
@@ -193,37 +211,6 @@ def _open_sse(port, path, *, timeout=10.0):
     ).encode("utf-8")
     s.sendall(req)
     return s
-
-
-def _read_event(s, *, marker="event: tail", deadline=8.0, allow_timeout=False):
-    """Read from the SSE socket until a frame containing ``marker`` (terminated
-    by a blank line) arrives, or until the deadline. Returns the matching frame
-    text, or ``None`` when ``allow_timeout`` and nothing matched in time."""
-    buf = b""
-    end = dt.datetime.now() + dt.timedelta(seconds=deadline)
-    while dt.datetime.now() < end:
-        s.settimeout(0.5)
-        try:
-            chunk = s.recv(4096)
-        except (_socket.timeout, TimeoutError):
-            continue
-        if not chunk:
-            break
-        buf += chunk
-        text = buf.decode("utf-8", "replace")
-        idx = text.find(marker)
-        if idx == -1:
-            continue
-        rest = text[idx:]
-        blank = rest.find("\n\n")
-        if blank == -1:
-            continue
-        return rest[:blank]
-    if allow_timeout:
-        return None
-    raise AssertionError(
-        f"no SSE frame matching {marker!r} arrived within {deadline}s; "
-        f"buffer={buf!r}")
 
 
 def test_events_403_for_non_loopback_host(tmp_path, monkeypatch):
@@ -238,7 +225,7 @@ def test_events_403_for_non_loopback_host(tmp_path, monkeypatch):
                          host="evil.example.com")
         assert status == 403
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_events_emits_tail_on_file_growth(tmp_path, monkeypatch):
@@ -251,16 +238,19 @@ def test_events_emits_tail_on_file_growth(tmp_path, monkeypatch):
         port = srv.server_address[1]
         s = _open_sse(port, "/api/conversation/s1/events")
         try:
-            # Let the connect-ingest + the cache-cursor `seen` baseline settle
-            # BEFORE the append, so the growth is detected by the steady-state
-            # poll loop (a write landing mid-connect-ingest would be consumed by
-            # it and baselined away — that catch-up path is the client's `open`
-            # pollTail, not the `tail` ping this test asserts).
-            time.sleep(1.0)
+            # Wait for the connect-ingest + cache-cursor `seen` baseline to be
+            # ESTABLISHED before the append, so the growth is detected by the
+            # steady-state poll loop (a write landing mid-connect-ingest would
+            # be consumed by it and baselined away — that catch-up path is the
+            # client's `open` pollTail, not the `tail` ping this test asserts).
+            # #630 S2: `ready` fires before resolve() and ingest(), so it does
+            # not mean a baseline exists. This frame does, which is why the
+            # one-second guess it replaces is gone.
+            read_event(s, marker="event: baselined")
             # Append a new assistant turn carrying a distinctive token.
             with open(jsonl, "a", encoding="utf-8") as fh:
                 fh.write(_asst_line("a2", "m2", "r2", "answer AA", sid="s1"))
-            frame = _read_event(s, marker="event: tail", deadline=10.0)
+            frame = read_event(s, marker="event: tail")
             assert frame.startswith("event: tail")
             data_line = [ln for ln in frame.splitlines()
                          if ln.startswith("data: ")][0]
@@ -273,7 +263,7 @@ def test_events_emits_tail_on_file_growth(tmp_path, monkeypatch):
         items = json.loads(body)["items"]
         assert any("AA" in (it.get("text") or "") for it in items)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_background_completion_live_tail_updates_the_open_conversation_once(
@@ -313,11 +303,13 @@ def test_background_completion_live_tail_updates_the_open_conversation_once(
 
         s = _open_sse(port, "/api/conversation/s1/events")
         try:
-            _read_event(s, marker="event: ready", deadline=8.0)
-            time.sleep(1.0)
+            # #630 S2: `ready` fires before resolve() and ingest(), so it does
+            # not mean a baseline exists. This frame does, which is why the
+            # one-second guess it replaces is gone.
+            read_event(s, marker="event: baselined")  # the server says the baseline exists
             with open(jsonl, "a", encoding="utf-8") as fh:
                 fh.write(notification)
-            frame = _read_event(s, marker="event: tail", deadline=10.0)
+            frame = read_event(s, marker="event: tail")
             assert json.loads(next(
                 line[len("data: "):]
                 for line in frame.splitlines()
@@ -369,7 +361,7 @@ def test_background_completion_live_tail_updates_the_open_conversation_once(
         finally:
             conn.close()
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_events_passive_under_no_sync(tmp_path, monkeypatch):
@@ -384,13 +376,11 @@ def test_events_passive_under_no_sync(tmp_path, monkeypatch):
         try:
             with open(jsonl, "a", encoding="utf-8") as fh:
                 fh.write(_asst_line("a2", "m2", "r2", "answer AA", sid="s1"))
-            frame = _read_event(s, marker="event: tail", deadline=3.0,
-                                allow_timeout=True)
-            assert frame is None
+            read_no_event(s, marker="event: tail", window=3.0)
         finally:
             s.close()
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_events_emits_ready_when_active(tmp_path, monkeypatch):
@@ -404,12 +394,12 @@ def test_events_emits_ready_when_active(tmp_path, monkeypatch):
         port = srv.server_address[1]
         s = _open_sse(port, "/api/conversation/s1/events")
         try:
-            frame = _read_event(s, marker="event: ready", deadline=8.0)
+            frame = read_event(s, marker="event: ready")
             assert frame.startswith("event: ready")
         finally:
             s.close()
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_events_passive_emits_no_ready(tmp_path, monkeypatch):
@@ -423,10 +413,8 @@ def test_events_passive_emits_no_ready(tmp_path, monkeypatch):
         port = srv.server_address[1]
         s = _open_sse(port, "/api/conversation/s1/events")
         try:
-            frame = _read_event(s, marker="event: ready", deadline=3.0,
-                                allow_timeout=True)
-            assert frame is None
+            read_no_event(s, marker="event: ready", window=3.0)
         finally:
             s.close()
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)

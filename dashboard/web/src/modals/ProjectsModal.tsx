@@ -183,7 +183,7 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
   };
 
   // Window-aware project rows: window-summed cost + window-summed
-  // attributed pct + window-summed sessions + window min/max of
+  // attributed pct + window-deduplicated sessions + window min/max of
   // first/last seen + derived % of week. Default sort is desc by window
   // cost (spec §3.4); a click on any `SortableHeader` cell persists an
   // override at `prefs.projectsSortOverride` and routes through
@@ -209,11 +209,11 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
         (s, c) => (c == null ? s : (s ?? 0) + c),
         null,
       );
-      // Per-week counts double-count cross-week sessions (rare in
-      // practice — a single Claude session typically stays inside one
-      // ISO Monday boundary). Matches the share-flow's window sum at
-      // `_build_share_projects_envelope` in bin/_cctally_dashboard.py.
-      const sessionsCount = weeklySessions.reduce((s, c) => s + c, 0);
+      // The server owns cross-bucket identity: a session active on both
+      // sides of a reset is still one session in the selected window.
+      // Fall back to the historical sum for stored/older envelopes.
+      const sessionsCount = p.session_counts_by_window?.[String(windowWeeks) as '1' | '4' | '8' | '12']
+        ?? weeklySessions.reduce((s, c) => s + c, 0);
       const firstSeenAt = weeklyFirstSeen.reduce<string | null>(
         (acc, ts) => (ts == null ? acc : acc == null || ts < acc ? ts : acc),
         null,

@@ -20,6 +20,8 @@ from _lib_dashboard_sources import (
 )
 from conftest import load_script, redirect_paths
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
+
 
 UTC = dt.timezone.utc
 
@@ -140,9 +142,7 @@ def _boot(ns, tmp_path, monkeypatch):
     handler.no_sync = True
     handler.display_tz_pref_override = None
     server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
-    server.daemon_threads = True
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    thread = start(server)
     return server, thread
 
 
@@ -160,7 +160,7 @@ def _render(
     if source_marker is not None:
         payload["source"] = source_marker
     port = server.server_address[1]
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     try:
         conn.request(
             "POST", "/api/share/render", body=json.dumps(payload),
@@ -179,7 +179,7 @@ def _render(
 
 def _request(server, method, path, payload=None):
     port = server.server_address[1]
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     try:
         headers = {"Host": f"127.0.0.1:{port}"}
         body = None
@@ -306,9 +306,7 @@ def test_source_share_defaults_omitted_source_to_legacy_claude_response(monkeypa
         assert rendered[-1].source == "claude"
         assert rendered[-1].source_label == "Claude"
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_source_share_uses_native_codex_snapshot_and_labeled_all_composition(monkeypatch, tmp_path):
@@ -327,9 +325,7 @@ def test_source_share_uses_native_codex_snapshot_and_labeled_all_composition(mon
         assert "Codex" in combined["body"]
         assert combined["snapshot"]["data_digest"] != codex["snapshot"]["data_digest"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_native_source_share_uses_the_requested_provider_panel_rows(monkeypatch, tmp_path):
@@ -347,9 +343,7 @@ def test_native_source_share_uses_the_requested_provider_panel_rows(monkeypatch,
         assert "Codex project" in result["body"]
         assert "Codex session" not in result["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_codex_current_week_share_uses_canonical_week_period_and_token_chrome(
@@ -383,9 +377,7 @@ def test_codex_current_week_share_uses_canonical_week_period_and_token_chrome(
         assert [column.label for column in snapshot.columns] == ["Week", "Tokens", "$ Cost"]
         assert "Current data" not in result["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_current_week_hero_freshness_changes_disclosure_digest_and_composer_drift(
@@ -488,9 +480,7 @@ def test_current_week_hero_freshness_changes_disclosure_digest_and_composer_drif
         assert section["drift_detected"] is False
         assert note in refreshed["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 @pytest.mark.parametrize(
@@ -524,9 +514,7 @@ def test_all_current_week_disclosure_stays_provider_local(
             assert "Codex" in result["body"]
             assert "$2.00" in result["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_the_current_week_share_note_ignores_the_shared_freshness_axes(
@@ -576,9 +564,7 @@ def test_the_current_week_share_note_ignores_the_shared_freshness_axes(
             assert status == 200
             assert "stale provider-cycle evidence" not in result["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_explicit_claude_current_week_retains_actual_and_digests_hero_freshness(
@@ -618,9 +604,7 @@ def test_explicit_claude_current_week_retains_actual_and_digests_hero_freshness(
         assert "$0.00" in stale["body"]
         assert stale["snapshot"]["data_digest"] != fresh["snapshot"]["data_digest"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_source_less_current_week_keeps_legacy_shape_when_hero_is_stale(
@@ -660,9 +644,7 @@ def test_source_less_current_week_keeps_legacy_shape_when_hero_is_stale(
         }
         assert "stale provider-cycle evidence" not in stale["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_codex_render_branches_before_claude_panel_build(monkeypatch, tmp_path):
@@ -685,9 +667,7 @@ def test_codex_render_branches_before_claude_panel_build(monkeypatch, tmp_path):
             "error": "source render failed",
         }
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_codex_data_change_updates_digest_and_compose_drift(monkeypatch, tmp_path):
@@ -736,9 +716,7 @@ def test_codex_data_change_updates_digest_and_compose_drift(monkeypatch, tmp_pat
         assert result["data_digest_now"] == second["snapshot"]["data_digest"]
         assert result["drift_detected"] is True
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 @pytest.mark.parametrize("endpoint", ["render", "compose"])
@@ -776,9 +754,7 @@ def test_source_share_exceptions_log_private_canaries_and_return_generic_envelop
         assert canary not in json.dumps(body)
         assert any(canary in line for line in logged)
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 @pytest.mark.parametrize("source", ["codex", "all"])
@@ -813,9 +789,7 @@ def test_noncurrent_source_share_rebuilds_codex_provider_state_without_sync(
         assert panel == "daily"
         assert options["period"] == {"kind": "previous"}
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_source_share_rejects_unknown_source_with_generic_capability_error(monkeypatch, tmp_path):
@@ -829,9 +803,7 @@ def test_source_share_rejects_unknown_source_with_generic_capability_error(monke
             "error": "source capability unavailable",
         }
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_source_identity_round_trips_presets_history_and_legacy_records_without_mutating_them(
@@ -880,9 +852,7 @@ def test_source_identity_round_trips_presets_history_and_legacy_records_without_
         assert stored["share"]["presets"]["sessions"]["codex-recap"]["source"] == "codex"
         assert stored["share"]["history"][-1]["source"] == "all"
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_source_compose_expands_all_and_supports_native_forecast(monkeypatch, tmp_path):
@@ -909,9 +879,7 @@ def test_source_compose_expands_all_and_supports_native_forecast(monkeypatch, tm
         assert forecast["snapshot"]["source"] == "codex"
         assert "Forecast" in forecast["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 # =========================================================================
@@ -949,9 +917,7 @@ def _boot_forecast(ns, tmp_path, monkeypatch, *, status, projected=82.5):
     handler.no_sync = True
     handler.display_tz_pref_override = None
     server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
-    server.daemon_threads = True
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    thread = start(server)
     return server, thread
 
 
@@ -1008,9 +974,7 @@ def _boot_forecast_with_budget(ns, tmp_path, monkeypatch, *, budget):
     handler.no_sync = True
     handler.display_tz_pref_override = None
     server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
-    server.daemon_threads = True
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    thread = start(server)
     return server, thread
 
 
@@ -1030,9 +994,7 @@ def test_share_forecast_carries_the_configured_budget_status(monkeypatch, tmp_pa
         # The quota projection it sits beside is untouched.
         assert "| 61.0% | 82.5% |" in forecast["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_share_forecast_omits_the_budget_note_when_none_is_configured(
@@ -1053,9 +1015,7 @@ def test_share_forecast_omits_the_budget_note_when_none_is_configured(
         assert "Budget (" not in forecast["body"]
         assert "| 61.0% | 82.5% |" in forecast["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def _forecast_recipe():
@@ -1130,9 +1090,7 @@ def _boot_forecast_budget_matrix(ns, tmp_path, monkeypatch):
     handler.no_sync = True
     handler.display_tz_pref_override = None
     server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
-    server.daemon_threads = True
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    thread = start(server)
     return server, thread
 
 
@@ -1157,9 +1115,7 @@ def test_share_claude_forecast_carries_its_configured_budget_status(
         # Never the OTHER provider's budget — nothing is composed across them.
         assert "calendar-month" not in forecast["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_share_all_forecast_budget_note_is_the_ACCOUNT_status_not_the_vendor_one(
@@ -1207,9 +1163,7 @@ def test_share_all_forecast_budget_note_is_the_ACCOUNT_status_not_the_vendor_one
             unfocused["body"])
         assert "$40.00" not in unfocused["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 @pytest.mark.parametrize(
@@ -1251,9 +1205,7 @@ def test_share_forecast_blanks_a_projection_whose_status_is_not_ok(
         assert "82.5%" not in composed["body"]
         assert "61.0%" in composed["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_share_forecast_publishes_an_ok_projection_unchanged(monkeypatch, tmp_path):
@@ -1267,9 +1219,7 @@ def test_share_forecast_publishes_an_ok_projection_unchanged(monkeypatch, tmp_pa
         assert status_code == 200
         assert "| 61.0% | 82.5% |" in forecast["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_share_forecast_blanks_after_an_idle_clock_turns_the_status_stale(
@@ -1310,9 +1260,7 @@ def test_share_forecast_blanks_after_an_idle_clock_turns_the_status_stale(
         assert status_code == 200
         assert "| 61.0% | \u2014 |" in forecast["body"]
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 # =====================================================================
@@ -1712,9 +1660,7 @@ def test_share_digest_is_stable_across_ten_milliseconds(
             "reaches it raw"
         )
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 @pytest.mark.parametrize(
@@ -1749,9 +1695,7 @@ def test_share_digest_ten_milliseconds_later_does_not_compose_as_drift(
         assert section["data_digest_now"] == at_add
         assert section["drift_detected"] is False
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_share_digest_changes_when_a_rendered_project_cost_changes(
@@ -1780,9 +1724,7 @@ def test_share_digest_changes_when_a_rendered_project_cost_changes(
         assert "99.50" in second["body"]
         assert after != before
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 # --- The eight discrimination controls (spec §4 Verification table) ---
@@ -1874,9 +1816,7 @@ def test_s3_control_codex_trend_and_forecast_content_moves_the_digest(
         assert trend_after != trend_before
         assert forecast_after != forecast_before
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_s3_control_all_mode_codex_only_change_moves_the_digest(
@@ -1910,9 +1850,7 @@ def test_s3_control_all_mode_codex_only_change_moves_the_digest(
         assert second["body"] != first["body"]
         assert after != before
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 @pytest.mark.parametrize(
@@ -1980,9 +1918,7 @@ def test_s3_control_codex_availability_change_moves_the_digest(
         assert second["body"] != first["body"]
         assert after != before
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_s3_control_codex_blocks_reclock_leaves_the_digest_alone(
@@ -2011,9 +1947,7 @@ def test_s3_control_codex_blocks_reclock_leaves_the_digest_alone(
         assert second["body"] == first["body"]
         assert after == before
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_s3_control_two_same_day_codex_blocks_windows_move_the_digest(
@@ -2042,9 +1976,7 @@ def test_s3_control_two_same_day_codex_blocks_windows_move_the_digest(
         assert second["body"] == first["body"]
         assert after != before
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_s3_control_current_week_visual_ignores_days_remaining(
@@ -2072,9 +2004,7 @@ def test_s3_control_current_week_visual_ignores_days_remaining(
         assert second["body"] == first["body"]
         assert after == before
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_s3_control_data_version_alone_leaves_the_digest_alone(
@@ -2093,9 +2023,7 @@ def test_s3_control_data_version_alone_leaves_the_digest_alone(
         assert second["body"] == first["body"]
         assert after == before
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_s3_control_content_toggles_leave_the_digest_alone(
@@ -2121,9 +2049,7 @@ def test_s3_control_content_toggles_leave_the_digest_alone(
         assert hidden["body"] != shown["body"]
         assert both_off == both_on
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 # The four render-only knobs, one variation at a time against a fixed
@@ -2200,9 +2126,7 @@ def test_share_digest_ignores_every_render_only_knob_across_the_registry(
         assert len(checked) >= 27, checked
         assert len(_S3_RENDER_ONLY_VARIANTS) == 6, _S3_RENDER_ONLY_VARIANTS
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_s3_a_section_stored_under_an_older_digest_version_is_not_drifted(
@@ -2251,9 +2175,7 @@ def test_s3_a_section_stored_under_an_older_digest_version_is_not_drifted(
         assert current["drift_detected"] is True
         assert current["data_digest_version"] == 2
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_s3_a_failing_digest_projection_still_answers_with_an_empty_digest(
@@ -2299,9 +2221,7 @@ def test_s3_a_failing_digest_projection_still_answers_with_an_empty_digest(
         assert result["snapshot"]["data_digest"] == ""
         assert result["snapshot"]["data_digest_version"] == 2
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)
 
 
 def test_s3_render_stamps_the_digest_version(monkeypatch, tmp_path):
@@ -2316,6 +2236,4 @@ def test_s3_render_stamps_the_digest_version(monkeypatch, tmp_path):
             assert status == 200, result
             assert result["snapshot"]["data_digest_version"] == 2
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        stop(server, thread)

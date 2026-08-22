@@ -1,6 +1,6 @@
 setup: warning: settings.json at /FAKE/.claude/settings.json is not valid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1). Fix it and re-run.
 Install
-  Symlinks       0/15 available at /FAKE/.local/bin/  ✗
+  Symlinks       0/16 available at /FAKE/.local/bin/  ✗
   PATH includes  yes                                   ✓
 Hooks (/FAKE/.claude/settings.json)
   PostToolBatch  missing                  ✗

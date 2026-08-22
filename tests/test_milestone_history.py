@@ -24,6 +24,10 @@ import sys
 import pytest
 
 from conftest import load_script, redirect_paths
+# `start` is aliased because this file also binds `start` as an ordinary
+# local in several tests, and a module-level name a function reassigns is a
+# local for that whole function.
+from tests._support_http import start as start_accept_loop, stop
 
 
 @pytest.fixture
@@ -1421,9 +1425,7 @@ def _boot_milestones_server(ns, tmp_path, monkeypatch, *, seed):
     HandlerCls.run_sync_now = staticmethod(lambda: None)
     HandlerCls.no_sync = True
     srv = _socketserver.TCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
-    t = _threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    srv._test_thread = start_accept_loop(srv)
     return srv
 
 
@@ -1459,8 +1461,7 @@ def test_api_milestones_claude_week_200(tmp_path, monkeypatch):
         assert body["detail_stamp"]
         assert {b["five_hour_window_key"] for b in body["blocks"]} >= {5155, 5149}
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_api_milestones_claude_reset_cycles_fetch_independently(tmp_path, monkeypatch):
@@ -1486,8 +1487,7 @@ def test_api_milestones_claude_reset_cycles_fetch_independently(tmp_path, monkey
         assert [len(body["segments"][0]["milestones"]) for body in bodies] == [2, 2]
         assert all(body["dividers"] == [] for body in bodies)
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_api_milestones_bad_source_400(tmp_path, monkeypatch):
@@ -1497,8 +1497,7 @@ def test_api_milestones_bad_source_400(tmp_path, monkeypatch):
         status, _body = _get(srv, "/api/milestones/nope/week/2026-05-15")
         assert status == 400
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_api_milestones_malformed_claude_key_400(tmp_path, monkeypatch):
@@ -1508,8 +1507,7 @@ def test_api_milestones_malformed_claude_key_400(tmp_path, monkeypatch):
         status, _body = _get(srv, "/api/milestones/claude/week/not-a-date")
         assert status == 400
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_api_milestones_claude_unknown_week_404(tmp_path, monkeypatch):
@@ -1527,8 +1525,7 @@ def test_api_milestones_claude_unknown_week_404(tmp_path, monkeypatch):
         assert body["code"] == "unknown_key"
         assert body["reason"] == "unknown"
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def _seed_codex_cycle(conn):
@@ -1563,8 +1560,7 @@ def test_api_milestones_codex_cycle_200(tmp_path, monkeypatch):
         assert body["dividers"] == []
         assert "segments" in body and "blocks" in body
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 _DETAIL_AS_OF = "2026-07-26T00:00:00Z"
@@ -1672,8 +1668,7 @@ def test_api_milestones_codex_detail_agrees_with_the_index(tmp_path, monkeypatch
         assert body["label"] == entry["label"]
         assert body["is_current"] == entry["is_current"]
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_api_milestones_codex_unknown_key_404(tmp_path, monkeypatch):
@@ -1687,5 +1682,4 @@ def test_api_milestones_codex_unknown_key_404(tmp_path, monkeypatch):
         assert body["code"] == "unknown_key"
         assert body["reason"] in {"pruned", "rebuild_pending", "projection_incoherent", "unknown"}
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)

@@ -11,6 +11,7 @@ the incident. Anything less stays unclassified, and therefore protected — the
 safe direction.
 """
 from __future__ import annotations
+import types
 
 import ast
 import json
@@ -112,7 +113,12 @@ def test_direct_conversations_recovery_writes_an_additive_v2_manifest(
     tmp_path, monkeypatch,
 ):
     ns, core, cache_mod = _load(tmp_path, monkeypatch)
-    monkeypatch.setattr(cache_mod.shutil, "which", lambda _name: "/usr/bin/cp")
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_shutil = types.SimpleNamespace(**vars(cache_mod.shutil))
+    _iso_shutil.which = lambda _name: "/usr/bin/cp"
+    monkeypatch.setattr(cache_mod, "shutil", _iso_shutil)
 
     real_run = subprocess.run
 
@@ -123,9 +129,12 @@ def test_direct_conversations_recovery_writes_an_additive_v2_manifest(
             )
         return real_run(command, **kwargs)
 
-    monkeypatch.setattr(
-        cache_mod.subprocess, "run", reject_clone,
-    )
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_subprocess = types.SimpleNamespace(**vars(cache_mod.subprocess))
+    _iso_subprocess.run = reject_clone
+    monkeypatch.setattr(cache_mod, "subprocess", _iso_subprocess)
     ns["open_conversations_db"](attach_cache=False).close()
     path = pathlib.Path(core.CONVERSATIONS_DB_PATH)
     raw = bytearray(path.read_bytes())
@@ -198,7 +207,14 @@ def test_a_resume_reads_context_from_the_pending_record(tmp_path, monkeypatch):
             raise OSError("injected sidecar move failure")
         return real_replace(src, dst)
 
-    monkeypatch.setattr(db_mod.os, "replace", fail_shm_once)
+    # #630 S2: patch the IMPORTER's reference, never the shared stdlib
+    # module object, which every other importer and every concurrent
+    # thread resolves through. The later line flips behaviour on the
+    # copy already installed, so the restore does not need a second
+    # setattr.
+    _iso_os = types.SimpleNamespace(**vars(db_mod.os))
+    _iso_os.replace = fail_shm_once
+    monkeypatch.setattr(db_mod, "os", _iso_os)
     with pytest.raises(
         sqlite3.DatabaseError, match="could not complete whole-family quarantine"
     ):
@@ -211,7 +227,7 @@ def test_a_resume_reads_context_from_the_pending_record(tmp_path, monkeypatch):
     record = json.loads(pending.read_text())
     assert record["context"]["trigger"] == "test.partial_quarantine"
 
-    monkeypatch.setattr(db_mod.os, "replace", real_replace)
+    _iso_os.replace = real_replace
     ns["open_cache_db"]().close()
     assert not pending.exists()
 
@@ -253,7 +269,14 @@ def test_the_conversations_resume_reads_context_from_the_pending_record(
             raise OSError("injected main-file move failure")
         return real_replace(src, dst)
 
-    monkeypatch.setattr(db_mod.os, "replace", fail_main_once)
+    # #630 S2: patch the IMPORTER's reference, never the shared stdlib
+    # module object, which every other importer and every concurrent
+    # thread resolves through. The later line flips behaviour on the
+    # copy already installed, so the restore does not need a second
+    # setattr.
+    _iso_os = types.SimpleNamespace(**vars(db_mod.os))
+    _iso_os.replace = fail_main_once
+    monkeypatch.setattr(db_mod, "os", _iso_os)
     with pytest.raises(
         sqlite3.DatabaseError, match="could not complete whole-family quarantine"
     ):
@@ -268,7 +291,7 @@ def test_the_conversations_resume_reads_context_from_the_pending_record(
     record = json.loads(pending.read_text())
     assert record["context"]["trigger"] == "test.conversations_partial_quarantine"
 
-    monkeypatch.setattr(db_mod.os, "replace", real_replace)
+    _iso_os.replace = real_replace
     # The failed quarantine also left a durable recovery state, so the next
     # open is the recovery re-entry rather than an ordinary one.
     cache_mod._open_conversations_db_for_recovery(attach_cache=False).close()

@@ -45,6 +45,7 @@ helpers they source unguarded.
 from __future__ import annotations
 
 import ast
+import functools
 import pathlib
 import re
 import subprocess
@@ -61,16 +62,207 @@ CAP_SECONDS = 120.0
 #: A budget under this is poll cadence, not a wait on the clock.
 POLL_CADENCE_SECONDS = 1.0
 
+#: A blocking budget below this is load-fragile: it fails on a busy runner and
+#: passes on an idle one, whichever way the mechanism behaves. #630 S2 measured
+#: a loopback socket timeout failing at a 2-second budget under three
+#: concurrent Docker lanes, and the slowest pytest node in the same runs took
+#: 23.1 seconds, so nothing under a few seconds is safe to depend on.
+#:
+#: THE VALUE IS 9.0, AND IT SITS IN A GAP RATHER THAN ON A NUMBER. This matters
+#: more than the magnitude, and it is the mistake the first attempt made. The
+#: comparison below is a strict `<`, so a floor set to a value budgets actually
+#: EQUAL exempts every one of them. The first attempt set 5.0 — and 5 seconds
+#: was the single most common budget in the estate, 128 sites across 27 files,
+#: overwhelmingly loopback connects against a server the test had just started.
+#: All 128 sat at exactly 5.0, all 128 were exempt, and the rule reported zero
+#: findings on a tree that was full of the class it was written to name.
+#:
+#: THE DISTRIBUTION, measured with the callee-aware and positional classifiers
+#: in place, over the tree at `baf5f2cb3`, before the sweep this constant's
+#: commit performed: 143 sites at exactly 5.0, 2 at 8.0, 41 at 10.0 across 19
+#: files, 9 at 15.0 and 11 at 20.0. The 5.0 and 8.0 clusters were dispositioned
+#: one site at a time and raised, so the rule now reports nothing below this
+#: floor — which is NOT the same as nothing being left under it. Two budgets
+#: remain below 9.0, `tests/test_load_invariance_harness.py` at 1.0 and
+#: `tests/test_statusline_persist.py` at 8.0, and both are exempt because they
+#: carry a parsed site-bound annotation. The rule's zero is therefore a zero by
+#: disposition, which is still a materially stronger claim than the first
+#: attempt's zero: that one was a zero by a floor parked on the mode of the
+#: distribution, and nobody had read the sites at all.
+#:
+#: WHY NOT HIGHER. Eleven would report the 41 sites at 10.0, which are mostly
+#: subprocess and lock waits rather than the loopback-connect class the
+#: confirmed failure belongs to. Raising them to the presence backstop moves
+#: exactly ONE `composed` total in `RECORDED` —
+#: `test_structural_protocol_acceptance_402.py::test_real_rebuild_doctor_and_dashboard_survive_all_structural_classes`,
+#: 190.0 to 250.0, because three of its budgets are 10.0 — and adds no row at
+#: all, so the cost is re-keying one entry of a closed baseline rather than
+#: growing it. Thirty would report 58. Nine is the midpoint of the empty band
+#: between the highest budget the rule still reports below it (none) and the
+#: next cluster (10.0), so no budget can sit on it and no edit can nudge one
+#: onto it. `test_the_floor_is_not_parked_on_a_budget_value` enforces that
+#: mechanically, because a docstring cannot.
+#:
+#: `tests/_support_http.PRESENCE_BACKSTOP_SECONDS` is 30.0, so every budget
+#: that goes through the shared helpers clears this floor by construction.
+LOAD_SAFE_BACKSTOP_SECONDS = 9.0
+
+#: Seconds of the cap a composed sum must leave free for the work that is not
+#: a budget, before this guard will accept it.
+#:
+#: WHY THE RULE CANNOT COMPARE AGAINST THE CAP ALONE. The composed rule read
+#: `total > CAP_SECONDS`, and a sum of exactly 120.0 therefore passed. That is
+#: not a tight rule, it is a wrong one: pytest-timeout kills the item at 120
+#: seconds of WALL CLOCK, and no item spends wall clock on its budgets alone.
+#: A test that starts a server, spawns a child or builds a corpus has already
+#: spent some of the cap before its first wait begins, so a sum of exactly the
+#: cap is spendable only by a test that does nothing else — which is not a test.
+#: Three functions sat at exactly 120.0 when this constant was added.
+#:
+#: WHY 9.0 RATHER THAN A NUMBER OF ITS OWN. It is `LOAD_SAFE_BACKSTOP_SECONDS`,
+#: the one contention figure this file measured: below it a single blocking
+#: wait is load-fragile because a busy runner cannot be depended on for a
+#: shorter slice of the clock. The non-budget work is subject to the same
+#: contention as the waits around it, so the smallest reservation this guard
+#: already believes in is the right one to reserve. Deriving it rather than
+#: writing a second literal also keeps the two from drifting apart.
+#:
+#: WHAT IT REPORTS. With the reservation in place the threshold is 111.0, and
+#: the measured distribution of composed sums across `tests/` steps 105.0,
+#: 120.0, 135.0 — so the threshold sits in an empty band and no sum can hide by
+#: landing on it. `test_the_composed_threshold_is_not_parked_on_a_sum` enforces
+#: that mechanically, exactly as its twin does for the floor.
+COMPOSED_HEADROOM_SECONDS = LOAD_SAFE_BACKSTOP_SECONDS
+
 #: Keyword arguments that name a blocking upper bound in seconds.
 BUDGET_KEYWORDS = frozenset({"timeout", "deadline_s", "deadline", "timeout_s"})
 
-#: Callables whose FIRST positional argument is a blocking upper bound.
-POSITIONAL_BUDGET_ATTRS = frozenset({"join"})
+#: Callees that accept a blocking upper bound POSITIONALLY, each mapped to the
+#: argument index it occupies and the shape the arguments before it must have.
+#:
+#: An index rather than a membership test, because the estate writes budgets at
+#: four different positions — `sock.settimeout(2.0)`,
+#: `socket.create_connection(addr, 2)`, `urlopen(url, None, 2)` and
+#: `select.select(r, w, x, 2.0)` — and reading position 0 for all of them would
+#: report the socket list `select` is watching as a duration.
+#:
+#: This held `join` alone. Everything else was invisible however it was
+#: written, which made the `settimeout` entry in `BLOCKING_CALLEES` dead
+#: weight: CPython accepts no keyword there, so no spelling of it could produce
+#: a finding at all.
+#:
+#: The `"bool"` shape guard is what keeps a dictionary lookup out.
+#: `Queue.get(block, timeout)` and `Lock.acquire(blocking, timeout)` both put a
+#: flag first, and `d.get(key, 5)` does not, so requiring a boolean literal
+#: there separates a budget from a default without giving up either call. The
+#: literal must also be TRUE: with the flag false CPython ignores the timeout
+#: entirely, so the number is never spent and reporting it would demand an
+#: annotation for a wait that does not happen. No such site exists today.
+POSITIONAL_BUDGET_ATTRS = {
+    "join": (0, None),
+    "wait": (0, None),
+    "settimeout": (0, None),
+    "create_connection": (1, None),
+    "communicate": (1, None),
+    "wait_for": (1, None),
+    "get": (1, "bool"),
+    "acquire": (1, "bool"),
+    "urlopen": (2, None),
+    "HTTPConnection": (2, None),
+    "Barrier": (2, None),
+    "select": (3, None),
+}
+
+#: The callees CPython accepts a budget from ONLY positionally. Each MUST carry
+#: a `POSITIONAL_BUDGET_ATTRS` entry, because without one there is no spelling
+#: of the call this guard can read, and an entry in `BLOCKING_CALLEES` that
+#: nothing can reach states a rule the collector does not apply.
+#: `test_every_positional_only_blocking_callee_can_be_collected` proves the
+#: keyword form really is refused rather than trusting this comment.
+POSITIONAL_ONLY_BUDGET_CALLEES = frozenset({"settimeout", "select"})
+
+#: Callees that BLOCK while they spend the budget they are handed. A budget
+#: keyword alone does not make a wait: `argparse.Namespace(timeout=5)` stores a
+#: configuration value and `subprocess.TimeoutExpired(cmd, timeout=5)` reports
+#: one that already expired, and neither can be reached by the pytest cap.
+#: Classification is therefore by callee.
+#:
+#: The set is an allowlist, and an allowlist skips whatever it does not name.
+#: `test_every_callee_carrying_a_budget_keyword_is_classified` closes that hole:
+#: a callee the estate uses and this file does not classify fails the guard by
+#: name, so a new blocking helper cannot be dropped in silence.
+BLOCKING_CALLEES = {
+    "run": "`subprocess.run` waits for the child to exit",
+    "wait": "`Popen.wait`, `Event.wait` and `Condition.wait` all block",
+    "wait_for": "`asyncio.wait_for` and `Condition.wait_for` block",
+    "communicate": "`Popen.communicate` waits for the streams to close",
+    "join": "`Thread.join` and `Process.join` block",
+    "acquire": "a lock acquisition blocks until the holder releases",
+    "get": "`Queue.get` blocks until an item is available",
+    "recv": "a socket receive blocks until bytes arrive",
+    "settimeout": "the budget every later blocking socket call then spends",
+    "connect": "a connect blocks until the peer accepts or the budget expires",
+    "create_connection": "`socket.create_connection` connects and so blocks",
+    "select": "`select.select` blocks until a stream is ready or time runs out",
+    "urlopen": "`urllib.request.urlopen` performs the request",
+    "HTTPConnection": "the budget every later call on that connection spends",
+    "Barrier": "the default budget every `barrier.wait()` on it then spends",
+    "codex_attribution_apply_locks": "acquires the Codex attribution locks",
+    "acquire_cache_writer_flocks": "acquires the cache writer flocks",
+    "acquire_ordered_flocks": "acquires the ordered flocks in lock order",
+    "run_worker": (
+        "`tests/journal_fixture_496_s4.py` runs one rebuild in a child process "
+        "and waits for it; reached across modules as `F.run_worker`"),
+    "run_stats_ingest": "takes the ingest lock and waits for the holder",
+    "retention_shared": "takes the retention flock and waits for the holder",
+    "AppServerClient": "connects to the app server before it returns",
+}
+
+#: The other half of the same decision, closed for the same reason. Each names a
+#: callee that takes a number spelled like a budget and waits for nothing.
+NON_BLOCKING_CALLEES = {
+    "Namespace": (
+        "`argparse.Namespace(timeout=…)` stores a configuration value the code "
+        "under test reads later; the test itself waits for nothing"),
+    "SimpleNamespace": (
+        "the same, in the form the contamination repairs use"),
+    "TimeoutExpired": (
+        "`subprocess.TimeoutExpired(cmd, timeout=…)` REPORTS a budget that has "
+        "already expired; constructing it spends nothing"),
+}
 
 #: Clocks a deadline is computed from.
 CLOCK_FUNCTIONS = frozenset({"monotonic", "perf_counter", "time"})
 
 ANNOTATION = "timing-budget:"
+
+#: An annotation and the reason it must carry. A bare `# timing-budget:`
+#: satisfied the substring test this replaces and recorded nothing, so the
+#: reason is parsed and required to be non-empty.
+#:
+#: Anchored to the start of the line, so an annotation occupies a comment line
+#: of its own. A substring test read the marker wherever it appeared, including
+#: inside this file's own scaffolds and prose, and a guard that reports itself
+#: for describing its own format is one nobody can keep green. Every one of the
+#: fifty annotations in the estate is already written this way, and a trailing
+#: one is not silently accepted — it excuses nothing, so its budget comes back
+#: as `unannotated`.
+_ANNOTATION_PATTERN = re.compile(r"^\s*#\s*timing-budget:(?P<reason>.*)$")
+
+#: How far from a budget an annotation may sit and still be bound to it: the
+#: budget's own line, the line above, and the line below.
+_ANNOTATION_REACH = (-1, 0, 1)
+
+#: Callees whose named observation window IS the assertion rather than a guess
+#: at how long something takes. `read_no_event(window=3.0)` asserts that no
+#: frame arrives in three seconds; the three seconds are what the test claims,
+#: so demanding a comment defending them would ask the author to justify the
+#: assertion itself. The window is still COLLECTED — it is spent in full every
+#: run, so one above the cap can no more fire than any other budget — and it is
+#: only exempt from the demand for a reason.
+ABSENCE_WINDOW_CALLEES = {
+    "read_no_event": "window",
+}
 
 
 #: Closed and named. Each entry states why the cap does not apply, not that the
@@ -98,30 +290,10 @@ RECORDED = {
      "test_real_rebuild_stall_is_bounded_and_retry_converges",
      "elapsed-ceiling", 5.0): (
         "keep — a fail-fast claim: the alternative behaviour is blocking until a lock is released, so the ceiling separates bounded from unbounded rather than fast from slow"),
-    ("tests/test_codex_window_canonicalization.py",
-     "test_r3_the_anchor_lookup_is_not_a_linear_scan",
-     "elapsed-ceiling", 5.0): (
-        "convert — a throughput measurement, which is the load-sensitive shape this guard exists to stop; it needs an operation-count or complexity assertion instead, and that is a change to the test's claim rather than to its number"),
-    ("tests/test_conversation_anon.py",
-     "test_trie_perf_smoke_large_plan_under_5s",
-     "elapsed-ceiling", 5.0): (
-        "convert — a throughput measurement, which is the load-sensitive shape this guard exists to stop; it needs an operation-count or complexity assertion instead, and that is a change to the test's claim rather than to its number"),
-    ("tests/test_conversation_outline.py",
-     "test_outline_thousand_turn_session",
-     "elapsed-ceiling", 5.0): (
-        "convert — a throughput measurement, which is the load-sensitive shape this guard exists to stop; it needs an operation-count or complexity assertion instead, and that is a change to the test's claim rather than to its number"),
     ("tests/test_dashboard_session_titles.py",
      "test_bounded_reader_does_not_block_on_an_exclusively_locked_store",
      "elapsed-ceiling", 2.0): (
         "keep — a fail-fast claim: the alternative behaviour is blocking until a lock is released, so the ceiling separates bounded from unbounded rather than fast from slow"),
-    ("tests/test_dashboard_source_invalidation.py",
-     "test_dashboard_source_scale_gate_reuses_idle_provider_state_without_rollout_scan",
-     "elapsed-ceiling", 2.0): (
-        "convert — a throughput measurement, which is the load-sensitive shape this guard exists to stop; it needs an operation-count or complexity assertion instead, and that is a change to the test's claim rather than to its number"),
-    ("tests/test_dashboard_source_invalidation.py",
-     "test_dashboard_source_scale_gate_reuses_idle_provider_state_without_rollout_scan",
-     "elapsed-ceiling", 12.0): (
-        "convert — a throughput measurement, which is the load-sensitive shape this guard exists to stop; it needs an operation-count or complexity assertion instead, and that is a change to the test's claim rather than to its number"),
     ("tests/test_db_vacuum.py",
      "test_vacuum_fails_promptly_under_active_reader",
      "elapsed-ceiling", 5.0): (
@@ -162,10 +334,6 @@ RECORDED = {
      "test_spawn_failure_waits_for_a_coalescer_and_settles_its_final_count",
      "elapsed-ceiling", 1.0): (
         "keep — a fail-fast claim: the alternative behaviour is blocking until a lock is released, so the ceiling separates bounded from unbounded rather than fast from slow"),
-    ("tests/test_retention_walk.py",
-     "test_the_walk_stays_under_the_wall_clock_backstop",
-     "elapsed-ceiling", 0.25): (
-        "convert — a throughput measurement, which is the load-sensitive shape this guard exists to stop; it needs an operation-count or complexity assertion instead, and that is a change to the test's claim rather than to its number"),
     ("tests/test_stats_writer_storm_386.py",
      "test_stats_open_fails_fast_while_maintenance_is_held",
      "elapsed-ceiling", 30.0): (
@@ -198,60 +366,6 @@ RECORDED = {
      "test_concurrency_storm_every_id_materialized_once",
      "composed", 300.0): (
         "keep — sequential hang detectors, not expected durations. Only one of them can be reached by a hang, so the worst-case sum over-states what any run can spend; lowering each to fit the sum is how a passing test is made flaky"),
-    ("tests/test_codex_dashboard_conversation_events.py",
-     "test_codex_ready_and_tail_use_conversation_key",
-     "fixed-wait", 1.0): (
-        "convert — a guess at how long the connect-ingest and cache-cursor "
-        "baseline take to settle, which is the load-sensitive shape this "
-        "guard exists to stop. Converting it needs an observable "
-        "baseline-established signal the SSE server does not emit today, so "
-        "the fix is a server change and is recorded here rather than guessed "
-        "at"),
-    ("tests/test_codex_dashboard_conversation_events.py",
-     "test_qualified_claude_key_speaks_conversation_key",
-     "fixed-wait", 1.0): (
-        "convert — a guess at how long the connect-ingest and cache-cursor "
-        "baseline take to settle, which is the load-sensitive shape this "
-        "guard exists to stop. Converting it needs an observable "
-        "baseline-established signal the SSE server does not emit today, so "
-        "the fix is a server change and is recorded here rather than guessed "
-        "at"),
-    ("tests/test_codex_dashboard_conversation_events.py",
-     "test_codex_subsequent_growth_re_detected",
-     "fixed-wait", 1.0): (
-        "convert — a guess at how long the connect-ingest and cache-cursor "
-        "baseline take to settle, which is the load-sensitive shape this "
-        "guard exists to stop. Converting it needs an observable "
-        "baseline-established signal the SSE server does not emit today, so "
-        "the fix is a server change and is recorded here rather than guessed "
-        "at"),
-    ("tests/test_codex_dashboard_conversation_events.py",
-     "test_unrelated_conversation_growth_does_not_emit",
-     "fixed-wait", 1.0): (
-        "convert — a guess at how long the connect-ingest and cache-cursor "
-        "baseline take to settle, which is the load-sensitive shape this "
-        "guard exists to stop. Converting it needs an observable "
-        "baseline-established signal the SSE server does not emit today, so "
-        "the fix is a server change and is recorded here rather than guessed "
-        "at"),
-    ("tests/test_dashboard_conversation_events.py",
-     "test_events_emits_tail_on_file_growth",
-     "fixed-wait", 1.0): (
-        "convert — a guess at how long the connect-ingest and cache-cursor "
-        "baseline take to settle, which is the load-sensitive shape this "
-        "guard exists to stop. Converting it needs an observable "
-        "baseline-established signal the SSE server does not emit today, so "
-        "the fix is a server change and is recorded here rather than guessed "
-        "at"),
-    ("tests/test_dashboard_conversation_events.py",
-     "test_background_completion_live_tail_updates_the_open_conversation_once",
-     "fixed-wait", 1.0): (
-        "convert — a guess at how long the connect-ingest and cache-cursor "
-        "baseline take to settle, which is the load-sensitive shape this "
-        "guard exists to stop. Converting it needs an observable "
-        "baseline-established signal the SSE server does not emit today, so "
-        "the fix is a server change and is recorded here rather than guessed "
-        "at"),
 }
 
 #: Shell findings that predate this guard, dispositioned in the same inventory.
@@ -313,8 +427,22 @@ class Finding:
 # --------------------------------------------------------------- resolution
 
 
-def _module_constants(tree: ast.Module) -> dict:
+#: The estate's one shared budget module. Its constants are followed into every
+#: file that imports them, because the alternative is the guard being unable to
+#: read the one number it most wants people to use.
+SUPPORT_MODULE = "tests._support_http"
+
+
+def _module_constants(tree: ast.Module, follow_support=True) -> dict:
     found = {}
+    if follow_support:
+        shared = _support_constants()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.module != SUPPORT_MODULE:
+                continue
+            for alias in node.names:
+                if alias.name in shared:
+                    found[alias.asname or alias.name] = shared[alias.name]
     for node in tree.body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
             target = node.targets[0]
@@ -323,6 +451,22 @@ def _module_constants(tree: ast.Module) -> dict:
                 if value is not None:
                     found[target.id] = value
     return found
+
+
+@functools.lru_cache(maxsize=1)
+def _support_constants() -> dict:
+    """The numeric module constants of `tests/_support_http.py`.
+
+    `PRESENCE_BACKSTOP_SECONDS` is the load-safe budget every consolidated call
+    site spells by name. Reading only assignments in the importing file left it
+    unresolvable, so the guard demanded an annotation on each of the 61 correct
+    adoptions — a justification for using the very constant it recommends.
+    """
+    path = REPO / "tests" / "_support_http.py"
+    if not path.exists():
+        return {}
+    return _module_constants(
+        ast.parse(path.read_text(encoding="utf-8")), follow_support=False)
 
 
 def _resolve(node, consts: dict, local: dict):
@@ -402,24 +546,136 @@ def _is_clock_call(node, bare=frozenset()) -> bool:
 # ------------------------------------------------------------ budget sources
 
 
-def _budgets_in_expression(node, consts, local, parameters, path, clocky=None):
-    """Every blocking upper bound named directly by this expression tree."""
-    out = []
+def _callee_of(call) -> str:
+    """The bare name a call is made through: `x.wait(…)` and `wait(…)` both `wait`."""
+    return getattr(call.func, "attr", getattr(call.func, "id", ""))
+
+
+def _blocking_names(tree) -> set:
+    """Every name a call in THIS module can block through.
+
+    `BLOCKING_CALLEES` plus the module's own wait helpers, to a fixpoint. The
+    estate writes many of its waits itself — `_read_bytes(deadline_s=…)`,
+    `_drain_stream(timeout=…)`, `_run_heal_child(timeout=…)` — and it also
+    binds production entry points to local names, as in
+    `real_ingest = _cctally_journal.run_stats_ingest`. A list of names could
+    not keep up with either, and dropping them would delete real budgets from
+    the guard's reach rather than only the misclassified ones.
+
+    A definition counts as blocking when its body reaches a blocking call at
+    all, rather than when the budget provably flows into one. The looser test
+    errs toward reporting, which is the safe direction here.
+    """
+    known = set(BLOCKING_CALLEES)
+    bare_sleep = _bare_sleep_names(tree)
+    definitions, aliases = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definitions.append(node)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, (ast.Name, ast.Attribute))
+        ):
+            source = getattr(node.value, "attr", getattr(node.value, "id", ""))
+            aliases.append((node.targets[0].id, source))
+    changed = True
+    while changed:
+        changed = False
+        for node in definitions:
+            if node.name in known:
+                continue
+            if _reaches_a_wait(node, known, bare_sleep):
+                known.add(node.name)
+                changed = True
+        for target, source in aliases:
+            if source in known and target not in known:
+                known.add(target)
+                changed = True
+    return known
+
+
+def _reaches_a_wait(node, known: set, bare_sleep: set) -> bool:
+    bare_clock = _clock_bare_names(node)
     for inner in ast.walk(node):
+        if isinstance(inner, ast.While) and _has_clock_call(inner.test, bare_clock):
+            # `while want(buf) is False and time.monotonic() < deadline:` is a
+            # wait spelled out rather than delegated, which is the shape
+            # `_read_bytes` and `_read_gzip_until` use. Recognising only
+            # delegated waits would drop the budget those helpers are given.
+            return True
         if not isinstance(inner, ast.Call):
             continue
-        callee = getattr(inner.func, "attr", getattr(inner.func, "id", "?"))
+        if _callee_of(inner) in known:
+            return True
+        if _callee_of(inner) == "sleep" or (
+            isinstance(inner.func, ast.Name) and inner.func.id in bare_sleep
+        ):
+            return True
+    return False
+
+
+def _has_clock_call(node, bare: set) -> bool:
+    return any(_is_clock_call(inner, bare) for inner in ast.walk(node))
+
+
+def _outside_lambdas(node):
+    """NODE and its descendants, stopping at every `lambda` body.
+
+    A lambda body runs where the callable it becomes is CALLED, which is not
+    the point in the enclosing function's path where it is written.
+    `threading.Thread(target=lambda: release.wait(60))` spends those sixty
+    seconds on the spawned thread and none of them here, and summing it into
+    the enclosing test read `tests/test_support_http.py` as 180 seconds of
+    sequential waiting against a 120-second cap. The guard already refuses to
+    sum a nested `def` for the same reason — `_statement_head` returns nothing
+    for one — and a lambda is only the expression spelling of it.
+
+    The budgets are not lost: `collect_budgets` gives every lambda a segment of
+    its own, so one over the cap is still reported.
+    """
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        for child in ast.iter_child_nodes(current):
+            if isinstance(child, ast.Lambda):
+                continue
+            stack.append(child)
+
+
+def _budgets_in_expression(node, consts, local, parameters, path, clocky=None,
+                           blocking=frozenset()):
+    """Every blocking upper bound named directly by this expression tree."""
+    out = []
+    for inner in _outside_lambdas(node):
+        if not isinstance(inner, ast.Call):
+            continue
+        callee = _callee_of(inner) or "?"
+        window = ABSENCE_WINDOW_CALLEES.get(callee)
+        if window is not None:
+            for kw in inner.keywords:
+                if kw.arg != window:
+                    continue
+                seconds = _resolve(kw.value, consts, local)
+                if seconds is not None:
+                    out.append(Finding(
+                        path, inner.lineno, "absence-window", seconds,
+                        "%s(%s=%g) is an observation window the assertion "
+                        "spends in full" % (callee, window, seconds)))
+            continue
+        if callee not in blocking:
+            # The number is stored, reported or configured rather than waited
+            # for, so no cap can be reached by it. `_blocking_names` decides.
+            continue
         for kw in inner.keywords:
             if kw.arg not in BUDGET_KEYWORDS:
                 continue
             out.append(_budget_finding(inner, kw.value, callee, kw.arg,
                                        consts, local, parameters, path, clocky))
-        if (
-            isinstance(inner.func, ast.Attribute)
-            and inner.func.attr in POSITIONAL_BUDGET_ATTRS
-            and inner.args
-            and _resolve(inner.args[0], consts, local) is not None
-        ):
+        argument = _positional_budget_argument(inner, callee, consts, local)
+        if argument is not None:
             # Only when the argument resolves to a NUMBER. `"\n".join(lines)`
             # and `os.path.join(a, b)` are the same attribute name, and there is
             # nothing in the syntax that separates them from `proc.join(90)`.
@@ -427,9 +683,40 @@ def _budgets_in_expression(node, consts, local, parameters, path, clocky=None):
             # demanding an annotation on every string join in the suite — 253 of
             # them, none of which is a wait. The keyword form, `join(timeout=…)`,
             # is unambiguous and is still checked above.
-            out.append(_budget_finding(inner, inner.args[0], callee, "positional",
+            out.append(_budget_finding(inner, argument, callee, "positional",
                                        consts, local, parameters, path, clocky))
     return [item for item in out if item is not None]
+
+
+def _positional_budget_argument(call, callee, consts, local):
+    """The positional argument of CALL that is a blocking budget, if any.
+
+    Returns the AST node rather than a number, because `_budget_finding` still
+    has to decide whether it is a remainder, a parameter or poll cadence.
+    """
+    entry = POSITIONAL_BUDGET_ATTRS.get(callee)
+    if entry is None:
+        return None
+    index, shape = entry
+    if len(call.args) <= index:
+        return None
+    if shape == "bool":
+        first = call.args[0]
+        if not (isinstance(first, ast.Constant)
+                and isinstance(first.value, bool)):
+            return None
+        if first.value is False:
+            # `q.get(False, 5.0)` and `lock.acquire(False, 5.0)` block for
+            # nothing at all: CPython ignores the timeout when the flag is
+            # false, and `acquire` raises on the pair outright. Reading the
+            # number as a budget would demand an annotation for time no run
+            # can spend, which is the same defect in the other direction as a
+            # budget the rules cannot see.
+            return None
+    value = call.args[index]
+    if _resolve(value, consts, local) is None:
+        return None
+    return value
 
 
 def _budget_finding(call, value_node, callee, argname, consts, local, parameters,
@@ -440,6 +727,13 @@ def _budget_finding(call, value_node, callee, argname, consts, local, parameters
         # is a number this guard can or should bound.
         return None
     derived, helpers, bare = clocky if clocky else (set(), set(), set())
+    inline = _clock_plus_constant(value_node, consts, local, clocky)
+    if inline is not None:
+        # A deadline written AT the call site, which `_waited_deadline` cannot
+        # see because there is no assignment to see it in.
+        return Finding(path, call.lineno, "deadline", inline,
+                       "%s(%s=…) sets a fresh deadline of %gs at the call site"
+                       % (callee, argname, inline))
     if _reads_the_clock(value_node, derived, helpers, bare):
         # `join(timeout=max(0, deadline - time.monotonic()))` is the remainder
         # of a deadline, and that deadline is detected where it is computed.
@@ -460,7 +754,7 @@ def _budget_finding(call, value_node, callee, argname, consts, local, parameters
                    "%s(%s=%g)" % (callee, argname, seconds))
 
 
-def _waited_deadline(stmt, consts, local, waited, path, bare=frozenset()):
+def _waited_deadline(stmt, consts, local, waited, path, clocky=None):
     """`end = time.monotonic() + 90` — but only when a wait then draws on it.
 
     The arithmetic alone is not a wait. `deadline = time.time() + 172800` in
@@ -476,19 +770,40 @@ def _waited_deadline(stmt, consts, local, waited, path, bare=frozenset()):
     if not isinstance(target, ast.Name) or target.id not in waited:
         return None
     value = stmt.value
-    if not (isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add)):
+    seconds = _clock_plus_constant(value, consts, local, clocky)
+    if seconds is None:
         return None
-    for a, b in ((value.left, value.right), (value.right, value.left)):
-        if _is_clock_call(a, bare):
+    return Finding(path, stmt.lineno, "deadline", seconds,
+                   "a deadline of %gs a wait draws its budget from" % seconds)
+
+
+def _clock_plus_constant(node, consts, local, clocky=None):
+    """The seconds in `clock() + N`, wherever that expression is written.
+
+    Addition and subtraction say opposite things about a budget. Subtracting a
+    clock reading takes what is LEFT of a deadline declared elsewhere, which is
+    why `_budget_finding` drops it; adding to one declares a NEW deadline of
+    exactly N seconds. The reading may also be one name away —
+    `started = time.monotonic()` then `deadline = started + 2.0` is the same
+    budget as the one-line form, and matching only the call form hid it:
+    `tests/test_rebuild_heal.py` spent a 2-second window waiting for three
+    spawned children, and it failed twice on the slower runner under contention
+    while this guard reported nothing.
+    """
+    if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)):
+        return None
+    derived, _helpers, bare = clocky if clocky else (set(), set(), set())
+    for a, b in ((node.left, node.right), (node.right, node.left)):
+        if _is_clock_call(a, bare) or (
+            isinstance(a, ast.Name) and a.id in derived
+        ):
             seconds = _resolve(b, consts, local)
             if seconds is not None and seconds >= POLL_CADENCE_SECONDS:
-                return Finding(path, stmt.lineno, "deadline", seconds,
-                               "a deadline of %gs a wait draws its budget from"
-                               % seconds)
+                return seconds
     return None
 
 
-def _names_waited_on(func, clocky=None) -> set:
+def _names_waited_on(func, clocky=None, blocking=frozenset()) -> set:
     """Names a wait in FUNC draws its budget from, following simple aliases.
 
     Two spellings spend a deadline. `while time.monotonic() < end` waits on it
@@ -512,10 +827,12 @@ def _names_waited_on(func, clocky=None) -> set:
     for node in ast.walk(func):
         if not isinstance(node, ast.Call):
             continue
+        if _callee_of(node) not in blocking:
+            continue
         drawn = [kw.value for kw in node.keywords if kw.arg in BUDGET_KEYWORDS]
-        if (isinstance(node.func, ast.Attribute)
-                and node.func.attr in POSITIONAL_BUDGET_ATTRS and node.args):
-            drawn.append(node.args[0])
+        entry = POSITIONAL_BUDGET_ATTRS.get(_callee_of(node))
+        if entry is not None and len(node.args) > entry[0]:
+            drawn.append(node.args[entry[0]])
         for value in drawn:
             if not _reads_the_clock(value, derived, helpers, bare):
                 continue
@@ -554,47 +871,47 @@ def _statement_head(stmt):
 
 
 def _walk_paths(body, consts, local, parameters, path, accumulator, segments,
-                waited=frozenset(), clocky=None):
+                waited=frozenset(), clocky=None, blocking=frozenset()):
     """Add BODY's budgets to ACCUMULATOR, forking a fresh one at every branch."""
     for stmt in body:
-        deadline = _waited_deadline(stmt, consts, local, waited, path,
-                                    clocky[2] if clocky else frozenset())
+        deadline = _waited_deadline(stmt, consts, local, waited, path, clocky)
         if deadline is not None:
             accumulator.append(deadline)
         for part in _statement_head(stmt):
             accumulator.extend(
-                _budgets_in_expression(part, consts, local, parameters, path, clocky)
+                _budgets_in_expression(part, consts, local, parameters, path,
+                                       clocky, blocking)
             )
         if isinstance(stmt, (ast.With, ast.AsyncWith)):
             _walk_paths(stmt.body, consts, local, parameters, path,
-                        accumulator, segments, waited, clocky)
+                        accumulator, segments, waited, clocky, blocking)
         elif isinstance(stmt, ast.Try):
             _walk_paths(stmt.body, consts, local, parameters, path,
-                        accumulator, segments, waited, clocky)
+                        accumulator, segments, waited, clocky, blocking)
             for handler in stmt.handlers:
                 segments.append(_fresh(handler.body, consts, local, parameters,
-                                       path, segments, waited, clocky))
+                                       path, segments, waited, clocky, blocking))
             segments.append(_fresh(stmt.orelse, consts, local, parameters,
-                                   path, segments, waited, clocky))
+                                   path, segments, waited, clocky, blocking))
             _walk_paths(stmt.finalbody, consts, local, parameters, path,
-                        accumulator, segments, waited, clocky)
+                        accumulator, segments, waited, clocky, blocking)
         elif isinstance(stmt, ast.If):
             segments.append(_fresh(stmt.body, consts, local, parameters, path,
-                                   segments, waited, clocky))
+                                   segments, waited, clocky, blocking))
             segments.append(_fresh(stmt.orelse, consts, local, parameters, path,
-                                   segments, waited, clocky))
+                                   segments, waited, clocky, blocking))
         elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
             segments.append(_fresh(stmt.body, consts, local, parameters, path,
-                                   segments, waited, clocky))
+                                   segments, waited, clocky, blocking))
             segments.append(_fresh(stmt.orelse, consts, local, parameters, path,
-                                   segments, waited, clocky))
+                                   segments, waited, clocky, blocking))
     return accumulator
 
 
 def _fresh(body, consts, local, parameters, path, segments, waited=frozenset(),
-           clocky=None):
+           clocky=None, blocking=frozenset()):
     return _walk_paths(body, consts, local, parameters, path, [], segments, waited,
-                       clocky)
+                       clocky, blocking)
 
 
 def _local_numbers(func, consts):
@@ -607,6 +924,65 @@ def _local_numbers(func, consts):
                 if value is not None:
                     local[target.id] = value
     return local
+
+
+def _collect_raw_budgets(relative, text) -> list:
+    """Every blocking budget in TEXT, at whatever value it carries.
+
+    `collect_budgets` returns FINDINGS — what the rules decided — and the rules
+    have thresholds, so nothing it returns can answer a question ABOUT a
+    threshold. `test_the_floor_is_not_parked_on_a_budget_value` needs the raw
+    distribution to check that the floor sits in a gap in it, which is exactly
+    the question a filtered list cannot be asked.
+
+    Lambda bodies are walked separately, exactly as `collect_budgets` walks
+    them, because `_budgets_in_expression` stops at every lambda it meets. Five
+    budgets in this estate live inside one — `release.wait(60)` handed to a
+    probe thread, four times over — so without this loop the parking check was
+    blind to a whole shape. It happened that none of the five sat on the floor,
+    which made the claim true by luck rather than by construction.
+    """
+    tree = ast.parse(text)
+    consts = _module_constants(tree)
+    clocky = (_clock_derived_names(tree), _clock_reading_helpers(tree),
+              _clock_bare_names(tree))
+    blocking = _blocking_names(tree)
+    out = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if (relative, func.name) in ALLOWLIST:
+            continue
+        arguments = func.args
+        parameters = {
+            a.arg for a in
+            list(arguments.posonlyargs) + list(arguments.args)
+            + list(arguments.kwonlyargs)
+        }
+        local = _local_numbers(func, consts)
+        segments = []
+        segments.append(
+            _walk_paths(func.body, consts, local, parameters, relative, [],
+                        segments, _names_waited_on(func, clocky, blocking),
+                        clocky, blocking)
+        )
+        for lam in ast.walk(func):
+            if not isinstance(lam, ast.Lambda):
+                continue
+            lam_args = lam.args
+            segments.append(_budgets_in_expression(
+                lam.body, consts, local,
+                parameters | {
+                    a.arg for a in
+                    list(lam_args.posonlyargs) + list(lam_args.args)
+                    + list(lam_args.kwonlyargs)
+                },
+                relative, clocky, blocking))
+        for segment in segments:
+            out.extend(b for b in segment
+                       if b.kind in ("budget", "deadline")
+                       and b.seconds is not None)
+    return _deduplicate(out)
 
 
 def collect_budgets(path, source=None) -> list:
@@ -622,9 +998,10 @@ def collect_budgets(path, source=None) -> list:
     consts = _module_constants(tree)
     clocky = (_clock_derived_names(tree), _clock_reading_helpers(tree),
               _clock_bare_names(tree))
+    blocking = _blocking_names(tree)
     lines = text.splitlines()
 
-    findings = []
+    findings, budget_lines = [], set()
     for func in ast.walk(tree):
         if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -640,12 +1017,31 @@ def collect_budgets(path, source=None) -> list:
         segments = []
         segments.append(
             _walk_paths(func.body, consts, local, parameters, relative, [], segments,
-                        _names_waited_on(func, clocky), clocky)
+                        _names_waited_on(func, clocky, blocking), clocky, blocking)
         )
+        for lam in ast.walk(func):
+            # One segment per lambda, for the reason `_outside_lambdas` states:
+            # its budgets are real and are still reported singly, but they do
+            # not run in sequence with the function that wrote them.
+            if not isinstance(lam, ast.Lambda):
+                continue
+            lam_args = lam.args
+            segments.append(_budgets_in_expression(
+                lam.body, consts, local,
+                parameters | {
+                    a.arg for a in
+                    list(lam_args.posonlyargs) + list(lam_args.args)
+                    + list(lam_args.kwonlyargs)
+                },
+                relative, clocky, blocking))
         for segment in segments:
+            budget_lines.update(b.lineno for b in segment)
             # A deadline computed from the clock is as unreachable as a
-            # `timeout=` of the same size, so both are checked singly.
-            singles = [b for b in segment if b.kind in ("budget", "deadline")]
+            # `timeout=` of the same size, so both are checked singly. An
+            # absence window joins them: it is spent in full every run, so one
+            # above the cap can no more fire than any other budget.
+            singles = [b for b in segment
+                       if b.kind in ("budget", "deadline", "absence-window")]
             for budget in singles:
                 if budget.seconds > CAP_SECONDS:
                     findings.append(Finding(
@@ -655,27 +1051,96 @@ def collect_budgets(path, source=None) -> list:
                         % (budget.detail, func.name, budget.seconds, CAP_SECONDS),
                         func.name))
             total = sum(b.seconds for b in segment if b.seconds)
-            if total > CAP_SECONDS and len(segment) > 1:
+            if (total + COMPOSED_HEADROOM_SECONDS > CAP_SECONDS
+                    and len(segment) > 1):
                 findings.append(Finding(
                     relative, segment[0].lineno, "composed", total,
-                    "%d budgets run in sequence in %s and total %gs, above the "
-                    "%gs cap: %s" % (len(segment), func.name, total, CAP_SECONDS,
-                                     ", ".join(b.detail for b in segment)),
+                    "%d budgets run in sequence in %s and total %gs, which "
+                    "leaves less than the %gs of the %gs cap an item needs for "
+                    "the work that is not a budget: %s"
+                    % (len(segment), func.name, total,
+                       COMPOSED_HEADROOM_SECONDS, CAP_SECONDS,
+                       ", ".join(b.detail for b in segment)),
                     func.name))
             for budget in segment:
+                if (
+                    budget.kind in ("budget", "deadline")
+                    and budget.seconds is not None
+                    and budget.seconds < LOAD_SAFE_BACKSTOP_SECONDS
+                    and not _annotated(lines, budget.lineno)
+                ):
+                    findings.append(Finding(
+                        relative, budget.lineno, "under-load-floor",
+                        budget.seconds,
+                        "%s in %s blocks for at most %gs, below the %gs a "
+                        "contended runner needs; raise it to "
+                        "`PRESENCE_BACKSTOP_SECONDS`, or add `# %s <reason>` "
+                        "on its own line above it when the short budget IS the "
+                        "claim" % (budget.detail, func.name, budget.seconds,
+                                   LOAD_SAFE_BACKSTOP_SECONDS, ANNOTATION),
+                        func.name))
                 if budget.kind == "unresolved" and not _annotated(lines, budget.lineno):
                     findings.append(Finding(
                         relative, budget.lineno, "unannotated", None,
-                        "%s; add `# %s <reason>` if it is deliberate"
-                        % (budget.detail, ANNOTATION), func.name))
+                        "%s; add `# %s <reason>` on its own line above it if "
+                        "it is deliberate" % (budget.detail, ANNOTATION),
+                        func.name))
+    # Every timing finding the guard can produce counts as a site an
+    # annotation may be bound to, not only a blocking budget. A retained
+    # wall-clock ceiling states its reason at the assertion, and reading only
+    # the budget collector here would report that reason as an excuse for
+    # nothing in the same run the ceiling rule accepted it.
+    budget_lines.update(
+        f.lineno for f in collect_elapsed_assertions(
+            path, source=text, include_annotated=True)
+    )
+    budget_lines.update(f.lineno for f in collect_fixed_waits(path, source=text))
+    findings.extend(_annotation_findings(lines, budget_lines, relative))
     return _deduplicate(findings)
 
 
+def _annotation_reason(lines, lineno):
+    """The non-empty reason bound to the budget at LINENO, or None."""
+    for offset in _ANNOTATION_REACH:
+        index = lineno - 1 + offset
+        if not (0 <= index < len(lines)):
+            continue
+        match = _ANNOTATION_PATTERN.match(lines[index])
+        if match is not None and match.group("reason").strip():
+            return match.group("reason").strip()
+    return None
+
+
 def _annotated(lines, lineno) -> bool:
-    for index in (lineno - 1, lineno - 2, lineno):
-        if 0 <= index < len(lines) and ANNOTATION in lines[index]:
-            return True
-    return False
+    return _annotation_reason(lines, lineno) is not None
+
+
+def _annotation_findings(lines, budget_lines, path) -> list:
+    """Every annotation that records no reason, or excuses no budget.
+
+    The closure `RECORDED` already has, one level down. An excuse left behind
+    by a wait that is gone reads as deliberate and hides the next real finding
+    at that site.
+    """
+    out = []
+    for number, line in enumerate(lines, start=1):
+        match = _ANNOTATION_PATTERN.match(line)
+        if match is None:
+            continue
+        reason = match.group("reason").strip()
+        if not reason:
+            out.append(Finding(
+                path, number, "empty-annotation", None,
+                "`# %s` records no reason; state what THIS site waits for"
+                % ANNOTATION))
+            continue
+        if not {number + offset for offset in _ANNOTATION_REACH} & budget_lines:
+            out.append(Finding(
+                path, number, "stale-annotation", None,
+                "`# %s %s` excuses no budget: the site it is bound to carries "
+                "none. Delete it, or move it onto the wait it describes"
+                % (ANNOTATION, reason)))
+    return out
 
 
 def _deduplicate(findings):
@@ -837,17 +1302,23 @@ def _numeric(node, module_constants, shadowed=frozenset()):
     return None
 
 
-def collect_elapsed_assertions(path, source=None) -> list:
+def collect_elapsed_assertions(path, source=None, include_annotated=False) -> list:
     """Assertions that bound a measured duration from ABOVE by a literal.
 
     A lower bound is a different claim — "this actually waited" — and cannot be
     failed by a slow machine, so it is left alone. A comparison between two
     measured durations is an ordering claim and carries no literal at all.
+
+    A ceiling carrying a site-bound `# timing-budget:` reason is deliberate and
+    is not reported. `include_annotated` asks for the unsuppressed set, which
+    is what the annotation contract needs to decide whether an annotation is
+    bound to anything.
     """
     relative = str(pathlib.Path(path).resolve().relative_to(REPO)) \
         if pathlib.Path(path).is_absolute() else str(path)
     text = source if source is not None else pathlib.Path(path).read_text(encoding="utf-8")
     tree = ast.parse(text)
+    lines = text.splitlines()
     module_constants = _module_constants(tree)
     derived, bare = _clock_derived_names(tree), _clock_bare_names(tree)
 
@@ -882,14 +1353,17 @@ def collect_elapsed_assertions(path, source=None) -> list:
                 else:
                     continue
                 seconds = _numeric(bound, module_constants, shadowed)
-                if _is_elapsed(measured, derived, bare) and seconds is not None:
-                    findings.append(Finding(
-                        relative, compare.lineno, "elapsed-ceiling",
-                        seconds,
-                        "an assertion bounds a measured duration above by %g "
-                        "seconds, which measures the machine rather than the "
-                        "mechanism" % seconds,
-                        function))
+                if not (_is_elapsed(measured, derived, bare) and seconds is not None):
+                    continue
+                if not include_annotated and _annotated(lines, compare.lineno):
+                    continue
+                findings.append(Finding(
+                    relative, compare.lineno, "elapsed-ceiling",
+                    seconds,
+                    "an assertion bounds a measured duration above by %g "
+                    "seconds, which measures the machine rather than the "
+                    "mechanism" % seconds,
+                    function))
     return _deduplicate(findings)
 
 
@@ -1204,6 +1678,125 @@ def test_two_sequential_budgets_are_summed():
     assert findings[0].seconds == 180
 
 
+def test_a_composed_sum_that_exactly_fills_the_cap_is_reported():
+    """`total > CAP_SECONDS` was not a tight rule, it was a wrong one.
+
+    pytest-timeout kills the item at 120 seconds of wall clock, and no item
+    spends wall clock on its budgets alone. A sum of exactly 120 is therefore
+    spendable only by a test that starts no server, spawns no child and builds
+    no corpus, which is not a test — so the last of these four waits can never
+    fire, and the worker is killed mid-wait with a generic timeout instead.
+
+    Three functions sat at exactly 120.0 when this test was written, each of
+    them four `PRESENCE_BACKSTOP_SECONDS` waits in a row.
+    """
+    at_cap = _budgets(
+        "def test_x(a, b, c, d):\n"
+        "    a.wait(timeout=30.0)\n"
+        "    b.wait(timeout=30.0)\n"
+        "    c.join(timeout=30.0)\n"
+        "    d.join(timeout=30.0)\n"
+    )
+    composed = [f for f in at_cap if f.kind == "composed"]
+    assert [f.seconds for f in composed] == [120.0], at_cap
+    assert "not a budget" in composed[0].detail, composed[0].detail
+
+    # And the rule reserves headroom rather than only closing the off-by-one:
+    # a sum one second under the cap is just as unspendable.
+    under_cap = _budgets(
+        "def test_x(a, b, c, d):\n"
+        "    a.wait(timeout=30.0)\n"
+        "    b.wait(timeout=30.0)\n"
+        "    c.join(timeout=30.0)\n"
+        "    d.join(timeout=29.0)\n"
+    )
+    assert [f.seconds for f in under_cap if f.kind == "composed"] == [119.0], \
+        under_cap
+
+    # The control. A sum that leaves the reservation free is silent, so the
+    # rule is not simply reporting every multi-budget function it sees.
+    leaves_room = _budgets(
+        "def test_x(a, b, c):\n"
+        "    a.wait(timeout=30.0)\n"
+        "    b.wait(timeout=30.0)\n"
+        "    c.join(timeout=30.0)\n"
+    )
+    assert [f for f in leaves_room if f.kind == "composed"] == [], leaves_room
+
+
+def test_the_composed_threshold_is_not_parked_on_a_sum():
+    """The twin of `test_the_floor_is_not_parked_on_a_budget_value`.
+
+    The composed comparison is a strict `>` on `total + headroom`, so a
+    function whose budgets sum to exactly `CAP_SECONDS - headroom` is exempt.
+    A threshold parked on a sum the estate actually writes would read as clean
+    on the very function it was written to name, and nothing in the guard could
+    tell that apart from a genuinely clean tree.
+
+    The measured distribution of composed sums steps 105.0, 120.0, 135.0, so
+    111.0 sits in an empty band. This check is what keeps it there.
+    """
+    threshold = CAP_SECONDS - COMPOSED_HEADROOM_SECONDS
+    parked, examined = {}, 0
+    for path in _tracked("tests/*.py"):
+        if not path.exists():
+            continue
+        relative = str(path.relative_to(REPO))
+        text = path.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        consts = _module_constants(tree)
+        clocky = _clock_bare_names(tree)
+        blocking = _blocking_names(tree)
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            arguments = func.args
+            parameters = {
+                a.arg for a in
+                list(arguments.posonlyargs) + list(arguments.args)
+                + list(arguments.kwonlyargs)
+            }
+            local = _local_numbers(func, consts)
+            segments = []
+            segments.append(_walk_paths(
+                func.body, consts, local, parameters, relative, [], segments,
+                _names_waited_on(func, clocky, blocking), clocky, blocking))
+            for lam in ast.walk(func):
+                # The rule sums lambda segments too, so this check must see
+                # them or it would certify a gap the rule does not have.
+                if not isinstance(lam, ast.Lambda):
+                    continue
+                lam_args = lam.args
+                segments.append(_budgets_in_expression(
+                    lam.body, consts, local,
+                    parameters | {
+                        a.arg for a in
+                        list(lam_args.posonlyargs) + list(lam_args.args)
+                        + list(lam_args.kwonlyargs)
+                    },
+                    relative, clocky, blocking))
+            for segment in segments:
+                if len(segment) < 2:
+                    continue
+                examined += 1
+                total = sum(b.seconds for b in segment if b.seconds)
+                if total == threshold:
+                    parked.setdefault(relative, []).append(segment[0].lineno)
+    # Non-vacuity, for the same reason the floor's twin carries one: this check
+    # passes by finding nothing, which is also what it would do if the walk
+    # returned no multi-budget segment at all. Seventy-two were measured when
+    # this was written.
+    assert examined > 50, (
+        "only %d multi-budget segments were examined across the estate, which "
+        "is too few for this check to have seen the distribution" % examined)
+    assert not parked, (
+        "these composed sums sit at exactly CAP_SECONDS - "
+        "COMPOSED_HEADROOM_SECONDS (%g), and the rule compares with a strict "
+        "`>`, so every one of them is exempt from the rule written to catch "
+        "them. Move the headroom so the threshold sits in a gap: %r"
+        % (threshold, parked))
+
+
 def test_a_try_body_continues_the_path_and_an_except_does_not():
     """`try:` is entered unconditionally; its handler is a different path."""
     summed = _budgets(
@@ -1328,6 +1921,287 @@ def test_a_parameter_valued_budget_is_charged_to_its_call_sites():
     assert findings == [], findings
 
 
+def test_a_configuration_value_named_timeout_is_not_a_blocking_budget():
+    """The shape at `tests/test_refresh_usage_cmd.py:35`.
+
+    `argparse.Namespace(timeout=…)` hands a number to the code under test as
+    configuration. Nothing in the test waits for it, so its size says nothing
+    about what the test can spend and the cap does not apply to it.
+    """
+    stored = _budgets(
+        "import argparse\n"
+        "def _args():\n"
+        "    return argparse.Namespace(json=False, timeout=300)\n"
+    )
+    assert stored == [], stored
+
+    spent = _budgets(
+        "import subprocess\n"
+        "def test_x():\n"
+        "    subprocess.run(['x'], timeout=300)\n"
+    )
+    assert _kinds(spent) == ["over-cap"], spent
+
+
+def test_an_exception_constructor_argument_is_not_a_blocking_budget():
+    """The shape at `tests/test_ua_discovery.py:122`.
+
+    `subprocess.TimeoutExpired(cmd, timeout=…)` REPORTS a budget that has
+    already expired. Constructing it waits for nothing.
+    """
+    raised = _budgets(
+        "import subprocess\n"
+        "def fake_run(cmd, **kwargs):\n"
+        "    raise subprocess.TimeoutExpired(cmd, timeout=300)\n"
+    )
+    assert raised == [], raised
+
+    waited = _budgets(
+        "def test_x(proc):\n"
+        "    proc.wait(timeout=300)\n"
+    )
+    assert _kinds(waited) == ["over-cap"], waited
+
+
+def test_the_real_exception_constructor_in_the_repository_is_not_a_budget():
+    """The classification, read off the file rather than off a copy of it."""
+    path = REPO / "tests" / "test_ua_discovery.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    raises = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _callee_of(node) == "TimeoutExpired"
+        and any(kw.arg in BUDGET_KEYWORDS for kw in node.keywords)
+    ]
+    assert raises, (
+        "tests/test_ua_discovery.py no longer raises TimeoutExpired with a "
+        "budget keyword; this test names a shape that has moved"
+    )
+    blocking = _blocking_names(tree)
+    assert "TimeoutExpired" not in blocking
+    assert "wait" in blocking and "run" in blocking
+
+
+def test_a_helper_defined_in_the_module_is_read_as_blocking_when_it_waits():
+    """An allowlist of names alone would drop every local wait helper.
+
+    `_read_bytes(deadline_s=…)` in `tests/test_dashboard_api_events.py` and
+    `_drain_stream(timeout=…)` in `tests/test_update.py` are waits this
+    repository wrote for itself. They are recognised because their bodies
+    reach a blocking call, not because their names were listed.
+    """
+    findings = _budgets(
+        "import socket\n"
+        "def _read_bytes(sock, *, deadline_s):\n"
+        "    sock.settimeout(deadline_s)\n"
+        "    return sock.recv(4096)\n"
+        "def test_x(sock):\n"
+        "    _read_bytes(sock, deadline_s=300)\n"
+    )
+    assert _kinds(findings) == ["over-cap"], findings
+
+    inert = _budgets(
+        "def _record(store, *, timeout):\n"
+        "    store['timeout'] = timeout\n"
+        "def test_x(store):\n"
+        "    _record(store, timeout=300)\n"
+    )
+    assert inert == [], inert
+
+
+def test_a_budget_handed_over_POSITIONALLY_is_collected():
+    """Half the estate's budgets are not written as keywords at all.
+
+    `POSITIONAL_BUDGET_ATTRS` held `join` alone, so every other positional form
+    was invisible — and `settimeout`, which CPython accepts ONLY positionally,
+    sat in `BLOCKING_CALLEES` unable to be collected through any spelling. Each
+    probe below returned nothing before this closure.
+    """
+    for source, seconds in (
+        ("import socket\n"
+         "def test_x(sock):\n"
+         "    sock.settimeout(2.0)\n", 2.0),
+        ("import socket\n"
+         "def test_x(addr):\n"
+         "    socket.create_connection(addr, 2)\n", 2.0),
+        ("def test_x(q):\n"
+         "    q.get(True, 2.0)\n", 2.0),
+        ("import select\n"
+         "def test_x(r):\n"
+         "    select.select([r], [], [], 2.0)\n", 2.0),
+        ("def test_x(proc):\n"
+         "    proc.communicate(b'', 2.0)\n", 2.0),
+        ("import urllib.request\n"
+         "def test_x(url):\n"
+         "    urllib.request.urlopen(url, None, 2.0)\n", 2.0),
+        ("import http.client\n"
+         "def test_x(port):\n"
+         "    http.client.HTTPConnection('127.0.0.1', port, 2.0)\n", 2.0),
+        ("def test_x(lock):\n"
+         "    lock.acquire(True, 2.0)\n", 2.0),
+        ("def test_x(done):\n"
+         "    done.wait(2.0)\n", 2.0),
+    ):
+        findings = _budgets(source)
+        assert _kinds(findings) == ["under-load-floor"], (source, findings)
+        assert [f.seconds for f in findings] == [seconds], (source, findings)
+
+
+def test_a_NON_BLOCKING_flag_makes_the_number_beside_it_not_a_budget():
+    """`q.get(False, 5.0)` waits for nothing, so the 5.0 is never spent.
+
+    The shape guard accepted any boolean literal, which reads the pair as a
+    budget in both directions. CPython ignores the timeout when the flag is
+    false, and `Lock.acquire(False, 5.0)` raises on the pair outright, so a
+    finding there would demand an annotation for time no run can spend. No
+    site in the estate writes it today, which is exactly why this is pinned by
+    a scaffold rather than by the tree.
+    """
+    for callee in ("get", "acquire"):
+        assert _budgets(
+            "def test_x(q):\n"
+            "    q.%s(False, 5.0)\n" % callee
+        ) == [], callee
+        # The true form is still read, so this is a narrowing rather than a
+        # hole: the same number under a blocking flag is still reported.
+        blocking = _budgets(
+            "def test_x(q):\n"
+            "    q.%s(True, 5.0)\n" % callee
+        )
+        assert [(f.kind, f.seconds) for f in blocking] == \
+            [("under-load-floor", 5.0)], (callee, blocking)
+
+
+def test_a_positional_lookalike_is_not_read_as_a_budget():
+    """The same attribute names mean other things, and a number does not settle it.
+
+    `d.get(key, 5)` supplies a default and `"x".join(parts)` builds a string.
+    The positional rule therefore reads a budget only at the argument INDEX the
+    callee puts it at, and only when the preceding arguments have the shape that
+    callee requires — `Queue.get` takes `block` first, and a dictionary lookup
+    does not.
+    """
+    for source in (
+        "def test_x(d):\n"
+        "    d.get('key', 5)\n",
+        "def test_x(lines):\n"
+        "    '\\n'.join(lines)\n",
+        "import os\n"
+        "def test_x(a, b):\n"
+        "    os.path.join(a, b)\n",
+    ):
+        assert _budgets(source) == [], source
+
+
+def test_every_positional_only_blocking_callee_can_be_collected():
+    """The other half of the closed world, which was open.
+
+    `test_every_callee_carrying_a_budget_keyword_is_classified` walks
+    `node.keywords`, so a callee that takes its budget positionally can never
+    reach it. `settimeout` proved the hole: it was named blocking, it is
+    positional-only in CPython, and no spelling of it could produce a finding.
+    An entry that cannot be collected is not a rule, it is a comment.
+    """
+    unreachable = sorted(
+        name for name in POSITIONAL_ONLY_BUDGET_CALLEES
+        if name not in POSITIONAL_BUDGET_ATTRS
+    )
+    assert not unreachable, (
+        "these callees accept a budget only positionally and carry no "
+        "`POSITIONAL_BUDGET_ATTRS` entry, so no call to them can ever be "
+        "collected: %r" % (unreachable,))
+    assert POSITIONAL_ONLY_BUDGET_CALLEES <= set(BLOCKING_CALLEES), (
+        "a positional-only budget callee must also be named blocking")
+
+    # The membership above is a claim about CPython, so it is checked against
+    # CPython rather than against this file's own comment. A release that
+    # started accepting the keyword would make the entry merely redundant; one
+    # that made another callee positional-only would make THIS list wrong, and
+    # only a runtime probe can tell the difference.
+    import select as _select
+    import socket as _socket
+
+    def refuses_the_keyword(call) -> bool:
+        try:
+            call()
+        except TypeError as exc:
+            return "keyword" in str(exc)
+        return False
+
+    probe = _socket.socket()
+    try:
+        assert refuses_the_keyword(lambda: probe.settimeout(value=1.0)), (
+            "socket.settimeout now accepts a keyword, so it is no longer "
+            "positional-only and this list is stale")
+    finally:
+        probe.close()
+    assert refuses_the_keyword(
+        lambda: _select.select(rlist=[], wlist=[], xlist=[], timeout=0)), (
+        "select.select now accepts a keyword, so it is no longer "
+        "positional-only and this list is stale")
+
+
+def test_a_budget_inside_a_lambda_is_not_summed_with_its_writer():
+    """A thread target does not run where it is written.
+
+    `threading.Thread(target=lambda: release.wait(60))` spends those sixty
+    seconds on the spawned thread. Summing them into the function that wrote
+    the lambda read `tests/test_support_http.py` as 180 seconds of sequential
+    waiting against a 120-second cap — a composed finding for waits that never
+    run in sequence at all.
+    """
+    findings = _budgets(
+        "import threading\n"
+        "def test_x(release, done, other):\n"
+        "    threading.Thread(target=lambda: release.wait(60)).start()\n"
+        "    done.wait(30)\n"
+        "    other.wait(30)\n"
+    )
+    assert [f.kind for f in findings if f.kind == "composed"] == [], findings
+
+    # Still collected, so a lambda cannot become a place to park an unreachable
+    # budget: its own segment reports it singly.
+    over = _budgets(
+        "import threading\n"
+        "def test_x(release):\n"
+        "    threading.Thread(target=lambda: release.wait(300)).start()\n"
+    )
+    assert _kinds(over) == ["over-cap"], over
+
+
+def test_every_callee_carrying_a_budget_keyword_is_classified():
+    """Closed world, so the allowlist cannot go silently blind.
+
+    An allowlist skips whatever it does not name, and a guard that skips a new
+    blocking helper reports "clean" identically to a guard with nothing to
+    report. This is what makes the allowlist safe to keep: every callee in the
+    estate that carries a budget keyword must be named blocking, named
+    non-blocking, or resolvable as a wait inside its own module.
+    """
+    unclassified, examined = {}, 0
+    for path in _tracked("tests/*.py"):
+        if not path.exists():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        blocking = _blocking_names(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not any(kw.arg in BUDGET_KEYWORDS for kw in node.keywords):
+                continue
+            examined += 1
+            callee = _callee_of(node)
+            if callee in blocking or callee in NON_BLOCKING_CALLEES:
+                continue
+            unclassified.setdefault(
+                callee, "%s:%d" % (path.relative_to(REPO), node.lineno))
+    assert examined, "the scan found no budget keywords at all, so it proves nothing"
+    assert not unclassified, (
+        "these callees carry a budget keyword and are classified neither way; "
+        "add each to BLOCKING_CALLEES or to NON_BLOCKING_CALLEES with the "
+        "reason: %r" % (unclassified,)
+    )
+
+
 def test_an_unresolvable_budget_must_be_annotated():
     bare = _budgets(
         "def test_x(proc, config):\n"
@@ -1341,6 +2215,243 @@ def test_an_unresolvable_budget_must_be_annotated():
         "    proc.wait(timeout=config.limit)\n"
     )
     assert annotated == [], annotated
+
+
+def test_a_budget_below_the_load_safe_floor_is_reported():
+    """The band the real failures live in, which the cap could never see.
+
+    An individual budget is only reported above 120 s, so everything in
+    `[1.0, 120.0]` was invisible by construction — and that is exactly where
+    the load-sensitive failures sit. The confirmed one was a loopback socket
+    timeout at a 2-second budget.
+    """
+    fragile = _budgets(
+        "import http.client\n"
+        "def test_x(port):\n"
+        "    http.client.HTTPConnection('127.0.0.1', port, timeout=2)\n"
+    )
+    assert _kinds(fragile) == ["under-load-floor"], fragile
+    assert fragile[0].seconds == 2.0
+
+    load_safe = _budgets(
+        "import http.client\n"
+        "def test_x(port):\n"
+        "    http.client.HTTPConnection('127.0.0.1', port, timeout=30)\n"
+    )
+    assert load_safe == [], load_safe
+
+    reasoned = _budgets(
+        "def test_x(queue):\n"
+        "    # timing-budget: the queue is asserted EMPTY here, so this window is the claim\n"
+        "    queue.get(timeout=2)\n"
+    )
+    assert reasoned == [], reasoned
+
+
+def test_the_floor_is_not_parked_on_a_budget_value():
+    """A floor equal to a budget the estate writes reports none of them.
+
+    The rule compares with a strict `<`, so a floor of 5.0 exempts every
+    5-second budget — and 5 seconds was the most common budget in this estate
+    by a wide margin: 128 sites across 27 files, mostly loopback connects
+    against a server the test had just started. The rule read as clean on a
+    tree full of exactly the class it names, and nothing in the guard could
+    tell that apart from a tree that was genuinely clean.
+
+    So the floor must sit in a GAP. This is the check that keeps it there, and
+    it is deliberately mechanical: the previous floor's docstring already
+    explained that the number was measured, and the number was still parked.
+    """
+    # A budget written inside a lambda is a budget. `_collect_raw_budgets`
+    # walks lambda bodies for that reason, and this scaffold pins it: without
+    # that walk the shape below is invisible here, so a floor parked on it
+    # would read as clean.
+    in_a_lambda = _collect_raw_budgets(
+        "tests/scaffold.py",
+        "import threading\n"
+        "def test_x(release):\n"
+        "    probe = threading.Thread(target=lambda: release.wait(%g))\n"
+        "    probe.start()\n" % LOAD_SAFE_BACKSTOP_SECONDS)
+    assert [b.seconds for b in in_a_lambda] == [LOAD_SAFE_BACKSTOP_SECONDS], \
+        in_a_lambda
+
+    parked, examined = {}, 0
+    for path in _tracked("tests/*.py"):
+        if not path.exists():
+            continue
+        relative = str(path.relative_to(REPO))
+        text = path.read_text(encoding="utf-8")
+        for finding in _collect_raw_budgets(relative, text):
+            examined += 1
+            if finding.seconds == LOAD_SAFE_BACKSTOP_SECONDS:
+                parked.setdefault(
+                    relative, []).append(finding.lineno)
+    # Non-vacuity. This check passes by finding nothing, which is also what it
+    # would do if the raw collector returned nothing at all — the same failure
+    # shape as the parked floor it exists to catch.
+    assert examined > 100, (
+        "the raw collector found %d budgets across the estate, which is too "
+        "few for this check to have examined the distribution" % examined)
+    assert not parked, (
+        "these budgets sit at exactly LOAD_SAFE_BACKSTOP_SECONDS (%g), and the "
+        "under-load-floor rule compares with a strict `<`, so every one of "
+        "them is exempt from the rule written to catch them. Move the floor "
+        "into a gap in the distribution: %r"
+        % (LOAD_SAFE_BACKSTOP_SECONDS, parked))
+
+
+def test_the_floor_covers_the_failure_that_was_measured():
+    """The number is a measurement, not a preference.
+
+    A floor at or below 2.0 would not report the one failure this repository
+    actually observed, and the shared helpers' presence backstop has to clear
+    it or every consolidated call site would be reported.
+    """
+    assert LOAD_SAFE_BACKSTOP_SECONDS > 2.0
+    assert LOAD_SAFE_BACKSTOP_SECONDS > POLL_CADENCE_SECONDS
+
+    support = (REPO / "tests" / "_support_http.py").read_text(encoding="utf-8")
+    assert "PRESENCE_BACKSTOP_SECONDS = 30.0" in support
+    assert LOAD_SAFE_BACKSTOP_SECONDS < 30.0
+
+
+def test_poll_cadence_stays_below_the_floor_rather_than_being_reported_by_it():
+    """A `result(timeout=0.5)` inside a wait loop is cadence, not a budget."""
+    findings = _budgets(
+        "import time\n"
+        "def test_x(ready):\n"
+        "    while not ready():\n"
+        "        time.sleep(0.01)\n"
+        "    ready().result(timeout=0.5)\n"
+    )
+    assert findings == [], findings
+
+
+def test_the_recorded_baseline_holds_no_unconverted_disposition():
+    """#630 S2 converted all twelve `convert` rows and deleted them.
+
+    A row still saying a test needs converting, months after the session that
+    was supposed to convert it, is a disposition nobody owns.
+    """
+    unconverted = sorted(
+        key for key, reason in list(RECORDED.items()) + list(RECORDED_SHELL.items())
+        if reason.startswith("convert")
+    )
+    assert not unconverted, unconverted
+    assert len(RECORDED) == 21, len(RECORDED)
+
+
+def test_an_empty_budget_annotation_is_rejected():
+    """`# timing-budget:` with nothing after it excused a budget and said nothing.
+
+    The old test was a substring search, so the marker alone passed. An
+    annotation exists to record what THIS site waits for; one that records
+    nothing is an excuse without a reason.
+    """
+    empty = _budgets(
+        "def test_x(proc, config):\n"
+        "    # timing-budget:\n"
+        "    proc.wait(timeout=config.limit)\n"
+    )
+    assert "empty-annotation" in _kinds(empty), empty
+    assert "unannotated" in _kinds(empty), empty
+
+    named = _budgets(
+        "def test_x(proc, config):\n"
+        "    # timing-budget: config.limit is pinned by the fixture below\n"
+        "    proc.wait(timeout=config.limit)\n"
+    )
+    assert named == [], named
+
+
+def test_an_annotation_whose_site_carries_no_budget_is_stale():
+    """An excuse for a wait that is gone hides the next real finding behind it.
+
+    The same closure `RECORDED` already has, one level down: a budget removed
+    or respelled must take its annotation with it.
+    """
+    orphaned = _budgets(
+        "def test_x(proc):\n"
+        "    # timing-budget: the child has exited, so returncode is set\n"
+        "    assert proc.returncode == 0\n"
+    )
+    assert _kinds(orphaned) == ["stale-annotation"], orphaned
+
+    bound = _budgets(
+        "def test_x(proc):\n"
+        "    # timing-budget: the child has exited, so returncode is set\n"
+        "    proc.wait(timeout=5)\n"
+    )
+    assert bound == [], bound
+
+
+def test_a_named_absence_window_is_annotated_by_construction():
+    """`read_no_event(window=…)` states the assertion, not a guess at a duration.
+
+    A presence backstop returns as soon as the thing arrives, so raising it is
+    free. An absence window is spent in full every run, which is why it stays
+    short — and why demanding a comment justifying its shortness would be
+    asking the author to defend the assertion's own semantics.
+
+    It is SEEN rather than skipped: a window above the cap is still reported,
+    because that window really is spent and really cannot fire.
+    """
+    short = _budgets(
+        "from tests._support_http import read_no_event\n"
+        "def test_x(sock):\n"
+        "    read_no_event(sock, marker='event: tail', window=3.0)\n"
+    )
+    assert short == [], short
+
+    unreachable = _budgets(
+        "from tests._support_http import read_no_event\n"
+        "def test_x(sock):\n"
+        "    read_no_event(sock, marker='event: tail', window=300.0)\n"
+    )
+    assert _kinds(unreachable) == ["over-cap"], unreachable
+
+
+def test_the_real_absence_windows_are_seen_and_carry_no_comment():
+    """The acceptance case, read off the two files rather than off a copy.
+
+    Also the invariant that separates the two ideas: an absence window may
+    never be `PRESENCE_BACKSTOP_SECONDS`. Thirty seconds of waiting for
+    something to arrive costs nothing when it arrives; thirty seconds of
+    waiting to prove nothing arrives costs thirty seconds, every run.
+    """
+    support = (REPO / "tests" / "_support_http.py").read_text(encoding="utf-8")
+    assert "def read_no_event(" in support
+    seen = 0
+    for name in ("tests/test_dashboard_conversation_events.py",
+                 "tests/test_codex_dashboard_conversation_events.py"):
+        path = REPO / name
+        text = path.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        lines = text.splitlines()
+        windows = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _callee_of(node) == "read_no_event"
+        ]
+        assert windows, "%s no longer asserts an absence at all" % name
+        constants = _module_constants(tree)
+        for call in windows:
+            seen += 1
+            given = [kw.value for kw in call.keywords if kw.arg == "window"]
+            assert len(given) == 1, (name, call.lineno)
+            seconds = _resolve(given[0], constants, {})
+            assert seconds is not None, (name, call.lineno)
+            assert seconds < 30.0, (
+                "%s:%d spends a %gs absence window; the presence backstop is "
+                "30s and an absence window is spent in full"
+                % (name, call.lineno, seconds)
+            )
+            assert not _annotated(lines, call.lineno), (
+                "%s:%d carries a budget annotation; a named absence window is "
+                "annotated by construction and needs no comment"
+                % (name, call.lineno)
+            )
+        assert not [f for f in collect_budgets(path) if f.kind == "unannotated"]
+    assert seen >= 5, seen
 
 
 def test_a_deadline_is_a_budget_only_when_a_loop_waits_on_it():
@@ -1357,6 +2468,32 @@ def test_a_deadline_is_a_budget_only_when_a_loop_waits_on_it():
         "import time\n"
         "def test_x(record):\n"
         "    record['expires_at'] = time.time() + 172800\n"
+    )
+    assert stored == [], stored
+
+
+def test_a_deadline_computed_from_a_clock_DERIVED_NAME_is_still_a_deadline():
+    """The reading may be one name away, and matching only the call form hid it.
+
+    `tests/test_rebuild_heal.py` waits two seconds for three spawned children
+    to admit a heal request, spelled `started = time.monotonic()` and then
+    `deadline = started + 2.0`. The contended lane failed it twice on the
+    slower runner while this guard reported nothing about it.
+    """
+    indirect = _budgets(
+        "import time\n"
+        "def test_x(ready):\n"
+        "    started = time.monotonic()\n"
+        "    deadline = started + 2.0\n"
+        "    while not ready() and time.monotonic() < deadline:\n"
+        "        time.sleep(0.01)\n"
+    )
+    assert _kinds(indirect) == ["under-load-floor"], indirect
+    assert indirect[0].seconds == 2.0
+
+    stored = _budgets(
+        "def test_x(record, captured_at):\n"
+        "    record['expires_at'] = captured_at + 2.0\n"
     )
     assert stored == [], stored
 
@@ -1387,6 +2524,84 @@ def test_a_deadline_only_a_clock_reading_wait_draws_on_is_still_reported():
         "    record['expires_at'] = expires\n"
     )
     assert horizon == [], horizon
+
+
+def test_a_deadline_COMPUTED_AT_THE_CALL_SITE_is_still_a_deadline():
+    """A budget that never touches a local name was worth nothing to the sum.
+
+    `_budget_finding` drops any budget expression that reads the clock, because
+    `timeout=deadline - time.monotonic()` is the REMAINDER of a deadline that
+    `_waited_deadline` already reported where it was assigned. That reasoning
+    holds only while the deadline IS assigned somewhere. Written inline as
+    `helper(deadline=time.monotonic() + 10.0)` the same budget is a NEW
+    deadline, there is no assignment for `_waited_deadline` to see, and the
+    guard counted zero.
+
+    `tests/test_dashboard_responsive_startup.py` spent 90 seconds of shared
+    budget, then joined for 30, then made two such inline calls for 10 and 30
+    more. Its true worst case was 160 seconds against a 120-second cap, and the
+    composed sum the guard computed was exactly 120.0, which the rule of the
+    day accepted because it compared `total > CAP_SECONDS`. Both halves are
+    fixed: the inline deadline is counted here, and the composed rule now
+    reserves `COMPOSED_HEADROOM_SECONDS` of the cap, so a sum of exactly 120
+    is reported rather than accepted.
+    """
+    inline = _budgets(
+        "import time\n"
+        "def _await(*, deadline):\n"
+        "    while time.monotonic() < deadline:\n"
+        "        time.sleep(0.05)\n"
+        "def test_x():\n"
+        "    _await(deadline=time.monotonic() + 130.0)\n"
+    )
+    assert _kinds(inline) == ["over-cap"], inline
+    assert inline[0].seconds == 130.0
+
+    # The remainder form still resolves to the deadline it draws from, not to a
+    # second budget of its own: subtraction takes what is left, addition makes
+    # more.
+    remainder = _budgets(
+        "import time\n"
+        "def _await(*, timeout):\n"
+        "    while time.monotonic() < timeout:\n"
+        "        time.sleep(0.05)\n"
+        "def test_x():\n"
+        "    end = time.monotonic() + 130.0\n"
+        "    _await(timeout=end - time.monotonic())\n"
+    )
+    assert [(f.kind, f.seconds) for f in remainder] == [("over-cap", 130.0)], \
+        remainder
+
+
+def test_the_inline_teardown_deadlines_are_counted_against_the_cap():
+    """The composed sum over the real file, which is what the miss cost.
+
+    Ninety seconds of shared budget plus a thirty-second join plus two inline
+    handler-exit deadlines is 160 against a 120-second cap. Every one of those
+    four waits is on one unconditional path — the body, then a `finally` — so a
+    hang in the product spends all four and pytest-timeout kills the worker
+    mid-teardown, which is the undiagnosable red #630 S1 removed.
+    """
+    findings = _budgets(
+        "import time\n"
+        "import threading\n"
+        "BUDGET = 90.0\n"
+        "BACKSTOP = 30.0\n"
+        "def _await(before, *, deadline):\n"
+        "    while time.monotonic() < deadline:\n"
+        "        time.sleep(0.05)\n"
+        "def test_x(thread, before, work):\n"
+        "    deadline = time.monotonic() + BUDGET\n"
+        "    try:\n"
+        "        while time.monotonic() < deadline:\n"
+        "            work()\n"
+        "    finally:\n"
+        "        thread.join(timeout=BACKSTOP)\n"
+        "        _await(before, deadline=time.monotonic() + 10.0)\n"
+        "        _await(before, deadline=time.monotonic() + BACKSTOP)\n"
+    )
+    composed = [f for f in findings if f.kind == "composed"]
+    assert [f.seconds for f in composed] == [160.0], findings
 
 
 def test_the_from_time_import_spelling_does_not_disable_the_rules():
@@ -1468,6 +2683,54 @@ def test_a_function_binding_does_not_resolve_through_a_shadowed_module_constant(
         "    assert elapsed < CLI_BUDGET_S\n"
     )
     assert findings == [], findings
+
+
+def test_an_elapsed_ceiling_may_be_annotated():
+    """A ceiling retained beside a structural counter states why at the site.
+
+    A structural counter must cover the COMPLETE expensive operation. Where it
+    covers only part of one — three bucket probes inside a 6,000-operation run,
+    trie edges inside a scrub over a megabyte — the wall clock is retained at a
+    load-safe budget beside it. That decision belongs at the assertion, where
+    the next reader is, rather than in a baseline this file would have to keep
+    growing.
+    """
+    bare = _elapsed(
+        "import time\n"
+        "def test_x(run):\n"
+        "    started = time.monotonic()\n"
+        "    run()\n"
+        "    assert time.monotonic() - started < 30.0\n"
+    )
+    assert _kinds(bare) == ["elapsed-ceiling"], bare
+
+    reasoned = _elapsed(
+        "import time\n"
+        "def test_x(run):\n"
+        "    started = time.monotonic()\n"
+        "    run()\n"
+        "    # timing-budget: retained beside the probe count, which bounds the lookup and not the 6,000 adds around it\n"
+        "    assert time.monotonic() - started < 30.0\n"
+    )
+    assert reasoned == [], reasoned
+
+
+def test_an_annotation_on_an_elapsed_ceiling_is_not_stale():
+    """The two halves of the contract have to agree about what a site carries.
+
+    The stale check reads the budget collector, and an elapsed ceiling is not a
+    budget. Without this the six retained ceilings would each be excused by the
+    ceiling rule and reported by the annotation rule in the same run.
+    """
+    source = (
+        "import time\n"
+        "def test_x(run):\n"
+        "    started = time.monotonic()\n"
+        "    run()\n"
+        "    # timing-budget: retained beside the probe count, which bounds the lookup and not the 6,000 adds around it\n"
+        "    assert time.monotonic() - started < 30.0\n"
+    )
+    assert _budgets(source) == [], _budgets(source)
 
 
 def test_an_elapsed_FLOOR_is_left_alone():
@@ -1706,6 +2969,22 @@ import time
 import urllib.request
 
 
+def _read_url_port(proc, deadline_s):
+    """Carried here because classification is callee-aware.
+
+    The excerpt calls this helper, and the helper is what makes
+    `deadline_s=90.0` a wait rather than a number. Reading it off the tree is
+    no longer possible — the file was rewritten in `1494562b3` — so the
+    snapshot carries it, trimmed to the loop that blocks.
+    """
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < deadline_s:
+        line = proc.stdout.readline()
+        if line:
+            return 8789, time.monotonic() - t0
+    raise RuntimeError("timed out waiting for the serving line")
+
+
 def test_bind_before_build_timing(proc, port):
     try:
         port, time_to_accept = _read_url_port(proc, deadline_s=90.0)
@@ -1742,8 +3021,17 @@ def test_it_flags_the_composed_deadlines_the_cap_cannot_grant():
     seconds. None of the later ones can be reached, because the cap fires first.
     """
     findings = _budgets(_DASHBOARD_STARTUP_AS_FOUND)
-    assert [f.kind for f in findings] == ["composed"], findings
-    assert findings[0].seconds == 275.0, findings[0].seconds
+    # EXCLUSIVE, not two filtered subsets. The snapshot carries exactly two
+    # defects and the whole finding list is asserted, so a third kind arriving
+    # on it — from a rule change, or from a rule newly misreading this shape —
+    # fails here instead of passing unseen between two `if f.kind ==` filters.
+    # The second is the OTHER defect this guard reports: a 5-second loopback
+    # connect against a server the test has just started, which is the exact
+    # class #630 S2 measured failing under contention. The snapshot is left as
+    # it was found rather than edited to make the assertion shorter.
+    assert [(f.kind, f.seconds) for f in findings] == [
+        ("composed", 275.0), ("under-load-floor", 5.0),
+    ], findings
 
 
 def test_it_flags_the_wait_that_polled_the_wrong_condition():

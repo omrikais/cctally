@@ -333,6 +333,13 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
      .dash-grid rule). A ::before overhang here would steal the first data row's
      tap, so grow the inner button's real min-height. */
   .modal-card .th-sortable .th-sort-btn { min-height: var(--tap-target); }
+  /* #620 S3 — the explain modal's retry button, the ONLY control offered in
+     the retryable state. Height only: a forced square would stretch a
+     word-labelled control into a shape its text does not fill, which is the
+     same reason `.topbar-explain` takes min-height alone. It belongs to this
+     widened block rather than a pointer-only one because it is a modal
+     control, and a narrow window driven by a mouse must reach it too. */
+  .explain-retry { min-height: var(--tap-target); }
   /* Composer real-box controls: kebab trigger, the opened kebab-menu actions,
      Clear all, and the "Anonymize all" banner action. */
   .composer-section-actions > button,
@@ -5366,13 +5373,15 @@ mark.current {
   /* #293 S4 BASKET-1 — keep the basket-chip OUT of the scrolled hide list so a
      non-empty basket stays reachable in the condensed mobile header (the chip
      self-removes when the basket is empty, so it shows exactly when non-empty).
-     view-switcher + doctor-chip stay hidden to keep the bar ≤64px. #294 S5 —
-     the source-switcher + source-status chip join that hide list: the collapsed
+     view-switcher + doctor-chip stay hidden to keep the bar ≤64px. Explain is
+     secondary navigation and also leaves the condensed row. #294 S5 — the
+     source-switcher + source-status chip join that hide list: the collapsed
      nowrap row has no room for the 3-segment selector, and the provider-native
      condensed readout already reflects the active source, so switching source
      is not a scrolled-header action (parity with the view-switcher). */
   .topbar.is-scrolled .view-switcher,
   .topbar.is-scrolled .source-switcher,
+  .topbar.is-scrolled .topbar-explain,
   .topbar.is-scrolled .source-status-chip,
   .topbar.is-scrolled .doctor-chip { display: none; }
   /* Row 2 = the action band: doctor pill at the start, basket chip +
@@ -5547,6 +5556,16 @@ mark.current {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* #636: the Block title carries an IANA zone that must remain readable,
+     not merely present in the accessible name. Let this one title use a
+     second line on phones; the zone tag stays atomic and the share/close
+     controls keep their fixed-size slots. Other modal titles retain the
+     established single-line ellipsis contract above. */
+  .block-modal-card .modal-header h2 {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
   }
   .modal-header .share-icon,
   .modal-header .provider-section-status,
@@ -7862,6 +7881,16 @@ mark.current {
   border-radius: 6px;
   background: var(--panel-bg-2);
 }
+/* A fully decorated desktop header can carry enough account chips that their
+   intrinsic width would wrap the global action cluster onto a second row.
+   Compact only this chrome-level row: every account remains fully visible and
+   keyboard reachable, while mobile keeps the larger wrapping chip recipe. */
+@media (min-width: 641px) {
+  .topbar > .account-chip-row .account-chip {
+    font-size: 11px;
+    padding-inline: var(--space-1);
+  }
+}
 .account-chip {
   appearance: none;
   border: none;
@@ -9780,7 +9809,11 @@ mark.current {
    A real `<button>`, because Tab must reach it and Enter or Space must
    activate it without the panel-focus flow residual R7 records as absent. The
    44px minimum touch target is the same floor `.conv-rail-chip` takes. */
-.alert-row-open {
+.alert-row-open,
+/* #620 S2 — the secondary affordance that opens the diagnosis of an alert's
+   own window. Same treatment as the primary one: one definition, so the two
+   cannot drift apart into two different-looking buttons in one cell. */
+.alert-row-explain {
   display: inline-flex;
   align-items: center;
   min-height: 24px;
@@ -9795,13 +9828,19 @@ mark.current {
   padding: 2px var(--space-2);
   cursor: pointer;
 }
-.alert-row-open:hover { color: var(--text); border-color: var(--accent-blue); }
-.alert-row-open:focus-visible {
+.alert-row-open:hover,
+.alert-row-explain:hover { color: var(--text); border-color: var(--accent-blue); }
+.alert-row-open:focus-visible,
+.alert-row-explain:focus-visible {
   outline: 2px solid var(--accent-blue);
   outline-offset: 2px;
 }
-/* Not a control: a closed window opens nothing, so nothing here is clickable.
-   It states the reason instead, which is what A11 requires. */
+/* #620 S2 — the sentence and, where the window is known, the diagnosis button
+   under it. A column is still not added: both live in the same cell, stacked. */
+.alert-row-unresolved { display: block; }
+/* Not a control: the SENTENCE opens nothing and is not clickable. It states the
+   reason instead, which is what A11 requires. Since #620 S2 a sibling button
+   may sit beneath it, offering the diagnosis of the same window. */
 .alert-row-withheld {
   display: block;
   margin-top: 4px;
@@ -9814,7 +9853,8 @@ mark.current {
 @media (pointer: coarse) {
   /* A touch target smaller than 44px is unusable, and the alerts table is one
      of the surfaces #503 sized for a thumb. */
-  .alert-row-open { min-height: 44px; padding: var(--space-1) var(--space-3); }
+  .alert-row-open,
+  .alert-row-explain { min-height: 44px; padding: var(--space-1) var(--space-3); }
 }
 .conv-rail-row {
   display: block;
@@ -14575,4 +14615,243 @@ mark.current {
     flex-wrap: wrap;
   }
   #settings-root .settings-scope-note { margin: 0; flex-basis: 100%; }
+}
+
+/* ═══ #620 S2 — the on-demand diagnosis ════════════════════════════════════
+   The dashboard ships exactly ONE theme: there is no `prefers-color-scheme`
+   handling and no `data-theme` attribute anywhere in this stylesheet, so every
+   rule below states one palette, drawn from the tokens at the top of the file.
+   Appended at the end of the file so source order settles any equal-specificity
+   tie in this block's favour rather than by accident. */
+
+/* The persistent, labelled entry point, beside the source and account
+   selectors it is scoped by. Deliberately NOT `.topbar-icon-btn`: that class
+   is the icon-only treatment, and this control is labelled in words. */
+.topbar-explain {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 12px;
+  background: none;
+  border: 1px solid var(--accent-indigo);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-meta);
+  line-height: 1.6;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.topbar-explain:hover { border-color: var(--text); }
+.topbar-explain:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+/* Coarse pointers get the HIG touch floor, matching the rest of the board
+   chrome. Height only — a forced square would stretch a word-labelled
+   control into a shape its text does not fill. */
+@media (pointer: coarse) {
+  .topbar-explain { min-height: var(--tap-target); }
+}
+
+.explain-status {
+  margin: 0 0 var(--space-3);
+  color: var(--text-dim);
+  font-size: var(--fs-body);
+}
+.explain-error { color: var(--accent-amber); }
+
+.explain-body { font-size: var(--fs-body); color: var(--text); }
+
+/* Window / alert-fired / measured. A definition list rather than a table, so
+   at 390px each value keeps its own label instead of being orphaned from a
+   header that has scrolled out of view (R8). */
+.explain-instants {
+  margin: 0 0 var(--space-3);
+  display: grid;
+  gap: var(--space-1);
+}
+.explain-instants > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.explain-instants dt {
+  color: var(--text-dim);
+  font-size: var(--fs-meta);
+  min-width: 84px;
+}
+.explain-instants dd { margin: 0; font-family: var(--font-mono); font-size: var(--fs-meta); }
+.explain-halfopen { color: var(--text-dim); font-family: inherit; }
+/* The IANA zone the instants on a line were converted into — on EVERY line
+   in this list, not only the window's. Dimmed like the half-open note beside
+   it, because it qualifies the instants rather than being another one. */
+.instant-zone { color: var(--text-dim); font-weight: 400; white-space: nowrap; }
+
+.explain-note {
+  margin: 0 0 var(--space-2);
+  color: var(--text-dim);
+  font-size: var(--fs-meta);
+}
+
+.explain-provider {
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-soft);
+}
+.explain-provider h3 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--fs-strong);
+  font-weight: 600;
+}
+.explain-provider h4 {
+  margin: var(--space-3) 0 var(--space-2);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+.explain-denominator {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+/* The wire identifier, in its own element rather than in the uppercasing
+   label: `text-transform: uppercase` destroyed the camelCase boundaries that
+   were the only cue separating its four words. */
+.explain-denominator-identity {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.explain-denominator-note { color: var(--text-dim); font-size: var(--fs-meta); }
+
+.explain-rows, .explain-classes { list-style: none; margin: 0; padding: 0; }
+.explain-row {
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.explain-row-head {
+  margin: 0 0 var(--space-1);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+.explain-rank { color: var(--text-dim); font-family: var(--font-mono); }
+.explain-row-class { color: var(--text-dim); font-size: var(--fs-meta); }
+.explain-row-subject { font-weight: 600; overflow-wrap: anywhere; }
+.explain-chip-contributor {
+  padding: 1px 8px;
+  border-radius: var(--radius-xs);
+  background: var(--chip-opus);
+  color: #fff;
+  font-size: var(--fs-eyebrow);
+  letter-spacing: 0.4px;
+}
+/* Each figure carries its own label, so nothing here depends on a column
+   header — and nothing depends on a `title` attribute, which a touch device
+   never reveals (R9). */
+.explain-row-figures {
+  margin: 0 0 var(--space-1);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+.explain-figure { display: flex; flex-direction: column; min-width: 0; }
+.explain-figure-label {
+  color: var(--text-dim);
+  font-size: var(--fs-eyebrow);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.explain-usd { font-family: var(--font-mono); font-weight: 600; }
+.explain-share, .explain-baseline { font-family: var(--font-mono); }
+.explain-withheld { color: var(--accent-amber); font-size: var(--fs-meta); }
+.explain-row-meta, .explain-coverage {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: var(--fs-meta);
+}
+/* A label beside a value, laid out the way the two sibling rows that do the
+   same thing are laid out — `.explain-row-figures` and `.explain-denominator`.
+   Without the gap the label and the command abutted at the same x and the
+   uppercase transform made them read as one word: `NEXT STEPcctally claude
+   daily …`. JSX strips the newline between the two elements, so no text node
+   separates them and the space has to come from the rule. */
+.explain-row-next {
+  margin: var(--space-1) 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+/* A long command wraps rather than forcing the modal into a horizontal
+   scroll: the modal body scrolls vertically only. */
+.explain-row-next code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  overflow-wrap: anywhere;
+  /* A flex item's `min-width: auto` floors it at its min-content width, so
+     the command has to be allowed to shrink before it can wrap. */
+  min-width: 0;
+}
+/* #620 S3 — the class-specific evidence, laid out exactly like the three
+   headline figures above it, so each value carries its own label and nothing
+   depends on a column header or a `title` attribute (R7/R9). It wraps at
+   390px for the same reason `.explain-row-figures` does. */
+.explain-evidence { margin-top: var(--space-1); }
+.explain-evidence-qualification {
+  color: var(--text-dim);
+  font-size: var(--fs-eyebrow);
+  overflow-wrap: anywhere;
+}
+/* Why rows could not be DECIDED, which is a different statement from the
+   coverage above it — so it reads as its own line rather than as more
+   coverage. */
+.explain-gaps { color: var(--accent-amber); }
+/* The published predicate of the class. Dimmed and wrapping, because it is a
+   definition a reader consults rather than a figure they scan. */
+.explain-rule {
+  margin: var(--space-1) 0 0;
+  color: var(--text-dim);
+  font-size: var(--fs-meta);
+  overflow-wrap: anywhere;
+}
+/* The retry affordance for `generation_incoherent`. A real <button>, so it is
+   in the tab order and activates on Enter and Space without the modal's
+   panel-focus flow (R7). */
+.explain-retry {
+  margin-top: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-xs);
+  background: var(--panel-bg-2);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.explain-retry:hover { border-color: var(--text-dim); }
+/* The retry button had a hover affordance and no keyboard one, so a
+   keyboard user reaching the only control in the retryable state fell
+   back to the thin UA ring. Same --focus-ring token the other 112
+   focus rules in this file use. */
+.explain-retry:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.explain-class { padding: var(--space-1) 0; }
+.explain-class-head { margin: 0; font-weight: 600; }
+
+.explain-verdict, .explain-overall {
+  margin: var(--space-3) 0 0;
+  font-weight: 600;
+}
+.explain-completeness {
+  color: var(--text-dim);
+  font-weight: 400;
+  font-size: var(--fs-meta);
 }

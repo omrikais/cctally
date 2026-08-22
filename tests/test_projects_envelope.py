@@ -61,6 +61,10 @@ def test_aggregate_projects_week_raw_finalize_matches_public():
     # mut keeps real sets (not range) so the accumulator can dedup later.
     assert mut, "multi-week fixture has current-week activity"
     assert all(isinstance(v["sessions"], set) for v in mut.values())
+    assert all(
+        finalized[bp].session_ids == frozenset(value["sessions"])
+        for bp, value in mut.items()
+    ), "the finalized week cache must retain identities for window dedup"
     # tail is the (ts_iso, id) of the last folded current-week entry.
     assert tail is not None
     assert isinstance(tail[0], str) and isinstance(tail[1], int)
@@ -216,6 +220,107 @@ def test_window_weeks_clamped_to_history():
     )
     assert env["trend"]["window_weeks"] <= 12
     assert env["trend"]["window_weeks"] == len(env["trend"]["weeks"])
+
+
+def test_usage_snapshot_read_is_bounded_and_reduced_before_python():
+    """#627: old status-line ticks must not cross the SQLite/Python boundary.
+
+    The live store has tens of thousands of snapshot rows but the Projects
+    envelope can render at most ``weeks_back`` week percentages.  Seed many
+    rows far outside the rendered window and two credited captures in the
+    current week.  The query must return no more than one non-null latest row
+    per candidate boundary date while the later, lower credit remains
+    authoritative. The small calendar-window allowance preserves #620's rule
+    that an unresolvable legacy boundary cannot evict a valid week.
+    """
+    source = _open(FIXTURE_DIR / "multi-week.db")
+    raw = sqlite3.connect(":memory:")
+    source.backup(raw)
+    source.close()
+
+    old_rows = [
+        (
+            f"2020-01-01T00:{i % 60:02d}:00Z",
+            "2019-12-30",
+            "2020-01-06",
+            "2019-12-30T00:00:00Z",
+            "2020-01-06T00:00:00Z",
+            float(i % 100),
+        )
+        for i in range(500)
+    ]
+    raw.executemany(
+        "INSERT INTO weekly_usage_snapshots("
+        " captured_at_utc, week_start_date, week_end_date, week_start_at,"
+        " week_end_at, weekly_percent) VALUES (?,?,?,?,?,?)",
+        old_rows,
+    )
+    current_start = _cctally_dashboard._projects_week_start_monday_utc(NOW_UTC)
+    current_end = current_start + dt.timedelta(days=7)
+    raw.executemany(
+        "INSERT INTO weekly_usage_snapshots("
+        " captured_at_utc, week_start_date, week_end_date, week_start_at,"
+        " week_end_at, weekly_percent) VALUES (?,?,?,?,?,?)",
+        [
+            ("2026-05-19T12:10:00Z", current_start.date().isoformat(),
+             current_end.date().isoformat(), current_start.isoformat(),
+             current_end.isoformat(), 90.0),
+            ("2026-05-19T12:20:00Z", current_start.date().isoformat(),
+             current_end.date().isoformat(), current_start.isoformat(),
+             current_end.isoformat(), 40.0),
+        ],
+    )
+    raw.commit()
+
+    class CountingCursor:
+        def __init__(self, inner, owner):
+            self.inner = inner
+            self.owner = owner
+
+        def fetchall(self):
+            rows = self.inner.fetchall()
+            self.owner.snapshot_rows = len(rows)
+            return rows
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    class CountingConnection:
+        def __init__(self, inner):
+            self.inner = inner
+            self.snapshot_rows = None
+
+        def execute(self, sql, parameters=()):
+            cursor = self.inner.execute(sql, parameters)
+            if (
+                "SELECT week_start_date, week_start_at, weekly_percent" in sql
+                and "FROM weekly_usage_snapshots" in sql
+            ):
+                return CountingCursor(cursor, self)
+            return cursor
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    conn = CountingConnection(raw)
+    _cctally_dashboard._projects_reset_memo()
+    env = _build_projects_envelope(
+        conn, now_utc=NOW_UTC, current_week=None, weeks_back=12,
+    )
+
+    assert conn.snapshot_rows is not None
+    assert conn.snapshot_rows <= 7 * 12, (
+        "the attribution query must return at most one latest row per date "
+        f"inside the bounded render window, got {conn.snapshot_rows}"
+    )
+    current = next(
+        row for row in env["trend"]["weeks"]
+        if row["week_start_date"] == current_start.date().isoformat()
+    )
+    assert current["total_pct"] == 40.0, (
+        "latest-row semantics must preserve an in-place credit"
+    )
+    raw.close()
 
 
 def test_determinism():

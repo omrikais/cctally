@@ -15,6 +15,7 @@ An idle (committed, no txn) connection pins no read snapshot, so the handler's
 separate raw connection can still TRUNCATE the WAL.
 """
 import argparse
+import types
 import fcntl
 import importlib
 import json
@@ -232,11 +233,12 @@ def test_stats_checkpoint_is_retired_before_file_or_sqlite_access(
     core = _load("_cctally_core")
     dbmod = _load("_cctally_db")
     monkeypatch.setattr(core, "DB_PATH", tmp_path / "must-not-be-read.db")
-    monkeypatch.setattr(
-        dbmod.sqlite3,
-        "connect",
-        lambda *_args, **_kwargs: pytest.fail("retired stats checkpoint opened SQLite"),
-    )
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(dbmod.sqlite3))
+    _iso_sqlite3.connect = lambda *_args, **_kwargs: pytest.fail("retired stats checkpoint opened SQLite")
+    monkeypatch.setattr(dbmod, "sqlite3", _iso_sqlite3)
 
     assert dbmod.cmd_db_checkpoint(_args(db="stats")) == 2
     captured = capsys.readouterr()

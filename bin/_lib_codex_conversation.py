@@ -2142,6 +2142,20 @@ def infer_codex_event_turns(
     return turns, current
 
 
+def fold_codex_event_turns(events) -> dict:
+    """Map each prefetched physical event's ``line_offset`` to its turn.
+
+    The pure half of ``_file_turn_map`` (#620 S3 X3): the caller supplies the
+    ordered ``codex_conversation_events`` batch and this returns
+    ``{line_offset: turn_id | None}`` over the same lifecycle inference cost
+    attribution and normalized prose already share. Opens no database.
+    """
+    materialized = list(events)
+    turns, _terminal = infer_codex_event_turns(materialized)
+    return {event.line_offset: turn
+            for event, turn in zip(materialized, turns)}
+
+
 def _is_late_turn_anchor(
     record_type: str | None, payload_type: str | None, explicit_turn: str | None,
 ) -> bool:

@@ -35,6 +35,7 @@ import _cctally_db as db
 import _lib_conversation_query as cq
 
 from conftest import load_script, redirect_paths
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
 
 _SID = "s1"
 
@@ -240,13 +241,12 @@ def _boot(ns, tmp_path, monkeypatch):
     HandlerCls.cctally_expose_transcripts = False
 
     srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    srv._test_thread = start(srv)
     return srv
 
 
 def _get(port, path):
-    c = HTTPConnection("127.0.0.1", port, timeout=5)
+    c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     c.request("GET", path)
     r = c.getresponse()
     body = r.read()
@@ -272,4 +272,4 @@ def test_handler_rejects_mutually_exclusive_cursors(tmp_path, monkeypatch):
             status, _ = _get(port, path)
             assert status == 400, (path, status)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)

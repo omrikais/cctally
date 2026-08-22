@@ -1,5 +1,6 @@
 import json
 import sqlite3, sys, pathlib
+import types
 
 import pytest
 
@@ -304,14 +305,26 @@ def test_iter_sync_entries_parses_each_line_once(monkeypatch):
     fh = io.StringIO(body)
 
     calls = {"n": 0}
-    real = cache.json.loads
+    real = json.loads
 
     def spy(s, *a, **k):
         calls["n"] += 1
         return real(s, *a, **k)
 
-    monkeypatch.setattr(cache.json, "loads", spy)
+    # Rebind the name on the IMPORTING module, not on the shared stdlib object.
+    # `cache.json is json`, so `monkeypatch.setattr(cache.json, "loads", spy)`
+    # replaced json.loads process-wide for the duration of this test, where any
+    # concurrent thread would have seen the spy. #628 fixed exactly this at
+    # tests/test_speed_column_read_paths.py:151-176; this was the second
+    # instance.
+    cache_local_json = types.SimpleNamespace(**vars(json))
+    cache_local_json.loads = spy
+    monkeypatch.setattr(cache, "json", cache_local_json)
     out = list(cache._iter_sync_entries(fh, "/p/a.jsonl"))
+
+    assert json.loads('{"unrelated": true}') == {"unrelated": True}, (
+        "the cache-local spy must not replace stdlib json.loads process-wide"
+    )
 
     assert calls["n"] == 3, f"one json.loads per line expected, got {calls['n']}"
     assert len(out) == 3

@@ -13,6 +13,8 @@ import pytest
 from conftest import load_script
 import _cctally_core
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
+
 # Every HOME-derived path constant resolves under a per-test directory
 # (#529 S4). The write detector caught this module creating the maintainer's
 # real ~/.local/share/cctally: its tests call load_script() themselves, and
@@ -337,12 +339,13 @@ class TestLegacyStopActivePoller:
             monkeypatch.setitem(ns, "_LEGACY_POLLER_PID_FILE", pid_file)
             outcome = ns["_legacy_stop_active_poller"]()
             assert outcome == "sigterm-took"
-            reaper.join(timeout=2)
+            # timing-budget: the reaper has collected the poller child `_legacy_stop_active_poller` signalled, so `proc.returncode` is set
+            reaper.join(timeout=PRESENCE_BACKSTOP_SECONDS)
             assert proc.returncode == -signal.SIGTERM
         finally:
             if proc.poll() is None:
                 proc.kill()
-                proc.wait(timeout=2)
+                proc.wait(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     def test_malformed_pid_file_treated_as_no_pid(self, ns, monkeypatch, tmp_path):
         """Non-numeric PID file content → 'stale-pid' (parse failure is
@@ -376,7 +379,7 @@ class TestLegacyStopActivePoller:
             assert proc.poll() is None
         finally:
             proc.kill()
-            proc.wait(timeout=2)
+            proc.wait(timeout=PRESENCE_BACKSTOP_SECONDS)
 
 
 class TestLegacyCleanupTmpSentinels:
@@ -734,14 +737,15 @@ class TestLegacyMigrationE2EActivePoller:
             # tmp sentinel was unlinked.
             assert str(pid_file) in mig["tmp_files_unlinked"]
             # And the process actually died via signal.
-            reaper.join(timeout=2)
+            # timing-budget: the reaper has collected the signalled poller child, so `proc.returncode` is set
+            reaper.join(timeout=PRESENCE_BACKSTOP_SECONDS)
             assert proc.returncode in (-signal.SIGTERM, -signal.SIGKILL), (
                 f"expected SIGTERM/SIGKILL exit, got {proc.returncode}"
             )
         finally:
             if proc.poll() is None:
                 proc.kill()
-                proc.wait(timeout=2)
+                proc.wait(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     def test_setup_with_stale_pid_no_signal(self, ns, tmp_path, monkeypatch):
         """Write a stale PID into the sentinel: the helper detects via

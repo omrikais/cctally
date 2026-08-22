@@ -187,6 +187,26 @@ def test_render_block_shape():
     )
 
 
+def test_render_block_names_and_links_the_complete_stable_span():
+    block = render_latest_stable_block(
+        "1.101.0",
+        "2026-08-19",
+        ["target highlight"],
+        previous_stable="1.95.5",
+        release_url=(
+            "https://github.com/omrikais/cctally/releases/tag/v1.101.0"
+        ),
+    )
+    assert block == (
+        "**Latest stable: v1.101.0** (2026-08-19)\n\n"
+        "Highlights from the `v1.95.5` to `v1.101.0` stable upgrade:\n\n"
+        "- target highlight\n\n"
+        "[See every change in this stable upgrade]"
+        "(https://github.com/omrikais/cctally/releases/tag/v1.101.0)"
+    )
+    assert lint_copy(block) == []
+
+
 # --------------------------------------------------------------------------
 # changelog_release_date
 # --------------------------------------------------------------------------
@@ -304,6 +324,28 @@ def test_committed_block_matches_kernel_render_for_v1810():
     bullets = extract_highlights(changelog, "1.81.0")
     date = changelog_release_date(changelog, "1.81.0")
     block = render_latest_stable_block("1.81.0", date, bullets)
+    assert interior == "\n" + block + "\n"
+
+
+def test_committed_block_matches_stable_span_render_for_v11010():
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    interior = readme[
+        readme.index(MARKER_BEGIN) + len(MARKER_BEGIN):readme.index(MARKER_END)
+    ]
+    if "v1.101.0" not in interior:
+        pytest.skip("committed latest-stable block is no longer v1.101.0")
+    changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    bullets = extract_highlights(changelog, "1.101.0")
+    date = changelog_release_date(changelog, "1.101.0")
+    block = render_latest_stable_block(
+        "1.101.0",
+        date,
+        bullets,
+        previous_stable="1.95.5",
+        release_url=(
+            "https://github.com/omrikais/cctally/releases/tag/v1.101.0"
+        ),
+    )
     assert interior == "\n" + block + "\n"
 
 

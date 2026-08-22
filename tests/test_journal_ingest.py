@@ -26,11 +26,14 @@ import datetime as dt
 import multiprocessing as mp
 import os
 import threading
+import time
 
 import pytest
 
 import _cctally_core  # preserved across load_script(), safe at module top
 from conftest import load_script, redirect_paths
+
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, remaining
 
 FIXED = dt.datetime(2026, 7, 22, 12, 0, 0, tzinfo=dt.timezone.utc)
 
@@ -396,8 +399,16 @@ def test_authoritative_blocks_opportunistic_skips(tmp_path, monkeypatch):
     release = ctx.Event()
     holder = ctx.Process(target=_hold_ingest_lock, args=(lock_path, ready, release))
     holder.start()
+    # ONE budget for the two handoff waits and the two joins, not one each.
+    # Four separate `PRESENCE_BACKSTOP_SECONDS` waits summed to the whole
+    # 120-second pytest cap, so a wedged lock handoff spent the cap between
+    # them and pytest-timeout killed the worker before any of the four
+    # assertion messages could name what it had been waiting for. The
+    # teardown join keeps its own budget, because it exists to outlast an
+    # exhausted body budget rather than to draw from it.
+    deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
     try:
-        assert ready.wait(5.0), "holder never acquired the ingest lock"
+        assert ready.wait(remaining(deadline)), "holder never acquired the ingest lock"
 
         opp = jr.run_stats_ingest(mode="opportunistic")
         assert opp.ran is False
@@ -428,14 +439,17 @@ def test_authoritative_blocks_opportunistic_skips(tmp_path, monkeypatch):
             name="authoritative-ingest-test",
         )
         authoritative.start()
-        assert authoritative_attempted.wait(5.0), (
+        assert authoritative_attempted.wait(remaining(deadline)), (
             "authoritative lock attempt was not observed"
         )
         assert authoritative.is_alive(), (
             "authoritative ingest completed while the child still owned the lock"
         )
         release.set()
-        authoritative.join(10.0)
+        # Draws from the shared deadline above, so no annotation is owed: the
+        # join proves the authoritative ingest returned once the child
+        # released the lock it was blocked on.
+        authoritative.join(timeout=remaining(deadline))
         assert not authoritative.is_alive(), "authoritative ingest did not unblock"
         assert auth_errors == []
         assert len(auth_results) == 1
@@ -444,7 +458,8 @@ def test_authoritative_blocks_opportunistic_skips(tmp_path, monkeypatch):
         assert _usage_count(ns) == 1
     finally:
         release.set()
-        holder.join(10)
+        # timing-budget: the lock-holding child has exited now that `release` is set, so `exitcode` can be read
+        holder.join(timeout=PRESENCE_BACKSTOP_SECONDS)
         assert holder.exitcode == 0
 
 

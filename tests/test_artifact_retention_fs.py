@@ -30,6 +30,8 @@ import pytest
 
 from conftest import load_script, redirect_paths
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, remaining
+
 
 def _load(tmp_path, monkeypatch):
     monkeypatch.setenv("CCTALLY_TEST_CONVERSATION_PROBE_COPY", "1")
@@ -100,7 +102,12 @@ def test_the_retention_lock_is_taken_after_the_conversation_provider_flocks(
     """
     ns, core, _store = _load(tmp_path, monkeypatch)
     cache_mod = sys.modules["_cctally_cache"]
-    monkeypatch.setattr(cache_mod.shutil, "which", lambda _name: "/usr/bin/cp")
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_shutil = types.SimpleNamespace(**vars(cache_mod.shutil))
+    _iso_shutil.which = lambda _name: "/usr/bin/cp"
+    monkeypatch.setattr(cache_mod, "shutil", _iso_shutil)
 
     real_run = subprocess.run
 
@@ -111,9 +118,12 @@ def test_the_retention_lock_is_taken_after_the_conversation_provider_flocks(
             )
         return real_run(command, **kwargs)
 
-    monkeypatch.setattr(
-        cache_mod.subprocess, "run", reject_clone,
-    )
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_subprocess = types.SimpleNamespace(**vars(cache_mod.subprocess))
+    _iso_subprocess.run = reject_clone
+    monkeypatch.setattr(cache_mod, "subprocess", _iso_subprocess)
     obs = _Observer()
     _trace_retention(monkeypatch, obs)
 
@@ -234,15 +244,22 @@ def test_two_threads_entering_at_depth_zero_take_exactly_one_flock(
     errors: list[BaseException] = []
 
     def body():
+        # ONE budget for all four waits, not one each. Four separate
+        # `PRESENCE_BACKSTOP_SECONDS` waits summed to the whole 120-second
+        # pytest cap, so a wedged handoff spent the cap here and the thread was
+        # still alive at teardown — the isolation plugin's thread guard then
+        # failed the item for a thread the test itself meant to reap. The
+        # enclosing join below is one backstop, so the body must fit in one.
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
         try:
-            start.wait(timeout=5.0)
-            with ret.retention_shared(timeout=5.0) as held:
+            start.wait(timeout=remaining(deadline))
+            with ret.retention_shared(timeout=remaining(deadline)) as held:
                 held_flags.append(held)
                 # Both threads are inside the hold from here until `leave`, so
                 # the depth each reads is the depth with two holders.
-                inside.wait(timeout=5.0)
+                inside.wait(timeout=remaining(deadline))
                 depths.append(ret.retention_depth())
-                leave.wait(timeout=5.0)
+                leave.wait(timeout=remaining(deadline))
         except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
             errors.append(exc)
             for broken in (start, inside, leave, overlap):
@@ -252,7 +269,8 @@ def test_two_threads_entering_at_depth_zero_take_exactly_one_flock(
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=20.0)
+        # timing-budget: both retention-body threads have returned, so `errors` can be read
+        thread.join(timeout=PRESENCE_BACKSTOP_SECONDS)
         assert not thread.is_alive()
 
     assert errors == []

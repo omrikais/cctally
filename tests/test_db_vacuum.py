@@ -5,6 +5,7 @@ an active reader via a real SQLite EXCLUSIVE lock, and refuses when free disk is
 below the ~2x-file margin.
 """
 from __future__ import annotations
+import types
 
 import argparse
 import pathlib
@@ -116,13 +117,14 @@ def test_vacuum_current_stats_never_runs_a_wal_checkpoint(
         def __getattr__(self, name):
             return getattr(self.inner, name)
 
-    monkeypatch.setattr(
-        _cctally_db.sqlite3,
-        "connect",
-        lambda *args, **kwargs: RecordingConnection(
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(_cctally_db.sqlite3))
+    _iso_sqlite3.connect = lambda *args, **kwargs: RecordingConnection(
             real_connect(*args, **kwargs)
-        ),
-    )
+        )
+    monkeypatch.setattr(_cctally_db, "sqlite3", _iso_sqlite3)
 
     assert ns["cmd_db_vacuum"](argparse.Namespace(db="stats")) == 0
     assert not any("wal_checkpoint" in sql.lower() for sql in statements)
@@ -148,7 +150,12 @@ def test_vacuum_refuses_legacy_stats_wal_without_opening_it(
     def forbidden_connect(*_args, **_kwargs):
         raise AssertionError("vacuum opened a legacy stats WAL family")
 
-    monkeypatch.setattr(_cctally_db.sqlite3, "connect", forbidden_connect)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(_cctally_db.sqlite3))
+    _iso_sqlite3.connect = forbidden_connect
+    monkeypatch.setattr(_cctally_db, "sqlite3", _iso_sqlite3)
     assert ns["cmd_db_vacuum"](argparse.Namespace(db="stats")) == 3
     assert "legacy wal" in capsys.readouterr().err.lower()
     assert path.read_bytes() == before

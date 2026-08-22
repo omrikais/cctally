@@ -40,6 +40,8 @@ public bin/cctally-doc-lint-test
 public bin/cctally-doctor-test
 public bin/cctally-dollar-per-percent
 private bin/cctally-envelope-oracle-test
+public bin/cctally-explain
+public bin/cctally-explain-test
 public bin/cctally-five-hour-blocks
 public bin/cctally-five-hour-blocks-test
 public bin/cctally-five-hour-breakdown

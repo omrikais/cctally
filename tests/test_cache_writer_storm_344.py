@@ -13,6 +13,7 @@ import sys
 import time
 
 import pytest
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -267,17 +268,17 @@ def test_killed_claude_transaction_retries_cursor_without_corruption(tmp_path):
                 break
             time.sleep(0.02)
         if not marker.exists():
-            stdout, stderr = victim.communicate(timeout=5)
+            stdout, stderr = victim.communicate(timeout=PRESENCE_BACKSTOP_SECONDS)
             pytest.fail(
                 "victim never reached the controlled precommit point\n"
                 f"stdout:\n{stdout}\nstderr:\n{stderr}"
             )
         os.kill(victim.pid, signal.SIGKILL)
-        victim.communicate(timeout=5)
+        victim.communicate(timeout=PRESENCE_BACKSTOP_SECONDS)
     finally:
         if victim.poll() is None:
             victim.kill()
-            victim.communicate(timeout=5)
+            victim.communicate(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     survivor_env = {
         key: value
@@ -344,17 +345,17 @@ def test_killed_codex_transaction_retries_cursor_without_corruption(tmp_path):
                 break
             time.sleep(0.02)
         if not marker.exists():
-            stdout, stderr = victim.communicate(timeout=5)
+            stdout, stderr = victim.communicate(timeout=PRESENCE_BACKSTOP_SECONDS)
             pytest.fail(
                 "victim never reached the controlled precommit point\n"
                 f"stdout:\n{stdout}\nstderr:\n{stderr}"
             )
         os.kill(victim.pid, signal.SIGKILL)
-        victim.communicate(timeout=5)
+        victim.communicate(timeout=PRESENCE_BACKSTOP_SECONDS)
     finally:
         if victim.poll() is None:
             victim.kill()
-            victim.communicate(timeout=5)
+            victim.communicate(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     survivor_env = {
         key: value
@@ -427,7 +428,7 @@ def test_killed_checkpointer_releases_global_lock_for_other_provider(tmp_path):
                 break
             time.sleep(0.02)
         if not marker.exists():
-            stdout, stderr = victim.communicate(timeout=5)
+            stdout, stderr = victim.communicate(timeout=PRESENCE_BACKSTOP_SECONDS)
             pytest.fail(
                 "victim never reached the controlled precheckpoint point\n"
                 f"stdout:\n{stdout}\nstderr:\n{stderr}"
@@ -454,11 +455,11 @@ def test_killed_checkpointer_releases_global_lock_for_other_provider(tmp_path):
             conn.close()
 
         os.kill(victim.pid, signal.SIGKILL)
-        victim.communicate(timeout=5)
+        victim.communicate(timeout=PRESENCE_BACKSTOP_SECONDS)
     finally:
         if victim.poll() is None:
             victim.kill()
-            victim.communicate(timeout=5)
+            victim.communicate(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     resumed_claude = subprocess.run(
         [sys.executable, str(ROOT / "bin" / "cctally"), "cache-sync",

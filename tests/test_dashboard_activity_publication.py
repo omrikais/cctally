@@ -15,6 +15,8 @@ import pytest
 
 from conftest import load_script, redirect_paths
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
+
 
 class _RecordingHub:
     def __init__(self):
@@ -300,7 +302,7 @@ def test_a_handler_rebuild_finishing_first_does_not_clear_the_loops_claim(mods):
             # unhandled-thread-exception warning, and the test passes. The main
             # thread asserts on `reached_mark` below, so a wait that expires is a
             # named failure.
-            reached_mark.append(loop_marked.wait(5))
+            reached_mark.append(loop_marked.wait(PRESENCE_BACKSTOP_SECONDS))
             if not reached_mark[-1]:
                 return
             # Step 3. The rebuild's terminal publish.
@@ -321,7 +323,7 @@ def test_a_handler_rebuild_finishing_first_does_not_clear_the_loops_claim(mods):
     assert sync_lock.acquire(blocking=False), "H must win the free acquire"
     h = threading.Thread(target=handler)
     h.start()
-    assert handler_holds.wait(5), "the handler never took the lock"
+    assert handler_holds.wait(PRESENCE_BACKSTOP_SECONDS), "the handler never took the lock"
 
     def run_body(batch):
         # Step 2 finished before `run_iteration` was entered: the loop marks
@@ -334,7 +336,8 @@ def test_a_handler_rebuild_finishing_first_does_not_clear_the_loops_claim(mods):
             in_flight.append(ref.get().sync_activity["rebuilding"])
 
     _drive_one_iteration(dash, ref=ref, hub=hub, run_body=run_body)
-    h.join(timeout=5)
+    # timing-budget: the handler thread has finished its publication iteration and written `in_flight` and `errors`
+    h.join(timeout=PRESENCE_BACKSTOP_SECONDS)
     assert not h.is_alive()
     if errors:
         # Chained so the handler thread's own traceback reaches the report. A

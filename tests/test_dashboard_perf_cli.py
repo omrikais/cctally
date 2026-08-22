@@ -15,6 +15,7 @@ import threading
 import pytest
 
 from conftest import load_script, redirect_paths  # type: ignore
+from tests._support_http import start, stop
 
 
 def _boot(ns, tmp_path, monkeypatch, *, token=None):
@@ -29,8 +30,7 @@ def _boot(ns, tmp_path, monkeypatch, *, token=None):
     H.cctally_expose_transcripts = False
     H.cctally_api_token = token
     srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), H)
-    srv.daemon_threads = True
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    srv._test_thread = start(srv)
     return srv
 
 
@@ -225,8 +225,7 @@ def test_a_running_dashboard_renders_a_report(monkeypatch, tmp_path, capsys):
         assert "ingest" in out and "builder" in out
     finally:
         ts.reset_for_tests()
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_json_mode_stamps_the_envelope_and_passes_the_payload_through(
@@ -246,8 +245,7 @@ def test_json_mode_stamps_the_envelope_and_passes_the_payload_through(
         assert payload["diagnostic"]["tick"]["tick_seq"] >= 0
         assert "tracing" in payload["diagnostic"]
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_trace_on_and_off_drive_the_gated_post(monkeypatch, tmp_path, capsys):
@@ -274,8 +272,7 @@ def test_trace_on_and_off_drive_the_gated_post(monkeypatch, tmp_path, capsys):
         perf.request_enabled(False)
         perf.apply_pending()
         perf.set_enabled(False)
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_a_bearer_protected_dashboard_needs_the_token(monkeypatch, tmp_path,
@@ -289,8 +286,7 @@ def test_a_bearer_protected_dashboard_needs_the_token(monkeypatch, tmp_path,
         assert ns["cmd_dashboard_perf"](_args(port=port, token="s3cret")) == 0
     finally:
         ns["DashboardHTTPHandler"].cctally_api_token = None
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
 
 def test_the_command_is_registered_and_help_is_well_formed():

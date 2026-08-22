@@ -1436,3 +1436,38 @@ def test_queued_slash_command_args_promoted():
     r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
     assert r.entry_type == lc.HUMAN
     assert r.text == "ship it"
+
+
+# #633: every text-block consumer must use the parser's producer convention.
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (None, ""),
+        ([], ""),
+        ({"type": "text", "text": "not a list"}, ""),
+        (["not a block", {"type": "image", "source": {}},
+          {"type": "text", "text": "kept"}], "kept"),
+        ("plain string content", "plain string content"),
+    ],
+)
+def test_text_block_join_convention_is_driven_by_the_real_producer(
+        content, expected):
+    import _lib_conversation as parser
+    import _lib_conversation_query as query
+
+    blocks, produced_text = parser._blocks_and_text(content)
+    assert produced_text == expected
+    assert parser._join_text_blocks(blocks) == expected
+    assert query._join_text_blocks(blocks) == expected
+    assert query._join_text_blocks is parser._join_text_blocks
+
+
+def test_shared_text_block_join_degrades_malformed_retained_shapes():
+    import _lib_conversation as parser
+    import _lib_conversation_query as query
+
+    assert query._join_text_blocks is parser._join_text_blocks
+    assert parser._join_text_blocks(None) == ""
+    assert parser._join_text_blocks({"kind": "text", "text": "not-list"}) == ""
+    assert parser._join_text_blocks(["not-a-block", {"kind": "image"},
+                                     {"kind": "text", "text": "kept"}]) == "kept"

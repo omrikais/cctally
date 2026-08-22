@@ -1272,15 +1272,18 @@ def _tokens_union(tokens: dict) -> dict:
 # ── cost attribution (§5.4) ───────────────────────────────────────────────────
 
 
-def _file_turn_map(conn: sqlite3.Connection, source_path: str) -> dict[int, str | None]:
-    """Exact physical-offset → canonical logical turn for one retained file.
+def _codex_file_events(conn: sqlite3.Connection, source_path: str) -> list:
+    """One retained file's physical events, in offset order.
 
-    Cost attribution and normalized prose use the same pure lifecycle inference,
-    including resumed segments whose native proof arrives on task completion.
+    Split out of ``_file_turn_map`` (#620 S3 X3) so the turn attribution can
+    run as a pure fold over a prefetched batch. This walk is UNBOUNDED by
+    construction: it reads every event the file retains, however far the
+    in-window entry sits behind that history, which is why the diagnosis
+    budgets its own use of it rather than calling this directly.
     """
     from _lib_jsonl import CodexPhysicalEvent
 
-    events = [
+    return [
         CodexPhysicalEvent(*row)
         for row in conn.execute(
             "SELECT source_path, line_offset, source_root_key, conversation_key, "
@@ -1291,8 +1294,19 @@ def _file_turn_map(conn: sqlite3.Connection, source_path: str) -> dict[int, str 
             (source_path,),
         )
     ]
-    turns, _terminal = kern.infer_codex_event_turns(events)
-    return {event.line_offset: turn for event, turn in zip(events, turns)}
+
+
+def _file_turn_map(conn: sqlite3.Connection, source_path: str) -> dict[int, str | None]:
+    """Exact physical-offset → canonical logical turn for one retained file.
+
+    Cost attribution and normalized prose use the same pure lifecycle inference,
+    including resumed segments whose native proof arrives on task completion.
+
+    Since #620 S3 this is a thin wrapper: it fetches and delegates to
+    ``fold_codex_event_turns``. Its signature, return shape and every caller
+    are unchanged.
+    """
+    return kern.fold_codex_event_turns(_codex_file_events(conn, source_path))
 
 
 def _attribute_costs(conn: sqlite3.Connection, conversation_key: str, effective_speed: str):

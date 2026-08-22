@@ -8,7 +8,9 @@ implementation:
 1. ``extract_highlights`` — pull up to N lint-clean highlight bullets from a
    specific ``## [X.Y.Z] - YYYY-MM-DD`` CHANGELOG section (exact version match,
    Added > Changed > Fixed priority, multiline flattening, terminal issue-ref
-   stripping, fenced-code skipping).
+   stripping, fenced-code skipping). ``render_latest_stable_block`` keeps that
+   compact target-section sample honest by naming and linking the complete
+   previous-stable-to-target upgrade span.
 2. ``normalize_highlight`` — deterministically rewrite a bullet so it satisfies
    the copy lint by construction (em/en dashes with surrounding spaces become
    ``, ``; doubled separators collapse; leading/trailing separators trim).
@@ -297,14 +299,33 @@ def extract_highlights(
 
 
 def render_latest_stable_block(
-    version: str, date: str, bullets: "list[str]"
+    version: str,
+    date: str,
+    bullets: "list[str]",
+    *,
+    previous_stable: "str | None" = None,
+    release_url: "str | None" = None,
 ) -> str:
     """Render the auto-maintained latest-stable block (no trailing newline
-    after the last bullet; version+date only when *bullets* is empty)."""
+    after the last line; initial baselines retain the single-release shape)."""
     base = f"**Latest stable: v{version}** ({date})\n"
+    if previous_stable is None:
+        if bullets:
+            return base + "\n" + "\n".join(f"- {b}" for b in bullets)
+        return base
+    if release_url is None:
+        raise ValueError("stable-span README block requires a release URL")
+    blocks = [
+        base.rstrip("\n"),
+        f"Highlights from the `v{previous_stable}` to `v{version}` "
+        "stable upgrade:",
+    ]
     if bullets:
-        return base + "\n" + "\n".join(f"- {b}" for b in bullets)
-    return base
+        blocks.append("\n".join(f"- {b}" for b in bullets))
+    blocks.append(
+        f"[See every change in this stable upgrade]({release_url})"
+    )
+    return "\n\n".join(blocks)
 
 
 # --------------------------------------------------------------------------

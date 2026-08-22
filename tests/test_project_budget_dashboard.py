@@ -19,15 +19,20 @@ dashboard Recent-alerts envelope + the ``alerts_settings`` mirror + the
 All offline/deterministic; the dashboard handler runs in a server thread.
 """
 from __future__ import annotations
+import types
 
 import datetime as dt
 import http.client
 import json
 import threading
+import traceback
 
 import pytest
 
 from conftest import load_script, redirect_paths
+
+from tests import _support_http  # noqa: E402
+from tests._support_http import post_json, serve_dashboard, stop
 
 WEEK_START = dt.datetime(2026, 5, 26, 14, 0, 0, tzinfo=dt.timezone.utc)
 
@@ -91,22 +96,69 @@ def _wire_dashboard_handlers(ns):
     ns["DashboardHTTPHandler"].display_tz_pref_override = None
 
 
-def _post_json(host, port, path, body, *, timeout=2):
-    c = http.client.HTTPConnection(host, port, timeout=timeout)
-    raw = json.dumps(body).encode()
-    host_header = f"{host}:{port}"
-    c.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
-    c.putheader("Content-Type", "application/json")
-    c.putheader("Content-Length", str(len(raw)))
-    c.putheader("Host", host_header)
-    c.putheader("Origin", f"http://{host_header}")
-    c.endheaders()
-    c.send(raw)
-    r = c.getresponse()
-    payload = r.read().decode("utf-8", errors="replace")
-    parsed = json.loads(payload) if payload else None
-    c.close()
-    return r.status, parsed
+def _serve_dashboard(ns):
+    """Start a diagnostic server whose handler errors the test can read.
+
+    The former `started` event is gone rather than moved. It was set
+    immediately before `serve_forever()`, so it proved the thread had been
+    scheduled and not that the listener was up — and the listener is already
+    up, because the server constructor binds and listens before this returns.
+    """
+    errors = []
+    base_server = ns["ThreadingHTTPServer"]
+
+    class _DiagnosticServer(base_server):
+        def handle_error(self, request, client_address):
+            errors.append(traceback.format_exc())
+            super().handle_error(request, client_address)
+
+    srv, t, port = serve_dashboard(
+        ns, server_class=_DiagnosticServer,
+        configure=lambda server: setattr(server, "_test_handler_errors", errors),
+    )
+    srv._test_thread = t
+    return srv, t, port
+
+
+def test_post_json_timeout_reports_request_phase(monkeypatch):
+    """A hosted-runner timeout must name the socket phase and endpoint."""
+    class _TimeoutConnection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def putrequest(self, *args, **kwargs):
+            pass
+
+        def putheader(self, *args, **kwargs):
+            pass
+
+        def endheaders(self):
+            pass
+
+        def send(self, raw):
+            pass
+
+        def getresponse(self):
+            raise TimeoutError("timed out")
+
+        def close(self):
+            pass
+
+    # #630 S2: rebind the module name on the IMPORTING module.
+    # `post_json` lives in tests/_support_http, which resolves
+    # `http.client.HTTPConnection` at call time; patching the shared
+    # stdlib attribute would have replaced it for the whole process.
+    _iso_client = types.SimpleNamespace(**vars(_support_http.http.client))
+    _iso_client.HTTPConnection = _TimeoutConnection
+    _iso_http = types.SimpleNamespace(client=_iso_client)
+    monkeypatch.setattr(_support_http, "http", _iso_http)
+    with pytest.raises(
+        AssertionError,
+        match=r"POST /api/settings.*response headers.*0\.01s",
+    ):
+        post_json(
+            12345, "/api/settings", {"budget": {}}, backstop=0.01
+        )
 
 
 # ── (1) envelope emits the project_budget axis ───────────────────────────
@@ -232,17 +284,14 @@ def test_alerts_test_endpoint_accepts_project_budget(ns, monkeypatch):
         lambda payload, *, mode="real", **kw: "queued",
     )
     _wire_dashboard_handlers(ns)
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = _serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/alerts/test",
+        status, body = post_json(
+            port, "/api/alerts/test",
             {"axis": "project_budget", "threshold": 100},
         )
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
     assert status == 200, body
     assert body["alert"]["axis"] == "project_budget"
@@ -267,17 +316,14 @@ def test_post_settings_persists_project_alerts_enabled(ns, monkeypatch):
         lambda start, now, mode="auto", **kw: {},
     )
     _wire_dashboard_handlers(ns)
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = _serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"budget": {"project_alerts_enabled": True}},
         )
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
     assert status == 200, body
     assert body["budget"]["project_alerts_enabled"] is True
@@ -338,17 +384,15 @@ def test_post_settings_codex_nested_merge_no_clobber(ns, monkeypatch):
         lambda start, now, **kw: 0.0,
     )
     _wire_dashboard_handlers(ns)
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = _serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"budget": {"codex": {"alerts_enabled": True}}},
+            server=srv,
         )
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
     assert status == 200, body
     import _cctally_core
@@ -370,17 +414,14 @@ def test_post_settings_codex_null_budget_400(ns):
     must not invent a Codex budget)."""
     _write_codex_budget_config(ns, codex=None)
     _wire_dashboard_handlers(ns)
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = _serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"budget": {"codex": {"alerts_enabled": True}}},
         )
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
     assert status == 400, body
     assert "Codex budget" in body["error"]
@@ -403,17 +444,14 @@ def test_post_settings_codex_not_object_400(ns):
         },
     )
     _wire_dashboard_handlers(ns)
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = _serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"budget": {"codex": ["not", "a", "dict"]}},
         )
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
     assert status == 400, body
     assert "must be an object" in body["error"]
@@ -456,17 +494,14 @@ def test_post_settings_codex_projected_toggle_does_not_latch(ns, monkeypatch):
         lambda start, now, **kw: 500.0,  # 250% — crosses 90 + 100
     )
     _wire_dashboard_handlers(ns)
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = _serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"budget": {"codex": {"projected_enabled": True}}},
         )
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
     assert status == 200, body
     # Projected toggle alone reconciles NOTHING — no actual-spend rows latched.
@@ -493,17 +528,14 @@ def test_post_settings_codex_alerts_toggle_does_latch(ns, monkeypatch):
         lambda start, now, **kw: 500.0,  # 250% — crosses 90 + 100
     )
     _wire_dashboard_handlers(ns)
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = _serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"budget": {"codex": {"alerts_enabled": True}}},
         )
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
     assert status == 200, body
     # Both thresholds latched (alerted_at set, no dispatch) — forward-only.
@@ -579,23 +611,20 @@ def test_post_settings_budget_period_change_triggers_reconcile(ns, monkeypatch):
         lambda start, now, **kw: 500.0,  # 250% of $200 — crosses 90 + 100
     )
     _wire_dashboard_handlers(ns)
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = _serve_dashboard(ns)
     try:
         # ONLY the period leaf is touched — isolates the `period` trigger token.
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/settings",
+        status, body = post_json(
+            port, "/api/settings",
             {"budget": {"period": "calendar-month"}},
-            # The response intentionally waits for the real history reconcile.
-            # A loaded CI lane can legitimately take longer than the helper's
-            # ordinary two-second request budget.
-            timeout=10,
+            # The response intentionally waits for the real history reconcile,
+            # which a loaded lane can take a while over. The shared 30-second
+            # presence backstop covers that; the local 10-second override this
+            # replaces did not have to.
+            server=srv,
         )
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, t)
 
     assert status == 200, body
     # Both thresholds latched (alerted_at set, no dispatch) — the reconcile fired
@@ -646,17 +675,14 @@ def test_alerts_test_endpoint_accepts_codex_budget(ns, monkeypatch):
         lambda payload, *, mode="real", **kw: "queued",
     )
     _wire_dashboard_handlers(ns)
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = _serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/alerts/test",
+        status, body = post_json(
+            port, "/api/alerts/test",
             {"axis": "codex_budget", "threshold": 100},
         )
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
     assert status == 200, body
     assert body["alert"]["axis"] == "codex_budget"
@@ -674,18 +700,15 @@ def test_alerts_test_endpoint_accepts_projected_codex_metric(ns, monkeypatch):
         lambda payload, *, mode="real", **kw: "queued",
     )
     _wire_dashboard_handlers(ns)
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = _serve_dashboard(ns)
     try:
-        status, body = _post_json(
-            "127.0.0.1", port, "/api/alerts/test",
+        status, body = post_json(
+            port, "/api/alerts/test",
             {"axis": "projected", "metric": "codex_budget_usd",
              "threshold": 100},
         )
     finally:
-        srv.shutdown()
+        stop(srv, t)
 
     assert status == 200, body
     assert body["alert"]["axis"] == "projected"

@@ -20,6 +20,7 @@ from http.client import HTTPConnection
 
 from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION
 from conftest import load_script, redirect_paths
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, shorten_sse_keepalive, start, stop
 
 # A real model id from CLAUDE_MODEL_PRICING so token-derived cost is non-zero.
 _MODEL = "claude-opus-4-8"
@@ -181,9 +182,16 @@ def _boot(
 ):
     """Seed the cache and start a server with the given bind/expose posture.
 
-    Returns the running ThreadingTCPServer; caller must ``srv.shutdown()``.
+    Returns the running ThreadingTCPServer; the caller must tear it down with
+    ``stop(srv, srv._test_thread)``, passing every SSE connection it opened.
     """
     redirect_paths(ns, monkeypatch, tmp_path)
+    # #630 S2: the /api/events handler blocks in `q.get(timeout=...)` and only
+    # learns its client has gone on the keep-alive write after that timeout —
+    # and on a socket the peer has closed the FIRST write still succeeds. At
+    # the shipped period that is two full timeouts, which is the whole
+    # presence backstop, so stop() could not reap the handler at all.
+    shorten_sse_keepalive(ns, monkeypatch)
     sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
     _seed_cache(ns)
 
@@ -208,16 +216,14 @@ def _boot(
     # long-lived SSE connection (`/api/events` blocks in a keep-alive loop)
     # does not wedge the single accept thread and starve later requests.
     srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    srv._test_thread = start(srv)
     return srv
 
 
 def _get(port, path, *, host=None):
     """GET helper. When ``host`` is given, send it as the literal Host header
     (skip_host=True) so the gate sees a non-loopback authority."""
-    c = HTTPConnection("127.0.0.1", port, timeout=5)
+    c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     if host is None:
         c.request("GET", path)
     else:
@@ -234,7 +240,7 @@ def _get(port, path, *, host=None):
 def _get_ct(port, path, *, host=None):
     """GET helper returning ``(status, content_type, body)`` — for routes whose
     Content-Type matters (e.g. the export route's ``text/markdown``)."""
-    c = HTTPConnection("127.0.0.1", port, timeout=5)
+    c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     if host is None:
         c.request("GET", path)
     else:
@@ -262,7 +268,7 @@ def test_gate_blocks_lan_hostname(tmp_path, monkeypatch):
         payload = json.loads(body)
         assert "error" in payload
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_gate_blocks_lan_bind_without_expose(tmp_path, monkeypatch):
@@ -275,7 +281,7 @@ def test_gate_blocks_lan_bind_without_expose(tmp_path, monkeypatch):
         status, _ = _get(port, "/api/conversations", host="192.168.0.9:8789")
         assert status == 403
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_conversations_route_returns_rail(tmp_path, monkeypatch):
@@ -297,7 +303,7 @@ def test_conversations_route_returns_rail(tmp_path, monkeypatch):
         assert s1["project_label"] == "proj"
         assert s1["cost_usd"] > 0
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_conversation_detail_and_search_routing(tmp_path, monkeypatch):
@@ -329,7 +335,7 @@ def test_conversation_detail_and_search_routing(tmp_path, monkeypatch):
         status, _ = _get(port, "/api/conversation/does-not-exist")
         assert status == 404
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_conversation_outline_route(tmp_path, monkeypatch):
@@ -364,7 +370,7 @@ def test_conversation_outline_route(tmp_path, monkeypatch):
                          host="machine.local:8789")
         assert status == 403
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_conversation_export_route(tmp_path, monkeypatch):
@@ -405,7 +411,7 @@ def test_conversation_export_route(tmp_path, monkeypatch):
                                host="machine.local:8789")
         assert status == 403, status
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_conversation_prompts_route(tmp_path, monkeypatch):
@@ -443,7 +449,7 @@ def test_conversation_prompts_route(tmp_path, monkeypatch):
                          host="machine.local:8789")
         assert status == 403
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_conversation_find_route(tmp_path, monkeypatch):
@@ -482,7 +488,7 @@ def test_conversation_find_route(tmp_path, monkeypatch):
                          host="machine.local:8789")
         assert status == 403
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_conversation_find_regex_case_params(tmp_path, monkeypatch):
@@ -525,7 +531,7 @@ def test_conversation_find_regex_case_params(tmp_path, monkeypatch):
             status, _ = _get(port, f"/api/conversation/s1/find?q=token&kind={k}")
             assert status == 400, (k, status)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_conversation_search_kind_param(tmp_path, monkeypatch):
@@ -543,7 +549,7 @@ def test_conversation_search_kind_param(tmp_path, monkeypatch):
         assert status == 400, (status, body)
         assert "error" in json.loads(body)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_conversation_detail_pagination_threads_query(tmp_path, monkeypatch):
@@ -577,7 +583,7 @@ def test_conversation_detail_pagination_threads_query(tmp_path, monkeypatch):
         assert page2["items"][0]["anchor"]["id"] != first_id
         assert page2["page"]["has_more"] is False
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_conversations_display_and_filter_both_read_stored_cost(tmp_path, monkeypatch):
@@ -639,7 +645,7 @@ def test_conversations_display_and_filter_both_read_stored_cost(tmp_path, monkey
         sids = {r["session_id"] for r in rows}
         assert "s1" not in sids, sids
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 class _ExplodingQuery:
@@ -684,7 +690,7 @@ def test_kernel_exception_returns_clean_500(tmp_path, monkeypatch):
             payload = json.loads(body)
             assert "error" in payload, (route, payload)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_conversation_store_open_failure_is_private_and_truthful(
@@ -743,8 +749,7 @@ def test_conversation_store_open_failure_is_private_and_truthful(
             assert "/private/secret" not in body_text, (route, body)
             assert "SELECT content" not in body_text, (route, body)
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
     server_log = capsys.readouterr().err
     assert "/private/secret/conversations.db" in server_log
     assert "SELECT content FROM conversation_messages" in server_log
@@ -768,7 +773,7 @@ def test_api_data_transcripts_enabled_is_host_aware(tmp_path, monkeypatch):
         assert status == 200, (status, body)
         assert json.loads(body)["transcriptsEnabled"] is False
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_api_data_codex_labels_follow_the_request_gate_without_contamination(
@@ -810,7 +815,7 @@ def test_api_data_codex_labels_follow_the_request_gate_without_contamination(
         reopened = json.loads(body)
         assert status == 200 and labels(reopened) == ("Private first prompt",)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def _first_sse_update_envelope(port, *, host=None, timeout=5.0):
@@ -962,7 +967,7 @@ def test_payload_route_input_result_and_gate(tmp_path, monkeypatch):
             port, "/api/conversation/sp/payload?tool_use_id=nope&which=result")
         assert status == 404
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_payload_route_source_gone_returns_410(tmp_path, monkeypatch):
@@ -991,7 +996,7 @@ def test_payload_route_source_gone_returns_410(tmp_path, monkeypatch):
         assert status == 410, (status, body)
         assert "error" in json.loads(body)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def _seed_background_payload_rows(ns, tmp_path, *, with_notification=True):
@@ -1096,7 +1101,7 @@ def test_payload_route_serves_a_recovered_background_result(tmp_path, monkeypatc
             f"/api/conversation/sbg/payload?tool_use_id={tuid}&which=background_result")
         assert status == 400
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_payload_route_background_notification_gone_returns_410(tmp_path, monkeypatch):
@@ -1116,7 +1121,7 @@ def test_payload_route_background_notification_gone_returns_410(tmp_path, monkey
             port, "/api/conversation/sbg/payload?tool_use_id=toolu_absent&which=result")
         assert status == 404
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_sse_update_envelope_carries_transcripts_enabled(tmp_path, monkeypatch):
@@ -1147,7 +1152,7 @@ def test_sse_update_envelope_carries_transcripts_enabled(tmp_path, monkeypatch):
         assert "transcriptsEnabled" in env, env
         assert env["transcriptsEnabled"] is False
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_sse_codex_labels_follow_each_connection_transcript_gate(
@@ -1187,7 +1192,7 @@ def test_sse_codex_labels_follow_each_connection_transcript_gate(
             "claude": None, "codex": None,
         }
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1207,7 +1212,7 @@ def _get_media(port, path, *, host=None, sec_fetch_site=None):
     """GET helper that returns ``(status, headers, body)`` so the media route's
     exact response headers can be asserted. Optional Host (gate spoof) +
     Sec-Fetch-Site (Fetch-Metadata oracle) headers."""
-    c = HTTPConnection("127.0.0.1", port, timeout=5)
+    c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     c.putrequest("GET", path, skip_host=(host is not None))
     if host is not None:
         c.putheader("Host", host)
@@ -1289,7 +1294,7 @@ def test_media_route_serves_png(tmp_path, monkeypatch):
         assert headers["Cache-Control"] == "private, max-age=86400"
         assert "Content-Disposition" not in headers
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_media_route_pdf_disposition(tmp_path, monkeypatch):
@@ -1306,7 +1311,7 @@ def test_media_route_pdf_disposition(tmp_path, monkeypatch):
         assert headers["Content-Disposition"] == 'inline; filename="attachment-0.pdf"'
         assert "Content-Security-Policy" not in headers   # no CSP sandbox for PDFs
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_media_route_param_validation(tmp_path, monkeypatch):
@@ -1324,7 +1329,7 @@ def test_media_route_param_validation(tmp_path, monkeypatch):
             status, _, _ = _get_media(port, path)
             assert status == 400, (path, status)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_media_route_404_unknown_and_unsupported(tmp_path, monkeypatch):
@@ -1364,7 +1369,7 @@ def test_media_route_404_unknown_and_unsupported(tmp_path, monkeypatch):
             port, "/api/conversation/sm/media?tool_use_id=tu_bmp&index=0")
         assert status == 404
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_media_route_410_gone(tmp_path, monkeypatch):
@@ -1378,7 +1383,7 @@ def test_media_route_410_gone(tmp_path, monkeypatch):
             port, "/api/conversation/sm/media?tool_use_id=tu_img&index=0")
         assert status == 410, (status, body)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_media_route_unexpected_read_error_500_envelope(tmp_path, monkeypatch):
@@ -1409,7 +1414,7 @@ def test_media_route_unexpected_read_error_500_envelope(tmp_path, monkeypatch):
         payload = json.loads(body)
         assert "RuntimeError: synthetic read failure" in payload["error"]
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_media_route_403_gate_and_cross_site(tmp_path, monkeypatch):
@@ -1437,7 +1442,7 @@ def test_media_route_403_gate_and_cross_site(tmp_path, monkeypatch):
             port, "/api/conversation/sm/media?tool_use_id=tu_img&index=0")
         assert status == 200 and body == PNG_BYTES
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_media_route_413_too_large(tmp_path, monkeypatch):
@@ -1475,7 +1480,7 @@ def test_media_route_413_too_large(tmp_path, monkeypatch):
             port, "/api/conversation/sm/media?uuid=ubig&index=0")
         assert status == 413, (status, body)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # === 1A: per-session cache-rebuild count helper ============================
@@ -1599,7 +1604,7 @@ def _get_json(srv, path):
     ``(status, parsed_json)``. The shared driver for the Task-2 HTTP filter
     tests (the same _boot harness the gate/rail tests use)."""
     from http.client import HTTPConnection
-    c = HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+    c = HTTPConnection("127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS)
     c.request("GET", path, headers={"Host": "127.0.0.1"})
     r = c.getresponse()
     body = r.read()
@@ -1623,7 +1628,7 @@ def test_facets_lists_projects_with_counts(tmp_path, monkeypatch):
         labels = [p["project_label"] for p in body["projects"]]
         assert labels == sorted(labels)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_filter_by_project(tmp_path, monkeypatch):
@@ -1636,7 +1641,7 @@ def test_filter_by_project(tmp_path, monkeypatch):
         assert {c["project_label"] for c in body["conversations"]} == {"proj"}
         assert {c["session_id"] for c in body["conversations"]} == {"s1"}
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_filter_by_project_multi_any(tmp_path, monkeypatch):
@@ -1649,7 +1654,7 @@ def test_filter_by_project_multi_any(tmp_path, monkeypatch):
         assert st == 200
         assert {c["project_label"] for c in body["conversations"]} == {"proj", "clean"}
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_filter_by_cost_and_rebuilds(tmp_path, monkeypatch):
@@ -1664,7 +1669,7 @@ def test_filter_by_cost_and_rebuilds(tmp_path, monkeypatch):
         assert sids == {"sess-rebuild"}, sids
         assert all(c["cost_usd"] >= 0.05 for c in body["conversations"])
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_filter_by_cost_max(tmp_path, monkeypatch):
@@ -1679,7 +1684,7 @@ def test_filter_by_cost_max(tmp_path, monkeypatch):
         assert sids == {"s1", "s2"}, sids
         assert all(c["cost_usd"] <= 0.05 for c in body["conversations"])
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_filter_by_date_range(tmp_path, monkeypatch):
@@ -1695,7 +1700,7 @@ def test_filter_by_date_range(tmp_path, monkeypatch):
         sids = {c["session_id"] for c in body["conversations"]}
         assert sids == {"s2", "sess-clean"}, sids
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_filter_pagination_correct(tmp_path, monkeypatch):
@@ -1715,7 +1720,7 @@ def test_filter_pagination_correct(tmp_path, monkeypatch):
         assert p1["page"]["has_more"] is True       # more after the first page
         assert p2["page"]["has_more"] is False      # the filtered set is exhausted
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_filter_bad_cost_is_400(tmp_path, monkeypatch):
@@ -1728,7 +1733,7 @@ def test_filter_bad_cost_is_400(tmp_path, monkeypatch):
         assert st == 400
         assert "error" in body
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_filter_bad_rebuild_is_400(tmp_path, monkeypatch):
@@ -1739,7 +1744,7 @@ def test_filter_bad_rebuild_is_400(tmp_path, monkeypatch):
         st, body = _get_json(srv, "/api/conversations?rebuild_min=lots")
         assert st == 400
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_filter_bad_date_is_400(tmp_path, monkeypatch):
@@ -1750,7 +1755,7 @@ def test_filter_bad_date_is_400(tmp_path, monkeypatch):
         st, body = _get_json(srv, "/api/conversations?date_from=not-a-date")
         assert st == 400
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_filter_dual_branch_parity(tmp_path, monkeypatch):
@@ -1851,7 +1856,7 @@ def test_filter_date_boundary_inclusion_rollup(tmp_path, monkeypatch):
         expected = {sid for sid, (_, keep) in _BOUNDARY_SESSIONS.items() if keep}
         assert got == expected, (got, expected)
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_filter_date_boundary_inclusion_live_branch_parity(tmp_path, monkeypatch):
@@ -1912,7 +1917,7 @@ def test_filter_degraded_set_on_live_branch_rollup_only_axis(tmp_path, monkeypat
         # it would be dropped — its presence proves the axis was NOT applied.
         assert "s1" in sids, sids
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_filter_degraded_absent_on_authoritative_cost_filter(tmp_path, monkeypatch):
@@ -1927,7 +1932,7 @@ def test_filter_degraded_absent_on_authoritative_cost_filter(tmp_path, monkeypat
         sids = {c["session_id"] for c in body["conversations"]}
         assert "s1" not in sids, sids   # below the floor -> actually dropped
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_filter_degraded_absent_on_live_branch_date_only(tmp_path, monkeypatch):
@@ -1941,7 +1946,7 @@ def test_filter_degraded_absent_on_live_branch_date_only(tmp_path, monkeypatch):
         assert st == 200, (st, body)
         assert not body["page"].get("filter_degraded"), body["page"]
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 
@@ -1989,7 +1994,7 @@ def test_conversations_model_filter_and_facets(tmp_path, monkeypatch):
         counts = {m["family"]: m["count"] for m in fac["models"]}
         assert counts == {"opus": 3}, counts
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ---- #281 S4: anonymized export param + anon-map route ---------------------
@@ -2038,7 +2043,7 @@ def test_conversation_export_anonymize_param(tmp_path, monkeypatch):
             st, _, _ = _get_ct(port, base + bad)
             assert st == 400, bad
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_conversation_anon_map_route(tmp_path, monkeypatch):
@@ -2071,4 +2076,4 @@ def test_conversation_anon_map_route(tmp_path, monkeypatch):
                      host="machine.local:8789")
         assert st == 403
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)

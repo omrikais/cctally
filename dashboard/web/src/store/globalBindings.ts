@@ -140,6 +140,13 @@ export function buildGlobalKeyBindings(): Binding[] {
     // `view:'any'` (#156): all-views chrome; without it this scope:'global'
     // binding would regress to dashboard-only.
     { key: 'd', scope: 'global', view: 'any', when: _doctorOpenGuard, action: () => dispatch({ type: 'OPEN_DOCTOR_MODAL' }) },
+    // #620 S2 D6 — the on-demand diagnosis. `scope:'global'` with the default
+    // 'dashboard' view, deliberately NOT `view:'any'`: the conversations reader
+    // already binds `e` to "next error", and the dispatcher's view gate is what
+    // keeps the two from colliding. The plain `_globalKeyGuard` is right here
+    // (unlike `d`'s composite one), because this key opens a PANEL modal, so it
+    // must also be inert while the Doctor modal is up.
+    { key: 'e', scope: 'global', when: _globalKeyGuard, action: () => dispatch({ type: 'OPEN_MODAL', kind: 'explain' }) },
     // Share v2 (spec §12.1). Opens the share modal for the focused panel.
     // Guards (composer/share/panel modals empty, no input mode, focus on a
     // share-capable panel, not mobile) live inside buildShareKeyBinding so

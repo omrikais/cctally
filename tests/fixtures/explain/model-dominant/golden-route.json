@@ -1,0 +1,2113 @@
+{
+  "applicableClassCount": 7,
+  "constants": {
+    "codexEventScanBudgetRows": 1048576,
+    "codexEventScanPerFileRows": 4096,
+    "confidenceHighMinSupport": 20,
+    "confidenceMediumMinCoverage": 0.8,
+    "confidenceMediumMinSupport": 5,
+    "contributorShareFloor": 0.2,
+    "conversationNormalizeBudgetRows": 2000,
+    "gapCodes": [
+      "ambiguous_origin_category",
+      "scan_budget_exhausted",
+      "unknown_context_window",
+      "unresolved_subagent_attribution"
+    ],
+    "largeContextMinWindowFraction": 0.8,
+    "minSubagentBuckets": 2,
+    "registry": [
+      {
+        "contributorClass": "model_mix",
+        "label": "Expensive model mix",
+        "minDistinctSubjects": 2,
+        "minPricedEntries": 20,
+        "subjectKind": "model"
+      },
+      {
+        "contributorClass": "project_concentration",
+        "label": "One project dominating",
+        "minDistinctSubjects": 2,
+        "minPricedEntries": 20,
+        "subjectKind": "project"
+      },
+      {
+        "contributorClass": "session_concentration",
+        "label": "One session dominating",
+        "minDistinctSubjects": 2,
+        "minPricedEntries": 20,
+        "subjectKind": "session"
+      },
+      {
+        "contributorClass": "five_hour_bursts",
+        "label": "Concentrated 5-hour bursts",
+        "minDistinctSubjects": 2,
+        "minPricedEntries": 20,
+        "subjectKind": "block"
+      },
+      {
+        "contributorClass": "cache_churn",
+        "label": "Prompt-cache churn",
+        "minDistinctSubjects": 1,
+        "minPricedEntries": 20,
+        "rule": {
+          "parameters": {
+            "cacheFloorTokens": 20000,
+            "collapseFraction": 0.5,
+            "createFloorTokens": 20000,
+            "recreateFraction": 0.75
+          },
+          "sentence": "Turns whose prompt cache was rebuilt: the cached prefix collapsed and was re-created in the same turn."
+        },
+        "subjectKind": "qualifying_set"
+      },
+      {
+        "contributorClass": "short_high_context",
+        "label": "Short conversations carrying large context",
+        "minDistinctSubjects": 1,
+        "minPricedEntries": 20,
+        "rule": {
+          "parameters": {
+            "maxHumanTurns": 3,
+            "minWindowFraction": 0.8
+          },
+          "sentence": "Conversations with at most 3 human turns where at least one request used at least 80% of that request's model context window. With several replies the largest single request fraction is used, never their sum."
+        },
+        "subjectKind": "qualifying_set"
+      },
+      {
+        "contributorClass": "subagent_fanout",
+        "label": "Subagent fan-out",
+        "minDistinctSubjects": 1,
+        "minPricedEntries": 20,
+        "rule": {
+          "parameters": {
+            "minBuckets": 2
+          },
+          "sentence": "Cost attributable to delegated subagent work, grouped by parent. On Codex this is an identifiable subset of unknown completeness."
+        },
+        "subjectKind": "qualifying_set"
+      }
+    ],
+    "seedScanBudgetRows": 50000,
+    "shareFloorEpsilon": 1e-09,
+    "shortConversationMaxHumanTurns": 3,
+    "tieEpsilonUsd": 1e-09,
+    "turnDefinition": "Turn definition: main-thread human messages only \u2014 non-sidechain, non-subagent, after command and meta normalisation; assistant replies associate with the nearest preceding human.",
+    "withholdMinCoverage": 0.5,
+    "withholdMinSupport": 2
+  },
+  "contractVersion": 1,
+  "measuredAt": "2026-08-17T00:00:00Z",
+  "notes": {
+    "overlap": "The classes overlap \u2014 one session is also a project and a model \u2014 so shares do not sum to 100 percent.",
+    "scope": "This explains locally retained cost and tokens, not quota percentage."
+  },
+  "overallCode": null,
+  "overallVerdict": "contributor_detected",
+  "results": [
+    {
+      "accountKey": null,
+      "applicableClassCount": 7,
+      "classes": [
+        {
+          "code": null,
+          "confidence": "high",
+          "contributorClass": "model_mix",
+          "population": {
+            "countCoverage": 1.0,
+            "gapCodes": [],
+            "identityCoverage": 1.0,
+            "observedEnd": "2026-08-11T04:45:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "pricingCoverage": 1.0,
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "retentionCoverage": 1.0,
+            "supportUnits": 60,
+            "usdCoverage": 1.0
+          },
+          "rows": [
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 1.0
+              },
+              "confidence": "high",
+              "contributorClass": "model_mix",
+              "isFallbackPricing": false,
+              "nextStep": "cctally claude daily -m calculate --since 2026-08-10 --until 2026-08-17",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 2.3009999999999997
+              },
+              "rank": 1,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.9677419354838709
+              },
+              "subjectKey": "claude-opus-4-20250514",
+              "subjectKind": "model",
+              "subjectLabel": "claude-opus-4-20250514"
+            }
+          ],
+          "supportShortfall": null,
+          "verdict": "contributor"
+        },
+        {
+          "code": null,
+          "confidence": "high",
+          "contributorClass": "project_concentration",
+          "population": {
+            "countCoverage": 1.0,
+            "gapCodes": [],
+            "identityCoverage": 1.0,
+            "observedEnd": "2026-08-11T04:45:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "pricingCoverage": 1.0,
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "retentionCoverage": 1.0,
+            "supportUnits": 60,
+            "usdCoverage": 1.0
+          },
+          "rows": [
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.26666666666666666
+              },
+              "confidence": "high",
+              "contributorClass": "project_concentration",
+              "isFallbackPricing": false,
+              "nextStep": "cctally project --source claude",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.594425
+              },
+              "rank": 2,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.25
+              },
+              "subjectKey": "project-1",
+              "subjectKind": "project",
+              "subjectLabel": "project-1"
+            },
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.26666666666666666
+              },
+              "confidence": "high",
+              "contributorClass": "project_concentration",
+              "isFallbackPricing": false,
+              "nextStep": "cctally project --source claude",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.594425
+              },
+              "rank": 3,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.25
+              },
+              "subjectKey": "project-2",
+              "subjectKind": "project",
+              "subjectLabel": "project-2"
+            },
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.23333333333333334
+              },
+              "confidence": "high",
+              "contributorClass": "project_concentration",
+              "isFallbackPricing": false,
+              "nextStep": "cctally project --source claude",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.594425
+              },
+              "rank": 4,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.25
+              },
+              "subjectKey": "project-3",
+              "subjectKind": "project",
+              "subjectLabel": "project-3"
+            },
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.23333333333333334
+              },
+              "confidence": "high",
+              "contributorClass": "project_concentration",
+              "isFallbackPricing": false,
+              "nextStep": "cctally project --source claude",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.594425
+              },
+              "rank": 5,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.25
+              },
+              "subjectKey": "project-4",
+              "subjectKind": "project",
+              "subjectLabel": "project-4"
+            }
+          ],
+          "supportShortfall": null,
+          "verdict": "contributor"
+        },
+        {
+          "code": null,
+          "confidence": "high",
+          "contributorClass": "session_concentration",
+          "population": {
+            "countCoverage": 1.0,
+            "gapCodes": [],
+            "identityCoverage": 1.0,
+            "observedEnd": "2026-08-11T04:45:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "pricingCoverage": 1.0,
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "retentionCoverage": 1.0,
+            "supportUnits": 60,
+            "usdCoverage": 1.0
+          },
+          "rows": [
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.2
+              },
+              "confidence": "high",
+              "contributorClass": "session_concentration",
+              "isFallbackPricing": false,
+              "nextStep": "cctally claude session -m calculate --since 2026-08-10 --until 2026-08-17",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.47553999999999996
+              },
+              "rank": 10,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.19999999999999998
+              },
+              "subjectKey": "session-1",
+              "subjectKind": "session",
+              "subjectLabel": "session-1"
+            },
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.2
+              },
+              "confidence": "high",
+              "contributorClass": "session_concentration",
+              "isFallbackPricing": false,
+              "nextStep": "cctally claude session -m calculate --since 2026-08-10 --until 2026-08-17",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.47553999999999996
+              },
+              "rank": 11,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.19999999999999998
+              },
+              "subjectKey": "session-2",
+              "subjectKind": "session",
+              "subjectLabel": "session-2"
+            },
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.2
+              },
+              "confidence": "high",
+              "contributorClass": "session_concentration",
+              "isFallbackPricing": false,
+              "nextStep": "cctally claude session -m calculate --since 2026-08-10 --until 2026-08-17",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.47553999999999996
+              },
+              "rank": 12,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.19999999999999998
+              },
+              "subjectKey": "session-3",
+              "subjectKind": "session",
+              "subjectLabel": "session-3"
+            },
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.2
+              },
+              "confidence": "high",
+              "contributorClass": "session_concentration",
+              "isFallbackPricing": false,
+              "nextStep": "cctally claude session -m calculate --since 2026-08-10 --until 2026-08-17",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.47553999999999996
+              },
+              "rank": 13,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.19999999999999998
+              },
+              "subjectKey": "session-4",
+              "subjectKind": "session",
+              "subjectLabel": "session-4"
+            },
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.2
+              },
+              "confidence": "high",
+              "contributorClass": "session_concentration",
+              "isFallbackPricing": false,
+              "nextStep": "cctally claude session -m calculate --since 2026-08-10 --until 2026-08-17",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.47553999999999996
+              },
+              "rank": 14,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.19999999999999998
+              },
+              "subjectKey": "session-5",
+              "subjectKind": "session",
+              "subjectLabel": "session-5"
+            }
+          ],
+          "supportShortfall": null,
+          "verdict": "contributor"
+        },
+        {
+          "code": null,
+          "confidence": "high",
+          "contributorClass": "five_hour_bursts",
+          "population": {
+            "countCoverage": 1.0,
+            "gapCodes": [],
+            "identityCoverage": 1.0,
+            "observedEnd": "2026-08-11T04:45:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "pricingCoverage": 1.0,
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "retentionCoverage": 1.0,
+            "supportUnits": 60,
+            "usdCoverage": 1.0
+          },
+          "rows": [
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.33333333333333337
+              },
+              "confidence": "high",
+              "contributorClass": "five_hour_bursts",
+              "isFallbackPricing": false,
+              "nextStep": "cctally five-hour-breakdown --block-start 2026-08-10T00:00:00Z",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.5752499999999999
+              },
+              "rank": 6,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.24193548387096772
+              },
+              "subjectKey": "claude|standard|2026-08-10T00:00:00Z",
+              "subjectKind": "block",
+              "subjectLabel": "2026-08-10T00:00:00Z"
+            },
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.33333333333333337
+              },
+              "confidence": "high",
+              "contributorClass": "five_hour_bursts",
+              "isFallbackPricing": false,
+              "nextStep": "cctally five-hour-breakdown --block-start 2026-08-10T05:00:00Z",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.5752499999999999
+              },
+              "rank": 7,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.24193548387096772
+              },
+              "subjectKey": "claude|standard|2026-08-10T05:00:00Z",
+              "subjectKind": "block",
+              "subjectLabel": "2026-08-10T05:00:00Z"
+            },
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.33333333333333337
+              },
+              "confidence": "high",
+              "contributorClass": "five_hour_bursts",
+              "isFallbackPricing": false,
+              "nextStep": "cctally five-hour-breakdown --block-start 2026-08-10T10:00:00Z",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.5752499999999999
+              },
+              "rank": 8,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.24193548387096772
+              },
+              "subjectKey": "claude|standard|2026-08-10T10:00:00Z",
+              "subjectKind": "block",
+              "subjectLabel": "2026-08-10T10:00:00Z"
+            },
+            {
+              "baseline": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.33333333333333337
+              },
+              "confidence": "high",
+              "contributorClass": "five_hour_bursts",
+              "isFallbackPricing": false,
+              "nextStep": "cctally five-hour-breakdown --block-start 2026-08-10T15:00:00Z",
+              "observedUsd": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.5752499999999999
+              },
+              "rank": 9,
+              "share": {
+                "population": {
+                  "countCoverage": 1.0,
+                  "gapCodes": [],
+                  "identityCoverage": 1.0,
+                  "observedEnd": "2026-08-11T04:45:00Z",
+                  "observedStart": "2026-08-10T00:00:00Z",
+                  "pricingCoverage": 1.0,
+                  "requestedEnd": "2026-08-17T00:00:00Z",
+                  "requestedStart": "2026-08-10T00:00:00Z",
+                  "retentionCoverage": 1.0,
+                  "supportUnits": 60,
+                  "usdCoverage": 1.0
+                },
+                "qualifications": [],
+                "state": "available",
+                "value": 0.24193548387096772
+              },
+              "subjectKey": "claude|standard|2026-08-10T15:00:00Z",
+              "subjectKind": "block",
+              "subjectLabel": "2026-08-10T15:00:00Z"
+            }
+          ],
+          "supportShortfall": null,
+          "verdict": "contributor"
+        },
+        {
+          "code": "signal_unavailable",
+          "confidence": null,
+          "contributorClass": "cache_churn",
+          "population": {
+            "gapCodes": [
+              "signal_unavailable"
+            ],
+            "observedEnd": "2026-08-11T04:45:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "retentionCoverage": 1.0,
+            "supportUnits": null
+          },
+          "rows": [],
+          "supportShortfall": null,
+          "verdict": "withheld"
+        },
+        {
+          "code": "signal_unavailable",
+          "confidence": null,
+          "contributorClass": "short_high_context",
+          "population": {
+            "gapCodes": [
+              "signal_unavailable"
+            ],
+            "observedEnd": "2026-08-11T04:45:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "retentionCoverage": 1.0,
+            "supportUnits": null
+          },
+          "rows": [],
+          "supportShortfall": null,
+          "verdict": "withheld"
+        },
+        {
+          "code": "signal_unavailable",
+          "confidence": null,
+          "contributorClass": "subagent_fanout",
+          "population": {
+            "gapCodes": [
+              "signal_unavailable"
+            ],
+            "observedEnd": "2026-08-11T04:45:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "retentionCoverage": 1.0,
+            "supportUnits": null
+          },
+          "rows": [],
+          "supportShortfall": null,
+          "verdict": "withheld"
+        }
+      ],
+      "code": null,
+      "contributors": [
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 1.0
+          },
+          "confidence": "high",
+          "contributorClass": "model_mix",
+          "isFallbackPricing": false,
+          "nextStep": "cctally claude daily -m calculate --since 2026-08-10 --until 2026-08-17",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 2.3009999999999997
+          },
+          "rank": 1,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.9677419354838709
+          },
+          "subjectKey": "claude-opus-4-20250514",
+          "subjectKind": "model",
+          "subjectLabel": "claude-opus-4-20250514"
+        },
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.26666666666666666
+          },
+          "confidence": "high",
+          "contributorClass": "project_concentration",
+          "isFallbackPricing": false,
+          "nextStep": "cctally project --source claude",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.594425
+          },
+          "rank": 2,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.25
+          },
+          "subjectKey": "project-1",
+          "subjectKind": "project",
+          "subjectLabel": "project-1"
+        },
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.26666666666666666
+          },
+          "confidence": "high",
+          "contributorClass": "project_concentration",
+          "isFallbackPricing": false,
+          "nextStep": "cctally project --source claude",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.594425
+          },
+          "rank": 3,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.25
+          },
+          "subjectKey": "project-2",
+          "subjectKind": "project",
+          "subjectLabel": "project-2"
+        },
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.23333333333333334
+          },
+          "confidence": "high",
+          "contributorClass": "project_concentration",
+          "isFallbackPricing": false,
+          "nextStep": "cctally project --source claude",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.594425
+          },
+          "rank": 4,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.25
+          },
+          "subjectKey": "project-3",
+          "subjectKind": "project",
+          "subjectLabel": "project-3"
+        },
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.23333333333333334
+          },
+          "confidence": "high",
+          "contributorClass": "project_concentration",
+          "isFallbackPricing": false,
+          "nextStep": "cctally project --source claude",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.594425
+          },
+          "rank": 5,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.25
+          },
+          "subjectKey": "project-4",
+          "subjectKind": "project",
+          "subjectLabel": "project-4"
+        },
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.33333333333333337
+          },
+          "confidence": "high",
+          "contributorClass": "five_hour_bursts",
+          "isFallbackPricing": false,
+          "nextStep": "cctally five-hour-breakdown --block-start 2026-08-10T00:00:00Z",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.5752499999999999
+          },
+          "rank": 6,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.24193548387096772
+          },
+          "subjectKey": "claude|standard|2026-08-10T00:00:00Z",
+          "subjectKind": "block",
+          "subjectLabel": "2026-08-10T00:00:00Z"
+        },
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.33333333333333337
+          },
+          "confidence": "high",
+          "contributorClass": "five_hour_bursts",
+          "isFallbackPricing": false,
+          "nextStep": "cctally five-hour-breakdown --block-start 2026-08-10T05:00:00Z",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.5752499999999999
+          },
+          "rank": 7,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.24193548387096772
+          },
+          "subjectKey": "claude|standard|2026-08-10T05:00:00Z",
+          "subjectKind": "block",
+          "subjectLabel": "2026-08-10T05:00:00Z"
+        },
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.33333333333333337
+          },
+          "confidence": "high",
+          "contributorClass": "five_hour_bursts",
+          "isFallbackPricing": false,
+          "nextStep": "cctally five-hour-breakdown --block-start 2026-08-10T10:00:00Z",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.5752499999999999
+          },
+          "rank": 8,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.24193548387096772
+          },
+          "subjectKey": "claude|standard|2026-08-10T10:00:00Z",
+          "subjectKind": "block",
+          "subjectLabel": "2026-08-10T10:00:00Z"
+        },
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.33333333333333337
+          },
+          "confidence": "high",
+          "contributorClass": "five_hour_bursts",
+          "isFallbackPricing": false,
+          "nextStep": "cctally five-hour-breakdown --block-start 2026-08-10T15:00:00Z",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.5752499999999999
+          },
+          "rank": 9,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.24193548387096772
+          },
+          "subjectKey": "claude|standard|2026-08-10T15:00:00Z",
+          "subjectKind": "block",
+          "subjectLabel": "2026-08-10T15:00:00Z"
+        },
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.2
+          },
+          "confidence": "high",
+          "contributorClass": "session_concentration",
+          "isFallbackPricing": false,
+          "nextStep": "cctally claude session -m calculate --since 2026-08-10 --until 2026-08-17",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.47553999999999996
+          },
+          "rank": 10,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.19999999999999998
+          },
+          "subjectKey": "session-1",
+          "subjectKind": "session",
+          "subjectLabel": "session-1"
+        },
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.2
+          },
+          "confidence": "high",
+          "contributorClass": "session_concentration",
+          "isFallbackPricing": false,
+          "nextStep": "cctally claude session -m calculate --since 2026-08-10 --until 2026-08-17",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.47553999999999996
+          },
+          "rank": 11,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.19999999999999998
+          },
+          "subjectKey": "session-2",
+          "subjectKind": "session",
+          "subjectLabel": "session-2"
+        },
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.2
+          },
+          "confidence": "high",
+          "contributorClass": "session_concentration",
+          "isFallbackPricing": false,
+          "nextStep": "cctally claude session -m calculate --since 2026-08-10 --until 2026-08-17",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.47553999999999996
+          },
+          "rank": 12,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.19999999999999998
+          },
+          "subjectKey": "session-3",
+          "subjectKind": "session",
+          "subjectLabel": "session-3"
+        },
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.2
+          },
+          "confidence": "high",
+          "contributorClass": "session_concentration",
+          "isFallbackPricing": false,
+          "nextStep": "cctally claude session -m calculate --since 2026-08-10 --until 2026-08-17",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.47553999999999996
+          },
+          "rank": 13,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.19999999999999998
+          },
+          "subjectKey": "session-4",
+          "subjectKind": "session",
+          "subjectLabel": "session-4"
+        },
+        {
+          "baseline": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.2
+          },
+          "confidence": "high",
+          "contributorClass": "session_concentration",
+          "isFallbackPricing": false,
+          "nextStep": "cctally claude session -m calculate --since 2026-08-10 --until 2026-08-17",
+          "observedUsd": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.47553999999999996
+          },
+          "rank": 14,
+          "share": {
+            "population": {
+              "countCoverage": 1.0,
+              "gapCodes": [],
+              "identityCoverage": 1.0,
+              "observedEnd": "2026-08-11T04:45:00Z",
+              "observedStart": "2026-08-10T00:00:00Z",
+              "pricingCoverage": 1.0,
+              "requestedEnd": "2026-08-17T00:00:00Z",
+              "requestedStart": "2026-08-10T00:00:00Z",
+              "retentionCoverage": 1.0,
+              "supportUnits": 60,
+              "usdCoverage": 1.0
+            },
+            "qualifications": [],
+            "state": "available",
+            "value": 0.19999999999999998
+          },
+          "subjectKey": "session-5",
+          "subjectKind": "session",
+          "subjectLabel": "session-5"
+        }
+      ],
+      "coverage": {
+        "countCoverage": 1.0,
+        "gapCodes": [],
+        "identityCoverage": 1.0,
+        "observedEnd": "2026-08-11T04:45:00Z",
+        "observedStart": "2026-08-10T00:00:00Z",
+        "pricingCoverage": 1.0,
+        "requestedEnd": "2026-08-17T00:00:00Z",
+        "requestedStart": "2026-08-10T00:00:00Z",
+        "retentionCoverage": 1.0,
+        "supportUnits": 60,
+        "usdCoverage": 1.0
+      },
+      "denominator": {
+        "accountKey": null,
+        "identity": "totalExplainedRetainedCost",
+        "populationDigest": "c96773a926c3699a37e55abcb118884c",
+        "source": "claude",
+        "usd": {
+          "population": {
+            "countCoverage": 1.0,
+            "gapCodes": [],
+            "identityCoverage": 1.0,
+            "observedEnd": "2026-08-11T04:45:00Z",
+            "observedStart": "2026-08-10T00:00:00Z",
+            "pricingCoverage": 1.0,
+            "requestedEnd": "2026-08-17T00:00:00Z",
+            "requestedStart": "2026-08-10T00:00:00Z",
+            "retentionCoverage": 1.0,
+            "supportUnits": 60,
+            "usdCoverage": 1.0
+          },
+          "qualifications": [],
+          "state": "available",
+          "value": 2.3777
+        },
+        "windowEnd": "2026-08-17T00:00:00Z",
+        "windowStart": "2026-08-10T00:00:00Z"
+      },
+      "effectiveSpeed": null,
+      "generation": {
+        "cache": "065cd91c552cb09e0d7a43d6a8b5c3e1b00b9d9151857005f53808cead8ccbcd",
+        "configuration": "7eb9e1ec6c9a432be5de325fbb53aabd8a981eae2e4527d4195f17a3f70b760e",
+        "generationId": "e49a39b8f79879f5ee95f777b7b0527b47ce69c2f999dfaab756d972c338cae3",
+        "stats": "bf815d33d697a8faa4bf754b6efc8c743d5912859117427cdc762d87f8e07eba"
+      },
+      "source": "claude",
+      "verdict": "contributor_detected",
+      "withheldClassCount": 3
+    }
+  ],
+  "schemaVersion": 1,
+  "window": {
+    "endAt": "2026-08-17T00:00:00Z",
+    "label": "2026-08-10..2026-08-16",
+    "startAt": "2026-08-10T00:00:00Z",
+    "tz": "Etc/UTC"
+  },
+  "withheldClassCount": 3
+}

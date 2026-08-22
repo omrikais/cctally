@@ -16,6 +16,8 @@ import pytest
 
 from conftest import load_script, redirect_paths
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
+
 
 def _load(monkeypatch, tmp_path):
     ns = load_script()
@@ -364,7 +366,7 @@ def _start_refresh_thread(*, name, target, results, errors, start_gate=None):
     def run():
         try:
             if start_gate is not None:
-                start_gate.wait(timeout=2)
+                start_gate.wait(timeout=PRESENCE_BACKSTOP_SECONDS)
             results[name] = target()
         except BaseException as exc:  # surfaced in the parent test thread
             errors[name] = exc
@@ -403,7 +405,7 @@ def test_force_and_hook_429_transitions_are_serialized(monkeypatch, tmp_path):
             concurrent = False
         target = max(float(retry_after_deadline), old_deadline)
         if concurrent and retry_after_deadline == short_deadline:
-            assert long_written.wait(timeout=2)
+            assert long_written.wait(timeout=PRESENCE_BACKSTOP_SECONDS)
         state["deadline"] = target
         state["count"] = old_count + 1
         if concurrent and retry_after_deadline == long_deadline:
@@ -448,7 +450,8 @@ def test_force_and_hook_429_transitions_are_serialized(monkeypatch, tmp_path):
         ),
     ]
     for thread in threads:
-        thread.join(timeout=5)
+        # timing-budget: each concurrent refresh thread has returned, so `results` and `errors` are complete
+        thread.join(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     assert not any(thread.is_alive() for thread in threads)
     assert errors == {}
@@ -475,7 +478,7 @@ def test_earlier_force_success_cannot_clear_later_hook_429(monkeypatch, tmp_path
                              nudge_dashboard=True):
         def finish():
             force_authority_entered.set()
-            assert automatic_started.wait(timeout=2)
+            assert automatic_started.wait(timeout=PRESENCE_BACKSTOP_SECONDS)
             return SimpleNamespace(status="ok", reason=None)
 
         if lock_held:
@@ -519,7 +522,7 @@ def test_earlier_force_success_cannot_clear_later_hook_429(monkeypatch, tmp_path
         results=results,
         errors=errors,
     )
-    assert force_authority_entered.wait(timeout=2)
+    assert force_authority_entered.wait(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     def automatic_refresh():
         automatic_started.set()
@@ -532,7 +535,8 @@ def test_earlier_force_success_cannot_clear_later_hook_429(monkeypatch, tmp_path
         errors=errors,
     )
     for thread in (force, automatic):
-        thread.join(timeout=5)
+        # timing-budget: the forced and the automatic refresh thread have both returned into `results`
+        thread.join(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     assert not force.is_alive()
     assert not automatic.is_alive()

@@ -11,6 +11,8 @@ import pytest
 
 from conftest import load_script
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, shorten_sse_keepalive, start, stop
+
 
 @pytest.fixture(autouse=True)
 def _isolated_home(monkeypatch, tmp_path):
@@ -32,11 +34,10 @@ def _get(ns, path: str):
     srv = ns["ThreadingHTTPServer"](
         ("127.0.0.1", 0), ns["DashboardHTTPHandler"]
     )
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
+    thread = start(srv)
     try:
         conn = http.client.HTTPConnection(
-            "127.0.0.1", srv.server_address[1], timeout=3
+            "127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS
         )
         conn.request("GET", path)
         response = conn.getresponse()
@@ -44,9 +45,7 @@ def _get(ns, path: str):
         conn.close()
         return result
     finally:
-        srv.shutdown()
-        thread.join(timeout=2)
-        srv.server_close()
+        stop(srv, thread)
 
 
 def test_api_doctor_absent_statusline_markers_emit_nullable_strict_json():
@@ -55,11 +54,10 @@ def test_api_doctor_absent_statusline_markers_emit_nullable_strict_json():
     srv = ns["ThreadingHTTPServer"](
         ("127.0.0.1", 0), ns["DashboardHTTPHandler"]
     )
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
+    thread = start(srv)
     try:
         conn = http.client.HTTPConnection(
-            "127.0.0.1", srv.server_address[1], timeout=3
+            "127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS
         )
         conn.request("GET", "/api/doctor")
         response = conn.getresponse()
@@ -81,9 +79,7 @@ def test_api_doctor_absent_statusline_markers_emit_nullable_strict_json():
         assert pipeline["details"]["selected_age_seconds"] is None
         conn.close()
     finally:
-        srv.shutdown()
-        thread.join(timeout=2)
-        srv.server_close()
+        stop(srv, thread)
 
 
 def test_api_data_recursively_normalizes_nonfinite_values(monkeypatch):
@@ -135,21 +131,22 @@ def test_api_events_recursively_normalizes_nonfinite_values(monkeypatch):
             "nested": {"positive": float("inf"), "negative": -float("inf")},
         },
     )
+    shorten_sse_keepalive(ns, monkeypatch)
     srv = ns["ThreadingHTTPServer"](
         ("127.0.0.1", 0), ns["DashboardHTTPHandler"]
     )
     srv.handle_error = lambda request, client_address: None
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
+    thread = start(srv)
+    conn = response = None
     try:
         hub.publish(snap)
         conn = http.client.HTTPConnection(
-            "127.0.0.1", srv.server_address[1], timeout=3
+            "127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS
         )
         conn.request("GET", "/api/events")
         response = conn.getresponse()
         frame = b""
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
         while b"\n\n" not in frame and time.monotonic() < deadline:
             frame += response.fp.read1(4096)
         data_line = next(
@@ -161,11 +158,11 @@ def test_api_events_recursively_normalizes_nonfinite_values(monkeypatch):
         assert payload == {
             "nested": {"positive": None, "negative": None},
         }
-        conn.close()
     finally:
-        srv.shutdown()
-        thread.join(timeout=2)
-        srv.server_close()
+        # The response as well as the connection: `socket.makefile()` holds an
+        # io-reference, so closing the connection alone leaves the descriptor
+        # open and the SSE handler never learns its client has gone.
+        stop(srv, thread, connections=[c for c in (conn, response) if c is not None])
 
 
 def test_api_data_unsupported_objects_fail_with_clean_json_500(monkeypatch):

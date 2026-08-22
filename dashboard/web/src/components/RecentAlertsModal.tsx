@@ -22,6 +22,7 @@ import { AlertFollowCell } from './AlertFollow';
 import { resolveSourceView } from '../store/sourceView';
 import { resolveViewAccountFocus } from '../store/accountFocus';
 import { AlertsEmptyGauge } from './AlertsEmptyGauge';
+import { ZoneTag } from './ZoneTag';
 import type { AlertEntry, CodexAlertRow, SourceAlertRow } from '../types/envelope';
 
 // Recent alerts modal — full history (last 100). ESC and backdrop
@@ -267,6 +268,7 @@ export function RecentAlertsModal(): JSX.Element {
               // rule. A truthiness test on `d.whenIso` would miss the second
               // case.
               const whenTitle = fmt.startedShortOrNull(d.whenIso, ctx);
+              const whenText = fmt.relativeOrAbsolute(d.whenIso ?? '', ctx);
               return (
                 <tr key={toastAlertId(row)} className="alert-modal-row">
                   <td className={`alert-threshold alert-cell-threshold severity-${severity} ${severity} num`}>
@@ -302,7 +304,8 @@ export function RecentAlertsModal(): JSX.Element {
                     className="alert-cell-when alert-when"
                     title={whenTitle ?? undefined}
                   >
-                    {fmt.relativeOrAbsolute(d.whenIso ?? '', ctx)}
+                    {whenText}
+                    {whenText === '—' ? null : <> <ZoneTag tz={ctx.tz} /></>}
                   </td>
                 </tr>
               );

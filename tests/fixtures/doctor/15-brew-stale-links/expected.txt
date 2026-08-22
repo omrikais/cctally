@@ -3,7 +3,7 @@ cctally doctor — 2026-05-13 14:22:31 UTC
 Install
   ✓ Mode                     installed
   ✓ Update channel           stable
-  ⚠ Symlinks                 15/15 available; 2 stale link(s) to clean
+  ⚠ Symlinks                 16/16 available; 2 stale link(s) to clean
       → Run `cctally setup` to clean stale links
   ✓ PATH                     cctally reachable on $PATH
   ✓ Legacy status-line snippet not detected

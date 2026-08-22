@@ -11,9 +11,17 @@ The gate is therefore two tests:
 
 * a deterministic OPERATION-COUNT test, which fails identically on every
   machine and is what actually catches a regression;
-* a generously bounded wall-clock backstop at 250 ms, roughly fifty times the
-  measured cost, on a corpus built at or above production scale. A fixture
-  smaller than the real corpus would make this leg unable to fail.
+* a wall-clock backstop on a corpus built at or above production scale. A
+  fixture smaller than the real corpus would make this leg unable to fail.
+
+The two are deliberately separate gates, and #630 S2 kept them that way. A
+syscall count cannot detect CPU work added BETWEEN the calls, which is what the
+wall clock is for. What changed is the budget: 250 ms was fifty times the
+measured 3.5–4.8 ms on an idle machine and well inside the range a contended
+runner reaches, so it failed on load rather than on a regression. It now sits
+at the load-safe 30 s, and a per-entry work counter runs beside it so a second
+pass over every entry fails deterministically rather than waiting for the
+clock to notice.
 """
 from __future__ import annotations
 
@@ -454,12 +462,47 @@ def test_the_corpus_the_latency_gate_uses_is_at_production_scale(
     assert len(graph.roots) >= 269
 
 
+def test_the_walk_computes_each_entrys_size_once(tmp_path, monkeypatch):
+    """The per-entry computation the syscall counts cannot see.
+
+    `_scan_entries` pays one `lstat` per entry and `_tree_bytes` then computes
+    that entry's allocated size from the result. A second pass over the same
+    entries adds no syscall at all, so the operation-count test would stay
+    green while the walk did twice the work.
+    """
+    _ns, core, ret = _load(tmp_path, monkeypatch)
+    build_production_corpus(core.APP_DIR)
+    computed = {"count": 0}
+    real_disk_bytes = ret._disk_bytes
+
+    def counting_disk_bytes(info):
+        computed["count"] += 1
+        return real_disk_bytes(info)
+
+    monkeypatch.setattr(ret, "_disk_bytes", counting_disk_bytes)
+    scan = ret.gather_retained_artifacts()
+    assert scan.entries_seen >= 1150, scan.entries_seen
+    assert computed["count"] <= scan.entries_seen, (
+        f"the per-entry size computation ran {computed['count']} times over "
+        f"{scan.entries_seen} entries — the walk makes more than one pass")
+    assert computed["count"] >= scan.entries_seen // 2, (
+        f"only {computed['count']} of {scan.entries_seen} entries had their "
+        "size computed; this counter is watching the wrong function")
+
+
 def test_the_walk_stays_under_the_wall_clock_backstop(tmp_path, monkeypatch):
-    """250 ms, roughly fifty times the measured 3.5–4.8 ms. Warm."""
+    """The second of the two gates: CPU work the syscall counts cannot see.
+
+    Kept rather than deleted, for the reason this module's header states — an
+    operation count and a wall clock are different claims. The budget is the
+    load-safe 30 s rather than the old 250 ms, which a contended runner reached
+    on a walk that had not regressed at all.
+    """
     _ns, core, ret = _load(tmp_path, monkeypatch)
     build_production_corpus(core.APP_DIR)
     ret.gather_retained_artifacts()          # warm the directory cache
     started = time.perf_counter()
     ret.gather_retained_artifacts()
     elapsed = time.perf_counter() - started
-    assert elapsed < 0.250, f"metadata walk took {elapsed * 1000:.1f} ms"
+    # timing-budget: retained beside the operation and per-entry counters, which bound the syscalls and the size computation but not CPU work added between them
+    assert elapsed < 30.0, f"metadata walk took {elapsed * 1000:.1f} ms"

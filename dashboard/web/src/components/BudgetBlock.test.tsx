@@ -389,6 +389,14 @@ describe('BudgetComposition rendering (#556 S5 §4.4/§4.6)', () => {
     expect(screen.getByText('Recent-24h')).toBeTruthy();
   });
 
+  it('places the minus sign before the currency symbol for an over-budget remainder', () => {
+    const env = configuredClaudeEnv({ remaining_usd: -535.52, verdict: 'over' });
+    render(<BudgetComposition env={env} selection="claude" surface="modal" />);
+    const remaining = screen.getByText('Remaining').parentElement;
+    expect(remaining?.textContent).toContain('−$535.52');
+    expect(remaining?.textContent).not.toContain('$-535.52');
+  });
+
   it('degrades to the section reason when the provider has no data at all', () => {
     const claude = makeClaudeSourceEntry({ data: null } as unknown as
       Partial<SourceEntry<never>>);

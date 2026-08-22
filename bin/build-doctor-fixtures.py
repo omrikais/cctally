@@ -13,10 +13,37 @@ CCTALLY_DOCTOR_REGENERATE=1.
 """
 from __future__ import annotations
 
+import ast
 import pathlib
+import re
 import textwrap
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "doctor"
+ENTRY_POINT = pathlib.Path(__file__).resolve().parent / "cctally"
+
+
+def _user_facing_wrappers() -> str:
+    """The wrapper names `cctally setup` symlinks, read from the constant.
+
+    Three scenarios seed a fake `~/.local/bin` (or brew prefix) with "every
+    user-facing binary", so `install.symlinks` reports OK. Hand-copying that
+    list left it one name short the moment a wrapper was added, and the
+    doctor goldens then recorded a WARN as the healthy baseline. Deriving it
+    from `SETUP_SYMLINK_NAMES` is what keeps the fixture producer in step
+    with the rule it is meant to exercise.
+    """
+    source = ENTRY_POINT.read_text()
+    match = re.search(r"^SETUP_SYMLINK_NAMES = \((.*?)^\)", source,
+                      re.S | re.M)
+    if match is None:
+        raise SystemExit("SETUP_SYMLINK_NAMES not found in bin/cctally")
+    names = ast.literal_eval(f"({match.group(1)})")
+    if len(names) < 10:
+        raise SystemExit(f"SETUP_SYMLINK_NAMES parsed as {names!r}")
+    return " ".join(names)
+
+
+USER_FACING_WRAPPERS = _user_facing_wrappers()
 
 SCENARIOS = {
     "01-all-ok":                 "all_ok",
@@ -170,13 +197,12 @@ def _scenario_body(slug: str) -> str:
     if slug == "all_ok":
         return textwrap.dedent("""\
             # Seed install + hooks + OAuth + valid update-state + 1 fresh snapshot.
-            # Symlink every cctally-* binary so install.symlinks is OK.
-            # Keep this list aligned with SETUP_SYMLINK_NAMES in bin/cctally.
-            for name in cctally cctally-alerts cctally-budget cctally-dashboard \\
-                       cctally-dollar-per-percent cctally-five-hour-blocks \\
-                       cctally-five-hour-breakdown cctally-forecast cctally-project \\
-                       cctally-refresh-usage cctally-statusline cctally-sync-week \\
-                       cctally-transcript cctally-tui cctally-update; do
+            # Symlink every user-facing binary so install.symlinks is OK.
+            # The list is derived from SETUP_SYMLINK_NAMES rather than copied:
+            # a hand-copied list left the fixture one name short the moment a
+            # wrapper was added, and the goldens then recorded a WARN as the
+            # healthy baseline.
+            for name in {USER_FACING_WRAPPERS}; do
                 ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/.local/bin/$name"
             done
             # CC settings.json — canonical hook shape that _is_cctally_hook_command
@@ -437,11 +463,7 @@ def _scenario_body(slug: str) -> str:
             # Faithful brew: <prefix>/bin holds all USER_FACING_BINS.
             # Reachability source for the empty ~/.local/bin slots → `ok`.
             mkdir -p "$HARNESS_FAKE_HOME/opt/homebrew/bin"
-            for name in cctally cctally-alerts cctally-budget cctally-dashboard \\
-                       cctally-dollar-per-percent cctally-five-hour-blocks \\
-                       cctally-five-hour-breakdown cctally-forecast cctally-project \\
-                       cctally-refresh-usage cctally-statusline cctally-sync-week \\
-                       cctally-transcript cctally-tui cctally-update; do
+            for name in {USER_FACING_WRAPPERS}; do
                 ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/opt/homebrew/bin/$name"
             done
             # A LIVE old-keg file + a ~/.local/bin link pointing at it (the
@@ -469,11 +491,7 @@ def _scenario_body(slug: str) -> str:
         # (empty ~/.local/bin slots reachable-elsewhere → ok).
         return textwrap.dedent("""\
             mkdir -p "$HARNESS_FAKE_HOME/opt/homebrew/bin"
-            for name in cctally cctally-alerts cctally-budget cctally-dashboard \\
-                       cctally-dollar-per-percent cctally-five-hour-blocks \\
-                       cctally-five-hour-breakdown cctally-forecast cctally-project \\
-                       cctally-refresh-usage cctally-statusline cctally-sync-week \\
-                       cctally-transcript cctally-tui cctally-update; do
+            for name in {USER_FACING_WRAPPERS}; do
                 ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/opt/homebrew/bin/$name"
             done
             write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
@@ -689,7 +707,11 @@ def main():
     for dir_name, slug in SCENARIOS.items():
         d = root / dir_name
         d.mkdir(parents=True, exist_ok=True)
-        (d / "setup.sh").write_text(_common_setup_preamble() + _scenario_body(slug))
+        (d / "setup.sh").write_text(
+            (_common_setup_preamble() + _scenario_body(slug)).replace(
+                "{USER_FACING_WRAPPERS}", USER_FACING_WRAPPERS
+            )
+        )
         (d / "setup.sh").chmod(0o755)
         (d / ".gitignore").write_text(_gitignore())
         # Issue #119: emit the per-scenario PATH-shape knobs the harness

@@ -82,7 +82,11 @@ def _ensure_sibling_loaded(name: str) -> None:
 
 
 _ensure_sibling_loaded("_lib_forecast")
-from _lib_forecast import ForecastInputs, BudgetRow, ForecastOutput, _compute_forecast
+from _lib_forecast import (
+    ForecastInputs, BudgetRow, ForecastOutput, _compute_forecast,
+    ForecastConfidenceAssessment, ForecastConfidenceCause,
+    assess_forecast_confidence,
+)
 
 # #279 S6 W4: the canonical None-safe UTC-Z serializer. forecast's former local
 # _iso_z (dt-only, no None guard) collapses to this single definition; the union
@@ -485,17 +489,23 @@ def _select_dollars_per_percent(
 
 
 def _assess_forecast_confidence(
-    elapsed_hours: float, p_now: float, snapshot_count: int
+    elapsed_hours: float, p_now: float, snapshot_count: int,
+    *, has_sample_ge_24h: bool = True,
 ) -> tuple[str, list[str]]:
-    """Binary confidence (spec §2)."""
-    reasons: list[str] = []
-    if elapsed_hours < 24:
-        reasons.append("elapsed_hours<24")
-    if p_now < 2:
-        reasons.append("percent<2")
-    if snapshot_count < 3:
-        reasons.append("snapshots<3")
-    return ("low", reasons) if reasons else ("high", [])
+    """Alias onto the pure predicate in `_lib_forecast` (#620 S2 E3).
+
+    Four import paths reach this name — `bin/cctally:1600`,
+    `bin/_cctally_record.py:427-428`, `bin/_cctally_record.py:1539` and
+    `tests/test_620_confidence_wording.py:141` — so it keeps its three
+    positional parameters and its `(confidence, list_of_reasons)` return
+    shape. `has_sample_ge_24h` defaults to True, which is what makes a
+    three-argument call emit exactly the three reasons it always did.
+    """
+    assessment = assess_forecast_confidence(
+        elapsed_hours, p_now, snapshot_count,
+        has_sample_ge_24h=has_sample_ge_24h,
+    )
+    return assessment.confidence, list(assessment.reasons)
 
 
 def _pick_p_24h_ago(
@@ -576,12 +586,12 @@ def _load_forecast_inputs(
         use_weekref_cost_cache=use_weekref_cost_cache,
         account_key=account_key,
     )
-    confidence, reasons = _assess_forecast_confidence(elapsed_hours, p_now, len(samples))
     target_24h = now_utc - dt.timedelta(hours=24)
     has_sample_ge_24h = any(s[0] <= target_24h for s in samples)
-    if not has_sample_ge_24h:
-        reasons = list(reasons) + ["no_sample_ge_24h"]
-        confidence = "low"
+    confidence, reasons = _assess_forecast_confidence(
+        elapsed_hours, p_now, len(samples),
+        has_sample_ge_24h=has_sample_ge_24h,
+    )
 
     return ForecastInputs(
         now_utc=now_utc,

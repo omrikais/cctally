@@ -10,6 +10,8 @@ we grab fresh modules AFTER load_script(); redirect_paths pins the tmp data dir.
 from __future__ import annotations
 
 import sqlite3
+import sys
+import types
 
 import pytest
 
@@ -43,17 +45,33 @@ def _trace_open(ns, monkeypatch):
     """Open stats.db once through a traced sqlite3.connect and return the list of
     executed statements captured on that connection."""
     seen: list[str] = []
-    real_connect = sqlite3.connect
+    store = sys.modules["_cctally_store"]
+    real_sqlite3 = store.sqlite3
+    real_connect = real_sqlite3.connect
 
     def traced(*a, **k):
         conn = real_connect(*a, **k)
         conn.set_trace_callback(seen.append)
         return conn
 
-    monkeypatch.setattr(sqlite3, "connect", traced)
+    # #630 S2: rebind the module name on the IMPORTING module. Every
+    # store open — cache, conversations and stats alike — connects
+    # through `_cctally_store`, so a rebind there is the whole
+    # chokepoint, and `sqlite3.connect` itself is never mutated, so no
+    # unrelated caller of the stdlib module sees this at all. The residual
+    # is stated rather than implied: `_cctally_store.sqlite3` is shared by
+    # every thread in this worker, so a concurrent STORE open inside the
+    # window still reaches this trap. Narrower than patching
+    # `sqlite3.connect`, not closure.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(real_sqlite3))
+    _iso_sqlite3.connect = traced
+    monkeypatch.setattr(store, "sqlite3", _iso_sqlite3)
     conn = ns["open_db"]()
     conn.close()
-    monkeypatch.setattr(sqlite3, "connect", real_connect)
+    monkeypatch.setattr(store, "sqlite3", real_sqlite3)
+    # A missed rebind returns an empty list, and every assertion built on this
+    # helper is about a statement being ABSENT, so it would pass vacuously.
+    assert seen, "the traced connect never fired; the rebind missed the opener"
     return seen
 
 

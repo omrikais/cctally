@@ -13,7 +13,7 @@ import { useScrollLock } from '../hooks/useScrollLock';
 import { ModalHeader } from './ModalHeader';
 
 interface ModalProps {
-  title: string;
+  title: ReactNode;
   accentClass: string; // e.g. 'accent-green' | 'accent-purple' | 'accent-amber' | 'accent-orange'
   children: ReactNode;
   // Optional slot rendered in the modal header, BEFORE the close button.

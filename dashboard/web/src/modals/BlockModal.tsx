@@ -5,6 +5,7 @@ import { useDisplayTz } from '../hooks/useDisplayTz';
 import { Modal } from './Modal';
 import { BlockTimeline } from './BlockTimeline';
 import { ShareIcon } from '../components/ShareIcon';
+import { ZoneTag } from '../components/ZoneTag';
 import { fmt, roundIsoToTenMinutes, type FmtCtx } from '../lib/fmt';
 import { ModelCostBars } from './ModelCostBars';
 import type { BlockDetail } from '../types/envelope';
@@ -112,14 +113,18 @@ export function BlockModal() {
     return () => ctl.abort();
   }, [startAt, generatedAt]);
 
-  const title = data
-    ? `${data.anchor === 'heuristic' ? '~ ' : ''}Block · ${data.label}`
-    : 'Block';
+  const title = data ? (
+    <>
+      {data.anchor === 'heuristic' ? '~ ' : ''}Block · {data.label}{' '}
+      <ZoneTag tz={ctx.tz} />
+    </>
+  ) : 'Block';
 
   return (
     <Modal
       title={title}
       accentClass="accent-blue"
+      cardClassName="block-modal-card"
       headerExtras={
         <ShareIcon
           panel="blocks"
@@ -159,6 +164,7 @@ function BlockContent({
         <span className="m-pill accent-blue">
           {fmtWindow(detail.start_at, detail.end_at, ctx)}
         </span>
+        <ZoneTag tz={ctx.tz} />
         <span className="m-pill">
           {detail.entries_count.toLocaleString('en-US')}{' '}
           {detail.entries_count === 1 ? 'entry' : 'entries'}

@@ -105,10 +105,11 @@ export const PROJECTS_COLUMNS: TableColumn<ProjectsTableRow>[] = [
 // actually read. It sits UNDER the window selector because both definitions
 // are relative to the window that selector chooses.
 export const PROJECTS_WINDOW_CAPTION =
-  'Used pp (sum) adds each week\u2019s attributed usage percentage across the '
-  + 'selected window \u2014 a sum of percentage points, not a share of any one '
-  + 'week. Cost share is each project\u2019s share of total project spend in that '
-  + 'same window.';
+  'Each selected window is a set of subscription-week buckets. Reset shifts '
+  + 'can leave gaps; the table and drill both use those same buckets. Used pp '
+  + '(sum) adds each bucket\u2019s attributed usage percentage \u2014 a sum of '
+  + 'percentage points, not a share of any one week. Cost share is each '
+  + 'project\u2019s share of total project spend in that same window.';
 
 // #620 S1 D1 — the merged-fold clause, stated on the surface rather than only
 // enforced in the server arithmetic. Rendered ONLY when the provider has more

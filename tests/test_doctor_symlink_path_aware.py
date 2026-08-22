@@ -1,5 +1,6 @@
 """Issue #114: _setup_compute_symlink_state is PATH-aware for empty slots."""
 import os
+import types
 import pathlib
 import sys
 
@@ -25,7 +26,12 @@ def _state(s, dst, monkeypatch, which_map):
     # through _reachable_elsewhere -> shutil.which(name, path=...), so the
     # stub must accept (and ignore) the `path` kwarg. which_map still
     # models "is <name> reachable via another channel?".
-    monkeypatch.setattr(s.shutil, "which", lambda n, path=None: which_map.get(n))
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_shutil = types.SimpleNamespace(**vars(s.shutil))
+    _iso_shutil.which = lambda n, path=None: which_map.get(n)
+    monkeypatch.setattr(s, "shutil", _iso_shutil)
     return dict(s._setup_compute_symlink_state(dst, dst))
 
 

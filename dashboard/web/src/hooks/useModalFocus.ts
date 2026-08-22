@@ -1,4 +1,16 @@
-import { useEffect, type RefObject } from 'react';
+import { useEffect, useRef, type RefObject } from 'react';
+
+interface ActiveTrap {
+  token: object;
+}
+
+// Component-local overlays (notably Help over Settings) are deliberately not
+// represented in the store focus-layer enum. Registration order is activation
+// order, so the newest enabled trap is the only one allowed to recover focus
+// that has fallen outside every card. Without this small stack, every mounted
+// listener would briefly pull focus through its own lower layer before the
+// topmost overlay won.
+const activeTraps: ActiveTrap[] = [];
 
 const FOCUSABLE_SELECTOR = [
   'a[href]',
@@ -76,6 +88,7 @@ export function useModalFocus(
   containerRef: RefObject<HTMLElement>,
   { active, trapEnabled = true, triggerId, initialFocus = 'first' }: UseModalFocusOptions,
 ): void {
+  const trapTokenRef = useRef<object>({});
   // Focus-in on activate; restore on deactivate/unmount. Keyed on `active` (NOT trapEnabled),
   // so suspending under a higher layer never triggers a spurious restore.
   useEffect(() => {
@@ -115,6 +128,21 @@ export function useModalFocus(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, triggerId, initialFocus]);
 
+  // Register enabled traps separately from their key listeners. Store-tracked
+  // layers normally leave exactly one entry; the stack also orders local-state
+  // overlays such as Help-over-Settings without widening the store enum.
+  useEffect(() => {
+    if (!active || !trapEnabled) return;
+    const entry: ActiveTrap = {
+      token: trapTokenRef.current,
+    };
+    activeTraps.push(entry);
+    return () => {
+      const index = activeTraps.indexOf(entry);
+      if (index !== -1) activeTraps.splice(index, 1);
+    };
+  }, [active, trapEnabled, containerRef]);
+
   // Tab-trap — attached only while open AND topmost.
   useEffect(() => {
     if (!active || !trapEnabled) return;
@@ -122,9 +150,8 @@ export function useModalFocus(
       if (e.key !== 'Tab') return;
       const container = containerRef.current;
       if (!container) return;
-      // Belt-and-suspenders: if focus already lives outside (a higher/local-state
-      // layer owns it, e.g. Help/Settings), do nothing.
-      if (!container.contains(document.activeElement)) return;
+      const topmost = activeTraps[activeTraps.length - 1];
+      if (topmost?.token !== trapTokenRef.current) return;
       const focusable = getFocusable(container);
       if (focusable.length === 0) {
         e.preventDefault();
@@ -134,6 +161,14 @@ export function useModalFocus(
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
       const activeEl = document.activeElement as HTMLElement | null;
+      if (!activeEl || !container.contains(activeEl)) {
+        // A control can unmount or disable while its modal remains open,
+        // dropping focus to <body>; focus may also already sit on page chrome
+        // behind the aria-modal card. The topmost trap owns Tab in both states.
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+        return;
+      }
       const idx = activeEl ? focusable.indexOf(activeEl) : -1;
       if (idx === -1) {
         // Focus is inside the container but NOT on a focusable — e.g. on the

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import ast
+import gzip
 import importlib.util
+import json
 import pathlib
 import re
 import sys
@@ -375,6 +377,18 @@ def _ctx(**kw):
     )
 
 
+def _closed_ctx():
+    """Neither predicate supplied — the fail-closed default the public tree
+    runs under, where no path is disclosable and no word is vouched for."""
+    return K.ScrubContext(roots={"home": "/Users/testuser", "repo": "/repo",
+                                 "tmp": "/tmp"})
+
+
+def _open_ctx():
+    """Both predicates supplied — what the private kernel injects."""
+    return _ctx(is_public_path=lambda p: True)
+
+
 @pytest.mark.parametrize("name,raw", sorted(CANARIES.items()))
 def test_every_canary_is_absent_from_the_scrubbed_line(name, raw):
     # A harness marker interpolates arbitrary values, which is exactly how a
@@ -651,6 +665,189 @@ def test_a_pytest_assertion_keeps_safe_structure_and_scrubs_dynamic_values():
     assert scrubbed.startswith(">       assert")
     assert secret not in scrubbed
     assert "/Users/testuser" not in scrubbed
+
+
+def test_summary_line_retains_node_and_exception_class():
+    ctx = _closed_ctx()          # neither predicate supplied
+    out = K.scrub_line(
+        "FAILED tests/x.py::test_y - TimeoutError: timed out", ctx)
+    assert out == "FAILED <path>::test_y - TimeoutError: [REDACTED: exception message]"
+
+
+def test_indented_summary_line_takes_the_node_rule_not_the_marker_rule():
+    ctx = _closed_ctx()
+    out = K.scrub_line(
+        "  FAILED tests/x.py::test_y - TimeoutError: timed out", ctx)
+    assert out == "  FAILED <path>::test_y - TimeoutError: [REDACTED: exception message]"
+
+
+def test_parameter_values_are_still_normalized_in_the_tail_form():
+    ctx = _open_ctx()            # both predicates supplied
+    out = K.scrub_line(
+        "FAILED tests/x.py::test_y[acme_private_token] - ValueError: bad", ctx)
+    assert "acme_private_token" not in out
+    assert out == "FAILED tests/x.py::test_y[<param>] - ValueError: [REDACTED: exception message]"
+
+
+# A parameter id is production content, and pytest writes it into the node id
+# verbatim — spaces, brackets and all. `tests/` holds 309 parametrize argument
+# constants containing a space, so every form below is reachable today.
+UNSAFE_PARAMETER_IDS = (
+    "elapsed_hours<24-less than 24 hours into the week",
+    "the client hated the quarterly numbers",
+    "nested[inner]value",
+    "trailing]bracket",
+    "acme_private_token",
+)
+
+
+@pytest.mark.parametrize("param", UNSAFE_PARAMETER_IDS)
+@pytest.mark.parametrize("ctx_name", ("closed", "open"))
+def test_a_parameter_id_is_normalized_whole_in_both_contexts(ctx_name, param):
+    # The node group used to stop at the first whitespace, so a parameter id
+    # carrying a space was truncated mid-value and the truncated span — which
+    # has no closing bracket — was never normalized. The fragment was then
+    # published: the transformer emitted it and the validator could not see
+    # it either, because its leg required the span to close.
+    ctx = _closed_ctx() if ctx_name == "closed" else _open_ctx()
+    raw = f"FAILED tests/x.py::test_y[{param}] - ValueError: boom"
+    out = K.scrub_line(raw, ctx)
+    for word in param.split():
+        assert word not in out, (raw, out)
+    assert "[<param>]" in out, out
+    assert K.validate_export([out], ROOTS) == [], out
+
+
+def test_a_class_nested_node_id_keeps_its_class_and_normalizes_its_parameter():
+    # The widened node group must still admit the `::Class::test` form, whose
+    # second separator is neither whitespace nor a bracket.
+    out = K.scrub_line(
+        "FAILED tests/x.py::TestThing::test_y[secret value] - ValueError: b",
+        _open_ctx(),
+    )
+    assert out == (
+        "FAILED tests/x.py::TestThing::test_y[<param>] - "
+        "ValueError: [REDACTED: exception message]"
+    ), out
+
+
+@pytest.mark.parametrize("param", UNSAFE_PARAMETER_IDS)
+@pytest.mark.parametrize("ctx_name", ("closed", "open"))
+def test_no_retained_bracket_span_is_anything_but_the_placeholder(ctx_name, param):
+    # The invariant behind the normalizer, asserted over the EMITTED bytes:
+    # every `[` a node line retains opens either the parameter placeholder or
+    # one of the kernel's own redaction placeholders, and nothing else.
+    ctx = _closed_ctx() if ctx_name == "closed" else _open_ctx()
+    allowed = {
+        "[<param>]",
+        K.EXCEPTION_MESSAGE_PLACEHOLDER,
+        K.UNCLASSIFIED_PLACEHOLDER,
+        K.UNCLASSIFIED_DETAIL,
+        K.JSON_PLACEHOLDER,
+    }
+    for raw in (
+        f"FAILED tests/x.py::test_y[{param}]",
+        f"FAILED tests/x.py::test_y[{param}] - ValueError: boom",
+        f"  ERROR tests/x.py::test_y[{param}] - ValueError: boom",
+        f"FAILED tests/x.py::test_y[{param}",
+    ):
+        out = K.scrub_line(raw, ctx)
+        spans = re.findall(r"\[[^\[\]]*\]", out)
+        assert set(spans) <= allowed, (raw, out, spans)
+        assert out.count("[") == len(spans), (raw, out)
+
+
+def test_unrecognized_tail_class_drops_the_tail_and_keeps_the_node():
+    ctx = _open_ctx()
+    out = K.scrub_line("FAILED tests/x.py::test_y - some prose here", ctx)
+    assert out == "FAILED tests/x.py::test_y"
+
+
+def test_e_gutter_retains_the_exception_class():
+    ctx = _closed_ctx()
+    out = K.scrub_line("E   TimeoutError: timed out", ctx)
+    assert out == "E   TimeoutError: [REDACTED: exception message]"
+
+
+def test_e_gutter_assertion_form_is_unchanged():
+    ctx = _closed_ctx()
+    line = "E       assert 1 == 2"
+    assert K.scrub_line(line, ctx) == line
+
+
+def test_nested_e_gutter_does_not_recurse():
+    ctx = _closed_ctx()
+    out = K.scrub_line("E   E   TimeoutError: timed out", ctx)
+    assert out == "E   " + K.UNCLASSIFIED_PLACEHOLDER
+
+
+def test_counters_line_is_retained_without_a_vocabulary():
+    ctx = _closed_ctx()
+    line = "1 failed, 100 passed, 3 skipped in 45.67s"
+    assert K.scrub_line(line, ctx) == line
+
+
+def test_counters_banner_form_is_retained_without_a_vocabulary():
+    ctx = _closed_ctx()
+    line = "=========== 1 failed, 100 passed in 12.34s ==========="
+    assert K.scrub_line(line, ctx) == line
+
+
+def test_counters_grammar_rejects_an_unknown_word():
+    ctx = _closed_ctx()
+    out = K.scrub_line("1 failed, 100 sprocketed in 45.67s", ctx)
+    assert out == K.UNCLASSIFIED_PLACEHOLDER
+
+
+def test_counters_grammar_rejects_trailing_prose():
+    ctx = _closed_ctx()
+    out = K.scrub_line("1 failed, 100 passed in 45.67s -- on host alpha", ctx)
+    assert out == K.UNCLASSIFIED_PLACEHOLDER
+
+
+def test_counters_grammar_admits_the_parenthetical_duration_pytest_really_emits():
+    # `format_session_duration` appends ` (H:MM:SS)` once a session runs a
+    # minute or longer, and every authoritative pytest leg does. Without this
+    # form the rule would be dead on the only line it exists for.
+    ctx = _closed_ctx()
+    line = "==== 1 failed, 340 passed, 3 skipped in 506.20s (0:08:26) ===="
+    assert K.scrub_line(line, ctx) == line
+
+
+def test_the_counters_rule_is_anchored_at_both_ends():
+    assert K._PYTEST_COUNTERS_RE.pattern.startswith("^")
+    assert K._PYTEST_COUNTERS_RE.pattern.endswith("$")
+
+
+def test_the_counters_rule_admits_no_canary_at_any_position():
+    # The append-only form of this guard cannot see a free field in the
+    # middle of an anchored pattern, so the canary is inserted at every
+    # position instead.
+    sample = "1 failed, 100 passed, 3 skipped in 45.67s"
+    assert K.scrub_line(sample, _closed_ctx()) == sample
+    for cut in range(len(sample) + 1):
+        tainted = sample[:cut] + TAIL_CANARY + sample[cut:]
+        assert tainted[cut:cut + len(TAIL_CANARY)] == TAIL_CANARY
+        out = K.scrub_line(tainted, _closed_ctx())
+        assert TAIL_CANARY not in out, (cut, tainted, out)
+
+
+def test_the_node_tail_never_retains_an_exception_message():
+    # The message is captured only so it cannot ride out on the node rule's
+    # authority; it must never appear in the output.
+    ctx = _open_ctx()
+    secret = "the client hated the quarterly numbers"
+    out = K.scrub_line(f"FAILED tests/x.py::test_y - ValueError: {secret}", ctx)
+    assert secret not in out, out
+    assert out.endswith(K.EXCEPTION_MESSAGE_PLACEHOLDER), out
+
+
+def test_the_gutter_authorizes_no_payload_of_its_own():
+    ctx = _closed_ctx()
+    secret = "the client hated the quarterly numbers"
+    out = K.scrub_line(f"E   {secret}", ctx)
+    assert secret not in out, out
+    assert out == "E   " + K.UNCLASSIFIED_PLACEHOLDER, out
 
 
 def test_the_marker_vocabulary_and_the_marker_prefix_rule_agree():
@@ -1257,6 +1454,711 @@ def test_the_validator_accepts_the_canonical_failure_line(line):
     assert K.validate_export([scrubbed], ROOTS) == [], (line, scrubbed)
 
 
+def test_the_validator_accepts_every_shape_f1_taught_the_transformer_to_keep():
+    # The four newly retained shapes, driven through the transformer so the
+    # test cannot pass against bytes the transformer never emits.
+    emitted = [
+        K.scrub_line(line, _ctx(is_public_path=lambda candidate: True))
+        for line in [
+            "FAILED tests/x.py::test_y - TimeoutError: timed out",
+            "  FAILED tests/x.py::test_y - TimeoutError: timed out",
+            "FAILED tests/x.py::test_y[acme_private_token] - ValueError: bad",
+            "E   TimeoutError: timed out",
+            "1 failed, 100 passed, 3 skipped in 45.67s",
+            "=========== 1 failed, 100 passed in 12.34s ===========",
+            "==== 1 failed, 340 passed, 3 skipped in 506.20s (0:08:26) ====",
+        ]
+    ]
+    assert K.validate_export(emitted, ROOTS) == [], emitted
+
+
+def test_validator_refuses_a_parameter_value_the_transformer_would_leak():
+    assert K.validate_export(
+        ["FAILED tests/x.py::test_y[acme_private_token] - ValueError: boom"])
+
+
+@pytest.mark.parametrize("leaked", [
+    "FAILED <path>::test_reason[elapsed_hours<24-less",
+    "FAILED tests/x.py::test_reason[elapsed_hours<24-less",
+    "  ERROR <path>::test_y[the client hated the quarterly",
+])
+def test_validator_refuses_an_unterminated_parameter_span(leaked):
+    # The measured leak: a truncated capture leaves a span with no closing
+    # bracket, which the previous leg required and therefore never judged.
+    violations = K.validate_export([leaked], ROOTS)
+    assert [v["reason"] for v in violations] == ["unnormalized-parameter"], (
+        leaked, violations)
+
+
+@pytest.mark.parametrize("ctx_name", ("closed", "open"))
+def test_a_closing_bracket_before_the_opening_one_is_normalized(ctx_name):
+    # The node group's `[^\s\[]+` excludes `[` and admits `]`, so a name whose
+    # FIRST bracket closes reached the normalizer intact — the normalizer
+    # fired only on `[` — and `]leak` was published. pytest cannot emit this
+    # name, but the rule is that no fragment of a parameter id is ever
+    # retained, and a member of that class the rule does not reach is a hole.
+    ctx = _closed_ctx() if ctx_name == "closed" else _open_ctx()
+    out = K.scrub_line("FAILED tests/x.py::test_y]leak[", ctx)
+    assert "leak" not in out, out
+    assert "[<param>]" in out, out
+    assert K.validate_export([out], ROOTS) == [], out
+
+
+def test_validator_refuses_a_node_name_whose_bracket_closes_first():
+    # The validator's own half of the same hole: `rest.find("[")` returned -1,
+    # so the leg did not judge the line either.
+    violations = K.validate_export(["FAILED <path>::test_y]leak"], ROOTS)
+    assert [v["reason"] for v in violations] == ["unnormalized-parameter"], violations
+
+
+@pytest.mark.parametrize("line", [
+    "note: see foo::bar[baz]",
+    "[cctally-test-all] pool::worker[3] finished",
+])
+def test_the_validator_does_not_judge_a_span_that_is_not_a_node_id(line):
+    # `unnormalized-parameter` is a structural reason, so a false positive
+    # here costs one redacted line rather than the whole file — but the line
+    # it redacts is one an operator needs, and a leg that judges spans it was
+    # never meant to reach is wrong however cheaply it fails. The leg judges a
+    # pytest node identifier, not every `::…[…]` span on every line.
+    assert K.validate_export([line], ROOTS) == [], line
+
+
+def test_validator_refuses_trailing_prose_after_the_exception():
+    assert K.validate_export(
+        ["FAILED <path>::test_y - ValueError: [REDACTED: exception message] on host alpha"])
+
+
+def test_validator_refuses_an_unknown_counter_word():
+    assert K.validate_export(["1 failed, 100 sprocketed in 45.67s"])
+
+
+@pytest.mark.parametrize("line", [
+    # Both measured against the shipped kernel. The transformer redacts each
+    # of them correctly today, so these are the BACKSTOP being blind, not a
+    # live leak: the leg restated the transformer's end-anchored shape, so a
+    # line that differed in the shape dimension was never judged at all.
+    "1 failed, 100 passed in 45.67s -- on host alpha",
+    "1 failed, 100 passed in 45.67s (1:01:01) === SECRET",
+])
+def test_validator_refuses_a_foreign_token_on_a_counters_line(line):
+    violations = K.validate_export([line], ROOTS)
+    assert [v["reason"] for v in violations] == ["unknown-counter-word"], (
+        line, violations)
+
+
+def test_validator_refuses_a_counters_line_that_lost_its_leading_anchor():
+    # Measured against the shipped transformer by removing its leading
+    # `^\s*=*\s*` anchor: it emitted this line and the validator said nothing,
+    # because the leg's trigger restated that same anchor character for
+    # character. The trigger now also fires on a counter pair plus the
+    # `in <duration>` tail, wherever on the line they appear.
+    line = "acme-holdings-billing 1 failed, 100 passed in 45.67s"
+    violations = K.validate_export([line], ROOTS)
+    assert [v["reason"] for v in violations] == ["unknown-counter-word"], violations
+
+
+def test_the_counters_leg_does_not_judge_a_progress_line_that_carries_a_count():
+    # The reason the trigger is not simply "a counter pair appears anywhere".
+    # The aggregator prints this line for every harness on every run, and it
+    # carries `3 failed`; judging it against pytest's closed vocabulary would
+    # redact the progress line out of every extract.
+    line = "[ 12/56] FAIL  share             product      3 failed   112s"
+    assert K.validate_export([line], ROOTS) == [], line
+
+
+def test_the_counters_leg_does_not_judge_a_line_that_merely_counts_something():
+    # The extract's own header and the retention notice both carry a
+    # counter-shaped token. Judging every such line against pytest's closed
+    # vocabulary would refuse the whole export on essentially every run.
+    lines = [
+        "[cctally-test-all] run r-1: sanitized failure extract over 3 subjects",
+        "EVIDENCE EVICTED: 5 runs, 1024 bytes (2 pass, 3 fail); "
+        "reasons: age; 1 coverage gaps",
+        "[cctally-test-all] evidence coverage is degraded: 3 gaps across "
+        "12 retained runs",
+        # The orphan-only and combined forms of the same notice, which reach
+        # the extract HEADER through `EV_COVERAGE_NOTE` and are therefore
+        # validated rather than scrubbed.
+        "[cctally-test-all] evidence coverage is degraded: 1 orphan directory "
+        "with no readable manifest across 12 retained runs",
+        "[cctally-test-all] evidence coverage is degraded: 3 gaps and "
+        "2 orphan directories with no readable manifest across 12 retained runs",
+        "[OMITTED: 42 lines outside the retained blocks; "
+        "full log retained at logs/share.log]",
+    ]
+    assert K.validate_export(lines, ROOTS) == []
+
+
+# Inputs that reach the transformer's gutter rule with another gutter inside
+# them AND really come out with both gutters. `FormattedExcinfo.get_source`
+# prefixes every line of a multi-line assertion message with `E `, and this
+# repository's own meta-tests embed a captured inner pytest run in an
+# assertion message, so the outer run's log really does carry
+# `E       E   assert …`.
+#
+# Every member must double under BOTH contexts — see the non-vacuity twin.
+# The corpus previously mixed doubling and collapsing inputs, and the twin
+# asked only that ONE member double, which the assert forms satisfy
+# trivially; twelve of the twenty parameter combinations therefore asserted
+# something about a line with a single gutter, and the corpus could have
+# drifted to all-collapsing without the twin noticing.
+DOUBLED_GUTTER_INPUTS = (
+    "E   E   assert 1 == 2",
+    "  E   E   assert record[0] == 1",
+    "E       E   assert 2 + 2 == 5",
+    "E   E   raise ValueError",
+)
+
+# Inputs whose inner gutter the transformer COLLAPSES: the body classifies as
+# nothing on its own terms, so the non-recursion guard treats the inner `E `
+# as ordinary content and the whole body is redacted behind one gutter. These
+# are the shapes the doubled corpus above must NOT contain, kept because the
+# collapse itself is the behaviour under test.
+COLLAPSED_GUTTER_INPUTS = (
+    "E   E   share diverged",
+    "E   E   SECRET PAYLOAD",
+    "E   E   E   assert 1 == 2",
+    "E   E   1 failed, 2 passed in 3.21s",
+    "E   E   FAILED tests/x.py::test_y[abc]",
+    "E   E   ValueError: boom",
+)
+
+# A SINGLE `E ` gutter wrapping pytest's own counters line, which the
+# transformer retains WHOLE: the gutter rule strips `E `, the body matches the
+# counters rule, and the line comes back byte for byte. The validator's
+# counters leg then judged the `E` against pytest's closed counter vocabulary
+# and refused it — a leg refusing correct transformer output, the third such
+# false positive in #630 S1 and the same fault that got the nested-gutter leg
+# withdrawn.
+#
+# Reachable with today's estate: `tests/test_isolation_contract.py` runs a
+# nested `python3 -m pytest -q` and puts `proc.stdout` in its assertion
+# message, so a failure writes the nested run's summary into the outer log as
+# `E         1 failed in 0.42s` — the single most diagnostic line there is.
+SINGLE_GUTTER_COUNTERS_INPUTS = (
+    "E         1 failed in 0.42s",
+    "E   1 failed, 2 passed in 3.21s",
+    "  E   3 passed in 1.00s",
+    "E       1 failed, 100 passed in 45.67s (0:01:01)",
+)
+
+
+@pytest.mark.parametrize("raw", DOUBLED_GUTTER_INPUTS + COLLAPSED_GUTTER_INPUTS
+                         + SINGLE_GUTTER_COUNTERS_INPUTS)
+@pytest.mark.parametrize("permissive", [False, True])
+def test_the_validator_accepts_every_gutter_the_transformer_emits(
+    raw, permissive
+):
+    """The transformer decides; the validator must not refuse what it decided.
+
+    Written by DRIVING the transformer rather than by hand-writing the
+    validator's input, which is exactly what the withdrawn `nested-gutter`
+    leg's own test failed to do: it fed the validator `E   E   SECRET
+    PAYLOAD`, a string the transformer redacts, so the false-positive branch
+    was never exercised and a leg that refused correct output shipped.
+
+    A refusal here is not a cosmetic defect. It flags a line the transformer
+    published on purpose, and it costs that line's bytes on every surface.
+    """
+    ctx = _ctx() if permissive else _closed_ctx()
+    emitted = K.scrub_line(raw, ctx)
+    assert K.validate_export([emitted], ROOTS) == [], (raw, emitted)
+
+
+@pytest.mark.parametrize("raw", DOUBLED_GUTTER_INPUTS)
+@pytest.mark.parametrize("permissive", [False, True])
+def test_every_doubled_gutter_input_really_doubles(raw, permissive):
+    """Non-vacuity for the acceptance test above, member by member.
+
+    Asserted per member rather than over the corpus as a whole. A twin that
+    asks only whether SOME member doubles cannot see a member that stopped,
+    and six of the ten members had stopped without the twin failing.
+    """
+    ctx = _ctx() if permissive else _closed_ctx()
+    emitted = K.scrub_line(raw, ctx)
+    assert re.match(r"^\s*E\s+E\s+\S", emitted), (raw, emitted)
+
+
+@pytest.mark.parametrize("raw", COLLAPSED_GUTTER_INPUTS)
+@pytest.mark.parametrize("permissive", [False, True])
+def test_every_collapsed_gutter_input_really_collapses(raw, permissive):
+    """The complement, so a member cannot silently move between the corpora."""
+    ctx = _ctx() if permissive else _closed_ctx()
+    emitted = K.scrub_line(raw, ctx)
+    assert not re.match(r"^\s*E\s+E\s+\S", emitted), (raw, emitted)
+    assert K.UNCLASSIFIED_PLACEHOLDER in emitted, (raw, emitted)
+
+
+@pytest.mark.parametrize("raw", SINGLE_GUTTER_COUNTERS_INPUTS)
+@pytest.mark.parametrize("permissive", [False, True])
+def test_a_gutter_wrapped_counters_line_is_retained_whole(raw, permissive):
+    """Non-vacuity: these really are retained byte for byte, so a refusal of
+    the emitted line is a refusal of the raw one."""
+    ctx = _ctx() if permissive else _closed_ctx()
+    assert K.scrub_line(raw, ctx) == raw, raw
+
+
+# A gutter-wrapped line that OPENS with an integer but is not a summary. The
+# counters leg must not reach these. Dropping the gutter before the trigger
+# rather than only before the refusal scan let `_counters_opening` see a body
+# it could never reach before, and every one of these fired the leg — a help
+# table's exit-code row is the measured case, and `cctally-dedup-audit --help`
+# really does print one. The cost was one redacted line rather than the whole
+# export, because `unknown-counter-word` is a structural reason, which is the
+# per-line degradation doing its job; the line is still one an operator needs.
+#
+# Every member is built from words THIS FILE's vocabulary vouches for, because
+# the case only exists where the transformer retains the line: under the
+# fail-closed context the gutter body is unvouched and the line is redacted,
+# so the validator never sees it and there is nothing to get wrong. A first
+# version of this corpus used a real help table's `2  usage error`, which the
+# repository vocabulary vouches for and this fixture's does not — every
+# parametrization skipped, and the guard below is what caught it.
+GUTTERED_NON_COUNTERS_INPUTS = (
+    "E   3 harness logs",
+    "E   2  shell pool",
+    "E       3 golden mismatch",
+    "E   008 stdout log",
+    "E           2  verdict product",
+    "E   12 line details",
+)
+
+
+@pytest.mark.parametrize("raw", GUTTERED_NON_COUNTERS_INPUTS)
+def test_a_guttered_line_opening_with_a_count_is_not_a_summary(raw):
+    ctx = _ctx()
+    emitted = K.scrub_line(raw, ctx)
+    # Retention is asserted, not assumed: a redacted line would make the
+    # refusal check below pass over a placeholder and prove nothing.
+    assert emitted == raw, (raw, emitted)
+    assert K.validate_export([emitted]) == [], (raw, emitted)
+
+
+@pytest.mark.parametrize("raw", GUTTERED_NON_COUNTERS_INPUTS)
+def test_the_guttered_non_counters_corpus_would_have_tripped_the_old_trigger(raw):
+    """Non-vacuity: each member really does open with a count once the gutter
+    is dropped, so it is a case the withdrawn trigger reached and the shipped
+    one must not. A member that could never trigger would assert nothing."""
+    assert K._counters_opening(K._strip_leading_gutter(raw.split())), raw
+    assert not K._counters_opening(raw.split()), raw
+
+
+@pytest.mark.parametrize("line", [
+    # The gutter is tolerated at the LEADING position and nowhere else, so a
+    # foreign token on a gutter-wrapped counters line is still refused …
+    "E   1 failed, 100 passed in 45.67s -- on host alpha",
+    "E   1 failed, 100 sprocketed in 45.67s",
+    # … and an `E` that is not the gutter is still a token nothing vouched for.
+    "1 failed, 100 passed in 45.67s E SECRET",
+])
+def test_the_counters_leg_still_refuses_a_foreign_token_behind_a_gutter(line):
+    violations = K.validate_export([line], ROOTS)
+    assert [v["reason"] for v in violations] == ["unknown-counter-word"], (
+        line, violations)
+
+
+@pytest.mark.parametrize("line", ["5 -foo", "5 -3", "3 + 4", "12 (a)"])
+def test_the_counters_opening_trigger_needs_a_LETTER_after_the_count(line):
+    """The condition the regex this helper replaced really carried.
+
+    `_COUNTERS_OPENING_RE` required the token after the count to BEGIN with a
+    letter; the helper that replaced it asked only that the token CONTAIN one,
+    which fired on `5 -foo` and refused a line no counters producer emits.
+    """
+    assert K.validate_export([line], ROOTS) == [], line
+
+
+def test_a_doubled_gutter_is_not_itself_a_violation():
+    """RECORDED PLAINLY, because a leg was withdrawn to make it true.
+
+    `E   E   SECRET PAYLOAD` is refused by nothing here, and the transformer
+    emits it in no context — the assertions below drive all three. The
+    doubling is not what would make such a line dangerous: this validator has
+    no gutter awareness in any other leg, the single-gutter form is accepted
+    too, and the payload is judged by the root, denylist and free-text legs
+    identically either way. A leg refusing the doubled form would therefore
+    close no disclosure class while refusing the `assert` bodies pytest
+    really produces.
+    """
+    assert K.validate_export(["E   E   SECRET PAYLOAD"], ROOTS) == []
+    assert K.validate_export(["E   SECRET PAYLOAD"], ROOTS) == []
+    # The transformer, which DOES hold the vocabulary, redacts it in every
+    # context — including one whose vocabulary vouches for the gutter letter
+    # itself, which is the only reading under which the withdrawn leg's
+    # `E   E   share diverged` row could ever have been a measurement.
+    redacted = "E   " + K.UNCLASSIFIED_PLACEHOLDER
+    assert K.scrub_line("E   E   SECRET PAYLOAD", _closed_ctx()) == redacted
+    assert K.scrub_line("E   E   SECRET PAYLOAD", _open_ctx()) == redacted
+    assert K.scrub_line(
+        "E   E   SECRET PAYLOAD",
+        _ctx(known_tokens=set(KNOWN_TOKENS) | {"e"}, is_public_path=lambda p: True),
+    ) == redacted
+    # And the row itself: `e` is not in this repository's vocabulary, so the
+    # permissive context redacts the line the comment used to call verbatim.
+    assert K.scrub_line("E   E   share diverged", _open_ctx()) == redacted
+    assert "e" not in KNOWN_TOKENS
+
+
+def _redaction_corpus(bad_lines, good_lines):
+    lines = list(good_lines)
+    for offset, bad in enumerate(bad_lines):
+        lines.insert(min(offset * 3 + 1, len(lines)), bad)
+    return lines
+
+
+GOOD_EXTRACT_LINE = "[cctally-test-all] run r-1: sanitized failure extract over 3 subjects"
+# A STRUCTURAL violation: the counters leg, one of the three legs whose false
+# positives motivated per-line degradation.
+BAD_EXTRACT_LINE = "1 failed, 100 sprocketed in 45.67s"
+# A CONTENT violation: production prose the transformer was supposed to have
+# removed. This is what a partial transformer fault leaks, and one of them is
+# enough to withhold the whole export.
+LEAKED_CONTENT_LINE = (
+    "the project reported an unexpected balance for this customer today"
+)
+
+
+def test_a_flagged_line_is_replaced_and_the_rest_of_the_extract_survives():
+    """The structural half of the nested-gutter regression.
+
+    A validator violation used to destroy the whole export, so one false
+    positive cost the operator every byte of the failure extract — the same
+    class as over-redaction, at the file level.
+    """
+    lines = _redaction_corpus([BAD_EXTRACT_LINE], [GOOD_EXTRACT_LINE] * 20)
+    violations = K.validate_export(lines, ROOTS)
+    assert len(violations) == 1, violations
+    out, record = K.apply_validation_redactions(lines, violations, ROOTS)
+    assert record["refused"] is False, record
+    assert record["redacted"] == 1 and record["total"] == len(lines), record
+    assert record["reasons"] == ["unknown-counter-word"], record
+    # Fail-closed for the offending line: its bytes are gone.
+    assert BAD_EXTRACT_LINE not in out
+    assert "sprocketed" not in "\n".join(out)
+    # And the rest of the extract really did survive.
+    assert out.count(GOOD_EXTRACT_LINE) == 20, out
+    # Never silent: the count and the distinct reasons are stated in the file.
+    assert record["notice"] and "1 of 21" in record["notice"], record
+    assert "unknown-counter-word" in record["notice"], record
+    # The replacement and the notice are output, so they clear the validator.
+    assert K.validate_export(out + [record["notice"]], ROOTS) == []
+
+
+def test_one_content_violation_refuses_the_whole_export():
+    """The systemic-breakage escape, decided by KIND rather than by volume.
+
+    A content violation means the transformer emitted a payload it was
+    supposed to have removed, so the UNFLAGGED lines cannot be trusted either
+    and there is nothing safe to publish. One is enough, and the rate it
+    arrives at says nothing about whether it is safe.
+    """
+    lines = [GOOD_EXTRACT_LINE] * 99 + [LEAKED_CONTENT_LINE]
+    violations = K.validate_export(lines, ROOTS)
+    assert [v["reason"] for v in violations] == ["free-form-text"], violations
+    out, record = K.apply_validation_redactions(lines, violations, ROOTS)
+    assert record["refused"] is True, record
+    assert record["refusal"] == "free-form-text", record
+    assert record["notice"] is None, record
+    assert out == lines
+
+
+def test_a_structural_violation_degrades_per_line_at_any_rate():
+    """The complement, and the reason the proportional escape was withdrawn.
+
+    A structural leg's false positive costs its own line however often it
+    fires. Half the extract is refused here and the other half still
+    publishes, which the previous quarter-of-the-lines threshold would have
+    turned into no export file at all.
+    """
+    lines = [BAD_EXTRACT_LINE] * 5 + [GOOD_EXTRACT_LINE] * 5
+    violations = K.validate_export(lines, ROOTS)
+    assert len(violations) == 5, violations
+    out, record = K.apply_validation_redactions(lines, violations, ROOTS)
+    assert record["refused"] is False, record
+    assert record["refusal"] is None, record
+    assert BAD_EXTRACT_LINE not in out, out
+    assert out.count(GOOD_EXTRACT_LINE) == 5, out
+    assert record["notice"] and "5 of 10" in record["notice"], record
+
+
+def test_a_content_violation_refuses_even_beside_structural_ones():
+    """The mixed case, and the reason the refusal cause is recorded.
+
+    The content violation is not first in the list, so a caller reporting
+    `violations[0]["reason"]` would name the structural leg — a leg that did
+    not cause the refusal and whose false positives are precisely why the
+    per-line degradation exists.
+    """
+    lines = [BAD_EXTRACT_LINE] * 3 + [LEAKED_CONTENT_LINE] + [
+        GOOD_EXTRACT_LINE] * 20
+    violations = K.validate_export(lines, ROOTS)
+    assert violations[0]["reason"] == "unknown-counter-word", violations
+    _out, record = K.apply_validation_redactions(lines, violations, ROOTS)
+    assert record["refused"] is True, record
+    assert record["refusal"] == "free-form-text", record
+
+
+@pytest.mark.parametrize("reason", sorted(
+    {name for name, _ in K._FORBIDDEN} | {"unsubstituted-root",
+                                          "free-form-text"}))
+def test_every_content_leg_is_outside_the_structural_set(reason):
+    """The classification, checked against the leg table rather than against a
+    transcription of it. A leg added to `_FORBIDDEN` later is a content leg
+    by default, which is the fail-closed direction; this pins that it stays
+    one."""
+    assert reason not in K.STRUCTURAL_VIOLATION_REASONS, reason
+
+
+# A failing pytest log of the shape this estate really produces, used to
+# measure what a PARTIAL transformer fault publishes.
+PARTIAL_FAULT_LOG = (
+    "============================= test session starts ==============================",
+    "tests/test_share_render.py::test_share_product FAILED",
+    "    def test_share_product(tmp_path):",
+    ">       assert result == expected",
+    "E       AssertionError: the golden did not match",
+    "E       assert 'acme holdings quarterly merger summary' == 'the expected text'",
+    "tests/test_share_render.py:118: AssertionError",
+    "--------------------------- Captured stdout call ---------------------------",
+    "the project reported an unexpected balance for this customer today",
+    "FAIL share: product diverged",
+    "[ 12/56] FAIL  share  product  3 failed  112s",
+    "Verdict: FAIL",
+    "Total: 56 harnesses",
+    "1 failed, 511 passed in 45.67s (0:01:01)",
+)
+PARTIAL_FAULT_LEAK = (
+    "E       assert 'acme holdings quarterly merger summary' == 'the expected text'"
+)
+
+
+def test_a_vocabulary_stage_fault_withholds_the_whole_extract(monkeypatch):
+    """The measured case that retired the proportional threshold.
+
+    The transformer's stages fail independently. A fault confined to the
+    vocabulary stage leaves root substitution and the path predicate working,
+    so neither of those legs fires and only `free-form-text` catches anything
+    — a leg needing six words, no digits and a 0.95 letters-and-spaces ratio,
+    which most real log lines miss. The flagged proportion is therefore far
+    below any threshold worth setting, while production content publishes
+    verbatim.
+    """
+    ctx = _open_ctx()
+    monkeypatch.setattr(
+        K, "unknown_vocabulary", lambda text, c, spans=(): []
+    )
+    out = [K.scrub_line(line, ctx) for line in PARTIAL_FAULT_LOG]
+    # Non-vacuity: production content really did survive the transformer, and
+    # no leg flagged the line carrying it. Single-quoted prose is invisible to
+    # both quoted-span legs, which are written over double quotes.
+    assert PARTIAL_FAULT_LEAK in out, out
+    violations = K.validate_export(out, ROOTS)
+    assert [v["reason"] for v in violations] == ["free-form-text"], violations
+    assert not any(v["excerpt"] == PARTIAL_FAULT_LEAK for v in violations)
+    # Well under the quarter the withdrawn threshold escaped at.
+    assert len(violations) / len(out) < 0.25, violations
+    _lines, record = K.apply_validation_redactions(out, violations, ROOTS)
+    assert record["refused"] is True, record
+    assert record["refusal"] == "free-form-text", record
+
+
+def test_an_unclassifiable_violation_refuses_rather_than_degrading():
+    # A violation with no reason at all is not a structural one. It is a
+    # verdict this function cannot read, and it takes the conservative branch.
+    _out, record = K.apply_validation_redactions(
+        [GOOD_EXTRACT_LINE] * 10, [{"index": 0}], ROOTS)
+    assert record["refused"] is True, record
+    assert record["refusal"] == "unclassified-violation", record
+
+
+@pytest.mark.parametrize("reason", sorted(
+    {name for name, _ in K._FORBIDDEN}
+    | {"unsubstituted-root", "free-form-text", "unnormalized-parameter",
+       "text-after-exception-placeholder", "unknown-counter-word"}
+))
+def test_every_redaction_placeholder_clears_the_validator(reason):
+    # A reason string that did not clear the validator would publish through
+    # the very gate this replacement stands in for.
+    placeholder = K.VALIDATION_REDACTION_TEMPLATE % reason
+    assert K.validate_export([placeholder], ROOTS) == [], placeholder
+    notice = K.VALIDATION_REDACTION_NOTICE % (2, 27, reason)
+    assert K.validate_export([notice], ROOTS) == [], notice
+
+
+def test_a_violation_index_that_addresses_no_line_refuses_wholesale():
+    # There is nothing safe to publish around a violation that cannot be
+    # located, so this escalates rather than writing the extract untouched.
+    # The reason is a STRUCTURAL one on purpose: a content reason would take
+    # the refusal branch above and this branch would never be reached.
+    lines = [GOOD_EXTRACT_LINE] * 10
+    _out, record = K.apply_validation_redactions(
+        lines, [{"index": 99, "reason": "unknown-counter-word"}], ROOTS)
+    assert record["refused"] is True, record
+    assert record["refusal"] == "unlocatable-violation", record
+
+
+def test_no_violations_leaves_the_extract_and_the_record_untouched():
+    lines = [GOOD_EXTRACT_LINE] * 3
+    out, record = K.apply_validation_redactions(lines, [], ROOTS)
+    assert out == lines
+    assert record == {
+        "redacted": 0, "total": 3, "reasons": [], "notice": None,
+        "refused": False, "refusal": None,
+    }
+
+
+def test_a_single_gutter_the_transformer_really_emits_is_still_accepted():
+    assert K.validate_export(
+        ["E   TimeoutError: [REDACTED: exception message]",
+         "E   [REDACTED: unclassified line]",
+         "E       assert 2 + 2 == 5",
+         # The counters shapes the corpus above drives through the
+         # transformer, stated here as literals too: this test is what the
+         # session's third false positive was measured against, and it passed
+         # while refusing every one of them.
+         "E         1 failed in 0.42s",
+         "E   1 failed, 2 passed in 3.21s",
+         "  E   3 passed in 1.00s",
+         "E       1 failed, 100 passed in 45.67s (0:01:01)"], ROOTS) == []
+
+
+# The classifiers the transformer decides with. The validator may share the
+# EMITTED placeholder constants — those are output, not decisions — but not
+# one of these.
+TRANSFORMER_CLASSIFIERS = (
+    "_PYTEST_NODE_RE", "_PYTEST_GUTTER_RE", "_PYTEST_COUNTERS_RE",
+    "_PYTEST_COUNT_WORD", "_PYTEST_SHORT_FRAME_RE", "_PYTEST_ASSERTION_RE",
+    "_STRUCTURED_VERBATIM", "_STRUCTURED_PREFIX", "_SECTION_RULE_RE",
+    "_MARKER_PREFIX_RE", "_EXCEPTION_RE", "_TRACEBACK_RE", "_DIFF_HEADER_RE",
+    "scrub_line", "_is_ordinary", "unknown_vocabulary",
+)
+
+
+def _names_reachable_from(tree, function_name):
+    """Every module-level name `function_name` reads, transitively.
+
+    Searching the function's own source text is not enough: a leg formulated
+    as a module-level constant is invisible to it, which is how
+    `_COUNTERS_SHAPE_RE`, `_NODE_PARAM_SPAN_RE` and `_EXCEPTION_PLACEHOLDER_TEXT`
+    escaped the previous version of this check entirely.
+    """
+    assignments = {}
+
+    def _record(target, value):
+        """One binding, over every module-level assignment FORM.
+
+        Collecting `ast.Assign` with an `ast.Name` target alone left two forms
+        of the very counterexample this check exists to close.
+        `SHAPE: object = _PYTEST_COUNTERS_RE` is an `AnnAssign` and resolved
+        to nothing but its own name; `A, B = X, Y` binds through an
+        `ast.Tuple` target and did the same.
+        """
+        if isinstance(target, ast.Name):
+            assignments[target.id] = value
+            return
+        if not isinstance(target, (ast.Tuple, ast.List)):
+            return
+        paired = (
+            value.elts
+            if isinstance(value, (ast.Tuple, ast.List))
+            and len(value.elts) == len(target.elts)
+            else None
+        )
+        for position, element in enumerate(target.elts):
+            # An unpacking whose right-hand side is not a matching literal
+            # sequence binds every name to the WHOLE value. That
+            # over-approximates reachability, which is the safe direction for
+            # a disjointness check: it can only report a restatement that is
+            # not there, never miss one that is.
+            _record(element, paired[position] if paired else value)
+
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                _record(target, node.value)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            _record(node.target, node.value)
+        elif isinstance(node, ast.FunctionDef):
+            # A HELPER the leg calls is part of the leg. Without this, moving
+            # a restatement one call deep would hide it from this check, and
+            # the leg's own trigger is written as two helpers.
+            assignments.setdefault(node.name, node)
+    start = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    reached, seen, queue = set(), set(), [start]
+    while queue:
+        for sub in ast.walk(queue.pop()):
+            if not isinstance(sub, ast.Name):
+                continue
+            reached.add(sub.id)
+            if sub.id in assignments and sub.id not in seen:
+                seen.add(sub.id)
+                queue.append(assignments[sub.id])
+    return reached
+
+
+def test_the_validator_legs_are_written_independently_of_the_transformer():
+    # The disjointness the mutation canaries above prove behaviourally,
+    # asserted statically as well. It follows the module-level names the
+    # function really references rather than searching its body text, so a leg
+    # that assigned `_COUNTERS_SHAPE_RE = _PYTEST_COUNTERS_RE` is caught.
+    tree = ast.parse((REPO / "bin" / "_lib_test_evidence.py").read_text())
+    reached = _names_reachable_from(tree, "_structural_violation")
+    # Non-vacuity: the walk must really have reached the leg constants, and
+    # must have descended into the trigger's helpers — `_COUNTERS_BANNER_CHAR`
+    # is referenced from `_counters_opening` and from nowhere else.
+    assert "_COUNTERS_ALLOWED_WORDS" in reached, sorted(reached)
+    assert "_NODE_TOKEN_RE" in reached, sorted(reached)
+    assert "_COUNTERS_BANNER_CHAR" in reached, sorted(reached)
+    shared = sorted(reached.intersection(TRANSFORMER_CLASSIFIERS))
+    assert not shared, shared
+
+
+@pytest.mark.parametrize("binding", [
+    # The counterexample the first version of the check would have passed:
+    # a leg constant assigned straight from the transformer's own classifier.
+    "_COUNTERS_SHAPE_RE = _PYTEST_COUNTERS_RE",
+    # The same restatement in an ANNOTATED assignment. The walk collected
+    # `ast.Assign` only, so this resolved to its own name and stopped there.
+    "_COUNTERS_SHAPE_RE: object = _PYTEST_COUNTERS_RE",
+    # And through tuple unpacking, element-wise…
+    "_COUNTERS_SHAPE_RE, _OTHER = _PYTEST_COUNTERS_RE, None",
+    # …and where the right-hand side is not a matching literal sequence, so
+    # every bound name reaches the whole value.
+    "_COUNTERS_SHAPE_RE, _OTHER = (_PYTEST_COUNTERS_RE, None, None)[:2]",
+])
+def test_the_static_disjointness_check_sees_a_module_level_restatement(binding):
+    tree = ast.parse(
+        "import re\n"
+        "_PYTEST_COUNTERS_RE = re.compile('x')\n"
+        + binding + "\n"
+        "def _structural_violation(text):\n"
+        "    return _COUNTERS_SHAPE_RE.match(text)\n"
+    )
+    reached = _names_reachable_from(tree, "_structural_violation")
+    assert "_PYTEST_COUNTERS_RE" in reached, sorted(reached)
+
+
+def test_the_static_disjointness_check_follows_a_helper_the_leg_calls():
+    # A restatement moved one call deep. The walk collected module-level
+    # ASSIGNMENTS only, so a helper's body was never entered and the leg's own
+    # trigger — which is written as two helpers — was checked at its call site
+    # and nowhere else.
+    tree = ast.parse(
+        "import re\n"
+        "_PYTEST_COUNTERS_RE = re.compile('x')\n"
+        "def _trigger(text):\n"
+        "    return _PYTEST_COUNTERS_RE.match(text)\n"
+        "def _structural_violation(text):\n"
+        "    return _trigger(text)\n"
+    )
+    reached = _names_reachable_from(tree, "_structural_violation")
+    assert "_PYTEST_COUNTERS_RE" in reached, sorted(reached)
+
+
 @pytest.mark.parametrize("name,raw", sorted(CANARIES.items()))
 def test_the_validator_rejects_every_raw_canary(name, raw):
     violations = K.validate_export([raw], ROOTS)
@@ -1639,4 +2541,279 @@ def test_the_public_kernel_imports_only_the_standard_library():
             modules.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             modules.add(node.module.split(".")[0])
-    assert modules <= {"__future__", "re"}, modules
+    # Enumerated rather than probed, so a NEW name has to be justified here
+    # before it can ship. `gzip`, `json` and `os` were added by #630 S1 F3's
+    # `merge_duration_legs`, which is the module's one I/O function. `zlib` is
+    # the same function's error vocabulary: a leg file left by a killed process
+    # is a truncated gzip member, and the decompressor raises `zlib.error` for
+    # one whose bytes no longer decode. Both are built-in C modules of the
+    # standard library, and `gzip` imports `zlib` itself, so neither adds a
+    # dependency the published tree does not already carry.
+    assert modules <= {"__future__", "gzip", "json", "os", "re", "zlib"}, modules
+
+
+# ------------------------------------------------ per-test durations merge (#630 S1)
+
+
+def _leg_file(tmp_path, leg, finished=True, records=2, name=None,
+              exit_status=0, omit_exit_status=False):
+    """One leg's intermediate file, in exactly the shape the pytest plugin
+    writes: gzip JSONL, one record per phase, terminated by a footer only when
+    the session reached `pytest_sessionfinish`.
+
+    `finished=False` writes a CLEANLY CLOSED file with the footer omitted.
+    That is a synthetic state — the plugin either writes a footer and closes,
+    or is killed and leaves a truncated stream — so it exercises the
+    missing-footer branch and nothing about truncation.
+    `_truncated_leg_file` below covers what the producer really leaves.
+    """
+    path = tmp_path / (name or f"durations-{leg}.jsonl.gz")
+    with gzip.open(path, "wt", encoding="utf-8", compresslevel=6) as handle:
+        for idx in range(records):
+            handle.write(json.dumps({
+                "nodeId": f"tests/x.py::test_{idx}",
+                "phase": "call",
+                "durationSeconds": 0.125,
+                "outcome": "passed",
+                "leg": leg,
+            }) + "\n")
+        if finished:
+            footer = {
+                "footer": True,
+                "leg": leg,
+                "records": records,
+                "sessionFinished": True,
+            }
+            if not omit_exit_status:
+                footer["exitStatus"] = exit_status
+            handle.write(json.dumps(footer) + "\n")
+    return str(path)
+
+
+def _truncated_leg_file(tmp_path, leg, keep=0.6, records=400):
+    """What a KILLED process really leaves: a gzip member cut mid-stream.
+
+    Enough records that the surviving prefix still decodes into some of them,
+    because a fixture whose prefix decodes to nothing cannot show that the
+    merge keeps what it could read.
+    """
+    path = pathlib.Path(_leg_file(tmp_path, leg, records=records))
+    raw = path.read_bytes()
+    path.write_bytes(raw[: int(len(raw) * keep)])
+    return str(path)
+
+
+def _read_merged(path):
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def test_merge_marks_an_unfinished_leg_incomplete(tmp_path):
+    # A leg whose process died before pytest_sessionfinish has no footer.
+    # Publishing it as complete would let a consumer read a truncated run
+    # as a run in which those tests were simply fast.
+    out = tmp_path / "merged.jsonl.gz"
+    result = K.merge_duration_legs(
+        [_leg_file(tmp_path, "pytest", finished=False)], str(out))
+    assert result["complete"] is False
+
+
+def test_merge_survives_a_truncated_leg_and_publishes_it_incomplete(tmp_path):
+    # The one failure mode this completeness contract exists for. A member cut
+    # mid-stream raises `EOFError`, which is NOT an `OSError`, so the merge
+    # used to die with a traceback and publish no artifact at all — strictly
+    # worse than publishing one marked incomplete.
+    out = tmp_path / "merged.jsonl.gz"
+    result = K.merge_duration_legs(
+        [_truncated_leg_file(tmp_path, "pytest")], str(out))
+    assert result["complete"] is False, result
+    assert out.exists(), sorted(p.name for p in tmp_path.iterdir())
+    footers = [r for r in _read_merged(out) if r.get("footer")]
+    assert footers[0]["complete"] is False, footers
+
+
+def test_merge_keeps_the_records_a_truncated_leg_did_decode(tmp_path):
+    # Non-vacuity for the test above, and the point of absorbing the error
+    # rather than reporting the leg absent: a partial record of a run that
+    # died is what this session exists to preserve.
+    out = tmp_path / "merged.jsonl.gz"
+    result = K.merge_duration_legs(
+        [_truncated_leg_file(tmp_path, "pytest", records=400)], str(out))
+    assert 0 < result["records"] < 400, result["records"]
+    assert result["legs"][0]["present"] is True, result["legs"]
+
+
+@pytest.mark.parametrize("status", [2, 3, 4])
+def test_merge_marks_a_leg_whose_session_did_not_finish_its_work(tmp_path, status):
+    # 2 interrupted, 3 INTERNALERROR, 4 usage error. `pytest_sessionfinish`
+    # runs on all three — `wrap_session` calls it from its `finally` block
+    # whenever `initstate >= 2` — so the footer is written and says the
+    # session finished. It did; it just did not run what it collected.
+    out = tmp_path / "merged.jsonl.gz"
+    result = K.merge_duration_legs(
+        [_leg_file(tmp_path, "pytest", exit_status=status)], str(out))
+    assert result["complete"] is False, result
+    leg = result["legs"][0]
+    assert leg["sessionFinished"] is True, leg
+    assert leg["exitStatus"] == status, leg
+    assert leg["populationWhole"] is False, leg
+
+
+@pytest.mark.parametrize("status", [0, 1, 5])
+def test_an_ordinary_run_is_complete_whatever_its_verdict(tmp_path, status):
+    # Exit 1 is "tests failed", which is a NORMAL, complete run and the one
+    # this artifact is most often read for. 5 is "nothing collected".
+    out = tmp_path / "merged.jsonl.gz"
+    result = K.merge_duration_legs(
+        [_leg_file(tmp_path, "pytest", exit_status=status)], str(out))
+    assert result["complete"] is True, result
+
+
+def test_a_footer_predating_the_exit_status_is_taken_at_its_word(tmp_path):
+    # Before the field existed the footer's presence WAS the signal, and
+    # refusing those artifacts would rewrite history as incomplete.
+    out = tmp_path / "merged.jsonl.gz"
+    result = K.merge_duration_legs(
+        [_leg_file(tmp_path, "pytest", omit_exit_status=True)], str(out))
+    assert result["complete"] is True, result
+
+
+def test_merge_marks_two_finished_legs_complete(tmp_path):
+    out = tmp_path / "merged.jsonl.gz"
+    result = K.merge_duration_legs(
+        [_leg_file(tmp_path, "pytest", finished=True),
+         _leg_file(tmp_path, "benchmark", finished=True)], str(out))
+    assert result["complete"] is True
+
+
+def test_merge_publishes_atomically(tmp_path):
+    # No partially written artifact may ever be visible at the final path.
+    out = tmp_path / "merged.jsonl.gz"
+    K.merge_duration_legs([_leg_file(tmp_path, "pytest", finished=True)], str(out))
+    assert out.exists()
+    assert not list(tmp_path.glob("merged.jsonl.gz.tmp*"))
+
+
+def test_merge_records_the_incomplete_state_in_the_artifact_itself(tmp_path):
+    # The caller's return value is not enough: S6 and S7 read the ARTIFACT,
+    # and a truncated file that carries no such statement reads as a complete
+    # one in which the missing tests were simply fast.
+    out = tmp_path / "merged.jsonl.gz"
+    K.merge_duration_legs(
+        [_leg_file(tmp_path, "pytest", finished=False)], str(out))
+    footers = [r for r in _read_merged(out) if r.get("footer")]
+    assert len(footers) == 1, footers
+    assert footers[0]["complete"] is False, footers
+
+
+def test_merge_orders_records_by_leg_then_node_then_phase(tmp_path):
+    out = tmp_path / "merged.jsonl.gz"
+    K.merge_duration_legs(
+        [_leg_file(tmp_path, "pytest"), _leg_file(tmp_path, "benchmark")],
+        str(out),
+    )
+    records = [r for r in _read_merged(out) if "nodeId" in r]
+    keys = [(r["leg"], r["nodeId"], r["phase"]) for r in records]
+    assert keys == sorted(keys), keys
+    assert {r["leg"] for r in records} == {"pytest", "benchmark"}
+
+
+def test_merge_counts_every_record_it_published(tmp_path):
+    out = tmp_path / "merged.jsonl.gz"
+    result = K.merge_duration_legs(
+        [_leg_file(tmp_path, "pytest", records=3),
+         _leg_file(tmp_path, "benchmark", records=2)],
+        str(out),
+    )
+    assert result["records"] == 5
+    assert len([r for r in _read_merged(out) if "nodeId" in r]) == 5
+
+
+def test_merge_treats_a_leg_file_that_never_appeared_as_incomplete(tmp_path):
+    # The leg RAN — the caller only hands in legs that ran — so a missing file
+    # means the process died before it could open one.
+    out = tmp_path / "merged.jsonl.gz"
+    result = K.merge_duration_legs(
+        [_leg_file(tmp_path, "pytest"), str(tmp_path / "absent.jsonl.gz")],
+        str(out),
+    )
+    assert result["complete"] is False
+    legs = {leg["leg"]: leg for leg in result["legs"]}
+    assert legs["absent.jsonl.gz"]["present"] is False, result["legs"]
+
+
+def test_merge_of_one_leg_is_complete_when_that_leg_finished(tmp_path):
+    # The benchmark leg only runs when a serial target exists, so a single-leg
+    # merge is the ordinary case and must not read as a truncated run.
+    out = tmp_path / "merged.jsonl.gz"
+    result = K.merge_duration_legs([_leg_file(tmp_path, "pytest")], str(out))
+    assert result["complete"] is True
+    assert [leg["leg"] for leg in result["legs"]] == ["pytest"]
+
+
+# ------------------------------------------- the retention budget (#630 S1, F5)
+#
+# Every constant below is a MEASUREMENT, and each one names where it came from.
+# The spec's 10 MiB per-run estimate for the durations artifact was an
+# estimate, not a bound; these replace it.
+
+# One authoritative full-suite run, tested head 8608d3167, TZ=Etc/UTC,
+# verdict PASS. 40,426 records across both pytest legs.
+MEASURED_DURATIONS_COMPRESSED_BYTES = 531_404
+# The same records as uncompressed JSONL. Retention sums real `st_size`, so the
+# compressed figure is what the cap actually meets — but a compression ratio is
+# not a correctness guarantee, so the cap must still hold at this figure.
+MEASURED_DURATIONS_UNCOMPRESSED_BYTES = 7_902_147
+# Read from the run ledger over its own 11.06-day window, per runner.
+CANONICAL_RUNS_IN_WINDOW = (152, 116)
+# Bytes retained today under the seven-day horizon, per runner.
+RETAINED_BASELINE_BYTES = (67_500_000, 70_300_000)
+
+
+def _projected_working_set_bytes(per_run_bytes=MEASURED_DURATIONS_COMPRESSED_BYTES):
+    """The worst host's projected footprint at the new horizon.
+
+    Today's footprint scaled by 12/7 — the horizon is what the baseline was
+    measured under — plus one durations artifact per canonical run the horizon
+    now holds.
+    """
+    return max(
+        int(baseline * 12 / 7) + runs * per_run_bytes
+        for baseline, runs in zip(RETAINED_BASELINE_BYTES, CANONICAL_RUNS_IN_WINDOW)
+    )
+
+
+def test_age_horizon_covers_the_ledger_window():
+    # 11.06 measured days; the cutoff is whole days * 86400, so 11 does not
+    # cover it.
+    assert K.DEFAULT_MAX_AGE_DAYS >= 12
+
+
+def test_byte_cap_exceeds_the_projected_working_set():
+    projected = _projected_working_set_bytes()
+    assert K.DEFAULT_MAX_BYTES > projected, (K.DEFAULT_MAX_BYTES, projected)
+
+
+def test_byte_cap_still_holds_if_the_durations_artifact_never_compressed():
+    # The one place the cap could be set too low by trusting a ratio. This is
+    # also what rules out keeping the previous 1 GiB cap: the uncompressed
+    # worst case exceeds it.
+    projected = _projected_working_set_bytes(
+        MEASURED_DURATIONS_UNCOMPRESSED_BYTES)
+    assert K.DEFAULT_MAX_BYTES > projected, (K.DEFAULT_MAX_BYTES, projected)
+    assert projected > 1073741824, projected
+
+
+def test_the_cap_stays_within_twice_the_uncompressed_worst_case():
+    # A LOOSE upper bound on the safety valve, not a tightness claim. The name
+    # this test used to carry ("not raised further than the measurement
+    # justifies") over-claimed: the plugin always writes gzip level 6, so the
+    # uncompressed case cannot occur, and against the real expected steady
+    # state of about 187 MiB the 2 GiB cap has roughly eleven times the
+    # headroom. What is actually asserted is that the cap did not float free
+    # of the measurement altogether — it is still anchored to the largest
+    # figure the measurement produced.
+    projected = _projected_working_set_bytes(
+        MEASURED_DURATIONS_UNCOMPRESSED_BYTES)
+    assert K.DEFAULT_MAX_BYTES <= projected * 2, (K.DEFAULT_MAX_BYTES, projected)
+

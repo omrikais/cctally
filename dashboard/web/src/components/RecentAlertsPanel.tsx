@@ -25,6 +25,7 @@ import { PANEL_REGISTRY } from '../lib/panelRegistry';
 import { PanelGrip } from './PanelGrip';
 import { ExpandButton } from './ExpandButton';
 import { AlertsEmptyGauge } from './AlertsEmptyGauge';
+import { ZoneTag } from './ZoneTag';
 
 // Recent alerts panel — compact, last-10, severity color, collapsible.
 // Click anywhere on the panel body to open the full-history modal
@@ -277,6 +278,7 @@ export function RecentAlertsPanel(): JSX.Element {
               // modal's when-cell reads the same helper, so the contract has
               // one home rather than a copy per surface.
               const whenTitle = fmt.startedShortOrNull(d.whenIso, ctx);
+              const whenText = fmt.relativeOrAbsolute(d.whenIso ?? '', ctx);
               return (
                 <li key={toastAlertId(row)} className="alert-row">
                   <span
@@ -307,7 +309,8 @@ export function RecentAlertsPanel(): JSX.Element {
                     className="alert-when"
                     title={whenTitle ?? undefined}
                   >
-                    {fmt.relativeOrAbsolute(d.whenIso ?? '', ctx)}
+                    {whenText}
+                    {whenText === '—' ? null : <> <ZoneTag tz={ctx.tz} /></>}
                   </span>
                 </li>
               );

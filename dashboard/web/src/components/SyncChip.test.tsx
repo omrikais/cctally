@@ -27,7 +27,11 @@ const mocked = vi.hoisted(() => ({
   connectionState: 'connected' as 'connected' | 'suspended' | 'resuming' | 'disconnected',
 }));
 
-function activity(over: { rebuilding?: boolean } = {}) {
+function activity(over: {
+  rebuilding?: boolean;
+  requested_id?: number;
+  started_id?: number;
+} = {}) {
   return {
     server_epoch: 'a1b2c3d4e5f60718',
     rebuilding: false,
@@ -220,6 +224,15 @@ describe('SyncChip refresh contract (#583 S2)', () => {
     // The user's own pending click is the more specific fact, so it wins over
     // the server-wide "some rebuild is running".
     expect(chip().textContent).toBe('queued…');
+  });
+
+  it('uses the published counters to distinguish accepted from started', () => {
+    dispatch({ type: 'REGISTER_SYNC_REQUEST', id: 4, epoch: 'a1b2c3d4e5f60718' });
+    mocked.env.sync_activity = activity({ requested_id: 4, started_id: 3 });
+    expect(chip().textContent).toBe('queued…');
+
+    mocked.env.sync_activity = activity({ requested_id: 4, started_id: 4 });
+    expect(chip().textContent).toBe('syncing…');
   });
 
   it('an in-flight POST outranks a queued request', () => {
@@ -549,5 +562,40 @@ describe('SyncChip refresh contract (#583 S2)', () => {
     const rebuilding = chip();
     expect(rebuilding.getAttribute('aria-live')).toBeNull();
     expect(rebuilding.getAttribute('aria-busy')).toBe('true');
+  });
+
+  it('commits paused and disconnected text together with aria-live', () => {
+    mocked.env = cleanEnv();
+    const { container, rerender } = render(<SyncChip />);
+    const records: MutationRecord[] = [];
+    const observer = new MutationObserver((batch) => records.push(...batch));
+    const target = container.querySelector('#sync-chip')!;
+    observer.observe(target, {
+      attributes: true,
+      attributeOldValue: true,
+      childList: true,
+      characterData: true,
+      subtree: true,
+    });
+
+    mocked.env = { ...cleanEnv(), sync_age_s: null };
+    rerender(<SyncChip />);
+    observer.takeRecords().forEach((record) => records.push(record));
+
+    const liveIndex = records.findIndex(
+      (record) => record.type === 'attributes' && record.attributeName === 'aria-live',
+    );
+    const textIndex = records.findIndex(
+      (record) => record.type === 'characterData' || record.type === 'childList',
+    );
+    expect(target.textContent).toBe('sync paused');
+    expect(target.getAttribute('aria-live')).toBe('polite');
+    expect(liveIndex).toBeGreaterThanOrEqual(0);
+    expect(textIndex).toBeGreaterThanOrEqual(0);
+    // React applies host attributes before child text within one commit. The
+    // invariant is that no intervening mutation/second effect commit leaves
+    // `aria-live=polite` attached to the prior ticking label.
+    expect(textIndex).toBe(liveIndex + 1);
+    observer.disconnect();
   });
 });

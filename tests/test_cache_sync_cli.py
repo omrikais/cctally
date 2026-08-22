@@ -5,6 +5,8 @@ import argparse, fcntl, json, multiprocessing, os, pathlib, shutil, sqlite3, tim
 import pytest
 from conftest import load_script, redirect_paths
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
+
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
@@ -215,12 +217,14 @@ def test_explicit_rebuild_bounds_a_stuck_claude_transcript_phase(env, capfd):
     proc = ctx.Process(target=invoke)
     started = time.monotonic()
     proc.start()
-    proc.join(timeout=2.0)
+    # timing-budget: the cache-sync child has exited; `finished` below records whether it did, and the assertion reads that flag rather than the elapsed time
+    proc.join(timeout=PRESENCE_BACKSTOP_SECONDS)
     elapsed = time.monotonic() - started
     finished = not proc.is_alive()
     if not finished:
         proc.kill()
-        proc.join(timeout=1.0)
+        # timing-budget: the killed cache-sync child has been reaped
+        proc.join(timeout=PRESENCE_BACKSTOP_SECONDS)
 
     assert finished, (
         "cmd_cache_sync did not contain the stuck Claude transcript phase "

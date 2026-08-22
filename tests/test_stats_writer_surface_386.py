@@ -247,6 +247,12 @@ FROZEN_WRITE_SITES = {
     # target-path provenance (it only ever builds scratch DBs, never DB_PATH),
     # but it is kept in the LEXICAL freeze because keeping it costs nothing and
     # a new write here is still worth seeing.
+    #
+    # #620 S3 added `create_conversations_db`, a third scratch-DB builder
+    # beside `create_stats_db` and `create_cache_db`. It contributes two
+    # `schema_migrations` sites (the CREATE and the stamping INSERT) and one
+    # `schema_migrations_skipped` site (the CREATE), all against a fixture
+    # file it has just created — the same provenance §3.2 excludes.
     "_fixture_builders.py": {
         "accounts": 3,
         "budget_milestones": 1,
@@ -258,8 +264,8 @@ FROZEN_WRITE_SITES = {
         "percent_milestones": 1,
         "project_budget_milestones": 1,
         "projected_milestones": 1,
-        "schema_migrations": 4,
-        "schema_migrations_skipped": 2,
+        "schema_migrations": 6,
+        "schema_migrations_skipped": 3,
         "week_reset_events": 2,
         "weekly_cost_snapshots": 3,
         "weekly_credit_floors": 1,

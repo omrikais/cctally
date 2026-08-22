@@ -17,8 +17,11 @@
       "sync.delta",
       "sync.noop"
     ],
-    "corpus_fingerprint": "81f01c23f9479751e2f679bdc2961511408fe86b2264632bfe41770ba06423e2",
+    "corpus_fingerprint": "7e4e38229503050ed1804ac4669efd3d25e7759e1261f915336d1caa5e74b931",
     "dataset_counts": {
+      "claude_sidechain_messages": 58000,
+      "codex_conversation_events": 153600,
+      "codex_conversation_messages": 1200,
       "codex_entries": 150000,
       "codex_files": 1200,
       "entries": 295942,
@@ -26,7 +29,7 @@
       "quota_windows": 2402,
       "sessions": 5000
     },
-    "generator_version": 6,
+    "generator_version": 7,
     "scale": "large",
     "seed": 42
   },
@@ -35,127 +38,130 @@
       "conversations.filtered": {
         "bytes": null,
         "count": 50,
-        "max_ms": 0.1727,
-        "median_ms": 0.1675,
-        "min_ms": 0.1602,
+        "max_ms": 0.2468,
+        "median_ms": 0.2428,
+        "min_ms": 0.2419,
         "phases": null
       },
       "conversations.page1": {
         "bytes": null,
         "count": 50,
-        "max_ms": 0.1128,
-        "median_ms": 0.1095,
-        "min_ms": 0.1001,
+        "max_ms": 0.1754,
+        "median_ms": 0.1637,
+        "min_ms": 0.1598,
         "phases": null
       },
       "conversations.sorted": {
         "bytes": null,
         "count": 50,
-        "max_ms": 0.3842,
-        "median_ms": 0.36,
-        "min_ms": 0.3552,
+        "max_ms": 0.5935,
+        "median_ms": 0.5913,
+        "min_ms": 0.5799,
         "phases": null
       },
       "find.in_conversation": {
         "bytes": null,
         "count": 12000,
-        "max_ms": 90.3047,
-        "median_ms": 88.8894,
-        "min_ms": 88.1345,
+        "max_ms": 585.731,
+        "median_ms": 131.5998,
+        "min_ms": 129.3387,
         "phases": null
       },
       "outline.build": {
         "bytes": null,
         "count": null,
-        "max_ms": 23.8495,
-        "median_ms": 22.8579,
-        "min_ms": 22.6106,
+        "max_ms": 33.1056,
+        "median_ms": 33.0577,
+        "min_ms": 32.6742,
         "phases": null
       },
       "payload.assemble": {
         "bytes": null,
         "count": null,
-        "max_ms": 429.0682,
-        "median_ms": 88.5828,
-        "min_ms": 88.0239,
+        "max_ms": 134.6432,
+        "median_ms": 133.4533,
+        "min_ms": 132.8778,
         "phases": null
       },
       "payload.assemble_memo_hit": {
         "bytes": null,
         "count": null,
-        "max_ms": 0.0168,
-        "median_ms": 0.0105,
-        "min_ms": 0.0085,
+        "max_ms": 0.015,
+        "median_ms": 0.0136,
+        "min_ms": 0.0132,
         "phases": null
       },
       "reconcile.cache_report": {
         "bytes": null,
         "count": null,
-        "max_ms": 1.9703,
-        "median_ms": 1.8554,
-        "min_ms": 1.8186,
+        "max_ms": 2.9428,
+        "median_ms": 2.935,
+        "min_ms": 2.8852,
         "phases": null
       },
       "reconcile.projects_env": {
         "bytes": null,
         "count": null,
-        "max_ms": 1.8252,
-        "median_ms": 1.8075,
-        "min_ms": 1.7888,
+        "max_ms": 2.8988,
+        "median_ms": 2.8766,
+        "min_ms": 2.8667,
         "phases": null
       },
       "search.cross_session": {
         "bytes": null,
         "count": 591884,
-        "max_ms": 2205.201,
-        "median_ms": 2191.4201,
-        "min_ms": 2175.2498,
+        "max_ms": 3238.6089,
+        "median_ms": 3236.282,
+        "min_ms": 3146.591,
         "phases": null
       },
       "snapshot.cold": {
         "bytes": null,
         "count": null,
-        "max_ms": 3007.0783,
-        "median_ms": 2975.5129,
-        "min_ms": 2652.734,
+        "max_ms": 2579.619,
+        "median_ms": 2577.69,
+        "min_ms": 2560.7021,
         "phases": null
       },
       "snapshot.idle": {
         "bytes": null,
         "count": null,
-        "max_ms": 1.5187,
-        "median_ms": 1.4667,
-        "min_ms": 1.4406,
+        "max_ms": 2.3447,
+        "median_ms": 2.3096,
+        "min_ms": 2.2991,
         "phases": null
       },
       "snapshot.warm": {
         "bytes": null,
         "count": null,
-        "max_ms": 415.4334,
-        "median_ms": 90.2555,
-        "min_ms": 89.9378,
+        "max_ms": 131.6724,
+        "median_ms": 131.5072,
+        "min_ms": 131.4494,
         "phases": null
       },
       "sync.delta": {
         "bytes": null,
         "count": 1,
-        "max_ms": 3.5018,
-        "median_ms": 3.4424,
-        "min_ms": 3.4115,
+        "max_ms": 5.6625,
+        "median_ms": 5.5198,
+        "min_ms": 5.4974,
         "phases": null
       },
       "sync.noop": {
         "bytes": null,
         "count": 5000,
-        "max_ms": 44.9431,
-        "median_ms": 44.1271,
-        "min_ms": 43.0442,
+        "max_ms": 70.0288,
+        "median_ms": 69.6087,
+        "min_ms": 69.5806,
         "phases": null
       }
     },
-    "cctally_version": "1.99.0",
-    "corpus_fingerprint": "81f01c23f9479751e2f679bdc2961511408fe86b2264632bfe41770ba06423e2",
+    "cctally_version": "1.101.0",
+    "corpus_fingerprint": "7e4e38229503050ed1804ac4669efd3d25e7759e1261f915336d1caa5e74b931",
     "dataset_counts": {
+      "claude_sidechain_messages": 58000,
+      "codex_conversation_events": 153600,
+      "codex_conversation_messages": 1200,
       "codex_entries": 150000,
       "codex_files": 1200,
       "entries": 295942,
@@ -163,7 +169,7 @@
       "quota_windows": 2402,
       "sessions": 5000
     },
-    "generator_version": 6,
+    "generator_version": 7,
     "machine_label": "darwin-arm64",
     "scale": "large",
     "seed": 42

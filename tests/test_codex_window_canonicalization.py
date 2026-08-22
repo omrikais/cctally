@@ -1344,13 +1344,28 @@ def test_r3_the_tolerance_boundary_stays_inclusive_at_600s():
     assert index.resolve(edge) == edge
 
 
+class _CountingBuckets(dict):
+    """A bucket map that records how many buckets a lookup probed."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.probes = 0
+
+    def get(self, key, default=None):
+        self.probes += 1
+        return super().get(key, default)
+
+
 def test_r3_the_anchor_lookup_is_not_a_linear_scan():
     """Bound test. Migration 032 runs the resolver over the WHOLE table
     synchronously on the first DB open after upgrade, and `cache-sync --rebuild`
     runs it over the whole walk. At the linear implementation's ~O(n^2) this is
-    a multi-minute hang on a year of 5h windows; the budget below is over two
-    orders of magnitude above the bucketed cost, so shared-runner load cannot
-    flip it."""
+    a multi-minute hang on a year of 5h windows.
+
+    The claim is structural: `ResetAnchorIndex.resolve` examines offsets -1, 0
+    and 1 (`bin/_lib_quota.py:177-194`), so it probes exactly three buckets per
+    call whatever the population is. A linear scan probes none — it walks the
+    anchor list — so the count fails at zero as well as at four."""
     import time
 
     base = dt.datetime(2026, 1, 1, tzinfo=UTC)
@@ -1361,8 +1376,14 @@ def test_r3_the_anchor_lookup_is_not_a_linear_scan():
     started = time.perf_counter()
     for anchor in anchors:
         index.add(anchor)
+    buckets = _CountingBuckets(index._buckets)
+    index._buckets = buckets
     for anchor in anchors:
         assert index.resolve(anchor + dt.timedelta(seconds=5)) == anchor
     elapsed = time.perf_counter() - started
-    assert elapsed < 5.0, (
+    assert buckets.probes == 3 * len(anchors), (
+        f"{buckets.probes} bucket probes over {len(anchors)} resolves; "
+        "resolve examines offsets -1, 0 and 1, so it is three per call")
+    # timing-budget: retained beside the probe count, which bounds the lookup and not the 6,000 adds the same loop performs
+    assert elapsed < 30.0, (
         f"6,000 anchors took {elapsed:.1f}s — the lookup is still linear")

@@ -761,6 +761,12 @@
           "last_seen_per_week": [
             "2026-04-16T12:00:00Z"
           ],
+          "session_counts_by_window": {
+            "1": 1,
+            "12": 1,
+            "4": 1,
+            "8": 1
+          },
           "sessions_per_week": [
             1
           ],
@@ -2211,6 +2217,12 @@
                 "last_seen_per_week": [
                   "2026-04-16T12:00:00Z"
                 ],
+                "session_counts_by_window": {
+                  "1": 1,
+                  "12": 1,
+                  "4": 1,
+                  "8": 1
+                },
                 "sessions_per_week": [
                   1
                 ],

@@ -20,8 +20,58 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
+from enum import Enum
 
 from _lib_budget import project_linear
+
+
+class ForecastConfidenceCause(str, Enum):
+    """The closed set of reasons a forecast is low-confidence.
+
+    The four values are a wire contract `--json` consumers read, so they are
+    the exact strings `_assess_forecast_confidence` has always emitted.
+    """
+
+    ELAPSED_HOURS = "elapsed_hours<24"
+    PERCENT = "percent<2"
+    SNAPSHOTS = "snapshots<3"
+    NO_SAMPLE_GE_24H = "no_sample_ge_24h"
+
+
+@dataclass(frozen=True)
+class ForecastConfidenceAssessment:
+    confidence: str                 # "high" | "low"
+    reasons: tuple[str, ...]
+
+
+def assess_forecast_confidence(
+    elapsed_hours: float,
+    percent: float,
+    snapshot_count: int,
+    *,
+    has_sample_ge_24h: bool,
+) -> ForecastConfidenceAssessment:
+    """The complete confidence predicate, including the fourth trigger.
+
+    `no_sample_ge_24h` used to be appended by `_load_forecast_inputs` after
+    it called the three-trigger predicate, which meant glue could add reasons
+    the predicate did not know about (#620 S2 E3, closes F19). Reason order
+    is `elapsed_hours<24`, `percent<2`, `snapshots<3`, `no_sample_ge_24h` —
+    the order the old call-plus-append produced.
+    """
+    reasons: list[str] = []
+    if elapsed_hours < 24:
+        reasons.append(ForecastConfidenceCause.ELAPSED_HOURS.value)
+    if percent < 2:
+        reasons.append(ForecastConfidenceCause.PERCENT.value)
+    if snapshot_count < 3:
+        reasons.append(ForecastConfidenceCause.SNAPSHOTS.value)
+    if not has_sample_ge_24h:
+        reasons.append(ForecastConfidenceCause.NO_SAMPLE_GE_24H.value)
+    return ForecastConfidenceAssessment(
+        confidence="low" if reasons else "high",
+        reasons=tuple(reasons),
+    )
 
 
 @dataclass

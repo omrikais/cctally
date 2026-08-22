@@ -21,6 +21,8 @@ from html.parser import HTMLParser
 
 from conftest import load_script
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, serve_dashboard, stop
+
 
 class _AssetExtractor(HTMLParser):
     """Collect script src and stylesheet href values from a built HTML doc."""
@@ -43,15 +45,8 @@ class _AssetExtractor(HTMLParser):
                 self.stylesheets.append(href)
 
 
-def _serve_once(ns, host: str = "127.0.0.1", port: int = 0):
-    srv = ns["ThreadingHTTPServer"]((host, port), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    return srv, t, srv.server_address[1]
-
-
 def _check(host: str, port: int, url_path: str) -> int:
-    c = http.client.HTTPConnection(host, port, timeout=2)
+    c = http.client.HTTPConnection(host, port, timeout=PRESENCE_BACKSTOP_SECONDS)
     c.request("GET", url_path)
     r = c.getresponse()
     r.read()
@@ -65,9 +60,9 @@ def test_dashboard_html_references_all_resolvable_assets() -> None:
     ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](
         ns["_empty_dashboard_snapshot"]()
     )
-    srv, t, port = _serve_once(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/")
         r = c.getresponse()
         assert r.status == 200, f"GET / status={r.status}"
@@ -99,5 +94,4 @@ def test_dashboard_html_references_all_resolvable_assets() -> None:
                 f"dashboard/static/ build output"
             )
     finally:
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t)

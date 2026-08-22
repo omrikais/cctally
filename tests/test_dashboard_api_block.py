@@ -2,6 +2,11 @@
 import datetime as dt
 
 from conftest import load_script
+# `start` is aliased because this file also binds `start` as an ordinary
+# local in several tests, and a module-level name a function reassigns is a
+# local for that whole function.
+from tests._support_http import (
+    PRESENCE_BACKSTOP_SECONDS, start as start_accept_loop, stop)
 
 
 def _make_entry(ns, *, ts: dt.datetime, model: str,
@@ -216,9 +221,7 @@ def _start_dashboard_server(ns, tmp_path, monkeypatch):
     HandlerCls.run_sync_now = staticmethod(lambda: None)
 
     srv = socketserver.TCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    srv._test_thread = start_accept_loop(srv)
     return srv
 
 
@@ -229,7 +232,7 @@ def test_api_block_endpoint_happy_path(tmp_path, monkeypatch):
         port = srv.server_address[1]
         start_at = "2026-04-22T14:00:00+00:00"
         encoded = urllib.parse.quote(start_at, safe="")
-        c = HTTPConnection("127.0.0.1", port, timeout=5)
+        c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", f"/api/block/{encoded}")
         r = c.getresponse()
         assert r.status == 200, r.status
@@ -240,7 +243,69 @@ def test_api_block_endpoint_happy_path(tmp_path, monkeypatch):
         # Reconcile holds across the wire too
         assert abs(body["samples"][-1]["cum"] - body["cost_usd"]) < 1e-9
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
+
+
+def test_api_block_endpoint_uses_recorded_membership_when_windows_overlap(
+    tmp_path, monkeypatch,
+):
+    """A reset shift can make adjacent canonical 5h windows overlap.
+
+    The grouping kernel assigns every overlap entry to exactly one recorded
+    window (the earlier reset wins).  The detail route must use that same
+    membership instead of selecting every entry in the target's raw time
+    interval, or its cumulative samples exceed ``block.cost_usd`` and the
+    reconcile assertion returns HTTP 500.
+    """
+    ns = load_script()
+    srv = _start_dashboard_server(ns, tmp_path, monkeypatch)
+    try:
+        prior_start = dt.datetime(2026, 4, 22, 9, 30, tzinfo=dt.timezone.utc)
+        prior_reset = dt.datetime(2026, 4, 22, 14, 30, tzinfo=dt.timezone.utc)
+        target_start = dt.datetime(2026, 4, 22, 14, 0, tzinfo=dt.timezone.utc)
+        target_reset = dt.datetime(2026, 4, 22, 19, 0, tzinfo=dt.timezone.utc)
+
+        stats = ns["open_db"]()
+        try:
+            for start, reset, closed in (
+                (prior_start, prior_reset, 1),
+                (target_start, target_reset, 0),
+            ):
+                stats.execute(
+                    "INSERT INTO five_hour_blocks ("
+                    "  five_hour_window_key, five_hour_resets_at, block_start_at,"
+                    "  first_observed_at_utc, last_observed_at_utc,"
+                    "  final_five_hour_percent, total_cost_usd, is_closed,"
+                    "  created_at_utc, last_updated_at_utc"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        int(reset.timestamp() // 600 * 600),
+                        reset.isoformat(), start.isoformat(),
+                        start.isoformat(), reset.isoformat(),
+                        10.0, 0.0, closed,
+                        start.isoformat(), reset.isoformat(),
+                    ),
+                )
+            stats.commit()
+        finally:
+            stats.close()
+
+        encoded = urllib.parse.quote(target_start.isoformat(), safe="")
+        c = HTTPConnection("127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS)
+        c.request("GET", f"/api/block/{encoded}")
+        r = c.getresponse()
+        assert r.status == 200, r.status
+        body = json.loads(r.read())
+
+        # The seeded entries at 14:05 and 14:20 fall in both raw intervals,
+        # but the grouping kernel assigns them to the prior 14:30 reset.  The
+        # current block owns only 14:45, 15:30 and 16:30.
+        assert body["entries_count"] == 3
+        assert len(body["samples"]) == 3
+        assert body["samples"][0]["t"] == "2026-04-22T14:45:00+00:00"
+        assert abs(body["samples"][-1]["cum"] - body["cost_usd"]) < 1e-9
+    finally:
+        stop(srv, srv._test_thread)
 
 
 def test_api_block_endpoint_404_unknown_start_at(tmp_path, monkeypatch):
@@ -249,12 +314,12 @@ def test_api_block_endpoint_404_unknown_start_at(tmp_path, monkeypatch):
     try:
         port = srv.server_address[1]
         encoded = urllib.parse.quote("2030-01-01T00:00:00+00:00", safe="")
-        c = HTTPConnection("127.0.0.1", port, timeout=5)
+        c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", f"/api/block/{encoded}")
         r = c.getresponse()
         assert r.status == 404
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_api_block_endpoint_400_malformed_start_at(tmp_path, monkeypatch):
@@ -262,17 +327,17 @@ def test_api_block_endpoint_400_malformed_start_at(tmp_path, monkeypatch):
     srv = _start_dashboard_server(ns, tmp_path, monkeypatch)
     try:
         port = srv.server_address[1]
-        c = HTTPConnection("127.0.0.1", port, timeout=5)
+        c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/api/block/not-a-datetime")
         r = c.getresponse()
         assert r.status == 400
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def _raw_get(port, path):
     chunks = []
-    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=PRESENCE_BACKSTOP_SECONDS)
     try:
         sock.sendall(
             f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
@@ -303,8 +368,7 @@ def test_api_block_preparation_failure_returns_one_500(tmp_path, monkeypatch):
     try:
         raw = _raw_get(srv.server_address[1], f"/api/block/{encoded}")
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
     assert raw.count(b"HTTP/1.") == 1, raw[:400]
     assert raw.split(b"\r\n", 1)[0].split()[1:2] == [b"500"], raw[:200]
@@ -339,8 +403,7 @@ def test_api_block_committed_404_failure_never_appends_a_second_response(
     try:
         raw = _raw_get(srv.server_address[1], f"/api/block/{encoded}")
     finally:
-        srv.shutdown()
-        srv.server_close()
+        stop(srv, srv._test_thread)
 
     assert fired, "the injected block 404 body failure never fired"
     assert raw.split(b"\r\n", 1)[0].split()[1:2] == [b"404"], raw[:200]
@@ -406,9 +469,7 @@ def _start_dashboard_server_with_neighbour_block(ns, tmp_path, monkeypatch):
     HandlerCls.sync_lock = threading.Lock()
     HandlerCls.run_sync_now = staticmethod(lambda: None)
     srv = socketserver.TCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    srv._test_thread = start_accept_loop(srv)
     return srv
 
 
@@ -426,7 +487,7 @@ def test_api_block_endpoint_ignores_entries_outside_requested_window(
         port = srv.server_address[1]
         start_at = "2026-04-22T14:00:00+00:00"
         encoded = urllib.parse.quote(start_at, safe="")
-        c = HTTPConnection("127.0.0.1", port, timeout=5)
+        c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", f"/api/block/{encoded}")
         r = c.getresponse()
         assert r.status == 200, r.status
@@ -437,7 +498,7 @@ def test_api_block_endpoint_ignores_entries_outside_requested_window(
         # Only the two entries inside [14:00, 19:00) are counted.
         assert body["entries_count"] == 2
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def _start_dashboard_server_floor_band_trap(ns, tmp_path, monkeypatch):
@@ -569,9 +630,7 @@ def _start_dashboard_server_floor_band_trap(ns, tmp_path, monkeypatch):
     HandlerCls.sync_lock = threading.Lock()
     HandlerCls.run_sync_now = staticmethod(lambda: None)
     srv = socketserver.TCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    srv._test_thread = start_accept_loop(srv)
     return srv
 
 
@@ -592,7 +651,7 @@ def test_block_detail_floor_band_trap_returns_exact_window(
         # 1. Prior block — exact bs hit (was 404 pre-fix).
         prior_start = "2026-04-15T04:39:59+00:00"
         encoded = urllib.parse.quote(prior_start, safe="")
-        c = HTTPConnection("127.0.0.1", port, timeout=5)
+        c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", f"/api/block/{encoded}")
         r = c.getresponse()
         assert r.status == 200, r.status
@@ -614,7 +673,7 @@ def test_block_detail_floor_band_trap_returns_exact_window(
         # 2. Active block — bs on the :40 boundary.
         active_start = "2026-04-15T09:40:00+00:00"
         encoded = urllib.parse.quote(active_start, safe="")
-        c = HTTPConnection("127.0.0.1", port, timeout=5)
+        c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", f"/api/block/{encoded}")
         r = c.getresponse()
         assert r.status == 200, r.status
@@ -628,9 +687,9 @@ def test_block_detail_floor_band_trap_returns_exact_window(
         # canonical window no longer renders at the floored start.
         floored_start = "2026-04-15T04:30:00+00:00"
         encoded = urllib.parse.quote(floored_start, safe="")
-        c = HTTPConnection("127.0.0.1", port, timeout=5)
+        c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", f"/api/block/{encoded}")
         r = c.getresponse()
         assert r.status == 404, r.status
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)

@@ -22,5 +22,16 @@ export function followAlertTarget(target: AlertTarget): void {
     kind: target.modal,
     ...(target.blockStartAt == null ? {} : { blockStartAt: target.blockStartAt }),
     ...(target.projectKey == null ? {} : { projectKey: target.projectKey }),
+    // #620 S2 — the four scope fields are passed UNCONDITIONALLY, including
+    // when they are null. They are what the diagnosis measures and what D3
+    // requires it to state, and this function is the single chokepoint every
+    // follow affordance dispatches through: spreading them conditionally, the
+    // way the two selectors above are spread, would make "this alert recorded
+    // no firing instant" indistinguishable from "this entry point forgot to
+    // pass one".
+    accountKey: target.accountKey,
+    windowStartAt: target.windowStartAt,
+    windowEndAt: target.windowEndAt,
+    alertFiredAt: target.alertFiredAt,
   });
 }

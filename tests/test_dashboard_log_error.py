@@ -12,19 +12,14 @@ import threading
 
 from conftest import load_script, redirect_paths
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, serve_dashboard, stop
+
 
 def _reset_logger():
     root = logging.getLogger("cctally")
     for h in list(root.handlers):
         root.removeHandler(h)
     root.propagate = True
-
-
-def _serve(ns, host="127.0.0.1", port=0):
-    srv = ns["ThreadingHTTPServer"]((host, port), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    return srv, t, srv.server_address[1]
 
 
 def _wire(ns):
@@ -45,7 +40,7 @@ def _wire(ns):
 
 
 def _get(host, port, path):
-    c = http.client.HTTPConnection(host, port, timeout=3)
+    c = http.client.HTTPConnection(host, port, timeout=PRESENCE_BACKSTOP_SECONDS)
     c.request("GET", path)
     r = c.getresponse()
     r.read()
@@ -54,7 +49,7 @@ def _get(host, port, path):
 
 
 def _post_no_origin(host, port, path):
-    c = http.client.HTTPConnection(host, port, timeout=3)
+    c = http.client.HTTPConnection(host, port, timeout=PRESENCE_BACKSTOP_SECONDS)
     body = b"{}"
     c.putrequest("POST", path, skip_accept_encoding=True)
     c.putheader("Content-Type", "application/json")
@@ -72,11 +67,11 @@ def test_routine_404_emits_nothing(monkeypatch, tmp_path, capfd):
     redirect_paths(ns, monkeypatch, tmp_path)
     _reset_logger()
     _wire(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         assert _get("127.0.0.1", port, "/definitely-missing-route") == 404
     finally:
-        srv.shutdown(); t.join(timeout=3)
+        stop(srv, t)
     err = capfd.readouterr().err
     assert "[cctally.dashboard]" not in err
     _reset_logger()
@@ -87,12 +82,12 @@ def test_routine_403_csrf_emits_nothing(monkeypatch, tmp_path, capfd):
     redirect_paths(ns, monkeypatch, tmp_path)
     _reset_logger()
     _wire(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         # POST /api/settings with no Origin -> CSRF 403 (JSON body form).
         assert _post_no_origin("127.0.0.1", port, "/api/settings") == 403
     finally:
-        srv.shutdown(); t.join(timeout=3)
+        stop(srv, t)
     err = capfd.readouterr().err
     assert "[cctally.dashboard]" not in err
     _reset_logger()
@@ -112,11 +107,11 @@ def test_handler_500_logs_one_line_with_path(monkeypatch, tmp_path, capfd):
     # raises and hits its explicit self.log_error(...) + JSON 500.
     monkeypatch.setitem(ns, "doctor_gather_state", _boom)
 
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         assert _get("127.0.0.1", port, "/api/doctor") == 500
     finally:
-        srv.shutdown(); t.join(timeout=3)
+        stop(srv, t)
     err = capfd.readouterr().err
     dash_lines = [ln for ln in err.splitlines()
                   if "[cctally.dashboard] ERROR" in ln]
@@ -133,11 +128,11 @@ def test_normal_200_emits_nothing(monkeypatch, tmp_path, capfd):
     redirect_paths(ns, monkeypatch, tmp_path)
     _reset_logger()
     _wire(ns)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         assert _get("127.0.0.1", port, "/api/data") == 200
     finally:
-        srv.shutdown(); t.join(timeout=3)
+        stop(srv, t)
     err = capfd.readouterr().err
     assert "[cctally.dashboard]" not in err
     _reset_logger()

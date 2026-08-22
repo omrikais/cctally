@@ -45,6 +45,7 @@ import time
 import pytest
 
 from conftest import load_script
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 
 def _wait_fn():
@@ -100,7 +101,7 @@ def test_wakeup_does_not_depend_on_handler_body():
     saved_term = signal.getsignal(signal.SIGTERM)
     try:
         t = _fire_signal_when_armed(signal.SIGTERM, saved_term)
-        woke = wait((signal.SIGTERM,), on_signal=None, timeout=5.0)
+        woke = wait((signal.SIGTERM,), on_signal=None, timeout=PRESENCE_BACKSTOP_SECONDS)
         t.join()
         assert woke is True
     finally:
@@ -118,11 +119,11 @@ def test_secondary_on_signal_callback_still_fires():
     fired = threading.Event()
     try:
         t = _fire_signal_when_armed(signal.SIGTERM, saved_term)
-        woke = wait((signal.SIGTERM,), on_signal=fired.set, timeout=5.0)
+        woke = wait((signal.SIGTERM,), on_signal=fired.set, timeout=PRESENCE_BACKSTOP_SECONDS)
         t.join()
         assert woke is True
         # The Python-level handler ran in addition to the C-level wakeup.
-        assert fired.wait(1.0) is True
+        assert fired.wait(PRESENCE_BACKSTOP_SECONDS) is True
     finally:
         signal.signal(signal.SIGTERM, saved_term)
 
@@ -197,7 +198,7 @@ def test_single_sigterm_stress():
     try:
         for i in range(20):
             t = _fire_signal_when_armed(signal.SIGTERM, saved_term)
-            woke = wait((signal.SIGTERM,), on_signal=None, timeout=5.0)
+            woke = wait((signal.SIGTERM,), on_signal=None, timeout=PRESENCE_BACKSTOP_SECONDS)
             t.join()
             assert woke is True, f"single SIGTERM lost on iteration {i}"
     finally:

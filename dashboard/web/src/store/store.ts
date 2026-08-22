@@ -97,7 +97,7 @@ const CONV_OUTLINE_OPEN_KEY = 'cctally.conv.outlineOpen';
 // S2 (#264): the single 'history' kind is un-collapsed back into the three
 // per-period modal kinds 'daily' | 'weekly' | 'monthly' (PeriodModal), each
 // opened by its own card. No Day·Week·Month toggle.
-export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'block' | 'daily' | 'weekly' | 'monthly' | 'alerts' | 'update' | 'projects' | 'cache-report';
+export type ModalKind = 'current-week' | 'forecast' | 'trend' | 'session' | 'block' | 'daily' | 'weekly' | 'monthly' | 'alerts' | 'update' | 'projects' | 'cache-report' | 'explain';
 
 // #217 S6 F4 — 'note' added: the per-turn bookmark note editor sets inputMode
 // 'note' on focus / null on blur+close so the reader's hotkey guard (which gates
@@ -504,6 +504,15 @@ export interface UIState {
   // projectKey, the modal opens with that project's detail pre-expanded.
   // Null on un-targeted opens (panel chrome click / '0' keybinding).
   openProjectKey: string | null;
+  // #620 S2 — the explain modal's scope. Set when a follow affordance opened
+  // it against one alert's own window; all four null when it was opened by the
+  // persistent control or by `e`, which asks about the current window.
+  // `openExplainAlertFiredAt` is the instant the warning fired, which is NOT
+  // the instant the diagnosis measures: D3 requires the surface to state both.
+  openExplainAccountKey: string | null;
+  openExplainWindowStartAt: string | null;
+  openExplainWindowEndAt: string | null;
+  openExplainAlertFiredAt: string | null;
   sessionsSort: SessionSortKey;
   filterText: string;
   searchText: string;
@@ -837,6 +846,10 @@ function loadInitial(): UIState {
     openBlockStartAt: null,
     openDailyDate: null,
     openProjectKey: null,
+    openExplainAccountKey: null,
+    openExplainWindowStartAt: null,
+    openExplainWindowEndAt: null,
+    openExplainAlertFiredAt: null,
     sessionsSort: prefs.sortDefault,
     filterText: localStorage.getItem(FILTER_KEY) ?? '',
     searchText: '',
@@ -1160,7 +1173,12 @@ export function effectiveSnapshotAge(
 
 // ----- Actions -----
 export type Action =
-  | { type: 'OPEN_MODAL'; kind: ModalKind; sessionId?: string; blockStartAt?: string; dailyDate?: string; projectKey?: string }
+  // #620 S2 — `accountKey` / `windowStartAt` / `windowEndAt` / `alertFiredAt`
+  // carry the scope the diagnosis measures and the instant D3 requires it to
+  // state beside its own. They are optional on the action because most
+  // openers have no alert behind them, and they reduce to explicit nulls.
+  | { type: 'OPEN_MODAL'; kind: ModalKind; sessionId?: string; blockStartAt?: string; dailyDate?: string; projectKey?: string;
+      accountKey?: string | null; windowStartAt?: string | null; windowEndAt?: string | null; alertFiredAt?: string | null }
   | { type: 'CLOSE_MODAL' }
   // #294 S5 — the global source selection. Persists to localStorage only when
   // it actually changes (identity-gated, like the basket / outline-width
@@ -1383,6 +1401,10 @@ const DISMISSED_ON_VIEW_SWITCH = {
   openBlockStartAt: null,
   openDailyDate: null,
   openProjectKey: null,
+  openExplainAccountKey: null,
+  openExplainWindowStartAt: null,
+  openExplainWindowEndAt: null,
+  openExplainAlertFiredAt: null,
   shareModal: null,
   composerModal: null,
   // #294 S5 — the qualified source-detail modal is a transient overlay too.
@@ -1409,6 +1431,10 @@ export function dispatch(action: Action): void {
         openBlockStartAt: action.blockStartAt ?? null,
         openDailyDate: action.dailyDate ?? null,
         openProjectKey: action.projectKey ?? null,
+        openExplainAccountKey: action.accountKey ?? null,
+        openExplainWindowStartAt: action.windowStartAt ?? null,
+        openExplainWindowEndAt: action.windowEndAt ?? null,
+        openExplainAlertFiredAt: action.alertFiredAt ?? null,
       };
       break;
     case 'CLOSE_MODAL':
@@ -1420,6 +1446,10 @@ export function dispatch(action: Action): void {
         openBlockStartAt: null,
         openDailyDate: null,
         openProjectKey: null,
+        openExplainAccountKey: null,
+        openExplainWindowStartAt: null,
+        openExplainWindowEndAt: null,
+        openExplainAlertFiredAt: null,
       };
       break;
     case 'SET_ACTIVE_SOURCE':

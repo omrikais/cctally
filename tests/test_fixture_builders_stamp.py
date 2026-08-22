@@ -3,6 +3,7 @@
 ship a fully-migrated stats.db so a read command's sync_cache walk can't flip
 the #93 upgrade-gate to PROCEED and recompute seeded display tables."""
 import sqlite3
+import types
 import tempfile
 from pathlib import Path
 
@@ -28,7 +29,12 @@ def test_create_stats_db_closes_builder_connection(monkeypatch, tmp_path):
         opened.append(conn)
         return conn
 
-    monkeypatch.setattr(fb.sqlite3, "connect", tracking_connect)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(fb.sqlite3))
+    _iso_sqlite3.connect = tracking_connect
+    monkeypatch.setattr(fb, "sqlite3", _iso_sqlite3)
     db = tmp_path / "stats.db"
     fb.create_stats_db(db)
 

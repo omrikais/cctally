@@ -13,6 +13,8 @@ import time
 
 import pytest
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 _ASSIGNED = {
@@ -766,14 +768,19 @@ def test_a_slow_child_is_carried_to_session_finish_not_blamed_on_its_test(
         problems = iso.collect_test_violations(guarded.node_id, handshake_grace=0.0)
         assert not any("missing handshake" in p for p in problems), problems
         assert proc.pid in iso.pending_handshakes()
-        # And it resolves cleanly once the child really has started.
-        deadline = time.monotonic() + 60
+        # And it resolves cleanly once the child really has started. Both
+        # waits were 60 seconds, which summed to the whole 120-second pytest
+        # cap and left the reap unable to report anything: the worker was
+        # killed first. Neither needs a minute. The child writes its handshake
+        # while the interpreter starts, long before the `sleep(20)` its script
+        # spends, and the reap below follows a `terminate()`.
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
         while proc.pid not in iso.read_handshakes() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert not iso.flush_late_handshake_problems()
     finally:
         proc.terminate()
-        proc.wait(timeout=60)
+        proc.wait(timeout=PRESENCE_BACKSTOP_SECONDS)
     iso.drop_node_from_ledger(guarded.node_id)
 
 
@@ -1230,7 +1237,7 @@ def test_a_concurrent_append_survives_the_ledger_rewrite(guarded, tmp_path, monk
             while not started.exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert started.exists(), "the racer never reached the append"
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
             while not _raced_in_file() and time.monotonic() < deadline:
                 time.sleep(0.02)
         return rows
@@ -1303,7 +1310,7 @@ def test_a_bootstrap_failure_row_survives_the_ledger_rewrite(
             while not started.exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert started.exists(), "the racer never reached the append"
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
             while not _bootstrap_row_in_file() and time.monotonic() < deadline:
                 time.sleep(0.02)
         return rows

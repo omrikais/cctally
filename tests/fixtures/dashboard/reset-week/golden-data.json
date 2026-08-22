@@ -1009,6 +1009,12 @@
             null,
             "2026-04-18T06:25:00Z"
           ],
+          "session_counts_by_window": {
+            "1": 4,
+            "12": 6,
+            "4": 5,
+            "8": 6
+          },
           "sessions_per_week": [
             1,
             0,
@@ -1048,6 +1054,12 @@
             "2026-04-08T06:00:00Z",
             null
           ],
+          "session_counts_by_window": {
+            "1": 0,
+            "12": 2,
+            "4": 2,
+            "8": 2
+          },
           "sessions_per_week": [
             0,
             1,
@@ -1087,6 +1099,12 @@
             null,
             "2026-04-18T09:35:00Z"
           ],
+          "session_counts_by_window": {
+            "1": 1,
+            "12": 1,
+            "4": 1,
+            "8": 1
+          },
           "sessions_per_week": [
             0,
             0,
@@ -2953,6 +2971,12 @@
                   null,
                   "2026-04-18T06:25:00Z"
                 ],
+                "session_counts_by_window": {
+                  "1": 4,
+                  "12": 6,
+                  "4": 5,
+                  "8": 6
+                },
                 "sessions_per_week": [
                   1,
                   0,
@@ -2992,6 +3016,12 @@
                   "2026-04-08T06:00:00Z",
                   null
                 ],
+                "session_counts_by_window": {
+                  "1": 0,
+                  "12": 2,
+                  "4": 2,
+                  "8": 2
+                },
                 "sessions_per_week": [
                   0,
                   1,
@@ -3031,6 +3061,12 @@
                   null,
                   "2026-04-18T09:35:00Z"
                 ],
+                "session_counts_by_window": {
+                  "1": 1,
+                  "12": 1,
+                  "4": 1,
+                  "8": 1
+                },
                 "sessions_per_week": [
                   0,
                   0,

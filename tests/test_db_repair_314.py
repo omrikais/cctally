@@ -234,7 +234,12 @@ def test_repair_refuses_incoherent_wal_before_open_or_checkpoint(
     def forbidden_connect(*_args, **_kwargs):
         raise AssertionError("repair opened an incoherent WAL family")
 
-    monkeypatch.setattr(_cctally_db.sqlite3, "connect", forbidden_connect)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(_cctally_db.sqlite3))
+    _iso_sqlite3.connect = forbidden_connect
+    monkeypatch.setattr(_cctally_db, "sqlite3", _iso_sqlite3)
     rc, counts, version, guard, reason = _cctally_db._repair_preflight_and_copy(
         source,
         tmp_path / "backup.db",
@@ -454,7 +459,12 @@ def test_repair_swap_failure_keeps_checkpointed_live_db_coherent(
     def fail_replace(_source, _destination):
         raise PermissionError("injected replace failure")
 
-    monkeypatch.setattr(os, "replace", fail_replace)
+    # #630 S2: rebind the module name on the IMPORTING module, never on
+    # the shared stdlib object that every other importer and every
+    # concurrent thread resolves through.
+    _iso_os = types.SimpleNamespace(**vars(sys.modules["_cctally_db"].os))
+    _iso_os.replace = fail_replace
+    monkeypatch.setattr(sys.modules["_cctally_db"], "os", _iso_os)
 
     rc = c.cmd_db_repair(_repair_args())
 
@@ -602,7 +612,12 @@ def test_repair_setup_failure_is_staged_and_releases_marker(
     def fail_tempdir(*_args, **_kwargs):
         raise PermissionError("injected tempdir failure")
 
-    monkeypatch.setattr(_cctally_db.tempfile, "TemporaryDirectory", fail_tempdir)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_tempfile = types.SimpleNamespace(**vars(_cctally_db.tempfile))
+    _iso_tempfile.TemporaryDirectory = fail_tempdir
+    monkeypatch.setattr(_cctally_db, "tempfile", _iso_tempfile)
 
     rc = c.cmd_db_repair(_repair_args())
 
@@ -697,7 +712,12 @@ def test_backup_publish_race_never_overwrites_new_owner_file(
         pathlib.Path(destination_path).write_bytes(b"racing owner")
         return real_link(source_path, destination_path)
 
-    monkeypatch.setattr(os, "link", race_link)
+    # #630 S2: rebind the module name on the IMPORTING module, never on
+    # the shared stdlib object that every other importer and every
+    # concurrent thread resolves through.
+    _iso_os = types.SimpleNamespace(**vars(sys.modules["_cctally_db"].os))
+    _iso_os.link = race_link
+    monkeypatch.setattr(sys.modules["_cctally_db"], "os", _iso_os)
 
     rc = c.cmd_db_backup(_backup_args(output))
 

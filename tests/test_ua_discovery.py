@@ -1,5 +1,7 @@
 """Unit tests for CC version discovery + UA derivation."""
 import pytest
+import sys
+import types
 from conftest import load_script
 
 
@@ -54,7 +56,14 @@ def test_discover_uses_claude_version_first(ns, monkeypatch, tmp_path):
         return subprocess.CompletedProcess(
             cmd, 0, stdout="claude-code 2.1.116 (Bun)\n", stderr=""
         )
-    monkeypatch.setattr(ns["subprocess"], "run", fake_run)
+    # #630 S2: rebind the module name on the IMPORTING module.
+    # `ns[...]` IS the shared stdlib object, so patching an attribute
+    # on it rebound that callable for the whole process.
+    _iso_subprocess = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].subprocess))
+    _iso_subprocess.run = fake_run
+    monkeypatch.setattr(
+        sys.modules["_cctally_refresh"], "subprocess", _iso_subprocess)
 
     assert ns["_discover_cc_version"]() == "2.1.116"
 
@@ -71,7 +80,14 @@ def test_discover_falls_back_to_versions_dir(ns, monkeypatch, tmp_path):
 
     def fake_run(cmd, **kwargs):
         raise FileNotFoundError("claude not on PATH")
-    monkeypatch.setattr(ns["subprocess"], "run", fake_run)
+    # #630 S2: rebind the module name on the IMPORTING module.
+    # `ns[...]` IS the shared stdlib object, so patching an attribute
+    # on it rebound that callable for the whole process.
+    _iso_subprocess = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].subprocess))
+    _iso_subprocess.run = fake_run
+    monkeypatch.setattr(
+        sys.modules["_cctally_refresh"], "subprocess", _iso_subprocess)
 
     assert ns["_discover_cc_version"]() == "2.1.116"
 
@@ -83,7 +99,14 @@ def test_discover_falls_back_to_sentinel(ns, monkeypatch, tmp_path):
 
     def fake_run(cmd, **kwargs):
         raise FileNotFoundError("no claude")
-    monkeypatch.setattr(ns["subprocess"], "run", fake_run)
+    # #630 S2: rebind the module name on the IMPORTING module.
+    # `ns[...]` IS the shared stdlib object, so patching an attribute
+    # on it rebound that callable for the whole process.
+    _iso_subprocess = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].subprocess))
+    _iso_subprocess.run = fake_run
+    monkeypatch.setattr(
+        sys.modules["_cctally_refresh"], "subprocess", _iso_subprocess)
 
     assert ns["_discover_cc_version"]() == ns["CLAUDE_CODE_UA_FALLBACK_VERSION"]
 
@@ -97,7 +120,14 @@ def test_discover_handles_subprocess_timeout(ns, monkeypatch, tmp_path):
 
     def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, timeout=5)
-    monkeypatch.setattr(ns["subprocess"], "run", fake_run)
+    # #630 S2: rebind the module name on the IMPORTING module.
+    # `ns[...]` IS the shared stdlib object, so patching an attribute
+    # on it rebound that callable for the whole process.
+    _iso_subprocess = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].subprocess))
+    _iso_subprocess.run = fake_run
+    monkeypatch.setattr(
+        sys.modules["_cctally_refresh"], "subprocess", _iso_subprocess)
 
     assert ns["_discover_cc_version"]() == "2.1.116"
 

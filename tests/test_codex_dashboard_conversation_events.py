@@ -22,6 +22,7 @@ import urllib.parse as _u
 from http.client import HTTPConnection
 
 from conftest import load_script, redirect_paths
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, read_event, read_no_event, start, stop
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BIN_DIR = REPO_ROOT / "bin"
@@ -64,7 +65,8 @@ def _make_snapshot(ns):
         blocks_panel=[], daily_panel=[])
 
 
-def _wire_handler(ns, *, no_sync=False, expose=False, bind="127.0.0.1"):
+def _wire_handler(ns, monkeypatch, *, no_sync=False, expose=False,
+                  bind="127.0.0.1"):
     HandlerCls = ns["DashboardHTTPHandler"]
     HandlerCls.snapshot_ref = ns["_SnapshotRef"](_make_snapshot(ns))
     HandlerCls.hub = ns["SSEHub"]()
@@ -74,10 +76,16 @@ def _wire_handler(ns, *, no_sync=False, expose=False, bind="127.0.0.1"):
     HandlerCls.cctally_expose_transcripts = expose
     HandlerCls.no_sync = no_sync
     import socketserver
+    # #630 S2: see the twin comment in tests/test_dashboard_conversation_events.py.
+    # A 1 s keep-alive is what lets an abandoned live-tail handler discover the
+    # closed client; `start()` installs the holder that lets `stop()` name and
+    # join it.
+    conv = sys.modules["_cctally_dashboard_conversation"]
+    monkeypatch.setattr(conv, "_LIVE_TAIL_KEEPALIVE", 1.0)
+
     srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
     srv.handle_error = lambda request, client_address: None
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    srv._test_thread = start(srv)
     return srv
 
 
@@ -104,7 +112,7 @@ def _boot_codex(ns, tmp_path, monkeypatch, *, scenario="modern-full",
         ns["sync_codex_conversations"](conn, rebuild=True)
     finally:
         conn.close()
-    srv = _wire_handler(ns, no_sync=no_sync)   # loads the dashboard + conv sibling
+    srv = _wire_handler(ns, monkeypatch, no_sync=no_sync)  # loads dashboard + conv
     if fast:
         _speed_up(monkeypatch)
     return srv, provider_root, rollout, key
@@ -121,7 +129,7 @@ def _speed_up(monkeypatch):
 
 
 def _get(port, path, *, host=None):
-    c = HTTPConnection("127.0.0.1", port, timeout=5)
+    c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     if host is None:
         c.request("GET", path)
     else:
@@ -145,31 +153,6 @@ def _open_sse(port, path, *, timeout=15.0):
     return s
 
 
-def _read_event(s, *, marker="event: tail", deadline=10.0, allow_timeout=False):
-    buf = b""
-    end = dt.datetime.now() + dt.timedelta(seconds=deadline)
-    while dt.datetime.now() < end:
-        s.settimeout(0.5)
-        try:
-            chunk = s.recv(4096)
-        except (_socket.timeout, TimeoutError):
-            continue
-        if not chunk:
-            break
-        buf += chunk
-        text = buf.decode("utf-8", "replace")
-        idx = text.find(marker)
-        if idx == -1:
-            continue
-        rest = text[idx:]
-        blank = rest.find("\n\n")
-        if blank == -1:
-            continue
-        return rest[:blank]
-    if allow_timeout:
-        return None
-    raise AssertionError(f"no SSE frame {marker!r} within {deadline}s; buf={buf!r}")
-
 
 def _events_path(key):
     return f"/api/conversation/{_u.quote(key, safe='')}/events"
@@ -189,7 +172,7 @@ def test_qualified_not_found_is_json_404_before_sse(tmp_path, monkeypatch):
         assert ctype and "application/json" in ctype     # JSON, not SSE
         assert json.loads(body)["status"] == "not_found"
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_qualified_normalization_pending_is_json_200(tmp_path, monkeypatch):
@@ -205,7 +188,7 @@ def test_qualified_normalization_pending_is_json_200(tmp_path, monkeypatch):
         assert ctype and "application/json" in ctype     # JSON, NOT event-stream
         assert json.loads(body)["status"] == "normalization_pending"
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_privacy_gate_403_before_any_preflight(tmp_path, monkeypatch):
@@ -216,7 +199,7 @@ def test_privacy_gate_403_before_any_preflight(tmp_path, monkeypatch):
         status, _body, _c = _get(port, _events_path(key), host="evil.example.com")
         assert status == 403
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ── qualified frames carry conversationKey (both providers) ─────────────────
@@ -229,12 +212,14 @@ def test_codex_ready_and_tail_use_conversation_key(tmp_path, monkeypatch):
         port = srv.server_address[1]
         s = _open_sse(port, _events_path(key))
         try:
-            assert _read_event(s, marker="event: ready", deadline=8.0
-                               ).startswith("event: ready")
-            time.sleep(1.0)                     # let connect-ingest + baseline settle
+            assert read_event(s, marker="event: ready").startswith("event: ready")
+            # #630 S2: `ready` fires before resolve() and ingest(), so it does
+            # not mean a baseline exists. This frame does, which is why the
+            # one-second guess it replaced is gone.
+            read_event(s, marker="event: baselined")  # the server says the baseline exists
             with open(rollout, "a", encoding="utf-8") as fh:
                 fh.write(_APPEND_LINE)
-            frame = _read_event(s, marker="event: tail", deadline=10.0)
+            frame = read_event(s, marker="event: tail")
             data = json.loads([ln for ln in frame.splitlines()
                                if ln.startswith("data: ")][0][len("data: "):])
             assert data.get("conversationKey") == key   # qualified frame
@@ -242,7 +227,7 @@ def test_codex_ready_and_tail_use_conversation_key(tmp_path, monkeypatch):
         finally:
             s.close()
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_qualified_claude_key_speaks_conversation_key(tmp_path, monkeypatch):
@@ -264,17 +249,19 @@ def test_qualified_claude_key_speaks_conversation_key(tmp_path, monkeypatch):
         ns["sync_claude_conversations"](conn, rebuild=True)
     finally:
         conn.close()
-    srv = _wire_handler(ns)
+    srv = _wire_handler(ns, monkeypatch)
     key = disp._mint_claude_conversation_key("s1")
     try:
         port = srv.server_address[1]
         s = _open_sse(port, _events_path(key))
         try:
-            _read_event(s, marker="event: ready", deadline=8.0)
-            time.sleep(1.0)
+            # #630 S2: `ready` fires before resolve() and ingest(), so it does
+            # not mean a baseline exists. This frame does, which is why the
+            # one-second guess it replaces is gone.
+            read_event(s, marker="event: baselined")  # the server says the baseline exists
             with open(jsonl, "a", encoding="utf-8") as fh:
                 fh.write(_asst_line("a2", "m2", "r2", "world", sid="s1"))
-            frame = _read_event(s, marker="event: tail", deadline=10.0)
+            frame = read_event(s, marker="event: tail")
             data = json.loads([ln for ln in frame.splitlines()
                                if ln.startswith("data: ")][0][len("data: "):])
             assert data.get("conversationKey") == key
@@ -282,7 +269,7 @@ def test_qualified_claude_key_speaks_conversation_key(tmp_path, monkeypatch):
         finally:
             s.close()
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_codex_subsequent_growth_re_detected(tmp_path, monkeypatch):
@@ -294,21 +281,23 @@ def test_codex_subsequent_growth_re_detected(tmp_path, monkeypatch):
         port = srv.server_address[1]
         s = _open_sse(port, _events_path(key))
         try:
-            _read_event(s, marker="event: ready", deadline=8.0)
-            time.sleep(1.0)
+            # #630 S2: `ready` fires before resolve() and ingest(), so it does
+            # not mean a baseline exists. This frame does, which is why the
+            # one-second guess it replaces is gone.
+            read_event(s, marker="event: baselined")  # the server says the baseline exists
             with open(rollout, "a", encoding="utf-8") as fh:
                 fh.write(_APPEND_LINE)
-            _read_event(s, marker="event: tail", deadline=10.0)
+            read_event(s, marker="event: tail")
             line2 = _APPEND_LINE.replace("appended turn", "second turn").replace(
                 "13:00:00", "13:05:00")
             with open(rollout, "a", encoding="utf-8") as fh:
                 fh.write(line2)
-            frame2 = _read_event(s, marker="event: tail", deadline=10.0)
+            frame2 = read_event(s, marker="event: tail")
             assert frame2.startswith("event: tail")
         finally:
             s.close()
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ── passivity + unrelated-mutation isolation ────────────────────────────────
@@ -321,16 +310,14 @@ def test_codex_passive_under_no_sync(tmp_path, monkeypatch):
         port = srv.server_address[1]
         s = _open_sse(port, _events_path(key))
         try:
-            assert _read_event(s, marker="event: ready", deadline=3.0,
-                               allow_timeout=True) is None   # passive: no ready
+            read_no_event(s, marker="event: ready", window=3.0)   # passive: no ready
             with open(rollout, "a", encoding="utf-8") as fh:
                 fh.write(_APPEND_LINE)
-            assert _read_event(s, marker="event: tail", deadline=3.0,
-                               allow_timeout=True) is None   # frozen: no tail
+            read_no_event(s, marker="event: tail", window=3.0)   # frozen: no tail
         finally:
             s.close()
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_unrelated_conversation_growth_does_not_emit(tmp_path, monkeypatch):
@@ -359,21 +346,22 @@ def test_unrelated_conversation_growth_does_not_emit(tmp_path, monkeypatch):
         ns["sync_codex_conversations"](conn, rebuild=True)
     finally:
         conn.close()
-    srv = _wire_handler(ns)
+    srv = _wire_handler(ns, monkeypatch)
     try:
         port = srv.server_address[1]
         s = _open_sse(port, _events_path(key_a))
         try:
-            _read_event(s, marker="event: ready", deadline=8.0)
-            time.sleep(1.0)
+            # #630 S2: `ready` fires before resolve() and ingest(), so it does
+            # not mean a baseline exists. This frame does, which is why the
+            # one-second guess it replaces is gone.
+            read_event(s, marker="event: baselined")  # the server says the baseline exists
             with open(b, "a", encoding="utf-8") as fh:      # grow the UNRELATED file
                 fh.write(_APPEND_LINE)
-            assert _read_event(s, marker="event: tail", deadline=3.0,
-                               allow_timeout=True) is None   # no emit for A
+            read_no_event(s, marker="event: tail", window=3.0)   # no emit for A
         finally:
             s.close()
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ── child discovery end-to-end (directory frontier) ─────────────────────────
@@ -389,13 +377,13 @@ def test_codex_child_discovery_emits_tail(tmp_path, monkeypatch):
         port = srv.server_address[1]
         s = _open_sse(port, _events_path(parent_key))
         try:
-            _read_event(s, marker="event: ready", deadline=8.0)
-            time.sleep(0.6)
+            read_event(s, marker="event: ready")
+            read_event(s, marker="event: baselined")  # the server says the baseline exists
             # Drop the child rollout under the same sessions tree (a new file no
             # table yet knows) — the frontier must find + ingest + widen + emit.
             child = provider_root / "sessions" / "2026" / "07" / "15" / "child.jsonl"
             shutil.copyfile(CORPUS / "nested-child.jsonl", child)
-            frame = _read_event(s, marker="event: tail", deadline=12.0)
+            frame = read_event(s, marker="event: tail")
             assert frame.startswith("event: tail")
         finally:
             s.close()
@@ -408,7 +396,7 @@ def test_codex_child_discovery_emits_tail(tmp_path, monkeypatch):
         assert str(provider_root / "sessions" / "2026" / "07" / "15" /
                    "child.jsonl") in paths
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 # ── dispatch-level preflight unit (all three statuses, no server) ────────────
@@ -417,7 +405,7 @@ def test_codex_child_discovery_emits_tail(tmp_path, monkeypatch):
 def test_neutral_events_preflight_statuses(tmp_path, monkeypatch):
     ns = load_script()
     srv, _root, _rollout, key = _boot_codex(ns, tmp_path, monkeypatch)
-    srv.shutdown()
+    stop(srv, srv._test_thread)
     conn = ns["open_conversations_db"]()
     try:
         ok = disp.neutral_events_preflight(conn, key)

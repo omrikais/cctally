@@ -15,6 +15,7 @@ import urllib.request
 import pytest
 
 from conftest import load_script, redirect_paths
+from tests._support_http import start, stop
 
 
 def _start_dashboard_server(ns, tmp_path, monkeypatch):
@@ -35,9 +36,7 @@ def _start_dashboard_server(ns, tmp_path, monkeypatch):
     HandlerCls.display_tz_pref_override = None
 
     srv = socketserver.TCPServer(("127.0.0.1", 0), HandlerCls)
-    srv.daemon_threads = True
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    srv._test_thread = start(srv)
     return srv
 
 
@@ -48,7 +47,7 @@ def dashboard_server(tmp_path, monkeypatch):
     try:
         yield "127.0.0.1", srv.server_address[1]
     finally:
-        srv.shutdown()
+        stop(srv, srv._test_thread)
 
 
 def test_favicon_ico_served(dashboard_server):

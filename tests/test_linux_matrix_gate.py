@@ -1,5 +1,6 @@
 """Release-blocking local Linux multi-interpreter gate (#595)."""
 from __future__ import annotations
+import types
 
 import datetime
 import importlib.machinery
@@ -855,9 +856,12 @@ def test_each_lane_is_released_before_the_next_one_starts(monkeypatch, tmp_path)
     gate = _load_gate()
     started: list[str] = []
     observed: list[int] = []
-    monkeypatch.setattr(
-        gate.subprocess, "Popen", _fake_popen_factory(gate, started, observed, {})
-    )
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_subprocess = types.SimpleNamespace(**vars(gate.subprocess))
+    _iso_subprocess.Popen = _fake_popen_factory(gate, started, observed, {})
+    monkeypatch.setattr(gate, "subprocess", _iso_subprocess)
 
     exits = gate._run_lanes(
         "docker",
@@ -883,11 +887,12 @@ def test_one_failing_lane_does_not_prevent_the_others_completing(
     gate = _load_gate()
     started: list[str] = []
     observed: list[int] = []
-    monkeypatch.setattr(
-        gate.subprocess,
-        "Popen",
-        _fake_popen_factory(gate, started, observed, {"3.11": 1}),
-    )
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_subprocess = types.SimpleNamespace(**vars(gate.subprocess))
+    _iso_subprocess.Popen = _fake_popen_factory(gate, started, observed, {"3.11": 1})
+    monkeypatch.setattr(gate, "subprocess", _iso_subprocess)
 
     exits = gate._run_lanes(
         "docker",
@@ -1127,9 +1132,12 @@ def test_lane_output_reaches_stdout_while_the_lane_runs(monkeypatch, tmp_path, c
     gate = _load_gate()
     started: list[str] = []
     observed: list[int] = []
-    monkeypatch.setattr(
-        gate.subprocess, "Popen", _fake_popen_factory(gate, started, observed, {})
-    )
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_subprocess = types.SimpleNamespace(**vars(gate.subprocess))
+    _iso_subprocess.Popen = _fake_popen_factory(gate, started, observed, {})
+    monkeypatch.setattr(gate, "subprocess", _iso_subprocess)
 
     gate._run_lanes(
         "docker",
@@ -1467,7 +1475,12 @@ def test_an_interrupted_lane_is_reaped_rather_than_left_running(monkeypatch, tmp
     outside acceptance mode, a container nothing else removes."""
     gate = _load_gate()
     process = _RaisingLaneProcess([b"partial output\n"], SystemExit(143))
-    monkeypatch.setattr(gate.subprocess, "Popen", lambda command, **kwargs: process)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_subprocess = types.SimpleNamespace(**vars(gate.subprocess))
+    _iso_subprocess.Popen = lambda command, **kwargs: process
+    monkeypatch.setattr(gate, "subprocess", _iso_subprocess)
 
     with pytest.raises(SystemExit):
         gate._run_lanes(
@@ -1505,7 +1518,12 @@ def test_lane_output_is_forwarded_as_bytes(monkeypatch, tmp_path, capsysbinary):
         def poll(self):
             return self.returncode
 
-    monkeypatch.setattr(gate.subprocess, "Popen", lambda command, **kwargs: _Lane())
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_subprocess = types.SimpleNamespace(**vars(gate.subprocess))
+    _iso_subprocess.Popen = lambda command, **kwargs: _Lane()
+    monkeypatch.setattr(gate, "subprocess", _iso_subprocess)
 
     gate._run_lanes(
         "docker",

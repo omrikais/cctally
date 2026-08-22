@@ -30,6 +30,8 @@ export const HELP_ROWS: ReadonlyArray<{ keys: string[]; desc: string }> = [
   { keys: ['a'], desc: 'cycle account (multi-account sources)' },
   { keys: ['s'], desc: 'open Settings' },
   { keys: ['d'], desc: 'open Doctor' },
+  // #620 S2 — the on-demand diagnosis of the current window.
+  { keys: ['e'], desc: 'explain where this window’s cost went' },
   { keys: ['S'], desc: 'share the focused panel (focus a panel first)' },
   { keys: ['B'], desc: 'open the report composer' },
   { keys: ['f'], desc: 'filter Sessions' },

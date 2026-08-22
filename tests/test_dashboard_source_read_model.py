@@ -8,6 +8,7 @@ import sqlite3
 import shutil
 import sys
 from collections.abc import Mapping
+import types
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -2008,14 +2009,29 @@ def test_codex_nonconversation_panels_never_open_conversation_store(
     conversation_path = ns["_cctally_core"].CONVERSATIONS_DB_PATH
     for suffix in ("", "-wal", "-shm"):
         pathlib.Path(str(conversation_path) + suffix).unlink(missing_ok=True)
-    real_connect = sqlite3.connect
+    store = sys.modules["_cctally_store"]
+    real_connect = store.sqlite3.connect
+
+    reached: list[str] = []
 
     def guarded_connect(database, *args, **kwargs):
+        reached.append(str(database))
         if "conversations.db" in str(database):
             raise AssertionError("non-conversation source model opened transcript store")
         return real_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(sqlite3, "connect", guarded_connect)
+    # #630 S2: rebind the module name on the IMPORTING module. Every
+    # store open — cache, conversations and stats alike — connects
+    # through `_cctally_store`, so a rebind there is the whole
+    # chokepoint, and `sqlite3.connect` itself is never mutated, so no
+    # unrelated caller of the stdlib module sees this at all. The residual
+    # is stated rather than implied: `_cctally_store.sqlite3` is shared by
+    # every thread in this worker, so a concurrent STORE open inside the
+    # window still reaches this trap. Narrower than patching
+    # `sqlite3.connect`, not closure.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(store.sqlite3))
+    _iso_sqlite3.connect = guarded_connect
+    monkeypatch.setattr(store, "sqlite3", _iso_sqlite3)
     try:
         _install_active_native_cycle(
             monkeypatch,
@@ -2040,6 +2056,18 @@ def test_codex_nonconversation_panels_never_open_conversation_store(
     finally:
         cache.close()
         stats.close()
+    # A positive control, because `reached` cannot supply one here.
+    # `build_codex_source_state` reads the connections it was handed and opens
+    # no store of its own, so `reached` stays empty on the healthy path and
+    # cannot tell an armed trap from a rebind that reaches nothing. Driving the
+    # production opener this test forbids proves the trap is installed where
+    # that opener resolves `sqlite3`, which is what makes the assertions above
+    # non-vacuous. It runs last because it leaves the trap tripped.
+    with pytest.raises(AssertionError, match="opened transcript store"):
+        ns["open_conversations_db"]()
+    assert reached, (
+        "the guarded connect never fired even for the control open; the "
+        "rebind missed the opener")
 
 
 def _insert_incomplete_accounting_row(

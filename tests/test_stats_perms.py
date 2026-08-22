@@ -19,6 +19,7 @@ Modelled on `tests/test_conversation_perms.py`, driven through `load_script()`
 + `redirect_paths()` so the kernel's path constants point at a temp data dir.
 """
 from __future__ import annotations
+import types
 
 import os
 import pathlib
@@ -218,7 +219,12 @@ def test_the_replacement_fallback_hardens_under_umask_022(ns, monkeypatch):
             os.chmod(db, 0o644)
         return result
 
-    monkeypatch.setattr(os, "replace", sampling_replace)
+    # #630 S2: rebind the module name on the IMPORTING module, never on
+    # the shared stdlib object that every other importer and every
+    # concurrent thread resolves through.
+    _iso_os = types.SimpleNamespace(**vars(jr.os))
+    _iso_os.replace = sampling_replace
+    monkeypatch.setattr(jr, "os", _iso_os)
     result = jr.rebuild_stats_index(
         context=jr.RebuildContext(trigger="db-rebuild")
     )
@@ -293,7 +299,12 @@ def test_no_chmod_happens_when_the_mode_is_already_correct(ns, monkeypatch):
         calls.append((str(path), mode))
         return real_chmod(path, mode, *args, **kwargs)
 
-    monkeypatch.setattr(os, "chmod", counting)
+    # #630 S2: rebind the module name on the IMPORTING module, never on
+    # the shared stdlib object that every other importer and every
+    # concurrent thread resolves through.
+    _iso_os = types.SimpleNamespace(**vars(sys.modules["_cctally_store"].os))
+    _iso_os.chmod = counting
+    monkeypatch.setattr(sys.modules["_cctally_store"], "os", _iso_os)
     store._harden_stats_family(core.DB_PATH)
     assert calls == [], f"the steady state chmod'd: {calls}"
 
@@ -309,7 +320,12 @@ def test_a_chmod_failure_degrades_rather_than_raising(ns, monkeypatch):
     def boom(*args, **kwargs):
         raise OSError("nope")
 
-    monkeypatch.setattr(os, "chmod", boom)
+    # #630 S2: rebind the module name on the IMPORTING module, never on
+    # the shared stdlib object that every other importer and every
+    # concurrent thread resolves through.
+    _iso_os = types.SimpleNamespace(**vars(sys.modules["_cctally_store"].os))
+    _iso_os.chmod = boom
+    monkeypatch.setattr(sys.modules["_cctally_store"], "os", _iso_os)
     store._harden_stats_family(core.DB_PATH)  # must not raise
 
 
@@ -322,11 +338,13 @@ def test_the_helper_never_unlinks_or_renames(ns, monkeypatch):
     os.chmod(core.DB_PATH, 0o644)
 
     forbidden = []
+    # #630 S2: rebind the module name on the IMPORTING module, never on the
+    # shared stdlib object. `store` is the module whose `os` reference the
+    # helper under test resolves.
+    _iso_os = types.SimpleNamespace(**vars(sys.modules["_cctally_store"].os))
     for name in ("unlink", "remove", "rename", "replace", "rmdir"):
-        monkeypatch.setattr(
-            os, name,
-            lambda *a, _n=name, **k: forbidden.append(_n),
-        )
+        setattr(_iso_os, name, lambda *a, _n=name, **k: forbidden.append(_n))
+    monkeypatch.setattr(sys.modules["_cctally_store"], "os", _iso_os)
     store._harden_stats_family(core.DB_PATH)
     assert forbidden == []
     assert _mode(core.DB_PATH) == 0o600
@@ -522,5 +540,10 @@ def test_a_log_dir_chmod_failure_is_swallowed(ns, monkeypatch):
     def boom(*args, **kwargs):
         raise OSError("nope")
 
-    monkeypatch.setattr(os, "chmod", boom)
+    # #630 S2: rebind the module name on the IMPORTING module, never on
+    # the shared stdlib object that every other importer and every
+    # concurrent thread resolves through.
+    _iso_os = types.SimpleNamespace(**vars(sys.modules["_cctally_store"].os))
+    _iso_os.chmod = boom
+    monkeypatch.setattr(sys.modules["_cctally_store"], "os", _iso_os)
     core.ensure_dirs()  # must not raise

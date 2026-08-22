@@ -72,7 +72,7 @@ ASSEMBLY_TURN_LADDER = [250, 500, 1000, 2000, 4000, 8000]   # full evidence run
 ASSEMBLY_TURN_LADDER_SMALL = [10, 40]                        # fast self-test
 
 # Bump when _emit_corpus changes what it writes for a given params dict.
-GENERATOR_VERSION = 6
+GENERATOR_VERSION = 7
 
 SCALES = {
     # The cheap end of the >=10x pair (#583 S1, spec §7.1). `tiny` and `small`
@@ -159,6 +159,7 @@ def emit_session_jsonl(
     n_turns,
     base_minute,
     git_branch,
+    is_sidechain=False,
 ) -> None:
     """Write one session's JSONL rows: paired user + assistant turns in the
     minimal real shape ``_lib_conversation.parse_message_row`` +
@@ -180,6 +181,7 @@ def emit_session_jsonl(
             "cwd": cwd,
             "gitBranch": git_branch,
             "message": {"role": "user", "content": _seeded_text(seed_rng, "prompt")},
+            **({"isSidechain": True} if is_sidechain else {}),
         })
         a_uuid = f"{session_id}-a{t}"
         rows.append({
@@ -203,6 +205,7 @@ def emit_session_jsonl(
                     "cache_creation_input_tokens": seed_rng.randint(0, 3000),
                 },
             },
+            **({"isSidechain": True} if is_sidechain else {}),
         })
         prev_uuid = a_uuid
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -267,6 +270,7 @@ def _emit_corpus(projects_dir: pathlib.Path, params: dict, rng: random.Random) -
             n_turns=n,
             base_minute=i * 100,
             git_branch=f"branch-{i % 4}",
+            is_sidechain=(i % 10 == 1),
         )
 
 
@@ -468,8 +472,14 @@ def expected_counts(params: dict) -> dict:
         "sessions": len(turn_counts),
         "entries": sum(turn_counts),
         "messages": 2 * sum(turn_counts),
+        "claude_sidechain_messages": 2 * sum(
+            turns for index, turns in enumerate(turn_counts)
+            if index % 10 == 1),
         "codex_entries": len(plan) * events,
         "codex_files": len(plan),
+        # session_meta + turn_context + one real prompt + token_count events.
+        "codex_conversation_events": len(plan) * (events + 3),
+        "codex_conversation_messages": len(plan),
         "quota_windows": 2 * sum(item.quota_events for item in plan),
     }
 
@@ -611,7 +621,13 @@ def _emit_codex_session(
             "thread_source": "user",
         }},
         {"timestamp": _iso(base_minute + 1), "type": "turn_context",
-         "payload": {"model": model}},
+         "payload": {"model": model,
+                     "model_context_window": 400_000,
+                     "turn_id": f"turn-{session_index}"}},
+        {"timestamp": _iso(base_minute + 2), "type": "response_item",
+         "payload": {"type": "message", "role": "user", "phase": "input",
+                     "content": [{"type": "input_text",
+                                  "text": _seeded_text(rng, "codex-prompt")}]}},
     ]
     cumulative = 0
     for k in range(events):
@@ -671,7 +687,7 @@ def _emit_codex_session(
                 },
             }
         rows.append({
-            "timestamp": _iso(base_minute + 2 + k),
+            "timestamp": _iso(base_minute + 3 + k),
             "type": "event_msg",
             "payload": {"type": "token_count", "info": info},
         })
@@ -1056,6 +1072,8 @@ def _build_fixture(*, scale: str, seed: int, root,
             conn = cctally.open_conversations_db()
             try:
                 cctally.sync_claude_conversations(conn)
+                if codex_roots:
+                    cctally.sync_codex_conversations(conn)
             finally:
                 conn.close()
             marker.write_text(json.dumps(want, sort_keys=True))
@@ -1132,8 +1150,14 @@ def dataset_counts(conn: sqlite3.Connection) -> dict:
         "sessions": n("SELECT COUNT(*) FROM conversation_sessions"),
         "entries": n("SELECT COUNT(*) FROM cache_db.session_entries"),
         "messages": n("SELECT COUNT(*) FROM conversation_messages"),
+        "claude_sidechain_messages": n(
+            "SELECT COUNT(*) FROM conversation_messages WHERE is_sidechain=1"),
         "codex_entries": n("SELECT COUNT(*) FROM cache_db.codex_session_entries"),
         "codex_files": n("SELECT COUNT(*) FROM cache_db.codex_session_files"),
+        "codex_conversation_events": n(
+            "SELECT COUNT(*) FROM codex_conversation_events"),
+        "codex_conversation_messages": n(
+            "SELECT COUNT(*) FROM codex_conversation_messages"),
         "quota_windows": n("SELECT COUNT(*) FROM cache_db.quota_window_snapshots"),
     }
 

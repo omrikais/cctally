@@ -16,6 +16,7 @@ All path constants are pinned under the per-test tmp APP_DIR so nothing
 touches the developer's real prod data dir.
 """
 import argparse
+import types
 import datetime as dt
 import json
 import os
@@ -523,7 +524,12 @@ def test_reset_zero_keeps_armed_consensus_until_the_next_revalidated_tick(
         app, session_id="zero", seven_pct=0, seven_resets_epoch=now + 3 * 86400,
     )
     clock = {"value": now}
-    monkeypatch.setattr(app._cctally_statusline.time, "time", lambda: clock["value"])
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_time = types.SimpleNamespace(**vars(app._cctally_statusline.time))
+    _iso_time.time = lambda: clock["value"]
+    monkeypatch.setattr(app._cctally_statusline, "time", _iso_time)
 
     app._statusline_persist(parsed, sync_for_test=True)  # settle baseline
     clock["value"] += 1
@@ -901,6 +907,7 @@ def test_concurrent_renders_yield_at_most_one_snapshot(tmp_path):
                 pass
             retry.wait(timeout=30)
 
+        # timing-budget: one attempt's stability window, and this loop RETRIES four times, so raising it multiplies the failing path past the pytest cap
         deadline = time.monotonic() + 8.0
         last = _count_snapshots(db_path)
         stable = 0

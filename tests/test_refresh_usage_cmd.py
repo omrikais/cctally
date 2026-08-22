@@ -1,5 +1,6 @@
 """Unit tests for cmd_refresh_usage orchestration + exit-code mapping."""
 import argparse
+import sys
 import contextlib
 import json as _json
 import pathlib
@@ -297,7 +298,18 @@ def test_cmd_refresh_usage_passes_user_agent_through(ns, monkeypatch, capsys):
     def fake_urlopen(req, timeout):
         captured["headers"] = dict(req.header_items())
         return FakeResponse()
-    monkeypatch.setattr(ns["urllib"].request, "urlopen", fake_urlopen)
+    # #630 S2: `ns["urllib"] is urllib`, so patching
+    # `ns["urllib"].request.urlopen` rebound stdlib urlopen for the
+    # whole process. Replace the namespace ENTRY with a local copy
+    # whose `request` is itself a local copy.
+    _iso_request = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib.request))
+    _iso_request.urlopen = fake_urlopen
+    _iso_urllib = types.SimpleNamespace(
+        **vars(sys.modules["_cctally_refresh"].urllib))
+    _iso_urllib.request = _iso_request
+    monkeypatch.setattr(
+        sys.modules["_cctally_refresh"], "urllib", _iso_urllib)
     monkeypatch.setitem(ns, "_discover_cc_version", lambda: "2.1.116")
     monkeypatch.setitem(ns, "load_config", lambda: {})
     _stub_token(monkeypatch, ns)

@@ -19,6 +19,7 @@ therefore grabs the fresh sibling modules from ``sys.modules`` AFTER
 ``load_script()`` and monkeypatches those.
 """
 import sqlite3
+import types
 import sys
 from pathlib import Path
 
@@ -75,7 +76,12 @@ def test_raw_epoch_probe_reads_the_header_without_opening_sqlite(
     def forbidden_connect(*_args, **_kwargs):
         raise AssertionError("raw epoch probe opened SQLite")
 
-    monkeypatch.setattr(store.sqlite3, "connect", forbidden_connect)
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_sqlite3 = types.SimpleNamespace(**vars(store.sqlite3))
+    _iso_sqlite3.connect = forbidden_connect
+    monkeypatch.setattr(store, "sqlite3", _iso_sqlite3)
     assert store._raw_user_version(path) == 1009
 
 

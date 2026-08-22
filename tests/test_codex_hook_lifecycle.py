@@ -21,6 +21,8 @@ from _lib_codex_hooks import (
 )
 from _lib_source_identity import source_root_key
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
+
 
 def _hook_args(*, source: str = "codex") -> argparse.Namespace:
     return argparse.Namespace(
@@ -44,7 +46,7 @@ def _hold_ingest_lock(lock_path: str, ready, release) -> None:
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         ready.set()
-        release.wait(5.0)
+        release.wait(PRESENCE_BACKSTOP_SECONDS)
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
@@ -235,7 +237,7 @@ def test_codex_tick_retries_budget_after_quota_worker_holds_ingest_lock(
     )
     holder.start()
     try:
-        assert ready.wait(5.0), "quota-worker lock holder never became ready"
+        assert ready.wait(PRESENCE_BACKSTOP_SECONDS), "quota-worker lock holder never became ready"
         assert ns["cmd_hook_tick"](_hook_args()) == 0
         marker_dir = ns["APP_DIR"] / "codex-hook-tick"
         first_markers = tuple(marker_dir.glob("*.last-success"))
@@ -250,7 +252,8 @@ def test_codex_tick_retries_budget_after_quota_worker_holds_ingest_lock(
             conn.close()
     finally:
         release.set()
-        holder.join(10.0)
+        # timing-budget: the lock-holding child has exited now that `release` is set, so `exitcode` can be read
+        holder.join(timeout=PRESENCE_BACKSTOP_SECONDS)
         assert holder.exitcode == 0
 
     assert ns["cmd_hook_tick"](_hook_args()) == 0

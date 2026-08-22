@@ -14,10 +14,11 @@ import os
 import socket
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 import pytest
+
+from tests._support_http import start, stop
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "bin" / "build-readme-screenshots.sh"
@@ -85,11 +86,11 @@ def default_port_occupied():
             return
         pytest.skip(f"cannot establish a listener on {DEFAULT_PORT}: {exc}")
     with srv:
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        srv._test_thread = start(srv)
         try:
             yield
         finally:
-            srv.shutdown()
+            stop(srv, srv._test_thread)
 
 
 @contextlib.contextmanager
@@ -106,11 +107,11 @@ def holding():
     """
     srv = _QuietThreadingHTTPServer(("127.0.0.1", 0), _Ok200Handler)
     with srv:
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        srv._test_thread = start(srv)
         try:
             yield srv.server_address[1]
         finally:
-            srv.shutdown()
+            stop(srv, srv._test_thread)
 
 
 def _is_a_bind_collision(result, port: int) -> bool:

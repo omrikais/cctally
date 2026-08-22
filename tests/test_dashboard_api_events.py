@@ -11,14 +11,56 @@ blocking until the full request size is satisfied) until we have the
 first complete event frame (terminated by `\n\n`).
 """
 import datetime as dt
+import shutil
+import pathlib
 import http.client
 import json
+import sys
 import threading
 import time
 
 import pytest
 
 from conftest import load_script, redirect_paths
+
+from tests._support_http import (
+    PRESENCE_BACKSTOP_SECONDS,
+    serve_dashboard,
+    shorten_sse_keepalive,
+    stop,
+)
+
+
+def _silence_handler_errors(srv):
+    """#220: the /api/events SSE handler runs an infinite loop, and
+    teardown never joins the in-flight handler, so the abandoned daemon
+    thread can raise a non-disconnect exception after the test returns.
+    The stdlib default `handle_error` would dump that traceback to
+    sys.stderr, contaminating a later test's capsys window under serial
+    pytest."""
+    srv.handle_error = lambda request, client_address: None
+
+
+@pytest.fixture(autouse=True)
+def _short_sse_keepalive(monkeypatch):
+    """Shorten the keep-alive period for every server this file boots.
+
+    The patch has to land AFTER `load_script()`, which drops and re-imports
+    every `_cctally_*` sibling, so a fixture body cannot apply it directly: the
+    module it patched would be replaced moments later. Wrapping this module's
+    own `load_script` name is the seam that runs at the right moment, and it is
+    the same importer-local rebind the contamination repairs use. Two tests set
+    0.2 explicitly because they assert on the keep-alive itself; their own
+    `monkeypatch.setattr` runs after this one and wins.
+    """
+    real_load_script = load_script
+
+    def loading(*args, **kwargs):
+        ns = real_load_script(*args, **kwargs)
+        shorten_sse_keepalive(ns, monkeypatch)
+        return ns
+
+    monkeypatch.setattr(sys.modules[__name__], "load_script", loading)
 
 
 @pytest.fixture(autouse=True)
@@ -45,16 +87,8 @@ def test_events_headers_and_first_frame():
     ns["DashboardHTTPHandler"].hub = hub
     ns["DashboardHTTPHandler"].snapshot_ref = ref
 
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    # #220: the /api/events SSE handler runs an infinite loop; teardown only
-    # `srv.shutdown()`s (never joins the in-flight handler), so the abandoned
-    # daemon thread can raise a non-disconnect exception after the test returns.
-    # The stdlib default `handle_error` would dump that traceback to sys.stderr,
-    # contaminating a later test's capsys window under serial pytest. Silence it.
-    srv.handle_error = lambda request, client_address: None
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = serve_dashboard(ns, configure=_silence_handler_errors)
+    live = []
 
     try:
         # Publish one snapshot BEFORE the client connects so the seeded-
@@ -62,9 +96,10 @@ def test_events_headers_and_first_frame():
         # keep-alive.
         hub.publish(snap)
 
-        c = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/api/events")
         r = c.getresponse()
+        live.extend((c, r))
         assert r.status == 200
         assert r.getheader("Content-Type").startswith("text/event-stream")
         assert r.getheader("Cache-Control") == "no-cache"
@@ -75,7 +110,7 @@ def test_events_headers_and_first_frame():
         # after the first frame the socket idles until the next publish
         # or 15s keep-alive.
         buf = b""
-        deadline = time.monotonic() + 2.0
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
         while b"\n\n" not in buf and time.monotonic() < deadline:
             try:
                 chunk = r.fp.read1(4096)
@@ -92,8 +127,9 @@ def test_events_headers_and_first_frame():
         payload = json.loads(data_line[len("data: "):])
         assert "header" in payload
     finally:
-        srv.shutdown()
-        t.join(timeout=2)
+        # The SSE handler sits in an unbounded loop that no server-side call
+        # interrupts, so the client socket is what ends it.
+        stop(srv, t, connections=live)
 
 
 def test_passive_sse_reflects_statusline_reducer_without_oauth(
@@ -148,7 +184,7 @@ def test_passive_sse_reflects_statusline_reducer_without_oauth(
             abort_phase = True
             phase.notify_all()
         for worker in workers:
-            worker.join(timeout=1)
+            worker.join(timeout=PRESENCE_BACKSTOP_SECONDS)
     assert workers_stopped, "statusline workers did not reach the reducer phase"
 
     hub = ns["SSEHub"]()
@@ -168,16 +204,15 @@ def test_passive_sse_reflects_statusline_reducer_without_oauth(
     assert snap.current_week.used_pct == 24.0
     ns["DashboardHTTPHandler"].hub = hub
     ns["DashboardHTTPHandler"].snapshot_ref = ref
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    srv.handle_error = lambda request, client_address: None
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
+    srv, thread, port = serve_dashboard(ns, configure=_silence_handler_errors)
+    live = []
     try:
-        client = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=3)
+        client = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         client.request("GET", "/api/events")
         response = client.getresponse()
+        live.extend((client, response))
         buf = b""
-        deadline = time.monotonic() + 2.0
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
         while b"\n\n" not in buf and time.monotonic() < deadline:
             try:
                 chunk = response.fp.read1(4096)
@@ -193,8 +228,7 @@ def test_passive_sse_reflects_statusline_reducer_without_oauth(
         envelope = json.loads(data_line[len("data: "):])
         assert envelope["current_week"]["used_pct"] == 24.0
     finally:
-        srv.shutdown()
-        thread.join(timeout=2)
+        stop(srv, thread, connections=live)
 
 
 # --- U8-G5: SSEHub multi-subscriber + cleanup (#217 S1) ---------------------
@@ -302,14 +336,18 @@ def test_delivery_projects_once_per_variant_under_concurrent_access():
     out = []
 
     def run():
-        gate.wait(timeout=5)
+        gate.wait(timeout=PRESENCE_BACKSTOP_SECONDS)
         out.append(delivery.encoded(variant, project))
 
     threads = [threading.Thread(target=run) for _ in range(2)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=5)
+        # timing-budget: both `gate`-released workers have returned, so `calls` is complete
+        t.join(timeout=PRESENCE_BACKSTOP_SECONDS)
+    assert not any(t.is_alive() for t in threads), (
+        "a worker outlived the backstop, so `calls` below would be read while "
+        "it was still being written")
     assert calls == [variant], f"expected exactly one projection, got {calls}"
     assert out == [
         b'event: update\ndata: {"k":1}\n\n',
@@ -432,11 +470,34 @@ class _Marker:
         self.marker = marker
 
 
+def _without_keep_alives(text):
+    """Drop `:`-prefixed comment frames, keeping every event frame byte-exact.
+
+    Splitting and rejoining on the frame terminator preserves the bytes of an
+    event frame, which one caller compares against the server's cached frame
+    byte for byte, and preserves a trailing partial frame.
+    """
+    parts = text.split("\n\n")
+    kept = [part for part in parts[:-1] if not part.startswith(":")]
+    return "".join(part + "\n\n" for part in kept) + parts[-1]
+
+
 def _read_one_frame(response, deadline_s=3.0):
-    """Read from an open SSE response until one complete frame arrives."""
+    """Read from an open SSE response until one complete EVENT frame arrives.
+
+    Keep-alive comment frames are removed rather than returned. Every caller
+    asserts on an `event:` line, and #630 S2 shortens the keep-alive period so
+    an abandoned handler notices its closed client inside `stop()`'s backstop,
+    which turns an interleaved comment frame from a theoretical possibility
+    into a real one. What is returned is otherwise unchanged — the whole
+    buffered text, not one frame — because one caller counts the frames in it.
+    """
     buf = b""
     deadline = time.monotonic() + deadline_s
-    while b"\n\n" not in buf and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        text = _without_keep_alives(buf.decode("utf-8", errors="replace"))
+        if "\n\n" in text:
+            return text
         try:
             chunk = response.fp.read1(4096)
         except TimeoutError:
@@ -444,7 +505,7 @@ def _read_one_frame(response, deadline_s=3.0):
         if not chunk:
             break
         buf += chunk
-    return buf.decode("utf-8", errors="replace")
+    return _without_keep_alives(buf.decode("utf-8", errors="replace"))
 
 
 def test_lagging_client_renders_only_the_newest_delivery():
@@ -459,7 +520,7 @@ def test_lagging_client_renders_only_the_newest_delivery():
     q = hub.subscribe()          # `_last` is None here, so no seed frame
     for i in range(4):
         hub.publish(_Marker(i))
-    first = q.get(timeout=1)
+    first = q.get(timeout=PRESENCE_BACKSTOP_SECONDS)
     assert first.snapshot.marker == 0, "precondition: the backlog starts stale"
     newest = ns["_drain_to_newest"](q, first)
     assert newest.snapshot.marker == 3
@@ -473,7 +534,7 @@ def test_drain_to_newest_returns_the_only_item_when_nothing_is_queued():
     hub = ns["SSEHub"]()
     q = hub.subscribe()
     hub.publish(_Marker("only"))
-    first = q.get(timeout=1)
+    first = q.get(timeout=PRESENCE_BACKSTOP_SECONDS)
     assert ns["_drain_to_newest"](q, first) is first
 
 
@@ -503,16 +564,12 @@ def test_one_projection_per_variant_per_tick_with_two_clients(monkeypatch):
     ref = ns["_SnapshotRef"](snap)
     ns["DashboardHTTPHandler"].hub = hub
     ns["DashboardHTTPHandler"].snapshot_ref = ref
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    srv.handle_error = lambda request, client_address: None
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = serve_dashboard(ns, configure=_silence_handler_errors)
     conns = []
     try:
         hub.publish(snap)
         for _ in range(2):
-            c = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
             c.request("GET", "/api/events")
             r = c.getresponse()
             assert r.status == 200
@@ -528,13 +585,7 @@ def test_one_projection_per_variant_per_tick_with_two_clients(monkeypatch):
         assert len(calls) == 1, (
             f"one published tick must project once, not {len(calls)} times")
     finally:
-        for c, _ in conns:
-            try:
-                c.close()
-            except Exception:
-                pass
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t, connections=[part for pair in conns for part in pair])
 
 
 def test_shareable_delivery_caches_complete_frame_bytes_for_two_clients():
@@ -550,12 +601,7 @@ def test_shareable_delivery_caches_complete_frame_bytes_for_two_clients():
     ref = ns["_SnapshotRef"](snap)
     ns["DashboardHTTPHandler"].hub = hub
     ns["DashboardHTTPHandler"].snapshot_ref = ref
-    srv = ns["ThreadingHTTPServer"](
-        ("127.0.0.1", 0), ns["DashboardHTTPHandler"]
-    )
-    srv.handle_error = lambda request, client_address: None
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
+    srv, thread, _port = serve_dashboard(ns, configure=_silence_handler_errors)
     clients = []
     try:
         # Consume each fresh per-connection seed first; the shared cache under
@@ -563,7 +609,7 @@ def test_shareable_delivery_caches_complete_frame_bytes_for_two_clients():
         hub.publish(snap)
         for _ in range(2):
             client = http.client.HTTPConnection(
-                "127.0.0.1", srv.server_address[1], timeout=3
+                "127.0.0.1", srv.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS
             )
             client.request("GET", "/api/events", headers={
                 "Accept-Encoding": "identity",
@@ -584,10 +630,7 @@ def test_shareable_delivery_caches_complete_frame_bytes_for_two_clients():
         assert cached[0].endswith(b"\n\n")
         assert received == [cached[0], cached[0]]
     finally:
-        for client, _ in clients:
-            client.close()
-        srv.shutdown()
-        thread.join(timeout=2)
+        stop(srv, thread, connections=[part for pair in clients for part in pair])
 
 
 def test_a_snapshot_without_precompute_is_never_shared(monkeypatch):
@@ -613,16 +656,12 @@ def test_a_snapshot_without_precompute_is_never_shared(monkeypatch):
     ref = ns["_SnapshotRef"](snap)
     ns["DashboardHTTPHandler"].hub = hub
     ns["DashboardHTTPHandler"].snapshot_ref = ref
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    srv.handle_error = lambda request, client_address: None
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = serve_dashboard(ns, configure=_silence_handler_errors)
     conns = []
     try:
         hub.publish(snap)
         for _ in range(2):
-            c = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
             c.request("GET", "/api/events")
             r = c.getresponse()
             conns.append((c, r))
@@ -634,13 +673,7 @@ def test_a_snapshot_without_precompute_is_never_shared(monkeypatch):
         assert len(calls) == 2, (
             f"an unshareable snapshot must project per client, not {len(calls)}")
     finally:
-        for c, _ in conns:
-            try:
-                c.close()
-            except Exception:
-                pass
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t, connections=[part for pair in conns for part in pair])
 
 
 def test_the_sse_loop_drains_its_queue_to_the_newest_delivery(monkeypatch):
@@ -667,14 +700,11 @@ def test_the_sse_loop_drains_its_queue_to_the_newest_delivery(monkeypatch):
     ref = ns["_SnapshotRef"](snap)
     ns["DashboardHTTPHandler"].hub = hub
     ns["DashboardHTTPHandler"].snapshot_ref = ref
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    srv.handle_error = lambda request, client_address: None
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    port = srv.server_address[1]
+    srv, t, port = serve_dashboard(ns, configure=_silence_handler_errors)
+    c = r = None
     try:
         hub.publish(snap)
-        c = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
         c.request("GET", "/api/events")
         r = c.getresponse()
         assert "event: update" in _read_one_frame(r)
@@ -690,12 +720,10 @@ def test_the_sse_loop_drains_its_queue_to_the_newest_delivery(monkeypatch):
         assert len(calls) == 1, (
             f"a four-deep backlog must project once, not {len(calls)} times")
     finally:
-        try:
-            c.close()
-        except Exception:
-            pass
-        srv.shutdown()
-        t.join(timeout=2)
+        # `c` and `r` are bound inside the `try`, so a connection or
+        # `getresponse()` failure would otherwise raise UnboundLocalError
+        # here and chain over the real error.
+        stop(srv, t, connections=[x for x in (c, r) if x is not None])
 
 
 # --- #583 S3 §6: gzip on the SSE stream -------------------------------------
@@ -705,10 +733,7 @@ def _serve(ns, hub, snap):
     """Boot a dashboard HTTP server wired to `hub`, returning (srv, thread)."""
     ns["DashboardHTTPHandler"].hub = hub
     ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](snap)
-    srv = ns["ThreadingHTTPServer"](("127.0.0.1", 0), ns["DashboardHTTPHandler"])
-    srv.handle_error = lambda request, client_address: None
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    srv, t, _port = serve_dashboard(ns, configure=_silence_handler_errors)
     return srv, t
 
 
@@ -719,7 +744,7 @@ def _connect(port, *, accept_encoding):
     told not to, so the identity case has to be requested deliberately rather
     than by omission.
     """
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     c.putrequest("GET", "/api/events", skip_accept_encoding=True)
     c.putheader("Host", f"127.0.0.1:{port}")
     if accept_encoding is not None:
@@ -775,6 +800,7 @@ def test_sse_stream_is_gzip_when_negotiated_and_decodes_incrementally(monkeypatc
     snap = _shareable_snapshot(ns)
     srv, t = _serve(ns, hub, snap)
     port = srv.server_address[1]
+    c = r = None
     try:
         hub.publish(snap)
         c, r = _connect(port, accept_encoding="gzip")
@@ -800,12 +826,10 @@ def test_sse_stream_is_gzip_when_negotiated_and_decodes_incrementally(monkeypatc
         assert text.count("event: update") >= 2, text[:400]
         assert ": keep-alive" in text, text[:400]
     finally:
-        try:
-            c.close()
-        except Exception:
-            pass
-        srv.shutdown()
-        t.join(timeout=2)
+        # `c` and `r` are bound inside the `try`, so a connection or
+        # `getresponse()` failure would otherwise raise UnboundLocalError
+        # here and chain over the real error.
+        stop(srv, t, connections=[x for x in (c, r) if x is not None])
 
 
 def test_keep_alive_goes_through_the_compressor(monkeypatch):
@@ -823,6 +847,7 @@ def test_keep_alive_goes_through_the_compressor(monkeypatch):
     snap = _shareable_snapshot(ns)
     srv, t = _serve(ns, hub, snap)
     port = srv.server_address[1]
+    c = r = None
     try:
         hub.publish(snap)
         c, r = _connect(port, accept_encoding="gzip")
@@ -844,12 +869,10 @@ def test_keep_alive_goes_through_the_compressor(monkeypatch):
         second = text.index("event: update", first + 1)
         assert first < ka < second, text[:400]
     finally:
-        try:
-            c.close()
-        except Exception:
-            pass
-        srv.shutdown()
-        t.join(timeout=2)
+        # `c` and `r` are bound inside the `try`, so a connection or
+        # `getresponse()` failure would otherwise raise UnboundLocalError
+        # here and chain over the real error.
+        stop(srv, t, connections=[x for x in (c, r) if x is not None])
 
 
 def test_sse_falls_back_to_identity_without_negotiation():
@@ -858,18 +881,33 @@ def test_sse_falls_back_to_identity_without_negotiation():
     snap = _shareable_snapshot(ns)
     srv, t = _serve(ns, hub, snap)
     port = srv.server_address[1]
+    closing = []
     try:
         hub.publish(snap)
         for header in (None, "identity", "gzip;q=0"):
             c, r = _connect(port, accept_encoding=header)
+            # Registered BEFORE the assertions below. Registering afterwards
+            # left a failing iteration's connection unregistered, so stop()
+            # reported a surviving handler thread on top of the real failure.
+            closing.extend((c, r))
             assert r.getheader("Content-Encoding") is None, header
             assert r.getheader("Vary") == "Accept-Encoding", header
-            raw = _read_bytes(r, lambda b: b"\n\n" in b, deadline_s=2.0)
+            raw = _read_bytes(r, lambda b: b"\n\n" in b, deadline_s=PRESENCE_BACKSTOP_SECONDS)
             assert "event: update" in raw.decode("utf-8"), header
+            # Close each connection as the loop advances rather than holding
+            # all three to the `finally`. Closing the client socket does not
+            # end the handler by itself: it is blocked in
+            # `q.get(timeout=_SSE_KEEPALIVE_SECONDS)` and learns its peer has
+            # gone only when a keep-alive write fails — and the FIRST write
+            # after a peer close still succeeds, so it exits about two
+            # keep-alive periods later. Releasing each one here starts that
+            # clock while the next iteration runs, instead of leaving three
+            # handlers for stop()'s reap to wait out together.
+            r.close()
             c.close()
+            closing.clear()
     finally:
-        srv.shutdown()
-        t.join(timeout=2)
+        stop(srv, t, connections=closing)
 
 
 def test_first_frame_is_flushed_not_buffered():
@@ -882,21 +920,20 @@ def test_first_frame_is_flushed_not_buffered():
     snap = _shareable_snapshot(ns)
     srv, t = _serve(ns, hub, snap)
     port = srv.server_address[1]
+    c = r = None
     try:
         hub.publish(snap)
         c, r = _connect(port, accept_encoding="gzip")
-        raw = _read_bytes(r, lambda b: b, deadline_s=2.0)
+        raw = _read_bytes(r, lambda b: b, deadline_s=PRESENCE_BACKSTOP_SECONDS)
         assert raw, "nothing was written — the compressor buffered the frame"
         text = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw)
         assert text.endswith(b"\n\n"), text[-40:]
         assert b"event: update" in text
     finally:
-        try:
-            c.close()
-        except Exception:
-            pass
-        srv.shutdown()
-        t.join(timeout=2)
+        # `c` and `r` are bound inside the `try`, so a connection or
+        # `getresponse()` failure would otherwise raise UnboundLocalError
+        # here and chain over the real error.
+        stop(srv, t, connections=[x for x in (c, r) if x is not None])
 
 
 # --- #583 S3 §9: the wire-byte gate over the pinned bench corpus -------------
@@ -941,7 +978,29 @@ def _corpus_envelope(data_dir, bbf):
         ), encode_bytes
 
 
-def test_compressed_update_is_at_most_a_quarter_of_the_legacy_frame(small_corpus):
+def _private_corpus(data_dir, tmp_path):
+    """Copy every corpus axis so this test owns cache.db and its flock.
+
+    #630 S2: the session-scoped corpus is built once per run and read by every
+    other consumer, so a test that syncs into it hands the next test a
+    different corpus than the one it was promised. Copied in the shape
+    `tests/test_tick_stats_integration.py` established at 7706a7038: SQLite
+    readers can create and remove the WAL sidecars between copytree's directory
+    scan and its copy2 call, and the built corpus is checkpointed, so those
+    sidecars are neither fixture inputs nor safe copy candidates.
+    """
+    source_root = pathlib.Path(data_dir).parent
+    private_root = tmp_path / "corpus"
+    shutil.copytree(
+        source_root, private_root,
+        ignore=shutil.ignore_patterns("*.db-shm", "*.db-wal"),
+    )
+    return private_root / pathlib.Path(data_dir).name
+
+
+def test_compressed_update_is_at_most_a_quarter_of_the_legacy_frame(
+    small_corpus, tmp_path,
+):
     """#583 S3 §9 acceptance 5. Bytes, not time, and a same-process ratio.
 
     The legacy comparison frame is this very envelope with the physical
@@ -953,7 +1012,10 @@ def test_compressed_update_is_at_most_a_quarter_of_the_legacy_frame(small_corpus
     import copy
     import zlib
     bbf = _load_build_bench()
-    env, encode_bytes = _corpus_envelope(small_corpus, bbf)
+    # #630 S2: `_corpus_envelope` builds with `skip_sync=False`, so it runs a
+    # real ingest over whatever data dir it is given.
+    env, encode_bytes = _corpus_envelope(
+        _private_corpus(small_corpus, tmp_path), bbf)
 
     sources = env["sources"]
     assert sources["all"]["data"]["providers"] == {"claude": None, "codex": None}

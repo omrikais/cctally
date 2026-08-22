@@ -21,6 +21,7 @@ import sqlite3
 import pytest
 
 from conftest import load_script, redirect_paths
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 UTC = dt.timezone.utc
 
@@ -524,7 +525,7 @@ def test_the_apply_lock_owner_releases_the_cache_flocks_only(env):
     import _cctally_core as core
     import _cctally_rederive as rederive
 
-    with rederive.codex_attribution_apply_locks(timeout=5.0) as owner:
+    with rederive.codex_attribution_apply_locks(timeout=PRESENCE_BACKSTOP_SECONDS) as owner:
         assert _busy(core.CACHE_LOCK_PATH)
         assert _busy(core.CACHE_LOCK_CODEX_PATH)
         assert _busy(core.JOURNAL_INGEST_LOCK_PATH)
@@ -547,7 +548,7 @@ def test_releasing_the_cache_flocks_twice_is_a_no_op(env):
     import _cctally_core as core
     import _cctally_rederive as rederive
 
-    with rederive.codex_attribution_apply_locks(timeout=5.0) as owner:
+    with rederive.codex_attribution_apply_locks(timeout=PRESENCE_BACKSTOP_SECONDS) as owner:
         owner.release_cache_flocks()
         owner.release_cache_flocks()
         assert _busy(core.JOURNAL_INGEST_LOCK_PATH)
@@ -560,7 +561,7 @@ def test_the_ordinary_ingest_cannot_run_under_the_apply_lock_set(env):
     ns, _quota, _cache_mod, jr, _jl = env
     import _cctally_rederive as rederive
 
-    with rederive.codex_attribution_apply_locks(timeout=5.0) as owner:
+    with rederive.codex_attribution_apply_locks(timeout=PRESENCE_BACKSTOP_SECONDS) as owner:
         owner.release_cache_flocks()
         result = jr.run_stats_ingest(mode="opportunistic", timeout_s=0.2)
     assert result.ran is False
@@ -579,10 +580,10 @@ def test_the_lock_accepting_ingest_runs_under_the_apply_lock_set(env):
     )
     jr.append_record(op)
 
-    with rederive.codex_attribution_apply_locks(timeout=5.0) as owner:
+    with rederive.codex_attribution_apply_locks(timeout=PRESENCE_BACKSTOP_SECONDS) as owner:
         owner.release_cache_flocks()
         result = jr.run_stats_ingest(
-            mode="authoritative", timeout_s=5.0, locks_held=True)
+            mode="authoritative", timeout_s=PRESENCE_BACKSTOP_SECONDS, locks_held=True)
     assert result.ran is True
     assert result.consumed >= 1
     # The cycle's own cache leg materialized the op, which is what makes the
@@ -615,15 +616,15 @@ def test_the_lock_accepting_ingest_refuses_while_the_cache_flocks_are_held(env):
         canonical_resets_at_utc=_z(RESET),
     ))
 
-    with rederive.codex_attribution_apply_locks(timeout=5.0) as owner:
+    with rederive.codex_attribution_apply_locks(timeout=PRESENCE_BACKSTOP_SECONDS) as owner:
         with pytest.raises(ValueError, match="cache writer flocks"):
             jr.run_stats_ingest(
-                mode="authoritative", timeout_s=5.0, locks_held=True)
+                mode="authoritative", timeout_s=PRESENCE_BACKSTOP_SECONDS, locks_held=True)
         owner.release_cache_flocks()
         # Released, the same call runs — which is what makes the refusal about
         # the flocks rather than about the flag.
         assert jr.run_stats_ingest(
-            mode="authoritative", timeout_s=5.0, locks_held=True).ran is True
+            mode="authoritative", timeout_s=PRESENCE_BACKSTOP_SECONDS, locks_held=True).ran is True
 
 
 def test_locks_held_declines_automatic_correction_recovery(env, monkeypatch):

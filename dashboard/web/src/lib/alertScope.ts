@@ -378,7 +378,8 @@ export type AlertTargetModal =
   | 'forecast'
   | 'projects'
   | 'block'
-  | 'monthly';
+  | 'monthly'
+  | 'explain';
 
 export interface AlertTarget {
   source: SourceName;
@@ -387,12 +388,48 @@ export interface AlertTarget {
   projectKey?: string;
   /** What the affordance says it opens. */
   label: string;
+  // ── #620 S2 ──────────────────────────────────────────────────────────────
+  // The scope the diagnosis needs to re-measure THIS alert's window, and the
+  // instant D3 requires the surface to state beside the measurement. Every
+  // target carries all four, filled from the derived scope in one place
+  // (`withAlertContext`) rather than at each construction site, so a future
+  // axis handler cannot ship a target that silently carries none of them.
+  //
+  // They are `null` rather than absent when unknown: a legal null needs no
+  // compatibility code on either side, where an absent key needs it on both.
+  accountKey: string | null;
+  windowStartAt: string | null;
+  windowEndAt: string | null;
+  /** `alerted_at` — when the warning fired, which is NOT when the diagnosis
+   *  that follows it measures. The surface states both. */
+  alertFiredAt: string | null;
 }
+
+/** An `AlertTarget` before the scope-derived fields are attached. */
+type AlertTargetCore = Omit<
+  AlertTarget,
+  'accountKey' | 'windowStartAt' | 'windowEndAt' | 'alertFiredAt'
+>;
 
 export interface AlertNavigation {
   available: boolean;
   withheldReason: string | null;
   target: AlertTarget | null;
+  /** #620 S2 — where the DIAGNOSIS of this alert's own window leads.
+   *
+   * Non-null exactly when the primary target could not be resolved AND the
+   * alert nonetheless fixes a window. That is the case the S1 comment above
+   * names as S2's work: the existing modals cannot render an arbitrary
+   * historical window, so S1 could only say why. `GET /api/diagnosis` takes
+   * explicit half-open bounds, so the window itself is now addressable, and
+   * following it re-measures exactly the window the warning fired against.
+   *
+   * Additive rather than a replacement. The withheld sentence stays and stays
+   * true — the week, the block or the period genuinely is not opened here —
+   * and the diagnosis is offered beside it. Null when the primary target IS
+   * available, because the reader already has a route, and null when no window
+   * was derived at all, which the diagnosis cannot measure either. */
+  explainTarget: AlertTarget | null;
 }
 
 export const CLOSED_WINDOW_REASON =
@@ -420,12 +457,54 @@ export const LIVE_WEEK_MISMATCH_REASON =
   'The live week on this dashboard is not the week this alert describes, so it '
   + 'is not opened here.';
 
+export const NO_PROJECT_IDENTITY_REASON =
+  'This alert retains no project identity, so its project cannot be opened.';
+
+/** What the #620 S2 secondary affordance says it opens. */
+export const EXPLAIN_WINDOW_LABEL = 'Explain this window';
+
 function navWithheld(reason: string): AlertNavigation {
-  return { available: false, withheldReason: reason, target: null };
+  return {
+    available: false, withheldReason: reason, target: null, explainTarget: null,
+  };
 }
 
-function navTo(target: AlertTarget): AlertNavigation {
-  return { available: true, withheldReason: null, target };
+function navTo(target: AlertTargetCore): AlertNavigation {
+  return {
+    available: true,
+    withheldReason: null,
+    explainTarget: null,
+    // Placeholders, replaced by `withAlertContext` on the way out. Written as
+    // nulls rather than omitted so the object is a complete `AlertTarget` at
+    // every point, and a handler that somehow escaped the wrapper would ship a
+    // stated absence rather than an undefined field.
+    target: {
+      ...target,
+      accountKey: null,
+      windowStartAt: null,
+      windowEndAt: null,
+      alertFiredAt: null,
+    },
+  };
+}
+
+/** The diagnosis target for one alert's window, or null when it has none. */
+function explainTargetFor(
+  scope: AlertScope,
+  provider: SourceName,
+): AlertTarget | null {
+  if (!scope.available || scope.windowStartMs == null || scope.windowEndMs == null) {
+    return null;
+  }
+  return {
+    source: provider,
+    modal: 'explain',
+    label: EXPLAIN_WINDOW_LABEL,
+    accountKey: null,
+    windowStartAt: null,
+    windowEndAt: null,
+    alertFiredAt: null,
+  };
 }
 
 /** Half-open equality against the dashboard's live subscription week.
@@ -482,7 +561,8 @@ function budgetTarget(
   // `calendar-week` has no matching surface: the Claude weekly view is keyed by
   // subscription week and the Codex weekly view by quota cycle, so neither is
   // the civil week this budget measures. Offering one would state a window the
-  // surface does not show.
+  // surface does not show. The diagnosis is offered beside this sentence
+  // instead (#620 S2), because it is keyed by nothing but its bounds.
   return navWithheld(NO_CALENDAR_WEEK_SURFACE_REASON);
 }
 
@@ -498,6 +578,66 @@ export function alertNavigation(
   now: Date,
 ): AlertNavigation {
   const scope = deriveScope(entry);
+  return withAlertContext(_targetFor(entry, env, now, scope), entry, scope);
+}
+
+/** Attach the scope-derived fields every target carries (#620 S2).
+ *
+ * One chokepoint rather than five construction sites. A per-site copy is the
+ * recurring failure here: the modal cannot state D3's two instants unless
+ * `alertFiredAt` reaches it, and an entry point that forgot to pass it looks
+ * identical to one where the alert genuinely recorded none. */
+function withAlertContext(
+  nav: AlertNavigation,
+  entry: AlertEntry,
+  scope: AlertScope,
+): AlertNavigation {
+  const fill = (target: AlertTarget | null): AlertTarget | null => (
+    target == null ? null : {
+      ...target,
+      // The vendor-wide sentinel is NOT an account key. It means the row is
+      // stamped across every account, and the diagnosis says that with an
+      // absent account selector, which is its own "all accounts" scope.
+      // Passing `*` through would send the route a ref no registry resolves.
+      accountKey: scope.accountKey === VENDOR_WIDE_KEY ? null : scope.accountKey,
+      windowStartAt: msToIso(scope.windowStartMs),
+      windowEndAt: msToIso(scope.windowEndMs),
+      alertFiredAt: firedAtOf(entry),
+    }
+  );
+  return {
+    ...nav,
+    target: fill(nav.target),
+    // The diagnosis is offered only where the primary target could not be
+    // resolved: where it could, the reader already has a route, and a second
+    // button on every alert row would be clutter rather than an answer.
+    explainTarget: nav.available
+      ? null
+      : fill(explainTargetFor(scope, explainProvider(entry, scope))),
+  };
+}
+
+function msToIso(ms: number | null): string | null {
+  return ms == null ? null : new Date(ms).toISOString();
+}
+
+/** The firing instant, or null when the row carries none.
+ *
+ * `BudgetExplain` and the forecast's cap affordance synthesize an entry with an
+ * empty `alerted_at`, because neither is a real alert row — nothing fired. An
+ * empty string is not an instant, so it is reported as the absence it is rather
+ * than rendered as a blank time. */
+function firedAtOf(entry: AlertEntry): string | null {
+  const raw = entry.alerted_at;
+  return typeof raw === 'string' && raw.trim() !== '' ? raw : null;
+}
+
+function _targetFor(
+  entry: AlertEntry,
+  env: Envelope | null,
+  now: Date,
+  scope: AlertScope,
+): AlertNavigation {
   if (!scope.available) {
     return navWithheld(scope.withheldReason ?? CLOSED_WINDOW_REASON);
   }
@@ -547,9 +687,7 @@ export function alertNavigation(
   }
   const projectKey = entry.context.project_key;
   if (typeof projectKey !== 'string' || projectKey.trim() === '') {
-    return navWithheld(
-      'This alert retains no project identity, so its project cannot be opened.',
-    );
+    return navWithheld(NO_PROJECT_IDENTITY_REASON);
   }
   return navTo({
     source: 'claude',
@@ -557,6 +695,12 @@ export function alertNavigation(
     projectKey,
     label: 'Open this project',
   });
+}
+
+/** Which provider the diagnosis of this alert's window belongs to. */
+function explainProvider(entry: AlertEntry, scope: AlertScope): SourceName {
+  if (entry.axis === 'codex_budget') return 'codex';
+  return scope.provider ?? 'claude';
 }
 
 /** The selection a target needs the board to be on before its modal opens.

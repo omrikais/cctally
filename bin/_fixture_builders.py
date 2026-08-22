@@ -39,6 +39,12 @@ from typing import Optional
 # doesn't matter; only stability does.
 FIXED_LAST_INGESTED_AT = "2026-04-15T15:00:00Z"
 
+# The origin category production writes when a `session_meta` carries no
+# explicit `thread_source`, per `_lib_jsonl._CODEX_DEFAULT_THREAD_SOURCE`.
+# Restated rather than imported: a fixture builder that imported the reader's
+# constants would agree with the reader by construction.
+CODEX_DEFAULT_THREAD_SOURCE = "user"
+
 
 def fixture_timestamp_utc(value: str | dt.datetime) -> str:
     """Return the UTC offset form stored by production cache ingestion.
@@ -684,6 +690,71 @@ def create_cache_db(path: Path) -> None:
         stamp_all_cache_migrations_applied(conn)
 
 
+def create_conversations_db(path: Path) -> None:
+    """Create (overwriting any existing file) a conversations.db with the full
+    current transcript schema, by delegating to the SINGLE schema source
+    ``_cctally_db._apply_conversations_schema``.
+
+    Same contract as ``create_cache_db``: the shared helper is the only place
+    the schema is written, so a table added there lands in every fixture
+    automatically. The migration-framework tables are stamped at the current
+    conversations-registry head, so a fixture opened by a real command cannot
+    replay a data migration over its seeded rows.
+
+    The ``_cctally_db`` import is FUNCTION-LEVEL, mirroring the two builders
+    above: it keeps this module import-time stdlib-pure with no import cycle.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()
+    register_fixture_db(path)
+    from _cctally_db import (  # noqa: E402,PLC0415 (intentional lazy)
+        _CONVERSATIONS_MIGRATIONS,
+        _apply_conversations_schema,
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        _apply_conversations_schema(conn)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name           TEXT PRIMARY KEY,
+                applied_at_utc TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS schema_migrations_skipped (
+                name           TEXT PRIMARY KEY,
+                skipped_at_utc TEXT NOT NULL,
+                reason         TEXT
+            );
+        """)
+        names = [migration.name for migration in _CONVERSATIONS_MIGRATIONS]
+        conn.executemany(
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) "
+            "VALUES (?, ?)",
+            [(name, _STATS_MIGRATION_STAMP_AT) for name in names],
+        )
+        conn.execute(f"PRAGMA user_version = {len(names)}")
+
+
+def _self_test_create_conversations_db() -> None:
+    """The transcript tables exist and the accounting families do not."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "conversations.db"
+        create_conversations_db(db)
+        with sqlite3.connect(db) as conn:
+            names = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")
+            }
+    assert "conversation_messages" in names, sorted(names)
+    assert "codex_conversation_messages" in names, sorted(names)
+    assert "codex_conversation_events" in names, sorted(names)
+    # Transcripts-only: the accounting families are dropped from this store.
+    assert "session_entries" not in names, sorted(names)
+    assert "codex_conversation_threads" not in names, sorted(names)
+    print("OK: create_conversations_db")
+
+
 def _self_test_stamp_all_stats_migrations_applied() -> None:
     """Verify the shared stamp helper marks every registered stats migration
     applied and advances user_version to len(registry) (cctally-dev#94)."""
@@ -1062,10 +1133,11 @@ def seed_codex_conversation_thread(
     native_thread_id: str,
     source_path: str,
     cwd: Optional[str],
-    root_thread_id: Optional[str] = None,
+    root_thread_id: str = CODEX_DEFAULT_THREAD_SOURCE,
     parent_thread_id: Optional[str] = None,
     git_json: Optional[str] = None,
     source_kind: Optional[str] = "user",
+    context_window: Optional[int] = None,
     first_seen_utc: str = FIXED_LAST_INGESTED_AT,
     last_seen_utc: str = FIXED_LAST_INGESTED_AT,
 ) -> None:
@@ -1074,16 +1146,26 @@ def seed_codex_conversation_thread(
     This is the row the qualified Codex accounting reader joins to resolve
     a project from `cwd`. Without it every entry counts as a
     missing-thread-join row and the dashboard degrades to the unqualified
-    accounting fallback instead of publishing project labels."""
+    accounting fallback instead of publishing project labels.
+
+    ``root_thread_id`` is the thread-ORIGIN CATEGORY, not a thread identifier.
+    ``_lib_jsonl._inferred_codex_thread_source`` returns an explicit
+    ``thread_source`` verbatim and falls back to the literal ``user``, which
+    is what this default reproduces. It used to default to
+    ``native_thread_id``, and a thread id is neither of the two literals the
+    #620 S3 origin classifier recognises — so every fixture built through this
+    helper without the argument produced threads that classifier reads as
+    ambiguous."""
     conn.execute(
         """INSERT INTO codex_conversation_threads
            (conversation_key, source_root_key, native_thread_id,
             root_thread_id, parent_thread_id, source_path, cwd, git_json,
-            source_kind, first_seen_utc, last_seen_utc)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            source_kind, context_window, first_seen_utc, last_seen_utc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (conversation_key, source_root_key, native_thread_id,
-         root_thread_id or native_thread_id, parent_thread_id, source_path,
-         cwd, git_json, source_kind, first_seen_utc, last_seen_utc),
+         root_thread_id, parent_thread_id, source_path,
+         cwd, git_json, source_kind, context_window, first_seen_utc,
+         last_seen_utc),
     )
 
 
@@ -1694,6 +1776,7 @@ if __name__ == "__main__":
     _self_test_create_stats_db()
     _self_test_stamp_all_stats_migrations_applied()
     _self_test_create_cache_db()
+    _self_test_create_conversations_db()
     _self_test_claude_seeders()
     _self_test_weekly_usage_seeder()
     _self_test_weekly_cost_seeder()

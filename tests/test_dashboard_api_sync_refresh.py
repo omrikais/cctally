@@ -9,6 +9,8 @@ import _lib_snapshot_cache as _snapshot_cache
 
 from conftest import load_script, redirect_paths
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, serve_dashboard, stop
+
 
 def test_run_sync_now_locked_callable_when_lock_held(monkeypatch, tmp_path):
     """_run_sync_now_locked must be callable WITH the caller already holding sync_lock."""
@@ -66,13 +68,6 @@ import http.client
 import json
 
 
-def _serve(ns, host="127.0.0.1", port=0):
-    srv = ns["ThreadingHTTPServer"]((host, port), ns["DashboardHTTPHandler"])
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    return srv, t, srv.server_address[1]
-
-
 def _wire(ns, *, no_sync=False, refresh_result=None, sync_lock=None):
     ns["DashboardHTTPHandler"].hub = ns["SSEHub"]()
     ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](
@@ -96,7 +91,7 @@ def _wire(ns, *, no_sync=False, refresh_result=None, sync_lock=None):
 
 
 def _post_sync(port):
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     c.request("POST", "/api/sync", body="{}", headers={
         "Content-Type": "application/json",
         "Origin": f"http://127.0.0.1:{port}",
@@ -112,13 +107,13 @@ def test_post_sync_ok_returns_204(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     rebuild_calls = _wire(ns)
     monkeypatch.setenv("CCTALLY_TEST_REFRESH_RESULT", "ok")
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, _ = _post_sync(port)
         assert status == 204
         assert rebuild_calls["n"] == 1
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_post_sync_rate_limited_returns_200_with_warning(monkeypatch, tmp_path):
@@ -126,7 +121,7 @@ def test_post_sync_rate_limited_returns_200_with_warning(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     rebuild_calls = _wire(ns)
     monkeypatch.setenv("CCTALLY_TEST_REFRESH_RESULT", "rate_limited")
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, body = _post_sync(port)
         assert status == 200
@@ -136,7 +131,7 @@ def test_post_sync_rate_limited_returns_200_with_warning(monkeypatch, tmp_path):
         assert codes == ["rate_limited"]
         assert rebuild_calls["n"] == 1
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_post_sync_fetch_failed_returns_200_with_warning(monkeypatch, tmp_path):
@@ -144,7 +139,7 @@ def test_post_sync_fetch_failed_returns_200_with_warning(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     rebuild_calls = _wire(ns)
     monkeypatch.setenv("CCTALLY_TEST_REFRESH_RESULT", "fetch_failed")
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, body = _post_sync(port)
         assert status == 200
@@ -153,7 +148,7 @@ def test_post_sync_fetch_failed_returns_200_with_warning(monkeypatch, tmp_path):
         assert codes == ["fetch_failed"]
         assert rebuild_calls["n"] == 1
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_post_sync_parse_failed(monkeypatch, tmp_path):
@@ -161,14 +156,14 @@ def test_post_sync_parse_failed(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire(ns)
     monkeypatch.setenv("CCTALLY_TEST_REFRESH_RESULT", "parse_failed")
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, body = _post_sync(port)
         assert status == 200
         env = json.loads(body)
         assert [w["code"] for w in env["warnings"]] == ["parse_failed"]
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_post_sync_no_token(monkeypatch, tmp_path):
@@ -176,14 +171,14 @@ def test_post_sync_no_token(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire(ns)
     monkeypatch.setenv("CCTALLY_TEST_REFRESH_RESULT", "no_oauth_token")
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, body = _post_sync(port)
         assert status == 200
         env = json.loads(body)
         assert [w["code"] for w in env["warnings"]] == ["no_oauth_token"]
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_post_sync_record_failed(monkeypatch, tmp_path):
@@ -191,14 +186,14 @@ def test_post_sync_record_failed(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire(ns)
     monkeypatch.setenv("CCTALLY_TEST_REFRESH_RESULT", "record_failed")
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, body = _post_sync(port)
         assert status == 200
         env = json.loads(body)
         assert [w["code"] for w in env["warnings"]] == ["record_failed"]
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_post_sync_no_sync_manual_refresh_reports_refresh_skipped(
@@ -217,7 +212,7 @@ def test_post_sync_no_sync_manual_refresh_reports_refresh_skipped(
         invoked["n"] += 1
         return ns["_RefreshUsageResult"](status="ok")
     monkeypatch.setitem(ns, "_refresh_usage_inproc", _spy)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, body = _post_sync(port)
         assert status == 200
@@ -225,7 +220,7 @@ def test_post_sync_no_sync_manual_refresh_reports_refresh_skipped(
         assert invoked["n"] == 0  # refresh skipped
         assert rebuild_calls["n"] == 1  # snapshot rebuild still happens
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_post_sync_free_lock_still_runs_synchronously(monkeypatch, tmp_path):
@@ -240,7 +235,7 @@ def test_post_sync_free_lock_still_runs_synchronously(monkeypatch, tmp_path):
     sync_lock = threading.Lock()
     rebuild_calls = _wire(ns, sync_lock=sync_lock)
     monkeypatch.setenv("CCTALLY_TEST_REFRESH_RESULT", "ok")
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, _ = _post_sync(port)
         assert status == 204
@@ -249,7 +244,7 @@ def test_post_sync_free_lock_still_runs_synchronously(monkeypatch, tmp_path):
         assert sync_lock.acquire(blocking=False) is True
         sync_lock.release()
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_post_sync_202_when_lock_held(monkeypatch, tmp_path):
@@ -259,7 +254,7 @@ def test_post_sync_202_when_lock_held(monkeypatch, tmp_path):
     sync_lock = threading.Lock()
     _wire(ns, sync_lock=sync_lock)
     monkeypatch.setenv("CCTALLY_TEST_REFRESH_RESULT", "ok")
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         sync_lock.acquire()          # hold it for the whole request
         try:
@@ -267,7 +262,7 @@ def test_post_sync_202_when_lock_held(monkeypatch, tmp_path):
         finally:
             sync_lock.release()
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
     assert status == 202
     env = json.loads(body)
     assert env["status"] == "queued"
@@ -285,7 +280,7 @@ def test_post_sync_202_does_not_refresh_or_rebuild_inline(monkeypatch, tmp_path)
         invoked["n"] += 1
         return ns["_RefreshUsageResult"](status="ok")
     monkeypatch.setitem(ns, "_refresh_usage_inproc", _spy)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         sync_lock.acquire()
         try:
@@ -293,7 +288,7 @@ def test_post_sync_202_does_not_refresh_or_rebuild_inline(monkeypatch, tmp_path)
         finally:
             sync_lock.release()
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
     assert status == 202
     assert invoked["n"] == 0
     assert rebuild_calls["n"] == 0
@@ -307,7 +302,7 @@ def test_post_sync_queued_request_records_the_refresh_intent(
     sync_lock = threading.Lock()
     _wire(ns, sync_lock=sync_lock)
     ref = ns["DashboardHTTPHandler"].snapshot_ref
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         sync_lock.acquire()
         try:
@@ -316,7 +311,7 @@ def test_post_sync_queued_request_records_the_refresh_intent(
         finally:
             sync_lock.release()
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
     assert ref.activity()["requested_id"] == 2
     batch_id, refresh = ref.capture_batch()
     assert batch_id == 2
@@ -328,7 +323,7 @@ def test_post_sync_never_returns_503(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     sync_lock = threading.Lock()
     _wire(ns, sync_lock=sync_lock)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         sync_lock.acquire()
         try:
@@ -336,7 +331,7 @@ def test_post_sync_never_returns_503(monkeypatch, tmp_path):
         finally:
             sync_lock.release()
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
     assert status != 503
 
 
@@ -351,11 +346,11 @@ def test_machine_nudge_queues_even_when_the_lock_is_free(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     rebuild_calls = _wire(ns)          # lock free for the whole request
     ref = ns["DashboardHTTPHandler"].snapshot_ref
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, body = _post_sync_path(port, "/api/sync?refresh=0&queue=1")
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
     assert status == 202
     assert json.loads(body)["status"] == "queued"
     assert rebuild_calls["n"] == 0
@@ -371,11 +366,11 @@ def test_no_sync_refuses_a_machine_nudge_without_queueing(monkeypatch, tmp_path)
     rebuild_calls = _wire(ns, no_sync=True)
     ref = ns["DashboardHTTPHandler"].snapshot_ref
     before = ref.activity()["requested_id"]
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, _ = _post_sync_path(port, "/api/sync?refresh=0&queue=1")
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
     assert status == 204
     assert ref.activity()["requested_id"] == before   # the freeze holds
     assert rebuild_calls["n"] == 0
@@ -402,7 +397,7 @@ def test_a_contended_manual_click_under_no_sync_waits_instead_of_queueing(
     sync_lock = threading.Lock()
     rebuild_calls = _wire(ns, no_sync=True, sync_lock=sync_lock)
     ref = ns["DashboardHTTPHandler"].snapshot_ref
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     releaser = None
     try:
         # Stand in for the /api/settings broadcast: the lock is genuinely held
@@ -413,8 +408,9 @@ def test_a_contended_manual_click_under_no_sync_waits_instead_of_queueing(
         status, body = _post_sync_path(port, "/api/sync?refresh=1")
     finally:
         if releaser is not None:
-            releaser.join(timeout=5)
-        srv.shutdown(); t.join(timeout=2)
+            # timing-budget: the releaser thread that unblocks the in-flight sync has returned
+            releaser.join(timeout=PRESENCE_BACKSTOP_SECONDS)
+        stop(srv, t)
 
     assert status == 200, body
     assert {"code": "refresh_skipped_no_sync"} in json.loads(body)["warnings"]
@@ -445,7 +441,7 @@ def test_a_wedged_rebuild_under_no_sync_answers_sync_busy(monkeypatch, tmp_path)
     sync_lock = threading.Lock()
     rebuild_calls = _wire(ns, no_sync=True, sync_lock=sync_lock)
     ref = ns["DashboardHTTPHandler"].snapshot_ref
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         sync_lock.acquire()          # a wedged rebuild: never released
         try:
@@ -458,7 +454,7 @@ def test_a_wedged_rebuild_under_no_sync_answers_sync_busy(monkeypatch, tmp_path)
         finally:
             sync_lock.release()
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
     assert status == 200, body
     env = json.loads(body)
@@ -483,7 +479,7 @@ def test_post_sync_immediate_during_long_automatic_cooldown(monkeypatch, tmp_pat
     monkeypatch.setenv("CCTALLY_TEST_REFRESH_RESULT", "ok")
 
     first_iteration_done = threading.Event()
-    stop = threading.Event()
+    stop_loop = threading.Event()
 
     def run_iteration():
         # Mirror the real automatic tick: hold the shared sync_lock only for the
@@ -494,24 +490,25 @@ def test_post_sync_immediate_during_long_automatic_cooldown(monkeypatch, tmp_pat
 
     loop_thread = threading.Thread(
         target=lambda: dash._dashboard_sync_loop(
-            stop=stop, interval=100.0, run_iteration=run_iteration,
+            stop=stop_loop, interval=100.0, run_iteration=run_iteration,
             take_sync_request=lambda: False,
         ),
         daemon=True,
     )
     loop_thread.start()
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         # The automatic thread has finished one iteration and is now parked in
         # its 100s cooldown, holding no lock.
-        assert first_iteration_done.wait(timeout=2)
+        assert first_iteration_done.wait(timeout=PRESENCE_BACKSTOP_SECONDS)
         status, _ = _post_sync(port)
         assert status == 204
         assert rebuild_calls["n"] == 1  # ran immediately — not gated by the cooldown
     finally:
-        stop.set()
-        loop_thread.join(timeout=2)
-        srv.shutdown(); t.join(timeout=2)
+        stop_loop.set()
+        # timing-budget: the periodic rebuild loop has exited now that `stop_loop` is set
+        loop_thread.join(timeout=PRESENCE_BACKSTOP_SECONDS)
+        stop(srv, t)
 
 
 def test_post_sync_lock_released_between_calls(monkeypatch, tmp_path):
@@ -521,20 +518,20 @@ def test_post_sync_lock_released_between_calls(monkeypatch, tmp_path):
     sync_lock = threading.Lock()
     _wire(ns, sync_lock=sync_lock)
     monkeypatch.setenv("CCTALLY_TEST_REFRESH_RESULT", "ok")
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         s1, _ = _post_sync(port)
         s2, _ = _post_sync(port)
         assert s1 == 204 and s2 == 204
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
 
 # ----------------------------------------------------------------------
 # Task 1 (#180): ?refresh=0 rebuild-only mode on POST /api/sync.
 # ----------------------------------------------------------------------
 def _post_sync_path(port, path="/api/sync"):
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     c.request("POST", path, body="", headers={
         "Origin": f"http://127.0.0.1:{port}",
         "Host": f"127.0.0.1:{port}",
@@ -555,14 +552,14 @@ def test_post_sync_refresh_zero_skips_fetch_rebuild_only(monkeypatch, tmp_path):
         invoked["n"] += 1
         return ns["_RefreshUsageResult"](status="ok")
     monkeypatch.setitem(ns, "_refresh_usage_inproc", _spy)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, _ = _post_sync_path(port, "/api/sync?refresh=0")
         assert status == 204
         assert invoked["n"] == 0        # fetch skipped
         assert rebuild_calls["n"] == 1  # rebuild still ran
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_post_sync_paramless_still_fetches(monkeypatch, tmp_path):
@@ -576,14 +573,14 @@ def test_post_sync_paramless_still_fetches(monkeypatch, tmp_path):
         invoked["n"] += 1
         return ns["_RefreshUsageResult"](status="ok")
     monkeypatch.setitem(ns, "_refresh_usage_inproc", _spy)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, _ = _post_sync_path(port, "/api/sync")
         assert status == 204
         assert invoked["n"] == 1        # fetch ran (default refresh=1)
         assert rebuild_calls["n"] == 1
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_nudge_helper_enqueues_against_a_real_server(monkeypatch, tmp_path):
@@ -606,7 +603,7 @@ def test_nudge_helper_enqueues_against_a_real_server(monkeypatch, tmp_path):
         invoked["n"] += 1
         return ns["_RefreshUsageResult"](status="ok")
     monkeypatch.setitem(ns, "_refresh_usage_inproc", _spy)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         # Real helper, real ephemeral port. urlopen returns only after the
         # handler has sent the 202, so the queue state is already settled.
@@ -618,7 +615,7 @@ def test_nudge_helper_enqueues_against_a_real_server(monkeypatch, tmp_path):
         assert batch_id == 1
         assert refresh is False                      # refresh=0 was honoured
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
 
 # ----------------------------------------------------------------------
@@ -631,7 +628,7 @@ def _post_sync_with_token(port, path="/api/sync?refresh=0&queue=1", token=None):
     }
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     c.request("POST", path, body="", headers=headers)
     r = c.getresponse()
     body = r.read().decode()
@@ -687,7 +684,7 @@ def _drain_flags(q):
 
 
 def _post_settings(port, body):
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
     raw = json.dumps(body).encode()
     c.putrequest("POST", "/api/settings", skip_host=True,
                  skip_accept_encoding=True)
@@ -705,26 +702,36 @@ def test_a_synchronous_api_sync_rebuild_is_visible_to_a_second_observer(
         monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
-    _wire(ns)                       # lock free — the SYNCHRONOUS branch
+    _wire(ns, no_sync=True)         # lock free — the SYNCHRONOUS branch
     hub = ns["DashboardHTTPHandler"].hub
+    ref = ns["DashboardHTTPHandler"].snapshot_ref
     observer = hub.subscribe()      # a second tab, not the requesting client
     seen = {}
+    monkeypatch.setitem(ns, "_tui_build_snapshot",
+                        lambda **kw: ns["_empty_dashboard_snapshot"]())
+    real_locked = ns["_make_run_sync_now_locked"](
+        ref=ref, hub=hub, pinned_now=None, display_tz_pref_override=None,
+    )
 
     def _locked():
         seen["mid_rebuild"] = _drain_flags(observer)
+        real_locked(skip_sync=True)
 
     ns["DashboardHTTPHandler"].run_sync_now_locked = staticmethod(_locked)
-    monkeypatch.setenv("CCTALLY_TEST_REFRESH_RESULT", "ok")
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
-        status, _ = _post_sync(port)
+        status, _ = _post_sync_path(port, "/api/sync?refresh=0")
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
+        _snapshot_cache.reset_owner_thread()
 
     assert status == 204
     assert True in seen.get("mid_rebuild", []), (
         "a second tab must be able to see that this dashboard is rebuilding "
         "while the requesting client's rebuild is still running"
+    )
+    assert False in _drain_flags(observer), (
+        "the observer test must drive the real terminal publish, not only a stub"
     )
     act = ns["DashboardHTTPHandler"].snapshot_ref.activity()
     assert act["rebuilding"] is False
@@ -734,24 +741,37 @@ def test_a_settings_broadcast_rebuild_is_visible_to_a_second_observer(
         monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
-    _wire(ns)
+    sync_lock = threading.Lock()
+    _wire(ns, no_sync=True, sync_lock=sync_lock)
     hub = ns["DashboardHTTPHandler"].hub
+    ref = ns["DashboardHTTPHandler"].snapshot_ref
     observer = hub.subscribe()
     seen = {}
+    monkeypatch.setitem(ns, "_tui_build_snapshot",
+                        lambda **kw: ns["_empty_dashboard_snapshot"]())
+    real_public = ns["_make_run_sync_now"](
+        sync_lock=sync_lock, ref=ref, hub=hub, pinned_now=None,
+        display_tz_pref_override=None,
+    )
 
     def _run_sync_now():
         seen["mid_rebuild"] = _drain_flags(observer)
+        real_public(skip_sync=True)
 
     ns["DashboardHTTPHandler"].run_sync_now = staticmethod(_run_sync_now)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, body = _post_settings(port, {"cache_report": {}})
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
+        _snapshot_cache.reset_owner_thread()
 
     assert status == 200, body
     assert True in seen.get("mid_rebuild", []), (
         "POST /api/settings rebuilds under the same lock and must report it"
+    )
+    assert False in _drain_flags(observer), (
+        "the observer test must drive the real terminal publish, not only a stub"
     )
     act = ns["DashboardHTTPHandler"].snapshot_ref.activity()
     assert act["rebuilding"] is False
@@ -812,11 +832,11 @@ def test_a_synchronous_api_sync_rebuild_still_publishes_only_two_frames(
     )
     ns["DashboardHTTPHandler"].run_sync_now_locked = staticmethod(
         lambda: real_locked(skip_sync=no_sync))
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, _ = _post_sync_path(port, "/api/sync?refresh=0")
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
         # The real locked body arms the #279 S5 owner-thread tripwire, and it
         # armed it on a SERVER REQUEST thread that is now gone. That global
         # lives in `_lib_snapshot_cache`, which `load_script()` does not reset,
@@ -841,15 +861,44 @@ def test_a_raising_synchronous_rebuild_still_clears_rebuilding(
         raise RuntimeError("rebuild exploded")
 
     ns["DashboardHTTPHandler"].run_sync_now_locked = staticmethod(_boom)
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, _ = _post_sync_path(port, "/api/sync?refresh=0")
     finally:
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
     assert status == 500
     act = ns["DashboardHTTPHandler"].snapshot_ref.activity()
     assert act["rebuilding"] is False
+
+
+def test_sync_loop_clears_a_claim_when_batch_capture_raises_after_claiming():
+    """#605 item 1: claim cleanup is structural, not a four-comment promise."""
+    claimed = {"value": False}
+    marks = []
+
+    def capture_batch():
+        claimed["value"] = True
+        raise RuntimeError("future capture publication failed")
+
+    def mark(value):
+        marks.append(value)
+        claimed["value"] = value
+
+    dash = importlib.import_module("_cctally_dashboard")
+    with pytest.raises(RuntimeError, match="capture publication failed"):
+        dash._dashboard_sync_loop(
+            stop=threading.Event(),
+            interval=1.0,
+            run_iteration=lambda **_kw: None,
+            pending_request=lambda: True,
+            capture_batch=capture_batch,
+            settle=lambda *_a, **_kw: None,
+            mark_rebuilding=mark,
+        )
+
+    assert claimed["value"] is False
+    assert marks[-1:] == [False]
 
 
 def test_unauthenticated_api_sync_still_401s(monkeypatch, tmp_path):
@@ -859,13 +908,13 @@ def test_unauthenticated_api_sync_still_401s(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire(ns)
     ns["DashboardHTTPHandler"].cctally_api_token = "s3cret"
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, _ = _post_sync_with_token(port, token=None)
         assert status == 401
     finally:
         ns["DashboardHTTPHandler"].cctally_api_token = None
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
 
 
 def test_authenticated_machine_nudge_queues(monkeypatch, tmp_path):
@@ -876,12 +925,12 @@ def test_authenticated_machine_nudge_queues(monkeypatch, tmp_path):
     _wire(ns)
     ns["DashboardHTTPHandler"].cctally_api_token = "s3cret"
     ref = ns["DashboardHTTPHandler"].snapshot_ref
-    srv, t, port = _serve(ns)
+    srv, t, port = serve_dashboard(ns)
     try:
         status, body = _post_sync_with_token(port, token="s3cret")
     finally:
         ns["DashboardHTTPHandler"].cctally_api_token = None
-        srv.shutdown(); t.join(timeout=2)
+        stop(srv, t)
     assert status == 202
     assert json.loads(body)["status"] == "queued"
     assert ref.activity()["requested_id"] == 1

@@ -71,6 +71,9 @@ describe('#264 S4 (A2) — Blocks renders every row (no cap)', () => {
     const labels = Array.from(container.querySelectorAll('.blocks-row .label')).map((n) =>
       (n.textContent ?? '').trim(),
     );
-    expect(labels).toEqual(['B0', 'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7']);
+    expect(labels).toEqual([
+      'B0 [Etc/UTC]', 'B1 [Etc/UTC]', 'B2 [Etc/UTC]', 'B3 [Etc/UTC]',
+      'B4 [Etc/UTC]', 'B5 [Etc/UTC]', 'B6 [Etc/UTC]', 'B7 [Etc/UTC]',
+    ]);
   });
 });

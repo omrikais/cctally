@@ -21,6 +21,8 @@ from _lib_dashboard_sources import (
 )
 from conftest import load_script, redirect_paths
 
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
+
 
 UTC = dt.timezone.utc
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -73,9 +75,7 @@ def _boot(ns, tmp_path, monkeypatch):
     handler.cctally_host = "127.0.0.1"
     handler.cctally_expose_transcripts = False
     server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
-    server.daemon_threads = True
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    thread = start(server)
     return server, thread
 
 
@@ -89,9 +89,7 @@ def _boot_snapshot(ns, snap):
     handler.cctally_host = "127.0.0.1"
     handler.cctally_expose_transcripts = False
     server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
-    server.daemon_threads = True
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    thread = start(server)
     return server, thread
 
 
@@ -279,7 +277,7 @@ def _seed_retained_route_history(ns, *, now, block_key):
 def _get(server, path):
     import http.client
 
-    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=PRESENCE_BACKSTOP_SECONDS)
     try:
         conn.request("GET", path)
         response = conn.getresponse()
@@ -292,9 +290,7 @@ def _get(server, path):
 
 
 def _close(server, thread):
-    server.shutdown()
-    server.server_close()
-    thread.join(timeout=2)
+    stop(server, thread)
 
 
 def test_claude_project_source_route_threads_the_selected_window(monkeypatch, tmp_path):

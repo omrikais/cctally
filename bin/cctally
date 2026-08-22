@@ -93,8 +93,10 @@ def _load_sibling(name: str):
     `_lib_transcript_access.transcripts_allowed`), then self-heal once the body
     finished. `_SIBLING_LOCK` serializes the load so a concurrent caller blocks
     until the body completes; `_LOADED_SIBLINGS` gates a lock-free fast path for
-    already-loaded siblings. Fail-closed by construction — a race waits, it never
-    returns a partial module early.
+    already-loaded siblings and retains the completed object owned by this
+    cctally module generation. Fail-closed by construction — a race waits, it
+    never returns a partial module early or adopts one registered by a newer
+    test-loader generation.
 
     For `_cctally_*.py` siblings that back-reference `cctally`, the sibling
     module exposes a `_cctally()` accessor that reads `sys.modules['cctally']`
@@ -115,19 +117,23 @@ def _load_sibling(name: str):
     # _load_sibling closure — regardless of pytest re-imports.
     sys.modules["cctally"] = _THIS_MODULE
     # Fast path: a sibling whose body has FULLY executed is returned without
-    # contending on the load lock. `_LOADED_SIBLINGS` is only ever added to,
-    # after a successful exec_module (below), so its membership is a stable
-    # "complete" signal — keeping the hot path lock-free for the ~50 sequential
-    # sibling loads at CLI startup and every warm request-thread lazy-load.
-    if name in _LOADED_SIBLINGS:
-        return sys.modules[name]
+    # contending on the load lock. The mapping is populated only after a
+    # successful exec_module (below), so its value is both a stable "complete"
+    # signal and the exact module object this cctally generation completed.
+    # Tests deliberately replace sys.modules entries between load_script()
+    # generations while older request threads may still run; consulting the
+    # process-global entry here would let an old loader adopt a newer partial.
+    loaded = _LOADED_SIBLINGS.get(name)
+    if loaded is not None:
+        return loaded
     # Slow path — serialize the actual load (#306). Any concurrent caller blocks
     # here until the owning thread finishes exec_module and records the name
     # complete, so it can never observe the half-initialized module.
     with _SIBLING_LOCK:
         # Completed while we waited for the lock.
-        if name in _LOADED_SIBLINGS:
-            return sys.modules[name]
+        loaded = _LOADED_SIBLINGS.get(name)
+        if loaded is not None:
+            return loaded
         cached = sys.modules.get(name)
         if cached is not None:
             # Registered but not yet recorded complete. Under the lock this is
@@ -159,7 +165,7 @@ def _load_sibling(name: str):
             # broken module is never recorded complete (mirrors importlib).
             sys.modules.pop(name, None)
             raise
-        _LOADED_SIBLINGS.add(name)
+        _LOADED_SIBLINGS[name] = mod
         return mod
 
 
@@ -185,12 +191,12 @@ _THIS_MODULE = sys.modules.get(__name__) or sys.modules.get("cctally")
 # conversation-path siblings are lazy-loaded on those threads. `_SIBLING_LOCK`
 # serializes the actual load so a concurrent caller can never observe a module
 # that is registered in sys.modules but whose exec_module is still mid-body (the
-# pre-registration window below), and `_LOADED_SIBLINGS` records the names whose
-# bodies have fully executed, gating a lock-free fast path. RLock (not Lock) so a
-# circular import that re-enters _load_sibling on the SAME thread during
-# exec_module cannot self-deadlock.
+# pre-registration window below), and `_LOADED_SIBLINGS` records the completed
+# module objects, gating a lock-free and generation-local fast path. RLock (not
+# Lock) lets a circular import re-enter _load_sibling on the SAME thread during
+# exec_module without self-deadlocking.
 _SIBLING_LOCK = threading.RLock()
-_LOADED_SIBLINGS: set[str] = set()
+_LOADED_SIBLINGS: dict[str, object] = {}
 
 
 # Hook-tick non-path constants (Section 1 of onboarding spec).
@@ -204,6 +210,7 @@ SETUP_SYMLINK_NAMES = (
     "cctally-budget",
     "cctally-dashboard",
     "cctally-dollar-per-percent",
+    "cctally-explain",
     "cctally-five-hour-blocks",
     "cctally-five-hour-breakdown",
     "cctally-forecast",
@@ -403,6 +410,40 @@ budget_status_payload = _lib_budget.budget_status_payload
 project_linear = _lib_budget.project_linear
 calendar_month_window = _lib_budget.calendar_month_window
 calendar_week_window = _lib_budget.calendar_week_window
+
+# Diagnosis kernel (#620 S2): the pure classification layer behind
+# `cctally explain` and `GET /api/diagnosis`. Re-exported like the other
+# _lib_* kernels; the store adapter and the renderer are separate siblings.
+_lib_diagnosis = _load_sibling("_lib_diagnosis")
+DIAGNOSIS_CONTRACT_VERSION = _lib_diagnosis.DIAGNOSIS_CONTRACT_VERSION
+DIAGNOSIS_CONTRIBUTOR_SHARE_FLOOR = _lib_diagnosis.DIAGNOSIS_CONTRIBUTOR_SHARE_FLOOR
+DIAGNOSIS_SHARE_FLOOR_EPSILON = _lib_diagnosis.DIAGNOSIS_SHARE_FLOOR_EPSILON
+DIAGNOSIS_TIE_EPSILON_USD = _lib_diagnosis.DIAGNOSIS_TIE_EPSILON_USD
+CONTRIBUTOR_REGISTRY = _lib_diagnosis.CONTRIBUTOR_REGISTRY
+ContributorSpec = _lib_diagnosis.ContributorSpec
+ContributorRow = _lib_diagnosis.ContributorRow
+ClassResult = _lib_diagnosis.ClassResult
+DiagnosisReport = _lib_diagnosis.DiagnosisReport
+DiagnosisWindow = _lib_diagnosis.DiagnosisWindow
+Denominator = _lib_diagnosis.Denominator
+EvidenceField = _lib_diagnosis.EvidenceField
+PopulationCoverage = _lib_diagnosis.PopulationCoverage
+SubjectFacts = _lib_diagnosis.SubjectFacts
+ProviderResult = _lib_diagnosis.ProviderResult
+EstablishmentError = _lib_diagnosis.EstablishmentError
+EstablishmentFailure = _lib_diagnosis.EstablishmentFailure
+WithheldCause = _lib_diagnosis.WithheldCause
+BaselineOutcome = _lib_diagnosis.BaselineOutcome
+VerdictState = _lib_diagnosis.VerdictState
+OverallVerdict = _lib_diagnosis.OverallVerdict
+assess_confidence = _lib_diagnosis.assess_confidence
+support_shortfall = _lib_diagnosis.support_shortfall
+classify_class = _lib_diagnosis.classify_class
+rank_rows = _lib_diagnosis.rank_rows
+overall_verdict = _lib_diagnosis.overall_verdict
+build_provider_result = _lib_diagnosis.build_provider_result
+build_report = _lib_diagnosis.build_report
+unreadable_store_is_terminal = _lib_diagnosis.unreadable_store_is_terminal
 
 # CLAUDE_MODEL_CONTEXT_WINDOWS / …_DEFAULT_FAMILY moved to _cctally_statusline.py (re-exported below).
 
@@ -1119,6 +1160,12 @@ maybe_record_codex_budget_milestone = _cctally_record.maybe_record_codex_budget_
 maybe_record_projected_alert = _cctally_record.maybe_record_projected_alert
 _weekly_pct_week_avg_projection = _cctally_record._weekly_pct_week_avg_projection
 _compute_block_totals = _cctally_record._compute_block_totals
+# #620 S2 E2: the pure fold lifted out of _compute_block_totals, plus the
+# canonical priced record and bucket shapes it folds over.
+PricedEntry = _cctally_record.PricedEntry
+BlockBucket = _cctally_record.BlockBucket
+BlockTotals = _cctally_record.BlockTotals
+fold_block_totals = _cctally_record.fold_block_totals
 maybe_update_five_hour_block = _cctally_record.maybe_update_five_hour_block
 cmd_record_usage = _cctally_record.cmd_record_usage
 CreditPlan = _cctally_record.CreditPlan
@@ -2999,6 +3046,28 @@ cmd_diff                 = _cctally_diff.cmd_diff                  # parser: c.c
 _emit_diff_debug_samples = _cctally_diff._emit_diff_debug_samples  # test_debug_sample_emission mod._emit_diff_debug_samples
 
 
+# Eager re-export of bin/_cctally_diagnosis.py — the `explain` handler, the
+# ONE wire adapter both surfaces serialize through, and the canonical
+# projection their equivalence is defined over (#620 S2). MUST load after the
+# _lib_diff_kernel block above, because `explain` resolves its window through
+# the same `_parse_diff_window` grammar. The store adapter it calls stays
+# lazily loaded, so an ordinary `cctally` invocation never opens a database
+# it does not need.
+#
+# Measured 2026-08-19: loading this sibling costs 20.5 ms of the median
+# `cctally --version`, which is compiling this module plus `_lib_diagnosis`.
+# It stays EAGER anyway, for the reason recorded at the `_lib_diff_kernel`
+# block below: the test surface reaches these symbols by dict-key access on
+# `mod.__dict__`, which no lazy binding can serve, and spec §4.8 makes the
+# eager pattern mandatory rather than preferred. Recovering the 20 ms belongs
+# to a change that shortens `cctally`'s import path as a whole.
+_cctally_diagnosis = _load_sibling("_cctally_diagnosis")
+cmd_explain          = _cctally_diagnosis.cmd_explain               # parser: c.cmd_explain
+diagnosis_to_wire    = _cctally_diagnosis.diagnosis_to_wire
+canonical_projection = _cctally_diagnosis.canonical_projection
+render_diagnosis_terminal = _cctally_diagnosis.render_terminal
+
+
 # Provider-aware analytics deliberately wrap the established command entries
 # here, leaving their Claude implementation modules untouched below the branch.
 _cmd_project_claude = cmd_project
@@ -3576,6 +3645,14 @@ def _post_command_update_hooks(command: str | None, args) -> None:
     if command == "setup" and getattr(args, "uninstall", False):
         return
     if command == "doctor":
+        return
+    if command == "explain":
+        # Read-only diagnostic by contract (#620 S3, spec 5.1): every store it
+        # touches is opened `mode=ro`, and it must reach no update check, no
+        # telemetry beat and no configuration write. Without this early return
+        # `_spawn_background_update_check` writes `update-state.json` and
+        # `update.log` into a data directory the command only read from. Same
+        # rationale class as `doctor` and `pricing-check` below.
         return
     if command == "pricing-check":
         # Read-only diagnostic (same rationale as doctor): load_config() would
