@@ -15,18 +15,17 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import importlib.util
 import io
 import json
 import os
 import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 # Every HOME-derived path constant resolves under a per-test directory
 # (#529 S4). The write detector caught this module creating the maintainer's
@@ -46,19 +45,12 @@ def cctally_mod(isolated_home):
     Function-scoped and dependent on ``isolated_home`` (#529 S4). It was
     module-scoped, so it ran once before any function fixture and left every
     path constant derived under the real HOME; the write detector caught this
-    module creating the maintainer's real ~/.local/share/cctally. This loader
-    uses SourceFileLoader rather than ``load_script()``, so it does not
-    re-derive on its own -- hence the explicit ``_init_paths_from_env()``,
-    which is safe here because it runs before any test applies a patch.
+    module creating the maintainer's real ~/.local/share/cctally.
+    ``load_script_module()`` re-derives the path constants itself on every load
+    that claims the ``cctally`` identity, so no explicit
+    ``_init_paths_from_env()`` call is needed here.
     """
-    loader = SourceFileLoader("cctally", str(CCTALLY))
-    spec = importlib.util.spec_from_loader("cctally", loader)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
-    import _cctally_core
-
-    _cctally_core._init_paths_from_env()
+    mod = load_script_module()
     return mod
 
 

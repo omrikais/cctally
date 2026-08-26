@@ -4,22 +4,15 @@ on:
     tags: ['v*']            # post-tag validation of the shipped artifact (fires on the public mirror; #131)
   schedule:
     - cron: '29 7 * * 4'    # weekly Thu 07:29 UTC (public mirror) — offset off pricing-freshness's Mon 09:17
-  workflow_dispatch: {}     # manual pre-cut/pre-merge gate (private source — validates an unpublished branch)
 jobs:
   test-linux:
-    # Free Actions minutes, split by repo (#131):
-    #   * public mirror (omrikais/cctally) — runs on ALL triggers (tags +
-    #     weekly cron + dispatch). GH-hosted minutes are free on public repos,
-    #     and this validates exactly the shipped artifact users npm/brew-install.
-    #   * private source (omrikais/cctally-dev) — runs ONLY on a manual
-    #     workflow_dispatch (the pre-cut/pre-merge gate for an UNPUBLISHED branch
-    #     the public mirror can't see). Tag pushes + the weekly cron skip here
-    #     (job `if` false → 0 billable minutes), so they accrue no paid private
-    #     Actions cost. The private superset (release/mirror harnesses) stays
-    #     covered by the self-hosted macOS push-CI in ci.yml.
-    if: >-
-      github.repository == 'omrikais/cctally' ||
-      (github.repository == 'omrikais/cctally-dev' && github.event_name == 'workflow_dispatch')
+    # #630 S5 retired the private hosted lane. It was workflow_dispatch-only and
+    # billable, and three consecutive dispatches timed out at 60 minutes with
+    # zero usable verdicts. The public mirror's minutes are free, so that lane
+    # is kept. Private tag and cron events still CREATE a run record because the
+    # workflow is mirrored verbatim, but this guard is evaluated before
+    # `runs-on`, so they consume no minutes.
+    if: github.repository == 'omrikais/cctally'
     runs-on: ubuntu-latest
     timeout-minutes: 60  # headroom over the observed run so a hung test can't wedge the job for GitHub's default 6h (#279 S7 W4)
     strategy:
@@ -34,9 +27,6 @@ jobs:
       # setup-python plus the pip install, setup-node plus `npm ci` — and FTS5
       # comes from Ubuntu's libsqlite3, which Debian builds with --enable-fts5.
       CCTALLY_AUTHORITATIVE_RUN: "1"
-      # Select the hosted Linux profile: it runs the complete platform estate
-      # except test-remote, whose SSH/macOS/Homebrew contract is owned by Gate 0.
-      CCTALLY_LINUX_MATRIX_RUN: "1"
       # Outer pool ONLY. The combined CCTALLY_TEST_JOBS knob set all three roles
       # at once, so pinning the pool to 2 also collapsed the later, otherwise-solo
       # pytest phase to 2 workers across all three matrix legs (#529 S5 §2.4).

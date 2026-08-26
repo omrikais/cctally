@@ -34,6 +34,27 @@ def test_pricing_constants_present_and_wellformed():
             dt.date.fromisoformat(e["expires"])
 
 
+def test_no_suppression_expires_before_the_pricing_snapshot_date():
+    """The floor that both pinned clocks stand on, stated generically.
+
+    `bin/cctally-pricing-check-test` and the CLI tests in this module pin their
+    analytic clock to PRICING_SNAPSHOT_DATE. An entry authored with an `expires`
+    earlier than that date is already expired at the pin, which would make those
+    goldens report a lapse the operator never let happen — and it is a defect in
+    its own right, because the snapshot date is the day every suppression was
+    last verified against the vendor. This guard is deliberately model-agnostic
+    so it outlives whichever suppressions currently carry a date.
+    """
+    early = [e for e in pricing.PRICING_DRIFT_ALLOWLIST
+             if "expires" in e and e["expires"] < pricing.PRICING_SNAPSHOT_DATE]
+    assert early == [], (
+        f"suppression expires before PRICING_SNAPSHOT_DATE "
+        f"({pricing.PRICING_SNAPSHOT_DATE}): {early}. Either remove the lapsed "
+        f"entries and adopt the upstream value, or re-verify them against the "
+        f"vendor and carry a later expires forward with the snapshot bump."
+    )
+
+
 # Vendor-verified per-MTok rates for the current Claude generation, as
 # (input, output, 5-minute cache write, cache read) per-token costs, taken from
 # platform.claude.com/docs/en/about-claude/pricing at PRICING_SNAPSHOT_DATE.
@@ -340,6 +361,41 @@ import json as _json
 
 _CCTALLY = pathlib.Path(__file__).resolve().parents[1] / "bin" / "cctally"
 
+# Pinned analytic clock for every `pricing-check` invocation below. The command
+# derives `expiredSuppressions` from each PRICING_DRIFT_ALLOWLIST entry's
+# `expires` against the `_command_as_of()` seam — offline too — and that array
+# feeds the actionability predicate, so an unpinned run is a test scheduled to
+# change verdict on a calendar date rather than on a code change: from the day
+# after Sol's cutover (#643) every clean run here goes exit 0 -> 1 untouched.
+# The pin is PRICING_SNAPSHOT_DATE, the day the tables and every current
+# suppression were last verified against the vendor; it matches PINNED_AS_OF in
+# bin/cctally-pricing-check-test, and
+# test_no_suppression_expires_before_the_pricing_snapshot_date holds the floor
+# both depend on. Tests that exercise a cutover pass their own date instead.
+_PINNED_AS_OF = f"{pricing.PRICING_SNAPSHOT_DATE}T00:00:00Z"
+
+
+def _earliest_suppression_lapse():
+    """First as-of date at which some SHIPPED suppression is expired.
+
+    Derived from the live allowlist rather than hardcoded, so the pinned clock
+    and the entries it exercises cannot disagree after an allowlist edit.
+    `expired_allowlist_entries` compares strictly, so an entry stays valid
+    THROUGH its `expires` and lapses the day after. Returns the as-of stamp and
+    the entries expected to have lapsed at it.
+    """
+    dated = [e for e in pricing.PRICING_DRIFT_ALLOWLIST if "expires" in e]
+    assert dated, (
+        "no shipped suppression carries an `expires`, so the CLI's expiry "
+        "wiring has nothing live to exercise — give this test an injected "
+        "allowlist or retire it deliberately"
+    )
+    lapse = (dt.date.fromisoformat(min(e["expires"] for e in dated))
+             + dt.timedelta(days=1))
+    expected = [e for e in dated
+                if dt.date.fromisoformat(e["expires"]) < lapse]
+    return f"{lapse.isoformat()}T00:00:00Z", expected
+
 
 def _run_cctally(args, home, extra_env=None):
     env = dict(os.environ)
@@ -356,16 +412,27 @@ def _run_cctally(args, home, extra_env=None):
     )
 
 
-def _seed_cache_with_models(home, claude_models=(), codex_models=(), age_days=1):
+def _seed_cache_with_models(home, claude_models=(), codex_models=(), age_days=1,
+                            as_of=None):
     """Create a minimal cache.db under <home>/.local/share/cctally with the
     SAME schema + WAL the app uses, seeded with one entry per model at
-    `age_days` before now. `claude_models` / `codex_models` are iterables of
-    (model, input_tokens) tuples (token total drives the WARN detail)."""
+    `age_days` before `as_of` (default: now). `claude_models` / `codex_models`
+    are iterables of (model, input_tokens) tuples (token total drives the WARN
+    detail).
+
+    Pass `as_of` whenever the command under test runs at a pinned clock AND the
+    assertion depends on the entry's age. Leaving the seed on the wall clock
+    while the command is pinned decouples the two, and the gap between them
+    moves every day until an age-sensitive assertion silently stops
+    discriminating — it fails GREEN, on a calendar date, with nothing to say so.
+    """
     import sqlite3
     cache_path = home / ".local" / "share" / "cctally" / "cache.db"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.with_name("cache.db.maintenance.lock").touch()
-    ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=age_days))
+    anchor = (dt.datetime.now(dt.timezone.utc) if as_of is None
+              else dt.datetime.fromisoformat(str(as_of).replace("Z", "+00:00")))
+    ts = (anchor - dt.timedelta(days=age_days))
     ts_iso = ts.isoformat().replace("+00:00", "Z")
     conn = sqlite3.connect(str(cache_path))
     try:
@@ -571,7 +638,8 @@ def test_doctor_pricing_ignores_out_of_window_models(tmp_path):
 
 def test_pricing_check_offline_clean_exit0(tmp_path):
     # Fresh HOME, no cache: offline coverage is empty -> nothing actionable.
-    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path)
+    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path,
+                     extra_env={"CCTALLY_AS_OF": _PINNED_AS_OF})
     assert r.returncode == 0, r.stderr
     doc = _json.loads(r.stdout)
     assert doc["schemaVersion"] == 1
@@ -583,7 +651,8 @@ def test_pricing_check_offline_clean_exit0(tmp_path):
 
 def test_pricing_check_offline_does_not_mutate_fresh_home(tmp_path):
     # Read-only contract (spec §5.1/§5.2): a virgin HOME must not create APP_DIR.
-    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path)
+    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path,
+                     extra_env={"CCTALLY_AS_OF": _PINNED_AS_OF})
     assert r.returncode == 0, r.stderr
     app_dir = tmp_path / ".local" / "share" / "cctally"
     assert not app_dir.exists(), (
@@ -598,7 +667,8 @@ def test_pricing_check_offline_finding_exit1(tmp_path):
         claude_models=[("claude-totally-made-up-9000", 12345)],
         age_days=1,
     )
-    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path)
+    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path,
+                     extra_env={"CCTALLY_AS_OF": _PINNED_AS_OF})
     assert r.returncode == 1, (r.returncode, r.stderr)
     doc = _json.loads(r.stdout)
     assert any(g["kind"] == "unpriced" and g["model"] == "claude-totally-made-up-9000"
@@ -611,22 +681,63 @@ def test_pricing_check_offline_ignores_codex_unattributed_model_sentinel(tmp_pat
         codex_models=[("unknown", 2_485_412)],
         age_days=1,
     )
-    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path)
+    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path,
+                     extra_env={"CCTALLY_AS_OF": _PINNED_AS_OF})
     assert r.returncode == 0, (r.returncode, r.stderr)
     assert _json.loads(r.stdout)["coverage"] == []
 
 
-def test_pricing_check_offline_today_no_suppressions(tmp_path):
-    # staleSuppressions is SKIPPED offline (no network), and the current
-    # evidence-backed allowlist has no dated cutover, so both additive keys are
-    # empty and exit 0.
-    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path)
+def test_pricing_check_offline_at_the_snapshot_date_has_no_suppressions(tmp_path):
+    # staleSuppressions is SKIPPED offline (no network), and no shipped
+    # suppression is expired at PRICING_SNAPSHOT_DATE (the six `gpt-5.6-sol`
+    # entries added in #643 carry a LATER cutover), so both additive keys are
+    # empty and exit 0. The clock is pinned because that second clause is
+    # date-dependent: at the wall clock this assertion goes false on the day
+    # after Sol's cutover with no code change.
+    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path,
+                     extra_env={"CCTALLY_AS_OF": _PINNED_AS_OF})
     assert r.returncode == 0, r.stderr
     doc = _json.loads(r.stdout)
     assert doc["staleSuppressions"] == []
     assert doc["expiredSuppressions"] == []
     # staleSuppressions is network-derived → skipped offline, NOT a degradation.
     assert "litellm" not in doc["degraded_components"]
+
+
+def test_pricing_check_offline_expired_suppression_exit1(tmp_path):
+    """The CLI's expiry wiring, end to end: payload array AND exit code.
+
+    Every golden and every other CLI test here asserts an EMPTY
+    `expiredSuppressions`, so without this test replacing the command's
+    `expired_allowlist_entries` call with a hardcoded `[]` would leave the whole
+    estate green. #279 S7 W7 shipped this coverage against the sonnet-5 intro
+    rate; #560 removed those dated entries and converted it to an assert-empty
+    test, and #643's dated Sol suppressions make the real assertion possible
+    again.
+
+    The clock is pinned the day after the earliest shipped cutover, derived
+    from the allowlist itself, so the test is not a scheduled red in either
+    direction. The other legs are asserted empty because they would otherwise
+    be an alternative source of the exit code.
+    """
+    as_of, expected = _earliest_suppression_lapse()
+    r = _run_cctally(
+        ["pricing-check", "--offline", "--json"], home=tmp_path,
+        extra_env={"CCTALLY_AS_OF": as_of},
+    )
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    doc = _json.loads(r.stdout)
+    assert doc["expiredSuppressions"] == expected, doc["expiredSuppressions"]
+    # Today that set is exactly Sol's six suppressed fields (#643). This states
+    # what the derivation above currently resolves to; editing the allowlist,
+    # not the passage of time, is what changes it.
+    assert {e["model"] for e in expected} == {"gpt-5.6-sol"}
+    assert len(expected) == 6
+    # Nothing else can be producing the exit code.
+    assert doc["coverage"] == []
+    assert doc["drift"]["value_drift"] == []
+    assert doc["drift"]["missing_from_us"] == []
+    assert doc["staleSuppressions"] == []
 
 
 def test_pricing_check_offline_does_not_revive_removed_sonnet_cutover(tmp_path):
@@ -670,12 +781,18 @@ def test_pricing_issue_findings_present_stale_expired():
 def test_pricing_check_offline_all_history_ignores_window(tmp_path):
     # The subcommand's coverage is ALL-HISTORY (vs doctor's 30-day). An
     # unpriced model 45 days old (out of doctor's window) STILL trips it.
+    # The seed is anchored to the SAME pinned clock the command runs at: this
+    # is the one test whose discrimination depends on the distance between the
+    # two, so seeding from the wall clock against a pinned command would let
+    # the entry drift inside a 30-day window and stop proving anything.
     _seed_cache_with_models(
         tmp_path,
         claude_models=[("claude-ancient-unpriced", 777)],
         age_days=45,
+        as_of=_PINNED_AS_OF,
     )
-    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path)
+    r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path,
+                     extra_env={"CCTALLY_AS_OF": _PINNED_AS_OF})
     assert r.returncode == 1, (r.returncode, r.stderr)
     doc = _json.loads(r.stdout)
     assert any(g["model"] == "claude-ancient-unpriced" for g in doc["coverage"]), doc
@@ -695,9 +812,33 @@ _MYTHOS_PREVIEW_LITELLM = {
     "cache_read_input_token_cost": 1e-06,
 }
 
+# OpenAI's promotional gpt-5.6 Sol rate, which PRICING_DRIFT_ALLOWLIST
+# suppresses on all six fields (#643). The bare `gpt-5.6` identifier carries
+# the same values upstream and is suppressed as an intentional omission,
+# because we alias it to Sol instead of duplicating the card.
+_GPT_56_SOL_LITELLM = {
+    "litellm_provider": "openai",
+    "input_cost_per_token": 4e-06,
+    "cache_read_input_token_cost": 4e-07,
+    "output_cost_per_token": 2e-05,
+    "input_cost_per_token_above_272k_tokens": 8e-06,
+    "cache_read_input_token_cost_above_272k_tokens": 8e-07,
+    "output_cost_per_token_above_272k_tokens": 3e-05,
+}
+
 
 def _litellm_with_allowlisted_preview(body=None):
-    snap = {"claude-mythos-preview": dict(_MYTHOS_PREVIEW_LITELLM)}
+    """A sparse LiteLLM fake that still carries every allowlisted divergence.
+
+    Each suppression must map to a real divergence in whatever snapshot the
+    run sees, or `stale_allowlist_entries` reports it and the scenario exits 1
+    for a reason the scenario is not testing.
+    """
+    snap = {
+        "claude-mythos-preview": dict(_MYTHOS_PREVIEW_LITELLM),
+        "gpt-5.6": dict(_GPT_56_SOL_LITELLM),
+        "gpt-5.6-sol": dict(_GPT_56_SOL_LITELLM),
+    }
     snap.update(body or {})
     return snap
 
@@ -716,6 +857,7 @@ def test_pricing_check_drift_via_injected_litellm_exit1(tmp_path):
     })
     f = _write_litellm(tmp_path, snap)
     env = dict(os.environ, HOME=str(tmp_path), TZ="Etc/UTC",
+               CCTALLY_AS_OF=_PINNED_AS_OF,
                CCTALLY_DISABLE_DEV_AUTODETECT="1",
                CCTALLY_PRICING_LITELLM_FILE=str(f),
                # Inject an empty (but valid) /v1/models response so the
@@ -735,6 +877,7 @@ def test_pricing_check_drift_via_injected_litellm_exit1(tmp_path):
 def test_pricing_check_degraded_clean_exit0(tmp_path):
     # LiteLLM unreachable (bad file) + no finding -> exit 0, status degraded.
     env = dict(os.environ, HOME=str(tmp_path), TZ="Etc/UTC",
+               CCTALLY_AS_OF=_PINNED_AS_OF,
                CCTALLY_DISABLE_DEV_AUTODETECT="1",
                CCTALLY_PRICING_LITELLM_FILE="/nonexistent/litellm.json",
                CCTALLY_PRICING_MODELS_FILE="/nonexistent/models.json")
@@ -758,6 +901,7 @@ def test_pricing_check_finding_while_degraded_exit1(tmp_path):
     })
     f = _write_litellm(tmp_path, snap)
     env = dict(os.environ, HOME=str(tmp_path), TZ="Etc/UTC",
+               CCTALLY_AS_OF=_PINNED_AS_OF,
                CCTALLY_DISABLE_DEV_AUTODETECT="1",
                CCTALLY_PRICING_LITELLM_FILE=str(f),
                CCTALLY_PRICING_MODELS_FILE="/nonexistent")  # forces degraded
@@ -775,6 +919,7 @@ def test_pricing_check_finding_while_degraded_exit1(tmp_path):
 def test_pricing_check_existence_gap_is_actionable_exit1(tmp_path):
     # The /v1/models leg surfaces a vendor model we don't price -> actionable.
     env = dict(os.environ, HOME=str(tmp_path), TZ="Etc/UTC",
+               CCTALLY_AS_OF=_PINNED_AS_OF,
                CCTALLY_DISABLE_DEV_AUTODETECT="1",
                # LiteLLM clean except for the intentional Preview mismatch.
                CCTALLY_PRICING_LITELLM_FILE=str(_write_litellm(
@@ -792,7 +937,8 @@ def test_pricing_check_existence_gap_is_actionable_exit1(tmp_path):
 
 def test_pricing_check_human_render_runs(tmp_path):
     # Non-JSON render must not crash and must mention pricing.
-    r = _run_cctally(["pricing-check", "--offline"], home=tmp_path)
+    r = _run_cctally(["pricing-check", "--offline"], home=tmp_path,
+                     extra_env={"CCTALLY_AS_OF": _PINNED_AS_OF})
     assert r.returncode == 0, r.stderr
     assert "pricing" in r.stdout.lower()
 

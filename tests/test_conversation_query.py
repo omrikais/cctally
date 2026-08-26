@@ -1,5 +1,6 @@
 import sqlite3, sys, pathlib
 import pytest
+from _fts5_gate import require_fts5  # the ONE FTS5 capability gate (#630 S6)
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 import _cctally_db as db
 import _cctally_cache as cc
@@ -681,8 +682,7 @@ def _seed_search_corpus(c):
 
 def test_search_fts_dedups_and_costs():
     c = _conn()
-    if not db._fts5_available(c):
-        import pytest; pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _seed_search_corpus(c)
     out = cq.search_conversations(c, "token", limit=50, offset=0)
     assert out["mode"] == "fts"
@@ -735,8 +735,7 @@ def test_search_empty_query_is_empty():
 
 def test_search_fts_punctuation_does_not_error():
     c = _conn()
-    if not db._fts5_available(c):
-        import pytest; pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _seed_search_corpus(c)
     # raw FTS operators / punctuation in user input must not raise — _fts_query
     # quotes each term as a string literal.
@@ -827,8 +826,7 @@ def test_search_snippet_generation_bounded_to_page_fts(monkeypatch):
     # Non-vacuity for the bound (FTS): the snippet batch must be issued for only
     # the page's rowids, not every match.
     c = _conn()
-    if not db._fts5_available(c):
-        import pytest; pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _seed_distinct_hits(c, 8, term="beta")
     seen = {"max": 0}
     real = cq._fts_snippets
@@ -916,8 +914,7 @@ def test_search_query_count_batched(monkeypatch):
     plus one rowid=? prose probe per badged hit. Post-fix: 2 corpus MATCHes
     (COUNT + page CTE) and ONE bounded IN-list prose probe (not per-hit)."""
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _seed_tool_only_hits(c, 6, term="needle")
     stats = _count_fts_query_shapes(
         c, lambda px: cq.search_conversations(px, "needle", kind="all",
@@ -936,8 +933,7 @@ def test_search_query_count_batched_byte_identical_results():
     the query-count test exercises (all badged 'tool', drawn from the tool
     snippet column)."""
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _seed_tool_only_hits(c, 6, term="needle")
     out = cq.search_conversations(c, "needle", kind="all", limit=200, offset=0)
     assert out["total"] == 6
@@ -1148,8 +1144,7 @@ def test_search_hits_include_title_fts():
     # only transitively by the golden harness). Skips cleanly when the sqlite
     # build lacks FTS5.
     c = _conn()
-    if not db._fts5_available(c):
-        import pytest; pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
          timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
          text="how does the reset work", cwd="/home/u/proj")
@@ -2772,8 +2767,7 @@ def _legacy_conn():
 
 def test_fresh_schema_has_split_fts():
     c = _conn()
-    if not db._fts5_available(c):
-        import pytest; pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     cols = [r[1] for r in c.execute("PRAGMA table_info(conversation_fts)")]
     assert cols == ["text", "search_tool", "search_thinking"]
     assert c.execute(
@@ -2783,8 +2777,7 @@ def test_fresh_schema_has_split_fts():
 
 def test_split_triggers_index_all_three_columns():
     c = _conn()
-    if not db._fts5_available(c):
-        import pytest; pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _msg(c, id=1, session_id="s", uuid="u1", source_path="f", byte_offset=0,
          entry_type="assistant", text="alpha",
          search_tool="beta", search_thinking="gamma")
@@ -2800,8 +2793,7 @@ def test_split_fts_rebuildable_external_content_column_names():
     # External-content FTS5 binds columns BY NAME — a mismatch creates fine but
     # breaks 'rebuild'. This pins the names match content-table columns.
     c = _conn()
-    if not db._fts5_available(c):
-        import pytest; pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _msg(c, id=1, session_id="s", uuid="u1", source_path="f", byte_offset=0,
          entry_type="assistant", text="alpha",
          search_tool="beta", search_thinking="gamma")
@@ -2814,8 +2806,7 @@ def test_split_fts_rebuildable_external_content_column_names():
 
 def test_legacy_shape_left_alone_when_pending():
     c = _legacy_conn()
-    if not db._fts5_available(c):
-        import pytest; pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     db._apply_cache_schema(c)   # re-apply must NOT swap the legacy shape
     cols = [r[1] for r in c.execute("PRAGMA table_info(conversation_fts)")]
     assert cols == ["text"]     # untouched until the sync-side swap
@@ -2871,8 +2862,7 @@ def _seed_kind_corpus(c):
 
 def test_search_kind_tools_finds_tool_content_and_badges():
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _seed_kind_corpus(c)
     out = cq.search_conversations(c, "npm", kind="tools")
     assert [h["uuid"] for h in out["hits"]] == ["B"]
@@ -2889,8 +2879,7 @@ def test_search_badge_probe_is_marker_based_not_nonempty():
     # A row matching ONLY in prose, but whose search_tool is non-empty (and would
     # yield an unmarked snippet): match_kinds MUST stay empty (spec F3).
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _msg(c, session_id="s1", uuid="P", source_path="p.jsonl", byte_offset=0,
          timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
          text="alpha beta gamma", search_tool="totally unrelated tool text",
@@ -2904,8 +2893,7 @@ def test_search_badges_aggregate_across_group_rows():
     # Two physical rows, SAME (session_id, uuid): one matches in text, the other
     # in search_tool. The single deduped hit badges across BOTH rows (F3).
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _msg(c, id=1, session_id="s1", uuid="G", source_path="g1.jsonl", byte_offset=0,
          timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
          text="needle here", model=_MODEL, msg_id="mG", req_id="rG",
@@ -2929,8 +2917,7 @@ def test_search_badge_facet_scope_carries_entry_type_predicate():
     into the prompts facet — the lookup's et_pred excludes it. Without the
     predicate the row set would include the assistant row and badge ['tool']."""
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _msg(c, id=1, session_id="s1", uuid="G", source_path="g1.jsonl", byte_offset=0,
          timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
          text="needle prompt", cwd="/home/u/proj")
@@ -2946,8 +2933,7 @@ def test_search_badge_facet_scope_carries_entry_type_predicate():
 
 def test_search_prompts_vs_assistant_entry_type_predicate():
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _msg(c, session_id="s1", uuid="H", source_path="h.jsonl", byte_offset=0,
          timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
          text="shared marker word", cwd="/home/u/proj")
@@ -2963,8 +2949,7 @@ def test_search_prompts_vs_assistant_entry_type_predicate():
 
 def test_search_kind_totals_exact_and_pages_disjoint():
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     n = 5
     for i in range(n):
         _msg(c, session_id=f"s{i}", uuid=f"u{i}", source_path=f"f{i}.jsonl",
@@ -2983,8 +2968,7 @@ def test_search_kind_totals_exact_and_pages_disjoint():
 
 def test_search_prefix_last_term_matches_while_typing():
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _msg(c, session_id="s1", uuid="K", source_path="k.jsonl", byte_offset=0,
          timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
          text="", model=_MODEL, msg_id="mK", req_id="rK",
@@ -2995,8 +2979,7 @@ def test_search_prefix_last_term_matches_while_typing():
 
 def test_search_prose_only_mode_when_pending():
     c = _legacy_conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     # legacy single-column FTS still indexes prose; seed a human + assistant row.
     _msg(c, id=1, session_id="s1", uuid="H", source_path="h.jsonl", byte_offset=0,
          timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
@@ -3083,8 +3066,7 @@ def _seed_find_session(c):
 
 def test_find_returns_rendered_turn_anchors_in_document_order():
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _seed_find_session(c)
     out = cq.find_in_conversation(c, "s1", "needle")
     assert out is not None
@@ -3101,8 +3083,7 @@ def test_find_returns_rendered_turn_anchors_in_document_order():
 
 def test_find_collapses_multi_member_matches_to_one_anchor():
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     # two assistant fragments sharing (msg_id, req_id): u1 matches in text,
     # u2 matches in search_thinking → ONE anchor, ["thinking"] (prose unbadged).
     _msg(c, id=1, session_id="s1", uuid="u1", source_path="f.jsonl", byte_offset=0,
@@ -3122,8 +3103,7 @@ def test_find_collapses_multi_member_matches_to_one_anchor():
 
 def test_find_cap_and_truncated_flag():
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     for i in range(12):
         _msg(c, id=i + 1, session_id="s1", uuid=f"u{i}", source_path="f.jsonl",
              byte_offset=i, timestamp_utc=f"2026-06-01T00:00:{i:02d}Z",
@@ -3183,8 +3163,7 @@ def test_find_zero_match_skips_assembly(monkeypatch):
     and short-circuits before _assemble_session. (Today the assembly runs before
     the match, paying a full session walk for a no-result find.)"""
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _seed_find_session(c)
     calls = []
     real_assemble = cq._assemble_session
@@ -3208,8 +3187,7 @@ def test_find_nonzero_match_output_unchanged():
     output to the pre-reorder behavior (anchors, badges, totals, mode/depth).
     Compared field-by-field against the known-good the existing find tests pin."""
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _seed_find_session(c)
     out = cq.find_in_conversation(c, "s1", "needle")
     assert out is not None
@@ -3227,8 +3205,7 @@ def test_find_nonzero_match_output_unchanged():
 
 def test_find_kind_scoping_and_like_mode():
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _seed_find_session(c)
     # kind="thinking" matches nothing here (no thinking column carries 'needle').
     out = cq.find_in_conversation(c, "s1", "needle", kind="thinking")
@@ -3244,8 +3221,7 @@ def test_find_kind_scoping_and_like_mode():
 
 def test_find_prose_only_mode_blocks_tool_thinking():
     c = _legacy_conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _msg(c, id=1, session_id="s1", uuid="hu", source_path="f.jsonl", byte_offset=0,
          timestamp_utc="2026-06-01T00:00:00Z", entry_type="human",
          text="needle prompt", cwd="/home/u/proj")
@@ -3265,8 +3241,7 @@ def test_find_no_regex_no_case_byte_stable():
     """Default args change nothing: the (regex=False, case=False) call is
     byte-identical to the no-kwargs call (the existing FTS/LIKE path)."""
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _seed_find_session(c)
     base = cq.find_in_conversation(c, "s1", "needle", kind="all")
     same = cq.find_in_conversation(c, "s1", "needle", kind="all",
@@ -3358,8 +3333,7 @@ def test_find_regex_anchors_match_fts_for_simple_term():
     produce identical anchors/ordering/match_kinds — only the matcher differs
     (proves the scan reuses the existing assembly-to-anchor loop)."""
     c = _conn()
-    if not db._fts5_available(c):
-        _pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _seed_find_session(c)
     fts = cq.find_in_conversation(c, "s1", "needle", kind="all")
     rx = cq.find_in_conversation(c, "s1", "needle", kind="all", regex=True)

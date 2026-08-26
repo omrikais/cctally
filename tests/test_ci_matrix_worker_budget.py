@@ -93,11 +93,14 @@ def test_matrix_lane_does_not_collapse_solo_pytest_workers() -> None:
     )
 
 
-def test_matrix_lane_selects_the_hosted_linux_profile() -> None:
-    """The profile omits the macOS/Homebrew remote-runner harness."""
+def test_the_linux_profile_variable_is_absent() -> None:
+    """The workflow now runs only on the public mirror, where the profile is
+    meaningless: the public manifest carries no `test-remote` to omit. The
+    local driver sets the variable itself for its own private lane (#630 S5).
+    """
     env = _job_env(WORKFLOW, JOB)
 
-    assert env.get("CCTALLY_LINUX_MATRIX_RUN") == "1", env
+    assert "CCTALLY_LINUX_MATRIX_RUN" not in env, env
 
 
 def test_matrix_lane_leaves_inner_and_pytest_unpinned() -> None:

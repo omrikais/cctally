@@ -9,5 +9,23 @@
     "input_cost_per_token": 1e-05,
     "litellm_provider": "anthropic",
     "output_cost_per_token": 5e-05
+  },
+  "gpt-5.6": {
+    "cache_read_input_token_cost": 4e-07,
+    "cache_read_input_token_cost_above_272k_tokens": 8e-07,
+    "input_cost_per_token": 4e-06,
+    "input_cost_per_token_above_272k_tokens": 8e-06,
+    "litellm_provider": "openai",
+    "output_cost_per_token": 2e-05,
+    "output_cost_per_token_above_272k_tokens": 3e-05
+  },
+  "gpt-5.6-sol": {
+    "cache_read_input_token_cost": 4e-07,
+    "cache_read_input_token_cost_above_272k_tokens": 8e-07,
+    "input_cost_per_token": 4e-06,
+    "input_cost_per_token_above_272k_tokens": 8e-06,
+    "litellm_provider": "openai",
+    "output_cost_per_token": 2e-05,
+    "output_cost_per_token_above_272k_tokens": 3e-05
   }
 }

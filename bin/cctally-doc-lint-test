@@ -9,7 +9,11 @@
 # top-level docs/*.md), excluding docs/superpowers/** (historical
 # specs/plans are records, not claims; also private/unmatched, absent on
 # the public mirror — the exclusion is defense-in-depth). Root
-# CHANGELOG.md is outside the scope by construction. The standalone-word
+# CHANGELOG.md is in scope, but for a different question and through a
+# different instrument: the banned-phrase scan never reads it, and
+# bin/cctally-changelog-lint checks its ENTRIES against the user-facing
+# policy at the bottom of this file. The two scopes stay disjoint.
+# The standalone-word
 # MIT check scopes to README.md + CONTRIBUTING.md only (a case-insensitive
 # substring would false-positive on "commit"; dashboard dep licenses are
 # out of scope).
@@ -149,6 +153,24 @@ if python3 "$REPO_ROOT/bin/_lib_readme_refresh.py" --check "$REPO_ROOT/README.md
     pass_count=$((pass_count + 1))
 else
     echo "FAIL: readme-refresh guard — bin/_lib_readme_refresh.py --check README.md reported issues"
+    fail_count=$((fail_count + 1))
+fi
+
+# --- changelog policy guard ------------------------------------------------
+# CHANGELOG.md publishes to the public repository verbatim and is reused as a
+# release-note body and a mirror commit message, so a non-compliant entry is an
+# outward-facing defect. doc-lint.yml runs this harness on the Markdown-only
+# edits ci.yml skips, which is exactly where a changelog edit lands.
+#
+# Runs on the public mirror too, where neither .mirror-allowlist nor the
+# classifier is published: the kernel records that the layer did not run rather
+# than reporting a clean pass over a population it could not see, and the
+# cited-path rule is decided by existence in the tree there.
+if python3 "$REPO_ROOT/bin/cctally-changelog-lint" --repo-root "$REPO_ROOT"; then
+    echo "ok: changelog policy (CHANGELOG.md entries are user-facing in shape)"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: changelog policy — bin/cctally-changelog-lint reported findings"
     fail_count=$((fail_count + 1))
 fi
 

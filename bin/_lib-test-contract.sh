@@ -65,6 +65,8 @@ pytest-internal
 pytest-no-failing-node-ids
 pytest-unavailable
 regeneration-enabled
+runtime-budget-exceeded
+runtime-budget-unavailable
 summary-unreadable
 visibility-classifier-failed
 visibility-classifier-unavailable
@@ -434,6 +436,259 @@ contract_freeze_wall_seconds() {
 
 CONTRACT_USAGE=0           # 1 once contract_usage_abort has been called
 
+# ---------------------------------------------------- the normalized budget
+#
+# #630 S7. The metric already existed: contract_emit_outcome publishes
+# `wallSeconds`, `passedCases` and their quotient. What did not exist was a
+# threshold, a check or a classification.
+#
+# The threshold is COMMITTED, in tests/authoritative-runtime-budget.json, so a
+# maintainer raising it does so in a commit a reviewer can see. That is the
+# mechanism that stops ordinary estate growth from silently breaching it: the
+# metric is normalized per case, so growing the estate does not move it and a
+# breach means the tree became more expensive PER CASE.
+#
+# One fleet-wide number, with no host lookup at check time and no influence on
+# scheduling. The cost of that choice is recorded rather than hidden: the fast
+# host observes about 56 s per 1,000 cases, so 120 is nearly silent there. The
+# budget's purpose is catching a step change, and a step change large enough to
+# matter appears on both hosts.
+CONTRACT_BUDGET_MAX=""     # the committed maximum, as a decimal string
+
+contract_budget_load() {  # contract_budget_load <path>
+    local path=$1 out rc
+    out=$(python3 - "$path" <<'PY'
+import json, math, sys
+
+
+def no_dupes(pairs):
+    seen = set()
+    for k, _ in pairs:
+        if k in seen:
+            raise ValueError("duplicate-key:%s" % k)
+        seen.add(k)
+    return dict(pairs)
+
+
+try:
+    with open(sys.argv[1], "rb") as handle:
+        raw = handle.read().decode("utf-8")
+except OSError as exc:
+    print("unreadable:%s" % (exc.strerror or "unreadable",))
+    sys.exit(1)
+# UnicodeDecodeError is a ValueError, not an OSError. Read as bytes and decode
+# explicitly so a non-UTF-8 budget file is refused with a cause the operator can
+# act on, rather than escaping the handler and printing an empty cause beside a
+# raw traceback.
+except UnicodeDecodeError:
+    print("unreadable:not UTF-8")
+    sys.exit(1)
+
+try:
+    doc = json.loads(raw, object_pairs_hook=no_dupes)
+except ValueError as exc:
+    msg = str(exc)
+    print(msg if msg.startswith("duplicate-key") else "unreadable:not JSON")
+    sys.exit(1)
+
+if not isinstance(doc, dict):
+    print("unreadable:not an object")
+    sys.exit(1)
+
+allowed = {"schemaVersion", "metric", "maxSecondsPerThousandCases"}
+extra = sorted(set(doc) - allowed)
+if extra:
+    print("unknown-key:%s" % extra[0])
+    sys.exit(1)
+missing = sorted(allowed - set(doc))
+if missing:
+    print("missing-key:%s" % missing[0])
+    sys.exit(1)
+if doc["schemaVersion"] != 1:
+    print("schemaVersion:%r" % (doc["schemaVersion"],))
+    sys.exit(1)
+if doc["metric"] != "secondsPerThousandCases":
+    print("metric:%r" % (doc["metric"],))
+    sys.exit(1)
+value = doc["maxSecondsPerThousandCases"]
+# bool is an int subclass, so True would otherwise pass as 1.
+if isinstance(value, bool) or not isinstance(value, (int, float)):
+    print("maxSecondsPerThousandCases:%r" % (value,))
+    sys.exit(1)
+# FINITENESS IS TESTED BEFORE THE SIGN, and it is not defensive. Python's json
+# parses the bare `NaN` and `Infinity` literals by default, and both survive a
+# sign test: every comparison against a NaN is false, and infinity is not below
+# zero. Either value then makes `raw > cap` false for every run that can exist,
+# so no run could ever breach the budget — the mechanism would be silently
+# disabled rather than loudly wrong. contract_budget_format would also raise
+# OverflowError on int(inf) while rendering the breach that never comes.
+if not math.isfinite(value) or value <= 0:
+    print("maxSecondsPerThousandCases:%r" % (value,))
+    sys.exit(1)
+print(repr(float(value)))
+PY
+    ) ; rc=$?
+    if [ $rc -ne 0 ]; then
+        contract_note "runtime budget: $out — fix tests/authoritative-runtime-budget.json"
+        contract_fail infrastructure runtime-budget-unavailable "${out%%:*}" admission
+        return 1
+    fi
+    CONTRACT_BUDGET_MAX=$out
+    return 0
+}
+
+# The ONE eligibility predicate, read twice: at admission, so a malformed or
+# missing budget refuses the run in seconds rather than after twenty minutes,
+# and again at the verdict, when CONTRACT_CLASS is final. Stated once so the two
+# readings cannot drift apart.
+#
+# Keyed on the AUTHORITATIVE marker and deliberately NOT on CCTALLY_REMOTE_EXEC.
+# .github/workflows/ci.yml's test-macos job sets CCTALLY_AUTHORITATIVE_RUN=1 and
+# executes bin/cctally-test-all DIRECTLY, never through the wrapper, so a
+# remote-marker predicate would leave the budget unenforced on exactly the run
+# that has no reusable receipt to fall back on.
+contract_budget_is_eligible() {
+    contract_is_authoritative || return 1
+    # `full` only: a --harness subset, the tier and linux-matrix each ran a
+    # different estate, so their quotients answer a different question.
+    [ "${COVERAGE_MODE:-}" = "full" ] || return 1
+    # One failure must not produce two reason codes. A red run has fewer passed
+    # cases, so the quotient inflates precisely when it carries no information.
+    [ "${CONTRACT_CLASS:-none}" = "none" ] || return 1
+    # The local escape hatch, refused HERE rather than by inheritance.
+    # bin/cctally-test-remote's CCTALLY_TEST_LOCAL=1 path execs the command with
+    # the caller's environment intact and unsets nothing, so a caller who
+    # exported the authoritative marker alongside it would otherwise satisfy the
+    # three tests above on a full local run. The wrapper also sanitizes the
+    # markers it owns before that exec, so the two defences are independent.
+    [ "${CCTALLY_TEST_LOCAL:-}" != "1" ] || return 1
+    # The PRIVATE profile only. Two real invocation paths run an authoritative
+    # `full` coverage mode over a PUBLIC tree, and the first four conditions
+    # admitted both. bin/cctally-test-linux-matrix --profile public sets
+    # CCTALLY_LINUX_MATRIX_RUN only for the private profile, so its public arm
+    # resolves to the ordinary `full` mode while exporting the authoritative
+    # marker unconditionally, and the release runbook invokes it at every cut.
+    # .github/workflows/ci.yml's `test-pr` job sets the same marker, runs
+    # bin/cctally-test-all with no arguments on ubuntu-latest, and is gated to
+    # the PUBLIC MIRROR, so it is active on contributor and fork pull requests.
+    # Both run a SMALLER estate on hardware this threshold never measured, so
+    # the comparison is meaningless in both directions — and a breach on the
+    # second would fail a contributor's pull request with a `product` verdict
+    # blaming their tree for a hosted runner's slowness.
+    #
+    # CONTRACT_PROFILE is the right discriminator because it already means
+    # exactly this: bin/cctally-test-all resolves it to `private` if and only if
+    # .mirror-allowlist is present, and that file is unmatched by its own
+    # patterns, so it is absent from every published public tree.
+    [ "${CONTRACT_PROFILE:-}" = "private" ] || return 1
+    return 0
+}
+
+# Renders operator-facing numbers readably: at most two decimals, with trailing
+# zeros trimmed, so a breach reads `120.04 > 120` rather than `120.040000>120.0`.
+#
+# Two decimals is not unconditional. A threshold small enough to round to zero
+# there — a fixture budget of 0.001, which every scratch estate in the suite
+# uses — would render as `0`, and `454.55 > 0` states something that is not
+# true of the file. Such a value falls back to Python's shortest round-trip
+# repr, which is `0.001` rather than `0.001000`.
+#
+# DISPLAY ONLY. The comparison itself stays on the raw quotient computed by
+# contract_budget_verdict, which is the whole point of that function; formatting
+# here must never feed a decision.
+contract_budget_format() {  # contract_budget_format <number>...
+    CB_NUMS="$*" python3 -c '
+import os
+
+out = []
+for token in os.environ["CB_NUMS"].split():
+    try:
+        value = float(token)
+    except ValueError:
+        out.append(token)
+        continue
+    if value == int(value):
+        text = str(int(value))
+    else:
+        text = "%.2f" % value
+        if float(text) == 0.0:
+            text = repr(value)
+        else:
+            text = text.rstrip("0").rstrip(".")
+    out.append(text or "0")
+print(" ".join(out))
+'
+}
+
+# Prints "<raw> ok" or "<raw> over", and fails loudly on an argument that is not
+# a number rather than reporting a verdict it did not compute.
+#
+# The RAW quotient, not the `secondsPerThousandCases` the record publishes:
+# that value is rounded to one decimal for display, and a threshold decided by a
+# display artifact is one nobody can reason about — 120.04 rounds to 120.0 and
+# would pass a cap of 120 it genuinely exceeds. STRICTLY greater, so a run
+# landing exactly on the budget passes: the budget exists to catch a step
+# change, and failing an exactly-conforming run buys nothing.
+contract_budget_verdict() {  # contract_budget_verdict <wall> <cases> <max>
+    CB_WALL="$1" CB_CASES="$2" CB_MAX="$3" python3 -c '
+import os, sys
+
+try:
+    wall = float(os.environ["CB_WALL"])
+    cases = float(os.environ["CB_CASES"])
+    cap = float(os.environ["CB_MAX"])
+except (KeyError, ValueError):
+    sys.exit(1)
+if cases <= 0 or cap <= 0:
+    sys.exit(1)
+raw = wall / cases * 1000.0
+print("%.6f %s" % (raw, "over" if raw > cap else "ok"))
+'
+}
+
+# Called once the class is final and before the verdict is printed, so the
+# printed verdict and the exit code agree. Never changes an existing verdict:
+# the eligibility predicate above refuses to speak unless the class is still
+# `none`.
+contract_check_runtime_budget() {
+    local cases verdict shown raw_shown max_shown
+    contract_budget_is_eligible || return 0
+    contract_freeze_wall_seconds
+    if [ -z "$CONTRACT_BUDGET_MAX" ]; then
+        contract_note "runtime budget: no committed threshold was loaded for this run, so the budget could not be evaluated; a budget that could not be evaluated is never recorded as one that was satisfied"
+        contract_fail infrastructure runtime-budget-unavailable "threshold" budget
+        return 0
+    fi
+    if [ "${CONTRACT_PYTEST_UNPARSED:-0}" = "1" ]; then
+        contract_note "runtime budget: pytest's passed-item count was unreadable, so the denominator could not be assembled; the budget is recorded as unavailable rather than satisfied"
+        contract_fail infrastructure runtime-budget-unavailable "denominator" budget
+        return 0
+    fi
+    cases=$((CONTRACT_PASSED + CONTRACT_PYTEST_PASSED))
+    if [ "$cases" -le 0 ]; then
+        contract_note "runtime budget: the run passed no cases, so it supports no claim about cost per case"
+        contract_fail infrastructure runtime-budget-unavailable "denominator" budget
+        return 0
+    fi
+    verdict=$(contract_budget_verdict "$CONTRACT_WALL_SECONDS" "$cases" "$CONTRACT_BUDGET_MAX") || {
+        contract_note "runtime budget: the normalized metric could not be computed from wallSeconds=$CONTRACT_WALL_SECONDS passedCases=$cases max=$CONTRACT_BUDGET_MAX"
+        contract_fail infrastructure runtime-budget-unavailable "metric" budget
+        return 0
+    }
+    case "$verdict" in
+        *" over")
+            # Display only, and computed AFTER the verdict: the comparison above
+            # ran on the raw quotient, and these two numbers exist so the
+            # operator reads `120.04 > 120` instead of `120.040000>120.0`.
+            shown=$(contract_budget_format "${verdict%% *}" "$CONTRACT_BUDGET_MAX")
+            raw_shown=${shown%% *}
+            max_shown=${shown##* }
+            contract_note "runtime budget: $raw_shown seconds per 1,000 cases exceeds the committed maximum of $max_shown (tests/authoritative-runtime-budget.json). This is a NORMALIZED measure, so ordinary estate growth does not move it — a breach means the tree became more expensive PER CASE. Raise the committed budget deliberately if the cost is intended."
+            contract_fail product runtime-budget-exceeded "$raw_shown > $max_shown" budget ;;
+    esac
+    return 0
+}
+
 contract_exit_code() {
     # A usage or configuration error is its own band and outranks the class
     # mapping: the spec assigns it 2, and without this case the aggregator's
@@ -482,6 +737,10 @@ contract_emit_outcome() {  # <exit_code>
     CONTRACT_COV_SELECTED="${COVERAGE_SELECTED:-}" \
     CONTRACT_COV_OMITTED="${COVERAGE_OMITTED:-}" \
     CONTRACT_COV_PYTEST="${COVERAGE_PYTEST:-full}" \
+    CONTRACT_COV_TIER_BASE="${COVERAGE_TIER_BASE_OID:-}" \
+    CONTRACT_COV_TIER_HEAD="${COVERAGE_TIER_HEAD_OID:-}" \
+    CONTRACT_COV_TIER_COMMITTED="${COVERAGE_TIER_COMMITTED_PATHS:-0}" \
+    CONTRACT_COV_TIER_WORKTREE="${COVERAGE_TIER_WORKTREE_PATHS:-0}" \
     python3 -c '
 import json, os
 
@@ -560,6 +819,17 @@ if os.environ.get("CONTRACT_COV_RESOLVED") == "1":
         "omittedHarnesses": os.environ.get("CONTRACT_COV_OMITTED", "").split(),
         "pytest": os.environ.get("CONTRACT_COV_PYTEST", "full"),
     }
+    # The resolved tier basis, so the selection is reproducible from the RECORD
+    # rather than only from the shell history of whoever invoked it. Present in
+    # tier mode alone: no other mode has a basis, and an object of empty strings
+    # would describe one that does not exist.
+    if doc["coverage"]["mode"] == "tier-fast":
+        doc["coverage"]["tierBasis"] = {
+            "baseOid": os.environ.get("CONTRACT_COV_TIER_BASE", ""),
+            "headOid": os.environ.get("CONTRACT_COV_TIER_HEAD", ""),
+            "committedPaths": _int("CONTRACT_COV_TIER_COMMITTED"),
+            "worktreePaths": _int("CONTRACT_COV_TIER_WORKTREE"),
+        }
 
 print(json.dumps(doc, sort_keys=True))
 ' > "$tmp" && mv -f "$tmp" "$dest"
@@ -878,7 +1148,7 @@ contract_classify_pytest() {  # <rc> [subject] [passed_items] [node_ids]
     case "$passed" in
         ''|*[!0-9]*)
             CONTRACT_PYTEST_UNPARSED=1
-            contract_note "pytest: the $subject leg's passed-item count could not be read from its log, so this run's passed-case total and normalized metric are recorded as null; the verdict is unaffected"
+            contract_note "pytest: the $subject leg's passed-item count could not be read from its log, so this run's passed-case total and normalized metric are recorded as null; on a run the runtime budget is eligible to judge that missing denominator is itself runtime-budget-unavailable (infrastructure, exit 3), and on every other run the verdict is unaffected"
             passed=0 ;;
     esac
     CONTRACT_PYTEST_PASSED=$((CONTRACT_PYTEST_PASSED + passed))
@@ -938,7 +1208,11 @@ contract_carrier_emit() {  # <observed_exit> <local_record_path>
 import json, os, sys
 
 VALID = {"none", "product", "infrastructure", "incomplete"}
-PHASES = {"admission", "harness", "pytest", "transport"}
+# CLOSED, and extended deliberately. A reason whose phase is not listed here is
+# rewritten to outcome-record-malformed — infrastructure at exit 3 — so a new
+# phase must be admitted here before anything emits it, or the reason silently
+# loses both its class and its exit code at the wrapper boundary (#630 S7).
+PHASES = {"admission", "harness", "pytest", "transport", "budget"}
 
 
 def synth(code, detail=""):

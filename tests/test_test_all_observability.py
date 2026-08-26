@@ -140,6 +140,26 @@ def _estate(tmp_path, harnesses=None, exits=None, smoke=True, manifest_min=None)
         + "\n",
         encoding="utf-8",
     )
+
+    # #630 S7. A real estate carries a committed runtime budget and an
+    # authoritative full run refuses to start without one, so every scratch
+    # estate carries one too. The maximum is deliberately enormous rather than
+    # the committed 120: a scratch estate passes a handful of cases in a few
+    # seconds, which is a per-case cost orders of magnitude worse than the real
+    # estate's, and a fixture pinned at the real threshold would breach it by
+    # construction on every case in this file.
+    (testsdir / "authoritative-runtime-budget.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "metric": "secondsPerThousandCases",
+                "maxSecondsPerThousandCases": 1000000,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return repo
 
 
@@ -1069,6 +1089,115 @@ def test_an_interrupted_run_is_recorded_aborted_and_reaps_its_pool(
     ), _descendants_mentioning(str(est / "bin" / "cctally-alpha-test"))
 
 
+def _scheduler_record(root):
+    text = (_run_dirs(root)[0] / "scheduler.tsv").read_text(encoding="utf-8")
+    return dict(
+        line.split("\t", 1) for line in text.splitlines() if "\t" in line
+    )
+
+
+def test_a_run_records_the_dispatch_order_it_actually_used(tmp_path):
+    """#630 S3. `scheduler=` is printed by plan mode and the fallback reason is
+    a stderr line, and an authoritative run emits neither — so without this
+    sidecar a measurement run carries no record of the treatment condition that
+    produced its timings, and twenty-eight of them would be uninterpretable.
+
+    Both arms are asserted in the pair of tests below rather than one, because
+    a sidecar hard-coded to `fallback` would satisfy either one alone.
+    """
+    est = _estate(tmp_path)
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
+    assert res.returncode == 0, res.stdout + res.stderr
+    # This estate carries no duration table, so the scheduler falls back — and
+    # the record says so rather than staying silent. The digest field states a
+    # CAUSE rather than a hash when there is nothing to hash, and which cause
+    # applies is deliberately not pinned here: under pytest,
+    # tests/isolation_bootstrap/sitecustomize.py appends the real repository's
+    # bin/ to every child process's sys.path, so the validator imports even
+    # though this estate does not carry it and the cause recorded is the
+    # table's own absence rather than the validator's.
+    record = _scheduler_record(root)
+    assert record["mode"] == "fallback", record
+    assert not record["table_digest"].startswith("sha256:"), record
+
+
+def test_the_scheduler_record_names_the_table_it_dispatched_from(tmp_path):
+    """The other arm. The digest is compared against the bytes on disk, so a
+    record that reported a constant, or hashed the wrong file, fails here."""
+    import hashlib
+
+    est = _estate(tmp_path)
+    # Not what makes this case work: under pytest,
+    # tests/isolation_bootstrap/sitecustomize.py appends the real repository's
+    # bin/ to every child process's sys.path, so the scheduler would import the
+    # validator with or without this copy. The copy is kept so the estate is
+    # self-sufficient rather than resting on that leak, and so the module the
+    # scheduler imports is the one this estate declares — sys.path.insert puts
+    # the estate's own bin/ first.
+    shutil.copy2(
+        BIN / "_lib_harness_durations.py", est / "bin" / "_lib_harness_durations.py"
+    )
+    table = est / "tests" / "authoritative-harness-durations.tsv"
+    table.write_text("alpha\t7\nreconcile\t3\n", encoding="utf-8")
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
+    assert res.returncode == 0, res.stdout + res.stderr
+    record = _scheduler_record(root)
+    assert record["mode"] == "lpt", record
+    assert record["table"] == "tests/authoritative-harness-durations.tsv", record
+    assert record["table_digest"] == (
+        "sha256:" + hashlib.sha256(table.read_bytes()).hexdigest()
+    ), record
+
+
+def test_the_recorded_digest_is_the_one_the_dispatch_decision_was_taken_from(
+    tmp_path,
+):
+    """The record must describe the dispatch decision, not the tree at teardown.
+
+    `SCHEDULER_MODE` is decided before the pool starts and the digest used to be
+    recomputed after it finished, so the two fields could describe different
+    bytes. A run leases its workdir for the whole sixteen minutes, which is the
+    window in which a tree can change under it. This case makes that window
+    deterministic: the `alpha` harness rewrites the duration table while the
+    pool is running, and the record must still name the bytes the scheduler
+    read.
+    """
+    import hashlib
+
+    est = _estate(tmp_path)
+    # Same reason as the sibling case above: sitecustomize would supply the
+    # validator anyway, and resting the only proof of the dispatch-time
+    # digest on that leak is exactly the trap this estate documents.
+    shutil.copy2(
+        BIN / "_lib_harness_durations.py", est / "bin" / "_lib_harness_durations.py"
+    )
+    table = est / "tests" / "authoritative-harness-durations.tsv"
+    dispatched = "alpha\t7\nreconcile\t3\n"
+    table.write_text(dispatched, encoding="utf-8")
+    (est / "bin" / "cctally-alpha-test").write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'alpha\\t99\\nreconcile\\t1\\n' > %s\n"
+        "printf '%%s\\n' %s\n" % (_sq(str(table)), _sq(DEFAULT_SUMMARY)),
+        encoding="utf-8",
+    )
+    (est / "bin" / "cctally-alpha-test").chmod(0o755)
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
+    assert res.returncode == 0, res.stdout + res.stderr
+    # Non-vacuity: without the mid-run rewrite the two digests are equal and
+    # this case cannot tell a dispatch-time record from a teardown-time one.
+    assert table.read_text(encoding="utf-8") != dispatched, table.read_text(
+        encoding="utf-8"
+    )
+    record = _scheduler_record(root)
+    assert record["mode"] == "lpt", record
+    assert record["table_digest"] == (
+        "sha256:" + hashlib.sha256(dispatched.encode("utf-8")).hexdigest()
+    ), record
+
+
 def test_a_completed_run_leaves_no_reporter_behind(tmp_path):
     est = _estate(tmp_path)
     root = tmp_path / "ev"
@@ -1307,11 +1436,11 @@ def test_the_console_withholds_the_block_when_a_content_leg_fires(tmp_path):
     over-firing, so nothing around it can be trusted and the block is
     withheld whole.
     """
-    res = _scrub_log(tmp_path, _SCRUB_LOG_LINES, "free-form-text")
+    res = _scrub_log(tmp_path, _SCRUB_LOG_LINES, "email")
     assert res.returncode == 0, res.stdout + res.stderr
     assert res.stdout == (
         "[REDACTED: alpha context refused by the validator, 1 violations, "
-        "cause: free-form-text]\n"
+        "cause: email]\n"
     ), res.stdout
     assert "passed: 0" not in res.stdout, res.stdout
 
@@ -2877,3 +3006,40 @@ def test_the_footer_records_the_real_exit_status(tmp_path, status):
     assert footer["footer"] is True, footer
     assert footer["exitStatus"] == status, footer
 
+
+
+def test_a_forced_control_arm_records_itself_as_its_own_mode(tmp_path):
+    """The measurement programme's only per-run proof of treatment condition.
+
+    A control arm recorded as `fallback` would be indistinguishable from a run
+    whose scheduler could not read its table, and a control arm recorded as
+    `lpt` would be indistinguishable from the treatment arm. Either confusion
+    invalidates the pair it belongs to, so the forced arm carries its own value
+    and still names the same table and digest as the treatment arm.
+    """
+    import hashlib
+
+    est = _estate(tmp_path)
+    shutil.copy2(
+        BIN / "_lib_harness_durations.py", est / "bin" / "_lib_harness_durations.py"
+    )
+    table = est / "tests" / "authoritative-harness-durations.tsv"
+    table.write_text("alpha\t7\nreconcile\t3\n", encoding="utf-8")
+    root = tmp_path / "ev"
+    res = _drive(
+        est,
+        tmp_path,
+        {
+            "CCTALLY_TEST_EVIDENCE_ROOT": str(root),
+            "CCTALLY_TEST_ALL_DISPATCH": "report",
+        },
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    record = _scheduler_record(root)
+    assert record["mode"] == "report-forced", record
+    # The provenance must be identical to the treatment arm's, or the pair
+    # differs in more than the one variable under test.
+    assert record["table"] == "tests/authoritative-harness-durations.tsv", record
+    assert record["table_digest"] == (
+        "sha256:" + hashlib.sha256(table.read_bytes()).hexdigest()
+    ), record

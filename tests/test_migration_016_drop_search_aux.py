@@ -26,12 +26,13 @@ topology asserting 016 defers rather than failing.
 """
 from __future__ import annotations
 
-import importlib.util as ilu
 import sqlite3
 import sys
 from pathlib import Path
 
 import pytest
+from _fts5_gate import require_fts5  # the ONE FTS5 capability gate (#630 S6)
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 
 BIN_DIR = Path(__file__).resolve().parent.parent / "bin"
@@ -40,18 +41,10 @@ _MIGRATION = "016_drop_search_aux"
 
 @pytest.fixture(scope="module")
 def cctally_module():
-    """Load bin/cctally once per module (registers the cache migrations).
-    bin/cctally has no ``.py`` suffix, so an explicit ``SourceFileLoader`` is
-    required."""
-    from importlib.machinery import SourceFileLoader
-
+    """Load bin/cctally once per module (registers the cache migrations)."""
     if str(BIN_DIR) not in sys.path:
         sys.path.insert(0, str(BIN_DIR))
-    loader = SourceFileLoader("cctally", str(BIN_DIR / "cctally"))
-    spec = ilu.spec_from_loader("cctally", loader)
-    mod = ilu.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
+    mod = load_script_module()
     return mod
 
 
@@ -183,8 +176,7 @@ def test_016_defers_on_legacy_aux_fts_topology(
     try:
         _apply_schema(conn, db_module)
         _add_search_aux(conn)
-        if not db_module._fts5_available(conn):
-            pytest.skip("FTS5 unavailable on this SQLite build")
+        require_fts5('FTS5 unavailable on this SQLite build')
         # Tear the fresh split FTS down to the legacy prose+aux pair so the aux
         # index + triggers reference search_aux (the topology DROP COLUMN can't
         # survive). Mirrors the migration-010 fixture builder's _to_legacy_shape.

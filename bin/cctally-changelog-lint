@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Refuse a CHANGELOG.md entry that is not user-facing in shape.
+
+A thin executable over `bin/_lib_changelog_policy.py`. It supplies both halves
+of the path axis — the mirror classifier, where the repository carries its data,
+and the tree-existence predicate, always — calls the kernel, prints the findings
+and maps the exit codes: 0 clean, 1 policy findings, 2 invalid invocation, 3 an
+inability to complete — unreadable input, or a classifier whose data is present
+but which cannot be loaded or called. A classifier that is merely ABSENT is not
+that case: the kernel reports the degrade, decides the path axis by existence
+alone, and the run still exits 0 or 1.
+
+The two are necessary conditions rather than a decider and a fallback, so a run
+that has both reports a cited path when either fails. Existence is answered from
+the repository INDEX; the filesystem is a reported fallback for a tree that has
+no index.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import pathlib
+import subprocess
+import sys
+
+# An ordinary import of a `bin/` sibling has CPython write
+# `bin/__pycache__/*.pyc` into the tree under test, which is a side effect in a
+# tool whose whole contract is that it only reads. The flag is read at import
+# time, so it is set before the import rather than after it.
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import _lib_changelog_policy as policy  # noqa: E402
+
+EXIT_OK, EXIT_FINDINGS, EXIT_USAGE, EXIT_INPUT = 0, 1, 2, 3
+
+
+class ClassifierBroken(Exception):
+    """The classifier's data is present but it cannot be loaded or called.
+
+    Distinct from ABSENCE, which is the reported-degrade path and stays exit
+    0/1. A classifier that raises is an inability to complete the check, and the
+    design assigns that exit 3 — never exit 1, which would be indistinguishable
+    from having found policy violations.
+    """
+
+
+def _load_classify(repo_root: pathlib.Path):
+    """The mirror's own `classify()`, or None where its data is absent.
+
+    Neither `.mirror-allowlist` nor `.githooks/_match.py` is published, so on
+    the public mirror this returns None, the kernel decides the path axis by
+    existence in the tree instead — and says so in its report.
+    """
+    matcher = repo_root / ".githooks" / "_match.py"
+    allowlist = repo_root / ".mirror-allowlist"
+    if not (matcher.is_file() and allowlist.is_file()):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("_cctally_match", matcher)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        text = allowlist.read_text(encoding="utf-8")
+    except Exception as exc:                      # noqa: BLE001 - see docstring
+        raise ClassifierBroken(f"cannot load {matcher}: {exc}") from exc
+
+    def classify(paths):
+        try:
+            return module.classify(paths, allowlist_text=text)
+        except Exception as exc:                  # noqa: BLE001 - see docstring
+            raise ClassifierBroken(f"{matcher} classify() failed: {exc}") from exc
+
+    return classify
+
+
+# `git ls-files` on this repository reads ~6,800 entries in well under a second.
+# The bound exists so that a wedged git can never hang a lint that is a gate.
+_INDEX_READ_TIMEOUT_SECONDS = 30
+
+
+def _index_paths(repo_root: pathlib.Path):
+    """Every path the repository index carries, and the directories they imply.
+
+    ``None`` where there is no index to read — a tarball export with no `.git`,
+    a directory that is not a repository, or no `git` on PATH. Those are the
+    filesystem fallback's cases, not errors.
+
+    The index holds files only, so a citation naming a directory those files sit
+    under is still followable and the implied prefixes are part of the set.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "-z"],
+            capture_output=True, timeout=_INDEX_READ_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    carried: set = set()
+    for entry in proc.stdout.decode("utf-8", "replace").split("\0"):
+        if not entry:
+            continue
+        carried.add(entry)
+        parts = entry.split("/")
+        for depth in range(1, len(parts)):
+            carried.add("/".join(parts[:depth]))
+    return carried
+
+
+def _tree_exists(repo_root: pathlib.Path):
+    """Does the tree being linted carry this cited path, and what said so?
+
+    Returns the predicate the kernel injects and the name of the source it
+    consulted, so a run is never ambiguous about what it read.
+
+    **The index is the answer, not the filesystem.** `Path.exists()` follows
+    symlinks, so a probe that built `bin/escape -> <a directory outside the
+    tree>` and `bin/etc -> /etc` had `bin/escape/secret.md` and `bin/etc/passwd`
+    both reported present. It is also not deterministic: `dashboard/web/node_modules`
+    is absent on a bare checkout and present in a clone that has run
+    `npm install`, so one tree linted two ways on two machines. `git ls-files`
+    follows no link, records the symlink itself and nothing beneath it, and is
+    identical on both machines. On the public mirror it returns the public file
+    set, which is exactly the right answer to "does this tree carry it".
+
+    The fallback, where there is no index, keeps its own guard: the candidate is
+    resolved and refused unless it lands inside the root, so a symlink cannot
+    reach the host there either. It is still approximate in the other direction,
+    because an untracked file present on this machine counts as carried, and the
+    run says so.
+
+    A token that is absolute or climbs out of the tree is not a repository
+    citation under either source. A glob spelling such as `bin/_lib_*.py` names
+    no literal file and is absent for the same reason.
+    """
+    carried = _index_paths(repo_root)
+    if carried is not None:
+        def exists(path: str) -> bool:
+            candidate = pathlib.PurePosixPath(path)
+            if candidate.is_absolute() or ".." in candidate.parts:
+                return False
+            return path in carried
+
+        return exists, "index"
+
+    root = repo_root.resolve()
+
+    def exists(path: str) -> bool:
+        candidate = pathlib.PurePosixPath(path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            return False
+        try:
+            resolved = (root / candidate).resolve()
+            if not resolved.is_relative_to(root):
+                return False
+            return resolved.exists()
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    return exists, "filesystem"
+
+
+_FILESYSTEM_SOURCE_NOTE = (
+    "note: the tree-existence check read the filesystem, because the repository "
+    "index is unavailable, so an untracked file that happens to be present here "
+    "counts as carried"
+)
+
+
+def _repo_root_for(path: pathlib.Path) -> "pathlib.Path | None":
+    """The repository root containing ``path``, or None when there is none."""
+    for candidate in [path if path.is_dir() else path.parent, *path.parents]:
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="cctally-changelog-lint",
+        description="Check CHANGELOG.md against the user-facing entry policy.",
+    )
+    parser.add_argument("--repo-root", metavar="DIR")
+    parser.add_argument("--file", metavar="PATH")
+    parser.add_argument("--json", action="store_true")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return EXIT_OK if exc.code == 0 else EXIT_USAGE
+
+    own_root = pathlib.Path(__file__).resolve().parent.parent
+    if args.repo_root:
+        root = pathlib.Path(args.repo_root).resolve()
+        target = pathlib.Path(args.file).resolve() if args.file else root / "CHANGELOG.md"
+    elif args.file:
+        # The allowlist that governs a file is the one in ITS repository, not
+        # the one beside this executable. Defaulting to `own_root` classified a
+        # linted file against a tree it has nothing to do with.
+        target = pathlib.Path(args.file).resolve()
+        root = _repo_root_for(target) or own_root
+    else:
+        root = own_root
+        target = root / "CHANGELOG.md"
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"cctally-changelog-lint: cannot read {target}: {exc}", file=sys.stderr)
+        return EXIT_INPUT
+
+    exists, existence_source = _tree_exists(root)
+    try:
+        classify = _load_classify(root)
+        report = policy.check_text(text, classify=classify, exists=exists)
+    except ClassifierBroken as exc:
+        print(f"cctally-changelog-lint: {exc}", file=sys.stderr)
+        return EXIT_INPUT
+
+    try:
+        label = str(target.relative_to(root))
+    except ValueError:
+        # A `--file` outside `--repo-root` has no repo-relative form, and the
+        # absolute path is the exact thing the `--json` `file` key was changed
+        # to stop printing: it published the runner's checkout location in every
+        # public CI run. The basename names the file that was read and leaks no
+        # location, so both output modes use it.
+        label = target.name
+    if args.json:
+        # The dataclass field is `classifier_available` and the wire key is
+        # `classifierAvailable`, per the camelCase envelope rule in
+        # `docs/cli-contract.md`. The asymmetry is deliberate.
+        print(json.dumps({
+            "schemaVersion": 1,
+            # The repo-relative form, matching what `format_report` prints. The
+            # absolute resolved path published the runner's checkout location
+            # in every public CI run.
+            "file": label,
+            "classifierAvailable": report.classifier_available,
+            "classifierNote": report.classifier_note,
+            # Which source answered "does this tree carry it". Always stated,
+            # so a machine reader never has to infer it from the environment.
+            "existenceSource": existence_source,
+            "findings": [{"line": f.line, "rule": f.rule, "detail": f.detail}
+                         for f in report.findings],
+        }, indent=2))
+    else:
+        rendered = policy.format_report(report, label)
+        if rendered:
+            print(rendered)
+        # Named only when it is the FALLBACK. The index is the contract, so
+        # silence means the index was read; the degrade is what a reader needs
+        # told, which is the convention `classifier_note` already follows.
+        if existence_source == "filesystem":
+            print(_FILESYSTEM_SOURCE_NOTE)
+    return EXIT_FINDINGS if report.findings else EXIT_OK
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

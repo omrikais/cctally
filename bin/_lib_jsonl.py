@@ -381,6 +381,19 @@ class _CodexIterState:
     # watermark by construction, and the caller persists exactly it (replacing
     # the old reconstructed initial+Σ(per-turn) sum, which could diverge).
     total_tokens: int = 0
+    # #647: provider time of the last accepted accounting event. The caller
+    # seeds this from the retained row immediately before a delta cursor, and
+    # the iterator advances it on every accepted accounting record. A lower
+    # cumulative can start a new producer generation only when its timestamp
+    # advances this independent chronological watermark; copied or
+    # out-of-order history at a new byte offset therefore cannot lower the
+    # cumulative watermark and make the copied suffix count twice.
+    last_accounting_timestamp: dt.datetime | None = None
+    # A provider lifecycle record (turn_context/task_started) observed since
+    # the last accepted accounting row. Token-count re-emissions cannot set
+    # this bit themselves, so it is the producer-transition evidence required
+    # before a restart-shaped lower cumulative may replace the watermark.
+    generation_transition_pending: bool = False
     # #279 S2 F1 parse-health counters — per-iterator-call; sync_codex_cache
     # folds them into CodexIngestStats after each file drains. Reason
     # vocabulary: info-non-dict / no-last-token-usage / bad-timestamp /
@@ -869,6 +882,57 @@ def _reject_nonfinite_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant: {value}")
 
 
+def _codex_generation_transition_between(
+    path_str: str, after_offset: int, before_offset: int,
+) -> bool:
+    """Return whether a producer lifecycle boundary exists in this byte gap.
+
+    ``after_offset`` is the physical row of the last retained accounting
+    event, so that row is skipped. ``before_offset`` is a durable resume cursor
+    and is never consumed. This reconstructs the one bit of parser state a
+    metadata-only or budgeted pass can leave between the last accounting row
+    and the next token event without adding another cache schema column.
+    Malformed or unreadable evidence fails closed.
+    """
+    if after_offset < 0 or before_offset <= after_offset:
+        return False
+    try:
+        with open(path_str, "rb") as fh:
+            fh.seek(after_offset)
+            fh.readline()  # skip the retained accounting record itself
+            while fh.tell() < before_offset:
+                line_offset = fh.tell()
+                line = fh.readline()
+                if not line or not line.endswith(b"\n"):
+                    return False
+                if fh.tell() > before_offset:
+                    return False
+                try:
+                    obj = json.loads(
+                        line.decode("utf-8"),
+                        parse_constant=_reject_nonfinite_json_constant,
+                    )
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+                    continue
+                if not isinstance(obj, dict) or not _json_value_is_finite(obj):
+                    continue
+                payload = (
+                    obj.get("payload")
+                    if isinstance(obj.get("payload"), dict)
+                    else {}
+                )
+                if obj.get("type") == "turn_context" or (
+                    obj.get("type") == "event_msg"
+                    and payload.get("type") == "task_started"
+                ):
+                    return True
+                if fh.tell() <= line_offset:  # defensive progress invariant
+                    return False
+    except OSError:
+        return False
+    return False
+
+
 def _seed_codex_iter_state(
     state: _CodexIterState, initial_session_id: str | None,
     initial_model: str | None, initial_total_tokens: int,
@@ -934,6 +998,11 @@ def _accounting_from_record(
             and state.thread.parent_thread_id is not None):
         return None, last_total_tokens, filename_session_id_warned
 
+    timestamp = _parse_codex_timestamp(obj.get("timestamp"))
+    if timestamp is None:
+        _codex_skip(state, "bad-timestamp")
+        return None, last_total_tokens, filename_session_id_warned
+
     total_token_usage = info.get("total_token_usage")
     if isinstance(total_token_usage, dict):
         try:
@@ -941,14 +1010,33 @@ def _accounting_from_record(
         except (TypeError, ValueError):
             cumulative = 0
         if cumulative <= last_total_tokens:
-            return None, last_total_tokens, filename_session_id_warned
+            # A continued Codex producer can append to the same rollout while
+            # restarting its cumulative counter at zero.  The first record of
+            # that new generation is self-originating: its cumulative total is
+            # exactly the complete provider-native last-turn total. A distinct
+            # producer lifecycle record must have occurred since the last
+            # accepted accounting row, and this event must also advance the
+            # retained maximum timestamp. Token-count re-emissions cannot
+            # manufacture the lifecycle evidence, even when they carry fresh
+            # timestamps. Equal totals remain duplicates, and arbitrary or
+            # non-monotonic lower totals remain noise.
+            try:
+                last_usage_total = int(last_token_usage.get("total_tokens") or 0)
+            except (TypeError, ValueError):
+                last_usage_total = 0
+            starts_generation = (
+                state.generation_transition_pending
+                and cumulative < last_total_tokens
+                and cumulative > 0
+                and cumulative == last_usage_total
+                and state.last_accounting_timestamp is not None
+                and timestamp > state.last_accounting_timestamp
+            )
+            if not starts_generation:
+                return None, last_total_tokens, filename_session_id_warned
     else:
         cumulative = None
 
-    timestamp = _parse_codex_timestamp(obj.get("timestamp"))
-    if timestamp is None:
-        _codex_skip(state, "bad-timestamp")
-        return None, last_total_tokens, filename_session_id_warned
     session_id = state.session_id
     if session_id is None:
         session_id = filename_uuid
@@ -982,6 +1070,12 @@ def _accounting_from_record(
     if cumulative is not None:
         state.total_tokens = cumulative
         last_total_tokens = cumulative
+    if (
+        state.last_accounting_timestamp is None
+        or timestamp > state.last_accounting_timestamp
+    ):
+        state.last_accounting_timestamp = timestamp
+    state.generation_transition_pending = False
     return entry, last_total_tokens, filename_session_id_warned
 
 
@@ -1076,6 +1170,9 @@ def _iter_codex_fused_records_with_offsets(
             model = _codex_string(payload.get("model"))
             if model is not None:
                 state.model = model.strip()
+            state.generation_transition_pending = True
+        elif obj.get("type") == "event_msg" and payload.get("type") == "task_started":
+            state.generation_transition_pending = True
 
         event = _event_from_record(
             obj, path_str, line_offset, source_root_key, state.thread

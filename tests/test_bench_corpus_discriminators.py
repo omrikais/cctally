@@ -234,7 +234,8 @@ def test_semantic_hash_separates_codex_content(axis, mutation, tmp_path,
     """
     bbf = _load_build_bench()
     data_dir = tmp_path / "corpus"
-    shutil.copytree(small_corpus, data_dir)
+    shutil.copytree(small_corpus, data_dir,
+                    ignore=shutil.ignore_patterns("*.db-shm", "*.db-wal"))
 
     conn = _writable_fixture_db(data_dir)
     try:

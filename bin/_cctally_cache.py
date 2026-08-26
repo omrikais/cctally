@@ -7327,6 +7327,20 @@ def sync_codex_cache(
                 model=initial_model,
                 total_tokens=initial_total_tokens,
             )
+            if start_offset > 0 and not truncated and not requalified:
+                prior_accounting = conn.execute(
+                    "SELECT MAX(timestamp_utc),MAX(line_offset) "
+                    "FROM codex_session_entries "
+                    "WHERE source_path=? AND line_offset<? ",
+                    (path_str, start_offset),
+                ).fetchone()
+                if prior_accounting is not None and prior_accounting[0] is not None:
+                    iter_state.last_accounting_timestamp = _parse_anchor_iso(
+                        prior_accounting[0])
+                if prior_accounting is not None and prior_accounting[1] is not None:
+                    iter_state.generation_transition_pending = (
+                        _lib_jsonl._codex_generation_transition_between(
+                            path_str, int(prior_accounting[1]), start_offset))
             if (
                 prev is not None and not truncated and not requalified
                 and prev_native_thread_id is not None
@@ -11223,6 +11237,23 @@ def sync_codex_conversations(
                 model=initial_model,
                 total_tokens=initial_total_tokens,
             )
+            if start_offset > 0 and not reset_file:
+                try:
+                    prior_accounting = conn.execute(
+                        "SELECT MAX(timestamp_utc),MAX(line_offset) FROM "
+                        "cache_db.codex_session_entries "
+                        "WHERE source_path=? AND line_offset<? ",
+                        (path_str, start_offset),
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    prior_accounting = None
+                if prior_accounting is not None and prior_accounting[0] is not None:
+                    state.last_accounting_timestamp = _parse_anchor_iso(
+                        prior_accounting[0])
+                if prior_accounting is not None and prior_accounting[1] is not None:
+                    state.generation_transition_pending = (
+                        _lib_jsonl._codex_generation_transition_between(
+                            path_str, int(prior_accounting[1]), start_offset))
             if initial_native and initial_root:
                 state.thread = _lib_jsonl.CodexThreadMetadata(
                     source_root_key=discovered.source_root_key,

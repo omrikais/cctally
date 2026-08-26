@@ -127,7 +127,7 @@
     {
       "name": "doc-lint",
       "visibility": "public",
-      "minCases": 10,
+      "minCases": 11,
       "countPolicy": "fixed"
     },
     {
@@ -229,7 +229,7 @@
     {
       "name": "preflight",
       "visibility": "public",
-      "minCases": 16,
+      "minCases": 20,
       "countPolicy": "fixed"
     },
     {

@@ -18,7 +18,7 @@
 # that the detectors work, and `real-tree` as the reason skipping removes a
 # duplicate rather than coverage.
 #
-# The matrix covers each of the tool's three CHECKS. It does not cover every
+# The matrix covers each of the tool's six CHECKS. It does not cover every
 # branch inside them, and the difference matters when reading a green run:
 #
 #   1. compile every Python file under bin/, selected by `.py` extension OR by
@@ -38,15 +38,47 @@
 #                              overlay-absent-public, overlay-absent-private.
 #                              NOT covered: the owners-tool-absent branch, and
 #                              the missing-bin/ branch one level up.
+#   4. validate tests/authoritative-harness-durations.tsv against the estate
+#      manifest (#630 S3)   -> cases durations-missing, durations-malformed,
+#                              durations-unknown, durations-uncovered. The
+#                              green control is this check's passing input,
+#                              because make_tree writes a covering table.
+#                              NOT covered: the duplicate-name branch and the
+#                              non-positive-duration branch, both of which the
+#                              scheduler's own pytest cases reach.
+#   5. read bin/cctally-test-all's plan and require scheduler=lpt (#630 S3)
+#                           -> case scheduler-fallback, against the clean
+#                              tree's stand-in aggregator as the green control,
+#                              plus scheduler-aggregator-absent (not faulted)
+#                              and scheduler-aggregator-unreadable (faulted),
+#                              which are the two halves the tool used to
+#                              conflate.
+#                              NOT covered: the plan-exited-non-zero branch and
+#                              the no-scheduler-line branch.
+#   6. classify each manifest row against .mirror-allowlist and compare with
+#      the declared visibility -> cases visibility-agrees, visibility-drift,
+#                              and classifier-bound, which guards the one
+#                              divergence between the seeded classifier and the
+#                              real one that a fixture edit can reach.
+#                              Their classifier is SEEDED into the synthetic
+#                              tree, not copied from .githooks/ — see the note
+#                              above seed_classifier. The real classifier is
+#                              covered by `real-tree`.
+#                              NOT covered: the classifier-absent branch, which
+#                              overlay-absent-private reaches incidentally, and
+#                              the classifier-raises branch.
 #
 # No case here exercises a check the tool does not perform. The remaining three
 # cases are the green control, the usage refusal, and `real-tree`.
 #
 # Each mutation is introduced into its own scratch copy of a minimal synthetic
-# repository, so a case can only fail for the defect it introduced. There is no
-# wall-clock assertion anywhere: the tool is fast because it parses and does
-# nothing else, and #529 S3 has just removed a load-sensitive ceiling that was
-# reddening release-stamp CI runs on a contended box.
+# repository, so a case can only fail for the defect it introduced. No case
+# here asserts a wall clock, and the tool asserts none either: it is fast
+# because it parses and does nothing else, and #529 S3 has just removed a
+# load-sensitive ceiling that was reddening release-stamp CI runs on a
+# contended box. The tool's check 5 does carry a 60-second HANG bound on the
+# aggregator subprocess, which is a different thing — see the paragraph on it
+# in bin/cctally-preflight's own docstring.
 #
 # NOTE for the ownership scraper (bin/cctally-test-owners): every fixture path
 # below is BUILT from variables rather than written as a literal, so this
@@ -54,6 +86,21 @@
 # an edge into a directory that exists only inside a scratch tree.
 
 set -uo pipefail
+
+# FIDELITY SCRUB. #630 S3's measurement programme runs whole authoritative
+# suites with CCTALLY_TEST_ALL_DISPATCH exported, and this harness runs inside
+# those suites. The tool under test reads that variable to decide which dispatch
+# arm to expect, so an inherited value silently rewrites what every scheduler
+# case below is asserting: the control arm made `scheduler-fallback` report "not
+# the control arm it was asked for" instead of "scheduler=fallback", and five
+# cases failed on a tree with nothing wrong with it.
+#
+# Each case that cares sets the variable itself, per invocation. Scrubbing it
+# here is what makes those settings the only source, so a case observes what it
+# asked for rather than what the surrounding run happens to export. This is the
+# same defect the pycache case hit from the other direction, and the same reason
+# bin/cctally-test-remote-test unsets CCTALLY_TEST_JOBS at its own top.
+unset CCTALLY_TEST_ALL_DISPATCH
 
 # Dev-instance isolation: force the prod data-dir layout under any fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -126,6 +173,55 @@ EOF
   }
 }
 EOF
+    # The duration table the dispatch scheduler reads (#630 S3). It is an exact
+    # cover of the manifest above, so the clean tree stays clean: without it
+    # every pre-existing green case would fail the new mandatory validation
+    # rather than the property it asserts.
+    printf '%s\t%s\n' "$H" 5 > "$d/tests/authoritative-harness-durations.tsv"
+    write_changelog "$d"
+    write_plan_stub "$d" lpt
+}
+
+# The changelog every synthetic tree starts from. Check 7 reads
+# <root>/CHANGELOG.md, so a tree without one would fault every pre-existing
+# green case on the new check rather than on the property it asserts. It cites
+# no path, because these trees carry almost no files and a citation would be
+# dead here for a reason that has nothing to do with the case under test.
+write_changelog () {   # write_changelog <root>
+    cat > "$1/CHANGELOG.md" <<'CHANGELOG_EOF'
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+## [Unreleased]
+
+### Added
+- A short user-facing line that names a surface and stays inside the cap.
+
+## [1.0.0] - 2026-05-06
+
+### Added
+- Initial release.
+CHANGELOG_EOF
+}
+
+# A stand-in aggregator, so check 5 has a plan to read. It answers plan mode
+# and refuses anything else, which is all the pre-flight asks of it. Stubbed
+# rather than copied for the same reason the mirror classifier is seeded: the
+# real bin/cctally-test-all wants the contract libraries, the evidence kernel
+# and a `reconcile` harness before it will plan at all, and reproducing that
+# here would turn this mutation matrix into a second estate fixture. The REAL
+# aggregator's plan is read by `real-tree` at the bottom of this file.
+write_plan_stub () {   # write_plan_stub <root> <scheduler mode>
+    local d=$1 mode=$2
+    {
+        printf '%s\n' '#!/usr/bin/env bash'
+        printf '%s\n' '[ "${CCTALLY_TEST_ALL_PLAN:-}" = 1 ] || { echo "stub: plan mode only" >&2; exit 2; }'
+        printf "printf 'harnesses=%%s\\\\n' %s\n" "$H"
+        printf "printf 'dispatch_harnesses=%%s\\\\n' %s\n" "$H"
+        printf "printf 'scheduler=%%s\\\\n' %s\n" "$mode"
+    } > "$d/bin/cctally-test-all" || return 1
+    chmod +x "$d/bin/cctally-test-all"
 }
 
 # Allocate a fresh tree for one case and echo its path.
@@ -140,8 +236,15 @@ new_tree () {   # new_tree <case name>
 # one that tripped a neighbour's, so every failing case also names the subject
 # it introduced and the diagnostic must mention it.
 expect_rc () {   # expect_rc <case name> <expected rc> <repo root> [substring]
-    local case_name=$1 want=$2 root=$3 want_text=${4-} got
-    "$PREFLIGHT" --repo-root "$root" > "$SCRATCH_DIR/$case_name.log" 2>&1
+    expect_rc_tool "$1" "$PREFLIGHT" "$2" "$3" "${4-}"
+}
+
+# The same contract for a case that mutates the TOOL rather than the tree, and
+# therefore runs a copied binary. Kept as the general form with expect_rc as
+# its wrapper, so the two can never drift on what a diagonal case must show.
+expect_rc_tool () {   # expect_rc_tool <case name> <binary> <expected rc> <root> [substring]
+    local case_name=$1 binary=$2 want=$3 root=$4 want_text=${5-} got
+    "$binary" --repo-root "$root" > "$SCRATCH_DIR/$case_name.log" 2>&1
     got=$?
     if [ "$got" != "$want" ]; then
         report "$case_name" FAIL "expected exit $want, got $got (see $SCRATCH_DIR/$case_name.log)"
@@ -252,6 +355,329 @@ d=$(new_tree overlay-absent-private)
 printf '%s\n' 'bin/cctally-*' 'tests/**' > "$d/.mirror-allowlist"
 expect_rc overlay-absent-private 3 "$d" "overlay"
 
+# ---- check 4: the harness duration table -------------------------------
+# The scheduler in bin/cctally-test-all falls back to report order on a bad
+# table and stays authoritative, because a stale table must never fail a gate.
+# That is only safe if the staleness is caught locally, which is these cases.
+# The green control above is this check's passing input: make_tree writes a
+# table that exactly covers its manifest, and `clean` would go red without it.
+d=$(new_tree durations-missing)
+rm -f "$d/tests/authoritative-harness-durations.tsv"
+expect_rc durations-missing 3 "$d" "authoritative-harness-durations.tsv"
+
+d=$(new_tree durations-malformed)
+printf '%s\t%s\n' "$H" not-a-number > "$d/tests/authoritative-harness-durations.tsv"
+expect_rc durations-malformed 3 "$d" "not-a-number"
+
+# Split from the case below on purpose. A single fixture that both omits the
+# real harness and adds an unknown one trips the unknown-name detector first,
+# so a case named for coverage would in fact have been reporting the other
+# detector's finding — the masquerade this harness's diagonal rule forbids.
+d=$(new_tree durations-unknown)
+{ printf '%s\t%s\n' "$H" 5; printf '%s\t%s\n' other 5; } \
+    > "$d/tests/authoritative-harness-durations.tsv"
+expect_rc durations-unknown 3 "$d" "other"
+
+# The substring names the COVERAGE detector, not the harness. `$H` is a
+# substring of the harness FILENAME, and check 3 prints that filename in its
+# own diagnostics — `bin/cctally-alpha-test exists but is not executable` is
+# one — so a case grepping for `$H` would accept a neighbouring detector's
+# finding as this one's. That is a statement about what the SUBSTRING can
+# discriminate, not about this fixture: run it and the tool reports exactly one
+# problem, and neither the dispatch scheduler nor the ownership scan says
+# anything. "does not cover" is emitted by this branch alone.
+d=$(new_tree durations-uncovered)
+: > "$d/tests/authoritative-harness-durations.tsv"
+expect_rc durations-uncovered 3 "$d" "does not cover"
+
+# ---- check 5: the dispatch decision the aggregator would take ----------
+# Check 4 validates the table's BYTES. It cannot see the run-time conditions
+# that make the scheduler fall back silently anyway — no python3, a python3
+# that answers non-zero, an unimportable validator, a broken shell capture — so
+# spec section 3's check 4 is only half implemented without this. The green
+# control is the clean tree, whose stand-in aggregator answers `scheduler=lpt`.
+#
+# NOT covered here: the plan-exited-non-zero branch, the no-scheduler-line
+# branch, and the no-aggregator branch, which every pre-existing case in this
+# file used to reach and none reaches now.
+d=$(new_tree scheduler-fallback)
+if write_plan_stub "$d" fallback; then
+    expect_rc scheduler-fallback 3 "$d" "scheduler=fallback"
+else
+    report scheduler-fallback FAIL "the plan stub could not be rewritten"
+fi
+
+# The two halves of "no usable aggregator", which the tool used to conflate.
+# An ABSENT aggregator is the documented synthetic-fixture case and is not
+# faulted. A PRESENT one that lost its executable bit is a real defect that
+# nothing else catches: bin/cctally-test-owners --verify checks the mode bit of
+# every manifest harness, and bin/cctally-test-all is deliberately not one of
+# them, so the pre-flight answered `clean` on a tree whose pool could not start.
+# Both halves are asserted, because a tool that faulted BOTH would satisfy the
+# second case alone while breaking every synthetic-fixture caller.
+d=$(new_tree scheduler-aggregator-absent)
+rm -f "$d/bin/cctally-test-all"
+expect_rc scheduler-aggregator-absent 0 "$d"
+
+d=$(new_tree scheduler-aggregator-unreadable)
+chmod 644 "$d/bin/cctally-test-all"
+expect_rc scheduler-aggregator-unreadable 3 "$d" "present but not executable"
+
+# The measurement control arm (#630 S3). The expected dispatch mode follows the
+# operator's explicit CCTALLY_TEST_ALL_DISPATCH, because this check exists to
+# catch an UNINTENDED fallback and plan mode inherits the environment: without
+# that, the wrapper would refuse every control-arm run for doing exactly what it
+# was told. Both directions are asserted. The second case is the one with teeth
+# -- an override that silently failed to take effect would otherwise produce a
+# run dispatched longest-first while the operator recorded it as the control,
+# and the whole paired programme would be wrong with nothing to show it. A tool
+# that simply accepted any mode whenever the variable was set would pass the
+# first case and fail the second.
+d=$(new_tree scheduler-forced-arm-honoured)
+if write_plan_stub "$d" report-forced; then
+    CCTALLY_TEST_ALL_DISPATCH=report expect_rc scheduler-forced-arm-honoured 0 "$d"
+else
+    report scheduler-forced-arm-honoured FAIL "the plan stub could not be rewritten"
+fi
+
+d=$(new_tree scheduler-forced-arm-ignored)
+if write_plan_stub "$d" lpt; then
+    CCTALLY_TEST_ALL_DISPATCH=report expect_rc scheduler-forced-arm-ignored 3 "$d" \
+        "not the control arm it was asked for"
+else
+    report scheduler-forced-arm-ignored FAIL "the plan stub could not be rewritten"
+fi
+
+# ---- check 6: declared visibility against the mirror allowlist ---------
+# The synthetic tree is PUBLIC (no .mirror-allowlist), so the classification
+# path is private-only and does not run there. Both cases below add one, plus
+# a classifier and the private ownership overlay a private tree also requires —
+# without the overlay these would fire the OWNERSHIP detector and say nothing
+# about visibility.
+#
+# WHAT THE SEEDED CLASSIFIER IS AND IS NOT. It is a second spelling of the
+# mirror-classification contract, and nothing binds it to .githooks/_match.py.
+# It cannot be bound: that module is mirror-private and this harness is public,
+# which is the whole reason it is seeded, and copying it back is precisely the
+# public-tree failure described below. So the divergence is documented and
+# bounded instead.
+#
+# The two known divergences: (1) a bare `!pattern` marks a path private here,
+# whereas the real module treats negation as a subtraction from a prior
+# positive match; (2) `**` is folded to `*` and matched with fnmatch, rather
+# than compiled through the real module's `_translate`.
+#
+# The bound: neither divergence is reachable by the inputs this seed decides.
+# `make_private` writes exactly two patterns, `bin/**` and `tests/**`, with no
+# negation, and the only paths classified are the manifest's harness files
+# under `bin/`. Under fnmatch, `*` already crosses `/`, so folding `**` changes
+# no verdict for those patterns. The `classifier-bound` case below fails if a
+# future fixture adds a negated pattern, which is the one divergence a fixture
+# edit can reach. What no public case can catch is the real module's own
+# semantics changing — that is `real-tree`'s job, and `real-tree` runs the real
+# classifier over the real allowlist and the real manifest on every private
+# run.
+#
+# The classifier is SEEDED rather than copied out of $REPO_ROOT/.githooks. That
+# file is mirror-private and this harness is public, so on the public tree the
+# copy produced no file at all — silently, because the harness runs under
+# `set -uo pipefail` with no `-e` — and the synthetic tree then became a
+# private profile carrying no classifier, which is check_visibility's
+# fail-closed refusal. `visibility-agrees` therefore failed on the public
+# mirror, and `visibility-drift` passed only because that refusal happens to
+# contain the word it grepped for. Seeding removes the divergence rather than
+# skipping the two cases on the public tree: every other input in this tree is
+# fabricated already, the case count stays fixed on both profiles, and the REAL
+# classifier is still exercised by `real-tree`, which runs the pre-flight over
+# this repository's own private tree.
+seed_classifier () {   # seed_classifier <root>
+    local d=$1
+    mkdir -p "$d/.githooks" || return 1
+    cat > "$d/.githooks/_match.py" <<'CLASSIFIER'
+"""A stand-in mirror classifier for bin/cctally-preflight-test's fixtures.
+
+Same entry point and same return shape as the real .githooks/_match.py: every
+path is reported as public, private or unmatched, and the allowlist text is
+what decides. The matching is deliberately the simplest thing that reads the
+allowlist at all — one fnmatch per non-comment line, later lines winning,
+`**` folded to `*`, a leading `!` meaning private — because a fuller
+reimplementation would be a second spelling of a contract this repository
+keeps in exactly one place.
+"""
+import fnmatch
+
+
+def classify(paths, allowlist_path=None, allowlist_text=None):
+    if allowlist_text is None:
+        with open(allowlist_path, encoding="utf-8") as handle:
+            allowlist_text = handle.read()
+    patterns = [
+        line.strip()
+        for line in allowlist_text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    out = {"public": [], "private": [], "unmatched": []}
+    for path in paths:
+        verdict = "unmatched"
+        for pattern in patterns:
+            negated = pattern.startswith("!")
+            glob = (pattern[1:] if negated else pattern).replace("**", "*")
+            if fnmatch.fnmatch(path, glob):
+                verdict = "private" if negated else "public"
+        out[verdict].append(path)
+    return out
+CLASSIFIER
+}
+
+make_private () {   # make_private <root>
+    local d=$1
+    printf '%s\n' 'bin/**' 'tests/**' > "$d/.mirror-allowlist" || return 1
+    seed_classifier "$d" || return 1
+    cat > "$d/tests/harness-ownership.private.json" <<OVERLAY
+{
+  "schemaVersion": 1,
+  "harnesses": {}
+}
+OVERLAY
+}
+
+# The passing input. Without it a check_visibility that reported drift on
+# everything would still pass the failing case below. Every fixture write is
+# checked, so a fixture that could not be built reports as a failure of this
+# case rather than as a silently different tree.
+d=$(new_tree visibility-agrees)
+if make_private "$d"; then
+    expect_rc visibility-agrees 0 "$d"
+else
+    report visibility-agrees FAIL "the private-profile fixture could not be built"
+fi
+
+# Flipping a row to `private` also makes bin/cctally-test-owners report it as
+# owned by neither file, so this tree has two problems and exit 3 alone proves
+# nothing — the pre-change tool already exited 3 here. The substring is what
+# discriminates, and it names the drift branch specifically: the bare word
+# "visibility" also appears in the classifier-absent refusal, so grepping for
+# it would let a fail-closed tree pass as a drift detection.
+# The seeded classifier's bound, made mechanical. Negation is the one place the
+# seed and .githooks/_match.py genuinely disagree, and the only one a fixture
+# edit can reach. This fails the moment a private fixture starts using it, so
+# the divergence documented above cannot quietly become load-bearing.
+d=$(new_tree classifier-bound)
+if ! make_private "$d"; then
+    report classifier-bound FAIL "the private-profile fixture could not be built"
+elif grep -q '^[[:space:]]*!' "$d/.mirror-allowlist"; then
+    report classifier-bound FAIL \
+        "the private fixture now carries a negated allowlist pattern, which the seeded classifier reads differently from .githooks/_match.py — bind the classifier or move the case to the real tree"
+else
+    report classifier-bound PASS
+fi
+
+d=$(new_tree visibility-drift)
+if make_private "$d"; then
+    python3 - "$d" <<'DRIFT'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "tests" / "authoritative-test-manifest.json"
+data = json.loads(p.read_text())
+data["harnesses"][0]["visibility"] = "private"   # the allowlist says public
+p.write_text(json.dumps(data, indent=2) + "\n")
+DRIFT
+    expect_rc visibility-drift 3 "$d" "classifies"
+else
+    report visibility-drift FAIL "the private-profile fixture could not be built"
+fi
+
+# ---- check 7: CHANGELOG.md against the user-facing policy ---------------
+# The green control above is this check's passing input: make_tree writes a
+# compliant changelog. These four are the diagonal - absent, unreadable,
+# non-compliant, and a second compliant shape that must stay clean.
+d=$(new_tree changelog-missing)
+rm -f "$d/CHANGELOG.md"
+expect_rc changelog-missing 3 "$d" "cannot read"
+
+# Unreadable is spelled as bytes that are not UTF-8 rather than as a mode bit,
+# because a suite that ever ran as root would read a 0000 file and the case
+# would silently stop discriminating.
+d=$(new_tree changelog-unreadable)
+printf 'not utf-8: \377\376\375\n' > "$d/CHANGELOG.md"
+expect_rc changelog-unreadable 3 "$d" "cannot read"
+
+d=$(new_tree changelog-noncompliant)
+sed -i.bak 's/^- A short user-facing line.*$/- A deliberately non-compliant probe entry that cites issue #99999./' \
+    "$d/CHANGELOG.md"
+rm -f "$d/CHANGELOG.md.bak"
+expect_rc changelog-noncompliant 3 "$d" "issue-ref"
+
+# A second compliant shape, so the case that must stay clean is not a copy of
+# the green control: a Maintenance section, a second subsection, and an entry
+# that runs close to the cap without crossing it.
+d=$(new_tree changelog-compliant)
+cat > "$d/CHANGELOG.md" <<'CHANGELOG_EOF'
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+## [Unreleased]
+
+### Added
+- A user-facing line naming a surface, written long enough to sit near the cap without crossing it, so the case exercises the length rule from the passing side rather than only from the failing side of it.
+
+### Fixed
+- A second subsection, so the section carries two.
+
+## [1.0.0] - 2026-05-06
+
+### Maintenance
+- Internal improvements only; no user-facing changes.
+CHANGELOG_EOF
+expect_rc changelog-compliant 0 "$d"
+
+# ---- the tool's own siblings -------------------------------------------
+# Every case above mutates the tree under test. These mutate the TOOL, because
+# the modules checks 4, 6 and 7 need are loaded from the binary's own directory
+# and no --repo-root can reach them. Both loads used to run at module scope, so
+# a missing sibling was an unhandled traceback at exit 1 — a code outside this
+# tool's taxonomy, on the very contract that says an inability to complete a
+# check is a reported defect at exit 3. The whole directory is copied rather
+# than assembled file by file: the pre-flight also runs bin/cctally-test-owners
+# from its own directory, and a partial copy would fail through that instead of
+# through the sibling the case removed.
+copy_tool_bin () {   # copy_tool_bin <case name>  -> echoes the copied binary
+    local d="$SCRATCH_DIR/$1-tool"
+    mkdir -p "$d" || return 1
+    cp -R "$REPO_ROOT/bin" "$d/bin" || return 1
+    printf '%s' "$d/bin/cctally-preflight"
+}
+
+tool=$(copy_tool_bin lint-absent) && rm -f "$(dirname "$tool")/cctally-changelog-lint"
+if [ -n "${tool:-}" ] && [ -x "$tool" ]; then
+    d=$(new_tree lint-absent)
+    expect_rc_tool lint-absent "$tool" 3 "$d" \
+        "CHANGELOG.md could not be checked against the user-facing policy"
+    # --help needs none of these modules to answer, and answered with a
+    # traceback while the load ran at import time.
+    "$tool" --help > "$SCRATCH_DIR/lint-absent-help.log" 2>&1
+    rc=$?
+    if [ "$rc" = 0 ]; then
+        report lint-absent-help PASS
+    else
+        report lint-absent-help FAIL \
+            "--help exited $rc with the changelog lint absent (see $SCRATCH_DIR/lint-absent-help.log)"
+    fi
+else
+    report lint-absent FAIL "the tool directory could not be copied"
+    report lint-absent-help FAIL "the tool directory could not be copied"
+fi
+
+tool=$(copy_tool_bin durations-lib-absent) \
+    && rm -f "$(dirname "$tool")/_lib_harness_durations.py"
+if [ -n "${tool:-}" ] && [ -x "$tool" ]; then
+    d=$(new_tree durations-lib-absent)
+    expect_rc_tool durations-lib-absent "$tool" 3 "$d" \
+        "the harness duration table cannot be validated"
+else
+    report durations-lib-absent FAIL "the tool directory could not be copied"
+fi
+
 # ---- invocation and the real tree --------------------------------------
 "$PREFLIGHT" --nonsense > "$SCRATCH_DIR/usage.log" 2>&1
 rc=$?
@@ -265,7 +691,7 @@ fi
 # genuinely duplicated: the mutations above prove the detectors work, and this
 # proves they are pointed at this repository.
 #
-# CONSTRAINT: this is the one case that reads the SHARED working tree, and
+# CONSTRAINT 1: this is the one case that reads the SHARED working tree, and
 # bin/cctally-test-all runs this harness inside a parallel pool alongside every
 # other harness. It is safe today because no harness writes into the tree it
 # reads: each builder writes to a scratch directory or stages its fixtures out
@@ -273,6 +699,17 @@ fi
 # the whole run. A harness that regenerated a fixture directory IN PLACE would
 # break that, and the symptom would be this leg going red intermittently and
 # only under parallelism — a defect in the other harness, reported here.
+#
+# CONSTRAINT 2 (#630 S3): since check 5 was added, this case also EXECUTES the
+# real bin/cctally-test-all, in plan mode, from inside that aggregator's own
+# pool. It is safe because plan mode is contractually side-effect-free: it
+# exits before admission and before any harness launch, writes no evidence
+# directory, takes no lock, and its one subprocess runs `python3 -B`. Verified
+# by running it. What would break it is plan mode acquiring any shared state —
+# a lock, an evidence path, a marker file — because this leg would then contend
+# with the very run that started it. Anything added to plan mode must stay
+# inside that contract, and tests/test_test_all_observability.py's plan-mode
+# boundary cases are where it is enforced.
 "$PREFLIGHT" > "$SCRATCH_DIR/real-tree.log" 2>&1
 rc=$?
 if [ "$rc" = 0 ]; then

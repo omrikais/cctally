@@ -178,10 +178,10 @@ def test_physical_conflict_requires_the_whole_stored_split_absent(
 # `claude_ingest_walk_complete` alone — that marker gates the stats recomputes
 # against a half-populated session_entries, a hazard 030 does not create.
 # ---------------------------------------------------------------------------
-import importlib.util as ilu
 import shutil
 import sys
 from pathlib import Path
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 FIXTURE_DIR = (
     Path(__file__).resolve().parent
@@ -196,15 +196,9 @@ _MIGRATION = "030_session_entries_cache_creation_split"
 
 @pytest.fixture(scope="module")
 def cctally_module():
-    from importlib.machinery import SourceFileLoader
-
     if str(BIN_DIR) not in sys.path:
         sys.path.insert(0, str(BIN_DIR))
-    loader = SourceFileLoader("cctally", str(BIN_DIR / "cctally"))
-    spec = ilu.spec_from_loader("cctally", loader)
-    mod = ilu.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
+    mod = load_script_module()
     return mod
 
 

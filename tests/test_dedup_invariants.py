@@ -278,7 +278,8 @@ def scratch_corpus(corpus, tmp_path):
     """A writable copy of the module-scoped corpus, for the negative cases and
     the mutation matrix. The corpus itself is never mutated in place."""
     dest = tmp_path / "corpus"
-    shutil.copytree(corpus, dest)
+    shutil.copytree(corpus, dest,
+                    ignore=shutil.ignore_patterns("*.db-shm", "*.db-wal"))
     return dest
 
 

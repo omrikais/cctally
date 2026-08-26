@@ -3,6 +3,7 @@ import sqlite3, sys, pathlib
 import types
 
 import pytest
+from _fts5_gate import require_fts5  # the ONE FTS5 capability gate (#630 S6)
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 import _cctally_db as db
@@ -39,8 +40,7 @@ def test_storage_dedup_is_source_path_byte_offset_not_uuid():
 
 def test_fts_present_when_available_and_indexes_text():
     conn = _fresh()
-    if not db._fts5_available(conn):
-        import pytest; pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     conn.execute("INSERT INTO conversation_messages"
                  "(session_id,uuid,source_path,byte_offset,timestamp_utc,entry_type,text,blocks_json,is_sidechain)"
                  " VALUES('s','u','f',0,'t','assistant','token limit window','[]',0)")
@@ -51,8 +51,7 @@ def test_fts_present_when_available_and_indexes_text():
 
 def test_delete_propagates_to_fts():
     conn = _fresh()
-    if not db._fts5_available(conn):
-        import pytest; pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     conn.execute("INSERT INTO conversation_messages"
                  "(session_id,uuid,source_path,byte_offset,timestamp_utc,entry_type,text,blocks_json,is_sidechain)"
                  " VALUES('s','u','f',0,'t','assistant','findme','[]',0)")
@@ -75,8 +74,7 @@ def test_fts_unavailable_sets_flag_and_skips_fts_table(monkeypatch):
 
 def test_update_text_reindexes_fts():
     conn = _fresh()
-    if not db._fts5_available(conn):
-        import pytest; pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     conn.execute("INSERT INTO conversation_messages"
                  "(session_id,uuid,source_path,byte_offset,timestamp_utc,entry_type,text,blocks_json,is_sidechain)"
                  " VALUES('s','u','f',0,'t','assistant','alpha','[]',0)")
@@ -106,8 +104,7 @@ def _insert_split(conn, uuid, off, *, text="", search_tool="", search_thinking="
 
 def test_split_fts_present_when_available_and_indexes_columns():
     conn = _fresh()
-    if not db._fts5_available(conn):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _insert_split(conn, "u", 0, text="PROSETOKEN", search_tool="TOOLTOKEN command",
                   search_thinking="THINKTOKEN")
     # each column matchable via the column-filter syntax; prose-only and
@@ -129,8 +126,7 @@ def test_split_fts_present_when_available_and_indexes_columns():
 
 def test_split_delete_propagates_to_fts():
     conn = _fresh()
-    if not db._fts5_available(conn):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _insert_split(conn, "u", 0, search_tool="findtool")
     conn.execute("DELETE FROM conversation_messages")
     assert conn.execute(
@@ -140,8 +136,7 @@ def test_split_delete_propagates_to_fts():
 
 def test_split_update_reindexes_each_column():
     conn = _fresh()
-    if not db._fts5_available(conn):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _insert_split(conn, "u", 0, search_tool="alphatool", search_thinking="alphathink")
     conn.execute("UPDATE conversation_messages SET search_tool='betatool' WHERE uuid='u'")
     assert conn.execute(
@@ -181,8 +176,7 @@ def test_split_fts_create_failure_drops_and_insert_still_commits(monkeypatch):
     conversation_messages INSERT must still commit (the shared write txn — which
     also carries session_entries cost ingest — is NOT rolled back)."""
     conn = sqlite3.connect(":memory:")
-    if not db._fts5_available(conn):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
 
     # Fail the split-table create by feeding a malformed DDL through the seam the
     # apply uses (the _CONV_FTS_SPLIT_DDL execute). Simulate by monkeypatching
@@ -715,8 +709,7 @@ def test_clear_conversation_messages_empties_both_and_keeps_integrity():
     naive 'clear the index then let the per-row delete trigger fire' ordering
     corrupts the external-content index ('database disk image is malformed')."""
     conn = _fresh()
-    if not db._fts5_available(conn):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     for i in range(6):
         _insert_msg(conn, f"u{i}", i, "alpha findme prose")
     conn.commit()
@@ -763,8 +756,7 @@ def test_sync_rebuild_keeps_fts_integrity(isolated):
     """A `cache-sync --rebuild` full-clears via the storm-free path and the FTS
     index remains integrity-valid + correctly repopulated."""
     ns, conn, projects, sync = isolated
-    if not db._fts5_available(conn):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     f = projects / "a.jsonl"
     f.write_text(_asst_line("a1", "m1", "r1", "alpha old prose") + _user_line("u1", "alpha more"))
     sync()
@@ -788,8 +780,7 @@ def test_sync_truncation_keeps_fts_integrity(isolated):
     """The truncation-escalation full-clear uses the same storm-free path; the
     FTS index stays integrity-valid after a real reset + re-ingest."""
     ns, conn, projects, sync = isolated
-    if not db._fts5_available(conn):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     fa = projects / "a.jsonl"
     fb = projects / "b.jsonl"
     fa.write_text(_asst_line("a1", "m1", "r1", "alpha gone") + _user_line("u1", "alpha gone2"))
@@ -1052,8 +1043,7 @@ def test_sync_consumes_search_split_flag_backfills_and_swaps(isolated):
     swapped to the split shape by the next real sync_cache, the tool content is
     backfilled into search_tool, and the flag + cursor clear."""
     ns, conn, projects, sync = isolated
-    if not db._fts5_available(conn):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     (projects / "a.jsonl").write_text(_asst_tooluse_line("a1", "m1", "r1"))
     sync()   # split-shape ingest of the tool row
     # Model a pre-S6 install: revert to legacy FTS shape, blank the split
@@ -1088,8 +1078,7 @@ def test_rebuild_swaps_legacy_shape_and_clears_split_flag(isolated):
     swaps to the split shape (the walk repopulates the columns through the new
     triggers) and clears the flag without a redundant backfill pass."""
     ns, conn, projects, sync = isolated
-    if not db._fts5_available(conn):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     (projects / "a.jsonl").write_text(_asst_tooluse_line("a1", "m1", "r1"))
     sync()
     _to_legacy_shape(conn)

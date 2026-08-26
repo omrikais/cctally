@@ -29,6 +29,21 @@
 # No path/version canonicalization is needed: pricing-check --json carries
 # no host-specific paths, and snapshotDate/litellmSource are deterministic
 # constants (a snapshot bump deliberately updates the golden).
+#
+# The clock IS an input, so it is pinned (see PINNED_AS_OF below).
+# `expiredSuppressions` is derived from each PRICING_DRIFT_ALLOWLIST entry's
+# optional `expires` date against the `_command_as_of()` seam, and it feeds the
+# actionability predicate, so at the wall clock every golden here would flip on
+# a calendar date with no code change: from 2026-11-22 the six `gpt-5.6-sol`
+# suppressions (#643) expire, offline_clean and degraded_clean go 0 -> 1, and
+# all five JSON goldens gain the entries. Measured across as-of dates from
+# 2026-01-01 to 2027-06-01, `expiredSuppressions` and the exit code it drives
+# are the ONLY clock-coupled parts of this payload: the coverage leg scans
+# all-history (since=None) so it never reads the clock, drift and
+# staleSuppressions compare values only, and no CLI code computes an age
+# against PRICING_SNAPSHOT_DATE — the sole PRICING_STALENESS_DAYS consumer is
+# the release skill's Gate 0.5 advisory, which no harness runs and which is
+# documented never to block a cut.
 
 set -uo pipefail
 
@@ -40,12 +55,45 @@ CCTALLY="$REPO_ROOT/bin/cctally"
 # Generated fixture inputs are staged out of tree (#529 S3). The committed
 # tree is the read-only template; nothing under it is written during a run.
 FIXTURE_STAGE=$(mktemp -d -t cctally-pricing-check-fixstage.XXXXXX)
+# Armed HERE, not with the combined trap further down: the PINNED_AS_OF guard
+# below can exit before SCRATCH_ROOT exists, and an exit between this mktemp
+# and that trap would leak this directory. The later trap supersedes this one.
+trap 'rm -rf "$FIXTURE_STAGE"' EXIT
 FIXTURES="$FIXTURE_STAGE/pricing-check"
 # Goldens address the COMMITTED root, never the staging copy above: this
 # harness's EXIT trap removes that copy, so a regenerate run writing there
 # would leave the committed goldens untouched.
 GOLDEN_ROOT="$REPO_ROOT/tests/fixtures/pricing-check"
 REGENERATE="${CCTALLY_PRICING_CHECK_REGENERATE:-}"
+
+# Pinned analytic clock (the only clock coupling in this payload — see the
+# header). It is PRICING_SNAPSHOT_DATE, the day the embedded tables and every
+# current suppression were last verified against the vendor, so the goldens
+# record the check as it reads at capture rather than at some later calendar
+# position. The assertion below is what makes that statement true rather than
+# merely intended: a snapshot bump that left this pin behind would otherwise
+# read as a deliberate capture date. It must also stay at or before the
+# earliest `expires` in PRICING_DRIFT_ALLOWLIST, or these goldens report
+# suppressions the operator has not actually let lapse; that floor is held
+# generically by tests/test_pricing_check.py::
+# test_no_suppression_expires_before_the_pricing_snapshot_date, and the cutover
+# itself is asserted in tests/test_codex_56_pricing.py.
+PINNED_AS_OF="2026-08-25T00:00:00Z"
+
+SNAPSHOT_DATE=$(sed -n \
+    's/^PRICING_SNAPSHOT_DATE[[:space:]]*=[[:space:]]*"\([0-9-]*\)".*/\1/p' \
+    "$REPO_ROOT/bin/_lib_pricing.py")
+if [ -z "$SNAPSHOT_DATE" ]; then
+    echo "FAIL: could not read PRICING_SNAPSHOT_DATE from bin/_lib_pricing.py" >&2
+    exit 1
+fi
+if [ "${PINNED_AS_OF%%T*}" != "$SNAPSHOT_DATE" ]; then
+    echo "FAIL: PINNED_AS_OF ($PINNED_AS_OF) is not PRICING_SNAPSHOT_DATE" \
+         "($SNAPSHOT_DATE) — a pricing sync moved the snapshot date and left" \
+         "this pin stale. Move the pin to the new capture date and regenerate" \
+         "the goldens with CCTALLY_PRICING_CHECK_REGENERATE=1." >&2
+    exit 1
+fi
 
 pass_count=0
 fail_count=0
@@ -124,6 +172,7 @@ run_scenario () {
     set +e
     raw=$(HOME="$scratch" \
           TZ=Etc/UTC \
+          CCTALLY_AS_OF="$PINNED_AS_OF" \
           PATH="$CLEAN_PATH" \
           NO_COLOR=1 \
           CCTALLY_DISABLE_DEV_AUTODETECT=1 \

@@ -17,12 +17,12 @@ flag and clear it (NOT the shared flag) when the reingest completes.
 """
 from __future__ import annotations
 
-import importlib.util as ilu
 import sqlite3
 import sys
 from pathlib import Path
 
 import pytest
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 
 BIN_DIR = Path(__file__).resolve().parent.parent / "bin"
@@ -35,15 +35,9 @@ _SHARED_FLAG = "conversation_reingest_pending"
 @pytest.fixture(scope="module")
 def cctally_module():
     """Load bin/cctally once per module (registers the cache migrations)."""
-    from importlib.machinery import SourceFileLoader
-
     if str(BIN_DIR) not in sys.path:
         sys.path.insert(0, str(BIN_DIR))
-    loader = SourceFileLoader("cctally", str(BIN_DIR / "cctally"))
-    spec = ilu.spec_from_loader("cctally", loader)
-    mod = ilu.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
+    mod = load_script_module()
     return mod
 
 

@@ -1,5 +1,4 @@
 """Tests for the issue #114 symlink upgrade self-heal (`repair-symlinks`)."""
-import importlib.util
 import os
 import pathlib
 import subprocess

@@ -1,9 +1,9 @@
 """#279 S2 F2: CCTALLY_DEBUG=1 yields a traceback from the top-level
 catch-all; default mode stays byte-identical (`Error: ...` only)."""
-import importlib.util
 import logging
 import pathlib
 import sys
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 BIN = pathlib.Path(__file__).resolve().parents[1] / "bin"
 
@@ -12,17 +12,12 @@ def _load_cctally(tmp_path, monkeypatch):
     monkeypatch.setenv("CCTALLY_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("CCTALLY_DISABLE_DEV_AUTODETECT", "1")
     monkeypatch.setenv("CCTALLY_DISABLE_UPDATE_CHECK", "1")
-    from importlib.machinery import SourceFileLoader
     for _name in [
         n for n in list(sys.modules)
         if n.startswith("_cctally_") and n != "_cctally_core"
     ]:
         del sys.modules[_name]
-    loader = SourceFileLoader("cctally", str(BIN / "cctally"))
-    spec = importlib.util.spec_from_loader("cctally", loader)
-    mod = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, "cctally", mod)
-    loader.exec_module(mod)
+    mod = load_script_module()
     return mod
 
 

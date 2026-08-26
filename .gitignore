@@ -3,6 +3,7 @@
 .idea/
 .wrangler/
 __pycache__/
+*.pyc
 .worktrees/
 .superpowers/
 # Codex CLI runtime state: .codex/ doubles as this repo's project-level

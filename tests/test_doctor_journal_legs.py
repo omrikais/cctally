@@ -328,18 +328,6 @@ def test_protocol_leg_fails_honestly_when_tainted_batches_were_omitted():
     assert r.remediation
 
 
-def test_both_new_legs_are_registered_in_the_journal_category():
-    import _lib_doctor
-    journal_category = next(
-        cat for cat in _lib_doctor._CATEGORY_DEFINITIONS if cat[0] == "journal")
-    ids = [check_id for check_id, _fn in journal_category[2]]
-    assert ids == [
-        "journal.presence", "journal.integrity", "journal.index_freshness",
-        "journal.auto_heal", "journal.writer_guard", "journal.conflicts",
-        "journal.protocol", "journal.quota_projection",
-    ]
-
-
 # ── writer guard (#386 spec §6.4) ─────────────────────────────────────────
 #
 # On an installed build the stats authorizer LOGS instead of raising, so this

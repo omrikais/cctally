@@ -26,6 +26,7 @@ import sys
 import threading
 
 import pytest
+from _fts5_gate import require_fts5  # the ONE FTS5 capability gate (#630 S6)
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 import _cctally_db as db   # noqa: E402
@@ -93,8 +94,8 @@ def _seed_titles(c):
 @pytest.mark.parametrize("fa", [True, False])
 def test_kind_title_returns_session_hit(fa):
     c = _conn()
-    if fa and not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    if fa:
+        require_fts5()
     _seed_titles(c)
     res = cq.search_conversations(c, "refactor", kind="title", fts_available=fa)
     assert res["kind"] == "title"
@@ -114,8 +115,8 @@ def test_kind_title_total_counts_only_anchorable(fa):
     """P2-9: a title row whose session has NO message rows must not count toward
     total or appear in the page."""
     c = _conn()
-    if fa and not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    if fa:
+        require_fts5()
     # s-orphan: title matches 'orphan' but the session has no conversation_messages.
     _title(c, "s-orphan", "orphan title here")
     # s-real: anchorable match for 'orphan'.
@@ -146,8 +147,7 @@ def test_kind_title_missing_vtable_degrades_to_like():
     The LIKE degradation still returns the correct session-level title hit (the
     title content lives in ``conversation_ai_titles``, not the dropped vtable)."""
     c = _conn()
-    if not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _seed_titles(c)
     # Simulate a missing/corrupt title vtable on an FTS5-capable build: drop the
     # sync triggers (so the DROP doesn't strand a live trigger) then the vtable.
@@ -196,8 +196,8 @@ def _seed_filter_corpus(c):
 @pytest.mark.parametrize("fa", [True, False])
 def test_search_applies_project_filter(fa):
     c = _conn()
-    if fa and not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    if fa:
+        require_fts5()
     _seed_filter_corpus(c)
     cc._recompute_conversation_sessions(c)         # make the rollup authoritative
     base = cq.search_conversations(c, "needle", kind="all", fts_available=fa)
@@ -212,8 +212,8 @@ def test_search_applies_project_filter(fa):
 @pytest.mark.parametrize("fa", [True, False])
 def test_search_applies_date_filter(fa):
     c = _conn()
-    if fa and not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    if fa:
+        require_fts5()
     _seed_filter_corpus(c)
     cc._recompute_conversation_sessions(c)
     # date_to is the EXCLUSIVE next-day bound; only sa (2026-06-01) qualifies.
@@ -226,8 +226,8 @@ def test_search_applies_date_filter(fa):
 @pytest.mark.parametrize("fa", [True, False])
 def test_title_kind_respects_filters(fa):
     c = _conn()
-    if fa and not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    if fa:
+        require_fts5()
     # two anchorable sessions, both titles match 'plan'.
     _msg(c, session_id="ta", uuid="hta", source_path="a.jsonl", byte_offset=0,
          timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="x",
@@ -250,8 +250,8 @@ def test_search_filter_degraded_uses_session_max_ts(fa):
     drop project/cost/rebuild, set filter_degraded, and apply the date axis via
     the session MAX(timestamp_utc) prefilter — NOT by matched-row ts."""
     c = _conn()
-    if fa and not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    if fa:
+        require_fts5()
     # session sx: an OLD matching turn (the 'needle') but a NEW later turn that
     # carries the session's MAX(timestamp_utc). The matched-row ts is old; the
     # session activity is new. A correct date_from over session activity must KEEP

@@ -46,6 +46,7 @@ import sys
 import tempfile
 
 import pytest
+from _fts5_gate import requires_fts5  # the ONE FTS5 capability gate (#630 S6)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 BIN = REPO / "bin"
@@ -509,17 +510,6 @@ def test_changed_sqlite_data_fails_the_comparison(tmp_path):
     assert any("cache.db" in line for line in diff_manifests(before, manifest(root)))
 
 
-def _fts5_available() -> bool:
-    conn = sqlite3.connect(":memory:")
-    try:
-        conn.execute("CREATE VIRTUAL TABLE probe USING fts5(body)")
-        return True
-    except sqlite3.OperationalError:
-        return False
-    finally:
-        conn.close()
-
-
 def _raw_dump(path: pathlib.Path) -> str:
     conn = sqlite3.connect(path)
     try:
@@ -556,7 +546,7 @@ def _external_content_fts_db(path: pathlib.Path, extra: tuple[str, ...] = ()) ->
         conn.close()
 
 
-@pytest.mark.skipif(not _fts5_available(), reason="this SQLite has no FTS5")
+@requires_fts5
 def test_the_canonical_form_drops_fts5_index_state(tmp_path):
     """The claim E3 corrected: sorting removes page layout, not FTS5 format.
 
@@ -586,7 +576,7 @@ def test_the_canonical_form_drops_fts5_index_state(tmp_path):
     )
 
 
-@pytest.mark.skipif(not _fts5_available(), reason="this SQLite has no FTS5")
+@requires_fts5
 def test_dropping_the_shadow_tables_still_sees_a_content_change(tmp_path):
     """Excluding index state must not excuse a change to what is indexed."""
     path = tmp_path / "one.db"

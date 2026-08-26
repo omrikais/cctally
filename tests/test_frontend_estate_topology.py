@@ -29,12 +29,17 @@ AGGREGATOR = "bin/cctally-test-all"
 EXPECTED = {
     "private-push-nonstamp": 1,
     "private-push-stamp": 0,
+    # #630 S4. A push whose tree an authoritative receipt already covers runs
+    # no estate at all, exactly as a release stamp does. Without this row the
+    # table would still say "private-push-nonstamp: 1" and no longer describe
+    # the whole space.
+    "private-push-discharged": 0,
     "markdown-only-push": 0,
     "private-same-repo-pr": 1,
     "private-fork-pr": 0,
     "public-mirror-pr": 1,
     "public-mirror-push": 0,
-    "tag-or-cron-or-dispatch": 3,
+    "tag-or-cron": 3,
 }
 
 
@@ -211,7 +216,7 @@ def test_the_bundle_lanes_are_exactly_the_expected_three():
 def test_the_matrix_lane_declares_three_python_legs():
     doc = yaml.safe_load(MATRIX_YML.read_text())
     versions = doc["jobs"]["test-linux"]["strategy"]["matrix"]["python-version"]
-    assert len(versions) == EXPECTED["tag-or-cron-or-dispatch"], versions
+    assert len(versions) == EXPECTED["tag-or-cron"], versions
 
 
 # ------------------------------------------------------ the multiplication
@@ -557,11 +562,11 @@ def _estate_executions(event: dict) -> int:
 
 
 def _push(repository, *, ref="refs/heads/main", changed=("bin/cctally",),
-          skip_heavy="false"):
+          skip_heavy="false", discharged="false"):
     return {
         "event_name": "push", "ref": ref, "action": None,
         "changed_paths": list(changed),
-        "needs": {"release-stamp-gate": "success"},
+        "needs": {"release-stamp-gate": "success", "receipt-gate": "success"},
         "context": {
             "cancelled()": False,
             "github.event_name": "push",
@@ -572,6 +577,9 @@ def _push(repository, *, ref="refs/heads/main", changed=("bin/cctally",),
             "github.event.pull_request.head.repo.full_name": ABSENT,
             "needs.release-stamp-gate.result": "success",
             "needs.release-stamp-gate.outputs.skipHeavy": skip_heavy,
+            # #630 S4's second conjunct on `test-macos`.
+            "needs.receipt-gate.result": "success",
+            "needs.receipt-gate.outputs.discharged": discharged,
         },
     }
 
@@ -580,7 +588,7 @@ def _pull_request(repository, head_repository):
     return {
         "event_name": "pull_request", "ref": "refs/heads/topic",
         "action": "opened", "changed_paths": ["bin/cctally"],
-        "needs": {"release-stamp-gate": "success"},
+        "needs": {"release-stamp-gate": "success", "receipt-gate": "success"},
         "context": {
             "cancelled()": False,
             "github.event_name": "pull_request",
@@ -590,6 +598,17 @@ def _pull_request(repository, head_repository):
             # its first condition and the gate's output is the literal 'false'.
             "needs.release-stamp-gate.result": "success",
             "needs.release-stamp-gate.outputs.skipHeavy": "false",
+            # A receipt is minted at a tree, and a pull_request event is
+            # evaluated at the merge commit's tree, so a PR never discharges.
+            #
+            # `success` is declared for every pull_request context, including
+            # the fork ones where `receipt-gate` is in fact SKIPPED by its own
+            # guard. That is a deliberate simplification: `receipt-gate` runs
+            # no vitest, so its admission contributes nothing to the count this
+            # model derives, and `test-macos` refuses a fork PR on its own
+            # head-repository equality whatever this status says.
+            "needs.receipt-gate.result": "success",
+            "needs.receipt-gate.outputs.discharged": "false",
         },
     }
 
@@ -611,6 +630,7 @@ EVENT_CONTEXTS = {
         _push(PRIVATE, changed=("CHANGELOG.md", "bin/cctally")),
     ],
     "private-push-stamp": [_push(PRIVATE, skip_heavy="true")],
+    "private-push-discharged": [_push(PRIVATE, discharged="true")],
     "markdown-only-push": [
         _push(PRIVATE, changed=("CHANGELOG.md",)),
         _push(PRIVATE, changed=("CHANGELOG.md", "docs/commands/blocks.md")),
@@ -620,21 +640,16 @@ EVENT_CONTEXTS = {
     "public-mirror-pr": [_pull_request(PUBLIC, "contributor/cctally")],
     "public-mirror-push": [_push(PUBLIC)],
     # `ci-linux-matrix` admits on the public repository for a tag push and the
-    # weekly cron, and on the private repository for a manual dispatch. Those
-    # are the three concrete events behind this row. A PRIVATE tag push is NOT
-    # one of them and is asserted separately below, because the row's own
-    # wording does not cover it.
-    "tag-or-cron-or-dispatch": [
+    # weekly cron. Those are the two concrete events behind this row. #630 S5
+    # retired the private manual dispatch, which used to be its third. A PRIVATE
+    # tag push is NOT one of them and is asserted separately below, because the
+    # row's own wording does not cover it.
+    "tag-or-cron": [
         _push(PUBLIC, ref="refs/tags/v1.95.6", changed=("package.json",)),
         {"event_name": "schedule", "ref": "refs/heads/main", "action": None,
          "changed_paths": ["bin/cctally"], "needs": {},
          "context": {"cancelled()": False, "github.event_name": "schedule",
                      "github.repository": PUBLIC}},
-        {"event_name": "workflow_dispatch", "ref": "refs/heads/main",
-         "action": None, "changed_paths": ["bin/cctally"], "needs": {},
-         "context": {"cancelled()": False,
-                     "github.event_name": "workflow_dispatch",
-                     "github.repository": PRIVATE}},
     ],
 }
 
@@ -642,7 +657,9 @@ EVENT_CONTEXTS = {
 def test_every_declared_event_has_at_least_one_concrete_context():
     assert set(EVENT_CONTEXTS) == set(EXPECTED), (
         sorted(EVENT_CONTEXTS), sorted(EXPECTED))
-    assert len(EXPECTED) == 8, sorted(EXPECTED)
+    # Bumped from 8 to 9 by #630 S4, deliberately: the anchor exists so that a
+    # new topology row is a decision rather than a side effect.
+    assert len(EXPECTED) == 9, sorted(EXPECTED)
     for event, contexts in EVENT_CONTEXTS.items():
         assert contexts, event
 
@@ -668,8 +685,21 @@ def test_a_failed_classifier_still_admits_the_gated_lane():
     the case D1 says must still run the heavy lane.
     """
     event = _push(PRIVATE)
-    event["needs"] = {"release-stamp-gate": "failure"}
+    # The KEY is replaced, not the dict: replacing it would drop `receipt-gate`
+    # and the count would then be undecidable rather than failing on the
+    # property under test.
+    event["needs"]["release-stamp-gate"] = "failure"
     event["context"]["needs.release-stamp-gate.result"] = "failure"
+    assert _estate_executions(event) == 1
+
+
+def test_a_failed_receipt_gate_also_still_admits_the_gated_lane():
+    """#630 S4's conjunct carries the same fail-safe polarity as D1's, and
+    every context in the table above declares that gate SUCCEEDED too, so
+    nothing there exercises this branch either."""
+    event = _push(PRIVATE, discharged="true")
+    event["needs"]["receipt-gate"] = "failure"
+    event["context"]["needs.receipt-gate.result"] = "failure"
     assert _estate_executions(event) == 1
 
 
@@ -800,18 +830,49 @@ PRIVATE_ZERO_CONTEXTS = {
 
 @pytest.mark.parametrize("label", sorted(PRIVATE_ZERO_CONTEXTS))
 def test_a_private_tag_push_or_cron_admits_no_lane(label):
-    """Recorded rather than folded into the table above. The D2 row groups tag
-    push, cron and dispatch at three legs, and that is true of the contexts
-    where `ci-linux-matrix` admits — which are the PUBLIC tag push, the PUBLIC
-    cron, and a dispatch on either repository. The two private events are not
-    among them: `ci.yml` triggers only on `push: branches: [main]`, and
-    `test-linux` admits the private repository only for `workflow_dispatch`.
+    """Recorded rather than folded into the table above. The D2 row groups the
+    tag push and the cron at three legs, and that is true of the contexts where
+    `ci-linux-matrix` admits — which are the PUBLIC tag push and the PUBLIC
+    cron. The two private events are not among them: `ci.yml` triggers only on
+    `push: branches: [main]`, and `test-linux` admits the public repository
+    only, since #630 S5 retired the private lane.
 
     Both matter concretely. The release tool's own Phase 2 tag push is private,
     so the event this repository actually produces runs the estate zero times,
     and the private weekly cron does the same for the same reason.
     """
     assert _estate_executions(PRIVATE_ZERO_CONTEXTS[label]) == 0
+
+
+def test_the_linux_matrix_declares_no_workflow_dispatch():
+    """#630 S5 retired the private dispatch lane. Three dispatches burned
+    billable minutes and returned zero usable verdicts, all timing out at 60
+    minutes. Asserted on the trigger block, so no dispatch event can create a
+    run at all — a job guard would only skip one after it existed.
+    """
+    doc = yaml.safe_load(MATRIX_YML.read_text())
+    # PyYAML resolves the bare key `on` to the boolean True, the same fallback
+    # `_workflow_starts` makes.
+    triggers = doc.get("on", doc.get(True))
+
+    assert isinstance(triggers, dict), triggers
+    assert "workflow_dispatch" not in triggers, triggers
+
+
+@pytest.mark.parametrize("repository", (PRIVATE, PUBLIC))
+def test_a_workflow_dispatch_cannot_start_the_linux_matrix(repository):
+    """The negative case the retirement actually promises. Asserting only that
+    the private JOB skips would still admit a run being created."""
+    event = {
+        "event_name": "workflow_dispatch", "ref": "refs/heads/main",
+        "action": None, "changed_paths": ["bin/cctally"], "needs": {},
+        "context": {"cancelled()": False,
+                    "github.event_name": "workflow_dispatch",
+                    "github.repository": repository},
+    }
+    doc = yaml.safe_load(MATRIX_YML.read_text())
+
+    assert _workflow_starts(doc, event) is False
 
 
 @pytest.mark.parametrize(

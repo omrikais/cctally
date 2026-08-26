@@ -12,14 +12,13 @@ surface — that coverage lives in
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import os
 import subprocess
 import sys
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CCTALLY = REPO_ROOT / "bin" / "cctally"
@@ -29,14 +28,10 @@ ANSI_CSI = "\x1b["
 
 
 def _load_cctally_module():
-    """Import the script as a module (no .py extension) so we can call
-    ``_resolve_color_enabled`` directly without spawning a subprocess.
+    """Import the script as a module so we can call ``_resolve_color_enabled``
+    directly without spawning a subprocess.
     """
-    loader = SourceFileLoader("cctally", str(CCTALLY))
-    spec = importlib.util.spec_from_loader("cctally", loader)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
+    mod = load_script_module()
     return mod
 
 

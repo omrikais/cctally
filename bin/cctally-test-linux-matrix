@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
-"""Run the release-blocking Linux/Python compatibility matrix locally.
+"""Run the local Linux/Python compatibility matrix.
 
 The gate materializes the clean checked-out commit into a disposable real Git
-checkout, then runs the Linux platform profile as a non-root user in a fresh
-Linux/arm64 container for every supported Python minor. The profile is full
-pytest plus every harness except the macOS/Homebrew LAN-runner harness. It models
-the private ``ci-linux-matrix.yml`` lane without consuming Actions minutes.
+checkout — or runs a tree somebody else materialized, via ``--source-tree`` —
+then runs it as a non-root user in a fresh Linux/arm64 container for every
+supported Python minor.
+
+The release runbook invokes it ADVISORY, once per cut, over the projected
+public tree: it reports and never refuses, because Gate 0 and its receipt are
+the only release-blocking test gates and the project makes no Linux support
+promise (#630 S5). It stays truthful for standalone use — the exit codes below
+are unchanged, and advisory is a property of the caller. Each run writes an
+immutable record under ``APP_DIR/release-records/``.
+
+``--profile private`` (the default) exports ``CCTALLY_LINUX_MATRIX_RUN=1``,
+which runs every harness except the macOS/Homebrew LAN-runner harness Gate 0
+owns. ``--profile public`` suppresses that export, because the public manifest
+carries no such harness to omit and the aggregator refuses the variable there.
 
 Provisioning lives in ``bin/cctally-test-linux-matrix.Dockerfile`` and is baked
 into a content-addressed image per Python minor, so a lane installs nothing.
@@ -28,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 
 PYTHON_VERSIONS = ("3.11", "3.12", "3.13")
@@ -558,14 +570,30 @@ def _resolve_image(
 
 
 def _container_script(
-    version: str, expected_head: str, acceptance: bool = False
+    version: str,
+    expected_head: str,
+    acceptance: bool = False,
+    profile: str = "private",
 ) -> str:
     """Render the lane script.
 
     ``acceptance`` is the ONLY thing that changes the container lifecycle. An
     ordinary gate run renders exactly what it rendered before acceptance mode
     existed, so the gate stays the thing the acceptance run measured.
+
+    ``profile`` selects which tree the lane is being handed. The private
+    profile exports ``CCTALLY_LINUX_MATRIX_RUN=1``, which drops ``test-remote``
+    and asserts exactly one such harness existed. The public profile must not:
+    the public manifest marks ``test-remote`` private, so the public subset
+    never contains it and ``bin/cctally-test-all`` refuses the variable
+    outright. Exporting it over a projected public tree reproduces the exact
+    production refusal #630 S5 exists to repair. ``public`` is therefore the
+    ABSENCE of the profile, resolving to the ordinary ``COVERAGE_MODE=full``,
+    and not a new named coverage mode.
     """
+    linux_profile = (
+        "  CCTALLY_LINUX_MATRIX_RUN=1 \\\n" if profile == "private" else ""
+    )
     sampler_start = ""
     acceptance_env = ""
     lane_prefix = ""
@@ -661,8 +689,7 @@ chown {CONTAINER_UID}:{CONTAINER_GID} /opt/cctally-lane.sh
   GITHUB_ACTIONS=true \
   CCTALLY_AUTHORITATIVE_RUN=1 \
   CCTALLY_AGENTMEM_TEST_POLICY=hosted-private-unavailable \
-  CCTALLY_LINUX_MATRIX_RUN=1 \
-  CCTALLY_OUTER_JOBS=2 \
+{linux_profile}  CCTALLY_OUTER_JOBS=2 \
   CCTALLY_PYTEST_JOBS=2 \
 {acceptance_env}  CCTALLY_TEST_MATRIX_ID={shlex.quote(version)} \
   LC_ALL=C.UTF-8 \
@@ -678,6 +705,8 @@ def _container_command(
     image: str,
     expected_head: str = "deadbeef" * 5,
     acceptance: dict | None = None,
+    candidate_label: str | None = None,
+    profile: str = "private",
 ) -> list[str]:
     command = [engine, "run"]
     if acceptance is None:
@@ -692,8 +721,14 @@ def _container_command(
         # The release runbook reaps lane containers by this label when it is
         # interrupted. Scoped to the tested commit so an interrupt cannot remove
         # a concurrent matrix run's containers.
+        #
+        # The label and the in-container expected head are separable because
+        # the runbook reaps by the SOURCE head it launched with, while a
+        # projected tree's expected head is a synthetic commit the runbook has
+        # never seen. Collapsing the two leaves an interrupted matrix
+        # unreapable (#630 S5). They coincide whenever nothing is projected.
         "--label",
-        f"{LANE_LABEL}={expected_head}",
+        f"{LANE_LABEL}={candidate_label or expected_head}",
         "--pull=never",
         "--platform",
         CONTAINER_PLATFORM,
@@ -711,7 +746,12 @@ def _container_command(
         image,
         "bash",
         "-lc",
-        _container_script(version, expected_head, acceptance=acceptance is not None),
+        _container_script(
+            version,
+            expected_head,
+            acceptance=acceptance is not None,
+            profile=profile,
+        ),
     ]
     return command
 
@@ -724,6 +764,8 @@ def _run_lanes(
     expected_head: str,
     outdir: pathlib.Path,
     acceptance: dict[str, dict] | None = None,
+    profile: str = "private",
+    candidate_label: str | None = None,
 ) -> dict[str, int]:
     """Run one lane at a time, and never cancel a later lane.
 
@@ -767,6 +809,8 @@ def _run_lanes(
                     image_ids[version],
                     expected_head=expected_head,
                     acceptance=None if acceptance is None else acceptance[version],
+                    candidate_label=candidate_label,
+                    profile=profile,
                 ),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -1082,6 +1126,102 @@ def _materialize_clean_head(
         raise GateError("disposable checkout does not exactly match clean HEAD")
 
 
+RECORD_SCHEMA_VERSION = 1
+RECORD_DIRNAME = "release-records"
+# The driver's own four-outcome vocabulary, NAMED rather than renumbered.
+# `_merge_lane_exit_codes` and `_compose_gate_exit` already distinguish these
+# four, so the record reuses them instead of inventing a second scale.
+RECORD_SIGNALS = {0: "green", 1: "productRed", 2: "invalidated", 3: "incomplete"}
+
+
+def _record_dir() -> pathlib.Path:
+    """Where advisory run records live: APP_DIR, outside the git tree.
+
+    Inside the tree they would be untracked files that Gate 0's own
+    cleanliness selection would see, and the two gates would then disagree
+    about whether the working tree is clean. `bin/_cctally_core.py` is the
+    single source of truth for APP_DIR and is public, so it is imported rather
+    than reimplemented here.
+    """
+    if str(_SCRIPT.parent) not in sys.path:
+        sys.path.insert(0, str(_SCRIPT.parent))
+    import _cctally_core
+
+    return _cctally_core.APP_DIR / RECORD_DIRNAME
+
+
+def _record_timestamp(moment: datetime.datetime) -> str:
+    return moment.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _new_run_id(started: datetime.datetime) -> str:
+    """A sortable, collision-free identity for one invocation.
+
+    Records are keyed by RUN, not by a candidate version: no version is
+    stamped at preflight time, and a single mutable path cannot survive two
+    interleaved runs or a death mid-write.
+    """
+    return (
+        f"{started.astimezone(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+        f"-{uuid.uuid4().hex[:8]}"
+    )
+
+
+def _record_signal(exit_code: int) -> str:
+    """Map a composed gate exit onto its signal.
+
+    An unmapped code answers `incomplete` rather than raising: an interrupt
+    exits 128+N, and a record writer must describe an unusual death rather than
+    add a second one.
+    """
+    return RECORD_SIGNALS.get(exit_code, "incomplete")
+
+
+def record_is_green(record: dict | None) -> bool:
+    """Whether this record establishes a completed, all-green matrix run.
+
+    A missing record, a `started`-only record and any non-green signal all
+    answer False. An advisory gate that fails quietly is indistinguishable from
+    one that passed, and only one of those is safe to ship on.
+    """
+    if not record:
+        return False
+    return (
+        record.get("state") == "finished"
+        and record.get("signal") == "green"
+        and record.get("exitCode") == 0
+    )
+
+
+def _publish_record(path: pathlib.Path, payload: dict) -> None:
+    """Write to a sibling temporary file, then rename it into place.
+
+    A write interrupted mid-publication must never leave truncated JSON where a
+    readable record was, so nothing is ever written to `path` directly.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    try:
+        with handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(handle.name, path)
+    except BaseException:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+        raise
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1110,6 +1250,22 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=None,
         help="Where to write the acceptance artifact (default: a temp path)",
     )
+    parser.add_argument(
+        "--source-tree",
+        default=None,
+        help="run this pre-materialized tree instead of cloning HEAD",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=("private", "public"),
+        default="private",
+        help="'public' suppresses the private Linux profile export",
+    )
+    parser.add_argument(
+        "--candidate-label",
+        default=None,
+        help="container label value; defaults to the expected head",
+    )
     return parser.parse_args(argv)
 
 
@@ -1128,7 +1284,76 @@ def _terminated(signum, _frame):
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the gate and record what it established, immutably and per run.
+
+    The record is written on ENTRY with `state: "started"` and rewritten with
+    the outcome in a `finally`, and `_terminated` turns SIGTERM into an ordinary
+    unwind, so a failure, a Ctrl-C and a `kill` all still finish the record and
+    mark it `signal: "incomplete"`. Only a SIGKILL or a hard crash leaves
+    `started` behind, and neither shape reads as green. Recording is the caller's whole basis for treating this gate
+    as advisory: a gate that fails quietly is indistinguishable from one that
+    passed, and the release runbook must be able to tell those apart.
+    """
     args = _parse_args(argv)
+    started = datetime.datetime.now(datetime.timezone.utc)
+    record = {
+        "schemaVersion": RECORD_SCHEMA_VERSION,
+        "runId": _new_run_id(started),
+        "profile": args.profile,
+        "sourceHead": None,
+        "projectedTree": None,
+        "imageEpoch": None,
+        "lanes": None,
+        "state": "started",
+        "signal": None,
+        "exitCode": None,
+        "startedAt": _record_timestamp(started),
+        "finishedAt": None,
+    }
+    try:
+        record_path = _record_dir() / f"{record['runId']}.json"
+        _publish_record(record_path, record)
+    except (OSError, ImportError, KeyError) as exc:
+        # `_record_dir()` imports `_cctally_core`, whose path resolution reads
+        # the password database, so this leg can fail with ImportError or
+        # KeyError as readily as with OSError. All three are the same class of
+        # infrastructure refusal and must exit 3 rather than escape as a
+        # traceback that exits 1 and reads as a product failure.
+        print(
+            "linux-matrix: infrastructure refusal: cannot resolve or write the "
+            f"release record: {exc}",
+            file=sys.stderr,
+        )
+        return 3
+    print(f"linux-matrix: release record {record_path}")
+
+    exit_code = 3
+    try:
+        exit_code = _run_gate(args, record)
+        return exit_code
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else 3
+        raise
+    finally:
+        record["state"] = "finished"
+        record["exitCode"] = exit_code
+        record["signal"] = _record_signal(exit_code)
+        record["finishedAt"] = _record_timestamp(
+            datetime.datetime.now(datetime.timezone.utc)
+        )
+        try:
+            _publish_record(record_path, record)
+        except OSError as exc:
+            # Best effort, and deliberately not fatal: a finalize that cannot
+            # be written leaves `started`, which reads as not-green. Raising
+            # here would replace the gate's real verdict with this one.
+            print(
+                f"linux-matrix: could not finalize the release record: {exc}",
+                file=sys.stderr,
+            )
+
+
+def _run_gate(args: argparse.Namespace, record: dict) -> int:
     versions = tuple(args.versions or PYTHON_VERSIONS)
     diagnostic_selection = args.versions is not None
     acceptance_mode = bool(getattr(args, "acceptance", False))
@@ -1144,6 +1369,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         root = _repo_root()
         head = _git_head(root)
+        record["sourceHead"] = head
         dirty = _git_status(root)
         if dirty:
             print(
@@ -1163,10 +1389,30 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"linux-matrix: testing {head}")
         epoch = _freshness_epoch(datetime.datetime.now(datetime.timezone.utc))
+        record["imageEpoch"] = epoch
         with tempfile.TemporaryDirectory(prefix="cctally-linux-matrix-") as raw:
             scratch = pathlib.Path(raw)
-            source_checkout = scratch / "cctally-dev"
-            _materialize_clean_head(root, source_checkout, head)
+            if args.source_tree is None:
+                source_checkout = scratch / "cctally-dev"
+                _materialize_clean_head(root, source_checkout, head)
+                # Nothing was projected, so the tree that runs IS the candidate
+                # and the two identities coincide.
+                expected_head = head
+            else:
+                # The projector is private and this driver is public, so the
+                # driver accepts a materialized tree rather than learning how
+                # to build one (#630 S5).
+                source_checkout = pathlib.Path(args.source_tree).resolve()
+                if not source_checkout.is_dir():
+                    raise GateError(
+                        f"--source-tree {source_checkout} is not a directory"
+                    )
+                expected_head = _git_head(source_checkout)
+                print(
+                    f"linux-matrix: running the pre-materialized tree "
+                    f"{expected_head} at {source_checkout}"
+                )
+            record["projectedTree"] = expected_head
 
             # Phase 2. Image resolution is serialized ahead of every lane:
             # three concurrent builds would contend for the daemon and the
@@ -1213,15 +1459,20 @@ def main(argv: list[str] | None = None) -> int:
                     versions,
                     images,
                     source_checkout,
-                    head,
+                    expected_head,
                     outdir,
                     acceptance=acceptance_specs,
+                    profile=args.profile,
+                    candidate_label=args.candidate_label,
                 )
             finally:
                 # Read the container ids while the temporary directory still
                 # exists, so the cleanup block outside it can still remove them.
                 if acceptance_specs is not None:
                     container_ids = _read_cid_files(acceptance_specs)
+            # Every lane's OWN code, not just the merged verdict: a merged 3
+            # must not erase which lane produced the 1.
+            record["lanes"] = dict(lane_exits)
 
             # Phase 4. Collect and render before merging anything.
             _render_lane_blocks(versions, outdir, lane_exits)

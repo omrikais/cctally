@@ -18,9 +18,6 @@ def test_registry_has_unique_ids():
 
 
 def test_registry_covers_all_share_capable_panels():
-    if not _T.SHARE_TEMPLATES:
-        import pytest
-        pytest.skip("registry not yet populated — re-enabled after M1.4")
     panels_in_registry = {t.panel for t in _T.SHARE_TEMPLATES}
     assert panels_in_registry == _T.SHARE_CAPABLE_PANELS, (
         f"panel coverage mismatch — extra: {panels_in_registry - _T.SHARE_CAPABLE_PANELS}, "
@@ -35,9 +32,6 @@ def test_alerts_panel_not_in_share_capable_set():
 
 
 def test_share_template_dataclass_is_frozen():
-    if not _T.SHARE_TEMPLATES:
-        import pytest
-        pytest.skip("registry not yet populated — re-enabled after M1.4")
     sample = _T.SHARE_TEMPLATES[0]
     import dataclasses
     assert dataclasses.is_dataclass(sample)

@@ -159,6 +159,30 @@ fi
 # publishes a record like every other terminal path. An unknown name is an
 # error rather than a silent no-op, because running nothing and reporting
 # success is the failure class #529 S1 closed.
+# ---- the tiered coverage mode (#630 S7) --------------------------------
+#
+# `--tier-fast <BASE-REV>` is a SEPARATE named coverage mode, never a relaxation
+# of `deliberate-subset`. Preserve-item 19 keeps a caller-chosen subset uncitable
+# and records that exiting 0 for it "was considered and rejected"; that stays
+# exactly as it is. The tier is citable for a different reason: `--harness` takes
+# a set the caller chose, so nothing in the tree can prove the caller chose
+# correctly, while `--tier-fast` derives its set through bin/cctally-test-owners
+# from the tree itself.
+#
+# The argument is a BASE REVISION, not a revision range, and the change set is
+# the merge-base diff UNIONED with working-tree dirt. The wrapper certifies the
+# complete materialized working tree, uncommitted and untracked inputs included
+# (preserve-item 10), so a range accepted verbatim would let a caller supply an
+# unrelated non-empty range that selected fewer harnesses than the tree actually
+# required — and receive a citable receipt for it. Because the working-tree half
+# is unioned in, a dirty tree can only WIDEN the selection, never narrow it.
+TIER_MODE=0
+TIER_BASE_REV=""
+COVERAGE_TIER_BASE_OID=""
+COVERAGE_TIER_HEAD_OID=""
+COVERAGE_TIER_COMMITTED_PATHS=0
+COVERAGE_TIER_WORKTREE_PATHS=0
+
 SUBSET_MODE=0
 SUBSET_SET=" "               # " name name ", the caller's set
 SUBSET_SEEN=()               # the same names, one array element each, for the duplicate test
@@ -226,10 +250,43 @@ while [ $# -gt 0 ]; do
             fi
             _with_pytest_seen=1
             shift ;;
+        --tier-fast)
+            # Same three separate refusals `--harness` makes, for the same
+            # reason: a caller can only fix the mistake they actually made.
+            if [ $# -lt 2 ]; then
+                contract_usage_abort "--tier-fast requires a base revision and none followed it" --tier-fast
+            fi
+            case "$2" in
+                '')
+                    contract_usage_abort "--tier-fast was given an empty base revision; the change set is derived from a revision, never from nothing" --tier-fast ;;
+                -*)
+                    contract_usage_abort "--tier-fast was given the option '$2' instead of a base revision, so its value is missing" --tier-fast ;;
+            esac
+            if [ "$TIER_MODE" = 1 ]; then
+                contract_usage_abort "--tier-fast may be given at most once; two bases are two different change sets" --tier-fast
+            fi
+            TIER_MODE=1
+            TIER_BASE_REV=$2
+            shift 2 ;;
         *)
-            contract_usage_abort "unrecognised argument '$1'; the only arguments are --harness NAME (repeatable) and --with-pytest" "$1" ;;
+            contract_usage_abort "unrecognised argument '$1'; the only arguments are --harness NAME (repeatable), --with-pytest and --tier-fast BASE-REV" "$1" ;;
     esac
 done
+
+# The tier's exclusions are stated BEFORE the --with-pytest/--harness pairing
+# rule below, so `--tier-fast X --with-pytest` names the conflict the caller
+# created rather than reporting that --with-pytest wants a --harness.
+if [ "$TIER_MODE" = 1 ]; then
+    if [ "$SUBSET_MODE" = 1 ]; then
+        contract_usage_abort "--tier-fast cannot accompany --harness: a subset is a set the caller chose and is deliberately uncitable, while a tier's set is derived from the tree" --tier-fast
+    fi
+    if [ "$_with_pytest_seen" = 1 ]; then
+        contract_usage_abort "--tier-fast cannot accompany --with-pytest: the tier narrows the harness axis alone and pytest always runs in full" --tier-fast
+    fi
+    if [ "$LINUX_MATRIX_MODE" = 1 ]; then
+        contract_usage_abort "--tier-fast cannot accompany CCTALLY_LINUX_MATRIX_RUN: the Linux profile owns its exact platform selection" --tier-fast
+    fi
+fi
 
 if [ "$_with_pytest_seen" = 1 ] && [ "$SUBSET_MODE" = 0 ]; then
     contract_usage_abort "--with-pytest requires at least one --harness; it is not a way to run the full suite" --with-pytest
@@ -251,6 +308,271 @@ if [ "$LINUX_MATRIX_MODE" = 1 ]; then
             || contract_usage_abort "CCTALLY_LINUX_MATRIX_RUN refuses root" CCTALLY_LINUX_MATRIX_RUN
     fi
     COVERAGE_MODE=linux-matrix
+fi
+
+if [ "$TIER_MODE" = 1 ]; then
+    # The manifest is the declared estate and is loaded HERE, exactly as the
+    # subset branch loads it. Admission below re-loads it and still compares it
+    # against the whole disk in BOTH directions — a harness on disk with no
+    # manifest row and a manifest row with no harness on disk are each a
+    # refusal — and admission runs before the pool starts. Preserve-item 26 is
+    # therefore satisfied by the gate that already exists: nothing EXECUTES a
+    # narrowed estate until exact equality has been proved.
+    contract_manifest_load "$REPO_ROOT/tests/authoritative-test-manifest.json" || contract_abort
+    _manifest_names=$(contract_manifest_harness_names "$CONTRACT_PROFILE")
+
+    # ---- 1-4: the basis, bound to the materialized tree ------------------
+    # Read-only git, and `python3 -B` because plan mode is contractually
+    # side-effect-free (preserve-item 25) and this block runs before it.
+    _tier_basis=$(python3 -B - "$REPO_ROOT" "$TIER_BASE_REV" <<'TIERPY'
+import subprocess
+import sys
+
+root, base_rev = sys.argv[1], sys.argv[2]
+
+
+# `--no-optional-locks` on EVERY call, not only the diffs. `git diff` refreshes
+# the index's stat cache and rewrites .git/index when it does, and this program
+# runs before plan mode, which preserve-item 25 requires to be literally
+# side-effect-free. The flag makes git skip taking the index lock, so the read
+# stays a read.
+def git(*args):
+    try:
+        proc = subprocess.run(
+            ["git", "--no-optional-locks", "-C", root, *args],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        print("git could not be run: %s" % exc)
+        raise SystemExit(1)
+    if proc.returncode != 0:
+        print(
+            "git %s failed: %s"
+            % (" ".join(args), proc.stderr.strip().replace("\n", "; "))
+        )
+        raise SystemExit(1)
+    return proc.stdout
+
+
+base = git("merge-base", base_rev, "HEAD").strip()
+head = git("rev-parse", "HEAD").strip()
+
+# A rename or a copy counts as a change to BOTH paths, and both statuses carry
+# two path tokens where every other status carries one. Reading a two-token
+# record as one token does not merely lose that record: it shifts the cursor,
+# so every path AFTER it is read out of a status slot. This is the same parse
+# bin/cctally-test-owners._parse_name_status performs, and it is repeated here
+# rather than shelled out to because the tier needs the committed half and the
+# working-tree half in ONE change set.
+tokens = [
+    t for t in git("diff", "--name-status", "-M", "-z", base, "HEAD").split("\0") if t
+]
+committed = []
+index = 0
+while index < len(tokens):
+    status = tokens[index]
+    index += 1
+    if status[:1] in ("R", "C"):
+        committed.extend(tokens[index:index + 2])
+        index += 2
+    else:
+        if index < len(tokens):
+            committed.append(tokens[index])
+        index += 1
+
+# The working-tree half of the change set, over the same selection the wrapper
+# materializes: tracked paths that differ from HEAD (modified, added and deleted
+# alike), plus untracked-not-ignored paths.
+#
+# Only the first of the two is exactly "the changed subset" of the wrapper's
+# `git ls-files --cached --others --exclude-standard` selection. The second
+# returns EVERY untracked-not-ignored path, changed or not, because an untracked
+# path has no committed state to differ from. That over-includes rather than
+# under-includes, which is the conservative direction and is why it is used
+# as-is.
+worktree = [t for t in git("diff", "--name-only", "-z", "HEAD").split("\0") if t]
+worktree += [
+    t
+    for t in git("ls-files", "-z", "--others", "--exclude-standard").split("\0")
+    if t
+]
+
+committed_set, worktree_set = set(committed), set(worktree)
+union = committed_set | worktree_set
+# The transport below is line-based, so a path carrying a newline would silently
+# become two paths. Refusing is the fail-closed answer.
+for rel in sorted(union):
+    if "\n" in rel or "\r" in rel:
+        print("a changed path contains a newline, which this basis cannot carry")
+        raise SystemExit(1)
+
+print(base)
+print(head)
+print(len(committed_set))
+print(len(worktree_set))
+for rel in sorted(union):
+    print(rel)
+TIERPY
+    # The message names the revision as CONTEXT and attributes nothing to it.
+    # The first wording said the revision was what the change set could not be
+    # derived from, which blamed the caller's argument for `git` being absent, a
+    # corrupt object, an unreadable repository, or a missing python3 — every
+    # internal failure this program can have. The interpolated diagnostic is
+    # what says which of those happened, so it is kept verbatim.
+    ) || contract_usage_abort "--tier-fast could not derive a change set (base revision '$TIER_BASE_REV'): ${_tier_basis:-the basis program produced no diagnostic}" --tier-fast
+
+    COVERAGE_TIER_BASE_OID=$(printf '%s\n' "$_tier_basis" | sed -n 1p)
+    COVERAGE_TIER_HEAD_OID=$(printf '%s\n' "$_tier_basis" | sed -n 2p)
+    COVERAGE_TIER_COMMITTED_PATHS=$(printf '%s\n' "$_tier_basis" | sed -n 3p)
+    COVERAGE_TIER_WORKTREE_PATHS=$(printf '%s\n' "$_tier_basis" | sed -n 4p)
+    _tier_paths=$(printf '%s\n' "$_tier_basis" | tail -n +5)
+
+    # ---- 5: ownership verification, BEFORE any narrow result is accepted --
+    # Ordering hazard 5. The admission gate proves the estate's NAMES; it says
+    # nothing about whether the ownership declarations used to narrow are TRUE,
+    # and only a direct declaration narrows. A failure here widens rather than
+    # trusting the map.
+    _tier_widen=0
+    _tier_owners="$REPO_ROOT/bin/cctally-test-owners"
+    if [ ! -x "$_tier_owners" ]; then
+        # A tier that cannot establish ownership selects everything; it never
+        # selects nothing.
+        #
+        # This branch used to be justified on the claim that the published
+        # public tree carries no bin/cctally-test-owners. That claim is FALSE:
+        # .mirror-allowlist line 8 is the positive glob `bin/cctally-*`, no
+        # negation covers the tool, and .githooks/_match.py classifies it
+        # `public`. Only the private overlay tests/harness-ownership.private.json
+        # is withheld, and the tool discovers that overlay by existence and
+        # operates on public rows alone when it is absent — so a tier on a
+        # published public tree attributes normally rather than always widening.
+        # The branch stays anyway: a tree that has lost the tool for any reason
+        # must still fail closed.
+        _tier_widen=1
+        printf 'cctally-test-all: --tier-fast: this tree carries no executable bin/cctally-test-owners, so ownership cannot be established; selecting the whole estate\n' >&2
+    elif ! "$_tier_owners" --verify --repo-root "$REPO_ROOT" >/dev/null 2>&1; then
+        _tier_widen=1
+        printf 'cctally-test-all: --tier-fast: ownership verification failed, so no narrowing derived from it can be trusted; selecting the whole estate (run bin/cctally-test-owners --verify to see why)\n' >&2
+    fi
+
+    # ---- 6: attribution ---------------------------------------------------
+    # `attribute().safe` and never `advisory_owners_of`: `safe` already collapses
+    # to the complete required estate whenever anything widened — an
+    # advisory-only match, an unattributed path, or an opaque harness — while
+    # the advisory map is a raw hint with no widening applied. F39 measured that
+    # this widens on 119 of 119 real merges, which is the designed fail-closed
+    # behaviour meeting real traffic rather than a defect.
+    _tier_safe=""
+    if [ "$_tier_widen" = 0 ] && [ -n "$_tier_paths" ]; then
+        _tier_safe=$(printf '%s\n' "$_tier_paths" \
+            | "$_tier_owners" --names-only --repo-root "$REPO_ROOT" 2>/dev/null \
+            | tr '\0' ' ') || {
+            _tier_widen=1
+            printf 'cctally-test-all: --tier-fast: bin/cctally-test-owners could not attribute the change set; selecting the whole estate\n' >&2
+        }
+    fi
+
+    # ---- 7: the two forced harnesses --------------------------------------
+    # `test-remote` because preserve-item 27 keeps it in the full Gate 0 and only
+    # the fixed linux-matrix profile may omit it, and `frontend` because the tier
+    # reasons about the harness axis alone and has no view of the frontend
+    # estate. Both are filtered through the ACTIVE profile's manifest names: a
+    # forced name the manifest does not carry would sit in `selected` while
+    # belonging to neither side of the partition, which is exactly what made
+    # revision 1 unimplementable on the public profile — `test-remote` is
+    # `visibility: private`, and contract_manifest_harness_names deliberately
+    # returns only public rows there.
+    _tier_want=" "
+    set -f                       # see the note on $SUBSET_SET above
+    for _forced in frontend test-remote; do
+        while IFS= read -r _n; do
+            [ "$_n" = "$_forced" ] || continue
+            case "$_tier_want" in
+                *" $_forced "*) ;;
+                *) _tier_want="$_tier_want$_forced " ;;
+            esac
+            break
+        done <<EOF
+$_manifest_names
+EOF
+    done
+    for _n in $_tier_safe; do
+        _found=0
+        while IFS= read -r _m; do
+            [ "$_m" = "$_n" ] && { _found=1; break; }
+        done <<EOF
+$_manifest_names
+EOF
+        if [ "$_found" != 1 ]; then
+            # Fail closed rather than dropping the name silently: attribution
+            # named a harness this profile's manifest does not declare, so the
+            # two disagree about the estate and no narrowing derived from that
+            # disagreement can be trusted.
+            _tier_widen=1
+            printf 'cctally-test-all: --tier-fast: attribution named %s, which the %s manifest does not declare; selecting the whole estate\n' "$_n" "$CONTRACT_PROFILE" >&2
+            break
+        fi
+        case "$_tier_want" in
+            *" $_n "*) ;;
+            *) _tier_want="$_tier_want$_n " ;;
+        esac
+    done
+
+    # ---- 8: the partition, in MANIFEST order ------------------------------
+    COVERAGE_SELECTED=""
+    COVERAGE_OMITTED=""
+    _tier_manifest_count=0
+    while IFS= read -r _n; do
+        [ -n "$_n" ] || continue
+        _tier_manifest_count=$((_tier_manifest_count + 1))
+        if [ "$_tier_widen" = 1 ]; then
+            COVERAGE_SELECTED="$COVERAGE_SELECTED$_n "
+            continue
+        fi
+        case "$_tier_want" in
+            *" $_n "*) COVERAGE_SELECTED="$COVERAGE_SELECTED$_n " ;;
+            *)         COVERAGE_OMITTED="$COVERAGE_OMITTED$_n " ;;
+        esac
+    done <<EOF
+$_manifest_names
+EOF
+    set +f
+    COVERAGE_SELECTED=${COVERAGE_SELECTED% }
+    COVERAGE_OMITTED=${COVERAGE_OMITTED% }
+    # Asserted rather than assumed, and REACHABLE — not merely insurance
+    # against a future edit, as this comment previously claimed. The manifest
+    # count counts LINES while the two counts below count IFS-split WORDS, so a
+    # manifest name containing whitespace makes the three disagree without any
+    # edit at all. Whatever the cause, it fails CLOSED into the full estate
+    # rather than refusing a run over a bookkeeping slip.
+    _tier_selected_count=0
+    _tier_omitted_count=0
+    set -f
+    for _n in $COVERAGE_SELECTED; do
+        _tier_selected_count=$((_tier_selected_count + 1))
+    done
+    for _n in $COVERAGE_OMITTED; do
+        _tier_omitted_count=$((_tier_omitted_count + 1))
+    done
+    set +f
+    if [ "$((_tier_selected_count + _tier_omitted_count))" -ne "$_tier_manifest_count" ]; then
+        printf 'cctally-test-all: --tier-fast: the selected and omitted lists are not an exact partition of the %s manifest (%s + %s of %s); selecting the whole estate\n' \
+            "$CONTRACT_PROFILE" "$_tier_selected_count" "$_tier_omitted_count" "$_tier_manifest_count" >&2
+        COVERAGE_SELECTED=$(printf '%s' "$_manifest_names" | tr '\n' ' ')
+        COVERAGE_SELECTED=${COVERAGE_SELECTED% }
+        COVERAGE_OMITTED=""
+    fi
+    COVERAGE_MODE=tier-fast
+    # The harness axis and nothing else. pytest runs in full, and the tier never
+    # calls bin/_lib_estate_discovery.discover(): it raises on a clean checkout
+    # until e2e/serve.sh builds the Playwright runtime, and — the reason that
+    # settles it — the aggregator has no Playwright EXECUTION axis to narrow,
+    # because bin/cctally-frontend-test runs `npx vitest run` as its estate leg.
+    COVERAGE_PYTEST=full
+    COVERAGE_RESOLVED=1
+    unset _tier_basis _tier_paths _tier_safe _tier_want _tier_owners _tier_widen
+    unset _tier_manifest_count _tier_selected_count _tier_omitted_count
 fi
 
 if [ "$SUBSET_MODE" = 1 ]; then
@@ -341,7 +663,7 @@ done
 # no outcome record, which is the one failure shape the verdict contract cannot
 # describe. `parallel_harnesses` is empty for an estate carrying no pool
 # harness at all.
-all_harnesses=(${parallel_harnesses[@]+"${parallel_harnesses[@]}"} "${final_harnesses[@]}")
+report_harnesses=(${parallel_harnesses[@]+"${parallel_harnesses[@]}"} "${final_harnesses[@]}")
 
 # `test-remote` verifies the macOS/Homebrew LAN execution wrapper itself. It is
 # deliberately outside the Linux/Python/filesystem compatibility profile and
@@ -350,7 +672,7 @@ all_harnesses=(${parallel_harnesses[@]+"${parallel_harnesses[@]}"} "${final_harn
 if [ "$LINUX_MATRIX_MODE" = 1 ]; then
     linux_harnesses=()
     linux_omitted=0
-    for h in ${all_harnesses[@]+"${all_harnesses[@]}"}; do
+    for h in ${report_harnesses[@]+"${report_harnesses[@]}"}; do
         if [ "$h" = test-remote ]; then
             linux_omitted=$((linux_omitted + 1))
         else
@@ -359,17 +681,21 @@ if [ "$LINUX_MATRIX_MODE" = 1 ]; then
     done
     [ "$linux_omitted" = 1 ] \
         || contract_usage_abort "the Linux matrix profile expected exactly one test-remote harness, found $linux_omitted" CCTALLY_LINUX_MATRIX_RUN
-    all_harnesses=(${linux_harnesses[@]+"${linux_harnesses[@]}"})
+    report_harnesses=(${linux_harnesses[@]+"${linux_harnesses[@]}"})
 fi
 
 # A subset narrows the EXECUTED set only, in manifest order. A selected name
 # that has no file on disk (or lost its executable bit) leaves nothing here,
 # and admission below refuses the run for that reason before the pool starts.
-if [ "$SUBSET_MODE" = 1 ]; then
+#
+# The tier narrows the same way and through the same filter, so the selection
+# it recorded is the selection the pool receives; the two modes differ in how
+# the set was derived, never in how it is applied.
+if [ "$SUBSET_MODE" = 1 ] || [ "$TIER_MODE" = 1 ]; then
     subset_harnesses=()
     set -f                       # see the note on $SUBSET_SET above
     for name in $COVERAGE_SELECTED; do
-        for h in ${all_harnesses[@]+"${all_harnesses[@]}"}; do
+        for h in ${report_harnesses[@]+"${report_harnesses[@]}"}; do
             if [ "$h" = "$name" ]; then
                 subset_harnesses+=("$name")
                 break
@@ -377,12 +703,194 @@ if [ "$SUBSET_MODE" = 1 ]; then
         done
     done
     set +f
-    all_harnesses=(${subset_harnesses[@]+"${subset_harnesses[@]}"})
+    report_harnesses=(${subset_harnesses[@]+"${subset_harnesses[@]}"})
 fi
+
+# ---- dispatch order (#630 S3) ------------------------------------------
+# Dispatch order is a SEPARATE array from report order (preserve-item 29).
+# Longest-processing-time first, from the committed table, because the pool is
+# tail-bound: `test-remote` is 723s of the table's 2714s total — a quarter of
+# all harness work — and sorts 58th of 61 alphabetically, so in report order it
+# starts late and holds one of four slots for the final 723s. The consequence
+# is arithmetic rather than a guess: 2714/4 = 678.5s, which is BELOW 723s, so
+# 723s is the pool's floor whatever the dispatch order and the only thing an
+# order can change is how much of it overlaps everything else.
+#
+# The table must be an exact cover of the FULL manifest; the current profile's
+# rows are then selected the way contract_manifest_harness_names selects names.
+# Anything wrong with it is a FALLBACK, never a refusal: a stale table must not
+# fail a gate. bin/cctally-preflight refuses it locally instead, before the
+# 16-minute round trip.
+#
+# The validation itself lives in bin/_lib_harness_durations.py, which
+# bin/cctally-preflight imports too. The two callers disagree about the
+# CONSEQUENCE — a fallback here, a local refusal there — and must never
+# disagree about the contract.
+#
+# The manifest is read through that module rather than through
+# CONTRACT_HARNESS_TABLE. That variable is populated by contract_manifest_load,
+# which runs only inside the subset branch above and again at admission — so on
+# a full run it is still empty at this point and every table row would classify
+# as an unknown harness. Reading the file directly also keeps this block from
+# turning a malformed manifest into a plan-mode refusal, which would break the
+# "plan mode exits before admission" contract the block below depends on.
+#
+# `python3 -B` because plan mode is contractually side-effect-free
+# (preserve-item 25) and an ordinary import of a bin/ sibling has CPython write
+# bin/__pycache__/_lib_harness_durations.<tag>.pyc into the tree under test.
+# CI invokes this script directly on the runner with neither
+# PYTHONPYCACHEPREFIX nor PYTHONDONTWRITEBYTECODE set, so without -B the
+# aggregator writes bytecode into whatever checkout it is run in.
+#
+# The capture takes stdout ALONE. It used to be `2>&1`, and the shell then read
+# only the first line of the merged stream — so any stderr line emitted on a
+# ZERO exit (a DeprecationWarning, anything PYTHONWARNINGS turns on) would have
+# become the dispatch list. Diagnostics belong on stderr and go there directly.
+#
+# The program prints TWO things, in this order: a provenance line naming the
+# table and its digest, then the dispatch order. The provenance is recorded
+# alongside SCHEDULER_MODE, and it is taken HERE rather than at teardown
+# because the mode is decided here: a run holds its workdir for the whole
+# sixteen minutes, so a digest read after the pool describes the tree as it
+# ended rather than the bytes the dispatch decision was taken from. It is
+# printed before the first `bail`, so every exit path records it.
+# MEASUREMENT CONTROL ARM. #630 S3's decision rule compares longest-first
+# dispatch against report order, and a paired difference is only a paired
+# difference when both arms run on the SAME tree. Without this override the
+# only way to reach report order is to delete the duration table, which faults
+# pre-flight and reds the preflight harness's real-tree case, so the control
+# arm was unobtainable on an otherwise-identical tree.
+#
+# Validated HERE, before any work, and fail-closed: an unrecognised value
+# refuses rather than falling through. A typo that fell through would produce a
+# run dispatched longest-first while the operator recorded it as the control,
+# and every number taken from that programme would be wrong with nothing to
+# show it.
+case "${CCTALLY_TEST_ALL_DISPATCH:-}" in
+    ''|lpt|report) ;;
+    *)
+        printf 'cctally-test-all: CCTALLY_TEST_ALL_DISPATCH=%s is not a dispatch mode; use lpt or report\n' \
+            "$CCTALLY_TEST_ALL_DISPATCH" >&2
+        exit 2
+        ;;
+esac
+SCHEDULER_MODE=fallback
+SCHEDULER_TABLE=unknown
+SCHEDULER_TABLE_DIGEST=unknown
+dispatch_harnesses=(${report_harnesses[@]+"${report_harnesses[@]}"})
+_scheduler_out=$(
+    REPORT_ORDER="${report_harnesses[*]+"${report_harnesses[*]}"}" \
+    python3 -B - "$REPO_ROOT" "$CONTRACT_PROFILE" <<'SCHEDPY'
+import hashlib
+import os
+import sys
+
+repo_root, profile = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(repo_root, "bin"))
+try:
+    import _lib_harness_durations as durations
+except ImportError as exc:
+    print("unknown\tvalidator-unimportable")
+    sys.stderr.write(
+        "scheduler: no duration table validator at %s/bin (%s); "
+        "dispatching in report order\n" % (repo_root, exc)
+    )
+    raise SystemExit(1)
+
+# Raw bytes rather than durations.read_table's text, because the record is
+# compared against the file on disk and text mode translates newlines.
+try:
+    with open(os.path.join(repo_root, durations.TABLE_REL), "rb") as handle:
+        _digest = "sha256:" + hashlib.sha256(handle.read()).hexdigest()
+except OSError:
+    _digest = "absent"
+print("%s\t%s" % (durations.TABLE_REL, _digest))
+
+
+def bail(reason):
+    sys.stderr.write("scheduler: %s; dispatching in report order\n" % reason)
+    raise SystemExit(1)
+
+
+manifest, error = durations.read_manifest(repo_root)
+if error:
+    bail(error)
+text, error = durations.read_table(repo_root)
+if error:
+    bail(error)
+table, error = durations.validate(text, manifest)
+if error:
+    bail(error)
+order, error = durations.dispatch_order(
+    os.environ.get("REPORT_ORDER", "").split(),
+    table,
+    durations.select_for_profile(manifest, profile),
+)
+if error:
+    bail(error)
+print(" ".join(order))
+SCHEDPY
+)
+_scheduler_rc=$?
+# Split the provenance line off the front. Command substitution strips trailing
+# newlines, so a program that bailed after printing provenance — and one whose
+# order was empty — both leave a single line here, and the order is empty.
+_scheduler_head=${_scheduler_out%%$'\n'*}
+_scheduler_order=${_scheduler_out#*$'\n'}
+if [ "$_scheduler_order" = "$_scheduler_out" ]; then
+    _scheduler_order=""
+fi
+case "$_scheduler_head" in
+    *$'\t'*)
+        SCHEDULER_TABLE=${_scheduler_head%%$'\t'*}
+        SCHEDULER_TABLE_DIGEST=${_scheduler_head#*$'\t'}
+        ;;
+esac
+if [ "$_scheduler_rc" -ne 0 ]; then
+    # The program above already wrote its own `scheduler: … ; dispatching in
+    # report order` line to stderr, naming the reason. Nothing is echoed here.
+    # This branch used to print the captured text, which only worked because
+    # the capture merged stderr into stdout — and on an empty estate that print
+    # emitted a bare blank line as if something were wrong.
+    :
+elif [ -n "$_scheduler_order" ]; then
+    # `read -r -a` rather than an unquoted array assignment: word splitting is
+    # the mechanism, but the assignment form also invites pathname expansion,
+    # and SC2206 is not on the gate's permitted-suppression list. A manifest
+    # harness name carries no whitespace, so one IFS split is exact.
+    read -r -a dispatch_harnesses <<< "$_scheduler_order"
+    SCHEDULER_MODE=lpt
+else
+    # Exit 0 with no names at all. This is REACHED, not defence: the subset
+    # branch above reassigns `report_harnesses`, and a `--harness NAME` whose
+    # file is absent or has lost its executable bit selects nothing, so
+    # `REPORT_ORDER` is empty and the ordering has nothing to return. Plan mode
+    # runs before admission, which is what lets that tree get this far —
+    # `CCTALLY_TEST_ALL_PLAN=1 bin/cctally-test-all --harness diff` with
+    # bin/cctally-diff-test not executable prints this line and then
+    # `harnesses=`, `dispatch_harnesses=` and `scheduler=fallback`. Admission
+    # refuses the same tree on a real run, before the pool starts.
+    #
+    # Dispatching an empty list would run NOTHING while the report still
+    # described a full estate, so the fallback says so rather than staying
+    # silent.
+    printf 'scheduler: the ordering returned no harness; dispatching in report order\n' >&2
+fi
+if [ "${CCTALLY_TEST_ALL_DISPATCH:-}" = "report" ]; then
+    # Applied AFTER the ordering ran, not instead of it, so the control arm
+    # records the same table and the same digest as the treatment arm and the
+    # pair differs in exactly one variable. The mode is its own value rather
+    # than `fallback`, because a forced control arm and a scheduler that could
+    # not read its table are different facts and the evidence must not
+    # conflate them.
+    dispatch_harnesses=(${report_harnesses[@]+"${report_harnesses[@]}"})
+    SCHEDULER_MODE=report-forced
+fi
+unset _scheduler_out _scheduler_head _scheduler_order _scheduler_rc
 
 # ---- plan mode: emit the resolved plan and exit before ANY side effect --
 if [ "${CCTALLY_TEST_ALL_PLAN:-}" = "1" ]; then
-    plan_harnesses=${all_harnesses[*]+"${all_harnesses[*]}"}
+    plan_harnesses=${report_harnesses[*]+"${report_harnesses[*]}"}
     printf 'ncpu=%s\n'   "$NCPU"
     # The EFFECTIVE configuration, not the dead BUDGET intermediate that used
     # to report the host's core count here. With all three roles explicitly
@@ -393,16 +901,38 @@ if [ "${CCTALLY_TEST_ALL_PLAN:-}" = "1" ]; then
     printf 'inner=%s\n'  "$INNER"
     printf 'pytest=%s\n' "$PYTEST"
     printf 'reconcile_in_pool=1\n'
-    # `harnesses=` is the single carrier of what a subset selected, and it
-    # reports the on-disk EXECUTION order, which is what the pool will receive.
-    # A second `selected=` line printing the same variable used to sit here; it
+    # `harnesses=` is the REPORT order — the order rows are printed in, which
+    # preserve-item 29 requires to be independent of dispatch. It is no longer
+    # what the pool receives: `dispatch_harnesses=` is. The bytes of this line
+    # are unchanged from before the split, so existing parsers still work, but
+    # its meaning is now report order specifically rather than the single order
+    # that used to be both.
+    #
+    # `harnesses=` also remains the single carrier of what a subset selected. A
+    # second `selected=` line printing the same variable used to sit here; it
     # carried no information the line above does not, while inviting a reader
     # to equate it with the record's `coverage.selectedHarnesses`, which is the
     # MANIFEST-ordered name list and a different thing. Set equality between
     # the two is forced by admission; their order and their source are not.
     printf 'harnesses=%s\n' "$plan_harnesses"
+    printf 'dispatch_harnesses=%s\n' "${dispatch_harnesses[*]+"${dispatch_harnesses[*]}"}"
+    printf 'scheduler=%s\n' "$SCHEDULER_MODE"
     printf 'mode=%s\n' "$COVERAGE_MODE"
     printf 'pytest_disposition=%s\n' "$COVERAGE_PYTEST"
+    # The tier's own lines, printed only in tier mode and named in their own
+    # namespace. `harnesses=` above stays the single carrier of a SUBSET's
+    # selection for the reason recorded there, and these do not reopen that: a
+    # tier's omitted list has no other carrier at all, and its selected list is
+    # MANIFEST-ordered where `harnesses=` is report-ordered, so they are
+    # genuinely different facts rather than the same variable twice.
+    if [ "$TIER_MODE" = 1 ]; then
+        printf 'tier_selected=%s\n' "$COVERAGE_SELECTED"
+        printf 'tier_omitted=%s\n' "$COVERAGE_OMITTED"
+        printf 'tier_base_oid=%s\n' "$COVERAGE_TIER_BASE_OID"
+        printf 'tier_head_oid=%s\n' "$COVERAGE_TIER_HEAD_OID"
+        printf 'tier_committed_paths=%s\n' "$COVERAGE_TIER_COMMITTED_PATHS"
+        printf 'tier_worktree_paths=%s\n' "$COVERAGE_TIER_WORKTREE_PATHS"
+    fi
     exit 0
 fi
 
@@ -1370,7 +1900,7 @@ case $? in
 esac
 
 printf '[cctally-test-all] run %s — %s harnesses, outer=%s inner=%s pytest=%s\n' \
-    "$RUN_ID" "${#all_harnesses[@]}" "$OUTER" "$INNER" "$PYTEST" >&2
+    "$RUN_ID" "${#report_harnesses[@]}" "$OUTER" "$INNER" "$PYTEST" >&2
 
 # ---- admission (#529 S1) -----------------------------------------------
 # AFTER plan mode by design: the block above exits "before ANY side effect" and
@@ -1431,6 +1961,21 @@ contract_admit_external_reason
 # — never green either way.
 if ! contract_admit_capabilities "$CONTRACT_PROFILE"; then
     contract_is_authoritative && contract_abort
+fi
+
+# ---- the committed runtime budget (#630 S7) ----------------------------
+# Parsed and validated HERE, at admission, so a malformed or missing budget
+# refuses the run in seconds rather than after twenty minutes of work whose
+# cost it then cannot judge. The completion check re-reads nothing; it compares
+# the computed metric against the value validated here.
+#
+# Loaded only when the run is ELIGIBLE, through the same predicate the check
+# reads. An ineligible run never compares itself against the budget, so
+# refusing it for a budget it will never read would be a refusal nobody asked
+# for — and `--harness`, the tier and linux-matrix are all ineligible.
+if contract_budget_is_eligible; then
+    contract_budget_load "$REPO_ROOT/tests/authoritative-runtime-budget.json" \
+        || contract_abort
 fi
 
 # ---- evidence resolution (#529 S2) -------------------------------------
@@ -1563,8 +2108,8 @@ case "$PROGRESS_INTERVAL" in *[!0-9]*|'') PROGRESS_INTERVAL=30 ;; esac
 # quieter than this.
 contract_is_authoritative && PROGRESS_INTERVAL=30
 
-ALL_HARNESS_NAMES=${all_harnesses[*]+"${all_harnesses[*]}"}
-HARNESS_TOTAL=${#all_harnesses[@]}
+ALL_HARNESS_NAMES=${report_harnesses[*]+"${report_harnesses[*]}"}
+HARNESS_TOTAL=${#report_harnesses[@]}
 REPORTER_PID=""
 POOL_PID=""
 PHASE_PID=""
@@ -1736,6 +2281,7 @@ _cleanup_run() {
         # status did not already decide — deleting either line left every
         # interrupt test green, which is the definition of an uncovered line.
         [ "$rc" -ge 128 ] && state=aborted
+        _record_scheduler
         _collect_timings
         _write_manifest "$state" "$rc"
         _harden_evidence_modes
@@ -1766,6 +2312,27 @@ _harden_evidence_modes() {
     [ -n "$EVIDENCE_DIR" ] || return 0
     find "$EVIDENCE_DIR" -type d -exec chmod 700 {} + 2>/dev/null || true
     find "$EVIDENCE_DIR" -type f -exec chmod 600 {} + 2>/dev/null || true
+    return 0
+}
+
+# #630 S3. A measurement run must record its own treatment condition, and the
+# only two places the dispatch decision appears otherwise are a plan-mode line
+# and a fallback diagnostic — neither of which an authoritative run emits. So
+# 28 measurement runs would have carried no record of which arm produced them.
+#
+# It goes into the evidence directory, NOT onto stdout: stdout is compared
+# against goldens, and this is provenance rather than output. All three fields
+# are decided in the dispatch block and only WRITTEN here. An earlier draft
+# recomputed the digest at teardown, which meant the mode described the run's
+# start and the digest described its end — different bytes whenever the tree
+# changed under the workdir lease.
+_record_scheduler() {
+    [ -n "$EVIDENCE_DIR" ] || return 0
+    {
+        printf 'mode\t%s\n' "$SCHEDULER_MODE"
+        printf 'table\t%s\n' "$SCHEDULER_TABLE"
+        printf 'table_digest\t%s\n' "$SCHEDULER_TABLE_DIGEST"
+    } > "$EVIDENCE_DIR/scheduler.tsv" 2>/dev/null || true
     return 0
 }
 
@@ -1864,7 +2431,7 @@ set -m
 # on an empty array under `set -u`; the emptiness test keeps `printf '%s\n'`
 # with no arguments from emitting the single blank line it would otherwise
 # print, which xargs implementations do not agree about.
-{ { [ "$HARNESS_TOTAL" -eq 0 ] || printf '%s\n' ${all_harnesses[@]+"${all_harnesses[@]}"} ; } \
+{ { [ "$HARNESS_TOTAL" -eq 0 ] || printf '%s\n' ${dispatch_harnesses[@]+"${dispatch_harnesses[@]}"} ; } \
     | xargs -P "$OUTER" -I {} bash -c 'run_one "$@"' _ {} ; } &
 POOL_PID=$!
 set +m
@@ -1884,7 +2451,7 @@ total_pass=0
 total_fail=0
 declare -a rows
 
-for h in ${all_harnesses[@]+"${all_harnesses[@]}"}; do
+for h in ${report_harnesses[@]+"${report_harnesses[@]}"}; do
     log="$LOGDIR/${h}.log"
     # The verdict comes from the classifier (exit sidecar + summary grammar +
     # the manifest floor); this loop keeps only the human row render.
@@ -2171,6 +2738,15 @@ else
     contract_fail incomplete pytest-unavailable "" pytest
 fi
 
+# ---- the normalized runtime budget (#630 S7) ---------------------------
+# AFTER every ordinary classification, so a secondary budget failure can never
+# mask the decisive test result, and BEFORE the verdict block below rather than
+# beside contract_finish, so the printed verdict and the exit code agree. Run
+# after the printed verdict, a breach would have left `Verdict: PASS (exit 0)`
+# in the scrollback above an exit 1 — the self-contradicting summary this file
+# already refuses elsewhere.
+contract_check_runtime_budget
+
 echo "----"
 for row in ${rows[@]+"${rows[@]}"}; do echo "$row"; done
 printf '%5s   %s\n' "$pytest_status" "pytest"
@@ -2189,7 +2765,7 @@ echo "----"
 echo "Timing: total=${SECONDS}s  shell-pool=${pool_wall}s  pytest=${pytest_wall}s  (outer=$OUTER inner=$INNER pytest=$PYTEST)"
 echo "Slowest harnesses:"
 {
-    for h in ${all_harnesses[@]+"${all_harnesses[@]}"}; do
+    for h in ${report_harnesses[@]+"${report_harnesses[@]}"}; do
         t=$(cat "$LOGDIR/${h}.time" 2>/dev/null || echo 0)
         printf '%s %s\n' "$t" "$h"
     done
@@ -2212,8 +2788,26 @@ _subset_other_reasons=$(printf '%s' "$CONTRACT_REASONS" \
 # a hole in it tells an operator nothing about which case they are in.
 _selected_display=$COVERAGE_SELECTED
 [ -n "$_selected_display" ] || _selected_display='(none)'
+# The tier's own coverage sentence. Without it a green tier printed `Verdict:
+# PASS (exit 0)` and nothing else — the two sentences below are gated on the
+# SUBSET mode — so a tier that omitted most of the estate read in scrollback
+# exactly like a full run, with the mode recorded only in a file the operator is
+# not looking at.
+#
+# Deliberately NOT the subset's "NOT a gate" wording. A subset is uncitable by
+# design; a tier is citable under its own gate identity, so borrowing that
+# sentence would state the opposite of what the mode means.
+_tier_verdict_note(){
+    [ "$COVERAGE_MODE" = "tier-fast" ] || return 0
+    local sel omit
+    sel=$(printf '%s' "$COVERAGE_SELECTED" | wc -w | tr -d ' ')
+    omit=$(printf '%s' "$COVERAGE_OMITTED" | wc -w | tr -d ' ')
+    printf '  coverage: tier-fast — %s of %s harness(es) omitted; the selection was derived from the tree, and the pytest estate ran in %s\n' \
+        "$omit" "$((sel + omit))" "$COVERAGE_PYTEST"
+}
 if [ "$CONTRACT_CLASS" = "none" ]; then
     echo "Verdict: PASS (exit $(contract_exit_code))"
+    _tier_verdict_note
 elif [ "$COVERAGE_MODE" = "subset" ] && [ "$_subset_other_reasons" = "0" ]; then
     # Exiting 3 on an all-passing targeted run is deliberately surprising, so
     # this states in plain terms what happened. Exiting 0 and recording the
@@ -2233,6 +2827,9 @@ else
         printf '  this was a deliberate subset run over %s and is NOT a gate, whatever its verdict\n' \
             "$_selected_display"
     fi
+    # A FAILING tier is the same reading problem as a green one: the reasons
+    # name what broke and nothing names how much of the estate was asked.
+    _tier_verdict_note
 fi
 
 # ---- retention and eviction (#529 S2) ----------------------------------

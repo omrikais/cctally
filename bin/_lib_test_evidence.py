@@ -377,7 +377,7 @@ _TYPED_PATTERNS = (
 # required trailing dashes and the tainted line simply stops matching. The
 # rule now lives in `_SECTION_RULE_RE` below, where its body is scrubbed.
 _STRUCTURED_VERBATIM = (
-    re.compile(r"^\s*$"),
+    re.compile(r"^[ \t]*$"),
     re.compile(r"^\s*-{3,}\s*$"),                               # a bare rule
     re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@\s*$"),     # diff hunk coords
     re.compile(r"^\s*Traceback \(most recent call last\):\s*$"),
@@ -490,10 +490,16 @@ _TEST_REMOTE_CASE_RE = re.compile(
 # one — `.githooks/`, `.agentmem/`, `scripts/`, `homebrew/`, `telemetry/` —
 # emitted verbatim. Enumerating what is safe cannot cover what nobody listed,
 # which is the same inversion the validator's absolute-path leg already had to
-# make. The final segment must carry a letter, or `38/56` in a progress line
-# would read as a path and a counter would be redacted.
+# make. Every directory segment must either contain a word character or be `.`
+# / `..`; otherwise the `-` before `/tmp` in `${TMPDIR:-/tmp}` wins the combined
+# scan one character before the absolute-path alternative and misclassifies
+# `-/tmp` as a public relative path. The final segment must carry a letter, or
+# `38/56` in a progress line would read as a path and a counter would be
+# redacted.
 _REPO_REL_RE = re.compile(
-    r"(?<![\w/.-])(?P<rel>(?:[\w.-]+/)+[\w.-]*[A-Za-z][\w.-]*)"
+    r"(?<![\w/.-])(?P<rel>"
+    r"(?:(?:\.{1,2}|(?=[\w.-]*\w/)[\w.-]+)/)+"
+    r"[\w.-]*[A-Za-z][\w.-]*)"
 )
 # Any absolute path that survived root substitution is unknown territory. One
 # character after the slash is enough: a two-character floor left `<home>/a`
@@ -515,10 +521,14 @@ _PATH_SCAN_RE = re.compile(f"{_ABS_PATH_RE.pattern}|{_REPO_REL_RE.pattern}")
 # whether every word in them was vouched for, so registering the words would
 # not have made the line legible. This class is a coarse "is this structured
 # output" test; the word-by-word provenance check below is what decides.
-_SAFE_LINE_RE = re.compile("^[\\s\\w.,:;=/()\\[\\]{}<>@%+*#!?'\"|~^&$–—-]*$")
+_SAFE_LINE_RE = re.compile("^[ \\t\\w.,:;=/()\\[\\]{}<>@%+*#!?'\"|~^&$–—-]*$")
 _OPAQUE_RUN_RE = re.compile(r"[A-Za-z]{40,}")
 _JSON_KEY_RE = re.compile(r'"\s*[A-Za-z_][\w.-]*"\s*:')
-_QUOTED_RE = re.compile(r'"([^"]*)"')
+# Python repr uses single quotes for the common case. Boundaries on that arm
+# distinguish a repr delimiter from the apostrophe inside `runner's`.
+_QUOTED_RE = re.compile(
+    r'''(?:"([^"\n]*)"|(?<![\w])'([^'\n]*)'(?![\w]))'''
+)
 # UNICODE letters, not Latin ones. `_SAFE_LINE_RE` admits `\w`, which is
 # Unicode-aware, so a Latin-only word rule inverted default-deny for every
 # non-Latin script: `FAIL diff: клиент diverged` matched no word run at all,
@@ -740,7 +750,7 @@ def unknown_vocabulary(text: str, ctx: "ScrubContext", decided_spans=()):
 
 def _has_quoted_free_text(text: str) -> bool:
     for match in _QUOTED_RE.finditer(text):
-        body = match.group(1)
+        body = match.group(1) if match.group(1) is not None else match.group(2)
         if len(body) >= MIN_QUOTED_FREE_TEXT and re.search(r"\s", body):
             return True
     return False
@@ -1103,10 +1113,11 @@ _FORBIDDEN = (
     # Stated as "any absolute path", not as a list of known roots. Enumerating
     # roots left most of the filesystem admissible — /root, /etc, /Library,
     # /mnt and /Volumes among them — so a checkout outside the enumerated set
-    # was disclosed in full. A leading slash preceded by a placeholder bracket
-    # or by a word character is not a path start, which is what keeps
-    # `<path>`, `bin/cctally-test-all` and `38/56` admissible.
-    ("absolute-path", re.compile(r"(?<![<\w])/[\w.-]")),
+    # was disclosed in full. A leading slash preceded by a placeholder bracket,
+    # a word character or a dot is not an absolute-path start. The dot exclusion
+    # keeps `./public` and `../public` admissible alongside `<path>`,
+    # `bin/cctally-test-all` and `38/56`.
+    ("absolute-path", re.compile(r"(?<![<\w.])/[\w.-]")),
     ("json-payload",
      re.compile(r'"(?:content|text|prompt|message|cwd|project|account)"\s*:')),
     ("control-bytes", re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")),
@@ -1121,8 +1132,8 @@ _FORBIDDEN = (
 # The word floor is SIX. A three-space floor rejected `FAIL <name>: <label>
 # diverged` — the line `bin/_lib-golden-diff.sh` emits from the chokepoint
 # every fixture harness compares through — and rejected an indentation-only
-# line as well. Since a failed validation leaves no export file at all, that
-# floor deleted the deliverable on essentially every real failing run: it
+# line as well. While this heuristic still refused wholesale, that floor
+# deleted the deliverable on essentially every real failing run: it
 # traded a disclosure hole for an availability hole, which is what turns a
 # detector into an outage. The floor can sit here because the transformer no
 # longer decides by how text looks: a suffix is now vouched for word by word
@@ -1130,7 +1141,11 @@ _FORBIDDEN = (
 # transformer bug admits rather than carrying the whole burden alone.
 _FREE_TEXT_MIN_WORDS = 6
 _FREE_TEXT_MIN_RATIO = 0.95
-_QUOTED_SPAN_RE = re.compile(r'"([^"\n]{8,}?)"')
+# Independently formulated rather than shared with `_QUOTED_RE`; the same
+# single-quote boundaries keep apostrophes from manufacturing a quoted span.
+_QUOTED_SPAN_RE = re.compile(
+    r'''(?:"([^"\n]{8,}?)"|(?<![\w])'([^'\n]{8,}?)'(?![\w]))'''
+)
 
 # The structural legs below cover the three shapes #630 S1 taught the
 # transformer to retain. Each is formulated over the EMITTED line rather than
@@ -1397,7 +1412,8 @@ def _looks_like_quoted_prose(text: str) -> bool:
     longer diagnostic — so the span is measured on its own terms. A quoted
     path has no internal space and is therefore not reached.
     """
-    for body in _QUOTED_SPAN_RE.findall(text):
+    for match in _QUOTED_SPAN_RE.finditer(text):
+        body = match.group(1) if match.group(1) is not None else match.group(2)
         if " " not in body:
             continue
         if _prose_ratio(body) >= _FREE_TEXT_MIN_RATIO:
@@ -1406,7 +1422,7 @@ def _looks_like_quoted_prose(text: str) -> bool:
 
 
 def validate_export(lines, roots=None):
-    """Violations that must block publication. Empty list means publishable."""
+    """Violations requiring per-line redaction or publication refusal."""
     violations = []
     for idx, line in enumerate(lines):
         text = line if isinstance(line, str) else ""
@@ -1442,18 +1458,16 @@ VALIDATION_REDACTION_NOTICE = (
     "[REDACTED: %d of %d lines were refused by the validator and replaced; "
     "reasons: %s]"
 )
-# The three STRUCTURAL legs — see `_structural_violation`. Each judges the
-# SHAPE of a line the transformer deliberately retains, and each is new in
-# #630 S1. All three have produced a false positive on correct transformer
-# output during that one session: an unnormalized-parameter leg that judged
-# every `::…[…]` span on any line, a nested-gutter leg that refused a doubled
-# `E ` gutter pytest really emits, and a counters leg that refused the
-# gutter-wrapped counters line above. A leg with that record must cost one
-# line when it is wrong, not the whole export.
+# The three STRUCTURAL legs — see `_structural_violation` — and the heuristic
+# free-form-text leg degrade per line. Each judges the SHAPE of sanitizer
+# output rather than proving that a specific secret class survived. #630 S1
+# established the structural class after validator false positives; the #637
+# repository sweep added 320 retained free-form-text judgements. A check with
+# that record must cost one line when it is wrong, not the whole export.
 #
 # Every OTHER reason `validate_export` can report is a CONTENT leg: an
-# unsubstituted root, the denylist patterns in `_FORBIDDEN`, and free-form
-# text. A content violation means the transformer emitted a payload it was
+# unsubstituted root or one of the denylist patterns in `_FORBIDDEN`. A content
+# violation means the transformer emitted a payload it was
 # supposed to have removed, which is the systemic-breakage signal the previous
 # whole-file refusal existed for, and it is not made safer by arriving alone.
 #
@@ -1462,7 +1476,8 @@ VALIDATION_REDACTION_NOTICE = (
 # wholesale rather than degrading per line, which is the fail-closed
 # direction. Enumerating the content legs instead would make an unfiled leg
 # degrade per line, which is the permissive one.
-STRUCTURAL_VIOLATION_REASONS = frozenset({
+PER_LINE_VIOLATION_REASONS = frozenset({
+    "free-form-text",
     "unnormalized-parameter",
     "text-after-exception-placeholder",
     "unknown-counter-word",
@@ -1471,35 +1486,27 @@ STRUCTURAL_VIOLATION_REASONS = frozenset({
 # NO RATE THRESHOLD. A proportional escape shipped here and is withdrawn,
 # because it decided the question by VOLUME when the question is one of KIND.
 #
-# The transformer has independent stages, and its stages fail independently. A
-# fault confined to the vocabulary stage leaves root substitution and the path
-# predicate working, so neither of those legs fires; measured against the
-# shipped kernel over a failing pytest log of this estate's own shape, such a
-# fault published a single-quoted production sentence verbatim while flagging
-# one line in fourteen — 7.1%, far under any threshold worth setting. The old
-# any-violation rule withheld that export; the proportional rule published it.
-# `test_a_vocabulary_stage_fault_withholds_the_whole_extract` pins the case.
-#
-# The reason split restores the canary without restoring the outage: one
-# content violation refuses everything, and a structural leg's false positive
-# costs its own line however often it fires. A second, volume-based escape on
-# top of that would only ever refuse an export whose every violation was
-# structural — which is to say an export whose payload no leg objected to —
-# and refusing that is the availability hole this mechanism exists to remove.
+# The issue is KIND, not VOLUME. A fault confined to the vocabulary stage is
+# checked independently by the single/double-quoted-span rule and the free-text
+# heuristic; every detected line is removed. A denylist hit or unsubstituted
+# root is stronger evidence that a concrete secret class survived, so one still
+# refuses wholesale. A rate threshold adds no useful safety distinction to
+# either group.
 def apply_validation_redactions(lines, violations, roots=None):
     """Replace each flagged line with a placeholder, or refuse wholesale.
 
     Returns `(lines, record)`. `record` carries `redacted`, `total`,
     `reasons`, `notice` and `refused`; when `refused` is true the caller must
-    publish nothing, because a CONTENT violation means the transformer rather
-    than one leg is broken and the UNFLAGGED lines cannot be trusted either.
+    publish nothing, because a denylist CONTENT violation means the transformer
+    rather than one leg is broken and the UNFLAGGED lines cannot be trusted.
 
     Degrading per line rather than per file is what keeps a single false
     positive from costing the operator every byte of a failure extract — the
     same failure class, at the file level, that the sanitizer's own
     over-redaction was raised as. Fail-closed still holds for the offending
     line: its bytes never reach the caller's output. It applies to the
-    STRUCTURAL legs only, for the reason recorded above the function.
+    structural and heuristic free-text legs only, for the reason recorded
+    above the function.
 
     The placeholders and the notice are OUTPUT, so they are put back through
     the same validator. A reason string that did not clear it would publish
@@ -1524,12 +1531,12 @@ def apply_validation_redactions(lines, violations, roots=None):
     }
     if not violations:
         return lines, record
-    # A violation carrying no reason at all is not a structural one: it is a
-    # violation this function cannot classify, and an unclassifiable violation
-    # takes the conservative outcome like any other content leg.
+    # A violation carrying no reason at all is not a recognized per-line leg:
+    # it is a violation this function cannot classify, and an unclassifiable
+    # violation takes the conservative outcome like any content leg.
     content = [
         v.get("reason") for v in violations
-        if v.get("reason") not in STRUCTURAL_VIOLATION_REASONS
+        if v.get("reason") not in PER_LINE_VIOLATION_REASONS
     ]
     if content:
         record["refused"] = True

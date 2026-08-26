@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import importlib.util
 import io
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CCTALLY = REPO_ROOT / "bin" / "cctally"
@@ -154,14 +154,8 @@ class TestAliasSurface:
 
 
 def _load_cctally_module():
-    """Import the ``cctally`` script as a module (no .py extension)."""
-    from importlib.machinery import SourceFileLoader
-
-    loader = SourceFileLoader("cctally", str(CCTALLY))
-    spec = importlib.util.spec_from_loader("cctally", loader)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
+    """Import the ``cctally`` script as a module."""
+    mod = load_script_module()
     return mod
 
 

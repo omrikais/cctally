@@ -7,6 +7,7 @@ import sys
 import pathlib
 
 import pytest
+from _fts5_gate import require_fts5  # the ONE FTS5 capability gate (#630 S6)
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 import _cctally_db as db
@@ -73,8 +74,7 @@ def test_migration_010_registered_after_009():
 
 def test_consume_search_split_backfills_and_swaps():
     c = _legacy_conn()
-    if not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _insert_row(c, 1, [
         {"kind": "thinking", "text": "ponder"},
         {"kind": "tool_use", "name": "Bash", "input": {"command": "rg needle"}}])
@@ -115,8 +115,7 @@ def test_consume_search_split_noop_when_flag_absent():
 
 def test_consume_search_split_resumes_from_cursor():
     c = _legacy_conn()
-    if not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     # three rows; pre-set row 1's search_tool + POISON its blocks_json so a
     # re-derivation would overwrite the pre-set value — proving the cursor skipped it.
     _insert_row(c, 1, [{"kind": "tool_use", "name": "Bash",
@@ -155,8 +154,7 @@ def test_consume_search_split_backfill_parity_with_ingest():
     rowA = list(lc.iter_message_rows(io.StringIO(line), "f"))[0]
 
     c = _legacy_conn()
-    if not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     # row B carries A's blocks_json with EMPTY search columns
     c.execute(
         "INSERT INTO conversation_messages"
@@ -266,8 +264,7 @@ def _ingest_line(c, obj, offset):
 def test_command_marker_excluded_from_prompts_facet():
     c = sqlite3.connect(":memory:")
     db._apply_cache_schema(c)
-    if not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     # a command echo + a REAL prompt sharing the distinctive word "needle"
     echo = _ingest_line(c, {
         "type": "user", "uuid": "u-echo",

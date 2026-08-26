@@ -16,6 +16,8 @@ import sys
 
 import pytest
 
+from _script_loader import load_script_module
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
 _BIN = REPO / "bin"
@@ -24,10 +26,9 @@ if str(_BIN) not in sys.path:
 
 
 def _load(name, path):
-    # SourceFileLoader handles both `.py` siblings and the extensionless
-    # `bin/cctally` main script (spec_from_file_location can't infer a
-    # loader for the latter). Mirrors the repo's canonical loaders
-    # (tests/test_config_path_override.py, tests/test_pricing_check.py).
+    # For `.py` siblings only. `bin/cctally` itself goes through
+    # `load_script_module()`, which additionally drops cached `_cctally_*`
+    # siblings and re-derives the path constants from the current HOME.
     from importlib.machinery import SourceFileLoader
 
     loader = SourceFileLoader(name, str(path))
@@ -143,7 +144,7 @@ def test_week_avg_projection_zero_elapsed_collapses_to_spent():
 
 def test_get_budget_config_ignores_unknown_keys():
     """Unknown budget sub-keys are warn-and-ignored, not fatal (forward compat)."""
-    cctally = _load("cctally", REPO / "bin" / "cctally")
+    cctally = load_script_module()
     out = cctally._get_budget_config(
         {"budget": {"weekly_usd": 300.0, "alerts_enabled": False, "bogus": 1}}
     )
@@ -155,7 +156,7 @@ def test_get_budget_config_ignores_unknown_keys():
 def test_f1_structural_forecast_uses_project_linear():
     """_compute_forecast must route projection through project_linear too."""
     import inspect
-    cctally = _load("cctally", REPO / "bin" / "cctally")
+    cctally = load_script_module()
     src = inspect.getsource(cctally._compute_forecast)
     assert "project_linear(" in src
 

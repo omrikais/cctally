@@ -31,7 +31,6 @@ no FTS5 skip-guard and run on a minimal (no-FTS5) sqlite build too.
 """
 from __future__ import annotations
 
-import importlib.util as ilu
 import json
 import shutil
 import sqlite3
@@ -39,6 +38,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 # W1 registry-completeness guard (#279 S7): declares this module exercises
 # the handler's second-invocation idempotency (test names vary across modules).
@@ -60,18 +60,10 @@ _FLAG = "conversation_reingest_enrichment_pending"
 
 @pytest.fixture(scope="module")
 def cctally_module():
-    """Load bin/cctally once per module (registers the cache migrations).
-    bin/cctally has no ``.py`` suffix, so an explicit ``SourceFileLoader`` is
-    required."""
-    from importlib.machinery import SourceFileLoader
-
+    """Load bin/cctally once per module (registers the cache migrations)."""
     if str(BIN_DIR) not in sys.path:
         sys.path.insert(0, str(BIN_DIR))
-    loader = SourceFileLoader("cctally", str(BIN_DIR / "cctally"))
-    spec = ilu.spec_from_loader("cctally", loader)
-    mod = ilu.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
+    mod = load_script_module()
     return mod
 
 

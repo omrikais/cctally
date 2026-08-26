@@ -39,7 +39,6 @@ SOAK = os.environ.get("CCTALLY_RUN_STORM_SOAK") == "1"
 
 #: Iteration / concurrency knobs. Default = one pass in the normal suite.
 STORM_WRITERS = 24 if SOAK else 8
-KILL_ROUNDS = 40 if SOAK else 6
 
 _REQUIRED_SYNC_WEEK_CONTENTION = {
     "[cache] sync already in progress; using existing cache",
@@ -52,6 +51,18 @@ _ALLOWED_SYNC_WEEK_CONTENTION = _REQUIRED_SYNC_WEEK_CONTENTION | {
     (
         "[cache] concurrent ingest in progress; falling back to direct JSONL "
         "parse for correctness"
+    ),
+    # The milestone path prints these on the same account-safe refusal, from
+    # bin/_cctally_record.py. They are copied from the source rather than from
+    # a failing run's stderr, so a change to either message breaks this gate
+    # loudly instead of silently widening it.
+    (
+        "[milestone] cost sync failed: account attribution unavailable "
+        "(cache required): concurrent ingest"
+    ),
+    (
+        "[milestone] skipping this crossing — its cost would come from a "
+        "snapshot taken before the crossing"
     ),
 }
 
@@ -1221,143 +1232,6 @@ def _grow_wal(db: pathlib.Path, commits: int, pad: int = 400) -> int:
             holder.stdout.close()
 
 
-#: A child that arms, announces, and then runs a TRUNCATE checkpoint. The
-#: announcement is the LAST statement before the PRAGMA, so a kill shortly after
-#: the parent reads it lands inside the checkpoint's page-copy loop.
-_CHECKPOINTER = (
-    "import sqlite3, sys\n"
-    "c = sqlite3.connect(sys.argv[1])\n"
-    "c.execute('PRAGMA busy_timeout=15000')\n"
-    "print('CHECKPOINTING', flush=True)\n"
-    "c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()\n"
-    "c.close()\n"
-)
-
-
-def _wait_for_stats_maintenance_hold(
-    app: pathlib.Path,
-    child: subprocess.Popen,
-    *,
-    timeout_s: float = 10.0,
-) -> bool:
-    """Observe the checkpoint CLI's shared maintenance-lock acquisition."""
-    lock_fd = os.open(
-        str(app / "stats.db.maintenance.lock"),
-        os.O_RDWR | os.O_CREAT,
-        0o600,
-    )
-    deadline = time.monotonic() + timeout_s
-    try:
-        while time.monotonic() < deadline:
-            if child.poll() is not None:
-                return False
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            else:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            time.sleep(0.005)
-        return False
-    finally:
-        os.close(lock_fd)
-
-
-@pytest.mark.skip(reason="#538 retired the live stats WAL checkpoint path")
-def test_h3_sigkill_mid_checkpoint_recovers_clean(tmp_path):
-    """SIGKILL a real `db checkpoint --db stats` mid-TRUNCATE on a grown WAL.
-
-    EXPECTED CLEAN — SQLite checkpoints are crash-restartable. The value is
-    characterisation: this is the only stats path that runs a large checkpoint,
-    and it is the one Stage 3's policy has to reason about.
-    """
-    env = _storm_env(tmp_path / "data")
-    _seed_journal(env, 3)
-    app = _resolved_app_dir(env)
-    db = app / "stats.db"
-
-    interrupted = 0
-    grown = 0
-    for r in range(KILL_ROUNDS):
-        assert _drain_wal(db) == 0
-        reader = sqlite3.connect(str(db))
-        reader.execute("BEGIN")
-        reader.execute(
-            "SELECT count(*) FROM weekly_usage_snapshots"
-        ).fetchone()
-        try:
-            size = _grow_wal(db, 900)
-            grown = max(grown, size)
-            assert size > 4 * 1024 * 1024
-            p = _spawn_writer(env, "db", "checkpoint", "--db", "stats")
-            armed = _wait_for_stats_maintenance_hold(app, p)
-            assert armed, (
-                "checkpoint child exited before acquiring the stats maintenance "
-                "lock, so the kill window was never reached"
-            )
-        finally:
-            reader.close()
-
-        # The read transaction pinned every grown WAL frame. Observing the
-        # maintenance hold proves the real CLI reached its checkpoint path;
-        # releasing the reader starts the drain without relying on scheduler
-        # timing from Popen.
-        time.sleep(0.0005 + (r % 6) * 0.002)
-        if p.poll() is None:
-            p.send_signal(signal.SIGKILL)
-            interrupted += 1
-        p.wait(timeout=60)
-        ok, text = _integrity_ok(db)
-        assert ok, f"H3 round {r} corrupted stats.db: {text}"
-
-    res = _cctally(env, "doctor", "--json")
-    assert res.returncode in (0, 2), res.stderr
-    ok, text = _integrity_ok(db)
-    assert ok, f"H3 produced corruption: {text}"
-    print(f"[H3-leg1] rounds={KILL_ROUNDS} "
-          f"cmd_interrupted={interrupted} grown_wal_bytes={grown}")
-    assert interrupted, (
-        "H3 leg 1 is vacuous: every `db checkpoint` child exited before its "
-        "kill delay elapsed, so the command was never interrupted"
-    )
-
-    # ---- second, sharper leg -------------------------------------------
-    # The rounds above interrupt the `db checkpoint` COMMAND, but ~300 ms of
-    # CLI startup dwarfs a ~15 ms checkpoint, so a 1-15 ms delay after Popen
-    # almost certainly lands during startup rather than inside the page-copy
-    # loop. Claiming "mid-checkpoint" on that alone would be exactly the #374
-    # failure. This leg announces itself from INSIDE the child, one statement
-    # before the PRAGMA, so the kill provably lands in the checkpoint.
-    inside = 0
-    for r in range(KILL_ROUNDS):
-        size = _wal_path(db).stat().st_size if _wal_path(db).exists() else 0
-        if size < 4 * 1024 * 1024:
-            size = _grow_wal(db, 900)
-        child = subprocess.Popen(
-            [sys.executable, "-c", _CHECKPOINTER, str(db)],
-            stdout=subprocess.PIPE, text=True,
-        )
-        try:
-            line = child.stdout.readline().strip()
-            assert line == "CHECKPOINTING", f"child never armed: {line!r}"
-            time.sleep(0.0005 + (r % 6) * 0.002)   # 0.5-10.5 ms into a ~15 ms op
-            if child.poll() is None:
-                child.send_signal(signal.SIGKILL)
-                inside += 1
-            child.wait(timeout=60)
-        finally:
-            if child.stdout is not None:
-                child.stdout.close()
-        ok, text = _integrity_ok(db)
-        assert ok, f"H3 in-checkpoint round {r} corrupted stats.db: {text}"
-
-    print(f"[H3] rounds={KILL_ROUNDS} cmd_interrupted={interrupted} "
-          f"in_checkpoint_kills={inside} grown_wal_bytes={grown}")
-    assert inside, (
-        "H3 second leg is vacuous: every checkpoint completed before the kill, "
-        "so the page-copy loop was never interrupted"
-    )
-
 
 # ---------------------------------------------------------------------------
 # H4 — physical replacement racing live openers (spec 4.2, the PRIMARY hypothesis)
@@ -1709,57 +1583,6 @@ def test_h4_two_concurrent_heals(tmp_path):
     finally:
         conn.close()
     assert rows >= 5, f"heal rebuilt an empty index: {rows} snapshots"
-
-
-@pytest.mark.skip(reason="#538 retired stats WAL checkpoint operation")
-def test_h4_reader_pinned_wal(tmp_path):
-    """A long-lived reader pinning the WAL across repeated checkpoint attempts.
-
-    CHARACTERISATION, not a RED candidate. Stage 1 measured that a pinned reader
-    defeats every checkpoint mode (PASSIVE returns in ~2 ms having changed
-    nothing; TRUNCATE costs 148 ms at a 100 ms busy_timeout or 16.07 s at
-    production's 15 s, and changes nothing either way) and that NEITHER raises —
-    they return a busy row. What this asserts is that repeatedly failing to
-    drain a pinned WAL is SAFE: no corruption, no orphan sidecar.
-    """
-    env = _storm_env(tmp_path / "data")
-    _seed_journal(env, 4)
-    app = _resolved_app_dir(env)
-    db = app / "stats.db"
-    grown = _grow_wal(db, 900)
-    assert grown > 1024 * 1024, grown
-
-    holder = _hold_open_handle(db)
-    outcomes = []
-    try:
-        wal_before = _wal_path(db).stat().st_size
-        for _ in range(4):
-            res = _cctally(env, "db", "checkpoint", "--db", "stats",
-                           "--busy-timeout-ms", "200")
-            outcomes.append(res.returncode)
-            ok, text = _integrity_ok(db)
-            assert ok, text
-        wal_after = _wal_path(db).stat().st_size
-    finally:
-        holder.send_signal(signal.SIGKILL)
-        holder.wait(timeout=30)
-        if holder.stdout is not None:
-            holder.stdout.close()
-
-    print(f"[H4-pinned] wal_before={wal_before} wal_after={wal_after} "
-          f"checkpoint_rcs={outcomes}")
-    # The pin is real: a pinned WAL does not shrink. If it did, this test is
-    # characterising something other than a pinned reader.
-    assert wal_after >= wal_before, (
-        f"the WAL drained under a held read transaction ({wal_before} -> "
-        f"{wal_after}); the reader was not actually pinning it"
-    )
-    assert _no_orphan_sidecars(db)
-
-    # And once the reader is gone the same command drains it, so the failure
-    # above is attributable to the pin and not to a broken checkpoint.
-    res = _cctally(env, "db", "checkpoint", "--db", "stats")
-    assert res.returncode == 0, res.stderr
 
 
 # ---------------------------------------------------------------------------

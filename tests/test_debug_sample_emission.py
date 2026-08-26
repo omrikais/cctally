@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import importlib.util
 import io
 import os
 import subprocess
@@ -15,20 +14,15 @@ import sys
 from pathlib import Path
 
 import pytest
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CCTALLY = REPO_ROOT / "bin" / "cctally"
 
 
 def _load_cctally_module():
-    """Import the ``cctally`` script as a module (no .py extension)."""
-    from importlib.machinery import SourceFileLoader
-
-    loader = SourceFileLoader("cctally", str(CCTALLY))
-    spec = importlib.util.spec_from_loader("cctally", loader)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
+    """Import the ``cctally`` script as a module."""
+    mod = load_script_module()
     return mod
 
 
@@ -1508,28 +1502,6 @@ class TestScopeFidelityRoundTwo:
         assert r.returncode == 0, (r.returncode, r.stderr)
         assert "Total entries processed: 1" in r.stderr, r.stderr
 
-    @pytest.mark.skip(
-        reason=(
-            "SR-P2.4 five-hour-blocks scope is implicitly covered by the "
-            "unit-level block-window computation: cmd_five_hour_blocks "
-            "uses a deferred loader bounded by [oldest_block_start, "
-            "newest_block_start + BLOCK_DURATION) (see bin/cctally Pattern "
-            "C). A subprocess test needs both blocks_table state AND "
-            "JSONL fixtures aligned, which is brittle to seed in a clean "
-            "home. The Pattern C loader-bounds logic is exercised by the "
-            "matrix tests (subprocess) and the empty-home short-form "
-            "path; full bound-fidelity coverage tracked in issue #92."
-        )
-    )
-    def test_five_hour_blocks_scopes_to_block_bounds(
-        self, tmp_path, monkeypatch,
-    ):
-        """SR-P2.4 (deferred): five-hour-blocks loader bounds to
-        block-window range, not raw --since/--until.
-        """
-        # See @pytest.mark.skip reason above.
-        pass
-
 
 @pytest.mark.parametrize("cmd", INSCOPE_CMDS)
 class TestDebugEmissionMatrixRoundTwo:
@@ -1583,30 +1555,3 @@ class TestDebugEmissionMatrixRoundTwo:
                 assert "Command: cctally diff (Window A:" in r.stderr, r.stderr
             else:
                 assert f"Command: cctally {cmd}" in r.stderr, r.stderr
-
-
-class TestDebugOneTimeEmissionAcrossDispatch:
-    """SR-P2.5.3: the _DEBUG_REPORT_EMITTED guard ensures only ONE
-    report per process even when a cmd dispatch composes multiple cmd_*
-    helpers. Each subprocess gets a fresh module so this is essentially
-    a smoke test that the guard semantics are intact at the helper
-    level. The per-cmd matrix variant (one subprocess per cmd) is
-    naturally one-shot per process; the unit-level guarantee lives in
-    TestEmitDebugSamplesGuard::test_one_time_per_process above.
-
-    A full cross-cmd in-process matrix would require setting up each
-    cmd's argparse contract independently — too invasive for the
-    boundary value it provides. Tracked in issue #92 if escalated.
-    """
-
-    @pytest.mark.skip(
-        reason=(
-            "Per-process one-shot semantics covered by "
-            "TestEmitDebugSamplesGuard::test_one_time_per_process at "
-            "unit level; full cross-cmd in-process matrix requires "
-            "per-cmd argparse stubbing that adds brittleness without "
-            "new coverage. Tracked in issue #92 if escalated."
-        )
-    )
-    def test_debug_one_time_emission_across_dispatch(self):
-        pass

@@ -22,6 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "bin"))
 
 import _lib_statusline as ls  # type: ignore[import-not-found]
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 
 # ---- Fixtures (no DB, no FS) -----------------------------------------------
@@ -690,14 +691,8 @@ class TestTzResolution:
 
     @staticmethod
     def _load():
-        from importlib.machinery import SourceFileLoader
-        import importlib.util as _u
 
-        loader = SourceFileLoader("cctally", str(REPO_ROOT / "bin" / "cctally"))
-        spec = _u.spec_from_loader("cctally", loader)
-        mod = _u.module_from_spec(spec)
-        sys.modules["cctally"] = mod
-        loader.exec_module(mod)
+        mod = load_script_module()
         return mod
 
     def test_cli_overrides_config_and_default(self, monkeypatch):

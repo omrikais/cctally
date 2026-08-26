@@ -6,6 +6,7 @@ import datetime
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import pathlib
 import re
@@ -188,6 +189,65 @@ def test_container_command_carries_the_runtime_fidelity_contract(tmp_path):
     assert "bin/cctally-test-all" in body
 
 
+def test_the_public_profile_suppresses_the_private_linux_profile():
+    """Running the projected PUBLIC tree with CCTALLY_LINUX_MATRIX_RUN=1 would
+    reproduce the exact production refusal this session repairs: the public
+    profile has no `test-remote` to omit, so `bin/cctally-test-all` exits 2
+    (#630 S5). The public lane runs ordinary COVERAGE_MODE=full instead.
+    """
+    gate = _load_gate()
+    body = gate._container_script("3.13", "deadbeef" * 5, profile="public")
+
+    assert "CCTALLY_LINUX_MATRIX_RUN" not in body
+    assert "CCTALLY_OUTER_JOBS=2" in body
+    assert "CCTALLY_PYTEST_JOBS=2" in body
+    assert "bin/cctally-test-all" in body
+
+
+def test_the_private_profile_is_the_default_and_still_exports_it():
+    """Non-vacuity for the case above: the suppression must be the PROFILE's
+    doing and not the export having been deleted outright, and every existing
+    caller passes no profile at all."""
+    gate = _load_gate()
+
+    assert (
+        gate._container_script("3.13", "deadbeef" * 5)
+        == gate._container_script("3.13", "deadbeef" * 5, profile="private")
+    )
+    assert "CCTALLY_LINUX_MATRIX_RUN=1" in gate._container_script(
+        "3.13", "deadbeef" * 5)
+
+
+def test_the_candidate_label_is_separable_from_the_expected_head():
+    """The release trap reaps interrupted lanes by
+    `label=cctally.linux-matrix.head=$MATRIX_HEAD`, where MATRIX_HEAD is the
+    SOURCE head. Under a projected tree the in-container expected head is a
+    synthetic commit, so without this split an interrupted matrix stops being
+    reapable (#630 S5).
+    """
+    gate = _load_gate()
+    command = gate._container_command(
+        "docker", "3.13", pathlib.Path("/src"), "img",
+        expected_head="b" * 40, candidate_label="a" * 40,
+    )
+    label = command[command.index("--label") + 1]
+
+    assert label == f"{gate.LANE_LABEL}={'a' * 40}"
+    assert "b" * 40 not in label
+    # The expected head is NOT dropped: the in-container assertion still pins
+    # the tree that actually runs, which is the projected commit.
+    assert f"test \"$(git rev-parse HEAD)\" = {'b' * 40}" in command[-1]
+
+
+def test_the_candidate_label_defaults_to_the_expected_head():
+    """Every caller that does not project keeps the behaviour it had."""
+    gate = _load_gate()
+    command = gate._container_command(
+        "docker", "3.13", pathlib.Path("/src"), "img", expected_head="b" * 40)
+
+    assert command[command.index("--label") + 1] == f"{gate.LANE_LABEL}={'b' * 40}"
+
+
 def test_dirty_tree_refuses_before_container_engine_probe(monkeypatch, tmp_path):
     gate = _load_gate()
     calls: list[list[str]] = []
@@ -208,7 +268,7 @@ def test_dirty_tree_refuses_before_container_engine_probe(monkeypatch, tmp_path)
 def _stub_lanes(gate, monkeypatch, lane_exits=None, record=None):
     def _lanes(
         engine, versions, images, source_checkout, expected_head, outdir,
-        acceptance=None,
+        acceptance=None, **kwargs,
     ):
         if record is not None:
             record.append(("lanes", tuple(versions)))
@@ -285,6 +345,289 @@ def test_matrix_refuses_if_tree_becomes_dirty_before_pass(
     assert "PASS" not in captured.out
 
 
+def test_a_pre_materialized_source_tree_is_run_without_cloning(
+    monkeypatch, tmp_path,
+):
+    """`--source-tree` runs a tree somebody else materialized. The projector
+    that builds the public projection is PRIVATE and this driver is public, so
+    the driver accepts the result rather than learning to project (#630 S5).
+    """
+    gate = _load_gate()
+    projected = tmp_path / "public"
+    projected.mkdir()
+    _stub_successful_matrix(monkeypatch, gate, tmp_path)
+
+    def _refuse(*args, **kwargs):
+        raise AssertionError("--source-tree must not clone anything")
+
+    monkeypatch.setattr(gate, "_materialize_clean_head", _refuse)
+    heads = {tmp_path: "a" * 40, projected: "c" * 40}
+    monkeypatch.setattr(
+        gate, "_git_head", lambda root: heads[pathlib.Path(root)])
+    monkeypatch.setattr(gate, "_git_status", lambda root: "")
+    observed: dict[str, object] = {}
+
+    def _lanes(engine, versions, images, source_checkout, expected_head, outdir,
+               acceptance=None, **kwargs):
+        observed["source"] = pathlib.Path(source_checkout)
+        observed["expected_head"] = expected_head
+        observed.update(kwargs)
+        for version in versions:
+            (outdir / f"{version}.log").write_text("stub\n")
+        return {version: 0 for version in versions}
+
+    monkeypatch.setattr(gate, "_run_lanes", _lanes)
+
+    assert gate.main([
+        "--source-tree", str(projected),
+        "--profile", "public",
+        "--candidate-label", "a" * 40,
+    ]) == 0
+    assert observed["source"] == projected
+    # The in-container assertion pins the tree that actually runs, so it is the
+    # PROJECTED head. The label stays the SOURCE head, which is what the release
+    # runbook's interrupt trap reaps by.
+    assert observed["expected_head"] == "c" * 40
+    assert observed["profile"] == "public"
+    assert observed["candidate_label"] == "a" * 40
+
+
+@pytest.fixture(autouse=True)
+def release_record_dir(monkeypatch, tmp_path):
+    """Redirect APP_DIR so no test writes an advisory record into the real one.
+
+    Autouse and module-wide, because EVERY `main()` path writes a record on
+    entry — including the refusals that return before a single lane runs. The
+    repository's write-isolation guard caught exactly that and named this fix:
+    `_record_dir` reads `_cctally_core.APP_DIR` at call time, so patching the
+    kernel reaches every gate module a test loads afterwards.
+    """
+    import _cctally_core
+
+    root = tmp_path / "app"
+    monkeypatch.setattr(_cctally_core, "APP_DIR", root)
+    return root / "release-records"
+
+
+def _only_record(directory):
+    written = sorted(directory.glob("*.json"))
+    assert len(written) == 1, written
+    return json.loads(written[0].read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("lane_exits", "signal", "exit_code"),
+    (
+        ({"3.11": 0, "3.12": 0, "3.13": 0}, "green", 0),
+        ({"3.11": 0, "3.12": 1, "3.13": 0}, "productRed", 1),
+        ({"3.11": 0, "3.12": 3, "3.13": 1}, "incomplete", 3),
+    ),
+)
+def test_the_record_maps_each_composed_exit_to_its_signal(
+    monkeypatch, tmp_path, release_record_dir, lane_exits, signal, exit_code,
+):
+    """The record reuses the driver's existing four-outcome vocabulary rather
+    than inventing one, and preserves every lane's OWN code — a merged verdict
+    of 3 must not erase which lane produced the 1 (#630 S5)."""
+    gate = _load_gate()
+    directory = release_record_dir
+    _stub_successful_matrix(monkeypatch, gate, tmp_path, lane_exits=lane_exits)
+    monkeypatch.setattr(gate, "_git_head", lambda root: "a" * 40)
+    monkeypatch.setattr(gate, "_git_status", lambda root: "")
+
+    assert gate.main([]) == exit_code
+    record = _only_record(directory)
+
+    assert record["schemaVersion"] == 1
+    assert record["state"] == "finished"
+    assert record["signal"] == signal
+    assert record["exitCode"] == exit_code
+    assert record["lanes"] == lane_exits
+    assert record["sourceHead"] == "a" * 40
+    assert record["projectedTree"] == "a" * 40
+    assert record["startedAt"].endswith("Z")
+    assert record["finishedAt"].endswith("Z")
+
+
+def test_an_invalidated_candidate_is_recorded_as_invalidated(
+    monkeypatch, tmp_path, release_record_dir,
+):
+    """Exit 2's own signal. Every lane may have passed and the record must
+    still not read green, because the candidate changed underneath them."""
+    gate = _load_gate()
+    directory = release_record_dir
+    _stub_successful_matrix(monkeypatch, gate, tmp_path)
+    heads = iter(("a" * 40, "b" * 40))
+    monkeypatch.setattr(gate, "_git_head", lambda root: next(heads))
+    monkeypatch.setattr(gate, "_git_status", lambda root: "")
+
+    assert gate.main([]) == 2
+    record = _only_record(directory)
+
+    assert record["signal"] == "invalidated"
+    assert record["lanes"] == {"3.11": 0, "3.12": 0, "3.13": 0}
+    assert gate.record_is_green(record) is False
+
+
+def test_a_refusal_before_any_lane_records_null_lanes(
+    monkeypatch, tmp_path, release_record_dir,
+):
+    """`lanes` is nullable because a dirty-tree or engine refusal happens
+    before any lane exit code exists. An empty MAPPING would read as "three
+    lanes, none reported", which is a different claim."""
+    gate = _load_gate()
+    directory = release_record_dir
+    monkeypatch.setattr(gate, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(gate, "_git_head", lambda root: "a" * 40)
+    monkeypatch.setattr(gate, "_git_status", lambda root: " M bin/cctally")
+
+    assert gate.main(["--engine", "docker"]) == 2
+    record = _only_record(directory)
+
+    assert record["lanes"] is None
+    assert record["state"] == "finished"
+    assert record["signal"] == "invalidated"
+    assert gate.record_is_green(record) is False
+
+
+def test_a_started_only_record_cannot_be_read_as_green(
+    monkeypatch, tmp_path, release_record_dir,
+):
+    """A driver that dies mid-run leaves `started` rather than nothing, and an
+    advisory gate that fails quietly is indistinguishable from one that passed.
+    Only one of those is safe to ship on."""
+    gate = _load_gate()
+    directory = release_record_dir
+    _stub_successful_matrix(monkeypatch, gate, tmp_path)
+    monkeypatch.setattr(gate, "_git_head", lambda root: "a" * 40)
+    monkeypatch.setattr(gate, "_git_status", lambda root: "")
+
+    def _die(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(gate, "_run_lanes", _die)
+    with pytest.raises(KeyboardInterrupt):
+        gate.main([])
+
+    record = _only_record(directory)
+    assert record["state"] == "finished"
+    assert record["signal"] != "green"
+    assert gate.record_is_green(record) is False
+    # And the on-entry shape itself, which is what an unwound process leaves.
+    entry = {"state": "started", "signal": None, "exitCode": None, "lanes": None}
+    assert gate.record_is_green(entry) is False
+
+
+def test_the_entry_record_exists_before_any_lane_runs(
+    monkeypatch, tmp_path, release_record_dir,
+):
+    """The `started` write is not a nicety: without it a driver killed between
+    entry and the first lane leaves no record at all, and "no run" would be
+    indistinguishable from "record not yet written"."""
+    gate = _load_gate()
+    directory = release_record_dir
+    _stub_successful_matrix(monkeypatch, gate, tmp_path)
+    monkeypatch.setattr(gate, "_git_head", lambda root: "a" * 40)
+    monkeypatch.setattr(gate, "_git_status", lambda root: "")
+    seen: list[dict] = []
+
+    def _peek(engine, versions, images, source_checkout, expected_head, outdir,
+              acceptance=None, **kwargs):
+        seen.append(_only_record(directory))
+        for version in versions:
+            (outdir / f"{version}.log").write_text("stub\n")
+        return {version: 0 for version in versions}
+
+    monkeypatch.setattr(gate, "_run_lanes", _peek)
+
+    assert gate.main([]) == 0
+    assert seen and seen[0]["state"] == "started"
+    assert seen[0]["lanes"] is None
+    assert seen[0]["signal"] is None
+    assert seen[0]["finishedAt"] is None
+
+
+def test_two_runs_write_two_distinct_records(
+    monkeypatch, tmp_path, release_record_dir,
+):
+    """Records are immutable and per-run, keyed by run id rather than by a
+    candidate version — no version is stamped at preflight time, and a single
+    mutable path cannot survive two interleaved runs."""
+    gate = _load_gate()
+    directory = release_record_dir
+    _stub_successful_matrix(monkeypatch, gate, tmp_path)
+    monkeypatch.setattr(gate, "_git_head", lambda root: "a" * 40)
+    monkeypatch.setattr(gate, "_git_status", lambda root: "")
+
+    assert gate.main([]) == 0
+    assert gate.main([]) == 0
+
+    written = sorted(directory.glob("*.json"))
+    assert len(written) == 2, written
+    ids = {json.loads(p.read_text(encoding="utf-8"))["runId"] for p in written}
+    assert len(ids) == 2, ids
+
+
+def test_the_record_is_published_by_an_atomic_replace(
+    monkeypatch, tmp_path, release_record_dir,
+):
+    """A write interrupted mid-publication must never leave truncated JSON in
+    place of a readable record, so the record is written to a sibling temporary
+    file and renamed."""
+    gate = _load_gate()
+    directory = release_record_dir
+    real_replace = os.replace
+    calls: list[tuple[str, str]] = []
+
+    def _spy(src, dst, **kwargs):
+        calls.append((str(src), str(dst)))
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(gate.os, "replace", _spy)
+    _stub_successful_matrix(monkeypatch, gate, tmp_path)
+    monkeypatch.setattr(gate, "_git_head", lambda root: "a" * 40)
+    monkeypatch.setattr(gate, "_git_status", lambda root: "")
+
+    assert gate.main([]) == 0
+    assert calls, "the record was written in place rather than renamed"
+    for source, destination in calls:
+        assert source != destination
+        assert destination.endswith(".json")
+
+
+def test_the_record_path_is_printed_so_the_operator_block_can_capture_it(
+    monkeypatch, tmp_path, release_record_dir, capsys,
+):
+    """The release runbook echoes the record path beside the matrix exit."""
+    gate = _load_gate()
+    directory = release_record_dir
+    _stub_successful_matrix(monkeypatch, gate, tmp_path)
+    monkeypatch.setattr(gate, "_git_head", lambda root: "a" * 40)
+    monkeypatch.setattr(gate, "_git_status", lambda root: "")
+
+    assert gate.main([]) == 0
+    written = sorted(directory.glob("*.json"))
+    assert str(written[0]) in capsys.readouterr().out
+
+
+def test_the_record_directory_is_derived_from_the_app_dir_chokepoint():
+    """Records live under APP_DIR, outside the git tree. Inside it they would
+    be untracked files that Gate 0's own cleanliness selection would then see,
+    and the two gates would disagree about whether the tree is clean.
+
+    Asserted as the RELATION to `_cctally_core.APP_DIR` rather than as a
+    literal path: the resolution order (explicit override, then dev checkout,
+    then prod) has one home and this must not become a second.
+    """
+    import _cctally_core
+
+    gate = _load_gate()
+    directory = gate._record_dir()
+
+    assert directory == _cctally_core.APP_DIR / "release-records"
+    assert REPO not in directory.parents and directory != REPO
+
+
 OVERLAP_MARKER = "# cctally release Gate 0 / Gate 0.25 overlap block"
 
 
@@ -295,7 +638,15 @@ def _overlap_block(text):
     return matching[0]
 
 
-def test_release_skill_makes_the_matrix_blocking_after_gate_zero():
+def test_the_matrix_is_advisory_and_still_printed():
+    """Gate 0 and its receipt are the only release-blocking test gates.
+
+    The matrix leaves the refusal predicate and keeps its printed line, joined
+    by a line naming the record path. Removing it from the predicate is the
+    whole of "advisory"; dropping the print as well would make a red matrix
+    indistinguishable from a green one, which is the failure this session's
+    record exists to prevent (#630 S5).
+    """
     skill = REPO / ".agents/skills/release-cctally/SKILL.md"
     if not skill.exists():
         pytest.skip("private release skill absent from public mirror")
@@ -306,10 +657,34 @@ def test_release_skill_makes_the_matrix_blocking_after_gate_zero():
     assert gate0 < matrix < pricing
     section = text[matrix:pricing]
     assert "bin/cctally-test-linux-matrix" in section
-    assert "release-blocking" in section
-    assert "workflow_dispatch" in section
 
     block = _overlap_block(text)
+
+    # The refusal predicate. Asserted on the line itself rather than on the
+    # whole block, because `MATRIX_RC` is still assigned and still echoed.
+    lines = block.splitlines()
+    refuse_at = [i for i, line in enumerate(lines) if "REFUSE" in line]
+    assert len(refuse_at) == 1, refuse_at
+    guards = [
+        line for line in lines[:refuse_at[0]] if line.startswith("if [")
+    ]
+    predicate = guards[-1]
+
+    assert "GATE0_RC" in predicate, predicate
+    assert "RECEIPT_RC" in predicate, predicate
+    assert "MATRIX_RC" not in predicate, predicate
+
+    # Both the matrix exit and the record path are always printed.
+    assert 'echo "Gate 0.25 Linux matrix:' in block
+    assert "MATRIX_RECORD" in block
+    assert "release record" in block
+
+    # The one local run validates the PROJECTED PUBLIC tree, and the label
+    # stays the SOURCE head so the interrupt trap can still reap by it.
+    assert "_cctally_public_projection" in block
+    assert "--source-tree" in block
+    assert "--profile public" in block
+    assert '--candidate-label "$MATRIX_HEAD"' in block
     # Gate 0 is backgrounded in its own process group and Gate 0.25 runs in the
     # foreground, so the preflight costs the longer of the two rather than the
     # sum. Gate 0 owns the exit-75 watch-retry loop, which encapsulates cleanly
@@ -350,6 +725,45 @@ def test_release_skill_makes_the_matrix_blocking_after_gate_zero():
     assert "GIT_OPTIONAL_LOCKS=0" in block
 
 
+# A module-level assignment rather than an inline parametrize tuple, so the
+# waiver marker below has a simple statement to scope itself to — a decorator
+# belongs to the function definition, which spans its whole body. These four
+# name maintainer-only documentation in order to assert what it no longer
+# CONTAINS, and the test skips on a checkout that does not carry them, so none
+# of them is a dependency. The marker has to sit INSIDE the statement's own
+# source span; a comment above it is not part of the node. That span covers the
+# WHOLE tuple, so an entry added here inherits the waiver silently — check any
+# new path against the same test before adding it.
+_RETIRED_PROSE_FILES = (  # mirror-private-ok
+    ".agent-workflows/skills/shared/release-cctally/SKILL.md",
+    ".agents/skills/release-cctally/SKILL.md",
+    ".claude/skills/release-cctally/SKILL.md",
+    "docs/remote-testing.md",
+)
+
+
+@pytest.mark.parametrize("relative", _RETIRED_PROSE_FILES)
+def test_the_expired_known_red_discharge_is_gone(relative):
+    """#622 and #623 are both closed, so the section's own expiry has fired,
+    and #624 — which would have mechanized it — closed NOT_PLANNED. A waiver
+    that outlives its condition turns into policy (#630 S5).
+
+    The two generated projections are included so a missed
+    `bin/check-agent-workflows --sync` cannot leave the retired text shipping
+    in the copy an agent actually loads.
+    """
+    path = REPO / relative
+    if not path.is_file():
+        pytest.skip("maintainer-only documentation absent from this checkout")
+    text = path.read_text(encoding="utf-8")
+
+    assert "must be exactly" not in text
+    assert "known-red" not in text
+    assert "#624" not in text
+    assert "58 of 59" not in text
+    assert "workflow_dispatch" not in text
+
+
 def _stub_release_root(tmp_path):
     root = tmp_path / "release-root"
     (root / "bin").mkdir(parents=True)
@@ -369,8 +783,24 @@ def _stub_release_root(tmp_path):
     (root / "bin" / "cctally-test-linux-matrix").write_text(
         "#!/bin/bash\n"
         'echo "matrix $*" >> "$STUB_LOG"\n'
+        'if [ -n "${STUB_RECORD_PATH:-}" ]; then\n'
+        '  echo "{}" > "$STUB_RECORD_PATH"\n'
+        '  echo "linux-matrix: release record $STUB_RECORD_PATH"\n'
+        "fi\n"
         'sleep "${STUB_MATRIX_SLEEP:-0}"\n'
         'exit "${STUB_MATRIX_RC:-0}"\n'
+    )
+    # The PRIVATE projector, stubbed. It is invoked as a python module path
+    # rather than through PATH, so it lives beside the other bin stubs.
+    (root / "bin" / "_cctally_public_projection.py").write_text(
+        "import os, sys\n"
+        "with open(os.environ['STUB_LOG'], 'a') as handle:\n"
+        "    handle.write('project %s\\n' % ' '.join(sys.argv[1:]))\n"
+        "rc = int(os.environ.get('STUB_PROJECT_RC', '0'))\n"
+        "if rc:\n"
+        "    sys.exit(rc)\n"
+        "os.makedirs(sys.argv[2], exist_ok=True)\n"
+        "print('projected-sha')\n"
     )
     (stubs / "git").write_text(
         "#!/bin/bash\n"
@@ -416,6 +846,12 @@ def _run_overlap_block(tmp_path, env_overrides, signal_after=None):
             "GATE0_OUT": str(tmp_path / "gate0.json"),
             "GATE0_STATUS": str(tmp_path / "gate0.status"),
             "STUB_LOG": str(log),
+            "STUB_RECORD_PATH": str(tmp_path / "record.json"),
+            # The block `rm -f`s this path and then `tee`s through it, so an
+            # unpinned default is shared state: xdist distributes this module's
+            # tests across workers, and one invocation's rm can unlink the file
+            # another is still writing.
+            "MATRIX_OUT": str(tmp_path / "matrix.log"),
         }
     )
     env.update(env_overrides)
@@ -435,18 +871,62 @@ def _run_overlap_block(tmp_path, env_overrides, signal_after=None):
 
 def test_overlap_block_waits_for_gate_zero_even_when_the_matrix_fails(tmp_path):
     """A failing matrix must never abandon a running Gate 0, and both statuses
-    must survive `set -e` semantics rather than aborting the collection."""
+    must survive `set -e` semantics rather than aborting the collection.
+
+    The matrix is ADVISORY since #630 S5, so its red is reported and the block
+    still succeeds. Gate 0 and its receipt are the only blocking test gates.
+    """
     status, out, log = _run_overlap_block(
         tmp_path,
         {"STUB_MATRIX_RC": "1", "STUB_GATE0_RC": "0", "STUB_GATE0_SLEEP": "2"},
     )
-    assert status == 2, out
+    assert status == 0, out
+    assert "REFUSE" not in out
     assert "Gate 0.25 Linux matrix:" in out
     assert "exit 1" in out
     assert "Gate 0 authoritative suite:" in out
     assert "remote --watch bin/cctally-test-all" in log
     # Gate 0 passed, so its receipt verification was attempted.
     assert "--verify-receipt RUN-1" in log
+
+
+def test_overlap_block_projects_the_public_tree_for_the_matrix(tmp_path):
+    """The single local run validates the projected PUBLIC tree, which is what
+    users install and the only choice that would have caught the live break."""
+    status, out, log = _run_overlap_block(
+        tmp_path, {"STUB_GATE0_RC": "0", "STUB_MATRIX_RC": "0"}
+    )
+    assert status == 0, out
+    assert "project HEAD " in log, log
+    matrix_calls = [line for line in log.splitlines() if line.startswith("matrix ")]
+    assert len(matrix_calls) == 1, log
+    assert "--source-tree " in matrix_calls[0]
+    assert "--profile public" in matrix_calls[0]
+    assert "--candidate-label abc123def456" in matrix_calls[0]
+
+
+def test_overlap_block_reports_a_matrix_that_left_no_record(tmp_path):
+    """An advisory gate that fails quietly is indistinguishable from one that
+    passed. A missing record is stated rather than omitted."""
+    status, out, _ = _run_overlap_block(
+        tmp_path,
+        {"STUB_GATE0_RC": "0", "STUB_MATRIX_RC": "0", "STUB_RECORD_PATH": ""},
+    )
+    assert status == 0, out
+    assert "NONE" in out, out
+
+
+def test_overlap_block_survives_a_projection_that_cannot_be_built(tmp_path):
+    """A projection failure leaves no Linux evidence, and that is reported —
+    but it must not block a cut that Gate 0 and its receipt both cleared."""
+    status, out, log = _run_overlap_block(
+        tmp_path,
+        {"STUB_GATE0_RC": "0", "STUB_MATRIX_RC": "0", "STUB_PROJECT_RC": "1"},
+    )
+    assert status == 0, out
+    assert "REFUSE" not in out
+    assert "matrix " not in log, log
+    assert "Gate 0.25 Linux matrix:      exit 3" in out
 
 
 def test_overlap_block_skips_receipt_verification_when_gate_zero_failed(tmp_path):
@@ -506,11 +986,16 @@ def test_remote_testing_manual_names_the_container_exception_and_boundaries():
     if not manual.exists():
         pytest.skip("private remote-testing manual absent from public mirror")
     text = manual.read_text()
-    assert "Local Linux multi-interpreter release gate" in text
+    assert "Local Linux multi-interpreter advisory gate" in text
     assert re.search(r"Python 3\.11, 3\.12,\s+and 3\.13", text)
     assert "non-root" in text
     assert "CCTALLY_AGENTMEM_TEST_POLICY=hosted-private-unavailable" in text
-    assert "workflow_dispatch" in text
+    # #630 S5 replaced the private hosted lane and the release-blocking framing.
+    # The manual must state what took their place, or the retirement would read
+    # as prose merely deleted.
+    assert "advisory" in text
+    assert "projected public tree" in text.lower()
+    assert "release-records" in text
     # The image the lanes run is provisioned automatically rather than by an
     # added operator step, and the manual records the measurement that decided
     # the lane schedule rather than only asserting the schedule it landed on.
@@ -805,6 +1290,113 @@ def test_the_gate_and_its_dockerfile_are_both_public_on_the_mirror():
             "`tests/**`, so a private Dockerfile would fail collection on the mirror "
             "and turn the public CI red"
         )
+
+
+def _load_projector():
+    """Import the PRIVATE public-tree projector, or skip.
+
+    Existence-gated rather than imported at module scope: this test module is
+    public via `tests/**`, and `bin/_cctally_public_projection.py` is private
+    because it imports the maintainer-only `bin/cctally-mirror-public`. A
+    module-scope import would fail public pytest COLLECTION, which is the
+    dependency class `tests/test_public_test_dep_closure.py` guards (#630 S5).
+    """
+    module_path = REPO / "bin/_cctally_public_projection.py"
+    mirror = REPO / "bin/cctally-mirror-public"
+    if not module_path.is_file() or not mirror.is_file():
+        pytest.skip("the public-tree projector is maintainer-only")
+    loader = importlib.machinery.SourceFileLoader(
+        "_cctally_public_projection_under_test", str(module_path)
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+def test_the_projection_is_a_root_commit_with_no_private_ancestry(tmp_path):
+    """A clone-and-delete projection keeps the private HEAD as its parent and
+    the private object database, and the container copies `.git` wholesale, so
+    `git show HEAD^:.mirror-allowlist` would recover a private file from a tree
+    that claims to be the public subset (#630 S5).
+    """
+    projector = _load_projector()
+    dest = tmp_path / "public"
+    sha = projector.project_public_tree("HEAD", REPO, dest)
+
+    def git(*args):
+        return subprocess.run(("git", "-C", str(dest)) + args,
+                              capture_output=True, text=True, check=True).stdout
+
+    assert git("rev-parse", "HEAD").strip() == sha
+    assert git("rev-list", "--count", "HEAD").strip() == "1"
+    assert git("status", "--porcelain", "--untracked-files=all") == ""
+
+    tree = set(git("ls-tree", "-r", "--name-only", "HEAD").split())
+    # Membership in the COMMITTED tree rather than `(dest / …).exists()`. It is
+    # the stronger statement — a file could be absent from the worktree and
+    # still recoverable from the tree — and it also keeps this public module
+    # from spelling a mirror-private path as an ungated filesystem probe, which
+    # `tests/test_public_test_dep_closure.py` refuses on sight.
+    assert ".mirror-allowlist" not in tree
+    # The marker below must sit inside the statement's own source span, which
+    # is why it is a trailing comment: it names a private path in order to
+    # assert its ABSENCE from a temporary projection, so it is not a dependency
+    # on the file and still holds on a clone that does not carry it.
+    assert "bin/cctally-test-remote" not in tree  # mirror-private-ok
+    assert "bin/cctally-test-all" in tree
+    # git's leaf semantics, not `is_file()`'s. `is_file()` follows the link, so
+    # a DANGLING symlink answers False and drops out of the comparison —
+    # tests/fixtures/setup carries one, pointing at /opt/cctally-prior. A
+    # symlink to a directory is likewise one leaf to git and is not descended.
+    disk = {
+        str(p.relative_to(dest)) for p in dest.rglob("*")
+        if p.relative_to(dest).parts[0] != ".git"
+        and (p.is_symlink() or p.is_file())
+    }
+    assert tree == disk
+
+
+def test_the_projection_retains_no_ref_that_could_recover_a_private_blob(
+    tmp_path,
+):
+    """The reason the clone-and-delete form was rejected, asserted directly.
+    A clone keeps the private object database reachable from its refs, so the
+    projection must carry exactly one ref and no remote, tag or stash."""
+    projector = _load_projector()
+    dest = tmp_path / "public"
+    projector.project_public_tree("HEAD", REPO, dest)
+
+    def git(*args):
+        return subprocess.run(("git", "-C", str(dest)) + args,
+                              capture_output=True, text=True, check=True).stdout
+
+    refs = git("for-each-ref", "--format=%(refname)").split()
+    assert len(refs) == 1, refs
+    assert git("rev-list", "--parents", "-n", "1", "HEAD").split() == [
+        git("rev-parse", "HEAD").strip()
+    ]
+    # The private allowlist is not merely absent from the worktree — it is
+    # unreachable from any object this repository holds.
+    recovered = subprocess.run(
+        ("git", "-C", str(dest), "cat-file", "-e", "HEAD^{tree}:.mirror-allowlist"),
+        capture_output=True, text=True,
+    )
+    assert recovered.returncode != 0, recovered.stdout
+
+
+def test_the_projection_refuses_a_destination_that_already_holds_files(tmp_path):
+    """This is the privacy boundary, so it fails loudly rather than merging
+    into whatever was already there."""
+    projector = _load_projector()
+    dest = tmp_path / "public"
+    dest.mkdir()
+    (dest / "leftover").write_text("x")
+
+    with pytest.raises(projector.ProjectionError):
+        projector.project_public_tree("HEAD", REPO, dest)
 
 
 class _FakeLaneProcess:

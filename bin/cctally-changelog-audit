@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Recompute every CHANGELOG.md baseline metric, each with its counting rule.
+
+The first draft of the changelog policy reported "1,162 entries across 180
+released sections", which conflated the `[Unreleased]` heading with a released
+one, and reported an issue-reference count that silently ignored wrapped
+entries. Both figures were wrong. This command exists so that no number quoted
+about the file rests on a one-off measurement, and so that every population is
+stated rather than assumed.
+
+Two counting rules are therefore reported side by side rather than merged:
+
+  * `issueRefs.firstLineOnly` counts entries whose FIRST line carries `#\\d+`.
+  * `issueRefs.byEntry` counts entries whose first line OR any continuation
+    line carries one. The second is larger, because a wrapped entry can carry a
+    reference its first line does not.
+
+Exit 0 always, unless the file cannot be read (3) or the invocation is invalid
+(2). This is a measurement, not a gate; `bin/cctally-changelog-lint` is the
+gate.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import re
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import _lib_changelog_policy as policy  # noqa: E402
+
+EXIT_OK, EXIT_USAGE, EXIT_INPUT = 0, 2, 3
+
+_HEADING_RE = re.compile(r"^## \[([^\]]+)\]")
+# There is no `_ISSUE_RE` here. This tool compiled its own copy of the same
+# literal, so both tools reporting 835 for the real file rested on two copies
+# nobody had edited. `policy.cites_an_issue` is the one definition.
+
+
+def audit(text: str, raw: bytes) -> dict:
+    """Every metric, over the populations named in the keys."""
+    headings: list[tuple[int, str]] = [
+        (number, match.group(1))
+        for number, line in enumerate(text.splitlines(), start=1)
+        if (match := _HEADING_RE.match(line))
+    ]
+    released_labels = {label for _line, label in headings if label != "Unreleased"}
+    released_sections = sum(1 for _line, label in headings if label != "Unreleased")
+
+    entries = policy.parse_entries(text)
+    unreleased = released = 0
+    first_line_only = by_entry = single_line = 0
+    for entry in entries:
+        label = ""
+        for number, candidate in headings:
+            if number <= entry.line:
+                label = candidate
+            else:
+                break
+        if label == "Unreleased":
+            unreleased += 1
+        elif label in released_labels:
+            released += 1
+
+        on_first = policy.cites_an_issue(entry.content)
+        anywhere = policy.cites_an_issue(policy.entry_text(entry))
+        first_line_only += int(on_first)
+        by_entry += int(anywhere)
+        single_line += int(not entry.continuations)
+
+    return {
+        "schemaVersion": 1,
+        "bytes": len(raw),
+        "releasedSections": released_sections,
+        "entries": {
+            "unreleased": unreleased,
+            "released": released,
+            "total": len(entries),
+        },
+        "issueRefs": {
+            "firstLineOnly": first_line_only,
+            "byEntry": by_entry,
+        },
+        "singlePhysicalLineEntries": single_line,
+    }
+
+
+def _render(report: dict) -> str:
+    entries = report["entries"]
+    refs = report["issueRefs"]
+    return "\n".join([
+        f"bytes: {report['bytes']:,}",
+        f"released sections (## [X.Y.Z], excluding [Unreleased]): "
+        f"{report['releasedSections']:,}",
+        f"entries: {entries['total']:,} "
+        f"({entries['unreleased']:,} unreleased + {entries['released']:,} released)",
+        f"entries carrying an issue reference on the first line: "
+        f"{refs['firstLineOnly']:,}",
+        f"entries carrying one on the first line or a continuation: "
+        f"{refs['byEntry']:,}",
+        f"entries already on one physical line: "
+        f"{report['singlePhysicalLineEntries']:,}",
+    ])
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="cctally-changelog-audit",
+        description="Recompute the CHANGELOG.md baseline metrics.",
+    )
+    parser.add_argument("--file", metavar="PATH")
+    parser.add_argument("--json", action="store_true")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return EXIT_OK if exc.code == 0 else EXIT_USAGE
+
+    target = (
+        pathlib.Path(args.file).resolve() if args.file
+        else pathlib.Path(__file__).resolve().parent.parent / "CHANGELOG.md"
+    )
+    try:
+        raw = target.read_bytes()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"cctally-changelog-audit: cannot read {target}: {exc}", file=sys.stderr)
+        return EXIT_INPUT
+
+    report = audit(text, raw)
+    print(json.dumps(report, indent=2) if args.json else _render(report))
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

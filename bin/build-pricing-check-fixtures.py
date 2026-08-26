@@ -47,11 +47,33 @@ _MYTHOS_PREVIEW_LITELLM = {
     "cache_creation_input_token_cost": 1.25e-05,
     "cache_read_input_token_cost": 1e-06,
 }
+# OpenAI's promotional gpt-5.6 Sol rate, suppressed on all six fields, plus the
+# bare `gpt-5.6` identifier we alias to Sol rather than pricing directly (#643).
+_GPT_56_SOL = "gpt-5.6-sol"
+_GPT_56_ALIAS = "gpt-5.6"
+_GPT_56_SOL_LITELLM = {
+    "litellm_provider": "openai",
+    "input_cost_per_token": 4e-06,
+    "cache_read_input_token_cost": 4e-07,
+    "output_cost_per_token": 2e-05,
+    "input_cost_per_token_above_272k_tokens": 8e-06,
+    "cache_read_input_token_cost_above_272k_tokens": 8e-07,
+    "output_cost_per_token_above_272k_tokens": 3e-05,
+}
 
 
 def _litellm_inject(extra: dict | None = None) -> dict:
-    """Keep the live, allowlisted Preview mismatch non-stale in sparse fakes."""
-    result = {_MYTHOS_PREVIEW: dict(_MYTHOS_PREVIEW_LITELLM)}
+    """Keep every allowlisted divergence non-stale in sparse fakes.
+
+    A suppression that maps to no divergence in the snapshot a scenario sees
+    is reported as stale, which is itself an actionable finding — so each
+    scenario would exit 1 for a reason it is not testing.
+    """
+    result = {
+        _MYTHOS_PREVIEW: dict(_MYTHOS_PREVIEW_LITELLM),
+        _GPT_56_ALIAS: dict(_GPT_56_SOL_LITELLM),
+        _GPT_56_SOL: dict(_GPT_56_SOL_LITELLM),
+    }
     result.update(extra or {})
     return result
 

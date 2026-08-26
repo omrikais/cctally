@@ -96,6 +96,16 @@ def _install():
         # Appended, never inserted: this runs before the child's own first line,
         # and prepending bin/ would let it shadow a same-named module the child
         # meant to import from somewhere else.
+        #
+        # TRAP FOR TEST AUTHORS (#630 S3). This line puts the REAL repository's
+        # bin/ on the sys.path of EVERY child process a pytest worker starts,
+        # for the whole run. So a synthetic-tree test asserting that some
+        # bin/_lib_*.py is ABSENT — that a scratch estate which does not carry
+        # the module therefore cannot import it — is vacuous under pytest and
+        # non-vacuous outside it, which is the worst combination: it passes
+        # here and states something that is not true of the tree it describes.
+        # Assert the OUTCOME the absence is supposed to produce, in a tree the
+        # test controls, rather than the absence itself.
         sys.path.append(kernel_dir)
     import _lib_test_isolation
 

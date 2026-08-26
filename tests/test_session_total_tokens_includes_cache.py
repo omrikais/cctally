@@ -13,12 +13,11 @@ golden harness (`bin/cctally-session-test`) covers those surfaces.
 from __future__ import annotations
 
 import datetime as dt
-import importlib.util
 import sys
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CCTALLY = REPO_ROOT / "bin" / "cctally"
@@ -26,11 +25,7 @@ CCTALLY = REPO_ROOT / "bin" / "cctally"
 
 @pytest.fixture(scope="module")
 def cctally_mod():
-    loader = SourceFileLoader("cctally", str(CCTALLY))
-    spec = importlib.util.spec_from_loader("cctally", loader)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
+    mod = load_script_module()
     return mod
 
 

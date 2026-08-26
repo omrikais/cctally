@@ -244,7 +244,6 @@ def test_wasted_splits_proportionally_for_a_mixed_entry():
 # and the cache-report kernel.
 # ---------------------------------------------------------------------------
 import datetime as _dt
-import importlib.util as _ilu
 import os as _os
 import subprocess as _sp
 

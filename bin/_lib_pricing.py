@@ -53,7 +53,7 @@ def _chip_for_model(name: str) -> str:
 # Date the embedded pricing snapshots below were last verified against
 # vendor sources. Bump whenever CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING
 # is synced. Read by `pricing-check` + the release pre-flight staleness nudge.
-PRICING_SNAPSHOT_DATE = "2026-08-13"
+PRICING_SNAPSHOT_DATE = "2026-08-25"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 # Canonical machine-readable pricing source (Claude values + Codex values).
@@ -73,6 +73,22 @@ LITELLM_PRICES_URL = (
 # currently mirrors successor Mythos 5's lower $10/$50 rate onto the Preview
 # identifier. Retained Preview rows therefore keep the explicit historical
 # rate rather than being rewritten to the successor's rate.
+#
+# gpt-5.6-sol (#643): OpenAI's pricing page states that "GPT-5.6 Sol's
+# promotional pricing is available at least through November 21, 2026" and
+# publishes no post-promotional price, so LiteLLM's $4/$20 per MTok rate is
+# time-boxed. This table is date-blind and roughly half the retained Sol rows
+# predate the promotion, so the pre-promotional $5/$30 card is kept and the
+# promotion is suppressed here. `expires` is what stops the divergence
+# ossifying: `stale_allowlist_entries` only fires if LiteLLM reverts, so a
+# promotion made permanent would otherwise never surface.
+#
+# gpt-5.6 (#643): a model-only entry, which suppresses `missing_from_us` rather
+# than a value drift. OpenAI lists `gpt-5.6` as an alias of `gpt-5.6-sol`, so
+# CODEX_MODEL_ALIASES resolves it instead of duplicating the rate card.
+# `diff_pricing` keys on raw table membership and is deliberately NOT
+# alias-aware, so the omission needs this entry. It is self-policing: it goes
+# stale automatically if upstream drops `gpt-5.6` or we restore a direct card.
 PRICING_DRIFT_ALLOWLIST: list[dict] = [
     {
         "model": "claude-mythos-preview",
@@ -90,6 +106,39 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
         "cache_creation_input_token_cost",
         "cache_read_input_token_cost",
     )
+] + [
+    {
+        "model": "gpt-5.6-sol",
+        "field": field,
+        "expires": "2026-11-21",
+        "reason": (
+            "OpenAI's pricing page guarantees GPT-5.6 Sol's promotional "
+            "$4/$20 per MTok rate only 'at least through November 21, 2026' "
+            "and publishes no post-promotional price. This table is "
+            "date-blind, so the pre-promotional $5/$30 card is kept rather "
+            "than adopting a rate that would have to be reverted by hand "
+            "when the promotion ends (#643)."
+        ),
+    }
+    for field in (
+        "input_cost_per_token",
+        "cache_read_input_token_cost",
+        "output_cost_per_token",
+        "input_cost_per_token_above_272k_tokens",
+        "cache_read_input_token_cost_above_272k_tokens",
+        "output_cost_per_token_above_272k_tokens",
+    )
+] + [
+    {
+        "model": "gpt-5.6",
+        "reason": (
+            "OpenAI lists gpt-5.6 as an alias of gpt-5.6-sol, so "
+            "CODEX_MODEL_ALIASES resolves it to Sol's card and this table "
+            "carries no duplicate entry. `diff_pricing` is deliberately not "
+            "alias-aware, so the intentional omission is suppressed here "
+            "(#643)."
+        ),
+    },
 ]
 
 # Anthropic API pricing snapshot:
@@ -398,10 +447,11 @@ _unknown_model_warnings: set[str] = set()
 # Codex (OpenAI) API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
 # - Captured: 2026-07-19 — the last FULL Codex sync. PRICING_SNAPSHOT_DATE has
-#   since moved for three targeted syncs (2026-07-24, the Claude-side opus-5
-#   sync; 2026-07-31, the gpt-5.6-terra/-luna correction logged below; and
-#   2026-08-13, the Claude-side Sonnet/Mythos sync above). Codex values outside
-#   the one Codex correction were NOT re-verified on those days.
+#   since moved for four targeted syncs (2026-07-24, the Claude-side opus-5
+#   sync; 2026-07-31, the gpt-5.6-terra/-luna correction logged below;
+#   2026-08-13, the Claude-side Sonnet/Mythos sync above; and 2026-08-25, the
+#   gpt-5.6-cyber addition logged below). Codex values outside those two Codex
+#   corrections were NOT re-verified on those days.
 # - As of the 2026-07-19 sync this carries every openai-provider
 #   gpt-5* model the LiteLLM snapshot lists, so `pricing-check`'s scope finds
 #   nothing missing. Models absent from this table still fall back to `gpt-5`
@@ -425,6 +475,21 @@ _unknown_model_warnings: set[str] = set()
 #   the vendor lists these as standard ongoing prices with no promotional or
 #   expiring annotation, so the durable rate is the cut rate. gpt-5.6 and
 #   gpt-5.6-sol were not repriced and are unchanged.
+#   2026-08-25 (#643): added gpt-5.6-cyber at OpenAI's published $12.50 input /
+#   $1.25 cached input / $75.00 output per MTok, with LiteLLM's above-272k tier
+#   ($25.00 / $2.50 / $112.50 per MTok). The vendor page shows dashes in the
+#   long-context columns, but max_input_tokens is 400,000, so a turn above the
+#   272,000 threshold is reachable and pricing it at the base rate would be
+#   knowingly wrong; LiteLLM's tier ratios match every other gpt-5.6 member.
+#   Removed the duplicated gpt-5.6 card and aliased that identifier to
+#   gpt-5.6-sol, which OpenAI lists it as an alias of. gpt-5.6-sol's own values
+#   are UNCHANGED: LiteLLM now carries OpenAI's promotional $4/$20 per MTok
+#   rate, which the vendor guarantees only "at least through November 21, 2026"
+#   and publishes no successor for. That promotion is suppressed in
+#   PRICING_DRIFT_ALLOWLIST with expires 2026-11-21 instead of being written
+#   into this date-blind table, because roughly half the retained Sol rows
+#   predate it. The accepted cost is that while the promotion runs, Sol
+#   reporting is high by 25% on input and 50% on output.
 #
 # Billing rules:
 # - reasoning_output_tokens is billed at the *output* rate (matches
@@ -518,19 +583,15 @@ CODEX_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "output_cost_per_token_above_272k_tokens": 4.5e-05,
     },
     # ── gpt-5.6 family (LiteLLM openai-provider entries) ──
-    # Exact model_prices_and_context_window.json values; each carries the
-    # above-272k tier (max_input_tokens 1050000). gpt-5.6 and gpt-5.6-sol keep
-    # gpt-5.5's rate card from the 2026-07-10 sync; -terra and -luna carry
-    # OpenAI's 2026-07-30 post-cut rates (#441) and no longer track gpt-5.4's
-    # card or any other model's.
-    "gpt-5.6": {
-        "input_cost_per_token": 5e-06,
-        "cache_read_input_token_cost": 5e-07,
-        "output_cost_per_token": 3e-05,
-        "input_cost_per_token_above_272k_tokens": 1e-05,
-        "cache_read_input_token_cost_above_272k_tokens": 1e-06,
-        "output_cost_per_token_above_272k_tokens": 4.5e-05,
-    },
+    # Every member carries the above-272k tier, but the context windows differ:
+    # -sol, -terra and -luna are max_input_tokens 922,000 and -cyber is 400,000.
+    # gpt-5.6-sol keeps gpt-5.5's rate card from the 2026-07-10 sync and is
+    # deliberately HELD there while OpenAI's promotion runs — see the
+    # gpt-5.6-sol block in PRICING_DRIFT_ALLOWLIST (#643). -terra and -luna
+    # carry OpenAI's 2026-07-30 post-cut rates (#441) and no longer track
+    # gpt-5.4's card or any other model's. -cyber carries its own launch rates.
+    # The bare `gpt-5.6` identifier is OpenAI's alias of -sol and has NO card
+    # here; CODEX_MODEL_ALIASES resolves it.
     "gpt-5.6-sol": {
         "input_cost_per_token": 5e-06,
         "cache_read_input_token_cost": 5e-07,
@@ -554,6 +615,16 @@ CODEX_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "input_cost_per_token_above_272k_tokens": 4e-07,
         "cache_read_input_token_cost_above_272k_tokens": 4e-08,
         "output_cost_per_token_above_272k_tokens": 1.8e-06,
+    },
+    # No cache_creation field: the Codex cost kernel never reads one, so
+    # carrying LiteLLM's would only give `diff_pricing` a value to compare.
+    "gpt-5.6-cyber": {
+        "input_cost_per_token": 1.25e-05,
+        "cache_read_input_token_cost": 1.25e-06,
+        "output_cost_per_token": 7.5e-05,
+        "input_cost_per_token_above_272k_tokens": 2.5e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 2.5e-06,
+        "output_cost_per_token_above_272k_tokens": 1.125e-04,
     },
     # ── Issue #123: full gpt-5.x LiteLLM sync (2026-05-30 snapshot) ──
     # Exact model_prices_and_context_window.json values for every
@@ -740,11 +811,16 @@ CODEX_LEGACY_FALLBACK_MODEL = "gpt-5"
 # drift retains one source of truth per card. OpenAI's live pricing page states
 # that ``daybreak-blue-latest`` currently points to ``gpt-5.6-sol`` and inherits
 # the underlying model's pricing; Codex emits the prefixed runtime identifier
-# retained below. ``codex-auto-review`` is the hidden Guardian model and maps to
-# the model current when it appeared, covering every retained event observed
-# for issue #535.
+# retained below. OpenAI's models page lists the bare ``gpt-5.6`` identifier as
+# an alias of ``gpt-5.6-sol`` too, so it resolves here rather than duplicating
+# Sol's rates (#643) — its intentional absence from CODEX_MODEL_PRICING is
+# covered by a model-only PRICING_DRIFT_ALLOWLIST entry.
+# ``codex-auto-review`` is the hidden Guardian model and maps to the model
+# current when it appeared, covering every retained event observed for issue
+# #535.
 CODEX_MODEL_ALIASES: dict[str, str] = {
     "codex-auto-review": "gpt-5.5",
+    "gpt-5.6": "gpt-5.6-sol",
     "gpt-daybreak-blue-latest": "gpt-5.6-sol",
 }
 

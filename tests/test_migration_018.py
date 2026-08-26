@@ -28,6 +28,7 @@ import sys
 import pathlib
 
 import pytest
+from _fts5_gate import require_fts5  # the ONE FTS5 capability gate (#630 S6)
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 import _cctally_db as db   # noqa: E402
@@ -64,8 +65,7 @@ def test_apply_cache_schema_creates_title_fts():
     """Fresh installs get the external-content title FTS table from
     ``_apply_cache_schema`` (FTS5-available branch)."""
     c = _conn()
-    if not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     cols = [r[1] for r in c.execute("PRAGMA table_info(conversation_title_fts)")]
     assert "ai_title" in cols
 
@@ -91,8 +91,7 @@ def test_018_idempotent_rerun():
 
 def test_title_fts_triggers_sync_insert_update_delete():
     c = _conn()
-    if not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _upsert_title(c, "s1", "refactor the cache module")
     rows = c.execute(
         "SELECT rowid FROM conversation_title_fts "
@@ -146,8 +145,7 @@ def test_consume_title_fts_rebuild_idempotent():
     """P1-7: 'rebuild' is idempotent even if 012's ai-title backfill already
     populated the index via triggers (the 012+018 both-pending ordering)."""
     c = _conn()
-    if not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _upsert_title(c, "s1", "alpha bravo")
     _upsert_title(c, "s2", "charlie delta")
     db._set_cache_meta(c, _FLAG, "1")
@@ -208,8 +206,7 @@ def test_consume_title_fts_legacy_shape_010_018_both_pending(monkeypatch):
     so ``legacy_present`` is False) then completes the backfill: the index becomes
     searchable and the flag clears."""
     c = _conn()
-    if not db._fts5_available(c):
-        pytest.skip("sqlite build lacks FTS5")
+    require_fts5()
     _legacy_text_shape_no_title_fts(c)
     # Both migration-010 and migration-018 flags armed in the SAME open.
     db._set_cache_meta(c, "conversation_search_split_pending", "1")

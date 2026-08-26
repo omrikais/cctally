@@ -146,6 +146,9 @@ def _estate(
     min_harness_rows=0,
     smoke_test=True,
     sentinel=False,
+    harness_sleep=None,
+    budget=None,
+    tier=False,
 ):
     """A known-green scratch estate; each case mutates exactly one property."""
     repo = tmp_path / "estate"
@@ -181,6 +184,7 @@ def _estate(
     harness_kill = harness_kill or {}
     manifest_min = manifest_min or {}
     manifest_visibility = manifest_visibility or {}
+    harness_sleep = harness_sleep or {}
 
     for name in disk:
         path = bindir / f"cctally-{name}-test"
@@ -200,6 +204,22 @@ def _estate(
             # never recorded, so the harness cannot be judged on what it
             # printed.
             body.append(f'mkdir -p "$LOGDIR/{name}.exit"')
+        if tier:
+            # ONE literal tests/fixtures/<name> reference, which is the scrape
+            # form tests/test_harness_ownership.py::
+            # test_scraper_finds_a_literal_fixture_reference pins. That is what
+            # lets the ownership row below be written directly without encoding
+            # a convention this file does not otherwise test: a row that
+            # disagreed with the scrape fails bin/cctally-test-owners --verify,
+            # and the tier then WIDENS, so a wrong row shows up as a visibly
+            # widened selection rather than as a silently passing one.
+            body.append(f': "$REPO_ROOT/tests/fixtures/{name}/seed.json"')
+        if name in harness_sleep:
+            # Wall time a case can rely on. The normalized budget's numerator is
+            # `$SECONDS`, an integer, so a run that finishes inside one second
+            # can record a zero numerator and satisfy any positive threshold —
+            # which would make a breach case pass for the wrong reason.
+            body.append(f"sleep {harness_sleep[name]}")
         if name in harness_kill:
             body.append(f"kill -{harness_kill[name]} $$")
             body.append("sleep 5")
@@ -242,6 +262,68 @@ def _estate(
         json.dumps(doc, indent=2) + "\n", encoding="utf-8"
     )
 
+    # #630 S7. A real estate carries a committed runtime budget, and an
+    # authoritative full run loads it at admission, so every estate carries one
+    # too. The DEFAULT maximum is deliberately enormous rather than the
+    # committed 120: a scratch estate passes about ten cases in a few seconds,
+    # which is a per-case cost three orders of magnitude worse than the real
+    # estate's, and a fixture that breached its own budget by construction
+    # would fail every unrelated authoritative case in this file. `budget` is
+    # a number to pin the maximum, a string to write the file verbatim, or
+    # False to omit it entirely.
+    if budget is not False:
+        if isinstance(budget, str):
+            budget_text = budget
+        else:
+            budget_text = json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "metric": "secondsPerThousandCases",
+                    "maxSecondsPerThousandCases": (
+                        1000000 if budget is None else budget
+                    ),
+                },
+                indent=2,
+            ) + "\n"
+        (testsdir / "authoritative-runtime-budget.json").write_text(
+            budget_text, encoding="utf-8"
+        )
+
+    if tier:
+        # #630 S7. The tier attributes its change set through
+        # bin/cctally-test-owners and runs that tool ITSELF before accepting any
+        # narrow result, so a tier estate carries the tool, the ownership rows,
+        # the fixture directories those rows declare, and a git repository —
+        # the basis is a merge-base computation unioned with working-tree dirt.
+        shutil.copy2(BIN / "cctally-test-owners", bindir / "cctally-test-owners")
+        (bindir / "cctally-test-owners").chmod(0o755)
+        public_rows, private_rows = {}, {}
+        for name in names:
+            row = {
+                "fixturePaths": [f"tests/fixtures/{name}"],
+                "sourcePaths": [],
+            }
+            if manifest_visibility.get(name, "public") == "public":
+                public_rows[name] = row
+            else:
+                private_rows[name] = row
+            fixture = testsdir / "fixtures" / name
+            fixture.mkdir(parents=True, exist_ok=True)
+            (fixture / "seed.json").write_text("{}\n", encoding="utf-8")
+        (testsdir / "harness-ownership.json").write_text(
+            json.dumps({"schemaVersion": 1, "harnesses": public_rows}, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+        if private:
+            (testsdir / "harness-ownership.private.json").write_text(
+                json.dumps(
+                    {"schemaVersion": 1, "harnesses": private_rows}, indent=2
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
     if private:
         # .mirror-allowlist excludes itself, so its presence is the private
         # discriminator bin/cctally-test-all already uses.
@@ -262,6 +344,16 @@ def _estate(
         githooks = repo / ".githooks"
         githooks.mkdir(exist_ok=True)
         shutil.copy2(REPO / ".githooks" / "_match.py", githooks / "_match.py")
+    if tier:
+        # LAST, so every file above is committed and the working tree starts
+        # clean. A case then dirties exactly what it means to attribute.
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.email=t@e", "-c", "user.name=t",
+             "commit", "-q", "-m", "seed"],
+            check=True,
+        )
     return repo
 
 
@@ -1259,7 +1351,7 @@ def test_both_artifacts_report_one_run_as_one_wall_time(tmp_path):
 # --------------------------------------------------- outcome schema + seams
 
 VALID_CLASSES = {"none", "product", "infrastructure", "incomplete"}
-VALID_PHASES = {"admission", "harness", "pytest", "transport"}
+VALID_PHASES = {"admission", "harness", "pytest", "transport", "budget"}
 
 
 def test_outcome_object_shape(tmp_path):
@@ -1320,6 +1412,524 @@ def test_every_reason_uses_the_declared_vocabulary(tmp_path):
     # `invalid` was Codex's name for the third class; the maintainer chose
     # `incomplete`. The vocabulary must never regress to it.
     assert out["failureClass"] != "invalid"
+
+
+# --- the normalized runtime budget (#630 S7) --------------------------------
+#
+# The metric already existed: the outcome record publishes `wallSeconds`,
+# `passedCases` and their quotient. What did not exist was a threshold, a check
+# or a classification. The threshold is COMMITTED, in
+# tests/authoritative-runtime-budget.json, so a maintainer raising it does so in
+# a commit a reviewer can see — which is the mechanism that stops ordinary
+# estate growth from silently breaching it.
+
+COMMITTED_BUDGET = REPO / "tests" / "authoritative-runtime-budget.json"
+
+
+def _budget_load(tmp_path, payload=None, path=None):
+    """Call the REAL contract_budget_load and report everything it recorded."""
+    if path is None:
+        path = tmp_path / "budget.json"
+        path.write_text(payload, encoding="utf-8")
+    r = _run_lib(
+        tmp_path,
+        f'contract_budget_load "{path}"\n'
+        'rc=$?\n'
+        'printf "rc=%s\\n" "$rc"\n'
+        'printf "class=%s\\n" "$CONTRACT_CLASS"\n'
+        'printf "max=%s\\n" "$CONTRACT_BUDGET_MAX"\n'
+        'printf "note=%s" "$CONTRACT_DIAGNOSTICS"\n'
+        'printf "\\nreasons=%s" "$CONTRACT_REASONS"\n',
+    )
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    fields = {}
+    for line in r.stdout.split("\n"):
+        key, _, value = line.partition("=")
+        if key in {"rc", "class", "max", "note"}:
+            fields[key] = value
+    reasons = []
+    for row in r.stdout.split("reasons=", 1)[1].split("\n"):
+        if row.strip():
+            reasons.append(row.split("\t"))
+    fields["codes"] = [row[0] for row in reasons]
+    fields["phases"] = [row[1] for row in reasons if len(row) > 1]
+    # The loader's own stderr, so a case can assert that a refusal reached the
+    # operator as a sentence rather than as a Python traceback.
+    fields["stderr"] = r.stderr
+    return fields
+
+
+@pytest.mark.parametrize(
+    "payload,cause",
+    [
+        ('{"schemaVersion": 2, "metric": "secondsPerThousandCases",'
+         ' "maxSecondsPerThousandCases": 120}', "schemaVersion"),
+        ('{"schemaVersion": 1, "metric": "wrong",'
+         ' "maxSecondsPerThousandCases": 120}', "metric"),
+        ('{"schemaVersion": 1, "metric": "secondsPerThousandCases"}', "max"),
+        ('{"schemaVersion": 1, "metric": "secondsPerThousandCases",'
+         ' "maxSecondsPerThousandCases": "120"}', "max"),
+        ('{"schemaVersion": 1, "metric": "secondsPerThousandCases",'
+         ' "maxSecondsPerThousandCases": 0}', "max"),
+        ('{"schemaVersion": 1, "metric": "secondsPerThousandCases",'
+         ' "maxSecondsPerThousandCases": -5}', "max"),
+        ('{"schemaVersion": 1, "metric": "secondsPerThousandCases",'
+         ' "maxSecondsPerThousandCases": true}', "max"),
+        ('{"schemaVersion": 1, "metric": "secondsPerThousandCases",'
+         ' "maxSecondsPerThousandCases": 120, "extra": 1}', "extra"),
+        ('{"schemaVersion": 1, "schemaVersion": 1,'
+         ' "metric": "secondsPerThousandCases",'
+         ' "maxSecondsPerThousandCases": 120}', "schemaVersion"),
+        # A real cause fragment on both of these, not "". `assert cause in
+        # got["note"]` is trivially true of the empty string, so a row passing
+        # `""` asserts nothing about what the operator was told.
+        ("not json at all", "not JSON"),
+        ("[1, 2, 3]", "not an object"),
+        # #630 S7 / Task 2 review. Python's json parses the bare `NaN` and
+        # `Infinity` literals by default, and BOTH pass a `value <= 0` guard,
+        # because every comparison against a NaN is false and infinity is not
+        # below zero. A budget of either then makes `raw > cap` false for every
+        # run that can exist, so no run can ever breach it — a silent disabling
+        # of the whole mechanism, in a design whose entire point is failing
+        # closed. `-Infinity` is a THIRD finiteness case, not a sign control:
+        # the loader tests finiteness before the sign, so `not
+        # math.isfinite(value) or value <= 0` short-circuits and the sign test
+        # never sees it. The sign controls are the `0` and `-5` rows above.
+        ('{"schemaVersion": 1, "metric": "secondsPerThousandCases",'
+         ' "maxSecondsPerThousandCases": NaN}', "max"),
+        ('{"schemaVersion": 1, "metric": "secondsPerThousandCases",'
+         ' "maxSecondsPerThousandCases": Infinity}', "max"),
+        ('{"schemaVersion": 1, "metric": "secondsPerThousandCases",'
+         ' "maxSecondsPerThousandCases": -Infinity}', "max"),
+    ],
+)
+def test_a_malformed_budget_is_refused(tmp_path, payload, cause):
+    """#630 S7. A budget that cannot be evaluated must never read as a budget
+    that was satisfied, so an unreadable file refuses the run in seconds rather
+    than being skipped after twenty minutes. The strictness matches what
+    contract_manifest_load already applies to the estate manifest: unknown
+    keys, duplicate keys, missing keys, non-numeric and non-positive values."""
+    got = _budget_load(tmp_path, payload)
+    assert got["rc"] == "1", got
+    assert got["class"] == "infrastructure", got
+    assert got["codes"] == ["runtime-budget-unavailable"], got
+    assert got["phases"] == ["admission"], got
+    assert got["max"] == "", "a refused budget must leave no threshold behind"
+    assert cause in got["note"], got
+
+
+def test_a_valid_budget_yields_its_maximum(tmp_path):
+    """The green control. A guard that only ever sees red cannot be told apart
+    from one that refuses everything."""
+    got = _budget_load(
+        tmp_path,
+        '{"schemaVersion": 1, "metric": "secondsPerThousandCases",'
+        ' "maxSecondsPerThousandCases": 120}',
+    )
+    assert got["rc"] == "0", got
+    assert got["class"] == "none", got
+    assert got["codes"] == [], got
+    assert float(got["max"]) == 120.0, got
+
+
+def test_a_non_utf8_budget_names_its_cause_instead_of_tracing(tmp_path):
+    """#630 S7 / Task 1 review. UnicodeDecodeError is a ValueError, not an
+    OSError, so a non-UTF-8 file used to escape the loader's handler: the run
+    was still refused, but the operator got `runtime budget:  — fix ...` with an
+    EMPTY cause beside a raw Python traceback. The refusal must name what is
+    wrong with the file."""
+    path = tmp_path / "budget.json"
+    path.write_bytes(b'{"schemaVersion": 1, "metric": "\xff\xfe"}\n')
+    got = _budget_load(tmp_path, path=path)
+    assert got["rc"] == "1", got
+    assert got["class"] == "infrastructure", got
+    assert got["codes"] == ["runtime-budget-unavailable"], got
+    assert got["phases"] == ["admission"], got
+    assert "UTF-8" in got["note"], got
+    # The second half, in the opposite direction. The escaping handler also
+    # refused, so only the two together separate "refused with a cause" from
+    # "refused with an empty cause beside 211 bytes of traceback".
+    assert "Traceback" not in got["stderr"], got["stderr"]
+
+
+def test_an_absent_budget_file_is_refused(tmp_path):
+    got = _budget_load(tmp_path, path=tmp_path / "there-is-no-such-file.json")
+    assert got["rc"] == "1", got
+    assert got["codes"] == ["runtime-budget-unavailable"], got
+
+
+def test_the_committed_budget_parses(tmp_path):
+    """The file that ships must satisfy its own loader."""
+    got = _budget_load(tmp_path, path=COMMITTED_BUDGET)
+    assert got["rc"] == "0", got
+    assert got["codes"] == [], got
+    assert float(got["max"]) > 0, got
+
+
+def test_the_committed_budget_is_the_number_the_spec_derived():
+    """Hard-coded on purpose and deliberately NOT read from the file it guards.
+
+    120 comes from docs/superpowers/audits/2026-08-23-630-s3-runs.tsv: the worst
+    contended shipped observation on either host is 87.3 s per 1,000 cases and
+    the worst degraded control is 103.2, so 120 clears both with headroom while
+    no healthy run approaches it. Raising it is a deliberate act in a reviewable
+    commit; this assertion is what makes the raise visible rather than silent.
+    """
+    doc = json.loads(COMMITTED_BUDGET.read_text(encoding="utf-8"))
+    assert doc["schemaVersion"] == 1, doc
+    assert doc["metric"] == "secondsPerThousandCases", doc
+    assert doc["maxSecondsPerThousandCases"] == 120, doc
+
+
+# The eligibility predicate. Keyed on the AUTHORITATIVE marker rather than on
+# CCTALLY_REMOTE_EXEC: .github/workflows/ci.yml's test-macos job sets
+# CCTALLY_AUTHORITATIVE_RUN=1 and executes bin/cctally-test-all DIRECTLY, never
+# through the wrapper, so a remote-marker predicate would leave the budget
+# unenforced on exactly the run that has no receipt to fall back on.
+
+
+@pytest.mark.parametrize(
+    "authoritative,mode,cls,local,profile,expected",
+    [
+        (True, "full", "none", False, "private", True),
+        (False, "full", "none", False, "private", False),         # not authoritative
+        (True, "subset", "none", False, "private", False),        # a deliberate subset
+        (True, "tier-fast", "none", False, "private", False),     # a tier is not a full run
+        (True, "linux-matrix", "none", False, "private", False),
+        (True, "full", "product", False, "private", False),       # already red
+        (True, "full", "infrastructure", False, "private", False),
+        (True, "full", "incomplete", False, "private", False),
+        (True, "full", "none", True, "private", False),           # the local hatch
+        (True, "full", "none", False, "public", False),           # a public tree
+    ],
+)
+def test_budget_eligibility(
+    tmp_path, authoritative, mode, cls, local, profile, expected
+):
+    """The five conditions, one case per row.
+
+    Every negative row differs from the positive row in exactly ONE axis, so
+    deleting any single condition from the predicate fails at least one row.
+
+    The class condition is what stops one failure from producing two reason
+    codes: a red run has fewer passed cases, so the quotient inflates precisely
+    when it carries no information. The profile condition (#630 S7 revision 3)
+    is what keeps the threshold off a PUBLIC tree: `bin/cctally-test-linux-matrix
+    --profile public` and ci.yml's `test-pr` job on the public mirror both set
+    the authoritative marker and resolve to `full`, and both run a smaller
+    estate on hardware the 120 never measured.
+    """
+    r = _run_lib(
+        tmp_path,
+        f"COVERAGE_MODE={mode}\n"
+        f"CONTRACT_CLASS={cls}\n"
+        f"CONTRACT_PROFILE={profile}\n"
+        "if contract_budget_is_eligible; then echo ELIGIBLE; else echo NO; fi\n",
+        env={
+            # Set EXPLICITLY in both directions rather than defaulted. Under the
+            # full suite the aggregator itself runs with CCTALLY_AUTHORITATIVE_RUN=1
+            # and every pytest child inherits it, so a case that merely omitted
+            # the variable would read the outer run's marker and pass standalone
+            # while failing inside the suite.
+            "CCTALLY_AUTHORITATIVE_RUN": "1" if authoritative else "",
+            "CCTALLY_TEST_LOCAL": "1" if local else "",
+        },
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == ("ELIGIBLE" if expected else "NO"), (r.stdout, r.stderr)
+
+
+# The comparison itself. The RAW quotient, not the record's published
+# `secondsPerThousandCases`, which is rounded to one decimal for display — a
+# threshold decided by a display artifact is one nobody can reason about.
+
+
+@pytest.mark.parametrize(
+    "wall,cases,over",
+    [
+        (11994, 100_000, False),   # 119.94 raw; under the cap either way
+        (12000, 100_000, False),   # exactly 120.0; strictly-greater PASSES it
+        (12004, 100_000, True),    # 120.04 raw, which ROUNDS DOWN to 120.0
+        (14270, 100_000, True),
+    ],
+)
+def test_the_breach_boundary_uses_the_raw_quotient(tmp_path, wall, cases, over):
+    r = _run_lib(tmp_path, f"contract_budget_verdict {wall} {cases} 120.0\n")
+    assert r.returncode == 0, r.stderr
+    raw, _, state = r.stdout.strip().partition(" ")
+    assert state == ("over" if over else "ok"), (r.stdout, r.stderr)
+    assert abs(float(raw) - wall / cases * 1000) < 1e-6, r.stdout
+
+
+def test_the_rounded_metric_would_not_have_caught_the_boundary_breach(tmp_path):
+    """The discriminating anchor for the case above, and the whole reason the
+    basis is specified. 120.04 rounds to 120.0, which is not greater than
+    120.0, so a check reading the record's published metric would pass this run
+    while the raw quotient fails it. Without this assertion the boundary matrix
+    above would be satisfied under either basis."""
+    assert round(12004 / 100_000 * 1000, 1) == 120.0
+    r = _run_lib(tmp_path, "contract_budget_verdict 12004 100000 120.0\n")
+    assert r.stdout.split()[1] == "over", r.stdout
+
+
+# The check, driven end to end through a real aggregator run.
+
+
+def _budget_reasons(proc):
+    return [x for x in _outcome(proc)["reasons"] if x["phase"] == "budget"]
+
+
+def test_an_eligible_run_within_the_budget_records_no_budget_reason(tmp_path):
+    """The green control for every red case below.
+
+    Every driven budget case in this section is a PRIVATE estate, because the
+    fifth eligibility condition is `CONTRACT_PROFILE == private` and a public
+    scratch estate would be ineligible for a second, unrelated reason — which
+    would leave each negative case below passing for the wrong one.
+    """
+    est = _estate(tmp_path, private=True)
+    r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _budget_reasons(r) == [], _outcome(r)
+
+
+def test_an_eligible_run_over_the_budget_is_product_at_exit_one(tmp_path):
+    """#630 S7. The class is `product` rather than `infrastructure` because the
+    instrument is working correctly and reporting a true fact about the tree;
+    `infrastructure` means the instrument itself broke."""
+    est = _estate(tmp_path, private=True, budget=0.001, harness_sleep={"alpha": 1})
+    r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    out = _outcome(r)
+    assert out["failureClass"] == "product", out
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    assert out["exitCode"] == 1, out
+    rows = _budget_reasons(r)
+    assert [x["code"] for x in rows] == ["runtime-budget-exceeded"], out
+    assert ">" in rows[0]["subject"], rows
+    # The operator is told what to do about it, not merely that it happened.
+    assert "per 1,000 cases" in r.stderr, r.stderr
+
+
+def test_the_breach_states_both_numbers_readably(tmp_path):
+    """#630 S7 / Task 1 review. The comparison runs on the raw quotient, which
+    is the whole point of contract_budget_verdict — but the operator was then
+    shown that raw value verbatim, so a breach read
+    `runtime-budget-exceeded(120.040000>120.0)`. Formatting is DISPLAY only and
+    must not touch the comparison, which
+    test_the_rounded_metric_would_not_have_caught_the_boundary_breach pins."""
+    est = _estate(tmp_path, private=True, budget=0.001, harness_sleep={"alpha": 1})
+    r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    subject = _budget_reasons(r)[0]["subject"]
+    assert re.fullmatch(r"\d+(\.\d{1,2})? > 0\.001", subject), subject
+    # The threshold reads as the number a maintainer typed into the committed
+    # file, not as its float repr.
+    assert "0.001000" not in r.stderr, r.stderr
+
+
+def test_a_non_authoritative_run_over_the_budget_is_still_green(tmp_path):
+    """The eligibility predicate is not decorative: the SAME estate that fails
+    above must pass with the marker absent."""
+    est = _estate(tmp_path, private=True, budget=0.001, harness_sleep={"alpha": 1})
+    r = _drive(est)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _budget_reasons(r) == [], _outcome(r)
+
+
+def test_a_public_tree_over_the_budget_is_still_green(tmp_path):
+    """#630 S7 revision 3. The SAME breaching estate, authoritative, `full`, and
+    not the local hatch — differing from the failing case in the profile alone.
+
+    Two real invocation paths reach exactly this state: the release runbook's
+    `bin/cctally-test-linux-matrix --profile public` at every cut, and ci.yml's
+    `test-pr` job, which runs on the PUBLIC MIRROR for contributor and fork pull
+    requests. Both run a smaller estate on hardware the committed 120 never
+    measured, so a breach there would blame a contributor's tree for a hosted
+    runner's slowness."""
+    est = _estate(tmp_path, private=False, budget=0.001, harness_sleep={"alpha": 1})
+    r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _budget_reasons(r) == [], _outcome(r)
+    assert _outcome(r)["coverage"]["mode"] == "full", _outcome(r)
+
+
+def test_a_subset_over_the_budget_gains_no_budget_reason(tmp_path):
+    """A deliberate subset is excluded by `coverage.mode`, and it could not be
+    authoritative anyway — the aggregator refuses that combination outright."""
+    est = _estate(tmp_path, private=True, harnesses=["alpha", "beta"], budget=0.001,
+                  harness_sleep={"alpha": 1})
+    r = _drive(est, args=("--harness", "alpha"))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert _budget_reasons(r) == [], _outcome(r)
+
+
+def test_a_red_run_gains_no_budget_reason(tmp_path):
+    """One failure must not produce two reason codes: a red run has fewer
+    passed cases, so the quotient inflates exactly when it is meaningless.
+
+    Non-vacuous by construction — the estate is the one
+    test_an_eligible_run_over_the_budget_is_product_at_exit_one proves does
+    breach, mutated only by making a harness fail."""
+    est = _estate(
+        tmp_path,
+        private=True,
+        budget=0.001,
+        harness_sleep={"alpha": 1},
+        harness_output={"alpha": "passed: 1   failed: 1\n"},
+        harness_exit={"alpha": 1},
+    )
+    r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    codes = _codes(r)
+    assert "harness-failed" in codes, codes
+    assert "runtime-budget-exceeded" not in codes, codes
+
+
+def test_a_null_denominator_is_unavailable_not_a_breach(tmp_path):
+    """passedCases is null when pytest's passed-item count was unreadable, which
+    is a different answer from zero. An otherwise-green eligible run that cannot
+    establish its denominator is infrastructure, never product — a budget that
+    could not be evaluated must never read as a budget that was satisfied."""
+    est = _estate(tmp_path, private=True)
+    env = dict(_pytest_output_shim(est, r'b"no summary line here at all\n"'))
+    env["CCTALLY_AUTHORITATIVE_RUN"] = "1"
+    r = _drive(est, env=env)
+    out = _outcome(r)
+    assert out["passedCases"] is None, out
+    assert [x["code"] for x in out["reasons"]] == ["runtime-budget-unavailable"], out
+    assert out["failureClass"] == "infrastructure", out
+    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+    assert out["exitCode"] == 3, out
+
+
+def test_a_missing_budget_refuses_an_eligible_run_before_anything_runs(tmp_path):
+    """Validated at ADMISSION, so a missing budget refuses the run in seconds
+    rather than after twenty minutes of work whose verdict it cannot judge."""
+    est = _estate(tmp_path, private=True, budget=False, sentinel=True)
+    ran = tmp_path / "ran"
+    ran.mkdir()
+    r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1",
+                         "SENTINEL_DIR": str(ran)})
+    out = _outcome(r)
+    assert out["failureClass"] == "infrastructure", out
+    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+    assert "runtime-budget-unavailable" in {x["code"] for x in out["reasons"]}, out
+    assert _executed(ran) == set(), (
+        "the run was refused at admission, so no harness may have executed"
+    )
+
+
+def test_a_malformed_budget_refuses_an_eligible_run(tmp_path):
+    est = _estate(tmp_path, private=True, budget='{"schemaVersion": 1}\n')
+    r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    out = _outcome(r)
+    assert out["failureClass"] == "infrastructure", out
+    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+    assert "runtime-budget-unavailable" in {x["code"] for x in out["reasons"]}, out
+
+
+def test_an_ineligible_run_is_not_refused_for_a_budget_it_never_reads(tmp_path):
+    """The admission load is gated by the SAME predicate the check is, so a run
+    that will never compare itself against the budget is not refused for one it
+    does not have."""
+    est = _estate(tmp_path, private=True, budget=False)
+    r = _drive(est)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "runtime-budget-unavailable" not in _codes(r), _outcome(r)
+
+
+def test_both_budget_reasons_are_registered():
+    """A code absent from _CONTRACT_REASON_CODES is not a code: the emission
+    sites are bare string literals, so nothing in the shell catches a typo."""
+    codes = _registry()
+    assert "runtime-budget-exceeded" in codes, sorted(codes)
+    assert "runtime-budget-unavailable" in codes, sorted(codes)
+
+
+# --- the carrier's phase set is CLOSED (#630 S7) ----------------------------
+#
+# bin/cctally-test-remote reads the aggregator's record through
+# contract_carrier_emit, which validates every reason row against its own phase
+# set and rewrites an unlisted phase to `outcome-record-malformed` —
+# infrastructure at exit 3. A reason whose phase the carrier does not know
+# therefore loses BOTH its class and its exit code on the way to the caller,
+# silently, and the record the caller sees names a transport fault rather than
+# the thing that actually happened.
+
+
+def _carrier_record(**overrides):
+    doc = {
+        "schemaVersion": 1,
+        "outcome": "fail",
+        "failureClass": "product",
+        "exitCode": 1,
+        "reasons": [],
+        "capabilities": {},
+        "totals": {"passed": 0, "failed": 0},
+    }
+    doc.update(overrides)
+    return doc
+
+
+def _carry(tmp_path, record, rc):
+    """Run the real carrier over a record; return its object and exit code."""
+    path = tmp_path / "carried-record.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    r = _run_lib(tmp_path, f'contract_carrier_emit {rc} "{path}"')
+    assert r.stdout.strip(), f"the carrier printed nothing\nstderr:\n{r.stderr}"
+    return json.loads(r.stdout), r.returncode
+
+
+@pytest.mark.parametrize(
+    "code,cls,exit_code,subject",
+    [
+        ("runtime-budget-exceeded", "product", 1, "142.7 > 120"),
+        # BOTH codes, because §2.5 asks for a carrier-level case for each and
+        # the two travel different class and exit-code paths. The `budget` phase
+        # is what the carrier validates, and it validates it per reason row.
+        ("runtime-budget-unavailable", "infrastructure", 3, "denominator"),
+    ],
+)
+def test_the_carrier_accepts_the_budget_phase(
+    tmp_path, code, cls, exit_code, subject
+):
+    """#630 S7. The carrier's phase set is CLOSED: a reason carrying an
+    unlisted phase is rewritten to outcome-record-malformed, which is
+    infrastructure and exits 3. That would strip runtime-budget-exceeded of
+    the product class and the exit 1 the whole design rests on, silently — and
+    it would make runtime-budget-unavailable indistinguishable from a transport
+    fault, which is the one thing it is not."""
+    doc, rc = _carry(
+        tmp_path,
+        _carrier_record(
+            failureClass=cls,
+            exitCode=exit_code,
+            reasons=[{"code": code, "phase": "budget", "subject": subject}],
+        ),
+        rc=exit_code,
+    )
+    assert doc["failureClass"] == cls, doc
+    assert doc["exitCode"] == exit_code, doc
+    assert rc == exit_code, (rc, doc)
+    assert [r["code"] for r in doc["reasons"]] == [code], doc
+
+
+def test_the_carrier_still_refuses_a_phase_outside_the_set(tmp_path):
+    """The non-vacuity control. Opening the set to `budget` must not open it
+    to everything: a set that accepts any string is not a closed set, and the
+    rewrite above would then be unreachable for every real malformed record."""
+    doc, rc = _carry(
+        tmp_path,
+        _carrier_record(
+            failureClass="product",
+            exitCode=1,
+            reasons=[{"code": "harness-failed", "phase": "invented",
+                      "subject": "x"}],
+        ),
+        rc=1,
+    )
+    assert doc["failureClass"] == "infrastructure", doc
+    assert rc == 3, (rc, doc)
+    assert [r["code"] for r in doc["reasons"]] == ["outcome-record-malformed"], doc
 
 
 # ------------------------------------------------------ committed-manifest floors
@@ -2302,3 +2912,173 @@ def test_present_agentmem_announces_that_the_gated_tests_ran(tmp_path):
     lines = [l for l in r.stdout.splitlines() if "agentmem contract:" in l]
     assert len(lines) == 1, (lines, r.stdout[-3000:])
     assert "agentmem is present" in lines[0], lines[0]
+
+
+# --- the tiered coverage mode in the RECORD (#630 S7) ------------------------
+#
+# tests/test_test_all_scheduler.py exercises the SELECTION — the basis, the
+# force-includes, the partition and every fail-closed leg — through plan mode.
+# What lives here is the contract the carrier and the wrapper read: the outcome
+# record a real tier run publishes, and the verdict it carries.
+
+
+def _tier_estate(tmp_path, **kwargs):
+    kwargs.setdefault("harnesses", ["alpha", "beta"])
+    return _estate(tmp_path, private=True, tier=True, **kwargs)
+
+
+def _tier_touch(est, name):
+    """Dirty one harness's fixture directory, which is a DIRECT ownership edge
+    and therefore the only class of evidence that narrows."""
+    (est / "tests" / "fixtures" / name / "seed.json").write_text(
+        '{"touched": true}\n', encoding="utf-8"
+    )
+
+
+def test_a_green_tier_run_is_class_none_at_exit_zero(tmp_path):
+    """§3.6. A tier run is a real verdict about what it RAN.
+    `contract_is_authoritative` is an execution-strength marker, not a
+    completeness predicate; completeness is carried separately by coverage.mode
+    and by the gate identity, which is what stops this being read as a verdict
+    about the whole estate."""
+    est = _tier_estate(tmp_path)
+    _tier_touch(est, "alpha")
+    r = _drive(est, args=("--tier-fast", "HEAD"),
+               env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    out = _outcome(r)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert out["failureClass"] == "none", out
+    assert out["outcome"] == "pass", out
+    # Preserve-item 19. The tier is a NEW named mode, never a relaxation of the
+    # subset's uncitable classification.
+    assert "deliberate-subset" not in _codes(r), out
+
+
+def test_a_green_tier_verdict_names_the_mode_and_the_omitted_count(tmp_path):
+    """#630 S7 / Task 2 review. A green tier printed `Verdict: PASS (exit 0)`
+    and nothing else, because the two sentences that state a selection are
+    gated on `COVERAGE_MODE = subset`. A tier that omitted most of the estate
+    therefore read in scrollback exactly like a full run, and the record — the
+    only place the mode appears — is written to a file the operator is not
+    looking at.
+
+    The line deliberately does NOT reuse the subset path's "NOT a gate"
+    wording: a subset is uncitable by design, while a tier is citable under its
+    own gate identity, so borrowing that sentence would state the opposite of
+    what the mode means."""
+    est = _tier_estate(tmp_path)
+    _tier_touch(est, "alpha")
+    r = _drive(est, args=("--tier-fast", "HEAD"),
+               env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    text = r.stdout + r.stderr
+    assert "Verdict: PASS" in text, text
+    assert "coverage: tier-fast" in text, text
+    # The count itself, not merely the word. A line naming the mode while
+    # reporting nothing about the size of the selection leaves the operator
+    # exactly where the finding found them.
+    assert "2 of 3 harness(es) omitted" in text, text
+    assert "NOT a gate" not in text, text
+
+    # Non-vacuity, in the direction that matters: the same estate run in full
+    # prints no such line, so a defect that printed it unconditionally would
+    # not satisfy this case.
+    full = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    assert full.returncode == 0, full.stdout + full.stderr
+    assert "coverage: tier-fast" not in (full.stdout + full.stderr), full.stdout
+
+
+def test_the_tier_record_carries_its_mode_partition_and_basis(tmp_path):
+    est = _tier_estate(tmp_path)
+    _tier_touch(est, "alpha")
+    r = _drive(est, args=("--tier-fast", "HEAD"),
+               env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    cov = _outcome(r)["coverage"]
+    assert cov["mode"] == "tier-fast", cov
+    assert cov["pytest"] == "full", cov
+    assert cov["selectedHarnesses"] == ["alpha"], cov
+    assert cov["omittedHarnesses"] == ["beta", "reconcile"], cov
+    assert set(cov["tierBasis"]) == {
+        "baseOid", "headOid", "committedPaths", "worktreePaths"
+    }, cov
+    assert len(cov["tierBasis"]["baseOid"]) == 40, cov
+    assert len(cov["tierBasis"]["headOid"]) == 40, cov
+    assert cov["tierBasis"]["committedPaths"] == 0, cov
+    assert cov["tierBasis"]["worktreePaths"] == 1, cov
+
+
+def test_a_full_run_record_carries_no_tier_basis(tmp_path):
+    """The basis is present in tier mode alone. An object of empty strings on
+    every other mode would describe a basis that does not exist, and the
+    wrapper's coverage validation reads this block."""
+    est = _tier_estate(tmp_path)
+    r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    cov = _outcome(r)["coverage"]
+    assert cov["mode"] == "full", cov
+    assert "tierBasis" not in cov, cov
+
+
+def test_the_tier_executes_only_what_it_selected(tmp_path):
+    """The selection reaches the POOL, not merely the record. Positive evidence
+    of execution, so this cannot be satisfied by a run that executed nothing."""
+    est = _tier_estate(tmp_path, sentinel=True)
+    _tier_touch(est, "alpha")
+    ran = tmp_path / "ran"
+    ran.mkdir()
+    r = _drive(est, args=("--tier-fast", "HEAD"),
+               env={"CCTALLY_AUTHORITATIVE_RUN": "1", "SENTINEL_DIR": str(ran)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _executed(ran) == {"alpha"}, _executed(ran)
+
+
+def test_the_tier_is_excluded_from_the_runtime_budget(tmp_path):
+    """Eligibility condition 2. The tier ran a DIFFERENT estate, so its quotient
+    answers a different question from the one the committed threshold was
+    derived for. Non-vacuous by construction: the same estate, the same marker
+    and the same 0.001 budget produce runtime-budget-exceeded on a full run."""
+    est = _tier_estate(tmp_path, budget=0.001, harness_sleep={"alpha": 1})
+    _tier_touch(est, "alpha")
+    full = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    assert [x["code"] for x in _budget_reasons(full)] == [
+        "runtime-budget-exceeded"
+    ], _outcome(full)
+
+    tiered = _drive(est, args=("--tier-fast", "HEAD"),
+                    env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    assert tiered.returncode == 0, tiered.stdout + tiered.stderr
+    assert _budget_reasons(tiered) == [], _outcome(tiered)
+
+
+def test_the_tier_and_a_subset_cannot_be_combined(tmp_path):
+    """Preserve-item 19 again, at the aggregator boundary rather than in plan
+    mode: a caller-chosen subset stays uncitable, so the two request surfaces
+    may not be merged into one run."""
+    est = _tier_estate(tmp_path)
+    r = _drive(est, args=("--tier-fast", "HEAD", "--harness", "alpha"))
+    assert r.returncode == 2, r.stdout + r.stderr
+    # The exact phrase, not merely both tokens: the pre-tier message
+    # "unrecognised argument '--tier-fast'; the only arguments are --harness
+    # NAME (repeatable) and --with-pytest" contains both tokens too, so a
+    # membership test alone was satisfied by an exit 2 for an unrelated reason.
+    assert "--tier-fast cannot accompany --harness" in r.stderr, r.stderr
+
+
+def test_a_tier_over_a_broken_ownership_map_widens_and_stays_tier_fast(tmp_path):
+    """§3.5 legs 2 and 4 together, in the record. Ownership verification runs
+    before a narrow result is accepted, and a failure widens — but the MODE is
+    decided by how the run was invoked and how its set was derived, never by
+    whether the set turned out to be everything. Deciding it by result would let
+    a widened tier mint the releasable full-suite gate."""
+    est = _tier_estate(tmp_path)
+    _tier_touch(est, "alpha")
+    path = est / "tests" / "harness-ownership.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["harnesses"]["beta"]["fixturePaths"] = ["tests/fixtures/alpha"]
+    path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+
+    r = _drive(est, args=("--tier-fast", "HEAD"),
+               env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    cov = _outcome(r)["coverage"]
+    assert cov["mode"] == "tier-fast", cov
+    assert cov["omittedHarnesses"] == [], cov
+    assert cov["selectedHarnesses"] == ["alpha", "beta", "reconcile"], cov

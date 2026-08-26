@@ -1,7 +1,6 @@
 """Layer A unit tests for bin/_lib_share.py."""
 from __future__ import annotations
 
-import importlib.machinery
 import importlib.util
 import os
 import pathlib
@@ -10,11 +9,14 @@ from datetime import datetime, timezone
 
 import pytest
 
+from _script_loader import load_script_module
+
 # Every HOME-derived path constant resolves under a per-test directory
-# (#529 S4). This module loads bin/cctally (or a sibling) through
-# SourceFileLoader or at import, and neither re-derives the path constants,
-# so pinning HOME alone would leave whatever the previous test on this xdist
-# worker left behind -- which is why it was green alone and red under -n 4.
+# (#529 S4). This module loads bin/_lib_share.py by path and bin/cctally under
+# an alternate identity, and neither load re-derives the path constants -- the
+# primitive re-derives them only for a load that claims the `cctally` identity.
+# So pinning HOME alone would leave whatever the previous test on this xdist
+# worker left behind, which is why it was green alone and red under -n 4.
 pytestmark = pytest.mark.usefixtures("isolated_paths")
 
 # Load _lib_share by path (same pattern bin/cctally uses for its peers).
@@ -42,24 +44,14 @@ else:
     sys.modules["_lib_share"] = _lib_share
     _spec.loader.exec_module(_lib_share)
 
-# Load bin/cctally as a module for testing destination/emit helpers. The
-# script has no .py extension, so we supply an explicit SourceFileLoader
-# (otherwise spec_from_file_location returns None for unrecognized suffixes).
-# The module guards CLI entry behind `if __name__ == "__main__":`, so
-# exec_module doesn't trigger argparse parsing. The CCTALLY_TEST_IMPORT env
-# var is defensive for any future restructure that might run argparse at
-# module import time.
+# Load bin/cctally as a module for testing destination/emit helpers, under its
+# own `_cctally_for_tests` identity so this module keeps a stable reference
+# across later `load_script()` calls that rebind `sys.modules["cctally"]`. The
+# script guards CLI entry behind `if __name__ == "__main__":`, so the load does
+# not trigger argparse parsing. The CCTALLY_TEST_IMPORT env var is defensive
+# for any future restructure that might run argparse at module import time.
 os.environ.setdefault("CCTALLY_TEST_IMPORT", "1")
-_CCTALLY_PATH = _REPO_ROOT / "bin" / "cctally"
-_cctally_loader = importlib.machinery.SourceFileLoader(
-    "_cctally_for_tests", str(_CCTALLY_PATH)
-)
-_cctally_spec = importlib.util.spec_from_loader(
-    "_cctally_for_tests", _cctally_loader
-)
-_cctally = importlib.util.module_from_spec(_cctally_spec)
-sys.modules["_cctally_for_tests"] = _cctally
-_cctally_loader.exec_module(_cctally)
+_cctally = load_script_module("_cctally_for_tests")
 
 # Re-export for terse test bodies.
 ShareSnapshot = _lib_share.ShareSnapshot

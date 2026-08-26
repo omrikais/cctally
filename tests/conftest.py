@@ -87,24 +87,22 @@ def _script_path() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent.parent / "bin" / "cctally"
 
 
-# Compile bin/cctally once per pytest session and reuse the code object
-# across every load_script() call. Each test still gets a fresh namespace via
-# exec(), preserving isolation. Under pytest-xdist (`pytest -n <N>`) each
-# worker is a fresh Python process, so this cache is per-worker and the
-# compile cost is paid N times instead of once; see tests/requirements-dev.txt
-# for the optional xdist dep.
+# bin/cctally is compiled once per process and the code object reused across
+# every load_script() call; each call still gets a fresh namespace via exec(),
+# preserving isolation. Under pytest-xdist each worker is a fresh Python
+# process, so the compile is paid once per worker. Both the cache and the load
+# itself live in tests/_script_loader.py since #630 S6 (one implementation, not
+# seventy); this module keeps only the path, which several fixtures below read.
 #
-# THE FIGURES THIS COMMENT USED TO CITE ARE STALE AND ARE CORRECTED HERE
-# (#529 S4). It described a "26K-line script" whose compile() cost ~146 ms and
-# whose exec() cost ~16 ms, and claimed the cache cut ~50 s off the suite.
-# Measured on the runner today: bin/cctally is 3,602 lines and 186 KB,
-# compile() takes 5.4 ms, and a warm exec() into a fresh namespace takes
-# 0.2 ms. Nothing comes from a bytecode cache either — sys.dont_write_bytecode
-# is True under pytest here and bin/__pycache__ does not exist — so a
-# SourceFileLoader load of the same file costs 5.7 ms, which is compile plus
-# exec and not a cache read.
+# THE FIGURES THE OLD COMMENT CITED WERE STALE AND ARE CORRECTED HERE (#529 S4).
+# It described a "26K-line script" whose compile() cost ~146 ms and whose exec()
+# cost ~16 ms, and claimed the cache cut ~50 s off the suite. Measured on the
+# runner: bin/cctally is 3,602 lines and 186 KB, compile() takes 5.4 ms, and a
+# warm exec() into a fresh namespace takes 0.2 ms. Nothing comes from a bytecode
+# cache either — sys.dont_write_bytecode is True under pytest here and
+# bin/__pycache__ does not exist — so a SourceFileLoader load of the same file
+# costs 5.7 ms, which is compile plus exec and not a cache read.
 _SCRIPT_PATH = _script_path()
-_SCRIPT_CODE = compile(_SCRIPT_PATH.read_text(), str(_SCRIPT_PATH), "exec")
 
 # Ensure bin/ is on sys.path so tests can do `import _cctally_core` at the
 # top of the file. After 2026-05-22 (issue #84) the 23 in-scope path
@@ -195,6 +193,7 @@ def _isolation_detector(request):
 # ledger uses, and the controller — the only process whose exit status the run
 # honours — sums them and emits ONE line.
 from _agentmem_gate import AGENTMEM_PRESENT, requires_agentmem  # noqa: E402
+from _script_loader import load_script_module  # noqa: E402 -- the ONE cctally loader
 
 _AGENTMEM_SKIP_FILE = "agentmem-skips"
 
@@ -654,22 +653,11 @@ def load_script():
 
     Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md §6.0a
     """
-    for _name in [n for n in sys.modules if n.startswith("_cctally_") and n != "_cctally_core"]:
-        del sys.modules[_name]
-    # Re-derive _cctally_core's path constants from the current HOME env
-    # var. Tests doing `setenv("HOME", tmp) + load_script()` rely on
-    # this to surface a fresh path set under the test's HOME without
-    # re-importing _cctally_core. Must run BEFORE the bin/cctally exec
-    # below so the script's `APP_DIR = _cctally_core.APP_DIR` re-export
-    # block snapshots the updated values.
-    core = sys.modules.get("_cctally_core")
-    if core is not None and hasattr(core, "_init_paths_from_env"):
-        core._init_paths_from_env()
-    mod = types.ModuleType("cctally")
-    mod.__file__ = str(_SCRIPT_PATH)
-    sys.modules["cctally"] = mod
-    exec(_SCRIPT_CODE, mod.__dict__)
-    return mod.__dict__
+    # ONE implementation, in tests/_script_loader.py (#630 S6). Seventy modules
+    # hand-rolled this load; the two behaviours documented above are the reason
+    # that mattered, and they now live in exactly one place. This function keeps
+    # its `dict` return shape, because 369 modules index it as a namespace.
+    return load_script_module().__dict__
 
 
 def redirect_paths(ns, monkeypatch, tmp_path):

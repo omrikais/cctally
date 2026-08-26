@@ -12,13 +12,13 @@ the ``unattributed`` sentinel is a resolved no-op (leave NULL).
 """
 from __future__ import annotations
 
-import importlib.util as ilu
 import shutil
 import sqlite3
 import sys
 from pathlib import Path
 
 import pytest
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 # Every HOME-derived path constant resolves under a per-test directory
 # (#529 S4). The write detector caught this module creating the maintainer's
@@ -53,23 +53,14 @@ def cctally_module(isolated_home):
     Function-scoped and dependent on ``isolated_home`` (#529 S4). It was
     module-scoped, so it ran once before any function fixture and left every
     path constant derived under the real HOME; the write detector caught this
-    module creating the maintainer's real ~/.local/share/cctally. A
-    SourceFileLoader load does not re-derive on its own, which is why the
-    explicit ``_init_paths_from_env()`` is here; it is safe at this point
-    because it runs before any test applies a patch.
+    module creating the maintainer's real ~/.local/share/cctally.
+    ``load_script_module()`` re-derives the path constants itself on every load
+    that claims the ``cctally`` identity, so no explicit
+    ``_init_paths_from_env()`` call is needed here.
     """
-    from importlib.machinery import SourceFileLoader
-
     if str(BIN_DIR) not in sys.path:
         sys.path.insert(0, str(BIN_DIR))
-    loader = SourceFileLoader("cctally", str(BIN_DIR / "cctally"))
-    spec = ilu.spec_from_loader("cctally", loader)
-    mod = ilu.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
-    import _cctally_core
-
-    _cctally_core._init_paths_from_env()
+    mod = load_script_module()
     return mod
 
 

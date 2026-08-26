@@ -15,6 +15,25 @@ on:
     paths-ignore:
       - '**/*.md'
 
+# #630 S4 (F25). One superseded push no longer occupies the single self-hosted
+# runner while a newer commit waits behind it. Measured over 100 pushes, 15 were
+# still running when a later push arrived, and the self-hosted occupancy lying
+# after the superseding push totalled 155 minutes over 10.4 days once the three
+# runner-stall runs are excluded — about 15 minutes a day.
+#
+# Pushes to `main` collapse into one group; pull requests group by number.
+# `test-pr` keeps its own job-level group under a DIFFERENT name, so the two
+# scopes cannot cancel each other or deadlock.
+#
+# The tradeoff, stated rather than buried: cancelling on `main` means a
+# superseded commit ends with no verdict of its own, and a red on the newer run
+# cannot be attributed to one of two commits without a bisect. That is
+# acceptable because the authoritative gate run BEFORE the push is the primary
+# evidence and CI is corroboration.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # #529 S7 (E1). A release stamp is a mechanical two-or-three-file version
   # bump over a tree release Gate 0 has already certified with an
@@ -53,6 +72,96 @@ jobs:
             --after "${{ github.event.after }}" \
             --event-name "${{ github.event_name }}"
 
+  # #630 S4 (F22). A push whose tree an authoritative receipt already covers
+  # does not need the estate run again. Every passing authoritative
+  # `bin/cctally-test-remote` run publishes a small JSON receipt as a git blob
+  # at `refs/cctally/receipts/<tree-oid>/<run-id>` on this repository, and this
+  # job decides whether one of them verifies completely against the pushed tree.
+  #
+  # SEPARATE from `release-stamp-gate` rather than merged into it: the two
+  # answer independent questions, and coupling their failure domains buys
+  # nothing.
+  #
+  # Guarded to the private repository. Without the guard it would run on every
+  # mirror push, which both wastes hosted minutes and changes the
+  # operator-selected public-push outcome — a public push must continue to run
+  # the release classifier and nothing else.
+  #
+  # The lookup key is the TREE OID, not the commit sha: a `--no-ff` merge of a
+  # fast-forwardable branch produces a new commit over an unchanged tree, and
+  # keying on the commit discards evidence the tree retains (measured: 35
+  # discharges of 100 pushes by tree, 16 by commit). Certification is still the
+  # digest, so a receipt minted over selected untracked input simply fails to
+  # reproduce and the estate runs.
+  receipt-gate:
+    # This step puts `secrets.GITHUB_TOKEN` in the environment of code that
+    # comes from the checkout, and on a `pull_request` event the checkout is
+    # the MERGE ref — so without an event guard, fork-authored code would see
+    # the token. The guard therefore deliberately MIRRORS the one on
+    # `test-macos`, this job's only consumer, which already refuses fork PRs:
+    # a context that could never act on the discharge cannot reach the token
+    # either, and same-repository PR discharge is preserved at zero cost.
+    if: >-
+      github.repository == 'omrikais/cctally-dev' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Read-only. This job reads the repository, fetches a ref namespace and
+    # writes one output; it needs no token scope beyond that.
+    permissions:
+      contents: read
+    outputs:
+      discharged: ${{ steps.classify.outputs.discharged }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The reconstruction reads git OBJECTS for one commit, so a shallow
+          # checkout carries everything it needs.
+          persist-credentials: false
+      - id: classify
+        env:
+          RECEIPT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # No `set -x`: a trace would echo the authorization header.
+          #
+          # Errexit is NOT cleared, and deliberately so. GitHub's default shell
+          # for a Linux `run:` without `shell:` is `bash -e {0}`, and `set -uo
+          # pipefail` adds flags without removing `-e`, so an unhandled failure
+          # here aborts the step. That is itself a fail-safe outcome: the job
+          # then ends `result != 'success'`, which leaves the `test-macos`
+          # conjunct true and runs the estate. The explicit `exit 0` paths and
+          # the `|| true` guards below exist so that a failed fetch, an absent
+          # namespace and a malformed candidate end as an ordinary
+          # `discharged=false` decision rather than as a job failure.
+          set -uo pipefail
+          receipts="${RUNNER_TEMP:-/tmp}/receipts"
+          mkdir -p "$receipts"
+          tree=$(git rev-parse 'HEAD^{tree}' 2>/dev/null || true)
+          if ! printf '%s' "$tree" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "receipt-gate: HEAD names no tree object; the estate runs" >&2
+            echo "discharged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # ONE non-persisted authenticated fetch, supplied through `-c` so the
+          # credential is scoped to this single command and never written to
+          # the repository's config. The checkout above persisted none.
+          basic=$(printf 'x-access-token:%s' "$RECEIPT_TOKEN" | base64 | tr -d '\n')
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $basic" \
+              fetch --no-tags origin \
+              "+refs/cctally/receipts/$tree/*:refs/receipts/$tree/*" 2>/dev/null \
+            || echo "receipt-gate: no receipt namespace for tree $tree" >&2
+          for ref in $(git for-each-ref --format='%(refname)' "refs/receipts/$tree/"); do
+            git cat-file blob "$ref" > "$receipts/${ref##*/}.json" 2>/dev/null || true
+          done
+          python3 .github/scripts/classify_receipt.py \
+            --sha "${{ github.sha }}" \
+            --repo . \
+            --receipts-dir "$receipts" \
+            --ref-namespace "$tree" \
+            --summary-file "$GITHUB_STEP_SUMMARY" >> "$GITHUB_OUTPUT"
+
   # test-linux (hosted ubuntu) was disabled to save GH Actions minutes.
   # The self-hosted macOS runner covers push-to-main plus trusted private
   # same-repository PRs; public-mirror/fork PRs use the hosted `test-pr`
@@ -66,14 +175,32 @@ jobs:
     # safety boundary; public-mirror/fork PRs stay on `test-pr` below.
     #
     # The two `release-stamp-gate` clauses are an ADDITIONAL conjunct (#529
-    # S7, E1); the repository and head-repository equalities above are
-    # untouched, so a broken, widened or deleted classifier still cannot put
-    # fork code on the maintainer's machine.
-    needs: [release-stamp-gate]
+    # S7, E1), and the two `receipt-gate` clauses are a second one (#630 S4);
+    # the repository and head-repository equalities above are untouched, so a
+    # broken, widened or deleted classifier still cannot put fork code on the
+    # maintainer's machine.
+    #
+    # The guarantee, stated exactly: while this workflow remains active, a
+    # `receipt-gate` that FAILS, is SKIPPED, or emits a MISSING or MALFORMED
+    # output leaves `result != 'success'` or `discharged != 'true'` true, so the
+    # estate RUNS. Only an explicit successful `discharged == 'true'` skips it.
+    # Two cases that guarantee deliberately does not cover: a CANCELLED run
+    # makes the leading `!cancelled()` false, so the job does not run — correct
+    # for a cancelled run, but not the estate running; and DELETING a job still
+    # named in `needs` makes the workflow graph invalid rather than producing a
+    # non-success result.
+    #
+    # Only `test-macos` carries this conjunct. The receipt certifies
+    # `bin/cctally-test-all`; it does not build the dashboard bundle and it does
+    # not run Playwright, so `dashboard-build-stability` and `e2e-reader` keep
+    # exactly their current guards.
+    needs: [release-stamp-gate, receipt-gate]
     if: >-
       !cancelled() &&
       (needs.release-stamp-gate.result != 'success' ||
        needs.release-stamp-gate.outputs.skipHeavy != 'true') &&
+      (needs.receipt-gate.result != 'success' ||
+       needs.receipt-gate.outputs.discharged != 'true') &&
       github.repository == 'omrikais/cctally-dev' &&
       (github.event_name == 'push' ||
        (github.event_name == 'pull_request' &&

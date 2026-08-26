@@ -327,12 +327,27 @@ class Estate:
 
 def verify(root: pathlib.Path) -> tuple[int, list[str], list[str]]:
     """``(exit_code, problems, notes)``."""
-    problems: list[str] = []
-    notes: list[str] = []
     try:
         estate = Estate(root)
     except Defect as exc:
-        return EXIT_DEFECT, [str(exc)], notes
+        return EXIT_DEFECT, [str(exc)], []
+    problems, notes = estate_problems(estate)
+    return (EXIT_DEFECT if problems else EXIT_OK), problems, notes
+
+
+def estate_problems(estate: Estate) -> tuple[list[str], list[str]]:
+    """``(problems, notes)`` for an estate that is already constructed.
+
+    Split out of ``verify`` so the QUERY path can run the same comparison
+    (#630 S7). Estate equality proves the estate's NAMES; it says nothing about
+    whether the ownership declarations used to narrow are true, and only a
+    direct declaration narrows. ``verify``'s own CLI contract is unchanged: it
+    still constructs the estate, prints these problems and maps them to
+    ``EXIT_DEFECT``.
+    """
+    root = estate.root
+    problems: list[str] = []
+    notes: list[str] = []
 
     notes.append("profile: %s" % estate.profile)
     if estate.overlay_present:
@@ -432,7 +447,7 @@ def verify(root: pathlib.Path) -> tuple[int, list[str], list[str]]:
                 "path therefore widens to the whole shell estate." % (name, reason)
             )
 
-    return (EXIT_DEFECT if problems else EXIT_OK), problems, notes
+    return problems, notes
 
 
 # -------------------------------------------------------------------- query
@@ -552,6 +567,19 @@ def attribute(estate: Estate, paths: list[str]) -> Attribution:
         widened.append(
             "harness '%s' is opaque: some fixture edge could not be proved from "
             "its text" % name
+        )
+
+    # #630 S7. Only a DIRECT declaration narrows, and until now nothing on this
+    # path ever asked whether the declarations were true. The admission gate in
+    # bin/cctally-test-all proves the estate's NAMES in both directions; it says
+    # nothing about ownership correctness, so a stale or false direct fixture
+    # declaration narrowed `safe` while producing no widening reason at all.
+    # Running the same comparison verify() runs closes that, and it must run
+    # BEFORE a narrow result is accepted rather than after (ordering hazard 5).
+    for problem in estate_problems(estate)[0]:
+        widened.append(
+            "the ownership declarations do not agree with the estate, so no "
+            "narrowing derived from them can be trusted: %s" % problem
         )
 
     if not paths:

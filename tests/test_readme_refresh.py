@@ -294,10 +294,69 @@ def test_lint_clean_text_returns_empty():
 # --------------------------------------------------------------------------
 # Live CHANGELOG + standing README guard
 # --------------------------------------------------------------------------
-def test_live_changelog_v1810_extracts_clean():
+# The first three bullets of the released v1.81.0 `### Added` subsection, copied
+# out of CHANGELOG.md verbatim, and the three strings extract_highlights turns
+# them into. Both are written out here rather than recomputed from the file,
+# because the version this replaced computed its expected value from the same
+# three lines the kernel reads, by nearly the same rule. Both sides therefore
+# moved together, and a rewrite that replaced every word of the section left it
+# green. A literal is the only form of the pin that cannot do that.
+V1810_ADDED_FIRST_THREE = (
+    "cctally tracks usage per account for each provider. If you use more than "
+    "one Claude or Codex account on this machine, each account's percent, "
+    "5-hour and quota milestones — and their alerts — are recorded and fire "
+    "independently.",
+    "`cctally account list|show|label` shows every observed account with its "
+    "provider, label, email, plan, first and last seen, and which is active, "
+    "and lets you set a durable friendly label that survives a stats rebuild.",
+    "Optional per-account weekly budgets through `config set budget.accounts` "
+    "and `config set budget.codex.accounts`. A budget targets an immutable "
+    "account even after you rename its label.",
+)
+V1810_EXPECTED_HIGHLIGHTS = (
+    "cctally tracks usage per account for each provider. If you use more than "
+    "one Claude or Codex account on this machine, each account's percent, "
+    "5-hour and quota milestones, and their alerts, are recorded and fire "
+    "independently.",
+    V1810_ADDED_FIRST_THREE[1],
+    V1810_ADDED_FIRST_THREE[2],
+)
+
+
+def test_live_changelog_v1810_extracts_the_pinned_highlights():
+    """Two literals: what the section says, and what the kernel makes of it.
+
+    PINNED. The exact text and order of the first three bullets of the real
+    v1.81.0 `### Added` subsection, and the exact text and order of the three
+    highlights `extract_highlights` returns for that version. Reword any of
+    those bullets, reorder them, delete one, or add an issue reference to one,
+    and one or both assertions fail. The two are separate because the kernel
+    strips a terminal `(#NNN)` before normalizing, so an issue reference added
+    to a pinned bullet is invisible in the extractor's output and is caught only
+    by the raw pin. It also pins that all three survive the copy lint, which is
+    what the README's block requires of a highlight.
+
+    NOT PINNED. Every other release section, and the README. Whether the
+    README's block agrees with the changelog is
+    ``test_committed_latest_stable_block_is_internally_consistent_not_current``,
+    and that test reads whatever version the README names, which is not this one.
+
+    v1.81.0 is released, so its section is frozen and these literals are not
+    expected to need updating. A failure is therefore either an edit to
+    published history or a change in how the kernel extracts, and both are
+    worth stopping for.
+    """
     text = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    section = text.split("\n## [1.81.0]", 1)[1].split("\n## [", 1)[0]
+    added = section.split("### Added", 1)[1].split("\n### ", 1)[0]
+    raw = tuple(
+        line[2:] for line in added.split("\n") if line.startswith("- ")
+    )[:3]
+    assert raw == V1810_ADDED_FIRST_THREE
+
     bullets = extract_highlights(text, "1.81.0")
-    assert len(bullets) == 3
+    assert bullets == list(V1810_EXPECTED_HIGHLIGHTS)
     for b in bullets:
         assert lint_copy("- " + b) == [], b
 
@@ -310,43 +369,191 @@ def test_readme_copy_lint_clean_and_markers_present():
     assert text.index(MARKER_BEGIN) < text.index(MARKER_END)
 
 
-def test_committed_block_matches_kernel_render_for_v1810():
-    # The committed latest-stable block must equal what the kernel renders from
-    # the CHANGELOG for the same version. Valid only while the block still says
-    # v1.81.0 (the refresh op rewrites it on the next stable release).
+class ReadmeBlockMalformed(AssertionError):
+    """The committed marker interior does not parse.
+
+    An ``AssertionError`` rather than a bare exception because a malformed
+    interior IS the failure. The two tests this replaced each opened with
+    ``if "v1.81.0" not in interior: pytest.skip(...)``, so the day the block
+    stopped naming that version they stopped checking anything and said nothing.
+    """
+
+
+_HEADER_PREFIX = "**Latest stable: v"
+_SPAN_PREFIX = "Highlights from the `v"
+_SPAN_MIDDLE = "` to `v"
+_SPAN_SUFFIX = "` stable upgrade:"
+_LINK_PREFIX = "[See every change in this stable upgrade]("
+
+
+def _public_repo() -> str:
+    """``PUBLIC_REPO`` read out of ``bin/cctally`` without importing the CLI.
+
+    Derived from the tree so it cannot drift from the constant the release path
+    builds the same URL from, and read by AST so this leaf test does not take on
+    the whole CLI's import surface for one string.
+    """
+    import ast
+
+    tree = ast.parse((REPO_ROOT / "bin" / "cctally").read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "PUBLIC_REPO":
+                return ast.literal_eval(node.value)
+    raise ReadmeBlockMalformed("bin/cctally declares no PUBLIC_REPO")
+
+
+def parse_latest_stable_interior(interior: str):
+    """(version, date, previous_stable, release_url), or RAISE.
+
+    There is no "nothing to check" return. Every component it extracts is
+    required to agree with the version in the header, so a block whose header,
+    span sentence and release link disagree is a failure rather than a partial
+    match.
+    """
+    if not interior.startswith("\n") or not interior.endswith("\n"):
+        raise ReadmeBlockMalformed(
+            "the marker interior must begin and end with a newline"
+        )
+    lines = interior[1:-1].split("\n")
+    headers = [line for line in lines if line.startswith(_HEADER_PREFIX)]
+    if len(headers) != 1:
+        raise ReadmeBlockMalformed(
+            f"expected exactly one latest-stable header line, found {len(headers)}"
+        )
+    if lines[0] != headers[0]:
+        raise ReadmeBlockMalformed(
+            "the latest-stable header must be the first line of the block"
+        )
+    version, sep, tail = headers[0][len(_HEADER_PREFIX):].partition("** (")
+    if not sep or not tail.endswith(")") or not version or len(tail) < 2:
+        raise ReadmeBlockMalformed(f"unparseable header line: {headers[0]!r}")
+    date = tail[:-1]
+
+    spans = [line for line in lines if line.startswith(_SPAN_PREFIX)]
+    if len(spans) > 1:
+        raise ReadmeBlockMalformed(f"expected at most one span sentence, found {len(spans)}")
+    previous_stable = None
+    if spans:
+        previous_stable, sep, tail = spans[0][len(_SPAN_PREFIX):].partition(_SPAN_MIDDLE)
+        if not sep or not tail.endswith(_SPAN_SUFFIX) or not previous_stable:
+            raise ReadmeBlockMalformed(f"unparseable span sentence: {spans[0]!r}")
+        span_target = tail[: -len(_SPAN_SUFFIX)]
+        if span_target != version:
+            raise ReadmeBlockMalformed(
+                f"the span sentence names v{span_target} but the header names v{version}"
+            )
+
+    links = [line for line in lines if line.startswith(_LINK_PREFIX)]
+    if len(links) > 1:
+        raise ReadmeBlockMalformed(f"expected at most one release link, found {len(links)}")
+    release_url = None
+    if links:
+        if not links[0].endswith(")"):
+            raise ReadmeBlockMalformed(f"unparseable release link: {links[0]!r}")
+        release_url = links[0][len(_LINK_PREFIX):-1]
+        if not release_url.endswith(f"/releases/tag/v{version}"):
+            raise ReadmeBlockMalformed(
+                f"the release link points at {release_url}, which does not name v{version}"
+            )
+
+    if (previous_stable is None) != (release_url is None):
+        raise ReadmeBlockMalformed(
+            "a stable-span block carries both the span sentence and the release "
+            "link, or neither"
+        )
+    return version, date, previous_stable, release_url
+
+
+def test_committed_latest_stable_block_is_internally_consistent_not_current():
+    """The committed block equals what the kernel renders for the version IT names.
+
+    This verifies CONSISTENCY, not CURRENCY, and the distinction is the point.
+    The target version is read out of the README, so a release that fails to
+    update the README leaves this test extracting the stale version, finding its
+    retained CHANGELOG section, rendering it and passing. Nothing in the tree
+    carries an independent offline notion of channel state — the release path
+    takes it from the immutable tag and the full GitHub release inventory — so
+    currency belongs to the release path and this test is named for what it
+    actually holds.
+
+    What it does hold is unskippable. It replaces two tests that each hard-coded
+    a version and skipped when the block no longer named it: #354 wrote the
+    v1.81.0 one, it died silently on 2026-07-25, and the response was a second
+    pinned test for v1.101.0 rather than a repaired guard. A malformed interior
+    fails here; there is no `pytest.skip` in this test at any version.
+    """
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     interior = readme[
         readme.index(MARKER_BEGIN) + len(MARKER_BEGIN):readme.index(MARKER_END)
     ]
-    if "v1.81.0" not in interior:
-        pytest.skip("committed latest-stable block is no longer v1.81.0")
+    version, _date, previous_stable, _url = parse_latest_stable_interior(interior)
+
     changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    bullets = extract_highlights(changelog, "1.81.0")
-    date = changelog_release_date(changelog, "1.81.0")
-    block = render_latest_stable_block("1.81.0", date, bullets)
+    bullets = extract_highlights(changelog, version)
+    date = changelog_release_date(changelog, version)
+    if previous_stable is None:
+        block = render_latest_stable_block(version, date, bullets)
+    else:
+        block = render_latest_stable_block(
+            version,
+            date,
+            bullets,
+            previous_stable=previous_stable,
+            release_url=(
+                f"https://github.com/{_public_repo()}/releases/tag/v{version}"
+            ),
+        )
     assert interior == "\n" + block + "\n"
 
 
-def test_committed_block_matches_stable_span_render_for_v11010():
-    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    interior = readme[
-        readme.index(MARKER_BEGIN) + len(MARKER_BEGIN):readme.index(MARKER_END)
-    ]
-    if "v1.101.0" not in interior:
-        pytest.skip("committed latest-stable block is no longer v1.101.0")
-    changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    bullets = extract_highlights(changelog, "1.101.0")
-    date = changelog_release_date(changelog, "1.101.0")
-    block = render_latest_stable_block(
-        "1.101.0",
-        date,
-        bullets,
-        previous_stable="1.95.5",
-        release_url=(
-            "https://github.com/omrikais/cctally/releases/tag/v1.101.0"
-        ),
+@pytest.mark.parametrize(
+    "corruption,expected",
+    [
+        ("no header", "exactly one latest-stable header line"),
+        ("span disagrees", "span sentence names"),
+        ("link disagrees", "does not name"),
+        ("two headers", "found 2"),
+        ("half a span", "both the span sentence"),
+    ],
+)
+def test_a_malformed_interior_fails_rather_than_reporting_nothing_to_check(
+    corruption, expected
+):
+    """The parse must never answer "no version found, nothing to check".
+
+    That answer is what the two version-pinned predecessors gave, in the form of
+    a skip, and it is why a dead guard stayed green for a month. Each case below
+    is a real corruption of the committed shape.
+    """
+    good = (
+        "\n**Latest stable: v9.9.9** (2026-01-01)\n"
+        "\nHighlights from the `v9.9.8` to `v9.9.9` stable upgrade:\n"
+        "\n- a highlight\n"
+        "\n[See every change in this stable upgrade]"
+        "(https://github.com/omrikais/cctally/releases/tag/v9.9.9)\n"
     )
-    assert interior == "\n" + block + "\n"
+    # The good shape must parse, or every case below would pass vacuously.
+    assert parse_latest_stable_interior(good) == (
+        "9.9.9", "2026-01-01", "9.9.8",
+        "https://github.com/omrikais/cctally/releases/tag/v9.9.9",
+    )
+    broken = {
+        "no header": good.replace("**Latest stable: v9.9.9**", "Latest stable 9.9.9"),
+        "span disagrees": good.replace("to `v9.9.9` stable", "to `v9.9.7` stable"),
+        "link disagrees": good.replace("releases/tag/v9.9.9", "releases/tag/v9.9.7"),
+        "two headers": good + "**Latest stable: v9.9.8** (2025-01-01)\n",
+        "half a span": good.replace(
+            "\n[See every change in this stable upgrade]"
+            "(https://github.com/omrikais/cctally/releases/tag/v9.9.9)\n",
+            "\n",
+        ),
+    }[corruption]
+    with pytest.raises(ReadmeBlockMalformed) as exc:
+        parse_latest_stable_interior(broken)
+    assert expected in str(exc.value), str(exc.value)
 
 
 def test_check_cli(tmp_path):

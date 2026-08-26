@@ -18,12 +18,13 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 # Every HOME-derived path constant resolves under a per-test directory
-# (#529 S4). This module loads bin/cctally (or a sibling) through
-# SourceFileLoader or at import, and neither re-derives the path constants,
-# so pinning HOME alone would leave whatever the previous test on this xdist
-# worker left behind -- which is why it was green alone and red under -n 4.
+# (#529 S4). The sibling modules this file loads at import do not re-derive the
+# path constants, so pinning HOME alone would leave whatever the previous test
+# on this xdist worker left behind -- which is why it was green alone and red
+# under -n 4.
 pytestmark = pytest.mark.usefixtures("isolated_paths")
 
 BIN_DIR = Path(__file__).resolve().parent.parent / "bin"
@@ -31,16 +32,11 @@ BIN_DIR = Path(__file__).resolve().parent.parent / "bin"
 
 @pytest.fixture(scope="module")
 def cctally_module():
-    # bin/cctally has no .py suffix → explicit SourceFileLoader. Loading it
-    # registers the sibling modules (_cctally_cache, _cctally_db) on the
-    # `cctally` namespace and the cache migrations.
+    # Loading bin/cctally registers the sibling modules (_cctally_cache,
+    # _cctally_db) and the cache migrations on the `cctally` namespace.
     if str(BIN_DIR) not in sys.path:
         sys.path.insert(0, str(BIN_DIR))
-    loader = SourceFileLoader("cctally", str(BIN_DIR / "cctally"))
-    spec = ilu.spec_from_loader("cctally", loader)
-    mod = ilu.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
+    mod = load_script_module()
     return mod
 
 

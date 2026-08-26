@@ -635,6 +635,104 @@ def test_an_advisory_source_edge_never_narrows(tmp_path) -> None:
     assert "alpha" in human.stdout
 
 
+def _required_estate(root: pathlib.Path) -> set[str]:
+    """The manifest names this tree's profile requires, read the same way
+    bin/cctally-test-owners reads them."""
+    return set(owners.Estate(root).required)
+
+
+def test_the_committed_map_still_widens_a_bin_module() -> None:
+    """#630 S7 / F39. The synthetic case above proves the RULE. This proves the
+    COMMITTED map still obeys it, which nothing asserted before the tier turned
+    attribution into a scheduling decision.
+
+    `shellcheck` declares `bin` as a sourcePath, and that is a truthful
+    statement — the harness does lint shell scripts across bin/. The risk F39
+    named is a consumer scheduling from `advisory_owners_of`, at which point
+    bin/_lib_share.py maps to a shell-syntax linter and to nothing else.
+
+    Both halves are load-bearing, in opposite directions. If a future edit gave
+    this path a DIRECT owner, `safe` would narrow and the second half fails. If
+    a future edit deleted shellcheck's sourcePaths, the path would become
+    unattributed — which also widens, so the second half would still pass and
+    only the first half catches it. Either assertion alone is satisfiable by a
+    map that has lost the property."""
+    human = _run("--repo-root", str(ROOT), "bin/_lib_share.py")
+    assert human.returncode == 0, human.stdout + human.stderr
+    assert "shellcheck" in human.stdout, human.stdout
+    assert "advisory" in human.stdout.lower(), human.stdout
+
+    names = _run("--names-only", "--repo-root", str(ROOT), "bin/_lib_share.py")
+    assert names.returncode == 0, names.stdout + names.stderr
+    required = _required_estate(ROOT)
+    # #630 S7 / Task 2 review. The comparison below is between a derived
+    # quantity and itself — `_required_estate` builds the same Estate and reads
+    # the same attribute bin/cctally-test-owners does — so it would hold as
+    # `set() == set()` if `required` ever became empty. The anchor is what
+    # separates "widened to the whole estate" from "there was no estate".
+    assert len(required) > 1, required
+    assert _safe_set(names) == required, (
+        "an advisory-only match must widen to the whole required estate"
+    )
+
+
+def _break_a_direct_fixture_declaration(root: pathlib.Path) -> None:
+    """Give `alpha` a DIRECT fixturePaths claim over a fixture directory its own
+    text never reaches.
+
+    This is the class §3.3 names: a direct declaration is the only evidence that
+    narrows, and nothing on the query path ever checked whether it was true. The
+    directory is created on disk so the only remaining inconsistency is the
+    declaration-versus-scrape one, rather than a second, unrelated problem."""
+    path = root / "tests" / "harness-ownership.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["harnesses"]["alpha"]["fixturePaths"] = sorted(
+        set(doc["harnesses"]["alpha"]["fixturePaths"]) | {"tests/fixtures/gamma"}
+    )
+    path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    (root / "tests" / "fixtures" / "gamma").mkdir(parents=True, exist_ok=True)
+
+
+def test_a_false_direct_declaration_widens_rather_than_narrowing(tmp_path) -> None:
+    """#630 S7 / pre-plan review P1. Estate equality proves the estate's NAMES;
+    it says nothing about whether the ownership data is TRUE. verify() performs
+    that comparison, and the ordinary query path constructed Estate(root) and
+    called attribute() without ever running it — so a stale or false direct
+    declaration narrowed `safe` while producing no widening reason at all."""
+    _query_tree(tmp_path)
+    # The in-test control. Without it this case cannot tell "widened because the
+    # declarations disagree" from "this query never narrowed in the first place".
+    control = _run(
+        "--names-only", "--repo-root", str(tmp_path),
+        "tests/fixtures/alpha/case/db.sqlite",
+    )
+    assert _safe_set(control) == {"alpha"}, control.stdout
+
+    _break_a_direct_fixture_declaration(tmp_path)
+    res = _run(
+        "--names-only", "--repo-root", str(tmp_path),
+        "tests/fixtures/alpha/case/db.sqlite",
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert _safe_set(res) == {"alpha", "beta", "gamma"}, res.stdout
+
+    # The operator is told WHY, in the same report that used to narrow silently.
+    human = _run(
+        "--repo-root", str(tmp_path), "tests/fixtures/alpha/case/db.sqlite"
+    )
+    assert "ownership declarations" in human.stdout, human.stdout
+
+
+def test_verify_keeps_its_own_exit_contract_on_a_broken_tree(tmp_path) -> None:
+    """The query path now runs the same comparison, but --verify is unchanged:
+    it still reports the problem on stderr and exits EXIT_DEFECT."""
+    _query_tree(tmp_path)
+    _break_a_direct_fixture_declaration(tmp_path)
+    res = _run("--verify", "--repo-root", str(tmp_path))
+    assert res.returncode == owners.EXIT_DEFECT, res.stdout + res.stderr
+    assert "tests/fixtures/gamma" in res.stderr, res.stderr
+
+
 def test_an_opaque_harness_widens_the_whole_answer(tmp_path) -> None:
     _make_tree(
         tmp_path,

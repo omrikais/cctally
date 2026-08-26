@@ -12,13 +12,13 @@ post.sqlite = the row UNCHANGED + the flag set + the 005 marker.
 """
 from __future__ import annotations
 
-import importlib.util as ilu
 import shutil
 import sqlite3
 import sys
 from pathlib import Path
 
 import pytest
+from _script_loader import load_script_module  # the ONE cctally loader (#630 S6)
 
 
 IDEMPOTENCY_COVERED = True
@@ -38,15 +38,9 @@ FLAG_KEY = "conversation_reingest_pending"
 
 @pytest.fixture(scope="module")
 def cctally_module():
-    from importlib.machinery import SourceFileLoader
-
     if str(BIN_DIR) not in sys.path:
         sys.path.insert(0, str(BIN_DIR))
-    loader = SourceFileLoader("cctally", str(BIN_DIR / "cctally"))
-    spec = ilu.spec_from_loader("cctally", loader)
-    mod = ilu.module_from_spec(spec)
-    sys.modules["cctally"] = mod
-    loader.exec_module(mod)
+    mod = load_script_module()
     return mod
 
 

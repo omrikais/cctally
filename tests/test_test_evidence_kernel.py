@@ -422,6 +422,13 @@ def test_a_safe_control_line_survives_byte_for_byte():
     assert K.scrub_line(safe, _ctx()) == safe
 
 
+def test_a_control_byte_is_not_admitted_as_blank_whitespace():
+    """A bare control byte must not ride through the blank-line exemption."""
+    out = K.scrub_line("\x1f", _ctx())
+    assert out == K.UNCLASSIFIED_PLACEHOLDER, out
+    assert K.validate_export([out], ROOTS) == []
+
+
 def test_a_generated_progress_line_survives_byte_for_byte():
     # The progress family reaches the export through the prefix path, whose
     # suffix is scrubbed; a real completion line must still come back whole.
@@ -584,6 +591,14 @@ def test_unclassifiable_prose_is_redacted_not_passed_through():
     assert out == "[REDACTED: unclassified line]"
 
 
+def test_single_quoted_prose_is_redacted_when_vocabulary_misses_it(monkeypatch):
+    """Python repr prose must not depend on the vocabulary backstop alone."""
+    raw = "assert 'acme holdings quarterly merger summary' == expected"
+    monkeypatch.setattr(K, "unknown_vocabulary", lambda text, ctx, spans=(): [])
+    out = K.scrub_line(raw, _open_ctx())
+    assert "acme holdings quarterly merger summary" not in out, out
+
+
 def test_prose_carrying_a_known_root_is_still_redacted():
     # Substituting a known root does not make the rest of the sentence safe.
     line = (
@@ -606,6 +621,18 @@ def test_a_repo_relative_path_survives_when_the_predicate_says_public():
     assert "bin/cctally-test-all" in out
     out2 = K.scrub_line("bin/cctally-test-remote:1: boom", ctx)
     assert "cctally-test-remote" not in out2
+
+
+def test_a_shell_default_does_not_hide_an_absolute_path_as_relative():
+    line = 'local TMPDIR="${TMPDIR:-/tmp}"'
+    ctx = K.ScrubContext(
+        is_public_path=lambda path: True,
+        known_tokens=KNOWN_TOKENS | {"local"},
+    )
+    out = K.scrub_line(line, ctx)
+    assert out != line, out
+    assert "/tmp" not in out, out
+    assert K.validate_export([out], ROOTS) == []
 
 
 def test_diff_coordinates_survive_but_payload_without_provenance_does_not():
@@ -1447,9 +1474,8 @@ GOLDEN_DIFF_LITERALS = (
 
 @pytest.mark.parametrize("line", GOLDEN_DIFF_LITERALS)
 def test_the_validator_accepts_the_canonical_failure_line(line):
-    # A failed validation leaves no export at all, so a false positive here is
-    # an availability failure, not a conservative one: it converts a detector
-    # into an outage on exactly the runs the extract exists for.
+    # A validator false positive removes this canonical failure line, so it is
+    # an availability failure rather than a conservative success.
     scrubbed = K.scrub_line(line, _ctx())
     assert K.validate_export([scrubbed], ROOTS) == [], (line, scrubbed)
 
@@ -1811,9 +1837,8 @@ GOOD_EXTRACT_LINE = "[cctally-test-all] run r-1: sanitized failure extract over 
 # A STRUCTURAL violation: the counters leg, one of the three legs whose false
 # positives motivated per-line degradation.
 BAD_EXTRACT_LINE = "1 failed, 100 sprocketed in 45.67s"
-# A CONTENT violation: production prose the transformer was supposed to have
-# removed. This is what a partial transformer fault leaks, and one of them is
-# enough to withhold the whole export.
+# A heuristic prose violation. Its own line is removed, while neighbouring
+# sanitizer-vouched evidence remains publishable.
 LEAKED_CONTENT_LINE = (
     "the project reported an unexpected balance for this customer today"
 )
@@ -1845,22 +1870,17 @@ def test_a_flagged_line_is_replaced_and_the_rest_of_the_extract_survives():
     assert K.validate_export(out + [record["notice"]], ROOTS) == []
 
 
-def test_one_content_violation_refuses_the_whole_export():
-    """The systemic-breakage escape, decided by KIND rather than by volume.
-
-    A content violation means the transformer emitted a payload it was
-    supposed to have removed, so the UNFLAGGED lines cannot be trusted either
-    and there is nothing safe to publish. One is enough, and the rate it
-    arrives at says nothing about whether it is safe.
-    """
+def test_one_free_form_violation_degrades_only_its_line():
+    """A heuristic prose hit cannot erase sanitizer-vouched neighbouring lines."""
     lines = [GOOD_EXTRACT_LINE] * 99 + [LEAKED_CONTENT_LINE]
     violations = K.validate_export(lines, ROOTS)
     assert [v["reason"] for v in violations] == ["free-form-text"], violations
     out, record = K.apply_validation_redactions(lines, violations, ROOTS)
-    assert record["refused"] is True, record
-    assert record["refusal"] == "free-form-text", record
-    assert record["notice"] is None, record
-    assert out == lines
+    assert record["refused"] is False, record
+    assert record["refusal"] is None, record
+    assert LEAKED_CONTENT_LINE not in out, out
+    assert out.count(GOOD_EXTRACT_LINE) == 99, out
+    assert record["notice"] and "1 of 100" in record["notice"], record
 
 
 def test_a_structural_violation_degrades_per_line_at_any_rate():
@@ -1882,33 +1902,32 @@ def test_a_structural_violation_degrades_per_line_at_any_rate():
     assert record["notice"] and "5 of 10" in record["notice"], record
 
 
-def test_a_content_violation_refuses_even_beside_structural_ones():
+def test_a_denylist_content_violation_refuses_even_beside_per_line_ones():
     """The mixed case, and the reason the refusal cause is recorded.
 
-    The content violation is not first in the list, so a caller reporting
-    `violations[0]["reason"]` would name the structural leg — a leg that did
-    not cause the refusal and whose false positives are precisely why the
-    per-line degradation exists.
+    The denylist content violation is not first in the list, so a caller
+    reporting `violations[0]["reason"]` would name the structural leg — a leg
+    that did not cause the refusal and whose false positives are precisely why
+    the per-line degradation exists.
     """
-    lines = [BAD_EXTRACT_LINE] * 3 + [LEAKED_CONTENT_LINE] + [
+    leaked_email = "maintainer@example.invalid"
+    lines = [BAD_EXTRACT_LINE] * 3 + [LEAKED_CONTENT_LINE, leaked_email] + [
         GOOD_EXTRACT_LINE] * 20
     violations = K.validate_export(lines, ROOTS)
     assert violations[0]["reason"] == "unknown-counter-word", violations
     _out, record = K.apply_validation_redactions(lines, violations, ROOTS)
     assert record["refused"] is True, record
-    assert record["refusal"] == "free-form-text", record
+    assert record["refusal"] == "email", record
 
 
 @pytest.mark.parametrize("reason", sorted(
-    {name for name, _ in K._FORBIDDEN} | {"unsubstituted-root",
-                                          "free-form-text"}))
-def test_every_content_leg_is_outside_the_structural_set(reason):
+    {name for name, _ in K._FORBIDDEN} | {"unsubstituted-root"}))
+def test_every_denylist_content_leg_is_outside_the_per_line_set(reason):
     """The classification, checked against the leg table rather than against a
-    transcription of it. A leg added to `_FORBIDDEN` later is a content leg
+    transcription of it. A leg added to `_FORBIDDEN` later is a denylist leg
     by default, which is the fail-closed direction; this pins that it stays
     one."""
-    assert reason not in K.STRUCTURAL_VIOLATION_REASONS, reason
-
+    assert reason not in K.PER_LINE_VIOLATION_REASONS, reason
 
 # A failing pytest log of the shape this estate really produces, used to
 # measure what a PARTIAL transformer fault publishes.
@@ -1933,34 +1952,25 @@ PARTIAL_FAULT_LEAK = (
 )
 
 
-def test_a_vocabulary_stage_fault_withholds_the_whole_extract(monkeypatch):
-    """The measured case that retired the proportional threshold.
-
-    The transformer's stages fail independently. A fault confined to the
-    vocabulary stage leaves root substitution and the path predicate working,
-    so neither of those legs fires and only `free-form-text` catches anything
-    — a leg needing six words, no digits and a 0.95 letters-and-spaces ratio,
-    which most real log lines miss. The flagged proportion is therefore far
-    below any threshold worth setting, while production content publishes
-    verbatim.
-    """
+def test_a_vocabulary_stage_fault_redacts_every_detected_leak(monkeypatch):
+    """Quote and prose backstops fail closed per line when vocabulary breaks."""
     ctx = _open_ctx()
     monkeypatch.setattr(
         K, "unknown_vocabulary", lambda text, c, spans=(): []
     )
     out = [K.scrub_line(line, ctx) for line in PARTIAL_FAULT_LOG]
-    # Non-vacuity: production content really did survive the transformer, and
-    # no leg flagged the line carrying it. Single-quoted prose is invisible to
-    # both quoted-span legs, which are written over double quotes.
-    assert PARTIAL_FAULT_LEAK in out, out
+    # The single-quoted repr is independently stopped by the transformer.
+    assert PARTIAL_FAULT_LEAK not in out, out
+    # The unquoted sentence demonstrates that the injected vocabulary fault
+    # really fired and leaves work for the independent validator.
+    assert LEAKED_CONTENT_LINE in out, out
     violations = K.validate_export(out, ROOTS)
     assert [v["reason"] for v in violations] == ["free-form-text"], violations
-    assert not any(v["excerpt"] == PARTIAL_FAULT_LEAK for v in violations)
-    # Well under the quarter the withdrawn threshold escaped at.
-    assert len(violations) / len(out) < 0.25, violations
-    _lines, record = K.apply_validation_redactions(out, violations, ROOTS)
-    assert record["refused"] is True, record
-    assert record["refusal"] == "free-form-text", record
+    assert violations[0]["excerpt"] == LEAKED_CONTENT_LINE, violations
+    redacted, record = K.apply_validation_redactions(out, violations, ROOTS)
+    assert record["refused"] is False, record
+    assert LEAKED_CONTENT_LINE not in redacted, redacted
+    assert K.validate_export(redacted + [record["notice"]], ROOTS) == []
 
 
 def test_an_unclassifiable_violation_refuses_rather_than_degrading():
@@ -2233,12 +2243,19 @@ def test_the_validator_still_admits_relative_and_placeholder_paths():
     # outage.
     assert K.validate_export([
         "bin/cctally-test-all:373: boom",
+        "python3 bin/cctally-mirror-public --public-clone ../public --reconcile --yes",
         '  File "bin/cctally-test-all", line 42, in main',
         "FAIL: dedup <home><path>",
         "--- <path>",
         "[ 38/56] PASS  diff  340 cases  48s",
         "[TRUNCATED: 4 lines omitted; full log retained at logs/share.log]",
     ], ROOTS) == []
+
+
+def test_the_validator_catches_single_quoted_prose_inside_an_assertion():
+    line = "E       assert 'acme holdings quarterly merger summary' == expected"
+    violations = K.validate_export([line], ROOTS)
+    assert [v["reason"] for v in violations] == ["free-form-text"], violations
 
 
 # Each entry is rejected by exactly one leg of the transformer's ordinariness
@@ -2816,4 +2833,3 @@ def test_the_cap_stays_within_twice_the_uncompressed_worst_case():
     projected = _projected_working_set_bytes(
         MEASURED_DURATIONS_UNCOMPRESSED_BYTES)
     assert K.DEFAULT_MAX_BYTES <= projected * 2, (K.DEFAULT_MAX_BYTES, projected)
-

@@ -12,30 +12,21 @@ Precedence (top wins):
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import sys
-from pathlib import Path
 
 import pytest
 
-CCTALLY = Path(__file__).resolve().parent.parent / "bin" / "cctally"
+from _script_loader import load_script_module
 
 
 @pytest.fixture(scope="module")
 def cctally_mod():
-    """Load ``bin/cctally`` as a Python module so we can call helpers directly.
+    """Load ``bin/cctally`` under its own identity and keep that reference.
 
-    ``bin/cctally`` has no ``.py`` extension, so ``spec_from_file_location``
-    needs an explicit ``SourceFileLoader`` to recognize it as Python source.
+    The ``cctally_cli`` name gives this module a durable ``sys.modules`` entry
+    that later ``load_script()`` calls, which rebind ``sys.modules["cctally"]``,
+    do not disturb.
     """
-    from importlib.machinery import SourceFileLoader
-
-    loader = SourceFileLoader("cctally_cli", str(CCTALLY))
-    spec = importlib.util.spec_from_loader("cctally_cli", loader)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["cctally_cli"] = mod
-    loader.exec_module(mod)
-    return mod
+    return load_script_module("cctally_cli")
 
 
 def _ns(**kwargs):

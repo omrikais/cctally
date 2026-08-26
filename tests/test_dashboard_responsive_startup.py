@@ -400,7 +400,8 @@ def _load_with_corpus(monkeypatch, tmp_path, small_corpus):
     """
     src_root = pathlib.Path(small_corpus).parent
     root = tmp_path / "corpus"
-    shutil.copytree(src_root, root)
+    shutil.copytree(src_root, root,
+                    ignore=shutil.ignore_patterns("*.db-shm", "*.db-wal"))
     for lock in (root / "data").glob("*.lock"):
         try:
             lock.unlink()

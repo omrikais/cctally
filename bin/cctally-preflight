@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Seconds-scale static pre-flight for a full-suite round trip (#529 S5 §5).
 
-Three checks, in order:
+Seven checks, in order:
 
   1. Compile every Python file under bin/ without writing bytecode. Files are
      selected by `.py` extension OR by a Python shebang: bin/cctally is
@@ -11,28 +11,156 @@ Three checks, in order:
   2. Syntax-check every shell script under bin/, with the interpreter chosen
      per file from its own shebang rather than assumed.
   3. Invoke bin/cctally-test-owners --verify.
+  4. Validate tests/authoritative-harness-durations.tsv against the estate
+     manifest, through the SAME validator the dispatch scheduler applies. The
+     scheduler treats a bad table as a non-fatal fallback, because a stale
+     table must never fail a gate; this is where it is refused instead, at the
+     keyboard rather than sixteen minutes later.
+  5. Ask bin/cctally-test-all's side-effect-free plan mode for the dispatch
+     decision it would take, and require `scheduler=lpt`. Check 4 reads the
+     same three files the scheduler reads and would pass while the scheduler
+     still fell back at run time: python3 absent or answering non-zero,
+     _lib_harness_durations unimportable from <root>/bin, or a broken
+     shell-side capture are all silent fallbacks no file validation can see.
+     A tree carrying no aggregator has no plan to report and is not faulted.
+  6. Classify every manifest row's harness path against .mirror-allowlist and
+     compare it with the declared visibility. Private profile only. The
+     authoritative admission check on the runner is unchanged; this is
+     duplicate LOCAL coverage of a check that reads three files and executes
+     nothing, and today costs a full round trip to discover.
+  7. Check CHANGELOG.md against the user-facing entry policy in
+     docs/changelog-policy.md, through the same pure kernel and the same two
+     path predicates bin/cctally-changelog-lint applies. The file publishes to
+     the public repository verbatim and is reused as a release-note body and a
+     mirror commit message, so a non-compliant entry is an outward-facing
+     defect; catching it here costs a parse of one file.
+
+Checks 4, 5, 6 and 7 are admitted under one boundary rule: pre-flight takes only
+checks that parse or verify local files deterministically and that have
+identical coverage inside the suite. No pytest, no harness execution, no
+fixture regeneration, no network probe, no runner-capability query, and no
+performance measurement. Check 5 is inside that rule rather than an exception
+to it: plan mode is the aggregator's documented side-effect-free dry run, it
+exits before admission and before any harness launch, and the suite reaches
+the same decision through tests/test_test_all_scheduler.py.
 
 Exit 0 clean, 2 invalid invocation, 3 for any detected defect or for an
 inability to complete the verification. An inability to verify fails; it never
 passes. There is no --json envelope, because nothing consumes one.
 
 This is an EARLY EXIT, not a gate with unique coverage. bin/cctally-preflight-test
-runs the same three checks inside the suite, which is what makes
+runs the same checks inside the suite, which is what makes
 CCTALLY_SKIP_PREFLIGHT=1 safe: skipping removes a duplicate rather than
 removing coverage. A gate that can fail the operation it guards turns a
 detector into an outage.
 
-No timing assertion exists anywhere for this tool. It is fast because it parses
-and does nothing else, and a wall-clock ceiling on a shared, contended box is
-the defect class #529 S3 has just removed.
+No wall-clock ASSERTION exists anywhere for this tool: no duration is compared
+against a ceiling, reported, or tuned, and no outcome depends on how long a
+check took. It is fast because it parses and does nothing else, and a duration
+ceiling on a shared, contended box is the defect class #529 S3 has just
+removed.
+
+One wall-clock BOUND does exist, and it is not that thing (#630 S3). Check 5
+runs the aggregator as a subprocess with `timeout=60`. That is a hang bound: it
+decides an outcome only when the aggregator never returns at all, which turns
+the pre-flight into the outage it exists to prevent. The margin is what
+separates the two. Plan mode measures 0.16 to 0.24 s against the 60 s bound —
+roughly 300x — on a path that takes no lock, opens no socket and sleeps
+nowhere; the ceiling #529 S3 removed sat at about 2.3x and reddened
+release-stamp runs on a contended box. A bound no honest run can approach
+records nothing about load; a ceiling a slow box can cross records load and
+calls it a defect.
 """
 from __future__ import annotations
 
 import argparse
+import importlib.machinery
+import importlib.util
 import os
 import pathlib
 import subprocess
 import sys
+
+# Check 1 compiles without writing bytecode, and this import must not undo
+# that for the tool's own directory. An ordinary import of a bin/ sibling has
+# CPython write bin/__pycache__/_lib_harness_durations.<tag>.pyc into the tree
+# under test, which is a side effect in a tool whose whole contract is that it
+# only reads. Set before the import, because the flag is read at import time.
+sys.dont_write_bytecode = True
+
+# The duration-table contract has ONE spelling, shared with the dispatch
+# scheduler in bin/cctally-test-all. Resolved from this script's own directory
+# rather than through an ambient PYTHONPATH, and deliberately from the tool's
+# own tree rather than from --repo-root: the contract belongs to the binary
+# doing the checking, not to the tree being checked.
+_BIN_DIR = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_BIN_DIR))
+
+
+class _SiblingUnavailable(Exception):
+    """A bin/ sibling one of the checks needs could not be loaded."""
+
+
+# Every sibling below is loaded INSIDE the check that uses it, never at module
+# scope. A module-scope load turns a missing or broken sibling into an
+# unhandled traceback and exit 1 — a code outside this tool's taxonomy, and the
+# opposite of the contract stated above, which is that an inability to complete
+# a check is a reported defect at exit 3. It also crashed `--help`, which needs
+# none of these modules to answer. bin/_cctally_release.py wraps its copy of
+# the same lint load for the same reason.
+_loaded: dict[str, object] = {}
+
+
+def _sibling(name: str):
+    """Import a bin/ sibling module by name, or raise _SiblingUnavailable.
+
+    Resolved from this script's own directory rather than through an ambient
+    PYTHONPATH, and deliberately from the tool's own tree rather than from
+    --repo-root: the contract belongs to the binary doing the checking, not to
+    the tree being checked.
+    """
+    if name not in _loaded:
+        try:
+            _loaded[name] = importlib.import_module(name)
+        except Exception as exc:  # noqa: BLE001 - reported, never raised out
+            raise _SiblingUnavailable(
+                "%s could not be loaded from %s: %s" % (name, _BIN_DIR, exc)
+            ) from exc
+    return _loaded[name]
+
+
+def _changelog_lint() -> object:
+    """bin/cctally-changelog-lint as a module, or raise _SiblingUnavailable.
+
+    Check 7 calls the pure kernel directly, but the kernel takes both halves of
+    its path axis as INJECTED predicates, and those two are I/O glue: a
+    classifier loaded from the tree's mirror data, and an existence predicate
+    read from the repository index. They already exist, once, inside the lint
+    executable. This loads that executable as a module and reuses them rather
+    than writing a second copy, because a gate that disagreed with the lint a
+    contributor runs by hand would be worse than no gate. The file is
+    EXTENSIONLESS, so it cannot be imported by name; its module body only sets
+    flags and imports the kernel, and its own main() is guarded.
+    """
+    key = "cctally-changelog-lint"
+    if key not in _loaded:
+        path = _BIN_DIR / key
+        try:
+            loader = importlib.machinery.SourceFileLoader(
+                "_cctally_preflight_changelog_lint", str(path)
+            )
+            module = importlib.util.module_from_spec(
+                importlib.util.spec_from_loader(
+                    "_cctally_preflight_changelog_lint", loader
+                )
+            )
+            loader.exec_module(module)
+        except Exception as exc:  # noqa: BLE001 - reported, never raised out
+            raise _SiblingUnavailable(
+                "%s could not be loaded: %s" % (path, exc)
+            ) from exc
+        _loaded[key] = module
+    return _loaded[key]
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -149,6 +277,213 @@ def check_ownership(root: pathlib.Path, owners: pathlib.Path) -> list[str]:
     return lines
 
 
+def check_durations(root: pathlib.Path) -> list[str]:
+    """The dispatch scheduler's own validation, applied as a refusal.
+
+    Deliberately the same three calls the scheduler makes, in the same order,
+    so the two can only ever disagree about the consequence.
+    """
+    try:
+        durations = _sibling("_lib_harness_durations")
+    except _SiblingUnavailable as exc:
+        return ["the harness duration table cannot be validated: %s" % exc]
+    manifest, error = durations.read_manifest(str(root))
+    if error:
+        return [error]
+    text, error = durations.read_table(str(root))
+    if error:
+        return [error]
+    _table, error = durations.validate(text, manifest)
+    if error:
+        return [error]
+    return []
+
+
+def _forced_dispatch() -> str:
+    """The dispatch arm the operator asked for, or "" when they asked for none.
+
+    Read through one helper so the tool and its harness agree on the spelling,
+    and so a future third arm has one place to be added.
+    """
+    return os.environ.get("CCTALLY_TEST_ALL_DISPATCH", "").strip()
+
+
+def check_scheduler_plan(root: pathlib.Path) -> list[str]:
+    """The dispatch decision, asked for rather than inferred.
+
+    check_durations reads the three files the scheduler reads, so it can only
+    prove the table is well formed. It cannot see the run-time conditions that
+    make the scheduler fall back anyway and stay silent about it: no python3 on
+    PATH, a python3 that answers non-zero, _lib_harness_durations unimportable
+    from <root>/bin, or a broken shell-side capture. Plan mode reports the
+    decision itself, exits before admission and before any harness launch, and
+    is the aggregator's own documented dry run — so asking it is the cheapest
+    honest way to check the half of §3's check 4 that file validation cannot.
+
+    A tree carrying NO aggregator has no plan to report and is not faulted:
+    this tool's synthetic-fixture callers are that shape, and a real checkout
+    that lost bin/cctally-test-all has no round trip to pre-flight. A tree
+    carrying one that lost its executable bit is the opposite case and is
+    faulted here, because nothing else sees it: bin/cctally-test-owners
+    --verify checks the mode bit of every manifest harness, and the aggregator
+    is deliberately not one of them, so conflating the two answered `clean` on
+    a tree whose pool could not start.
+    """
+    aggregator = root / "bin" / "cctally-test-all"
+    if not aggregator.exists():
+        return []
+    if not os.access(aggregator, os.X_OK):
+        return [
+            "%s is present but not executable, so the dispatch plan cannot be "
+            "read — chmod +x it" % aggregator
+        ]
+    environment = dict(os.environ)
+    environment["CCTALLY_TEST_ALL_PLAN"] = "1"
+    # Under the suite this tool runs as a harness, and the aggregator's own
+    # environment reaches it. CCTALLY_TEST_ALL_OUTCOME_FILE is set for every
+    # authoritative run, and the aggregator refuses to combine it with plan
+    # mode (exit 2, "a plan is never an authoritative outcome"), so leaving it
+    # in place would fail this check on precisely the runs that matter most.
+    environment.pop("CCTALLY_TEST_ALL_OUTCOME_FILE", None)
+    try:
+        proc = subprocess.run(
+            [str(aggregator)],
+            cwd=str(root),
+            env=environment,
+            capture_output=True,
+            text=True,
+            # This tool is seconds-scale by contract. The timeout is not a
+            # performance assertion — it is not compared against, reported, or
+            # tuned — it is the bound that keeps a hung aggregator from turning
+            # a pre-flight into the outage it exists to prevent.
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return ["the dispatch plan could not be read from %s: %s" % (aggregator, exc)]
+    detail = (proc.stderr or "").strip().splitlines()
+    trailer = (" — %s" % detail[-1]) if detail else ""
+    if proc.returncode != 0:
+        return [
+            "%s plan mode exited %d, so the dispatch decision cannot be read%s"
+            % (aggregator, proc.returncode, trailer)
+        ]
+    mode = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("scheduler="):
+            mode = line.split("=", 1)[1].strip()
+    if mode is None:
+        return [
+            "%s plan mode printed no scheduler= line, so the dispatch decision "
+            "cannot be read" % aggregator
+        ]
+    # The expected mode follows the operator's own explicit choice. This check
+    # exists to catch an UNINTENDED fallback, and #630 S3's measurement
+    # programme runs its control arm with CCTALLY_TEST_ALL_DISPATCH=report set.
+    # Plan mode is a subprocess and inherits the environment, so without this
+    # the wrapper would refuse every control-arm run for doing exactly what it
+    # was told. The table itself is still validated independently by
+    # check_durations, so forcing the control arm hides no table defect.
+    expected = "report-forced" if _forced_dispatch() == "report" else "lpt"
+    if mode != expected:
+        if expected == "report-forced":
+            return [
+                "CCTALLY_TEST_ALL_DISPATCH=report was set but the dispatch "
+                "scheduler reports scheduler=%s, so this run is not the control "
+                "arm it was asked for%s" % (mode, trailer)
+            ]
+        return [
+            "the dispatch scheduler reports scheduler=%s, so the pool would run "
+            "in report order rather than longest-first%s" % (mode, trailer)
+        ]
+    return []
+
+
+def check_visibility(root: pathlib.Path) -> list[str]:
+    """contract_admit_visibility, run locally.
+
+    Private profile only: .mirror-allowlist excludes itself, so its presence is
+    exactly the private discriminator, and the public tree ships neither that
+    file nor the classifier.
+    """
+    allowlist = root / ".mirror-allowlist"
+    if not allowlist.is_file():
+        return []
+    classifier = root / ".githooks" / "_match.py"
+    if not classifier.is_file():
+        return [
+            "this tree is the PRIVATE profile (.mirror-allowlist is present) but "
+            "the allowlist classifier %s is absent, so the declared visibility of "
+            "every manifest row cannot be checked — restore it, or remove "
+            ".mirror-allowlist if this tree is meant to be the public subset"
+            % classifier
+        ]
+    try:
+        durations = _sibling("_lib_harness_durations")
+    except _SiblingUnavailable as exc:
+        return ["declared visibility cannot be checked: %s" % exc]
+    manifest, error = durations.read_manifest(str(root))
+    if error:
+        return [error]
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_cctally_preflight_match", str(classifier)
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        text = allowlist.read_text(encoding="utf-8")
+        paths = ["bin/cctally-%s-test" % name for name, _ in manifest]
+        public = set(module.classify(paths, allowlist_text=text)["public"])
+    except Exception as exc:  # the classifier is arbitrary local code
+        return ["the allowlist classifier %s could not be run: %s" % (classifier, exc)]
+    problems: list[str] = []
+    for (name, declared), path in zip(manifest, paths):
+        actual = "public" if path in public else "private"
+        if actual != declared:
+            problems.append(
+                "manifest row '%s' declares visibility '%s' but .githooks/_match.py "
+                "classifies %s as '%s' — fix the row or fix .mirror-allowlist"
+                % (name, declared, path, actual)
+            )
+    return problems
+
+
+def check_changelog(root: pathlib.Path) -> list[str]:
+    """CHANGELOG.md entries must meet the policy in docs/changelog-policy.md.
+
+    Both halves of the kernel's path axis are supplied where this tree carries
+    what each needs. The mirror classifier answers whether a cited path would
+    be published and is absent on the public mirror, where the kernel records
+    that the layer did not run rather than reporting a clean pass over a
+    population it could not see; the existence predicate answers whether this
+    tree carries the path and is always supplied.
+
+    An inability to check is a defect, not a pass: a classifier whose data is
+    present but which cannot be loaded, an absent or broken lint executable,
+    and an unreadable changelog all report a problem rather than an empty list.
+    """
+    target = root / "CHANGELOG.md"
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return ["cannot read %s: %s" % (target, exc)]
+    try:
+        lint = _changelog_lint()
+        policy = _sibling("_lib_changelog_policy")
+        exists, _source = lint._tree_exists(root)
+        classify = lint._load_classify(root)
+        report = policy.check_text(text, classify=classify, exists=exists)
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        return [
+            "CHANGELOG.md could not be checked against the user-facing policy: %s"
+            % exc
+        ]
+    return [
+        "CHANGELOG.md:%d: %s: %s (see docs/changelog-policy.md)"
+        % (finding.line, finding.rule, finding.detail)
+        for finding in report.findings
+    ]
+
+
 def run(root: pathlib.Path) -> tuple[int, list[str]]:
     bin_dir = root / "bin"
     if not bin_dir.is_dir():
@@ -156,6 +491,10 @@ def run(root: pathlib.Path) -> tuple[int, list[str]]:
     problems = check_python(bin_dir)
     problems += check_shell(bin_dir)
     problems += check_ownership(root, pathlib.Path(__file__).resolve().parent / _OWNERS)
+    problems += check_durations(root)
+    problems += check_scheduler_plan(root)
+    problems += check_visibility(root)
+    problems += check_changelog(root)
     return (EXIT_DEFECT if problems else EXIT_OK), problems
 
 
@@ -164,7 +503,10 @@ def main(argv: list[str]) -> int:
         prog="cctally-preflight",
         description=(
             "Compile every Python file under bin/, syntax-check every shell "
-            "script, and verify harness ownership — before a remote round trip."
+            "script, verify harness ownership, validate the harness duration "
+            "table, confirm the dispatch scheduler is armed, check declared "
+            "visibility against the mirror allowlist, and check CHANGELOG.md "
+            "against the user-facing entry policy — before a remote round trip."
         ),
     )
     parser.add_argument(
