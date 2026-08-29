@@ -103,6 +103,17 @@ for scenario_dir in "$FIXTURES_DIR"/*/; do
         weekly-svg-breakdown)  cmd="weekly";           fmt="svg";  theme="light"; extra="--breakdown" ;;
         forecast-md)           cmd="forecast";         fmt="md";   theme="light"; extra="--no-sync" ;;
         forecast-svg)          cmd="forecast";         fmt="svg";  theme="light"; extra="--no-sync" ;;
+        # #661 S2 section 3.2: the right-censored artifact, whose "Projected
+        # end-of-week %" row must state the withholding rather than reprint
+        # the current reading.
+        forecast-md-censored)  cmd="forecast";         fmt="md";   theme="light"; extra="--no-sync" ;;
+        # #661 S2 section 3.6: a displayed-zero week is NOT censored. Its
+        # projection is published from the corrected point of 0.25, so the
+        # artifact's "Projected end-of-week %" row states a band instead of
+        # the withholding the earlier draft produced. The beyond-horizon
+        # presentation bound is NOT exercised here — this artifact has no
+        # ceiling-distance row to render it in.
+        forecast-md-zero-week) cmd="forecast";         fmt="md";   theme="light"; extra="--no-sync" ;;
         project-md-anon)       cmd="project";          fmt="md";   theme="light" ;;
         project-md-reveal)     cmd="project";          fmt="md";   theme="light"; extra="--reveal-projects" ;;
         five-hour-blocks-md)   cmd="five-hour-blocks"; fmt="md";   theme="light" ;;

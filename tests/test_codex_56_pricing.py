@@ -98,8 +98,9 @@ def _load_session_metrics():
     only the module-level definitions.
     """
     module = types.ModuleType("codex_session_metrics_under_test")
-    module.__file__ = str(SESSION_METRICS)
-    exec(compile(SESSION_METRICS.read_text(), str(SESSION_METRICS), "exec"),
+    module.__file__ = str(SESSION_METRICS)  # mirror-private-ok: metadata only
+    exec(compile(SESSION_METRICS.read_text(),  # mirror-private-ok: all callers carry requires_session_metrics
+                 str(SESSION_METRICS), "exec"),
          module.__dict__)
     return module
 

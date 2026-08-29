@@ -19,6 +19,7 @@ Journal
 Data
 Accounts
 Pricing
+Quota
 Safety
   ⚠ Dashboard bind           config: lan
       → Run `cctally config set dashboard.bind loopback`.
@@ -26,4 +27,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 54 OK · 8 WARN · 0 FAIL
+Summary: 56 OK · 8 WARN · 0 FAIL

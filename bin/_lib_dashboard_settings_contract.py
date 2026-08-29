@@ -25,6 +25,8 @@ SETTINGS_LEAF_DISPOSITIONS = {
     "display.tz": WRITABLE,
     "alerts.enabled": WRITABLE,
     "alerts.projected_enabled": WRITABLE,
+    # #661 S2 section 6.2. Recording is unconditional; this gates the PUSH.
+    "alerts.rate_change_enabled": WRITABLE,
     "alerts.notifier": WRITABLE,
     "dashboard.cache_failure_markers": WRITABLE,
     "dashboard.live_tail": WRITABLE,

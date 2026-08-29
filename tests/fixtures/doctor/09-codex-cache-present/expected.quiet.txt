@@ -22,9 +22,10 @@ Data
       → Run `cctally cache-sync --source codex --rebuild`
 Accounts
 Pricing
+Quota
 Safety
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 54 OK · 8 WARN · 0 FAIL
+Summary: 56 OK · 8 WARN · 0 FAIL

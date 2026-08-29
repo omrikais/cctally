@@ -605,10 +605,12 @@ def _container_script(
             f"{CONTAINER_METRICS_DIR}/samples-{version}.jsonl &\n"
             "cctally_sampler_pid=$!\n\n"
         )
-        # --durations=0 has no route into the hard-coded pytest invocation in
-        # bin/cctally-test-all, so it is injected here rather than by editing
-        # the aggregator.
-        acceptance_env = "  PYTEST_ADDOPTS=--durations=0 \\\n"
+        # #648 D7 sanitizes PYTEST_ADDOPTS out of both execution legs, because
+        # `--ignore` through it narrowed an authoritative run that admission had
+        # observed in full. That closed the route this lane was using, so the
+        # aggregator now recognises a variable that can only ADD a reporting
+        # flag and never narrow anything.
+        acceptance_env = "  CCTALLY_PYTEST_DURATIONS=1 \\\n"
         lane_prefix = "set +e\n"
         lane_suffix = (
             "\ncctally_lane_status=$?\n"

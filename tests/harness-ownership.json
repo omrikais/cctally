@@ -230,6 +230,16 @@
       ],
       "sourcePaths": []
     },
+    "quota": {
+      "fixturePaths": [
+        "bin/build-quota-fixtures.py",
+        "tests/fixtures/quota"
+      ],
+      "sourcePaths": [
+        "bin/_lib_quota_model.py",
+        "bin/_cctally_quota_model.py"
+      ]
+    },
     "reconcile": {
       "fixturePaths": [
         "bin/build-budget-fixtures.py",

@@ -237,6 +237,37 @@ assert_eq "snapshot count unchanged by dedup tick" "2" "$snap_count"
 # branch of the live record-usage path's new credit logic + the
 # downstream self-heal probe (Task 8).
 
+# HOW CALLERS PASS THE PROGRAM (#641). Each scenario below reads its Python into
+# `scenario_py` with `IFS= read -r -d '' scenario_py <<'PY' … PY`, then passes
+# "$scenario_py". Do NOT go back to `f "$(cat <<'PY' … PY\n)"`.
+#
+# The hazard needs BOTH halves, and stating only one of them has already misled
+# a reader of this file. bash 3.2 — the shell floor this repository declares,
+# and `/bin/bash` on macOS — scans a `$( … )` command substitution by counting
+# characters rather than by parsing it, and a quoted heredoc delimiter does not
+# stop that scan. When the substitution sits inside DOUBLE QUOTES, an apostrophe
+# anywhere in the scanned body opens a quote that swallows the rest of the file.
+# One `# but window B's canonical anchor` in a Python comment was enough to make
+# this whole harness fail to parse under the floor. Measured on 3.2.57:
+# `f "$(cat <<'PY' … PY)"` with one apostrophe exits 2, the same body written as
+# `out=$(cat <<'PY' … PY)` exits 0, and the quoted form with no apostrophe exits
+# 0 — so neither half is the defect on its own.
+#
+# Two consequences, both easy to get backwards. The `out=$(… python3 - <<'PY')`
+# at line 52 of this file is safe because it is UNQUOTED, not because its
+# apostrophes happen to sit inside double-quoted Python spans; several of them
+# sit in bare `#` comments and it parses under the floor regardless. And the
+# eleven sites repaired in bin/cctally-reconcile-test are all unquoted
+# `result=$(…)`, so they were never apostrophe-fragile at all: their defect was
+# the closing `)` placed on the opening line before the here-document body,
+# which is a different shape with a different repair.
+#
+# Rewording that one comment would have repaired the file and left the next
+# apostrophe anyone types armed to break it again. `read -d ''` takes the
+# heredoc as ordinary redirection rather than as a scanned region, so ordinary
+# English prose in a Python comment cannot break the parse. It returns non-zero
+# at end of input, which is what the `|| true` absorbs under `set -uo pipefail`;
+# verified under 3.2.57 that the program is captured intact and the status is 0.
 run_credit_scenario () {
     # $1 = label, $2 = inline python.
     local label="$1"
@@ -268,7 +299,7 @@ run_credit_scenario () {
 # drive record-usage at 2% with the same end_at. Assert: one
 # week_reset_events row keyed on old==new==end_at, one new snapshot row
 # at 2% via the reset-aware clamp, hwm-7d force-written to 2.0.
-run_credit_scenario "credit-fires" "$(cat <<'PY'
+IFS= read -r -d '' scenario_py <<'PY' || true
 import importlib.util, os, pathlib, sys, argparse, datetime as dt
 from importlib.machinery import SourceFileLoader
 repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
@@ -326,11 +357,11 @@ parts = (mod.APP_DIR / "hwm-7d").read_text().strip().split()
 assert parts == [ws, "2.0"], f"hwm-7d={parts}"
 print("OK")
 PY
-)"
+run_credit_scenario "credit-fires" "$scenario_py"
 
 # Scenario B: second record-usage call with same end_at + 3% is a no-op
 # for the event row (prior is now 2%, drop is +1 not >= 25pp).
-run_credit_scenario "credit-second-call-no-op" "$(cat <<'PY'
+IFS= read -r -d '' scenario_py <<'PY' || true
 import importlib.util, os, pathlib, sys, argparse, datetime as dt
 from importlib.machinery import SourceFileLoader
 repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
@@ -372,11 +403,11 @@ finally:
     conn.close()
 print("OK")
 PY
-)"
+run_credit_scenario "credit-second-call-no-op" "$scenario_py"
 
 # Scenario C: credit fires, then post-credit usage climbs. Assert
 # the reset-aware clamp lets 3% land (since post-segment MAX is 2%).
-run_credit_scenario "credit-then-rising" "$(cat <<'PY'
+IFS= read -r -d '' scenario_py <<'PY' || true
 import importlib.util, os, pathlib, sys, argparse, datetime as dt
 from importlib.machinery import SourceFileLoader
 repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
@@ -420,7 +451,7 @@ finally:
     conn.close()
 print("OK")
 PY
-)"
+run_credit_scenario "credit-then-rising" "$scenario_py"
 
 # Scenario: a 5h window rollover at a FLAT weekly+5h percent still persists
 # the NEW window's canonical five_hour_blocks anchor. This is the "current
@@ -435,7 +466,7 @@ PY
 # the statusline is immune — it renders the live rate_limits, not the DB).
 # POST-FIX the rollover heal materializes window B's block on the dedup
 # tick, WITHOUT inserting an extra snapshot row (the heal is block-only).
-run_credit_scenario "window-rollover-flat-percent-heals-block" "$(cat <<'PY'
+IFS= read -r -d '' scenario_py <<'PY' || true
 import importlib.util, os, pathlib, sys, argparse, datetime as dt
 from importlib.machinery import SourceFileLoader
 repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
@@ -485,7 +516,7 @@ assert n_snap == 1, f"unexpected extra snapshot row(s): {n_snap}"
 assert n_b == 1, f"window B five_hour_blocks rows = {n_b} (expected 1)"
 print("OK")
 PY
-)"
+run_credit_scenario "window-rollover-flat-percent-heals-block" "$scenario_py"
 
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]

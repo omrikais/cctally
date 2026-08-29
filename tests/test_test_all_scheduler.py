@@ -20,6 +20,8 @@ import sys
 
 import pytest
 
+from tests import _estate_stub
+
 REPO = pathlib.Path(__file__).resolve().parents[1]
 BIN = REPO / "bin"
 RUNNER = BIN / "cctally-test-all"
@@ -141,7 +143,8 @@ def test_linux_matrix_plan_excludes_only_the_mac_remote_harness():
     assert linux["pytest_disposition"] == "full"
 
 
-def _copy_python_kernels(bindir, *, validator_body=None):
+def _copy_python_kernels(bindir, *, validator_body=None, estate_report=None,
+                         estate_legs=None):
     """The aggregator's python dependencies, and only those.
 
     `_lib_test_*.py` is matched as a CLASS, because the evidence bridge loads
@@ -163,6 +166,17 @@ def _copy_python_kernels(bindir, *, validator_body=None):
     """
     for kernel in sorted(BIN.glob("_lib_test_*.py")):
         shutil.copy2(kernel, bindir / kernel.name)
+    # #648 D10. The glob acquires the estate checker, and a scratch tree records
+    # no artifact for it to compare against. `estate_legs` is how the one case
+    # that asserts the two pytest execution legs declares them, since the
+    # aggregator now builds both from the plan rather than from shell literals.
+    _estate_stub.install(bindir, report=estate_report, legs=estate_legs)
+    # #648 D7. Both pytest legs load `-p tests._estate_leg_plugin`, so a
+    # scratch estate that omitted it would fail on a missing module.
+    repo_tests = bindir.parent / "tests"
+    repo_tests.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(REPO / "tests" / "_estate_leg_plugin.py",
+                 repo_tests / "_estate_leg_plugin.py")
     target = bindir / "_lib_harness_durations.py"
     if validator_body is None:
         shutil.copy2(BIN / "_lib_harness_durations.py", target)
@@ -299,25 +313,13 @@ def _tree(
         + "\n"
     )
 
-    # #630 S7. A real estate carries a committed runtime budget and an
-    # authoritative full run refuses to start without one, so every scratch
-    # estate carries one too. The maximum is deliberately enormous rather than
-    # the committed 120: a scratch estate passes a handful of cases in a few
-    # seconds, which is a per-case cost orders of magnitude worse than the real
-    # estate's, and a fixture pinned at the real threshold would breach it by
-    # construction on every case in this file.
-    (tests_dir / "authoritative-runtime-budget.json").write_text(
-        json.dumps(
-            {
-                "schemaVersion": 1,
-                "metric": "secondsPerThousandCases",
-                "maxSecondsPerThousandCases": 1000000,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    # NO runtime budget is written here, and that is deliberate (#650 item 5).
+    # A budget is read only by an ELIGIBLE run, which requires
+    # CCTALLY_AUTHORITATIVE_RUN=1. That variable appears nowhere in this file,
+    # and all three subprocess helpers build a fresh `env` dictionary from PATH
+    # plus explicitly named keys rather than inheriting the ambient
+    # environment — so no case here can reach an eligible run, and the two
+    # copies that used to sit at this point were dead fixture code.
     if durations is not None:
         (tests_dir / "authoritative-harness-durations.tsv").write_text(
             "".join("%s\t%s\n" % (name, secs) for name, secs in durations)
@@ -454,8 +456,33 @@ def test_public_subset_tree_does_not_require_the_private_test_remote_harness(
     assert "test-remote" not in _kv(p.stdout)["harnesses"].split()
 
 
-def test_wall_clock_benchmarks_run_outside_xdist(tmp_path):
-    """Wall-clock SLAs must not compete with the parallel pytest estate."""
+BENCHMARK_LEGS = [
+    {
+        "name": "benchmark",
+        "selectors": [
+            ["file", "tests/test_rebuild_benchmark.py"],
+            ["node", "tests/test_stats_writer_storm_386.py::"
+                     "test_h1_multiwriter_baseline_stays_intact"],
+            ["node", "tests/test_stats_writer_storm_386.py::"
+                     "test_dashboard_source_reader_releases_rollback_snapshot"],
+        ],
+        "nodes": [],
+    },
+    {"name": "pytest", "selectors": [], "nodes": []},
+]
+
+
+def _fake_pytest_tree(tmp_path, *, legs, extra_env=None):
+    """A synthetic checkout whose pytest boundary is a recording fake.
+
+    Extracted from `test_wall_clock_benchmarks_run_outside_xdist` unchanged so
+    the execution-declaration cases can drive the same boundary. Everything but
+    `python3 -m pytest` DELEGATES to the real interpreter, because the contract
+    library parses the manifest and encodes the outcome object with stdlib json.
+
+    Returns `(runner, calls, env)`; `calls` is the file every faked pytest argv
+    is appended to, in invocation order.
+    """
     repo = tmp_path / "repo"
     bindir = repo / "bin"
     tests_dir = repo / "tests"
@@ -465,17 +492,9 @@ def test_wall_clock_benchmarks_run_outside_xdist(tmp_path):
     fake_bin.mkdir()
     runner = bindir / "cctally-test-all"
     shutil.copy2(RUNNER, runner)
-    # Matched as a CLASS: bin/_lib-test-contract.sh sources bin/_lib-fts5-probe.sh
-    # and refuses without it (#529 S6, exception X2), so an estate that copied
-    # one library by name refuses to start the moment the contract grows a
-    # second. The failure is silent-looking rather than obvious — the estate
-    # aborts with the contract's own diagnostic, and every assertion about what
-    # the aggregator SHOULD have said then reads as a behaviour change.
     for lib in sorted(BIN.glob("_lib-*.sh")):
         shutil.copy2(lib, bindir / lib.name)
-    # bin/cctally-test-all imports the evidence kernels (#529 S2) and, since
-    # #630 S3, the duration-table validator. See _copy_python_kernels.
-    _copy_python_kernels(bindir)
+    _copy_python_kernels(bindir, estate_legs=legs)
 
     for name in ("codex-quota", "source-aware", "reconcile"):
         harness = bindir / f"cctally-{name}-test"
@@ -508,33 +527,14 @@ def test_wall_clock_benchmarks_run_outside_xdist(tmp_path):
         encoding="utf-8",
     )
 
-    # #630 S7. A real estate carries a committed runtime budget and an
-    # authoritative full run refuses to start without one, so every scratch
-    # estate carries one too. The maximum is deliberately enormous rather than
-    # the committed 120: a scratch estate passes a handful of cases in a few
-    # seconds, which is a per-case cost orders of magnitude worse than the real
-    # estate's, and a fixture pinned at the real threshold would breach it by
-    # construction on every case in this file.
-    (tests_dir / "authoritative-runtime-budget.json").write_text(
-        json.dumps(
-            {
-                "schemaVersion": 1,
-                "metric": "secondsPerThousandCases",
-                "maxSecondsPerThousandCases": 1000000,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
+    # NO runtime budget is written here, and that is deliberate (#650 item 5).
+    # A budget is read only by an ELIGIBLE run, which requires
+    # CCTALLY_AUTHORITATIVE_RUN=1, and no case here reaches one.
     (tests_dir / "test_rebuild_benchmark.py").write_text(
-        "# execution is represented by the fake pytest below\n",
-        encoding="utf-8",
+        "# execution is represented by the fake pytest below\n", encoding="utf-8",
     )
     (tests_dir / "test_stats_writer_storm_386.py").write_text(
-        "# execution is represented by the fake pytest below\n",
-        encoding="utf-8",
+        "# execution is represented by the fake pytest below\n", encoding="utf-8",
     )
     calls = tmp_path / "pytest-calls"
     fake_python = fake_bin / "python3"
@@ -544,13 +544,17 @@ def test_wall_clock_benchmarks_run_outside_xdist(tmp_path):
     # that answered 2 to every other form would fail the fixture, not the
     # property under test. The two optional-plugin probes keep their fixed
     # answers so this case stays independent of what is pip-installed.
+    #
+    # The recorded line carries the ENVIRONMENT the leg was given as well as its
+    # argv, because #648 D7 sanitizes that environment and an argv-only record
+    # could not tell a sanitized leg from an unsanitized one.
     fake_python.write_text(
         """#!/usr/bin/env bash
 if [ "$1" = "-m" ] && [ "$2" = "pytest" ]; then
     if [ "${3:-}" = "--version" ]; then
         exit 0
     fi
-    printf '%s\\n' "$*" >> "$CCTALLY_FAKE_PYTHON_LOG"
+    printf 'ADDOPTS=[%s] %s\\n' "${PYTEST_ADDOPTS:-}" "$*" >> "$CCTALLY_FAKE_PYTHON_LOG"
     exit 0
 fi
 if [ "$1" = "-c" ]; then
@@ -570,8 +574,15 @@ exec "$CCTALLY_REAL_PYTHON3" "$@"
         "CCTALLY_REAL_PYTHON3": sys.executable,
         "CCTALLY_TEST_JOBS": "2",
     }
+    env.update(extra_env or {})
+    return runner, calls, env
+
+
+def test_wall_clock_benchmarks_run_outside_xdist(tmp_path):
+    """Wall-clock SLAs must not compete with the parallel pytest estate."""
+    runner, calls, env = _fake_pytest_tree(tmp_path, legs=BENCHMARK_LEGS)
     proc = subprocess.run(
-        [str(runner)], env=env, capture_output=True, text=True, timeout=30
+        [str(runner)], env=env, capture_output=True, text=True, timeout=60
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -599,6 +610,76 @@ exec "$CCTALLY_REAL_PYTHON3" "$@"
         "test_dashboard_source_reader_releases_rollback_snapshot"
     ) in benchmark
     assert " -n " not in benchmark
+
+
+def test_both_legs_are_built_from_the_execution_declaration(tmp_path):
+    """#648 D7 -- ONE declaration, and the shell holds no copy of it.
+
+    Proven by moving the declaration rather than by reading the source: these
+    selectors name files and nodes the aggregator's retired literals never
+    mentioned, so argv that still matched the old ones would be argv built from
+    a second copy.
+    """
+    runner, calls, env = _fake_pytest_tree(tmp_path, legs=[
+        {"name": "benchmark", "selectors": [
+            ["file", "tests/test_moved_benchmark.py"],
+            ["node", "tests/test_other.py::test_moved_node"],
+        ], "nodes": []},
+        {"name": "pytest", "selectors": [], "nodes": []},
+    ])
+    proc = subprocess.run(
+        [str(runner)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    bulk, benchmark = calls.read_text(encoding="utf-8").splitlines()
+    assert "--ignore=tests/test_moved_benchmark.py" in bulk
+    assert "--deselect=tests/test_other.py::test_moved_node" in bulk
+    assert "tests/test_rebuild_benchmark.py" not in bulk
+    assert "tests/test_moved_benchmark.py" in benchmark
+    assert "tests/test_other.py::test_moved_node" in benchmark
+
+
+def test_pytest_addopts_does_not_reach_either_execution_leg(tmp_path):
+    """#648 M13, D7 -- a pre-existing hole in the gate this session inherits.
+
+    `PYTEST_ADDOPTS=--ignore=tests/<file>.py` narrows an authoritative run while
+    admission observes the complete estate, and the run still exits 0. Nothing
+    reads the variable and it is absent from `forbiddenRegeneration`, so the
+    execution legs are sanitized instead.
+    """
+    runner, calls, env = _fake_pytest_tree(
+        tmp_path, legs=BENCHMARK_LEGS,
+        extra_env={"PYTEST_ADDOPTS": "--ignore=tests/test_rebuild_benchmark.py"},
+    )
+    proc = subprocess.run(
+        [str(runner)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    for line in calls.read_text(encoding="utf-8").splitlines():
+        assert line.startswith("ADDOPTS=[] "), line
+    assert "PYTEST_ADDOPTS" in proc.stderr
+
+
+def test_the_durations_variable_is_the_supported_route_addopts_used_to_be(
+        tmp_path):
+    """Sanitizing PYTEST_ADDOPTS removes a capability the Linux lane used.
+
+    `bin/cctally-test-linux-matrix` injected `PYTEST_ADDOPTS=--durations=0` on
+    its acceptance lane precisely because the aggregator's pytest invocation was
+    hard-coded. Sanitizing the variable without a replacement would silently
+    drop that lane's per-test timing output, so a narrow variable that cannot
+    NARROW anything takes its place.
+    """
+    runner, calls, env = _fake_pytest_tree(
+        tmp_path, legs=BENCHMARK_LEGS,
+        extra_env={"CCTALLY_PYTEST_DURATIONS": "1"},
+    )
+    proc = subprocess.run(
+        [str(runner)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    for line in calls.read_text(encoding="utf-8").splitlines():
+        assert "--durations=0" in line, line
 
 
 # ------------------------------------------- the effective-configuration plan

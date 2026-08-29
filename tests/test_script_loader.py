@@ -8,9 +8,10 @@ neither, which is why sixty-four modules that hand-rolled one were each one
 from __future__ import annotations
 
 import ast
+import copy
 import pathlib
-import re
 import sys
+import textwrap
 
 import pytest
 
@@ -267,14 +268,68 @@ def test_an_alternate_identity_load_evicts_no_sibling():
 #     importlib loader.
 #
 # A matcher that cannot see a form will not see the next instance of that form
-# either, so the three capabilities below — constant resolution, parameter
-# substitution, and the ``ModuleType`` construction — are the rule, and the
-# migrations that followed them are the consequence.
+# either, so the capabilities below are the rule and the migrations that
+# followed them are the consequence. #649 measured nine further forms the S6
+# matcher could not see and rebuilt it around five ideas, each of which exists
+# for a reason rather than for generality:
+#
+#   * EVIDENCE LATTICE (``_path_evidence``). A path expression evaluates to
+#     CCTALLY, OTHER or UNKNOWN over three verb classes — wrappers that
+#     preserve the final component, constructors that read it from their last
+#     operand, and verbs such as ``.parent`` that yield a DIFFERENT path and so
+#     discard the evidence. UNKNOWN is not a soft OTHER. It is the value that
+#     makes the determination indeterminate, and returning OTHER for an
+#     expression the routine merely failed to evaluate is precisely how a blind
+#     predicate hands back a determinate answer.
+#
+#   * TRUTH TABLE (``_determine``). Identity resolving to ``cctally`` forces
+#     YES; CCTALLY path evidence forces YES; OTHER path evidence is NO; UNKNOWN
+#     is INDETERMINATE and is REPORTED. The identity argument can only force a
+#     positive. It can never establish a negative, because the estate
+#     deliberately loads the script as ``_cctally_for_tests`` and
+#     ``cctally_cli``, so a negative keyed on identity would let any loader
+#     escape by renaming its module.
+#
+#   * NAMESPACE DATAFLOW (``_writes_into_namespace``). A ``types.ModuleType``
+#     call is half a loader and the ``exec`` that fills it is the other half.
+#     They are associated only when the constructor's result is bound to a name
+#     and an ``exec`` in the same scope writes into that name's ``__dict__`` or
+#     ``vars()``. The deleted guard asked whether the MODULE contained an
+#     ``exec`` anywhere, which paired every constructor with every ``exec`` in
+#     the file. Only PATH-DERIVED code counts, so an ``exec`` over source text
+#     the test built is code generation rather than a load.
+#
+#   * BOUNDED OUTWARD RECURSION (``resolve_outward``). An indeterminate call is
+#     followed to its callers, at most ``_INDIRECTION_DEPTH`` hops, and the
+#     OUTERMOST site supplying the concrete value is what is reported. Cycles
+#     are broken with the active recursion stack rather than a global visited
+#     set, which would conflate two call sites reaching the same generic helper
+#     in different states. Exhausting the bound REPORTS rather than drops: a
+#     bound that silently discards a chain is the blind spot, not the fix for
+#     it. Substitution is structural, over AST nodes; the textual regex it
+#     replaces rewrote names inside f-strings and string literals too.
+#
+#   * SHARED SOURCE KERNEL (``_loader_sites_in_source``). The matcher takes
+#     source TEXT, so the generated-child detector runs the identical rule over
+#     program text held in a string literal. Extending that detector's
+#     vocabulary instead was measured and rejected: it produces five false
+#     positives, two of them on module docstrings that merely describe the
+#     pattern in prose.
 # ──────────────────────────────────────────────────────────────────────────
 
+#: Callees whose argument 0 is the module identity and argument 1 the path.
 _LOADER_CALLS = ("SourceFileLoader", "spec_from_file_location")
+#: `runpy.run_path` inverts that: the path is argument 0 and the identity is
+#: the `run_name` keyword. `run_module` is deliberately ABSENT — bin/cctally is
+#: extensionless and unimportable by name, which is why this repository loads it
+#: by path in the first place, so `run_module("cctally")` would resolve some
+#: unrelated installed distribution and matching it on identity would
+#: manufacture a false positive rather than close a hole.
+_RUNPY_PATH_CALL = "run_path"
 _MODULE_CONSTRUCTOR = "ModuleType"
-_SUBSTITUTION_ROUNDS = 6
+#: Methods that read a file's CONTENT. For an `exec`'s code argument, the
+#: expression naming the FILE is the receiver of one of these.
+_CONTENT_READER_METHODS = {"read_text", "read_bytes", "read"}
 
 
 def _callee_name(node):
@@ -284,54 +339,6 @@ def _callee_name(node):
     if isinstance(func, ast.Name):
         return func.id
     return None
-
-
-def _simple_assignments(scope):
-    """Map every ``name = <expr>`` in ``scope`` to that expression's source."""
-    out = {}
-    for node in ast.walk(scope):
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-        ):
-            out[node.targets[0].id] = ast.unparse(node.value)
-    return out
-
-
-def _substitute(src, bindings):
-    """Replace bound names in ``src`` by their expressions, to a fixed point."""
-    for _ in range(_SUBSTITUTION_ROUNDS):
-        expanded = src
-        for name, value in bindings.items():
-            expanded = re.sub(
-                rf"\b{re.escape(name)}\b",
-                lambda _match, replacement=value: f"({replacement})",
-                expanded,
-            )
-        if expanded == src:
-            break
-        src = expanded
-    return src
-
-
-def _points_at_cctally(identity_src, path_src, bindings):
-    """True when this loader call builds a module from ``bin/cctally``.
-
-    Two independent signals, because either one alone misses real sites. The
-    identity argument names the module — but three sites deliberately load the
-    script under another name. The path argument names the file — but it is
-    written as ``str(CONSTANT)`` more often than as a literal, so it is
-    resolved through the assignments in scope before it is read.
-    """
-    if identity_src.replace("'", '"').strip('()" ') == "cctally":
-        return True
-    if not path_src:
-        return False
-    for candidate in (path_src, _substitute(path_src, bindings)):
-        if candidate.replace("'", '"').rstrip(")").endswith('"cctally"'):
-            return True
-    return False
 
 
 def _parameter_names(func_node):
@@ -354,17 +361,729 @@ def _positional_parameters(func_node):
 
 
 def _default_bindings(func_node):
-    """Bind each parameter that has a default to that default's source."""
+    """Bind each parameter that has a default to that default's EXPRESSION.
+
+    A default is a value the call site supplies by omitting the argument, so it
+    is layered under the supplied arguments at the call site rather than read
+    at the loader call.
+    """
     args = func_node.args
     positional = [*args.posonlyargs, *args.args]
     out = {}
     for param, default in zip(positional[len(positional) - len(args.defaults):],
                               args.defaults):
-        out[param.arg] = ast.unparse(default)
+        out[param.arg] = default
     for param, default in zip(args.kwonlyargs, args.kw_defaults):
         if default is not None:
-            out[param.arg] = ast.unparse(default)
+            out[param.arg] = default
     return out
+
+
+#: The three values a path expression can carry. ``UNKNOWN`` is not a soft
+#: ``OTHER``: it is the value that makes the determination indeterminate, and an
+#: indeterminate loader is REPORTED. Returning ``OTHER`` for an expression the
+#: routine merely failed to evaluate is how a blind predicate hands back a
+#: determinate answer, which is the defect class this matcher exists to close.
+CCTALLY_EVIDENCE = "CCTALLY"
+OTHER_EVIDENCE = "OTHER"
+UNKNOWN_EVIDENCE = "UNKNOWN"
+
+_SCRIPT_COMPONENT = "cctally"
+#: How far an alias chain is followed before the routine gives up. The cap also
+#: breaks a cycle such as ``a = b`` / ``b = a``, so no visited set is needed.
+_ALIAS_DEPTH = 6
+_SEPARATORS = ("/", "\\")
+#: `printf`-style conversion types. A conversion is BARE when its type follows
+#: the `%` immediately, which is the only shape whose literal tail starts two
+#: characters later.
+_BARE_CONVERSION_TYPES = frozenset("diouxXeEfFgGcrsa")
+
+#: Verbs that do not change a path's final component, so evidence passes through.
+_LEAF_PRESERVING_CALLS = {
+    "str", "fspath", "Path", "PurePath", "PurePosixPath", "PureWindowsPath",
+    "PosixPath", "WindowsPath",
+}
+_LEAF_PRESERVING_METHODS = {"resolve", "absolute", "expanduser", "as_posix"}
+#: Verbs that yield a DIFFERENT path, so a cctally subtree below one is not
+#: evidence of cctally. This is the ``str(SCRIPT.parent)`` repair: the value of
+#: that expression is the directory, and a predicate that only asks whether
+#: ``cctally`` appears somewhere in the source calls it a hit.
+_PATH_CHANGING_METHODS = {"parent", "parents", "with_name", "with_suffix",
+                          "with_stem"}
+_PATH_CHANGING_CALLS = {"dirname"}
+#: Verbs whose final component is read from their LAST operand.
+_PATH_CONSTRUCTOR_CALLS = {"join"}
+
+#: Outward hops the call-site search will make. `tests/test_bench.py` needs
+#: two. Exhausting this bound yields "indeterminate", never "no": a bound that
+#: silently drops a chain is the blind spot, not the fix for it.
+_INDIRECTION_DEPTH = 4
+
+
+def _final_component(text):
+    """The last path component of a literal, or None when there is none."""
+    parts = [part for part in text.replace("\\", "/").split("/") if part]
+    return parts[-1] if parts else None
+
+
+def _evidence_for_component(component):
+    if component is None:
+        return UNKNOWN_EVIDENCE
+    return CCTALLY_EVIDENCE if component == _SCRIPT_COMPONENT else OTHER_EVIDENCE
+
+
+def _string_constant(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+#: Stands in for a name whose every binding is a determinate non-cctally path.
+#: A name bound in several places is not necessarily undeterminable — a loop
+#: over a literal tuple of module names binds it to each of them in turn, and
+#: none of them being cctally is a FACT rather than an absence of one.
+_OTHER_BINDING = ast.Constant(value="\x00not-cctally")
+
+
+def _computed_component_evidence(suffix):
+    """A component whose start is computed but whose tail is a literal.
+
+    `f"{name}.py"` is not evaluable, but it cannot BE `cctally` either: the
+    script is extensionless, so a component ending in `.py` is a determinate
+    NO. Treating every computed component as UNKNOWN would report the estate's
+    generic `_lib_*` sibling loaders, of which there are dozens, and an
+    indeterminate answer where a determinate one is available is a false
+    positive rather than caution.
+    """
+    if _SCRIPT_COMPONENT.endswith(suffix):
+        return UNKNOWN_EVIDENCE
+    return OTHER_EVIDENCE
+
+
+def _after_a_path_change(inner):
+    """A path-changing verb applied to ``inner`` names a DIFFERENT path.
+
+    Applied to a cctally subtree it yields OTHER rather than CCTALLY. Applied
+    to something the routine could not evaluate it stays UNKNOWN, because a
+    different path derived from an unknown one is still unknown.
+    """
+    return UNKNOWN_EVIDENCE if inner == UNKNOWN_EVIDENCE else OTHER_EVIDENCE
+
+
+def _joined_str_evidence(node):
+    """The final component of an f-string, read backwards from its tail.
+
+    A ``{...}`` slot reached before any separator means the final component is
+    partly computed, which is UNKNOWN rather than a component that happens to
+    end in the literal chunk after the slot.
+    """
+    tail = ""
+    for value in reversed(node.values):
+        chunk = _string_constant(value)
+        if chunk is None:
+            return _computed_component_evidence(tail)
+        normalized = chunk.replace("\\", "/")
+        if "/" in normalized:
+            return _evidence_for_component(normalized.rsplit("/", 1)[1] + tail)
+        tail = chunk + tail
+    return _evidence_for_component(_final_component(tail))
+
+
+def _binop_evidence(node, bindings, depth):
+    if isinstance(node.op, ast.Div):
+        # `A / B` takes its final component from B whatever A is, which is why
+        # an unresolvable prefix does not weaken what the tail states.
+        return _path_evidence(node.right, bindings, depth)
+    if isinstance(node.op, ast.Add):
+        tail = _string_constant(node.right)
+        if tail is None:
+            return UNKNOWN_EVIDENCE
+        if any(sep in tail for sep in _SEPARATORS):
+            return _evidence_for_component(_final_component(tail))
+        # `"cc" + "tally"` is a COMPUTED component. Folding the concatenation
+        # would report a determinate answer for an expression whose component
+        # the next spelling could hide just as easily, so what is read is the
+        # literal TAIL and nothing else.
+        return _computed_component_evidence(tail)
+    if isinstance(node.op, ast.Mod):
+        template = _string_constant(node.left)
+        if template is None:
+            return UNKNOWN_EVIDENCE
+        normalized = template.replace("\\", "/")
+        if "/" not in normalized:
+            return UNKNOWN_EVIDENCE
+        tail = normalized.rsplit("/", 1)[1]
+        if "%" in tail:
+            # Reading the text after the last conversion as a literal is only
+            # sound when that conversion is `%<type>` and nothing else. A
+            # mapping key, a flag, a width or a precision makes the conversion
+            # longer than two characters, so the leftover would be part of the
+            # conversion rather than a component tail.
+            conversion = tail.rsplit("%", 1)[1]
+            if not conversion or conversion[0] not in _BARE_CONVERSION_TYPES:
+                return UNKNOWN_EVIDENCE
+            return _computed_component_evidence(conversion[1:])
+        if not tail:
+            return UNKNOWN_EVIDENCE
+        return _evidence_for_component(tail)
+    return UNKNOWN_EVIDENCE
+
+
+def _call_evidence(node, bindings, depth):
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        if func.attr in _PATH_CHANGING_METHODS:
+            return _after_a_path_change(_path_evidence(func.value, bindings, depth))
+        if func.attr in _LEAF_PRESERVING_METHODS:
+            return _path_evidence(func.value, bindings, depth)
+    callee = _callee_name(node)
+    if callee in _PATH_CHANGING_CALLS:
+        return _after_a_path_change(
+            _path_evidence(node.args[0] if node.args else None, bindings, depth)
+        )
+    if callee in _LEAF_PRESERVING_CALLS or callee in _PATH_CONSTRUCTOR_CALLS:
+        # The LAST positional argument, not the first: `Path("bin", "cctally")`
+        # and `os.path.join(BIN, "cctally")` both name the file in their tail.
+        return _path_evidence(node.args[-1] if node.args else None, bindings, depth)
+    return UNKNOWN_EVIDENCE
+
+
+def _path_evidence(node, bindings, depth=0):
+    """Evaluate a path expression symbolically to CCTALLY, OTHER or UNKNOWN.
+
+    The comparison is on the FINAL component and it is exact, so
+    ``cctally-bench``, ``cctally-release`` and ``_cctally_db.py`` are all
+    OTHER. Both separators are recognized, so a Windows-style ``bin\\cctally``
+    literal is CCTALLY rather than UNKNOWN.
+    """
+    if node is None:
+        return UNKNOWN_EVIDENCE
+    literal = _string_constant(node)
+    if literal is not None:
+        return _evidence_for_component(_final_component(literal))
+    if isinstance(node, ast.Name):
+        if depth >= _ALIAS_DEPTH or node.id not in bindings:
+            return UNKNOWN_EVIDENCE
+        return _path_evidence(bindings[node.id], bindings, depth + 1)
+    if isinstance(node, ast.BinOp):
+        return _binop_evidence(node, bindings, depth)
+    if isinstance(node, ast.JoinedStr):
+        return _joined_str_evidence(node)
+    if isinstance(node, ast.Attribute):
+        if node.attr in _PATH_CHANGING_METHODS:
+            return _after_a_path_change(_path_evidence(node.value, bindings, depth))
+        return UNKNOWN_EVIDENCE
+    if isinstance(node, ast.Subscript):
+        # `SCRIPT.parents[0]` is a path change; `paths[0]` is opaque.
+        inner = node.value
+        if isinstance(inner, ast.Attribute) and inner.attr in _PATH_CHANGING_METHODS:
+            return _after_a_path_change(_path_evidence(inner.value, bindings, depth))
+        return UNKNOWN_EVIDENCE
+    if isinstance(node, ast.Call):
+        return _call_evidence(node, bindings, depth)
+    return UNKNOWN_EVIDENCE
+
+
+def _identity_literal(node, bindings, depth=0):
+    """The module name a loader call asks for, when it is a resolvable literal."""
+    if node is None:
+        return None
+    literal = _string_constant(node)
+    if literal is not None:
+        return literal
+    if isinstance(node, ast.Name) and depth < _ALIAS_DEPTH:
+        return _identity_literal(bindings.get(node.id), bindings, depth + 1)
+    return None
+
+
+#: Nodes that own their own namespace. `_simple_assignments` used `ast.walk`,
+#: which descends through all of them, so a helper's local bound a name that a
+#: DIFFERENT function's loader call then read. A class body is a boundary too:
+#: its assignments are reachable only as `Cls.ATTR` and are never injected into
+#: the enclosing scope as bare names.
+_SCOPE_BOUNDARIES = (
+    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
+    ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+)
+
+
+def _iter_scope_nodes(scope):
+    """Every node under ``scope`` that a NESTED scope does not own."""
+    for child in ast.iter_child_nodes(scope):
+        if isinstance(child, _SCOPE_BOUNDARIES):
+            continue
+        yield child
+        yield from _iter_scope_nodes(child)
+
+
+def _bound_names(target):
+    """The bare names an assignment target binds.
+
+    An `obj.attr` or `container[key]` target binds neither `obj` nor
+    `container`, so recording one would replace a good binding for that name
+    with an undeterminable one.
+    """
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Starred):
+        return _bound_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names = []
+        for element in target.elts:
+            names.extend(_bound_names(element))
+        return names
+    return []
+
+
+def _reduce_candidates(candidates, base=None):
+    """Collapse each name's candidate expressions to one binding.
+
+    "Last one in the AST wins" is not available, because one branch may bind
+    ``bin/cctally`` and another a different path, and which one the parser saw
+    second is not a fact about the program. A name resolves to the
+    cctally-bearing candidate if any is one; to a determinate non-cctally
+    stand-in when EVERY candidate is a concrete other path; and otherwise to
+    undeterminable.
+    """
+    settled = dict(base or {})
+    settled.update({
+        name: nodes[0] if len(nodes) == 1 else None
+        for name, nodes in candidates.items()
+    })
+    for name, nodes in candidates.items():
+        if len(nodes) == 1:
+            continue
+        evidence = [
+            _path_evidence(node, settled) if node is not None else UNKNOWN_EVIDENCE
+            for node in nodes
+        ]
+        if CCTALLY_EVIDENCE in evidence:
+            settled[name] = nodes[evidence.index(CCTALLY_EVIDENCE)]
+        elif evidence and all(value == OTHER_EVIDENCE for value in evidence):
+            settled[name] = _OTHER_BINDING
+    return {name: settled[name] for name in candidates}
+
+
+def _parametrize_names(node):
+    """The parameter names one ``parametrize`` decorator supplies."""
+    literal = _string_constant(node)
+    if literal is not None:
+        return [part.strip() for part in literal.split(",") if part.strip()]
+    if isinstance(node, (ast.Tuple, ast.List)):
+        names = [_string_constant(element) for element in node.elts]
+        return [name for name in names if name] if all(names) else []
+    return []
+
+
+def _literal_sequence(node, bindings, depth=0):
+    """The elements of a literal sequence, following one chain of names."""
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return node.elts
+    if isinstance(node, ast.Name) and depth < _ALIAS_DEPTH:
+        return _literal_sequence(bindings.get(node.id), bindings, depth + 1)
+    return None
+
+
+def _indirect_parameters(decorator, names, module_bindings):
+    """The parameters this decorator hands to a FIXTURE rather than to the test.
+
+    Under ``indirect``, pytest passes the row value to a fixture and the test
+    parameter holds whatever that fixture RETURNS, so binding the row would
+    answer a question about a value the test never receives. That is the
+    fixture-fed escape re-entering through the mechanism added to suppress one
+    false positive, so an indirect parameter is recorded as bound-but-
+    undeterminable instead.
+
+    ``indirect`` may be a boolean or a list of parameter names. A value that is
+    neither — a name the matcher cannot evaluate, a call — names parameters it
+    cannot enumerate, so every parameter the decorator supplies is treated as
+    fixture-fed.
+
+    Three spellings other than the keyword reach the same parameter. pytest
+    forwards a mark's positional arguments to ``Metafunc.parametrize``, whose
+    third parameter IS ``indirect``, so ``parametrize(names, rows, True)``
+    means what the keyword means. A ``**`` splat may carry it under a mapping
+    the matcher cannot read, and so may a keyword whose value is not literal;
+    both are treated as naming every parameter, because a splat that cannot be
+    enumerated must not answer NO on behalf of the parameters it might list.
+    """
+    node = next(
+        (kw.value for kw in decorator.keywords if kw.arg == "indirect"), None)
+    if node is None and len(decorator.args) > 2:
+        node = decorator.args[2]
+    if node is None:
+        if any(keyword.arg is None for keyword in decorator.keywords):
+            return set(names)
+        return set()
+    if isinstance(node, ast.Constant):
+        return set(names) if node.value else set()
+    elements = _literal_sequence(node, module_bindings)
+    if elements is None:
+        return set(names)
+    listed = [_string_constant(element) for element in elements]
+    if any(listed_name is None for listed_name in listed):
+        return set(names)
+    return {listed_name for listed_name in listed if listed_name in names}
+
+
+def _parametrize_bindings(function, module_bindings):
+    """Bind a test function's parameters to the values pytest supplies.
+
+    `@pytest.mark.parametrize` IS a call site — pytest supplies the argument —
+    so a parameter fed by one is not unresolvable, and reporting it would be a
+    false positive over values the decorator states literally. A parameter fed
+    by a FIXTURE stays absent, which is the form the rule deliberately reports,
+    and an ``indirect`` parameter is fixture-fed however literal its rows look.
+    """
+    candidates = {}
+    for decorator in getattr(function, "decorator_list", ()):
+        if (
+            not isinstance(decorator, ast.Call)
+            or _callee_name(decorator) != "parametrize"
+            or len(decorator.args) < 2
+        ):
+            continue
+        names = _parametrize_names(decorator.args[0])
+        if not names:
+            continue
+        rows = _literal_sequence(decorator.args[1], module_bindings)
+        if not rows:
+            for name in names:
+                candidates.setdefault(name, []).append(None)
+            continue
+        indirect = _indirect_parameters(decorator, names, module_bindings)
+        for row in rows:
+            if len(names) == 1:
+                values = [row]
+            elif isinstance(row, (ast.Tuple, ast.List)) and len(row.elts) == len(names):
+                values = list(row.elts)
+            else:
+                values = [None] * len(names)
+            for name, value in zip(names, values):
+                candidates.setdefault(name, []).append(
+                    None if name in indirect else value)
+    return _reduce_candidates(candidates, module_bindings)
+
+
+def _scope_bindings(scope):
+    """Map every name ``scope`` binds to the expression it is bound to.
+
+    A value of ``None`` means the name is bound by a form whose value cannot be
+    determined, which is NOT the same as the name being absent: dropping such a
+    name silently turns a bound name into an unbound one, and an unbound name
+    reads as a determinate answer where an indeterminate one is correct.
+
+    Rebinding is not "last one in the AST wins", because one branch may bind
+    ``bin/cctally`` and another a different path, and which one the parser saw
+    second is not a fact about the program. A name bound more than once
+    resolves to the cctally-bearing expression if any of them is one, and
+    otherwise to ``None``.
+    """
+    candidates = {}
+
+    def record(name, value):
+        candidates.setdefault(name, []).append(value)
+
+    def bind(target, value):
+        if isinstance(target, ast.Name):
+            record(target.id, value)
+            return
+        if isinstance(target, (ast.Tuple, ast.List)) and (
+            isinstance(value, (ast.Tuple, ast.List))
+            and len(value.elts) == len(target.elts)
+            and not any(isinstance(e, ast.Starred) for e in target.elts)
+        ):
+            for element, item in zip(target.elts, value.elts):
+                bind(element, item)
+            return
+        for name in _bound_names(target):
+            record(name, None)
+
+    for node in _iter_scope_nodes(scope):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                bind(target, node.value)
+        elif isinstance(node, ast.AnnAssign):
+            if node.value is not None:
+                bind(node.target, node.value)
+        elif isinstance(node, ast.NamedExpr):
+            bind(node.target, node.value)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            elements = (
+                node.iter.elts
+                if isinstance(node.iter, (ast.Tuple, ast.List, ast.Set))
+                else None
+            )
+            if elements:
+                for element in elements:
+                    bind(node.target, element)
+            else:
+                for name in _bound_names(node.target):
+                    record(name, None)
+        elif isinstance(node, ast.AugAssign):
+            for name in _bound_names(node.target):
+                record(name, None)
+        elif isinstance(node, ast.withitem):
+            if node.optional_vars is not None:
+                for name in _bound_names(node.optional_vars):
+                    record(name, None)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                record(node.name, None)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            if node.name:
+                record(node.name, None)
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest:
+                record(node.rest, None)
+
+    return _reduce_candidates(candidates)
+
+
+#: Text-assembling callees. A method here is literal text only when its
+#: RECEIVER is, because ``SCRIPT.read_text()`` has the same shape as
+#: ``"\n".join(...)`` and must never qualify; a function here ignores its
+#: module, so ``textwrap.dedent`` qualifies without ``textwrap`` being bound.
+_TEXT_ONLY_METHODS = frozenset(
+    {"format", "join", "strip", "lstrip", "rstrip", "replace", "upper", "lower"}
+)
+_TEXT_ONLY_FUNCTIONS = frozenset({"dedent", "indent"})
+
+
+def _is_literal_text(node, bindings, depth=0):
+    """True when this expression's value is text assembled in THIS file.
+
+    Such an expression names no file however its ``compile()`` filename
+    argument is spelled, so an ``exec`` over it generates code rather than
+    loading one.
+
+    The predicate this replaces asked only whether the node was a string
+    literal or an f-string. That left `textwrap.dedent("...")`, `"a" + "b"`,
+    `"\\n".join([...])` and `"...".format(...)` falling through to the filename
+    fallback, where a filename of `bin/cctally` reported generated code as a
+    load — and dedent over a triple-quoted template is this estate's most
+    common way of writing a child program.
+
+    Every operand must reduce to a literal, which is what keeps a file read
+    out: `SCRIPT.read_text()` fails on a receiver that is a `Name`, and
+    `open(str(SCRIPT)).read()` fails on a callee outside the two sets above.
+    """
+    if depth > _ALIAS_DEPTH:
+        return False
+    if isinstance(node, (ast.Constant, ast.JoinedStr)):
+        return True
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_is_literal_text(e, bindings, depth + 1) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            _is_literal_text(item, bindings, depth + 1)
+            for item in (*node.keys, *node.values)
+            if item is not None
+        )
+    if isinstance(node, ast.BinOp):
+        return _is_literal_text(node.left, bindings, depth + 1) and _is_literal_text(
+            node.right, bindings, depth + 1
+        )
+    if isinstance(node, ast.Name):
+        bound = bindings.get(node.id)
+        return bound is not None and _is_literal_text(bound, bindings, depth + 1)
+    if isinstance(node, ast.Call):
+        callee = _callee_name(node)
+        if isinstance(node.func, ast.Attribute):
+            if callee not in _TEXT_ONLY_METHODS and callee not in _TEXT_ONLY_FUNCTIONS:
+                return False
+            if callee in _TEXT_ONLY_METHODS and not _is_literal_text(
+                node.func.value, bindings, depth + 1
+            ):
+                return False
+        elif callee not in _TEXT_ONLY_FUNCTIONS:
+            return False
+        return all(
+            _is_literal_text(argument, bindings, depth + 1)
+            for argument in (*node.args, *(kw.value for kw in node.keywords))
+        )
+    return False
+
+
+def _code_path_expression(node, bindings):
+    """The expression naming the FILE an ``exec``'s code argument came from.
+
+    ``None`` when the code argument names no file, which is the rule that only
+    PATH-DERIVED code is a load. A source string built in the test is not one:
+    `tests/test_lib_changelog_policy.py` execs `"import re\n" + SHAPES[shape]`
+    into `vars(module)`, and a rule that read that as a load would report a
+    guard's own probe fixture as a hand-rolled cctally loader.
+
+    ``compile()``'s SOURCE argument is what the evidence is read from, and its
+    filename argument is only the fallback. The filename is a label the caller
+    chooses and the interpreter reports in tracebacks; it is not where the code
+    came from. ``compile(src, "<string>", "exec")`` is the default idiom for
+    compiling source that did not come from a file, and ``<string>`` holds no
+    separator, so preferring it turned a real load into a determinate NO.
+
+    The fallback is skipped when the source argument is text this file
+    assembled, because such a call generates code and its filename cannot make
+    it a load. It is kept for everything else, so a source expression the
+    routine cannot follow still reads its filename rather than dropping the
+    site.
+
+    The literal-text test also runs on the whole node, which is what stops a
+    NAME bound to source text from being read as a path: `SRC = "a = 1\\n/cctally"`
+    followed by `exec(compile(SRC, "<string>", "exec"), {})` would otherwise
+    resolve `SRC` through the lattice and find a `cctally` component inside the
+    program text.
+    """
+    if _is_literal_text(node, bindings):
+        return None
+    if isinstance(node, ast.Call):
+        callee = _callee_name(node)
+        if callee == "compile":
+            if not node.args:
+                return None
+            source = _code_path_expression(node.args[0], bindings)
+            if source is not None:
+                return source
+            if _is_literal_text(node.args[0], bindings) or len(node.args) < 2:
+                return None
+            return node.args[1]
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in _CONTENT_READER_METHODS
+        ):
+            return node.func.value
+        return None
+    if isinstance(node, ast.Name):
+        # A local alias or a parameter. The evidence lattice resolves the first
+        # and the outward recursion may resolve the second.
+        return node
+    return None
+
+
+def _writes_into_namespace(node, name):
+    """True when ``node`` is ``<name>.__dict__`` or ``vars(<name>)``.
+
+    This is the dataflow that associates a `ModuleType` with the `exec` that
+    fills it. Association by PROXIMITY — the deleted module-wide `module_execs`
+    flag — paired every constructor in a file with every `exec` in it.
+    """
+    if (
+        isinstance(node, ast.Attribute)
+        and node.attr == "__dict__"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == name
+    ):
+        return True
+    return (
+        isinstance(node, ast.Call)
+        and _callee_name(node) == "vars"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == name
+    )
+
+
+def _determine(identity_node, path_node, bindings):
+    """Does this call build a module from ``bin/cctally``?
+
+    The identity argument can only force a YES. It can never establish a NO,
+    because the estate deliberately loads the script under other names —
+    `_cctally_for_tests` and `cctally_cli` are both live — so a negative keyed
+    on identity would let any loader escape by renaming its module, which is
+    the blind spot this rule exists to close.
+
+    An UNKNOWN path is "indeterminate", and an indeterminate site is reported.
+    """
+    if _identity_literal(identity_node, bindings) == _SCRIPT_COMPONENT:
+        return "yes"
+    evidence = _path_evidence(path_node, bindings)
+    if evidence == CCTALLY_EVIDENCE:
+        return "yes"
+    if evidence == OTHER_EVIDENCE:
+        return "no"
+    return "indeterminate"
+
+
+class _ParameterRebinder(ast.NodeTransformer):
+    """Replace a helper's parameters by the arguments one call site supplies."""
+
+    def __init__(self, parameters, supplied):
+        self._parameters = parameters
+        self._supplied = supplied
+
+    def visit_Name(self, node):
+        if node.id in self._parameters and node.id in self._supplied:
+            return self._supplied[node.id]
+        return node
+
+
+def _rebind(node, parameters, supplied):
+    """Rebuild ``node`` with one call site's arguments in its parameter slots.
+
+    Structural, not textual. The regex substitution this replaces rewrote the
+    unparsed SOURCE of the expression, which meant a name inside an f-string or
+    a string literal was rewritten too.
+    """
+    if node is None:
+        return None
+    return _ParameterRebinder(parameters, supplied).visit(copy.deepcopy(node))
+
+
+class _AliasExpander(ast.NodeTransformer):
+    def __init__(self, bindings, parameters):
+        self._bindings = bindings
+        self._parameters = parameters
+        self.changed = False
+
+    def visit_Name(self, node):
+        if node.id in self._parameters:
+            return node
+        value = self._bindings.get(node.id)
+        if value is None:
+            return node
+        self.changed = True
+        return value
+
+
+def _expand_local_aliases(node, bindings, parameters):
+    """Collapse a helper's own locals into an expression before it travels.
+
+    ``target = p`` makes the loader's path argument a LOCAL name that the call
+    site knows nothing about. Left alone, the rebind at the call site replaces
+    nothing, the site stays indeterminate, and it is reported wherever it
+    stands — a false positive whenever the call site supplies another script.
+    """
+    if node is None:
+        return None
+    current = node
+    for _ in range(_ALIAS_DEPTH):
+        expander = _AliasExpander(bindings, parameters)
+        expanded = expander.visit(copy.deepcopy(current))
+        if not expander.changed:
+            return current
+        current = expanded
+    return current
+
+
+def _evidence_key(identity_node, path_node, bindings, parameters):
+    """The state a memoized outward resolution is keyed on.
+
+    Keying on the function node alone would collapse two call sites that reach
+    the same generic helper in different evidence states, so re-reaching a
+    helper in a state that DOES supply cctally would return the earlier state's
+    empty answer.
+    """
+    def unresolved(node):
+        if node is None:
+            return ()
+        return tuple(sorted({
+            name.id for name in ast.walk(node)
+            if isinstance(name, ast.Name) and name.id in parameters
+        }))
+
+    return (
+        _identity_literal(identity_node, bindings), unresolved(identity_node),
+        _path_evidence(path_node, bindings), unresolved(path_node),
+    )
 
 
 def cctally_loader_sites(path):
@@ -376,9 +1095,8 @@ def cctally_loader_sites(path):
     that supplies ``cctally`` — which is the site that has to change, because
     the helper itself is legitimately generic over other modules.
     """
-    source = path.read_text(encoding="utf-8")
     try:
-        tree = ast.parse(source)
+        return _loader_sites_in_source(path.read_text(encoding="utf-8"), path.name)
     except SyntaxError as exc:  # pragma: no cover - no such file exists today
         raise AssertionError(
             f"{path} is not parseable Python, so the one-loader rule cannot "
@@ -386,11 +1104,21 @@ def cctally_loader_sites(path):
             "a stated reason"
         ) from exc
 
-    module_assignments = _simple_assignments(tree)
-    module_execs = any(
-        isinstance(node, ast.Call) and _callee_name(node) == "exec"
-        for node in ast.walk(tree)
-    )
+
+def _loader_sites_in_source(source, label):
+    """The matcher itself, over source TEXT rather than a file.
+
+    Embedded child programs live in string literals, so the generated-child
+    detector needs the same matcher over text it never reads from disk. Keeping
+    one implementation is the point: a capability added here reaches both.
+
+    This raises ``SyntaxError`` rather than translating it, because the
+    generated-child detector uses that exception as its candidacy test — a
+    string literal that does not parse is not a program.
+    """
+    tree = ast.parse(source)
+    module_bindings = _scope_bindings(tree)
+
     enclosing = {}
     for node in ast.walk(tree):
         for child in ast.iter_child_nodes(node):
@@ -404,98 +1132,316 @@ def cctally_loader_sites(path):
             current = enclosing.get(current)
         return None
 
-    hits = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not node.args:
-            continue
-        callee = _callee_name(node)
-        if callee not in _LOADER_CALLS and callee != _MODULE_CONSTRUCTOR:
-            continue
-        # `types.ModuleType(name)` is only half a loader; the other half is the
-        # `exec` that fills the namespace. Without one, the call is building a
-        # module for some other purpose and is not this rule's business.
-        if callee == _MODULE_CONSTRUCTOR and not module_execs:
-            continue
-        identity_src = ast.unparse(node.args[0])
-        path_node = node.args[1] if len(node.args) > 1 else None
-        path_src = (
-            ast.unparse(path_node)
-            if path_node is not None and callee in _LOADER_CALLS
-            else ""
-        )
-        function = enclosing_function(node)
-        bindings = dict(module_assignments)
-        if function is not None:
-            bindings.update(_simple_assignments(function))
-        if _points_at_cctally(identity_src, path_src, bindings):
-            hits.append(node.lineno)
-            continue
+    scope_cache = {}
+
+    def locals_of(function):
         if function is None:
-            continue
+            return {}
+        key = id(function)
+        if key not in scope_cache:
+            scope_cache[key] = _scope_bindings(function)
+        return scope_cache[key]
+
+    merged_cache = {}
+
+    def bindings_for(function):
+        """Module bindings with ``function``'s own locals layered over them.
+
+        Parameter DEFAULTS are deliberately absent here. A default is a value
+        the CALL SITE supplies by omitting the argument, so resolving it at the
+        loader call would report the generic helper's own line instead of the
+        site that has to change.
+        """
+        if function is None:
+            return module_bindings
+        key = id(function)
+        if key not in merged_cache:
+            merged = dict(module_bindings)
+            merged.update(_parametrize_bindings(function, module_bindings))
+            merged.update(locals_of(function))
+            merged_cache[key] = merged
+        return merged_cache[key]
+
+    calls_by_name = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = _callee_name(node)
+            if name is not None:
+                calls_by_name.setdefault(name, []).append(node)
+
+    memo = {}
+
+    def resolve_outward(function, identity_node, path_node, report_line, stack, depth):
+        """Follow an indeterminate loader call outward to its callers.
+
+        The line reported is the OUTERMOST call site that supplies the concrete
+        value, because every helper below it is legitimately generic over other
+        modules and does not have to change.
+
+        Cycles are broken with the ACTIVE RECURSION STACK rather than a global
+        visited set: a set keyed on the function node conflates two call sites
+        that reach the same generic helper with different bindings and can
+        discard the branch that supplies cctally. Exhausting the depth bound,
+        finding no call site, or finding only call sites already on the stack
+        all report the site where it stands, because a bound that silently
+        drops a chain is the blind spot rather than the fix for it.
+        """
+        if function is None or depth >= _INDIRECTION_DEPTH:
+            return [report_line]
         parameters = set(_parameter_names(function))
-        identity_is_parameter = (
-            isinstance(node.args[0], ast.Name) and node.args[0].id in parameters
+        identity_expr = _expand_local_aliases(
+            identity_node, locals_of(function), parameters)
+        path_expr = _expand_local_aliases(path_node, locals_of(function), parameters)
+        key = (
+            id(function),
+            depth,
+            tuple(id(entry) for entry in stack),
+            _evidence_key(identity_expr, path_expr, bindings_for(function), parameters),
         )
-        path_names = (
-            {n.id for n in ast.walk(path_node) if isinstance(n, ast.Name)}
-            if path_node is not None
-            else set()
-        )
-        path_is_parameter = bool(path_names & parameters)
-        if not (identity_is_parameter or path_is_parameter):
-            continue
+        if key in memo:
+            return memo[key]
         ordered = _positional_parameters(function)
-        for call in ast.walk(tree):
-            if not isinstance(call, ast.Call) or _callee_name(call) != function.name:
+        defaults = _default_bindings(function)
+        found = []
+        considered = 0
+        for call in calls_by_name.get(function.name, ()):
+            call_function = enclosing_function(call)
+            if call_function is not None and any(
+                call_function is entry for entry in stack
+            ):
                 continue
-            supplied = _default_bindings(function)
-            for index, arg in enumerate(call.args):
+            considered += 1
+            supplied = dict(defaults)
+            for index, argument in enumerate(call.args):
                 if index < len(ordered):
-                    supplied[ordered[index]] = ast.unparse(arg)
+                    supplied[ordered[index]] = argument
             for keyword in call.keywords:
                 if keyword.arg:
-                    supplied[keyword.arg] = ast.unparse(keyword.value)
-            resolved = dict(bindings)
-            resolved.update(supplied)
-            if _points_at_cctally(
-                _substitute(identity_src, supplied) if identity_is_parameter
-                else identity_src,
-                _substitute(path_src, supplied) if path_is_parameter else path_src,
-                resolved,
+                    supplied[keyword.arg] = keyword.value
+            new_identity = _rebind(identity_expr, parameters, supplied)
+            new_path = _rebind(path_expr, parameters, supplied)
+            verdict = _determine(new_identity, new_path, bindings_for(call_function))
+            if verdict == "yes":
+                found.append(call.lineno)
+            elif verdict == "indeterminate":
+                found.extend(resolve_outward(
+                    call_function, new_identity, new_path, call.lineno,
+                    stack + (function,), depth + 1,
+                ))
+        if considered == 0:
+            found = [report_line]
+        memo[key] = found
+        return found
+
+    def loader_candidates():
+        """Every call this rule examines, as (node, identity node, path node).
+
+        A `ModuleType` paired with an `exec` is reported at the CONSTRUCTOR and
+        the `exec` is consumed, so one load never reports two sites.
+        """
+        constructors = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and _callee_name(node.value) == _MODULE_CONSTRUCTOR
+                and node.value.args
             ):
-                hits.append(call.lineno)
-    return [f"{path.name}:{line}" for line in sorted(set(hits))]
+                constructors.append((node.value, node.targets[0].id))
+        execs = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and _callee_name(node) == "exec"
+            and node.args
+        ]
+        paired = {}
+        consumed = set()
+        for constructor, name in constructors:
+            scope = enclosing_function(constructor)
+            for call in execs:
+                if len(call.args) < 2 or id(call) in consumed:
+                    continue
+                if enclosing_function(call) is not scope:
+                    continue
+                if not _writes_into_namespace(call.args[1], name):
+                    continue
+                paired[id(constructor)] = call
+                consumed.add(id(call))
+                break
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            callee = _callee_name(node)
+            if callee in _LOADER_CALLS and node.args:
+                yield (
+                    node,
+                    node.args[0],
+                    node.args[1] if len(node.args) > 1 else None,
+                )
+            elif callee == _RUNPY_PATH_CALL and node.args:
+                run_name = next(
+                    (kw.value for kw in node.keywords if kw.arg == "run_name"), None)
+                yield node, run_name, node.args[0]
+            elif callee == _MODULE_CONSTRUCTOR and node.args:
+                filler = paired.get(id(node))
+                path = (
+                    _code_path_expression(
+                        filler.args[0], bindings_for(enclosing_function(node)))
+                    if filler is not None
+                    else None
+                )
+                if path is not None:
+                    yield node, node.args[0], path
+            elif callee == "exec" and node.args and id(node) not in consumed:
+                # Only path-derived code is a load. An `exec` over source text
+                # the test built is code generation, and reporting it would
+                # report every probe fixture in the estate.
+                path = _code_path_expression(
+                    node.args[0], bindings_for(enclosing_function(node)))
+                if path is not None:
+                    yield node, None, path
+
+    hits = []
+    for node, identity_node, path_node in loader_candidates():
+        function = enclosing_function(node)
+        verdict = _determine(identity_node, path_node, bindings_for(function))
+        if verdict == "yes":
+            hits.append(node.lineno)
+        elif verdict == "indeterminate":
+            hits.extend(resolve_outward(
+                function, identity_node, path_node, node.lineno, (), 0))
+    return [f"{label}:{line}" for line in sorted(set(hits))]
 
 
-def _embedded_loader_source(path):
-    """True when ``path`` writes a cctally loader into source for a CHILD.
+def _candidate_snippets(tree):
+    """Every string literal that might be a program, with f-string slots kept.
+
+    Each ``{...}`` slot becomes one opaque placeholder NAME rather than being
+    dropped. Dropping them is what makes the estate's only candidate f-string
+    child — `tests/test_rewrite_release_notes.py:1107` — unparseable as
+    ``runpy.run_path(, run_name='__main__')``, so the detector never saw it. A
+    placeholder keeps the text parseable and leaves the path UNKNOWN, which the
+    determination reports.
+
+    "Parses as Python" admits ordinary data: ``"not found\n"`` parses as the
+    expression ``not found``, and a manifest of slash-separated paths parses as
+    a chain of divisions. That is harmless, because such a snippet holds no
+    loader call — but it is why these are called snippets rather than child
+    programs.
+
+    An f-string's own literal chunks are NOT yielded separately, because a
+    chunk that happened to hold a whole loader call would then be counted both
+    inside the joined text and on its own.
+    """
+    slot = 0
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.JoinedStr):
+            parts = []
+            for value in node.values:
+                chunk = _string_constant(value)
+                if chunk is not None:
+                    parts.append(chunk)
+                else:
+                    slot += 1
+                    parts.append(f"_CCTALLY_PLACEHOLDER_{slot}")
+            yield "".join(parts)
+            continue
+        chunk = _string_constant(node)
+        if chunk is not None:
+            yield chunk
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _substitute_format_fields(text):
+    """Replace ``str.format`` fields by opaque names, or None when there are none.
+
+    A child program can be a `.format` TEMPLATE rather than an f-string, and
+    such a template is not valid Python: `SourceFileLoader("cctally", {cli!r})`
+    raises a SyntaxError, so a parse-based detector skips it entirely.
+    `tests/test_stats_corruption_epic_e2e_496.py` and
+    `tests/test_stats_writer_storm_386.py` are both written this way, and both
+    embed a real `bin/cctally` loader.
+    """
+    out = []
+    slot = 0
+    index = 0
+    found = False
+    while index < len(text):
+        char = text[index]
+        pair = text[index:index + 2]
+        if pair in ("{{", "}}"):
+            out.append(char)
+            index += 2
+            continue
+        if char == "{":
+            close = text.find("}", index)
+            if close == -1:
+                out.append(char)
+                index += 1
+                continue
+            slot += 1
+            out.append(f"_CCTALLY_PLACEHOLDER_{slot}")
+            index = close + 1
+            found = True
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out) if found else None
+
+
+def _snippet_readings(snippet):
+    """Every way this text might be the program its author wrote.
+
+    A child program is routinely INDENTED inside a `textwrap.dedent(...)` block
+    and routinely a `.format` template, and neither reading parses as written.
+    Every reading that parses is matched and the largest site count wins, so
+    the order these are tried in cannot hide a loader.
+    """
+    readings = [snippet]
+    dedented = textwrap.dedent(snippet)
+    if dedented != snippet:
+        readings.append(dedented)
+    for text in list(readings):
+        formatted = _substitute_format_fields(text)
+        if formatted is not None:
+            readings.append(formatted)
+    return readings
+
+
+def _embedded_loader_sites(path):
+    """How many cctally loader sites ``path`` writes into source for a CHILD.
 
     The construction is inside a string literal rather than in the module's own
-    code, so it is invisible to the matcher above. Both constructions count, and
-    an f-string's literal chunks are joined first, because the site that made
-    this necessary splits its program text around one ``{...}`` placeholder.
+    code, so the estate scan cannot see it. This runs the SAME matcher over
+    that text, which is why extending a vocabulary of literal probes was the
+    wrong repair: the old detector asked whether the text mentioned `cctally`
+    near a loader name, when the question is whether the text LOADS
+    `bin/cctally`.
+
+    A count rather than a boolean: a second embedded loader inside a file that
+    is already known would otherwise leave `found == known` untouched, so the
+    carve-out assertion would pass while the detector missed a new site.
     """
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    texts = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.JoinedStr):
-            texts.append(
-                "".join(
-                    part.value
-                    for part in node.values
-                    if isinstance(part, ast.Constant) and isinstance(part.value, str)
-                )
-            )
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            texts.append(node.value)
-    for text in texts:
-        if "cctally" not in text or "\n" not in text:
+    total = 0
+    for snippet in _candidate_snippets(ast.parse(path.read_text(encoding="utf-8"))):
+        if "\n" not in snippet:
             continue
-        if "SourceFileLoader(" in text:
-            return True
-        if "ModuleType(" in text and "exec(" in text:
-            return True
-    return False
+        best = 0
+        for reading in _snippet_readings(snippet):
+            try:
+                sites = _loader_sites_in_source(reading, "<embedded>")
+            except (SyntaxError, ValueError, RecursionError):
+                # Not a program in this reading. This is the candidacy test,
+                # not an error path.
+                continue
+            best = max(best, len(sites))
+        total += best
+    return total
 
 
 def _tests_dir():
@@ -545,7 +1491,26 @@ _STANDALONE_FIXTURE_LOADERS = {
     "fixtures/tui/snapshot_ok.py": "cctally tui --snapshot-module argument",
     "fixtures/tui/snapshot_over.py": "cctally tui --snapshot-module argument",
     "fixtures/tui/snapshot_warn.py": "cctally tui --snapshot-module argument",
+    # #661 S2 spec section 13's right-censored consumer. Same class as its
+    # siblings above: a separate `cctally tui --snapshot-module` process
+    # executes it, so it cannot reach `tests/_script_loader`.
+    "fixtures/tui/snapshot_censored.py": "cctally tui --snapshot-module argument",
 }
+
+
+def _is_exempt(relative):
+    """True when this path relative to ``tests/`` keeps a hand-rolled loader.
+
+    Relative path only. The basename fallback this replaces exempted any file
+    named `conftest.py` or `test_rebuild_heal.py` ANYWHERE under tests/,
+    regardless of directory. Every current member sits at the `tests/` root or
+    is already spelled as a relative path, so no key changes value.
+    """
+    return relative in (
+        {"_script_loader.py", "conftest.py"}
+        | set(_CHILD_PROCESS_LOADERS)
+        | set(_STANDALONE_FIXTURE_LOADERS)
+    )
 
 
 def test_the_matcher_sees_a_generic_helper_given_the_cctally_identity(tmp_path):
@@ -553,9 +1518,11 @@ def test_the_matcher_sees_a_generic_helper_given_the_cctally_identity(tmp_path):
 
     The path argument here is a fixture attribute the matcher cannot resolve,
     so the identity channel is the only one that can catch this site. It was
-    inert before: ``_substitute`` parenthesizes every value it substitutes, and
-    the literal comparison stripped quotes but not parentheses, so a parameter
-    bound to ``"cctally"`` arrived as ``('cctally')`` and never matched.
+    inert in the first version of the matcher: the textual substitution
+    parenthesized every value it substituted, and the literal comparison
+    stripped quotes but not parentheses, so a parameter bound to ``"cctally"``
+    arrived as ``('cctally')`` and never matched. Substitution is structural
+    now, so the value arrives as the node the call site wrote.
     """
     module = tmp_path / "test_synthetic_identity.py"
     module.write_text(
@@ -596,31 +1563,840 @@ def test_the_matcher_sees_a_loader_behind_a_bound_method(tmp_path):
     assert cctally_loader_sites(module) == ["test_synthetic_method.py:11"]
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# The evidence lattice over path expressions, and the binding model it reads.
+# ──────────────────────────────────────────────────────────────────────────
+
+_PRELUDE = (
+    "import os, pathlib\n"
+    "ROOT = pathlib.Path('/repo')\n"
+    "BIN = ROOT / 'bin'\n"
+    "SCRIPT = ROOT / 'bin' / 'cctally'\n"
+)
+
+
+def _evidence_of(expression, prelude=""):
+    """Evidence for ``expression`` evaluated with ``prelude``'s module bindings."""
+    tree = ast.parse(f"{prelude}\n_probe = {expression}\n")
+    bindings = _scope_bindings(tree)
+    return _path_evidence(bindings["_probe"], bindings)
+
+
+@pytest.mark.parametrize("expression", [
+    "'cctally'",
+    "'bin/cctally'",
+    "SCRIPT",
+    "str(SCRIPT)",
+    "SCRIPT.as_posix()",
+    "str(SCRIPT.resolve())",
+    "f'{BIN}/cctally'",
+    "BIN + '/cctally'",
+    "os.path.join(BIN, 'cctally')",
+    "'%s/cctally' % BIN",
+    "pathlib.PurePath('bin', 'cctally')",
+    "'bin\\\\cctally'",
+    # The prefix is unresolvable and the final component is still exactly
+    # `cctally`, which is what CCTALLY means. The rejected containment
+    # predicate and this routine agree here for different reasons: the routine
+    # reads the LAST component of the `/` operator, so a prefix it cannot
+    # evaluate does not weaken what the tail states.
+    "UNBOUND / 'cctally'",
+])
+def test_path_evidence_recognizes_every_spelling(expression):
+    """Seven of these are spellings the tail test could not see.
+
+    ``rstrip(")")`` followed by ``endswith('"cctally"')`` is defeated by any
+    trailing method call, and it never had a chance at a separator-joined form
+    such as an f-string or a ``+`` concatenation.
+    """
+    assert _evidence_of(expression, _PRELUDE) == CCTALLY_EVIDENCE
+
+
+@pytest.mark.parametrize("expression", [
+    "SCRIPT.parent",
+    "SCRIPT.parents[0]",
+    "os.path.dirname(str(SCRIPT))",
+    "SCRIPT.with_name('other')",
+    "SCRIPT.with_suffix('.py')",
+    "'bin/cctally-bench'",
+    "ROOT / 'bin' / 'cctally-release'",
+])
+def test_path_evidence_rejects_a_path_that_is_not_the_script(expression):
+    """A path-changing verb applied to bin/cctally yields the DIRECTORY.
+
+    This is the repair the containment predicate could not make: a lexical
+    test sees `cctally` inside `str(SCRIPT.parent)` and calls it a hit, when
+    the value is `bin/`.
+    """
+    assert _evidence_of(expression, _PRELUDE) == OTHER_EVIDENCE
+
+
+@pytest.mark.parametrize("expression", [
+    "fixture.script",
+    "'cc' + 'tally'",
+    "f'{BIN}cctally'",
+    "'%s/%s' % (BIN, NAME)",
+    "paths[0]",
+    "build_path()",
+])
+def test_path_evidence_is_unknown_rather_than_negative(expression):
+    """An expression the routine cannot evaluate must NOT resolve to OTHER.
+
+    Returning OTHER here is how a blind predicate reports a determinate
+    answer, which is exactly the class of defect this issue exists to close.
+    """
+    assert _evidence_of(expression, _PRELUDE + "NAME = object()\n") == UNKNOWN_EVIDENCE
+
+
+@pytest.mark.parametrize("expression", [
+    "'bin/%(n)s' % D",
+    "'bin/%-5s' % NAME",
+    "'bin/%.7s' % NAME",
+    "'bin/%5s' % NAME",
+])
+def test_a_percent_conversion_that_is_not_bare_is_unknown(expression):
+    """A conversion is two characters long only when its type follows the ``%``.
+
+    Every type in ``_BARE_CONVERSION_TYPES`` is two characters long that way,
+    not just ``%s`` and ``%r``, and the old code was correct for all of them.
+    What it could not read is a conversion carrying a mapping key, a flag, a
+    width or a precision, which is what each row above spells.
+
+    Stripping exactly one character after the last ``%`` left the rest of a
+    mapping key, a flag, a width or a precision behind — ``n)s``, ``5s``,
+    ``7s`` — and then compared that leftover text against ``cctally`` as though
+    it were a real path component. Every one of those spellings can evaluate to
+    ``bin/cctally`` at runtime, ``"bin/%(n)s" % {"n": "cctally"}`` most plainly,
+    so a determinate NO for any of them is the fail-open direction.
+    """
+    prelude = _PRELUDE + "NAME = object()\nD = {}\n"
+    assert _evidence_of(expression, prelude) == UNKNOWN_EVIDENCE
+
+
+def test_a_bare_percent_conversion_keeps_its_literal_tail_determinate():
+    """The determinate half of the same rule, which the repair must not lose.
+
+    ``bin/cctally`` is extensionless, so a component ending in ``.py`` cannot be
+    the script whatever the conversion produces.
+    """
+    assert _evidence_of(
+        "'bin/%s.py' % NAME", _PRELUDE + "NAME = object()\n"
+    ) == OTHER_EVIDENCE
+
+
+@pytest.mark.parametrize("expression", ["'bin/%s' % NAME", "'bin/%r' % NAME"])
+def test_a_bare_conversion_ending_the_string_leaves_nothing_determinate(expression):
+    """These two answer UNKNOWN for a different reason than their neighbours.
+
+    The conversion ends the string, so the literal tail is empty and the whole
+    final component is whatever the operand renders to. That held before the
+    bare-conversion repair and still holds after it, which is why these rows
+    sit here rather than beside the mapping-key and width spellings the repair
+    is actually about.
+    """
+    assert _evidence_of(
+        expression, _PRELUDE + "NAME = object()\n"
+    ) == UNKNOWN_EVIDENCE
+
+
+def test_scope_bindings_stop_at_a_nested_function():
+    """A helper's local must not bind a name in module scope.
+
+    `_simple_assignments` used `ast.walk`, which descends into every function
+    body, so an unrelated helper's local could bind a name a different
+    function's loader call reads.
+    """
+    tree = ast.parse(
+        "OUTER = 'bin/cctally'\n"
+        "def helper():\n"
+        "    INNER = 'bin/cctally'\n"
+        "    return INNER\n"
+    )
+    bindings = _scope_bindings(tree)
+    assert "OUTER" in bindings
+    assert "INNER" not in bindings
+
+
+def test_scope_bindings_reach_into_a_conditional_but_not_a_class():
+    """An `if` body is the enclosing scope; a class body is not.
+
+    A class attribute is reachable only as `Cls.ATTR` and is never injected
+    into the enclosing scope as a bare name.
+    """
+    tree = ast.parse(
+        "import pathlib\n"
+        "if True:\n"
+        "    GUARDED = pathlib.Path('bin/cctally')\n"
+        "class Holder:\n"
+        "    ATTRIBUTE = pathlib.Path('bin/cctally')\n"
+    )
+    bindings = _scope_bindings(tree)
+    assert "GUARDED" in bindings
+    assert "ATTRIBUTE" not in bindings
+
+
+@pytest.mark.parametrize("statement", [
+    "TARGET: pathlib.Path = ROOT / 'bin' / 'cctally'",
+    "ROOT2, TARGET = pathlib.Path('/r'), ROOT / 'bin' / 'cctally'",
+    "(TARGET := ROOT / 'bin' / 'cctally')",
+])
+def test_scope_bindings_resolve_the_newly_supported_forms(statement):
+    """Each form binds a name the previous model dropped on the floor.
+
+    The name is deliberately NOT one the prelude already binds: reusing
+    `SCRIPT` would let the prelude's plain assignment answer the question and
+    the row would pass whether or not the new form resolves.
+    """
+    assert _evidence_of("TARGET", _PRELUDE + statement + "\n") == CCTALLY_EVIDENCE
+
+
+@pytest.mark.parametrize("statement", [
+    "for SCRIPT in candidates: pass",
+    "with open('f') as SCRIPT: pass",
+    "try:\n    pass\nexcept OSError as SCRIPT:\n    pass",
+])
+def test_a_dynamically_bound_name_is_unknown_not_absent(statement):
+    """Dropping these silently turns a bound name into an unbound one.
+
+    An absent name and a name bound to something undeterminable are different
+    facts, and only the second one must make the determination indeterminate.
+    """
+    prelude = "candidates = []\n" + statement + "\n"
+    tree = ast.parse(prelude + "_probe = SCRIPT\n")
+    bindings = _scope_bindings(tree)
+    assert "SCRIPT" in bindings and bindings["SCRIPT"] is None
+    assert _path_evidence(bindings["_probe"], bindings) == UNKNOWN_EVIDENCE
+
+
+def test_a_name_bound_differently_in_two_branches_is_not_last_one_wins():
+    """One branch binds the script and the other does not.
+
+    "Last assignment in the AST wins" would report whichever the parser saw
+    second, which is not a fact about the program.
+    """
+    prelude = (
+        "import pathlib\n"
+        "if flag:\n"
+        "    SCRIPT = pathlib.Path('bin/cctally')\n"
+        "else:\n"
+        "    SCRIPT = pathlib.Path('bin/cctally-bench')\n"
+    )
+    assert _evidence_of("SCRIPT", prelude) == CCTALLY_EVIDENCE
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The determination, and the outward call-site recursion that feeds it.
+# ──────────────────────────────────────────────────────────────────────────
+
+_LOADER_PRELUDE = (
+    "import pathlib\n"
+    "from importlib.machinery import SourceFileLoader\n"
+    "ROOT = pathlib.Path('/repo')\n"
+    "SCRIPT = ROOT / 'bin' / 'cctally'\n"
+)
+
+
+def _sites(source):
+    return _loader_sites_in_source(source, "probe.py")
+
+
+def test_an_opaque_path_under_a_non_cctally_identity_is_reported():
+    """The fixture-fed form the issue names.
+
+    Keying the negative on the identity argument is what let this through: a
+    resolvable identity that is not `cctally` is no evidence about the path,
+    because the estate already loads the script as `_cctally_for_tests` and
+    `cctally_cli`.
+    """
+    assert _sites(
+        "from importlib.machinery import SourceFileLoader\n"
+        "def test_a(fixture):\n"
+        "    return SourceFileLoader('shadow', fixture.script).load_module()\n"
+    ) == ["probe.py:3"]
+
+
+def test_a_resolvable_non_cctally_path_in_a_test_function_is_not_reported():
+    """The negative control for the rule above.
+
+    Fail-closed on UNKNOWN is only affordable because a path that resolves to
+    a concrete other component still resolves to a determinate NO.
+    """
+    assert _sites(
+        "from importlib.machinery import SourceFileLoader\n"
+        "def test_a(tmp_path):\n"
+        "    return SourceFileLoader('m', str(tmp_path / 'm.py')).load_module()\n"
+    ) == []
+
+
+def test_two_levels_of_helper_indirection_report_the_outermost_call_site():
+    """`tests/test_bench.py` holds this chain live, one hop below offending."""
+    assert _sites(
+        _LOADER_PRELUDE
+        + "def _load_path(mod_name, file_name):\n"
+          "    return SourceFileLoader(mod_name, str(ROOT / 'bin' / file_name)).load_module()\n"
+          "def _load_bin(name):\n"
+          "    return _load_path(name.replace('-', '_'), name)\n"
+          "def test_a():\n"
+          "    return _load_bin('cctally')\n"
+    ) == ["probe.py:10"]
+
+
+def test_the_live_test_bench_shape_loading_another_script_is_not_reported():
+    assert _sites(
+        _LOADER_PRELUDE
+        + "def _load_path(mod_name, file_name):\n"
+          "    return SourceFileLoader(mod_name, str(ROOT / 'bin' / file_name)).load_module()\n"
+          "def _load_bin(name):\n"
+          "    return _load_path(name.replace('-', '_'), name)\n"
+          "def test_a():\n"
+          "    return _load_bin('cctally-bench')\n"
+    ) == []
+
+
+def test_exceeding_the_indirection_depth_is_reported_not_dropped():
+    """A silent bound is the exact failure this issue exists to close.
+
+    The line asserted is where the bound is REACHED rather than where the
+    loader stands. The call at line 6 is followed outward through the calls at
+    lines 18, 16 and 14, and the fourth hop — the call `_h2` makes at line 12 —
+    exhausts ``_INDIRECTION_DEPTH``, so that is the site reported. Asserting
+    only that the result is non-empty would pass for any line the matcher
+    happened to name, and would pass equally for a matcher that reported every
+    site in the file.
+    """
+    chain = "".join(
+        f"def _h{i}(n, p):\n    return _h{i + 1}(n, p)\n"
+        for i in range(_INDIRECTION_DEPTH + 2)
+    )
+    source = (
+        _LOADER_PRELUDE
+        + f"def _h{_INDIRECTION_DEPTH + 2}(n, p):\n"
+          "    return SourceFileLoader(n, p).load_module()\n"
+        + chain
+        + "def test_a():\n    return _h0('shadow', str(SCRIPT))\n"
+    )
+    assert _sites(source) == ["probe.py:12"]
+
+
+def test_a_mutually_recursive_helper_pair_terminates():
+    """A global visited set keyed on the function node would lose a branch."""
+    assert _sites(
+        _LOADER_PRELUDE
+        + "def _a(n, p):\n    return _b(n, p)\n"
+          "def _b(n, p):\n    return _a(n, p) or SourceFileLoader(n, p).load_module()\n"
+          "def test_a():\n    return _a('cctally', 'anything')\n"
+    ) == ["probe.py:10"]
+
+
+def test_a_helper_whose_call_sites_disagree_reports_only_the_offending_one():
+    assert _sites(
+        _LOADER_PRELUDE
+        + "def _load(n, p):\n"
+          "    return SourceFileLoader(n, p).load_module()\n"
+          "def test_a():\n    return _load('bench', str(ROOT / 'bin' / 'cctally-bench'))\n"
+          "def test_b():\n    return _load('shadow', str(SCRIPT))\n"
+    ) == ["probe.py:10"]
+
+
+def test_a_parameter_default_counts_as_a_supplied_value():
+    assert _sites(
+        _LOADER_PRELUDE
+        + "def _load(n, p=str(SCRIPT)):\n"
+          "    return SourceFileLoader(n, p).load_module()\n"
+          "def test_a():\n    return _load('shadow')\n"
+    ) == ["probe.py:8"]
+
+
+def test_a_local_alias_of_a_parameter_resolves_through_the_call_site():
+    """A local alias is not resolvable where it stands, only outward.
+
+    `target` is bound to a parameter, so the loader call itself is
+    indeterminate. Only the call site supplies a value, and the alias has to
+    survive the outward hop or the site is reported wherever it stands.
+    """
+    assert _sites(
+        _LOADER_PRELUDE
+        + "def _load(n, p):\n"
+          "    target = p\n"
+          "    return SourceFileLoader(n, target).load_module()\n"
+          "def test_a():\n    return _load('shadow', str(SCRIPT))\n"
+    ) == ["probe.py:9"]
+
+
+def test_a_local_alias_carrying_another_script_is_not_reported():
+    """The same alias, resolved outward to a path that is NOT the script.
+
+    Without the alias surviving the hop this reports a false positive: the
+    call site's path stays unresolvable and fail-closed reporting fires.
+    """
+    assert _sites(
+        _LOADER_PRELUDE
+        + "def _load(n, p):\n"
+          "    target = p\n"
+          "    return SourceFileLoader(n, target).load_module()\n"
+          "def test_a():\n"
+          "    return _load('shadow', str(ROOT / 'bin' / 'cctally-bench'))\n"
+    ) == []
+
+
+_INDIRECT_PRELUDE = (
+    "import pytest\n"
+    "from importlib.machinery import SourceFileLoader\n"
+    "INDIRECT = object()\n"
+)
+
+
+@pytest.mark.parametrize("decorator,expected", [
+    ("@pytest.mark.parametrize('script', ['bin/cctally-bench'], indirect=True)",
+     ["probe.py:6"]),
+    ("@pytest.mark.parametrize('script', ['bin/cctally-bench'], indirect=['script'])",
+     ["probe.py:6"]),
+    ("@pytest.mark.parametrize('script', ['bin/cctally-bench'], indirect=INDIRECT)",
+     ["probe.py:6"]),
+    ("@pytest.mark.parametrize('script', ['bin/cctally-bench'], indirect=False)",
+     []),
+    ("@pytest.mark.parametrize('script', ['bin/cctally-bench'])",
+     []),
+])
+def test_an_indirect_parametrization_binds_a_value_the_test_never_receives(
+        decorator, expected):
+    """With ``indirect``, pytest hands the literal to a FIXTURE.
+
+    What the test parameter holds is whatever that fixture returns, so reading
+    the decorator's row as the parameter's value answers a question about a
+    value the test never receives. That is the fixture-fed escape re-entering
+    through the mechanism added to suppress one false positive, so an indirect
+    parameter is recorded as bound-but-undeterminable and the site is reported.
+
+    A non-literal ``indirect`` names parameters the matcher cannot enumerate,
+    so every parameter the decorator supplies is treated as fixture-fed.
+    """
+    assert _sites(
+        _INDIRECT_PRELUDE
+        + decorator + "\n"
+        + "def test_a(script):\n"
+          "    return SourceFileLoader('shadow', script).load_module()\n"
+    ) == expected
+
+
+def test_only_the_indirect_half_of_a_parametrization_is_undeterminable():
+    """``indirect`` may name a subset, and the rest still bind their rows.
+
+    Treating the whole decorator as undeterminable whenever ``indirect``
+    appears would report every direct parameter beside an indirect one, which
+    is a false positive rather than caution.
+    """
+    assert _sites(
+        _INDIRECT_PRELUDE
+        + "@pytest.mark.parametrize('name,script', [('m', 'bin/cctally-bench')], "
+          "indirect=['name'])\n"
+          "def test_a(name, script):\n"
+          "    return SourceFileLoader(name, script).load_module()\n"
+    ) == []
+
+
+@pytest.mark.parametrize("decorator", [
+    "@pytest.mark.parametrize('script', ['bin/cctally-bench'], True)",
+    "@pytest.mark.parametrize('script', ['bin/cctally-bench'], **OPTS)",
+])
+def test_indirect_reaches_the_matcher_by_three_spellings(decorator):
+    """``indirect`` is not always a keyword the decorator states literally.
+
+    pytest forwards a mark's positional arguments to ``Metafunc.parametrize``,
+    whose third parameter IS ``indirect``, so the positional form means what
+    the keyword means. A ``**`` splat can carry it under a mapping the matcher
+    cannot read, and a splat that cannot be enumerated must not answer NO on
+    behalf of the parameters it might name. Reading only the keyword left both
+    binding a row value the test never receives.
+    """
+    assert _sites(
+        _INDIRECT_PRELUDE
+        + "OPTS = {'indirect': True}\n"
+        + decorator + "\n"
+          "def test_a(script):\n"
+          "    return SourceFileLoader('shadow', script).load_module()\n"
+    ) != []
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Loader kinds that are not an importlib call: ModuleType, exec, runpy.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_module_type_under_an_alternate_identity_is_reported():
+    """`types.ModuleType` is half a loader; the `exec` is the other half."""
+    assert _sites(
+        "import pathlib, types\n"
+        "SCRIPT = pathlib.Path('/repo') / 'bin' / 'cctally'\n"
+        "def test_a():\n"
+        "    module = types.ModuleType('shadow')\n"
+        "    exec(compile(SCRIPT.read_text(), str(SCRIPT), 'exec'), module.__dict__)\n"
+        "    return module\n"
+    ) == ["probe.py:4"]
+
+
+def test_module_type_filled_from_another_script_is_not_reported():
+    assert _sites(
+        "import pathlib, types\n"
+        "SCRIPT = pathlib.Path('/repo') / 'bin' / 'cctally-bench'\n"
+        "def test_a():\n"
+        "    module = types.ModuleType('shadow')\n"
+        "    exec(compile(SCRIPT.read_text(), str(SCRIPT), 'exec'), module.__dict__)\n"
+        "    return module\n"
+    ) == []
+
+
+def test_unrelated_constructors_and_an_unrelated_exec_are_not_paired():
+    """The pre-fix `module_execs` guard pairs every constructor with every exec.
+
+    `tests/test_isolation_plugin_globals.py` and
+    `tests/test_lib_changelog_policy.py` are the live shapes: the first builds
+    ModuleType objects with no exec at all, the second execs a GENERATED SOURCE
+    STRING into vars(module), which is not a file load.
+    """
+    assert _sites(
+        "import types\n"
+        "def test_a():\n"
+        "    module = types.ModuleType('fake_importer')\n"
+        "    module.json = None\n"
+        "    return module\n"
+        "def test_b():\n"
+        "    other = types.ModuleType('_probe')\n"
+        "    exec('X = 1\\n', vars(other))\n"
+        "    return other\n"
+    ) == []
+
+
+def test_a_module_named_cctally_that_no_exec_fills_is_not_a_loader():
+    """What the module-wide `module_execs` flag got wrong, in one file.
+
+    The flag asked only whether the MODULE contains an `exec` anywhere, so any
+    `ModuleType("cctally")` in a file that happens to hold one elsewhere was
+    reported. A module object registered under the script's name and filled by
+    hand is a stub, not a load, and the dataflow rule is what separates them.
+    """
+    assert _sites(
+        "import types\n"
+        "def test_a():\n"
+        "    stub = types.ModuleType('cctally')\n"
+        "    stub.VALUE = 1\n"
+        "    return stub\n"
+        "def test_b():\n"
+        "    exec('X = 1\\n', {})\n"
+    ) == []
+
+
+def test_exec_compile_into_a_plain_dict_is_reported():
+    """The pre-migration conftest.load_script shape: no ModuleType at all."""
+    assert _sites(
+        "import pathlib\n"
+        "SCRIPT = pathlib.Path('/repo') / 'bin' / 'cctally'\n"
+        "def test_a():\n"
+        "    namespace = {}\n"
+        "    exec(compile(SCRIPT.read_text(), str(SCRIPT), 'exec'), namespace)\n"
+        "    return namespace\n"
+    ) == ["probe.py:5"]
+
+
+def test_exec_of_a_generated_source_string_is_not_a_loader():
+    assert _sites(
+        "def test_a():\n"
+        "    namespace = {}\n"
+        "    exec(compile('X = 1\\n', '<generated>', 'exec'), namespace)\n"
+        "    return namespace\n"
+    ) == []
+
+
+@pytest.mark.parametrize("code", [
+    "compile(SCRIPT.read_text(), '<string>', 'exec')",
+    "compile(SCRIPT.read_text(), '<cctally>', 'exec')",
+    "compile(SCRIPT.read_text(), filename='<string>', mode='exec')",
+    "compile(SCRIPT.read_text(), str(SCRIPT), 'exec')",
+])
+def test_a_compiled_load_is_read_from_its_source_argument(code):
+    """The code executed comes from the SOURCE argument, not from the filename.
+
+    ``compile(src, "<string>", "exec")`` is the default idiom for compiling
+    source that did not come from a file, and ``<string>`` has no path
+    separator, so preferring the filename made its final component ``<string>``
+    — a determinate NO for a call that really does load the script. The keyword
+    form was already caught, because it leaves one positional argument and the
+    routine fell back to unwrapping it; that fallback is the rule which now
+    applies in both spellings.
+    """
+    assert _sites(
+        "import pathlib\n"
+        "SCRIPT = pathlib.Path('/repo') / 'bin' / 'cctally'\n"
+        "def test_a():\n"
+        f"    exec({code}, {{}})\n"
+    ) == ["probe.py:4"]
+
+
+def test_generated_source_compiled_under_the_scripts_name_is_not_a_load():
+    """The negative half of the same preference order.
+
+    A filename is a label the caller chooses and the interpreter only reports
+    in tracebacks. Reading it as the path let generated source claim to be the
+    script, which is the false-positive direction of the same defect.
+    """
+    assert _sites(
+        "import pathlib\n"
+        "SCRIPT = pathlib.Path('/repo') / 'bin' / 'cctally'\n"
+        "def test_a():\n"
+        "    exec(compile('X = 1\\n', str(SCRIPT), 'exec'), {})\n"
+    ) == []
+
+
+@pytest.mark.parametrize("source", [
+    "textwrap.dedent('X = 1\\n')",
+    "'X = 1' + '\\n'",
+    "'\\n'.join(['X = 1'])",
+    "'X = {}'.format(1)",
+])
+def test_source_this_file_assembled_is_generated_however_it_is_spelled(source):
+    """The same negative, for text built by anything but a bare literal.
+
+    Asking whether the code argument IS a literal answers a syntactic question
+    where the real one is whether the value was assembled here. Each spelling
+    below is source text written in this file, and each fell through to the
+    filename fallback and reported generated code as a load. ``dedent`` over a
+    triple-quoted template is the shape that matters: it is how this estate
+    writes most of its child programs.
+    """
+    assert _sites(
+        "import pathlib, textwrap\n"
+        "SCRIPT = pathlib.Path('/repo') / 'bin' / 'cctally'\n"
+        "def test_a():\n"
+        f"    exec(compile({source}, str(SCRIPT), 'exec'), {{}})\n"
+    ) == []
+
+
+def test_a_name_bound_to_source_text_is_not_read_as_a_path():
+    """Preferring the source argument made the PROGRAM TEXT a path expression.
+
+    A name bound to source text resolves through the lattice like any other,
+    so a generated program that happens to contain a ``/cctally`` component
+    was reported as loading the script.
+    """
+    assert _sites(
+        "SRC = 'a = 1\\n/cctally'\n"
+        "def test_a():\n"
+        "    exec(compile(SRC, '<string>', 'exec'), {})\n"
+    ) == []
+
+
+@pytest.mark.parametrize("call,expected", [
+    ("runpy.run_path(str(SCRIPT), run_name='cctally')", ["probe.py:4"]),
+    ("runpy.run_path(str(SCRIPT))", ["probe.py:4"]),
+    ("runpy.run_path(str(ROOT / 'bin' / 'cctally-bench'))", []),
+    ("runpy.run_module('cctally')", []),
+])
+def test_runpy_run_path_is_a_loader_and_run_module_is_not(call, expected):
+    """`bin/cctally` is extensionless and unimportable by name.
+
+    That is why this repository loads it by path, and why matching
+    `run_module("cctally")` on identity would report an unrelated installed
+    distribution rather than close a hole.
+    """
+    assert _sites(
+        "import pathlib, runpy\n"
+        "ROOT = pathlib.Path('/repo')\n"
+        "SCRIPT = ROOT / 'bin' / 'cctally'\n"
+        f"{call}\n"
+    ) == expected
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The generated-child detector, which reuses the matcher over embedded text.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _embedded_count(tmp_path, source):
+    module = tmp_path / "embedded_probe.py"
+    module.write_text(source, encoding="utf-8")
+    return _embedded_loader_sites(module)
+
+
+def test_an_embedded_spec_from_file_location_child_is_detected(tmp_path):
+    assert _embedded_count(
+        tmp_path,
+        "CHILD = '''\n"
+        "import importlib.util\n"
+        "spec = importlib.util.spec_from_file_location('cctally', '/repo/bin/cctally')\n"
+        "'''\n",
+    ) == 1
+
+
+def test_an_embedded_runpy_child_is_detected(tmp_path):
+    assert _embedded_count(
+        tmp_path,
+        "CHILD = '''\n"
+        "import runpy\n"
+        "runpy.run_path('/repo/bin/cctally', run_name='cctally')\n"
+        "'''\n",
+    ) == 1
+
+
+def test_prose_naming_the_loader_is_not_a_child_program(tmp_path):
+    """Two live modules match on their DOCSTRINGS, not on a program.
+
+    `test_five_hour_block_envelope.py` and `test_five_hour_block_selector.py`
+    describe the loader pattern in prose, which is why widening the detector's
+    VOCABULARY was the wrong repair: the question is not whether the text
+    mentions cctally near a loader name, it is whether the text loads it.
+    """
+    assert _embedded_count(
+        tmp_path,
+        '"""The plan\'s fixture uses spec_from_file_location("cctally", ...)\n'
+        'to import the script, which would write to the real data directory.\n'
+        '"""\n',
+    ) == 0
+
+
+def test_an_embedded_child_loading_a_different_script_is_not_detected(tmp_path):
+    """`test_public_test_dep_closure.py`'s child, in miniature."""
+    assert _embedded_count(
+        tmp_path,
+        "CHILD = '''\n"
+        "import importlib.util\n"
+        "_gate = ('cctally-release',)\n"
+        "importlib.util.spec_from_file_location('r', '/repo/bin/_cctally_release.py')\n"
+        "'''\n",
+    ) == 0
+
+
+def test_two_embedded_sites_in_one_file_are_counted_separately(tmp_path):
+    """A boolean detector over a filename set cannot express this.
+
+    Adding a second embedded loader to a file already in `known` leaves
+    `found == known` unchanged, so the assertion passes while the detector
+    misses a new site.
+    """
+    assert _embedded_count(
+        tmp_path,
+        "FIRST = '''\n"
+        "from importlib.machinery import SourceFileLoader\n"
+        "SourceFileLoader('cctally', '/repo/bin/cctally').load_module()\n"
+        "'''\n"
+        "SECOND = '''\n"
+        "import runpy\n"
+        "runpy.run_path('/repo/bin/cctally')\n"
+        "'''\n",
+    ) == 2
+
+
+def test_an_fstring_child_has_its_placeholders_substituted_not_dropped(tmp_path):
+    """Dropping the slots leaves `run_path(, run_name=...)`, a SyntaxError.
+
+    Measured on `tests/test_rewrite_release_notes.py:1107`, the estate's only
+    candidate f-string child.
+    """
+    assert _embedded_count(
+        tmp_path,
+        "SCRIPT = '/repo/bin/cctally'\n"
+        "CHILD = f'''\n"
+        "import runpy\n"
+        "runpy.run_path({SCRIPT!r}, run_name='__main__')\n"
+        "'''\n",
+    ) == 1
+
+
+@pytest.mark.parametrize("relative,expected", [
+    ("_script_loader.py", True),
+    ("conftest.py", True),
+    ("test_rebuild_heal.py", True),
+    ("fixtures/tui/snapshot_ok.py", True),
+    ("subdir/test_rebuild_heal.py", False),
+    ("subdir/conftest.py", False),
+    ("fixtures/tui/subdir/snapshot_ok.py", False),
+])
+def test_an_exemption_is_keyed_on_the_relative_path_not_the_basename(relative, expected):
+    """A basename fallback exempts a file anywhere under tests/.
+
+    The fixture entries were already keyed by relative path; the two
+    child-process entries and the two primitive entries were not, so a nested
+    file sharing one of their names inherited the exemption silently.
+    """
+    assert _is_exempt(relative) is expected
+
+
 def test_the_estate_has_one_loader_implementation():
     """A rule, not a list: no test module may build its own cctally module.
 
     Enumerated from the tree so a new hand-rolled copy is caught rather than a
     known one re-checked. Four classes are exempt and every one is named: the
     primitive itself, the two modules whose loader runs inside a child process
-    (``_CHILD_PROCESS_LOADERS``), the five fixture files a separate ``cctally``
-    process executes (``_STANDALONE_FIXTURE_LOADERS``), and the ten that embed
-    the loader inside source written out for another interpreter, which the test
-    below covers.
+    (``_CHILD_PROCESS_LOADERS``), the six fixture files a separate ``cctally``
+    process executes (``_STANDALONE_FIXTURE_LOADERS``), and the thirteen that
+    embed the loader inside source written out for another interpreter, which
+    the test below covers.
+
+    Scope is decided by ``_is_exempt`` and by nothing else, so this scan and
+    the determinacy scan below cannot disagree about which files are in it.
     """
     tests_dir = _tests_dir()
-    exempt = (
-        {"_script_loader.py", "conftest.py"}
-        | set(_CHILD_PROCESS_LOADERS)
-        | set(_STANDALONE_FIXTURE_LOADERS)
-    )
     offenders = []
     for path in _estate_python_files():
-        if path.relative_to(tests_dir).as_posix() in exempt or path.name in exempt:
+        if _is_exempt(path.relative_to(tests_dir).as_posix()):
             continue
         offenders.extend(cctally_loader_sites(path))
     assert offenders == [], (
         "these sites build their own cctally module instead of calling "
         f"load_script_module(): {offenders}"
+    )
+
+
+def test_every_estate_loader_call_reaches_a_determinate_answer():
+    """AC12, as an assertion rather than a one-off measurement.
+
+    The estate holds 157 loader calls. Nine of them load `bin/cctally`, spread
+    across eight files because `test_writer_reroute.py` holds two — at `:1384`
+    and `:1418` — and every one of those eight files is already exempt. So
+    every OTHER call must resolve to a determinate NO, not to `indeterminate`,
+    which the guard reports. That is what the whole-estate scan states here:
+    with the exempt files INCLUDED, the matcher reports those eight files and
+    no others. The offender test above cannot say this, because it skips the
+    exempt files before it looks at them, so a false positive inside one would
+    be invisible to it.
+
+    The call count is a floor rather than a figure, so adding a loader call to
+    the estate does not fail this test — while a matcher that stopped
+    recognizing loader calls at all, which would make every other assertion
+    here pass vacuously, does.
+    """
+    tests_dir = _tests_dir()
+    vocabulary = (*_LOADER_CALLS, _MODULE_CONSTRUCTOR, _RUNPY_PATH_CALL)
+    scanned = 0
+    reported = {}
+    for path in _estate_python_files():
+        # This module is excluded from its own universe for the reason the
+        # generated-child test states: it holds the synthetic loader sources
+        # the matcher is tested against.
+        if path.name == "test_script_loader.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        scanned += sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _callee_name(node) in vocabulary
+        )
+        sites = cctally_loader_sites(path)
+        if sites:
+            reported[path.relative_to(tests_dir).as_posix()] = sites
+    assert scanned >= 100, (
+        f"only {scanned} loader calls were found under tests/, where the "
+        "measurement was 157; a matcher that recognizes nothing passes every "
+        "other assertion in this module vacuously"
+    )
+    unexpected = sorted(r for r in reported if not _is_exempt(r))
+    assert unexpected == [], (
+        "the matcher reports a file outside the four exempt classes, which is "
+        "a defect in the PREDICATE rather than a candidate for a new "
+        f"exemption: {unexpected}"
+    )
+    carved_out = set(_CHILD_PROCESS_LOADERS) | set(_STANDALONE_FIXTURE_LOADERS)
+    assert carved_out <= set(reported), (
+        "an exempted file no longer reports the loader its exemption names: "
+        f"{sorted(carved_out - set(reported))}"
     )
 
 
@@ -640,7 +2416,7 @@ def test_the_child_process_carve_out_still_describes_the_tree():
 
 
 def test_the_standalone_fixture_carve_out_still_describes_the_tree():
-    """Same check for the five fixture files, which are data rather than tests.
+    """Same check for the six fixture files, which are data rather than tests.
 
     They are exempt because a separate ``cctally`` process executes them, not
     because they are under ``tests/fixtures/``. A blanket directory exemption
@@ -655,46 +2431,72 @@ def test_the_standalone_fixture_carve_out_still_describes_the_tree():
 
 
 def test_generated_child_sites_are_named_rather_than_silently_left():
-    """Ten modules embed the loader in source for a separate interpreter.
+    """Thirteen modules embed a loader in source for a separate interpreter.
 
     A child program started by `subprocess` has no `tests/` on its path and no
     parent pytest helper to import, so it cannot call the primitive. They are
     listed here so that leaving them is a recorded decision rather than an
-    oversight, and so that an eleventh appearing is a failing test rather than a
-    silent regression.
+    oversight, and so that a fourteenth appearing is a failing test rather than
+    a silent regression.
 
-    ``test_codex_fused_ingest.py`` is the tenth. Its child builds the module
-    with ``types.ModuleType`` and ``exec(compile(...))``, so the earlier
-    detector — which required the literal text ``SourceFileLoader(`` inside the
-    string — did not see it, and the count stated here was nine.
+    Membership means the module embeds a loader the detector cannot prove is
+    NOT `bin/cctally` — which is the honest reading of a fail-closed detector,
+    and why three of the entries below load something else entirely.
+
+    Both sides are COUNTS rather than names. While `found` was a set of
+    filenames and the detector a boolean, adding a second embedded loader to a
+    file already listed here left `found == known` untouched, so this assertion
+    passed while the detector missed a new site. The counts state what the
+    boolean could not: `test_doctor_gather.py` holds four embedded loaders and
+    `test_stats_rebuild_recovery_388.py` holds three.
     """
     known = {
-        "test_cache_write_ttl_pricing.py",
-        "test_claude_fast_pricing.py",
-        "test_codex_fused_ingest.py",
-        "test_correction_rebuild_orchestration_394.py",
-        "test_debug_sample_emission.py",
-        "test_doctor_gather.py",
-        "test_stats_corruption_epic_e2e_496.py",
-        "test_stats_rebuild_cutover_388.py",
-        "test_stats_rebuild_recovery_388.py",
-        "test_stats_writer_storm_386.py",
+        "test_cache_write_ttl_pricing.py": 1,
+        "test_claude_fast_pricing.py": 1,
+        "test_codex_fused_ingest.py": 1,
+        "test_correction_rebuild_orchestration_394.py": 1,
+        "test_debug_sample_emission.py": 1,
+        "test_doctor_gather.py": 4,
+        # Loads tests/isolation_bootstrap/sitecustomize.py through an f-string
+        # placeholder, so the child's path is UNKNOWN rather than provably not
+        # the script.
+        "test_isolation_contract.py": 1,
+        # Runs bin/cctally-rewrite-release-notes through `runpy.run_path` with
+        # an f-string placeholder path. Invisible until `run_path` joined the
+        # vocabulary AND the placeholder kept the child parseable.
+        "test_rewrite_release_notes.py": 1,
+        # Two `.format` child templates — `_HOLDER` at :324 and `_DETECTOR` at
+        # :369 — each spawning a child that loads bin/cctally through its
+        # `{cli!r}` slot.
+        "test_stats_corruption_epic_e2e_496.py": 2,
+        "test_stats_rebuild_cutover_388.py": 1,
+        "test_stats_rebuild_recovery_388.py": 3,
+        "test_stats_writer_storm_386.py": 1,
+        # The embedded validator shim loads whatever `EV_SHIM_REAL_KERNEL`
+        # names, so the path is a subscript the detector cannot evaluate.
+        "test_test_all_observability.py": 1,
     }
     tests_dir = _tests_dir()
     # This module is excluded from its own universe. It holds the synthetic
     # loader sources the matcher is tested against, so scanning it makes the
-    # guard report on its own corpus rather than on the estate. The suppression
-    # scanner solves the identical problem by excluding a helper's own body.
+    # guard report on its own corpus rather than on the estate. That exclusion
+    # is MORE necessary now, not less, because the detector runs the shared
+    # kernel over exactly those sources. The suppression scanner solves the
+    # identical problem by excluding a helper's own body.
     scanning_itself = "test_script_loader.py"
     found = {
-        path.relative_to(tests_dir).as_posix()
+        path.relative_to(tests_dir).as_posix(): count
         for path in _estate_python_files()
-        if path.name != scanning_itself and _embedded_loader_source(path)
+        if path.name != scanning_itself
+        and (count := _embedded_loader_sites(path))
     }
     assert found == known, (
         "the generated-child carve-out changed; a NEW module embedding the "
-        f"loader in child source must be justified: added={found - known}, "
-        f"removed={known - found}"
+        "loader in child source must be justified, and a changed COUNT means "
+        "an existing module gained or lost a site: "
+        f"added={ {k: v for k, v in found.items() if k not in known} }, "
+        f"removed={ {k: v for k, v in known.items() if k not in found} }, "
+        f"changed={ {k: (known[k], found[k]) for k in known.keys() & found.keys() if known[k] != found[k]} }"
     )
 
 

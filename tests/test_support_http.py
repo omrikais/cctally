@@ -16,7 +16,7 @@ import pytest
 from tests import _support_http
 from tests._support_http import (
     EXHAUSTED_DEADLINE_FLOOR_SECONDS, PRESENCE_BACKSTOP_SECONDS, post_json,
-    read_event, read_no_event, remaining, serve, stop,
+    read_event, read_no_event, remaining, start, stop,
 )
 
 
@@ -67,7 +67,8 @@ def test_remaining_shares_one_deadline_and_never_returns_a_poll():
 
 
 def test_serve_returns_a_listening_server_and_stop_joins_its_thread():
-    srv, thread = serve(_echo_server)
+    srv = _echo_server()
+    thread = start(srv)
     try:
         assert srv.server_address[1] != 0
         code, body = post_json(srv.server_address[1], "/x", {"a": 1})
@@ -78,7 +79,8 @@ def test_serve_returns_a_listening_server_and_stop_joins_its_thread():
 
 
 def test_stop_reports_a_surviving_thread_by_name():
-    srv, accept_thread = serve(_echo_server)
+    srv = _echo_server()
+    accept_thread = start(srv)
     release = threading.Event()
     stuck = threading.Thread(target=lambda: release.wait(60), name="stuck-probe",
                              daemon=True)
@@ -113,7 +115,8 @@ def _recorded_deadline(monkeypatch, *, frame):
     def fake_drain(_sock, marker, deadline_seconds):
         seen["marker"] = marker
         seen["deadline"] = deadline_seconds
-        return frame, "", 0.0
+        return frame, "", 0.0, (_support_http.MATCHED if frame is not None
+                                else _support_http.WINDOW_EXPIRED), None
 
     monkeypatch.setattr(_support_http, "_drain_for", fake_drain)
     return seen
@@ -168,6 +171,11 @@ def test_a_raise_from_settimeout_leaves_the_residue_with_the_socket():
     restored, so a later `read_no_event` on the same socket would have found an
     empty buffer and passed by having nothing to look at — vacuous rather than
     wrong, which is the failure this session exists to remove.
+
+    The raise no longer escapes: `settimeout` sits inside the same `try` as
+    `recv`, so it is reported as the socket-error outcome instead of reaching
+    the caller as a bare `Bad file descriptor`. The subject of this test is
+    unchanged — the `finally` hands the popped residue back on that path too.
     """
     class ClosedSocket:
         def settimeout(self, _seconds):
@@ -175,9 +183,71 @@ def test_a_raise_from_settimeout_leaves_the_residue_with_the_socket():
 
     sock = ClosedSocket()
     _support_http._RESIDUE[sock] = b"event: keepalive\n\n"
-    with pytest.raises(OSError):
-        _support_http._drain_for(sock, "tail", 5.0)
+    _frame, _tail, _elapsed, outcome, detail = _support_http._drain_for(
+        sock, "tail", 5.0)
+    # Equality, not `startswith`. The outcome is the constant itself and the
+    # raised text travels beside it, so a caller can ask `outcome in
+    # (PEER_CLOSED, SOCKET_ERROR)` and get the right answer.
+    assert outcome == _support_http.SOCKET_ERROR
+    assert "Bad file descriptor" in detail
     assert _support_http._RESIDUE.get(sock) == b"event: keepalive\n\n"
+
+
+def test_read_event_names_a_peer_close_differently_from_a_window_expiry():
+    """The two failures used to print identically, which hid which happened."""
+    a, b = socket.socketpair()
+    try:
+        b.close()
+        with pytest.raises(AssertionError) as closed:
+            read_event(a, marker="event: ready", backstop=1.0)
+    finally:
+        a.close()
+    c, d = socket.socketpair()
+    try:
+        with pytest.raises(AssertionError) as quiet:
+            read_event(c, marker="event: ready", backstop=1.0)
+    finally:
+        c.close()
+        d.close()
+    assert str(closed.value) != str(quiet.value)
+    assert "peer-closed" in str(closed.value)
+    assert "window-expired" in str(quiet.value)
+
+
+def test_read_no_event_fails_when_the_peer_closed_before_the_window_elapsed():
+    """EOF is not silence. A closed peer proves nothing about the server.
+
+    `_drain_for` used to leave on an empty read and on a window expiry through
+    the same return, so a negative assertion passed when its transport had
+    gone away — vacuous rather than wrong.
+    """
+    a, b = socket.socketpair()
+    try:
+        b.close()
+        with pytest.raises(AssertionError) as excinfo:
+            read_no_event(a, marker="event: tail", window=3.0)
+        assert "closed" in str(excinfo.value)
+    finally:
+        a.close()
+
+
+def test_read_no_event_fails_when_the_socket_raises_before_the_window_elapsed():
+    """A socket double, because a really-closed socket raises from settimeout.
+
+    The interesting case is the one that used to pass silently: `settimeout`
+    succeeds and `recv` raises, which the old `except OSError: break` turned
+    into a successful "nothing arrived".
+    """
+    class RaisingSocket:
+        def settimeout(self, _seconds):
+            return None
+
+        def recv(self, _size):
+            raise OSError(104, "Connection reset by peer")
+
+    with pytest.raises(AssertionError) as excinfo:
+        read_no_event(RaisingSocket(), marker="event: tail", window=3.0)
+    assert "Connection reset by peer" in str(excinfo.value)
 
 
 def test_a_frame_buffered_by_an_absence_check_is_still_readable_after_it():
@@ -390,7 +460,8 @@ def test_a_daemon_handler_thread_is_still_tracked():
     handler thread" for a server that had one — the opposite of the truth.
     """
     started, ended = threading.Event(), threading.Event()
-    srv, thread = serve(lambda: _sse_server(started, ended))
+    srv = _sse_server(started, ended)
+    thread = start(srv)
     sock = _open_stream(srv.server_address[1])
     try:
         assert started.wait(PRESENCE_BACKSTOP_SECONDS), "the handler never ran"
@@ -416,8 +487,9 @@ def test_start_makes_the_handlers_daemons_on_a_non_daemon_server_class():
     interpreter exit for its full remaining duration.
     """
     started, ended = threading.Event(), threading.Event()
-    srv, thread = serve(lambda: _sse_server(
-        started, ended, server_class=socketserver.ThreadingTCPServer))
+    srv = _sse_server(started, ended,
+                      server_class=socketserver.ThreadingTCPServer)
+    thread = start(srv)
     sock = _open_stream(srv.server_address[1])
     try:
         assert started.wait(PRESENCE_BACKSTOP_SECONDS), "the handler never ran"
@@ -443,7 +515,8 @@ def test_a_server_not_started_through_start_reports_that_it_cannot_track():
 
 def test_stop_closes_the_connections_it_is_given_and_reaps_the_handler():
     started, ended = threading.Event(), threading.Event()
-    srv, thread = serve(lambda: _sse_server(started, ended))
+    srv = _sse_server(started, ended)
+    thread = start(srv)
     sock = _open_stream(srv.server_address[1])
     assert started.wait(PRESENCE_BACKSTOP_SECONDS), "the handler never ran"
     stop(srv, thread, connections=[sock])
@@ -462,7 +535,8 @@ def test_stop_names_a_surviving_handler_and_still_closes_the_listener():
     per failure.
     """
     started, ended = threading.Event(), threading.Event()
-    srv, thread = serve(lambda: _sse_server(started, ended))
+    srv = _sse_server(started, ended)
+    thread = start(srv)
     sock = _open_stream(srv.server_address[1])
     handler = None
     try:
@@ -506,7 +580,8 @@ def test_a_wedged_accept_thread_names_the_handlers_that_are_still_running():
     described the wrong state.
     """
     started, ended = threading.Event(), threading.Event()
-    srv, accept_thread = serve(lambda: _sse_server(started, ended))
+    srv = _sse_server(started, ended)
+    accept_thread = start(srv)
     sock = _open_stream(srv.server_address[1])
     release = threading.Event()
     wedged = threading.Thread(target=lambda: release.wait(60),
@@ -554,9 +629,9 @@ def test_a_wedged_accept_thread_on_a_non_threading_server_says_so():
     thread that "every tracked handler thread has exited" about a server that
     never had a handler thread to exit.
     """
-    srv, accept_thread = serve(lambda: _sse_server(
-        threading.Event(), threading.Event(),
-        server_class=socketserver.TCPServer))
+    srv = _sse_server(threading.Event(), threading.Event(),
+                      server_class=socketserver.TCPServer)
+    accept_thread = start(srv)
     release = threading.Event()
     wedged = threading.Thread(target=lambda: release.wait(60),
                               name="wedged-plain-accept-probe", daemon=True)
@@ -597,6 +672,7 @@ def test_a_connection_whose_close_fails_does_not_abort_the_teardown():
         def close(self):
             raise OSError("already closed")
 
-    srv, thread = serve(_echo_server)
+    srv = _echo_server()
+    thread = start(srv)
     stop(srv, thread, connections=[_Hostile()])
     assert not thread.is_alive()

@@ -258,17 +258,46 @@ def _optional_pct_cell(value, *, scale: float = 100.0):
     return _LS.PercentCell(float(value) * scale)
 
 
+def _optional_fraction_percent(value, spec: str = ".1f") -> str:
+    """A fraction rendered as a percent, or `n/a` when it is withheld.
+
+    #661 S2. `projected_end_pct` is `None` at a right-censored reading and on
+    a week with no observed usage. `float(... or 0.0) * 100` printed `0.0%`,
+    which states that nothing will be consumed by week end — on a screen whose
+    message is that the meter is already at its cap.
+    """
+    if value is None:
+        return "n/a"
+    return f"{float(value) * 100.0:{spec}}%"
+
+
+#: Beyond this many days a ceiling distance is arithmetic without content.
+#: The rate it comes from is a within-week pace, so a month is already four
+#: times the window it was measured over. #661 S2 spec §3.6.
+CEILING_HORIZON_DAYS = 30.0
+
+
 def _optional_days(value, spec: str = ".1f") -> str:
-    """A number of days, or `n/a` when the distance is not defined.
+    """A number of days, `n/a` when undefined, or a beyond-horizon token.
 
     #620 S1. `days_to_90pct` / `days_to_100pct` are withheld when no rate was
     observed, because a ceiling is not reachable on any timeline the data
     describes. `float(... or 0.0)` printed `0.0`, which says the ceiling has
     already been reached — the opposite fact.
+
+    #661 S2 §3.6 adds the far end. A very small rate produces a very distant
+    ceiling date, and on a week whose meter reads a displayed zero the
+    corrected pace put `Days→90%` at 1166.8 — arithmetically right and
+    practically useless. This is a PRESENTATION bound and not a withholding:
+    the panel data still carries the exact float, and the rate underneath
+    stays published. Only the rendered string changes.
     """
     if value is None:
         return "n/a"
-    return f"{float(value):{spec}}"
+    days = float(value)
+    if days > CEILING_HORIZON_DAYS:
+        return f">{CEILING_HORIZON_DAYS:.0f}d"
+    return f"{days:{spec}}"
 
 
 def _optional_signed_pct(value) -> str:
@@ -969,7 +998,8 @@ def _build_forecast_recap(*, panel_data, options):
         totals=_kpi_strip(
             ("Days→90%",  _optional_days(panel_data.get('days_to_90pct'))),
             ("Days→100%", _optional_days(panel_data.get('days_to_100pct'))),
-            ("End %",     f"{float(panel_data.get('projected_end_pct') or 0.0)*100:.1f}%"),
+            ("End %",     _optional_fraction_percent(
+                panel_data.get('projected_end_pct'))),
         ),
         notes=notes,
         generated_at=_utc_now(),
@@ -1626,7 +1656,8 @@ def _build_forecast_visual(*, panel_data, options):
         totals=_kpi_strip(
             ("Days→90%",  _optional_days(panel_data.get('days_to_90pct'))),
             ("Days→100%", _optional_days(panel_data.get('days_to_100pct'))),
-            ("End %",     f"{float(panel_data.get('projected_end_pct') or 0.0)*100:.1f}%"),
+            ("End %",     _optional_fraction_percent(
+                panel_data.get('projected_end_pct'))),
         ),
         notes=notes,
         generated_at=_utc_now(),
@@ -1694,7 +1725,8 @@ def _build_forecast_detail(*, panel_data, options):
         totals=_kpi_strip(
             ("Days→90%",  _optional_days(panel_data.get('days_to_90pct'))),
             ("Days→100%", _optional_days(panel_data.get('days_to_100pct'))),
-            ("End %",     f"{float(panel_data.get('projected_end_pct') or 0.0)*100:.1f}%"),
+            ("End %",     _optional_fraction_percent(
+                panel_data.get('projected_end_pct'))),
         ),
         notes=notes,
         generated_at=_utc_now(),

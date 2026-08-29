@@ -26,6 +26,8 @@ import time
 import pytest
 import yaml
 
+from helpers.authoritative_runtime_budget import write_budget
+from tests import _estate_stub
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS, remaining
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -70,6 +72,34 @@ def _has_vocabulary_producer(path):
 VOCABULARY_AVAILABLE = any(_has_vocabulary_producer(path) for path in _kernels())
 
 
+def _production_constant(name):
+    """One integer constant, read from the aggregator's own source.
+
+    Re-declaring a value here makes a case agree with itself rather than with
+    production. `ORPHAN_GRACE_SECONDS` is the worked example: raising the real
+    window to 1,200 seconds would have been caught by the backdating far below,
+    but lowering it to 1 second would not, because every case backdated past
+    both.
+
+    Reading the value is not the same as pinning it. A case that both derives
+    its bound from here AND needs the declared value to stay put must assert
+    that value separately, or a change to the runner moves the case with it.
+    """
+    match = re.search(
+        r"^%s\s*=\s*(\d+)\s*$" % re.escape(name),
+        RUNNER.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert match, "%s is not defined in %s" % (name, RUNNER)
+    return int(match.group(1))
+
+
+#: The cadence an authoritative run reports at, whatever the seam is set to.
+AUTHORITATIVE_PROGRESS_INTERVAL = _production_constant(
+    "AUTHORITATIVE_PROGRESS_INTERVAL"
+)
+
+
 def _estate(tmp_path, harnesses=None, exits=None, smoke=True, manifest_min=None):
     """A scratch repository whose harnesses print exactly what a case needs."""
     harnesses = dict(harnesses or {"alpha": [DEFAULT_SUMMARY]})
@@ -90,6 +120,18 @@ def _estate(tmp_path, harnesses=None, exits=None, smoke=True, manifest_min=None)
         shutil.copy2(lib, bindir / lib.name)
     for kernel in _kernels():
         shutil.copy2(kernel, bindir / kernel.name)
+    # #648 D10. The class glob above copies the estate checker too, and a
+    # scratch estate carries no committed artifact for it to check against, so
+    # every case here failed at admission on the fixture rather than on the
+    # property it asserts (51 of them, measured). The stub answers with a clean
+    # report; the aggregator's own handling of that report is not stubbed.
+    _estate_stub.install(bindir)
+    # #648 D7. Both pytest legs load `-p tests._estate_leg_plugin`, so a scratch
+    # estate that omitted it would fail on a missing module. Copied rather than
+    # guarded by an existence check: a guard around the proof is exactly the
+    # shape D7 removed from the leg construction.
+    shutil.copy2(REPO / "tests" / "_estate_leg_plugin.py",
+                 testsdir / "_estate_leg_plugin.py")
 
     # `reconcile` stays in the aggregator's final_harnesses as an ordering
     # device, so every estate must carry it or the pool runs a harness that is
@@ -141,25 +183,8 @@ def _estate(tmp_path, harnesses=None, exits=None, smoke=True, manifest_min=None)
         encoding="utf-8",
     )
 
-    # #630 S7. A real estate carries a committed runtime budget and an
-    # authoritative full run refuses to start without one, so every scratch
-    # estate carries one too. The maximum is deliberately enormous rather than
-    # the committed 120: a scratch estate passes a handful of cases in a few
-    # seconds, which is a per-case cost orders of magnitude worse than the real
-    # estate's, and a fixture pinned at the real threshold would breach it by
-    # construction on every case in this file.
-    (testsdir / "authoritative-runtime-budget.json").write_text(
-        json.dumps(
-            {
-                "schemaVersion": 1,
-                "metric": "secondsPerThousandCases",
-                "maxSecondsPerThousandCases": 1000000,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    # #630 S7, one spelling since #650 item 5.
+    write_budget(testsdir)
     return repo
 
 
@@ -497,6 +522,83 @@ def _completions(stderr):
     ]
 
 
+#: How long the authoritative-cadence case makes its pool last. Long enough
+#: that a run honouring the one-second seam must print intermediate ticks, and
+#: short enough to stay a rounding error against the estate it runs in.
+SEAM_EVIDENCE_SECONDS = 3
+
+
+#: One pattern per `printf` in the reporter loop, named for the phase each
+#: one prints for. Kept separate rather than folded into one alternation with
+#: a fallback label, so a third shape added later has to be given its phase
+#: here instead of arriving silently as a pool line.
+POOL_HEARTBEAT_RE = re.compile(
+    r"^\[cctally-test-all\] (?P<elapsed>\d+)s — \d+/\d+ done, .*queued$"
+)
+PHASE_HEARTBEAT_RE = re.compile(
+    r"^\[cctally-test-all\] (?P<elapsed>\d+)s — (?P<phase>pytest|benchmark) running$"
+)
+#: The aggregator's own measurement of how long the shell pool ran, which is
+#: exactly how long the pool reporter was alive to print cadence lines.
+POOL_WALL_RE = re.compile(
+    r"^\[cctally-test-all\] shell pool finished — (?P<seconds>\d+)s; classifying "
+)
+
+
+def _heartbeats(stderr):
+    """`(elapsed_seconds, phase)` for every cadence line the reporter wrote."""
+    marks = []
+    for line in stderr.splitlines():
+        match = PHASE_HEARTBEAT_RE.match(line)
+        if match:
+            marks.append((int(match.group("elapsed")), match.group("phase")))
+            continue
+        match = POOL_HEARTBEAT_RE.match(line)
+        if match:
+            marks.append((int(match.group("elapsed")), "pool"))
+    return marks
+
+
+def _pool_wall_seconds(stderr):
+    """How long the shell pool ran, as the aggregator itself reported it."""
+    matches = [
+        match for match in map(POOL_WALL_RE.match, stderr.splitlines()) if match
+    ]
+    assert len(matches) == 1, stderr
+    return int(matches[0].group("seconds"))
+
+
+def _cadence_violations(marks, interval):
+    """Consecutive same-phase heartbeats written closer together than `interval`.
+
+    Only same-phase pairs are governed by the cadence, because a phase change
+    emits its own immediate pulse. Judging every adjacent pair instead would
+    call the pool-to-pytest pulse a violation on any estate whose pool
+    finishes quickly, and judging the count instead would make the verdict a
+    function of how fast the machine happened to be.
+    """
+    return [
+        (previous, current)
+        for previous, current in zip(marks, marks[1:])
+        if previous[1] == current[1] and current[0] - previous[0] < interval
+    ]
+
+
+def _seed_slow_harness(est, name, seconds):
+    """Give one harness a body that sleeps before it reports success.
+
+    The file `_estate` already wrote for `name` is replaced wholesale, so an
+    `exits=` entry for the same harness has no effect once this has run.
+    """
+    path = est / "bin" / ("cctally-%s-test" % name)
+    path.write_text(
+        "#!/usr/bin/env bash\nsleep %d\nprintf '%%s\\n' %s\n"
+        % (seconds, _sq(DEFAULT_SUMMARY)),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
 def _blocks(stderr):
     """`(opener, body)` for every `---- … ----` diagnostic block on stderr.
 
@@ -762,11 +864,7 @@ def test_a_heartbeat_never_lands_inside_a_multiline_diagnostic(tmp_path):
     # them, and the reporter really was running at a one-second cadence.
     assert len(blocks) >= 4, [b[0] for b in blocks]
     assert all(body for _, body in blocks), [b[0] for b in blocks if not b[1]]
-    heartbeats = [
-        line for line in res.stderr.splitlines()
-        if line.startswith("[cctally-test-all] ") and line.split()[1].endswith("s")
-    ]
-    assert heartbeats, res.stderr
+    assert _heartbeats(res.stderr), res.stderr
     for opener, body in blocks:
         for line in body:
             assert not line.startswith("[cctally-test-all]"), (opener, line)
@@ -780,11 +878,7 @@ def test_a_hung_harness_is_named_by_the_heartbeat(tmp_path):
         tmp_path,
         harnesses={"alpha": [DEFAULT_SUMMARY], "slow": [DEFAULT_SUMMARY]},
     )
-    (est / "bin" / "cctally-slow-test").write_text(
-        "#!/usr/bin/env bash\nsleep 4\nprintf '%s\\n' 'passed: 1   failed: 0'\n",
-        encoding="utf-8",
-    )
-    (est / "bin" / "cctally-slow-test").chmod(0o755)
+    _seed_slow_harness(est, "slow", 4)
     res = _drive(
         est,
         tmp_path,
@@ -806,7 +900,13 @@ def test_a_hung_harness_is_named_by_the_heartbeat(tmp_path):
 def test_the_progress_cadence_cannot_be_loosened_on_an_authoritative_run(tmp_path):
     """The seam exists for tests. No caller may make a run whose green is
     meant to be believed quieter than the fixed cadence."""
-    est = _estate(tmp_path)
+    est = _estate(tmp_path, harnesses={"slow": [DEFAULT_SUMMARY]})
+    # The pool is made to last, because a pool that finishes inside one second
+    # emits its transition pulse and nothing else NO MATTER which interval is
+    # in force, and a case that cannot tell the two apart is not a gate. The
+    # sleep is a floor rather than a race: a slower machine lengthens the span
+    # the assertions below require and can never shorten it.
+    _seed_slow_harness(est, "slow", SEAM_EVIDENCE_SECONDS + 2)
     res = _drive(
         est,
         tmp_path,
@@ -816,18 +916,82 @@ def test_the_progress_cadence_cannot_be_loosened_on_an_authoritative_run(tmp_pat
             "CCTALLY_AUTHORITATIVE_RUN": "1",
         },
     )
-    # Every phase now emits one immediate pulse. The estate finishes well
-    # inside thirty seconds, so honouring the one-second seam would produce
-    # additional cadence ticks; pinning the authoritative cadence produces
-    # only the transition pulse.
-    heartbeats = [
-        line for line in res.stderr.splitlines()
-        if line.startswith("[cctally-test-all] ") and line.split()[1].endswith("s")
-    ]
-    assert len(heartbeats) == 2, heartbeats
-    assert "queued" in heartbeats[0], heartbeats
-    assert heartbeats[1].endswith("pytest running"), heartbeats
+    assert res.returncode == 0, res.stdout + res.stderr
+    marks = _heartbeats(res.stderr)
+    phases = [phase for _, phase in marks]
+    assert phases[:1] == ["pool"], res.stderr
+    assert "pytest" in phases, res.stderr
+    # Non-vacuity, asserted rather than assumed: the pool reporter really was
+    # alive long enough that honouring the one-second seam would have had to
+    # print intermediate pool ticks. Without this the case passes on a fast
+    # runner whichever interval governs, which is what the replaced exact
+    # count hid. The aggregator's own pool figure is the right window: the
+    # span to the next phase pulse also covers classification, which happens
+    # after the pool reporter has been joined and can print nothing.
+    assert _pool_wall_seconds(res.stderr) >= SEAM_EVIDENCE_SECONDS, res.stderr
+    # The property itself, stated against the cadence production uses rather
+    # than against how long this estate happened to take. A run that honoured
+    # the seam puts same-phase heartbeats a second apart; a contended runner
+    # that reaches the next fixed tick does not, which is why counting them
+    # reddened this case with no defect present (#642).
+    assert not _cadence_violations(marks, AUTHORITATIVE_PROGRESS_INTERVAL), marks
     assert _completions(res.stderr), res.stderr
+
+
+#: The stderr of the contended round that reddened the case above while the
+#: aggregator was behaving correctly (#642). It is recorded
+#: rather than reproduced: producing a third tick for real means waiting out
+#: the whole authoritative interval and then trusting the machine to have been
+#: slow enough, which is the load dependence being removed here.
+CONTENDED_AUTHORITATIVE_STDERR = """\
+[cctally-test-all] 1s — 0/2 done, 0 running: none; 2 queued
+[cctally-test-all] 8s — pytest running
+[cctally-test-all] 38s — pytest running
+"""
+
+
+def test_the_authoritative_cadence_is_the_pinned_thirty_seconds():
+    """The cases here measure against whatever the runner declares, so the
+    declaration itself needs pinning or it moves them with it.
+
+    Raising it makes a run whose green is meant to be believed quieter than
+    the contract promises. Lowering it makes the test-only seam
+    indistinguishable from the fixed cadence, which is the whole property the
+    case below exists to prove. Either is a deliberate two-file change.
+    """
+    assert AUTHORITATIVE_PROGRESS_INTERVAL == 30
+
+
+def test_a_slow_authoritative_run_is_not_a_loosened_cadence():
+    """#642: a third heartbeat means the run was slow, not that it was quiet.
+
+    The count of heartbeats is a function of how long the estate took. The
+    spacing between them is not, so the spacing is what the gate asserts.
+    """
+    marks = _heartbeats(CONTENDED_AUTHORITATIVE_STDERR)
+    assert marks == [(1, "pool"), (8, "pytest"), (38, "pytest")], marks
+    # The fact that made the replaced assertion fail: three heartbeats, not
+    # two. Pinned here so this case keeps covering the run it was filed for.
+    assert len(marks) > 2, marks
+    assert not _cadence_violations(marks, AUTHORITATIVE_PROGRESS_INTERVAL), marks
+
+
+def test_a_seam_honouring_run_is_still_caught_as_a_loosened_cadence():
+    """Non-vacuity for the case above: the property can still fail.
+
+    A run that honoured `CCTALLY_PROGRESS_INTERVAL=1` across the same
+    thirty-eight seconds emits a heartbeat a second, which is exactly what an
+    authoritative run may not do and what the replaced count assertion was
+    there to catch.
+    """
+    loosened = "".join(
+        "[cctally-test-all] %ss — pytest running\n" % second
+        for second in range(8, 39)
+    )
+    marks = _heartbeats(loosened)
+    assert len(marks) == 31, marks
+    violations = _cadence_violations(marks, AUTHORITATIVE_PROGRESS_INTERVAL)
+    assert len(violations) == len(marks) - 1, violations
 
 
 def test_each_pytest_phase_change_emits_an_immediate_reporter_line(tmp_path):
@@ -1979,23 +2143,6 @@ def test_record_is_rebuilt_from_disk_when_a_deletion_fails(tmp_path):
     # bytes as reclaimed and a hole where its evidence still sits.
     assert record["lastEvictedRuns"] == 0, record
     assert record["gaps"] == [], record
-
-
-def _production_constant(name):
-    """One integer constant, read from the aggregator's own source.
-
-    Re-declaring the value here made the tests agree with themselves rather
-    than with production: raising the real window to 1,200 seconds would have
-    been caught by the backdating below, but lowering it to 1 second would
-    not, because every test backdated far past both.
-    """
-    match = re.search(
-        r"^%s\s*=\s*(\d+)\s*$" % re.escape(name),
-        RUNNER.read_text(encoding="utf-8"),
-        re.MULTILINE,
-    )
-    assert match, "%s is not defined in %s" % (name, RUNNER)
-    return int(match.group(1))
 
 
 # A directory younger than this is a run still starting up, not an orphan.

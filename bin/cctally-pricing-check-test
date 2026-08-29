@@ -60,10 +60,12 @@ FIXTURE_STAGE=$(mktemp -d -t cctally-pricing-check-fixstage.XXXXXX)
 # and that trap would leak this directory. The later trap supersedes this one.
 trap 'rm -rf "$FIXTURE_STAGE"' EXIT
 FIXTURES="$FIXTURE_STAGE/pricing-check"
-# Goldens address the COMMITTED root, never the staging copy above: this
-# harness's EXIT trap removes that copy, so a regenerate run writing there
-# would leave the committed goldens untouched.
-GOLDEN_ROOT="$REPO_ROOT/tests/fixtures/pricing-check"
+# Goldens address the COMMITTED root by default, never the staging copy above:
+# this harness's EXIT trap removes that copy, so a regenerate run writing there
+# would leave the committed goldens untouched. The explicit test-only override
+# lets the regeneration contract corrupt and restore an independent scratch
+# copy; the ordinary documented regeneration command still writes the tree.
+GOLDEN_ROOT="${CCTALLY_PRICING_CHECK_GOLDEN_ROOT:-$REPO_ROOT/tests/fixtures/pricing-check}"
 REGENERATE="${CCTALLY_PRICING_CHECK_REGENERATE:-}"
 
 # Pinned analytic clock (the only clock coupling in this payload — see the

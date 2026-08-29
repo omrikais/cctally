@@ -10,10 +10,60 @@ for the full design.
 from __future__ import annotations
 
 import json
+import pathlib
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Optional
+
+
+def _load_lib(name: str):
+    """Late-import a sibling under ``bin/`` (the ``_lib_view_models`` recipe).
+
+    Late rather than top-level, so this KERNEL carries no import-time edge to
+    the quota modules and stays importable on its own.
+
+    WHAT THAT DOES NOT BUY, corrected after the #661 S2 review. An earlier
+    revision of this docstring claimed that a status line on an install which
+    has never fitted a calibration "loads none of them". At runtime it loads
+    all of them. ``_seven_day_projection`` imports ``_lib_forecast``
+    unconditionally, and ``_lib_forecast`` imports ``_lib_quota_model`` at
+    module scope, so the quota kernel arrives with the projection whether or
+    not a calibration exists. ``_rate_change_marker`` then calls
+    ``inj.quota_regimes()`` whenever any 5h or 7d reading exists, and that
+    port imports ``_cctally_quota_model``; a withheld figure imports
+    ``_lib_quota_copy``.
+
+    MEASURED here, as marginal cost in ONE process in the order the status
+    line pays it, three runs on an Apple M4 Max under CPython 3.13:
+    ``_cctally_core`` 13.1-13.4ms, then ``_lib_forecast`` 12.1-13.5ms,
+    ``_lib_quota_model`` 0.0ms because ``_lib_forecast`` already pulled it,
+    ``_cctally_quota_model`` 1.5-1.8ms, and ``_lib_quota_copy`` 0.1-0.3ms.
+    So about 14ms per prompt beyond ``_cctally_core``. Those durations are
+    this machine's; the STRUCTURAL fact — four modules, of which the largest
+    is on the unconditional projection path — is not.
+
+    That is an unstated cost rather than a violated constraint. Spec §9's
+    rule is about ``cache.db`` and ``analyse``, and neither is touched; see
+    ``tests/test_statusline_quota.py``, which makes both explode rather than
+    reading the source for their names. Gating the quota port behind a cheap
+    ``Path.exists()`` on the calibration file was measured and NOT taken: it
+    would remove ``_cctally_quota_model`` alone, 1.5ms of the 14, because
+    ``_lib_forecast`` and the kernel it pulls are already loaded by then, and
+    it would add a stat(2) to every prompt on an install that does have a
+    calibration.
+    """
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
+    import importlib.util as _ilu
+    p = pathlib.Path(__file__).resolve().parent / f"{name}.py"
+    spec = _ilu.spec_from_file_location(name, p)
+    mod = _ilu.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # ---- Stdin payload (subset we care about) ----------------------------------
@@ -97,6 +147,18 @@ class StatuslineInjections:
     context_pct: Callable[[Optional[str], Optional[str]], Optional[float]]
     # Emits one-shot stderr warnings (deduped by message — caller maintains set).
     warn_once: Callable[[str], None]
+    # #661 S2 §9. The stored metering regimes for this install, oldest
+    # first, as plain dicts — a dedicated FILESYSTEM port and deliberately
+    # NOT the DB port beside it. The read takes no flock and no throttle:
+    # `save_calibrations` writes through `os.replace` in the same directory,
+    # so a lock-free reader always sees a complete old or new inode, and a
+    # flock here would let a writer stall a prompt. It returns `()` for
+    # every unusable state — absent, malformed, version-ahead, quarantined
+    # — because the status line cannot distinguish them without scanning
+    # quarantine sidecars and renders the same thing for all of them: no
+    # marker. The default supplies no regimes, so a caller that has not
+    # wired the port renders exactly what it rendered before.
+    quota_regimes: Callable[[], tuple] = staticmethod(lambda: ())
 
 
 # ---- ParseError sentinel ---------------------------------------------------
@@ -369,20 +431,173 @@ def _fmt_countdown(seconds: int) -> str:
     return f"{minutes}m"
 
 
+#: The 7d meter's window length. The projection measures a rate over the
+#: elapsed part of THIS window, so it needs the window's span, and the reset
+#: epoch alone gives only its end.
+_SEVEN_DAY_HOURS = 7 * 24.0
+
+#: The marker §6.6's predicate raises. Short because it shares a line with
+#: four other segments, and literal because a bare glyph would have to be
+#: looked up: the word says the rate changed and `cctally quota` says how.
+_RATE_CHANGE_MARKER = "Δrate"
+
+#: How much of the window must have elapsed before a pace projection is
+#: rendered here. NOT a new threshold: it is
+#: `ForecastConfidenceCause.ELAPSED_HOURS`, the estate's existing rule for
+#: when a week-pace projection is low-confidence, restated as a number
+#: because the status line has no room for the `LOW CONF` qualifier
+#: `forecast` prints beside one. Without it the slot publishes arithmetic
+#: that is correct and useless: a 42% reading ten hours into a week
+#: projects to 697%, and a per-prompt line is the worst place to put a
+#: figure that moves by hundreds of points between prompts.
+_PROJECTION_MIN_ELAPSED_HOURS = 24.0
+
+#: The short-register word for each selectable projection basis, keyed by the
+#: `ProjectionBasis` wire value.
+#:
+#: WHY THIS IS NOT IN `_lib_quota_copy` (#661 S2 remediation, finding E7). The
+#: review asked whether these two words are a fourth withheld-figure
+#: vocabulary, since neither is a member of `EVIDENCE_CODES` and neither has a
+#: copy-table entry. They are not, and the reading taken here is the one spec
+#: §8 states: the "short register" is a REGISTER — a short labelled token
+#: where the slot is fixed-width — rather than a closed set of cause codes.
+#: The basis is not a withholding cause; it names which measurement produced a
+#: figure that IS present, so it has no membership in that union by
+#: construction, and putting it in `_lib_quota_copy` would widen a module
+#: whose own docstring says it covers exactly those fifteen codes.
+#:
+#: What the review's concern gets right is the DUPLICATION: the same two words
+#: are spelled independently here and in `BASIS_LABEL` in
+#: `dashboard/web/src/panels/ForecastPanel.tsx`. Naming them once on each side
+#: does not merge them, so `tests/test_statusline_basis_vocabulary.py` pins
+#: the two spellings against each other. The Forecast MODAL deliberately uses
+#: the LONG forms ("calibrated model", "corrected meter"), which is §8's other
+#: register and not a third vocabulary.
+BASIS_SHORT_FORM: dict = {
+    "calibrated": "model",
+    "corrected-meter": "meter",
+}
+
+
+@dataclass(frozen=True)
+class _ProjectionInputs:
+    """The duck-typed operand `select_projection_basis` reads.
+
+    The selector is shared with `forecast` and the dashboard and takes
+    whatever object carries these attributes, so the status line builds the
+    smallest one that answers it rather than reaching for a forecast.
+
+    `calibrated_projection_pct` is deliberately absent. Producing it needs a
+    whole-week `session_entries` scan, and spec §9 forbids this surface from
+    touching `cache.db` for quota at all, so the basis on this surface is
+    always the corrected meter. The selector is still asked rather than
+    bypassed, so the token the line prints names the basis it actually used
+    and would name a different one the day the basis becomes cheap.
+    """
+    p_now: "float | None"
+    p_now_corrected: "float | None"
+    right_censored: bool
+    elapsed_hours: "float | None"
+    remaining_hours: "float | None"
+
+
+def _seven_day_projection(seven_pct, seven_resets, now_epoch) -> Optional[str]:
+    """The `→ …` token for the 7d slot, or None when there is none.
+
+    None — rather than a withheld token — in the three cases where there is
+    nothing to say rather than a typed reason not to say it: the reset epoch
+    is unknown, so there is no window to project over; the reset instant has
+    already passed, so the window it named has closed; or too little of the
+    window has elapsed for a pace to mean anything. Otherwise the slot
+    carries a value with its basis, or the withholding cause in the short
+    register.
+    """
+    if seven_pct is None or seven_resets is None:
+        return None
+    if seven_resets <= now_epoch:
+        # A CLOSED window. The clamp below would drive `remaining` to 0 and
+        # `elapsed` to the whole 168 hours, so the projection would equal the
+        # corrected reading and the line would print a projected end-of-week
+        # percent for a week that has already ended. It is reachable from the
+        # DB-latest fallback row and from a long-idle machine, and it is a
+        # missing window rather than a statement about the reading — so it is
+        # withheld the way an unknown reset is, above the censoring branch
+        # and above the elapsed gate.
+        return None
+    fc = _load_lib("_lib_forecast")
+    remaining = (seven_resets - now_epoch) / 3600.0
+    remaining = max(0.0, min(_SEVEN_DAY_HOURS, remaining))
+    elapsed = _SEVEN_DAY_HOURS - remaining
+    shown = float(seven_pct)
+    corrected = fc.corrected_percent_point(shown)
+    selected = fc.select_projection_basis(_ProjectionInputs(
+        p_now=shown,
+        p_now_corrected=corrected,
+        # Censoring is read off the correction rather than re-tested here.
+        # `corrected_percent_point` returns None exactly when the reading is
+        # right-censored — a displayed 100 denotes `[99, +inf)` and has no
+        # finite point estimate — and a second spelling of that test would
+        # be a second place to disagree with it.
+        right_censored=corrected is None,
+        elapsed_hours=elapsed,
+        remaining_hours=remaining,
+    ))
+    if selected.basis is fc.ProjectionBasis.WITHHELD:
+        # A withholding is a statement about the READING and does not
+        # depend on how much of the window has elapsed, so it is rendered
+        # before the confidence gate below. A right-censored 100 is the
+        # case: it has no point estimate at any point in the week.
+        copy = _load_lib("_lib_quota_copy")
+        return f"→ {copy.short_form(selected.code)}"
+    if elapsed < _PROJECTION_MIN_ELAPSED_HOURS:
+        # Too early in the window for a pace to mean anything. The slot
+        # keeps the shape it has always had rather than printing a token,
+        # for the same reason an unknown reset epoch does: there is nothing
+        # to say, and a per-prompt line must not fill with non-statements.
+        return None
+    basis = BASIS_SHORT_FORM.get(selected.basis.value, selected.basis.value)
+    return f"→ {int(round(selected.value))}% {basis}"
+
+
+def _rate_change_marker(inj: StatuslineInjections) -> Optional[str]:
+    """`Δrate` while §6.6's predicate holds, else None.
+
+    The predicate is DERIVED — the active open regime has a confirmed
+    predecessor — so the marker clears on its own when that regime closes
+    and needs no durable state, which §1 forbids this session from adding.
+    """
+    try:
+        regimes = list(inj.quota_regimes() or ())
+    except Exception:                                  # noqa: BLE001
+        # A port that raises must not take the prompt down with it. The
+        # marker is information; the status line is the shell's.
+        return None
+    if not regimes:
+        return None
+    mrc = _load_lib("_lib_meter_rate_change")
+    return _RATE_CHANGE_MARKER if mrc.active_rate_change(regimes) else None
+
+
 def resolve_cctally_extensions(
     inp: StatuslineInput,
     now: datetime,
     inj: StatuslineInjections,
     *,
     include_countdowns: bool = True,
+    include_projection: bool = True,
 ) -> Optional[str]:
-    """Segment 5 — cctally-only `5h X% (...) · 7d Y% (...)`.
+    """Segment 5 — cctally-only `5h X% (...) · 7d Y% (...) → Z% meter`.
 
     Source priority chain (spec §3.5):
         1. stdin rate_limits (preferred — freshest)
         2. DB latest weekly_usage_snapshots row (if stdin EMPTY)
         3. HWM monotonic clamp (within window only)
         4. If all empty → return None (segment 5 suppressed)
+
+    #661 S2 §9: the 7d slot also carries the projected end-of-week percent
+    with the basis it came from, and a `Δrate` marker while §6.6's predicate
+    holds. `include_projection` is False for `--usage-only`, which is the
+    compact two-reading form other tools embed and keeps its shape.
     """
     five_pct = inp.rate_limits_5h_pct
     five_resets = inp.rate_limits_5h_resets_at
@@ -421,7 +636,16 @@ def resolve_cctally_extensions(
         s = f"7d {int(round(seven_pct))}%"
         if include_countdowns and seven_resets is not None:
             s += f" ({_fmt_countdown(seven_resets - now_epoch)})"
+        if include_projection:
+            projection = _seven_day_projection(
+                seven_pct, seven_resets, now_epoch)
+            if projection is not None:
+                s += f" {projection}"
         parts.append(s)
+    if include_projection:
+        marker = _rate_change_marker(inj)
+        if marker is not None:
+            parts.append(marker)
     return " · ".join(parts)
 
 
@@ -471,7 +695,7 @@ def render_statusline(
     """
     if args.usage_only:
         ext = resolve_cctally_extensions(
-            inp, now, inj, include_countdowns=False
+            inp, now, inj, include_countdowns=False, include_projection=False
         )
         return "" if ext is None else _colorize_usage_segment(ext, args)
 

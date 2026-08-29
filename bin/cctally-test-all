@@ -195,6 +195,9 @@ COVERAGE_PYTEST=full
 # selection carries none rather than describing one it does not have.
 COVERAGE_RESOLVED=0
 _with_pytest_seen=0
+# #648 D12. Off by default on a `--harness` subset and meaningless
+# anywhere else, because every other mode runs the check unconditionally.
+ESTATE_CHECK_OPT_IN=0
 LINUX_MATRIX_MODE=${CCTALLY_LINUX_MATRIX_RUN:-0}
 case "$LINUX_MATRIX_MODE" in
     0|1) ;;
@@ -250,6 +253,12 @@ while [ $# -gt 0 ]; do
             fi
             _with_pytest_seen=1
             shift ;;
+        --with-estate-check)
+            if [ "$ESTATE_CHECK_OPT_IN" = 1 ]; then
+                contract_usage_abort "--with-estate-check may be given at most once" --with-estate-check
+            fi
+            ESTATE_CHECK_OPT_IN=1
+            shift ;;
         --tier-fast)
             # Same three separate refusals `--harness` makes, for the same
             # reason: a caller can only fix the mistake they actually made.
@@ -269,7 +278,7 @@ while [ $# -gt 0 ]; do
             TIER_BASE_REV=$2
             shift 2 ;;
         *)
-            contract_usage_abort "unrecognised argument '$1'; the only arguments are --harness NAME (repeatable), --with-pytest and --tier-fast BASE-REV" "$1" ;;
+            contract_usage_abort "unrecognised argument '$1'; the only arguments are --harness NAME (repeatable), --with-pytest, --with-estate-check and --tier-fast BASE-REV" "$1" ;;
     esac
 done
 
@@ -290,6 +299,14 @@ fi
 
 if [ "$_with_pytest_seen" = 1 ] && [ "$SUBSET_MODE" = 0 ]; then
     contract_usage_abort "--with-pytest requires at least one --harness; it is not a way to run the full suite" --with-pytest
+fi
+
+# #648 D12. The flag turns the estate check ON for the one mode that omits it,
+# and every other mode already runs it unconditionally, so outside a subset it
+# would be a no-op that reads like a request. Refusing says which of the two the
+# caller meant rather than accepting a word that changes nothing.
+if [ "$ESTATE_CHECK_OPT_IN" = 1 ] && [ "$SUBSET_MODE" = 0 ]; then
+    contract_usage_abort "--with-estate-check requires at least one --harness; every other mode runs the estate check unconditionally, so the flag would change nothing here" --with-estate-check
 fi
 
 if [ "$LINUX_MATRIX_MODE" = 1 ]; then
@@ -522,10 +539,8 @@ EOF
     # ---- 8: the partition, in MANIFEST order ------------------------------
     COVERAGE_SELECTED=""
     COVERAGE_OMITTED=""
-    _tier_manifest_count=0
     while IFS= read -r _n; do
         [ -n "$_n" ] || continue
-        _tier_manifest_count=$((_tier_manifest_count + 1))
         if [ "$_tier_widen" = 1 ]; then
             COVERAGE_SELECTED="$COVERAGE_SELECTED$_n "
             continue
@@ -540,25 +555,20 @@ EOF
     set +f
     COVERAGE_SELECTED=${COVERAGE_SELECTED% }
     COVERAGE_OMITTED=${COVERAGE_OMITTED% }
-    # Asserted rather than assumed, and REACHABLE — not merely insurance
-    # against a future edit, as this comment previously claimed. The manifest
-    # count counts LINES while the two counts below count IFS-split WORDS, so a
-    # manifest name containing whitespace makes the three disagree without any
-    # edit at all. Whatever the cause, it fails CLOSED into the full estate
-    # rather than refusing a run over a bookkeeping slip.
-    _tier_selected_count=0
-    _tier_omitted_count=0
-    set -f
-    for _n in $COVERAGE_SELECTED; do
-        _tier_selected_count=$((_tier_selected_count + 1))
-    done
-    for _n in $COVERAGE_OMITTED; do
-        _tier_omitted_count=$((_tier_omitted_count + 1))
-    done
-    set +f
-    if [ "$((_tier_selected_count + _tier_omitted_count))" -ne "$_tier_manifest_count" ]; then
+    # Asserted rather than assumed. The arithmetic lives in
+    # contract_partition_counts_agree, which is where it is also driven directly
+    # by a test (#650 item 3): the manifest count counts LINES while the two
+    # other counts count IFS-split WORDS, so a manifest name containing
+    # whitespace or a glob metacharacter makes the three disagree — and since
+    # contract_manifest_load enforces the name grammar, no manifest it accepts
+    # can reach this branch any more. It stays as the backstop for a future
+    # divergence, and it fails CLOSED into the full estate rather than refusing
+    # a run over a bookkeeping slip.
+    if ! contract_partition_counts_agree \
+            "$_manifest_names" "$COVERAGE_SELECTED" "$COVERAGE_OMITTED"; then
         printf 'cctally-test-all: --tier-fast: the selected and omitted lists are not an exact partition of the %s manifest (%s + %s of %s); selecting the whole estate\n' \
-            "$CONTRACT_PROFILE" "$_tier_selected_count" "$_tier_omitted_count" "$_tier_manifest_count" >&2
+            "$CONTRACT_PROFILE" "$CONTRACT_PARTITION_SELECTED_COUNT" \
+            "$CONTRACT_PARTITION_OMITTED_COUNT" "$CONTRACT_PARTITION_MANIFEST_COUNT" >&2
         COVERAGE_SELECTED=$(printf '%s' "$_manifest_names" | tr '\n' ' ')
         COVERAGE_SELECTED=${COVERAGE_SELECTED% }
         COVERAGE_OMITTED=""
@@ -572,7 +582,6 @@ EOF
     COVERAGE_PYTEST=full
     COVERAGE_RESOLVED=1
     unset _tier_basis _tier_paths _tier_safe _tier_want _tier_owners _tier_widen
-    unset _tier_manifest_count _tier_selected_count _tier_omitted_count
 fi
 
 if [ "$SUBSET_MODE" = 1 ]; then
@@ -1963,6 +1972,49 @@ if ! contract_admit_capabilities "$CONTRACT_PROFILE"; then
     contract_is_authoritative && contract_abort
 fi
 
+# ---- the committed estate (#648 D6, D12) -------------------------------
+# The structural check: this tree's live pytest, frontend and suppression sets
+# against the committed estate artifact, and every artifact transition against
+# committed history for authorization. It runs HERE — after capability
+# admission and before LOGDIR exists — so a refusal creates nothing and no
+# harness has launched.
+#
+# D12 says "every otherwise-admitted non-plan invocation", and these are the
+# exits that come first, named rather than assumed away:
+#   * plan mode returns before the manifest is even parsed, so it can yield no
+#     estate verdict at all;
+#   * every `contract_usage_abort` in the argument parser, the tier's exclusion
+#     rules, the Linux profile's platform guards and the worker-budget checks
+#     exit 2 long before this line;
+#   * `contract_manifest_load`, `contract_admit_harnesses`,
+#     `contract_admit_regeneration` and `contract_admit_capabilities` each abort
+#     above on their own reason code.
+# A run that reaches this line has therefore been admitted on every earlier
+# axis, which is what makes "otherwise-admitted" a description of this
+# placement rather than a claim it cannot support.
+#
+# The three-valued return is what separates D12's two failure dispositions:
+# drift and an unauthorized transition abort every mode, while an inability
+# aborts only an authoritative run and is otherwise recorded `incomplete`, so
+# the run continues and can never be green.
+if contract_estate_check_required "$COVERAGE_MODE" "$ESTATE_CHECK_OPT_IN"; then
+    contract_admit_estate "$REPO_ROOT" "$CONTRACT_PROFILE"
+    _estate_admit_rc=$?
+    if [ "$_estate_admit_rc" -eq 1 ]; then
+        contract_abort
+    fi
+fi
+
+# ---- the pytest execution declaration (#648 D7) ------------------------
+# Validated whenever the pytest phase will run, INCLUDING on a `--harness`
+# subset given --with-pytest. The complete estate check is exempt there (D12)
+# and this is not: the legs are built from the declaration on every path that
+# runs them, so a declaration that no longer expands must refuse on every such
+# path too. It is cheap — it reads the committed artifact and derives nothing.
+if [ "$COVERAGE_PYTEST" != "skipped" ]; then
+    contract_admit_estate_plan "$REPO_ROOT" "$CONTRACT_PROFILE" || contract_abort
+fi
+
 # ---- the committed runtime budget (#630 S7) ----------------------------
 # Parsed and validated HERE, at admission, so a malformed or missing budget
 # refuses the run in seconds rather than after twenty minutes of work whose
@@ -2100,13 +2152,19 @@ mkdir -p "$PROGRESS_DIR" 2>/dev/null || true
 # unlikely. Everything goes to stderr: the deterministic aggregated block on
 # stdout stays byte-stable, and tests/test_authoritative_test_contract.py
 # parses that block.
-PROGRESS_INTERVAL=${CCTALLY_PROGRESS_INTERVAL:-30}
-case "$PROGRESS_INTERVAL" in *[!0-9]*|'') PROGRESS_INTERVAL=30 ;; esac
-[ "$PROGRESS_INTERVAL" -lt 1 ] && PROGRESS_INTERVAL=30
+# The one cadence a run whose green is meant to be believed reports at. Named
+# rather than repeated, so a case can assert against the value production
+# actually uses instead of restating it and agreeing only with itself.
+AUTHORITATIVE_PROGRESS_INTERVAL=30
+PROGRESS_INTERVAL=${CCTALLY_PROGRESS_INTERVAL:-$AUTHORITATIVE_PROGRESS_INTERVAL}
+case "$PROGRESS_INTERVAL" in
+    *[!0-9]*|'') PROGRESS_INTERVAL=$AUTHORITATIVE_PROGRESS_INTERVAL ;;
+esac
+[ "$PROGRESS_INTERVAL" -lt 1 ] && PROGRESS_INTERVAL=$AUTHORITATIVE_PROGRESS_INTERVAL
 # The seam exists for tests only. An authoritative run keeps the fixed
 # cadence, so no caller can make a run whose green is meant to be believed
 # quieter than this.
-contract_is_authoritative && PROGRESS_INTERVAL=30
+contract_is_authoritative && PROGRESS_INTERVAL=$AUTHORITATIVE_PROGRESS_INTERVAL
 
 ALL_HARNESS_NAMES=${report_harnesses[*]+"${report_harnesses[*]}"}
 HARNESS_TOTAL=${#report_harnesses[@]}
@@ -2549,6 +2607,48 @@ _parse_pytest_failed_nodes() {   # <logfile>
         "$1" || true
 }
 
+# #648 D7. WHAT THE LEG ACTUALLY COLLECTED, against what it was declared to own.
+#
+# One direction only, and deliberately: a DECLARED identifier that was not
+# collected is a narrowing, which is the failure M13 measured. An identifier
+# collected but not declared is not a narrowing, and reporting it here would
+# duplicate the estate check's own `manifest-unexpected-pytest-node` while
+# firing on every synthetic tree whose plan declares nothing.
+#
+# FAIL CLOSED on a missing observed record. The plugin writes one file per
+# process, so an empty directory means the plugin never ran — a comparison that
+# did not happen, which must not read as agreement.
+_estate_leg_observed_check() {   # <leg> <expected-file> <observed-dir>
+    local leg=$1 expected=$2 observed=$3 missing count first
+    if [ ! -f "$expected" ]; then
+        contract_note "pytest: the '$leg' leg declared no node list at $expected — the execution declaration could not be expanded, so what this leg collected cannot be checked against what it owns"
+        contract_fail infrastructure manifest-missing-pytest-node "$leg" pytest
+        return 1
+    fi
+    # An expected set that is empty makes the comparison vacuous, which is
+    # correct for a tree that records no estate and is never the real tree's
+    # case: the artifact's own schema requires every leg's share to be
+    # non-empty. Returning early also keeps the missing-directory branch below
+    # from firing on a tree that legitimately asked for nothing.
+    if [ ! -s "$expected" ]; then
+        return 0
+    fi
+    if [ ! -d "$observed" ] || [ -z "$(ls -A "$observed" 2>/dev/null)" ]; then
+        contract_note "pytest: the '$leg' leg recorded nothing it collected (no files under $observed) — tests/_estate_leg_plugin.py did not run, so this leg's collection is unverified and the run refuses rather than assume it was complete"
+        contract_fail infrastructure manifest-missing-pytest-node "$leg" pytest
+        return 1
+    fi
+    missing=$(LC_ALL=C comm -23 \
+        <(LC_ALL=C sort -u "$expected") \
+        <(cat "$observed"/*.txt 2>/dev/null | LC_ALL=C sort -u))
+    [ -n "$missing" ] || return 0
+    count=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
+    first=$(printf '%s\n' "$missing" | head -n 1)
+    contract_note "pytest: the '$leg' leg was declared to own $count node identifier(s) it did not collect, beginning with '$first' — the leg was narrowed after its argv was built (a conftest hook, a plugin, or an option), so this run verified less than it claims"
+    contract_fail infrastructure manifest-missing-pytest-node "$first" pytest
+    return 1
+}
+
 if [ "$COVERAGE_PYTEST" = "skipped" ]; then
     # A subset run skips the pytest phase, and the serial benchmark leg with
     # it, unless --with-pytest was given (section 4.3). Nothing is recorded
@@ -2560,14 +2660,19 @@ if [ "$COVERAGE_PYTEST" = "skipped" ]; then
 elif python3 -m pytest --version >/dev/null 2>&1; then
     pytest_status="PASS"
     pytest_log="$LOGDIR/pytest.log"
-    pytest_rebuild_benchmark="tests/test_rebuild_benchmark.py"
-    pytest_contention_benchmark="tests/test_stats_writer_storm_386.py"
     pytest_serial_targets=()
     pytest_timeout_args=()
+    # #648 D7. The two legs are built from the ONE `pytestExecution`
+    # declaration, validated at admission. The file and node literals that used
+    # to sit here, and the `[ -f ... ]` guards around them, are gone: a target
+    # that no longer exists is now an admission failure rather than a leg that
+    # silently ran less.
+    pytest_estate_selectors_seen=0
     # -rfE forces the "short test summary info" section to emit FAILED/ERROR
     # node IDs on every run (issue #141: otherwise a Phase-3 flake under xdist
     # is undiagnosable once the interleaved stderr is rm -rf'd on EXIT).
-    pytest_args=(tests/ -q -rfE)
+    pytest_args=(tests/ -q -rfE -p tests._estate_leg_plugin)
+    estate_observed_root="$LOGDIR/estate-observed"
     # ---- per-test durations (#630 S1, F3) --------------------------------
     # Authoritative runs with an evidence directory only. A standalone `-p`
     # plugin rather than pytest.ini or conftest.py: both of those would change
@@ -2584,19 +2689,26 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
         pytest_args+=(-p tests._pytest_durations_plugin)
         pytest_durations_legs+=("$pytest_durations_main")
     fi
-    if [ -f "$REPO_ROOT/$pytest_rebuild_benchmark" ]; then
-        pytest_args+=(--ignore="$pytest_rebuild_benchmark")
-        pytest_serial_targets+=("$pytest_rebuild_benchmark")
-    fi
-    if [ -f "$REPO_ROOT/$pytest_contention_benchmark" ]; then
-        for node in \
-            "$pytest_contention_benchmark::test_h1_multiwriter_baseline_stays_intact" \
-            "$pytest_contention_benchmark::test_dashboard_source_reader_releases_rollback_snapshot"
-        do
-            pytest_args+=(--deselect="$node")
-            pytest_serial_targets+=("$node")
-        done
-    fi
+    while IFS=$'\t' read -r _sel_kind _sel_value; do
+        [ -n "$_sel_value" ] || continue
+        pytest_estate_selectors_seen=1
+        pytest_serial_targets+=("$_sel_value")
+        case "$_sel_kind" in
+            file) pytest_args+=(--ignore="$_sel_value") ;;
+            node) pytest_args+=(--deselect="$_sel_value") ;;
+        esac
+    done <<EOF
+$CONTRACT_ESTATE_SELECTORS
+EOF
+    # The per-leg node lists, for the collected-identifier proof below. This is
+    # the second expansion: admission ran `--validate-legs`, which writes
+    # nothing because it precedes LOGDIR. A failure here cannot be silent —
+    # the comparison treats a missing expected list as a failure.
+    estate_leg_dir="$LOGDIR/estate-legs"
+    estate_plan_log="$LOGDIR/estate-legs.log"
+    python3 "$REPO_ROOT/bin/_lib_test_estate.py" --repo "$REPO_ROOT" \
+        --profile "$CONTRACT_PROFILE" --plan-legs "$estate_leg_dir" \
+        > "$estate_plan_log" 2>&1 || true
     if python3 -c 'import xdist' >/dev/null 2>&1; then
         pytest_args+=(-n "$PYTEST")
     fi
@@ -2608,6 +2720,48 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
         pytest_timeout_args+=(--timeout="${CCTALLY_PYTEST_TIMEOUT:-120}" --timeout-method=thread)
     fi
     pytest_args+=(${pytest_timeout_args[@]+"${pytest_timeout_args[@]}"})
+
+    # ---- the sanitized execution environment (#648 M13, D7) --------------
+    # `PYTEST_ADDOPTS=--ignore=tests/<file>.py` narrowed an authoritative run
+    # while admission observed the complete estate, and the run exited 0. The
+    # variable is absent from `forbiddenRegeneration` and no admission check
+    # reads it, so it is REMOVED from both legs here.
+    #
+    # THE KEY LIST DELIBERATELY DIVERGES from the one the discovery subprocess
+    # uses. That list also drops CCTALLY_AGENTMEM_TEST_POLICY, which is right
+    # for COLLECTION — the derived node set must not depend on it — and wrong
+    # for EXECUTION, where the policy decides whether the agentmem-gated tests
+    # assert or skip. Dropping it here would silently weaken every authoritative
+    # run. `TZ` is likewise not pinned: the caller pins it (see CLAUDE.md), and
+    # forcing it would change what a deliberate non-UTC local run tests without
+    # saying so.
+    #
+    # THE RESIDUAL, analysed rather than left for a reader to wonder about.
+    # Two further variables reach these legs uncontrolled, and neither can
+    # narrow a run silently as the code stands.
+    #   PYTEST_DISABLE_PLUGIN_AUTOLOAD -- setting it makes pytest reject `-n`
+    #     and `--timeout`, which both legs pass, so the leg exits 4 and
+    #     contract_classify_pytest reports it. A run cannot be quietly narrowed
+    #     by it; it can only fail loudly.
+    #   PYTHONPATH -- it cannot register a plugin on its own, because a plugin
+    #     must still be named by `-p` or by an entry point, and both legs run
+    #     under `python3 -m pytest`, which puts the repository root FIRST on
+    #     sys.path. So it cannot shadow `tests` either.
+    # Neither is added to the removal list, because removing a variable that
+    # cannot narrow the run would break the deliberate uses a caller has for it
+    # while buying nothing.
+    pytest_env_sanitize=(env -u PYTEST_ADDOPTS -u PYTEST_PLUGINS -u PYTEST_CURRENT_TEST)
+    if [ -n "${PYTEST_ADDOPTS:-}" ] || [ -n "${PYTEST_PLUGINS:-}" ]; then
+        printf '[cctally-test-all] pytest: PYTEST_ADDOPTS/PYTEST_PLUGINS were present and are REMOVED from both execution legs — they can narrow a run that admission observed in full (#648 M13); use CCTALLY_PYTEST_DURATIONS=1 for per-test timings\n' >&2
+    fi
+    # The one capability PYTEST_ADDOPTS was carrying on a shipped lane.
+    # bin/cctally-test-linux-matrix injected `--durations=0` through it on the
+    # acceptance lane because this invocation was hard-coded. A variable that
+    # can only ADD a reporting flag replaces it, so the lane keeps its timings
+    # and the narrowing hole stays closed.
+    if [ "${CCTALLY_PYTEST_DURATIONS:-}" = 1 ]; then
+        pytest_args+=(--durations=0)
+    fi
     pytest_start=$SECONDS
     # Each leg runs as its own process group for the reasons given at the pool:
     # `wait` is interruptible by a trapped signal and the group is reapable.
@@ -2617,7 +2771,8 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
     { cd "$REPO_ROOT" \
       && CCTALLY_DURATIONS_PATH="$pytest_durations_main" \
          CCTALLY_DURATIONS_LEG=pytest \
-         python3 -m pytest "${pytest_args[@]}" ; } \
+         CCTALLY_ESTATE_OBSERVED_DIR="$estate_observed_root/pytest" \
+         "${pytest_env_sanitize[@]}" python3 -m pytest "${pytest_args[@]}" ; } \
         > "$pytest_log" 2>&1 &
     PHASE_PID=$!
     set +m
@@ -2648,14 +2803,27 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
     fi
     contract_classify_pytest "$pytest_rc" "pytest" \
         "$(_parse_pytest_passed "$pytest_log")" "$pytest_node_state"
-    if [ "${#pytest_serial_targets[@]}" -gt 0 ]; then
+    if ! _estate_leg_observed_check pytest "$estate_leg_dir/pytest.txt" \
+            "$estate_observed_root/pytest"; then
+        pytest_status="FAIL"
+    fi
+    # #648 D7. Derived from the DECLARATION, not from an array the file-existence
+    # guards happened to fill. A declared target that vanished refuses at
+    # admission, so the only way this leg is skipped is that the artifact
+    # declares no leg but the complement — which the schema forbids for the real
+    # artifact and permits only for a tree that records no estate.
+    if [ "$pytest_estate_selectors_seen" = 1 ]; then
         printf '[cctally-test-all] benchmark phase started — serial targets: %s\n' \
             "${#pytest_serial_targets[@]}" >&2
         _phase_set benchmark
         _reporter_wait_phase benchmark
         pytest_benchmark_log="$LOGDIR/pytest-benchmark.log"
-        pytest_benchmark_args=("${pytest_serial_targets[@]}" -q -rfE)
+        pytest_benchmark_args=("${pytest_serial_targets[@]}" -q -rfE
+                               -p tests._estate_leg_plugin)
         pytest_benchmark_args+=(${pytest_timeout_args[@]+"${pytest_timeout_args[@]}"})
+        if [ "${CCTALLY_PYTEST_DURATIONS:-}" = 1 ]; then
+            pytest_benchmark_args+=(--durations=0)
+        fi
         if [ -n "$pytest_durations_bench" ]; then
             pytest_benchmark_args+=(-p tests._pytest_durations_plugin)
             pytest_durations_legs+=("$pytest_durations_bench")
@@ -2664,6 +2832,8 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
         { cd "$REPO_ROOT" \
           && CCTALLY_DURATIONS_PATH="$pytest_durations_bench" \
              CCTALLY_DURATIONS_LEG=benchmark \
+             CCTALLY_ESTATE_OBSERVED_DIR="$estate_observed_root/benchmark" \
+             "${pytest_env_sanitize[@]}" \
              python3 -m pytest "${pytest_benchmark_args[@]}" ; } \
             > "$pytest_benchmark_log" 2>&1 &
         PHASE_PID=$!
@@ -2692,6 +2862,11 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
         fi
         contract_classify_pytest "$pytest_benchmark_rc" "benchmark" \
             "$(_parse_pytest_passed "$pytest_benchmark_log")" "$benchmark_node_state"
+        if ! _estate_leg_observed_check benchmark \
+                "$estate_leg_dir/benchmark.txt" \
+                "$estate_observed_root/benchmark"; then
+            pytest_status="FAIL"
+        fi
     fi
     # Both legs have completed here, which is the earliest point at which the
     # merge can state completeness for either of them. Only legs that RAN are

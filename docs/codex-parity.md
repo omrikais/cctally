@@ -39,6 +39,11 @@ ordered Claude/Codex sections.
 Codex project identity is root-qualified internally but exposes only an opaque
 `projectKey` and privacy-safe label. An exact opaque key wins; an exact label
 must be unique in the selected Codex set; ambiguous labels are usage errors.
+Missing Codex project metadata degrades EXPLICITLY and never basename-merges: a
+row whose root cannot be resolved is reported as unattributed rather than being
+folded into another project that happens to share its directory basename, so a
+`--source codex` or `--source all` total never silently absorbs one project's
+spend into another's.
 Codex cached input is token reuse, never a Claude cache hit. Its input is
 inclusive of cached input and output is inclusive of reasoning output.
 

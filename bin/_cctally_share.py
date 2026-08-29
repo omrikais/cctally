@@ -946,8 +946,8 @@ def _build_forecast_snapshot(
     actual_series: list[tuple[str, float, float]],
     projected_series: list[tuple[str, float, float]],
     current_pct: float,
-    projected_low_pct: float,
-    projected_high_pct: float,
+    projected_low_pct: "float | None",
+    projected_high_pct: "float | None",
     days_remaining: float,
     dollars_per_percent: "float | None",
     dollars_per_percent_source: str,
@@ -975,10 +975,11 @@ def _build_forecast_snapshot(
       wraps `ForecastInputs`). No helper extraction was needed; we pass
       the actual scalars in directly.
     - `ForecastInputs` carries a single `dollars_per_percent` value plus
-      a `dollars_per_percent_source` enum (`this_week` /
-      `trailing_4wk_median` / `this_week_sparse`); there is no separate
-      `dpp_week_avg` and `dpp_24h`. The table renders one $/1% row with
-      the source as a paren suffix in the metric cell.
+      a `dollars_per_percent_source` code — the six members of
+      `_lib_forecast.DOLLARS_PER_PERCENT_SOURCES`, which is the one place
+      that union is written down. There is no separate `dpp_week_avg` and
+      `dpp_24h`. The table renders one $/1% row with the source's human
+      copy as a paren suffix in the metric cell.
     - The plan's single `projected_eow_pct` is split into a low/high
       range (matching `--render-forecast-terminal`'s "Forecast 80–95%"
       band). The table shows both ends; the projected_series ray uses
@@ -1031,13 +1032,20 @@ def _build_forecast_snapshot(
     # single value (no recent-24h sample), low == high.
     # 0.05 threshold: below .1f display precision — tighter spreads would
     # render as identical decimals, so collapse to a single value.
-    if abs(projected_high_pct - projected_low_pct) < 0.05:
+    # #661 S2 spec section 3.2: a right-censored reading has no point
+    # estimate, so the row states the withholding and its cause rather than
+    # printing the current reading under a "Projected" label.
+    if projected_high_pct is None or projected_low_pct is None:
+        projected_text = "withheld — meter at cap"
+    elif abs(projected_high_pct - projected_low_pct) < 0.05:
         projected_text = f"{projected_high_pct:.1f}%"
     else:
         projected_text = (
             f"{projected_low_pct:.1f}% — {projected_high_pct:.1f}%"
         )
-    dpp_source_label = dollars_per_percent_source.replace("_", " ")
+    dpp_source_label = sys.modules["cctally"]._load_sibling(
+        "_lib_forecast").dollars_per_percent_source_label(
+            dollars_per_percent_source)
     # #620 S1 D5: a withheld rate renders as the same `n/a` the report trend
     # table already uses for an absent $/1%. Forcing it through MoneyCell
     # would print $0.00, which is the fabrication this contract removes.

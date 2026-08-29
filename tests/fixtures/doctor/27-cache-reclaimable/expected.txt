@@ -67,6 +67,9 @@ Accounts
   ✓ Codex window attribution no operator window attribution recorded
 Pricing
   ✓ Coverage                 all observed models priced
+Quota
+  ✓ Metering rate            no change detected
+  ✓ Calibration              no calibration fitted yet
 Safety
   ✓ Dashboard bind           config: loopback
   ✓ Backup/sync              cctally data excluded from Time Machine
@@ -78,4 +81,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 57 OK · 5 WARN · 0 FAIL
+Summary: 59 OK · 5 WARN · 0 FAIL

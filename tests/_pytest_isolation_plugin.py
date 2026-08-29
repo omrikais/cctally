@@ -16,12 +16,27 @@ longer-lived thread registers it here. No such fixture exists today, so the
 registration surface starts empty and the contract is enforceable rather than
 aspirational.
 
-MECHANISM. Both detectors report through `pytest_runtest_makereport` rather
+MECHANISM. Both detectors DETECT through `pytest_runtest_makereport` rather
 than by raising inside a hookwrapper. An exception raised out of a hookwrapper
 is an INTERNALERROR to pytest — it aborts the session with exit code 3 and
 belongs to no item — so it could not satisfy the requirement that a leak fails
 the item that caused it. Mutating the phase report attributes the failure to
 that item, keeps the run going, and yields the ordinary exit code 1.
+
+MECHANISM, where the verdict is REPORTED. Detection alone reported a leaking
+item as both passed and errored: pytest counts the call phase separately and
+its taxonomy calls a non-passing teardown an ERROR, so the summary said an item
+passed while the run failed because of it. A leak is not observable before
+teardown and the call report is already built by then, so the verdict is MOVED
+rather than duplicated. `pytest_report_teststatus` decides which counter a
+report lands in, independently of which phase produced it: it suppresses the
+status of a passing call report that carries no `wasxfail`, and lets the
+teardown report — the phase that can see the leak — carry the item's single
+verdict. A leak therefore reads as a FAILED item named in the short summary.
+The teardown report still keeps `outcome = "failed"`, so `Session.testsfailed`
+increments and the run exits 1. The move is bounded on both sides: a non-strict
+XPASS keeps pytest's own status, and a teardown this plugin did not fail keeps
+pytest's ERROR verdict.
 
 MECHANISM, the three phases. The state detector compares at setup, at call and
 at teardown. The two earlier comparisons are made from `pytest_runtest_setup`
@@ -369,5 +384,77 @@ def pytest_runtest_makereport(item, call):
     if report.outcome == "failed" and report.longrepr is not None:
         report.longrepr = f"{report.longrepr}\n\n{joined}"
     else:
+        if report.when == "teardown":
+            _BLAMED_TEARDOWNS.add(report.nodeid)
         report.outcome = "failed"
         report.longrepr = joined
+
+
+#: Node ids whose CALL phase passed. `pytest_report_teststatus` sees a report
+#: rather than an item, and a teardown report alone cannot tell a clean item
+#: from one that errored in SETUP and so never ran its call phase at all.
+_CALL_PASSED: "set[str]" = set()
+
+#: Node ids whose TEARDOWN report THIS PLUGIN failed, written by
+#: `pytest_runtest_makereport` at the one branch that sets `report.outcome`.
+#: `pytest_report_teststatus` reads it and reclassifies a failed teardown as
+#: FAILED only for a member. Without it the reclassification fired on any
+#: failed teardown report, so an ordinary fixture finalizer that raised was
+#: reported as FAILED instead of pytest's ERROR, and an item that errored in
+#: both setup and teardown read `1 error, 1 failed` where pytest reads
+#: `2 errors`. The plugin changes the verdict only for problems it raised.
+_BLAMED_TEARDOWNS: "set[str]" = set()
+
+
+def pytest_sessionstart(session):
+    """Clear both node-id sets, because a process can run more than one session.
+
+    Within one session each set is bounded by the run. Across two in-process
+    `pytest.main()` calls a repeated node id would otherwise inherit the
+    earlier session's verdict — a stale PASSED, or a stale FAILED reclassifying
+    a teardown error the plugin did not raise this time.
+    """
+    _CALL_PASSED.clear()
+    _BLAMED_TEARDOWNS.clear()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_report_teststatus(report, config):
+    """Emit each item's single verdict from the phase that can see a leak.
+
+    pytest's own taxonomy calls a non-passing TEARDOWN an ERROR and counts the
+    CALL phase separately, so a leaking item was reported as both passed and
+    errored — a summary line saying an item passed when the run failed because
+    of it. A leak is not observable before teardown and the call report is
+    already built by then, so the fix is to move the verdict rather than to
+    mutate a completed phase: suppress the status of a passing call report, and
+    let the teardown report carry passed or failed for the whole item.
+
+    The suppression covers every passing call report that carries no
+    `wasxfail`, because at call time nothing yet knows whether the item will
+    leak. Every other outcome is left alone. A call-phase FAILURE keeps its own
+    verdict here and gains no second one at teardown. A skip reports outcome
+    `skipped`, so it never enters this branch. A non-strict XPASS DOES report
+    outcome `passed`, and it is excluded by name: pytest marks such a report
+    with a `wasxfail` attribute, and suppressing it turned an XPASS into a
+    PASSED emitted from teardown. An item that errored in SETUP never entered
+    `_CALL_PASSED`, so it acquires no teardown pass.
+
+    A failed teardown is reclassified as FAILED only when this plugin is the
+    one that failed it. Any other failed teardown — a fixture finalizer that
+    raised on its own — falls through to pytest's own ERROR verdict, which is
+    also why that path returns rather than reaching the `_CALL_PASSED` check
+    below: an item whose teardown really errored must not be reported PASSED.
+    """
+    if (report.when == "call" and report.outcome == "passed"
+            and not hasattr(report, "wasxfail")):
+        _CALL_PASSED.add(report.nodeid)
+        return "", "", ""
+    if report.when == "teardown":
+        if report.outcome == "failed":
+            if report.nodeid in _BLAMED_TEARDOWNS:
+                return "failed", "F", "FAILED"
+            return None
+        if report.nodeid in _CALL_PASSED:
+            return "passed", ".", "PASSED"
+    return None

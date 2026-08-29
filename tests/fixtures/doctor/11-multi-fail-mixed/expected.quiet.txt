@@ -27,9 +27,10 @@ Data
       → No snapshot in >1h. Hooks may be broken — check `cctally setup --status`.
 Accounts
 Pricing
+Quota
 Safety
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 51 OK · 8 WARN · 3 FAIL
+Summary: 53 OK · 8 WARN · 3 FAIL

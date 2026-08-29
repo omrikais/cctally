@@ -581,6 +581,7 @@ from _cctally_dashboard_envelope import (
     _envelope_rows_project_budget,
     _ENVELOPE_AXIS_MAPPERS,
     _build_alerts_envelope_array,
+    _build_meter_rate_change_array,
     _model_breakdowns_to_models,
 )
 
@@ -8281,6 +8282,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 if "projected_enabled" in alerts_in:
                     merged_alerts["projected_enabled"] = (
                         alerts_in["projected_enabled"]
+                    )
+                # #661 S2 section 6.2's PUSH gate. Assigned VERBATIM, like
+                # every sibling here: the boolean rule lives in
+                # `_get_alerts_config`, which runs against the merged block
+                # below, so a `bool()` here would coerce "yes" to True and
+                # destroy the evidence before the canonical validator could
+                # refuse it.
+                if "rate_change_enabled" in alerts_in:
+                    merged_alerts["rate_change_enabled"] = (
+                        alerts_in["rate_change_enabled"]
                     )
                 if "notifier" in alerts_in:
                     merged_alerts["notifier"] = alerts_in["notifier"]

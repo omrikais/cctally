@@ -45,6 +45,338 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+# ---------------------------------------------------------------------------
+# Modelled quota attribution (#661 S2 spec §5)
+#
+# `Used %` used to be a project's share of the window's DOLLARS, scaled by the
+# week's meter reading. Cache reads are far cheaper per token than output
+# under the model's weights, so that proxy over-credits a cache-heavy project
+# and under-credits an output-heavy Opus one: it reports a cost share under a
+# column whose name says quota.
+# ---------------------------------------------------------------------------
+
+#: Why modelled quota is not published for a week or a whole run. A closed
+#: set. `account-not-resolved` is the run-level one (§5.3); the rest are
+#: per-week and are the reasons that week fell back to the cost share.
+ATTRIBUTION_CAUSES = ("account-not-resolved", "calibration-absent",
+                      "regime-boundary", "unsupported-composition",
+                      "no-local-history")
+
+#: The three bases a row or a run can carry.
+ATTRIBUTION_BASES = ("modelled", "cost-share", "withheld")
+
+#: The cause a residual states when it cannot be computed against a whole,
+#: single-account, unfiltered population. A residual over a partial
+#: population is not a residual.
+RESIDUAL_MISALIGNED = "population-misaligned"
+
+#: The other two reasons a residual is absent, which are NOT misalignment
+#: (#661 S2 Stage C review). Spec §5.2 states the first outright — "an
+#: absent observed side withholds on its own" — as a condition separate from
+#: the account, window and filter alignment `RESIDUAL_MISALIGNED` names. All
+#: three used to render as `population-misaligned`, and once the §5.2 footer
+#: put that code in front of a terminal user as the sentence "the account,
+#: the window or the population does not align", a run whose only defect was
+#: a modelled week without a meter snapshot told the user something false
+#: about their own request. This is the same defect class Stage C fixed for
+#: `credit-baseline-absent` versus `reset-baseline-absent`: the withholding
+#: is right and the named cause is wrong.
+RESIDUAL_OBSERVED_ABSENT = "observed-absent"
+RESIDUAL_NO_MODELLED_WEEKS = "no-modelled-weeks"
+
+#: The closed set of residual causes, asserted by the tests exactly as
+#: `MOVEMENT_WITHHELD_CAUSES` is. A member with no copy in
+#: `_ATTRIBUTION_CAUSE_COPY` renders as its own code, which is readable but
+#: is not the sentence the footer owes a terminal reader.
+RESIDUAL_CAUSES = (RESIDUAL_MISALIGNED, RESIDUAL_OBSERVED_ABSENT,
+                   RESIDUAL_NO_MODELLED_WEEKS)
+
+#: Bumped from 1 because `attributedUsedPercent` and `costPerPercent` keep
+#: their spellings and change their MEANING, from a share of the window's
+#: dollars to modelled weekly quota. `docs/cli-contract.md` classifies a
+#: changed value meaning as breaking. The additive `attribution` block and
+#: the per-row `attributionBasis` would not on their own have required it.
+PROJECT_JSON_SCHEMA_VERSION = 2
+
+
+class WeekAttribution:
+    """How ONE subscription week's `Used %` is measured.
+
+    `units_per_point` is set only on the `modelled` basis; a cost-share week
+    carries the typed cause of its fallback instead.
+    """
+
+    __slots__ = ("basis", "cause", "units_per_point")
+
+    def __init__(self, basis, cause, units_per_point):
+        self.basis = basis
+        self.cause = cause
+        self.units_per_point = units_per_point
+
+    def __repr__(self):                                # pragma: no cover
+        return (f"WeekAttribution(basis={self.basis!r}, cause={self.cause!r},"
+                f" units_per_point={self.units_per_point!r})")
+
+
+def _entry_quota_record(entry):
+    """`(EntryRecord, weighted_units)` for one joined cache entry.
+
+    `units` is None when the entry contributes nothing to the general weekly
+    meter — a family that does not drain it, or a cache-write split the store
+    cannot supply. Both are exactly what `population_units` skips, so the
+    per-project parts keep summing to the population's own units rather than
+    drifting above it.
+
+    This runs on the RAW entry, before `_accumulate_entry_into_bucket`, which
+    drops the one-hour cache-write split. Weighting an aggregate bucket would
+    silently mis-price every cache-heavy project — the failure spec §5.1 names.
+    """
+    qm = _cctally()._load_sibling("_lib_quota_model")
+    model = str(getattr(entry, "model", "") or "")
+    if qm.family_participation(qm.normalize_family(model)) != "general":
+        return None, None
+    record = qm.EntryRecord(
+        at=entry.timestamp,
+        model=model,
+        fresh=getattr(entry, "input_tokens", 0) or 0,
+        output=getattr(entry, "output_tokens", 0) or 0,
+        cache_create_total=getattr(entry, "cache_creation_tokens", 0) or 0,
+        cache_1h=getattr(entry, "cache_1h_tokens", None),
+        cache_read=getattr(entry, "cache_read_tokens", 0) or 0,
+    )
+    return record, qm.weighted_units(record)
+
+
+def probe_provider_decoration(conn, provider: str) -> bool:
+    """Whether `provider` renders account decoration, failing CLOSED.
+
+    Spec §5.3 hangs on this answer: `False` lets a merged read publish a
+    number under `Used %`, and on a genuinely decorated store that number is
+    the cost share F1 exists to remove. So only ONE condition may relax the
+    gate — the `accounts` table not being there at all, which really does
+    mean the store cannot hold more than one real account, and which several
+    hand-built fixtures are thin enough to hit.
+
+    Catching `sqlite3.Error` around the decoration query itself was much
+    wider than that: it also covers `database is locked`, `file is not a
+    database`, `disk I/O error` and `no such column`, and a WAL-contended
+    two-account store answering `False` is exactly the publication §5.3
+    forbids. Every such failure therefore answers `True`, which withholds.
+    The table probe is the `PRAGMA table_info` form `_snapshot_columns` uses.
+    """
+    c = _cctally()
+    try:
+        present = bool(conn.execute("PRAGMA table_info(accounts)").fetchall())
+    except sqlite3.Error:
+        return True
+    if not present:
+        return False
+    try:
+        return bool(c.provider_is_decorated(conn, provider))
+    except sqlite3.Error:
+        return True
+
+
+def resolve_attribution_account_gate(*, account_key, decorated):
+    """`(basis, cause)` when the run cannot model at all, else `(None, None)`.
+
+    Spec §5.3. `project` without `--account` passes `account_key=None`, which
+    means MERGED, and S1 publishes no valid merged calibration. On a decorated
+    multi-account install, modelled quota is therefore withheld and
+    `--account` is required: silently falling back to the cost share there
+    would keep publishing the very number F1 exists to remove, under a column
+    the acceptance criterion says reports the correct account.
+
+    At a single real account the #341 R8 gate means nothing decorates and the
+    merged path IS the account path, so this affects only genuinely
+    multi-account installs.
+    """
+    if account_key is None and decorated:
+        return "withheld", "account-not-resolved"
+    return None, None
+
+
+def resolve_week_attribution(regime, records, *, week_start, week_end):
+    """Whether one subscription week can be modelled, and at what rate.
+
+    A week whose entries do not all fall inside the regime's half-open
+    interval falls back for the WHOLE week. The validated reader publishes
+    only the OPEN regime, so the earlier segment has no rate at all, and
+    spec §5.1 forbids producing a partial-week mixture — modelling half a
+    week and cost-sharing the other half would publish a figure that is
+    neither.
+
+    Support is re-tested over the whole account-week population through
+    §1.1's apply adapter rather than per project, and rather than inherited
+    from the regime's stored status, which describes S1's fit population and
+    not this one.
+    """
+    if regime is None:
+        return WeekAttribution("cost-share", "calibration-absent", None)
+    if week_start < regime.effective_from:
+        return WeekAttribution("cost-share", "regime-boundary", None)
+    if regime.effective_until is not None \
+            and week_end > regime.effective_until:
+        return WeekAttribution("cost-share", "regime-boundary", None)
+    qcg = _cctally()._load_sibling("_cctally_quota_calibration")
+    applied = qcg.apply_regime(regime, list(records))
+    if isinstance(applied, qcg.ApplyRejection):
+        return WeekAttribution("cost-share", applied.value, None)
+    return WeekAttribution("modelled", None, regime.units_per_point)
+
+
+def range_covers_whole_weeks(since, until, bounds, *, now) -> bool:
+    """Whether `[since, until]` slices no subscription week it touches.
+
+    `whole_weeks` used to be `not weeks_missing_snapshot`, which asks a
+    different question — whether every week has a snapshot. A three-day
+    `--since 2026-06-03 --until 2026-06-05` over one fully-snapshotted week
+    passed it, and §5.2's residual was then published against a meter
+    reading covering the whole week and a modelled population covering three
+    days of it. That is exactly the misalignment §5.2 names.
+
+    The snapshot condition is not lost by the replacement: the residual's
+    observed side is already `None` unless every modelled week carries a
+    snapshot, and a `None` observed side withholds on its own.
+
+    The OPEN week is covered whole by a range running to `now`, because the
+    meter reading and the local entries both stop there and neither side is
+    clipped relative to the other. A closed week needs the range to reach
+    its recorded end.
+    """
+    if not bounds:
+        return False
+    if since > bounds[0][0]:
+        return False
+    last_end = bounds[-1][1]
+    if last_end > now:
+        return until >= now
+    # `until` is an INCLUSIVE instant and a week's end is EXCLUSIVE, so a
+    # date-only `--until 2026-06-07` arrives as 23:59:59.999999 and covers a
+    # week ending 2026-06-08T00:00:00 exactly. One microsecond is the
+    # resolution `datetime` has, not a tolerance.
+    return until >= last_end - dt.timedelta(microseconds=1)
+
+
+def residual_withholding_cause(*, account_resolved, whole_weeks, filtered,
+                               fallback_weeks):
+    """None when the observed-minus-modelled residual may be stated.
+
+    Spec §5.2: only when the account, the window and the population align —
+    a single resolved account, whole subscription weeks, and no fallback or
+    filter splitting the population.
+    """
+    if not account_resolved or not whole_weeks or filtered or fallback_weeks:
+        return RESIDUAL_MISALIGNED
+    return None
+
+
+#: Human copy for the typed causes the footer renders. A cause with no entry
+#: renders as its own code, which is readable and never blank.
+_ATTRIBUTION_CAUSE_COPY: dict = {
+    "account-not-resolved":
+        "this install has more than one account and the read is merged; "
+        "pass --account to model quota",
+    "calibration-absent": "no usable quota calibration on this install",
+    "regime-boundary": "the week crosses a metering-rate boundary",
+    "unsupported-composition":
+        "the week's model mix sits outside the calibration's support",
+    "no-local-history": "no local entries to model",
+    RESIDUAL_MISALIGNED:
+        "the account, the window or the population does not align",
+    RESIDUAL_OBSERVED_ABSENT:
+        "at least one modelled week carries no meter snapshot, so there is "
+        "no observed side to subtract from",
+    RESIDUAL_NO_MODELLED_WEEKS:
+        "this window models no subscription week",
+}
+
+
+def _cause_copy(cause) -> str:
+    if cause is None:
+        return "no cause stated"
+    return _ATTRIBUTION_CAUSE_COPY.get(cause, str(cause))
+
+
+def render_attribution_footer(totals, *, basis, cause) -> "list[str]":
+    """Spec §5.2's footer lines for the terminal `project` table.
+
+    The four quantities are named separately rather than conflated into "the
+    rows do not add up", and the residual is stated with its SIGN AS
+    MEASURED and never with a direction: §2.2 measured that difference with
+    both signs, so a footer asserting one would be false half the time. The
+    same sentence says outright that the difference does not identify or
+    estimate off-machine usage, because §2.2's probe in that direction is
+    structurally blind and §2.2 forbids the claim.
+
+    Returns a list of lines so the caller appends without an inline guard.
+    A withheld quantity states its cause and no number; it is absent rather
+    than zero.
+    """
+    totals = totals or {}
+    lines: list[str] = []
+    if basis == "withheld":
+        lines.append(
+            f"Used %: modelled quota withheld \u2014 {_cause_copy(cause)}.")
+    else:
+        modelled = totals.get("modelledWeekPoints")
+        visible = totals.get("visibleRowPoints")
+        unmodelled = totals.get("filteredOrUnmodelledPoints")
+        if modelled is None:
+            lines.append(
+                "Modelled quota: withheld \u2014 "
+                f"{_cause_copy(cause)}. Used % is a cost share.")
+        else:
+            parts = [f"{modelled:,.2f} points across the modelled weeks"]
+            if visible is not None:
+                parts.append(f"{visible:,.2f} in the rows listed")
+            if unmodelled is not None:
+                parts.append(
+                    f"{unmodelled:,.2f} filtered or unmodelled")
+            lines.append("Modelled quota: " + "; ".join(parts) + ".")
+    residual = totals.get("observedMinusModelledPoints")
+    residual_cause = totals.get("residualCause")
+    if residual is None:
+        lines.append(
+            "Observed meter minus modelled local quota: withheld \u2014 "
+            f"{_cause_copy(residual_cause)}.")
+    else:
+        lines.append(
+            "Observed meter minus modelled local quota: "
+            f"{residual:+,.2f} points, as measured. This is a difference "
+            "between two quantities, not an identification or an estimate "
+            "of usage from another machine.")
+    return lines
+
+
+def residual_absence_cause(*, observed, modelled):
+    """Why `observed_minus_modelled` returned None, or None when it did not.
+
+    A pure classifier over the two operands, so the caller states which side
+    is missing instead of reporting every absence as misalignment. The
+    modelled side is checked first because when BOTH are absent the window
+    modelled nothing at all, and naming the observed side there would blame
+    the meter for a window that asked nothing of it.
+    """
+    if modelled is None:
+        return RESIDUAL_NO_MODELLED_WEEKS
+    if observed is None:
+        return RESIDUAL_OBSERVED_ABSENT
+    return None
+
+
+def observed_minus_modelled(*, observed, modelled):
+    """The meter's reading minus the modelled local points, or None.
+
+    §2.2 measured this difference with BOTH signs, so no caller may assume it
+    has one, and no surface may state it as off-machine usage. It is the
+    difference itself, named as such.
+    """
+    if observed is None or modelled is None:
+        return None
+    return observed - modelled
+
+
 def _load_week_snapshots(
     since: dt.datetime, until: dt.datetime, *,
     account_key: "str | None" = None,
@@ -282,8 +614,18 @@ def _project_json_payload(
     warnings: list[str],
     include_breakdown: bool,
     week_snapshots: dict[dt.datetime, float],
+    attribution_basis: str = "cost-share",
+    attribution_cause: "str | None" = None,
+    attribution_totals: "dict | None" = None,
 ) -> dict:
     """Build the project subcommand's --json payload per spec §4.
+
+    `schemaVersion` is 2 from #661 S2. `attributedUsedPercent` and
+    `costPerPercent` keep their spellings and change their MEANING, from a
+    share of the window's dollars to modelled weekly quota, and
+    `docs/cli-contract.md` classifies a changed value meaning as breaking.
+    The `attribution` block and the per-row `attributionBasis` are the v2
+    additions that say which measure a given payload actually carries.
 
     Accepts rows already sorted by the caller (so ordering flags apply
     uniformly to both terminal and JSON modes). Aggregates `totals.costUsd`
@@ -325,6 +667,10 @@ def _project_json_payload(
                 round(row["cost_per_pct"], 4)
                 if row["cost_per_pct"] is not None else None
             ),
+            # A project can span weeks that resolved differently, so the
+            # basis is a row field and not only a payload one. A row is
+            # `modelled` only when EVERY contributing week was.
+            "attributionBasis": row.get("attribution_basis", "cost-share"),
         }
         if include_breakdown:
             p["models"] = [
@@ -354,10 +700,26 @@ def _project_json_payload(
             ),
             "weeklyAttributionAvailable": len(weeks_missing_snapshot) == 0,
         },
+        "attribution": {
+            "basis": attribution_basis,
+            "cause": attribution_cause,
+            # The four quantities spec §5.2 names, which the earlier draft
+            # conflated into "the rows do not add up". `residualCause` is
+            # set whenever the residual could not be computed against a
+            # whole, single-account, unfiltered population.
+            "totals": dict(attribution_totals or {
+                "modelledWeekPoints": None,
+                "visibleRowPoints": None,
+                "filteredOrUnmodelledPoints": None,
+                "observedMinusModelledPoints": None,
+                "residualCause": RESIDUAL_MISALIGNED,
+            }),
+        },
         "projects": projects_json,
         "warnings": warnings,
     }
-    return _cctally().stamp_schema_version(payload)
+    return _cctally().stamp_schema_version(
+        payload, version=PROJECT_JSON_SCHEMA_VERSION)
 
 
 def _project_json_output(**kwargs) -> str:
@@ -639,6 +1001,28 @@ def cmd_project(args: argparse.Namespace) -> int:
             command_label="project",
         )
 
+    # #661 S2 spec §5. The run-level gate first: on a decorated multi-account
+    # install a merged read has no valid calibration to apply, so modelled
+    # quota is withheld and `--account` is required rather than silently
+    # falling back to the cost share.
+    _decorated = probe_provider_decoration(conn, "claude")
+    run_basis, run_cause = resolve_attribution_account_gate(
+        account_key=acct_key, decorated=_decorated,
+    )
+    attribution_regime = None
+    if run_basis is None:
+        try:
+            qcg = c._load_sibling("_cctally_quota_calibration")
+            attribution_regime = qcg.read_calibration_file(
+                account_key=acct_key).regime
+        except Exception:                              # noqa: BLE001
+            attribution_regime = None
+    # Per-week weighted units, and the records the whole-week support test
+    # runs over. Collected on EVERY entry — the denominator is the account's
+    # whole week, not the user's slice.
+    week_units_total: dict = {}
+    week_records: dict = {}
+
     for entry in joined_entries_all:
         # Skip synthetic entries (Claude Code internal markers) to match
         # `_aggregate_cache_by_session` / `_aggregate_claude_sessions`.
@@ -668,6 +1052,16 @@ def cmd_project(args: argparse.Namespace) -> int:
         total_cost_by_week[week_start] = (
             total_cost_by_week.get(week_start, 0.0) + entry_cost
         )
+
+        # #661 S2 §5.1: weight BEFORE bucket aggregation, which drops the
+        # one-hour cache-write split `weighted_units` needs. Same whole-week
+        # scope as the cost denominator above, for the same reason.
+        entry_record, entry_units = (
+            _entry_quota_record(entry) if run_basis is None else (None, None))
+        if entry_units is not None:
+            week_units_total[week_start] = (
+                week_units_total.get(week_start, 0.0) + entry_units)
+            week_records.setdefault(week_start, []).append(entry_record)
 
         # User-slice gate: visible rows only include entries within
         # [since_dt, until_dt]. Entries outside the slice still
@@ -709,10 +1103,13 @@ def cmd_project(args: argparse.Namespace) -> int:
                 "input": 0, "output": 0,
                 "cache_write": 0, "cache_read": 0,
                 "cost_usd": 0.0,
+                "units": 0.0,
                 "models": {},
             }
             buckets[bkey] = b
         _accumulate_entry_into_bucket(b, entry, pre_computed_cost=entry_cost)
+        if entry_units is not None:
+            b["units"] += entry_units
 
     # The remediation moved OUT of these two sentences and into the shared
     # affordance line below (#620 S1 D11), so the terminal states the problem
@@ -758,6 +1155,36 @@ def cmd_project(args: argparse.Namespace) -> int:
         ws for ws in weeks_in_range if ws not in week_snapshots
     }
 
+    # #661 S2 §5.1: one decision per subscription week, over that week's WHOLE
+    # account population. A week with an unsupported or out-of-regime segment
+    # falls back for the whole week; partial-week mixtures are not produced.
+    week_attribution: dict = {}
+    for ws in sorted(set(week_starts) | set(week_records)):
+        week_attribution[ws] = resolve_week_attribution(
+            attribution_regime, week_records.get(ws, ()),
+            week_start=ws, week_end=ws + dt.timedelta(days=7))
+    modelled_weeks = sorted(
+        ws for ws, attr in week_attribution.items()
+        if attr.basis == "modelled")
+    fallback_weeks = sorted(
+        ws for ws, attr in week_attribution.items()
+        if attr.basis != "modelled")
+    # The run's basis is the weakest any contributing week reached, because a
+    # payload that claimed `modelled` while some of its rows came from a cost
+    # share would be answering the same question two ways.
+    if run_basis is not None:
+        attribution_basis, attribution_cause = run_basis, run_cause
+    elif modelled_weeks and not fallback_weeks:
+        attribution_basis, attribution_cause = "modelled", None
+    elif modelled_weeks:
+        attribution_basis = "cost-share"
+        attribution_cause = week_attribution[fallback_weeks[0]].cause
+    else:
+        attribution_basis = "cost-share"
+        attribution_cause = (
+            week_attribution[fallback_weeks[0]].cause if fallback_weeks
+            else "calibration-absent")
+
     # Collapse (project_key, week) buckets into one row per project, summing
     # tokens / cost / sessions / first_seen / last_seen / models across the
     # weeks the project appears in.
@@ -783,6 +1210,11 @@ def cmd_project(args: argparse.Namespace) -> int:
                 # lacked a snapshot" (→ None) and "genuine zero attribution"
                 # (→ 0.0 after a real contribution). Spec §3.
                 "attributed_pct": None,
+                "units": 0.0,
+                # `modelled` only when EVERY contributing week was; the first
+                # fallback week degrades the row.
+                "attribution_basis": (
+                    "withheld" if run_basis == "withheld" else "modelled"),
                 "models": {},
             }
             project_rows[key.bucket_path] = row
@@ -796,6 +1228,7 @@ def cmd_project(args: argparse.Namespace) -> int:
         row["cache_write"] += b["cache_write"]
         row["cache_read"] += b["cache_read"]
         row["cost_usd"] += b["cost_usd"]
+        row["units"] += b["units"]
 
         # Merge per-model sub-buckets.
         for model, mb in b["models"].items():
@@ -819,17 +1252,33 @@ def cmd_project(args: argparse.Namespace) -> int:
             rm["cache_write"] += mb["cache_write"]
             rm["cache_read"] += mb["cache_read"]
 
-        # Attribution contribution (only if this week has a snapshot and
-        # the week has nonzero total cost — a zero denominator would make
-        # the ratio meaningless). `attributed_pct` stays `None` until the
-        # first real contribution; subsequent contributions accumulate.
-        week_pct = week_snapshots.get(wstart)
-        week_total = total_cost_by_week.get(wstart, 0.0)
-        if week_pct is not None and week_total > 0:
-            contribution = (b["cost_usd"] / week_total) * week_pct
+        # Attribution contribution. #661 S2 §5: MODELLED quota where this
+        # week's population supports it — the bucket's own weighted units
+        # over the regime's units-per-point, which needs no meter reading and
+        # no cost denominator at all — and the #86 cost share otherwise.
+        #
+        # The cost share stays gated on a snapshot and a nonzero week total,
+        # because a zero denominator would make the ratio meaningless.
+        # `attributed_pct` stays `None` until the first real contribution;
+        # subsequent contributions accumulate.
+        attr = week_attribution.get(wstart)
+        if run_basis == "withheld":
+            # §5.3: no modelled quota and no cost-share stand-in either.
+            pass
+        elif attr is not None and attr.basis == "modelled":
             row["attributed_pct"] = (
-                (row["attributed_pct"] or 0.0) + contribution
+                (row["attributed_pct"] or 0.0)
+                + b["units"] / attr.units_per_point
             )
+        else:
+            row["attribution_basis"] = "cost-share"
+            week_pct = week_snapshots.get(wstart)
+            week_total = total_cost_by_week.get(wstart, 0.0)
+            if week_pct is not None and week_total > 0:
+                contribution = (b["cost_usd"] / week_total) * week_pct
+                row["attributed_pct"] = (
+                    (row["attributed_pct"] or 0.0) + contribution
+                )
 
     # Compute $/1% per project: `cost_per_pct = cost_usd / attributed_pct`
     # when attribution is positive; None otherwise (e.g. every contributing
@@ -841,6 +1290,74 @@ def cmd_project(args: argparse.Namespace) -> int:
             row["cost_per_pct"] = row["cost_usd"] / ap
         else:
             row["cost_per_pct"] = None
+
+    # #661 S2 §5.2. Four distinct quantities, named rather than conflated
+    # into "the rows do not add up":
+    #   1. modelled-week points          — every local entry in the window's
+    #                                      MODELLED weeks, weighted and
+    #                                      converted
+    #   2. visible-row points            — the subset the rendered rows carry
+    #   3. filtered or unmodelled points — exactly 1 minus 2
+    #   4. observed minus modelled       — the meter's reading minus 1
+    #
+    # The measured scope of 1 is the window's modelled weeks and NOT every
+    # local entry in the window, which is why the key is spelled
+    # `modelledWeekPoints`. A fallback week's points appear in NEITHER 1 nor
+    # 3 — they are not comparable to a modelled quantity — and a run holding
+    # one withholds the residual outright, so the two quantities that are
+    # published are the ones this run can actually measure.
+    if run_basis == "withheld" or not modelled_weeks:
+        modelled_week_points = None
+        visible_points = None
+        unmodelled_points = None
+    else:
+        modelled_week_points = stable_sum(
+            week_units_total.get(ws, 0.0)
+            / week_attribution[ws].units_per_point
+            for ws in modelled_weeks)
+        visible_points = stable_sum(
+            b["units"] / week_attribution[wstart].units_per_point
+            for (_key, wstart), b in buckets.items()
+            if week_attribution.get(wstart) is not None
+            and week_attribution[wstart].basis == "modelled")
+        unmodelled_points = modelled_week_points - visible_points
+    observed_points = (
+        stable_sum(week_snapshots[ws] for ws in modelled_weeks
+                   if ws in week_snapshots)
+        if modelled_weeks
+        and all(ws in week_snapshots for ws in modelled_weeks)
+        else None)
+    residual_cause = residual_withholding_cause(
+        account_resolved=(run_basis is None),
+        whole_weeks=range_covers_whole_weeks(
+            since_dt, until_dt, parsed_bounds, now=now),
+        filtered=bool(project_patterns or model_patterns),
+        fallback_weeks=len(fallback_weeks),
+    )
+    attribution_totals = {
+        "modelledWeekPoints": (
+            None if modelled_week_points is None
+            else round(modelled_week_points, 4)),
+        "visibleRowPoints": (
+            None if visible_points is None else round(visible_points, 4)),
+        "filteredOrUnmodelledPoints": (
+            None if unmodelled_points is None
+            else round(unmodelled_points, 4)),
+        "observedMinusModelledPoints": None,
+        "residualCause": residual_cause,
+    }
+    if residual_cause is None:
+        residual = observed_minus_modelled(
+            observed=observed_points, modelled=modelled_week_points)
+        attribution_totals["observedMinusModelledPoints"] = (
+            None if residual is None else round(residual, 4))
+        if residual is None:
+            # The population aligns, so the absence is one of the two the
+            # alignment test cannot see: no modelled week at all, or a
+            # modelled week with no meter snapshot. Naming either of them
+            # `population-misaligned` states a false reason.
+            attribution_totals["residualCause"] = residual_absence_cause(
+                observed=observed_points, modelled=modelled_week_points)
 
     # Collect warnings to surface in the JSON payload (terminal path emits
     # them inline via eprint earlier, so this list stays JSON-specific).
@@ -911,6 +1428,9 @@ def cmd_project(args: argparse.Namespace) -> int:
             warnings=warnings,
             include_breakdown=args.breakdown,
             week_snapshots=week_snapshots,
+            attribution_basis=attribution_basis,
+            attribution_cause=attribution_cause,
+            attribution_totals=attribution_totals,
         )
         payload.update(c.account_json_fields(acct_key))  # #341 R8 decoration
         sink = getattr(args, "_source_result_sink", None)
@@ -943,5 +1463,10 @@ def cmd_project(args: argparse.Namespace) -> int:
         weeks_in_range=len(weeks_in_range),
         color=c._resolve_color_enabled(args),
         compact=args.compact,
+        # #661 S2 §5.2. The four quantities existed only in `project --json`,
+        # so a terminal user got no reconciliation information at all.
+        attribution_footer=render_attribution_footer(
+            attribution_totals, basis=attribution_basis,
+            cause=attribution_cause),
     ))
     return 0

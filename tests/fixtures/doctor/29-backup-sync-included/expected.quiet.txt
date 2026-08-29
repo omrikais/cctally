@@ -15,6 +15,7 @@ Journal
 Data
 Accounts
 Pricing
+Quota
 Safety
   ⚠ Backup/sync              cctally data is inside iCloud Drive
       → Exclude the cctally data directory from file-level backup/sync and use `cctally db backup --db stats` or `--db cache` for consistent SQLite snapshots
@@ -22,4 +23,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 56 OK · 6 WARN · 0 FAIL
+Summary: 58 OK · 6 WARN · 0 FAIL

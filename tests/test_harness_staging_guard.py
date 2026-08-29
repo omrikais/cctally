@@ -29,7 +29,12 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 HELPER = REPO / "bin" / "_lib-harness-env.sh"
 
 
-def _stage(destination: str, name: str = "doctor") -> subprocess.CompletedProcess:
+def _stage(
+    destination: str,
+    name: str = "doctor",
+    *,
+    temp_root: pathlib.Path | None = None,
+) -> subprocess.CompletedProcess:
     script = (
         'set -uo pipefail\n'
         '. "$1"\n'
@@ -37,7 +42,14 @@ def _stage(destination: str, name: str = "doctor") -> subprocess.CompletedProces
     )
     return subprocess.run(
         ["bash", "-c", script, "_", str(HELPER), name, destination],
-        capture_output=True, text=True, cwd=str(REPO), timeout=110,
+        capture_output=True,
+        text=True,
+        cwd=str(REPO),
+        timeout=110,
+        env=dict(
+            os.environ,
+            **({"TMPDIR": str(temp_root)} if temp_root is not None else {}),
+        ),
     )
 
 
@@ -47,30 +59,27 @@ def test_an_empty_destination_is_refused():
     assert "refusing an empty destination" in proc.stderr
 
 
-def test_a_destination_in_the_repository_is_refused():
+def test_a_destination_in_the_repository_is_refused(tmp_path):
     """The in-place rebuild, refused at the one place that would perform it.
 
-    A sentinel copy stands in for `tests/fixtures/doctor`, and the committed
-    tree itself is never handed to the helper. The helper's third statement is
-    `rm -rf "$dest"`: passing the real path meant that removing the guard this
-    test protects would delete the committed tree, and the run that reported the
-    regression would also be the run that caused it.
+    A sentinel copy outside a deliberately narrower TMPDIR stands in for
+    `tests/fixtures/doctor`. It is outside the helper's allowed root but remains
+    wholly under pytest scratch, so neither the passing test nor a regression in
+    the guard creates or removes an untracked path in the live repository.
     """
     committed = REPO / "tests" / "fixtures" / "doctor"
     assert committed.is_dir(), "this test needs a committed tree to copy"
-    sentinel = REPO / ".staging-guard-sentinel" / "doctor"
-    shutil.rmtree(sentinel.parent, ignore_errors=True)
-    try:
-        shutil.copytree(committed, sentinel)
-        before = sorted(path.name for path in sentinel.iterdir())
-        assert before, "the sentinel copy is empty, so surviving proves nothing"
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    sentinel = tmp_path / "outside" / "doctor"
+    shutil.copytree(committed, sentinel)
+    before = sorted(path.name for path in sentinel.iterdir())
+    assert before, "the sentinel copy is empty, so surviving proves nothing"
 
-        proc = _stage(str(sentinel))
-        assert proc.returncode == 2, (proc.returncode, proc.stderr)
-        assert "refusing a destination outside" in proc.stderr
-        assert sorted(path.name for path in sentinel.iterdir()) == before
-    finally:
-        shutil.rmtree(sentinel.parent, ignore_errors=True)
+    proc = _stage(str(sentinel), temp_root=allowed_root)
+    assert proc.returncode == 2, (proc.returncode, proc.stderr)
+    assert "refusing a destination outside" in proc.stderr
+    assert sorted(path.name for path in sentinel.iterdir()) == before
 
 
 def test_a_destination_under_the_temp_root_is_accepted(tmp_path):

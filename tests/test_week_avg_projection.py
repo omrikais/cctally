@@ -4,8 +4,13 @@ The budget counterpart (week_avg_projection_usd) is covered in
 tests/test_budget.py. This module pins the forecast week-average projection
 the projected-pace alert axis will fire on:
 
-    week_avg_projection_pct = p_now + r_avg * remaining_hours
-    where r_avg = p_now / elapsed_hours   (forecast's week-average rate)
+    week_avg_projection_pct = p_corrected + r_avg * remaining_hours
+    where r_avg = p_corrected / elapsed_hours   (week-average rate)
+
+`p_corrected` is the ceiling-corrected reading (#661 S2 spec section 3.1):
+a displayed `k` means true consumption fell in `[k-1, k)`, so the estimate
+is `k - 0.5` for every reading above 1. The raw displayed value stays on
+``ForecastInputs.p_now`` for the renderers.
 
 _compute_forecast honest-imports project_linear from _lib_budget (its pure
 home) — the forecast kernel moved to bin/_lib_forecast.py in #279 S4 F2.
@@ -62,16 +67,16 @@ def test_forecast_output_exposes_week_average_projection_pct(cctally_mod):
     mod = cctally_mod
     inp = _mk_inputs(mod, p_now=50.0, elapsed_hours=84.0, remaining_hours=84.0)
     out = mod._compute_forecast(inp, targets=[100, 90])
-    # r_avg = 50/84; proj = 50 + (50/84)*84 = 100.
-    assert abs(out.week_avg_projection_pct - 100.0) < 1e-9
+    # r_avg = 49.5/84; proj = 49.5 + (49.5/84)*84 = 99.
+    assert abs(out.week_avg_projection_pct - 99.0) < 1e-9
 
 
 def test_forecast_week_avg_projection_zero_elapsed_collapses_to_p_now(cctally_mod):
     mod = cctally_mod
     inp = _mk_inputs(mod, p_now=33.0, elapsed_hours=0.0, remaining_hours=84.0)
     out = mod._compute_forecast(inp, targets=[100, 90])
-    # elapsed 0 => r_avg 0 => projection == p_now.
-    assert abs(out.week_avg_projection_pct - 33.0) < 1e-9
+    # elapsed 0 => r_avg 0 => projection == the corrected reading, 32.5.
+    assert abs(out.week_avg_projection_pct - 32.5) < 1e-9
 
 
 def test_forecast_json_carries_week_avg_projection_pct(cctally_mod):
@@ -80,4 +85,4 @@ def test_forecast_json_carries_week_avg_projection_pct(cctally_mod):
     out = mod._compute_forecast(inp, targets=[100, 90])
     payload = mod._build_forecast_json_payload(out)
     assert "week_avg_projection_pct" in payload["forecast"]
-    assert abs(payload["forecast"]["week_avg_projection_pct"] - 100.0) < 1e-3
+    assert abs(payload["forecast"]["week_avg_projection_pct"] - 99.0) < 1e-3

@@ -152,3 +152,7 @@ Anonymization is **best-effort over known tokens; review before sharing.** The t
 - `3` — `--account` was requested but the attribution cache is unavailable.
 
 See [`docs/cli-contract.md`](../cli-contract.md) for the repo-wide exit-code taxonomy and JSON envelope conventions.
+
+## Implementation
+
+The anonymization plan is a pure kernel, `bin/_lib_conversation_anon.py`, so the CLI and the dashboard `/export` route produce byte-identical output from one implementation. A qualified reference resolves its plan through that kernel's `build_anon_plan_for_sources`, which is what lets one export mix Claude and Codex identifiers without either provider's tokens leaking into the other's scrub set. The command glue — argument parsing, source resolution and rendering — is `bin/_cctally_transcript.py`.

@@ -966,16 +966,24 @@ def _build_forecast_share_panel_data(options: dict,
     Reuses ``DataSnapshot.forecast`` (ForecastOutput) and, when populated
     by the sync thread, ``DataSnapshot.forecast_view`` (the kernel
     wrapper from issue #57) for the (100, 90) budget pair.
-    ``projection_curve`` is synthesized from ``r_avg`` / ``r_recent`` /
-    ``inputs.p_now`` — the same arithmetic ``snapshot_to_envelope`` does
-    for ``week_avg_projection_pct`` / ``recent_24h_projection_pct``,
-    extended across the next 7 days.
+
+    ``projected_end_pct`` is the kernel's SELECTED projection (#661 S2 spec
+    section 3.3) rather than a sixth re-derivation of it, and the curve and
+    the ceiling distances are measured from the same ceiling-corrected base
+    the kernel used. This function previously paired a RAW ``inputs.p_now``
+    with the corrected ``r_avg`` the kernel publishes and described that as
+    "the same arithmetic ``snapshot_to_envelope`` does", which stopped being
+    true the moment the correction landed.
+
+    Every one of those quantities is withheld at a right-censored reading and
+    on a week with no observed usage, because each is derived from a meter
+    that supplies no point estimate.
     """
     fc = getattr(snap, "forecast", None) if snap else None
     fc_view = getattr(snap, "forecast_view", None) if snap else None
     if fc is None:
         return {
-            "projected_end_pct":  0.0,
+            "projected_end_pct":  None,
             # With no forecast at all there is no rate, so neither ceiling has
             # a distance — the same withholding the populated path performs.
             "days_to_100pct":     None,
@@ -987,25 +995,43 @@ def _build_forecast_share_panel_data(options: dict,
             "projection_curve": [],
             "confidence":       "LOW CONF",
         }
+    from _lib_forecast import projection_base
+
     inputs = getattr(fc, "inputs", None)
-    p_now = float(getattr(inputs, "p_now", 0.0) or 0.0) if inputs else 0.0
+    # The CEILING-CORRECTED base, through the one named resolver. `None` at a
+    # right-censored reading, where there is no point estimate at all.
+    base = projection_base(inputs) if inputs is not None else None
+    p_now = None if base is None else float(base)
     remaining_hours = float(
         getattr(inputs, "remaining_hours", 0.0) or 0.0
     ) if inputs else 0.0
     confidence = getattr(inputs, "confidence", "ok") if inputs else "ok"
-    r_avg = float(getattr(fc, "r_avg", 0.0) or 0.0)
+    r_avg_raw = getattr(fc, "r_avg", None)
+    r_avg = None if r_avg_raw is None else float(r_avg_raw)
     r_recent_raw = getattr(fc, "r_recent", None)
     r_recent = float(r_recent_raw) if r_recent_raw is not None else r_avg
-    # End-of-week projected %
-    projected_end_pct = (p_now + r_avg * remaining_hours) / 100.0
+    # End-of-week projected % — the kernel's selected value, expressed as the
+    # fraction this panel's contract carries. `None` when the kernel withheld
+    # it, which the templates render as `n/a` rather than as `0.0%`.
+    selected = getattr(fc, "week_avg_projection_pct", None)
+    projected_end_pct = None if selected is None else float(selected) / 100.0
     # Days to ceilings (simple inverse: hours-to-target / 24).
-    # The two exit conditions are opposite facts and must not share a value.
-    # `p_now >= target_pct` means the target is already reached, and zero days
-    # to it is true. `r_avg <= 0` means no rate was observed, so the target is
-    # not reachable on any timeline this data describes — and in the no-usage
-    # state BOTH hold (`p_now == 0`, `r_avg == 0`), so the shared `0.0`
-    # rendered `Days->90% 0.0`, stating the opposite of the truth.
+    # The three exit conditions are different facts and must not share a
+    # value. `p_now >= target_pct` means the target is already reached, and
+    # zero days to it is true. `r_avg <= 0` means no rate was observed, so the
+    # target is not reachable on any timeline this data describes. A withheld
+    # base or rate means the meter supplies no distance at all.
+    #
+    # #661 S2 §3.1 changed which of these fires in the no-usage state. Before
+    # the ceiling correction both `p_now == 0` and `r_avg == 0` held there,
+    # and the shared `0.0` rendered `Days->90% 0.0`, stating the opposite of
+    # the truth. The corrected point of a displayed 0 is 0.25, so NEITHER
+    # holds now: the distance is a real, finite, very large number. Bounding
+    # it is a PRESENTATION decision and is made in `_optional_days`, so this
+    # function keeps publishing the exact figure.
     def _days_to_ceiling(target_pct: float) -> "float | None":
+        if p_now is None or r_avg is None:
+            return None
         if p_now >= target_pct:
             return 0.0
         if r_avg <= 0:
@@ -1045,18 +1071,23 @@ def _build_forecast_share_panel_data(options: dict,
     # defect one layer below the fix.
     _raw_dpp = getattr(inputs, "dollars_per_percent", None) if inputs else None
     dpp = None if _raw_dpp is None else float(_raw_dpp)
-    budgets["avg"] = None if dpp is None else dpp * r_avg * 24.0
-    budgets["recent_24h"] = None if dpp is None else dpp * r_recent * 24.0
-    # Projection curve — 7-day forward, using r_avg
+    budgets["avg"] = (None if dpp is None or r_avg is None
+                      else dpp * r_avg * 24.0)
+    budgets["recent_24h"] = (None if dpp is None or r_recent is None
+                             else dpp * r_recent * 24.0)
+    # Projection curve — 7-day forward, using r_avg from the corrected base.
+    # Empty when either is withheld: a curve drawn from a censored reading is
+    # the same fabrication the scalar above refuses.
     today = _share_now_utc().date()
     projection_curve: list[dict] = []
-    for i in range(7):
-        d = today + dt.timedelta(days=i)
-        pct = (p_now + r_avg * (i * 24.0)) / 100.0
-        projection_curve.append({
-            "date":               d.isoformat(),
-            "projected_pct_used": pct,
-        })
+    if p_now is not None and r_avg is not None:
+        for i in range(7):
+            d = today + dt.timedelta(days=i)
+            pct = (p_now + r_avg * (i * 24.0)) / 100.0
+            projection_curve.append({
+                "date":               d.isoformat(),
+                "projected_pct_used": pct,
+            })
     return {
         "projected_end_pct":  projected_end_pct,
         "days_to_100pct":     days_to_100,

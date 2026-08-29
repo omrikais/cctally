@@ -1493,9 +1493,69 @@ def maybe_record_codex_budget_milestone(
     return fired
 
 
-def _weekly_pct_week_avg_projection(conn, now_utc):
+def _forecast_reaches_the_calibrated_basis(
+        now_utc, week_start_at, week_end_at, *, account_key=None) -> bool:
+    """True when the FORECAST would publish a model-backed projection here.
+
+    Spec section 3.3 conditions the twin's abstention on the alert path being
+    unable to reach "the basis the forecast published" — not on a regime
+    merely validating. Those are different questions, and the gap between
+    them is reachable: `apply_regime` re-tests support against THIS week's
+    population and rejects an unsupported or empty one, so a calibration can
+    validate while the forecast still falls back to the corrected meter. At
+    the start of every week the population is empty, and gating on
+    readability there returned `None` from the twin and silently disabled the
+    weekly 90%/100% projected alert.
+
+    This calls the SAME helper the loader calls, with the SAME account key,
+    so the two cannot answer differently. The earlier probe always read the
+    merged bucket while the loader used its caller's key, which on a
+    decorated multi-account install let the forecast publish a calibrated
+    projection while the twin saw no merged regime and fired on the meter.
+
+    Any failure to reach the helper is reported as "not calibrated", which
+    keeps the twin firing rather than going quiet on an unrelated defect.
+
+    COST. This is NOT a cheap probe once a regime validates. `_calibrated_projection`
+    reads the calibration file first — one small file read on every install
+    that has never run `cctally quota`, and the common case — but when a
+    regime does validate it then opens `cache.db` and runs a full current-week
+    `session_entries` SELECT, on a path `record-usage` and `hook-tick` reach
+    once per prompt. Measured over the twelve most recent completed
+    subscription weeks of the maintainer's August 2026 store snapshot
+    (476,216 `session_entries` rows), on an Apple M4 Max Mac Studio under
+    CPython 3.14 with the file cache warm, a WHOLE week is a median 16,923
+    rows and 28 ms and at worst 27,664 rows and 46 ms. This read covers the
+    current week only as far as now, so it is a fraction of that early in
+    the week and reaches it by the week's end. The durations are this
+    machine's and another host will differ; what does not vary is that the
+    read is one unbounded week-scan rather than a bounded probe. A cheap bound is available in principle — the same
+    query with `COUNT(*)`, or a bounded `LIMIT 1` existence probe, would
+    answer the empty-population half of `apply_regime`'s rejection without
+    materializing the rows — but it would not answer the composition-support
+    half, which needs the whole population. Not implemented here.
+    """
+    try:
+        value, _code = _cctally()._load_sibling(
+            "_cctally_forecast")._calibrated_projection(
+                now_utc, week_start_at, week_end_at, account_key=account_key)
+        return value is not None
+    except Exception:
+        return False
+
+
+def _weekly_pct_week_avg_projection(conn, now_utc, *, account_key=None):
     """Compute the week-AVERAGE weekly-% projection for the current
-    subscription week, snapshot-only (CHEAP — no cost SUM, no ``sync_cache``).
+    subscription week from snapshots alone.
+
+    ``account_key`` is an AFFORDANCE, not a threaded production value. The one
+    shipped caller (the projected-alert leg in ``maybe_record_projected_alert``)
+    passes none, and the window it resolves just above comes from a merged
+    ``_fetch_current_week_snapshots``, so the whole projected-alert path is
+    account-blind today. Making it per-account is a #341 change to that leg
+    rather than to this helper, and this session does not make it. The
+    parameter exists so the abstention gate below can be given the SAME key
+    the forecast loader would use once the leg is threaded.
 
     Returns ``(projected_pct, low_conf)`` or ``None`` when no current-week
     snapshot resolves. The value is computed by the IDENTICAL formula +
@@ -1518,12 +1578,33 @@ def _weekly_pct_week_avg_projection(conn, now_utc):
 
     Deliberately does NOT call ``_sum_cost_for_range`` (the weekly-% projection
     needs no spend; the forecast kernel's ``week_avg_projection_pct`` is also
-    spend-free).
+    spend-free), and never calls ``sync_cache``.
+
+    It is NOT, however, snapshot-only any more. The #661 S2 abstention gate
+    below calls ``_forecast_reaches_the_calibrated_basis``, which reads the
+    calibration file and — when a regime validates — opens ``cache.db`` for a
+    full current-week ``session_entries`` SELECT. See that helper's COST note.
     """
-    fetched = _fetch_current_week_snapshots(conn, now_utc)
+    fetched = _fetch_current_week_snapshots(conn, now_utc,
+                                            account_key=account_key)
     if fetched is None:
         return None
     week_start_at, week_end_at, samples = fetched
+    # #661 S2 spec section 3.3, invariant PROJECTED1-b. This helper computes
+    # the week average from snapshots alone, and the calibrated basis needs
+    # the current week's weighted units. So when the FORECAST reaches that
+    # basis it publishes a model-backed projection this value cannot equal,
+    # and the twin ABSTAINS rather than firing on the corrected meter, which
+    # would alert on a number the screen does not show.
+    #
+    # The gate is the basis the forecast actually reached, resolved with the
+    # window this helper just resolved, so a calibration that validates but
+    # does not apply to this week's population leaves the twin firing. It
+    # never calls `analyse_account`: the probe reads the calibration file and,
+    # only when a regime validates, one bounded current-week query.
+    if _forecast_reaches_the_calibrated_basis(
+            now_utc, week_start_at, week_end_at, account_key=account_key):
+        return None
     week_start_at, samples = _apply_midweek_reset_override(
         conn, week_start_at, week_end_at, samples
     )
@@ -1532,8 +1613,35 @@ def _weekly_pct_week_avg_projection(conn, now_utc):
     p_now = samples[-1][1]
     elapsed_hours = (now_utc - week_start_at).total_seconds() / 3600.0
     remaining_hours = max(0.0, (week_end_at - now_utc).total_seconds() / 3600.0)
-    r_avg = p_now / elapsed_hours if elapsed_hours > 0 else 0.0
-    projected_pct = p_now + r_avg * remaining_hours
+    # #661 S2 spec section 3.1/3.3: the same CEILING-CORRECTED operand
+    # `_compute_forecast` projects from. The reconcile invariant PROJECTED1
+    # binds this value to `forecast --json`'s `week_avg_projection_pct`
+    # within 1e-9, so the two must share the operand as well as the formula.
+    # A right-censored reading has no corrected point and therefore no
+    # projection at all: the detector abstains rather than firing on a
+    # number the observation cannot supply.
+    # Imported HERE rather than at module scope, and NOT for a measured
+    # saving. An earlier revision of this comment claimed the module-scope
+    # form cost `record-usage` and `hook-tick` 18.5 ms per run, about 11 ms of
+    # it `_lib_quota_model` "which neither command previously loaded at all".
+    # That is false: `bin/cctally` loads `_lib_quota_model` at line 574 and
+    # `_cctally_forecast` at line 1667, both unconditionally, and
+    # `_cctally_forecast` honest-imports `_lib_forecast` at its own module
+    # top. By the time either command reaches this helper the module is
+    # already in `sys.modules`, and the incremental import measures 0.000 ms.
+    # 18.5 ms is the COLD import into a bare interpreter, which no shipped
+    # path performs. What the local form does buy is correctness: it pairs
+    # with `_ensure_sibling_loaded`, which the module-scope form omitted, so
+    # it does not depend on `_load_sibling` having happened to insert `bin/`
+    # into `sys.path` at `bin/cctally:156`.
+    _ensure_sibling_loaded("_lib_forecast")
+    from _lib_forecast import corrected_percent_point
+
+    p_corrected = corrected_percent_point(p_now)
+    if p_corrected is None:
+        return None
+    r_avg = p_corrected / elapsed_hours if elapsed_hours > 0 else 0.0
+    projected_pct = p_corrected + r_avg * remaining_hours
 
     # Confidence comes from the predicate in one call, fourth trigger
     # included, so this LOW CONF gate == forecast's and glue no longer

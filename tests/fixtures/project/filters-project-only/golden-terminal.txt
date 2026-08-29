@@ -16,3 +16,5 @@
 │             │        │ a.m.   │ a.m.   │         │          │         │        │         │         │        │        │
 └─────────────┴────────┴────────┴────────┴─────────┴──────────┴─────────┴────────┴─────────┴─────────┴────────┴────────┘
 Cost Share: each project's share of $6.75 — the total cost of the 2 projects listed.
+Modelled quota: withheld — no usable quota calibration on this install. Used % is a cost share.
+Observed meter minus modelled local quota: withheld — the account, the window or the population does not align.

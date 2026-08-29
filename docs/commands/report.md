@@ -74,8 +74,10 @@ cctally codex report
 
 For Claude, each recent subscription week joins the latest usage % snapshot with
 the latest cost snapshot, divide cost by percent, and render a trend.
-This is the metric that surfaces quota-rule changes (or your own usage
-shifts) early.
+
+**`$ / 1%` is dollars over METER POINTS, and that has a consequence worth stating plainly (#661 S2 §11).** When the provider charges more points for the same tokens, the denominator grows while the numerator does not, so the metric FALLS — and a falling `$ / 1%` reads as improved efficiency. It is the same number a genuinely cheaper week produces. The metric also cannot separate a metering-rate change from a shift in your model mix or your cache ratio, because all three move the same ratio in the same direction.
+
+So `$ / 1%` is a trend line, not a detector. [`cctally quota`](quota.md) is the detector: it fits the weighted units behind one meter point, records a confirmed rate transition with its effective instant, and states the evidence for both. `$ / 1%` itself stays exactly as it is — it answers a different and still useful question, which is what a week of work cost against the quota it consumed.
 
 ## Options
 

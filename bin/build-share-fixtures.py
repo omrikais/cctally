@@ -12,6 +12,7 @@ Scenarios cover the share-enabled subcommands across formats:
   report-md, report-svg-light, report-svg-dark, report-empty-html,
   daily-md, daily-md-desc, monthly-md, weekly-md, weekly-html,
   weekly-svg-breakdown, forecast-md, forecast-svg,
+  forecast-md-censored,
   project-md-anon, project-md-reveal, five-hour-blocks-md, session-md.
 
 The fixtures share one synthetic dataset:
@@ -90,6 +91,25 @@ SCENARIOS: tuple[str, ...] = (
     # actual-vs-projected ray with x_value-based scaling. The forecast-md
     # case stays markdown-only (no chart in md output).
     "forecast-svg",
+    # #661 S2 spec section 3.2: the 100% right-censored path on every
+    # consumer. The share artifact printed the CURRENT reading under a
+    # "Projected end-of-week %" label with nothing saying it was withheld,
+    # and no fixture reached the state. Same data shape as forecast-md; only
+    # the current week's meter reading differs.
+    "forecast-md-censored",
+    # #661 S2 spec section 3.6: a week whose meter reads a displayed ZERO is
+    # NOT censored. It projects from the corrected point of 0.25 exactly as
+    # any other reading, so the artifact carries a real "Projected
+    # end-of-week %" band (0.2% — 0.4%) where the earlier draft of this
+    # session withheld it. That is what this fixture exercises end to end,
+    # and no other fixture reached the state.
+    #
+    # It does NOT exercise the beyond-horizon presentation bound, which an
+    # earlier version of this comment claimed: the CLI forecast markdown
+    # artifact has no ceiling-distance row at all, so no fixture of this
+    # shape can reach that bound. Same data shape as forecast-md; only the
+    # current week's meter reading differs.
+    "forecast-md-zero-week",
     "project-md-anon",
     "project-md-reveal",
     "five-hour-blocks-md",
@@ -127,6 +147,27 @@ _CREDIT_FIVE_HOUR_SCENARIOS: frozenset[str] = frozenset({
 # empty-data branches (e.g. cmd_report's no-weeks --format path).
 _EMPTY_STATS_SCENARIOS: frozenset[str] = frozenset({
     "report-empty-html",
+})
+
+# Scenarios whose CURRENT week's meter reads at or beyond its cap, so the
+# forecast is right-censored: a displayed 100 denotes `[99, +inf)` and has no
+# point estimate (#661 S2 spec section 3.2).
+_CENSORED_WEEK_SCENARIOS: frozenset[str] = frozenset({
+    "forecast-md-censored",
+})
+
+# Scenarios whose CURRENT week's meter reads a displayed zero. That reading is
+# bounded — `[0, 0.5)` — so it is not censored and the forecast projects from
+# its corrected midpoint of 0.25 (#661 S2 spec section 3.6). What this
+# exercises end to end is the projection band on a zero week, which no other
+# fixture reached. It does NOT exercise the renderer's beyond-horizon bound,
+# which an earlier version of this comment claimed: the CLI forecast markdown
+# artifact carries no ceiling-distance row at all, so no fixture of this shape
+# can reach that bound. The bound itself is unit-tested, at
+# `tests/test_lib_share_templates.py::
+# test_a_ceiling_beyond_the_horizon_is_bounded_not_printed`.
+_ZERO_WEEK_SCENARIOS: frozenset[str] = frozenset({
+    "forecast-md-zero-week",
 })
 
 # Synthetic 4-week trend ending 2026-05-04 (Monday). Tuples are
@@ -169,6 +210,7 @@ SESSION_FILES: tuple[tuple[str, str | None, str | None], ...] = (
 
 def _seed_stats_db(
     path: pathlib.Path, *, empty: bool = False, seed_credit: bool = False,
+    censored_week: bool = False, zero_week: bool = False,
 ) -> None:
     """Stats.db: weekly_usage_snapshots + weekly_cost_snapshots + one
     five_hour_blocks row.
@@ -199,7 +241,20 @@ def _seed_stats_db(
         return
     with sqlite3.connect(path) as conn:
         stamp_all_stats_migrations_applied(conn)
-        for ws, used_pct, cost in WEEKS:
+        weeks = WEEKS
+        if censored_week:
+            # The last row is the CURRENT week under the harness's pinned
+            # clock. Reading it at 103 puts the forecast in the right-censored
+            # state; every earlier week is untouched so the trend is the same.
+            weeks = WEEKS[:-1] + ((WEEKS[-1][0], 103.0, WEEKS[-1][2]),)
+        if zero_week:
+            # Same rule, the other end of the meter: the last row is the
+            # CURRENT week and reading it at 0 exercises section 3.6's
+            # bounded-interval case. The cost is kept, because a displayed
+            # zero with real spend is exactly the state the earlier draft
+            # mislabelled `no-local-history`.
+            weeks = WEEKS[:-1] + ((WEEKS[-1][0], 0.0, WEEKS[-1][2]),)
+        for ws, used_pct, cost in weeks:
             # Compute week_end_date 7 days later — required NOT NULL on both tables.
             from datetime import date, timedelta
             ws_d = date.fromisoformat(ws)
@@ -352,6 +407,8 @@ def main() -> int:
             scen_dir / "stats.db",
             empty=empty_stats,
             seed_credit=seed_credit,
+            censored_week=scenario in _CENSORED_WEEK_SCENARIOS,
+            zero_week=scenario in _ZERO_WEEK_SCENARIOS,
         )
         _seed_cache_db(scen_dir / "cache.db")
         _write_changelog(scen_dir / "CHANGELOG.md")

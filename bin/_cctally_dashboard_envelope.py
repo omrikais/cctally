@@ -824,6 +824,68 @@ def _source_bundle_to_envelope(bundle: object | None) -> dict:
         }
 
 
+#: How many rate-change events the envelope publishes. A metering-rate
+#: transition is rare — the maintainer's store holds one — so this is a
+#: bound rather than a page size, and a store holding more than a handful
+#: describes a detector that is misfiring rather than a busy account.
+METER_RATE_CHANGE_LIMIT = 20
+
+
+def _build_meter_rate_change_array(
+    conn: sqlite3.Connection, limit: int = METER_RATE_CHANGE_LIMIT,
+) -> list:
+    """The #661 S2 §6.1 non-threshold event family's wire rows.
+
+    A SEPARATE array from `alerts`, and deliberately so. Every member of
+    `AXIS_REGISTRY` is a numeric threshold axis: `AlertEntry` requires a
+    numeric `threshold`, its `id` is threshold-shaped, and `alert_row_owner`
+    raises on a seventh axis so that adding one without deciding its
+    ownership fails a test rather than shipping an invisible row. A rate
+    transition has neither a threshold nor a threshold-derived severity, so
+    it gets its own discriminated variant instead of being forced into that
+    union.
+
+    Each row carries the explicit severity, the old and new rates, the
+    effective instant, its OWNERSHIP (which provider tab renders it) and its
+    SCOPE (the account, decorated under R8 exactly as the alert rows are).
+    """
+    account_fields = _alert_account_resolver(conn)
+    try:
+        rows = conn.execute(
+            "SELECT provider, account_key, effective_from,"
+            "       previous_units_per_point, new_units_per_point, severity,"
+            "       detected_at_utc, created_at_utc"
+            "  FROM meter_rate_change_events"
+            " ORDER BY unixepoch(effective_from) DESC, id DESC"
+            " LIMIT ?", (int(limit),)).fetchall()
+    except sqlite3.Error:
+        # A store predating epoch 1011 has no such table, and the rebuild
+        # that creates it is deferred to a background worker. An empty array
+        # renders as "no change recorded", which is the truth on that store.
+        return []
+    out: list[dict] = []
+    for (provider, account_key, effective_from, previous, new, severity,
+         detected_at, created_at) in rows:
+        entry = {
+            # Opaque React key. It is never parsed — the same contract the
+            # alert `id` carries.
+            "id": f"meter_rate_change:{provider}:{account_key}:{effective_from}",
+            "family": "meter_rate_change",
+            "provider": str(provider),
+            "owner": str(provider),
+            "severity": str(severity or "info"),
+            "effective_from": str(effective_from),
+            "detected_at": str(detected_at or created_at or ""),
+            "recorded_at": str(created_at or ""),
+            "previous_units_per_point": (
+                None if previous is None else float(previous)),
+            "new_units_per_point": None if new is None else float(new),
+        }
+        entry.update(account_fields(str(provider), account_key))
+        out.append(entry)
+    return out
+
+
 def _build_alerts_envelope_array(
     conn: sqlite3.Connection,
     limit: int = 100,
@@ -1103,6 +1165,222 @@ def _sync_activity_envelope(activity: "dict | None") -> dict:
     }
 
 
+#: How far two subscription-week anchors may drift and still count as the
+#: same reset domain. The week anchor is normalized to the hour to absorb
+#: Anthropic's reset jitter, so two hours is comfortably wider than the
+#: jitter and far narrower than the shortest interval a synthesized
+#: mid-week row could produce.
+_RESET_DOMAIN_TOLERANCE_SECONDS = 2 * 3600
+_SUBSCRIPTION_WEEK_SECONDS = 7 * 24 * 3600
+
+
+def _same_reset_domain(current_start, prior_start) -> bool:
+    """Whether two week anchors belong to the same reset domain.
+
+    Spec §10.1 requires the prior operand to share the current row's reset
+    domain. The rows carry no domain field, so it is derived from the one
+    thing they always carry: two anchors are in the same domain when they
+    are a whole number of subscription weeks apart. A row synthesized by
+    reset or credit handling sits at a fractional offset and is skipped
+    rather than silently used, which is exactly what that clause is for.
+    """
+    if current_start is None or prior_start is None:
+        return False
+    delta = (current_start - prior_start).total_seconds()
+    if delta <= 0:
+        return False
+    offset = delta % _SUBSCRIPTION_WEEK_SECONDS
+    return min(offset, _SUBSCRIPTION_WEEK_SECONDS - offset) <= \
+        _RESET_DOMAIN_TOLERANCE_SECONDS
+
+
+def _cause_presentation(code):
+    """The §8 presentation fields for one cause, or None for no cause.
+
+    ADDITIVE beside the machine `code`, which is unchanged and stays the
+    stable value a client keys on. A client that receives no presentation
+    fields — a new tab against an older server, which `execvp` makes
+    ordinary — derives the short token from the code itself through the same
+    named function this uses.
+    """
+    if not code:
+        return None
+    try:
+        copy = sys.modules["cctally"]._load_sibling("_lib_quota_copy")
+    except Exception:                                  # noqa: BLE001
+        return None
+    out = copy.presentation(code)
+    return out or None
+
+
+def _forecast_quota_envelope(fc, cw, rate_change):
+    """Spec §10's optional typed `forecast.quota` object.
+
+    Additive, and deliberately does NOT bump `source_schema_version`: that
+    field describes the provider-source bundles, not this.
+
+    Every quantity here was already computed. The basis, the codes, the
+    corrected interval and the calibrated triple come off the forecast the
+    envelope is already serializing, and `rate_change` is the caller's cheap
+    calibration-file read. Nothing here opens a store.
+
+    NO PRESENTATION LATCH: this is rebuilt from the current forecast on
+    every refresh, so the surface switches with the shared selector rather
+    than presenting a model whose evidence has since been withheld.
+    """
+    if fc is None:
+        return None
+    inputs = getattr(fc, "inputs", None)
+    interval = getattr(inputs, "p_now_interval", None)
+    code = getattr(fc, "projection_code", None)
+    calibration_code = getattr(inputs, "calibrated_withheld_code", None)
+    consumption = getattr(inputs, "calibrated_consumption_pct", None)
+    consumption_interval = getattr(
+        inputs, "calibrated_consumption_interval", None)
+    observed = getattr(cw, "used_pct", None) if cw is not None else None
+    basis = getattr(fc, "projection_basis", None)
+    projection = getattr(fc, "week_avg_projection_pct", None)
+    headroom = getattr(inputs, "calibrated_headroom_pct", None)
+    # The calibrated view is published as a UNIT (#661 S2 review, D2).
+    #
+    # `select_projection_basis` reads ONLY `calibrated_projection_pct`, so a
+    # non-null projection beside a null modelled consumption would publish
+    # `basis: "calibrated"` over a number the model does not state — a modal
+    # reading "basis: model" above "modelled consumption: —". The invariant
+    # held until now only because `_calibrated_week_detail` sets the whole
+    # triple or none of it, which is the producer's discipline rather than a
+    # property of this serializer.
+    #
+    # WITHHELD rather than demoted. Demoting to `corrected-meter` would
+    # relabel a number the calibrated model produced, and the meter's own
+    # projection is not on this forecast to substitute, so there is nothing
+    # honest to publish. `withheld` is an already-rendered basis on the panel
+    # and in the modal, and it carries a cause.
+    # `projection is None` is included for completeness rather than because
+    # it is reachable: `select_projection_basis` reads `calibrated_projection_pct`,
+    # so a null projection does not yield this basis in the first place, and
+    # `bin/_lib_forecast.py` nulls the projection only on its WITHHELD branch.
+    # The argument that motivates the other two operands -- that the whole
+    # triple is the producer's discipline and not a property of this
+    # serializer -- applies to the projection identically, so leaving it out
+    # would make the guard state a narrower invariant than the one it means.
+    if basis == "calibrated" and (projection is None
+                                  or consumption is None
+                                  or headroom is None):
+        basis = "withheld"
+        projection = None
+        consumption = None
+        consumption_interval = None
+        headroom = None
+        code = code or "unavailable"
+        calibration_code = calibration_code or "unavailable"
+    return {
+        "basis":              basis,
+        "projection_pct":     projection,
+        "right_censored":     bool(getattr(fc, "right_censored", False)),
+        # The cause of a WITHHELD projection, and separately why the
+        # CALIBRATED basis was not reached. They are different questions and
+        # a surface that collapses them says nothing when it falls back.
+        "code":               code,
+        "code_presentation":  _cause_presentation(code),
+        "calibration_code":   calibration_code,
+        "calibration_code_presentation":
+            _cause_presentation(calibration_code),
+        # The corrected-meter interval a displayed reading denotes. `hi` is
+        # null at a right-censored 100, which is unbounded above.
+        "corrected_interval":
+            None if interval is None
+            else {"lo": interval[0], "hi": interval[1]},
+        "calibrated_consumption_pct": consumption,
+        "calibrated_consumption_interval":
+            None if not consumption_interval
+            else {"lo": consumption_interval[0],
+                  "hi": consumption_interval[1]},
+        "calibrated_headroom_pct": headroom,
+        "rate_change":        rate_change,
+        # Spec §10: the observed meter minus the modelled local quota,
+        # labelled as exactly that. It is a DIFFERENCE between two
+        # quantities and does not identify or estimate usage from another
+        # machine; the modal states that sentence, and it is null unless
+        # both sides exist.
+        "observed_minus_modelled_pct":
+            None if (observed is None or consumption is None)
+            else observed - consumption,
+    }
+
+
+def _header_rate_and_delta(current_rate, current_week_start, trend):
+    """`(dollar_per_pct, vs_last_week_delta)` from ONE current operand.
+
+    Spec §10.1, and the defect it closes: `header.dollar_per_pct` came from
+    `_tui_build_current_week` while `header.vs_last_week_delta` came from the
+    operand `build_trend_view` returned. Two computations, no guard, so the
+    hero could publish a week-over-week comparison on a screen stating no
+    `$ / 1%` at all.
+
+    Both values are computed here, from the header's own current operand,
+    before serialization — so the client never reconciles two differently
+    sourced "current" values. When the current rate is absent BOTH are null,
+    because a delta measured from an absent operand is not a delta.
+
+    The prior operand is the NEAREST COMPARABLE completed row, and
+    comparable is the exact list §10.1 gives. Provider and account scope are
+    properties of the whole snapshot, so every row in `trend` shares them by
+    construction; what has to be tested per row is the remaining three:
+
+      * a completed rather than current interval (`is_current` is False);
+      * a non-null rate on that row; and
+      * the same reset domain as the current week.
+
+    A row failing any of them is SKIPPED and the walk continues to the next
+    older row, rather than the delta being abandoned or the row being used.
+
+    NEAREST IS BY ANCHOR, not by list position. The walk used to be
+    `reversed(list(trend))`, which makes "nearest" mean "last in the list" and
+    rests the whole clause on `snap.trend` arriving ascending. That holds for
+    `build_trend_view` and for every committed fixture and was stated nowhere,
+    and `_same_reset_domain` accepts any positive whole-week multiple, so a
+    row twenty weeks back was as comparable as one week back. The candidates
+    are therefore ordered here, newest anchor first. A row carrying no anchor
+    sorts last and is skipped by the reset-domain test anyway.
+    """
+    if current_rate is None:
+        return None, None
+    # Only rows whose anchor is a `datetime` are sorted; anything else keeps
+    # list order after them. `sorted` compares the keys, so one naive anchor
+    # beside an aware one -- or a `str` anchor, which the sibling row type at
+    # `bin/_lib_view_models.py:174` carries -- would raise `TypeError` inside
+    # the dashboard's serialization path and surface as a 500 rather than a
+    # withheld figure. `build_trend_view` emits aware datetimes today, so the
+    # partition is a guard against a future producer, not a live defect.
+    # Ties keep list order, because `sorted` is stable: two rows sharing an
+    # anchor resolve to the earlier one in `trend`.
+    rows = list(trend or ())
+    anchored = [r for r in rows
+                if isinstance(getattr(r, "week_start_at", None), dt.datetime)]
+    unanchored = [r for r in rows
+                  if not isinstance(getattr(r, "week_start_at", None),
+                                    dt.datetime)]
+    aware = [r for r in anchored if r.week_start_at.tzinfo is not None]
+    naive = [r for r in anchored if r.week_start_at.tzinfo is None]
+    candidates = (
+        sorted(aware, key=lambda row: row.week_start_at, reverse=True)
+        + sorted(naive, key=lambda row: row.week_start_at, reverse=True)
+        + unanchored
+    )
+    for row in candidates:
+        if getattr(row, "is_current", False):
+            continue
+        prior_rate = getattr(row, "dollars_per_percent", None)
+        if prior_rate is None:
+            continue
+        if not _same_reset_domain(current_week_start,
+                                  getattr(row, "week_start_at", None)):
+            continue
+        return current_rate, current_rate - prior_rate
+    return current_rate, None
+
+
 def snapshot_to_envelope(snap: "DataSnapshot", *,
                          now_utc: "dt.datetime",
                          monotonic_now: "float | None" = None,
@@ -1256,17 +1534,13 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         inputs = getattr(fc, "inputs", None)
         if inputs is not None:
             confidence = getattr(inputs, "confidence", None)
-        r_avg = getattr(fc, "r_avg", None)
-        r_recent = getattr(fc, "r_recent", None)
-        p_now = getattr(inputs, "p_now", None) if inputs is not None else None
-        rem_hrs = getattr(inputs, "remaining_hours", None) if inputs is not None else None
-        if p_now is not None and rem_hrs is not None and r_avg is not None:
-            fcast_pct = p_now + r_avg * rem_hrs
-        if (p_now is not None and rem_hrs is not None
-                and r_recent is not None):
-            p_final_recent = p_now + r_recent * rem_hrs
-            if fcast_pct is None or p_final_recent != fcast_pct:
-                recent_24h_pct = p_final_recent
+        # The ONE decomposition (#661 S2 spec section 3.3), so this legacy
+        # branch cannot answer the projection question differently from the
+        # View path above it — which is exactly what the `over` golden
+        # recorded before this call replaced the inline arithmetic.
+        from _lib_view_models import _forecast_projection_pcts
+
+        fcast_pct, recent_24h_pct = _forecast_projection_pcts(fc)
         if getattr(fc, "already_capped", False):
             verdict = "capped"
         elif getattr(fc, "projected_cap", False):
@@ -1474,6 +1748,11 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     # the entire snapshot — fall back to safe defaults and rely on
     # `_warn_alerts_bad_config_once` for the user-visible signal.
     alerts_array = list(getattr(snap, "alerts", []) or [])
+    # #661 S2 §6.1. Precomputed at sync time beside `alerts`, so
+    # `snapshot_to_envelope` stays a pure renderer with no DB I/O on the
+    # dashboard hot path.
+    meter_rate_changes_array = list(
+        getattr(snap, "meter_rate_changes", []) or [])
     # #268 M4: reuse the precompute's config (or the fallback load_config()
     # resolved above) — the envelope used to call load_config() a SECOND time
     # here. Within one tick both reads returned the same file, so this is
@@ -1551,6 +1830,11 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # template itself).
         "notifier":           _alerts_cfg.get("notifier", "auto"),
         "command_configured": _alerts_cfg.get("command_template") is not None,
+        # #661 S2 §6.2: the metering-rate-change family's PUSH toggle. The
+        # events themselves are recorded whatever this says, so the client
+        # renders the history with no configuration; this mirror only tells
+        # Settings whether the OS popup is armed.
+        "rate_change_enabled": bool(_alerts_cfg.get("rate_change_enabled")),
     }
     # Dashboard render-prefs mirror (cache-failure-markers opt-out, spec §5).
     # Reuses the single `_cfg_for_alerts = load_config()` read above (no extra
@@ -1666,6 +1950,15 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         (r for r in reversed(snap.trend) if r.is_current), None
     ) if snap.trend else None
 
+    # #661 S2 §10.1. BOTH header operands are decided here, together, from
+    # the header's own current rate. `_current_trend` is retained above
+    # because other blocks read it, but its `delta_dpp` is no longer what
+    # the header publishes: that field is computed against whichever row
+    # happened to precede the current one in the trend series, which is a
+    # different question from "the nearest comparable prior operand".
+    dollar_pp, header_delta = _header_rate_and_delta(
+        dollar_pp, week_start_at_utc, snap.trend)
+
     envelope = {
         "envelope_version": 2,
         # #278 Theme A: single additive first-paint hydration latch. True only
@@ -1718,9 +2011,7 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
             "dollar_per_pct":     dollar_pp,
             "forecast_pct":       header_fcast_pct,
             "forecast_verdict":   verdict,
-            "vs_last_week_delta": (
-                _current_trend.delta_dpp if _current_trend is not None else None
-            ),
+            "vs_last_week_delta": header_delta,
         },
 
         "current_week":
@@ -1804,6 +2095,12 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                                                 else 2 if confidence == "low"
                                                 else 0),
                 "explain":                     sys.modules["cctally"]._build_forecast_json_payload(fc),
+                # #661 S2 §10. Optional, typed, and ADDITIVE: it sits under
+                # `forecast` because `ForecastEnvelope` is its semantic
+                # boundary, and it does not bump `source_schema_version`,
+                # which describes the provider-source bundles.
+                "quota":                       _forecast_quota_envelope(
+                    fc, cw, getattr(snap, "quota_rate_change", None)),
             },
 
         "trend":
@@ -1920,6 +2217,14 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # threshold-actions T5: see prelude above for rationale.
         "alerts":           alerts_array,
         "alerts_settings":  alerts_settings,
+
+        # #661 S2 §6.1: the non-threshold event family, in its OWN array
+        # rather than inside `alerts`. `AlertEntry` requires a numeric
+        # threshold and a rate transition has none, so mixing the two would
+        # either weaken that contract or ship a row every consumer skips.
+        # Additive optional — `envelope_version` stays at 2, and an older
+        # client simply does not read it.
+        "meter_rate_changes": meter_rate_changes_array,
 
         # Dashboard render-prefs mirror (cache-failure-markers opt-out, spec
         # §5). Additive optional, like alerts_settings — envelope_version

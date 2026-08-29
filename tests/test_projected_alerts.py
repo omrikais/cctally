@@ -214,7 +214,9 @@ def test_projected_levels_already_latched_predicate(ns):
 
 
 def test_weekly_pct_fires_on_week_average_crossing(ns, monkeypatch):
-    # p_now=60 at 84h elapsed, 84h remaining → r_avg=60/84, proj=120 → fires 90 & 100.
+    # p_now displays 60 at 84h elapsed, 84h remaining. #661 S2 spec section
+    # 3.1: the detector projects from the CEILING-CORRECTED reading, so the
+    # operand is 59.5 → r_avg = 59.5/84, proj = 119 → fires 90 & 100.
     _seed_snapshots(ns, _high_conf_samples(60.0))
     _write_config(ns, alerts={"enabled": True, "projected_enabled": True})
     captured = _patch_dispatch(ns, monkeypatch)
@@ -226,7 +228,7 @@ def test_weekly_pct_fires_on_week_average_crossing(ns, monkeypatch):
         ("weekly_pct", 90), ("weekly_pct", 100)
     ]
     assert all(r["alerted_at"] is not None for r in rows)
-    assert all(abs(r["projected_value"] - 120.0) < 1e-9 for r in rows)
+    assert all(abs(r["projected_value"] - 119.0) < 1e-9 for r in rows)
     assert all(abs(r["denominator"] - 100.0) < 1e-9 for r in rows)
     assert all(r["week_start_at"] == WEEK_KEY for r in rows)
     assert {p["threshold"] for p, _ in captured} == {90, 100}
@@ -236,7 +238,8 @@ def test_weekly_pct_fires_on_week_average_crossing(ns, monkeypatch):
 
 
 def test_weekly_pct_does_not_fire_when_week_average_below_threshold(ns, monkeypatch):
-    # p_now=40 → week-average proj = 80 < 90. recent-24h is hot but weekly_pct
+    # p_now displays 40 → corrected 39.5 → week-average proj = 79 < 90.
+    # recent-24h is hot but weekly_pct
     # is snapshot-only (no recent rate input), so nothing fires.
     _seed_snapshots(ns, _high_conf_samples(40.0))
     _write_config(ns, alerts={"enabled": True, "projected_enabled": True})
@@ -249,8 +252,11 @@ def test_weekly_pct_does_not_fire_when_week_average_below_threshold(ns, monkeypa
 
 
 def test_weekly_pct_fires_when_average_crosses(ns, monkeypatch):
-    # p_now=50 → proj=100 → crosses 90 and (snap-up) 100.
-    _seed_snapshots(ns, _high_conf_samples(50.0))
+    # p_now displays 51 → corrected 50.5 → proj = 101 → crosses 90 and 100.
+    # (The exact-equality snap-up is its own test below; a displayed reading
+    # can no longer produce an exactly-even projection on this window, because
+    # the corrected operand is always a half-integer.)
+    _seed_snapshots(ns, _high_conf_samples(51.0))
     _write_config(ns, alerts={"enabled": True, "projected_enabled": True})
     _patch_dispatch(ns, monkeypatch)
 
@@ -258,7 +264,7 @@ def test_weekly_pct_fires_when_average_crosses(ns, monkeypatch):
 
     rows = _rows(ns)
     assert [r["threshold"] for r in rows] == [90, 100]
-    assert all(abs(r["projected_value"] - 100.0) < 1e-9 for r in rows)
+    assert all(abs(r["projected_value"] - 101.0) < 1e-9 for r in rows)
 
 
 # ── LOW CONF suppression (+ non-vacuity proof lives in a sibling test) ────
@@ -268,6 +274,8 @@ def test_low_conf_window_suppresses(ns, monkeypatch):
     # Only ONE sample, none >=24h old → forecast confidence LOW → no fire even
     # though proj would be 120 (p_now=60 at 84h elapsed). This is the
     # confidence-gate suppression case the non-vacuity proof inverts.
+    # (The projection is 119 under the #661 S2 ceiling correction; the exact
+    # figure is immaterial here, only that it is above both thresholds.)
     _seed_snapshots(ns, [(83.0, 60.0)])
     _write_config(ns, alerts={"enabled": True, "projected_enabled": True})
     captured = _patch_dispatch(ns, monkeypatch)
@@ -315,8 +323,20 @@ def test_fire_once_no_refire_no_unfire(ns, monkeypatch):
 
 
 def test_exact_threshold_equality_snaps_up(ns, monkeypatch):
-    # p_now=45 → proj exactly 90.0 → fires 90 (proj + 1e-9 >= 90); 100 not.
-    _seed_snapshots(ns, _high_conf_samples(45.0))
+    """A projection landing exactly ON a threshold fires it (proj + 1e-9).
+
+    The window is re-anchored for this case. #661 S2 spec section 3.1 makes
+    the projected operand a HALF-integer (a displayed `k` corrects to
+    `k - 0.5`), so on the module's midweek window every projection is
+    `2k - 1` — an odd integer that can never equal 90. Measuring at 42h into
+    a 168h week gives a factor of four instead of two, and a displayed 23
+    projects to exactly 22.5 * 4 == 90.0.
+    """
+    as_of = WEEK_START + dt.timedelta(hours=42)
+    monkeypatch.setenv("CCTALLY_AS_OF", _iso(as_of))
+    # Offsets 1h and 12h are both more than 24h before AS_OF, which is what
+    # keeps the confidence gate HIGH on this shorter elapsed window.
+    _seed_snapshots(ns, [(1.0, 5.0), (12.0, 14.0), (41.0, 23.0)])
     _write_config(ns, alerts={"enabled": True, "projected_enabled": True})
     _patch_dispatch(ns, monkeypatch)
 
@@ -328,7 +348,7 @@ def test_exact_threshold_equality_snaps_up(ns, monkeypatch):
 
 
 def test_just_below_threshold_does_not_fire(ns, monkeypatch):
-    # p_now=44.9 → proj = 89.8 < 90 → nothing.
+    # p_now displays 44.9 → corrected 43.5 → proj = 87 < 90 → nothing.
     _seed_snapshots(ns, _high_conf_samples(44.9))
     _write_config(ns, alerts={"enabled": True, "projected_enabled": True})
     _patch_dispatch(ns, monkeypatch)

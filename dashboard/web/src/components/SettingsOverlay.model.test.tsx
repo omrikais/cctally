@@ -397,8 +397,9 @@ describe('registry structure', () => {
     }
   });
 
-  it('declares thirteen server fields, three browser fields and two staged actions', () => {
-    expect(REGISTRY.filter((f) => f.kind === 'server')).toHaveLength(13);
+  it('declares fourteen server fields, three browser fields and two staged actions', () => {
+    // Fourteen since #661 S2 added `alerts.rate_change_enabled`.
+    expect(REGISTRY.filter((f) => f.kind === 'server')).toHaveLength(14);
     expect(REGISTRY.filter((f) => f.kind === 'browser')).toHaveLength(3);
     expect(REGISTRY.filter((f) => f.kind === 'stagedAction')).toHaveLength(2);
   });

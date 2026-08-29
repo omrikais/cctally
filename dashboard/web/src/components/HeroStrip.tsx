@@ -279,7 +279,19 @@ function SharedHero({
         // accounting scope and cannot be borrowed while focused.
         dollarPerPct={accounts == null ? h?.dollar_per_pct : null}
         forecastPct={accounts == null ? h?.forecast_pct : null}
-        vsLastWeekDelta={accounts == null ? h?.vs_last_week_delta : null}
+        // #661 S2 section 10.1 — the shared Claude/All branch brought into
+        // line with the Codex branch below, which has always guarded its
+        // delta on a non-null rate. Without this the hero could render a
+        // week-over-week comparison on a screen whose `$ / 1%` slot reads a
+        // dash, because the two values came from two computations with no
+        // guard between them. The envelope now couples them too; this is the
+        // client half, and it holds even against an older server whose
+        // envelope predates that coupling.
+        vsLastWeekDelta={
+          accounts == null && h?.dollar_per_pct != null
+            ? h?.vs_last_week_delta
+            : null
+        }
         freshness={accounts == null ? cw?.freshness ?? null : null}
         ctx={ctx}
         verdict={accounts == null ? verdict : null}

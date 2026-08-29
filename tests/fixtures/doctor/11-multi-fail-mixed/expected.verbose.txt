@@ -76,7 +76,7 @@ Database
         conversations_quick_check: None
   ✓ Version ahead            none ahead
       details:
-        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1010, 'mismatch': False}
+        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1011, 'mismatch': False}
         cache.db: {'user_version': 0, 'registry_size': 44, 'ahead': False}
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
@@ -268,6 +268,18 @@ Pricing
       details:
         unpriced: []
         fallback: []
+Quota
+  ✓ Metering rate            no change detected
+      details:
+        active: False
+        effective_from: None
+        previous_units_per_point: None
+        new_units_per_point: None
+  ✓ Calibration              no calibration fitted yet
+      details:
+        rejection: calibration-absent
+        status: None
+        present: False
 Safety
   ✓ Dashboard bind           config: loopback
       details:
@@ -294,4 +306,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 51 OK · 8 WARN · 3 FAIL
+Summary: 53 OK · 8 WARN · 3 FAIL

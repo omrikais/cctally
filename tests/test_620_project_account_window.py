@@ -214,6 +214,23 @@ def test_unfiltered_project_output_stays_merged(two_account_store, capsys):
     it previously did, measured against bob's 90.0. This is the contract
     change the correction announces, not a regression: the old window
     contained a week the user did not ask for.
+
+    #661 S2 spec section 5.3 changed what the merged read PUBLISHES. This
+    fixture holds two real accounts, so the #341 R8 gate decorates, and a
+    merged read has no valid calibration to apply — S1 fits per account.
+    `Used %` is therefore WITHHELD with the cause `account-not-resolved` and
+    `--account` is required to obtain it. Falling back to the cost share
+    there would keep publishing the very number F1 exists to remove, under a
+    column the acceptance criterion says reports the correct account.
+
+    The WALK is unchanged and this test still pins it — including the
+    ARITHMETIC. `weeksInRange` and `rangeStart` pin the boundary SET, which
+    is not the same claim: the removed `attributedUsedPercent == 50.0` was
+    what proved that only the entry INSIDE the two-interval window
+    contributes, and `usedPercent is not None` pins no value at all. The
+    exact-value assertion moved to the row's own tokens and cost, which say
+    the same thing about the walk without depending on an attribution the
+    same session withheld.
     """
     app, _ka, _kb = two_account_store
     payload = _run_project_json(app, capsys)
@@ -222,8 +239,29 @@ def test_unfiltered_project_output_stays_merged(two_account_store, capsys):
         f"{payload['weeksInRange']}"
     )
     assert payload["rangeStart"] == "2026-05-21", payload["rangeStart"]
+    assert payload["attribution"]["basis"] == "withheld"
+    assert payload["attribution"]["cause"] == "account-not-resolved"
     row = payload["projects"][0]
-    assert row["attributedUsedPercent"] == pytest.approx(50.0, abs=1e-6), (
-        "only the entry inside the two-interval window contributes; got "
-        f"{row['attributedUsedPercent']}"
+    assert row["attributedUsedPercent"] is None, (
+        "a decorated merged view publishes no attribution at all, not a "
+        f"cost-share stand-in; got {row['attributedUsedPercent']}"
     )
+    assert row["attributionBasis"] == "withheld"
+    assert row["costPerPercent"] is None
+    # The walk's arithmetic, pinned exactly. Alice has TWO seeded entries
+    # with identical token counts; only e2 (05-22T12) falls inside the two
+    # merged intervals, and e1 (05-19T12) sits in [05-18T00, 05-21T09) which
+    # `--weeks 2` does not reach. One entry's tokens is therefore the whole
+    # claim, and a walk that admitted e1 would double both figures.
+    assert row["sessions"] == 1, row["sessions"]
+    assert row["inputTokens"] == 100_000, row["inputTokens"]
+    assert row["outputTokens"] == 20_000, row["outputTokens"]
+    assert payload["totals"]["costUsd"] == pytest.approx(
+        row["costUsd"]), "one project, so the total is that project's cost"
+    # The merged TOTAL is a meter reading rather than an attribution, so it
+    # is unaffected: the withholding is about dividing it among projects.
+    # It sums the STORED weeks intersecting [05-21T09, 05-26T12] — alice's
+    # 50.0 plus bob's 90.0 and 20.0 — and not the merged interval starts,
+    # which is why it exceeds either account's own reading.
+    assert payload["totals"]["usedPercent"] == pytest.approx(160.0), (
+        payload["totals"]["usedPercent"])

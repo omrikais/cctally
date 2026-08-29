@@ -130,6 +130,10 @@ def test_doctor_state_has_required_fields():
         # #496 S6 §7.3: the read-only retention scan and plan behind
         # db.retained_artifacts.
         "retained_artifacts",
+        # #661 S2 §7: the `quota` category's two inputs, gathered through the
+        # non-mutating calibration reader.
+        "quota_calibration",
+        "quota_rate_change",
     }
     assert fields == expected, fields ^ expected
 
@@ -1371,7 +1375,7 @@ def test_run_checks_returns_all_categories():
     rep = L.run_checks(_state())
     assert {c.id for c in rep.categories} == {
         "install", "hooks", "auth", "db", "journal", "data", "accounts",
-        "pricing", "safety", "telemetry",
+        "pricing", "quota", "safety", "telemetry",
     }
 
 
@@ -1471,7 +1475,7 @@ def test_serialize_json_top_level_shape():
     cat_ids = [c["id"] for c in payload["categories"]]
     assert cat_ids == [
         "install", "hooks", "auth", "db", "journal", "data", "accounts",
-        "pricing", "safety", "telemetry",
+        "pricing", "quota", "safety", "telemetry",
     ]
 
 

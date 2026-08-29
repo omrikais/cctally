@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "week": {
     "start_at": "2026-04-13T14:00:00Z",
     "end_at": "2026-04-20T14:00:00Z",
@@ -10,21 +10,30 @@
   },
   "current": {
     "weekly_percent": 5.0,
+    "weekly_percent_corrected": 4.5,
+    "weekly_percent_interval": [
+      4.0,
+      5.0
+    ],
     "five_hour_percent": null,
     "spent_usd": 2.85,
     "snapshot_count": 7,
     "latest_snapshot_at": "2026-04-16T20:00:00Z"
   },
   "rates": {
-    "week_average_pct_per_hour": 0.064103,
-    "recent_24h_pct_per_hour": 0.064103,
-    "dollars_per_percent": 0.57,
+    "week_average_pct_per_hour": 0.057692,
+    "recent_24h_pct_per_hour": 0.066667,
+    "dollars_per_percent": 0.633333,
     "dollars_per_percent_source": "this_week_sparse"
   },
   "forecast": {
-    "final_percent_low": 10.769,
-    "final_percent_high": 10.769,
-    "week_avg_projection_pct": 10.769,
+    "final_percent_low": 9.692,
+    "final_percent_high": 10.5,
+    "week_avg_projection_pct": 9.692,
+    "right_censored": false,
+    "projection_basis": "corrected-meter",
+    "projection_code": null,
+    "calibration_code": "unavailable",
     "projected_cap": false,
     "cap_at": null,
     "already_capped": false,
@@ -34,15 +43,15 @@
   "budget": [
     {
       "target_percent": 100,
-      "pct_headroom": 95.0,
-      "dollars_per_day": 14.44,
-      "percent_per_day": 25.333
+      "pct_headroom": 95.5,
+      "dollars_per_day": 16.128889,
+      "percent_per_day": 25.467
     },
     {
       "target_percent": 90,
-      "pct_headroom": 85.0,
-      "dollars_per_day": 12.92,
-      "percent_per_day": 22.667
+      "pct_headroom": 85.5,
+      "dollars_per_day": 14.44,
+      "percent_per_day": 22.8
     }
   ],
   "meta": {

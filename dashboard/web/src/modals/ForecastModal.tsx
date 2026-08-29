@@ -21,7 +21,9 @@ import {
 import type { Envelope, ForecastEnvelope, SourceName } from '../types/envelope';
 import { SourceChip } from '../panels/sourcePanel';
 import { providerAccentClass } from '../lib/providerAccent';
-import { dollarsPerPercentReason } from '../lib/withheldCopy';
+import { dollarsPerPercentQualification, dollarsPerPercentReason } from '../lib/withheldCopy';
+import { causeLong, rateChangeSummary } from '../lib/quotaCopy';
+import { useDisplayTz } from '../hooks/useDisplayTz';
 import { alertNavigation, envelopeNow, parseInstantMs } from '../lib/alertScope';
 import { followAlertTarget } from '../store/followAlertTarget';
 
@@ -677,6 +679,104 @@ function AllForecastModal() {
   );
 }
 
+// #661 S2 section 10 — the quota model's own view of this week, and the ONLY
+// place the observed-minus-modelled difference appears.
+//
+// It stays out of the headline, the status line, `doctor`, project
+// normalization and every dollar figure. Here it is labelled strictly as what
+// it is: the observed meter minus the modelled local quota, with the sentence
+// saying it does not identify or estimate usage from another machine.
+//
+// Renders nothing at all when the server published no quota object — every
+// server predating this session, and every Codex projection.
+export function QuotaSection({ env }: { env: Envelope | null }): JSX.Element | null {
+  const display = useDisplayTz();
+  const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
+  const quota = env?.forecast?.quota ?? null;
+  if (quota == null) return null;
+  const basisLabel = quota.basis === 'calibrated'
+    ? 'calibrated model'
+    : quota.basis === 'corrected-meter'
+      ? 'corrected meter'
+      : 'withheld';
+  const rateChange = quota.rate_change;
+  const rateSummary = rateChangeSummary(
+    rateChange?.previous_units_per_point, rateChange?.new_units_per_point,
+  );
+  const residual = quota.observed_minus_modelled_pct;
+  return (
+    <>
+      <h3 className="m-sec sec-quota">
+        <svg className="icon" aria-hidden="true">
+          <use href="/static/icons.svg#activity" />
+        </svg>
+        Quota model
+      </h3>
+      <div className="mfc-kvgrid" data-testid="mfc-quota">
+        <div className="mfc-krow">
+          <span className="l">basis</span>
+          <span className="v" id="mfc-quota-basis">{basisLabel}</span>
+        </div>
+        <div className="mfc-krow">
+          <span className="l">modelled consumption</span>
+          <span className={`v${quota.calibrated_consumption_pct == null ? ' m-unavailable' : ''}`}>
+            {fmt.pct1(quota.calibrated_consumption_pct)}
+          </span>
+        </div>
+        <div className="mfc-krow">
+          <span className="l">modelled headroom</span>
+          <span className={`v${quota.calibrated_headroom_pct == null ? ' m-unavailable' : ''}`}>
+            {fmt.pct1(quota.calibrated_headroom_pct)}
+          </span>
+        </div>
+        <div className="mfc-krow">
+          <span className="l">meter reading covers</span>
+          <span className="v">
+            {quota.corrected_interval == null
+              ? '—'
+              : quota.corrected_interval.hi == null
+                ? `${fmt.pct1(quota.corrected_interval.lo)} or more`
+                : `${fmt.pct1(quota.corrected_interval.lo)} – ${fmt.pct1(quota.corrected_interval.hi)}`}
+          </span>
+        </div>
+      </div>
+      {/* Both cause fields, and they answer DIFFERENT questions: `code` is why
+          a projection was withheld, `calibration_code` is why the calibrated
+          basis was not reached. Falling back to the meter is not a
+          withholding, so one line cannot carry both. */}
+      {quota.code && (
+        <p className="mfc-rate-note" data-testid="mfc-quota-code">
+          {causeLong(quota.code_presentation, quota.code)}
+        </p>
+      )}
+      {quota.calibration_code && (
+        <p className="mfc-rate-note" data-testid="mfc-quota-calibration-code">
+          The calibrated model was not used: {causeLong(
+            quota.calibration_code_presentation, quota.calibration_code)}.
+        </p>
+      )}
+      {rateChange?.active === true && (
+        <p className="mfc-rate-note" data-testid="mfc-quota-rate-change">
+          The provider changed its metering rate
+          {rateChange.effective_from
+            ? ` effective ${fmt.dateShort(rateChange.effective_from, ctx)}`
+            : ''}
+          {rateSummary ? `: ${rateSummary}` : ''}. This is the provider&rsquo;s
+          behaviour, not a cctally malfunction.
+        </p>
+      )}
+      {residual != null && (
+        <p className="mfc-rate-note" data-testid="mfc-quota-residual">
+          Observed meter minus modelled local quota:{' '}
+          <span className="num">{residual >= 0 ? '+' : ''}{residual.toFixed(2)}</span>{' '}
+          points, as measured. This is a difference between two quantities, not
+          an identification or an estimate of usage from another machine.
+        </p>
+      )}
+    </>
+  );
+}
+
 function CanonicalForecastModal({ source }: { source: SourceName }) {
   // #416 — the expansion of a scoped panel stays scoped (see `useScopedSnapshot`).
   const env = useScopedSnapshot(source);
@@ -886,6 +986,8 @@ function CanonicalForecastModal({ source }: { source: SourceName }) {
           </div>
         </div>
 
+        <QuotaSection env={env} />
+
         <h3 className="m-sec sec-range">
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#bar-chart" />
@@ -977,6 +1079,17 @@ function CanonicalForecastModal({ source }: { source: SourceName }) {
         {rates?.dollars_per_percent == null && (
           <p className="mfc-rate-note">
             {dollarsPerPercentReason(rates?.dollars_per_percent_source)}
+          </p>
+        )}
+        {/* #661 S2 (Stage C review, F11) — the same note slot for a rate that
+            IS published but qualified. `dollarsPerPercentReason` fires only on
+            a null rate, and both qualified source labels accompany a non-null
+            one, so a drift-reduced or unverified rate reached this modal with
+            no qualification at all. */}
+        {rates?.dollars_per_percent != null
+          && dollarsPerPercentQualification(rates?.dollars_per_percent_source) && (
+          <p className="mfc-rate-note" data-testid="mfc-rate-qualification">
+            {dollarsPerPercentQualification(rates?.dollars_per_percent_source)}
           </p>
         )}
 

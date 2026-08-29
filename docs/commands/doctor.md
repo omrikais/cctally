@@ -190,6 +190,16 @@ The append-only journal is the durable truth for stats.db (DB journal redesign �
 ### Pricing
 - `pricing.coverage` — WARN when your **recent (trailing 30-day)** session data contains a model cctally cannot price exactly: a Claude model that resolves to `$0` (`unpriced` — silent undercount) or a Codex model approximated via the `gpt-5` fallback (`fallback`). `details` lists each offending model ID + entry count + token volume; remediation points at [`pricing-check`](pricing-check.md) and the embedded pricing tables. OK when every observed model is priced, or when the cache is absent (no usage to assess). Read-only — the scan never creates the data dir on a fresh HOME. This is the offline counterpart to [`pricing-check`](pricing-check.md)'s coverage leg (which scans *all* history, not just the last 30 days), and it rolls into the dashboard health chip/modal for free.
 
+### Quota
+Neither check can FAIL, so neither affects `doctor`'s exit code — the same posture `pricing.coverage` and `data.parse_health` take.
+
+- `quota.meter_drift` — OK-with-detail, stating whether Anthropic's metering rate changed for this account. The predicate is derived rather than stored: the active open regime has a confirmed predecessor, and the marker shows for the whole of that successor regime. `details` carries `active`, the effective instant, and the previous and new weighted units per meter point. A rate change is the provider's behaviour rather than a cctally malfunction, so this check reports it and never warns. An install that has never run [`quota`](quota.md) reports `no change detected`. The effective day in the summary is the **UTC** calendar day and says so, because this report carries no display-timezone plumbing and every other datetime it emits is UTC.
+  - **Scope limitation, stated rather than left silent:** this check reads the MERGED calibration bucket and takes no account argument. On a decorated multi-account install it therefore reports the merged regime's transition, which may be `no change detected` while a per-account regime did change, or a stale merged transition while a per-account one did not. Run [`quota`](quota.md) with `--account` for the per-account answer. At a single real account the R8 gate means nothing decorates and the merged bucket is the account bucket, so this affects only genuinely multi-account installs.
+  - **The same limitation applies to the other two surfaces that render this predicate**, and it is recorded here once for all three: the [status line](statusline.md)'s `Δrate` marker and the [dashboard](dashboard.md) Forecast panel's `Δ rate` chip both resolve the merged bucket too. All three read one glyph off a regime pair with no account argument to give it, which is why the limitation is shared rather than specific to `doctor`.
+- `quota.calibration` — WARN when the stored calibration cannot be used because it is malformed, unreadable, from a newer cctally, or was fitted under other constants or by an earlier algorithm. **Stale here means a fingerprint or algorithm-revision mismatch, not calendar age**: a calibration fitted months ago under the current constants is healthy, and one fitted yesterday under other constants is not. An absent calibration, or one whose successor fit is not yet predictive, is OK-with-detail. Remediation is to run [`quota`](quota.md), which refits it.
+
+Both checks read the calibration through the non-mutating reader rather than through the loader `quota` itself uses. That loader renames a malformed or version-ahead file aside, and `doctor` is documented read-only, so calling it here would make `doctor` a writer. An already-quarantined file is reported simply as a missing primary; the checks do not scan quarantine sidecars.
+
 ### Safety
 - `safety.dashboard_bind` — WARN when stored config is non-loopback OR (when invoked from inside the dashboard server) when the runtime bind is non-loopback.
 - `safety.backup_sync` — WARN only when the resolved cctally data directory is confirmed inside an unexcluded file-level backup/sync root (Time Machine, iCloud Drive, or Dropbox). Remediation says to exclude the live data directory and use `cctally db backup --db stats` / `--db cache` for consistent SQLite snapshots. An absent destination, an explicit Time Machine exclusion, an unavailable tool, or a non-macOS platform is informational/OK; Doctor never guesses inclusion. The CLI uses bounded read-only `tmutil` probes. The dashboard's frequent shallow gather remains subprocess-free (static iCloud/Dropbox root detection still applies), preserving envelope liveness. Details contain only status/provider—never the local path.
@@ -239,6 +249,10 @@ The dashboard exposes the same diagnostic via:
 - **Modal** — full report with refresh button. Opened by clicking the chip or pressing `d`.
 - **`GET /api/doctor`** — returns the same JSON the CLI emits.
 - **SSE envelope** — every snapshot carries `doctor: { severity, counts, generated_at, fingerprint }` (aggregate only, ~120 bytes).
+
+## Implementation
+
+The report is a pure kernel, `bin/_lib_doctor.py`: it takes an already-gathered state object and returns the check list, so every check is decided without touching the filesystem, the network or the clock. All of the I/O sits in one layer, `doctor_gather_state`, which is also what lets the dashboard render the same checks from the same state without running the command.
 
 ## See also
 

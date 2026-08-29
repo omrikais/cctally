@@ -260,7 +260,10 @@ def _ensure_sibling_loaded(name: str) -> None:
 
 
 _ensure_sibling_loaded("_lib_forecast")
-from _lib_forecast import _compute_forecast, ForecastInputs, ForecastOutput, BudgetRow
+from _lib_forecast import (
+    _compute_forecast, ForecastInputs, ForecastOutput, BudgetRow,
+    corrected_percent_point, projection_base,
+)
 _ensure_sibling_loaded("_lib_dashboard_sources")
 _ensure_sibling_loaded("_cctally_dashboard_sources")
 from _cctally_dashboard_sources import (
@@ -421,6 +424,11 @@ def _dashboard_build_weekly_periods(*args, **kwargs):
 
 def _build_alerts_envelope_array(*args, **kwargs):
     return sys.modules["cctally"]._build_alerts_envelope_array(*args, **kwargs)
+
+
+def _build_meter_rate_change_array(*args, **kwargs):
+    return sys.modules["cctally"]._build_meter_rate_change_array(
+        *args, **kwargs)
 
 
 def _select_current_block_for_envelope(*args, **kwargs):
@@ -915,6 +923,12 @@ from _lib_view_models import (  # noqa: E402
     TuiSessionRow,
 )
 
+# The ONE projection decomposition every consumer shares (#661 S2 spec
+# section 3.3). The TUI used to re-derive `p_now + rate * remaining` at three
+# render sites, which is how a censored reading reached the screen as a
+# number the kernel had already withheld.
+from _lib_view_models import _forecast_projection_pcts  # noqa: E402
+
 
 @dataclass
 class TuiPercentMilestone:
@@ -1207,6 +1221,17 @@ class DataSnapshot:
     # `current_week.five_hour_block` is precomputed via
     # `_select_current_block_for_envelope`).
     alerts: list[dict] = field(default_factory=list)
+    # #661 S2 §6.1: the non-threshold rate-change family's wire rows, built
+    # beside `alerts` at sync time for the same reason — the envelope stays a
+    # pure renderer.
+    meter_rate_changes: list[dict] = field(default_factory=list)
+    # #661 S2 §6.6: the DERIVED marker state — the active open regime has a
+    # confirmed predecessor — read from the calibration file at sync time so
+    # the envelope stays a pure renderer. `None` means no change is active,
+    # which is also what an absent, malformed or quarantined calibration
+    # renders. Distinct from `meter_rate_changes` above, which is the event
+    # HISTORY; this is whether the current regime is a successor.
+    quota_rate_change: "dict | None" = None
     # ---- 5h in-place credit (v1.7.x) ----
     # Already-envelope-shaped dicts for the CurrentWeekModal's new 5h
     # milestone timeline (spec §5.3, Codex r1 finding 3). Parallel to
@@ -1393,7 +1418,8 @@ class DataSnapshot:
             five_hour_resets_at=as_of.replace(minute=0, second=0, microsecond=0)
                 + dt.timedelta(hours=3),
             spent_usd=spent_usd,
-            dollars_per_percent=spent_usd / used_pct,
+            # The same corrected divisor `_tui_build_current_week` now uses.
+            dollars_per_percent=spent_usd / corrected_percent_point(used_pct),
             latest_snapshot_at=as_of,
             freshness_label="fresh",
             freshness_age=12,
@@ -1416,25 +1442,31 @@ class DataSnapshot:
         # Recent 24h slightly lower: ~94% → r_recent = (94 - 53) / 82 ≈ 0.500.
         r_recent = (94.0 - used_pct) / remaining_hours if remaining_hours > 0 else 0.0
         p_24h_ago = max(0.0, used_pct - r_recent * 24.0)
-        dpp = spent_usd / used_pct
-        final_low = used_pct + r_recent * remaining_hours
-        final_high = used_pct + r_avg * remaining_hours
+        # #661 S2. The CEILING-CORRECTED reading is the operand every render
+        # path projects from, so the demo derives its projections and budget
+        # headroom from the same one. Deriving them from the displayed
+        # `used_pct` while `_tui_panel_forecast` reads the corrected base made
+        # the demo screenshot's panel and header disagree by a point.
+        base = corrected_percent_point(used_pct)
+        dpp = spent_usd / base
+        final_low = base + r_recent * remaining_hours
+        final_high = base + r_avg * remaining_hours
         # Two BudgetRows mirroring the TUI's hard-coded targets [100, 90].
         budgets = [
             BudgetRow(
                 target_percent=100,
-                pct_headroom=100.0 - used_pct,
-                dollars_per_day=((100.0 - used_pct) * dpp / remaining_days)
+                pct_headroom=100.0 - base,
+                dollars_per_day=((100.0 - base) * dpp / remaining_days)
                                  if remaining_days > 0 else None,
-                percent_per_day=((100.0 - used_pct) / remaining_days)
+                percent_per_day=((100.0 - base) / remaining_days)
                                  if remaining_days > 0 else None,
             ),
             BudgetRow(
                 target_percent=90,
-                pct_headroom=90.0 - used_pct,
-                dollars_per_day=((90.0 - used_pct) * dpp / remaining_days)
+                pct_headroom=90.0 - base,
+                dollars_per_day=((90.0 - base) * dpp / remaining_days)
                                  if remaining_days > 0 else None,
-                percent_per_day=((90.0 - used_pct) / remaining_days)
+                percent_per_day=((90.0 - base) / remaining_days)
                                  if remaining_days > 0 else None,
             ),
         ]
@@ -1464,7 +1496,7 @@ class DataSnapshot:
             r_recent=r_recent,
             final_percent_low=final_low,
             final_percent_high=final_high,
-            week_avg_projection_pct=used_pct + r_avg * remaining_hours,
+            week_avg_projection_pct=base + r_avg * remaining_hours,
             projected_cap=final_high >= 100.0,
             already_capped=False,
             cap_at=None,
@@ -1663,7 +1695,17 @@ def _tui_build_current_week(
     spent, total_tokens = _sum_cost_and_tokens_for_range(
         week_start_at, now_utc, mode="auto", skip_sync=skip_sync
     )
-    dpp = (spent / used_pct) if used_pct > 0 else None
+    # #661 S2 spec section 3.4. This card computes its own `spent / used_pct`
+    # independently of the forecast kernel, so a correction confined to that
+    # kernel would leave this surface stating an uncorrected figure. The GATE
+    # stays on the displayed reading (a displayed 0 corrects to 0.25, and
+    # dividing by that would publish a rate on a week with no observed
+    # usage); only the DIVISOR is corrected. A right-censored reading has no
+    # corrected point, so the displayed reading is retained as the divisor
+    # there — the same operand this card has always used.
+    used_pct_corrected = corrected_percent_point(used_pct)
+    dpp_divisor = used_pct if used_pct_corrected is None else used_pct_corrected
+    dpp = (spent / dpp_divisor) if used_pct > 0 else None
     # Collect every textual variant of week_start_at that parses to the same
     # instant — mirrors `_fetch_current_week_snapshots` lines 9199-9210 so
     # legacy local-offset rows and newly UTC-canonicalized rows both contribute.
@@ -4384,6 +4426,8 @@ def _tui_build_snapshot_once(
         blocks_panel: list[BlocksPanelRow] = []
         daily_panel:  list[DailyPanelRow]  = []
         alerts: list[dict] = []
+        meter_rate_changes: list[dict] = []
+        quota_rate_change: "dict | None" = None
         # ── Sync-once (spec §4, #268) ──────────────────────────────────
         # Ingest new JSONL bytes into the cache EXACTLY ONCE at the top of
         # the rebuild, then read every builder with skip_sync=True (pure
@@ -4914,6 +4958,33 @@ def _tui_build_snapshot_once(
                 alerts = _build_alerts_envelope_array(conn)
             except Exception as exc:
                 capture_failure("alerts", "stats", exc)
+        # Its OWN phase, not `build.alerts` (#661 S2 Stage C review, F13).
+        # `cctally dashboard-perf --trace` reads these names as the
+        # attribution of where a tick's cost went, so a second query billed to
+        # a phase that did not run it makes that attribution wrong — however
+        # small the query is. §6.1 keeps this family out of `AXIS_REGISTRY`
+        # precisely because it is not one of the threshold axes, and the trace
+        # names follow the same separation.
+        with _perf.phase("build.meter_rate_changes"):
+            try:
+                meter_rate_changes = _build_meter_rate_change_array(conn)
+            except Exception as exc:
+                capture_failure("meter_rate_changes", "stats", exc)
+            try:
+                # §6.6's predicate, from the calibration FILE. One small
+                # read through the non-mutating reader — never
+                # `load_calibrations`, which quarantines by renaming — and
+                # no store at all. An unreadable file yields no marker,
+                # which is the same thing an absent one yields, because the
+                # reader cannot tell them apart without scanning sidecars.
+                _mrc = _cctally()._load_sibling("_lib_meter_rate_change")
+                _qg = _cctally()._load_sibling("_cctally_quota_model")
+                _state = _qg.read_stored_state_readonly()
+                if _state is not None:
+                    quota_rate_change = _mrc.active_rate_change(
+                        _qg.stored_regimes(_state, None))
+            except Exception as exc:
+                capture_failure("quota_rate_change", "calibration", exc)
         # ---- 5h in-place credit (v1.7.x) ----
         # Load 5h milestones (pre + post credit) for the current
         # block's window so CurrentWeekModal can render a merged
@@ -5140,6 +5211,8 @@ def _tui_build_snapshot_once(
             blocks_panel=blocks_panel,
             daily_panel=daily_panel,
             alerts=alerts,
+            meter_rate_changes=meter_rate_changes,
+            quota_rate_change=quota_rate_change,
             five_hour_milestones=fh_milestones,
             week_index=week_index,
             daily_total_cost_usd=daily_total_cost_usd,
@@ -6275,11 +6348,50 @@ def _tui_verdict_of(forecast) -> str:
     if forecast is None or getattr(forecast.inputs, "confidence", "high") == "low":
         return "LOW CONF"
     high = forecast.final_percent_high
+    if high is None:
+        # A right-censored reading publishes no projection, and the meter is
+        # at its cap by construction (#661 S2 spec section 3.2).
+        return "OVER"
     if high >= 100:
         return "OVER"
     if high >= 90:
         return "WARN"
     return "GOOD"
+
+
+#: How each withheld-projection cause reads in the TUI's short register.
+#: The codes are members of the quota kernel's closed `EVIDENCE_CODES` union
+#: and arrive on `ForecastOutput.projection_code`.
+#: The SHORT register of spec section 8: every TUI slot that can carry a
+#: withheld figure is width-fixed, so the sentence form would wrap outside the
+#: panel border. The full sentences belong to the wide surfaces.
+_TUI_PROJECTION_CAUSE: dict = {
+    "right-censored": "meter at its cap — no upper bound",
+    "no-local-history": "no usage observed this week",
+}
+
+
+def _tui_projection_cause(forecast) -> str:
+    """The short token a withheld projection states, never a blank."""
+    code = getattr(forecast, "projection_code", None)
+    return _TUI_PROJECTION_CAUSE.get(code, "projection unavailable")
+
+
+def _tui_projection_pair(forecast) -> "tuple[int | None, int | None]":
+    """`(week_avg_pct, recent_24h_pct)` as whole percents, or `(None, None)`.
+
+    The week-average value is the kernel's SELECTED projection rather than a
+    re-derivation of it (#661 S2 spec section 3.3), so a calibrated basis
+    reaches the screen as the model's number and a withheld one reaches it as
+    nothing at all. The recent-24h value is the second method and stays
+    derived from the corrected base; it collapses onto the first when there
+    is no 24-hour-prior sample.
+    """
+    week_avg, recent = _forecast_projection_pcts(forecast)
+    if week_avg is None:
+        return None, None
+    return int(round(week_avg)), int(round(recent if recent is not None
+                                           else week_avg))
 
 
 def _tui_panel_forecast(
@@ -6308,13 +6420,11 @@ def _tui_panel_forecast(
         cls = _tui_bar_color(val)
         return f"{{{cls}}}{b}{{/}}"
 
-    # Compute the two projection values DIRECTLY from the rate methods,
-    # not from final_low/final_high which are min/max aggregates and
-    # swap labels when the recent-24h rate is lower than week-avg.
-    p_now = fc.inputs.p_now
-    remaining = fc.inputs.remaining_hours
-    wa = int(round(p_now + fc.r_avg * remaining))
-    rc = wa if fc.r_recent is None else int(round(p_now + fc.r_recent * remaining))
+    # The kernel's SELECTED week-average projection, and the recent-24h
+    # method beside it (#661 S2 spec section 3.3). Not final_low/final_high,
+    # which are min/max aggregates and swap labels when the recent-24h rate
+    # is lower than the week average.
+    wa, rc = _tui_projection_pair(fc)
     # Budget table row values
     b100 = next((r for r in fc.budgets if r.target_percent == 100), None)
     b90 = next((r for r in fc.budgets if r.target_percent == 90), None)
@@ -6322,12 +6432,25 @@ def _tui_panel_forecast(
     b90_str  = f"${b90.dollars_per_day:.2f}/day"  if b90  and b90.dollars_per_day  is not None else "—"
     conf = "low" if verdict == "LOW CONF" else "high"
 
+    if wa is None:
+        # #661 S2 spec section 3.2: no projection is fabricated from a meter
+        # that supplies no point estimate. The two bars are replaced by the
+        # typed cause, not by a zero.
+        projection_lines = [
+            f" {{dim}}Projection{{/}}                {{warn}}withheld{{/}}",
+            f" {{faint}}{_tui_projection_cause(fc)}{{/}}",
+        ]
+    else:
+        projection_lines = [
+            f" {{dim}}Projection by week-avg{{/}}    {bar_tagged(wa)} {{bright}}{wa:>3d}%{{/}}",
+            f" {{dim}}Projection by recent 24h{{/}}  {bar_tagged(rc)} {{bright}}{rc:>3d}%{{/}}",
+        ]
+
     return [
         "",
         f"  {{badge.{vcls}}} [ {verdict} ] {{/}} {{dim}}{vmsg}{{/}}",
         "",
-        f" {{dim}}Projection by week-avg{{/}}    {bar_tagged(wa)} {{bright}}{wa:>3d}%{{/}}",
-        f" {{dim}}Projection by recent 24h{{/}}  {bar_tagged(rc)} {{bright}}{rc:>3d}%{{/}}",
+    ] + projection_lines + [
         "",
         f" {{dim}}Budget to stay ≤100%{{/}}   {{bright}}{b100_str}{{/}}",
         f" {{dim}}Budget to stay  ≤90%{{/}}   {{bright}}{b90_str}{{/}}",
@@ -6759,7 +6882,8 @@ def _tui_header_strip_a(
             # on final_percent_high). Using low here would display e.g.
             # "Fcst 74% WARN" where the WARN comes from a >=90% high
             # projection, understating risk in the most glanceable line.
-            fcst_pct = f"{int(round(fc.final_percent_high))}%"
+            fcst_pct = ("\u2014" if fc.final_percent_high is None
+                        else f"{int(round(fc.final_percent_high))}%")
         hdr = preview_prefix + (
             f"{{bright.b}}Week {format_display_dt(cw.week_start_at, runtime.display_tz, fmt='%b %d', suffix=False)}–{format_display_dt(cw.week_end_at, runtime.display_tz, fmt='%b %d', suffix=False)}{{/}} "
             f"{{faint}}│{{/}} Used {{{used_cls}.b}}{cw.used_pct:.1f}%{{/}} "
@@ -7156,18 +7280,17 @@ def _tui_render_variant_b(
     vcls = _TUI_VERDICT_CLS[verdict]
     # _TUI_VERDICT_CLS always maps to ok/warn/bad after the SSoT fix, so vcls
     # is guaranteed to be a valid badge class here.
+    wa = rc = None
     if snap.forecast:
-        # Compute projections directly from rate methods — final_low/final_high
-        # are min/max aggregates and swap labels when recent-24h rate is lower
-        # than week-average (mirrors the Variant A fix in commit 15b6fab).
-        p_now = snap.forecast.inputs.p_now
-        remaining = snap.forecast.inputs.remaining_hours
-        wa = int(round(p_now + snap.forecast.r_avg * remaining))
-        rc = wa if snap.forecast.r_recent is None else int(round(p_now + snap.forecast.r_recent * remaining))
-    else:
-        wa, rc = 0, 0
+        # The kernel's selected projection and the second method beside it,
+        # through the one decomposition (#661 S2 spec section 3.3).
+        wa, rc = _tui_projection_pair(snap.forecast)
     vmsg = _TUI_VERDICT_SHORT[verdict]
-    ribbon_text = f"  [ {verdict} ]   {vmsg}   ·   week-avg {wa}%   ·   recent-24h {rc}%"
+    if wa is None:
+        ribbon_text = (f"  [ {verdict} ]   {vmsg}   ·   "
+                       f"projection withheld")
+    else:
+        ribbon_text = f"  [ {verdict} ]   {vmsg}   ·   week-avg {wa}%   ·   recent-24h {rc}%"
     ribbon_pad = max(0, width - len(ribbon_text))
     ribbon = f"{{badge.{vcls}}}{ribbon_text}{' ' * ribbon_pad}{{/}}"
 
@@ -7267,11 +7390,21 @@ def _tui_render_variant_b(
             format_display_dt(cw.week_end_at, runtime.display_tz, fmt="%b %d %H:%M", suffix=True)
             if cw else "—"
         )
+        if wa is None:
+            # #661 S2 spec section 3.2: the strip states the withholding and
+            # its cause rather than colouring a bar from a meter that supplies
+            # no point estimate.
+            projection_fragment = (
+                f"  {{dim}}projection{{/}} {{warn.b}}withheld{{/}}  "
+                f"{{faint}}{_tui_projection_cause(snap.forecast)}{{/}}  ")
+        else:
+            projection_fragment = (
+                f"  {{dim}}wk-avg{{/}} {{{_tui_bar_color(wa)}.b}}{wa}%{{/}}  "
+                f"{{dim}}24h{{/}} {{{_tui_bar_color(rc)}.b}}{rc}%{{/}}  ")
         fcstrip_body = [
             "",
-            (f"  {{dim}}wk-avg{{/}} {{{_tui_bar_color(wa)}.b}}{wa}%{{/}}  "
-             f"{{dim}}24h{{/}} {{{_tui_bar_color(rc)}.b}}{rc}%{{/}}  "
-             f"{{faint}}│{{/}}  "
+            (projection_fragment
+             + f"{{faint}}│{{/}}  "
              f"{{dim}}≤100%{{/}} {{bright.b}}{b100_s}{{/}}  "
              f"{{dim}}≤90%{{/}} {{bright.b}}{b90_s}{{/}}  "
              f"{{faint}}│{{/}}  "
@@ -7633,24 +7766,60 @@ def _tui_modal_forecast(snap, runtime, width):
     else:
         lines.append("  {dim}Used 24h ago{/}   {dim}—  (insufficient history){/}")
     lines.append("")
-    lines.append("  {dim.b}Two rate paths{/}")
-    lines.append(f"  {{dim}}  r_avg     {inp.p_now:.1f} / {inp.elapsed_hours:.1f}      = {{/}}{{b}}{fc.r_avg:.4f} %/h{{/}}")
-    if fc.r_recent is not None and inp.p_24h_ago is not None:
-        lines.append(f"  {{dim}}  r_recent  ({inp.p_now:.1f}-{inp.p_24h_ago:.1f}) / {inp.t_24h_actual_hours:.1f}  = {{/}}{{b}}{fc.r_recent:.4f} %/h{{/}}")
+    # The hero band above prints the DISPLAYED readings, which is what every
+    # other surface shows. The two rate lines below divide the CEILING-
+    # CORRECTED midpoints of those readings, so the operands differ from the
+    # numbers three lines up by half a point each. Saying so is the whole
+    # point of an explain modal (#661 S2).
+    lines.append("  {dim.b}Two rate paths{/}   "
+                 "{faint}(operands are ceiling-corrected){/}")
+    # `getattr`, because the modal is also driven by duck-typed inputs stubs
+    # that predate the corrected pair; those fall back to the raw reading.
+    _p_corrected = getattr(inp, "p_now_corrected", None)
+    _p24_corrected = getattr(inp, "p_24h_ago_corrected", None)
+    _rate_num = projection_base(inp)
+    _censored = bool(getattr(fc, "right_censored", False))
+    if fc.r_avg is None:
+        lines.append("  {dim}  r_avg     unavailable — "
+                     + _tui_projection_cause(fc) + "{/}")
+    else:
+        lines.append(f"  {{dim}}  r_avg     {_rate_num:.1f} / {inp.elapsed_hours:.1f}      = {{/}}{{b}}{fc.r_avg:.4f} %/h{{/}}")
+    if (fc.r_recent is not None and _p24_corrected is not None
+            and _p_corrected is not None):
+        lines.append(f"  {{dim}}  r_recent  ({_p_corrected:.1f}-{_p24_corrected:.1f}) / {inp.t_24h_actual_hours:.1f}  = {{/}}{{b}}{fc.r_recent:.4f} %/h{{/}}")
+    elif _censored:
+        # The cause is the CENSORING, not a missing sample: this shape can
+        # carry a 24-hour-prior reading and still have no rate, because the
+        # current reading has no point estimate to subtract from.
+        lines.append("  {dim}  r_recent  unavailable — "
+                     + _tui_projection_cause(fc) + "{/}")
     else:
         lines.append("  {dim}  r_recent  unavailable — no 24h-prior sample{/}")
     lines.append("")
     lines.append(f"  {{dim.b}}Project to week end ({inp.remaining_hours:.1f}h remaining){{/}}")
-    if fc.r_recent is not None:
-        wa = inp.p_now + fc.r_avg * inp.remaining_hours
-        rc = inp.p_now + fc.r_recent * inp.remaining_hours
-        lines.append(f"  {{dim}}  by week-avg    = {{/}}{{warn}}{wa:.1f}%{{/}}")
+    _wa_sel = getattr(fc, "week_avg_projection_pct", None)
+    if _wa_sel is None:
+        lines.append("  {dim}  projection     = withheld — "
+                     + _tui_projection_cause(fc) + "{/}")
+    elif fc.r_recent is not None and fc.final_percent_high is not None:
+        base = _rate_num
+        rc = base + fc.r_recent * inp.remaining_hours
+        lines.append(f"  {{dim}}  by week-avg    = {{/}}{{warn}}{_wa_sel:.1f}%{{/}}")
         lines.append(f"  {{dim}}  by recent-24h  = {{/}}{{ok}}{rc:.1f}%{{/}}")
         lines.append(f"  {{dim}}  high           = {{/}}{{{vcls}.b}}{fc.final_percent_high:.1f}%{{/}}     {{dim}}verdict:{{/}} {{{vcls}.b}}{verdict}{{/}}")
     else:
-        lines.append(f"  {{dim}}  projection     = {{/}}{{{vcls}.b}}{fc.final_percent_high:.1f}%{{/}}     {{dim}}verdict:{{/}} {{{vcls}.b}}{verdict}{{/}}")
+        lines.append(f"  {{dim}}  projection     = {{/}}{{{vcls}.b}}{_wa_sel:.1f}%{{/}}     {{dim}}verdict:{{/}} {{{vcls}.b}}{verdict}{{/}}")
     lines.append("")
     lines.append(f"  {{dim.b}}Daily $ budgets ({inp.remaining_days:.3f} days remaining){{/}}")
+    if not fc.budgets:
+        # The censored branch of `_compute_forecast` publishes NO budget rows
+        # at all, because every one of them is priced off headroom the meter
+        # cannot bound. The loop below then emitted nothing and the section
+        # rendered as a bare header with no rows and no cause — beside a
+        # projection line that states its own. A heading over silence reads
+        # as a rendering fault, not as a withholding.
+        lines.append("  {dim}  —  withheld — " + _tui_projection_cause(fc)
+                     + "{/}")
     for b in fc.budgets:
         if b.dollars_per_day is not None:
             lines.append(f"  {{dim}}  ≤{b.target_percent}%   {{/}}{{b}}${b.dollars_per_day:.2f}/day{{/}}")

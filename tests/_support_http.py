@@ -153,12 +153,6 @@ def start(server):
     return thread
 
 
-def serve(server_factory):
-    """Construct a server with `server_factory()` and start its accept loop."""
-    srv = server_factory()
-    return srv, start(srv)
-
-
 def serve_dashboard(ns, *, host="127.0.0.1", port=0,
                     handler_key="DashboardHTTPHandler",
                     server_key="ThreadingHTTPServer",
@@ -175,13 +169,10 @@ def serve_dashboard(ns, *, host="127.0.0.1", port=0,
     """
     cls = server_class if server_class is not None else ns[server_key]
 
-    def factory():
-        srv = cls((host, port), ns[handler_key])
-        if configure is not None:
-            configure(srv)
-        return srv
-
-    srv, thread = serve(factory)
+    srv = cls((host, port), ns[handler_key])
+    if configure is not None:
+        configure(srv)
+    thread = start(srv)
     return srv, thread, srv.server_address[1]
 
 
@@ -491,21 +482,46 @@ def _match_frame(buf, marker):
     return frame, buf[:start] + buf[blank + 2:]
 
 
+#: Why `_drain_for` stopped reading. The first two are ordinary outcomes; the
+#: last two mean the transport went away, which makes a negative assertion
+#: vacuous rather than satisfied.
+#:
+#: `_drain_for` returns one of these four constants VERBATIM and carries any
+#: exception text beside it as a separate `detail` value. An earlier version
+#: interpolated the exception into the outcome string, so `SOCKET_ERROR` was
+#: never returned as itself and `outcome == SOCKET_ERROR` was False for exactly
+#: the case the constant names. Membership — `outcome in (PEER_CLOSED,
+#: SOCKET_ERROR)` — is therefore a correct way to ask whether the transport
+#: died, and the raise sites append `detail` so the reader still sees the text.
+MATCHED = "matched"
+WINDOW_EXPIRED = "window-expired"
+PEER_CLOSED = "peer-closed"
+SOCKET_ERROR = "socket-error"
+
+
 def _drain_for(sock, marker, deadline_seconds):
     """Read until a frame containing `marker` completes, or time runs out.
 
-    Returns `(frame_or_None, buffered_tail, elapsed)`. Whatever was read and
-    not returned stays with the socket, so the next call sees it.
+    Returns `(frame_or_None, buffered_tail, elapsed, outcome, detail)`, where
+    `outcome` is one of `MATCHED`, `WINDOW_EXPIRED`, `PEER_CLOSED` or
+    `SOCKET_ERROR` returned verbatim, and `detail` is the raised exception's
+    text on the `SOCKET_ERROR` path and `None` everywhere else. A caller needs
+    that distinction because a window that expired with the stream open and a
+    transport that died early are opposite results, and this function used to
+    return the same value for both.
 
-    The hand-back is in a `finally` because the buffer is POPPED on the way in.
-    `sock.settimeout(...)` raises `OSError` on a closed socket, and that raise
-    used to leave with the residue already popped and never restored — so a
-    later `read_no_event` on the same socket would have observed an empty
-    buffer and passed by having nothing to look at. That is vacuous rather than
-    wrong, which is the failure this session exists to remove.
+    Whatever was read and not returned stays with the socket, so the next call
+    sees it. The hand-back is in a `finally` because the buffer is POPPED on
+    the way in. `sock.settimeout(...)` raises `OSError` on a closed socket, and
+    that raise used to leave with the residue already popped and never restored
+    — so a later `read_no_event` on the same socket would have observed an
+    empty buffer and passed by having nothing to look at. That is vacuous
+    rather than wrong, which is the failure this session exists to remove.
     """
     buf = _RESIDUE.pop(sock, b"")
     started = time.monotonic()
+    detail = None
+    outcome = WINDOW_EXPIRED
     try:
         while True:
             matched = _match_frame(buf, marker)
@@ -513,35 +529,46 @@ def _drain_for(sock, marker, deadline_seconds):
                 frame, remainder = matched
                 tail = buf.decode("utf-8", "replace")[-512:]
                 buf = remainder
-                return frame, tail, time.monotonic() - started
+                return frame, tail, time.monotonic() - started, MATCHED, None
             remaining_s = deadline_seconds - (time.monotonic() - started)
             if remaining_s <= 0:
                 break
-            sock.settimeout(min(0.5, remaining_s))
             try:
+                # `settimeout` is INSIDE the `try` because it raises `OSError`
+                # on a closed socket, and that raise escaped the function as a
+                # bare `Bad file descriptor` instead of reaching a caller that
+                # could name the transport.
+                sock.settimeout(min(0.5, remaining_s))
                 chunk = sock.recv(4096)
             except (_socket.timeout, TimeoutError):
                 continue
-            except OSError:
+            except OSError as exc:
+                outcome, detail = SOCKET_ERROR, str(exc)
                 break
             if not chunk:
+                outcome = PEER_CLOSED
                 break
             buf += chunk
-        return None, buf.decode("utf-8", "replace")[-512:], \
-            time.monotonic() - started
+        return (None, buf.decode("utf-8", "replace")[-512:],
+                time.monotonic() - started, outcome, detail)
     finally:
         _RESIDUE[sock] = buf
+
+
+def _ended(outcome, detail):
+    """The outcome as a reader sees it: the constant, plus any raised text."""
+    return outcome if detail is None else "%s: %s" % (outcome, detail)
 
 
 def read_event(sock, *, marker, backstop=PRESENCE_BACKSTOP_SECONDS):
     """Wait for an SSE frame containing `marker`. Returns as soon as it lands."""
     backstop = _transport_backstop(backstop)
-    frame, tail, elapsed = _drain_for(sock, marker, backstop)
+    frame, tail, elapsed, outcome, detail = _drain_for(sock, marker, backstop)
     if frame is None:
         raise AssertionError(
             f"no SSE frame matching {marker!r} arrived within the {backstop}s "
-            f"presence backstop (waited {elapsed:.2f}s); "
-            f"last 512 buffered bytes: {tail!r}"
+            f"presence backstop (waited {elapsed:.2f}s, ended: "
+            f"{_ended(outcome, detail)}); last 512 buffered bytes: {tail!r}"
         )
     return frame
 
@@ -552,11 +579,22 @@ def read_no_event(sock, *, marker, window):
     `window` is the assertion's observation period and is spent in full. It is
     deliberately a separate parameter from the presence backstop, and the
     timing-budget guard treats a named absence window as annotated.
+
+    A transport that goes away before the window elapses does NOT satisfy this
+    assertion. Nothing arriving on a socket the peer closed says nothing about
+    the server, so both dead-transport outcomes raise rather than return.
     """
-    frame, _tail, _elapsed = _drain_for(sock, marker, window)
+    frame, _tail, elapsed, outcome, detail = _drain_for(sock, marker, window)
     if frame is not None:
         raise AssertionError(
             f"an SSE frame matching {marker!r} arrived within the {window}s "
             f"absence window, which the test asserts must not happen; "
             f"frame: {frame!r}"
+        )
+    if outcome in (PEER_CLOSED, SOCKET_ERROR):
+        raise AssertionError(
+            f"the transport went away after {elapsed:.2f}s of the {window}s "
+            f"absence window for {marker!r} ({_ended(outcome, detail)}), so "
+            f"the window was never observed and this assertion proves nothing "
+            f"about the server; a negative assertion needs a live connection"
         )

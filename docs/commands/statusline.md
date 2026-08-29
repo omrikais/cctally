@@ -68,7 +68,45 @@ Five `|`-delimited segments, left to right:
 | 2 | `💰 $X.XX session / $Y.YY today / $Z.ZZ block (Hh Mm left)` | session per `--cost-source`; today bucketed in `display.tz`; block = active 5h block; `time-left = block_end − now`, clamped `≥ 0m`. |
 | 3 | `🔥 $X.XX/hr` (+ optional visual indicator) | active 5h block cost ÷ elapsed hours. `-B` controls the visual. |
 | 4 | `🧠 X%` (or `🧠 N/A`) | tail-read last assistant `message.usage`, divided by `CLAUDE_MODEL_CONTEXT_WINDOWS[<model_id>]`. |
-| 5 | `5h X% (Hh Mm) · 7d Y% (Dd Hh)` — **cctally extension, default-on** | stdin `rate_limits` → DB HWM clamp → DB-latest-row fallback → suppress. |
+| 5 | `5h X% (Hh Mm) · 7d Y% (Dd Hh) → Z% meter · Δrate` — **cctally extension, default-on** | stdin `rate_limits` → DB HWM clamp → DB-latest-row fallback → suppress. The projection and the marker are #661 S2 additions, described below. |
+
+### The 7d projection and the metering-rate marker (#661 S2 §9)
+
+The 7d slot carries the projected end-of-week percent and names the
+measurement it came from. `→ 58% meter` says the week is on course for 58%
+and that the figure came from the corrected meter reading; `→ 58% model`
+would say it came from the fitted quota model.
+
+**This surface is basis-aware, not always model-backed, and today the basis
+is always the meter.** Producing a calibrated projection needs a whole-week
+scan of the entry cache, and the status line runs once per prompt, so it
+never opens `cache.db` for quota and never calls the analysis
+[`quota`](quota.md) runs. What it does read is the calibration file, once,
+with no lock and no throttle. The word in the slot is the basis the shared
+selector actually chose, so it would say `model` on the day that basis
+becomes cheap rather than needing a second edit here.
+
+The reading is CORRECTED before it is projected. A displayed 40 means the
+week consumed somewhere in `[39, 40)`, so the pace is measured from 39.5.
+
+Two states carry no projection at all, because there is nothing to say
+rather than a reason not to say it: an unknown reset instant, which leaves
+no window to project over, and a window less than 24 hours old, where a pace
+is the estate's own definition of low confidence and a small denominator
+makes the figure swing by hundreds of points between prompts. A displayed
+100 is different: it means `[99, +inf)`, has no point estimate at all, and
+renders `→ right censored` at any point in the week.
+
+`Δrate` appears while the **merged** active metering regime has a confirmed
+predecessor — that is, while the provider's rate change is the one currently
+in force. It clears on its own when that regime closes. An absent,
+unreadable, malformed or quarantined calibration renders no marker and
+nothing else changes; the status line cannot tell those four apart without
+scanning quarantine sidecars, and it does not scan them.
+
+**The marker is account-blind, and on a decorated multi-account install that matters.** The read resolves the merged calibration bucket rather than the focused account's, exactly as [`doctor`](doctor.md)'s `quota.meter_drift` check does and for the same reason: the marker is one glyph on a per-prompt line with no account context to carry. So on an install with more than one real Claude account the marker states that *a* metering rate changed, not that the account you are currently billing to changed. Note the consequence inside one `forecast.quota` object on the dashboard, which shares this read: the projection half is account-scoped and the `rate_change` half is not. Use [`cctally quota`](quota.md), which is account-scoped, when you need to know whose rate moved.
+
+A closed 7d window renders no projection. When the stored reset instant has already passed — a stale fallback row, or a long-idle machine — the slot prints the reading and its countdown and no `→` token at all, the same way an unknown reset does, because there is no open window to project over.
 
 When `--cost-source both` is in effect, segment 2's `session` slot
 collapses to a side-by-side view:
@@ -94,6 +132,9 @@ reset countdowns:
 ```
 5h 34% · 7d 42%
 ```
+
+`--usage-only` renders neither the projection nor the marker: it is the
+compact two-reading form other tools embed, and it keeps that shape.
 
 If no 5h/7d usage data is available, `--usage-only` writes an empty line.
 `--usage-only` takes precedence over `--cctally-extensions` /

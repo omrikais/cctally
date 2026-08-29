@@ -1,0 +1,2065 @@
+{
+  "schemaVersion": 1,
+  "run": {
+    "store": "<a read-only snapshot copy of the maintainer's production store, taken 2026-08-28>",
+    "account": "merged",
+    "now": "2026-08-28T00:00:00+00:00",
+    "resetScoping": "new_week_end_at match AND detected_at_utc<=t",
+    "weekCoalescing": "normalize both boundaries to the nearest hour, then merge two normalized windows whose half-open spans overlap for more than half of the shorter span, unless a week_reset_events row records the transition between their end instants; each physical week takes the boundaries of its most-populated window and the maximum weekly_percent over every merged spelling",
+    "prerepair": false,
+    "prerepairEvidence": "repaired: the shipped selector withheld a credited week with no post-credit baseline, leaving too few candidates for the trailing median (control 'trailing_4wk_median', treatment 'this_week_sparse')",
+    "provenance": "Measured by tests/quota_budget_error_harness.py against the named store, on the REPAIRED code, at the same clock and over the same population as budget-error-baseline.json. #661 S2 spec section 4.3's acceptance evidence."
+  },
+  "population": {
+    "weeks": 29,
+    "decisionPoints": 174,
+    "usablePoints": 110,
+    "span": {
+      "from": "2026-02-05T08:00:00+00:00",
+      "to": "2026-08-22T05:00:00+00:00"
+    }
+  },
+  "weeks": [
+    {
+      "weekStartAt": "2026-02-05T08:00:00+00:00",
+      "weekEndAt": "2026-02-12T08:00:00+00:00",
+      "finalPercent": 51.0,
+      "decisionPoints": 6,
+      "snapshots": 1320,
+      "windows": [
+        {
+          "startAt": "2026-02-05T08:00:00+00:00",
+          "endAt": "2026-02-12T08:00:00+00:00",
+          "snapshots": 1320,
+          "highestPercent": 51.0,
+          "spellings": 18
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-02-12T08:00:00+00:00",
+      "weekEndAt": "2026-02-19T08:00:00+00:00",
+      "finalPercent": 32.0,
+      "decisionPoints": 6,
+      "snapshots": 1510,
+      "windows": [
+        {
+          "startAt": "2026-02-12T08:00:00+00:00",
+          "endAt": "2026-02-19T08:00:00+00:00",
+          "snapshots": 1510,
+          "highestPercent": 32.0,
+          "spellings": 5
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-02-19T08:00:00+00:00",
+      "weekEndAt": "2026-02-26T08:00:00+00:00",
+      "finalPercent": 27.0,
+      "decisionPoints": 6,
+      "snapshots": 1492,
+      "windows": [
+        {
+          "startAt": "2026-02-19T08:00:00+00:00",
+          "endAt": "2026-02-26T08:00:00+00:00",
+          "snapshots": 1492,
+          "highestPercent": 27.0,
+          "spellings": 9
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-02-27T07:00:00+00:00",
+      "weekEndAt": "2026-03-06T07:00:00+00:00",
+      "finalPercent": 46.0,
+      "decisionPoints": 6,
+      "snapshots": 1545,
+      "windows": [
+        {
+          "startAt": "2026-02-26T08:00:00+00:00",
+          "endAt": "2026-03-06T07:00:00+00:00",
+          "snapshots": 9,
+          "highestPercent": 6.0,
+          "spellings": 1
+        },
+        {
+          "startAt": "2026-02-27T07:00:00+00:00",
+          "endAt": "2026-03-06T07:00:00+00:00",
+          "snapshots": 1536,
+          "highestPercent": 46.0,
+          "spellings": 5
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-03-06T07:00:00+00:00",
+      "weekEndAt": "2026-03-13T07:00:00+00:00",
+      "finalPercent": 39.0,
+      "decisionPoints": 6,
+      "snapshots": 930,
+      "windows": [
+        {
+          "startAt": "2026-03-06T07:00:00+00:00",
+          "endAt": "2026-03-13T07:00:00+00:00",
+          "snapshots": 930,
+          "highestPercent": 39.0,
+          "spellings": 30
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-03-13T07:00:00+00:00",
+      "weekEndAt": "2026-03-20T07:00:00+00:00",
+      "finalPercent": 36.0,
+      "decisionPoints": 6,
+      "snapshots": 1459,
+      "windows": [
+        {
+          "startAt": "2026-03-13T07:00:00+00:00",
+          "endAt": "2026-03-20T07:00:00+00:00",
+          "snapshots": 1457,
+          "highestPercent": 36.0,
+          "spellings": 1
+        },
+        {
+          "startAt": "2026-03-13T11:00:00+00:00",
+          "endAt": "2026-03-20T11:00:00+00:00",
+          "snapshots": 1,
+          "highestPercent": 33.0,
+          "spellings": 1
+        },
+        {
+          "startAt": "2026-03-13T12:00:00+00:00",
+          "endAt": "2026-03-20T12:00:00+00:00",
+          "snapshots": 1,
+          "highestPercent": 33.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-03-20T07:00:00+00:00",
+      "weekEndAt": "2026-03-27T07:00:00+00:00",
+      "finalPercent": 42.0,
+      "decisionPoints": 6,
+      "snapshots": 1493,
+      "windows": [
+        {
+          "startAt": "2026-03-20T07:00:00+00:00",
+          "endAt": "2026-03-27T07:00:00+00:00",
+          "snapshots": 1493,
+          "highestPercent": 42.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-03-27T07:00:00+00:00",
+      "weekEndAt": "2026-04-03T07:00:00+00:00",
+      "finalPercent": 62.0,
+      "decisionPoints": 6,
+      "snapshots": 1734,
+      "windows": [
+        {
+          "startAt": "2026-03-27T07:00:00+00:00",
+          "endAt": "2026-04-03T07:00:00+00:00",
+          "snapshots": 1734,
+          "highestPercent": 62.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-04-03T07:00:00+00:00",
+      "weekEndAt": "2026-04-10T07:00:00+00:00",
+      "finalPercent": 57.0,
+      "decisionPoints": 6,
+      "snapshots": 1184,
+      "windows": [
+        {
+          "startAt": "2026-04-03T07:00:00+00:00",
+          "endAt": "2026-04-10T07:00:00+00:00",
+          "snapshots": 1184,
+          "highestPercent": 57.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-04-10T07:00:00+00:00",
+      "weekEndAt": "2026-04-17T07:00:00+00:00",
+      "finalPercent": 34.0,
+      "decisionPoints": 6,
+      "snapshots": 232,
+      "windows": [
+        {
+          "startAt": "2026-04-10T07:00:00+00:00",
+          "endAt": "2026-04-17T07:00:00+00:00",
+          "snapshots": 232,
+          "highestPercent": 34.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-04-16T19:00:00+00:00",
+      "weekEndAt": "2026-04-23T19:00:00+00:00",
+      "finalPercent": 86.0,
+      "decisionPoints": 6,
+      "snapshots": 901,
+      "windows": [
+        {
+          "startAt": "2026-04-16T19:00:00+00:00",
+          "endAt": "2026-04-23T19:00:00+00:00",
+          "snapshots": 901,
+          "highestPercent": 86.0,
+          "spellings": 2
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-04-18T05:00:00+00:00",
+      "weekEndAt": "2026-04-25T05:00:00+00:00",
+      "finalPercent": 25.0,
+      "decisionPoints": 6,
+      "snapshots": 253,
+      "windows": [
+        {
+          "startAt": "2026-04-18T05:00:00+00:00",
+          "endAt": "2026-04-25T05:00:00+00:00",
+          "snapshots": 253,
+          "highestPercent": 25.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-04-25T05:00:00+00:00",
+      "weekEndAt": "2026-05-02T05:00:00+00:00",
+      "finalPercent": 92.0,
+      "decisionPoints": 6,
+      "snapshots": 829,
+      "windows": [
+        {
+          "startAt": "2026-04-25T05:00:00+00:00",
+          "endAt": "2026-05-02T05:00:00+00:00",
+          "snapshots": 829,
+          "highestPercent": 92.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-05-02T05:00:00+00:00",
+      "weekEndAt": "2026-05-09T05:00:00+00:00",
+      "finalPercent": 94.0,
+      "decisionPoints": 6,
+      "snapshots": 640,
+      "windows": [
+        {
+          "startAt": "2026-05-02T05:00:00+00:00",
+          "endAt": "2026-05-09T05:00:00+00:00",
+          "snapshots": 640,
+          "highestPercent": 94.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-05-09T05:00:00+00:00",
+      "weekEndAt": "2026-05-16T05:00:00+00:00",
+      "finalPercent": 67.0,
+      "decisionPoints": 6,
+      "snapshots": 532,
+      "windows": [
+        {
+          "startAt": "2026-05-09T05:00:00+00:00",
+          "endAt": "2026-05-16T05:00:00+00:00",
+          "snapshots": 532,
+          "highestPercent": 67.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-05-16T05:00:00+00:00",
+      "weekEndAt": "2026-05-23T05:00:00+00:00",
+      "finalPercent": 61.0,
+      "decisionPoints": 6,
+      "snapshots": 456,
+      "windows": [
+        {
+          "startAt": "2026-05-16T05:00:00+00:00",
+          "endAt": "2026-05-23T05:00:00+00:00",
+          "snapshots": 456,
+          "highestPercent": 61.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-05-23T05:00:00+00:00",
+      "weekEndAt": "2026-05-30T05:00:00+00:00",
+      "finalPercent": 41.0,
+      "decisionPoints": 6,
+      "snapshots": 429,
+      "windows": [
+        {
+          "startAt": "2026-05-23T05:00:00+00:00",
+          "endAt": "2026-05-30T05:00:00+00:00",
+          "snapshots": 429,
+          "highestPercent": 41.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-05-30T05:00:00+00:00",
+      "weekEndAt": "2026-06-06T05:00:00+00:00",
+      "finalPercent": 56.0,
+      "decisionPoints": 6,
+      "snapshots": 424,
+      "windows": [
+        {
+          "startAt": "2026-05-30T05:00:00+00:00",
+          "endAt": "2026-06-06T05:00:00+00:00",
+          "snapshots": 424,
+          "highestPercent": 56.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-06-06T05:00:00+00:00",
+      "weekEndAt": "2026-06-13T05:00:00+00:00",
+      "finalPercent": 45.0,
+      "decisionPoints": 6,
+      "snapshots": 440,
+      "windows": [
+        {
+          "startAt": "2026-06-06T05:00:00+00:00",
+          "endAt": "2026-06-13T05:00:00+00:00",
+          "snapshots": 440,
+          "highestPercent": 45.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-06-13T05:00:00+00:00",
+      "weekEndAt": "2026-06-20T05:00:00+00:00",
+      "finalPercent": 48.0,
+      "decisionPoints": 6,
+      "snapshots": 368,
+      "windows": [
+        {
+          "startAt": "2026-06-13T05:00:00+00:00",
+          "endAt": "2026-06-20T05:00:00+00:00",
+          "snapshots": 368,
+          "highestPercent": 48.0,
+          "spellings": 2
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-06-20T05:00:00+00:00",
+      "weekEndAt": "2026-06-27T05:00:00+00:00",
+      "finalPercent": 76.0,
+      "decisionPoints": 6,
+      "snapshots": 478,
+      "windows": [
+        {
+          "startAt": "2026-06-20T05:00:00+00:00",
+          "endAt": "2026-06-27T05:00:00+00:00",
+          "snapshots": 478,
+          "highestPercent": 76.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-06-27T05:00:00+00:00",
+      "weekEndAt": "2026-07-04T05:00:00+00:00",
+      "finalPercent": 33.0,
+      "decisionPoints": 6,
+      "snapshots": 393,
+      "windows": [
+        {
+          "startAt": "2026-06-27T05:00:00+00:00",
+          "endAt": "2026-07-04T05:00:00+00:00",
+          "snapshots": 393,
+          "highestPercent": 33.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-07-04T05:00:00+00:00",
+      "weekEndAt": "2026-07-11T05:00:00+00:00",
+      "finalPercent": 54.0,
+      "decisionPoints": 6,
+      "snapshots": 540,
+      "windows": [
+        {
+          "startAt": "2026-07-04T05:00:00+00:00",
+          "endAt": "2026-07-11T05:00:00+00:00",
+          "snapshots": 540,
+          "highestPercent": 54.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-07-11T05:00:00+00:00",
+      "weekEndAt": "2026-07-18T05:00:00+00:00",
+      "finalPercent": 55.0,
+      "decisionPoints": 6,
+      "snapshots": 487,
+      "windows": [
+        {
+          "startAt": "2026-07-11T05:00:00+00:00",
+          "endAt": "2026-07-18T05:00:00+00:00",
+          "snapshots": 487,
+          "highestPercent": 55.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-07-18T05:00:00+00:00",
+      "weekEndAt": "2026-07-25T05:00:00+00:00",
+      "finalPercent": 71.0,
+      "decisionPoints": 6,
+      "snapshots": 425,
+      "windows": [
+        {
+          "startAt": "2026-07-18T05:00:00+00:00",
+          "endAt": "2026-07-25T05:00:00+00:00",
+          "snapshots": 425,
+          "highestPercent": 71.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-07-25T05:00:00+00:00",
+      "weekEndAt": "2026-08-01T05:00:00+00:00",
+      "finalPercent": 77.0,
+      "decisionPoints": 6,
+      "snapshots": 497,
+      "windows": [
+        {
+          "startAt": "2026-07-25T05:00:00+00:00",
+          "endAt": "2026-08-01T05:00:00+00:00",
+          "snapshots": 497,
+          "highestPercent": 77.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-08-01T05:00:00+00:00",
+      "weekEndAt": "2026-08-08T05:00:00+00:00",
+      "finalPercent": 86.0,
+      "decisionPoints": 6,
+      "snapshots": 548,
+      "windows": [
+        {
+          "startAt": "2026-08-01T05:00:00+00:00",
+          "endAt": "2026-08-08T05:00:00+00:00",
+          "snapshots": 548,
+          "highestPercent": 86.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-08-08T05:00:00+00:00",
+      "weekEndAt": "2026-08-15T05:00:00+00:00",
+      "finalPercent": 83.0,
+      "decisionPoints": 6,
+      "snapshots": 531,
+      "windows": [
+        {
+          "startAt": "2026-08-08T05:00:00+00:00",
+          "endAt": "2026-08-15T05:00:00+00:00",
+          "snapshots": 531,
+          "highestPercent": 83.0,
+          "spellings": 1
+        }
+      ]
+    },
+    {
+      "weekStartAt": "2026-08-15T05:00:00+00:00",
+      "weekEndAt": "2026-08-22T05:00:00+00:00",
+      "finalPercent": 81.0,
+      "decisionPoints": 6,
+      "snapshots": 518,
+      "windows": [
+        {
+          "startAt": "2026-08-15T05:00:00+00:00",
+          "endAt": "2026-08-22T05:00:00+00:00",
+          "snapshots": 518,
+          "highestPercent": 81.0,
+          "spellings": 1
+        }
+      ]
+    }
+  ],
+  "points": [
+    {
+      "at": "2026-02-06T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-07T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-08T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-09T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-10T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-11T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-13T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-14T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-15T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-16T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-17T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-18T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-20T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-21T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-22T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-23T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-24T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-25T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-02-28T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-03-01T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-03-02T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-03-03T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-03-04T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-03-05T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-03-07T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 2.0,
+      "realizedRemainingMovementPct": 37.0,
+      "dollarsPerPercent": 17.428119326087046,
+      "predictedRemainingUsd": 644.8404150652207,
+      "actualRemainingUsd": 415.93912824999893,
+      "signedRelativeErrorPct": 55.0324004808803
+    },
+    {
+      "at": "2026-03-08T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 9.0,
+      "realizedRemainingMovementPct": 30.0,
+      "dollarsPerPercent": 17.428119326087046,
+      "predictedRemainingUsd": 522.8435797826114,
+      "actualRemainingUsd": 314.63004070000045,
+      "signedRelativeErrorPct": 66.1772596854928
+    },
+    {
+      "at": "2026-03-09T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 13.0,
+      "realizedRemainingMovementPct": 26.0,
+      "dollarsPerPercent": 15.706238748000025,
+      "predictedRemainingUsd": 408.3622074480007,
+      "actualRemainingUsd": 256.06502629999943,
+      "signedRelativeErrorPct": 59.47597895292957
+    },
+    {
+      "at": "2026-03-10T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 20.0,
+      "realizedRemainingMovementPct": 19.0,
+      "dollarsPerPercent": 13.30168361538464,
+      "predictedRemainingUsd": 252.73198869230816,
+      "actualRemainingUsd": 193.0101801499996,
+      "signedRelativeErrorPct": 30.942310139234742
+    },
+    {
+      "at": "2026-03-11T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 23.0,
+      "realizedRemainingMovementPct": 16.0,
+      "dollarsPerPercent": 12.733506988888927,
+      "predictedRemainingUsd": 203.73611182222282,
+      "actualRemainingUsd": 165.88910339999973,
+      "signedRelativeErrorPct": 22.814644028164153
+    },
+    {
+      "at": "2026-03-12T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 28.0,
+      "realizedRemainingMovementPct": 11.0,
+      "dollarsPerPercent": 12.055941072727277,
+      "predictedRemainingUsd": 132.61535180000004,
+      "actualRemainingUsd": 120.85463115000017,
+      "signedRelativeErrorPct": 9.731294976526723
+    },
+    {
+      "at": "2026-03-14T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 4.0,
+      "realizedRemainingMovementPct": 32.0,
+      "dollarsPerPercent": 13.708879110606045,
+      "predictedRemainingUsd": 438.68413153939343,
+      "actualRemainingUsd": 875.1775119999974,
+      "signedRelativeErrorPct": -49.874839615463664
+    },
+    {
+      "at": "2026-03-15T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 10.0,
+      "realizedRemainingMovementPct": 26.0,
+      "dollarsPerPercent": 17.516587436842116,
+      "predictedRemainingUsd": 455.431273357895,
+      "actualRemainingUsd": 769.3478312999952,
+      "signedRelativeErrorPct": -40.802943112436395
+    },
+    {
+      "at": "2026-03-16T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 13.0,
+      "realizedRemainingMovementPct": 23.0,
+      "dollarsPerPercent": 21.505233568000023,
+      "predictedRemainingUsd": 494.62037206400055,
+      "actualRemainingUsd": 666.9399923499951,
+      "signedRelativeErrorPct": -25.837350025872357
+    },
+    {
+      "at": "2026-03-17T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 16.0,
+      "realizedRemainingMovementPct": 20.0,
+      "dollarsPerPercent": 24.33025984838717,
+      "predictedRemainingUsd": 486.6051969677434,
+      "actualRemainingUsd": 558.6363843000007,
+      "signedRelativeErrorPct": -12.894109541847335
+    },
+    {
+      "at": "2026-03-18T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 21.0,
+      "realizedRemainingMovementPct": 15.0,
+      "dollarsPerPercent": 25.95865518048784,
+      "predictedRemainingUsd": 389.3798277073176,
+      "actualRemainingUsd": 403.60298075,
+      "signedRelativeErrorPct": -3.5240455896168164
+    },
+    {
+      "at": "2026-03-19T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 26.0,
+      "realizedRemainingMovementPct": 10.0,
+      "dollarsPerPercent": 25.84823691568632,
+      "predictedRemainingUsd": 258.48236915686323,
+      "actualRemainingUsd": 276.6253705999994,
+      "signedRelativeErrorPct": -6.558690334073153
+    },
+    {
+      "at": "2026-03-21T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 5.0,
+      "realizedRemainingMovementPct": 37.0,
+      "dollarsPerPercent": 27.22946022859845,
+      "predictedRemainingUsd": 1007.4900284581427,
+      "actualRemainingUsd": 1051.925155399999,
+      "signedRelativeErrorPct": -4.224171911257296
+    },
+    {
+      "at": "2026-03-22T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 11.0,
+      "realizedRemainingMovementPct": 31.0,
+      "dollarsPerPercent": 36.80933136190477,
+      "predictedRemainingUsd": 1141.0892722190479,
+      "actualRemainingUsd": 831.2109304499995,
+      "signedRelativeErrorPct": 37.280349718366544
+    },
+    {
+      "at": "2026-03-23T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 16.0,
+      "realizedRemainingMovementPct": 26.0,
+      "dollarsPerPercent": 33.936978409677494,
+      "predictedRemainingUsd": 882.3614386516149,
+      "actualRemainingUsd": 691.6857444000012,
+      "signedRelativeErrorPct": 27.56680989818782
+    },
+    {
+      "at": "2026-03-24T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 22.0,
+      "realizedRemainingMovementPct": 20.0,
+      "dollarsPerPercent": 32.19441112093025,
+      "predictedRemainingUsd": 643.888222418605,
+      "actualRemainingUsd": 525.52907065,
+      "signedRelativeErrorPct": 22.521903806807988
+    },
+    {
+      "at": "2026-03-25T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 28.0,
+      "realizedRemainingMovementPct": 14.0,
+      "dollarsPerPercent": 31.3177536545455,
+      "predictedRemainingUsd": 438.448551163637,
+      "actualRemainingUsd": 356.4706842499995,
+      "signedRelativeErrorPct": 22.997085184190027
+    },
+    {
+      "at": "2026-03-26T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 33.0,
+      "realizedRemainingMovementPct": 9.0,
+      "dollarsPerPercent": 30.370710309230766,
+      "predictedRemainingUsd": 273.3363927830769,
+      "actualRemainingUsd": 230.6608247000003,
+      "signedRelativeErrorPct": 18.501437397781302
+    },
+    {
+      "at": "2026-03-28T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 9.0,
+      "realizedRemainingMovementPct": 53.0,
+      "dollarsPerPercent": 27.22946022859845,
+      "predictedRemainingUsd": 1443.161392115718,
+      "actualRemainingUsd": 776.4422993500036,
+      "signedRelativeErrorPct": 85.86846612090251
+    },
+    {
+      "at": "2026-03-29T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 15.0,
+      "realizedRemainingMovementPct": 47.0,
+      "dollarsPerPercent": 27.791091699999964,
+      "predictedRemainingUsd": 1306.1813098999983,
+      "actualRemainingUsd": 626.0396314500041,
+      "signedRelativeErrorPct": 108.6419524071793
+    },
+    {
+      "at": "2026-03-30T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 18.0,
+      "realizedRemainingMovementPct": 44.0,
+      "dollarsPerPercent": 26.397511122857082,
+      "predictedRemainingUsd": 1161.4904894057117,
+      "actualRemainingUsd": 567.0540164500012,
+      "signedRelativeErrorPct": 104.82889737332877
+    },
+    {
+      "at": "2026-03-31T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 24.0,
+      "realizedRemainingMovementPct": 38.0,
+      "dollarsPerPercent": 22.95257926170204,
+      "predictedRemainingUsd": 872.1980119446775,
+      "actualRemainingUsd": 489.62484845000114,
+      "signedRelativeErrorPct": 78.13597792387033
+    },
+    {
+      "at": "2026-04-01T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 33.0,
+      "realizedRemainingMovementPct": 29.0,
+      "dollarsPerPercent": 20.078628492307683,
+      "predictedRemainingUsd": 582.2802262769228,
+      "actualRemainingUsd": 376.4550351000002,
+      "signedRelativeErrorPct": 54.67457517794866
+    },
+    {
+      "at": "2026-04-02T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 42.0,
+      "realizedRemainingMovementPct": 20.0,
+      "dollarsPerPercent": 19.232585526506043,
+      "predictedRemainingUsd": 384.65171053012085,
+      "actualRemainingUsd": 230.85816175000005,
+      "signedRelativeErrorPct": 66.61819864383493
+    },
+    {
+      "at": "2026-04-04T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 8.0,
+      "realizedRemainingMovementPct": 49.0,
+      "dollarsPerPercent": 24.053090427993638,
+      "predictedRemainingUsd": 1178.6014309716882,
+      "actualRemainingUsd": 631.0309914500032,
+      "signedRelativeErrorPct": 86.77393772110307
+    },
+    {
+      "at": "2026-04-05T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 16.0,
+      "realizedRemainingMovementPct": 41.0,
+      "dollarsPerPercent": 14.584273277419367,
+      "predictedRemainingUsd": 597.9552043741941,
+      "actualRemainingUsd": 506.80150065000134,
+      "signedRelativeErrorPct": 17.986076127888925
+    },
+    {
+      "at": "2026-04-06T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 26.0,
+      "realizedRemainingMovementPct": 31.0,
+      "dollarsPerPercent": 13.68005709411764,
+      "predictedRemainingUsd": 424.08176991764685,
+      "actualRemainingUsd": 384.0162805500014,
+      "signedRelativeErrorPct": 10.43327884699635
+    },
+    {
+      "at": "2026-04-07T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 33.0,
+      "realizedRemainingMovementPct": 24.0,
+      "dollarsPerPercent": 13.39130451230771,
+      "predictedRemainingUsd": 321.39130829538504,
+      "actualRemainingUsd": 297.6403397999993,
+      "signedRelativeErrorPct": 7.979754529021603
+    },
+    {
+      "at": "2026-04-08T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 39.0,
+      "realizedRemainingMovementPct": 18.0,
+      "dollarsPerPercent": 13.117213723376636,
+      "predictedRemainingUsd": 236.10984702077945,
+      "actualRemainingUsd": 227.84500809999972,
+      "signedRelativeErrorPct": 3.6273952147120787
+    },
+    {
+      "at": "2026-04-09T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 44.0,
+      "realizedRemainingMovementPct": 13.0,
+      "dollarsPerPercent": 13.254677054022984,
+      "predictedRemainingUsd": 172.3108017022988,
+      "actualRemainingUsd": 156.2792846,
+      "signedRelativeErrorPct": 10.258248329797368
+    },
+    {
+      "at": "2026-04-11T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 1.0,
+      "realizedRemainingMovementPct": 33.0,
+      "dollarsPerPercent": 18.118704603629055,
+      "predictedRemainingUsd": 597.9172519197589,
+      "actualRemainingUsd": 433.21063215000027,
+      "signedRelativeErrorPct": 38.019985555832
+    },
+    {
+      "at": "2026-04-12T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 10.0,
+      "realizedRemainingMovementPct": 24.0,
+      "dollarsPerPercent": 16.607976415789476,
+      "predictedRemainingUsd": 398.5914339789474,
+      "actualRemainingUsd": 296.13442769999983,
+      "signedRelativeErrorPct": 34.598140808789054
+    },
+    {
+      "at": "2026-04-13T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 13.0,
+      "realizedRemainingMovementPct": 21.0,
+      "dollarsPerPercent": 15.837298972000024,
+      "predictedRemainingUsd": 332.5832784120005,
+      "actualRemainingUsd": 255.94396650000047,
+      "signedRelativeErrorPct": 29.94378533709247
+    },
+    {
+      "at": "2026-04-14T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 19.0,
+      "realizedRemainingMovementPct": 15.0,
+      "dollarsPerPercent": 13.82240381351354,
+      "predictedRemainingUsd": 207.3360572027031,
+      "actualRemainingUsd": 198.19573309999996,
+      "signedRelativeErrorPct": 4.611766338123628
+    },
+    {
+      "at": "2026-04-15T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 23.0,
+      "realizedRemainingMovementPct": 11.0,
+      "dollarsPerPercent": 13.482237255555596,
+      "predictedRemainingUsd": 148.30460981111156,
+      "actualRemainingUsd": 150.55986540000023,
+      "signedRelativeErrorPct": -1.4979128620346585
+    },
+    {
+      "at": "2026-04-16T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 28.000000000000004,
+      "realizedRemainingMovementPct": 5.9999999999999964,
+      "dollarsPerPercent": 12.79644880363639,
+      "predictedRemainingUsd": 76.7786928218183,
+      "actualRemainingUsd": 102.00786155000007,
+      "signedRelativeErrorPct": -24.732572906467087
+    },
+    {
+      "at": "2026-04-17T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 2.0,
+      "realizedRemainingMovementPct": 84.0,
+      "dollarsPerPercent": 18.118704603629055,
+      "predictedRemainingUsd": 1521.9711867048406,
+      "actualRemainingUsd": 1194.0751441000016,
+      "signedRelativeErrorPct": 27.460251913373586
+    },
+    {
+      "at": "2026-04-18T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 10.0,
+      "realizedRemainingMovementPct": 76.0,
+      "dollarsPerPercent": 15.201733973684222,
+      "predictedRemainingUsd": 1155.3317820000009,
+      "actualRemainingUsd": 1082.7131313500017,
+      "signedRelativeErrorPct": 6.707099835341721
+    },
+    {
+      "at": "2026-04-19T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-04-20T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-04-21T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-04-22T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-04-19T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-04-20T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-04-21T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-04-22T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-04-23T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-04-24T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 4.0,
+      "realizedRemainingMovementPct": 21.0,
+      "dollarsPerPercent": 18.118704603629055,
+      "predictedRemainingUsd": 380.49279667621016,
+      "actualRemainingUsd": 315.6725262500009,
+      "signedRelativeErrorPct": 20.534023405912123
+    },
+    {
+      "at": "2026-04-26T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 12.0,
+      "realizedRemainingMovementPct": 80.0,
+      "dollarsPerPercent": 14.972979456521754,
+      "predictedRemainingUsd": 1197.8383565217403,
+      "actualRemainingUsd": 1248.363311499998,
+      "signedRelativeErrorPct": -4.047295728160127
+    },
+    {
+      "at": "2026-04-27T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 26.0,
+      "realizedRemainingMovementPct": 66.0,
+      "dollarsPerPercent": 15.770129558823566,
+      "predictedRemainingUsd": 1040.8285508823553,
+      "actualRemainingUsd": 1018.4142714999996,
+      "signedRelativeErrorPct": 2.200899968668178
+    },
+    {
+      "at": "2026-04-28T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 35.0,
+      "realizedRemainingMovementPct": 57.0,
+      "dollarsPerPercent": 15.419566920289872,
+      "predictedRemainingUsd": 878.9153144565228,
+      "actualRemainingUsd": 888.5775164999982,
+      "signedRelativeErrorPct": -1.0873786320335552
+    },
+    {
+      "at": "2026-04-29T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 51.0,
+      "realizedRemainingMovementPct": 41.0,
+      "dollarsPerPercent": 14.650991801980178,
+      "predictedRemainingUsd": 600.6906638811873,
+      "actualRemainingUsd": 680.6774892499989,
+      "signedRelativeErrorPct": -11.751060764025652
+    },
+    {
+      "at": "2026-04-30T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 56.00000000000001,
+      "realizedRemainingMovementPct": 35.99999999999999,
+      "dollarsPerPercent": 14.71818589639637,
+      "predictedRemainingUsd": 529.8546922702692,
+      "actualRemainingUsd": 603.6932579999984,
+      "signedRelativeErrorPct": -12.231139697394038
+    },
+    {
+      "at": "2026-05-01T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 71.0,
+      "realizedRemainingMovementPct": 21.0,
+      "dollarsPerPercent": 14.902871070922012,
+      "predictedRemainingUsd": 312.96029248936225,
+      "actualRemainingUsd": 369.90016475000164,
+      "signedRelativeErrorPct": -15.393308164413067
+    },
+    {
+      "at": "2026-05-03T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 14.0,
+      "realizedRemainingMovementPct": 80.0,
+      "dollarsPerPercent": 14.599883555555566,
+      "predictedRemainingUsd": 1167.9906844444454,
+      "actualRemainingUsd": 1309.9274790000031,
+      "signedRelativeErrorPct": -10.8354696600389
+    },
+    {
+      "at": "2026-05-04T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 22.0,
+      "realizedRemainingMovementPct": 72.0,
+      "dollarsPerPercent": 16.44925960465119,
+      "predictedRemainingUsd": 1184.3466915348856,
+      "actualRemainingUsd": 1153.3668255000011,
+      "signedRelativeErrorPct": 2.686037551102119
+    },
+    {
+      "at": "2026-05-05T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 30.0,
+      "realizedRemainingMovementPct": 64.0,
+      "dollarsPerPercent": 16.652014415254257,
+      "predictedRemainingUsd": 1065.7289225762725,
+      "actualRemainingUsd": 1015.7914817499998,
+      "signedRelativeErrorPct": 4.916111399186055
+    },
+    {
+      "at": "2026-05-06T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 41.0,
+      "realizedRemainingMovementPct": 53.0,
+      "dollarsPerPercent": 16.670511277777806,
+      "predictedRemainingUsd": 883.5370977222237,
+      "actualRemainingUsd": 831.8702002500002,
+      "signedRelativeErrorPct": 6.210932601828535
+    },
+    {
+      "at": "2026-05-07T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 57.0,
+      "realizedRemainingMovementPct": 37.0,
+      "dollarsPerPercent": 16.51805428318588,
+      "predictedRemainingUsd": 611.1680084778775,
+      "actualRemainingUsd": 573.7558400000005,
+      "signedRelativeErrorPct": 6.520573015496796
+    },
+    {
+      "at": "2026-05-08T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 71.0,
+      "realizedRemainingMovementPct": 23.0,
+      "dollarsPerPercent": 16.07484291134757,
+      "predictedRemainingUsd": 369.7213869609941,
+      "actualRemainingUsd": 373.7494817499985,
+      "signedRelativeErrorPct": -1.0777526085504505
+    },
+    {
+      "at": "2026-05-10T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-05-11T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-05-12T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-05-13T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-05-14T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-05-15T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-05-17T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 7.0,
+      "realizedRemainingMovementPct": 54.0,
+      "dollarsPerPercent": 15.736489680706594,
+      "predictedRemainingUsd": 849.770442758156,
+      "actualRemainingUsd": 1674.9774146000016,
+      "signedRelativeErrorPct": -49.26675217521734
+    },
+    {
+      "at": "2026-05-18T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 14.0,
+      "realizedRemainingMovementPct": 47.0,
+      "dollarsPerPercent": 33.15423077777773,
+      "predictedRemainingUsd": 1558.2488465555532,
+      "actualRemainingUsd": 1422.9738458500035,
+      "signedRelativeErrorPct": 9.506499441298171
+    },
+    {
+      "at": "2026-05-19T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 19.0,
+      "realizedRemainingMovementPct": 42.0,
+      "dollarsPerPercent": 33.03129604054054,
+      "predictedRemainingUsd": 1387.3144337027027,
+      "actualRemainingUsd": 1259.4769846000022,
+      "signedRelativeErrorPct": 10.150042491113915
+    },
+    {
+      "at": "2026-05-20T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 29.0,
+      "realizedRemainingMovementPct": 32.0,
+      "dollarsPerPercent": 32.564283684210544,
+      "predictedRemainingUsd": 1042.0570778947374,
+      "actualRemainingUsd": 942.4738763499984,
+      "signedRelativeErrorPct": 10.566149794029696
+    },
+    {
+      "at": "2026-05-21T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 34.0,
+      "realizedRemainingMovementPct": 27.0,
+      "dollarsPerPercent": 31.75938898507468,
+      "predictedRemainingUsd": 857.5035025970163,
+      "actualRemainingUsd": 806.6164303499993,
+      "signedRelativeErrorPct": 6.308707625126929
+    },
+    {
+      "at": "2026-05-22T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 41.0,
+      "realizedRemainingMovementPct": 20.0,
+      "dollarsPerPercent": 32.38076989012346,
+      "predictedRemainingUsd": 647.6153978024693,
+      "actualRemainingUsd": 559.1347807999981,
+      "signedRelativeErrorPct": 15.824559666253451
+    },
+    {
+      "at": "2026-05-24T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-05-25T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-05-26T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-05-27T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-05-28T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-05-29T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 9.0,
+      "realizedRemainingMovementPct": 32.0,
+      "dollarsPerPercent": 15.736489680706594,
+      "predictedRemainingUsd": 503.567669782611,
+      "actualRemainingUsd": 374.74117830000125,
+      "signedRelativeErrorPct": 34.377458081075076
+    },
+    {
+      "at": "2026-05-31T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-06-01T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-06-02T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 5.0,
+      "realizedRemainingMovementPct": 51.0,
+      "dollarsPerPercent": 15.736489680706594,
+      "predictedRemainingUsd": 802.5609737160363,
+      "actualRemainingUsd": 1510.2921680499942,
+      "signedRelativeErrorPct": -46.86054852868246
+    },
+    {
+      "at": "2026-06-03T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 14.0,
+      "realizedRemainingMovementPct": 42.0,
+      "dollarsPerPercent": 31.69819296666673,
+      "predictedRemainingUsd": 1331.3241046000028,
+      "actualRemainingUsd": 1223.4502564999923,
+      "signedRelativeErrorPct": 8.817183005757224
+    },
+    {
+      "at": "2026-06-04T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 22.0,
+      "realizedRemainingMovementPct": 34.0,
+      "dollarsPerPercent": 29.71234256511625,
+      "predictedRemainingUsd": 1010.2196472139525,
+      "actualRemainingUsd": 1012.5604963999987,
+      "signedRelativeErrorPct": -0.2311811683715389
+    },
+    {
+      "at": "2026-06-05T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 37.0,
+      "realizedRemainingMovementPct": 19.0,
+      "dollarsPerPercent": 30.874300480821883,
+      "predictedRemainingUsd": 586.6117091356158,
+      "actualRemainingUsd": 524.4638940000003,
+      "signedRelativeErrorPct": 11.849779526598915
+    },
+    {
+      "at": "2026-06-07T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-06-08T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-06-09T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-06-10T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-06-11T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 7.0,
+      "realizedRemainingMovementPct": 38.0,
+      "dollarsPerPercent": 15.736489680706594,
+      "predictedRemainingUsd": 597.9866078668506,
+      "actualRemainingUsd": 1048.2878611499987,
+      "signedRelativeErrorPct": -42.95587786251346
+    },
+    {
+      "at": "2026-06-12T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 25.0,
+      "realizedRemainingMovementPct": 20.0,
+      "dollarsPerPercent": 28.148083108163206,
+      "predictedRemainingUsd": 562.9616621632641,
+      "actualRemainingUsd": 578.2585126500009,
+      "signedRelativeErrorPct": -2.6453307910047776
+    },
+    {
+      "at": "2026-06-14T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 9.0,
+      "realizedRemainingMovementPct": 39.0,
+      "dollarsPerPercent": 15.736489680706594,
+      "predictedRemainingUsd": 613.7230975475571,
+      "actualRemainingUsd": 1548.2649455999976,
+      "signedRelativeErrorPct": -60.36058949137277
+    },
+    {
+      "at": "2026-06-15T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 15.0,
+      "realizedRemainingMovementPct": 33.0,
+      "dollarsPerPercent": 32.65350124137936,
+      "predictedRemainingUsd": 1077.565540965519,
+      "actualRemainingUsd": 1349.62659585,
+      "signedRelativeErrorPct": -20.15824641578999
+    },
+    {
+      "at": "2026-06-16T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 23.0,
+      "realizedRemainingMovementPct": 25.0,
+      "dollarsPerPercent": 31.128798544444518,
+      "predictedRemainingUsd": 778.2199636111129,
+      "actualRemainingUsd": 1122.7043966000012,
+      "signedRelativeErrorPct": -30.68344918146978
+    },
+    {
+      "at": "2026-06-17T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 29.0,
+      "realizedRemainingMovementPct": 19.0,
+      "dollarsPerPercent": 31.26870238596493,
+      "predictedRemainingUsd": 594.1053453333336,
+      "actualRemainingUsd": 931.9443458500019,
+      "signedRelativeErrorPct": -36.250984516520056
+    },
+    {
+      "at": "2026-06-18T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 38.0,
+      "realizedRemainingMovementPct": 10.0,
+      "dollarsPerPercent": 29.856785410666774,
+      "predictedRemainingUsd": 298.5678541066677,
+      "actualRemainingUsd": 703.4729109499983,
+      "signedRelativeErrorPct": -57.55801688177735
+    },
+    {
+      "at": "2026-06-19T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 46.0,
+      "realizedRemainingMovementPct": 2.0,
+      "dollarsPerPercent": 30.42896480769243,
+      "predictedRemainingUsd": 60.85792961538486,
+      "actualRemainingUsd": 438.5844651000007,
+      "signedRelativeErrorPct": -86.12401157402856
+    },
+    {
+      "at": "2026-06-21T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 9.0,
+      "realizedRemainingMovementPct": 67.0,
+      "dollarsPerPercent": 22.48516162976202,
+      "predictedRemainingUsd": 1506.5058291940552,
+      "actualRemainingUsd": 2229.7354192000043,
+      "signedRelativeErrorPct": -32.43566854516906
+    },
+    {
+      "at": "2026-06-22T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 22.0,
+      "realizedRemainingMovementPct": 54.0,
+      "dollarsPerPercent": 35.51503124883721,
+      "predictedRemainingUsd": 1917.8116874372095,
+      "actualRemainingUsd": 1757.0875362999989,
+      "signedRelativeErrorPct": 9.14719089497708
+    },
+    {
+      "at": "2026-06-23T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 32.0,
+      "realizedRemainingMovementPct": 44.0,
+      "dollarsPerPercent": 34.25576207777756,
+      "predictedRemainingUsd": 1507.2535314222127,
+      "actualRemainingUsd": 1441.6042027000005,
+      "signedRelativeErrorPct": 4.553907972747073
+    },
+    {
+      "at": "2026-06-24T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 43.0,
+      "realizedRemainingMovementPct": 33.0,
+      "dollarsPerPercent": 33.14492405529389,
+      "predictedRemainingUsd": 1093.7824938246983,
+      "actualRemainingUsd": 1112.001435800001,
+      "signedRelativeErrorPct": -1.6383919470567492
+    },
+    {
+      "at": "2026-06-25T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 57.0,
+      "realizedRemainingMovementPct": 19.0,
+      "dollarsPerPercent": 34.141284151327326,
+      "predictedRemainingUsd": 648.6843988752192,
+      "actualRemainingUsd": 591.6781536000004,
+      "signedRelativeErrorPct": 9.63467130370973
+    },
+    {
+      "at": "2026-06-26T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 66.0,
+      "realizedRemainingMovementPct": 10.0,
+      "dollarsPerPercent": 34.8688999580153,
+      "predictedRemainingUsd": 348.688999580153,
+      "actualRemainingUsd": 236.74776089999986,
+      "signedRelativeErrorPct": 47.28291336509667
+    },
+    {
+      "at": "2026-06-28T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-06-29T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-06-30T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-07-01T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-07-02T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 2.0,
+      "realizedRemainingMovementPct": 31.0,
+      "dollarsPerPercent": 29.80149229246692,
+      "predictedRemainingUsd": 923.8462610664745,
+      "actualRemainingUsd": 741.6959509999998,
+      "signedRelativeErrorPct": 24.558622683714066
+    },
+    {
+      "at": "2026-07-03T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 15.0,
+      "realizedRemainingMovementPct": 18.0,
+      "dollarsPerPercent": 30.226360362069,
+      "predictedRemainingUsd": 544.074486517242,
+      "actualRemainingUsd": 357.36885095000076,
+      "signedRelativeErrorPct": 52.24451853341944
+    },
+    {
+      "at": "2026-07-05T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-07-06T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-07-07T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-07-08T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-07-09T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-07-10T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 9.0,
+      "realizedRemainingMovementPct": 45.0,
+      "dollarsPerPercent": 29.80149229246692,
+      "predictedRemainingUsd": 1341.0671531610114,
+      "actualRemainingUsd": 725.2374589999994,
+      "signedRelativeErrorPct": 84.91421485731787
+    },
+    {
+      "at": "2026-07-12T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-07-13T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-07-14T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-07-15T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-07-16T00:00:00+00:00",
+      "usable": false,
+      "cause": "no-current-week-snapshot"
+    },
+    {
+      "at": "2026-07-17T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 18.0,
+      "realizedRemainingMovementPct": 37.0,
+      "dollarsPerPercent": 27.805773514285764,
+      "predictedRemainingUsd": 1028.8136200285733,
+      "actualRemainingUsd": 1015.711603700001,
+      "signedRelativeErrorPct": 1.2899346902058315
+    },
+    {
+      "at": "2026-07-19T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 2.0,
+      "realizedRemainingMovementPct": 69.0,
+      "dollarsPerPercent": 29.80149229246692,
+      "predictedRemainingUsd": 2056.3029681802177,
+      "actualRemainingUsd": 2315.9911176000055,
+      "signedRelativeErrorPct": -11.212830111753412
+    },
+    {
+      "at": "2026-07-20T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 4.0,
+      "realizedRemainingMovementPct": 67.0,
+      "dollarsPerPercent": 29.80149229246692,
+      "predictedRemainingUsd": 1996.6999835952838,
+      "actualRemainingUsd": 2266.906971100005,
+      "signedRelativeErrorPct": -11.919632827879337
+    },
+    {
+      "at": "2026-07-21T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 6.0,
+      "realizedRemainingMovementPct": 65.0,
+      "dollarsPerPercent": 29.80149229246692,
+      "predictedRemainingUsd": 1937.09699901035,
+      "actualRemainingUsd": 2189.4195585500033,
+      "signedRelativeErrorPct": -11.524632570047935
+    },
+    {
+      "at": "2026-07-22T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 12.0,
+      "realizedRemainingMovementPct": 59.0,
+      "dollarsPerPercent": 31.03114578695651,
+      "predictedRemainingUsd": 1830.8376014304342,
+      "actualRemainingUsd": 1990.3629272999972,
+      "signedRelativeErrorPct": -8.01488631452582
+    },
+    {
+      "at": "2026-07-23T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 24.0,
+      "realizedRemainingMovementPct": 47.0,
+      "dollarsPerPercent": 29.102848227659603,
+      "predictedRemainingUsd": 1367.8338667000014,
+      "actualRemainingUsd": 1663.3041704999978,
+      "signedRelativeErrorPct": -17.764057172487966
+    },
+    {
+      "at": "2026-07-24T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 46.0,
+      "realizedRemainingMovementPct": 25.0,
+      "dollarsPerPercent": 30.77968460989002,
+      "predictedRemainingUsd": 769.4921152472505,
+      "actualRemainingUsd": 946.7454541000025,
+      "signedRelativeErrorPct": -18.722386052674846
+    },
+    {
+      "at": "2026-07-26T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 5.0,
+      "realizedRemainingMovementPct": 72.0,
+      "dollarsPerPercent": 31.862151996155696,
+      "predictedRemainingUsd": 2294.0749437232103,
+      "actualRemainingUsd": 3556.671264150006,
+      "signedRelativeErrorPct": -35.49938205291341
+    },
+    {
+      "at": "2026-07-27T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 11.0,
+      "realizedRemainingMovementPct": 66.0,
+      "dollarsPerPercent": 51.418163804761825,
+      "predictedRemainingUsd": 3393.5988111142806,
+      "actualRemainingUsd": 3261.3801537000027,
+      "signedRelativeErrorPct": 4.054070705749441
+    },
+    {
+      "at": "2026-07-28T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 16.0,
+      "realizedRemainingMovementPct": 61.0,
+      "dollarsPerPercent": 51.331796948387016,
+      "predictedRemainingUsd": 3131.239613851608,
+      "actualRemainingUsd": 3005.6280209500064,
+      "signedRelativeErrorPct": 4.179212864201958
+    },
+    {
+      "at": "2026-07-29T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 29.0,
+      "realizedRemainingMovementPct": 48.0,
+      "dollarsPerPercent": 51.381072785965095,
+      "predictedRemainingUsd": 2466.2914937263245,
+      "actualRemainingUsd": 2336.9102992500066,
+      "signedRelativeErrorPct": 5.53642108205183
+    },
+    {
+      "at": "2026-07-30T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 34.0,
+      "realizedRemainingMovementPct": 43.0,
+      "dollarsPerPercent": 49.297549713433064,
+      "predictedRemainingUsd": 2119.7946376776217,
+      "actualRemainingUsd": 2149.80295825,
+      "signedRelativeErrorPct": -1.3958637677569177
+    },
+    {
+      "at": "2026-07-31T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 51.0,
+      "realizedRemainingMovementPct": 26.0,
+      "dollarsPerPercent": 48.923012016831706,
+      "predictedRemainingUsd": 1271.9983124376245,
+      "actualRemainingUsd": 1330.6587667999897,
+      "signedRelativeErrorPct": -4.408376950270563
+    },
+    {
+      "at": "2026-08-02T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 9.0,
+      "realizedRemainingMovementPct": 77.0,
+      "dollarsPerPercent": 33.11302021601651,
+      "predictedRemainingUsd": 2549.7025566332713,
+      "actualRemainingUsd": 3914.3561701500184,
+      "signedRelativeErrorPct": -34.86278596524461
+    },
+    {
+      "at": "2026-08-03T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 14.0,
+      "realizedRemainingMovementPct": 72.0,
+      "dollarsPerPercent": 54.44401879629634,
+      "predictedRemainingUsd": 3919.9693533333366,
+      "actualRemainingUsd": 3611.9121161500216,
+      "signedRelativeErrorPct": 8.528923940477178
+    },
+    {
+      "at": "2026-08-04T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 23.0,
+      "realizedRemainingMovementPct": 63.0,
+      "dollarsPerPercent": 53.044341639999935,
+      "predictedRemainingUsd": 3341.793523319996,
+      "actualRemainingUsd": 3153.4086830000097,
+      "signedRelativeErrorPct": 5.974006519851577
+    },
+    {
+      "at": "2026-08-05T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 35.0,
+      "realizedRemainingMovementPct": 51.0,
+      "dollarsPerPercent": 51.43519062318844,
+      "predictedRemainingUsd": 2623.1947217826105,
+      "actualRemainingUsd": 2572.3922934000016,
+      "signedRelativeErrorPct": 1.9749098344351654
+    },
+    {
+      "at": "2026-08-06T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 46.0,
+      "realizedRemainingMovementPct": 40.0,
+      "dollarsPerPercent": 50.458521309889825,
+      "predictedRemainingUsd": 2018.340852395593,
+      "actualRemainingUsd": 2051.0436502999983,
+      "signedRelativeErrorPct": -1.59444670519918
+    },
+    {
+      "at": "2026-08-07T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 60.0,
+      "realizedRemainingMovementPct": 26.0,
+      "dollarsPerPercent": 49.91973182689077,
+      "predictedRemainingUsd": 1297.9130274991599,
+      "actualRemainingUsd": 1376.6823262000019,
+      "signedRelativeErrorPct": -5.721675741873259
+    },
+    {
+      "at": "2026-08-09T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 5.0,
+      "realizedRemainingMovementPct": 78.0,
+      "dollarsPerPercent": 41.26687123418921,
+      "predictedRemainingUsd": 3218.8159562667583,
+      "actualRemainingUsd": 3872.9260095000154,
+      "signedRelativeErrorPct": -16.88929898554145
+    },
+    {
+      "at": "2026-08-10T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 14.0,
+      "realizedRemainingMovementPct": 69.0,
+      "dollarsPerPercent": 43.449436029629666,
+      "predictedRemainingUsd": 2998.011086044447,
+      "actualRemainingUsd": 3520.1926545000124,
+      "signedRelativeErrorPct": -14.833891769759772
+    },
+    {
+      "at": "2026-08-11T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 23.0,
+      "realizedRemainingMovementPct": 60.0,
+      "dollarsPerPercent": 44.728471646666755,
+      "predictedRemainingUsd": 2683.708298800005,
+      "actualRemainingUsd": 3100.369428850011,
+      "signedRelativeErrorPct": -13.439080071324073
+    },
+    {
+      "at": "2026-08-12T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 30.0,
+      "realizedRemainingMovementPct": 53.0,
+      "dollarsPerPercent": 47.79157791694931,
+      "predictedRemainingUsd": 2532.9536295983135,
+      "actualRemainingUsd": 2696.9084923500022,
+      "signedRelativeErrorPct": -6.0793632122394925
+    },
+    {
+      "at": "2026-08-13T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 40.0,
+      "realizedRemainingMovementPct": 43.0,
+      "dollarsPerPercent": 47.21075662784813,
+      "predictedRemainingUsd": 2030.0625349974694,
+      "actualRemainingUsd": 2241.9351540999983,
+      "signedRelativeErrorPct": -9.450434760125031
+    },
+    {
+      "at": "2026-08-14T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 54.0,
+      "realizedRemainingMovementPct": 29.0,
+      "dollarsPerPercent": 49.89966501775716,
+      "predictedRemainingUsd": 1447.0902855149575,
+      "actualRemainingUsd": 1437.1279624499996,
+      "signedRelativeErrorPct": 0.6932105786859957
+    },
+    {
+      "at": "2026-08-16T00:00:00+00:00",
+      "usable": true,
+      "path": "trailing_4wk_median",
+      "pNow": 7.0,
+      "realizedRemainingMovementPct": 74.0,
+      "dollarsPerPercent": 49.423095420298225,
+      "predictedRemainingUsd": 3657.3090611020684,
+      "actualRemainingUsd": 3770.292442950014,
+      "signedRelativeErrorPct": -2.996674225077969
+    },
+    {
+      "at": "2026-08-17T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 18.0,
+      "realizedRemainingMovementPct": 63.0,
+      "dollarsPerPercent": 51.62746467142869,
+      "predictedRemainingUsd": 3252.5302743000075,
+      "actualRemainingUsd": 3150.850310100014,
+      "signedRelativeErrorPct": 3.227064258624388
+    },
+    {
+      "at": "2026-08-18T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 25.0,
+      "realizedRemainingMovementPct": 56.0,
+      "dollarsPerPercent": 49.61921505102046,
+      "predictedRemainingUsd": 2778.676042857146,
+      "actualRemainingUsd": 2838.66017310001,
+      "signedRelativeErrorPct": -2.1131141660171764
+    },
+    {
+      "at": "2026-08-19T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 32.0,
+      "realizedRemainingMovementPct": 49.0,
+      "dollarsPerPercent": 50.317996931746066,
+      "predictedRemainingUsd": 2465.581849655557,
+      "actualRemainingUsd": 2469.3140385000097,
+      "signedRelativeErrorPct": -0.15114273787224408
+    },
+    {
+      "at": "2026-08-20T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 44.0,
+      "realizedRemainingMovementPct": 37.0,
+      "dollarsPerPercent": 52.636460628735605,
+      "predictedRemainingUsd": 1947.5490432632173,
+      "actualRemainingUsd": 1764.6449045000081,
+      "signedRelativeErrorPct": 10.364926014111205
+    },
+    {
+      "at": "2026-08-21T00:00:00+00:00",
+      "usable": true,
+      "path": "this_week",
+      "pNow": 55.0,
+      "realizedRemainingMovementPct": 26.0,
+      "dollarsPerPercent": 52.44510894770643,
+      "predictedRemainingUsd": 1363.572832640367,
+      "actualRemainingUsd": 1196.0725042000024,
+      "signedRelativeErrorPct": 14.004195218282181
+    }
+  ],
+  "summary": {
+    "medianAbsPct": 11.884706177239126,
+    "p90AbsPct": 57.55801688177735,
+    "worstAbsPct": 108.6419524071793,
+    "signedMedianPct": 3.4272297366682336,
+    "byPath": {
+      "this_week": {
+        "points": 86,
+        "medianAbsPct": 9.940668733820319,
+        "p90AbsPct": 47.28291336509667,
+        "worstAbsPct": 108.6419524071793,
+        "signedMedianPct": 4.1166417849757,
+        "overPredicted": 51
+      },
+      "trailing_4wk_median": {
+        "points": 24,
+        "medianAbsPct": 35.181084009079015,
+        "p90AbsPct": 84.91421485731787,
+        "worstAbsPct": 86.77393772110307,
+        "signedMedianPct": -7.718501011505355,
+        "overPredicted": 10
+      }
+    }
+  }
+}

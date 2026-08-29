@@ -1,5 +1,5 @@
 /// <reference types="node" />
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -346,4 +346,62 @@ describe('#255 global no-orphan-literal lint', () => {
     expect(/color-mix\(in srgb, var\(--accent-/.test(masked)).toBe(true);
     expect(/lint-allow:/.test(rawCss255)).toBe(true);
   });
+});
+
+// #661 S2 remediation, finding C1. `ForecastModal` shipped a heading with
+// `className="m-sec sec-quota"` and `index.css` had no `.m-sec.sec-quota`
+// rule at all, so the heading rendered in the inherited colour while every
+// sibling heading was tinted — and nothing errored, because an unmatched
+// modifier class is silent. This scans the client for every `sec-*` modifier
+// actually used beside `m-sec` and requires a rule for each, so the next one
+// fails here rather than shipping untinted.
+describe('#661 S2 — every m-sec accent modifier has a rule', () => {
+  const srcDir = resolve(process.cwd(), 'src');
+
+  function walk(dir: string): string[] {
+    const out: string[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = resolve(dir, entry.name);
+      if (entry.isDirectory()) out.push(...walk(full));
+      else if (/\.tsx?$/.test(entry.name)) out.push(full);
+    }
+    return out;
+  }
+
+  // NOT `ruleBody`: that helper matches `selector + " {"` literally, and the
+  // accent block aligns its opening braces with runs of spaces, so seven of
+  // the thirteen rules would read as absent. This matches the selector with
+  // whitespace tolerance instead.
+  function accentBody(name: string): string | null {
+    const re = new RegExp(`\\.m-sec\\.sec-${name}\\s*\\{([^}]*)\\}`);
+    const match = css.match(re);
+    return match ? match[1] : null;
+  }
+
+  const used = new Set<string>();
+  for (const file of walk(srcDir)) {
+    const text = readFileSync(file, 'utf8');
+    for (const m of text.matchAll(/m-sec\s+sec-([a-z0-9-]+)/g)) used.add(m[1]);
+  }
+
+  it('finds the modifiers the client actually uses', () => {
+    // Non-vacuity: an empty scan would satisfy every assertion below.
+    expect(used.size).toBeGreaterThanOrEqual(10);
+    expect(used.has('quota')).toBe(true);
+  });
+
+  it('resolves a rule that exists and refuses one that does not', () => {
+    // Non-vacuity for the matcher itself: a regex that matched nothing would
+    // report every modifier as missing, and one that matched anything would
+    // report none.
+    expect(accentBody('quota')).toMatch(/color:/);
+    expect(accentBody('no-such-accent')).toBeNull();
+  });
+
+  it.each([...used].sort())('.m-sec.sec-%s is defined and sets a colour',
+    (name) => {
+      const body = accentBody(name);
+      expect(body, `no .m-sec.sec-${name} rule in index.css`).not.toBeNull();
+      expect(body).toMatch(/color:/);
+    });
 });

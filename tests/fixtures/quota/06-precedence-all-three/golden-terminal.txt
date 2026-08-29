@@ -1,0 +1,35 @@
+cctally quota — weekly quota consumption and metering rate
+
+DATA
+  entries through            2026-08-28T00:30:00+00:00
+  analysis start             2026-07-25T00:00:00+00:00   (supported composition: 2026-07-25 onward)
+  eligible days              8   (4 withheld)
+
+CALIBRATION   effective blended weighted units per weekly point
+  fitted                     withheld: local-history-incomplete
+  The fitted value is not a provider budget. It is one effective blended rate,
+  valid for the observed model and token blend, and it is the provider's budget
+  minus an unmeasured, workload-dependent amount.
+
+CURRENT WEEK
+  window                     2026-08-22T08:00:00+00:00 .. 2026-08-29T08:00:00+00:00
+  observed meter             34%
+  modelled consumption       withheld: local-history-incomplete
+  headroom to 100%           withheld: local-history-incomplete
+  projection to week end     withheld: local-history-incomplete
+
+COMPOSITION SUPPORT   radii are EFFECTIVE: max(observed spread, materiality floor)
+  family radius              0.0200   (observed 0.0000)
+  token-class radius         0.0106   (observed 0.0000)
+  out-of-scope: claude-fable-5, claude-mythos-5 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled
+
+DETECTOR
+  split                      none
+  eligible days scanned      8   (Holm family 0)
+  baseline fit               withheld: insufficient-history  (no-confirmed-split)
+  successor fit              withheld: insufficient-history  (no-confirmed-split)
+
+VERDICT   withheld   (status local-history-incomplete, exit 3)
+  This is not a finding of no rate change. The evidence needed to decide is
+  missing, so no verdict is reported either way.
+exit: 3

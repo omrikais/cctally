@@ -3114,7 +3114,13 @@ class TestDashboardUpdateCheckThread:
         monkeypatch.setitem(ns, "UPDATE_DASHBOARD_CHECK_POLL_S", 0.05)
         monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
         called: list[int] = []
-        monkeypatch.setitem(ns, "_is_update_check_due", lambda cfg: False)
+        gate_checked = threading.Event()
+
+        def not_due(_cfg):
+            gate_checked.set()
+            return False
+
+        monkeypatch.setitem(ns, "_is_update_check_due", not_due)
         monkeypatch.setitem(
             ns, "_do_update_check", lambda: called.append(1)
         )
@@ -3123,8 +3129,9 @@ class TestDashboardUpdateCheckThread:
         stop_event = threading.Event()
         t = ns["_DashboardUpdateCheckThread"](stop_event)
         t.start()
-        # Let it tick a couple of times.
-        time.sleep(0.2)
+        assert gate_checked.wait(PRESENCE_BACKSTOP_SECONDS), (
+            "update-check thread never evaluated the not-due gate"
+        )
         stop_event.set()
         # timing-budget: the update-check thread has exited now that `stop_event` is set, so `called` is final
         t.join(timeout=PRESENCE_BACKSTOP_SECONDS)

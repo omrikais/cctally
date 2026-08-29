@@ -321,6 +321,11 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     "_cctally_five_hour.py": 1,
     "_cctally_journal.py": 18,
     "_cctally_pricing_check.py": 1,
+    # One, in `_read_stats_component`: a single `SELECT {column} FROM
+    # {table}` shared by `week_reset_events` and `weekly_credit_floors`,
+    # the two authoritative credit tables. Neither is a projection table,
+    # so no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
+    "_cctally_quota_model.py": 1,
     "_cctally_quota.py": 1,
     "_cctally_record.py": 1,
     "_cctally_release.py": 4,
@@ -331,6 +336,14 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     "_lib_doctor.py": 1,
     "_lib_snapshot_cache.py": 1,
     "_lib_subscription_weeks.py": 1,
+    # NOT a read. `bin/_lib_test_estate.py` opens no database and issues no SQL;
+    # it is the #648 estate checker, and its one match is the English message
+    # `f"moved from {was!r} to {SKIPPED!r}"`, which the case-insensitive
+    # `FROM\s+{` pattern cannot tell from a dynamic target. Recorded rather than
+    # reworded, because the count is what makes a new match visible: if a real
+    # dynamic read ever arrives in that module the count moves to 2 and this
+    # guard reports it.
+    "_lib_test_estate.py": 1,
 }
 
 #: The dynamic-target reads that provably reach a projection family, named by

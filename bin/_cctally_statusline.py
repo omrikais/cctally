@@ -1857,6 +1857,39 @@ def _build_statusline_injections(warn_once):
             return None
         return ctx_tokens / window * 100.0
 
+    def _quota_regimes() -> tuple:
+        """#661 S2 §9. The stored metering regimes, read without mutating.
+
+        Three properties this read must have, and each is a decision:
+
+        * It takes NO flock and NO throttle. `save_calibrations` writes
+          through `os.replace` in the same directory, so a lock-free reader
+          always sees a complete old or new inode; a flock here would let a
+          writer stall a prompt.
+        * It goes through `read_stored_state_readonly`, not through
+          `load_calibrations`. The loader renames a malformed or
+          version-ahead file aside through `_quarantine`, and a status line
+          that quarantines the user's calibration once per prompt would be a
+          writer on the hottest path in the product.
+        * It catches `OSError` on the open and the read rather than
+          pre-checking existence, which `read_stored_state_readonly` already
+          does — a quarantine rename can remove the primary name between a
+          check and an open, and the reader cannot tell "quarantined" from
+          "absent" without scanning sidecars. It does not scan them; both
+          render the same thing, which is no marker.
+
+        It also NEVER opens `cache.db` and never calls `analyse`. The
+        marker is derived from the regime pair alone.
+        """
+        try:
+            glue = _cctally()._load_sibling("_cctally_quota_model")
+            state = glue.read_stored_state_readonly()
+            if state is None:
+                return ()
+            return tuple(glue.stored_regimes(state, None))
+        except Exception:                              # noqa: BLE001
+            return ()
+
     return _lib_statusline.StatuslineInjections(
         cctally_session_cost=_cctally_session_cost,
         today_cost=_today_cost,
@@ -1865,4 +1898,5 @@ def _build_statusline_injections(warn_once):
         db_latest_rate_limits=_db_latest_rate_limits,
         context_pct=_context_pct,
         warn_once=warn_once,
+        quota_regimes=_quota_regimes,
     )

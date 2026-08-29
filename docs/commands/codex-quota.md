@@ -25,6 +25,8 @@ COMMON = [--root-key FULL_SOURCE_ROOT_KEY]
 ## Local-rollout data and freshness
 
 These commands read quota observations retained from local Codex rollout files.
+The observation is the `payload.info.rate_limits` object on a rollout record; a
+record without that field carries no quota window and contributes nothing.
 By default they first run one Codex cache sync; `--no-sync` reads the retained
 local evidence without that sync. Either path reconciles the durable quota
 projection before rendering, so a previously interrupted cache/stats update can

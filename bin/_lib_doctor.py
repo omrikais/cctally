@@ -141,6 +141,23 @@ class DoctorState:
     # token_total); the kernel only reads `.kind`/`.model`/`.entry_count`/
     # `.token_total`, so any duck-typed equivalent works for tests.
     pricing_coverage: Optional[list] = None
+    # #661 S2 §7. The `quota` category's whole input, gathered through the
+    # §1.1 NON-MUTATING reader rather than `load_calibrations`, which renames
+    # a malformed or version-ahead file aside through `_quarantine` and would
+    # make a documented read-only command a writer.
+    #
+    # `quota_calibration` is `{"rejection": str | None, "status": str | None,
+    # "present": bool}`; `None` means the gather could not run at all (an
+    # import failure or a hand-built state), which reads as OK-with-detail
+    # exactly as `pricing_coverage is None` does.
+    #
+    # `quota_rate_change` is `{"active": bool, "effective_from": str | None,
+    # "previous_units_per_point": float | None,
+    # "new_units_per_point": float | None}` — §6.6's DERIVED marker
+    # predicate, which is "the active open regime has a confirmed
+    # predecessor" and requires no new durable state.
+    quota_calibration: Optional[dict] = None
+    quota_rate_change: Optional[dict] = None
     # Conversation viewer (Plan 2, spec §5): the resolved
     # `dashboard.expose_transcripts` opt-in. Only consequential when the bind
     # is LAN — `_check_safety_dashboard_bind` then surfaces an extra
@@ -952,7 +969,7 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
             # current index as a mismatch; keep this in lockstep with core
             # (#496 S5b §6.1). It stays a literal because this kernel is pure and
             # must not import `_cctally_core`.
-            epoch = 1010
+            epoch = 1011
         mismatch = uv > legacy_head and uv != epoch
         return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
                 "mismatch": mismatch}
@@ -1166,6 +1183,24 @@ def _check_data_codex_cache(s: DoctorState) -> CheckResult:
         remediation=None,
         details={"entries": count, "codex_last_entry_age_s": age_s},
     )
+
+
+def _utc_day_label(stamp: object) -> str:
+    """One ISO stamp as its UTC calendar day, or `""` when unusable.
+
+    A text slice is not this: `"2026-08-25T23:00:00+02:00"[:10]` is
+    `2026-08-25` where the UTC day is the 25th only by luck of the offset,
+    and the store holds mixed offset spellings.
+    """
+    if not stamp:
+        return ""
+    try:
+        parsed = dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%d")
 
 
 def _age_seconds(stamp: object, now_utc: dt.datetime) -> Optional[int]:
@@ -3535,6 +3570,15 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
     ("pricing", "Pricing", (
         ("pricing.coverage", "_check_pricing_coverage"),
     )),
+    # #661 S2 §7. NEITHER check can FAIL, so `doctor`'s exit code is
+    # unaffected — the same posture `pricing.coverage` and
+    # `data.parse_health` take. A metering-rate change is the provider's
+    # behaviour, not a cctally malfunction, and an absent calibration is the
+    # ordinary state of an install that has never run `cctally quota`.
+    ("quota", "Quota", (
+        ("quota.meter_drift", "_check_quota_meter_drift"),
+        ("quota.calibration", "_check_quota_calibration"),
+    )),
     ("safety", "Safety", (
         ("safety.dashboard_bind", "_check_safety_dashboard_bind"),
         ("safety.backup_sync", "_check_safety_backup_sync"),
@@ -3547,6 +3591,120 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("telemetry.state", "_check_telemetry"),
     )),
 )
+
+
+#: Which `RegimeRejection` values are a WARNing rather than an ordinary
+#: state. §7: stale means a fingerprint or algorithm-revision mismatch, NOT
+#: calendar age — S1 defines no age — so a calibration fitted in January under
+#: the current constants is healthy and one fitted yesterday under other
+#: constants is not.
+_QUOTA_CALIBRATION_WARN: dict = {
+    "calibration-schema-version":
+        "the stored calibration is from a newer cctally",
+    "calibration-fingerprint-mismatch":
+        "the stored calibration was fitted under other constants",
+    "calibration-revision-mismatch":
+        "the stored calibration was fitted by an earlier algorithm",
+    "calibration-malformed": "the stored calibration could not be parsed",
+    "calibration-unreadable": "the stored calibration could not be read",
+}
+
+#: The rejections that are ordinary rather than a problem. An
+#: already-quarantined file is reported simply as a missing primary: the
+#: reader cannot tell it from an absent one without scanning sidecars, and it
+#: does not scan them.
+_QUOTA_CALIBRATION_OK: dict = {
+    "calibration-absent": "no calibration fitted yet",
+    "calibration-detection-only":
+        "a metering-rate change is fitted but not yet predictive",
+}
+
+
+def _check_quota_calibration(s: DoctorState) -> CheckResult:
+    """WARN on an unreadable, version-ahead or fingerprint-mismatched
+    calibration; OK on an absent one or one with insufficient history.
+
+    It cannot FAIL. Every state it reports is either normal or self-correcting
+    on the next `cctally quota` run, and `doctor` FAIL exits 2.
+    """
+    state = s.quota_calibration
+    if not state:
+        return CheckResult(
+            id="quota.calibration", title="Calibration",
+            severity="ok", summary="not assessed",
+            remediation=None,
+            details={"rejection": None, "status": None, "present": False},
+        )
+    rejection = state.get("rejection")
+    details = {
+        "rejection": rejection,
+        "status": state.get("status"),
+        "present": bool(state.get("present")),
+    }
+    if rejection is None:
+        return CheckResult(
+            id="quota.calibration", title="Calibration",
+            severity="ok", summary="fitted and usable",
+            remediation=None, details=details,
+        )
+    warn = _QUOTA_CALIBRATION_WARN.get(str(rejection))
+    if warn is not None:
+        return CheckResult(
+            id="quota.calibration", title="Calibration",
+            severity="warn", summary=warn,
+            remediation="Run `cctally quota` to refit it.",
+            details=details,
+        )
+    return CheckResult(
+        id="quota.calibration", title="Calibration",
+        severity="ok",
+        summary=_QUOTA_CALIBRATION_OK.get(
+            str(rejection), "no usable calibration"),
+        remediation=None, details=details,
+    )
+
+
+def _check_quota_meter_drift(s: DoctorState) -> CheckResult:
+    """OK-with-detail, stating whether §6.6's marker predicate holds.
+
+    The predicate is DERIVED, never stored: the active open regime has a
+    confirmed predecessor, and the marker shows for the whole of that
+    successor regime. A rate change is the provider's behaviour rather than a
+    cctally malfunction, so this check states it and never warns.
+    """
+    state = s.quota_rate_change
+    if not state:
+        return CheckResult(
+            id="quota.meter_drift", title="Metering rate",
+            severity="ok", summary="not assessed",
+            remediation=None, details={"active": False},
+        )
+    details = {
+        "active": bool(state.get("active")),
+        "effective_from": state.get("effective_from"),
+        "previous_units_per_point": state.get("previous_units_per_point"),
+        "new_units_per_point": state.get("new_units_per_point"),
+    }
+    if not details["active"]:
+        return CheckResult(
+            id="quota.meter_drift", title="Metering rate",
+            severity="ok", summary="no change detected",
+            remediation=None, details=details,
+        )
+    # The stamp is a clock INSTANT, so a bare `YYYY-MM-DD` slice of its text
+    # names the UTC calendar day while reading as the user's own (#661 S2
+    # Stage C review, F8). This kernel has no display-timezone plumbing —
+    # every other datetime it emits is UTC through `_iso_z` — so the day is
+    # parsed rather than sliced, normalized to UTC, and LABELLED as UTC.
+    effective = _utc_day_label(details["effective_from"])
+    summary = (f"rate changed {effective} UTC" if effective
+               else "rate changed")
+    return CheckResult(
+        id="quota.meter_drift", title="Metering rate",
+        severity="ok", summary=summary,
+        remediation="Run `cctally quota` for the fitted budget.",
+        details=details,
+    )
 
 
 def _evaluate_one(check_id: str, check_fn_name: str,

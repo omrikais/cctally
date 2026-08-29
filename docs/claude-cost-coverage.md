@@ -33,7 +33,9 @@ Because these records do not carry model or token counts, cctally cannot
 reconstruct their cost, synthesize a safe model row, or historically backfill
 them. The size of the gap varies with behavior and version. A measurement from
 one session is not a universal correction factor, so cctally does not apply a
-percentage uplift or estimate the missing amount.
+percentage uplift or estimate the missing amount on any COST surface.
+
+That refusal is scoped to cost, and the scope is the reason rather than an exception to it. What it forbids is applying one session's measured shortfall to everybody else's dollars as though it were a constant. A per-user fit is not that: `cctally quota` fits a units-per-point value from the user's OWN retained history and applies it to nobody else, so it satisfies the stated reason rather than working around it. That command discloses the same gap in its own terms — its fitted value is the provider's budget minus an unmeasured, workload-dependent amount — and it publishes no cost figure at all. See `docs/commands/quota.md`.
 
 ## Affected surfaces
 

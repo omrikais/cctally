@@ -11,7 +11,15 @@ import {
 import { alertDisplay } from '../lib/alertIdentity';
 import { AlertFollowCell } from './AlertFollow';
 import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
-import type { AlertEntry, CodexAlertRow, ClaudeAlertSourceRow, SourceAlertRow } from '../types/envelope';
+import { rateChangeSummary } from '../lib/quotaCopy';
+import { isMeterRateChangePayload } from '../store/store';
+import type {
+  AlertEntry,
+  CodexAlertRow,
+  ClaudeAlertSourceRow,
+  MeterRateChangeEntry,
+  SourceAlertRow,
+} from '../types/envelope';
 
 // Normalize a toast payload (a legacy AlertEntry from SHOW_ALERT_TOAST /
 // INGEST_SNAPSHOT_ALERTS, or a source-qualified row from INGEST_SOURCE_ALERTS)
@@ -145,6 +153,47 @@ function CodexToastBody({ row }: { row: CodexAlertRow }): JSX.Element {
   );
 }
 
+// #661 S2 section 6.1 — the non-threshold family's OWN toast branch, on the
+// variant tag. It is not a widening of the threshold body: there is no
+// threshold to name, no threshold-derived severity, and no window to follow,
+// so the head renders the family's explicit severity and the body states the
+// direction and size of the change plus the one command that explains it.
+function RateChangeToast({
+  entry,
+  onDismiss,
+}: {
+  entry: MeterRateChangeEntry;
+  onDismiss: () => void;
+}): JSX.Element {
+  const summary = rateChangeSummary(
+    entry.previous_units_per_point, entry.new_units_per_point,
+  );
+  const provider = entry.provider
+    ? entry.provider.charAt(0).toUpperCase() + entry.provider.slice(1)
+    : 'Provider';
+  return (
+    <div
+      className={`toast toast--alert toast--severity-${entry.severity}`}
+      role="alert"
+      onClick={onDismiss}
+      data-testid="toast-meter-rate-change"
+    >
+      <div className="toast--alert-head">
+        <span className="chip chip-rate-change">metering rate</span>
+        <span className={`source-chip source-chip--${entry.provider}`}>
+          {provider}
+        </span>
+        <span className="toast--alert-dismiss-hint">click to dismiss</span>
+      </div>
+      <div className="toast--alert-title">{provider} metering rate changed</div>
+      {summary && <div className="toast--alert-sub">{summary}</div>}
+      <div className="toast--alert-body">
+        Run <code>cctally quota</code> for the fitted budget and its evidence.
+      </div>
+    </div>
+  );
+}
+
 export function Toast() {
   const toast = useSyncExternalStore(subscribeStore, () => getState().toast);
   const env = useScopedSnapshot();
@@ -161,7 +210,16 @@ export function Toast() {
     return () => window.clearTimeout(id);
   }, [toast]);
 
-  const alertPayload = toast?.kind === 'alert' ? normalizeToastRow(toast.payload) : null;
+  const rawPayload = toast?.kind === 'alert' ? toast.payload : null;
+  // Branch on the variant tag BEFORE normalizing. `normalizeToastRow` maps a
+  // payload onto a threshold-shaped row, and a rate transition has no
+  // threshold to map.
+  const rateChange =
+    rawPayload && isMeterRateChangePayload(rawPayload) ? rawPayload : null;
+  const alertPayload =
+    rawPayload != null && !isMeterRateChangePayload(rawPayload)
+      ? normalizeToastRow(rawPayload)
+      : null;
   const d = alertPayload ? alertDisplay(alertPayload) : null;
 
   return (
@@ -174,6 +232,12 @@ export function Toast() {
         <div className="toast" role="status" aria-live="polite">
           {toast.text}
         </div>
+      )}
+      {rateChange && (
+        <RateChangeToast
+          entry={rateChange}
+          onDismiss={() => dispatch({ type: 'HIDE_TOAST' })}
+        />
       )}
       {alertPayload && d && (
         <div

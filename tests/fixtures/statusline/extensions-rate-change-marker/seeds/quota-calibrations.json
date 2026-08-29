@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "accounts": {
+    "*": {
+      "regimes": [
+        {
+          "effectiveFrom": "2026-04-25T00:00:00+00:00",
+          "effectiveUntil": "2026-05-20T00:00:00+00:00",
+          "unitsPerPoint": 2442620.0,
+          "status": "ok"
+        },
+        {
+          "effectiveFrom": "2026-05-20T00:00:00+00:00",
+          "effectiveUntil": null,
+          "unitsPerPoint": 1685000.0,
+          "status": "insufficient-history"
+        }
+      ]
+    }
+  }
+}

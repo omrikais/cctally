@@ -1,0 +1,139 @@
+{
+  "declarations": [
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0001",
+      "predecessorDigest": "e52307c5043970152ac7f8d453ad996b1efd1657b3daa099617be3344e80cd52",
+      "profile": "public",
+      "reason": "The seven tests these identifiers name load or execute a mirror-private generator script, so a public clone could not run them: inside a real public projection of this tree they failed with FileNotFoundError. They were moved into a mirror-private test module and are therefore collected under new identifiers in the private profile only. The move was NOT verbatim, and the difference is recorded here rather than glossed: two bodies are byte-identical, four changed cosmetically (an import hoisted to module scope, an unused tmp_path fixture dropped, a path literal replaced by a module constant, and one call updated for a helper signature that changed under it), and one changed semantically - test_the_generator_declares_the_two_execution_legs_the_aggregator_runs replaced a pytest.skip guard on the aggregator being absent with an assertion that the aggregator is present. The cause is retired rather than reclassified because these exact identifiers exist in neither profile after the move.",
+      "rows": [
+        "tests/test_estate_manifest.py::test_the_artifacts_the_generator_writes_do_not_block_a_regeneration",
+        "tests/test_estate_manifest.py::test_the_generator_declares_the_two_execution_legs_the_aggregator_runs",
+        "tests/test_estate_manifest.py::test_the_generator_refuses_a_ref_that_is_not_head",
+        "tests/test_estate_manifest.py::test_the_generator_refuses_an_unauthorized_shrink",
+        "tests/test_estate_manifest.py::test_the_generator_refuses_to_describe_a_tree_it_is_not_looking_at",
+        "tests/test_estate_manifest.py::test_the_generator_takes_no_force_flag_anywhere_in_its_parser",
+        "tests/test_estate_manifest.py::test_the_generators_refusal_actually_refuses_and_names_the_rows"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0003",
+      "predecessorDigest": "e52307c5043970152ac7f8d453ad996b1efd1657b3daa099617be3344e80cd52",
+      "profile": "public",
+      "reason": "This test asserted that both declaration ledgers were empty, which was true only while they were newly seeded. The split above put the first two declarations in them, so the test was renamed to test_the_committed_ledgers_load_and_carry_validated_declarations and now asserts that every committed declaration validates and that no identifier is reused across the two files. The old identifier is retired because a renamed test is a new identifier, not a moved one.",
+      "rows": [
+        "tests/test_estate_manifest.py::test_the_seeded_ledgers_are_present_and_empty"
+      ]
+    },
+    {
+      "axis": "suppressions",
+      "cause": "retired",
+      "id": "R-0005",
+      "predecessorDigest": "e52307c5043970152ac7f8d453ad996b1efd1657b3daa099617be3344e80cd52",
+      "profile": "public",
+      "reason": "No suppression was added. A suppression key carries the name of the test that encloses it, and this skip moved from test_the_seeded_ledgers_are_present_and_empty to test_the_committed_ledgers_load_and_carry_validated_declarations when that test was renamed, so one key left the axis and an identical one arrived. The skip itself is unchanged and still guards the same thing: tests/authoritative-estate-retirements.private.json is mirror-private, so a public clone has no such file to load.",
+      "rows": [
+        "tests/test_estate_manifest.py::test_the_committed_ledgers_load_and_carry_validated_declarations::skip_call::not path.exists()"
+      ]
+    },
+    {
+      "axis": "suppressions",
+      "cause": "retired",
+      "id": "R-0007",
+      "predecessorDigest": "4ace4eb190c9629320c5815f8520a86703c1d4cf81b39424bb1d3e04619de838",
+      "profile": "public",
+      "reason": "Nothing was retired, and the cause says otherwise only because the vocabulary has no other word: an addition is the harmful direction on this axis, and the two causes are 'retired' and 'reclassified', neither of which describes a suppression that arrived. #648 D3a records that wart and this entry is an instance of it. What actually changed: two tests added to tests/test_authoritative_test_contract.py call that module's own _tier_estate fixture builder, which reaches a conditional pytest.skip guarding the maintainer-local allowlist classifier. The skip fires only where that classifier is absent, which is a public clone, and it is the same guard every other case in that module already carries. No test was weakened and no coverage was suppressed on a tree that can run it.",
+      "rows": [
+        "tests/test_authoritative_test_contract.py::test_a_tier_run_runs_the_estate_check::helper_call::helper=test_authoritative_test_contract._tier_estate",
+        "tests/test_authoritative_test_contract.py::test_an_estate_inability_aborts_an_authoritative_run::helper_call::helper=test_authoritative_test_contract._tier_estate"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0009",
+      "predecessorDigest": "4ef7fca7360b4f159f4f92379c9010b0b05e9f3634d9ba6ae0199d32b3c548df",
+      "profile": "public",
+      "reason": "The test was renamed, and a renamed test is a new identifier rather than a moved one. It is now test_plan_execution_collapses_two_selectors_that_name_the_same_node, whose name describes what its body actually asserts: an overlap WITHIN one leg's selector list is accepted and collapsed, because a leg's share is a set. The old name promised a refusal the body never asserted, which a review found. The refusal that does exist is between legs, and it is now pinned by the new test_plan_execution_refuses_a_node_two_legs_both_claim. No coverage was retired: the body is unchanged and one case was added beside it. The cause is retired rather than reclassified because this exact identifier exists in neither profile after the rename.",
+      "rows": [
+        "tests/test_estate_manifest.py::test_plan_execution_refuses_overlapping_leg_shares"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0012",
+      "predecessorDigest": "49974415a28e82782e70b1cfe2103a8d32bc1fa6ab660520121b672d9c685be1",
+      "profile": "public",
+      "reason": "Three renames, no retired coverage, all caused by #661 S2's own changes. (1) test_writable_leaves_are_exactly_the_eighteen_the_endpoint_writes is now test_writable_leaves_are_exactly_the_nineteen_the_endpoint_writes, because S2 added alerts.rate_change_enabled as the nineteenth WRITABLE leaf. The count is in the name, so the name had to move with it. The body is unchanged and asserts the same property against the larger set, and a second test added beside it (test_every_writable_leaf_reaches_config_json) now drives every WRITABLE leaf through the real endpoint and asserts the value lands in config.json -- which is the hole the old test left open and a browser QA pass found: the contract listed the key as writable while POST /api/settings silently dropped it. (2) and (3) test_live_ingest_acquires_maintenance_before_ingest_lock[0-1010] and [1010-1010] are the SAME test with the same three cases. It parametrizes on CURRENT_EPOCH, which S2 raised from 1010 to 1011 for the new meter_rate_change_events table, so pytest derives the ids [0-1011] and [1011-1011] instead. No case was removed: the third id, [0-0], is a literal and is unchanged in both profiles. The cause is retired rather than reclassified because these exact identifiers exist in neither profile afterwards, which is the same reading R-0003 and R-0009 took of a rename. Worth recording for the next reader: three code reviews checked this branch for removed or renamed nodes by grepping the diff for '^-def test' and reported zero. That method cannot see (2) or (3) at all, because the def line never changed -- only a constant the parametrize reads. The gate is what caught them.",
+      "rows": [
+        "tests/test_config_settings_contract.py::test_writable_leaves_are_exactly_the_eighteen_the_endpoint_writes",
+        "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1010]",
+        "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1010-1010]"
+      ]
+    },
+    {
+      "axis": "frontendTests",
+      "cause": "retired",
+      "id": "R-0014",
+      "predecessorDigest": "49974415a28e82782e70b1cfe2103a8d32bc1fa6ab660520121b672d9c685be1",
+      "profile": "public",
+      "reason": "A rename, not a retirement, and the successor is three lines away. The vitest case 'declares thirteen server fields, three browser fields and two staged actions' is now 'declares fourteen server fields, ...' at dashboard/web/src/components/SettingsOverlay.model.test.tsx:400, because #661 S2 added the alerts.rate_change_enabled row to SETTINGS_MANIFEST and the registry. The count is in the case name, so the name moved with the count; the body is otherwise unchanged and asserts the same registry shape against fourteen fields. The browser-field and staged-action counts are untouched. The cause is retired rather than reclassified because this exact identifier exists in neither profile afterwards.",
+      "rows": [
+        "vitest::src/components/SettingsOverlay.model.test.tsx::registry structure > declares thirteen server fields, three browser fields and two staged actions"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "reclassified",
+      "id": "R-0016",
+      "predecessorDigest": "b0789ba27dcb1e08b004d824c85e6159c393206a9424693645c84364fe8371aa",
+      "profile": "public",
+      "reason": "Reclassified, not retired: all 27 identifiers still exist and still run, in the private profile only. The module moved there because it reads docs/superpowers/specs/2026-08-28-661-s2-quota-insight-surfaces.md at line 26, and docs/superpowers is mirror-private, so a public clone would collect these tests and fail on a file it does not carry. The authoritative full-suite run found exactly that, through tests/test_public_test_dep_closure.py::test_no_public_test_references_private_paths_at_runtime. The dependency is deliberate and is the point of the module: it PARSES the spec's own section 2.1 sentence and asserts the committed baseline artifact's summary matches it, so the artifact and the prose describing it cannot drift apart. An earlier revision hand-copied those figures into a dict instead, and the prose became a third copy nothing checked. The two rejected alternatives the closure test's own message offers are worse here: allowlisting docs/superpowers would publish the design record, and gating the read on .exists() would leave the module collected in public while asserting nothing, and would add a suppression, which is the harmful direction on that axis and would need its own ledger entry. The cause is reclassified rather than retired because every row below is present in the private profile, which is the condition the generator checks before accepting this cause.",
+      "rows": [
+        "tests/test_quota_budget_error_harness.py::test_a5_an_artifact_from_a_populated_store_validates",
+        "tests/test_quota_budget_error_harness.py::test_a5_coalescing_does_not_chain_a_stray_into_the_following_week",
+        "tests/test_quota_budget_error_harness.py::test_a5_coalescing_keeps_two_weeks_a_reset_event_separates",
+        "tests/test_quota_budget_error_harness.py::test_a5_coalescing_merges_hour_shifted_replicas_of_one_week",
+        "tests/test_quota_budget_error_harness.py::test_a5_coalescing_never_merges_consecutive_weeks",
+        "tests/test_quota_budget_error_harness.py::test_a5_coalescing_refuses_a_component_holding_a_separated_pair",
+        "tests/test_quota_budget_error_harness.py::test_a5_harness_measures_a_populated_store",
+        "tests/test_quota_budget_error_harness.py::test_a5_harness_refuses_a_store_that_does_not_exist",
+        "tests/test_quota_budget_error_harness.py::test_a5_harness_refuses_an_empty_store_rather_than_reporting_zero",
+        "tests/test_quota_budget_error_harness.py::test_a5_harness_rejects_an_unparseable_clock",
+        "tests/test_quota_budget_error_harness.py::test_a5_harness_writes_the_artifact_where_it_is_told",
+        "tests/test_quota_budget_error_harness.py::test_a5_prerepair_is_derived_rather_than_asserted",
+        "tests/test_quota_budget_error_harness.py::test_a5_prerepair_is_undecided_when_the_probe_cannot_reach_the_branch",
+        "tests/test_quota_budget_error_harness.py::test_a5_prerepair_is_undecided_when_the_probe_raises",
+        "tests/test_quota_budget_error_harness.py::test_a5_the_baseline_artifact_is_committed",
+        "tests/test_quota_budget_error_harness.py::test_a5_the_baseline_carries_its_measured_rows",
+        "tests/test_quota_budget_error_harness.py::test_a5_the_baseline_matches_the_harness_artifact_schema",
+        "tests/test_quota_budget_error_harness.py::test_a5_the_baseline_names_the_branch_the_error_is_concentrated_in",
+        "tests/test_quota_budget_error_harness.py::test_a5_the_baseline_records_how_it_coalesced_its_weeks",
+        "tests/test_quota_budget_error_harness.py::test_a5_the_baseline_records_its_reset_scoping_and_provenance",
+        "tests/test_quota_budget_error_harness.py::test_a5_the_baseline_summary_matches_the_specs_measured_figures",
+        "tests/test_quota_budget_error_harness.py::test_a5_the_postrepair_artifact_is_committed",
+        "tests/test_quota_budget_error_harness.py::test_a5_the_postrepair_artifact_matches_the_harness_schema",
+        "tests/test_quota_budget_error_harness.py::test_a5_the_postrepair_branch_figures_match_the_spec",
+        "tests/test_quota_budget_error_harness.py::test_a5_the_postrepair_summary_matches_the_specs_stated_figures",
+        "tests/test_quota_budget_error_harness.py::test_a5_the_repaired_branch_improves_on_every_one_of_its_statistics",
+        "tests/test_quota_budget_error_harness.py::test_a5_the_two_artifacts_measure_the_same_population"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0017",
+      "predecessorDigest": "9f58a2c9a93e889a72b66d8e1af4af86a96c5970e955b637520fe84128e67aec",
+      "profile": "public",
+      "reason": "A rename, not retired coverage. test_the_remedy_states_the_prune_gap_conditionally is now test_the_remedy_distinguishes_targeted_unlink_from_recursive_pruning because the old name described conditional output while the body asserted a static remedy block. The successor still covers the same missing-path distinction and now also pins the clarified wording that separates targeted optional-golden unlinking from recursive pruning. Four focused regression tests were added beside it for the remaining diagnostic behaviors. The cause is retired because the old identifier exists in neither profile after the rename.",
+      "rows": [
+        "tests/test_fixture_builder_contract.py::test_the_remedy_states_the_prune_gap_conditionally"
+      ]
+    }
+  ],
+  "schemaVersion": 1
+}

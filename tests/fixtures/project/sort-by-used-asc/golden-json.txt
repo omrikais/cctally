@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "rangeStart": "2026-04-13",
   "rangeEnd": "2026-04-15",
   "weeksInRange": 1,
@@ -8,6 +8,17 @@
     "costUsd": 9.0,
     "usedPercent": 50.0,
     "weeklyAttributionAvailable": true
+  },
+  "attribution": {
+    "basis": "cost-share",
+    "cause": "calibration-absent",
+    "totals": {
+      "modelledWeekPoints": null,
+      "visibleRowPoints": null,
+      "filteredOrUnmodelledPoints": null,
+      "observedMinusModelledPoints": null,
+      "residualCause": "population-misaligned"
+    }
   },
   "projects": [
     {
@@ -23,7 +34,8 @@
       "cacheReadTokens": 0,
       "costUsd": 1.5,
       "attributedUsedPercent": 8.3333,
-      "costPerPercent": 0.18
+      "costPerPercent": 0.18,
+      "attributionBasis": "cost-share"
     },
     {
       "displayKey": "alpha-big",
@@ -38,7 +50,8 @@
       "cacheReadTokens": 0,
       "costUsd": 7.5,
       "attributedUsedPercent": 41.6667,
-      "costPerPercent": 0.18
+      "costPerPercent": 0.18,
+      "attributionBasis": "cost-share"
     }
   ],
   "warnings": []

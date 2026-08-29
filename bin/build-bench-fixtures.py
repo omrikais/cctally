@@ -828,7 +828,17 @@ def _marker_payload(cctally, *, seed, scale, identity_root=None) -> dict:
         # Falling back to {} gave every unknown scale ONE shared params_hash,
         # so two different unknown scales collided in the marker.
         raise ValueError(f"unknown scale {scale!r}; choose from {sorted(SCALES)}")
-    payload = {"seed": int(seed), "scale": str(scale), "pricing_date": pricing_date}
+    payload = {
+        "seed": int(seed),
+        "scale": str(scale),
+        "pricing_date": pricing_date,
+        # stats.db is copied with the cached corpus. A different checkout can
+        # share this machine-global root while carrying another disposable
+        # index epoch, so accepting its marker would hand the caller a
+        # version-mismatched index and defer the first product read to a
+        # background rebuild.
+        "stats_epoch": cctally._cctally_core.STATS_INDEX_EPOCH,
+    }
     params = SCALES[scale]
     # Every scale carries a params_hash (#583 S1). Previously only the ladder
     # scales did, so changing `small` or `large` cardinality or provider content
@@ -1000,9 +1010,10 @@ def _build_fixture(*, scale: str, seed: int, root,
     via ``sync_cache`` and ``conversations.db`` via
     ``sync_claude_conversations``, and returns ``root/data`` (the resolved
     ``CCTALLY_DATA_DIR``). Idempotent: if a marker records a matching
-    ``(seed, scale, pricing_date)`` and ``cache.db`` exists, the JSONL-emit +
-    ``sync_cache`` are skipped (a ``large`` rebuild is slow), but env is still
-    pinned + paths re-resolved so callers can open the cache immediately."""
+    ``(seed, scale, pricing_date, stats_epoch)`` and ``cache.db`` exists, the
+    JSONL-emit + ``sync_cache`` are skipped (a ``large`` rebuild is slow), but
+    env is still pinned + paths re-resolved so callers can open the cache
+    immediately."""
     if scale not in SCALES:
         raise ValueError(f"unknown scale {scale!r}; choose from {sorted(SCALES)}")
     root = pathlib.Path(root)

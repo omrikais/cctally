@@ -16,9 +16,10 @@ Accounts
   ⚠ Codex reset anchors      1 Codex quota observation(s) lack a canonical reset anchor
       → Run `cctally cache-sync --source codex --rebuild`
 Pricing
+Quota
 Safety
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 57 OK · 5 WARN · 0 FAIL
+Summary: 59 OK · 5 WARN · 0 FAIL

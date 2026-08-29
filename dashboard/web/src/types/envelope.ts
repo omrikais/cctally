@@ -103,6 +103,13 @@ export interface Envelope {
   // a separate GET /api/settings; matches the Python envelope's
   // `alerts_settings` block emitted by snapshot_to_envelope.
   alerts_settings: AlertsSettingsEnvelope;
+  // #661 S2 §6.1: the non-threshold metering-rate-change family, in its OWN
+  // array rather than inside `alerts`. `AlertEntry` requires a numeric
+  // `threshold` and a rate transition has none, so the two are separate
+  // discriminated variants. Additive optional — an older server omits it
+  // entirely, which a dashboard tab surviving an `execvp` restart really can
+  // meet, so every consumer must tolerate its absence.
+  meter_rate_changes?: MeterRateChangeEntry[];
   // update-subcommand mirror — `{state, suppress}` shape matches GET
   // /api/update/status's payload so coerceUpdateState/Suppress consume
   // both the bootstrap fetch and live SSE ticks uniformly. Optional so
@@ -347,6 +354,46 @@ export interface AlertEntry {
   };
 }
 
+// ---- The non-threshold metering-rate-change family (#661 S2 §6.1) ----
+//
+// Deliberately NOT an `AlertAxis`. Every member of that union is a numeric
+// threshold axis: `AlertEntry` requires a numeric `threshold`, its `id` is
+// threshold-shaped, and the Python `alert_row_owner` raises on a seventh
+// axis so that adding one without deciding its ownership fails a test rather
+// than shipping a row that renders nowhere. A provider metering-rate
+// transition has no percentage threshold and no threshold-derived severity,
+// so it carries its own variant with an EXPLICIT severity.
+//
+// Field-for-field parity with the Python builder
+// `_build_meter_rate_change_array` is pinned by a test, so a key added on
+// one side and not the other fails rather than silently disappearing.
+export interface MeterRateChangeEntry {
+  // Opaque React key. Never parsed — the same contract `AlertEntry.id`
+  // carries.
+  id: string;
+  // The discriminator. One member today; it exists so a second
+  // non-threshold family can join this array without a second array.
+  family: 'meter_rate_change';
+  provider: string;
+  // Which provider tab renders the row. Separate from `provider` because
+  // ownership is a rendering decision and provider is a fact about the row.
+  owner: string;
+  // EXPLICIT, never derived from a threshold: `info` when the rate became
+  // more generous, `warn` on a drop, `alarm` on a drop of a quarter or more.
+  severity: 'info' | 'warn' | 'alarm';
+  // The instant the new rate took effect, and when cctally observed it.
+  effective_from: string;
+  detected_at: string;
+  recorded_at: string;
+  // Weighted quota units per meter point, before and after. A HIGHER value
+  // is a more generous rate — more work before the meter moves one point.
+  previous_units_per_point: number | null;
+  new_units_per_point: number | null;
+  // R8: present only when this provider has more than one real account.
+  accountKey?: string;
+  accountLabel?: string;
+}
+
 export interface AlertsSettingsEnvelope {
   enabled: boolean;
   weekly_thresholds: number[];
@@ -393,6 +440,10 @@ export interface AlertsSettingsEnvelope {
   // boolean is mirrored so the UI can enable/disable the "Custom command"
   // option. Optional + defaults false.
   command_configured?: boolean;
+  // #661 S2 §6.2: the rate-change PUSH toggle. The events themselves are
+  // recorded whatever this says, so the client renders the history with no
+  // configuration; this only tells Settings whether the OS popup is armed.
+  rate_change_enabled?: boolean;
 }
 
 export interface DisplayEnvelope {
@@ -557,6 +608,61 @@ export interface FiveHourCredit {
   delta_pp: number;
 }
 
+// #661 S2 section 8: the presentation half of one withheld-figure cause.
+// ADDITIVE beside the machine `code`, which is unchanged and stays the value
+// a client keys on. A new client meeting an OLD server receives no
+// presentation object at all and derives the short token from the code
+// itself through `deriveShortFromCode` — degraded to no sentence, never to a
+// blank, which matters because a dashboard tab can outlive a server restart
+// through `execvp`.
+export interface QuotaCausePresentation {
+  code: string;
+  short: string;
+  long: string;
+}
+
+// #661 S2 section 6.6: the DERIVED marker state. The active open regime has
+// a confirmed predecessor, and the marker shows for the whole of that
+// successor regime. Distinct from `meter_rate_changes`, which is the event
+// HISTORY; this is whether the CURRENT regime is a successor.
+export interface QuotaRateChangeState {
+  active: boolean;
+  effective_from: string | null;
+  severity?: 'info' | 'warn' | 'alarm' | null;
+  previous_units_per_point?: number | null;
+  new_units_per_point?: number | null;
+}
+
+// #661 S2 section 10. Optional and additive: it sits under `forecast`
+// because `ForecastEnvelope` is its semantic boundary, and it does NOT bump
+// `source_schema_version`, which describes the provider-source bundles.
+export interface ForecastQuotaEnvelope {
+  // Which measurement produced `projection_pct`.
+  basis: 'calibrated' | 'corrected-meter' | 'withheld' | null;
+  projection_pct: number | null;
+  right_censored: boolean;
+  // Why the projection is WITHHELD. Null whenever one was published.
+  code: string | null;
+  code_presentation: QuotaCausePresentation | null;
+  // Why the CALIBRATED basis was not reached — a different question, and a
+  // surface that collapses the two says nothing when it falls back to the
+  // meter. Null when the calibrated basis WAS reached.
+  calibration_code: string | null;
+  calibration_code_presentation: QuotaCausePresentation | null;
+  // The interval a displayed reading denotes after the ceiling correction.
+  // `hi` is null at a right-censored 100, which is unbounded above.
+  corrected_interval: { lo: number; hi: number | null } | null;
+  calibrated_consumption_pct: number | null;
+  calibrated_consumption_interval: { lo: number; hi: number | null } | null;
+  calibrated_headroom_pct: number | null;
+  rate_change: QuotaRateChangeState | null;
+  // The observed meter minus the modelled local quota, and nothing more. It
+  // is a DIFFERENCE between two quantities and does not identify or estimate
+  // usage from another machine; the modal states that sentence beside it.
+  // Null unless both sides exist.
+  observed_minus_modelled_pct: number | null;
+}
+
 export interface ForecastEnvelope {
   verdict: Verdict;
   week_avg_projection_pct: number | null;
@@ -566,6 +672,9 @@ export interface ForecastEnvelope {
   confidence: 'high' | 'low' | 'unknown';
   confidence_score: number;
   explain: unknown; // opaque ForecastOutput JSON blob; modal renders it
+  // Optional because a server predating #661 S2 omits it entirely, and
+  // nullable because "no forecast quota view" is a real state.
+  quota?: ForecastQuotaEnvelope | null;
 }
 
 export interface TrendEnvelope {

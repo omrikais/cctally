@@ -13,7 +13,17 @@ import { fileURLToPath } from 'node:url';
 import type { APIResponse, Page, Route } from '@playwright/test';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const RUNTIME = resolve(HERE, '.runtime');
+// #648 D9 — the estate collector supplies its own fixture runtime directory.
+// `loadManifest()` runs at module load in nine spec files, so a collector that
+// could only read the fixed in-tree path could never enumerate a tree it must
+// not write into. `e2e/serve.sh` leaves the variable unset, so a normal run
+// still resolves `e2e/.runtime`.
+//
+// `||` and not `??`: the nullish operator falls back on null and undefined
+// only, so `CCTALLY_E2E_RUNTIME_DIR=""` — which is what exporting the variable
+// empty, or clearing it in a wrapper, produces — resolved to the process
+// working directory instead of the in-tree runtime.
+const RUNTIME = resolve(process.env.CCTALLY_E2E_RUNTIME_DIR || resolve(HERE, '.runtime'));
 
 // #583 S3 §7 — fulfil a mutated `/api/data` body without contradicting itself.
 //

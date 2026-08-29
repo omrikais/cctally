@@ -318,6 +318,10 @@ Following a warning re-measures its window against live data rather than reconst
 
 The route is read-only and is deliberately not an envelope key: it is a surface most ticks never display, and an envelope key would pay its cost on every tick. Status codes and selectors are in [`dashboard`](dashboard.md#endpoints).
 
+## Implementation
+
+The diagnosis is a pure kernel, `bin/_lib_diagnosis.py`, and every store read goes through a single adapter, `bin/_cctally_diagnosis_sources.py`. That adapter opens each database read-only (SQLite `mode=ro`), reports a `{stats, cache, configuration}` generation vector so an incoherent set of sources is refused rather than blended, and owns the Codex pool-compatible block join. The CLI and the one `diagnosis_to_wire` adapter that renders the JSON envelope live in `bin/_cctally_diagnosis.py`. A report-establishment failure is raised as an `EstablishmentFailure`, which is always exit 3.
+
 ## Related
 
 - [`cctally diff`](diff.md) — compare two windows directly.

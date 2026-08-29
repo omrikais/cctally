@@ -555,29 +555,52 @@ def test_header_vs_last_week_delta_null_on_empty_trend():
 
 
 def test_header_vs_last_week_delta_uses_is_current_row():
-    """#207 B1: the vs-last-week delta is the ``is_current`` trend row's
-    ``delta_dpp`` — selected by the flag, NOT by position [-1]. A trailing
-    non-current row proves the selector picks by ``is_current``."""
+    """The vs-last-week delta and the rate it qualifies come from ONE
+    operand, and the prior operand is the nearest COMPARABLE completed week.
+
+    #207 B1 made this the ``is_current`` row's own ``delta_dpp``, selected by
+    the flag rather than by position ``[-1]``. #661 S2 section 10.1 replaced
+    that: the delta is now the HEADER's current rate minus the nearest
+    comparable prior operand, because the header's rate and the trend row's
+    are two different computations and publishing a comparison between one
+    row's pair while the header shows the other's was the defect. What both
+    revisions have in common, and what this test still guards, is that a
+    trailing non-current row is never mistaken for the comparison point.
+
+    The rows keep their #207 values so the expected delta is unchanged at
+    -0.07; what changed is which two numbers produce it.
+    """
     ns = load_script()
     snap = ns["_empty_dashboard_snapshot"]()
+    current_start = dt.datetime(2026, 4, 13, 14, 0, tzinfo=dt.timezone.utc)
 
-    def mk(label, dpp, delta, cur):
+    def mk(label, dpp, delta, cur, start):
         return types.SimpleNamespace(
             week_label=label, used_pct=10.0, dollars_per_percent=dpp,
             delta_dpp=delta, is_current=cur, spark_height=1,
+            week_start_at=start,
         )
 
-    # Oldest-first; the current week is the flagged row, NOT positionally
-    # guaranteed last — a trailing non-current row proves the selector
-    # picks by is_current, not by [-1].
+    snap.current_week = types.SimpleNamespace(
+        week_start_at=current_start,
+        week_end_at=current_start + dt.timedelta(days=7),
+        used_pct=10.0, five_hour_pct=None, five_hour_resets_at=None,
+        spent_usd=12.3, dollars_per_percent=1.23,
+        latest_snapshot_at=current_start,
+    )
+    # Oldest-first, and the current week is the FLAGGED row rather than the
+    # positionally last one. `W3-stale` is the trailing non-current row: it
+    # sits three days after the current anchor, so it belongs to no prior
+    # subscription week and its 9.99 must never become the comparison point.
     snap.trend = [
-        mk("W1", 1.30, None, False),
-        mk("W2", 1.23, -0.07, True),
-        mk("W3-stale", 9.99, 8.76, False),
+        mk("W1", 1.30, None, False, current_start - dt.timedelta(days=7)),
+        mk("W2", 1.23, -0.07, True, current_start),
+        mk("W3-stale", 9.99, 8.76, False, current_start + dt.timedelta(days=3)),
     ]
     env = ns["snapshot_to_envelope"](
         snap, now_utc=dt.datetime(2026, 4, 20, 12, 0, tzinfo=dt.timezone.utc))
-    assert env["header"]["vs_last_week_delta"] == -0.07
+    assert env["header"]["dollar_per_pct"] == 1.23
+    assert env["header"]["vs_last_week_delta"] == pytest.approx(-0.07)
 
 
 # --- #583 S3 §6/§7: /api/data serves the last PUBLISHED state, compressed ----

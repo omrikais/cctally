@@ -405,6 +405,13 @@ export const REGISTRY = [
     section: 'alerts',
     read: (s) => s.alerts.projected_weekly_enabled ?? false,
   }),
+  boolField({
+    id: 'alerts.rate_change_enabled',
+    label: 'Metering-rate-change notifications',
+    path: 'alerts.rate_change_enabled',
+    section: 'alerts',
+    read: (s) => s.alerts.rate_change_enabled ?? false,
+  }),
   BUDGET_WEEKLY_USD,
   boolField({
     id: 'budget.projected_enabled',

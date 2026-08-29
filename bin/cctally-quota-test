@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# Fixture-based validation harness for `cctally quota` (#661 S1).
+#
+# Walks tests/fixtures/quota/*/input.env, runs the two output modes (default
+# terminal and --json) at a pinned CCTALLY_AS_OF, and diffs each against its
+# golden through bin/_lib-golden-diff.sh. Exits 0 on all-pass, 1 on any diff.
+#
+# It does NOT use bin/_lib-fixture-harness.sh's `run_mode`, for one reason
+# that is specific to this command: `cctally quota` PERSISTS its fitted
+# calibration. `run_mode` reuses one fake HOME across a scenario's modes, so
+# the terminal run would write a durable regime that the JSON run then reports
+# as a recorded prior, and the second golden would silently depend on the
+# order the first ran in. Each mode therefore gets its own copy of the
+# scenario's HOME, which makes both goldens a recording of a FIRST run — and
+# the one scenario that must show a recorded prior seeds the file explicitly
+# instead of inheriting one.
+#
+# Uses stage_fixtures_out_of_tree, so the committed tree is copied to scratch
+# and the builder rebuilds only its own outputs there; the in-tree fixtures
+# stay byte-stable across runs.
+
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+HARNESS_FIXTURES_DIR="$REPO_ROOT/tests/fixtures/quota"
+HARNESS_BIN="$REPO_ROOT/bin/cctally"
+
+# shellcheck source=bin/_lib-harness-env.sh
+. "$REPO_ROOT/bin/_lib-harness-env.sh"
+# shellcheck source=bin/_lib-golden-diff.sh
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+
+SCRATCH_DIR=$(mktemp -d -t cctally-quota-fixtures-XXXXXX) || {
+    echo "FAIL: could not create a scratch directory" >&2
+    exit 1
+}
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+export GOLDEN_DIFF_TMPDIR="$SCRATCH_DIR"
+
+stage_fixtures_out_of_tree quota "$SCRATCH_DIR/quota" || {
+    echo "FAIL: build-quota-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+pass_count=0
+fail_count=0
+
+run_quota_mode () {
+    local name="$1" label="$2" flags="$3" suffix="$4"
+    local golden home actual status
+    golden="$HARNESS_FIXTURES_DIR/$name/golden-$suffix.txt"
+    # A per-mode COPY, because the command persists. See the header.
+    home="$SCRATCH_DIR/run/$name.$suffix"
+    rm -rf "$home"
+    mkdir -p "$(dirname "$home")"
+    cp -Rp "$SCRATCH_DIR/quota/$name" "$home" || {
+        echo "FAIL $name/$label: could not stage the scenario HOME"
+        fail_count=$((fail_count + 1))
+        return 0
+    }
+
+    AS_OF=""
+    FLAGS=""
+    # shellcheck disable=SC1090
+    . "$HARNESS_FIXTURES_DIR/$name/input.env"
+    if [ -z "$AS_OF" ]; then
+        echo "FAIL $name/$label: input.env sets no AS_OF"
+        fail_count=$((fail_count + 1))
+        return 0
+    fi
+
+    # FLAGS and the mode flags both carry several words and word-split
+    # intentionally, which is the same contract the shared wrapper applies to
+    # them. Stated in prose rather than as a `shellcheck disable=SC2086`
+    # directive: the estate lints at --severity=warning, where SC2086 is
+    # info-level and never emitted, so the directive would be an obsolete
+    # suppression and bin/cctally-shellcheck refuses those.
+    actual=$(env -u CODEX_HOME HOME="$home" NO_COLOR=1 TZ=Etc/UTC COLUMNS=120 \
+             CCTALLY_AS_OF="$AS_OF" "$HARNESS_BIN" quota $FLAGS $flags 2>&1)
+    status=$?
+
+    # The exit code is part of the contract (spec section 23), so it is
+    # appended to the compared bytes rather than checked separately. A golden
+    # that recorded only the text would pass over a command that printed the
+    # right report and returned the wrong code.
+    actual="$actual
+exit: $status"
+
+    if [ -n "${HARNESS_REGEN:-}" ]; then
+        printf '%s\n' "$actual" > "$golden"
+        echo "REGEN $name/$label"
+        pass_count=$((pass_count + 1))
+        return 0
+    fi
+    if [ ! -s "$golden" ]; then
+        echo "FAIL $name/$label: $(basename "$golden") is missing or empty"
+        fail_count=$((fail_count + 1))
+        return 0
+    fi
+    if ! _golden_diff_str "$label" "$golden" "$actual" 300; then
+        fail_count=$((fail_count + 1))
+        return 0
+    fi
+    echo "PASS $name/$label"
+    pass_count=$((pass_count + 1))
+}
+
+# A scenario is a directory carrying an `input.env`. The sibling
+# `evidence/` directory holds the mirror-private threshold corpus, which is
+# read by pytest rather than by this harness, so it is skipped by that
+# predicate rather than by a name this loop would have to remember.
+scenario_count=0
+for dir in "$HARNESS_FIXTURES_DIR"/*/; do
+    name=$(basename "$dir")
+    [ -f "$dir/input.env" ] || continue
+    scenario_count=$((scenario_count + 1))
+    run_quota_mode "$name" "terminal" ""       "terminal"
+    run_quota_mode "$name" "json"     "--json" "json"
+done
+
+# A skip predicate that matched everything would leave this harness reporting
+# a clean pass over nothing, which is the failure the manifest's minCases
+# floor also guards. Both are cheap; neither alone is a mechanism.
+if [ "$scenario_count" -lt 8 ]; then
+    echo "FAIL: only $scenario_count scenario(s) carried an input.env"
+    fail_count=$((fail_count + 1))
+fi
+
+# ─── Persistence: the fit survives a real cache rebuild and a stats rebuild ─
+#
+# Spec section 7 says living in neither database satisfies the durability
+# requirement by construction, and then says the acceptance criterion still
+# demands a test that performs a REAL rebuild of each and re-reads the value.
+# A construction argument is not a measurement.
+persistence_scenario="01-steady-no-change"
+persistence_home="$SCRATCH_DIR/run/$persistence_scenario.persistence"
+rm -rf "$persistence_home"
+mkdir -p "$(dirname "$persistence_home")"
+cp -Rp "$SCRATCH_DIR/quota/$persistence_scenario" "$persistence_home"
+AS_OF=""
+# shellcheck disable=SC1090
+. "$HARNESS_FIXTURES_DIR/$persistence_scenario/input.env"
+state_file="$persistence_home/.local/share/cctally/quota-calibrations.json"
+
+env -u CODEX_HOME HOME="$persistence_home" NO_COLOR=1 TZ=Etc/UTC \
+    CCTALLY_AS_OF="$AS_OF" "$HARNESS_BIN" quota --json >/dev/null 2>&1
+before=$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["accounts"]["*"]["regimes"][0]["unitsPerPoint"])
+' "$state_file" 2>/dev/null)
+
+# The exit codes are CHECKED. Discarding them lets a refused rebuild leave
+# the calibration file untouched, so `before = after` would pass while
+# certifying that nothing happened rather than that the file survived.
+env -u CODEX_HOME HOME="$persistence_home" NO_COLOR=1 TZ=Etc/UTC \
+    "$HARNESS_BIN" cache-sync --rebuild --source claude >/dev/null 2>&1
+cache_rebuild_status=$?
+env -u CODEX_HOME HOME="$persistence_home" NO_COLOR=1 TZ=Etc/UTC \
+    "$HARNESS_BIN" db rebuild --db stats >/dev/null 2>&1
+stats_rebuild_status=$?
+after=$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["accounts"]["*"]["regimes"][0]["unitsPerPoint"])
+' "$state_file" 2>/dev/null)
+
+if [ "$cache_rebuild_status" -ne 0 ] || [ "$stats_rebuild_status" -ne 0 ]; then
+    echo "FAIL persistence/survives-cache-and-stats-rebuild:" \
+         "rebuild refused (cache-sync $cache_rebuild_status," \
+         "db rebuild $stats_rebuild_status); the survival check certifies" \
+         "nothing unless both rebuilds ran"
+    fail_count=$((fail_count + 1))
+elif [ -n "$before" ] && [ "$before" = "$after" ]; then
+    echo "PASS persistence/survives-cache-and-stats-rebuild"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL persistence/survives-cache-and-stats-rebuild: '$before' != '$after'"
+    fail_count=$((fail_count + 1))
+fi
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

@@ -85,6 +85,16 @@ _EVT_CLASSIFICATIONS = {
     # re-derived into the claude-usage scratch index.
     "quota_threshold_event": KindClassification(
         "retained", "Codex terminal quota alert evidence is outside claude-usage"),
+    # #661 S2 §6.4: the metering-rate-change latch. `retained`, for the same
+    # reason as both siblings above — it is a durable forward-only alert
+    # boundary replayed by its OWN fold applier, and nothing in the
+    # claude-usage family derives it. Re-deriving it would be impossible in
+    # any case: its trigger is a persistence transition on an unjournaled
+    # calibration file, which is exactly why §6.5 requires the payload to be
+    # self-sufficient.
+    "meter_rate_change": KindClassification(
+        "retained",
+        "the metering-rate latch is replayed, never re-derived"),
 }
 
 _OP_CLASSIFICATIONS = {

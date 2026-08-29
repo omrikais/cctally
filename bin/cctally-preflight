@@ -1,15 +1,28 @@
 #!/usr/bin/env python3
 """Seconds-scale static pre-flight for a full-suite round trip (#529 S5 §5).
 
-Seven checks, in order:
+Eight checks, in order:
 
-  1. Compile every Python file under bin/ without writing bytecode. Files are
-     selected by `.py` extension OR by a Python shebang: bin/cctally is
-     EXTENSIONLESS, so an extension-keyed scan would skip the most important
-     file in the tree, and bin/codex-session-metrics shows that is a class
-     rather than one special case.
-  2. Syntax-check every shell script under bin/, with the interpreter chosen
-     per file from its own shebang rather than assumed.
+  1. Compile every Python file in the REPOSITORY — not bin/ alone (#655) —
+     without writing bytecode. Files are selected by `.py` extension OR by a
+     Python shebang: bin/cctally is EXTENSIONLESS, so an extension-keyed scan
+     would skip the most important file in the tree, and
+     bin/codex-session-metrics shows that is a class rather than one special
+     case. The subject set comes from the SAME pruned walk check 2 uses, so a
+     Python syntax error outside bin/ is now found rather than invisible; the
+     two checks were asymmetric from #641 until #655 closed it.
+  2. Syntax-check every shell subject in the REPOSITORY — not bin/ alone — on
+     three legs. The primary parse uses the interpreter chosen per file from
+     its own shebang rather than assumed. A non-empty stderr from that parse is
+     a finding even at exit 0, which is how bash 5 reports an unterminated
+     here-document and how eleven of them went unreported for months. And every
+     subject whose interpreter is bash is parsed a second time by a bash 3.x
+     interpreter, because 3.2 is the floor this repository declares while
+     `#!/usr/bin/env bash` resolves to Homebrew 5.x on every box that runs the
+     suite, so the declared floor was never actually exercised. The subject set
+     is a PRUNED filesystem walk rather than `git ls-files`, because this tool
+     must not require a git repository: the tree it checks may be a
+     materialized copy. See check_shell and iter_shell_subjects.
   3. Invoke bin/cctally-test-owners --verify.
   4. Validate tests/authoritative-harness-durations.tsv against the estate
      manifest, through the SAME validator the dispatch scheduler applies. The
@@ -34,8 +47,16 @@ Seven checks, in order:
      the public repository verbatim and is reused as a release-note body and a
      mirror commit message, so a non-compliant entry is an outward-facing
      defect; catching it here costs a parse of one file.
+  8. Validate tests/authoritative-runtime-budget.json through the REAL
+     contract_budget_load, invoked as a caught subprocess. That loader is
+     embedded Python inside bin/_lib-test-contract.sh, so unlike check 4 there
+     is no module to import and no Python API to call; running the shell
+     function is what keeps the committed file validated by the parser that
+     refuses it at admission and keeps the refusal vocabulary in one place.
+     A malformed budget otherwise costs a full round trip to discover, because
+     admission is where it is caught today.
 
-Checks 4, 5, 6 and 7 are admitted under one boundary rule: pre-flight takes only
+Checks 4, 5, 6, 7 and 8 are admitted under one boundary rule: pre-flight takes only
 checks that parse or verify local files deterministically and that have
 identical coverage inside the suite. No pytest, no harness execution, no
 fixture regeneration, no network probe, no runner-capability query, and no
@@ -60,16 +81,28 @@ check took. It is fast because it parses and does nothing else, and a duration
 ceiling on a shared, contended box is the defect class #529 S3 has just
 removed.
 
-One wall-clock BOUND does exist, and it is not that thing (#630 S3). Check 5
-runs the aggregator as a subprocess with `timeout=60`. That is a hang bound: it
-decides an outcome only when the aggregator never returns at all, which turns
-the pre-flight into the outage it exists to prevent. The margin is what
-separates the two. Plan mode measures 0.16 to 0.24 s against the 60 s bound —
-roughly 300x — on a path that takes no lock, opens no socket and sleeps
-nowhere; the ceiling #529 S3 removed sat at about 2.3x and reddened
-release-stamp runs on a contended box. A bound no honest run can approach
-records nothing about load; a ceiling a slow box can cross records load and
-calls it a defect.
+Wall-clock BOUNDS do exist, and they are not that thing (#630 S3, #641, #655).
+EVERY subprocess this tool starts carries one, and each is a hang bound: it
+decides an outcome only when the subprocess never returns at all, which is the
+case that turns the pre-flight into the outage it exists to prevent. There are
+two of them, named separately because they bound materially different work:
+`_PARSE_TIMEOUT_SECONDS` on each `-n` parse, and `_SUBPROCESS_TIMEOUT_SECONDS`
+on the bash version probe, the ownership validator, the runtime-budget loader
+and the aggregator in plan mode. Both are 60 today.
+
+A third, `_SHELL_CHECK_DEADLINE_SECONDS`, is an AGGREGATE bound over check 2
+rather than a per-call one, because a per-call bound stops one stuck
+interpreter and does not stop hundreds of them. It gates whether the next parse
+is launched and never shortens a launched one; no path in this tool computes a
+timeout from the time remaining, which would launch a healthy parse with a
+fractional bound near the deadline and report it as a defect in the file.
+
+The margin is what separates a bound from a ceiling. Plan mode measures 0.16 to
+0.24 s against 60 — roughly 300x — on a path that takes no lock, opens no
+socket and sleeps nowhere; the ceiling #529 S3 removed sat at about 2.3x and
+reddened release-stamp runs on a contended box. A bound no honest run can
+approach records nothing about load; a ceiling a slow box can cross records
+load and calls it a defect.
 """
 from __future__ import annotations
 
@@ -80,6 +113,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import time
 
 # Check 1 compiles without writing bytecode, and this import must not undo
 # that for the tool's own directory. An ordinary import of a bin/ sibling has
@@ -181,7 +215,7 @@ def _shebang(path: pathlib.Path) -> str:
 
 
 def classify(path: pathlib.Path) -> str:
-    """``"python"``, ``"shell"`` or ``""`` for one file under ``bin/``."""
+    """``"python"``, ``"shell"`` or ``""`` for one file in the tree."""
     shebang = _shebang(path)
     if path.suffix == ".py" or "python" in shebang:
         return "python"
@@ -215,11 +249,30 @@ def shell_interpreter(path: pathlib.Path) -> str:
     return "bash"
 
 
-def check_python(bin_dir: pathlib.Path) -> list[str]:
+def check_python(
+    root: pathlib.Path, subjects: list[pathlib.Path] | None = None
+) -> list[str]:
+    """Compile every Python subject in the tree without writing bytecode.
+
+    ``subjects`` MUST be `_subjects_by_kind(root)["python"]` for the same
+    ``root``, because ``root`` is then read for nothing else and a list taken
+    from a different tree would be checked in silence. `run` supplies one,
+    because `check_python` and `check_shell` would otherwise walk and classify
+    the whole tree once each: two traversals, and every file classified twice
+    where one pass answers both checks. `classify` opens every file it is
+    given, so that cost is real. When the argument is omitted the check
+    enumerates its own subjects, which is what keeps `check_python(root)` a
+    working call for the harness and for the Linux observation.
+
+    No count is written here, for the reason given at
+    `_PARSE_TIMEOUT_SECONDS`: this file ships to the public mirror, whose tree
+    is a subset with a different subject set. The measured figures are in the
+    maintainer's session record.
+    """
     problems: list[str] = []
-    for path in sorted(p for p in bin_dir.rglob("*") if p.is_file()):
-        if classify(path) != "python":
-            continue
+    if subjects is None:
+        subjects = iter_python_subjects(root)
+    for path in subjects:
         try:
             source = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
@@ -234,16 +287,371 @@ def check_python(bin_dir: pathlib.Path) -> list[str]:
     return problems
 
 
-def check_shell(bin_dir: pathlib.Path) -> list[str]:
+# Directory basenames pruned wherever they appear, and repository-relative
+# directory paths pruned at their own location, with the tracked trees that sit
+# INSIDE a pruned path re-included. The universe of this check is source, and
+# the walk is a pruned filesystem walk rather than `git ls-files` because
+# pre-flight must not require a git repository: bin/cctally-test-remote
+# materializes the working tree onto a runner, and a materialized copy is
+# exactly the tree this check most needs to cover.
+#
+# .cctally-remote-state is the one entry that is not merely an optimisation.
+# It is a runner-owned root, and provisioning clones a SEPARATE repository
+# beneath it; bin/cctally-preflight-test runs this tool against the real working
+# tree, so an unpruned walk would report another project's shell files as this
+# repository's defects.
+_PRUNE_DIR_NAMES = frozenset({
+    ".git", ".worktrees", "node_modules", "__pycache__", ".venv",
+    ".cctally-remote-state", ".wrangler", ".superpowers", ".playwright-mcp",
+})
+_PRUNE_DIR_PATHS = ("dashboard/static", ".agentmem/local", ".claude", ".codex")
+# .claude/ and .codex/ are mirror-private, so the public tree carries neither,
+# and that is exactly why naming them here is safe rather than a dependency:
+# these constants only decide whether to DESCEND into a directory the walk has
+# already found. On a tree without them os.walk never yields one and the names
+# are never compared against anything, so absence is tolerated by construction,
+# which is the condition the waiver below exists for. They are named at all
+# because `.gitignore` is default-deny over both trees with exactly these
+# re-included, and .claude/skills holds a shell subject the walk must reach.
+_KEEP_DIR_PATHS = (  # mirror-private-ok
+    ".claude/skills", ".claude/agents", ".codex/agents",
+)
+
+
+def _kept(rel: str) -> bool:
+    """True when ``rel`` sits inside a tree re-included from a pruned path."""
+    return any(rel == keep or rel.startswith(keep + "/") for keep in _KEEP_DIR_PATHS)
+
+
+def iter_source_files(root: pathlib.Path) -> list[pathlib.Path]:
+    """Every non-pruned regular file in the tree, in a stable order.
+
+    The walk is a pruned filesystem walk rather than `git ls-files` because
+    pre-flight must not require a git repository: bin/cctally-test-remote
+    materializes the working tree onto a runner, and a materialized copy is
+    exactly the tree this check most needs to cover.
+
+    Classification is deliberately NOT applied here, so that one traversal can
+    be classified once and partitioned by `_subjects_by_kind`. That is what
+    makes a single walk POSSIBLE; it does not by itself make one happen, and an
+    earlier draft of this docstring claimed it did. Whether the tree is walked
+    once is decided by the caller: `run` partitions once and hands each check
+    its own list, while `iter_shell_subjects` and `iter_python_subjects` each
+    perform their own walk when they are called on their own. Those two are
+    kept as standalone seams for callers outside `run` — the harness's
+    walk-prune-matrix case and the Linux observation both call them directly —
+    and the cost is real, because `classify` opens every file it is given.
+    """
+    files: list[pathlib.Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        rel = "" if rel == "." else rel.replace(os.sep, "/")
+        keep_dirs = []
+        for name in dirnames:
+            child = name if not rel else rel + "/" + name
+            if name in _PRUNE_DIR_NAMES:
+                continue
+            if child in _PRUNE_DIR_PATHS and not _kept(child):
+                # Descend anyway when a re-included tree lives beneath, so
+                # .claude/skills survives a pruned .claude.
+                if not any(keep.startswith(child + "/") for keep in _KEEP_DIR_PATHS):
+                    continue
+            keep_dirs.append(name)
+        dirnames[:] = sorted(keep_dirs)
+        for name in sorted(filenames):
+            relfile = name if not rel else rel + "/" + name
+            if not _kept(relfile) and any(
+                relfile.startswith(pruned + "/") for pruned in _PRUNE_DIR_PATHS
+            ):
+                continue
+            path = root / relfile
+            if path.is_file():
+                files.append(path)
+    return files
+
+
+def _subjects_by_kind(root: pathlib.Path) -> dict[str, list[pathlib.Path]]:
+    """One walk, one classification pass, partitioned by kind."""
+    by_kind: dict[str, list[pathlib.Path]] = {"shell": [], "python": []}
+    for path in iter_source_files(root):
+        kind = classify(path)
+        if kind in by_kind:
+            by_kind[kind].append(path)
+    return by_kind
+
+
+def iter_shell_subjects(root: pathlib.Path) -> list[pathlib.Path]:
+    """Every shell subject in the tree, in a stable order.
+
+    Classified exactly as ``classify`` classifies one file, so a `.sh` file
+    with no shebang is included: ``shell_interpreter``'s contract is that such
+    a file is a bash-sourced fragment, and shebangless fragments are a
+    recurring shape in this tree rather than an anomaly. A shebang-keyed
+    enumeration would silently exclude every one of them.
+
+    No count is written here, for the reason given at
+    `_PARSE_TIMEOUT_SECONDS`: this file ships to the public mirror, whose tree
+    is a subset with a different subject set.
+    """
+    return _subjects_by_kind(root)["shell"]
+
+
+def iter_python_subjects(root: pathlib.Path) -> list[pathlib.Path]:
+    """Every Python subject in the tree, in a stable order.
+
+    Repository-wide rather than bin/-only (#655). check_shell has been
+    tree-wide since #641, and the asymmetry meant a Python syntax error
+    anywhere outside bin/ was invisible to the pre-flight.
+    """
+    return _subjects_by_kind(root)["python"]
+
+
+_LEGACY_BASH_ENV = "CCTALLY_PREFLIGHT_BASH32"
+
+# A hang bound on every `-n` parse, matching the one check 5 puts on the
+# aggregator. An interpreter that never returns would hang the pre-flight, and a
+# hung pre-flight is the outage class this tool's docstring says it exists to
+# avoid. It is generous because these are parses and nothing else: the primary
+# leg sweeps every shell subject in the tree, while the legacy bash-3.x leg
+# sweeps only the bash-interpreted ones; the honest full shell check takes a few
+# seconds, so a single subject that reaches this bound is stuck rather than
+# slow. A timeout is reported as a finding, so the exit taxonomy still answers 3
+# rather than propagating an exception.
+#
+# Deliberately no subject COUNT here (#655). This file ships to the public
+# mirror, whose tree is a subset with a different subject set, so a count
+# asserted here is false there — and it goes stale in this tree on any added
+# file, which happened during the very session that corrected this comment. The
+# exact counts belong in the maintainer's remote-testing reference.
+_PARSE_TIMEOUT_SECONDS = 60
+
+# The same hang bound, for the subprocesses that are NOT parses: the bash
+# version probe, the ownership validator, the runtime-budget validator and the
+# aggregator in plan mode. Deliberately a SEPARATE name from the parse bound
+# even though the values match today. They bound materially different work —
+# one interpreter parsing one file, versus a Python validator or the aggregator
+# — so a later measurement that moves one must not silently move the other.
+_SUBPROCESS_TIMEOUT_SECONDS = 60
+
+# An AGGREGATE bound over the whole shell check, distinct from the per-call one.
+# The per-call bound stops ONE stuck interpreter; it does not stop hundreds of
+# them, whose aggregate worst case on this tree is roughly twelve hours.
+#
+# It gates only whether the NEXT parse is LAUNCHED. It never shortens a parse
+# that has been launched, and no code path anywhere computes a per-call timeout
+# from the time remaining. An earlier design capped each call at
+# min(per_call, remaining), and that is wrong in exactly the way this tool's
+# docstring forbids: as remaining approaches zero a perfectly healthy parse is
+# launched with a fractional timeout, times out, and is reported as a defect in
+# the file. A bound that fails a healthy subject because the box was slow is a
+# ceiling, which is the class #529 S3 removed.
+#
+# 600 against an honest full check of about 5.8 seconds is roughly 100x. The
+# ceiling #529 S3 removed sat at about 2.3x.
+_SHELL_CHECK_DEADLINE_SECONDS = 600
+
+# A minimal reproduction of the defect class the legacy leg exists to see: a
+# `case` pattern's closing paren ends the enclosing `$( … )` early, because
+# bash 3.2 scans a command substitution by counting characters rather than by
+# parsing it. Fed to the interpreter on STDIN and never written to disk —
+# pre-flight's contract is that it only reads, to the point of setting
+# sys.dont_write_bytecode so its own imports leave no __pycache__ in the tree
+# under test, and a temporary control file would break that for no benefit.
+# Measured: /bin/bash 3.2 -n exits 2 on this, bash 5.x -n exits 0.
+_LEGACY_CONTROL = "x=$(case a in\nb) echo b ;;\nesac)\n"
+
+
+def _bash_major(interpreter: str) -> tuple[str, str]:
+    """``(major, "")`` for a bash-family interpreter, or ``("", reason)``."""
+    try:
+        proc = subprocess.run(
+            [interpreter, "-c", 'printf %s "${BASH_VERSINFO[0]}"'],
+            capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "", "%s could not be run: %s" % (interpreter, exc)
+    major = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not major.isdigit():
+        return "", "%s did not report a bash major version" % interpreter
+    return major, ""
+
+
+def resolve_legacy_bash() -> tuple[str, list[str], list[str]]:
+    """``(interpreter, problems, notes)`` for the bash 3.x floor leg.
+
+    Resolution order: the path in CCTALLY_PREFLIGHT_BASH32 when that variable is
+    set and non-empty; otherwise /bin/bash when its BASH_VERSINFO[0] is 3;
+    otherwise no legacy interpreter is available.
+
+    An absent interpreter is a STATED skip and not a finding, because a Linux
+    container legitimately has no 3.x bash. A PIN that is not major version 3 is
+    a finding, because the pin is a claim about what the interpreter is and a
+    false claim is an operator error rather than an absent capability.
+
+    A probe that FAILED is a finding on both paths (#655). Absence, and a
+    version that is simply not 3, remain the stated skip they have always been;
+    a /bin/bash that hangs or cannot be run is neither of those, and reporting
+    it as an absent interpreter would drop the floor leg without a word.
+    """
+    pinned = os.environ.get(_LEGACY_BASH_ENV, "").strip()
+    if pinned:
+        major, reason = _bash_major(pinned)
+        if reason:
+            return "", ["%s=%s cannot be used as the bash 3.x floor: %s"
+                        % (_LEGACY_BASH_ENV, pinned, reason)], []
+        if major != "3":
+            return "", ["%s=%s reports bash major version %s, not 3, so it cannot "
+                        "stand in for the 3.2 floor — pin a 3.x bash or unset the "
+                        "variable" % (_LEGACY_BASH_ENV, pinned, major)], []
+        return pinned, [], []
+    absent = [
+        "no bash 3.x interpreter is available, so the declared bash 3.2 floor was "
+        "NOT checked on this host; set %s to one to enable that leg"
+        % _LEGACY_BASH_ENV
+    ]
+    probe = "/bin/bash"
+    if not os.path.exists(probe):
+        # EXISTENCE, not executability. os.access(probe, os.X_OK) was the test
+        # here, which sent a /bin/bash that exists but cannot be executed down
+        # this path and reported it as an absent interpreter — the same
+        # fail-open T11 removes one line below, reintroduced by the guard that
+        # precedes it. Present-but-unrunnable is not absence: it reaches
+        # _bash_major, whose PermissionError is an OSError and becomes the
+        # finding T11 requires. Absence is the Linux-container case this note
+        # exists for, and nothing is probed there, so nothing can fail.
+        return "", [], absent
+    major, reason = _bash_major(probe)
+    if major == "3":
+        return probe, [], []
+    if reason:
+        # A probe that FAILED is not an interpreter that is absent. This return
+        # used to discard the reason, so a hung or unrunnable /bin/bash was
+        # reported as "no bash 3.x available" — a fail-open path on the exact
+        # leg #641 added, which would silently drop the floor leg on the very
+        # host that cannot answer for it. A version that is simply not 3 stays
+        # the stated skip it has always been.
+        return "", ["the bash 3.x floor could not be resolved: %s" % reason], []
+    return "", [], absent
+
+
+def _legacy_parser_is_blind(interpreter: str) -> list[str]:
+    """A parser that accepts the known-bad control asserts nothing."""
+    try:
+        proc = subprocess.run(
+            [interpreter, "-n"], input=_LEGACY_CONTROL,
+            capture_output=True, text=True, timeout=_PARSE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        # Ahead of the broader clause below, and worded like the two timeout
+        # findings in check_shell: the leg, the invocation, the bound and the
+        # operation. The generic wording names none of them, so a hung
+        # interpreter here read as an unspecified subprocess failure.
+        return ["the bash 3.x floor cannot be checked: %s -n did not return "
+                "within %d seconds while parsing the known-bad control"
+                % (interpreter, _PARSE_TIMEOUT_SECONDS)]
+    except (OSError, subprocess.SubprocessError) as exc:
+        return ["the bash 3.x floor cannot be checked: %s could not parse the "
+                "known-bad control: %s" % (interpreter, exc)]
+    if proc.returncode == 0:
+        return ["%s ACCEPTS the known-bad bash 3.2 control, so it is blind to the "
+                "defect class this leg exists to see and a green verdict from it "
+                "asserts nothing — pin a real 3.x bash in %s, or unset it"
+                % (interpreter, _LEGACY_BASH_ENV)]
+    return []
+
+
+def check_shell(
+    root: pathlib.Path, notes: list[str],
+    subjects: list[pathlib.Path] | None = None,
+) -> list[str]:
+    """Syntax-check every shell subject in the TREE, on three legs.
+
+    ``subjects`` lets the caller supply an already-partitioned subject list, on
+    the same terms as `check_python`: it MUST be
+    `_subjects_by_kind(root)["shell"]` for the same ``root``, because ``root``
+    is read for nothing else once it is supplied. `run` classifies the tree
+    once and hands each check its half, and an omitted argument means enumerate
+    here. See `check_python` for the cost that motivates it.
+
+    ``notes`` is REQUIRED rather than defaulted. The floor leg's skip is stated
+    by appending to it, and a default would let a caller drop that statement by
+    omitting one argument — which is the silent skip this check forbids.
+
+    The primary parse uses the interpreter the file's own shebang names. Two
+    further legs exist because the primary one, alone, missed three real
+    defects in this repository:
+
+      * A non-empty stderr at exit 0 is a finding. bash 5 reports
+        `unterminated here-document` this way, and a return-code-only reading
+        has never reported it. This leg needs no 3.x interpreter and therefore
+        works on Linux.
+      * Every subject `shell_interpreter` calls bash is parsed a second time by
+        a bash 3.x interpreter, which is the floor this repository declares.
+        Homebrew bash 5 answers `bash` on PATH here and on both LAN runners, so
+        the declared floor was never actually exercised.
+
+    The sweep STOPS on either of two conditions, and neither shortens a parse
+    that has already been launched (#655). `_SHELL_CHECK_DEADLINE_SECONDS`
+    gates whether the next parse is launched at all, and a parse that exhausts
+    its own full `_PARSE_TIMEOUT_SECONDS` stops the sweep as well, because one
+    stuck interpreter means this tree is not verifiable on this host. When the
+    sweep stops, a finding states how many subjects each leg left unchecked,
+    rather than a short list of per-subject findings reading as a clean tree.
+    """
     problems: list[str] = []
-    for path in sorted(p for p in bin_dir.rglob("*") if p.is_file()):
-        if classify(path) != "shell":
-            continue
+    legacy, legacy_problems, legacy_notes = resolve_legacy_bash()
+    problems += legacy_problems
+    notes += legacy_notes
+    if legacy:
+        blind = _legacy_parser_is_blind(legacy)
+        if blind:
+            problems += blind
+            legacy = ""
+    if subjects is None:
+        subjects = iter_shell_subjects(root)
+    # T1 says the aggregate clock starts at check_shell ENTRY. It starts here
+    # instead, after the legacy interpreter has been resolved, after the
+    # blind-parser control parse, and after the subject enumeration. Each of
+    # those carries its own bound already — the two probes are bounded
+    # subprocesses and the walk runs no subprocess at all — so excluding them
+    # gives the sweep its full deadline rather than a deadline the preamble has
+    # already spent part of. The property T1 exists for is preserved: what the
+    # clock gates is whether the next PARSE is launched.
+    started = time.monotonic()
+    stop_reason = ""
+    # The first subject index whose leg was never resolved. Kept separately per
+    # leg because a legacy parse that hangs has already had its primary parse
+    # answered, and reporting that subject as an unchecked PRIMARY would
+    # overstate what was left unverified.
+    primary_stop = len(subjects)
+    floor_stop = len(subjects)
+    for index, path in enumerate(subjects):
+        if time.monotonic() - started >= _SHELL_CHECK_DEADLINE_SECONDS:
+            # Gates whether this parse is LAUNCHED. It never shortens one that
+            # has been. See _SHELL_CHECK_DEADLINE_SECONDS.
+            stop_reason = ("the aggregate %d-second deadline expired"
+                           % _SHELL_CHECK_DEADLINE_SECONDS)
+            primary_stop = floor_stop = index
+            break
         interpreter = shell_interpreter(path)
         try:
             proc = subprocess.run(
-                [interpreter, "-n", str(path)], capture_output=True, text=True
+                [interpreter, "-n", str(path)], capture_output=True, text=True,
+                timeout=_PARSE_TIMEOUT_SECONDS,
             )
+        except subprocess.TimeoutExpired:
+            problems.append(
+                "%s could not be syntax-checked: %s -n did not return within %d "
+                "seconds" % (path, interpreter, _PARSE_TIMEOUT_SECONDS)
+            )
+            # One interpreter that exhausts its FULL bound means this tree is
+            # not verifiable on this host. The run is going to exit 3 whatever
+            # follows, and continuing would spend the same bound on every
+            # remaining subject to prove it again.
+            stop_reason = ("%s -n exhausted its full %d-second bound on %s"
+                           % (interpreter, _PARSE_TIMEOUT_SECONDS, path))
+            primary_stop = floor_stop = index
+            break
         except OSError as exc:
             problems.append(
                 "%s could not be syntax-checked: %s -n is unavailable (%s)"
@@ -256,6 +664,70 @@ def check_shell(bin_dir: pathlib.Path) -> list[str]:
                 "%s: %s" % (path, detail[0] if detail else "%s -n exited %d"
                             % (interpreter, proc.returncode))
             )
+            # A file the current interpreter already refuses does not need the
+            # floor's opinion as well; one defect, one finding.
+            continue
+        warning = (proc.stderr or "").strip().splitlines()
+        if warning:
+            problems.append(
+                "%s: %s -n exited 0 but wrote a diagnostic: %s"
+                % (path, interpreter, warning[0])
+            )
+        if not legacy or interpreter != "bash":
+            continue
+        try:
+            old = subprocess.run(
+                [legacy, "-n", str(path)], capture_output=True, text=True,
+                timeout=_PARSE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            problems.append(
+                "%s could not be checked against the bash 3.2 floor: %s -n did "
+                "not return within %d seconds"
+                % (path, legacy, _PARSE_TIMEOUT_SECONDS)
+            )
+            stop_reason = ("%s -n exhausted its full %d-second bound on %s"
+                           % (legacy, _PARSE_TIMEOUT_SECONDS, path))
+            # This subject's PRIMARY parse already answered, so only the floor
+            # leg is unresolved from here.
+            primary_stop = index + 1
+            floor_stop = index
+            break
+        except OSError as exc:
+            problems.append(
+                "%s could not be checked against the bash 3.2 floor: %s -n is "
+                "unavailable (%s)" % (path, legacy, exc)
+            )
+            continue
+        if old.returncode != 0:
+            detail = (old.stderr or old.stdout).strip().splitlines()
+            problems.append(
+                "%s: does not parse under the declared bash 3.2 floor (%s): %s"
+                % (path, legacy, detail[0] if detail else "-n exited %d" % old.returncode)
+            )
+    if stop_reason:
+        # An incomplete sweep must never read as a clean tree. This tool's
+        # contract is that an inability to verify FAILS, so what went
+        # unverified is stated rather than left to be inferred from a count of
+        # per-subject findings that is silently short.
+        #
+        # The floor tally below is an UPPER bound, not an exact count. It
+        # counts every remaining bash-interpreted subject, and the floor leg is
+        # reached only for a subject whose PRIMARY parse exited 0: one that
+        # would have failed, or that raised OSError, is `continue`d before the
+        # floor leg and would never have reached it. Overstating what went
+        # unverified is the safe direction for a finding whose whole purpose is
+        # to refuse a clean verdict.
+        floor_unchecked = (
+            sum(1 for remaining in subjects[floor_stop:]
+                if shell_interpreter(remaining) == "bash") if legacy else 0
+        )
+        problems.append(
+            "the shell syntax check did not complete (%s): %d primary "
+            "subject(s) and %d bash 3.2-floor subject(s) were left unchecked; "
+            "no clean shell verdict is available"
+            % (stop_reason, len(subjects) - primary_stop, floor_unchecked)
+        )
     return problems
 
 
@@ -265,8 +737,16 @@ def check_ownership(root: pathlib.Path, owners: pathlib.Path) -> list[str]:
     try:
         proc = subprocess.run(
             [sys.executable, str(owners), "--verify", "--repo-root", str(root)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired:
+        # This subprocess carried no bound at all until #655, while the tool's
+        # own documentation said every wall-clock bound in it is a hang bound —
+        # which invites the reading that every subprocess has one. A validator
+        # that never returns is an inability to verify ownership, which this
+        # tool reports as a defect rather than as a pass.
+        return ["harness ownership could not be verified: %s did not return "
+                "within %d seconds" % (owners, _SUBPROCESS_TIMEOUT_SECONDS)]
     except OSError as exc:
         return ["%s could not be run: %s" % (owners, exc)]
     if proc.returncode == 0:
@@ -297,6 +777,66 @@ def check_durations(root: pathlib.Path) -> list[str]:
     if error:
         return [error]
     return []
+
+
+_CONTRACT_LIB = "_lib-test-contract.sh"
+
+
+def check_runtime_budget(root: pathlib.Path) -> list[str]:
+    """The committed runtime budget, validated by the parser that owns it.
+
+    check_durations reuses the scheduler's validator by IMPORTING
+    _lib_harness_durations and calling its Python API. There is no equivalent
+    module here: contract_budget_load is embedded Python inside a shell library,
+    so nothing can be imported and that structure cannot be reused. The real
+    loader is invoked through a caught subprocess instead, which is what keeps
+    the committed file validated by the same parser that validates it at
+    admission and keeps the refusal vocabulary in exactly one place.
+
+    Resolved from this script's own directory, exactly as _sibling resolves the
+    Python siblings and for the same reason: the contract belongs to the binary
+    doing the checking, not to the tree being checked. A library that is absent
+    or that fails is an inability to complete a declared check, which this tool
+    reports as a defect at exit 3 rather than as a pass.
+    """
+    library = _BIN_DIR / _CONTRACT_LIB
+    budget = root / "tests" / "authoritative-runtime-budget.json"
+    if not library.is_file():
+        return [
+            "the committed runtime budget cannot be validated: %s is absent, so "
+            "the loader that owns the file's contract cannot be reached" % library
+        ]
+    script = (
+        'set -uo pipefail\n'
+        'source "$1" || exit 2\n'
+        'contract_budget_load "$2" || { contract_print_diagnostics; exit 1; }\n'
+    )
+    try:
+        proc = subprocess.run(
+            ["bash", "-c", script, "cctally-preflight", str(library), str(budget)],
+            capture_output=True, text=True,
+            # The same HANG bound check 5 carries, for the same reason: it
+            # decides an outcome only when the subprocess never returns at all.
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [
+            "the committed runtime budget cannot be validated: %s could not be "
+            "run: %s" % (library, exc)
+        ]
+    if proc.returncode == 0:
+        return []
+    lines = [ln.strip() for ln in (proc.stderr or proc.stdout).splitlines() if ln.strip()]
+    if proc.returncode != 1 or not lines:
+        return [
+            "the committed runtime budget cannot be validated: %s exited %d "
+            "against %s%s"
+            % (library, proc.returncode, budget, (" - %s" % lines[-1]) if lines else "")
+        ]
+    # The loader's own diagnostic, verbatim. It already names the file and the
+    # cause, and restating either here would be a second spelling of a
+    # vocabulary this repository keeps in exactly one place.
+    return lines
 
 
 def _forced_dispatch() -> str:
@@ -356,7 +896,7 @@ def check_scheduler_plan(root: pathlib.Path) -> list[str]:
             # performance assertion — it is not compared against, reported, or
             # tuned — it is the bound that keeps a hung aggregator from turning
             # a pre-flight into the outage it exists to prevent.
-            timeout=60,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return ["the dispatch plan could not be read from %s: %s" % (aggregator, exc)]
@@ -484,29 +1024,56 @@ def check_changelog(root: pathlib.Path) -> list[str]:
     ]
 
 
-def run(root: pathlib.Path) -> tuple[int, list[str]]:
+def run(root: pathlib.Path) -> tuple[int, list[str], list[str]]:
+    """``(exit code, problems, notes)``.
+
+    A NOTE is a leg that could not run for a legitimate reason — today, only an
+    absent bash 3.x interpreter. It is stated rather than silent, because a leg
+    that can vanish without a word is a leg nobody notices has stopped running.
+    It is not a finding and does not change the exit code.
+    """
+    notes: list[str] = []
     bin_dir = root / "bin"
     if not bin_dir.is_dir():
-        return EXIT_DEFECT, ["%s has no bin/ directory, so nothing can be checked" % root]
-    problems = check_python(bin_dir)
-    problems += check_shell(bin_dir)
+        return EXIT_DEFECT, [
+            "%s has no bin/ directory, so nothing can be checked" % root
+        ], notes
+    # One walk, one classification pass, both halves handed on. Calling
+    # check_python(root) and check_shell(root, notes) here instead walks the
+    # tree twice and classifies every file twice. No count is written here,
+    # for the reason given at `_PARSE_TIMEOUT_SECONDS`.
+    #
+    # This also enumerates the SHELL subjects before check_python compiles its
+    # own, where the shell walk previously ran after check_python returned.
+    # That widens the window between a subject's is_file() at walk time and its
+    # `bash -n` at parse time, so a file deleted inside it is reported as a
+    # defect rather than skipped. The harness's real-tree case already assumes
+    # a quiescent estate for the whole run; this widens that assumption, it
+    # does not introduce it.
+    by_kind = _subjects_by_kind(root)
+    problems = check_python(root, by_kind["python"])
+    problems += check_shell(root, notes, by_kind["shell"])
     problems += check_ownership(root, pathlib.Path(__file__).resolve().parent / _OWNERS)
     problems += check_durations(root)
     problems += check_scheduler_plan(root)
     problems += check_visibility(root)
     problems += check_changelog(root)
-    return (EXIT_DEFECT if problems else EXIT_OK), problems
+    problems += check_runtime_budget(root)
+    return (EXIT_DEFECT if problems else EXIT_OK), problems, notes
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="cctally-preflight",
         description=(
-            "Compile every Python file under bin/, syntax-check every shell "
-            "script, verify harness ownership, validate the harness duration "
-            "table, confirm the dispatch scheduler is armed, check declared "
-            "visibility against the mirror allowlist, and check CHANGELOG.md "
-            "against the user-facing entry policy — before a remote round trip."
+            "Compile every Python file in the repository, syntax-check every "
+            "shell subject in the repository against its own interpreter and against "
+            "the declared bash 3.2 floor, verify harness ownership, validate "
+            "the harness duration table, confirm the dispatch scheduler is "
+            "armed, check declared "
+            "visibility against the mirror allowlist, check CHANGELOG.md "
+            "against the user-facing entry policy, and validate the committed "
+            "runtime budget through its own loader — before a remote round trip."
         ),
     )
     parser.add_argument(
@@ -524,7 +1091,9 @@ def main(argv: list[str]) -> int:
         sys.stderr.write("preflight: %s is not a directory\n" % root)
         return EXIT_USAGE
 
-    code, problems = run(root)
+    code, problems, notes = run(root)
+    for note in notes:
+        sys.stderr.write("preflight: note: %s\n" % note)
     for problem in problems:
         sys.stderr.write("preflight: %s\n" % problem)
     if code == EXIT_OK:

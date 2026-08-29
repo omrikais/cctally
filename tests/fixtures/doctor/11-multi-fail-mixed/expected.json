@@ -222,7 +222,7 @@
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1010,
+                            "epoch": 1011,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -996,6 +996,36 @@
             "checks": [
                 {
                     "details": {
+                        "active": false,
+                        "effective_from": null,
+                        "new_units_per_point": null,
+                        "previous_units_per_point": null
+                    },
+                    "id": "quota.meter_drift",
+                    "severity": "ok",
+                    "summary": "no change detected",
+                    "title": "Metering rate"
+                },
+                {
+                    "details": {
+                        "present": false,
+                        "rejection": "calibration-absent",
+                        "status": null
+                    },
+                    "id": "quota.calibration",
+                    "severity": "ok",
+                    "summary": "no calibration fitted yet",
+                    "title": "Calibration"
+                }
+            ],
+            "id": "quota",
+            "severity": "ok",
+            "title": "Quota"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
                         "config": "loopback",
                         "runtime_bind": null
                     },
@@ -1077,7 +1107,7 @@
     "overall": {
         "counts": {
             "fail": 3,
-            "ok": 51,
+            "ok": 53,
             "warn": 8
         },
         "severity": "fail"

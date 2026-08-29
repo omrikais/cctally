@@ -113,17 +113,108 @@ ones you asked for and are used verbatim.
 
 ## Claude `Used %`
 
-For a single subscription week *W* and project *P*:
+`Used %` is a project's **modelled weekly quota** wherever the fitted
+calibration `cctally quota` writes can be applied to the week, and the older
+cost share otherwise. The two are computed differently and the payload says
+which one you are reading.
+
+**Modelled quota.** For a single subscription week *W* and project *P*:
+
+    attributed_pct[P, W] = weighted_units[P, W] / units_per_point[W]
+
+`weighted_units` is the same per-request weighting `cctally quota` fits, run
+on each entry BEFORE it is aggregated into a project bucket — the aggregate
+drops the one-hour cache-write split the weighting needs. It needs no meter
+reading and no cost denominator at all.
+
+A week is modelled only when every entry in it falls inside one S1 metering
+regime and the week's whole account population passes that regime's
+composition support test. A week that fails either falls back for the **whole
+week**: partial-week mixtures are not produced. Support is tested over the
+account-week population, never per project.
+
+**The cost share** is the fallback, and is what every install without a fitted
+calibration reports:
 
     attributed_pct[P, W] = (cost[P, W] / total_cost[W]) * weekly_percent[W]
 
 Where `total_cost[W]` is the sum across **all** entries in the week (not
 affected by `--project` / `--model` filters — the denominator stays
-invariant). Over a multi-week range, per-week attributions sum: three
-weeks of 20% → `60.0% (3wk)`. The `(Nwk)` suffix makes this explicit.
-`—` in the `Used %` column means the week had no
-`weekly_usage_snapshots` row (usually: very fresh install). `$/1%` is
+invariant). This proxy over-credits a cache-heavy project and under-credits an
+output-heavy Opus one, because cache reads are far cheaper per token than
+output under the model's weights. That is the reason the modelled basis
+exists.
+
+Over a multi-week range, per-week attributions sum: three weeks of 20% →
+`60.0% (3wk)`. The `(Nwk)` suffix makes this explicit. `—` in the `Used %`
+column means the week had no `weekly_usage_snapshots` row (usually: very fresh
+install), or that modelled quota was withheld. `$/1%` is
 `cost / attributed_pct`.
+
+**`--account` is required on a decorated multi-account install.** A run
+without `--account` is merged, and no valid merged calibration exists, so
+modelled quota is withheld with the cause `account-not-resolved` rather than
+falling back to the cost share — falling back would keep publishing a cost
+share under a column that says quota. At a single real account nothing
+decorates and the merged path is the account path, so this affects only
+genuinely multi-account installs.
+
+## `--json` schema 2
+
+`project --json` carries `schemaVersion: 2`. `attributedUsedPercent` and
+`costPerPercent` keep their spellings and change their meaning, from the cost
+share to modelled quota, which the CLI contract classifies as breaking on its
+own.
+
+The additive keys:
+
+- `attribution.basis` — `modelled`, `cost-share` or `withheld` for the run as
+  a whole. The run reports the weakest basis any contributing week reached.
+- `attribution.cause` — the typed reason modelled quota was not reached:
+  `account-not-resolved`, `calibration-absent`, `regime-boundary`,
+  `unsupported-composition` or `no-local-history`. `null` when the basis is
+  `modelled`.
+- `attribution.totals` — four distinct quantities, which are not the same
+  number and are never conflated: `modelledWeekPoints` (every local entry in
+  the window's MODELLED weeks, weighted and converted), `visibleRowPoints`
+  (the subset the rendered rows carry), `filteredOrUnmodelledPoints` (exactly
+  the difference between the two), and `observedMinusModelledPoints` (the
+  meter's reading minus the first). A week that fell back to the cost share
+  contributes to none of the three point figures, because its points are not
+  comparable to a modelled quantity; a run holding one withholds the residual
+  outright. The residual is stated only when the account, the window and the
+  population align — a single resolved account, a range that covers every
+  subscription week it touches whole, and no fallback or filter splitting the
+  population — and `residualCause` names the cause otherwise. That cause is
+  one of three, and they are separate conditions rather than three names for
+  one: `population-misaligned` when the account, the window or a filter split
+  the population; `observed-absent` when at least one modelled week carries no
+  meter snapshot, so there is no observed side to subtract from; and
+  `no-modelled-weeks` when the window modelled no subscription week at all.
+  The last two are not misalignments — the population is whole and one operand
+  simply is not there — and reporting them as misalignment told a user their
+  window or filters were at fault when neither was. **The residual is not an
+  estimate of off-machine usage**, and it has been measured with both signs,
+  so no consumer may assume a direction.
+- `projects[].attributionBasis` — the same three-member vocabulary per row. A
+  project spanning weeks that resolved differently reports `cost-share`.
+
+A v1 consumer that read `attributedUsedPercent` as a cost share must read
+`attribution.basis` to know which measure it holds. On an install with no
+fitted calibration the basis is `cost-share` and the value is unchanged.
+
+The terminal table states the same four quantities in a footer under it, so a
+terminal user gets the reconciliation a `--json` consumer already had. The
+footer prints the residual with the sign it was measured with and says
+outright that the difference is not an identification or an estimate of usage
+from another machine; it never states a direction.
+
+"Whole subscription weeks" means the requested range covers every
+subscription week it touches from that week's start to its end. A range like
+`--since 2026-06-03 --until 2026-06-05` slices one week, so the meter reading
+covers seven days while the modelled population covers three, and the
+residual is withheld. The OPEN week is covered whole by a range running to
+now, because the meter reading and the local entries both stop there.
 
 ## Claude `Cost Share`
 

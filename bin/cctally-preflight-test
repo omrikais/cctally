@@ -18,20 +18,47 @@
 # that the detectors work, and `real-tree` as the reason skipping removes a
 # duplicate rather than coverage.
 #
-# The matrix covers each of the tool's six CHECKS. It does not cover every
+# The matrix covers each of the tool's eight CHECKS. It does not cover every
 # branch inside them, and the difference matters when reading a green run:
 #
-#   1. compile every Python file under bin/, selected by `.py` extension OR by
-#      a Python shebang     -> cases python-extension, python-extensionless,
+#   1. compile every Python file in the TREE (#655), selected by `.py`
+#      extension OR by a Python shebang
+#                           -> cases python-extension, python-extensionless,
 #                              plus the two controls that prove the selector
-#                              does not simply compile everything.
+#                              does not simply compile everything, plus
+#                              python-subject-outside-bin for the widened
+#                              subject set itself, which is the one behaviour
+#                              the other four leave unpinned because every one
+#                              of them plants its subject under bin/.
 #                              NOT covered: the unreadable-source branch and
 #                              the null-byte branch (compile raises ValueError,
 #                              not SyntaxError).
-#   2. syntax-check every shell script, `bash -n` or `sh -n` chosen per file
-#      from its own shebang -> cases shell-bash, shell-sh.
-#      NOT covered: the `.sh` extension selector and the no-shebang default,
-#      because no synthetic tree here carries a `.sh` file at all.
+#   2. syntax-check every shell subject in the TREE on three legs (#641)
+#                           -> cases shell-bash, shell-sh for the primary parse;
+#                              shell-legacy-only and shell-shebangless-fragment
+#                              for the bash 3.2 floor leg;
+#                              shell-warning-at-exit-zero for the leg that reads
+#                              stderr rather than the return code;
+#                              shell-legacy-pin-not-three and
+#                              shell-legacy-parser-blind for the two operator
+#                              errors the floor leg refuses;
+#                              shell-subject-parity for the pruned walk's
+#                              subject set, and shell-prune-protected-roots for
+#                              the prune list that keeps it honest;
+#                              shell-subject-outside-bin for the widened subject
+#                              set itself, which is the one behaviour the other
+#                              cases leave unpinned because every one of them
+#                              plants its subject under bin/;
+#                              shell-read-only-tree for the tool's read-only
+#                              contract, which is what keeps the known-bad
+#                              control on stdin rather than in a temporary file.
+#                              shell-shebangless-fragment is what pins the
+#                              `.sh`-with-no-shebang selector, which covers a
+#                              recurring shape among this repository's shell
+#                              subjects, so a predicate keyed on a bash shebang
+#                              would silently exclude every one of them.
+#                              NOT covered: the interpreter-unavailable branch
+#                              of either leg.
 #   3. bin/cctally-test-owners --verify
 #                           -> cases missing-harness, unexpected-harness,
 #                              lost-executable-bit, removed-edge, stale-edge,
@@ -67,6 +94,22 @@
 #                              NOT covered: the classifier-absent branch, which
 #                              overlay-absent-private reaches incidentally, and
 #                              the classifier-raises branch.
+#   7. check CHANGELOG.md against the user-facing entry policy
+#                           -> cases changelog-missing, changelog-unreadable,
+#                              changelog-noncompliant, and changelog-compliant
+#                              as a second passing shape.
+#                              NOT covered: the classifier-present-but-
+#                              unloadable branch.
+#   8. validate tests/authoritative-runtime-budget.json through the REAL
+#      contract_budget_load (#650) -> cases budget-missing, budget-malformed,
+#                              budget-unparseable, and budget-valid-variant as
+#                              a second passing shape. The green control is
+#                              this check's passing input, because make_tree
+#                              writes a valid budget.
+#                              NOT covered: the duplicate-key, unknown-key,
+#                              missing-key and non-finite branches, all of
+#                              which tests/test_authoritative_test_contract.py
+#                              drives against the same loader.
 #
 # No case here exercises a check the tool does not perform. The remaining three
 # cases are the green control, the usage refusal, and `real-tree`.
@@ -102,6 +145,28 @@ set -uo pipefail
 # bin/cctally-test-remote-test unsets CCTALLY_TEST_JOBS at its own top.
 unset CCTALLY_TEST_ALL_DISPATCH
 
+# CCTALLY_PREFLIGHT_BASH32 is scrubbed for the same reason and by the same rule
+# (#641). The tool resolves the PIN before it falls back to /bin/bash, while the
+# LEGACY_BASH probe below reads /bin/bash alone, so an exported pin makes the
+# harness and the tool disagree about which interpreter the floor leg is using:
+# the harness would decide the two floor cases can run while the tool parsed
+# with something else entirely, and on a Linux lane with a pin exported the
+# harness would state a SKIP for a leg that in fact ran.
+#
+# Scrubbed rather than reconciled by teaching the probe to read the pin. The two
+# cases that care about the pin — shell-legacy-pin-not-three and
+# shell-legacy-parser-blind — set it per invocation, and this unset is what makes
+# those settings the only source, so each case observes what it asked for rather
+# than what the surrounding run happens to export. Honouring an inherited pin
+# would leave shell-legacy-only and shell-shebangless-fragment parsing under an
+# interpreter no case chose, which is the defect this paragraph exists to
+# prevent. Deriving LEGACY_BASH from the tool's own resolve_legacy_bash was the
+# other candidate and was rejected: a module load that failed would leave the
+# variable empty, and an empty variable here is a stated SKIP, so a broken
+# derivation would silently disable both floor cases — the silent skip the floor
+# leg's own contract forbids.
+unset CCTALLY_PREFLIGHT_BASH32
+
 # Dev-instance isolation: force the prod data-dir layout under any fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
 
@@ -122,6 +187,29 @@ cleanup_on_exit () {
     fi
 }
 trap cleanup_on_exit EXIT
+
+# The bash 3.x interpreter the floor leg resolves when nothing is pinned, or ""
+# when this host has none. macOS ships 3.2 at /bin/bash; a Linux container
+# legitimately has no 3.x bash at all, which is why the two cases that need one
+# state a skip rather than passing silently, and why the `preflight` manifest row
+# is countPolicy `variable` on a bash-3-availability axis.
+LEGACY_BASH=""
+if [ -x /bin/bash ] \
+   && [ "$(/bin/bash -c 'printf %s "${BASH_VERSINFO[0]}"' 2>/dev/null)" = 3 ]; then
+    LEGACY_BASH=/bin/bash
+fi
+
+# The exact tally on each axis of LEGACY_BASH, asserted at the bottom of this
+# file. `minCases` in tests/authoritative-test-manifest.json is a FLOOR and
+# countPolicy/countAxis are advisory to the reader, so the floor alone cannot
+# notice the two bash-3-gated cases silently disappearing: the run would simply
+# report the lower number and still clear it. These are the numbers an actual
+# run printed, and they must be updated DELIBERATELY whenever a case is added
+# or removed (#655). The difference between them is exactly
+# shell-legacy-only and shell-shebangless-fragment, which state a SKIP where no
+# bash 3.x interpreter exists.
+EXPECTED_CASES_WITH_BASH3=60
+EXPECTED_CASES_WITHOUT_BASH3=58
 
 report () {
     local case_name="$1"; local status="$2"; local detail="${3-}"
@@ -178,6 +266,20 @@ EOF
     # every pre-existing green case would fail the new mandatory validation
     # rather than the property it asserts.
     printf '%s\t%s\n' "$H" 5 > "$d/tests/authoritative-harness-durations.tsv"
+    # The committed runtime budget check 8 validates (#650 item 4). Written into
+    # every synthetic tree for the same reason the duration table and the
+    # changelog are: without it every pre-existing green case would fault on the
+    # new check rather than on the property it asserts. The maximum is the same
+    # deliberately enormous fixture value the pytest estates use — this tree is
+    # never measured against it, and a value that could be breached would make
+    # the fixture's own cost decide an unrelated case.
+    cat > "$d/tests/authoritative-runtime-budget.json" <<'BUDGET_EOF'
+{
+  "schemaVersion": 1,
+  "metric": "secondsPerThousandCases",
+  "maxSecondsPerThousandCases": 1000000
+}
+BUDGET_EOF
     write_changelog "$d"
     write_plan_stub "$d" lpt
 }
@@ -300,6 +402,389 @@ d=$(new_tree shell-sh)
 printf '%s\n%s\n' '#!/bin/sh' 'case x in' > "$d/bin/cctally-broken-posix"
 chmod +x "$d/bin/cctally-broken-posix"
 expect_rc shell-sh 3 "$d" "cctally-broken-posix"
+
+# ---- check 2, the bash 3.2 floor leg and the stderr leg (#641) ----------
+# The primary parse above runs the interpreter the file's own shebang names,
+# which resolves to Homebrew bash 5 here and on both LAN runners. Three real
+# defects in this repository were invisible to it: two files parsed clean under
+# 5 and were rejected by the declared 3.2 floor, and one exited 0 while writing
+# eleven warnings that a return-code-only reading never looked at.
+#
+# The body below is the shape that discriminates the two interpreters. bash 3.2
+# scans a `$( … )` command substitution by counting characters rather than by
+# parsing it, so an unbalanced `)` — which is what an ordinary `case` pattern is
+# — ends the substitution early. bash 5 parses the region properly and accepts
+# it. Every fixture line is written from a single-quoted printf argument, so
+# this harness's own text carries no such construct.
+write_legacy_only_body () {   # write_legacy_only_body <file> [shebang line]
+    local f=$1 shebang=${2-}
+    {
+        if [ -n "$shebang" ]; then printf '%s\n' "$shebang"; fi
+        printf '%s\n' 'x=$(case a in'
+        printf '%s\n' 'b) echo b ;;'
+        printf '%s\n' 'esac)'
+        printf '%s\n' 'echo "$x"'
+    } > "$f"
+}
+
+# A stand-in bash, used by the two operator-error cases. It answers the tool's
+# version probe with <major> and exits <rc> for everything else, including the
+# known-bad control the tool feeds on stdin. Stubbed rather than resolved from
+# the host for two different reasons: no machine has a bash 3.x that is BLIND to
+# that control, so `shell-legacy-parser-blind` has nothing real to pin; and no
+# lane guarantees a non-3 bash at a predictable path, so pinning one would make
+# `shell-legacy-pin-not-three` depend on what the host happens to install. Both
+# stubs live outside the tree under test, so the pre-flight never scans them.
+write_bash_stub () {   # write_bash_stub <path> <major version> <rc for -n>
+    local f=$1 major=$2 rc=$3
+    {
+        printf '%s\n' '#!/usr/bin/env bash'
+        printf '%s\n' 'case "${1-}" in'
+        printf '  (-c) printf %%s %s ;;\n' "$major"
+        printf '  (*) exit %s ;;\n' "$rc"
+        printf '%s\n' 'esac'
+    } > "$f" || return 1
+    chmod +x "$f"
+}
+
+# A file bash 5 accepts and bash 3.2 rejects. This is the defect class the issue
+# is about, and the case that proves the floor leg actually runs.
+if [ -n "$LEGACY_BASH" ]; then
+    d=$(new_tree shell-legacy-only)
+    write_legacy_only_body "$d/bin/cctally-legacy-only-wrapper" '#!/usr/bin/env bash'
+    chmod +x "$d/bin/cctally-legacy-only-wrapper"
+    expect_rc shell-legacy-only 3 "$d" \
+        "cctally-legacy-only-wrapper: does not parse under the declared bash 3.2 floor"
+else
+    echo "SKIP shell-legacy-only: this host has no bash 3.x interpreter"
+fi
+
+# The predicate for the floor leg is `shell_interpreter(path) == "bash"`, NOT
+# the presence of a bash shebang. A `.sh` file with no shebang is a bash-sourced
+# fragment by that function's documented contract, and that shape recurs among
+# this tree's shell subjects rather than being an anomaly — among them the
+# executable bin/_lib-golden-diff.sh and the sourced bin/_lib-fixture-cache.sh.
+# Without
+# this case a future change back to a shebang-keyed predicate would silently
+# exclude every one of them and reproduce the blindness #641 is about.
+#
+# The exact number is deliberately not written here. This harness ships to the
+# public mirror, whose tree is a subset with a different subject set, so a count
+# stated here is false there and goes stale here on any added file; it belongs
+# in the maintainer's remote-testing reference instead.
+if [ -n "$LEGACY_BASH" ]; then
+    d=$(new_tree shell-shebangless-fragment)
+    write_legacy_only_body "$d/bin/_lib-legacy-fragment.sh"
+    if head -n 1 "$d/bin/_lib-legacy-fragment.sh" | grep -q '^#!'; then
+        report shell-shebangless-fragment FAIL \
+            "the fixture grew a shebang, so it no longer pins the no-shebang selector"
+    else
+        expect_rc shell-shebangless-fragment 3 "$d" \
+            "_lib-legacy-fragment.sh: does not parse under the declared bash 3.2 floor"
+    fi
+else
+    echo "SKIP shell-shebangless-fragment: this host has no bash 3.x interpreter"
+fi
+
+# Non-empty stderr at exit 0 is a finding. bash 5 reports an unterminated
+# here-document this way, which is how bin/cctally-reconcile-test emitted eleven
+# warnings for months with nothing listening. This leg needs no 3.x interpreter,
+# so unlike the two cases above it runs on every lane.
+#
+# The substring names the LEG as well as the file, and the reason is that this
+# fixture reaches exactly one leg on every host. Measured: `/bin/bash -n`
+# 3.2.57 exits 0 on it and writes nothing, so the floor leg never fires here —
+# the shape bash 5 warns about is not the shape 3.2 rejects. Naming the leg is
+# therefore what keeps this case on its own diagonal against the two floor cases
+# above, which fire on the same tree shape through a different detector.
+d=$(new_tree shell-warning-at-exit-zero)
+{
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf 'out=$(cat <<%sBODY%s 2>&1)\n' "'" "'"
+    printf '%s\n' 'a line of body text'
+    printf '%s\n' 'BODY'
+    printf '%s\n' 'echo "$out"'
+} > "$d/bin/cctally-warned-wrapper"
+chmod +x "$d/bin/cctally-warned-wrapper"
+expect_rc shell-warning-at-exit-zero 3 "$d" \
+    "cctally-warned-wrapper: bash -n exited 0 but wrote a diagnostic"
+
+# CCTALLY_PREFLIGHT_BASH32 is a CLAIM about what the pinned interpreter is, and
+# a false claim is an operator error rather than an absent capability. An absent
+# interpreter is a stated skip; a pin that is not major version 3 is a finding.
+d=$(new_tree shell-legacy-pin-not-three)
+if write_bash_stub "$SCRATCH_DIR/bash-stub-v5" 5 0; then
+    CCTALLY_PREFLIGHT_BASH32="$SCRATCH_DIR/bash-stub-v5" \
+        expect_rc shell-legacy-pin-not-three 3 "$d" \
+        "reports bash major version 5, not 3"
+else
+    report shell-legacy-pin-not-three FAIL "the bash stub could not be written"
+fi
+
+# The blind-parser guard. Before the floor leg's verdicts are trusted, the tool
+# parses a minimal reproduction of the defect class with the resolved
+# interpreter, fed on stdin so nothing is written into the tree under test. A
+# parser that ACCEPTS the control cannot see the class, so a green verdict from
+# it asserts nothing — and the tree here is otherwise clean, which is exactly the
+# reading the guard must refuse.
+d=$(new_tree shell-legacy-parser-blind)
+if write_bash_stub "$SCRATCH_DIR/bash-stub-blind" 3 0; then
+    CCTALLY_PREFLIGHT_BASH32="$SCRATCH_DIR/bash-stub-blind" \
+        expect_rc shell-legacy-parser-blind 3 "$d" \
+        "ACCEPTS the known-bad bash 3.2 control"
+else
+    report shell-legacy-parser-blind FAIL "the bash stub could not be written"
+fi
+
+# R4a's headline behaviour: a defect OUTSIDE bin/ is found. Every other
+# `expect_rc … 3` case in this file plants its subject under `$d/bin/`, and
+# `shell-subject-parity` below calls iter_shell_subjects directly rather than
+# through check_shell — so before this case existed, narrowing check_shell back
+# to a bin/-only rglob left all forty-seven cases green while the whole point of
+# widening the subject set went unpinned.
+#
+# The planted file fails the PRIMARY parse, so the case fires on every lane
+# rather than only where a 3.x bash exists, and its path is built from the same
+# two variables every other fixture path here uses — see the NOTE at the top
+# about the ownership scraper.
+d=$(new_tree shell-subject-outside-bin)
+printf '%s\n%s\n' '#!/usr/bin/env bash' 'if [ 1 ]; then' > "$d/tests/$FX/$H/broken.sh"
+# The assertion names the LEG as well as the file, matching its neighbours. A
+# bare `broken.sh` would be satisfied by any detector that happened to print
+# that basename, and a future case planting its own broken.sh elsewhere could
+# collide with it. The text is the primary parse's own first stderr line, which
+# check_shell includes verbatim in the finding — measured, not guessed, and a
+# prefix of what both bash 3.2 and bash 5 write for this fixture.
+expect_rc shell-subject-outside-bin 3 "$d" \
+    "$d/tests/$FX/$H/broken.sh: line 3: syntax error: unexpected end of file"
+
+# check_python was bin/-only while check_shell was repository-wide, so a Python
+# syntax error outside bin/ was invisible (#655). This case is what keeps the
+# walk widened: narrowing check_python back to a bin/ rglob leaves every other
+# case green.
+d=$(new_tree python-subject-outside-bin)
+printf '%s\n%s\n' 'def broken(:' '    pass' > "$d/tests/$FX/$H/broken_syntax.py"
+expect_rc python-subject-outside-bin 3 "$d" "broken_syntax.py"
+
+# The tool only READS. The control the blind-parser guard feeds is fed on stdin
+# and never written to disk, and the tool goes as far as setting
+# sys.dont_write_bytecode so its own imports leave no __pycache__ in the tree
+# under test. Nothing above would notice a regression that wrote the control to
+# a temporary file: the stub parsers ignore stdin, so a file-based control would
+# still produce the same exit codes and the same diagnostics.
+#
+# The pin is what makes this case non-vacuous on every lane. It resolves to a
+# stub that reports major 3, so the floor leg runs and the control IS fed, and
+# that stub answers the bare `-n` control non-zero (so it is not judged blind)
+# while answering a `-n <file>` parse zero (so the tree stays clean).
+#
+# What exit 0 does and does not establish (#655). A run that failed to resolve
+# the pin, or whose guard supplied a pathname instead of a bare `-n`, would
+# exit 3 rather than 0. Exit 0 therefore proves only that, IF the control was
+# fed, it was fed on stdin; it does not prove the blind-parser guard exists or
+# ran, because deleting that guard entirely also yields exit 0 here.
+# `shell-legacy-parser-blind` pins the guard's existence separately.
+write_seeing_bash_stub () {   # write_seeing_bash_stub <path>
+    local f=$1
+    {
+        printf '%s\n' '#!/usr/bin/env bash'
+        printf '%s\n' 'if [ "${1-}" = -c ]; then printf %s 3; exit 0; fi'
+        printf '%s\n' 'if [ "$#" -eq 1 ]; then exit 2; fi'
+        printf '%s\n' 'exit 0'
+    } > "$f" || return 1
+    chmod +x "$f"
+}
+
+d=$(new_tree shell-read-only-tree)
+if write_seeing_bash_stub "$SCRATCH_DIR/bash-stub-seeing"; then
+    before="$SCRATCH_DIR/shell-read-only-tree.before"
+    after="$SCRATCH_DIR/shell-read-only-tree.after"
+    ( cd "$d" && find . -print | LC_ALL=C sort ) > "$before"
+    CCTALLY_PREFLIGHT_BASH32="$SCRATCH_DIR/bash-stub-seeing" \
+        "$PREFLIGHT" --repo-root "$d" > "$SCRATCH_DIR/shell-read-only-tree.log" 2>&1
+    read_only_rc=$?
+    ( cd "$d" && find . -print | LC_ALL=C sort ) > "$after"
+    if [ "$read_only_rc" != 0 ]; then
+        report shell-read-only-tree FAIL \
+            "expected exit 0 for the pinned stdin-form control check, got $read_only_rc (see $SCRATCH_DIR/shell-read-only-tree.log)"
+    # What this case enforces is PATH-SET STABILITY, not immutability: it
+    # compares `find . -print` output, so it detects a file added to or removed
+    # from the tree, but an in-place change to an existing file's content, mode
+    # or metadata leaves the path set identical and is invisible to it. It also
+    # cannot see a write outside the tree, or a transient file removed before
+    # the after-snapshot — a /tmp write with cleanup would pass. The concern the
+    # finding was raised for, a temp file inside the tree under test, IS
+    # covered. Proving process-wide no-write behaviour needs strace or dtruss,
+    # or a write-denying sandbox, and is outside this portable harness (#655).
+    elif ! diff -u "$before" "$after" > "$SCRATCH_DIR/shell-read-only-tree.diff" 2>&1; then
+        report shell-read-only-tree FAIL \
+            "the tool changed the file set of the tree it checked (see $SCRATCH_DIR/shell-read-only-tree.diff)"
+    else
+        report shell-read-only-tree PASS
+    fi
+else
+    report shell-read-only-tree FAIL "the bash stub could not be written"
+fi
+
+# The subject set itself. The walk is a PRUNED filesystem walk rather than
+# `git ls-files`, because the pre-flight must not require a git repository — the
+# tree it checks may be a materialized copy. This case is what keeps that
+# pruning honest: a prune that silently swallowed a directory would otherwise
+# read as "everything parses".
+#
+# The reference is `--cached --others --exclude-standard` and NOT a tracked-only
+# list, because an authoritative run deliberately materializes untracked but
+# non-ignored working-tree input; a tracked-only comparison would declare a
+# parity the runner does not have. It runs against the REAL tree for the same
+# reason `real-tree` does, and under the same CONSTRAINT 1 stated there.
+if python3 - "$REPO_ROOT" > "$SCRATCH_DIR/shell-subject-parity.log" 2>&1 <<'PARITY'
+import importlib.machinery, importlib.util, pathlib, subprocess, sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+loader = importlib.machinery.SourceFileLoader(
+    "preflight_under_test", str(root / "bin" / "cctally-preflight")
+)
+mod = importlib.util.module_from_spec(
+    importlib.util.spec_from_loader("preflight_under_test", loader)
+)
+loader.exec_module(mod)
+
+walked = set()
+for path in mod.iter_shell_subjects(root):
+    walked.add(str(path.relative_to(root)))
+
+listed = subprocess.run(
+    ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard"],
+    capture_output=True, text=True,
+)
+if listed.returncode != 0:
+    sys.exit("git ls-files failed: %s" % listed.stderr.strip())
+
+reference = set()
+for rel in listed.stdout.splitlines():
+    if not rel:
+        continue
+    path = root / rel
+    if path.is_file() and mod.classify(path) == "shell":
+        reference.add(rel)
+
+# Non-vacuity: an empty reference would make any walk agree with it.
+if len(reference) < 100:
+    sys.exit("the reference set holds only %d subjects, so the comparison "
+             "proves nothing" % len(reference))
+
+extra = sorted(walked - reference)
+missing = sorted(reference - walked)
+if extra or missing:
+    sys.exit("walk-only=%s reference-only=%s" % (extra[:5], missing[:5]))
+print("parity over %d shell subjects" % len(reference))
+PARITY
+then
+    report shell-subject-parity PASS
+else
+    report shell-subject-parity FAIL \
+        "the pruned walk disagrees with git's view of the working tree (see $SCRATCH_DIR/shell-subject-parity.log)"
+fi
+
+# The prune list is a CORRECTNESS requirement, not a performance one, so it
+# needs a case that fires when the pruning stops working.
+# .cctally-remote-state is the entry that is not optional: it is a runner-owned
+# root, provisioning clones a SEPARATE repository beneath it, and this harness
+# runs the pre-flight against the real working tree — so an unpruned walk would
+# report another project's shell files as this repository's defects. The planted
+# files fail the PRIMARY parse, so the case fires on every lane rather than only
+# where a 3.x bash exists.
+d=$(new_tree shell-prune-protected-roots)
+for pruned in .cctally-remote-state/clone/bin node_modules/pkg dashboard/static .claude; do
+    mkdir -p "$d/$pruned"
+    printf '%s\n%s\n' '#!/usr/bin/env bash' 'if [ 1 ]; then' > "$d/$pruned/planted.sh"
+done
+expect_rc shell-prune-protected-roots 0 "$d"
+
+# A8 (#655). Every prune and every re-inclusion, exercised with a planted
+# subject of BOTH kinds, comparing the EXACT emitted sets. shell-subject-parity
+# cannot do this: it asserts equality with git plus a floor of 100, and two of
+# the three re-included paths currently hold no classified source in this
+# repository, so a regression that dropped them would be invisible to it. This
+# case is also what pins the walk as UNCHANGED across the #655 factoring of
+# iter_source_files, and it covers iter_python_subjects, which no other case
+# reaches at the iterator level.
+d=$(new_tree walk-prune-matrix)
+if python3 - "$REPO_ROOT/bin/cctally-preflight" "$d" \
+        > "$SCRATCH_DIR/walk-prune-matrix.log" 2>&1 <<'PROBE'
+import importlib.machinery, importlib.util, pathlib, sys
+
+tool, root = sys.argv[1], pathlib.Path(sys.argv[2])
+loader = importlib.machinery.SourceFileLoader("pf", tool)
+spec = importlib.util.spec_from_loader("pf", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+
+
+def plant(rel):
+    target = root / rel
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "planted.sh").write_text("#!/usr/bin/env bash\ntrue\n", encoding="utf-8")
+    (target / "planted.py").write_text("x = 1\n", encoding="utf-8")
+
+
+# INDEPENDENT of the tool. Reading the expectation out of the tool's own
+# constants is what makes a case like this vacuous: deleting an entry from
+# _KEEP_DIR_PATHS then deletes the assertion about it too, and the case stays
+# green through the very regression it exists to catch. Measured — the first
+# draft of this case did exactly that. These literals are the walk's declared
+# prune matrix, and the equality gate below is what forces a deliberate edit
+# here whenever the tool's constants move.
+EXPECT_PRUNE_NAMES = {
+    ".git", ".worktrees", "node_modules", "__pycache__", ".venv",
+    ".cctally-remote-state", ".wrangler", ".superpowers", ".playwright-mcp",
+}
+EXPECT_PRUNE_PATHS = ("dashboard/static", ".agentmem/local", ".claude", ".codex")
+EXPECT_KEEP_PATHS = (  # mirror-private-ok
+    ".claude/skills", ".claude/agents", ".codex/agents",
+)
+
+failures = []
+if set(mod._PRUNE_DIR_NAMES) != EXPECT_PRUNE_NAMES:
+    failures.append(
+        "_PRUNE_DIR_NAMES changed: %s" % sorted(
+            set(mod._PRUNE_DIR_NAMES) ^ EXPECT_PRUNE_NAMES))
+if tuple(mod._PRUNE_DIR_PATHS) != EXPECT_PRUNE_PATHS:
+    failures.append("_PRUNE_DIR_PATHS changed: %r" % (tuple(mod._PRUNE_DIR_PATHS),))
+if tuple(mod._KEEP_DIR_PATHS) != EXPECT_KEEP_PATHS:
+    failures.append("_KEEP_DIR_PATHS changed: %r" % (tuple(mod._KEEP_DIR_PATHS),))
+
+pruned = sorted(EXPECT_PRUNE_NAMES) + list(EXPECT_PRUNE_PATHS)
+kept = list(EXPECT_KEEP_PATHS)
+for rel in pruned + kept:
+    plant(rel)
+
+shell = {str(p.relative_to(root)) for p in mod.iter_shell_subjects(root)}
+python = {str(p.relative_to(root)) for p in mod.iter_python_subjects(root)}
+
+for rel in pruned:
+    if rel in kept:
+        continue
+    for name, found in (("planted.sh", shell), ("planted.py", python)):
+        if "%s/%s" % (rel, name) in found:
+            failures.append("pruned path %s/%s was emitted" % (rel, name))
+for rel in kept:
+    for name, found in (("planted.sh", shell), ("planted.py", python)):
+        if "%s/%s" % (rel, name) not in found:
+            failures.append("re-included path %s/%s was NOT emitted" % (rel, name))
+
+if failures:
+    for f in failures:
+        print("WALK-DEFECT:", f)
+    raise SystemExit(1)
+print("walk matrix clean: %d pruned, %d re-included" % (len(pruned), len(kept)))
+PROBE
+then
+    report walk-prune-matrix PASS
+else
+    report walk-prune-matrix FAIL \
+        "the pruned/re-included walk matrix did not hold (see $SCRATCH_DIR/walk-prune-matrix.log)"
+fi
 
 # ---- check 3: harness-discovery and ownership drift --------------------
 d=$(new_tree missing-harness)
@@ -631,6 +1116,56 @@ All notable changes to this project are documented in this file.
 CHANGELOG_EOF
 expect_rc changelog-compliant 0 "$d"
 
+# ---- check 8: the committed runtime budget ------------------------------
+# The budget is refused at admission by contract_budget_load after a full round
+# trip. This is where the same parser refuses it at the keyboard instead. The
+# tool cannot reuse check_durations' import-and-degrade structure, because
+# contract_budget_load is embedded Python inside a shell library and there is no
+# module to import; it invokes the real loader through a caught subprocess, so
+# the refusal vocabulary is not duplicated here or in the tool.
+#
+# The green control above is this check's passing input: make_tree writes a
+# valid budget, and `clean` would go red without it.
+# The substring names the ABSENCE, not the filename: every check-8 diagnostic
+# ends with `fix tests/authoritative-runtime-budget.json`, so a case grepping
+# for the filename would accept the malformed case's finding as this one's.
+d=$(new_tree budget-missing)
+rm -f "$d/tests/authoritative-runtime-budget.json"
+expect_rc budget-missing 3 "$d" "No such file or directory"
+
+# Malformed in the SHAPE the parser owns, not merely as broken JSON: a value
+# that is not a positive finite number is the mutation that would silently
+# disable the budget mechanism rather than break it loudly, and it is the one
+# the parser exists to refuse.
+d=$(new_tree budget-malformed)
+cat > "$d/tests/authoritative-runtime-budget.json" <<'BUDGET_EOF'
+{
+  "schemaVersion": 1,
+  "metric": "secondsPerThousandCases",
+  "maxSecondsPerThousandCases": -5
+}
+BUDGET_EOF
+expect_rc budget-malformed 3 "$d" "maxSecondsPerThousandCases"
+
+# Not JSON at all, so the case that reaches the parse branch is separate from
+# the one that reaches the shape branch. The substring names the parse cause
+# rather than the filename, which check 8's missing case already greps for.
+d=$(new_tree budget-unparseable)
+printf '%s\n' 'not json at all' > "$d/tests/authoritative-runtime-budget.json"
+expect_rc budget-unparseable 3 "$d" "not JSON"
+
+# A second VALID shape, so the passing side of the check is not a copy of the
+# green control: a float maximum, and the keys in a different order.
+d=$(new_tree budget-valid-variant)
+cat > "$d/tests/authoritative-runtime-budget.json" <<'BUDGET_EOF'
+{
+  "metric": "secondsPerThousandCases",
+  "maxSecondsPerThousandCases": 0.001,
+  "schemaVersion": 1
+}
+BUDGET_EOF
+expect_rc budget-valid-variant 0 "$d"
+
 # ---- the tool's own siblings -------------------------------------------
 # Every case above mutates the tree under test. These mutate the TOOL, because
 # the modules checks 4, 6 and 7 need are loaded from the binary's own directory
@@ -678,6 +1213,243 @@ else
     report durations-lib-absent FAIL "the tool directory could not be copied"
 fi
 
+tool=$(copy_tool_bin budget-lib-absent) \
+    && rm -f "$(dirname "$tool")/_lib-test-contract.sh"
+if [ -n "${tool:-}" ] && [ -x "$tool" ]; then
+    d=$(new_tree budget-lib-absent)
+    expect_rc_tool budget-lib-absent "$tool" 3 "$d" \
+        "the committed runtime budget cannot be validated"
+else
+    report budget-lib-absent FAIL "the tool directory could not be copied"
+fi
+
+# ---- the tool's timeout bounds (#655) ----------------------------------
+# Every case in this section shortens a timeout constant in a COPIED tool, so
+# the case costs a second or two instead of sixty, and drives a real sleeping
+# stub through the genuine subprocess.run(timeout=...) plumbing rather than
+# mocking it out.
+#
+# The `grep -q` after each `sed` is LOAD-BEARING, not decoration. An unmatched
+# substitution leaves the production value in place, the stub finishes well
+# inside it, and the case then reports a pass while asserting nothing at all.
+# The committed production values are pinned separately by
+# timeout-constants-pinned at the end of this section, because nothing else
+# here would notice a bound shortened in production — which would turn a hang
+# bound into the ceiling this tool's docstring forbids.
+#
+# The shortened bounds are ONE second wherever the case allows it, and that is
+# a wall-clock decision rather than an aesthetic one. Each case costs its own
+# bound, because the stub is killed at it rather than returning. This harness
+# is itself run end to end inside a maintainer acceptance test, under that
+# test's own 120-second pytest-timeout cap, so seconds spent sleeping here are
+# seconds taken from a budget that cannot be raised. Measured on an idle
+# runner: 55.6 s wall for 21.8 s of CPU before this trim.
+
+# T4/A4. A hang in the blind-parser probe must report in its OWN words. It
+# used to reach the generic `(OSError, SubprocessError)` clause, whose wording
+# names neither the bound nor the operation.
+tool=$(copy_tool_bin legacy-control-timeout)
+if [ -n "${tool:-}" ] && [ -x "$tool" ]; then
+    if sed -i.bak 's/^_PARSE_TIMEOUT_SECONDS = 60$/_PARSE_TIMEOUT_SECONDS = 1/' "$tool" \
+        && grep -qxF '_PARSE_TIMEOUT_SECONDS = 1' "$tool"; then
+        rm -f "$tool.bak"
+        {
+            printf '%s\n' '#!/usr/bin/env bash'
+            printf '%s\n' 'if [ "${1-}" = -c ]; then printf %s 3; exit 0; fi'
+            printf '%s\n' 'sleep 20'
+        } > "$SCRATCH_DIR/bash-stub-hanging-control"
+        chmod +x "$SCRATCH_DIR/bash-stub-hanging-control"
+        d=$(new_tree legacy-control-timeout)
+        CCTALLY_PREFLIGHT_BASH32="$SCRATCH_DIR/bash-stub-hanging-control" \
+            expect_rc_tool legacy-control-timeout "$tool" 3 "$d" \
+            "did not return within 1 seconds while parsing the known-bad control"
+    else
+        report legacy-control-timeout FAIL \
+            "the parse-timeout substitution did not apply to the copied tool"
+    fi
+else
+    report legacy-control-timeout FAIL "the tool directory could not be copied"
+fi
+
+# T2/A2. check_ownership ran an UNBOUNDED subprocess while the tool's own
+# maintainer documentation said every wall-clock bound in it is a hang bound —
+# which invites the reading that every subprocess carries one. The validator is
+# loaded from beside the binary and no --repo-root can redirect it, so the
+# copied-tool path is the only way to reach it.
+tool=$(copy_tool_bin ownership-timeout)
+if [ -n "${tool:-}" ] && [ -x "$tool" ]; then
+    if sed -i.bak 's/^_SUBPROCESS_TIMEOUT_SECONDS = 60$/_SUBPROCESS_TIMEOUT_SECONDS = 1/' "$tool" \
+        && grep -qxF '_SUBPROCESS_TIMEOUT_SECONDS = 1' "$tool"; then
+        rm -f "$tool.bak"
+        printf '%s\n%s\n' '#!/usr/bin/env python3' 'import time; time.sleep(20)' \
+            > "$(dirname "$tool")/cctally-test-owners"
+        chmod +x "$(dirname "$tool")/cctally-test-owners"
+        d=$(new_tree ownership-timeout)
+        # The BOUND, not just the leg name. An earlier draft of this comment
+        # claimed the leg name alone is also rendered by an absent validator
+        # and by a non-zero --verify, which is false: that branch renders
+        # "cannot be verified" and the --verify branch returns the validator's
+        # own output, so neither contains this substring and the leg name was
+        # already unique to the timeout. Asserting the bound is nonetheless the
+        # stronger form, because it additionally proves the substituted
+        # constant was applied. The two halves cannot be asserted as one
+        # substring because the validator's path sits between them, and this is
+        # the half that is specific to the timeout: nothing else in the tool
+        # renders "did not return within 1 seconds" while only
+        # _SUBPROCESS_TIMEOUT_SECONDS is substituted, because the three other
+        # messages of this shape all interpolate _PARSE_TIMEOUT_SECONDS.
+        expect_rc_tool ownership-timeout "$tool" 3 "$d" \
+            "did not return within 1 seconds"
+    else
+        report ownership-timeout FAIL \
+            "the subprocess-timeout substitution did not apply to the copied tool"
+    fi
+else
+    report ownership-timeout FAIL "the tool directory could not be copied"
+fi
+
+# T11/A2. The UNPINNED /bin/bash probe failed open: resolve_legacy_bash wrote
+# `major, _reason = _bash_major("/bin/bash")` and discarded the reason, so a
+# timeout, an OSError, or output that is not a digit all fell through into the
+# benign "no bash 3.x interpreter is available" NOTE. A hung /bin/bash was
+# reported as an absent one, on the exact leg #641 added.
+#
+# The pinned path already reports a failure correctly, so pinning THAT would
+# assert nothing about this. The probe's interpreter is an absolute literal
+# that no environment variable can redirect, so the copied tool's own call site
+# is substituted — the same checked-substitution discipline the cases above use.
+tool=$(copy_tool_bin bash-probe-failure)
+if [ -n "${tool:-}" ] && [ -x "$tool" ]; then
+    probe_stub="$SCRATCH_DIR/bash-probe-hang"
+    if sed -i.bak 's/^_SUBPROCESS_TIMEOUT_SECONDS = 60$/_SUBPROCESS_TIMEOUT_SECONDS = 1/' "$tool" \
+        && grep -qxF '_SUBPROCESS_TIMEOUT_SECONDS = 1' "$tool" \
+        && sed -i.bak2 "s|^    probe = \"/bin/bash\"\$|    probe = \"$probe_stub\"|" "$tool" \
+        && grep -qxF "    probe = \"$probe_stub\"" "$tool"; then
+        rm -f "$tool.bak" "$tool.bak2"
+        printf '%s\n%s\n' '#!/bin/sh' 'sleep 20' > "$probe_stub"
+        chmod +x "$probe_stub"
+        d=$(new_tree bash-probe-failure)
+        expect_rc_tool bash-probe-failure "$tool" 3 "$d" \
+            "the bash 3.x floor could not be resolved"
+    else
+        report bash-probe-failure FAIL \
+            "the unpinned-probe substitution did not apply to the copied tool"
+    fi
+else
+    report bash-probe-failure FAIL "the tool directory could not be copied"
+fi
+
+# The primary parse invokes the BARE interpreter name `shell_interpreter`
+# returns, and subprocess.run resolves a bare name through PATH — verified by
+# running it, not assumed. So a stub earlier in PATH is the seam that makes the
+# primary leg slow or stuck without touching the tool's own resolution logic.
+# The legacy leg takes a caller-supplied absolute path and is unaffected, which
+# is what keeps these two cases about the primary sweep.
+#
+# PATH is saved and restored around each call rather than prefixed onto it. A
+# bash assignment that prefixes a FUNCTION invocation is not reliably restored
+# when the function returns, and a leaked PATH here would redirect `bash` for
+# every case below.
+write_path_stub () {   # write_path_stub <dir> <body line>
+    local dir=$1 body=$2
+    mkdir -p "$dir" || return 1
+    printf '%s\n%s\n' '#!/bin/sh' "$body" > "$dir/bash" || return 1
+    chmod +x "$dir/bash"
+}
+
+# T1/A1, first half. The AGGREGATE deadline must STOP the sweep and state what
+# went unchecked, rather than reporting a clean tree. Several subjects are each
+# slow but perfectly healthy: none reaches the 30-second per-call bound, and
+# together they exceed the 2-second aggregate. That combination is the point —
+# it is what distinguishes stopping the sweep from truncating a parse.
+tool=$(copy_tool_bin shell-deadline-expired)
+if [ -n "${tool:-}" ] && [ -x "$tool" ]; then
+    if sed -i.bak -e 's/^_SHELL_CHECK_DEADLINE_SECONDS = 600$/_SHELL_CHECK_DEADLINE_SECONDS = 2/' \
+                  -e 's/^_PARSE_TIMEOUT_SECONDS = 60$/_PARSE_TIMEOUT_SECONDS = 30/' "$tool" \
+        && grep -qxF '_SHELL_CHECK_DEADLINE_SECONDS = 2' "$tool" \
+        && grep -qxF '_PARSE_TIMEOUT_SECONDS = 30' "$tool" \
+        && write_path_stub "$SCRATCH_DIR/slowbin" 'sleep 1'; then
+        rm -f "$tool.bak"
+        d=$(new_tree shell-deadline-expired)
+        # The stand-in aggregator's own shebang resolves `bash` through PATH
+        # too, so leaving it in place would have the stub swallow plan mode and
+        # add check 5's finding to a case that is about check 2. An ABSENT
+        # aggregator is documented as not faulted, and scheduler-aggregator-absent
+        # is what pins that.
+        rm -f "$d/bin/cctally-test-all"
+        for n in 1 2 3 4 5 6; do
+            printf '%s\n' '#!/usr/bin/env bash' > "$d/bin/cctally-slow-$n"
+            chmod +x "$d/bin/cctally-slow-$n"
+        done
+        saved_path=$PATH
+        PATH="$SCRATCH_DIR/slowbin:$PATH"
+        expect_rc_tool shell-deadline-expired "$tool" 3 "$d" \
+            "left unchecked; no clean shell verdict is available"
+        PATH=$saved_path
+    else
+        report shell-deadline-expired FAIL \
+            "the deadline substitution did not apply to the copied tool"
+    fi
+else
+    report shell-deadline-expired FAIL "the tool directory could not be copied"
+fi
+
+# T1/A1, second half. ONE interpreter that never returns must stop the sweep,
+# rather than costing a full per-call bound on every subject in the tree. The
+# subprocess bound is shortened alongside the parse bound only so the two
+# checks that run AFTER the sweep do not each wait on the same stuck stub.
+tool=$(copy_tool_bin shell-parse-stuck)
+if [ -n "${tool:-}" ] && [ -x "$tool" ]; then
+    if sed -i.bak -e 's/^_PARSE_TIMEOUT_SECONDS = 60$/_PARSE_TIMEOUT_SECONDS = 1/' \
+                  -e 's/^_SUBPROCESS_TIMEOUT_SECONDS = 60$/_SUBPROCESS_TIMEOUT_SECONDS = 1/' "$tool" \
+        && grep -qxF '_PARSE_TIMEOUT_SECONDS = 1' "$tool" \
+        && grep -qxF '_SUBPROCESS_TIMEOUT_SECONDS = 1' "$tool" \
+        && write_path_stub "$SCRATCH_DIR/stuckbin" 'sleep 20'; then
+        rm -f "$tool.bak"
+        d=$(new_tree shell-parse-stuck)
+        rm -f "$d/bin/cctally-test-all"
+        saved_path=$PATH
+        PATH="$SCRATCH_DIR/stuckbin:$PATH"
+        expect_rc_tool shell-parse-stuck "$tool" 3 "$d" \
+            "left unchecked; no clean shell verdict is available"
+        PATH=$saved_path
+    else
+        report shell-parse-stuck FAIL \
+            "the parse-timeout substitution did not apply to the copied tool"
+    fi
+else
+    report shell-parse-stuck FAIL "the tool directory could not be copied"
+fi
+
+# A1's third assertion: no code path computes a REDUCED per-parse timeout. The
+# rejected design capped each call at min(per_call, remaining), which launches a
+# healthy parse with a fractional timeout near the deadline and then reports it
+# as a defect in the file — a ceiling, not a bound. Every `timeout=` in the tool
+# must therefore be a bare constant.
+if grep -n 'timeout=' "$PREFLIGHT" | grep -vE 'timeout=_[A-Z_]+,?$' \
+        > "$SCRATCH_DIR/timeout-no-derived-bound.log" 2>&1; then
+    report timeout-no-derived-bound FAIL \
+        "a timeout= argument in the tool is not a bare named constant (see $SCRATCH_DIR/timeout-no-derived-bound.log)"
+else
+    report timeout-no-derived-bound PASS
+fi
+
+# The cases above shorten these constants in a COPIED tool. This is what keeps
+# the COMMITTED values honest: a bound shortened in production would turn a
+# hang bound into the ceiling this tool's docstring forbids, and every timeout
+# case above would still pass.
+pinned_ok=1
+for pin in '_PARSE_TIMEOUT_SECONDS = 60' '_SUBPROCESS_TIMEOUT_SECONDS = 60' \
+           '_SHELL_CHECK_DEADLINE_SECONDS = 600'; do
+    grep -qxF "$pin" "$PREFLIGHT" || { pinned_ok=0; echo "missing: $pin"; }
+done
+if [ "$pinned_ok" = 1 ]; then
+    report timeout-constants-pinned PASS
+else
+    report timeout-constants-pinned FAIL \
+        "a committed timeout constant is not at its documented production value"
+fi
+
 # ---- invocation and the real tree --------------------------------------
 "$PREFLIGHT" --nonsense > "$SCRATCH_DIR/usage.log" 2>&1
 rc=$?
@@ -716,6 +1488,99 @@ if [ "$rc" = 0 ]; then
     report real-tree PASS
 else
     report real-tree FAIL "the working tree does not pass its own pre-flight (exit $rc; see $SCRATCH_DIR/real-tree.log)"
+fi
+
+# ---- the pre-flight invokes no pytest collection (#648 D10) ------------
+#
+# #648 records the estate by running the real collectors, and the obvious place
+# to put that check is the pre-flight, since it already guards the round trip.
+# D10 rejects that: the pre-flight runs eight static or plan-mode checks in 3.6
+# to 4.5 seconds and runs no collection at all, and adding the complete estate
+# check would change what the tool IS -- bin/cctally-test-remote runs it before
+# every authoritative round trip, so a 20-second collection there is paid on
+# every run.
+#
+# The decision is recorded as a REGRESSION rather than as prose, because prose
+# does not notice when someone adds a collector. A `python3` that refuses
+# `-m pytest`, and a `pytest` that refuses everything, are placed ahead of the
+# real ones on PATH; both record what asked for them. The pre-flight must still
+# exit 0 and leave no record. Everything else DELEGATES to the real interpreter,
+# because the pre-flight compiles the whole tree with it and a stub that failed
+# every form would fail the fixture rather than the property.
+poison_dir="$SCRATCH_DIR/poison-bin"
+collection_marker="$SCRATCH_DIR/collection.marker"
+real_python3=$(command -v python3)
+mkdir -p "$poison_dir"
+{
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf 'if [ "$1" = "-m" ] && [ "$2" = "pytest" ]; then\n'
+    printf '    printf "python3 -m pytest %%s\\n" "$*" >> %s\n' "$collection_marker"
+    printf '    exit 66\n'
+    printf 'fi\n'
+    printf 'exec %s "$@"\n' "$real_python3"
+} > "$poison_dir/python3"
+{
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf 'printf "pytest %%s\\n" "$*" >> %s\n' "$collection_marker"
+    printf 'exit 66\n'
+} > "$poison_dir/pytest"
+chmod +x "$poison_dir/python3" "$poison_dir/pytest"
+PATH="$poison_dir:$PATH" "$PREFLIGHT" > "$SCRATCH_DIR/no-collection.log" 2>&1
+rc=$?
+if [ "$rc" != 0 ]; then
+    report no-pytest-collection FAIL \
+        "the pre-flight did not survive a poisoned pytest (exit $rc; see $SCRATCH_DIR/no-collection.log)"
+elif [ -f "$collection_marker" ]; then
+    report no-pytest-collection FAIL \
+        "the pre-flight invoked pytest: $(tr '\n' ' ' < "$collection_marker")"
+else
+    report no-pytest-collection PASS
+fi
+
+# ---- the pre-flight names no estate collector (#648 D10, review P2-5) --------
+#
+# The runtime case above CANNOT see the route by which collection would
+# actually arrive. bin/_lib_estate_discovery.py spawns collection as
+# `[sys.executable, "-m", "pytest", ...]`, and `sys.executable` is an ABSOLUTE
+# path resolved inside an interpreter the stub has already delegated to. So a
+# `python3 bin/_lib_test_estate.py --check` added to the pre-flight would run
+# the real pytest by absolute path, write no marker, and report PASS.
+#
+# This case closes that route at the source instead of at run time, and it
+# composes with the runtime case rather than replacing it: the runtime case
+# still catches a bare `pytest` or a `python3 -m pytest` written directly into
+# the pre-flight, and this one catches every invocation of the two modules that
+# spawn collection under an absolute interpreter path.
+#
+# MEASURED on 2026-08-28, both halves, on a LAN runner. Under the poisoned
+# PATH the direct form `python3 -m pytest --version` exits 66 and writes the
+# marker, while `subprocess.run([sys.executable, "-m", "pytest", "--version"])`
+# runs the real pytest 9.1.1, exits 0 and writes NO marker -- so the runtime
+# case reports PASS on exactly the route the estate collectors use. Inserting a
+# valid Python call to bin/_lib_test_estate.py into bin/cctally-preflight then
+# produced 59 passed / 1 failed: this case failed and no-pytest-collection
+# still passed.
+estate_names=$(grep -n '_lib_test_estate\|_lib_estate_discovery' "$PREFLIGHT" || true)
+if [ -n "$estate_names" ]; then
+    report no-estate-collector FAIL \
+        "bin/cctally-preflight names an estate collector, which spawns pytest under an absolute interpreter path the poisoned-PATH case cannot see: $(printf '%s' "$estate_names" | tr '\n' ' ')"
+else
+    report no-estate-collector PASS
+fi
+
+# The tally invariant. See EXPECTED_CASES_WITH_BASH3 at the top of this file
+# for why the manifest's minCases floor is not sufficient on its own.
+if [ -n "$LEGACY_BASH" ]; then
+    expected_cases=$EXPECTED_CASES_WITH_BASH3
+    axis="a bash 3.x interpreter is available"
+else
+    expected_cases=$EXPECTED_CASES_WITHOUT_BASH3
+    axis="no bash 3.x interpreter is available"
+fi
+if [ "$((pass_count + fail_count))" != "$expected_cases" ]; then
+    printf 'FAIL case-tally: %d cases ran where %d are expected when %s\n' \
+        "$((pass_count + fail_count))" "$expected_cases" "$axis"
+    fail_count=$((fail_count + 1))
 fi
 
 echo "----"

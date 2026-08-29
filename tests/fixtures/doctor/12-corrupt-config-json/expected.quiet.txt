@@ -21,6 +21,7 @@ Journal
 Data
 Accounts
 Pricing
+Quota
 Safety
   ✗ config.json              unreadable: JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
       → Fix or remove ~/.local/share/cctally/config.json
@@ -28,4 +29,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 53 OK · 7 WARN · 2 FAIL
+Summary: 55 OK · 7 WARN · 2 FAIL

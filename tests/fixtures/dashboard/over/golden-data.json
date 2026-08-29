@@ -19,6 +19,7 @@
     "project_alerts_enabled": false,
     "projected_budget_enabled": false,
     "projected_weekly_enabled": false,
+    "rate_change_enabled": false,
     "weekly_thresholds": [
       90,
       95
@@ -1808,17 +1809,26 @@
         "latest_snapshot_at": "2026-04-19T10:00:00Z",
         "snapshot_count": 12,
         "spent_usd": 47.48,
-        "weekly_percent": 105.0
+        "weekly_percent": 105.0,
+        "weekly_percent_corrected": null,
+        "weekly_percent_interval": [
+          99.0,
+          null
+        ]
       },
       "forecast": {
         "already_capped": true,
+        "calibration_code": "unavailable",
         "cap_at": null,
         "confidence": "high",
-        "final_percent_high": 126.0,
-        "final_percent_low": 112.538,
+        "final_percent_high": null,
+        "final_percent_low": null,
         "low_confidence_reasons": [],
         "projected_cap": true,
-        "week_avg_projection_pct": 126.0
+        "projection_basis": "withheld",
+        "projection_code": "right-censored",
+        "right_censored": true,
+        "week_avg_projection_pct": null
       },
       "meta": {
         "generated_at": "2026-04-19T10:00:00Z",
@@ -1827,8 +1837,8 @@
       "rates": {
         "dollars_per_percent": 0.45219,
         "dollars_per_percent_source": "this_week",
-        "recent_24h_pct_per_hour": 0.269231,
-        "week_average_pct_per_hour": 0.75
+        "recent_24h_pct_per_hour": null,
+        "week_average_pct_per_hour": null
       },
       "week": {
         "elapsed_fraction": 0.8333,
@@ -1839,23 +1849,50 @@
         "start_at": "2026-04-13T14:00:00Z"
       }
     },
-    "recent_24h_projection_pct": 112.53846153846153,
+    "quota": {
+      "basis": "withheld",
+      "calibrated_consumption_interval": null,
+      "calibrated_consumption_pct": null,
+      "calibrated_headroom_pct": null,
+      "calibration_code": "unavailable",
+      "calibration_code_presentation": {
+        "code": "unavailable",
+        "long": "no usable calibration could be read for this account",
+        "short": "unavailable"
+      },
+      "code": "right-censored",
+      "code_presentation": {
+        "code": "right-censored",
+        "long": "the meter reached its ceiling, so the real consumption is only known to be at least the reading",
+        "short": "right censored"
+      },
+      "corrected_interval": {
+        "hi": null,
+        "lo": 99.0
+      },
+      "observed_minus_modelled_pct": null,
+      "projection_pct": null,
+      "rate_change": null,
+      "right_censored": true
+    },
+    "recent_24h_projection_pct": null,
     "verdict": "capped",
-    "week_avg_projection_pct": 126.0
+    "week_avg_projection_pct": null
   },
   "generated_at": "__NOW__",
   "header": {
     "dollar_per_pct": 0.4521904761904763,
     "five_hour_pct": null,
-    "forecast_pct": 126.0,
+    "forecast_pct": null,
     "forecast_verdict": "capped",
     "used_pct": 105.0,
-    "vs_last_week_delta": null,
+    "vs_last_week_delta": 0.016293040293040406,
     "week_label": "Apr 13\u2013Apr 20"
   },
   "hydrating": false,
   "last_sync_at": null,
   "last_sync_error": null,
+  "meter_rate_changes": [],
   "monthly": {
     "rows": [
       {
@@ -2502,17 +2539,26 @@
                 "latest_snapshot_at": "2026-04-19T10:00:00Z",
                 "snapshot_count": 12,
                 "spent_usd": 47.48,
-                "weekly_percent": 105.0
+                "weekly_percent": 105.0,
+                "weekly_percent_corrected": null,
+                "weekly_percent_interval": [
+                  99.0,
+                  null
+                ]
               },
               "forecast": {
                 "already_capped": true,
+                "calibration_code": "unavailable",
                 "cap_at": null,
                 "confidence": "high",
-                "final_percent_high": 126.0,
-                "final_percent_low": 112.538,
+                "final_percent_high": null,
+                "final_percent_low": null,
                 "low_confidence_reasons": [],
                 "projected_cap": true,
-                "week_avg_projection_pct": 126.0
+                "projection_basis": "withheld",
+                "projection_code": "right-censored",
+                "right_censored": true,
+                "week_avg_projection_pct": null
               },
               "meta": {
                 "generated_at": "2026-04-19T10:00:00Z",
@@ -2521,8 +2567,8 @@
               "rates": {
                 "dollars_per_percent": 0.45219,
                 "dollars_per_percent_source": "this_week",
-                "recent_24h_pct_per_hour": 0.269231,
-                "week_average_pct_per_hour": 0.75
+                "recent_24h_pct_per_hour": null,
+                "week_average_pct_per_hour": null
               },
               "week": {
                 "elapsed_fraction": 0.8333,
@@ -2533,9 +2579,35 @@
                 "start_at": "2026-04-13T14:00:00Z"
               }
             },
-            "recent_24h_projection_pct": 112.53846153846153,
+            "quota": {
+              "basis": "withheld",
+              "calibrated_consumption_interval": null,
+              "calibrated_consumption_pct": null,
+              "calibrated_headroom_pct": null,
+              "calibration_code": "unavailable",
+              "calibration_code_presentation": {
+                "code": "unavailable",
+                "long": "no usable calibration could be read for this account",
+                "short": "unavailable"
+              },
+              "code": "right-censored",
+              "code_presentation": {
+                "code": "right-censored",
+                "long": "the meter reached its ceiling, so the real consumption is only known to be at least the reading",
+                "short": "right censored"
+              },
+              "corrected_interval": {
+                "hi": null,
+                "lo": 99.0
+              },
+              "observed_minus_modelled_pct": null,
+              "projection_pct": null,
+              "rate_change": null,
+              "right_censored": true
+            },
+            "recent_24h_projection_pct": null,
             "verdict": "capped",
-            "week_avg_projection_pct": 126.0
+            "week_avg_projection_pct": null
           },
           "settings": {
             "budget_enabled": false,
@@ -2553,6 +2625,7 @@
             "project_alerts_enabled": false,
             "projected_budget_enabled": false,
             "projected_weekly_enabled": false,
+            "rate_change_enabled": false,
             "weekly_thresholds": [
               90,
               95
@@ -3374,17 +3447,26 @@
                 "latest_snapshot_at": "2026-04-19T10:00:00Z",
                 "snapshot_count": 12,
                 "spent_usd": 47.48,
-                "weekly_percent": 105.0
+                "weekly_percent": 105.0,
+                "weekly_percent_corrected": null,
+                "weekly_percent_interval": [
+                  99.0,
+                  null
+                ]
               },
               "forecast": {
                 "already_capped": true,
+                "calibration_code": "unavailable",
                 "cap_at": null,
                 "confidence": "high",
-                "final_percent_high": 126.0,
-                "final_percent_low": 112.538,
+                "final_percent_high": null,
+                "final_percent_low": null,
                 "low_confidence_reasons": [],
                 "projected_cap": true,
-                "week_avg_projection_pct": 126.0
+                "projection_basis": "withheld",
+                "projection_code": "right-censored",
+                "right_censored": true,
+                "week_avg_projection_pct": null
               },
               "meta": {
                 "generated_at": "2026-04-19T10:00:00Z",
@@ -3393,8 +3475,8 @@
               "rates": {
                 "dollars_per_percent": 0.45219,
                 "dollars_per_percent_source": "this_week",
-                "recent_24h_pct_per_hour": 0.269231,
-                "week_average_pct_per_hour": 0.75
+                "recent_24h_pct_per_hour": null,
+                "week_average_pct_per_hour": null
               },
               "week": {
                 "elapsed_fraction": 0.8333,
@@ -3405,17 +3487,43 @@
                 "start_at": "2026-04-13T14:00:00Z"
               }
             },
-            "recent_24h_projection_pct": 112.53846153846153,
+            "quota": {
+              "basis": "withheld",
+              "calibrated_consumption_interval": null,
+              "calibrated_consumption_pct": null,
+              "calibrated_headroom_pct": null,
+              "calibration_code": "unavailable",
+              "calibration_code_presentation": {
+                "code": "unavailable",
+                "long": "no usable calibration could be read for this account",
+                "short": "unavailable"
+              },
+              "code": "right-censored",
+              "code_presentation": {
+                "code": "right-censored",
+                "long": "the meter reached its ceiling, so the real consumption is only known to be at least the reading",
+                "short": "right censored"
+              },
+              "corrected_interval": {
+                "hi": null,
+                "lo": 99.0
+              },
+              "observed_minus_modelled_pct": null,
+              "projection_pct": null,
+              "rate_change": null,
+              "right_censored": true
+            },
+            "recent_24h_projection_pct": null,
             "verdict": "capped",
-            "week_avg_projection_pct": 126.0
+            "week_avg_projection_pct": null
           },
           "header": {
             "dollar_per_pct": 0.4521904761904763,
             "five_hour_pct": null,
-            "forecast_pct": 126.0,
+            "forecast_pct": null,
             "forecast_verdict": "capped",
             "used_pct": 105.0,
-            "vs_last_week_delta": null,
+            "vs_last_week_delta": 0.016293040293040406,
             "week_label": "Apr 13\u2013Apr 20"
           },
           "total_tokens": 6588000,

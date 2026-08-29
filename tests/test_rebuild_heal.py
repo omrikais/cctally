@@ -34,7 +34,7 @@ import pytest
 
 from conftest import load_script, redirect_paths
 
-from tests._support_http import PRESENCE_BACKSTOP_SECONDS
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, remaining
 
 _BIN_DIR = str(pathlib.Path(__file__).resolve().parent.parent / "bin")
 # NOTE: appends use the DEFAULT real-now segment (no now_utc pin) so obs +
@@ -694,9 +694,16 @@ def test_admission_contender_receives_the_elected_identity_before_marker_reread(
     import _cctally_store as st
 
     entered = threading.Event()
+    contender_attempted = threading.Event()
     release = threading.Event()
     real_write = _cctally_db._atomic_write_private_json
+    real_acquire = st._heal_flock_bounded
     first_marker_write = True
+
+    def observed_acquire(path, timeout_s):
+        if threading.current_thread().name == "heal-admission-contender":
+            contender_attempted.set()
+        return real_acquire(path, timeout_s)
 
     def paused_write(path, payload):
         nonlocal first_marker_write
@@ -707,6 +714,7 @@ def test_admission_contender_receives_the_elected_identity_before_marker_reread(
         return real_write(path, payload)
 
     monkeypatch.setattr(_cctally_db, "_atomic_write_private_json", paused_write)
+    monkeypatch.setattr(st, "_heal_flock_bounded", observed_acquire)
     results = {}
 
     def reserve(name):
@@ -721,11 +729,18 @@ def test_admission_contender_receives_the_elected_identity_before_marker_reread(
         )
 
     winner = threading.Thread(target=reserve, args=("winner",))
-    loser = threading.Thread(target=reserve, args=("loser",))
+    loser = threading.Thread(
+        target=reserve,
+        args=("loser",),
+        name="heal-admission-contender",
+    )
     winner.start()
-    assert entered.wait(PRESENCE_BACKSTOP_SECONDS)
+    admission_deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+    assert entered.wait(remaining(admission_deadline))
     loser.start()
-    time.sleep(0.05)
+    assert contender_attempted.wait(remaining(admission_deadline)), (
+        "the losing reservation never attempted the admission flock"
+    )
     release.set()
     # timing-budget: the winning reservation thread has recorded its outcome in `results`
     winner.join(timeout=PRESENCE_BACKSTOP_SECONDS)
@@ -844,8 +859,15 @@ def test_spawn_failure_waits_for_a_coalescer_and_settles_its_final_count(
     owner = {"healId": "spawn-owner", "probeKind": "readability"}
     assert st.reserve_stats_corruption_heal(owner) == "reserved"
     entered = threading.Event()
+    finisher_attempted = threading.Event()
     release = threading.Event()
     real_write = _cctally_db._atomic_write_private_json
+    real_acquire = st._heal_flock_bounded
+
+    def observed_acquire(path, timeout_s):
+        if threading.current_thread().name == "heal-spawn-finisher":
+            finisher_attempted.set()
+        return real_acquire(path, timeout_s)
 
     def pause_coalescer(path, payload):
         if (
@@ -857,6 +879,7 @@ def test_spawn_failure_waits_for_a_coalescer_and_settles_its_final_count(
         return real_write(path, payload)
 
     monkeypatch.setattr(_cctally_db, "_atomic_write_private_json", pause_coalescer)
+    monkeypatch.setattr(st, "_heal_flock_bounded", observed_acquire)
     monkeypatch.setattr(_cctally_update, "_spawn_detached", lambda _cmd: False)
     results = {}
 
@@ -869,12 +892,15 @@ def test_spawn_failure_waits_for_a_coalescer_and_settles_its_final_count(
         results["spawn"] = st.complete_stats_corruption_heal("reserved")
 
     loser = threading.Thread(target=coalesce)
-    finisher = threading.Thread(target=fail_spawn)
+    finisher = threading.Thread(target=fail_spawn, name="heal-spawn-finisher")
     loser.start()
-    assert entered.wait(PRESENCE_BACKSTOP_SECONDS)
+    completion_deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+    assert entered.wait(remaining(completion_deadline))
     started = time.monotonic()
     finisher.start()
-    time.sleep(0.05)
+    assert finisher_attempted.wait(remaining(completion_deadline)), (
+        "spawn-failure cleanup never attempted the admission flock"
+    )
     release.set()
     # timing-budget: the coalescing loser has recorded its outcome in `results`
     loser.join(timeout=PRESENCE_BACKSTOP_SECONDS)
@@ -1687,8 +1713,14 @@ def _shared_maintenance_holder(bin_dir, home_dir, data_dir, ready, release):
         _os.close(fd)
 
 
-def _heal_without_spawning_worker(bin_dir, home_dir, data_dir, q):
-    """Run the real detector but record, rather than launch, its worker."""
+def _heal_without_spawning_worker(bin_dir, home_dir, data_dir, q, ready, begin):
+    """Run the real detector but record, rather than launch, its worker.
+
+    `ready` and `begin` exist so the parent's ceiling bounds admission alone.
+    The spawn and the `_load_cctally_in_child` import are paid before `ready`
+    is set; the parent reads its clock only once every child has signalled, so
+    neither cost lies inside the measured span.
+    """
     import sqlite3 as _sqlite3
 
     try:
@@ -1697,6 +1729,11 @@ def _heal_without_spawning_worker(bin_dir, home_dir, data_dir, q):
         import _cctally_update
 
         _cctally_update._spawn_detached = lambda _command: True
+        ready.set()
+        # A barrier rather than a duration: the parent sets `begin` as soon as
+        # every child is ready, so the argument is a liveness backstop and not
+        # a period this child is expected to spend.
+        begin.wait(PRESENCE_BACKSTOP_SECONDS)
         try:
             outcome = _cctally_store.HEAL_HOOK(
                 "stats",
@@ -1788,20 +1825,37 @@ def test_foreign_page_storm_admits_once_before_shared_maintenance_drains(
     assert ready.wait(20), "the shared maintenance holder never became ready"
 
     q = ctx.Queue()
+    begin = ctx.Event()
+    detector_ready = [ctx.Event() for _ in range(3)]
     detectors = [
         ctx.Process(
             target=_heal_without_spawning_worker,
-            args=(_BIN_DIR, os.environ["HOME"], str(core.APP_DIR), q),
+            args=(_BIN_DIR, os.environ["HOME"], str(core.APP_DIR), q,
+                  detector_ready[index], begin),
         )
-        for _ in range(3)
+        for index in range(3)
     ]
-    started = time.monotonic()
     for detector in detectors:
         detector.start()
+    # ONE budget for all three waits, not one budget each. Three sequential
+    # `PRESENCE_BACKSTOP_SECONDS` waits are ninety seconds in a test that
+    # already spends up to twenty on `ready.wait(20)` and thirty on the marker
+    # deadline, under a 120-second pytest cap: a detector that never signals
+    # gets the worker killed before this assertion can say which one it was.
+    barrier_deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+    for index, signal in enumerate(detector_ready):
+        assert signal.wait(remaining(barrier_deadline)), (
+            f"detector {index} never finished loading cctally, so the "
+            f"admission clock cannot start")
+    # Every child has paid its spawn and import cost, so from here the only
+    # work inside the measured span is the admission itself.
+    started = time.monotonic()
+    begin.set()
     marker = core.APP_DIR / "stats-corruption-heal.pending"
     deadline = started + PRESENCE_BACKSTOP_SECONDS
     while not marker.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
+    admission_elapsed = time.monotonic() - started
     admitted_while_contended = marker.exists()
 
     results = []
@@ -1824,7 +1878,7 @@ def test_foreign_page_storm_admits_once_before_shared_maintenance_drains(
         "no durable heal request was admitted while maintenance stayed shared; "
         "detectors are still waiting on the old pre-admission five-second path"
     )
-    assert time.monotonic() - started < 5.0
+    assert admission_elapsed < 5.0
     assert all(result[0] == "raised" for result in results), results
     assert sorted(result[2] for result in results) == [
         "pending", "pending", "spawned",
@@ -1833,6 +1887,60 @@ def test_foreign_page_storm_admits_once_before_shared_maintenance_drains(
     events = st.read_stats_heal_events()
     assert len(events) == 1, events
     assert events[0]["coalescedDetections"] == 2
+
+
+def test_the_contended_admission_is_timed_from_a_ready_barrier():
+    """The ceiling must bound admission, not three process spawns.
+
+    `started` was taken before `detector.start()`, so a 5-second ceiling
+    written as a fail-fast claim about admission actually bounded three spawn
+    calls, three module imports in the children, and everything after them. The
+    barrier is what makes the recorded rationale true: the children pay the
+    spawn and import cost BEFORE the clock is read, and only the admission runs
+    inside the measured span.
+
+    The span has two ends and this test asserts BOTH. Proving only that every
+    spawn precedes the clock read left the closing end unpinned: moving
+    `admission_elapsed` back below the queue reads and the joins would restore
+    the exact defect this barrier removed, and a test that checks only the
+    opening end would stay green through it.
+    """
+    import inspect
+    source = inspect.getsource(
+        test_foreign_page_storm_admits_once_before_shared_maintenance_drains)
+    # Each token must identify one site. `detector.join(` alone appears twice —
+    # the backstop join and the post-terminate one — so the closing end is
+    # keyed on the full backstop call, which appears once.
+    for token in ("admission_elapsed = time.monotonic() - started", "q.get(",
+                  "detector.join(timeout=PRESENCE_BACKSTOP_SECONDS)"):
+        assert source.count(token) == 1, (
+            f"{token!r} no longer identifies exactly one site in the test "
+            f"under inspection, so an index into it names the wrong statement")
+    # The barrier WAIT, not the event list's declaration. The events must be
+    # created before the children that receive them, so the declaration is
+    # necessarily above the spawn loop and says nothing about ordering.
+    ready_at = source.index("enumerate(detector_ready)")
+    started_at = source.index("started = time.monotonic()")
+    begin_at = source.index("begin.set()")
+    spawn_at = source.index("detector.start()")
+    assert spawn_at < ready_at < started_at < begin_at, (
+        "the clock must be read after every detector is ready and before they "
+        "are released, so no spawn lies inside the measured span")
+    snapshot_at = source.index("admission_elapsed = time.monotonic() - started")
+    queue_at = source.index("q.get(")
+    join_at = source.index("detector.join(timeout=PRESENCE_BACKSTOP_SECONDS)")
+    assert begin_at < snapshot_at < queue_at, (
+        "the elapsed reading must be snapshotted when the marker appears and "
+        "before any result is dequeued, so no `q.get` lies inside the "
+        "measured span")
+    assert snapshot_at < join_at, (
+        "the elapsed reading must be snapshotted before the detectors are "
+        "joined, so no join lies inside the measured span")
+    child = inspect.getsource(_heal_without_spawning_worker)
+    assert child.index("ready.set()") < child.index("begin.wait("), (
+        "the child must signal ready before it waits to begin")
+    assert child.index("begin.wait(") < child.index("HEAL_HOOK"), (
+        "the child must not reach HEAL_HOOK until the parent releases it")
 
 
 def test_concurrent_detections_coalesce_into_one_deferred_heal(ns, tmp_path):

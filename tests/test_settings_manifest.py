@@ -101,7 +101,8 @@ def manifest():
 def test_every_allowed_key_has_exactly_one_rendered_disposition(manifest):
     from _cctally_config import ALLOWED_CONFIG_KEYS
 
-    assert len(ALLOWED_CONFIG_KEYS) == 37
+    # 38 since #661 S2 added `alerts.rate_change_enabled`.
+    assert len(ALLOWED_CONFIG_KEYS) == 38
     for key in ALLOWED_CONFIG_KEYS:
         entries = [e for e in manifest if e["key"] == key]
         assert len(entries) == 1, f"{key} has {len(entries)} dispositions"
@@ -126,7 +127,10 @@ def test_the_partition_matches_the_specified_counts(manifest):
     for entry in manifest:
         counts[entry["disposition"]] = counts.get(entry["disposition"], 0) + 1
     assert counts == {
-        "editable": 13,
+        # 14 since #661 S2 made `alerts.rate_change_enabled` editable. Every
+        # other alert toggle in this estate is editable, and a switch a user
+        # has to reach for the CLI to flip is one they will not find.
+        "editable": 14,
         "readOnly": 1,
         "disclosed": 3,
         "cliOnly": 20,
@@ -187,6 +191,8 @@ PINNED_COMMANDS = {
     "budget.codex": "cctally budget set 200 --vendor codex",
     "budget.codex.amount_usd": "cctally budget set 200 --vendor codex",
     "budget.weekly_usd": "cctally budget set 200",
+    "alerts.rate_change_enabled":
+        "cctally config set alerts.rate_change_enabled true",
     "alerts.command_template":
         'cctally config set alerts.command_template \'["notify-send","{title}","{body}"]\'',
     "alerts.quota":

@@ -65,6 +65,7 @@ public bin/cctally-pricing-check-test
 public bin/cctally-project
 public bin/cctally-project-test
 private bin/cctally-reap-test
+public bin/cctally-quota-test
 public bin/cctally-reconcile-test
 public bin/cctally-record-credit-test
 public bin/cctally-record-usage-selfheal-test

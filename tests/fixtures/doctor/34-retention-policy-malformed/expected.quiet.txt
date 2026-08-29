@@ -17,9 +17,10 @@ Journal
 Data
 Accounts
 Pricing
+Quota
 Safety
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 56 OK · 5 WARN · 1 FAIL
+Summary: 58 OK · 5 WARN · 1 FAIL

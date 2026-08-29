@@ -300,6 +300,7 @@ ALLOWED_CONFIG_KEYS = (
     "display.tz",
     "alerts.enabled",
     "alerts.projected_enabled",
+    "alerts.rate_change_enabled",
     "alerts.notifier",
     "alerts.command_template",
     "alerts.quota",
@@ -1006,6 +1007,16 @@ def _config_known_value(config: dict, key: str) -> "object":
             return bool(_get_alerts_config(config)["projected_enabled"])
         except c._AlertsConfigError:
             return False
+    if key == "alerts.rate_change_enabled":
+        # #661 S2 section 6.2's PUSH gate. Recording a metering-rate change is
+        # unconditional; this key gates only the notification. Same posture as
+        # alerts.projected_enabled — validated boolean, default False, and a
+        # corrupt alerts block surfaces the default rather than erroring out of
+        # a plain `config get`.
+        try:
+            return bool(_get_alerts_config(config)["rate_change_enabled"])
+        except c._AlertsConfigError:
+            return False
     if key == "alerts.notifier":
         # Validated dispatch backend (defaults to 'auto' when unset). A corrupt
         # alerts block surfaces the default — mirrors alerts.enabled.
@@ -1466,6 +1477,53 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         else:
             print(
                 f"alerts.projected_enabled={'true' if normalized else 'false'}"
+            )
+        return 0
+    if key == "alerts.rate_change_enabled":
+        # #661 S2 section 6.2. Identical posture to alerts.projected_enabled
+        # above, including the re-message: _normalize_alerts_enabled_value
+        # hardcodes "alerts.enabled" in its ValueError text, so the branch
+        # names the key the user actually typed.
+        try:
+            normalized = c._normalize_alerts_enabled_value(raw)
+        except ValueError:
+            print(
+                f"cctally: invalid boolean value for "
+                f"alerts.rate_change_enabled: "
+                f"{raw!r} (expected true|false|yes|no|1|0|on|off)",
+                file=sys.stderr,
+            )
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing_alerts = config.get("alerts")
+            if existing_alerts is not None and not isinstance(
+                existing_alerts, dict
+            ):
+                print(
+                    "cctally: alerts config error: alerts must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            alerts_block = dict(existing_alerts or {})
+            alerts_block["rate_change_enabled"] = normalized
+            try:
+                _get_alerts_config({**config, "alerts": alerts_block})
+            except _AlertsConfigError as exc:
+                print(f"cctally: alerts config error: {exc}", file=sys.stderr)
+                return 2
+            config["alerts"] = alerts_block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(
+                json.dumps(
+                    {"alerts": {"rate_change_enabled": normalized}}, indent=2
+                )
+            )
+        else:
+            print(
+                f"alerts.rate_change_enabled="
+                f"{'true' if normalized else 'false'}"
             )
         return 0
     if key == "alerts.notifier":
@@ -2296,6 +2354,7 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
     if key in (
         "alerts.enabled",
         "alerts.projected_enabled",
+        "alerts.rate_change_enabled",
         "alerts.notifier",
         "alerts.command_template",
         "alerts.quota",
@@ -2305,8 +2364,9 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
         # self-deadlock per the gotcha in CLAUDE.md). Unsetting just the
         # named key preserves any user-customized threshold lists
         # (`weekly_thresholds`, `five_hour_thresholds`) and the sibling
-        # enabled/projected_enabled/notifier/command_template keys. For
-        # enabled/projected_enabled/notifier the read-time validator
+        # enabled/projected_enabled/rate_change_enabled/notifier/
+        # command_template keys. For enabled/projected_enabled/
+        # rate_change_enabled/notifier the read-time validator
         # (`_get_alerts_config`) re-applies the canonical default
         # (`False` / `"auto"`) for the missing key on next get. NOT so for
         # command_template when notifier == "command": the cross-field

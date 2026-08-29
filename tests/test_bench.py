@@ -203,7 +203,7 @@ def test_building_a_fixture_from_a_test_restores_every_pinned_axis(
 
 
 def test_marker_params_hash_covers_every_scale(tmp_path):
-    """A profile-shape change must bust the cached fixture for any scale."""
+    """Profile shape and stats epoch both invalidate the cached fixture."""
     bbf = _load_build_bench()
 
     with bbf.pinned_env(tmp_path / "d", tmp_path / "c",
@@ -222,6 +222,19 @@ def test_marker_params_hash_covers_every_scale(tmp_path):
             bbf.SCALES["small"] = original
         assert changed["params_hash"] != base["params_hash"], (
             "changing a profile's cardinality must change its marker")
+
+        original_epoch = cctally._cctally_core.STATS_INDEX_EPOCH
+        try:
+            cctally._cctally_core.STATS_INDEX_EPOCH = original_epoch + 1
+            changed_epoch = bbf._marker_payload(
+                cctally, seed=42, scale="small"
+            )
+        finally:
+            cctally._cctally_core.STATS_INDEX_EPOCH = original_epoch
+        assert changed_epoch != base, (
+            "a stats epoch change must invalidate a cached corpus before its "
+            "stats.db can be copied into a different checkout"
+        )
 
 
 # ── Task 2: runner JSON schema ────────────────────────────────────────────

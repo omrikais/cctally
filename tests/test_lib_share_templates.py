@@ -255,3 +255,67 @@ def test_prepared_session_chart_axis_reads_rank_then_alias(template_id):
     prepared = _T._LS._prepare(snap, reveal_projects=False)
     assert [p.x_label for p in prepared.chart.points] == \
         ["1 · project-1", "2 · project-2"]
+
+
+# --- #661 S2 §3.6 — the ceiling distance has a presentation horizon --------
+
+def _forecast_panel_data(days_to_90, days_to_100):
+    return {
+        "projected_end_pct": 0.004,
+        "days_to_100pct": days_to_100,
+        "days_to_90pct": days_to_90,
+        "daily_budgets": {"avg": 0.01, "recent_24h": 0.01,
+                          "until_90pct": 0.02, "until_100pct": 0.02},
+        "projection_curve": [
+            {"date": "2026-05-04", "projected_pct_used": 0.0025},
+        ],
+        "confidence": "ok",
+    }
+
+
+def _forecast_rows(days_to_90, days_to_100, template_id="forecast-recap"):
+    snap = _T.get_template(template_id).builder(
+        panel_data=_forecast_panel_data(days_to_90, days_to_100),
+        options={"format": "md", "theme": "light", "reveal_projects": True,
+                 "no_branding": False, "show_chart": True, "show_table": True,
+                 "display_tz": "Etc/UTC"},
+    )
+    return {t.label: t.value for t in snap.totals}
+
+
+@_pytest.mark.parametrize(
+    "template_id", ["forecast-recap", "forecast-visual", "forecast-detail"])
+def test_a_ceiling_beyond_the_horizon_is_bounded_not_printed(template_id):
+    """A displayed-zero week projects from the corrected point of 0.25, and
+    that pace puts the 90% ceiling 1,166.8 days out — arithmetically right
+    and practically useless. The renderer states the bound instead.
+
+    This is a PRESENTATION bound and not a withholding: the panel data still
+    carries the exact float and the rate underneath stays published, so the
+    row must not read `n/a`, which means the distance is undefined.
+    """
+    rows = _forecast_rows(1166.8, 1296.4, template_id)
+    assert rows["Days→90%"] == ">30d"
+    assert rows["Days→100%"] == ">30d"
+    assert rows["Days→90%"] != "n/a"
+
+
+@_pytest.mark.parametrize(
+    "template_id", ["forecast-recap", "forecast-visual", "forecast-detail"])
+def test_a_ceiling_inside_the_horizon_still_prints_its_figure(template_id):
+    """The non-vacuity twin: the bound must not swallow an ordinary distance.
+
+    30.0 is the boundary itself and is INSIDE, so a `>=` comparison would be
+    caught here rather than shipping a horizon one day short of its own
+    constant.
+    """
+    rows = _forecast_rows(6.5, 30.0, template_id)
+    assert rows["Days→90%"] == "6.5"
+    assert rows["Days→100%"] == "30.0"
+
+
+def test_an_undefined_ceiling_distance_is_still_not_available():
+    """`n/a` and the horizon token are different facts and must not merge."""
+    rows = _forecast_rows(None, None)
+    assert rows["Days→90%"] == "n/a"
+    assert rows["Days→100%"] == "n/a"

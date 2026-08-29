@@ -400,7 +400,17 @@ _init_paths_from_env()
 # removing the shared-memory WAL page map implicated by the retained corruption
 # bundles. The one-time rebuild is the mode transition; no stats migration is
 # added and cache/conversations remain WAL/NORMAL.
-STATS_INDEX_EPOCH = 1010
+# 1010 -> 1011 (#661 S2 §6.4): the meter-rate-change event family. Adds
+# `meter_rate_change_events`, a durable forward-only record that one provider
+# metering-rate transition was observed, keyed
+# `(provider, account_key, effective_from)`. It is an epoch bump and NOT a
+# stats migration for the two reasons every bump since 1005 carries: the
+# 13-entry registry is frozen, AND an epoch-current open returns before any
+# schema work, so a `@stats_migration` handler would never run on an upgraded
+# install and the table would simply never appear. `quota_alert_arming` is the
+# precedent the family follows — a journaled STATE record whose boundary
+# survives a rebuild, so history cannot re-fire.
+STATS_INDEX_EPOCH = 1011
 LEGACY_STATS_HEAD = 13
 
 #: #496 S1 F1. A NEW branch, for a state that cannot occur before the
@@ -965,6 +975,12 @@ _ALERTS_CONFIG_VALID_KEYS = {
     "weekly_thresholds",
     "five_hour_thresholds",
     "projected_enabled",
+    # #661 S2 §6.2. The metering-rate-change family's PUSH toggle, and only
+    # its push toggle: events are recorded from the first upgrade whatever
+    # this says, so every pull surface shows the state with no configuration.
+    # It defaults OFF like every other alert toggle, so an upgrade never
+    # produces a surprise notification.
+    "rate_change_enabled",
     "notifier",
     "command_template",
 }
@@ -1062,6 +1078,17 @@ def _get_alerts_config(cfg: "dict | None") -> dict:
             f"{type(projected_enabled).__name__}: {projected_enabled!r}",
             field="alerts.projected_enabled",
         )
+    # #661 S2 §6.2: the rate-change PUSH toggle, default OFF. Recording is
+    # unconditional and does not consult this — the split is what lets a user
+    # learn that the rate changed without opting in while nothing arrives
+    # unbidden. Bool-validated rather than coerced, like `projected_enabled`.
+    rate_change_enabled = block.get("rate_change_enabled", False)
+    if not isinstance(rate_change_enabled, bool):
+        raise _AlertsConfigError(
+            f"alerts.rate_change_enabled must be a JSON boolean, got "
+            f"{type(rate_change_enabled).__name__}: {rate_change_enabled!r}",
+            field="alerts.rate_change_enabled",
+        )
     # Dispatch-global keys (Phase B). `notifier` selects the backend;
     # `command_template` is an argv list for the `command` backend (and may be
     # set ahead of switching the backend). The cross-field constraint
@@ -1109,6 +1136,7 @@ def _get_alerts_config(cfg: "dict | None") -> dict:
         "weekly_thresholds": weekly,
         "five_hour_thresholds": five_hour,
         "projected_enabled": projected_enabled,
+        "rate_change_enabled": rate_change_enabled,
         "notifier": notifier,
         "command_template": command_template,
     }
@@ -1636,6 +1664,39 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
             next_evaluation_by_root_json TEXT NOT NULL DEFAULT '{}',
             PRIMARY KEY(source)
         );
+
+        -- #661 S2 §6: a provider metering-rate transition, recorded from the
+        -- first upgrade whether or not notification is enabled (§6.2). The
+        -- row is the durable forward-only latch: its presence is what stops
+        -- the same transition alerting twice, and it survives a stats.db
+        -- rebuild because the journal event that created it carries a
+        -- self-sufficient payload (§6.5).
+        --
+        -- The identity is `(provider, account_key, effective_from)` and the
+        -- promise is stated at exactly that precision — once per exact key,
+        -- not "once per provider regime". `reduce_state` closes and
+        -- re-creates regimes on a fingerprint change and a revised detector
+        -- can select a different `effective_from` for the same underlying
+        -- transition; separately, R8 can turn a formerly merged identity into
+        -- a real account key. Both produce a new key for a transition a human
+        -- would call the same one. The FINGERPRINT stays out of the key
+        -- deliberately: including it would re-alert on our own algorithm
+        -- revisions.
+        CREATE TABLE IF NOT EXISTS meter_rate_change_events (
+            id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider                 TEXT    NOT NULL,
+            account_key              TEXT    NOT NULL DEFAULT 'unattributed',
+            effective_from           TEXT    NOT NULL,
+            previous_units_per_point REAL    NOT NULL,
+            new_units_per_point      REAL    NOT NULL,
+            severity                 TEXT    NOT NULL,
+            detected_at_utc          TEXT    NOT NULL,
+            created_at_utc           TEXT    NOT NULL,
+            notified_at              TEXT,
+            UNIQUE(provider, account_key, effective_from)
+        );
+        CREATE INDEX IF NOT EXISTS idx_meter_rate_change_events_key
+            ON meter_rate_change_events(provider, account_key, effective_from);
 
         CREATE TABLE IF NOT EXISTS quota_alert_arming (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,

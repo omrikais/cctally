@@ -51,8 +51,10 @@ def _write_claude_json(path, account_uuid):
 
 def test_epoch_is_1010(ns):
     # A deliberate literal tripwire, not a tautology: asserting against
-    # `STATS_INDEX_EPOCH` would pass forever and stop reporting a bump.
-    assert _cctally_core.STATS_INDEX_EPOCH == 1010
+    # `STATS_INDEX_EPOCH` would pass forever and stop reporting a bump. The
+    # node id keeps its original number because removing one is a coverage
+    # loss the estate gate refuses; the literal below is the live one.
+    assert _cctally_core.STATS_INDEX_EPOCH == 1011
 
 
 def test_transition_appends_op_with_resolved_identity(ns, tmp_path):

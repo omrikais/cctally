@@ -1,0 +1,33 @@
+════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+ Week Apr 14–Apr 21 │ Used 103.0% (5h 38%) │ $/1% $0.45 │ Fcst — OVER │ ● synced —                                      
+════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+               ╔══════════════════════════════════ Forecast · explain ══════════════════════════════════╗               
+               ║                                                                                        ║               
+               ║   Now            2026-04-20 09:00 UTC                                                  ║               
+               ║   Week elapsed   153.0h / 168h  (91.1%)                                                ║               
+               ║   Used now       103.0%                                                                ║               
+               ║   Used 24h ago   88.0%                                                                 ║               
+               ║                                                                                        ║               
+               ║   Two rate paths   (operands are ceiling-corrected)                                    ║               
+               ║     r_avg     unavailable — meter at its cap — no upper bound                          ║               
+               ║     r_recent  unavailable — meter at its cap — no upper bound                          ║               
+               ║                                                                                        ║               
+               ║   Project to week end (15.0h remaining)                                                ║               
+               ║     projection     = withheld — meter at its cap — no upper bound                      ║               
+               ║                                                                                        ║               
+               ║   Daily $ budgets (0.625 days remaining)                                               ║               
+               ║     —  withheld — meter at its cap — no upper bound                                    ║               
+               ║                                                                                        ║               
+               ║   confidence: high · based on 7-day rate                                               ║               
+               ║                                                                                        ║               
+               ║                                                                                        ║               
+               ║                                                                                        ║               
+               ║                                                                                        ║               
+               ║                                                                                        ║               
+               ║                                                                                        ║               
+               ║                                                                                        ║               
+               ║                                                                                        ║               
+               ║                                                                                        ║               
+               ╚═══════════════════════════════════════ Esc back ═══════════════════════════════════════╝               
+════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+ Tab focus  ↑↓ scroll  r refresh  s sort  f filter  / search  Enter open  v variant  ? help  q quit                     

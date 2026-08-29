@@ -28,6 +28,7 @@ Spec: docs/superpowers/specs/2026-05-31-extract-forecast-budget-cmd-design.md
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime as dt
 import json
 import math
@@ -85,7 +86,9 @@ _ensure_sibling_loaded("_lib_forecast")
 from _lib_forecast import (
     ForecastInputs, BudgetRow, ForecastOutput, _compute_forecast,
     ForecastConfidenceAssessment, ForecastConfidenceCause,
-    assess_forecast_confidence,
+    assess_forecast_confidence, corrected_percent_interval,
+    corrected_percent_point, select_projection_basis, ProjectionBasis,
+    SelectedProjection, dollars_per_percent_source_label,
 )
 
 # #279 S6 W4: the canonical None-safe UTC-Z serializer. forecast's former local
@@ -366,6 +369,397 @@ def _build_budget_status_inputs(
     )
 
 
+#: Why a week's realized meter movement could not be measured. A closed set,
+#: local to this consumer: these causes never reach the wire, because a week
+#: whose movement is withheld is simply absent from the trailing median.
+#:
+#: The two `*-baseline-absent` members name the RECORD that created the
+#: segment. Reporting a reset-created segment as `credit-baseline-absent`
+#: named the wrong boundary kind — the withholding itself was right either
+#: way, but the cause pointed a reader at a table with nothing in it.
+#: `boundary-records-unreadable` is the fail-closed member: a present
+#: boundary table that could not be read withholds the week rather than
+#: summing it as if the credit had zeroed the meter.
+MOVEMENT_WITHHELD_CAUSES = ("credit-baseline-absent", "reset-baseline-absent",
+                            "boundary-records-unreadable", "right-censored",
+                            "no-readings")
+
+#: The `source` `_insert_credit_snapshot` stamps on the synthetic post-credit
+#: baseline it writes. That writer is the sole producer of the string, and it
+#: is what separates a new baseline from an ordinary reading.
+_CREDIT_SNAPSHOT_SOURCE = "record-credit"
+
+#: A displayed reading at or above this denotes `[99, inf)` and has no point
+#: estimate, so the week is right-censored (spec §3.2, §4.1).
+_CENSORED_READING = 100.0
+
+
+@dataclass(frozen=True)
+class WeekMovement:
+    """The meter movement one prior week realized, or why it is unknowable.
+
+    `points` and `withheld_cause` are mutually exclusive: a withheld week
+    carries no number, and is absent from the trailing median rather than
+    contributing a zero.
+    """
+
+    points: "float | None"
+    withheld_cause: "str | None"
+    segments: int = 0
+
+
+def _credit_snapshot_effective(payload_json):
+    """The credit instant a synthetic post-credit snapshot names, or None.
+
+    `_insert_credit_snapshot` writes `{"kind", "from", "to", "effective"}`
+    with the effective moment normalized to a `+00:00` spelling. A payload
+    this cannot read yields None, which the caller treats as unbound rather
+    than as a mismatch.
+    """
+    if not payload_json:
+        return None
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return parse_iso_datetime(
+            str(payload.get("effective")), "credit.effective")
+    except (TypeError, ValueError):
+        return None
+
+
+class BoundaryRecordsUnreadable(Exception):
+    """A recorded boundary table exists but could not be read.
+
+    The fail-closed signal for `_realized_week_movement`. Losing either
+    boundary leg does not degrade the answer, it changes it: a credited week
+    whose credit rows are missing collapses to one segment and is summed as
+    if the credit had zeroed the meter, which spec §4.1 calls unknowable.
+    """
+
+
+def _boundary_table_present(conn, table: str) -> bool:
+    """Whether `table` exists, RAISING when the catalogue itself is unreadable.
+
+    The one permitted relaxation: a store with no `weekly_credit_floors`
+    table has recorded no credits, and one with no `week_reset_events` table
+    has recorded no resets, so an absent table really does contribute no
+    boundaries. Everything else — a locked store, a corrupt file, a renamed
+    column — is a read that failed and must withhold the week.
+    """
+    try:
+        return bool(conn.execute(f"PRAGMA table_info({table})").fetchall())
+    except sqlite3.Error as exc:
+        raise BoundaryRecordsUnreadable(table) from exc
+
+
+def _week_segment_boundaries(conn, week_start_at, week_end_at,
+                             week_start_date, *, account_key=None):
+    """The recorded reset and credit instants strictly inside the week.
+
+    Returns `[(instant, kind)]` sorted by instant, where `kind` is `"reset"`
+    or `"credit"` — the caller names the boundary kind in its withholding
+    cause, so a reset-created segment is not reported as a missing credit
+    baseline.
+
+    Spec §4.1: `week_reset_events` and `weekly_credit_floors` are the
+    authoritative boundary records, and a decrease is never used to infer
+    one. Both legs are scoped the way `_reset_aware_floor` scopes them, to
+    the same account and the same week, so this reducer and #290's floor
+    agree on which record belongs to which week. The reset leg's upper
+    comparison is strict here where the floor's is inclusive, because a
+    record landing exactly on `week_end_at` opens the NEXT week rather than
+    segmenting this one. `unixepoch()` rather than a textual comparison,
+    because the two legs carry mixed offset spellings.
+
+    Both legs fail CLOSED, by raising `BoundaryRecordsUnreadable`, on any
+    store error other than the table not existing — and the credit leg also
+    fails closed on a week key it cannot query with. Ten lines away
+    `_snapshot_columns` already fails closed for the same class of defect,
+    and the whole fail-closed argument for this reducer depends on seeing
+    the credit rows. An ABSENT table is the one permitted relaxation: a
+    store with no `weekly_credit_floors` records no credits at all, so there
+    is no row to miss.
+    """
+    acct = "" if account_key is None else " AND account_key = ?"
+    acct_p: tuple = () if account_key is None else (account_key,)
+    stamps: list = []
+    if _boundary_table_present(conn, "week_reset_events"):
+        try:
+            stamps += [
+                (row[0], "reset") for row in conn.execute(
+                    "SELECT effective_reset_at_utc FROM week_reset_events"
+                    " WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?)"
+                    "   AND unixepoch(effective_reset_at_utc) <  unixepoch(?)"
+                    + acct,
+                    (week_start_at.isoformat(), week_end_at.isoformat())
+                    + acct_p,
+                ).fetchall()]
+        except sqlite3.Error as exc:
+            raise BoundaryRecordsUnreadable("week_reset_events") from exc
+    if _boundary_table_present(conn, "weekly_credit_floors"):
+        if not week_start_date:
+            # The THIRD route to the same wrong arithmetic (#661 S2 Stage C
+            # review). This table is keyed by `week_start_date`, so a falsy
+            # key cannot select the week's credit rows: the leg used to be
+            # SKIPPED here, silently, and a credited week then summed as one
+            # unsegmented run. That is the arithmetic the two `raise`
+            # statements around it exist to prevent, so this leg fails closed
+            # too. `weekly_usage_snapshots.week_start_date` is `TEXT NOT
+            # NULL`, so only an empty string reaches this in production and
+            # the branch costs nothing; it makes the fail-closed claim true
+            # rather than nearly true.
+            raise BoundaryRecordsUnreadable("weekly_credit_floors")
+        try:
+            stamps += [
+                (row[0], "credit") for row in conn.execute(
+                    "SELECT effective_at_utc FROM weekly_credit_floors"
+                    " WHERE week_start_date = ?" + acct,
+                    (week_start_date,) + acct_p,
+                ).fetchall()]
+        except sqlite3.Error as exc:
+            raise BoundaryRecordsUnreadable("weekly_credit_floors") from exc
+    found: dict = {}
+    for stamp, kind in stamps:
+        try:
+            at = parse_iso_datetime(str(stamp), "movement.boundary")
+        except (TypeError, ValueError):
+            continue
+        if week_start_at < at < week_end_at:
+            # A credit record wins a shared instant: it is the one that
+            # writes the synthetic baseline the segment is measured from.
+            if kind == "credit" or at not in found:
+                found[at] = kind
+    return [(at, found[at]) for at in sorted(found)]
+
+
+def _realized_week_movement(conn, week_start_at, week_end_at, week_start_date,
+                            readings, *,
+                            account_key: "str | None" = None) -> WeekMovement:
+    """How many meter points one completed week actually consumed.
+
+    `readings` is the week's snapshots as `(captured_at, weekly_percent,
+    source, payload_json)`; the caller supplies them because it has already
+    selected them, and `conn` is used only for the two boundary tables.
+
+    The reducer SEGMENTS at each recorded reset and credit boundary and sums
+    positive deltas within each segment. The first segment measures from
+    zero, because a week starts at an empty meter and its first reading is
+    itself consumption. Every later segment measures from the synthetic
+    post-credit snapshot `_apply_credit` writes, which is a new baseline and
+    not fresh consumption.
+
+    When a segment holding readings has no such baseline the WHOLE WEEK is
+    withheld. It is not rescued by counting the first post-credit observation
+    as consumption: on the #290 fixture's readings of 46 then 31, a naive
+    positive-adjacent sum yields 46 because the drop contributes zero, and
+    counting 31 yields 77 by assuming the credit zeroed the meter. Neither is
+    knowable. A segment holding no readings needs no baseline, because a
+    reset ends a week and the readings after it carry the next window's
+    bounds.
+
+    A week whose meter reached a displayed 100% is right-censored and is
+    withheld for the same reason §3.2 refuses a point estimate there.
+    """
+    parsed: list = []
+    for row in readings:
+        captured, percent = row[0], row[1]
+        source = row[2] if len(row) > 2 else None
+        payload = row[3] if len(row) > 3 else None
+        if percent is None:
+            continue
+        try:
+            at = parse_iso_datetime(str(captured), "movement.captured_at")
+        except (TypeError, ValueError):
+            continue
+        parsed.append((at, float(percent), str(source or ""), payload))
+    if not parsed:
+        return WeekMovement(None, "no-readings")
+    parsed.sort(key=lambda row: row[0])
+    if any(row[1] >= _CENSORED_READING for row in parsed):
+        return WeekMovement(None, "right-censored")
+
+    try:
+        boundaries = _week_segment_boundaries(
+            conn, week_start_at, week_end_at, week_start_date,
+            account_key=account_key)
+    except BoundaryRecordsUnreadable:
+        # Fail CLOSED. Without the recorded boundaries `edges` collapses to
+        # the week start and a credited week is summed as one segment, which
+        # is the "assume the credit zeroed the meter" arithmetic §4.1 calls
+        # unknowable — and on the #290 shape it yields 46 as the denominator
+        # instead of a withholding.
+        return WeekMovement(None, "boundary-records-unreadable")
+    edges = [(week_start_at, "week-start")] + boundaries
+    total = 0.0
+    segments = 0
+    for position, (low, kind) in enumerate(edges):
+        high = edges[position + 1][0] if position + 1 < len(edges) else None
+        chunk = [row for row in parsed
+                 if (position == 0 or low <= row[0])
+                 and (high is None or row[0] < high)]
+        if not chunk:
+            continue
+        segments += 1
+        if position == 0:
+            previous = 0.0
+            rest = chunk
+        else:
+            first = chunk[0]
+            stated = _credit_snapshot_effective(first[3])
+            if first[2] != _CREDIT_SNAPSHOT_SOURCE or (
+                    stated is not None and stated != low):
+                # Name the record that created the segment. A reset-created
+                # segment reported as `credit-baseline-absent` names the
+                # wrong boundary kind; the withholding itself is right
+                # either way.
+                return WeekMovement(None, f"{kind}-baseline-absent")
+            previous = first[1]
+            rest = chunk[1:]
+        for row in rest:
+            if row[1] > previous:
+                total += row[1] - previous
+            previous = row[1]
+    return WeekMovement(total, None, segments)
+
+
+def _snapshot_columns(conn) -> set:
+    """The column names `weekly_usage_snapshots` actually carries.
+
+    Every production store has `source` and `payload_json`, and several
+    hand-built fixtures do not. Selecting them unconditionally would turn a
+    thin fixture into an `OperationalError`; selecting NULL instead makes the
+    reducer unable to identify a synthetic post-credit baseline, which
+    withholds a credited week rather than mispricing it.
+    """
+    try:
+        rows = conn.execute(
+            "PRAGMA table_info(weekly_usage_snapshots)").fetchall()
+    except sqlite3.Error:
+        return set()
+    return {str(row[1]) for row in rows}
+
+
+def _dpp_candidate_regime(current_week_start, *, account_key):
+    """The S1 regime the TARGET week sits in, or None when there is none.
+
+    None means "no regime restriction is knowable", which is the inert state
+    and the common one. It arises when the validated reader refuses — no
+    calibration, a fingerprint or revision mismatch, or S1's `detection-only`
+    prediction gate — and equally when the target week falls outside the OPEN
+    regime the reader publishes. The reader returns only that one regime, so
+    a target week inside a closed predecessor cannot be matched against
+    anything, and restricting it would exclude every candidate rather than
+    the incomparable ones.
+
+    `account_key=None` reads the MERGED `*` bucket, which spec §5.3 declares
+    invalid as a source of published quota on a decorated install, and this
+    path deliberately carries no decoration gate. Three reasons, recorded
+    here so the question is not re-opened from the §5.3 text alone.
+
+    First, §5.3 forbids PUBLISHING a modelled figure attributed to an
+    account from a merged calibration. Nothing of the kind happens here: the
+    regime is used only to decide which prior weeks are comparable, and its
+    `units_per_point` never enters the returned rate, which is
+    `week_cost / realized_points` end to end. A test pins that behaviourally
+    — two regimes differing only in `unitsPerPoint` publish the same rate.
+
+    Second, the regime's scope and the population's scope always agree,
+    because both come from this same `account_key`: a merged call reads the
+    merged bucket against merged candidate weeks and a merged entry
+    population, and `forecast --account X` reads X's bucket against X's.
+
+    Third, the residual case is bounded. On a decorated install `cctally
+    quota` resolves real account keys and never writes the `*` bucket, so
+    the reader refuses and the restriction is inert. The one reachable state
+    is a `*` bucket fitted while the install had a single account and read
+    after it became decorated, and there the regime can only DROP candidates
+    — pushing the branch toward the fallback it already has — never publish
+    a wrong number.
+    """
+    c = _cctally()
+    try:
+        qcg = c._load_sibling("_cctally_quota_calibration")
+        read = qcg.read_calibration_file(account_key=account_key)
+    except Exception:                                  # noqa: BLE001
+        return None
+    regime = getattr(read, "regime", None)
+    if regime is None:
+        return None
+    if current_week_start < regime.effective_from:
+        return None
+    if regime.effective_until is not None \
+            and current_week_start >= regime.effective_until:
+        return None
+    return regime
+
+
+def _dpp_candidate_in_regime(regime, week_start_at, week_end_at) -> bool:
+    """Whether one candidate week sits inside `regime`'s own interval.
+
+    Split out of `_dpp_candidate_comparability` (#661 S2 Stage C review)
+    because the two halves of that verdict have different costs and
+    different failure modes. This half is a pure date comparison that
+    reaches no store, so the caller keeps applying it after a population
+    read has failed; the other half opens `cache.db`, so the caller stops
+    applying it once one read has failed. Folding the two together let one
+    unreadable probe admit every later week, including weeks on the far side
+    of a metering-rate boundary, which is precisely what spec section 4.2's
+    sparse fallback exists to avoid.
+    """
+    if week_start_at < regime.effective_from:
+        return False
+    if regime.effective_until is not None \
+            and week_end_at > regime.effective_until:
+        return False
+    return True
+
+
+def _dpp_candidate_comparability(regime, week_start_at, week_end_at, *,
+                                 account_key, cache_conn_factory=None):
+    """One candidate's verdict, over four distinct outcomes.
+
+    - `"comparable"` — in regime, and its own population passes the support
+      test.
+    - `"incomparable"` — in regime, population read, support test failed.
+      This is drift, and only this.
+    - `"excluded"` — on the far side of a rate boundary.
+    - `"unreadable"` — the population could not be read at all. Folding this
+      into `"excluded"` made a locked `cache.db` look like twelve weeks that
+      had each crossed a rate boundary, which silently collapsed the branch
+      to `this_week_sparse`; the caller now acts on the distinction.
+
+    Spec §4.2. Same-regime is necessary but not sufficient, because an S1
+    regime describes weighted units per meter point while dollars per point
+    also varies with model mix, pricing, cache mix and speed tier. The
+    additional condition is §1.1's apply adapter run over the candidate
+    week's own population: a week whose composition sits outside the regime's
+    recorded radii is exactly the week `cctally quota` would refuse to model,
+    so no second notion of comparability is invented here.
+
+    `cache_conn_factory`, when given, returns a `cache.db` connection the
+    caller reuses across candidates, so one selector call opens that database
+    once rather than once per probe.
+    """
+    if not _dpp_candidate_in_regime(regime, week_start_at, week_end_at):
+        return "excluded"
+    c = _cctally()
+    try:
+        qcg = c._load_sibling("_cctally_quota_calibration")
+        entries = _week_entry_records(
+            week_start_at, week_end_at, account_key=account_key,
+            cache_conn_factory=cache_conn_factory)
+    except Exception:                                  # noqa: BLE001
+        return "unreadable"
+    applied = qcg.apply_regime(regime, entries)
+    if isinstance(applied, qcg.ApplyRejection):
+        return "incomparable"
+    return "comparable"
+
+
 def _select_dollars_per_percent(
     conn: sqlite3.Connection,
     now_utc: dt.datetime,
@@ -376,8 +770,20 @@ def _select_dollars_per_percent(
     skip_sync: bool = False,
     use_weekref_cost_cache: bool = False,
     account_key: "str | None" = None,
+    p_now_corrected: "float | None" = None,
 ) -> "tuple[float | None, str]":
     """Return (dollars_per_percent, source_label). See spec §1 selection rule.
+
+    #661 S2 spec section 3.1: ``p_now_corrected`` is the ceiling-corrected
+    estimate of what was actually consumed and is the DIVISOR for the two
+    current-week paths. ``p_now`` stays the displayed reading and remains the
+    GATE, deliberately: the ``>= 10`` threshold is about having a stable
+    sample, and dividing 10 into 9.5 would flip a displayed 10 into the
+    trailing-median branch; the ``> 0`` threshold is what withholds the rate
+    on a week with no observed usage, and the corrected point for a displayed
+    0 is 0.25, so correcting the gate would publish a rate there. Omitting
+    the argument keeps the displayed reading as the divisor, which is the
+    right-censored case: there is no corrected point to divide by.
 
     #620 S1 D5: the rate is ``None`` when no usage has been observed. It used
     to be ``0.0`` paired with the ``this_week_sparse`` label, which published
@@ -386,7 +792,11 @@ def _select_dollars_per_percent(
     spend. Absence is now typed, and the cause travels on the existing
     companion source field rather than a new key.
 
-    Eligible prior week: week_end_at < now_utc AND final_weekly_percent >= 1.
+    Eligible prior week (#661 S2 spec §4): it closed before `now_utc`, its
+    REALIZED meter movement is known and at least 1 point, and — when a
+    trustworthy S1 regime covers the target week — it sits in that same
+    regime and its own population still passes the regime's composition
+    support test. The denominator is that movement, not `_floored_week_max`.
     Uses the existing `_sum_cost_for_range` helper (which opens the cache DB
     via `get_entries`); `conn` is only used for snapshot queries.
 
@@ -396,14 +806,21 @@ def _select_dollars_per_percent(
     the trailing-4wk-median prior-week snapshot + cost reads to that account.
     """
     c = _cctally()
+    divisor = p_now if p_now_corrected is None else p_now_corrected
     # Path 1: current week, stable sample.
     if p_now >= 10.0 and p_now > 0:
-        return spent_usd / p_now, "this_week"
+        return spent_usd / divisor, "this_week"
 
-    # Path 2: trailing 4-week median, reset-aware floored (#290).
+    # Path 2: trailing 4-week median over REALIZED meter movement (#661 S2
+    # spec §4). The denominator used to be `_floored_week_max(week)` — #290's
+    # reset-aware, display-oriented high-water mark, which on a credited week
+    # is the POST-credit reading and therefore a fragment of the week's
+    # cost-bearing consumption. `_floored_week_max` is unchanged and still
+    # serves its current-high-water and MAX-clamp consumers; the defect was
+    # in this consumer.
     import statistics
     # Bounded candidate selection: the <=12 most-recent prior weeks. The median
-    # needs 4 eligible; 12 leaves margin so flooring a credited week below 1%
+    # needs 4 eligible; 12 leaves margin so a withheld or incomparable week
     # can't starve it, while keeping this hot path (live forecast view +
     # dashboard refresh) from materializing all history.
     _acct_pred = "" if account_key is None else " AND account_key = ?"
@@ -417,18 +834,29 @@ def _select_dollars_per_percent(
         (current_week_start.isoformat(),) + _acct_p,
     ).fetchall()
     we_by_ws: dict[dt.datetime, dt.datetime] = {}
-    rows_in: list = []
+    wsd_by_ws: dict[dt.datetime, str] = {}
+    readings_by_ws: dict = {}
     ws_iso_list = [row[0] for row in cand]
     if ws_iso_list:
         placeholders = ",".join("?" * len(ws_iso_list))
+        # `source` and `payload_json` are what separate a synthetic
+        # post-credit baseline from an ordinary reading. A store without them
+        # cannot supply that distinction, so they are selected as NULL there
+        # and the reducer withholds any credited week — the fail-closed
+        # direction.
+        present = _snapshot_columns(conn)
+        source_col = ("source" if "source" in present else "NULL")
+        payload_col = ("payload_json" if "payload_json" in present
+                       else "NULL")
         snap = conn.execute(
             "SELECT week_start_date, week_start_at, week_end_at, "
-            "       captured_at_utc, weekly_percent "
+            "       captured_at_utc, weekly_percent, "
+            f"      {source_col}, {payload_col} "
             "FROM weekly_usage_snapshots "
             "WHERE week_start_at IN (" + placeholders + ")" + _acct_pred,
             ws_iso_list + list(_acct_p),
         ).fetchall()
-        for wsd, ws_iso, we_iso, cap_iso, pct in snap:
+        for wsd, ws_iso, we_iso, cap_iso, pct, source, payload in snap:
             if pct is None:
                 continue
             try:
@@ -437,22 +865,131 @@ def _select_dollars_per_percent(
             except ValueError:
                 continue
             we_by_ws.setdefault(ws, we)  # first-wins; all rows share one instant
-            rows_in.append((ws, wsd, ws_iso, we_iso, cap_iso, pct))
-    floored = c._floored_week_max(
-        conn, rows_in, account_key=account_key)  # {ws_instant -> floored max}
-    eligible: list[tuple[dt.datetime, dt.datetime, float]] = [
-        (ws, we_by_ws[ws], floored[ws])
-        for ws in floored
-        if ws in we_by_ws
-        and ws < current_week_start
-        and we_by_ws[ws] < now_utc
-        and floored[ws] >= 1.0
-    ]
-    eligible.sort(key=lambda x: x[0], reverse=True)
+            if wsd is not None:
+                wsd_by_ws.setdefault(ws, wsd)
+            readings_by_ws.setdefault(ws, []).append(
+                (cap_iso, pct, source, payload))
+    # Spec §4.2. Both clauses are gated on a trustworthy regime existing: the
+    # validated reader publishes only the OPEN regime and refuses one S1
+    # marked `detection-only`, so on an install with no calibration there is
+    # no regime information and the restriction is inert. Applying it anyway
+    # would exclude every candidate rather than the incomparable ones.
+    regime = _dpp_candidate_regime(current_week_start, account_key=account_key)
+    eligible: list[tuple[dt.datetime, dt.datetime, float]] = []
+    drifted = False
+    unverified = False
+    # Cost bound (#661 S2 Stage C review). Each comparability probe opens
+    # `cache.db`, scans one subscription week of `session_entries` and turns
+    # the rows into kernel records, so an unbounded per-candidate probe
+    # added up to twelve opens and twelve scans to the live forecast view
+    # and to every dashboard refresh, arriving the day a user's calibration
+    # first became prediction-ready. Two bounds, in the spirit of the
+    # `use_weekref_cost_cache` read beside it:
+    #   * the loop stops at the four candidates the median consumes, so the
+    #     usual cost is four scans rather than twelve; and
+    #   * one `cache.db` connection serves every probe in the call, so the
+    #     open cost is paid once rather than per candidate.
+    # MEASURED, over the twelve most recent completed subscription weeks of
+    # the maintainer's August 2026 store snapshot (476,216 `session_entries`
+    # rows), on an Apple M4 Max Mac Studio under CPython 3.14 with the file
+    # cache warm: a median 16,923 rows and 28 ms per probe, worst 27,664
+    # rows and 46 ms; the SQL scan alone is a median 13 ms and the rest is
+    # building the records. So the usual bounded cost is about 110 ms, and
+    # the WORST CASE — a trustworthy prediction-ready regime with eight or
+    # more candidates rejected before four survive — is one open plus twelve
+    # probes: about 340 ms at the MEDIAN per-probe cost, and up to about
+    # 550 ms if every one of the twelve is as heavy as the heaviest week
+    # measured. Both figures are stated because an earlier revision gave only
+    # the first while calling it the worst case, which mixes the statistics:
+    # a reader taking "worst case" literally computes 12 x 46 ms from the
+    # figures two lines above and gets a different number. Those durations
+    # are this machine's; another host will differ, and the two LAN runners
+    # alone differ by about 1.4x. The
+    # STRUCTURAL bound, at most twelve week-scans per call, is hardware
+    # independent and is what the tests pin. With no trustworthy regime —
+    # every install that has never fit one — no probe runs at all and the
+    # cost is zero.
+    #
+    # NO COMMITTED PROBE-COST HARNESS, deliberately, unlike the realized-error
+    # measurement at `tests/quota_budget_error_harness.py`. That one exists
+    # because spec §4's acceptance criterion is a RE-RUN of it against a
+    # committed artifact, so the number has to be reproducible to be checked.
+    # This one is a duration on one machine over one private store, and a
+    # committed harness would either need that store — which validates a
+    # figure but must never supply one — or a synthetic corpus whose timings
+    # say nothing about the real one. The bound a reader can act on is the
+    # structural one, and it is pinned by test rather than by this comment.
+    shared_cache: dict = {"conn": None, "opened": False}
+
+    def _shared_cache_conn():
+        # Opened on FIRST probe and never before: a selector call that never
+        # reaches a probe — no regime, or every candidate rejected on
+        # movement — must not touch `cache.db` at all.
+        if not shared_cache["opened"]:
+            shared_cache["opened"] = True
+            try:
+                shared_cache["conn"] = c._load_sibling(
+                    "_cctally_cache").open_cache_db()
+            except Exception:                          # noqa: BLE001
+                shared_cache["conn"] = None
+        return shared_cache["conn"]
+
+    try:
+        for ws in sorted(readings_by_ws, reverse=True):
+            if len(eligible) >= 4:
+                # Only the first four are ever used (`eligible[:4]` below),
+                # so a fifth probe cannot change the published rate. It also
+                # cannot change `drifted`, which qualifies the SELECTED
+                # population: a candidate examined after the fourth survivor
+                # was never a candidate for selection.
+                break
+            we = we_by_ws.get(ws)
+            if we is None or ws >= current_week_start or we >= now_utc:
+                continue
+            movement = _realized_week_movement(
+                conn, ws, we, wsd_by_ws.get(ws), readings_by_ws[ws],
+                account_key=account_key)
+            if movement.points is None or movement.points < 1.0:
+                continue
+            if regime is not None:
+                # The BOUNDARY half is applied to EVERY candidate, including
+                # the ones examined after a read has failed (#661 S2 Stage C
+                # review). It is a date comparison that reaches no store, so
+                # keeping it costs nothing, and dropping it admitted weeks
+                # from the far side of a metering-rate boundary into the
+                # median — the failure section 4.2 names outright. Only the
+                # POPULATION half below goes inert on an unreadable store.
+                if not _dpp_candidate_in_regime(regime, ws, we):
+                    continue
+            if regime is not None and not unverified:
+                verdict = _dpp_candidate_comparability(
+                    regime, ws, we, account_key=account_key,
+                    cache_conn_factory=_shared_cache_conn)
+                if verdict == "incomparable":
+                    drifted = True
+                    continue
+                if verdict == "unreadable":
+                    # The same store serves every candidate, so a read that
+                    # failed here fails for all of them. Dropping them would
+                    # exclude every candidate rather than the incomparable
+                    # ones — the exact failure `_dpp_candidate_regime`'s
+                    # docstring refuses — so the POPULATION test becomes
+                    # inert for this call and the rate says it was not
+                    # verified. The boundary test above is unaffected.
+                    unverified = True
+                elif verdict != "comparable":
+                    continue
+            eligible.append((ws, we, movement.points))
+    finally:
+        if shared_cache["conn"] is not None:
+            try:
+                shared_cache["conn"].close()
+            except Exception:                          # noqa: BLE001
+                pass
     prior = eligible[:4]
     if len(prior) >= 4:
         values: list[float] = []
-        for ws, we, final_pct in prior:
+        for ws, we, realized_points in prior:
             if use_weekref_cost_cache:
                 # #269 §4: every `prior` week satisfies `we < now_utc` (an
                 # eligibility filter above), so all four are CLOSED and
@@ -475,12 +1012,30 @@ def _select_dollars_per_percent(
                     ws, we, mode="auto", skip_sync=skip_sync,
                     account_key=account_key,
                 )
-            values.append(week_cost / final_pct)
-        return statistics.median(values), "trailing_4wk_median"
+            # `realized_points` is the week's REALIZED meter movement, not a
+            # final percentage: since §4 the denominator is what the meter
+            # actually moved through, so a credited week no longer divides by
+            # its post-credit fragment.
+            values.append(week_cost / realized_points)
+        # Spec §4.2's third clause: the selected rate carries reduced
+        # confidence when the historical population has drifted. The
+        # qualification travels on the existing companion source field rather
+        # than a new key, which is the same decision #620 S1 D5 made for the
+        # withheld-rate cause. `unverified` is the third register: the
+        # comparability test could not run at all, which is neither drift nor
+        # a clean verification, and it outranks `drifted` because a drift
+        # verdict from a partly-unreadable population is not one.
+        if unverified:
+            label = "trailing_4wk_median_unverified"
+        elif drifted:
+            label = "trailing_4wk_median_drifted"
+        else:
+            label = "trailing_4wk_median"
+        return statistics.median(values), label
 
     # Path 3: fall back to current week even if sparse.
     if p_now > 0:
-        return spent_usd / p_now, "this_week_sparse"
+        return spent_usd / divisor, "this_week_sparse"
     # p_now == 0: there is no signal to divide by. Withhold the rate and say
     # why (#620 S1 D5). Every dollar figure derived from it becomes
     # unavailable; percent projections are unaffected because they never
@@ -523,6 +1078,191 @@ def _pick_p_24h_ago(
     pick = min(samples, key=lambda s: abs((s[0] - target).total_seconds()))
     t_actual = (now_utc - pick[0]).total_seconds() / 3600.0
     return pick[1], t_actual
+
+
+#: Which member of the quota kernel's closed `EVIDENCE_CODES` union states
+#: each calibration-read rejection. `stale` is the union's word for "fitted
+#: under other constants", which is what a fingerprint or revision mismatch
+#: means; every other rejection is reported as `unavailable`, because the
+#: reader deliberately cannot distinguish a quarantined file from an absent
+#: one without scanning sidecars, and it does not scan them.
+_CALIBRATION_REJECTION_CODES: dict = {
+    "calibration-fingerprint-mismatch": "stale",
+    "calibration-revision-mismatch": "stale",
+}
+
+#: The cause a `detection-only` refusal states when the stored regime's own
+#: status is not itself a member of the closed union. S1 only marks a
+#: successor `detection-only` while its status is NOT `ok`, so the stored
+#: status is normally the precise cause and this is the floor under it.
+_DETECTION_ONLY_FALLBACK_CODE = "insufficient-history"
+
+
+@dataclasses.dataclass(frozen=True)
+class CalibratedWeek:
+    """Everything one calibrated week-scan produces, or the cause it did not.
+
+    A single dataclass rather than a widening tuple because the dashboard
+    needs the CONSUMPTION and the headroom (spec §10) as well as the
+    projection, and reading them from a second call would run a second
+    unbounded week scan per refresh for numbers the first scan already
+    computed.
+    """
+    projection_pct: "float | None" = None
+    consumption_pct: "float | None" = None
+    consumption_lo: "float | None" = None
+    consumption_hi: "float | None" = None
+    headroom_pct: "float | None" = None
+    code: "str | None" = None
+
+
+def _calibrated_projection(
+    now_utc: dt.datetime,
+    week_start_at: dt.datetime,
+    week_end_at: dt.datetime,
+    *,
+    account_key: "str | None",
+) -> "tuple[float | None, str | None]":
+    """`(projected_end_of_week_percent, withheld_code)` from the S1 model.
+
+    The two-value form every caller outside the dashboard envelope wants.
+    `_calibrated_week_detail` is the one implementation.
+    """
+    detail = _calibrated_week_detail(
+        now_utc, week_start_at, week_end_at, account_key=account_key)
+    return detail.projection_pct, detail.code
+
+
+def _calibrated_week_detail(
+    now_utc: dt.datetime,
+    week_start_at: dt.datetime,
+    week_end_at: dt.datetime,
+    *,
+    account_key: "str | None",
+) -> CalibratedWeek:
+    """The S1 model's view of THIS week, or the typed cause it has none.
+
+    Reads the persisted calibration through the section 1.1 NON-MUTATING
+    reader — never `load_calibrations`, which quarantines by renaming — and
+    only opens the entry cache when a regime actually validates, so the
+    common no-calibration install pays one small file read and nothing else.
+
+    The support test runs against THIS week's own population rather than
+    trusting the regime's stored status, and the pace projection mirrors the
+    kernel's `_project`: consumption scaled by span over elapsed.
+    """
+    c = _cctally()
+    try:
+        qcg = c._load_sibling("_cctally_quota_calibration")
+    except Exception:                                  # noqa: BLE001
+        # A `CalibratedWeek`, never the two-value tuple this function returned
+        # before it grew a dataclass. `_calibrated_projection` reads
+        # `detail.projection_pct` off the result, so a tuple here raises
+        # `AttributeError` instead of withholding — the same defect class as
+        # `persist_and_detect`'s `None, None`.
+        return CalibratedWeek(code="unavailable")
+    read = qcg.read_calibration_file(account_key=account_key)
+    if read.regime is None:
+        rejection = getattr(read.rejection, "value", None)
+        if rejection == "calibration-detection-only":
+            # S1 held this successor fit below its prediction gate, and the
+            # regime records which blocking status it carried. State that
+            # rather than a generic word: the user reconciles it against
+            # `cctally quota`, which prints the same status.
+            qm = c._load_sibling("_lib_quota_model")
+            stored = read.regime_status
+            return CalibratedWeek(code=(
+                stored if stored in qm.EVIDENCE_CODES
+                else _DETECTION_ONLY_FALLBACK_CODE))
+        return CalibratedWeek(code=_CALIBRATION_REJECTION_CODES.get(
+            rejection, "unavailable"))
+
+    horizon = min(now_utc, week_end_at)
+    try:
+        entries = _week_entry_records(
+            week_start_at, horizon, account_key=account_key)
+    except sqlite3.Error:
+        return CalibratedWeek(code="unavailable")
+    applied = qcg.apply_regime(read.regime, entries)
+    if isinstance(applied, qcg.ApplyRejection):
+        return CalibratedWeek(code=applied.value)
+
+    elapsed = (horizon - week_start_at).total_seconds()
+    span = (week_end_at - week_start_at).total_seconds()
+    if elapsed <= 0 or span <= 0:
+        return CalibratedWeek(code="unavailable")
+    projected = applied.consumed_points * (span / elapsed)
+    if not math.isfinite(projected):
+        # A non-finite product is not a projection. Returning it would let
+        # the selector fall back to the meter with no cause on the wire —
+        # `calibration_code` would read null beside a `corrected-meter`
+        # basis, which is the silent fallback this function's own contract
+        # forbids. The refusal is stated here, at the producer.
+        return CalibratedWeek(code="unavailable")
+    consumed = applied.consumed_points
+    return CalibratedWeek(
+        projection_pct=projected,
+        consumption_pct=consumed,
+        consumption_lo=getattr(applied, "consumed_lo", None),
+        consumption_hi=getattr(applied, "consumed_hi", None),
+        # Headroom is measured against the meter's 100-point ceiling and is
+        # clamped at zero: a week already past its quota has no headroom
+        # left, and a negative one would read as an overdraft the meter does
+        # not express.
+        headroom_pct=max(0.0, 100.0 - consumed),
+    )
+
+
+def _week_entry_records(start, end, *, account_key,
+                        cache_conn_factory=None):
+    """One subscription week's priced requests as quota-kernel `EntryRecord`s.
+
+    Bounded by the subscription week, and read straight out of `cache.db`
+    rather than through `analyse_account`, which runs two unbounded reads
+    plus a detector.
+
+    Named for a week rather than for THE current week because §4.2's
+    comparability probe calls it for prior weeks too.
+
+    `cache_conn_factory`, when given, returns a shared `cache.db` connection
+    this call reads from and does NOT close; the caller owns its lifetime.
+    The comparability probe passes one so a selector call opens that database
+    once instead of once per candidate. It is a FACTORY rather than a live
+    connection so a selector call that never reaches a probe never opens the
+    database at all.
+    """
+    c = _cctally()
+    qm = c._load_sibling("_lib_quota_model")
+    glue = c._load_sibling("_cctally_quota_model")
+    shared = None if cache_conn_factory is None else cache_conn_factory()
+    owned = shared is None
+    cache = (c._load_sibling("_cctally_cache").open_cache_db()
+             if owned else shared)
+    try:
+        sql = (
+            "SELECT timestamp_utc, model, input_tokens, output_tokens,"
+            " cache_create_tokens, cache_create_1h_tokens, cache_read_tokens"
+            " FROM session_entries"
+            " WHERE timestamp_utc >= ? AND timestamp_utc < ?"
+        )
+        params: list = [start.isoformat(), end.isoformat()]
+        clause, extra = glue._account_clause("account_key", account_key)
+        sql += clause
+        params.extend(extra)
+        rows = cache.execute(sql, params).fetchall()
+    finally:
+        if owned:
+            cache.close()
+    records = []
+    for row in rows:
+        at = glue.parse_instant(row[0], "timestamp_utc")
+        if at is None or not (start <= at < end):
+            continue
+        records.append(qm.EntryRecord(
+            at=at, model=str(row[1] or ""), fresh=row[2] or 0,
+            output=row[3] or 0, cache_create_total=row[4] or 0,
+            cache_1h=row[5], cache_read=row[6] or 0))
+    return records
 
 
 def _load_forecast_inputs(
@@ -578,6 +1318,20 @@ def _load_forecast_inputs(
     )
     p_24h_ago, t_24h = _pick_p_24h_ago(samples, now_utc)
 
+    # #661 S2 spec section 3.1. The ceiling correction is applied HERE,
+    # before `ForecastInputs` is constructed, for two independent reasons:
+    # `_compute_forecast` does not select the dollars-per-percent
+    # denominator, so a kernel-only correction would leave the call below
+    # raw; and the kernel computes the recent rate as a DIFFERENCE of the two
+    # endpoints, so correcting only the current one would corrupt that
+    # difference rather than fix it. Both endpoints are corrected together.
+    p_now_corrected = corrected_percent_point(p_now)
+    p_now_interval = corrected_percent_interval(p_now)
+    p_24h_ago_corrected = corrected_percent_point(p_24h_ago)
+    right_censored = p_now_corrected is None
+    calibrated = _calibrated_week_detail(
+        now_utc, week_start_at, week_end_at, account_key=account_key)
+
     # Cache is warm for this invocation after the spent_usd lookup. Suppress
     # re-syncs in downstream cost lookups (trailing-4wk-median loop hits
     # _sum_cost_for_range once per historical week).
@@ -585,6 +1339,7 @@ def _load_forecast_inputs(
         conn, now_utc, week_start_at, p_now, spent_usd, skip_sync=True,
         use_weekref_cost_cache=use_weekref_cost_cache,
         account_key=account_key,
+        p_now_corrected=p_now_corrected,
     )
     target_24h = now_utc - dt.timedelta(hours=24)
     has_sample_ge_24h = any(s[0] <= target_24h for s in samples)
@@ -612,6 +1367,17 @@ def _load_forecast_inputs(
         dollars_per_percent_source=dpp_source,
         confidence=confidence,
         low_confidence_reasons=reasons,
+        p_now_corrected=p_now_corrected,
+        p_now_interval=p_now_interval,
+        p_24h_ago_corrected=p_24h_ago_corrected,
+        right_censored=right_censored,
+        calibrated_projection_pct=calibrated.projection_pct,
+        calibrated_withheld_code=calibrated.code,
+        calibrated_consumption_pct=calibrated.consumption_pct,
+        calibrated_consumption_interval=(
+            None if calibrated.consumption_pct is None
+            else (calibrated.consumption_lo, calibrated.consumption_hi)),
+        calibrated_headroom_pct=calibrated.headroom_pct,
     )
 
 
@@ -639,6 +1405,17 @@ def _parse_forecast_targets(raw: str) -> list[int]:
 
 TOOL_VERSION = "forecast-v1"  # Bumped on material JSON-schema changes.
 
+#: `forecast --json`'s envelope version (#661 S2 spec section 3.5).
+#:
+#: Bumped from 1 because `final_percent_low`, `final_percent_high` and
+#: `week_avg_projection_pct` changed from always-number to NULLABLE, and
+#: because their meaning changed from raw-derived to corrected-derived.
+#: `docs/cli-contract.md` classifies a changed value type and a changed value
+#: meaning as breaking, and this change is both. The new corrected, interval,
+#: censoring and basis keys are additive and would not on their own have
+#: required a bump.
+FORECAST_JSON_SCHEMA_VERSION = 2
+
 
 def _build_forecast_json_payload(out: ForecastOutput) -> dict:
     """Dict shape for the forecast JSON endpoint and for the dashboard
@@ -657,6 +1434,18 @@ def _build_forecast_json_payload(out: ForecastOutput) -> dict:
         },
         "current": {
             "weekly_percent":     round(i.p_now, 3),
+            # #661 S2 spec section 3.1. `weekly_percent` stays the RAW
+            # displayed reading; the two keys below state the ceiling-
+            # corrected operand every rate and projection above is computed
+            # from, so a consumer can re-derive them rather than re-deriving
+            # from a number the kernel did not use. Both null when the
+            # reading is right-censored.
+            "weekly_percent_corrected": (
+                None if i.p_now_corrected is None
+                else round(i.p_now_corrected, 3)),
+            "weekly_percent_interval": (
+                None if i.p_now_interval is None
+                else [i.p_now_interval[0], i.p_now_interval[1]]),
             "five_hour_percent":  (None if i.five_hour_percent is None
                                    else round(i.five_hour_percent, 3)),
             "spent_usd":          round(i.spent_usd, 6),
@@ -664,7 +1453,11 @@ def _build_forecast_json_payload(out: ForecastOutput) -> dict:
             "latest_snapshot_at": _iso_z(i.latest_snapshot_at),
         },
         "rates": {
-            "week_average_pct_per_hour":   round(out.r_avg, 6),
+            # #661 S2 spec section 3.2: a right-censored reading supplies no
+            # rate either, so this nulls rather than dividing the displayed
+            # value the model declares censored.
+            "week_average_pct_per_hour":   (None if out.r_avg is None
+                                            else round(out.r_avg, 6)),
             "recent_24h_pct_per_hour":     (None if out.r_recent is None
                                             else round(out.r_recent, 6)),
             "dollars_per_percent":         (
@@ -674,9 +1467,28 @@ def _build_forecast_json_payload(out: ForecastOutput) -> dict:
             "dollars_per_percent_source":  i.dollars_per_percent_source,
         },
         "forecast": {
-            "final_percent_low":  round(out.final_percent_low, 3),
-            "final_percent_high": round(out.final_percent_high, 3),
-            "week_avg_projection_pct": round(out.week_avg_projection_pct, 3),
+            # #661 S2 spec section 3.2: a right-censored reading has no point
+            # estimate, so these three null rather than carrying a value the
+            # observation cannot supply. `right_censored` is the additive
+            # companion field that says which state the nulls mean.
+            "final_percent_low":  (None if out.final_percent_low is None
+                                   else round(out.final_percent_low, 3)),
+            "final_percent_high": (None if out.final_percent_high is None
+                                   else round(out.final_percent_high, 3)),
+            "week_avg_projection_pct": (
+                None if out.week_avg_projection_pct is None
+                else round(out.week_avg_projection_pct, 3)),
+            "right_censored":     bool(out.right_censored),
+            # #661 S2 spec section 3.3: one named typed state per surface.
+            "projection_basis":   out.projection_basis,
+            "projection_code":    out.projection_code,
+            # Why the CALIBRATED basis was not reached, as a member of the
+            # quota kernel's closed `EVIDENCE_CODES` union; null when it was.
+            # `projection_code` is the cause of a WITHHELD projection and
+            # cannot carry this: falling back to the corrected meter is not a
+            # withholding, and a surface that says nothing here is silently
+            # falling back (spec section 1.1).
+            "calibration_code":   i.calibrated_withheld_code,
             "projected_cap":      out.projected_cap,
             "cap_at":             (None if out.cap_at is None else _iso_z(out.cap_at)),
             "already_capped":     out.already_capped,
@@ -710,8 +1522,33 @@ def _emit_forecast_json(out: ForecastOutput, *, extra: "dict | None" = None) -> 
     if extra:  # #341 R8 decoration (accountKey/accountLabel; empty unless --account)
         payload.update(extra)
     return json.dumps(
-        _cctally().stamp_schema_version(payload),
+        _cctally().stamp_schema_version(
+            payload, version=FORECAST_JSON_SCHEMA_VERSION),
         indent=2)
+
+
+#: The sentence a withheld projection states in the terminal's wide register
+#: (spec section 8). Keyed on `ForecastOutput.projection_code`, a member of
+#: the quota kernel's closed `EVIDENCE_CODES` union.
+_WITHHELD_PROJECTION_WORDING: dict = {
+    "right-censored": "the meter reads at its cap, so consumption has no "
+                      "upper bound",
+    # The uncensored withholding: the corrected point, the elapsed span or
+    # the remaining span is missing, so there is no pace to project along.
+    "unavailable": "the week's window supplies no pace to project along",
+    # RETAINED although `select_projection_basis` no longer emits it. Spec
+    # section 3.6 reversed the zero-end withholding, but `projection_code`
+    # is a wire field a dashboard tab can still be holding from an older
+    # server across an `execvp`, and a code with no wording renders the
+    # generic fallback where a specific sentence exists.
+    "no-local-history": "no usage has been observed this week",
+}
+
+
+def _withheld_projection_wording(out: ForecastOutput) -> str:
+    """Why the projection is absent, never a blank."""
+    return _WITHHELD_PROJECTION_WORDING.get(
+        out.projection_code, "the projection is unavailable")
 
 
 def _render_forecast_status_line(out: ForecastOutput, color: bool) -> str:
@@ -721,12 +1558,25 @@ def _render_forecast_status_line(out: ForecastOutput, color: bool) -> str:
         return c._style_ansi(s, code, color)
 
     i = out.inputs
+    # `already_capped` is the whole predicate here: `_compute_forecast` sets
+    # it only in the right-censored branch. That is NOT the only branch that
+    # nulls `final_percent_high` — the WITHHELD branch does too — so the
+    # `low is None or high is None` arm below is what handles that shape, and
+    # the two arms are disjoint rather than one subsuming the other.
     if out.already_capped:
         return _c("\u26a0 CAPPED", "31")       # red
     if i.confidence == "low":
         return _c("tracking\u2026", "2")       # dim
     low = out.final_percent_low
     high = out.final_percent_high
+    if low is None or high is None:
+        # A projection the kernel withheld without the meter being capped:
+        # the corrected point, the elapsed span or the remaining span was
+        # missing, which `_load_forecast_inputs` does not produce. This arm
+        # therefore guards the KERNEL's contract rather than the loader's
+        # current output \u2014 `_compute_forecast` may return this shape for any
+        # caller-built inputs, and the arms below would `round(None)`.
+        return _c("tracking\u2026", "2")       # dim
     low_disp = round(low)
     high_disp = round(high)
     pct_range = f"{low_disp}\u2013{high_disp}%"
@@ -966,6 +1816,16 @@ def _render_forecast_terminal(out: "ForecastOutput", args, color: bool) -> str:
         forecast_extra_lines = [
             c._style_ansi(row, "33", color) for row in conf_rows[1:]
         ]
+    elif out.final_percent_high is None or out.final_percent_low is None:
+        # A projection the kernel withheld without the meter being capped —
+        # today, a week with no observed usage. Through `_load_forecast_inputs`
+        # that reading also trips `percent<2` and the LOW CONF arm above
+        # catches it, so this arm guards the KERNEL's contract rather than the
+        # loader's current output: the rounding below would `round(None)` for
+        # any caller-built inputs in that state.
+        forecast_line = c._style_ansi(
+            f"Forecast withheld — {_withheld_projection_wording(out)}",
+            "33", color)
     else:
         low, high = out.final_percent_low, out.final_percent_high
         low_rnd = round(low)
@@ -980,10 +1840,15 @@ def _render_forecast_terminal(out: "ForecastOutput", args, color: bool) -> str:
         forecast_line = c._style_ansi(
             f"Forecast {low_rnd}%\u2013{high_disp}", glyph_color, color) + warn
 
+    # A withheld projection collapses the bar's projection band onto the
+    # observed reading, so the bar shows what was measured and draws no
+    # forecast region at all (#661 S2 spec section 3.2).
     bar_lines = _render_forecast_progress_bar(
         used=i.p_now,
-        low=out.final_percent_low,
-        high=out.final_percent_high,
+        low=(i.p_now if out.final_percent_low is None
+             else out.final_percent_low),
+        high=(i.p_now if out.final_percent_high is None
+              else out.final_percent_high),
         width=inner_w - 2,
         unicode_ok=unicode_ok,
         color=color,
@@ -1007,7 +1872,9 @@ def _render_forecast_terminal(out: "ForecastOutput", args, color: bool) -> str:
     # ── Footer
     footer_bits = []
     footer_bits.append(c._style_ansi(
-        f"rate source: {i.dollars_per_percent_source.replace('_', ' ')}", "2", color))
+        "rate source: "
+        + dollars_per_percent_source_label(i.dollars_per_percent_source),
+        "2", color))
     if out.cap_at is not None:
         # format_display_dt: zone-label suffix disambiguates --tz vs host-local
         # in the rendered footer (matches the reset-chip subtitle).
@@ -1041,8 +1908,9 @@ def _render_forecast_terminal(out: "ForecastOutput", args, color: bool) -> str:
     # --explain footer
     if getattr(args, "explain", False):
         r_rec = "\u2014" if out.r_recent is None else f"{out.r_recent:.3f}%/h"
+        r_av = "\u2014" if out.r_avg is None else f"{out.r_avg:.3f}%/h"
         lines.append(c._style_ansi(
-            f"  r_avg={out.r_avg:.3f}%/h \u00b7 r_recent={r_rec} \u00b7 "
+            f"  r_avg={r_av} \u00b7 r_recent={r_rec} \u00b7 "
             f"{i.snapshot_count} snapshots \u00b7 $/1% source={i.dollars_per_percent_source}",
             "2", color))
 
@@ -1704,14 +2572,12 @@ def cmd_forecast(args: argparse.Namespace) -> int:
             )
             now_x = (i.now_utc - i.week_start_at).total_seconds() / 3600.0
             end_x = (i.week_end_at - i.week_start_at).total_seconds() / 3600.0
-            if output.already_capped:
-                # Flat ray: y stays at p_now across the remaining window.
-                projected_series.append(
-                    (now_label, now_x, float(i.p_now))
-                )
-                projected_series.append(
-                    (end_label, end_x, float(i.p_now))
-                )
+            if output.final_percent_high is None:
+                # #661 S2 spec section 3.2. The ray used to run flat at
+                # `p_now` across the remaining window, which draws a
+                # projection under a "projected" label out of a reading that
+                # supplies no point estimate. There is no ray to draw.
+                pass
             else:
                 projected_series.append(
                     (now_label, now_x, float(i.p_now))
@@ -1730,8 +2596,15 @@ def cmd_forecast(args: argparse.Namespace) -> int:
             actual_series=actual_series,
             projected_series=projected_series,
             current_pct=float(i.p_now),
-            projected_low_pct=float(output.final_percent_low),
-            projected_high_pct=float(output.final_percent_high),
+            # #661 S2 spec section 3.2. Substituting `p_now` printed
+            # "Projected end-of-week % 103.0% — 103.0%" — the CURRENT reading
+            # under a "Projected" label, with nothing saying it was withheld.
+            # `None` reaches the table as the same withheld token the ceiling
+            # distances already use.
+            projected_low_pct=(None if output.final_percent_low is None
+                               else float(output.final_percent_low)),
+            projected_high_pct=(None if output.final_percent_high is None
+                                else float(output.final_percent_high)),
             days_remaining=float(i.remaining_days),
             # #620 S1 D5: no `float(...)` coercion — that would turn a
             # withheld rate back into $0.00 one layer below the fix.

@@ -188,7 +188,7 @@ def test_api_doctor_get_returns_full_payload(tmp_path, monkeypatch):
     cats = {c["id"] for c in payload["categories"]}
     assert cats == {
         "install", "hooks", "auth", "db", "journal", "data", "accounts",
-        "pricing", "safety", "telemetry",
+        "pricing", "quota", "safety", "telemetry",
     }
     assert set(payload["overall"]["counts"].keys()) == {"ok", "warn", "fail"}
     assert payload["overall"]["severity"] in {"ok", "warn", "fail"}

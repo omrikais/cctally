@@ -25,6 +25,11 @@ End-to-end coverage of the mirror tool's surviving surfaces (the per-commit
 trailer/replay model was retired in #281 S9):
   - bootstrap (empty / non-empty-refused / force-overwrite / dry-run)
   - reconcile (clean / idempotent / refuses cursor-behind / refuses dirty)
+
+Run: `python3 bin/build-mirror-public-fixtures.py`
+to (re)generate every scenario's setup.sh, run.sh and goldens into
+tests/fixtures/mirror-public/. This builder does NOT remove a scenario
+directory it no longer declares; delete such a directory by hand.
 """
 
 from __future__ import annotations
@@ -614,10 +619,17 @@ def build(out_root: Path) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--out", default=str(FIXTURES_DIR))
+    p.add_argument(
+        "--out", default=None,
+        help="Override the output directory (defaults to "
+             "tests/fixtures/mirror-public/). Harnesses build into a per-run "
+             "scratch dir so the committed fixtures stay byte-stable and a test "
+             "run leaves the tracked tree alone.",
+    )
     args = p.parse_args()
-    build(Path(args.out))
-    print(f"mirror-public fixtures: built {len(SCENARIOS)} scenarios → {args.out}")
+    out = Path(args.out) if args.out is not None else FIXTURES_DIR
+    build(out)
+    print(f"mirror-public fixtures: built {len(SCENARIOS)} scenarios → {out}")
     return 0
 
 

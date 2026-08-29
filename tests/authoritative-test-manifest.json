@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "seededAt": "2026-08-08",
-  "minHarnessRows": 61,
+  "minHarnessRows": 62,
   "harnesses": [
     {
       "name": "5h-canonical",
@@ -16,17 +16,17 @@
       "countPolicy": "fixed"
     },
     {
-      "name": "alerts-dispatch",
-      "visibility": "public",
-      "minCases": 22,
-      "countPolicy": "fixed"
-    },
-    {
       "name": "alerts",
       "visibility": "public",
       "minCases": 125,
       "countPolicy": "variable",
       "countAxis": "uname-s"
+    },
+    {
+      "name": "alerts-dispatch",
+      "visibility": "public",
+      "minCases": 22,
+      "countPolicy": "fixed"
     },
     {
       "name": "bench",
@@ -101,15 +101,15 @@
       "countPolicy": "fixed"
     },
     {
-      "name": "daily-instances",
-      "visibility": "public",
-      "minCases": 12,
-      "countPolicy": "fixed"
-    },
-    {
       "name": "daily",
       "visibility": "public",
       "minCases": 8,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "daily-instances",
+      "visibility": "public",
+      "minCases": 12,
       "countPolicy": "fixed"
     },
     {
@@ -229,8 +229,9 @@
     {
       "name": "preflight",
       "visibility": "public",
-      "minCases": 20,
-      "countPolicy": "fixed"
+      "minCases": 57,
+      "countPolicy": "variable",
+      "countAxis": "bash3-availability"
     },
     {
       "name": "pricing-check",
@@ -245,6 +246,12 @@
       "countPolicy": "fixed"
     },
     {
+      "name": "quota",
+      "visibility": "public",
+      "minCases": 17,
+      "countPolicy": "fixed"
+    },
+    {
       "name": "reap",
       "visibility": "private",
       "minCases": 54,
@@ -253,7 +260,7 @@
     {
       "name": "reconcile",
       "visibility": "public",
-      "minCases": 76,
+      "minCases": 77,
       "countPolicy": "fixed"
     },
     {
@@ -275,15 +282,15 @@
       "countPolicy": "fixed"
     },
     {
-      "name": "release-harness-isolation",
-      "visibility": "private",
-      "minCases": 1,
-      "countPolicy": "fixed"
-    },
-    {
       "name": "release",
       "visibility": "private",
       "minCases": 75,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "release-harness-isolation",
+      "visibility": "private",
+      "minCases": 1,
       "countPolicy": "fixed"
     },
     {
@@ -313,7 +320,7 @@
     {
       "name": "share",
       "visibility": "public",
-      "minCases": 20,
+      "minCases": 21,
       "countPolicy": "fixed"
     },
     {
@@ -349,13 +356,13 @@
     {
       "name": "test-remote",
       "visibility": "private",
-      "minCases": 693,
+      "minCases": 724,
       "countPolicy": "fixed"
     },
     {
       "name": "tui",
       "visibility": "public",
-      "minCases": 18,
+      "minCases": 21,
       "countPolicy": "fixed"
     },
     {

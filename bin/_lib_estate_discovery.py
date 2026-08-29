@@ -60,16 +60,16 @@ class, so the scan is AST throughout.
 
 WHAT THIS KERNEL DOES NOT COVER, stated rather than implied
 -----------------------------------------------------------
-* **Vitest suppression state.** The pinned Vitest 4.1.5 ``list --json``
-  contract exposes identity and file but not task mode, and reporters do not
-  enrich the list operation. A Vitest test changed from active to statically
-  skipped keeps an identical row. Vitest rows are ids alone; Playwright rows
+* **Vitest task-mode fields.** The pinned Vitest 4.1.5 ``list --json`` contract
+  exposes identity and file but no explicit mode field. It nevertheless omits
+  an effectively skipped task, so active-to-skipped is an identity removal and
+  the frontend axis detects it. Vitest rows remain ids alone; Playwright rows
   carry ``expected_status``.
 * **Runtime-invoked frontend modifiers.** A ``test.skip()`` called from inside
   an unexecuted test body is invisible to both collectors.
-* **Frontend suppressions generally** are the frontend axis's business:
-  ``it.skip``, ``describe.skip`` and ``test.fixme`` are invisible to a Python
-  AST walk and are not counted in the suppression inventory.
+* **Frontend source declarations** are the frontend axis's business. They are
+  not counted in the Python suppression inventory; the runner-derived identity
+  set records their effective result instead.
 
 Three Python mechanisms were checked for and are ABSENT from this tree,
 recorded so the next reader knows they were looked for rather than overlooked:
@@ -817,6 +817,10 @@ def _sanitized_env() -> dict:
         env.pop(key, None)
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # #648 D8. A defensive pin, not a repair: every #648 measurement held the
+    # timezone constant, so no timezone-dependent collection was observed. It
+    # is removed as an uncontrolled input rather than as a known mover.
+    env["TZ"] = "Etc/UTC"
     return env
 
 
@@ -998,11 +1002,10 @@ class FrontendRow:
 
     ``expected_status`` is populated for Playwright and is ALWAYS ``None`` for
     Vitest. Vitest 4.1.5's ``list --json`` exposes identity, file and location
-    but not task mode, and reporters do not enrich the list operation, so a
-    Vitest test changed from active to statically skipped keeps an identical
-    row. That is a real hole, named here rather than papered over with an
-    invented status; an ids-only set still detects a removed or renamed test,
-    which is the larger loss class.
+    but not task mode. Effective mode is encoded through row presence: a
+    statically skipped task is omitted, so active-to-skipped is visible as an
+    identity removal even though no status value can be invented for rows that
+    remain.
     """
 
     runner: str
@@ -1011,9 +1014,23 @@ class FrontendRow:
 
 
 def _relative_posix(path: Path, base: Path) -> str:
+    """``path`` relative to ``base``, falling back to the absolute form.
+
+    Both sides are resolved before the comparison, because the runner reports a
+    path it resolved and the caller may hold one it did not. On macOS that is the
+    ORDINARY case rather than an exotic one: ``tempfile`` hands back
+    ``/var/folders/...`` while ``/var`` is a symlink to ``/private/var``, so the
+    two spellings name the same file and ``relative_to`` still raises.
+
+    That mattered concretely. Deriving the #648 public profile inside a temporary
+    projection returned all 5,405 Vitest rows carrying the maintainer's absolute
+    temp path, and the public artifact would have PUBLISHED it. The fallback is
+    kept for a path genuinely outside ``base``; it is no longer reached by a
+    difference of spelling alone.
+    """
     try:
-        return path.relative_to(base).as_posix()
-    except ValueError:
+        return path.resolve().relative_to(base.resolve()).as_posix()
+    except (ValueError, OSError):
         return path.as_posix()
 
 
@@ -1088,12 +1105,26 @@ def parse_playwright_list(payload) -> list:
     return sorted(rows, key=lambda r: (r.runner, r.id))
 
 
-def _run_frontend(argv, cwd: Path):
+# The e2e runtime-directory seam (#648 D9). `dashboard/web/e2e/utils.ts` reads
+# this and falls back to its own `e2e/.runtime` when it is unset, so a caller
+# that built the fixture runtime somewhere else — a projection, a temporary
+# directory — can point both runners at it without writing into the tree under
+# enumeration.
+E2E_RUNTIME_DIR_ENV = "CCTALLY_E2E_RUNTIME_DIR"
+
+
+def _run_frontend(argv, cwd: Path, runtime_dir=None):
     env = dict(os.environ)
     # The JSON reporter writes to a FILE when this is set, so enumeration would
     # leave an artifact behind and return nothing on stdout.
     env.pop("PLAYWRIGHT_JSON_OUTPUT_NAME", None)
     env.pop("PLAYWRIGHT_HTML_REPORT", None)
+    # An inherited value is REMOVED rather than forwarded. A stale export would
+    # otherwise redirect an enumeration the caller believes it pinned, and the
+    # result would look exactly like a live set.
+    env.pop(E2E_RUNTIME_DIR_ENV, None)
+    if runtime_dir is not None:
+        env[E2E_RUNTIME_DIR_ENV] = str(runtime_dir)
     return subprocess.run(
         argv, cwd=str(cwd), env=env, capture_output=True, text=True, check=False,
     )
@@ -1116,7 +1147,7 @@ def _json_document(text: str, opener: str, runner: str):
         raise EstateDiscoveryError(f"{runner} enumeration produced invalid JSON: {exc}")
 
 
-def collect_frontend_tests(root) -> list:
+def collect_frontend_tests(root, runtime_dir=None) -> list:
     """Both frontend estates, from each runner's own list mode.
 
     A ``*.test.*``/``*.spec.*`` glob would conflate them: Vitest excludes
@@ -1135,6 +1166,15 @@ def collect_frontend_tests(root) -> list:
     runtime itself: the CALLER builds it first. There is no partial mode — a
     caller that silently accepted a missing axis is the failure this kernel
     exists to prevent.
+
+    ``runtime_dir`` is that seam (#648 D9). When it is supplied both runners are
+    invoked with ``CCTALLY_E2E_RUNTIME_DIR`` set to it, and
+    ``dashboard/web/e2e/utils.ts`` resolves the manifest there instead of at
+    ``e2e/.runtime``. That is what lets a caller enumerate a tree it must not
+    write into — a public projection, for one — after building the runtime
+    somewhere else. When it is ``None`` any inherited value is REMOVED, so the
+    fixed in-tree path is the only fallback and a stale export cannot redirect
+    the derivation.
     """
     root = Path(root)
     web = root / "dashboard" / "web"
@@ -1152,7 +1192,9 @@ def collect_frontend_tests(root) -> list:
                 f"frontend collection precondition unmet: {runner} is not "
                 f"installed at {path}; run `npm ci` in dashboard/web"
             )
-    vitest_result = _run_frontend([str(binaries["vitest"]), "list", "--json"], web)
+    vitest_result = _run_frontend(
+        [str(binaries["vitest"]), "list", "--json"], web, runtime_dir=runtime_dir,
+    )
     if vitest_result.returncode != 0:
         raise _frontend_failure(vitest_result, "vitest")
     rows = parse_vitest_list(_json_document(vitest_result.stdout, "[", "vitest"), web)
@@ -1164,6 +1206,7 @@ def collect_frontend_tests(root) -> list:
     # a generic "exit 1" into the precondition the caller can act on.
     playwright_result = _run_frontend(
         [str(binaries["playwright"]), "test", "--list", "--reporter=json"], web,
+        runtime_dir=runtime_dir,
     )
     if "{" not in playwright_result.stdout:
         raise _frontend_failure(playwright_result, "playwright")

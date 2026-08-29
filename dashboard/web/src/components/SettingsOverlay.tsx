@@ -91,6 +91,7 @@ const EXTRA_ROW_HELP: Record<string, string> = {
   'alerts.notifier': 'osascript notify-send popup dispatch backend',
   'alerts.enabled': 'threshold master weekly 5h',
   'alerts.projected_enabled': 'pace projection weekly percent',
+  'alerts.rate_change_enabled': 'metering rate change provider quota units per point',
   'budget.weekly_usd': 'amount equivalent dollars spend cap',
   'budget.projected_enabled': 'pace projection budget dollars',
   'budget.project_alerts_enabled': 'per-project git root',
@@ -772,6 +773,7 @@ export function SettingsOverlay() {
   const claudeChanged = anyDirty(
     'alerts.enabled',
     'alerts.projected_enabled',
+    'alerts.rate_change_enabled',
     'budget.weekly_usd',
     'budget.projected_enabled',
     'budget.project_alerts_enabled',
@@ -1246,6 +1248,28 @@ export function SettingsOverlay() {
                         <p className="settings-hint">
                           Pace is where the week is heading if the last day&apos;s rate
                           continues to the reset.
+                        </p>
+                      </div>
+                    )}
+                    {show('alerts.rate_change_enabled') && (
+                      <div className="settings-subgroup">
+                        <label>
+                          <input
+                            type="checkbox"
+                            name="rate-change-enabled"
+                            data-settings-field="alerts.rate_change_enabled"
+                            checked={form.draftOf<boolean>('alerts.rate_change_enabled')}
+                            onChange={(e) =>
+                              editField('alerts.rate_change_enabled', e.target.checked)
+                            }
+                          />{' '}
+                          Metering-rate-change notifications{' '}
+                          {keyTag('alerts.rate_change_enabled')}
+                          {scopeNote('machine')}
+                        </label>
+                        <p className="settings-hint">
+                          The change is recorded either way and every view shows
+                          it. This decides whether it also notifies.
                         </p>
                       </div>
                     )}

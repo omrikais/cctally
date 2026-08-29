@@ -1021,6 +1021,41 @@ def _load_codex_quota_observations_for_doctor(*, force_cold: bool = False):
     return loaded
 
 
+_QUOTA_NO_CHANGE: dict = {
+    "active": False, "effective_from": None,
+    "previous_units_per_point": None, "new_units_per_point": None,
+}
+
+
+def _gather_quota_rate_change(c, rejection=None) -> "dict | None":
+    """§6.6's derived marker state, read WITHOUT the prediction gate.
+
+    The rate-change surfaces read the regime pair deliberately: S1 marks a
+    successor `detection-only` while its fit stays below the PREDICTION gate,
+    and detection is exactly what a detection-grade fit is for. So this
+    gather goes to the stored regimes rather than through the validated
+    reader's default, which refuses that mark.
+
+    An ABSENT calibration is "no change detected", not "not assessed" — a
+    store with no fitted regime has no transition to report, and that is the
+    state of every install that has never run `cctally quota`. `None` is
+    reserved for a calibration that exists and could not be read, where the
+    sibling `quota.calibration` check is already WARNing about it.
+    """
+    if rejection == "calibration-absent":
+        return dict(_QUOTA_NO_CHANGE)
+    mrc = c._load_sibling("_lib_meter_rate_change")
+    glue = c._load_sibling("_cctally_quota_model")
+    loaded = glue.read_stored_state_readonly()
+    if loaded is None:
+        return None
+    regimes = glue.stored_regimes(loaded, None)
+    active = mrc.active_rate_change(regimes)
+    if active is None:
+        return dict(_QUOTA_NO_CHANGE)
+    return active
+
+
 def doctor_gather_state(
     *,
     now_utc: "dt.datetime | None" = None,
@@ -2028,6 +2063,31 @@ def _doctor_gather_state_impl(
             except Exception:
                 pricing_coverage = None
 
+    with _lib_perf.phase("doctor.quota_calibration"):
+        # ── Quota (#661 S2 §7) ───────────────────────────────────────────
+        # Through the §1.1 NON-MUTATING reader. `load_calibrations` renames a
+        # malformed or version-ahead file aside through `_quarantine`, so
+        # calling it here would make a documented read-only command a writer.
+        # An already-quarantined file is reported simply as a missing primary:
+        # the reader cannot tell it from an absent one without scanning
+        # sidecars, and it deliberately does not scan them.
+        quota_calibration = None
+        quota_rate_change = None
+        try:
+            qcg = c._load_sibling("_cctally_quota_calibration")
+            read = qcg.read_calibration_file(account_key=None)
+            quota_calibration = {
+                "rejection": (None if read.rejection is None
+                              else str(read.rejection.value)),
+                "status": read.regime_status,
+                "present": read.regime is not None,
+            }
+            quota_rate_change = _gather_quota_rate_change(
+                c, quota_calibration["rejection"])
+        except Exception:
+            quota_calibration = None
+            quota_rate_change = None
+
     # ── Meta ─────────────────────────────────────────────────────────
     with _lib_perf.phase("doctor.journal"):
         # ── Journal (DB journal redesign §9) ─────────────────────────────
@@ -2413,6 +2473,9 @@ def _doctor_gather_state_impl(
         telemetry_reason=telemetry_reason,
         # Pricing-freshness check (spec §5.1): trailing-30d coverage gaps.
         pricing_coverage=pricing_coverage,
+        # #661 S2 §7: the `quota` category's two inputs.
+        quota_calibration=quota_calibration,
+        quota_rate_change=quota_rate_change,
         # Conversation-sessions rollup consistency (#217 S1 / U9).
         conv_sessions_rollup_count=conv_sessions_rollup_count,
         conv_messages_distinct_sessions=conv_messages_distinct_sessions,

@@ -23,7 +23,13 @@ import { resolveSourceView } from '../store/sourceView';
 import { resolveViewAccountFocus } from '../store/accountFocus';
 import { AlertsEmptyGauge } from './AlertsEmptyGauge';
 import { ZoneTag } from './ZoneTag';
-import type { AlertEntry, CodexAlertRow, SourceAlertRow } from '../types/envelope';
+import { rateChangeSummary } from '../lib/quotaCopy';
+import type {
+  AlertEntry,
+  CodexAlertRow,
+  MeterRateChangeEntry,
+  SourceAlertRow,
+} from '../types/envelope';
 
 // Recent alerts modal — full history (last 100). ESC and backdrop
 // close via the shared `<Modal>` chrome (which also handles the
@@ -177,6 +183,90 @@ function CodexCostCell(): JSX.Element {
   return <span className="num">—</span>;
 }
 
+// #661 S2 section 6.1 — the non-threshold family gets its OWN section with
+// its own columns, and never a row in the table above.
+//
+// That table is threshold-shaped: its columns are `%`, `Axis`, `Cost` and
+// `Context`, and a rate transition has no percentage, no axis in
+// `AXIS_REGISTRY`, no cost and no window to follow. Forcing one into those
+// columns would print an em-dash in three of them and mislabel the fourth.
+// The columns here are the ones a rate transition actually has: which
+// provider's rate moved, how far, and when it took effect.
+function RateChangeSection({
+  rows,
+  ctx,
+  showAccountColumn,
+}: {
+  rows: MeterRateChangeEntry[];
+  ctx: { tz: string; offsetLabel: string };
+  showAccountColumn: boolean;
+}): JSX.Element {
+  return (
+    <section className="alerts-rate-change" data-testid="alerts-rate-change">
+      <h3 className="alerts-rate-change-heading">Metering rate changes</h3>
+      <p className="alerts-rate-change-note">
+        The provider changed how much work one meter point buys. This is the
+        provider&rsquo;s behaviour, not a cctally malfunction.
+      </p>
+      <table className="alerts-table alerts-table--rate-change">
+        <thead>
+          <tr>
+            <th scope="col">Provider</th>
+            {showAccountColumn && <th scope="col">Account</th>}
+            <th scope="col">Change</th>
+            <th scope="col">Units / point</th>
+            <th scope="col">Effective</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => {
+            const summary = rateChangeSummary(
+              row.previous_units_per_point, row.new_units_per_point,
+            );
+            const effectiveTitle = fmt.startedShortOrNull(row.effective_from, ctx);
+            const effectiveText = fmt.relativeOrAbsolute(row.effective_from ?? '', ctx);
+            return (
+              <tr key={row.id} className="alert-modal-row">
+                <td className="alert-cell-source">
+                  <span className={`source-chip source-chip--${row.provider}`}>
+                    {row.provider}
+                  </span>
+                </td>
+                {showAccountColumn && (
+                  <td className="alert-cell-account">
+                    {row.accountLabel != null && (
+                      <span className="alert-account-chip" title={row.accountLabel}>
+                        {row.accountLabel}
+                      </span>
+                    )}
+                  </td>
+                )}
+                <td className={`alert-cell-axis severity-${row.severity} ${row.severity}`}>
+                  <span className={`chip chip-rate-change severity-${row.severity}`}>
+                    {summary ?? 'rate changed'}
+                  </span>
+                </td>
+                <td className="alert-cell-cost num">
+                  {row.previous_units_per_point != null && row.new_units_per_point != null
+                    ? `${Math.round(row.previous_units_per_point).toLocaleString()} → ${Math.round(row.new_units_per_point).toLocaleString()}`
+                    : '—'}
+                </td>
+                <td
+                  className="alert-cell-when alert-when"
+                  title={effectiveTitle ?? undefined}
+                >
+                  {effectiveText}
+                  {effectiveText === '—' ? null : <> <ZoneTag tz={ctx.tz} /></>}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
 export function RecentAlertsModal(): JSX.Element {
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().openModalSource ?? getState().activeSource);
   const env = useScopedSnapshot(activeSource);
@@ -231,11 +321,36 @@ export function RecentAlertsModal(): JSX.Element {
   const rows = focusedRows.slice(0, ALERTS_MODAL_CAP);
   const showSourceColumn = activeSource === 'all';
   const showAccountColumn = rows.some((row) => alertAccount(row) != null);
+  // #661 S2 section 6.1 — the non-threshold family, from its OWN wire array.
+  // Filtered by the active provider tab the same way the threshold rows are,
+  // because ownership is a rendering decision the row already carries.
+  const rateChanges = (env?.meter_rate_changes ?? []).filter(
+    (row) => activeSource === 'all' || row.owner === activeSource,
+  );
+  const showRateAccountColumn = rateChanges.some((r) => r.accountLabel != null);
 
-  if (rows.length === 0) {
+  if (rows.length === 0 && rateChanges.length === 0) {
     return (
       <Modal title="Recent alerts" accentClass="accent-amber">
         <AlertsEmptyGauge source={activeSource} usedPct={usedPct} thresholds={weeklyThresholds} />
+      </Modal>
+    );
+  }
+
+  if (rows.length === 0) {
+    // A store with a recorded rate transition and no threshold crossing is a
+    // real state, and the empty gauge would hide the one thing there IS to
+    // report. The gauge still renders, because "no thresholds crossed" is
+    // also true and is what it says.
+    return (
+      <Modal title="Recent alerts" accentClass="accent-amber">
+        <div className="alerts-modal-body">
+          <AlertsEmptyGauge source={activeSource} usedPct={usedPct} thresholds={weeklyThresholds} />
+          <RateChangeSection
+            rows={rateChanges} ctx={ctx}
+            showAccountColumn={showRateAccountColumn}
+          />
+        </div>
       </Modal>
     );
   }
@@ -316,6 +431,12 @@ export function RecentAlertsModal(): JSX.Element {
           <div className="alerts-modal-foot">
             Showing {ALERTS_MODAL_CAP} of {focusedRows.length} most recent
           </div>
+        )}
+        {rateChanges.length > 0 && (
+          <RateChangeSection
+            rows={rateChanges} ctx={ctx}
+            showAccountColumn={showRateAccountColumn}
+          />
         )}
       </div>
     </Modal>

@@ -8,18 +8,18 @@
                ║   Used now       67.3%                                                                 ║               
                ║   Used 24h ago   28.9%                                                                 ║               
                ║                                                                                        ║               
-               ║   Two rate paths                                                                       ║               
-               ║     r_avg     67.3 / 153.0      = 0.4399 %/h                                           ║               
-               ║     r_recent  (67.3-28.9) / 24.0  = 1.6000 %/h                                         ║               
+               ║   Two rate paths   (operands are ceiling-corrected)                                    ║               
+               ║     r_avg     66.5 / 153.0      = 0.4346 %/h                                           ║               
+               ║     r_recent  (66.5-27.5) / 24.0  = 1.6250 %/h                                         ║               
                ║                                                                                        ║               
                ║   Project to week end (15.0h remaining)                                                ║               
-               ║     by week-avg    = 73.9%                                                             ║               
-               ║     by recent-24h  = 91.3%                                                             ║               
-               ║     high           = 91.3%     verdict: WARN                                           ║               
+               ║     by week-avg    = 73.0%                                                             ║               
+               ║     by recent-24h  = 90.9%                                                             ║               
+               ║     high           = 90.9%     verdict: WARN                                           ║               
                ║                                                                                        ║               
                ║   Daily $ budgets (0.625 days remaining)                                               ║               
-               ║     ≤100%   $21.97/day                                                                 ║               
-               ║     ≤90%   $15.25/day                                                                  ║               
+               ║     ≤100%   $22.51/day                                                                 ║               
+               ║     ≤90%   $15.79/day                                                                  ║               
                ║                                                                                        ║               
                ║   confidence: high · based on 7-day rate                                               ║               
                ║                                                                                        ║               

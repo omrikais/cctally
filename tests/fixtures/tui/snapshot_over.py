@@ -34,10 +34,17 @@ _P_NOW = 92.4
 _P_24H = 73.2
 _DPP = 0.45
 
-_R_AVG = _P_NOW / _ELAPSED_H                                      # ≈ 0.60392
-_R_REC = max(0.0, (_P_NOW - _P_24H) / 24.0)                       # = 0.8
-_P_FIN_AVG = _P_NOW + _R_AVG * _REMAINING_H                       # ≈ 101.459
-_P_FIN_REC = _P_NOW + _R_REC * _REMAINING_H                       # = 104.4
+# #661 S2 spec section 3.1: the forecast kernel runs on the CEILING-CORRECTED
+# reading, so this fixture derives its rates, projections and budget headroom
+# from the same operand `_compute_forecast` would use. Deriving them from the
+# displayed reading instead would make the Forecast explain modal print an
+# arithmetic identity that does not hold.
+_P_CORR = m.corrected_percent_point(_P_NOW)
+_P24_CORR = m.corrected_percent_point(_P_24H)
+_R_AVG = _P_CORR / _ELAPSED_H
+_R_REC = max(0.0, (_P_CORR - _P24_CORR) / 24.0)
+_P_FIN_AVG = _P_CORR + _R_AVG * _REMAINING_H
+_P_FIN_REC = _P_CORR + _R_REC * _REMAINING_H
 # Cap forecast: r_pessimistic = max(r_avg, r_recent) = 0.8
 # hours_to_cap = (100 - 92.4) / 0.8 = 9.5 → cap_at = _NOW + 9h30m
 _CAP_AT = _NOW + dt.timedelta(hours=9, minutes=30)
@@ -76,9 +83,9 @@ _FC = m.ForecastOutput(
         # target=100: headroom > 0 → populated row.
         m.BudgetRow(
             target_percent=100,
-            pct_headroom=100.0 - _P_NOW,
-            dollars_per_day=((100.0 - _P_NOW) * _DPP) / _REMAINING_D,
-            percent_per_day=(100.0 - _P_NOW) / _REMAINING_D,
+            pct_headroom=100.0 - _P_CORR,
+            dollars_per_day=((100.0 - _P_CORR) * _DPP) / _REMAINING_D,
+            percent_per_day=(100.0 - _P_CORR) / _REMAINING_D,
         ),
         # target=90: p_now (92.4) already past 90 → headroom <= 0, all-None row
         # per _compute_forecast's budget-row invariant.

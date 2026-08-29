@@ -86,6 +86,21 @@ export const SETTINGS_MANIFEST: readonly ManifestEntry[] = [
     defaultText: 'false',
   },
   {
+    // #661 S2 section 6.2. Recording is unconditional from the first upgrade,
+    // so `cctally quota`, `doctor`, the status line and the dashboard all show
+    // the state with no configuration; this toggle gates the PUSH only, and it
+    // defaults off like every other alert toggle in this estate so an upgrade
+    // never produces a surprise notification.
+    key: 'alerts.rate_change_enabled',
+    label: 'Metering-rate-change notifications',
+    section: 'alerts',
+    disposition: 'editable',
+    fieldId: 'alerts.rate_change_enabled',
+    command: 'cctally config set alerts.rate_change_enabled true',
+    reason: '',
+    defaultText: 'false',
+  },
+  {
     key: 'alerts.notifier',
     label: 'Alert notifier',
     section: 'alerts',

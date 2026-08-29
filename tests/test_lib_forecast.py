@@ -71,19 +71,22 @@ def test_compute_forecast_band_ordered():
 
 
 def test_compute_forecast_week_avg_projection_matches_manual():
-    # r_avg = 50/84; proj = 50 + (50/84)*84 = 100. Mirrors
+    # #661 S2 spec section 3.1: the kernel runs on the CEILING-CORRECTED
+    # reading, so a displayed 50 is 49.5 consumed. r_avg = 49.5/84;
+    # proj = 49.5 + (49.5/84)*84 = 99.0. Mirrors
     # tests/test_week_avg_projection.py through the direct import.
     out = _compute_forecast(_mk_inputs(p_now=50.0, elapsed_hours=84.0,
                                        remaining_hours=84.0), [100, 90])
-    assert abs(out.week_avg_projection_pct - 100.0) < 1e-9
+    assert abs(out.week_avg_projection_pct - 99.0) < 1e-9
 
 
 def test_compute_forecast_zero_elapsed_guard():
-    # elapsed 0 => r_avg 0 => projection collapses to p_now (no ZeroDivision).
+    # elapsed 0 => r_avg 0 => projection collapses to the corrected reading
+    # (no ZeroDivision). A displayed 33 is 32.5 consumed.
     out = _compute_forecast(_mk_inputs(p_now=33.0, elapsed_hours=0.0,
                                        remaining_hours=84.0), [100, 90])
     assert out.r_avg == 0.0
-    assert abs(out.week_avg_projection_pct - 33.0) < 1e-9
+    assert abs(out.week_avg_projection_pct - 32.5) < 1e-9
 
 
 def test_compute_forecast_targets_produce_budget_rows():

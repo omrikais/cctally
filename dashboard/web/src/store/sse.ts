@@ -356,6 +356,10 @@ function ingestAlerts(snap: Envelope): void {
   dispatch({
     type: 'INGEST_SOURCE_ALERTS',
     rows: collectToastAlertRows(snap),
+    // #661 S2 section 6.1 — the non-threshold family travels in its own
+    // array, from the envelope's own separate array. `?? []` covers a server
+    // predating the family, which omits the field entirely.
+    rateChanges: snap.meter_rate_changes ?? [],
     alertsSettings: snap.alerts_settings ?? FALLBACK_ALERTS_SETTINGS,
     isFirstTick,
   });

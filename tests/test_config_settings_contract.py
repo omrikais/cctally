@@ -26,7 +26,7 @@ def _load():
     return mod
 
 
-def test_writable_leaves_are_exactly_the_eighteen_the_endpoint_writes():
+def test_writable_leaves_are_exactly_the_nineteen_the_endpoint_writes():
     m = _load()
     writable = {
         p for p, d in m.SETTINGS_LEAF_DISPOSITIONS.items() if d == m.WRITABLE
@@ -34,6 +34,9 @@ def test_writable_leaves_are_exactly_the_eighteen_the_endpoint_writes():
     assert writable == {
         "display.tz",
         "alerts.enabled", "alerts.projected_enabled", "alerts.notifier",
+        # #661 S2 section 6.2: the metering-rate-change PUSH toggle.
+        # Recording is unconditional and this gates only the notification.
+        "alerts.rate_change_enabled",
         "dashboard.cache_failure_markers", "dashboard.live_tail",
         "dashboard.lan_auth",
         "update.check.enabled", "update.check.ttl_hours", "update.channel",

@@ -19,6 +19,7 @@
     "project_alerts_enabled": false,
     "projected_budget_enabled": false,
     "projected_weekly_enabled": false,
+    "rate_change_enabled": false,
     "weekly_thresholds": [
       90,
       95
@@ -97,6 +98,7 @@
   "hydrating": false,
   "last_sync_at": null,
   "last_sync_error": null,
+  "meter_rate_changes": [],
   "monthly": {
     "rows": [],
     "total_cost_usd": 0.0,
@@ -308,6 +310,7 @@
             "project_alerts_enabled": false,
             "projected_budget_enabled": false,
             "projected_weekly_enabled": false,
+            "rate_change_enabled": false,
             "weekly_thresholds": [
               90,
               95

@@ -1,4 +1,4 @@
-import type { AlertEntry, AlertsSettingsEnvelope, DashboardSelection, Envelope, SessionRow, SourceAlertRow, SourceName } from '../types/envelope';
+import type { AlertEntry, AlertsSettingsEnvelope, DashboardSelection, Envelope, MeterRateChangeEntry, SessionRow, SourceAlertRow, SourceName } from '../types/envelope';
 import type { SourceResource } from '../hooks/useSourceDetail';
 import { seedFormsForRow, toastAlertId } from '../lib/alertIdentity';
 import {
@@ -309,8 +309,23 @@ export type ToastState =
   // normalizes both to a source row at render time and shows a source chip; the
   // legacy reducers keep RAW AlertEntry payloads so their existing store tests
   // stay byte-stable.
-  | { kind: 'alert'; payload: AlertEntry | SourceAlertRow }
+  // #661 S2 section 6.1: the non-threshold metering-rate-change family
+  // joins this union as its OWN variant, discriminated by `family`. It is
+  // deliberately NOT folded into `AlertEntry`: every member of that union is
+  // a numeric threshold axis, `AlertEntry` requires a numeric `threshold`,
+  // and `alert_row_owner` raises on a seventh axis so that adding one
+  // without deciding its ownership fails a test rather than shipping an
+  // invisible row. A rate transition has no threshold and no
+  // threshold-derived severity.
+  | { kind: 'alert'; payload: AlertEntry | SourceAlertRow | MeterRateChangeEntry }
   | null;
+
+/** Whether one toast payload is the non-threshold rate-change variant. */
+export function isMeterRateChangePayload(
+  payload: AlertEntry | SourceAlertRow | MeterRateChangeEntry,
+): payload is MeterRateChangeEntry {
+  return 'family' in payload && payload.family === 'meter_rate_change';
+}
 
 // Mirrors the Python envelope's alerts_settings block; lets
 // SettingsOverlay seed without a separate GET.
@@ -333,6 +348,10 @@ export interface AlertsConfig {
   // envelope's alerts_settings block. Both default false.
   projected_weekly_enabled?: boolean;
   projected_budget_enabled?: boolean;
+  // #661 S2 section 6.2: the non-threshold rate-change family's PUSH toggle.
+  // Recording is unconditional and this gates only the notification, so a
+  // server predating the family omits the key and the default is false.
+  rate_change_enabled?: boolean;
   // Per-project budget axis (issue #19/#121): single opt-in toggle mirrored
   // from the envelope's alerts_settings block. Defaults false.
   project_alerts_enabled?: boolean;
@@ -588,7 +607,7 @@ export interface UIState {
   // #294 S5 §6.7 — carries either legacy AlertEntry rows (legacy path) or
   // source-qualified rows (new pipeline) so a Codex toast can queue beside a
   // Claude one; the Toast normalizes both at render.
-  alertToastQueue: Array<AlertEntry | SourceAlertRow>;
+  alertToastQueue: Array<AlertEntry | SourceAlertRow | MeterRateChangeEntry>;
   // UI-only preview of panelOrder during an in-flight drag. While set,
   // App.tsx renders this order (FLIP animates) but prefs.panelOrder
   // remains untouched. Committed to prefs on drop (COMMIT_DRAG_PREVIEW)
@@ -717,6 +736,7 @@ function defaultAlertsConfig(): AlertsConfig {
     weekly_usd: null,
     projected_weekly_enabled: false,
     projected_budget_enabled: false,
+    rate_change_enabled: false,
     project_alerts_enabled: false,
     codex_budget_configured: false,
     codex_budget_alerts_enabled: false,
@@ -1320,6 +1340,12 @@ export type Action =
   | {
       type: 'INGEST_SOURCE_ALERTS';
       rows: SourceAlertRow[];
+      // #661 S2 section 6.1: the non-threshold family's rows, carried
+      // alongside the threshold rows rather than inside them. They share
+      // the forward-only seen-set and the toast queue — the mechanism is
+      // about "has this been shown", which is the same question — but they
+      // never enter `rows`, so no threshold consumer widens to meet them.
+      rateChanges?: MeterRateChangeEntry[];
       alertsSettings: AlertsSettingsEnvelope;
       isFirstTick: boolean;
     }
@@ -2169,11 +2195,18 @@ export function dispatch(action: Action): void {
       // top-level array → no codex_budget double-toast). Toasts fire for rows
       // of every source; the panel (not the store) filters by active source.
       const seen = new Set(state.seenAlertIds);
+      const rateChanges = action.rateChanges ?? [];
       if (action.isFirstTick) {
         // Cold-start / reconnect: seed every row as seen (both the normalized
         // and bare legacy forms, for one release of continuity) without
         // surfacing a toast, and clear the queue so a reconnect can't replay.
         for (const r of action.rows) for (const f of seedFormsForRow(r)) seen.add(f);
+        // Same rule for the rate-change family: its events are recorded from
+        // the first upgrade (section 6.2), so a cold start finds a history a
+        // user has already seen in `cctally quota` and the doctor detail. A
+        // toast for each of them on first connect would be exactly the
+        // surprise notification the default-off convention exists to prevent.
+        for (const r of rateChanges) seen.add(r.id);
         state = {
           ...state,
           seenAlertIds: seen,
@@ -2184,15 +2217,23 @@ export function dispatch(action: Action): void {
       }
       const fresh = action.rows.filter((r) => !seen.has(toastAlertId(r)));
       for (const r of fresh) for (const f of seedFormsForRow(r)) seen.add(f);
+      const freshRateChanges = rateChanges.filter((r) => !seen.has(r.id));
+      for (const r of freshRateChanges) seen.add(r.id);
+      // Threshold rows first, then the rate transitions. The order is a
+      // decision: a threshold crossing is about this week's consumption and
+      // is actionable now, while a rate transition explains why the meter
+      // moves differently from here on.
+      const freshAll: Array<AlertEntry | SourceAlertRow | MeterRateChangeEntry> =
+        [...fresh, ...freshRateChanges];
 
       let toast = state.toast;
       let queue = state.alertToastQueue;
-      if (fresh.length > 0) {
+      if (freshAll.length > 0) {
         if (!toast || toast.kind !== 'alert') {
-          toast = { kind: 'alert', payload: fresh[0] };
-          queue = [...queue, ...fresh.slice(1)];
+          toast = { kind: 'alert', payload: freshAll[0] };
+          queue = [...queue, ...freshAll.slice(1)];
         } else {
-          queue = [...queue, ...fresh];
+          queue = [...queue, ...freshAll];
         }
       }
       state = {

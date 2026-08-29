@@ -51,6 +51,36 @@ export function withheldMessage(result: AggregateWithheld, noun: string): string
 // branch for the same reason `withheldMessage` does: the in-place update path
 // lets an old client meet a newer server without reloading the JavaScript, so
 // an unheard-of code must render generic copy rather than nothing.
+// #661 S2 (Stage C review, F11) — why a PUBLISHED `$ / 1%` rate carries
+// reduced confidence.
+//
+// Spec section 4.2's third clause: the trailing-median rate is qualified when
+// the historical population has drifted outside the calibration's support, and
+// separately when the comparability test could not run at all. Both
+// qualifications ride on the same companion source field as the withheld
+// causes, so the rate is NON-NULL and `dollarsPerPercentReason` — which only
+// fires on a null rate — never saw them. A dashboard user was shown a
+// drift-reduced or unverified rate with no qualification at all.
+//
+// Returns null for every source that carries no qualification, which is the
+// common case, so the caller renders nothing rather than a reassurance.
+export function dollarsPerPercentQualification(
+  code: string | null | undefined,
+): string | null {
+  switch (code) {
+    case 'trailing_4wk_median_drifted':
+      return 'One or more prior weeks were dropped from this median because '
+        + 'their model mix sits outside the calibration\u2019s support, so the '
+        + 'rate is measured over a reduced population.';
+    case 'trailing_4wk_median_unverified':
+      return 'The comparability test could not read the entry store, so the '
+        + 'prior weeks in this median were not checked against the current '
+        + 'metering rate.';
+    default:
+      return null;
+  }
+}
+
 export function dollarsPerPercentReason(code: string | null | undefined): string {
   switch (code) {
     case 'no_usage_observed':

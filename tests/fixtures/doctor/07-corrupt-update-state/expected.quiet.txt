@@ -19,9 +19,10 @@ Journal
 Data
 Accounts
 Pricing
+Quota
 Safety
   ✗ update-state.json        unreadable: UpdateError: update-state.json is not valid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
       → `rm ~/.local/share/cctally/update-state.json` (will be regenerated)
 Telemetry
 
-Summary: 55 OK · 6 WARN · 1 FAIL
+Summary: 57 OK · 6 WARN · 1 FAIL

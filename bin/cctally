@@ -568,6 +568,29 @@ _iter_codex_jsonl_entries_with_offsets = _lib_jsonl._iter_codex_jsonl_entries_wi
 # Provider-neutral quota interpretation kernel (#294 S2).  The module is pure
 # and contains no database, config, filesystem, notifier, parser, or command
 # dependency; adapters added in later stages own those concerns.
+# Quota model kernel (#661 S1): the pure-fn layer behind `cctally quota`,
+# re-exported here like the other _lib_* kernels so tests and the glue reach
+# one loaded instance.
+_lib_quota_model = _load_sibling("_lib_quota_model")
+CalibrationStatus = _lib_quota_model.CalibrationStatus
+WithholdingCause = _lib_quota_model.WithholdingCause
+Verdict = _lib_quota_model.Verdict
+BlockingReason = _lib_quota_model.BlockingReason
+CalibrationEvidence = _lib_quota_model.CalibrationEvidence
+QuotaAnalysis = _lib_quota_model.QuotaAnalysis
+DailyObservation = _lib_quota_model.DailyObservation
+DetectorResult = _lib_quota_model.DetectorResult
+EntryRecord = _lib_quota_model.EntryRecord
+SnapshotRecord = _lib_quota_model.SnapshotRecord
+CreditRecord = _lib_quota_model.CreditRecord
+Segment = _lib_quota_model.Segment
+Interval = _lib_quota_model.Interval
+Support = _lib_quota_model.Support
+quota_model_analyse = _lib_quota_model.analyse
+QUOTA_MODEL_ALGORITHM_REVISION = _lib_quota_model.QUOTA_MODEL_ALGORITHM_REVISION
+QUOTA_MODEL_CONSTANTS_FINGERPRINT = (
+    _lib_quota_model.QUOTA_MODEL_CONSTANTS_FINGERPRINT)
+
 _lib_quota = _load_sibling("_lib_quota")
 QuotaWindowIdentity = _lib_quota.QuotaWindowIdentity
 QuotaObservation = _lib_quota.QuotaObservation
@@ -888,6 +911,12 @@ cmd_pricing_check = _cctally_pricing_check.cmd_pricing_check
 # Batch E, C7). Re-exported so doctor (c._pricing_observed_models) resolves.
 _pricing_observed_models = _cctally_pricing_check._pricing_observed_models
 _PRICING_SCAN_DEFAULT_WINDOW = _cctally_pricing_check._PRICING_SCAN_DEFAULT_WINDOW
+
+# Eager re-export of bin/_cctally_quota_model.py — `cmd_quota` is invoked
+# via the parser's `set_defaults(func=c.cmd_quota)`, which resolves through
+# cctally's namespace, so it must live here.
+_cctally_quota_model = _load_sibling("_cctally_quota_model")
+cmd_quota = _cctally_quota_model.cmd_quota
 
 # Eager re-export of bin/_cctally_doctor.py — `cmd_doctor` is the parser's
 # `set_defaults(func=c.cmd_doctor)` target; `doctor_gather_state` is a
@@ -1477,6 +1506,7 @@ _project_detail_for_window = _cctally_dashboard._project_detail_for_window
 _handle_get_project_detail_impl = _cctally_dashboard._handle_get_project_detail_impl
 _select_current_block_for_envelope = _cctally_dashboard._select_current_block_for_envelope
 _build_alerts_envelope_array = _cctally_dashboard._build_alerts_envelope_array
+_build_meter_rate_change_array = _cctally_dashboard._build_meter_rate_change_array
 snapshot_to_envelope = _cctally_dashboard.snapshot_to_envelope
 _session_detail_to_envelope = _cctally_dashboard._session_detail_to_envelope
 DashboardHTTPHandler = _cctally_dashboard.DashboardHTTPHandler
@@ -1654,6 +1684,8 @@ _assess_forecast_confidence = _cctally_forecast._assess_forecast_confidence
 _pick_p_24h_ago = _cctally_forecast._pick_p_24h_ago
 _load_forecast_inputs = _cctally_forecast._load_forecast_inputs
 _compute_forecast = _cctally_forecast._compute_forecast
+corrected_percent_point = _cctally_forecast.corrected_percent_point
+corrected_percent_interval = _cctally_forecast.corrected_percent_interval
 _parse_forecast_targets = _cctally_forecast._parse_forecast_targets
 TOOL_VERSION = _cctally_forecast.TOOL_VERSION
 _build_forecast_json_payload = _cctally_forecast._build_forecast_json_payload

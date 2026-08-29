@@ -215,6 +215,38 @@ describe('<HeroStrip /> vs last week metric (#207 B1)', () => {
     return container.querySelector('[data-metric="vs-last-week"]') as HTMLElement | null;
   }
 
+  // #661 S2 section 10.1. The Codex hero branch has always guarded its delta
+  // on a non-null rate; the shared Claude/All branch rendered the rate and
+  // branched the delta INDEPENDENTLY, so the hero could publish a
+  // week-over-week comparison on a screen whose `$ / 1%` slot reads a dash.
+  // The envelope now couples the two operands as well; this is the client
+  // half, and it holds even against an older server whose envelope predates
+  // that coupling.
+  it('renders NO delta when the rate operand is absent', () => {
+    const env = heroEnvelope();
+    env.header.dollar_per_pct = null;
+    env.header.vs_last_week_delta = -0.8;
+    if (env.current_week) env.current_week.dollar_per_pct = null;
+    _resetForTests();
+    updateSnapshot(env);
+    const { container } = render(<HeroStrip />);
+    const cell = container.querySelector('[data-metric="vs-last-week"]');
+    expect(cell).not.toBeNull();
+    expect(cell!.querySelector('use')).toBeNull();
+    expect(cell!.textContent).toContain('—');
+  });
+
+  it('still renders the delta when the rate IS present — the guard is not a blanket', () => {
+    const env = heroEnvelope();
+    env.header.dollar_per_pct = 23.4;
+    env.header.vs_last_week_delta = -0.8;
+    _resetForTests();
+    updateSnapshot(env);
+    const { container } = render(<HeroStrip />);
+    const cell = container.querySelector('[data-metric="vs-last-week"]');
+    expect(cell!.querySelector('use')).not.toBeNull();
+  });
+
   it('renders an em-dash value (no icon) when the delta is null', () => {
     const cell = metricFor(null)!;
     expect(cell).not.toBeNull();

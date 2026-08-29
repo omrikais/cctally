@@ -3488,6 +3488,71 @@ def _build_pricing_check_parser(subparsers, name, *, help_text, xref=None):
     )
     pc_p.set_defaults(func=c.cmd_pricing_check)
 
+def _build_quota_parser(subparsers, name, *, help_text, xref=None):
+    """Build the top-level `quota` parser (#661 S1, spec section 8).
+
+    Registered ONLY at top level. There is no `claude quota` twin and no Bash
+    wrapper: `_build_claude_parser` enumerates its leaves by hand and
+    `_REGISTRATION` enumerates the flat commands separately, so nothing
+    mirrors automatically and there is no accidental duplication to prevent.
+    """
+    c = _cctally()
+    q = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+            """\
+            Report how much of your weekly Claude quota your usage consumes,
+            computed from tokens against a budget fitted from your own
+            history, and whether the provider has changed the metering rate.
+
+            The fitted value is one effective blended rate in weighted units
+            per weekly point. It is valid for the model and token blend your
+            own history shows, it is NOT a provider budget, and it is the
+            provider's budget minus an unmeasured, workload-dependent amount.
+
+            Exit codes:
+              0 — trustworthy result, no rate change detected.
+              1 — a rate change is confirmed. Detection has its own stricter
+                  gates than prediction, so this can be reported while the
+                  calibration itself is still too thin to predict from.
+              2 — argument or validation error.
+              3 — judgment withheld: the data is unhealthy or a store is
+                  unavailable.
+              4 — the evidence is healthy but too thin, fragmented or
+                  unstable to fit.
+
+            See docs/commands/quota.md for the JSON schema.
+            """
+        ),
+    )
+    q.add_argument(
+        "--since", metavar="DATE",
+        help="Ignore data before this ISO date or timestamp. It never widens "
+             "the window past the supported-composition era.",
+    )
+    q.add_argument(
+        "--watch-from", metavar="DATE",
+        help="Evaluate this split date instead of scanning for one. Bypasses "
+             "the scan and the multiplicity correction, never the health or "
+             "fit gates. A run passing it persists nothing.",
+    )
+    q.add_argument(
+        "--account", metavar="REF",
+        help="Scope to one account (label, email or unique key prefix)",
+    )
+    q.add_argument(
+        "--json", action="store_true",
+        help="Emit machine-readable JSON to stdout (schemaVersion: 1)",
+    )
+    q.add_argument(
+        "--reset-calibration", action="store_true",
+        help="Discard the stored calibration for the selected account",
+    )
+    q.set_defaults(func=c.cmd_quota)
+
+
 def _build_hook_tick_parser(subparsers, name, *, help_text, xref=None):
     """Build the `hook-tick` parser (registered via _REGISTRATION; #279 S6 W3).
 
@@ -3830,6 +3895,7 @@ _REGISTRATION = (
     _Reg('doctor', _build_doctor_parser, "Diagnose data freshness and install state", None, None),
     _Reg('dashboard-perf', _build_dashboard_perf_parser, "Read a running dashboard's tick cost; arm its phase trace", None, None),
     _Reg('pricing-check', _build_pricing_check_parser, "Detect stale or missing embedded model pricing", None, None),
+    _Reg('quota', _build_quota_parser, "Report weekly quota consumption and metering-rate changes", None, None),
     _Reg('hook-tick', _build_hook_tick_parser, argparse.SUPPRESS, None, None),
     _Reg('__preview', _build_preview_parser, argparse.SUPPRESS, None, lambda c: getattr(c, "cmd_preview", None) is not None),
     _Reg('update', _build_update_parser, "Update cctally to the latest version", None, None),

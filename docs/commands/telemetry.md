@@ -65,6 +65,10 @@ The `--json` payload carries `enabled`, `reason`, `version`, `os`, `period`, `to
 | `0` | Success (status shown, or the action applied). |
 | `2` | Argument/usage error (argparse convention), or a config-validation error on `on`/`off`. |
 
+## Implementation
+
+The beat and every predicate that decides whether it fires live in `bin/_cctally_telemetry.py`.
+
 ## See also
 
 - [`../telemetry.md`](../telemetry.md) — the full transparency page (privacy properties, retention, threat model).

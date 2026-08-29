@@ -17,7 +17,38 @@ import {
 } from '../lib/dashboardPresentation';
 import { SourceChip } from './sourcePanel';
 import { BudgetComposition } from '../components/BudgetBlock';
+import { causeShort } from '../lib/quotaCopy';
 import type { Envelope } from '../types/envelope';
+
+// #661 S2 sections 9 and 10 — how the panel names the basis its projection
+// came from. The vocabulary is the same one the status line prints, so a user
+// reading both surfaces reads one word for one thing.
+const BASIS_LABEL: Record<string, string> = {
+  calibrated: 'model',
+  'corrected-meter': 'meter',
+};
+
+/**
+ * The one line the panel adds: which measurement produced the projection, or
+ * the short-register cause when it was withheld.
+ *
+ * Returns null when the server published no quota object at all, which is
+ * every server predating this session and every Codex projection — so the
+ * panel keeps exactly the shape it had rather than growing an empty row.
+ */
+export function forecastBasisLine(
+  env: Envelope | null,
+): { label: string; value: string } | null {
+  const quota = env?.forecast?.quota ?? null;
+  if (quota == null || quota.basis == null) return null;
+  if (quota.basis === 'withheld') {
+    return {
+      label: 'Basis',
+      value: causeShort(quota.code_presentation, quota.code) || 'withheld',
+    };
+  }
+  return { label: 'Basis', value: BASIS_LABEL[quota.basis] ?? quota.basis };
+}
 
 // #416 QA P0 — the shared blank. A forecast is a claim about ONE quota
 // allowance, and a decorated Codex provider has several; no summary statistic
@@ -246,6 +277,12 @@ export function ForecastPanel() {
   const projectedLabel = esc === 'over' && fc.projected != null
     ? '≥100%'
     : fmt.pct1(fc.projected);
+  // #661 S2 sections 9, 10 and 6.6. Both are null on every server predating
+  // this session and on a Codex projection, so the panel keeps its committed
+  // shape there rather than growing an empty row and an empty chip.
+  const basisLine = forecastBasisLine(env);
+  const rateChange = env?.forecast?.quota?.rate_change ?? null;
+  const rateChangeActive = rateChange?.active === true;
   return (
     <section
       className={`panel accent-purple fc-tile fc-esc-${esc}${hasEdge ? ' fc-accent-edge' : ''}`}
@@ -281,15 +318,41 @@ export function ForecastPanel() {
           <div className={`fc-num is-${esc}${perAccount ? ' is-blank' : ''}`}>
             {perAccount ? <ForecastPerAccountValue /> : projectedLabel}
           </div>
-          {v && (
-            <span className={`fc-verdict-chip is-${esc}`}>
-              <span className="fc-verdict-glyph" aria-hidden="true">{v.glyph}</span>
-              {' '}
-              {v.label}
-            </span>
-          )}
-          {section != null && section.status !== 'available' && !perAccount && !sectionSubstituted && (
-            <span className="provider-section-status">{section.status}</span>
+          {/* One wrapping row for every chip the hero carries, so the verdict,
+              the source status and the rate-change marker read as one line
+              rather than as a stack of unrelated badges. `.fc-hero` is a
+              column flex, so before this wrapper each chip took a row of its
+              own and the pinned region grew by one row per chip — which the
+              panel can least afford in the degraded state, where all three
+              are present. */}
+          {(v
+            || (section != null && section.status !== 'available' && !perAccount && !sectionSubstituted)
+            || rateChangeActive) && (
+            <div className="fc-chiprow">
+              {v && (
+                <span className={`fc-verdict-chip is-${esc}`}>
+                  <span className="fc-verdict-glyph" aria-hidden="true">{v.glyph}</span>
+                  {' '}
+                  {v.label}
+                </span>
+              )}
+              {section != null && section.status !== 'available' && !perAccount && !sectionSubstituted && (
+                <span className="provider-section-status">{section.status}</span>
+              )}
+              {/* Section 6.6's DERIVED marker: the active open regime has a
+                  confirmed predecessor. It shows for the whole of that
+                  successor regime and clears on its own when the regime
+                  closes, so it needs no durable state. */}
+              {rateChangeActive && (
+                <span
+                  className={`fc-rate-chip severity-${rateChange?.severity ?? 'warn'}`}
+                  data-testid="fc-rate-change-chip"
+                  title="The provider changed how much work one meter point buys. Open this panel for the detail."
+                >
+                  Δ rate
+                </span>
+              )}
+            </div>
           )}
         </div>
         {section?.reason && !perAccount && (
@@ -306,6 +369,12 @@ export function ForecastPanel() {
             style={{ width: `${perAccount ? 0 : Math.min(100, Math.max(0, fc.projected ?? 0))}%` }}
           />
         </div>
+        {/* #661 S2 section 10.2, defect 1. The hero, the reason sentence and
+            the pace bar stay pinned; everything below them scrolls inside
+            this bounded region, so the panel body's own `scrollHeight`
+            equals its `clientHeight` instead of overflowing the shared
+            368px row by 35px whenever the source publishes a degradation. */}
+        <div className="fc-scroll">
         <div className="fc-budget-foot">
           <div className="fc-foot-line">
             <span className="fc-foot-k">{perAccount ? 'Current quota' : fc.recentLabel}</span>
@@ -321,6 +390,15 @@ export function ForecastPanel() {
               <span className="fc-foot-v">{line.value}</span>
             </div>
           ))}
+          {/* Section 9's wording, on this surface too: the panel is
+              basis-aware rather than always model-backed, and it states which
+              measurement produced the number above. */}
+          {basisLine && !perAccount && (
+            <div className="fc-foot-line" data-testid="fc-basis-line">
+              <span className="fc-foot-k">{basisLine.label}</span>
+              <span className="fc-foot-v">{basisLine.value}</span>
+            </div>
+          )}
         </div>
         {/* #556 S5 §1.3 / decision 4 — the same block ships on both provider
             tabs, not only under All: once the status is on the wire and the
@@ -329,6 +407,7 @@ export function ForecastPanel() {
             own tab does. */}
         <div className="fc-budget-block">
           <BudgetComposition env={env} selection={activeSource} surface="panel" />
+        </div>
         </div>
       </div>
     </section>

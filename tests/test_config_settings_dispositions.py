@@ -268,7 +268,8 @@ def test_display_is_the_one_block_that_requires_a_leaf(post):
 
 EMPTY_BLOCK_ECHOES = [
     ("alerts", {"enabled", "weekly_thresholds", "five_hour_thresholds",
-                "projected_enabled", "notifier", "command_configured"}),
+                "projected_enabled", "rate_change_enabled", "notifier",
+                "command_configured"}),
     ("budget", {"weekly_usd", "alerts_enabled", "alert_thresholds",
                 "projected_enabled", "period", "projects",
                 "project_alerts_enabled", "accounts", "codex"}),
@@ -378,3 +379,98 @@ def test_malformed_stored_block_rejection_also_names_its_field(post):
     assert status == 400, out
     assert out["error"] == "alerts must be an object"
     assert out["field"] == "alerts"
+
+
+# --- Every WRITABLE leaf actually reaches config.json --------------------
+#
+# The hole the #661 S2 review found. `tests/test_config_settings_contract.py`
+# asserts the contract LISTS a set of writable leaves; nothing asserted that
+# the endpoint WRITES them. `alerts.rate_change_enabled` was added to the
+# contract as WRITABLE, the list test was updated from eighteen to nineteen,
+# and the endpoint's alerts merge never copied the key — a save answered 200,
+# reported three changes, and persisted two. This drives each writable leaf
+# through the real endpoint and reads the value back off disk.
+
+#: `leaf -> (value sent, value expected in config.json)`. The two differ only
+#: where the endpoint canonicalizes, and today nothing here does.
+WRITABLE_LEAF_VALUES: dict = {
+    "display.tz": ("America/New_York", "America/New_York"),
+    "alerts.enabled": (True, True),
+    "alerts.projected_enabled": (True, True),
+    "alerts.rate_change_enabled": (True, True),
+    "alerts.notifier": ("none", "none"),
+    "dashboard.cache_failure_markers": (False, False),
+    "dashboard.live_tail": (False, False),
+    "dashboard.lan_auth": (False, False),
+    "update.check.enabled": (False, False),
+    "update.check.ttl_hours": (12, 12),
+    "update.channel": ("beta", "beta"),
+    "cache_report.anomaly_threshold_pp": (20, 20),
+    "budget.weekly_usd": (250, 250),
+    "budget.alerts_enabled": (True, True),
+    "budget.alert_thresholds": ([80, 95], [80, 95]),
+    "budget.projected_enabled": (True, True),
+    "budget.project_alerts_enabled": (True, True),
+    "budget.codex.alerts_enabled": (True, True),
+    "budget.codex.projected_enabled": (True, True),
+}
+
+#: Enough stored config that a single-leaf PUT validates on its own: a Claude
+#: budget amount for the Claude toggles, and the Codex block the endpoint
+#: refuses to invent.
+WRITABLE_SEED = {
+    "budget": {
+        "weekly_usd": 100,
+        "codex": {"amount_usd": 50, "period": "calendar-month"},
+    }
+}
+
+
+def _nest(path: str, value):
+    out = value
+    for part in reversed(path.split(".")):
+        out = {part: out}
+    return out
+
+
+def _dig(config: dict, path: str):
+    node = config
+    for part in path.split("."):
+        assert isinstance(node, dict), f"{path}: {part} has no object above it"
+        assert part in node, f"{path}: {part} absent from {sorted(node)}"
+        node = node[part]
+    return node
+
+
+def _writable_leaves():
+    contract = _load_contract()
+    return sorted(
+        path for path, disposition in
+        contract.SETTINGS_LEAF_DISPOSITIONS.items()
+        if disposition == contract.WRITABLE
+    )
+
+
+def _load_contract():
+    import importlib.util
+    path = _BIN / "_lib_dashboard_settings_contract.py"
+    spec = importlib.util.spec_from_file_location(
+        "_lib_dashboard_settings_contract_probe", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_the_value_table_covers_every_writable_leaf():
+    """A leaf added to the contract with no value here would be silently
+    unexercised, which is the same shape of hole this closes."""
+    assert sorted(WRITABLE_LEAF_VALUES) == _writable_leaves()
+
+
+@pytest.mark.parametrize("leaf", _writable_leaves())
+def test_every_writable_leaf_reaches_config_json(post, leaf):
+    sent, expected = WRITABLE_LEAF_VALUES[leaf]
+    status, out, cfg = post(_nest(leaf, sent), seed=WRITABLE_SEED)
+    assert status == 200, out
+    assert cfg is not None, "no config.json was written"
+    assert _dig(cfg, leaf) == expected

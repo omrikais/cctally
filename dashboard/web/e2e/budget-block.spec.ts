@@ -45,7 +45,9 @@ for (const viewport of MATRIX) {
     await expect(claudePanel).toBeVisible();
     // The two quota-ceiling rows qualify the PROJECTION and stay in the
     // forecast footer.
-    const claudeForecastFoot = claudePanel.locator('.fc-body > .fc-budget-foot');
+    // #661 wrapped the footer in the panel's bounded scroll region so a
+    // degradation reason cannot push the shared row past its fixed height.
+    const claudeForecastFoot = claudePanel.locator('.fc-scroll > .fc-budget-foot');
     await expect(claudeForecastFoot).toContainText('Budget ≤100%');
     await expect(claudeForecastFoot).toContainText('Budget ≤90%');
     // `Budget pace` is a CONFIGURED-BUDGET quantity and left this footer.
@@ -61,7 +63,7 @@ for (const viewport of MATRIX) {
     // ---- Codex tab ------------------------------------------------------
     await selectSource(page, 'codex');
     const codexPanel = page.locator('#panel-forecast');
-    const codexForecastFoot = codexPanel.locator('.fc-body > .fc-budget-foot');
+    const codexForecastFoot = codexPanel.locator('.fc-scroll > .fc-budget-foot');
     // `Confidence` qualifies the projection and stays.
     await expect(codexForecastFoot).toContainText('Confidence');
     await expect(codexForecastFoot).not.toContainText('Budget pace');

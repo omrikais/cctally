@@ -1,7 +1,7 @@
 Warning: 2 entries lacked project_path.
 → Run `cctally cache-sync --source claude` — claude · 2026-04-13 00:00 → 2026-04-15 15:00 UTC
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "rangeStart": "2026-04-13",
   "rangeEnd": "2026-04-15",
   "weeksInRange": 1,
@@ -10,6 +10,17 @@ Warning: 2 entries lacked project_path.
     "costUsd": 11.25,
     "usedPercent": 30.0,
     "weeklyAttributionAvailable": true
+  },
+  "attribution": {
+    "basis": "cost-share",
+    "cause": "calibration-absent",
+    "totals": {
+      "modelledWeekPoints": null,
+      "visibleRowPoints": null,
+      "filteredOrUnmodelledPoints": null,
+      "observedMinusModelledPoints": null,
+      "residualCause": "population-misaligned"
+    }
   },
   "projects": [
     {
@@ -25,7 +36,8 @@ Warning: 2 entries lacked project_path.
       "cacheReadTokens": 0,
       "costUsd": 6.75,
       "attributedUsedPercent": 18.0,
-      "costPerPercent": 0.375
+      "costPerPercent": 0.375,
+      "attributionBasis": "cost-share"
     },
     {
       "displayKey": "(unknown)",
@@ -40,7 +52,8 @@ Warning: 2 entries lacked project_path.
       "cacheReadTokens": 0,
       "costUsd": 4.5,
       "attributedUsedPercent": 12.0,
-      "costPerPercent": 0.375
+      "costPerPercent": 0.375,
+      "attributionBasis": "cost-share"
     }
   ],
   "warnings": [

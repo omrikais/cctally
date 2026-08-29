@@ -132,7 +132,7 @@ const LARGE_AMOUNT_CASES = [
   },
   {
     source: 'all' as const,
-    fixture: COMBINED_FIXTURE,
+    fixture: DECORATED_FIXTURE,
     mutate: (envelope: Record<string, any>) => {
       envelope.sources.all.data.combined.cost_usd = 3947.86;
     },
@@ -168,6 +168,35 @@ for (const { source, fixture, mutate } of LARGE_AMOUNT_CASES) {
     expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.clientWidth + 1);
     expect(geometry.textRight).toBeLessThanOrEqual(geometry.stripRight + 1);
     expect(geometry.documentScrollWidth).toBeLessThanOrEqual(geometry.documentClientWidth);
+
+    if (source === 'all') {
+      await page.setViewportSize({ width: 768, height: 900 });
+      const claudeLeg = page.getByTestId('hero-leg-claude');
+      await expect(claudeLeg).toHaveText('$2.05 · 3 accounts');
+      const supportGeometry = await claudeLeg.evaluate((node) => {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const text = range.getBoundingClientRect();
+        const row = node.closest('.sup-row')!;
+        const rowRect = row.getBoundingClientRect();
+        const stripRect = node.closest('.hero-strip')!.getBoundingClientRect();
+        return {
+          textRight: text.right,
+          rowRight: rowRect.right,
+          rowClientWidth: row.clientWidth,
+          rowScrollWidth: row.scrollWidth,
+          stripRight: stripRect.right,
+          documentClientWidth: document.documentElement.clientWidth,
+          documentScrollWidth: document.documentElement.scrollWidth,
+        };
+      });
+      expect(supportGeometry.rowScrollWidth)
+        .toBeLessThanOrEqual(supportGeometry.rowClientWidth + 1);
+      expect(supportGeometry.textRight).toBeLessThanOrEqual(supportGeometry.rowRight + 1);
+      expect(supportGeometry.textRight).toBeLessThanOrEqual(supportGeometry.stripRight + 1);
+      expect(supportGeometry.documentScrollWidth)
+        .toBeLessThanOrEqual(supportGeometry.documentClientWidth);
+    }
   });
 }
 

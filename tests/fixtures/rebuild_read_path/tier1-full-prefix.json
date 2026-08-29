@@ -3085,6 +3085,7 @@
     "five_hour_blocks": 13,
     "five_hour_milestones": 25,
     "five_hour_reset_events": 0,
+    "meter_rate_change_events": 0,
     "percent_milestones": 38,
     "project_budget_milestones": 0,
     "projected_milestones": 0,
@@ -4232,6 +4233,7 @@
       }
     ],
     "five_hour_reset_events": [],
+    "meter_rate_change_events": [],
     "percent_milestones": [
       {
         "account_key": "claude:acct-benchmark-primary",

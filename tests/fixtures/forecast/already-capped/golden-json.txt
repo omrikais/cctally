@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "week": {
     "start_at": "2026-04-13T14:00:00Z",
     "end_at": "2026-04-20T14:00:00Z",
@@ -10,21 +10,30 @@
   },
   "current": {
     "weekly_percent": 103.0,
+    "weekly_percent_corrected": null,
+    "weekly_percent_interval": [
+      99.0,
+      null
+    ],
     "five_hour_percent": null,
     "spent_usd": 42.0,
     "snapshot_count": 6,
     "latest_snapshot_at": "2026-04-18T14:00:00Z"
   },
   "rates": {
-    "week_average_pct_per_hour": 0.858333,
-    "recent_24h_pct_per_hour": 0.0,
+    "week_average_pct_per_hour": null,
+    "recent_24h_pct_per_hour": null,
     "dollars_per_percent": 0.407767,
     "dollars_per_percent_source": "this_week"
   },
   "forecast": {
-    "final_percent_low": 103.0,
-    "final_percent_high": 144.2,
-    "week_avg_projection_pct": 144.2,
+    "final_percent_low": null,
+    "final_percent_high": null,
+    "week_avg_projection_pct": null,
+    "right_censored": true,
+    "projection_basis": "withheld",
+    "projection_code": "right-censored",
+    "calibration_code": "unavailable",
     "projected_cap": true,
     "cap_at": null,
     "already_capped": true,

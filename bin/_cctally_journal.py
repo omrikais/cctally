@@ -3611,7 +3611,16 @@ _ACCOUNTS_MACHINERY_KINDS = frozenset(
 # STRUCTURALLY by tests/test_accounts_journal.py (iterating both spec registries),
 # so a future data-bearing kind cannot silently escape classification.
 _CLASSIFIER_VENDOR_TAGGED_KINDS = frozenset(("budget",))
-_CLASSIFIER_EXEMPT_KINDS = frozenset(("weekly_credit_effects",))
+# `meter_rate_change` (#661 S2 §6.4) is EXEMPT for the same structural reason
+# `weekly_credit_effects` is: this classifier exists to normalise the account
+# of a LEGACY, unstamped line, and no such line can exist for this family. It
+# was introduced with epoch 1011, every emission carries `payload.account_key`
+# from the first one, and its target table has no unstamped history to
+# normalise. Filing it under `_EVT_KIND_PROVIDER` would claim a fixed vendor
+# for a family whose provider is a payload field, which is the failure the
+# vendor-tagged case exists to avoid.
+_CLASSIFIER_EXEMPT_KINDS = frozenset((
+    "weekly_credit_effects", "meter_rate_change"))
 
 
 def classify_legacy_provider(record) -> str | None:
@@ -3893,6 +3902,70 @@ def _apply_quota_alert_arming(conn, evt):
     return None
 
 
+def _meter_rate_change_row(evt) -> "tuple | None":
+    """The row `meter_rate_change_events` takes, or None for a bad payload.
+
+    Normalising rather than trusting the payload keeps a malformed record from
+    raising here and prefix-stopping the whole fold.
+    """
+    p = evt.get("payload") or {}
+    provider = p.get("provider")
+    effective_from = p.get("effective_from")
+    if not provider or not effective_from:
+        return None
+    try:
+        previous = float(p.get("previous_units_per_point"))
+        new = float(p.get("new_units_per_point"))
+    except (TypeError, ValueError):
+        return None
+    account_key = p.get("account_key") or _lib_accounts.UNATTRIBUTED
+    created = p.get("created_at_utc") or evt.get("at")
+    return (str(provider), str(account_key), str(effective_from), previous,
+            new, str(p.get("severity") or "info"),
+            str(p.get("detected_at_utc") or created or ""), str(created or ""))
+
+
+def _insert_meter_rate_change(conn, evt) -> bool:
+    """Insert one rate-change row. True when THIS call created it.
+
+    The return value is the §6.5 step-5 predicate: a notification is queued
+    only when the insert actually created a row, so a crash-replayed
+    duplicate, an ordinary re-run and a rebuild all converge silently. It is
+    `rowcount`, never `lastrowid` — the same predicate the milestone families
+    use, because `lastrowid` is left over from a previous insert when
+    `INSERT OR IGNORE` ignores.
+    """
+    row = _meter_rate_change_row(evt)
+    if row is None:
+        return False
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO meter_rate_change_events "
+        "(provider, account_key, effective_from, previous_units_per_point,"
+        " new_units_per_point, severity, detected_at_utc, created_at_utc) "
+        "VALUES (?,?,?,?,?,?,?,?)", row)
+    return cur.rowcount == 1
+
+
+def _apply_meter_rate_change(conn, evt):
+    """Fold a `meter_rate_change` evt (#661 S2 §6.4/§6.5).
+
+    `meter_rate_change_events` is the durable forward-only latch that one
+    provider metering-rate transition was recorded. It has no `journal_id`
+    column, so idempotence rides the natural-key `INSERT OR IGNORE` exactly as
+    `quota_alert_arming` and `quota_threshold_events` do rather than an
+    `INSERT OR IGNORE` on the journal id.
+
+    Replay reaches this applier with NO `IngestContext`, so it is
+    structurally unable to queue a notification — invariant (iv), and the
+    reason a rebuild cannot re-fire history. `notified_at` is deliberately not
+    journaled and not touched here: whether a notification was dispatched is a
+    local delivery fact, not a durable one, and replaying a stale value would
+    fight the live path.
+    """
+    _insert_meter_rate_change(conn, evt)
+    return None
+
+
 def _apply_quota_threshold_event(conn, evt):
     """Fold a `quota_threshold_event` evt (#416 spec §7.2, review F13).
 
@@ -4158,6 +4231,12 @@ _EVT_SPECS = {
     # insert is `INSERT OR IGNORE`, so neither can clobber the other's row.
     "quota_threshold_event": _EvtSpec(
         None, order=44, applier=_apply_quota_threshold_event),
+    # #661 S2 §6.4. An independent stats.db table with no FK into the
+    # journal-covered families and its own natural-key insert applier, so the
+    # order is arbitrary among evts. 43 keeps it beside the other two quota
+    # state families rather than implying a dependency it does not have.
+    "meter_rate_change": _EvtSpec(
+        None, order=43, applier=_apply_meter_rate_change),
 }
 for _hs in _HARVEST_SPECS:
     if _hs.children:
@@ -4386,6 +4465,54 @@ def _pipeline_op_fold(ctx, record) -> None:
 
 
 PIPELINE.append(_pipeline_op_fold)
+
+
+def record_meter_rate_change(ctx, transition, *, notify: bool,
+                             created_at: str) -> bool:
+    """Steps 4 and 5 of spec §6.5, run INSIDE the cycle transaction.
+
+    Journal-first (invariant i): the evt line is appended and fsync'd through
+    the leaf `journal.lock` before the transaction containing its row commits,
+    exactly as `emit_model_a` does. The payload is a pure function of the
+    transition, so a crash-replayed duplicate line is byte-identical and folds
+    to a clean no-op.
+
+    Returns whether THIS call created the row. A notification is queued only
+    then, and only when `notify` is true — §6.2 splits recording from
+    notifying, so the row exists from the first upgrade while the push follows
+    the existing default-off toggle. The queue is `ctx.pending_alerts`, which
+    step 6 drains AFTER the commit: committed-before-notify, and a crash
+    between the two loses at most one dispatch rather than recording an alert
+    that never happened.
+    """
+    mrc = _load_meter_rate_change()
+    payload = mrc.event_payload(transition, created_at=created_at)
+    eid = _lib_journal.evt_id(
+        mrc.EVT_ID_PREFIX, transition.provider, transition.account_key,
+        transition.effective_from)
+    evt = _lib_journal.make_evt(
+        kind=mrc.EVT_KIND, id=eid, at=created_at, payload=payload)
+    append_record(evt)
+    ctx.events_emitted += 1
+    created = _insert_meter_rate_change(ctx.conn, evt)
+    if created and notify:
+        ctx.pending_alerts.append(mrc.alert_payload(transition))
+    return created
+
+
+def _load_meter_rate_change():
+    """The pure kernel, via the call-time sibling accessor.
+
+    A module-level `import _lib_meter_rate_change` would be honest here, but
+    this module is imported by the kernel-extraction paths that must not grow
+    new import-time edges; every other optional sibling in this file is
+    reached the same way.
+    """
+    cctally = sys.modules.get("cctally")
+    if cctally is not None and hasattr(cctally, "_load_sibling"):
+        return cctally._load_sibling("_lib_meter_rate_change")
+    import _lib_meter_rate_change
+    return _lib_meter_rate_change
 
 
 def _dispatch_pending_alerts(alerts: list) -> None:
@@ -6049,7 +6176,8 @@ def _preflight_live_events(
 # --------------------------------------------------------------------------
 
 def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
-               codex_apply=None, post_commit=None) -> IngestResult:
+               codex_apply=None, post_commit=None,
+               meter_rate_change=None) -> IngestResult:
     # Step 1: HW snapshot (leaf lock, µs). Lines appended after this — by other
     # processes OR by this cycle's own evt emission — are past HW and belong to
     # the next cycle (§5.2.1, closes the skipped-append race).
@@ -6074,7 +6202,8 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
     cursor = None
     cursor_target = None
     if hw is None:
-        if reconcile_config is None and codex_apply is None:
+        if (reconcile_config is None and codex_apply is None
+                and meter_rate_change is None):
             return IngestResult(ran=True, consumed=0, malformed=0,
                                 events_emitted=0, alerts=[])
     else:
@@ -6190,6 +6319,18 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
         # the whole cycle back (invariant ii).
         if codex_apply is not None:
             codex_apply(ctx)
+        # 4b'''. #661 S2 §6.5 steps 4-5. A confirmed metering-rate transition,
+        # already decided under the calibration file's leaf lock and released
+        # before any stats lock was taken (step 2), is journaled and applied
+        # here — inside this transaction, journal-first, with its notification
+        # queued to `ctx.pending_alerts` for the post-commit dispatch below.
+        # It sits beside the Codex leg rather than in the pipeline because its
+        # trigger is a persistence transition rather than a journal record.
+        if meter_rate_change is not None:
+            record_meter_rate_change(
+                ctx, meter_rate_change["transition"],
+                notify=bool(meter_rate_change.get("notify")),
+                created_at=str(meter_rate_change["created_at"]))
         # 4c. Journal + stamp the natural-keyed rows the pipeline inserted.
         # Early-out (Task 6 gate P2): the ONLY source of `journal_id IS NULL`
         # rows is a Task-5 chokepoint called from a step-4b pipeline hook —
@@ -6267,6 +6408,7 @@ def _run_stats_ingest_once(
     reconcile_config=None,
     codex_apply=None,
     post_commit=None,
+    meter_rate_change=None,
     locks_held: bool = False,
 ) -> IngestResult:
     """Run one single-flight attempt, without correction-recovery orchestration.
@@ -6439,7 +6581,8 @@ def _run_stats_ingest_once(
             with _cctally_store.stats_write_scope("ingest", ingest_lock=True):
                 return _run_cycle(conn, reconcile_config=reconcile_config,
                                   codex_apply=codex_apply,
-                                  post_commit=post_commit)
+                                  post_commit=post_commit,
+                                  meter_rate_change=meter_rate_change)
         except CorrectionRebuildRequired:
             # The public boundary must unwind its transaction, internally owned
             # connection, ingest lock, and maintenance-shared lock before it can
@@ -6705,6 +6848,7 @@ def run_stats_ingest(
     reconcile_config=None,
     codex_apply=None,
     post_commit=None,
+    meter_rate_change=None,
     locks_held: bool = False,
 ) -> IngestResult:
     """Run one cycle, healing one completed-correction mismatch when safe.
@@ -6730,6 +6874,7 @@ def run_stats_ingest(
         "reconcile_config": reconcile_config,
         "codex_apply": codex_apply,
         "post_commit": post_commit,
+        "meter_rate_change": meter_rate_change,
         "locks_held": locks_held,
     }
     try:
@@ -6841,6 +6986,7 @@ _REBUILD_COUNT_TABLES = (
     "five_hour_milestones", "budget_milestones", "projected_milestones",
     "project_budget_milestones", "quota_alert_arming", "quota_window_blocks",
     "quota_percent_milestones", "quota_threshold_events", "accounts",
+    "meter_rate_change_events",
 )
 
 
@@ -7014,6 +7160,7 @@ _REBUILD_REQUIRED_TABLES = frozenset(
         "journal_selector_batch_records",
         "journal_selector_batches",
         "journal_selector_state",
+        "meter_rate_change_events",
         "percent_milestones",
         "project_budget_milestones",
         "projected_milestones",
@@ -7053,6 +7200,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
         "idx_five_hour_reset_events_journal_id",
         "idx_five_hour_reset_events_journal_id_null",
         "idx_journal_protocol_violations_batch",
+        "idx_meter_rate_change_events_key",
         "idx_percent_milestones_journal_id",
         "idx_percent_milestones_journal_id_null",
         "idx_project_budget_milestones_journal_id",
@@ -7077,7 +7225,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
 # omitted column, constraint, partial predicate, or index definition.  An epoch
 # schema change must update this contract alongside STATS_INDEX_EPOCH.
 _REBUILD_SCHEMA_FINGERPRINT = (
-    "2b378fc3be1c7bb249bb0c3ddd2111a802f689cf30b3fd42806a116611c799e6"
+    "472e77f23b289eb9141c2b318b94f24e98d509a73a9063568fbd66b04013ead3"
 )
 
 

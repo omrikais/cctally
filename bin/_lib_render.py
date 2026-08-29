@@ -2791,6 +2791,7 @@ def _render_project_table(
     no_color: bool = False,
     color: "bool | None" = None,
     compact: bool = False,
+    attribution_footer: "list[str] | None" = None,
 ) -> str:
     """Render project rollup as a ccusage-style ANSI table.
 
@@ -3089,6 +3090,11 @@ def _render_project_table(
             f"project{project_plural} listed."
         )
     )
+
+    # #661 S2 §5.2. Pre-rendered by the caller, which owns the four
+    # quantities and their typed causes; this renderer only places them.
+    for line in (attribution_footer or []):
+        out.append(_dim(line))
 
     return "\n".join(out)
 

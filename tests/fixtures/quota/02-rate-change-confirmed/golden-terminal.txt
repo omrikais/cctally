@@ -1,0 +1,34 @@
+cctally quota — weekly quota consumption and metering rate
+
+DATA
+  entries through            2026-08-28T00:30:00+00:00
+  analysis start             2026-07-25T00:00:00+00:00   (supported composition: 2026-07-25 onward)
+  eligible days              29   (0 withheld)
+
+CALIBRATION   effective blended weighted units per weekly point
+  fitted                     withheld: insufficient-history  (successor-regime)
+  The fitted value is not a provider budget. It is one effective blended rate,
+  valid for the observed model and token blend, and it is the provider's budget
+  minus an unmeasured, workload-dependent amount.
+
+CURRENT WEEK
+  window                     2026-08-26T08:00:00+00:00 .. 2026-09-02T08:00:00+00:00
+  observed meter             12%
+  modelled consumption       withheld: insufficient-history  (successor-regime)
+  headroom to 100%           withheld: insufficient-history  (successor-regime)
+  projection to week end     withheld: insufficient-history  (successor-regime)
+
+COMPOSITION SUPPORT   radii are EFFECTIVE: max(observed spread, materiality floor)
+  family radius              0.0200   (observed 0.0000)
+  token-class radius         0.0106   (observed 0.0000)
+  out-of-scope: claude-fable-5, claude-mythos-5 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled
+
+DETECTOR
+  split                      2026-08-25
+  eligible days scanned      29   (Holm family 13)
+  p (raw / Holm)             0.000547 / 0.007115
+  baseline fit               1,997,234   [1,989,427 , 2,005,041]  (superseded, split-at:2026-08-25)
+  successor fit              1,401,312   [1,346,620 , 1,456,005]  (successor-regime, detection-only)
+
+VERDICT   rate-change-detected   (status insufficient-history, exit 1)
+exit: 1

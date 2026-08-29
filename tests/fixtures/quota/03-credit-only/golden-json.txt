@@ -1,0 +1,227 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-28T06:00:00+00:00",
+  "status": "ok",
+  "verdict": "no-rate-change",
+  "exitCode": 0,
+  "scope": {
+    "accountKey": null,
+    "accountLabel": null,
+    "merged": true,
+    "analysisStart": "2026-07-25T00:00:00+00:00",
+    "invocation": "automatic"
+  },
+  "calibration": {
+    "recorded": null,
+    "fitted": {
+      "state": "available",
+      "value": 1998064.464516129,
+      "interval": {
+        "lo": 1990227.6732475904,
+        "hi": 2005901.2557846678
+      },
+      "support": {
+        "days": 29,
+        "segments": 6
+      },
+      "population": {
+        "days": 29,
+        "segments": 6,
+        "withheld": 1,
+        "considered": 30
+      },
+      "code": null,
+      "qualifications": []
+    }
+  },
+  "analysis": {
+    "baseline": {
+      "fit": {
+        "state": "withheld",
+        "value": null,
+        "interval": null,
+        "support": null,
+        "population": {
+          "days": 0,
+          "segments": 0,
+          "withheld": 0,
+          "considered": 0
+        },
+        "code": "insufficient-history",
+        "qualifications": [
+          "no-confirmed-split"
+        ]
+      }
+    },
+    "watch": {
+      "fit": {
+        "state": "withheld",
+        "value": null,
+        "interval": null,
+        "support": null,
+        "population": {
+          "days": 29,
+          "segments": 6,
+          "withheld": 1,
+          "considered": 30
+        },
+        "code": "insufficient-history",
+        "qualifications": [
+          "no-confirmed-split"
+        ]
+      }
+    }
+  },
+  "currentWeek": {
+    "start": "2026-08-25T08:00:00+00:00",
+    "end": "2026-09-01T08:00:00+00:00",
+    "observedPercent": 15,
+    "observedMinusModelled": 2.03194993947562,
+    "consumption": {
+      "state": "available",
+      "value": 12.96805006052438,
+      "interval": {
+        "lo": 12.917385601747451,
+        "hi": 13.019113515650826
+      },
+      "support": {
+        "days": 29,
+        "segments": 6
+      },
+      "population": {
+        "days": 29,
+        "segments": 6,
+        "withheld": 1,
+        "considered": 30
+      },
+      "code": null,
+      "qualifications": []
+    },
+    "projection": {
+      "state": "available",
+      "value": 31.12332014525851,
+      "interval": {
+        "lo": 31.00172544419388,
+        "hi": 31.24587243756198
+      },
+      "support": {
+        "days": 29,
+        "segments": 6
+      },
+      "population": {
+        "days": 29,
+        "segments": 6,
+        "withheld": 1,
+        "considered": 30
+      },
+      "code": null,
+      "qualifications": []
+    },
+    "headroom": {
+      "state": "available",
+      "value": 87.03194993947562,
+      "interval": {
+        "lo": 86.98088648434917,
+        "hi": 87.08261439825255
+      },
+      "support": {
+        "days": 29,
+        "segments": 6
+      },
+      "population": {
+        "days": 29,
+        "segments": 6,
+        "withheld": 1,
+        "considered": 30
+      },
+      "code": null,
+      "qualifications": []
+    }
+  },
+  "composition": {
+    "baseline": {
+      "familyShares": {
+        "claude-opus-5": 1.0
+      },
+      "classShares": {
+        "cache_1h": 0.0,
+        "cache_read": 0.0,
+        "fresh": 1.0,
+        "output": 0.0
+      }
+    },
+    "current": {
+      "familyShares": {
+        "claude-opus-5": 1.0
+      },
+      "classShares": {
+        "cache_1h": 0.0,
+        "cache_read": 0.0,
+        "fresh": 1.0,
+        "output": 0.0
+      }
+    },
+    "familyRadiusEffective": 0.02,
+    "classRadiusEffective": 0.01057775709238613,
+    "familyRadiusEmpirical": 0.0,
+    "classRadiusEmpirical": 0.0,
+    "radiusRule": "max(observed spread, materiality floor)"
+  },
+  "health": {
+    "entriesThrough": "2026-08-28T00:30:00+00:00",
+    "snapshots": 60,
+    "segments": 6,
+    "credits": 1,
+    "eligibleDays": 29,
+    "withheldDays": 1,
+    "eligibilityFence": 3789636.8021462574,
+    "unattributedUnits": 10001000.0,
+    "unattributedEntries": 2,
+    "inProgressDayExcluded": [],
+    "forecastPopulationEntries": 4,
+    "rejectedNumericInputs": [],
+    "unrecognisedSnapshotSources": {},
+    "legacyDateOnlyWeekAnchors": 0,
+    "storeCause": null,
+    "calibrationFileQuarantinedTo": null
+  },
+  "method": {
+    "algorithmRevision": 2,
+    "constantsFingerprint": "1e2e74ff673bb32dc93d2cf582d5e84eb93fff9cfae39e4272edc25a30da25ee",
+    "verifiedAt": "2026-08-28",
+    "supportedCompositionFrom": "2026-07-25",
+    "coefficientEras": [
+      {
+        "from": null,
+        "until": "2026-07-25",
+        "state": "unvalidated",
+        "provenance": "docs/quota-model.md: the Opus 4.8 era fits at about 1,989,101 units per point against 2.4M for Opus 5, a budget difference the shared token-class coefficients do not absorb. The shipped estimator gives 1,265,184 to 1,479,027 over the same weeks, and spec section 6 declines to adjudicate between the two."
+      },
+      {
+        "from": "2026-07-25",
+        "until": null,
+        "state": "validated",
+        "provenance": "docs/quota-model.md: 2026-07-25 is the Opus 5 changeover, the epoch the token-class weights were fitted on."
+      }
+    ],
+    "detector": {
+      "splitDate": null,
+      "rawP": null,
+      "holmP": null,
+      "holmFamilySize": 13,
+      "baselineDays": 0,
+      "watchDays": 0,
+      "longestRun": 0,
+      "qualified": false,
+      "inputEligibleDays": 29,
+      "scannedEligibleDays": 29,
+      "truncatedEligibleDays": 0,
+      "scanStartDate": "2026-07-29",
+      "maxAutoScanDays": 64,
+      "historyTruncated": false
+    },
+    "dedicatedPoolScope": "out-of-scope: claude-fable-5, claude-mythos-5 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled"
+  },
+  "blocking": []
+}
+exit: 0

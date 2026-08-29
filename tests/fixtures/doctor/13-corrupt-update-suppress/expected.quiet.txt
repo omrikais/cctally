@@ -19,6 +19,7 @@ Journal
 Data
 Accounts
 Pricing
+Quota
 Safety
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
@@ -26,4 +27,4 @@ Safety
       → `rm ~/.local/share/cctally/update-suppress.json`
 Telemetry
 
-Summary: 54 OK · 7 WARN · 1 FAIL
+Summary: 56 OK · 7 WARN · 1 FAIL

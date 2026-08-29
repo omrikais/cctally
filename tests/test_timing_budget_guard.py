@@ -325,7 +325,7 @@ RECORDED = {
     ("tests/test_rebuild_heal.py",
      "test_foreign_page_storm_admits_once_before_shared_maintenance_drains",
      "elapsed-ceiling", 5.0): (
-        "keep — a fail-fast claim: the alternative behaviour is blocking until a lock is released, so the ceiling separates bounded from unbounded rather than fast from slow"),
+        "keep — a fail-fast claim about ADMISSION specifically: a ready barrier puts the three detector spawns and their imports before the clock is read, so the ceiling separates an admission that is bounded from one that blocks on the maintenance hold, rather than measuring how fast the machine spawns processes"),
     ("tests/test_rebuild_heal.py",
      "test_heal_admission_refreshes_while_a_long_worker_holds_its_flock",
      "elapsed-ceiling", 5.0): (
@@ -521,6 +521,24 @@ def _clock_bare_names(tree) -> set:
     return names
 
 
+def _clock_module_names(tree) -> set:
+    """Names an ``import time`` statement binds in this module.
+
+    The attribute ``time`` is ambiguous: ``time.time()`` reads the clock, but
+    ``datetime.time(...)`` constructs a value.  Resolve that one spelling from
+    the imported receiver while keeping ``monotonic`` and ``perf_counter``
+    receiver-independent, as they are unambiguous across the estate.
+    """
+    names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Import):
+            continue
+        for alias in node.names:
+            if alias.name == "time":
+                names.add(alias.asname or alias.name)
+    return names
+
+
 def _bare_sleep_names(tree) -> set:
     """Names `from time import sleep` binds, for the same reason."""
     names = set()
@@ -533,11 +551,17 @@ def _bare_sleep_names(tree) -> set:
     return names
 
 
-def _is_clock_call(node, bare=frozenset()) -> bool:
+def _is_clock_call(node, bare=frozenset(), modules=frozenset()) -> bool:
     if not isinstance(node, ast.Call):
         return False
     if isinstance(node.func, ast.Attribute):
-        return node.func.attr in CLOCK_FUNCTIONS
+        if node.func.attr in {"monotonic", "perf_counter"}:
+            return True
+        return (
+            node.func.attr == "time"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in modules
+        )
     if isinstance(node.func, ast.Name):
         return node.func.id in bare
     return False
@@ -568,6 +592,8 @@ def _blocking_names(tree) -> set:
     """
     known = set(BLOCKING_CALLEES)
     bare_sleep = _bare_sleep_names(tree)
+    bare_clock = _clock_bare_names(tree)
+    clock_modules = _clock_module_names(tree)
     definitions, aliases = [], []
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -586,7 +612,9 @@ def _blocking_names(tree) -> set:
         for node in definitions:
             if node.name in known:
                 continue
-            if _reaches_a_wait(node, known, bare_sleep):
+            if _reaches_a_wait(
+                node, known, bare_sleep, bare_clock, clock_modules
+            ):
                 known.add(node.name)
                 changed = True
         for target, source in aliases:
@@ -596,10 +624,13 @@ def _blocking_names(tree) -> set:
     return known
 
 
-def _reaches_a_wait(node, known: set, bare_sleep: set) -> bool:
-    bare_clock = _clock_bare_names(node)
+def _reaches_a_wait(node, known: set, bare_sleep: set, bare_clock: set,
+                    clock_modules: set) -> bool:
     for inner in ast.walk(node):
-        if isinstance(inner, ast.While) and _has_clock_call(inner.test, bare_clock):
+        if (
+            isinstance(inner, ast.While)
+            and _has_clock_call(inner.test, bare_clock, clock_modules)
+        ):
             # `while want(buf) is False and time.monotonic() < deadline:` is a
             # wait spelled out rather than delegated, which is the shape
             # `_read_bytes` and `_read_gzip_until` use. Recognising only
@@ -616,8 +647,10 @@ def _reaches_a_wait(node, known: set, bare_sleep: set) -> bool:
     return False
 
 
-def _has_clock_call(node, bare: set) -> bool:
-    return any(_is_clock_call(inner, bare) for inner in ast.walk(node))
+def _has_clock_call(node, bare: set, modules: set) -> bool:
+    return any(
+        _is_clock_call(inner, bare, modules) for inner in ast.walk(node)
+    )
 
 
 def _outside_lambdas(node):
@@ -726,7 +759,9 @@ def _budget_finding(call, value_node, callee, argname, consts, local, parameters
         # non-blocking attempt, and elsewhere it asks to wait forever. Neither
         # is a number this guard can or should bound.
         return None
-    derived, helpers, bare = clocky if clocky else (set(), set(), set())
+    derived, helpers, bare, modules = (
+        clocky if clocky else (set(), set(), set(), set())
+    )
     inline = _clock_plus_constant(value_node, consts, local, clocky)
     if inline is not None:
         # A deadline written AT the call site, which `_waited_deadline` cannot
@@ -734,7 +769,7 @@ def _budget_finding(call, value_node, callee, argname, consts, local, parameters
         return Finding(path, call.lineno, "deadline", inline,
                        "%s(%s=…) sets a fresh deadline of %gs at the call site"
                        % (callee, argname, inline))
-    if _reads_the_clock(value_node, derived, helpers, bare):
+    if _reads_the_clock(value_node, derived, helpers, bare, modules):
         # `join(timeout=max(0, deadline - time.monotonic()))` is the remainder
         # of a deadline, and that deadline is detected where it is computed.
         # Reporting the remainder as well would demand an annotation on the
@@ -792,9 +827,11 @@ def _clock_plus_constant(node, consts, local, clocky=None):
     """
     if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)):
         return None
-    derived, _helpers, bare = clocky if clocky else (set(), set(), set())
+    derived, _helpers, bare, modules = (
+        clocky if clocky else (set(), set(), set(), set())
+    )
     for a, b in ((node.left, node.right), (node.right, node.left)):
-        if _is_clock_call(a, bare) or (
+        if _is_clock_call(a, bare, modules) or (
             isinstance(a, ast.Name) and a.id in derived
         ):
             seconds = _resolve(b, consts, local)
@@ -817,7 +854,9 @@ def _names_waited_on(func, clocky=None, blocking=frozenset()) -> set:
     `end = overall_deadline` also means the budget is declared under the first
     name and spent under the second, which is what the alias closure follows.
     """
-    derived, helpers, bare = clocky if clocky else (set(), set(), set())
+    derived, helpers, bare, modules = (
+        clocky if clocky else (set(), set(), set(), set())
+    )
     names = set()
     for node in ast.walk(func):
         if isinstance(node, ast.While):
@@ -834,7 +873,7 @@ def _names_waited_on(func, clocky=None, blocking=frozenset()) -> set:
         if entry is not None and len(node.args) > entry[0]:
             drawn.append(node.args[entry[0]])
         for value in drawn:
-            if not _reads_the_clock(value, derived, helpers, bare):
+            if not _reads_the_clock(value, derived, helpers, bare, modules):
                 continue
             for inner in ast.walk(value):
                 if isinstance(inner, ast.Name):
@@ -945,7 +984,7 @@ def _collect_raw_budgets(relative, text) -> list:
     tree = ast.parse(text)
     consts = _module_constants(tree)
     clocky = (_clock_derived_names(tree), _clock_reading_helpers(tree),
-              _clock_bare_names(tree))
+              _clock_bare_names(tree), _clock_module_names(tree))
     blocking = _blocking_names(tree)
     out = []
     for func in ast.walk(tree):
@@ -997,7 +1036,7 @@ def collect_budgets(path, source=None) -> list:
     tree = ast.parse(text)
     consts = _module_constants(tree)
     clocky = (_clock_derived_names(tree), _clock_reading_helpers(tree),
-              _clock_bare_names(tree))
+              _clock_bare_names(tree), _clock_module_names(tree))
     blocking = _blocking_names(tree)
     lines = text.splitlines()
 
@@ -1168,6 +1207,7 @@ def _clock_derived_names(tree) -> set:
     """
     derived, changed = set(), True
     bare = _clock_bare_names(tree)
+    modules = _clock_module_names(tree)
     assignments = [
         (node.targets[0].id, node.value)
         for node in ast.walk(tree)
@@ -1179,7 +1219,7 @@ def _clock_derived_names(tree) -> set:
         for name, value in assignments:
             if name in derived:
                 continue
-            if _reads_the_clock(value, derived, bare=bare):
+            if _reads_the_clock(value, derived, bare=bare, modules=modules):
                 derived.add(name)
                 changed = True
     return derived
@@ -1194,18 +1234,22 @@ def _clock_reading_helpers(tree) -> set:
     read and demands an annotation on the very shape it wants people to use.
     """
     names, bare = set(), _clock_bare_names(tree)
+    modules = _clock_module_names(tree)
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if any(_is_clock_call(inner, bare) for inner in ast.walk(node)):
+        if any(
+            _is_clock_call(inner, bare, modules) for inner in ast.walk(node)
+        ):
             names.add(node.name)
     return names
 
 
 def _reads_the_clock(node, derived: set, helpers: set = frozenset(),
-                     bare: set = frozenset()) -> bool:
+                     bare: set = frozenset(),
+                     modules: set = frozenset()) -> bool:
     for inner in ast.walk(node):
-        if _is_clock_call(inner, bare):
+        if _is_clock_call(inner, bare, modules):
             return True
         if isinstance(inner, ast.Name) and inner.id in derived:
             return True
@@ -1218,16 +1262,17 @@ def _reads_the_clock(node, derived: set, helpers: set = frozenset(),
     return False
 
 
-def _is_elapsed(node, derived: set, bare: set = frozenset()) -> bool:
+def _is_elapsed(node, derived: set, bare: set = frozenset(),
+                modules: set = frozenset()) -> bool:
     """Whether NODE is a duration this run measured."""
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub):
         for side in (node.left, node.right):
-            if _is_clock_call(side, bare):
+            if _is_clock_call(side, bare, modules):
                 return True
             if isinstance(side, ast.Name) and side.id in derived:
                 return True
-        return (_is_elapsed(node.left, derived, bare)
-                or _is_elapsed(node.right, derived, bare))
+        return (_is_elapsed(node.left, derived, bare, modules)
+                or _is_elapsed(node.right, derived, bare, modules))
     if isinstance(node, ast.Name):
         return node.id in derived
     # `abs(stored - time.time()) < 60` asks whether two values are CLOSE, which
@@ -1321,6 +1366,7 @@ def collect_elapsed_assertions(path, source=None, include_annotated=False) -> li
     lines = text.splitlines()
     module_constants = _module_constants(tree)
     derived, bare = _clock_derived_names(tree), _clock_bare_names(tree)
+    modules = _clock_module_names(tree)
 
     enclosing = {}
     for func in ast.walk(tree):
@@ -1353,7 +1399,10 @@ def collect_elapsed_assertions(path, source=None, include_annotated=False) -> li
                 else:
                     continue
                 seconds = _numeric(bound, module_constants, shadowed)
-                if not (_is_elapsed(measured, derived, bare) and seconds is not None):
+                if not (
+                    _is_elapsed(measured, derived, bare, modules)
+                    and seconds is not None
+                ):
                     continue
                 if not include_annotated and _annotated(lines, compare.lineno):
                     continue
@@ -1745,7 +1794,8 @@ def test_the_composed_threshold_is_not_parked_on_a_sum():
         text = path.read_text(encoding="utf-8")
         tree = ast.parse(text)
         consts = _module_constants(tree)
-        clocky = _clock_bare_names(tree)
+        clocky = (_clock_derived_names(tree), _clock_reading_helpers(tree),
+                  _clock_bare_names(tree), _clock_module_names(tree))
         blocking = _blocking_names(tree)
         for func in ast.walk(tree):
             if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -2605,11 +2655,15 @@ def test_the_inline_teardown_deadlines_are_counted_against_the_cap():
 
 
 def test_the_from_time_import_spelling_does_not_disable_the_rules():
-    """One import line turned off two rules for a whole module, silently.
+    """Import spelling cannot disable a real clock or invent one from datetime.
 
     `time.sleep` was matched on the attribute and `time.monotonic()` on the
     attribute too, so `from time import sleep, monotonic` left the fixed-wait
     rule, the deadline rule and the elapsed-ceiling rule with nothing to match.
+
+    The ambiguous `.time()` spelling has the opposite trap: `datetime.time(...)`
+    constructs a value and reads no clock, while the time module is genuinely
+    imported under all three spellings below in the estate.
     """
     slept = collect_fixed_waits(
         "tests/scaffold.py",
@@ -2635,6 +2689,32 @@ def test_the_from_time_import_spelling_does_not_disable_the_rules():
         "    assert monotonic() - started < 5.0\n"
     )
     assert _kinds(ceiling) == ["elapsed-ceiling"], ceiling
+
+    constructors = _elapsed(
+        "import datetime\n"
+        "import datetime as dt\n"
+        "def test_x():\n"
+        "    first = datetime.time(8)\n"
+        "    second = dt.time(9)\n"
+        "    radius = first.minute + second.minute\n"
+        "    assert radius < 0.05\n"
+    )
+    assert constructors == [], constructors
+
+    for alias in ("time", "_time", "_t"):
+        findings = _elapsed(
+            "import time as %s\n" % alias
+            + "def test_x(run):\n"
+            + "    started = %s.time()\n" % alias
+            + "    run()\n"
+            + "    assert %s.time() - started < 5.0\n" % alias
+        )
+        assert _kinds(findings) == ["elapsed-ceiling"], (alias, findings)
+
+    # The real file that exposed #668 contains constructors but no clock read.
+    path = REPO / "tests" / "test_quota_model_kernel.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assert _clock_derived_names(tree) == set()
 
 
 # --------------------------------------------------- elapsed assertion rules

@@ -39,6 +39,10 @@ binary-log
 capability-missing
 case-floor-unmet
 deliberate-subset
+estate-artifact-unreadable
+estate-discovery-failed
+estate-partition-invalid
+estate-shrink-unauthorized
 evidence-init-failed
 evidence-kernel-missing
 exit-summary-mismatch
@@ -48,10 +52,17 @@ harness-not-executable
 job-killed
 job-vanished
 manifest-duplicate-key
+manifest-invalid-name
 manifest-invalid-row
+manifest-missing-frontend-test
 manifest-missing-harness
+manifest-missing-pytest-node
+manifest-missing-suppression
 manifest-nontrivial
+manifest-unexpected-frontend-test
 manifest-unexpected-harness
+manifest-unexpected-pytest-node
+manifest-unexpected-suppression
 manifest-unknown-key
 manifest-unreadable
 outcome-exit-mismatch
@@ -121,7 +132,7 @@ contract_manifest_load() {  # contract_manifest_load <path>
           CONTRACT_HARNESS_KEYS="$_CONTRACT_HARNESS_KEYS" \
           CONTRACT_CAPABILITY_KEYS="$_CONTRACT_CAPABILITY_KEYS" \
           python3 - "$path" <<'PY'
-import json, os, sys
+import json, os, re, sys
 
 path = sys.argv[1]
 
@@ -136,9 +147,18 @@ def no_dupes(pairs):
 
 
 try:
-    raw = open(path, encoding="utf-8").read()
-except OSError:
-    print("manifest-unreadable:")
+    with open(path, "rb") as handle:
+        raw = handle.read().decode("utf-8")
+except OSError as exc:
+    print("manifest-unreadable:%s" % (exc.strerror or "unreadable",))
+    sys.exit(1)
+# UnicodeDecodeError is a ValueError, not an OSError. Read as bytes and decode
+# explicitly so a non-UTF-8 manifest is refused with a cause the operator can
+# act on, rather than escaping the handler and printing an empty cause beside a
+# raw traceback. contract_budget_load carries the identical shape, which is what
+# makes docs/remote-testing.md's equal-strictness claim true of the shipped code.
+except UnicodeDecodeError:
+    print("manifest-unreadable:not UTF-8")
     sys.exit(1)
 
 try:
@@ -176,6 +196,17 @@ for row in doc.get("harnesses", []):
     if not isinstance(name, str) or not name:
         print("manifest-invalid-row:name=%r" % (name,))
         sys.exit(1)
+    # THE NAME GRAMMAR. A harness name is serialized into a tab-and-newline
+    # separated table, read back through shell word splitting, and counted by
+    # word splitting again in the tier partition. Whitespace makes those three
+    # readings disagree, and a glob metacharacter is expanded by any word-split
+    # path that has not disabled pathname expansion — so a whitespace-only rule
+    # would leave half the divergence open. The grammar is the basename shape
+    # every harness on disk already has, because the name is the middle of
+    # `bin/cctally-<name>-test`.
+    if not re.match(r"^[a-z0-9]+(?:-[a-z0-9]+)*$", name):
+        print("manifest-invalid-name:%s" % (name,))
+        sys.exit(1)
     floor_value = row.get("minCases")
     if not isinstance(floor_value, int) or isinstance(floor_value, bool) or floor_value < 0:
         print("manifest-invalid-row:%s minCases=%r" % (name, floor_value))
@@ -204,10 +235,18 @@ PY
         subject=${out#*:}
         [ "$subject" = "$out" ] && subject=""
         case "$code" in
-            manifest-duplicate-key|manifest-unknown-key|manifest-invalid-row|manifest-nontrivial|manifest-unreadable) ;;
+            manifest-duplicate-key|manifest-unknown-key|manifest-invalid-row|manifest-invalid-name|manifest-nontrivial|manifest-unreadable) ;;
             *) code=manifest-unreadable; subject="" ;;
         esac
-        contract_note "manifest: $code${subject:+ ($subject)} — fix tests/authoritative-test-manifest.json"
+        # The grammar refusal states the RULE, not only the offending name. A
+        # bare "manifest-invalid-name (alpha bravo)" tells an operator that a
+        # name was rejected without telling them which shape is accepted, and
+        # the shape is the whole content of this check.
+        if [ "$code" = manifest-invalid-name ]; then
+            contract_note "manifest: harness name '$subject' is outside the accepted grammar ^[a-z0-9]+(-[a-z0-9]+)*\$ — a name is word-split on three separate paths, so whitespace and glob metacharacters are unsafe in one; rename the row and bin/cctally-<name>-test together"
+        else
+            contract_note "manifest: $code${subject:+ ($subject)} — fix tests/authoritative-test-manifest.json"
+        fi
         contract_fail infrastructure "$code" "$subject"
         return 1
     fi
@@ -279,6 +318,49 @@ contract_min_cases() {  # <name>
 contract_declared_visibility() {  # <name>
     printf '%s\n' "$CONTRACT_HARNESS_TABLE" \
         | awk -F'\t' -v n="$1" '$1==n {print $2; exit}'
+}
+
+# ------------------------------------------------- the tier partition's counts
+# The arithmetic behind bin/cctally-test-all's widen-to-the-whole-estate
+# backstop, EXTRACTED so it can be driven directly (#650 item 3).
+#
+# It is extracted rather than left inline because the branch it feeds is
+# unreachable through any manifest contract_manifest_load accepts: the manifest
+# count counts LINES while the two other counts count IFS-split WORDS, and the
+# name grammar above is exactly what makes those three readings agree for every
+# accepted name. The branch stays — it is the backstop for a future divergence
+# and it fails CLOSED into the full estate rather than refusing a run — and this
+# seam is what lets a test reach it with a name the loader would now refuse,
+# instead of pretending a valid manifest reaches it.
+#
+# Pathname expansion is disabled around both word-split walks and restored only
+# if this function turned it off, so a caller that had already disabled it is
+# not silently handed it back on.
+CONTRACT_PARTITION_MANIFEST_COUNT=0
+CONTRACT_PARTITION_SELECTED_COUNT=0
+CONTRACT_PARTITION_OMITTED_COUNT=0
+
+contract_partition_counts_agree() {  # <names, newline-sep> <selected> <omitted>
+    local names=$1 selected=$2 omitted=$3 n restore_glob=0
+    CONTRACT_PARTITION_MANIFEST_COUNT=0
+    CONTRACT_PARTITION_SELECTED_COUNT=0
+    CONTRACT_PARTITION_OMITTED_COUNT=0
+    while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        CONTRACT_PARTITION_MANIFEST_COUNT=$((CONTRACT_PARTITION_MANIFEST_COUNT + 1))
+    done <<EOF
+$names
+EOF
+    case $- in *f*) ;; *) restore_glob=1; set -f ;; esac
+    for n in $selected; do
+        CONTRACT_PARTITION_SELECTED_COUNT=$((CONTRACT_PARTITION_SELECTED_COUNT + 1))
+    done
+    for n in $omitted; do
+        CONTRACT_PARTITION_OMITTED_COUNT=$((CONTRACT_PARTITION_OMITTED_COUNT + 1))
+    done
+    if [ "$restore_glob" = 1 ]; then set +f; fi
+    [ "$((CONTRACT_PARTITION_SELECTED_COUNT + CONTRACT_PARTITION_OMITTED_COUNT))" \
+        -eq "$CONTRACT_PARTITION_MANIFEST_COUNT" ]
 }
 
 # ------------------------------------------------------------------- admission
@@ -1019,6 +1101,264 @@ contract_admit_regeneration() {
     done <<EOF
 $CONTRACT_FORBIDDEN_LIST
 EOF
+    return $ok
+}
+
+# #648 D12. WHICH RUN MODES RUN THE COMPLETE ESTATE CHECK.
+#
+# A predicate rather than an inline condition, for two reasons. It is a contract
+# rule and belongs beside the other admission rules; and `CCTALLY_LINUX_MATRIX_RUN`
+# refuses on `uname -s` outside plan mode, so a condition written inline in the
+# aggregator could only ever be exercised on one platform.
+#
+# FAIL CLOSED on the mode axis: everything requires the check except the one
+# mode that has argued for an exemption. `--harness` is already unconditionally
+# `deliberate-subset` and exits 3 whatever happens, so the complete check adds
+# no protection against a green result there, and it would materially slow the
+# targeted test-driven loop this repository runs constantly. It is available on
+# that path as an explicit diagnostic. A mode added later and not taught to this
+# predicate inherits the checking behaviour, never the exemption.
+#
+# Plan mode is absent because it never reaches here: it exits before admission.
+contract_estate_check_required() {  # <coverage_mode> <opt_in>
+    case "$1" in
+        subset) [ "${2:-0}" = 1 ] ;;
+        *)      return 0 ;;
+    esac
+}
+
+# #648 D7. THE PYTEST EXECUTION DECLARATION, VALIDATED AT ADMISSION.
+#
+# The artifact's `pytestExecution` block is the single place the two legs are
+# declared, and the helper proves it partitions the recorded estate: every
+# selector matches at least one node, every required leg's share is non-empty,
+# the shares are disjoint and their union is the whole estate. A selector that
+# matches nothing is therefore an ADMISSION failure (acceptance criterion 17)
+# rather than a leg that silently runs less, which is what the retired
+# `[ -f ... ]` guards in the aggregator produced.
+#
+# `--validate-legs` and not `--plan-legs`, because admission precedes `LOGDIR`
+# and has nowhere to write the per-leg node files. Creating a directory here
+# would leave one behind on every refusal.
+#
+# The selectors are captured into CONTRACT_ESTATE_SELECTORS as `kind<TAB>value`
+# lines. The aggregator builds BOTH legs' argv from them: a `file` selector
+# becomes `--ignore=` on the bulk leg, a `node` selector becomes `--deselect=`,
+# and every selector is a target of the serial leg.
+CONTRACT_ESTATE_SELECTORS=""
+
+contract_admit_estate_plan() {  # contract_admit_estate_plan <repo_root> <profile>
+    local root=$1 profile=$2 out rc tab=$'\t' f1 f2 f3 f4
+    CONTRACT_ESTATE_SELECTORS=""
+    out=$(python3 "$root/bin/_lib_test_estate.py" \
+        --repo "$root" --profile "$profile" --validate-legs 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ] || ! printf '%s\n' "$out" | grep -q "^end${tab}ok$"; then
+        contract_note "admission: the pytest execution declaration does not expand against the recorded estate (exit $rc) — $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"
+        contract_fail infrastructure estate-partition-invalid pytestExecution admission
+        return 1
+    fi
+    while IFS="$tab" read -r f1 f2 f3 f4; do
+        [ "$f1" = selector ] || continue
+        CONTRACT_ESTATE_SELECTORS="${CONTRACT_ESTATE_SELECTORS}${f3}${tab}${f4}"$'\n'
+    done <<EOF
+$out
+EOF
+    return 0
+}
+
+# ---------------------------------------------------------------- the estate
+#
+# #648 D6. The committed estate artifact is compared against this tree's own
+# live derivation, and every artifact transition against committed history is
+# checked for authorization. The comparison itself lives in the public helper
+# `bin/_lib_test_estate.py`, which returns TAGS and renders no verdict; this
+# function is where a tag becomes one of the ten reason codes registered above.
+#
+# Every literal is written out at a bare `contract_fail` call rather than
+# assembled into a variable, because `test_every_emitted_reason_code_is_in_the_-
+# registry` and its dead-code twin scan these sources with a regular expression.
+# A `contract_fail "$class" "$code"` would emit correctly and be invisible to
+# both directions of that scan, which is the failure mode the scan exists to
+# prevent. The repetition is the point.
+#
+# RETURN VALUE, three-valued rather than boolean:
+#   0  the record and the tree agree, and every transition is authorized
+#   1  drift or an unauthorized transition — the caller aborts
+#   2  an inability on a NON-authoritative run — recorded incomplete, and the
+#      run continues and can never be green (D12)
+# An inability on an authoritative run returns 1: such a run refuses to start
+# rather than verify less than it claims.
+contract_admit_estate() {  # contract_admit_estate <repo_root> <profile>
+    local root=$1 profile=$2 report errfile rc ok=0 saw_end=0
+    # The terminator's PAYLOAD and the record kinds are both read, because a
+    # reader that ignored either would fail OPEN on a report kind it does not
+    # know yet: `end problems` beside no recognised problem record, or a future
+    # record kind falling through a `case` with no default arm. Neither is
+    # producible by today's `render_report`, which is exactly why neither would
+    # be noticed the day it becomes producible.
+    local end_state="" saw_problem=0 saw_unknown=0
+    # FIVE names, not six. The longest record this loop acts on carries exactly
+    # five fields; the `uncovered` record carries six and is deliberately not
+    # acted on, so its sixth field lands in `f5` alongside the fifth and nothing
+    # reads either. A sixth name would be assigned and never used.
+    local f1 f2 f3 f4 f5
+
+    report=$(mktemp -t cctally-estate-report.XXXXXX) || report=""
+    errfile=$(mktemp -t cctally-estate-stderr.XXXXXX) || errfile=""
+    if [ -z "$report" ] || [ -z "$errfile" ]; then
+        rm -f "$report" "$errfile"
+        contract_note "admission: could not allocate a scratch file for the estate check (mktemp failed; check TMPDIR) — admission refuses rather than skip the comparison"
+        contract_fail infrastructure admission-scratch-failed "" admission
+        return 1
+    fi
+
+    python3 "$root/bin/_lib_test_estate.py" \
+        --repo "$root" --profile "$profile" --check \
+        > "$report" 2> "$errfile"
+    rc=$?
+
+    # The `end` line is load-bearing in the FAIL-CLOSED direction. A checker
+    # killed halfway prints a well-formed prefix and no terminator, and a reader
+    # that judged only on the records it saw would read a truncated report as
+    # agreement. Absence of the terminator is therefore an inability in its own
+    # right, independent of the exit status.
+    if [ "$rc" -ne 0 ]; then
+        contract_note "admission: the estate checker exited $rc — $(tail -n 3 "$errfile" 2>/dev/null | tr '\n' ' ')"
+    fi
+
+    while IFS=$'\t' read -r f1 f2 f3 f4 f5; do
+        case "$f1" in
+        end)
+            saw_end=1
+            end_state=$f2
+            ;;
+        note)
+            contract_note "$f2"
+            ;;
+        row|uncovered|version|profile|leg|selector)
+            : # diagnostics the operator reads in the report, not verdict input
+            ;;
+        inability)
+            saw_problem=1
+            case "$f2" in
+            artifact-unreadable)
+                contract_note "admission: the estate record could not be read — $f3"
+                if contract_is_authoritative; then
+                    contract_fail infrastructure estate-artifact-unreadable "$f2" admission
+                    ok=1
+                else
+                    contract_fail incomplete estate-artifact-unreadable "$f2" admission
+                    if [ "$ok" -eq 0 ]; then ok=2; fi
+                fi
+                ;;
+            partition-invalid)
+                contract_note "admission: the public/private partition does not describe this tree — $f3"
+                if contract_is_authoritative; then
+                    contract_fail infrastructure estate-partition-invalid "$f2" admission
+                    ok=1
+                else
+                    contract_fail incomplete estate-partition-invalid "$f2" admission
+                    if [ "$ok" -eq 0 ]; then ok=2; fi
+                fi
+                ;;
+            *)
+                # Every other inability, discovery included. A tag this shell
+                # does not recognise lands here rather than being ignored: an
+                # unknown inability is still an inability.
+                contract_note "admission: the live estate could not be derived — $f3"
+                if contract_is_authoritative; then
+                    contract_fail infrastructure estate-discovery-failed "$f2" admission
+                    ok=1
+                else
+                    contract_fail incomplete estate-discovery-failed "$f2" admission
+                    if [ "$ok" -eq 0 ]; then ok=2; fi
+                fi
+                ;;
+            esac
+            ;;
+        unauthorized)
+            saw_problem=1
+            contract_note "admission: $f2 harmful estate transition(s) are not covered by a declaration, beginning with $f4 '$f5' in the $f3 profile — add an entry to the matching tests/authoritative-estate-retirements*.json naming the rows and the predecessor digest, or restore what was removed"
+            contract_fail infrastructure estate-shrink-unauthorized "$f5" admission
+            ok=1
+            ;;
+        finding)
+            saw_problem=1
+            # $f2 direction, $f3 axis, $f4 count, $f5 the first row.
+            case "$f2/$f3" in
+            unexpected/pytestNodes)
+                contract_note "admission: $f4 pytest node identifier(s) are collected here and absent from the estate record, beginning with '$f5' — regenerate the artifacts, or find out what added them"
+                contract_fail infrastructure manifest-unexpected-pytest-node "$f5" admission
+                ;;
+            missing/pytestNodes)
+                contract_note "admission: $f4 pytest node identifier(s) are in the estate record and are NOT collected here, beginning with '$f5' — a lost test is exactly what this record exists to catch"
+                contract_fail infrastructure manifest-missing-pytest-node "$f5" admission
+                ;;
+            unexpected/frontendTests)
+                contract_note "admission: $f4 frontend test(s) are collected here and absent from the estate record, beginning with '$f5'"
+                contract_fail infrastructure manifest-unexpected-frontend-test "$f5" admission
+                ;;
+            missing/frontendTests)
+                contract_note "admission: $f4 frontend test(s) are in the estate record and are NOT collected here, beginning with '$f5'"
+                contract_fail infrastructure manifest-missing-frontend-test "$f5" admission
+                ;;
+            unexpected/suppressions)
+                contract_note "admission: $f4 suppression(s) are in this tree and absent from the estate record, beginning with '$f5' — a new suppression is the harmful direction on this axis"
+                contract_fail infrastructure manifest-unexpected-suppression "$f5" admission
+                ;;
+            missing/suppressions)
+                contract_note "admission: $f4 suppression(s) are in the estate record and are absent from this tree, beginning with '$f5' — removing one is free, so regenerate the artifacts"
+                contract_fail infrastructure manifest-missing-suppression "$f5" admission
+                ;;
+            *)
+                contract_note "admission: the estate checker reported a finding this contract does not recognise ($f2 on $f3) — treated as an inability rather than ignored"
+                contract_fail infrastructure estate-discovery-failed "$f3" admission
+                ;;
+            esac
+            ok=1
+            ;;
+        *)
+            # No default arm at all is how a future record kind gets DROPPED.
+            # Reported once however many such records arrive, because the
+            # operator needs the first one named and not a hundred copies of
+            # the same reason.
+            if [ "$saw_unknown" -eq 0 ]; then
+                saw_unknown=1
+                contract_note "admission: the estate checker emitted a record kind this contract does not recognise ('$f1') — an unknown record is an inability, never something to ignore"
+                if contract_is_authoritative; then
+                    contract_fail infrastructure estate-discovery-failed "unknown-record" admission
+                    ok=1
+                else
+                    contract_fail incomplete estate-discovery-failed "unknown-record" admission
+                    if [ "$ok" -eq 0 ]; then ok=2; fi
+                fi
+            fi
+            ;;
+        esac
+    done < "$report"
+
+    if [ "$saw_end" -ne 1 ]; then
+        contract_note "admission: the estate checker produced no terminated report (exit $rc); a truncated report is an inability, never an agreement"
+        if contract_is_authoritative; then
+            contract_fail infrastructure estate-discovery-failed "no-report" admission
+            ok=1
+        else
+            contract_fail incomplete estate-discovery-failed "no-report" admission
+            if [ "$ok" -eq 0 ]; then ok=2; fi
+        fi
+    elif [ "$end_state" = problems ] && [ "$saw_problem" -ne 1 ]; then
+        contract_note "admission: the estate checker terminated its report with 'problems' and named none this contract recognises (exit $rc); the terminator's payload is read rather than assumed, so a problem this shell cannot name is an inability"
+        if contract_is_authoritative; then
+            contract_fail infrastructure estate-discovery-failed "unnamed-problems" admission
+            ok=1
+        else
+            contract_fail incomplete estate-discovery-failed "unnamed-problems" admission
+            if [ "$ok" -eq 0 ]; then ok=2; fi
+        fi
+    fi
+
+    rm -f "$report" "$errfile"
     return $ok
 }
 

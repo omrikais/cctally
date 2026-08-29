@@ -109,12 +109,17 @@ def test_open_db_write_waits_for_concurrent_holder(ns):
     holder.execute("BEGIN IMMEDIATE")
 
     result: dict[str, object] = {}
+    insert_started = threading.Event()
 
     def worker() -> None:
-        started = time.monotonic()
         try:
             with _thread_write_scope():
                 conn = ns["open_db"]()
+                conn.set_trace_callback(
+                    lambda statement: insert_started.set()
+                    if statement.startswith("INSERT INTO weekly_usage_snapshots")
+                    else None
+                )
                 conn.execute(
                     "INSERT INTO weekly_usage_snapshots "
                     "(captured_at_utc, week_start_date, week_end_date, "
@@ -127,13 +132,15 @@ def test_open_db_write_waits_for_concurrent_holder(ns):
             result["ok"] = True
         except Exception as exc:  # pragma: no cover - failure path asserted below
             result["error"] = exc
-        finally:
-            result["elapsed"] = time.monotonic() - started
 
     th = threading.Thread(target=worker, name="busy-timeout-waiter")
     th.start()
-    # Hold the lock long enough that the worker is provably blocked on it.
-    time.sleep(0.5)
+    assert insert_started.wait(PRESENCE_BACKSTOP_SECONDS), (
+        "worker never reached the INSERT while the holder owned the write lock"
+    )
+    assert th.is_alive(), (
+        "worker left the traced INSERT before the held lock was released"
+    )
     holder.execute("COMMIT")
     holder.close()
     # timing-budget: the worker has completed the write it was blocked on, now that the holder committed and closed
@@ -145,13 +152,6 @@ def test_open_db_write_waits_for_concurrent_holder(ns):
         f"{result.get('error')!r}"
     )
     assert result.get("ok") is True
-    # It really waited for the holder (released at ~0.5s) rather than racing
-    # through before the lock was taken.
-    assert float(result["elapsed"]) >= 0.4, (  # type: ignore[arg-type]
-        f"write completed in {result['elapsed']}s — it did not actually "
-        "contend for the held lock"
-    )
-
     # The row landed exactly once.
     verify = ns["open_db"]()
     try:

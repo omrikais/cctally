@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "rangeStart": "2026-04-13",
   "rangeEnd": "2026-04-15",
   "weeksInRange": 1,
@@ -8,6 +8,17 @@
     "costUsd": 3.0,
     "usedPercent": 70.0,
     "weeklyAttributionAvailable": true
+  },
+  "attribution": {
+    "basis": "cost-share",
+    "cause": "calibration-absent",
+    "totals": {
+      "modelledWeekPoints": null,
+      "visibleRowPoints": null,
+      "filteredOrUnmodelledPoints": null,
+      "observedMinusModelledPoints": null,
+      "residualCause": "population-misaligned"
+    }
   },
   "projects": [
     {
@@ -23,7 +34,8 @@
       "cacheReadTokens": 0,
       "costUsd": 3.0,
       "attributedUsedPercent": 70.0,
-      "costPerPercent": 0.0429
+      "costPerPercent": 0.0429,
+      "attributionBasis": "cost-share"
     }
   ],
   "warnings": []

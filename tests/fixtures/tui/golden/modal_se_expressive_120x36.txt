@@ -1,4 +1,4 @@
-  [ WARN ]   on track, no slack   ·   week-avg 74%   ·   recent-24h 91%                                                 
+  [ WARN ]   on track, no slack   ·   week-avg 73%   ·   recent-24h 91%                                                 
  Week Apr 14–Apr 21   $28.31 spent · $/1% $0.42 · resets in 0d 15h   ·   ● synced —                                     
 ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
                                                                                                                         

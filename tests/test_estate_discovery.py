@@ -12,6 +12,7 @@ import importlib.util
 import inspect
 import json
 import pathlib
+import subprocess
 import sys
 
 import pytest
@@ -643,8 +644,8 @@ def test_collection_neutralizes_an_inherited_agentmem_policy(tmp_path, monkeypat
 # Payload excerpts captured on the LAN runner on 2026-08-25 from the pinned
 # runners themselves — Vitest 4.1.5 `list --json` and Playwright 1.61.1
 # `test --list --reporter=json`. The Playwright `expectedStatus: "skipped"` row
-# is the one synthesized value: this tree currently carries zero frontend
-# suppressions, so no real row can demonstrate the transition criterion 4 names.
+# is synthesized to pin field propagation; the real-runner Vitest mode
+# transition is exercised separately below rather than inferred from payloads.
 _VITEST_PAYLOAD = [
     {
         "name": "SidechainGroup > renders each member as a MessageItem in the body",
@@ -694,13 +695,7 @@ _PLAYWRIGHT_PAYLOAD = {
 
 
 def test_vitest_rows_are_ids_only_and_playwright_rows_carry_status():
-    """Criterion 4. Vitest 4.1.5's list contract exposes no task mode.
-
-    An ids-only Vitest set still detects a removed or renamed test, which is the
-    larger loss class; a Vitest test changed from active to statically skipped
-    keeps an identical row, and that limitation is documented rather than
-    implied.
-    """
+    """Vitest encodes effective mode through row presence; Playwright has status."""
     vitest = ED.parse_vitest_list(_VITEST_PAYLOAD, pathlib.Path("/w"))
     playwright = ED.parse_playwright_list(_PLAYWRIGHT_PAYLOAD)
     assert vitest and playwright
@@ -708,6 +703,42 @@ def test_vitest_rows_are_ids_only_and_playwright_rows_carry_status():
     assert all(r.runner == "playwright" for r in playwright)
     assert all(r.expected_status is not None for r in playwright)
     assert {r.id for r in vitest}.isdisjoint({r.id for r in playwright})
+
+
+def test_vitest_list_drops_a_test_when_it_becomes_statically_skipped(tmp_path):
+    """#666 premise check against the pinned real runner, not a canned payload.
+
+    Vitest does not expose ``mode`` on a row, but its list operation excludes a
+    skipped task. The active-to-skipped transition is therefore an identity
+    removal, which the existing frontend estate axis already rejects.
+    """
+    installed = REPO / "dashboard" / "web" / "node_modules"
+    assert (installed / ".bin" / "vitest").is_file(), (
+        "the authoritative runner must provision dashboard/web/node_modules"
+    )
+    web = tmp_path / "web"
+    web.mkdir()
+    (web / "node_modules").symlink_to(installed, target_is_directory=True)
+    probe = web / "mode-probe.test.ts"
+
+    def listed_names(body: str) -> list[str]:
+        probe.write_text(
+            "import { test } from 'vitest'\n" + body + "\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [str(web / "node_modules" / ".bin" / "vitest"),
+             "list", probe.name, "--json"],
+            cwd=web,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return [row["name"] for row in json.loads(result.stdout)]
+
+    assert listed_names("test('mode probe', () => {})") == ["mode probe"]
+    assert listed_names("test.skip('mode probe', () => {})") == []
 
 
 def test_a_playwright_test_changed_to_skipped_is_a_changed_row():
@@ -958,3 +989,97 @@ def test_the_kernel_is_public_in_the_mirror_allowlist():
         if line.strip() and not line.strip().startswith("#")
     }
     assert "bin/_lib_estate_discovery.py" in entries
+
+
+# ---------------------------------------------------------------------------
+# #648 Task 1 — the sanitized timezone pin and the e2e runtime seam
+# ---------------------------------------------------------------------------
+
+
+def test_the_collection_environment_pins_the_timezone(monkeypatch):
+    """An inherited TZ must not reach the collection subprocess.
+
+    #648 D8. This pin removes an uncontrolled input; no timezone-dependent
+    collection was ever observed, so this guards a hole rather than a defect.
+
+    The inherited value is set to something OTHER than the pin first. Every
+    authoritative run in this repository is started with `TZ=Etc/UTC`, so a bare
+    `env["TZ"] == "Etc/UTC"` assertion passes on the runner whether or not the
+    pin exists, and would certify nothing.
+    """
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    kernel = _load_kernel()
+    env = kernel._sanitized_env()
+    assert env["TZ"] == "Etc/UTC"
+
+
+def test_frontend_collection_accepts_an_injected_runtime_directory(tmp_path):
+    """#648 D9 — the collector supplies its own e2e runtime directory.
+
+    A clean checkout has no `dashboard/web/e2e/.runtime/manifest.json`, so a
+    collector that could only read the fixed path could never derive the
+    frontend axis on the tree it is asked about.
+    """
+    kernel = _load_kernel()
+    import inspect
+    sig = inspect.signature(kernel.collect_frontend_tests)
+    assert "runtime_dir" in sig.parameters
+    assert sig.parameters["runtime_dir"].default is None
+
+
+def test_the_injected_runtime_directory_reaches_both_runners(tmp_path, monkeypatch):
+    """The seam is the ENVIRONMENT the runners see, not just a parameter.
+
+    A signature test alone passes against a parameter the collector accepts and
+    ignores, which is exactly the shape that would leave the generator unable to
+    derive the frontend axis inside a projection.
+    """
+    monkeypatch.setenv("CCTALLY_E2E_RUNTIME_DIR", "/inherited/must/not/survive")
+    binaries = tmp_path / "dashboard" / "web" / "node_modules" / ".bin"
+    binaries.mkdir(parents=True)
+    seen = tmp_path / "seen"
+    seen.mkdir()
+    payload = json.dumps([])
+    for name, body in (
+        ("vitest", payload),
+        ("playwright", json.dumps(_PLAYWRIGHT_PAYLOAD)),
+    ):
+        script = binaries / name
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s" "${{CCTALLY_E2E_RUNTIME_DIR-<unset>}}" > "{seen}/{name}"\n'
+            f"cat <<'PAYLOAD'\n{body}\nPAYLOAD\n"
+        )
+        script.chmod(0o755)
+    injected = tmp_path / "runtime"
+    injected.mkdir()
+    ED.collect_frontend_tests(tmp_path, runtime_dir=injected)
+    for name in ("vitest", "playwright"):
+        assert (seen / name).read_text() == str(injected), name
+
+    # With no injection the inherited value is REMOVED rather than forwarded,
+    # so a stale export cannot silently redirect a derivation.
+    ED.collect_frontend_tests(tmp_path)
+    for name in ("vitest", "playwright"):
+        assert (seen / name).read_text() == "<unset>", name
+
+
+def test_vitest_paths_stay_relative_when_the_root_reaches_through_a_symlink(tmp_path):
+    """#648. An unresolved root must not put an ABSOLUTE path in the estate.
+
+    `_relative_posix` falls back to the absolute path when `relative_to` raises,
+    and on macOS that fires for the ordinary case: `tempfile` hands back
+    `/var/folders/...` while the runner reports the resolved
+    `/private/var/folders/...`, so the two differ by a symlink component alone.
+    Measured while generating the #648 artifacts inside a temporary public
+    projection: all 5,405 Vitest rows came back carrying the maintainer's
+    absolute temp path, which the public artifact would then have PUBLISHED.
+    """
+    real = tmp_path / "real" / "dashboard" / "web"
+    real.mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "real", target_is_directory=True)
+    web_through_link = link / "dashboard" / "web"
+    payload = [{"name": "a > b", "file": str(real / "src" / "x.test.tsx")}]
+    rows = ED.parse_vitest_list(payload, web_through_link)
+    assert rows[0].id == "src/x.test.tsx::a > b"

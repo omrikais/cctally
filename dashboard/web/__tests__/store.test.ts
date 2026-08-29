@@ -295,6 +295,10 @@ describe('alerts store (T8)', () => {
       // Projected axis (issue #121): both opt-in toggles default OFF.
       projected_weekly_enabled: false,
       projected_budget_enabled: false,
+      // #661 S2 section 6.2: the metering-rate-change PUSH toggle. Recording
+      // is unconditional and this gates only the notification, so it defaults
+      // OFF with every other alert toggle in this estate.
+      rate_change_enabled: false,
       // Per-project budget axis (issue #19/#121): the opt-in toggle defaults OFF.
       project_alerts_enabled: false,
       // Codex budget toggles (#134): no Codex budget + both toggles default OFF

@@ -33,10 +33,17 @@ _P_NOW = 34.2
 _P_24H = 31.0  # Decelerating: r_recent = (34.2 - 31.0)/24 ≈ 0.133 < r_avg ≈ 0.224
 _DPP = 0.42
 
-_R_AVG = _P_NOW / _ELAPSED_H                                      # ≈ 0.22353
-_R_REC = max(0.0, (_P_NOW - _P_24H) / 24.0)                       # ≈ 0.13333
-_P_FIN_AVG = _P_NOW + _R_AVG * _REMAINING_H                       # ≈ 37.553
-_P_FIN_REC = _P_NOW + _R_REC * _REMAINING_H                       # ≈ 36.200
+# #661 S2 spec section 3.1: the forecast kernel runs on the CEILING-CORRECTED
+# reading, so this fixture derives its rates, projections and budget headroom
+# from the same operand `_compute_forecast` would use. Deriving them from the
+# displayed reading instead would make the Forecast explain modal print an
+# arithmetic identity that does not hold.
+_P_CORR = m.corrected_percent_point(_P_NOW)
+_P24_CORR = m.corrected_percent_point(_P_24H)
+_R_AVG = _P_CORR / _ELAPSED_H
+_R_REC = max(0.0, (_P_CORR - _P24_CORR) / 24.0)
+_P_FIN_AVG = _P_CORR + _R_AVG * _REMAINING_H
+_P_FIN_REC = _P_CORR + _R_REC * _REMAINING_H
 
 _FC_INPUTS = m.ForecastInputs(
     now_utc=_NOW,
@@ -71,15 +78,15 @@ _FC = m.ForecastOutput(
     budgets=[
         m.BudgetRow(
             target_percent=100,
-            pct_headroom=100.0 - _P_NOW,
-            dollars_per_day=((100.0 - _P_NOW) * _DPP) / _REMAINING_D,
-            percent_per_day=(100.0 - _P_NOW) / _REMAINING_D,
+            pct_headroom=100.0 - _P_CORR,
+            dollars_per_day=((100.0 - _P_CORR) * _DPP) / _REMAINING_D,
+            percent_per_day=(100.0 - _P_CORR) / _REMAINING_D,
         ),
         m.BudgetRow(
             target_percent=90,
-            pct_headroom=90.0 - _P_NOW,
-            dollars_per_day=((90.0 - _P_NOW) * _DPP) / _REMAINING_D,
-            percent_per_day=(90.0 - _P_NOW) / _REMAINING_D,
+            pct_headroom=90.0 - _P_CORR,
+            dollars_per_day=((90.0 - _P_CORR) * _DPP) / _REMAINING_D,
+            percent_per_day=(90.0 - _P_CORR) / _REMAINING_D,
         ),
     ],
 )

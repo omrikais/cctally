@@ -5,6 +5,62 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.104.0] - 2026-08-29
+
+### Added
+- `cctally quota` reports how much of your weekly quota your usage consumes and whether Anthropic has changed the metering rate, from a budget fitted to your own history rather than a shipped constant. See `docs/commands/quota.md`.
+- `cctally quota --json` publishes the fit, the current week's consumption and projection, the composition support radii and the detector's own bound under `schemaVersion` 1.
+- `cctally quota --reset-calibration` discards the stored calibration for one account, and `--since` and `--watch-from` narrow or override the window the analysis uses.
+- `bin/cctally-preflight` compiles every Python file in the repository, not only the ones beside it, so a syntax error anywhere in the tree now blocks a test run instead of surfacing during one.
+- `cctally forecast --json` states the reading its arithmetic used and where its projection came from, through `weekly_percent_corrected`, `right_censored`, `projection_basis`, `projection_code` and `calibration_code`.
+- `cctally forecast --json` moves to `schemaVersion` 2: its three projection fields can now be null, and they are measured from a different reading than before.
+- `cctally project --json` moves to `schemaVersion` 2. `attributedUsedPercent` and `costPerPercent` keep their spelling and change their meaning, from a share of the window's cost to modelled weekly quota.
+- `cctally project` reports each project's `Used %` as modelled quota units rather than as its share of the window's dollars, so a cache-heavy project no longer reads high and an output-heavy Opus one no longer reads low.
+- `cctally doctor` reports a new Quota category: whether Anthropic changed your weekly metering rate, and whether the stored calibration is usable. Neither check can fail, so neither changes doctor's exit code.
+- `cctally quota` records a durable event when it confirms a metering-rate change, so it and `doctor` report the change with no configuration. The desktop notification stays off until you set `alerts.rate_change_enabled`.
+- `cctally project` states its four modelled-quota figures under the table — window total, listed-row total, filtered or unmodelled, and the meter's reading minus the modelled total — where before they were in `--json` only.
+- The status line's 7d slot shows where the week is heading and which measurement said so, as `7d 42% (2d 3h) → 58% meter`, plus a `Δrate` marker while a metering-rate change is in force.
+- The dashboard's Forecast panel names the basis its projection came from and shows a `Δ rate` chip while a metering-rate change is in force.
+- The dashboard's Forecast modal adds the modelled consumption, the headroom, what the meter reading covers, and the meter's reading minus the modelled total.
+- The dashboard's Recent Alerts modal lists metering-rate changes in their own section, with the size and direction of the change and the instant it took effect, and a rate change now raises its own toast.
+- `alerts.rate_change_enabled` is settable with `cctally config set` and from the dashboard's Settings overlay, so turning the notification on no longer means editing `config.json` by hand.
+- `bin/cctally-test-all` refuses to start when the recorded test estate disagrees with what this tree collects, when a recorded test disappeared without a declaration authorizing it, or when it cannot derive the estate at all.
+- `bin/cctally-test-all --with-estate-check` runs that check on a `--harness` subset, which otherwise skips it to keep a targeted run fast.
+
+### Changed
+- `cctally forecast`, the TUI and the dashboard measure your pace from what you consumed rather than from the rounded-up meter reading, so rates and projections read about half a point lower and daily budgets a little larger.
+- At a displayed 100% the forecast shows no projection, no time-to-cap and no daily budget, because a capped meter says only that you are past 99%. `cctally quota` still models consumption there, from tokens.
+- The projected-pace weekly alert stays quiet once `cctally quota` has fitted your budget, rather than firing on a pace the forecast no longer shows you.
+- `cctally forecast`'s trailing four-week dollar rate divides each prior week's cost by the meter movement that week realized, not by its post-credit high-water mark, which priced one measured week at $355 per point against a true $25.
+- A prior week whose realized movement cannot be established is left out of the forecast's four-week median rather than guessed at, and so is a week whose meter reached 100%.
+- `cctally project` withholds its meter-versus-modelled difference when the requested range slices a subscription week, instead of stating a whole-week difference beside a three-day range.
+- `cctally forecast` names its dollar rate's source in words — `trailing 4wk median (drift-reduced confidence)` rather than the bare code — and says when the comparability test behind that rate could not run.
+- `rates.week_average_pct_per_hour` in `cctally forecast --json` is null at a reading of 100% or more, because a capped meter supplies no rate to average.
+- `cctally quota` refuses to predict from a metering rate it has only just detected. It says so, and the forecast, the TUI and the dashboard fall back to the meter and state the reason, rather than projecting from a three-day fit.
+- `bin/cctally-preflight` lists the repository once instead of once per check, so widening the Python check to the whole tree costs one pass rather than two.
+- `docs/commands/report.md` states that `$ / 1%` falls when the provider charges more points for the same tokens, so a drop can read as improved efficiency, and points at `cctally quota` as the detector. The metric itself is unchanged.
+- `cctally project` names the absent operand when it withholds the meter-versus-modelled difference — a modelled week with no snapshot, or a window that modelled no week — instead of reporting either as a misaligned population.
+- `bin/cctally-test-all` builds both of its pytest phases from one recorded declaration rather than from hard-coded file names, and refuses at startup when a named target no longer exists.
+- `bin/cctally-test-all` removes `PYTEST_ADDOPTS` and `PYTEST_PLUGINS` from both pytest phases so neither can narrow a run; set `CCTALLY_PYTEST_DURATIONS=1` for per-test timings instead.
+
+### Fixed
+- The dashboard keeps the full account-count value visible in the `All` hero at tablet widths instead of clipping it mid-word.
+- A shared forecast artifact writes a ceiling more than 30 days out as `>30d` instead of printing the literal figure, which on a barely-used week read `1166.8`.
+- The terminal forecast's explain modal says why it shows no daily budgets at a capped meter, instead of printing the heading over nothing.
+- `bin/cctally-preflight` bounds every command it runs, including the harness-ownership check, and reports a hung system bash version probe rather than silently skipping the bash 3.2 floor check.
+- `bin/cctally-preflight` stops its shell syntax sweep and reports what went unchecked when an interpreter hangs, rather than spending its full per-file timeout on every remaining file.
+- `cctally project` withholds modelled quota on a multi-account install whose account registry cannot be read, instead of falling back to a cost share under the `Used %` column.
+- `cctally forecast` leaves a prior week out of its four-week median when the recorded credit or reset rows for that week cannot be read, instead of summing the week as if the credit had zeroed the meter.
+- `cctally forecast` keeps prior weeks from before a metering-rate change out of its four-week median even when it cannot read the entry cache, instead of admitting every one of them after a single failed read.
+- The dashboard hero shows no week-over-week `$ / 1%` comparison when it has no `$ / 1%` to compare, instead of printing a change beside a dash.
+- The dashboard's Forecast panel keeps its pace bar visible and its content inside the card when the source reports a degradation, where the bar collapsed to nothing and the panel overflowed.
+- The dashboard's Forecast modal says when a published `$ / 1%` rate was measured over a reduced or unverified population, where before the qualification was only visible in `--json`.
+- A metering-rate change desktop notification shows the effective date in your own timezone rather than in UTC.
+- Interrupting `cctally quota` with Ctrl-C while it records a metering-rate change stops the command, rather than printing a recording failure and carrying on.
+- `cctally quota` carries on when it cannot read your stored calibration file, rather than stopping with a Python traceback.
+- The status line's 7d slot shows no projection once the stored reset instant has passed, rather than projecting over a week that has already ended.
+- The dashboard's Forecast panel puts its verdict, status and `Δ rate` chips on one line instead of stacking them, giving the card back a row of height. The Forecast modal's Quota model heading is now tinted like every other section heading.
+
 ## [1.103.0] - 2026-08-26
 
 ### Added

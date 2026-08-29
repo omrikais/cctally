@@ -5,11 +5,11 @@
 ║                                                          ║║                                                          ║
 ║ Used   ███████████████████████████░░░░░░░░░░░░░  67.3%   ║║   [ WARN ]  on track, no slack                           ║
 ║                                                          ║║                                                          ║
-║ 5-hour █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  12%     ║║ Projection by week-avg    ██████████████████░░░░░░  74%  ║
+║ 5-hour █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  12%     ║║ Projection by week-avg    ██████████████████░░░░░░  73%  ║
 ║        resets in 3h 42m                                  ║║ Projection by recent 24h  ██████████████████████░░  91%  ║
 ║                                                          ║║                                                          ║
-║ Spent    $28.31        $/1%  $0.42                       ║║ Budget to stay ≤100%   $21.97/day                        ║
-║ Reset    Apr 21 00:00 UTC  (in 0d 15h)                   ║║ Budget to stay  ≤90%   $15.25/day                        ║
+║ Spent    $28.31        $/1%  $0.42                       ║║ Budget to stay ≤100%   $22.51/day                        ║
+║ Reset    Apr 21 00:00 UTC  (in 0d 15h)                   ║║ Budget to stay  ≤90%   $15.79/day                        ║
 ║                                                          ║║                                                          ║
 ║ · last snapshot: 2m 04s ago                              ║║ confidence: high · based on 7-day rate                   ║
 ║  ⏱ as of 08:57:56 · 124s ago                             ║║                                                          ║

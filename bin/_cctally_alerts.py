@@ -140,6 +140,56 @@ def _alert_text_quota(payload: dict, _tz) -> tuple[str, str, str]:
     # dashboard alert envelope, so the CLI line is the only routing it gets.
     return title, subtitle, _with_next_step(body, payload, _tz)
 
+
+def _alert_text_meter_rate_change(payload: dict, tz) -> tuple[str, str, str]:
+    """#661 S2 §6.1: the non-threshold family's own copy.
+
+    It states the direction and the size of the change, and it states them as
+    a rate the provider sets rather than as anything cctally can act on. There
+    is no threshold to name, which is the whole reason this family is not an
+    `AXIS_REGISTRY` member.
+
+    Two DELIBERATE divergences from the threshold builders, both recorded in
+    `docs/alerts-gotchas.md` (#661 S2 Stage C review, F7b):
+
+    * The body does not end with `_with_next_step`. That helper derives its
+      affordance through `alert_next_step_command`, which branches on
+      `AXIS_REGISTRY` axes; this family is deliberately not one, so it has no
+      window to scope and no branch to reach. The affordance is stated
+      directly instead.
+    * This builder and `_alert_text_quota` above it live in this glue module
+      rather than in the pure `_lib_alerts_payload` kernel, which holds the
+      other five. That is the placement both non-registry families use.
+
+    `effective_from` IS routed through `format_display_dt`. It is a clock
+    instant, not a calendar day, so the carve-out `_alert_text_weekly`
+    documents for `week_start_date` does not apply: slicing its first ten
+    characters showed a user at UTC+13 or UTC-8 a date one day away from
+    their own.
+    """
+    previous = float(payload.get("previous_units_per_point") or 0.0)
+    new = float(payload.get("new_units_per_point") or 0.0)
+    provider = str(payload.get("provider") or "claude").capitalize()
+    if previous > 0.0 and new > 0.0:
+        change = (new - previous) / previous * 100.0
+        direction = "less" if change < 0 else "more"
+        subtitle = (
+            f"each meter point now covers {abs(change):.0f}% {direction} usage")
+    else:
+        subtitle = "the rate this account is metered at changed"
+    raw = str(payload.get("effective_from") or "")
+    try:
+        effective = _lib_alerts_payload.format_display_dt(
+            raw, tz, fmt="%Y-%m-%d", suffix=False) if raw else ""
+    except ValueError:
+        effective = ""
+    body = (
+        f"Effective {effective}. Run `cctally quota` for the fitted budget "
+        f"and its evidence." if effective else
+        "Run `cctally quota` for the fitted budget and its evidence.")
+    return f"cctally - {provider} metering rate changed", subtitle, body
+
+
 # Phase B: severity policy + the cross-platform dispatch kernel. The kernel is
 # pure (parameterized on platform + which_on_path); this module is the I/O glue
 # that injects the real sys.platform / shutil.which and spawns with shell=False.
@@ -293,6 +343,8 @@ def _dispatch_alert_notification(
         title, subtitle, body = _alert_text_projected(payload, tz)
     elif axis == "quota":
         title, subtitle, body = _alert_text_quota(payload, tz)
+    elif axis == "meter_rate_change":
+        title, subtitle, body = _alert_text_meter_rate_change(payload, tz)
     else:
         title, subtitle, body = (
             "cctally - alert",
@@ -310,10 +362,19 @@ def _dispatch_alert_notification(
     # trailing log column. A missing threshold (defensive — shouldn't happen for
     # a real crossing) floors at "info".
     threshold = payload.get("threshold")
-    try:
-        severity = severity_for(int(threshold)) if threshold is not None else "info"
-    except (TypeError, ValueError):
-        severity = "info"
+    if axis == "meter_rate_change":
+        # #661 S2 §6.1: this family carries an EXPLICIT severity, because a
+        # rate transition has no percentage threshold for `severity_for` to
+        # map. Reading it verbatim is what keeps the three tiers meaningful
+        # here; falling through would floor every transition at `info`.
+        severity = str(payload.get("severity") or "info")
+        if severity not in ("info", "warn", "alarm"):
+            severity = "info"
+    else:
+        try:
+            severity = severity_for(int(threshold)) if threshold is not None else "info"
+        except (TypeError, ValueError):
+            severity = "info"
     urgency = severity_to_urgency(severity)
 
     if platform is None:

@@ -19,6 +19,7 @@
     "project_alerts_enabled": false,
     "projected_budget_enabled": false,
     "projected_weekly_enabled": false,
+    "rate_change_enabled": false,
     "weekly_thresholds": [
       90,
       95
@@ -463,7 +464,7 @@
     "window_days": 14
   },
   "current_week": {
-    "dollar_per_pct": 0.4761194029850747,
+    "dollar_per_pct": 0.47969924812030085,
     "five_hour_block": null,
     "five_hour_milestones": [],
     "five_hour_pct": null,
@@ -1570,22 +1571,22 @@
   "doctor": "__DOCTOR_BLOCK__",
   "envelope_version": 2,
   "forecast": {
-    "budget_100_per_day_usd": 8.978251599147123,
-    "budget_90_per_day_usd": 6.257569296375268,
+    "budget_100_per_day_usd": 9.182814178302902,
+    "budget_90_per_day_usd": 6.441675617615468,
     "confidence": "high",
     "confidence_score": 7,
     "explain": {
       "budget": [
         {
-          "dollars_per_day": 8.978252,
-          "pct_headroom": 33.0,
-          "percent_per_day": 18.857,
+          "dollars_per_day": 9.182814,
+          "pct_headroom": 33.5,
+          "percent_per_day": 19.143,
           "target_percent": 100
         },
         {
-          "dollars_per_day": 6.257569,
-          "pct_headroom": 23.0,
-          "percent_per_day": 13.143,
+          "dollars_per_day": 6.441676,
+          "pct_headroom": 23.5,
+          "percent_per_day": 13.429,
           "target_percent": 90
         }
       ],
@@ -1594,27 +1595,36 @@
         "latest_snapshot_at": "2026-04-18T20:00:00Z",
         "snapshot_count": 13,
         "spent_usd": 31.9,
-        "weekly_percent": 67.0
+        "weekly_percent": 67.0,
+        "weekly_percent_corrected": 66.5,
+        "weekly_percent_interval": [
+          66.0,
+          67.0
+        ]
       },
       "forecast": {
         "already_capped": false,
-        "cap_at": "2026-04-20T03:46:40Z",
+        "calibration_code": "unavailable",
+        "cap_at": "2026-04-20T04:15:33Z",
         "confidence": "high",
-        "final_percent_high": 110.615,
-        "final_percent_low": 89.333,
+        "final_percent_high": 110.115,
+        "final_percent_low": 88.667,
         "low_confidence_reasons": [],
         "projected_cap": true,
-        "week_avg_projection_pct": 89.333
+        "projection_basis": "corrected-meter",
+        "projection_code": null,
+        "right_censored": false,
+        "week_avg_projection_pct": 88.667
       },
       "meta": {
         "generated_at": "2026-04-18T20:00:00Z",
         "tool_version": "forecast-v1"
       },
       "rates": {
-        "dollars_per_percent": 0.476119,
+        "dollars_per_percent": 0.479699,
         "dollars_per_percent_source": "this_week",
         "recent_24h_pct_per_hour": 1.038462,
-        "week_average_pct_per_hour": 0.531746
+        "week_average_pct_per_hour": 0.527778
       },
       "week": {
         "elapsed_fraction": 0.75,
@@ -1625,23 +1635,46 @@
         "start_at": "2026-04-13T14:00:00Z"
       }
     },
-    "recent_24h_projection_pct": 110.61538461538461,
+    "quota": {
+      "basis": "corrected-meter",
+      "calibrated_consumption_interval": null,
+      "calibrated_consumption_pct": null,
+      "calibrated_headroom_pct": null,
+      "calibration_code": "unavailable",
+      "calibration_code_presentation": {
+        "code": "unavailable",
+        "long": "no usable calibration could be read for this account",
+        "short": "unavailable"
+      },
+      "code": null,
+      "code_presentation": null,
+      "corrected_interval": {
+        "hi": 67.0,
+        "lo": 66.0
+      },
+      "observed_minus_modelled_pct": null,
+      "projection_pct": 88.66666666666667,
+      "rate_change": null,
+      "right_censored": false
+    },
+    "recent_24h_projection_pct": 110.11538461538461,
     "verdict": "cap",
-    "week_avg_projection_pct": 89.33333333333333
+    "week_avg_projection_pct": 88.66666666666667
   },
   "generated_at": "__NOW__",
   "header": {
-    "dollar_per_pct": 0.4761194029850747,
+    "dollar_per_pct": 0.47969924812030085,
     "five_hour_pct": null,
-    "forecast_pct": 110.61538461538461,
+    "forecast_pct": 110.11538461538461,
     "forecast_verdict": "cap",
     "used_pct": 67.0,
-    "vs_last_week_delta": null,
+    "vs_last_week_delta": 0.039699248120300845,
     "week_label": "Apr 13\u2013Apr 20"
   },
   "hydrating": false,
   "last_sync_at": null,
   "last_sync_error": null,
+  "meter_rate_changes": [],
   "monthly": {
     "rows": [
       {
@@ -2369,22 +2402,22 @@
         },
         "budget": {
           "forecast": {
-            "budget_100_per_day_usd": 8.978251599147123,
-            "budget_90_per_day_usd": 6.257569296375268,
+            "budget_100_per_day_usd": 9.182814178302902,
+            "budget_90_per_day_usd": 6.441675617615468,
             "confidence": "high",
             "confidence_score": 7,
             "explain": {
               "budget": [
                 {
-                  "dollars_per_day": 8.978252,
-                  "pct_headroom": 33.0,
-                  "percent_per_day": 18.857,
+                  "dollars_per_day": 9.182814,
+                  "pct_headroom": 33.5,
+                  "percent_per_day": 19.143,
                   "target_percent": 100
                 },
                 {
-                  "dollars_per_day": 6.257569,
-                  "pct_headroom": 23.0,
-                  "percent_per_day": 13.143,
+                  "dollars_per_day": 6.441676,
+                  "pct_headroom": 23.5,
+                  "percent_per_day": 13.429,
                   "target_percent": 90
                 }
               ],
@@ -2393,27 +2426,36 @@
                 "latest_snapshot_at": "2026-04-18T20:00:00Z",
                 "snapshot_count": 13,
                 "spent_usd": 31.9,
-                "weekly_percent": 67.0
+                "weekly_percent": 67.0,
+                "weekly_percent_corrected": 66.5,
+                "weekly_percent_interval": [
+                  66.0,
+                  67.0
+                ]
               },
               "forecast": {
                 "already_capped": false,
-                "cap_at": "2026-04-20T03:46:40Z",
+                "calibration_code": "unavailable",
+                "cap_at": "2026-04-20T04:15:33Z",
                 "confidence": "high",
-                "final_percent_high": 110.615,
-                "final_percent_low": 89.333,
+                "final_percent_high": 110.115,
+                "final_percent_low": 88.667,
                 "low_confidence_reasons": [],
                 "projected_cap": true,
-                "week_avg_projection_pct": 89.333
+                "projection_basis": "corrected-meter",
+                "projection_code": null,
+                "right_censored": false,
+                "week_avg_projection_pct": 88.667
               },
               "meta": {
                 "generated_at": "2026-04-18T20:00:00Z",
                 "tool_version": "forecast-v1"
               },
               "rates": {
-                "dollars_per_percent": 0.476119,
+                "dollars_per_percent": 0.479699,
                 "dollars_per_percent_source": "this_week",
                 "recent_24h_pct_per_hour": 1.038462,
-                "week_average_pct_per_hour": 0.531746
+                "week_average_pct_per_hour": 0.527778
               },
               "week": {
                 "elapsed_fraction": 0.75,
@@ -2424,9 +2466,31 @@
                 "start_at": "2026-04-13T14:00:00Z"
               }
             },
-            "recent_24h_projection_pct": 110.61538461538461,
+            "quota": {
+              "basis": "corrected-meter",
+              "calibrated_consumption_interval": null,
+              "calibrated_consumption_pct": null,
+              "calibrated_headroom_pct": null,
+              "calibration_code": "unavailable",
+              "calibration_code_presentation": {
+                "code": "unavailable",
+                "long": "no usable calibration could be read for this account",
+                "short": "unavailable"
+              },
+              "code": null,
+              "code_presentation": null,
+              "corrected_interval": {
+                "hi": 67.0,
+                "lo": 66.0
+              },
+              "observed_minus_modelled_pct": null,
+              "projection_pct": 88.66666666666667,
+              "rate_change": null,
+              "right_censored": false
+            },
+            "recent_24h_projection_pct": 110.11538461538461,
             "verdict": "cap",
-            "week_avg_projection_pct": 89.33333333333333
+            "week_avg_projection_pct": 88.66666666666667
           },
           "settings": {
             "budget_enabled": false,
@@ -2444,6 +2508,7 @@
             "project_alerts_enabled": false,
             "projected_budget_enabled": false,
             "projected_weekly_enabled": false,
+            "rate_change_enabled": false,
             "weekly_thresholds": [
               90,
               95
@@ -2454,7 +2519,7 @@
         "hero": {
           "cost_usd": 31.900000000000006,
           "current_week": {
-            "dollar_per_pct": 0.4761194029850747,
+            "dollar_per_pct": 0.47969924812030085,
             "five_hour_block": null,
             "five_hour_milestones": [],
             "five_hour_pct": null,
@@ -3023,22 +3088,22 @@
             "week_start_at": "2026-04-13T14:00:00Z"
           },
           "forecast": {
-            "budget_100_per_day_usd": 8.978251599147123,
-            "budget_90_per_day_usd": 6.257569296375268,
+            "budget_100_per_day_usd": 9.182814178302902,
+            "budget_90_per_day_usd": 6.441675617615468,
             "confidence": "high",
             "confidence_score": 7,
             "explain": {
               "budget": [
                 {
-                  "dollars_per_day": 8.978252,
-                  "pct_headroom": 33.0,
-                  "percent_per_day": 18.857,
+                  "dollars_per_day": 9.182814,
+                  "pct_headroom": 33.5,
+                  "percent_per_day": 19.143,
                   "target_percent": 100
                 },
                 {
-                  "dollars_per_day": 6.257569,
-                  "pct_headroom": 23.0,
-                  "percent_per_day": 13.143,
+                  "dollars_per_day": 6.441676,
+                  "pct_headroom": 23.5,
+                  "percent_per_day": 13.429,
                   "target_percent": 90
                 }
               ],
@@ -3047,27 +3112,36 @@
                 "latest_snapshot_at": "2026-04-18T20:00:00Z",
                 "snapshot_count": 13,
                 "spent_usd": 31.9,
-                "weekly_percent": 67.0
+                "weekly_percent": 67.0,
+                "weekly_percent_corrected": 66.5,
+                "weekly_percent_interval": [
+                  66.0,
+                  67.0
+                ]
               },
               "forecast": {
                 "already_capped": false,
-                "cap_at": "2026-04-20T03:46:40Z",
+                "calibration_code": "unavailable",
+                "cap_at": "2026-04-20T04:15:33Z",
                 "confidence": "high",
-                "final_percent_high": 110.615,
-                "final_percent_low": 89.333,
+                "final_percent_high": 110.115,
+                "final_percent_low": 88.667,
                 "low_confidence_reasons": [],
                 "projected_cap": true,
-                "week_avg_projection_pct": 89.333
+                "projection_basis": "corrected-meter",
+                "projection_code": null,
+                "right_censored": false,
+                "week_avg_projection_pct": 88.667
               },
               "meta": {
                 "generated_at": "2026-04-18T20:00:00Z",
                 "tool_version": "forecast-v1"
               },
               "rates": {
-                "dollars_per_percent": 0.476119,
+                "dollars_per_percent": 0.479699,
                 "dollars_per_percent_source": "this_week",
                 "recent_24h_pct_per_hour": 1.038462,
-                "week_average_pct_per_hour": 0.531746
+                "week_average_pct_per_hour": 0.527778
               },
               "week": {
                 "elapsed_fraction": 0.75,
@@ -3078,17 +3152,39 @@
                 "start_at": "2026-04-13T14:00:00Z"
               }
             },
-            "recent_24h_projection_pct": 110.61538461538461,
+            "quota": {
+              "basis": "corrected-meter",
+              "calibrated_consumption_interval": null,
+              "calibrated_consumption_pct": null,
+              "calibrated_headroom_pct": null,
+              "calibration_code": "unavailable",
+              "calibration_code_presentation": {
+                "code": "unavailable",
+                "long": "no usable calibration could be read for this account",
+                "short": "unavailable"
+              },
+              "code": null,
+              "code_presentation": null,
+              "corrected_interval": {
+                "hi": 67.0,
+                "lo": 66.0
+              },
+              "observed_minus_modelled_pct": null,
+              "projection_pct": 88.66666666666667,
+              "rate_change": null,
+              "right_censored": false
+            },
+            "recent_24h_projection_pct": 110.11538461538461,
             "verdict": "cap",
-            "week_avg_projection_pct": 89.33333333333333
+            "week_avg_projection_pct": 88.66666666666667
           },
           "header": {
-            "dollar_per_pct": 0.4761194029850747,
+            "dollar_per_pct": 0.47969924812030085,
             "five_hour_pct": null,
-            "forecast_pct": 110.61538461538461,
+            "forecast_pct": 110.11538461538461,
             "forecast_verdict": "cap",
             "used_pct": 67.0,
-            "vs_last_week_delta": null,
+            "vs_last_week_delta": 0.039699248120300845,
             "week_label": "Apr 13\u2013Apr 20"
           },
           "total_tokens": 5662000,
@@ -5141,7 +5237,7 @@
             }
           ],
           "current_week": {
-            "dollar_per_pct": 0.4761194029850747,
+            "dollar_per_pct": 0.47969924812030085,
             "five_hour_block": null,
             "five_hour_pct": null,
             "five_hour_resets_in_sec": null,

@@ -10,12 +10,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from helpers.authoritative_runtime_budget import write_budget
+from tests import _estate_stub
 
 REPO = Path(__file__).resolve().parent.parent
 BIN = REPO / "bin"
@@ -119,6 +123,249 @@ def test_committed_manifest_parses(tmp_path):
     assert "OK" in r.stdout
 
 
+# ------------------------------------------- the loader's two remaining holes
+#
+# #650 items 2 and 3. Both are about a manifest the loader cannot read or must
+# not accept, and both were reachable while the run still failed closed — which
+# is why neither was caught by the exit-code matrix above. What was wrong was
+# the CAUSE the operator reads, not the verdict.
+
+
+def test_a_non_utf8_manifest_is_refused_with_a_named_cause(tmp_path):
+    """UnicodeDecodeError is a ValueError, not an OSError.
+
+    `open(path, encoding="utf-8").read()` inside `except OSError` therefore let
+    a non-UTF-8 manifest escape the handler: the run still failed closed, but
+    the operator read an empty cause beside a raw Python traceback.
+    """
+    m = tmp_path / "manifest.json"
+    m.write_bytes(b'{"schemaVersion": 1, "harnesses": [], "\xff\xfe": 2}')
+    r = _run_lib(
+        tmp_path,
+        f'contract_manifest_load "{m}"; '
+        'echo "$CONTRACT_CLASS $CONTRACT_LAST_CODE"; '
+        'contract_print_diagnostics',
+    )
+    assert "infrastructure manifest-unreadable" in r.stdout
+    assert "not UTF-8" in r.stderr, r.stderr
+    assert "Traceback" not in r.stderr, r.stderr
+
+
+def test_an_absent_manifest_reports_the_operating_system_cause(tmp_path):
+    """The manifest loader adopts contract_budget_load's cause reporting.
+
+    The budget loader already reported `unreadable:%s` with `exc.strerror`
+    while this one printed a bare `manifest-unreadable:` that named nothing, so
+    a missing file and an unreadable directory read identically.
+    """
+    r = _run_lib(
+        tmp_path,
+        f'contract_manifest_load "{tmp_path}/absent.json"; contract_print_diagnostics',
+    )
+    assert "manifest-unreadable" in r.stderr
+    assert "No such file or directory" in r.stderr, r.stderr
+
+
+# The harness-name grammar. Names are serialized into tab-and-newline separated
+# tables, consumed through shell word splitting, and counted by word splitting
+# in the tier partition, so whitespace and glob metacharacters are each unsafe
+# on a word-split path.
+GRAMMAR_REJECTS = [
+    ("whitespace", "alpha bravo"),
+    ("tab", "alpha\tbravo"),
+    ("glob-star", "alpha*"),
+    ("glob-question", "alph?"),
+    ("glob-class", "alpha[ab]"),
+    ("uppercase", "Alpha"),
+    ("underscore", "alpha_bravo"),
+    ("leading-dash", "-alpha"),
+    ("trailing-dash", "alpha-"),
+    ("double-dash", "alpha--bravo"),
+    ("dot", "alpha.bravo"),
+    ("slash", "alpha/bravo"),
+    ("newline", "alpha\nbravo"),
+]
+
+
+@pytest.mark.parametrize("label,name", GRAMMAR_REJECTS, ids=[c[0] for c in GRAMMAR_REJECTS])
+def test_a_harness_name_outside_the_grammar_is_refused(tmp_path, label, name):
+    obj = dict(MINIMAL)
+    obj["harnesses"] = [dict(MINIMAL["harnesses"][0], name=name)]
+    m = _manifest(tmp_path, obj)
+    r = _run_lib(
+        tmp_path,
+        f'contract_manifest_load "{m}"; echo "$CONTRACT_CLASS $CONTRACT_LAST_CODE"',
+    )
+    assert "infrastructure manifest-invalid-name" in r.stdout, r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("name", ["a", "alpha", "alpha-bravo", "five-hour-blocks", "s3", "a1-b2-c3"])
+def test_a_conforming_harness_name_is_accepted(tmp_path, name):
+    """The green control. A refusal that fired on everything would satisfy the
+    matrix above while refusing the committed manifest."""
+    obj = dict(MINIMAL)
+    obj["harnesses"] = [dict(MINIMAL["harnesses"][0], name=name)]
+    m = _manifest(tmp_path, obj)
+    r = _run_lib(tmp_path, f'contract_manifest_load "{m}" && echo OK')
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "OK" in r.stdout
+
+
+def test_every_committed_harness_name_conforms_to_the_grammar():
+    """Stated over the committed file directly, not only through the loader.
+
+    `test_committed_manifest_parses` would also redden if a committed name
+    stopped conforming, but it would redden for `manifest-invalid-name` with no
+    statement of which name or which rule — and this is the file a maintainer
+    edits.
+    """
+    doc = json.loads(
+        (REPO / "tests" / "authoritative-test-manifest.json").read_text(encoding="utf-8")
+    )
+    bad = [
+        row["name"] for row in doc["harnesses"]
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", row["name"])
+    ]
+    assert not bad, bad
+
+
+# ------------------------------------------ the tier partition's count backstop
+#
+# `bin/cctally-test-all` fails closed into the whole estate when its selected
+# and omitted lists are not an exact partition of the manifest. Once
+# contract_manifest_load enforces the name grammar above, NO manifest the loader
+# accepts can reach that branch: the manifest count counts LINES and the two
+# other counts count IFS-split WORDS, and the grammar is exactly what makes
+# those three agree for every accepted name.
+#
+# The branch stays, because it is the backstop for a future divergence and
+# because it fails closed into the full estate rather than refusing a run. It is
+# driven HERE through the pure helper the aggregator calls, with a name the
+# loader would now refuse, so the test is honest about why the branch is
+# otherwise unreachable rather than pretending a valid manifest reaches it.
+
+
+def _partition(tmp_path, names, selected, omitted):
+    r = _run_lib(
+        tmp_path,
+        "if contract_partition_counts_agree "
+        f"{shlex.quote(names)} {shlex.quote(selected)} {shlex.quote(omitted)}; "
+        'then echo "AGREE"; else echo "DISAGREE"; fi; '
+        'echo "$CONTRACT_PARTITION_MANIFEST_COUNT '
+        '$CONTRACT_PARTITION_SELECTED_COUNT $CONTRACT_PARTITION_OMITTED_COUNT"',
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    verdict, counts = r.stdout.split()[0], r.stdout.split()[1:]
+    return verdict, [int(c) for c in counts]
+
+
+def test_the_partition_helper_agrees_on_an_exact_partition(tmp_path):
+    verdict, counts = _partition(
+        tmp_path, "alpha\nbravo\ncharlie", "alpha bravo ", "charlie "
+    )
+    assert verdict == "AGREE"
+    assert counts == [3, 2, 1]
+
+
+def test_the_partition_helper_disagrees_on_a_word_split_name(tmp_path):
+    """The one input that reaches the aggregator's widen-to-the-whole-estate
+    backstop, and the reason it is driven through the helper rather than
+    through a manifest: `contract_manifest_load` now refuses this name."""
+    verdict, counts = _partition(tmp_path, "alpha bravo\ncharlie", "alpha bravo charlie ", "")
+    assert verdict == "DISAGREE"
+    assert counts == [2, 3, 0]
+
+
+def test_the_partition_helper_disagrees_on_a_dropped_name(tmp_path):
+    verdict, counts = _partition(tmp_path, "alpha\nbravo\ncharlie", "alpha ", "bravo ")
+    assert verdict == "DISAGREE"
+    assert counts == [3, 1, 1]
+
+
+def test_the_partition_helper_leaves_pathname_expansion_off(tmp_path):
+    """A `*` in a list must not expand against the working directory. The
+    aggregator disables globbing around its own walks for exactly this reason,
+    and a helper that re-enabled it would count whatever the scratch directory
+    happens to contain."""
+    (tmp_path / "decoy-one").write_text("x")
+    (tmp_path / "decoy-two").write_text("x")
+    verdict, counts = _partition(tmp_path, "decoy*", "decoy* ", "")
+    assert verdict == "AGREE"
+    assert counts == [1, 1, 0]
+
+
+def test_the_aggregator_calls_the_partition_helper():
+    """The seam is load-bearing only if the aggregator uses it.
+
+    Without this, the helper above could be a second, parallel spelling of the
+    arithmetic and the cases driving it would prove nothing about the branch
+    they claim to reach.
+    """
+    text = (BIN / "cctally-test-all").read_text(encoding="utf-8")
+    assert "contract_partition_counts_agree" in text
+
+
+# --------------------------------- contract_check_runtime_budget's two guards
+#
+# Both are correct defensive code that the shipped wiring cannot reach.
+# Eligibility at check time implies eligibility at admission, where a missing
+# budget already refused the run, and an eligible run that passed no cases at
+# all does not reach a green class. They are driven directly so that the
+# classification and the SUBJECT each guard reports are pinned: the two share a
+# reason code and are told apart only by the subject.
+
+_BUDGET_ELIGIBLE = {
+    "CCTALLY_AUTHORITATIVE_RUN": "1",
+    "CCTALLY_TEST_LOCAL": "",
+}
+
+_BUDGET_PRELUDE = (
+    "COVERAGE_MODE=full\n"
+    "CONTRACT_PROFILE=private\n"
+    "CONTRACT_CLASS=none\n"
+    "CONTRACT_PYTEST_UNPARSED=0\n"
+)
+
+
+def _budget_check(tmp_path, snippet):
+    r = _run_lib(
+        tmp_path,
+        _BUDGET_PRELUDE + snippet + "\n"
+        "contract_check_runtime_budget\n"
+        'printf "%s" "$CONTRACT_REASONS"',
+        env=_BUDGET_ELIGIBLE,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    rows = [ln.split("\t") for ln in r.stdout.splitlines() if ln.strip()]
+    return r, rows
+
+
+def test_an_unloaded_threshold_is_recorded_as_unavailable_not_satisfied(tmp_path):
+    r, rows = _budget_check(
+        tmp_path,
+        'CONTRACT_BUDGET_MAX=""\nCONTRACT_PASSED=10\nCONTRACT_PYTEST_PASSED=10',
+    )
+    assert rows == [["runtime-budget-unavailable", "budget", "threshold"]], r.stdout
+
+
+def test_a_run_that_passed_no_cases_is_recorded_as_unavailable(tmp_path):
+    r, rows = _budget_check(
+        tmp_path,
+        "CONTRACT_BUDGET_MAX=120\nCONTRACT_PASSED=0\nCONTRACT_PYTEST_PASSED=0",
+    )
+    assert rows == [["runtime-budget-unavailable", "budget", "denominator"]], r.stdout
+
+
+def test_the_two_guards_are_green_when_both_inputs_are_present(tmp_path):
+    """The control. A check that classified everything as unavailable would
+    satisfy both cases above."""
+    r, rows = _budget_check(
+        tmp_path,
+        "CONTRACT_BUDGET_MAX=1000000\nCONTRACT_PASSED=10\nCONTRACT_PYTEST_PASSED=10",
+    )
+    assert rows == [], r.stdout
+
+
 # --------------------------------------------------------------- scratch estate
 #
 # No capability-override environment seam exists on purpose: a bypass variable
@@ -149,6 +396,9 @@ def _estate(
     harness_sleep=None,
     budget=None,
     tier=False,
+    estate_report=None,
+    estate_exit=None,
+    estate_plan_exit=None,
 ):
     """A known-green scratch estate; each case mutates exactly one property."""
     repo = tmp_path / "estate"
@@ -170,6 +420,19 @@ def _estate(
     # maintainer-local, so naming it here would break the mirrored suite.
     for kernel in sorted(BIN.glob("_lib_test_*.py")):
         shutil.copy2(kernel, bindir / kernel.name)
+    # #648 D10. The class glob above acquires the estate checker automatically,
+    # and this estate records no artifact for it to compare against, so 56 cases
+    # here failed at admission on the fixture instead of on their own property.
+    # `estate_report` is how a case asks for a specific report instead of the
+    # clean one, which is what exercises the real contract mapping.
+    _estate_stub.install(bindir, report=estate_report, exit_code=estate_exit,
+                         plan_exit_code=estate_plan_exit)
+    # #648 D7. Both pytest legs load `-p tests._estate_leg_plugin`, so a scratch
+    # estate that omitted it would fail on a missing module. It is copied rather
+    # than made conditional on existing: a file-existence guard around the proof
+    # is exactly the shape D7 removed from the leg construction.
+    shutil.copy2(REPO / "tests" / "_estate_leg_plugin.py",
+                 testsdir / "_estate_leg_plugin.py")
 
     # bin/cctally-test-all keeps `reconcile` in final_harnesses as a summary
     # ordering device, so every estate must carry it or the pool runs a harness
@@ -262,32 +525,9 @@ def _estate(
         json.dumps(doc, indent=2) + "\n", encoding="utf-8"
     )
 
-    # #630 S7. A real estate carries a committed runtime budget, and an
-    # authoritative full run loads it at admission, so every estate carries one
-    # too. The DEFAULT maximum is deliberately enormous rather than the
-    # committed 120: a scratch estate passes about ten cases in a few seconds,
-    # which is a per-case cost three orders of magnitude worse than the real
-    # estate's, and a fixture that breached its own budget by construction
-    # would fail every unrelated authoritative case in this file. `budget` is
-    # a number to pin the maximum, a string to write the file verbatim, or
-    # False to omit it entirely.
-    if budget is not False:
-        if isinstance(budget, str):
-            budget_text = budget
-        else:
-            budget_text = json.dumps(
-                {
-                    "schemaVersion": 1,
-                    "metric": "secondsPerThousandCases",
-                    "maxSecondsPerThousandCases": (
-                        1000000 if budget is None else budget
-                    ),
-                },
-                indent=2,
-            ) + "\n"
-        (testsdir / "authoritative-runtime-budget.json").write_text(
-            budget_text, encoding="utf-8"
-        )
+    # #630 S7, one spelling since #650 item 5. `budget` is a number to pin the
+    # maximum, a string to write the file verbatim, or False to omit it.
+    write_budget(testsdir, budget)
 
     if tier:
         # #630 S7. The tier attributes its change set through
@@ -1845,6 +2085,435 @@ def test_both_budget_reasons_are_registered():
     assert "runtime-budget-unavailable" in codes, sorted(codes)
 
 
+# --- the estate check, driven end to end (#648 D6, D11, D12) ----------------
+#
+# The estate helper in these scratch trees is a stub (tests/_estate_stub.py):
+# a scratch estate records no committed artifact, so the comparison itself has
+# nothing to compare. Everything downstream of the report is real -- the
+# aggregator's mode predicate, `contract_admit_estate`, the reason-code
+# mapping, the failure class and the exit code.
+
+
+def test_a_full_run_runs_the_estate_check(tmp_path):
+    """#648 D12 -- a full run is citable, so it checks."""
+    est = _estate(tmp_path)
+    r = _drive(est)
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = _estate_stub.invocations(est)
+    assert any("--check" in call for call in calls), calls
+
+
+def test_a_harness_subset_does_not_run_the_estate_check(tmp_path):
+    """#648 D12 -- POSITIVE evidence, through the stub's own invocation log.
+
+    A subset already records `deliberate-subset` and exits 3 whatever happens,
+    so the complete check adds no protection there and would slow the targeted
+    loop this repository runs constantly. Asserted on a file that must not
+    exist rather than on the absence of a diagnostic, because a diagnostic can
+    be absent for reasons that have nothing to do with the check running.
+    """
+    est = _estate(tmp_path, harnesses=["alpha"])
+    r = _drive(est, args=("--harness", "alpha"))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert _codes(r) == {"deliberate-subset"}, _outcome(r)
+    assert _estate_stub.invocations(est) == []
+
+
+def test_a_harness_subset_runs_the_estate_check_under_the_opt_in(tmp_path):
+    est = _estate(tmp_path, harnesses=["alpha"])
+    r = _drive(est, args=("--harness", "alpha", "--with-estate-check"))
+    assert r.returncode == 3, r.stdout + r.stderr
+    calls = _estate_stub.invocations(est)
+    assert any("--check" in call for call in calls), calls
+
+
+def test_the_opt_in_flag_is_refused_without_a_harness(tmp_path):
+    """It would change nothing on any other mode, so accepting it would accept
+    a word the caller meant as a request."""
+    est = _estate(tmp_path)
+    r = _drive(est, args=("--with-estate-check",))
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "requires at least one --harness" in r.stderr
+
+
+def test_plan_mode_runs_no_estate_check(tmp_path):
+    """Plan mode exits before admission, so it can yield no estate verdict.
+
+    Driven without `_drive`, which pins `CCTALLY_TEST_ALL_OUTCOME_FILE`; the
+    aggregator refuses that variable in plan mode, because a plan is never an
+    authoritative outcome.
+    """
+    est = _estate(tmp_path)
+    r = subprocess.run(
+        [str(est / "bin" / "cctally-test-all")],
+        env={"PATH": os.environ["PATH"], "CCTALLY_TEST_ALL_PLAN": "1",
+             "CCTALLY_TEST_JOBS": "1"},
+        capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _estate_stub.invocations(est) == []
+
+
+@pytest.mark.parametrize(
+    "direction,axis,code",
+    [
+        ("missing", "pytestNodes", "manifest-missing-pytest-node"),
+        ("unexpected", "pytestNodes", "manifest-unexpected-pytest-node"),
+        ("missing", "frontendTests", "manifest-missing-frontend-test"),
+        ("unexpected", "frontendTests", "manifest-unexpected-frontend-test"),
+        ("missing", "suppressions", "manifest-missing-suppression"),
+        ("unexpected", "suppressions", "manifest-unexpected-suppression"),
+    ],
+)
+def test_each_axis_reports_its_own_directional_code(tmp_path, direction, axis,
+                                                    code):
+    """#648 D5, acceptance criteria 3 to 5 -- six codes, not one generic one."""
+    est = _estate(
+        tmp_path,
+        estate_report=_estate_stub.drift_report(direction, axis, "row-under-test"),
+    )
+    r = _drive(est)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert code in _codes(r), _outcome(r)
+    assert _outcome(r)["failureClass"] == "infrastructure"
+
+
+@pytest.mark.parametrize(
+    "tag,code",
+    [
+        ("artifact-unreadable", "estate-artifact-unreadable"),
+        ("discovery-failed", "estate-discovery-failed"),
+        ("partition-invalid", "estate-partition-invalid"),
+    ],
+)
+def test_each_inability_reports_its_own_code(tmp_path, tag, code):
+    """#648 acceptance criterion 6 -- never a generic one."""
+    est = _estate(
+        tmp_path, estate_report=_estate_stub.inability_report(tag, "the reason"),
+    )
+    r = _drive(est)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert code in _codes(r), _outcome(r)
+
+
+def test_an_unauthorized_transition_reports_its_own_code(tmp_path):
+    """#648 acceptance criteria 7 to 9."""
+    est = _estate(
+        tmp_path,
+        estate_report=_estate_stub.unauthorized_report(
+            "pytestNodes", "tests/test_a.py::test_gone"),
+    )
+    r = _drive(est)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "estate-shrink-unauthorized" in _codes(r), _outcome(r)
+    assert "tests/test_a.py::test_gone" in r.stderr
+
+
+def test_an_inability_is_recorded_incomplete_on_a_non_authoritative_run(tmp_path):
+    """#648 D12 -- a non-authoritative run records it and can never be green.
+
+    It does NOT abort: the run continues and every harness still executes, so
+    the operator gets the results alongside the reason the run is uncitable.
+    Proven by the harness sentinel rather than by the exit code, which an abort
+    would produce identically.
+    """
+    sentinels = tmp_path / "sentinels"
+    sentinels.mkdir()
+    est = _estate(
+        tmp_path, sentinel=True,
+        estate_report=_estate_stub.inability_report(
+            "discovery-failed", "vitest is not installed"),
+    )
+    r = _drive(est, env={"SENTINEL_DIR": str(sentinels)})
+    assert r.returncode == 3, r.stdout + r.stderr
+    out = _outcome(r)
+    assert out["failureClass"] == "incomplete", out
+    assert "estate-discovery-failed" in _codes(r), out
+    assert (sentinels / "alpha.ran").exists(), sorted(sentinels.iterdir())
+
+
+def test_drift_aborts_even_on_a_non_authoritative_run(tmp_path):
+    """#648 D12 -- "proven drift aborts" in every mode, authoritative or not.
+
+    Drift is a fact about the tree, not about how much this run claims, so it
+    is fatal wherever the check runs. Only INABILITY is graded by
+    authoritativeness.
+    """
+    sentinels = tmp_path / "sentinels"
+    sentinels.mkdir()
+    est = _estate(
+        tmp_path, sentinel=True,
+        estate_report=_estate_stub.drift_report(
+            "missing", "pytestNodes", "tests/test_a.py::test_gone"),
+    )
+    r = _drive(est, env={"SENTINEL_DIR": str(sentinels)})
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert not (sentinels / "alpha.ran").exists(), sorted(sentinels.iterdir())
+
+
+def test_a_truncated_report_is_an_inability_and_not_an_agreement(tmp_path):
+    """FAIL CLOSED on the terminator.
+
+    A checker killed halfway prints a well-formed prefix and no `end` line. A
+    reader that judged only on the records it had seen would read that as
+    agreement, which is the one reading this whole mechanism cannot afford.
+    """
+    est = _estate(
+        tmp_path,
+        estate_report="version\t1\nprofile\tpublic\n",
+        estate_exit=0,
+    )
+    r = _drive(est)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "estate-discovery-failed" in _codes(r), _outcome(r)
+
+
+def test_a_checker_that_cannot_run_at_all_is_an_inability(tmp_path):
+    est = _estate(tmp_path, estate_report="", estate_exit=3)
+    r = _drive(est)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "estate-discovery-failed" in _codes(r), _outcome(r)
+
+
+def test_a_report_terminated_problems_that_names_none_is_an_inability(tmp_path):
+    """FAIL CLOSED on the terminator's PAYLOAD, not merely on its presence.
+
+    The reader matched `end` and never read the field beside it, so a report
+    that says `problems` while carrying no record this shell recognises was
+    read as agreement. Nothing produces that today, because `render_report`
+    writes `end problems` only alongside a recognised problem record. A future
+    record kind would produce exactly it, and the failure would be silent and
+    green -- which is the one reading this mechanism cannot afford.
+    """
+    est = _estate(
+        tmp_path,
+        estate_report="version\t1\nprofile\tpublic\nnote\tsomething\nend\tproblems\n",
+    )
+    r = _drive(est)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "estate-discovery-failed" in _codes(r), _outcome(r)
+
+
+def test_a_record_kind_this_contract_does_not_recognise_is_an_inability(tmp_path):
+    """The `case` had no default arm, so an unknown record kind was DROPPED.
+
+    An unrecognised inability tag already lands in that arm's `*)` and is
+    treated as an inability; the record kind one level above it had no such
+    arm at all. A future problem record would therefore be discarded and the
+    run would end green on a report that named a problem.
+    """
+    est = _estate(
+        tmp_path,
+        estate_report=(
+            "version\t1\nprofile\tpublic\n"
+            "future-problem\tpytestNodes\ta-row\n"
+            "end\tok\n"
+        ),
+    )
+    r = _drive(est)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "estate-discovery-failed" in _codes(r), _outcome(r)
+
+
+def _declare_one_leg(est, nodes):
+    """Re-install the stub so the plan declares exactly these node identifiers."""
+    _estate_stub.install(
+        est / "bin",
+        legs=[{"name": "pytest", "selectors": [], "nodes": list(nodes)}],
+    )
+
+
+def test_a_leg_that_collected_less_than_it_declared_fails_the_run(tmp_path):
+    """#648 D7, acceptance criterion 18 -- what pytest ASKED for is not enough.
+
+    Deriving argv from the declaration proves what pytest was asked to collect.
+    It cannot prove what pytest DID collect, and M13 measured the gap: a
+    narrowing that reaches the leg leaves admission observing the complete
+    estate and the run exiting 0. The narrowing here is a conftest hook rather
+    than `PYTEST_ADDOPTS`, because the sanitizer now removes that variable
+    before the leg starts -- so the environment route can no longer produce the
+    condition, and the proof needs a route that still can.
+    """
+    est = _estate(tmp_path)
+    (est / "tests" / "test_narrowed.py").write_text(
+        "def test_narrowed():\n    assert True\n", encoding="utf-8")
+    (est / "tests" / "conftest.py").write_text(
+        "def pytest_collection_modifyitems(config, items):\n"
+        "    items[:] = [i for i in items if 'test_narrowed' not in i.nodeid]\n",
+        encoding="utf-8")
+    _declare_one_leg(est, ["tests/test_scratch_smoke.py::test_ok",
+                           "tests/test_narrowed.py::test_narrowed"])
+    r = _drive(est)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "manifest-missing-pytest-node" in _codes(r), _outcome(r)
+    assert "tests/test_narrowed.py::test_narrowed" in r.stderr
+
+
+def test_a_leg_that_collected_its_whole_declared_share_passes(tmp_path):
+    """The control arm. Without it the case above would pass on a comparison
+    that failed for every run, which is not a comparison at all."""
+    est = _estate(tmp_path)
+    (est / "tests" / "test_narrowed.py").write_text(
+        "def test_narrowed():\n    assert True\n", encoding="utf-8")
+    _declare_one_leg(est, ["tests/test_scratch_smoke.py::test_ok",
+                           "tests/test_narrowed.py::test_narrowed"])
+    r = _drive(est)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_a_leg_with_no_observed_record_at_all_fails_closed(tmp_path):
+    """A comparison whose observed half is missing is a comparison that did not
+    happen, and it must never read as agreement."""
+    est = _estate(tmp_path)
+    _declare_one_leg(est, ["tests/test_scratch_smoke.py::test_ok"])
+    (est / "tests" / "_estate_leg_plugin.py").write_text(
+        "# the plugin this tree carries records nothing\n", encoding="utf-8")
+    r = _drive(est)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "manifest-missing-pytest-node" in _codes(r), _outcome(r)
+
+
+def test_an_unexpandable_execution_declaration_fails_admission(tmp_path):
+    """#648 acceptance criterion 17 -- a missing target is an admission failure.
+
+    The retired shell literals were wrapped in `[ -f ... ]` guards, so a
+    benchmark file that vanished produced a run that silently omitted the serial
+    leg and still exited 0. The declaration is validated at admission instead,
+    and a selector matching nothing refuses the run before anything launches.
+    """
+    est = _estate(tmp_path, estate_plan_exit=3)
+    r = _drive(est)
+    assert r.returncode == 3, r.stdout + r.stderr
+    out = _outcome(r)
+    assert "estate-partition-invalid" in _codes(r), out
+    assert {x["subject"] for x in out["reasons"]
+            if x["code"] == "estate-partition-invalid"} == {"pytestExecution"}, out
+    assert "does not expand against the recorded estate" in r.stderr
+
+
+def test_a_subset_with_pytest_still_validates_the_execution_declaration(tmp_path):
+    """The complete check is exempt on a subset (D12); the declaration is not.
+
+    The legs are built from it on every path that RUNS them, so a declaration
+    that no longer expands must refuse on every such path. Proven by driving
+    the exemption and the requirement in one run: no `--check` invocation, and
+    an admission refusal anyway.
+    """
+    est = _estate(tmp_path, harnesses=["alpha"], estate_plan_exit=3)
+    r = _drive(est, args=("--harness", "alpha", "--with-pytest"))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "estate-partition-invalid" in _codes(r), _outcome(r)
+    calls = _estate_stub.invocations(est)
+    assert not any("--check" in call for call in calls), calls
+
+
+def test_a_subset_without_pytest_validates_no_execution_declaration(tmp_path):
+    """Nothing runs the legs, so nothing needs them to expand."""
+    est = _estate(tmp_path, harnesses=["alpha"], estate_plan_exit=3)
+    r = _drive(est, args=("--harness", "alpha"))
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert _codes(r) == {"deliberate-subset"}, _outcome(r)
+
+
+def test_the_estate_check_is_required_in_every_citable_mode(tmp_path):
+    """#648 D12 -- the run-mode contract, stated rather than inherited.
+
+    Every mode that can produce a green or citable result runs the complete
+    structural check: a full run, `--tier-fast`, and the Linux matrix profile.
+    The Linux profile cannot be driven end to end from a macOS runner, because
+    a non-plan `CCTALLY_LINUX_MATRIX_RUN` refuses on `uname -s`, so the mode
+    rule lives in a predicate that can be exercised directly instead of being
+    an inline condition only one platform can reach.
+    """
+    for mode in ("full", "tier-fast", "linux-matrix"):
+        r = _run_lib(
+            tmp_path,
+            f'if contract_estate_check_required {mode} 0; then echo YES; '
+            f'else echo NO; fi',
+        )
+        assert r.stdout.strip() == "YES", (mode, r.stdout, r.stderr)
+
+
+def test_a_harness_subset_runs_the_estate_check_only_on_the_opt_in(tmp_path):
+    """#648 D12 -- a subset is already unconditionally uncitable.
+
+    `--harness` records `deliberate-subset` and exits 3 whatever happens, so
+    the complete check adds no protection against a green result there and
+    would materially slow the targeted loop this repository runs constantly. It
+    is available as an explicit diagnostic instead.
+    """
+    off = _run_lib(
+        tmp_path,
+        'if contract_estate_check_required subset 0; then echo YES; else echo NO; fi',
+    )
+    assert off.stdout.strip() == "NO", off.stdout + off.stderr
+    on = _run_lib(
+        tmp_path,
+        'if contract_estate_check_required subset 1; then echo YES; else echo NO; fi',
+    )
+    assert on.stdout.strip() == "YES", on.stdout + on.stderr
+
+
+def test_an_unknown_coverage_mode_still_requires_the_estate_check(tmp_path):
+    """Fail closed on the mode axis too.
+
+    A mode added later and not taught to this predicate must inherit the
+    checking behaviour, never the exemption: the exemption is the thing that
+    has to be argued for, and `subset` is the only mode that has argued for it.
+    """
+    r = _run_lib(
+        tmp_path,
+        'if contract_estate_check_required something-new 0; then echo YES; '
+        'else echo NO; fi',
+    )
+    assert r.stdout.strip() == "YES", r.stdout + r.stderr
+
+
+def test_every_estate_reason_code_is_registered():
+    """#648 D5 -- ten codes, and every literal lives in the contract shell.
+
+    Six directional codes, one pair per axis, plus four inability and
+    authorization codes. The emission sites are bare string literals in shell,
+    so nothing catches a typo; registration is the only check there is.
+    """
+    codes = _registry()
+    expected = {
+        "estate-artifact-unreadable",
+        "estate-discovery-failed",
+        "estate-partition-invalid",
+        "estate-shrink-unauthorized",
+        "manifest-missing-frontend-test",
+        "manifest-missing-pytest-node",
+        "manifest-missing-suppression",
+        "manifest-unexpected-frontend-test",
+        "manifest-unexpected-pytest-node",
+        "manifest-unexpected-suppression",
+    }
+    assert expected <= codes, sorted(expected - codes)
+
+
+def test_the_estate_codes_are_emitted_from_the_contract_shell_alone():
+    """#648 D5 -- `_CODE_SOURCES` is not widened, so every literal is here.
+
+    The helper returns TAGS and the shell maps them, which is what keeps the
+    registration scan able to see all ten at their single emission site. A code
+    emitted from the Python helper instead would be invisible to the scan and
+    would fail the dead-code direction of the registration test.
+    """
+    import re
+
+    text = (BIN / "_lib-test-contract.sh").read_text(encoding="utf-8")
+    emitted = set(re.findall(r"contract_fail\s+\w+\s+([a-z][a-z0-9-]+)", text))
+    for code in (
+        "estate-artifact-unreadable", "estate-discovery-failed",
+        "estate-partition-invalid", "estate-shrink-unauthorized",
+        "manifest-missing-frontend-test", "manifest-missing-pytest-node",
+        "manifest-missing-suppression", "manifest-unexpected-frontend-test",
+        "manifest-unexpected-pytest-node", "manifest-unexpected-suppression",
+    ):
+        assert code in emitted, code
+
+
 # --- the carrier's phase set is CLOSED (#630 S7) ----------------------------
 #
 # bin/cctally-test-remote reads the aggregator's record through
@@ -1978,13 +2647,27 @@ def test_the_committed_case_floors_sum_above_a_hard_coded_bound():
 
 def test_only_a_variable_row_carries_a_count_axis():
     """`countPolicy` / `countAxis` are advisory to the reader, but a `variable`
-    row that names no axis records no evidence for its own claim. `alerts` is
-    currently the only variable row, asserted by name so a future one cannot be
-    added without a deliberate edit here."""
+    row that names no axis records no evidence for its own claim. The variable
+    rows are asserted BY NAME, so a future one cannot be added without a
+    deliberate edit here.
+
+    `alerts` varies on the platform, because several of its cases need macOS
+    `osascript`. `preflight` varies on whether the host has a bash 3.x
+    interpreter (#641): two of its cases parse a fixture against the declared
+    bash 3.2 floor, and a Linux container legitimately has none, so they state a
+    skip rather than passing silently. It prints 58 cases where one exists and
+    56 where none does, and `minCases` is the 56 that holds on every lane. A
+    single floor cannot protect the bash-3 axis, because a macOS run that
+    silently stopped executing both gated cases would report 56 and still clear
+    it; the harness asserts its own exact tally per axis for that reason
+    (#655)."""
     rows = _committed_manifest()["harnesses"]
     variable = {r["name"]: r.get("countAxis") for r in rows
                 if r.get("countPolicy") == "variable"}
-    assert variable == {"alerts": "uname-s"}, variable
+    assert variable == {
+        "alerts": "uname-s",
+        "preflight": "bash3-availability",
+    }, variable
     for row in rows:
         if row.get("countPolicy") != "variable":
             assert row.get("countPolicy") == "fixed", row
@@ -2036,7 +2719,6 @@ _EMISSION_PATTERNS = (
 _CODE_SOURCES = (
     "bin/_lib-test-contract.sh",
     "bin/cctally-test-all",
-    "bin/cctally-test-remote",
     # Plus every kernel the aggregator and the wrapper delegate to, matched as
     # a CLASS rather than listed one at a time (#529 S2, spec section 7).
     # Neither #529 S2 kernel emits a reason code today, so this has no live
@@ -2046,6 +2728,8 @@ _CODE_SOURCES = (
 ) + tuple(
     sorted(f"bin/{path.name}" for path in BIN.glob("_lib_test_*.py"))
 )
+if (REPO / "bin" / "cctally-test-remote").exists():
+    _CODE_SOURCES += ("bin/cctally-test-remote",)
 
 
 def _registry():
@@ -2952,6 +3636,45 @@ def test_a_green_tier_run_is_class_none_at_exit_zero(tmp_path):
     # Preserve-item 19. The tier is a NEW named mode, never a relaxation of the
     # subset's uncitable classification.
     assert "deliberate-subset" not in _codes(r), out
+
+
+def test_a_tier_run_runs_the_estate_check(tmp_path):
+    """#648 D12 -- `--tier-fast` carries its own gate identity and is citable,
+    so it runs the complete check like a full run does."""
+    est = _tier_estate(tmp_path)
+    _tier_touch(est, "alpha")
+    r = _drive(est, args=("--tier-fast", "HEAD"),
+               env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = _estate_stub.invocations(est)
+    assert any("--check" in call for call in calls), calls
+
+
+def test_an_estate_inability_aborts_an_authoritative_run(tmp_path):
+    """#648 D12 -- an authoritative run refuses to START rather than verify
+    less than it claims.
+
+    The mirror image of the non-authoritative case: there the run continues and
+    is recorded incomplete, here nothing executes at all. Proven by the harness
+    sentinel, because both dispositions exit 3 and the exit code alone cannot
+    tell them apart.
+    """
+    sentinels = tmp_path / "sentinels"
+    sentinels.mkdir()
+    est = _tier_estate(
+        tmp_path, sentinel=True,
+        estate_report=_estate_stub.inability_report(
+            "discovery-failed", "the e2e fixture runtime could not be built"),
+    )
+    _tier_touch(est, "alpha")
+    r = _drive(est, args=("--tier-fast", "HEAD"),
+               env={"CCTALLY_AUTHORITATIVE_RUN": "1",
+                    "SENTINEL_DIR": str(sentinels)})
+    assert r.returncode == 3, r.stdout + r.stderr
+    out = _outcome(r)
+    assert out["failureClass"] == "infrastructure", out
+    assert "estate-discovery-failed" in _codes(r), out
+    assert not list(sentinels.iterdir()), sorted(sentinels.iterdir())
 
 
 def test_a_green_tier_verdict_names_the_mode_and_the_omitted_count(tmp_path):

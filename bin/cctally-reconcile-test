@@ -13,6 +13,19 @@
 #
 # Failure format: RECONCILE FAIL <invariant> <fixture>: <diagnostic>
 # Exits 0 on all-pass, non-zero on any failure.
+#
+# HEREDOC SHAPE (#641). Every `$( … python3 - <<'DELIM' … )` site in this file
+# closes its command substitution on a line AFTER the heredoc terminator, never
+# on the opening line. The redirection stays on the opening line, attached to
+# the same command, so the substitution captures the same text and leaves the
+# same `$?`; only the closing delimiter is placed differently. That is not a
+# style choice. bash 3.2 — the shell floor this repository declares, and
+# `/bin/bash` on macOS — scans a command substitution by counting characters
+# rather than by parsing it, and a heredoc boundary does not stop that scan, so
+# the opening-line form is a hard syntax error there. bash 5 parses the region
+# properly but still warns `command substitution: 1 unterminated here-document`
+# on stderr while exiting 0, which is how eleven of these sat here unreported.
+# `bin/cctally-preflight`'s check 2 now fails on both signals.
 
 set -uo pipefail
 
@@ -289,7 +302,7 @@ cache_report_snapshot_invariants () {
         result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" \
                  HOME="$fixture_home" TZ=Etc/UTC AS_OF="$AS_OF" \
                  FIXTURE_LABEL="$fixture" \
-                 python3 - <<'PYCR' 2>&1)
+                 python3 - <<'PYCR' 2>&1
 import importlib.util, os, pathlib, sys, types, datetime as dt
 from importlib.machinery import SourceFileLoader
 
@@ -381,6 +394,7 @@ assert r_cr4 < 1e-9, (
 
 print("OK")
 PYCR
+)
         rc_py=$?
         if [ $rc_py -ne 0 ]; then
             echo "RECONCILE FAIL $name $fixture: $result"
@@ -433,7 +447,7 @@ cache_report_display_tz_invariant () {
              HOME="$fixture_home" TZ=Asia/Tokyo \
              AS_OF="2026-04-15T23:30:00Z" \
              FIXTURE_LABEL="$fixture" \
-             python3 - <<'PYCR5' 2>&1)
+             python3 - <<'PYCR5' 2>&1
 import os, pathlib, sys, types, datetime as dt
 
 repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
@@ -506,6 +520,7 @@ assert snap.today.date not in {r.date for r in snap.days if r.observed}, (
 
 print("OK")
 PYCR5
+)
     rc_py=$?
     if [ $rc_py -ne 0 ]; then
         echo "RECONCILE FAIL $name $fixture: $result"
@@ -1246,7 +1261,7 @@ PYSEED
     local rc_py result
     result=$(HOME="$home" TZ=Asia/Jerusalem NO_COLOR=1 \
              RECONCILE_BIN="$BIN" RECONCILE_HOME="$home" \
-             python3 - <<'PYCHECK' 2>&1); rc_py=$?
+             python3 - <<'PYCHECK' 2>&1
 import json
 import os
 import subprocess
@@ -1334,6 +1349,7 @@ if not hit:
 
 print("OK")
 PYCHECK
+); rc_py=$?
 
     rm -rf "$home"
     if [ $rc_py -ne 0 ]; then
@@ -1473,7 +1489,7 @@ sch1_milestone_alerted_at_columns () {
     fi
 
     local rc_py result
-    result=$(SCH1_HOME="$home" python3 - <<'PYCHECK' 2>&1); rc_py=$?
+    result=$(SCH1_HOME="$home" python3 - <<'PYCHECK' 2>&1
 import os
 import pathlib
 import sqlite3
@@ -1496,6 +1512,7 @@ finally:
     conn.close()
 print("OK")
 PYCHECK
+); rc_py=$?
 
     rm -rf "$home"
     if [ $rc_py -ne 0 ]; then
@@ -1547,7 +1564,7 @@ a1_a2_alerts_envelope () {
     fi
 
     local rc_py result
-    result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" A1A2_HOME="$home" python3 - <<'PYCHECK' 2>&1); rc_py=$?
+    result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" A1A2_HOME="$home" python3 - <<'PYCHECK' 2>&1
 import importlib.util
 import os
 import pathlib
@@ -1757,6 +1774,7 @@ finally:
 
 print("OK")
 PYCHECK
+); rc_py=$?
 
     rm -rf "$home"
     if [ $rc_py -ne 0 ]; then
@@ -1789,7 +1807,7 @@ credit_invariants () {
     local name="credit_invariants"
     local home; home="$(mktemp -d -t cctally-reconcile-credit.XXXXXX)"
     local result rc_py
-    result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$home" TZ=Etc/UTC python3 - <<'PYCRED' 2>&1)
+    result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$home" TZ=Etc/UTC python3 - <<'PYCRED' 2>&1
 import importlib.util, os, pathlib, sys
 from importlib.machinery import SourceFileLoader
 
@@ -1914,6 +1932,7 @@ try:
 finally:
     conn.close()
 PYCRED
+)
     rc_py=$?
     rm -rf "$home"
     if [ $rc_py -ne 0 ]; then
@@ -1955,7 +1974,7 @@ five_hour_credit_invariants () {
     local name="five_hour_credit_invariants"
     local home; home="$(mktemp -d -t cctally-reconcile-5hcredit.XXXXXX)"
     local result rc_py
-    result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$home" TZ=Etc/UTC python3 - <<'PY5HC' 2>&1)
+    result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$home" TZ=Etc/UTC python3 - <<'PY5HC' 2>&1
 import importlib.util, os, pathlib, sys
 from importlib.machinery import SourceFileLoader
 
@@ -2059,6 +2078,7 @@ try:
 finally:
     conn.close()
 PY5HC
+)
     rc_py=$?
     rm -rf "$home"
     if [ $rc_py -ne 0 ]; then
@@ -2131,7 +2151,7 @@ five_hour_credit_invariants
 projects_envelope_invariants () {
     local name="projects_envelope_invariants"
     local result rc_py
-    result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" TZ=Etc/UTC python3 - <<'PYPROJ' 2>&1)
+    result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" TZ=Etc/UTC python3 - <<'PYPROJ' 2>&1
 import importlib.util, os, pathlib, sqlite3, sys, types
 from importlib.machinery import SourceFileLoader
 
@@ -2372,6 +2392,7 @@ for label, fixture in (
 
 print("OK")
 PYPROJ
+)
     rc_py=$?
     if [ $rc_py -ne 0 ]; then
         echo "RECONCILE FAIL $name: $result"
@@ -3007,7 +3028,7 @@ done
 #      week-average numbers were the same by construction with no distinct
 #      high-end to mis-bind to — these fixtures supply that distinct high end.)
 
-# ── Weekly_pct leg: forecast --json week_avg_projection_pct ↔ detector ──
+# ── PROJECTED1-a (equality): forecast --json week_avg ↔ detector ──
 PROJECTED1_WEEKLY_PY='
 import json, os, sys, importlib.util
 from importlib.machinery import SourceFileLoader
@@ -3041,10 +3062,31 @@ assert abs(emitted - round(detector_value, 3)) < 1e-9, (
 )
 
 # Independent cross-check from forecast --json'\''s OWN published rates/window
-# (a path that does not touch the detector): p_now + r_avg*remaining. The
-# published rate is rounded to 6 dp, so this is a coarse sanity bound (not the
-# 1e-9 contract above), guarding against a grossly wrong formula.
-p_now = fc["current"]["weekly_percent"]
+# (a path that does not touch the detector): p_corrected + r_avg*remaining.
+# The published rate is rounded to 6 dp, so this is a coarse sanity bound (not
+# the 1e-9 contract above), guarding against a grossly wrong formula.
+#
+# #661 S2 spec section 3.1: the operand is the CEILING-CORRECTED reading the
+# kernel projects from, published beside the raw one. Re-deriving from
+# `weekly_percent` would compare the emitted value against a projection from
+# an operand the kernel never used, and miss by exactly half a point.
+# The twin of the b-leg'"'"'s guard (#661 S2 spec section 3.3). The equality
+# above binds two numbers; without this the leg would still pass if a
+# calibration reached this fixture and the forecast moved to the model basis,
+# because the detector would then abstain and the assertion would fail
+# confusingly rather than naming the cause. Assert the basis, then reconcile.
+basis = fc["forecast"]["projection_basis"]
+calibration_cause = fc["forecast"]["calibration_code"]
+assert basis == "corrected-meter", (
+    f"PROJECTED1-a: the forecast is on basis {basis!r} rather than the "
+    f"corrected meter, so the cross-check below re-derives from an operand "
+    f"the kernel did not use (calibration cause: {calibration_cause!r})"
+)
+p_now = fc["current"]["weekly_percent_corrected"]
+assert p_now is not None, (
+    "PROJECTED1 weekly: the fixture is right-censored, so there is no "
+    "projection to reconcile"
+)
 r_avg = fc["rates"]["week_average_pct_per_hour"]
 remaining_h = fc["week"]["remaining_hours"]
 rederived = p_now + r_avg * remaining_h
@@ -3069,7 +3111,7 @@ if [ -f "$fc_home/input.env" ]; then
     fc_json=$(HOME="$fc_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
         "$BIN" forecast --json 2>/dev/null); rc_f=$?
     if [ $rc_f -ne 0 ]; then
-        echo "RECONCILE FAIL projected_alert_eq_displayed_week_avg forecast/projected-cap: forecast --json rc=$rc_f"
+        echo "RECONCILE FAIL projected1a_alert_eq_displayed_week_avg forecast/projected-cap: forecast --json rc=$rc_f"
         fail_count=$((fail_count + 1))
     else
         result=$(RECONCILE_A="$fc_json" \
@@ -3078,15 +3120,93 @@ if [ -f "$fc_home/input.env" ]; then
             CCTALLY_DISABLE_DEV_AUTODETECT=1 \
             python3 -c "$PROJECTED1_WEEKLY_PY" 2>&1); rc_py=$?
         if [ $rc_py -ne 0 ]; then
-            echo "RECONCILE FAIL projected_alert_eq_displayed_week_avg forecast/projected-cap: $result"
+            echo "RECONCILE FAIL projected1a_alert_eq_displayed_week_avg forecast/projected-cap: $result"
             fail_count=$((fail_count + 1))
         else
-            echo "PASS projected_alert_eq_displayed_week_avg forecast/projected-cap"
+            echo "PASS projected1a_alert_eq_displayed_week_avg forecast/projected-cap"
             pass_count=$((pass_count + 1))
         fi
     fi
 else
-    echo "RECONCILE FAIL projected_alert_eq_displayed_week_avg forecast/projected-cap: fixture missing"
+    echo "RECONCILE FAIL projected1a_alert_eq_displayed_week_avg forecast/projected-cap: fixture missing"
+    fail_count=$((fail_count + 1))
+fi
+
+# ── PROJECTED1-b (abstention): the twin must not fire on the other basis ──
+#
+# #661 S2 spec section 3.3. `_weekly_pct_week_avg_projection` is snapshot-only
+# and the CALIBRATED basis needs the current week'"'"'s weighted units, so the
+# two consumers cannot always reach the same basis. A single equality
+# invariant would then be satisfiable only by testing the meter branch, which
+# is the opposite of what PROJECTED1 exists for. This leg asserts the twin
+# ABSTAINED, not that it matched — and guards its own non-vacuity by
+# requiring the forecast to be on the calibrated basis, because if the
+# forecast were also on the meter the abstention would pass for the wrong
+# reason.
+#
+# The scenario HOME is a COPY carrying a calibration written from the
+# fixture'"'"'s own current-week composition, so the support test passes by
+# construction rather than by a hand-guessed centre.
+PROJECTED1B_PY='
+import json, os, sys, datetime as dt, importlib.util
+from importlib.machinery import SourceFileLoader
+
+bin_dir = os.environ["PROJECTED_BIN_DIR"]
+sys.path.insert(0, bin_dir)
+loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
+spec = importlib.util.spec_from_loader("cctally", loader)
+c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
+loader.exec_module(c)
+import _lib_forecast as fc
+import _lib_quota_model as qm
+
+conn = c.open_db()
+now = c._command_as_of()
+inputs = c._load_forecast_inputs(conn, now, skip_sync=True)
+assert inputs is not None, "PROJECTED1-b: no current-week snapshot"
+
+selection = fc.select_projection_basis(inputs)
+assert selection.basis is fc.ProjectionBasis.CALIBRATED, (
+    "PROJECTED1-b VACUOUS: the forecast is on basis "
+    f"{selection.basis.value!r} rather than the calibrated one, so an "
+    f"abstention assertion would pass for the wrong reason "
+    f"(cause: {inputs.calibrated_withheld_code!r})"
+)
+assert c._weekly_pct_week_avg_projection(conn, now) is None, (
+    "PROJECTED1-b: the snapshot-only twin returned a projection while the "
+    "forecast published a calibrated one; it must abstain rather than fire "
+    "on the corrected meter"
+)
+'
+
+p1b_home="$SCRATCH_DIR/projected1b-home"
+rm -rf "$p1b_home"
+if [ -d "$fc_home" ] && cp -Rp "$fc_home" "$p1b_home" 2>/dev/null; then
+    AS_OF=""
+    # shellcheck disable=SC1091
+    . "$fc_home/input.env"
+    seeded=$(PROJECTED_BIN_DIR="$REPO_ROOT/bin" HOME="$p1b_home" \
+        NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+        CCTALLY_DISABLE_DEV_AUTODETECT=1 \
+        python3 "$REPO_ROOT/bin/_lib-reconcile-seed-calibration.py" 2>&1); rc_s=$?
+    if [ $rc_s -ne 0 ]; then
+        echo "RECONCILE FAIL projected1b_alert_abstains forecast/projected-cap: could not seed a calibration: $seeded"
+        fail_count=$((fail_count + 1))
+    else
+        result=$(PROJECTED_BIN_DIR="$REPO_ROOT/bin" HOME="$p1b_home" \
+            NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+            CCTALLY_DISABLE_DEV_AUTODETECT=1 \
+            python3 -c "$PROJECTED1B_PY" 2>&1); rc_py=$?
+        if [ $rc_py -ne 0 ]; then
+            echo "RECONCILE FAIL projected1b_alert_abstains forecast/projected-cap: $result"
+            fail_count=$((fail_count + 1))
+        else
+            echo "PASS projected1b_alert_abstains forecast/projected-cap"
+            pass_count=$((pass_count + 1))
+        fi
+    fi
+else
+    echo "RECONCILE FAIL projected1b_alert_abstains forecast/projected-cap: fixture missing"
     fail_count=$((fail_count + 1))
 fi
 
@@ -4038,7 +4158,7 @@ upct_reader_run () {
     # Dashboard envelope via the pure-Python in-process path (spec §2.2 surface
     # 4): _tui_build_snapshot(now_utc=..., skip_sync=True) -> snapshot_to_envelope.
     ENVPCT=$(CCTALLY_DATA_DIR="$datadir" REPO_ROOT_RESOLVED="$REPO_ROOT" \
-             UPCT_NOW="$as_of" CCTALLY_AS_OF="$as_of" TZ=Etc/UTC python3 - <<'PYENV' 2>/dev/null)
+             UPCT_NOW="$as_of" CCTALLY_AS_OF="$as_of" TZ=Etc/UTC python3 - <<'PYENV' 2>/dev/null
 import datetime as dt, os, pathlib, sys, types
 repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
 script_path = repo_root / "bin" / "cctally"
@@ -4054,6 +4174,7 @@ env = E.snapshot_to_envelope(snap, now_utc=NOW)
 cw = env.get("current_week")
 print(cw["used_pct"] if cw and cw.get("used_pct") is not None else "None")
 PYENV
+)
     if [ "$rc_mode" != "none" ]; then
         RC=$(HOME="$h" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$as_of" "$BIN" \
              record-credit --to 1 --dry-run --json 2>/dev/null)
@@ -4063,7 +4184,7 @@ PYENV
              UPCT_RC_MODE="$rc_mode" UPCT_RC_FROM="$rc_from" \
              UPCT_FC="$FC" UPCT_WK="$WK" UPCT_RP="$RP" UPCT_PJ="$PJ" \
              UPCT_SL="$SL" UPCT_ENV="$ENVPCT" UPCT_RC="$RC" \
-             python3 - <<'PYCHK' 2>&1); rc_py=$?
+             python3 - <<'PYCHK' 2>&1
 import json, os, re, sys
 name = os.environ["UPCT_NAME"]
 exp = float(os.environ["UPCT_EXPECTED"])
@@ -4103,6 +4224,7 @@ if errs:
     print("; ".join(errs), file=sys.stderr)
     sys.exit(1)
 PYCHK
+); rc_py=$?
     if [ $rc_py -ne 0 ]; then
         echo "RECONCILE FAIL $name upct/$(basename "$h"): $result"
         fail_count=$((fail_count + 1))
@@ -4245,7 +4367,7 @@ ttl_split_run () {
     local out rc
     mkdir -p "$h"
     out=$(RECONCILE_BIN="$BIN" RECONCILE_HOME="$h" \
-          PYTHONPATH="$REPO_ROOT/bin" TZ=Etc/UTC python3 - <<'PYTTL' 2>&1); rc=$?
+          PYTHONPATH="$REPO_ROOT/bin" TZ=Etc/UTC python3 - <<'PYTTL' 2>&1
 import json, os, pathlib, shutil, subprocess, sys
 
 BIN = os.environ["RECONCILE_BIN"]
@@ -4358,6 +4480,7 @@ if not cached > plain:
         f"than split-stripped cost {plain!r} - the 1h portion is being priced at "
         f"the 5-minute rate, so this fixture proves nothing")
 PYTTL
+); rc=$?
     if [ "$rc" -eq 0 ]; then
         echo "PASS R-TTL1 ttl-split (cache path == direct-JSONL path, 1e-9)"
         echo "PASS R-TTL2 ttl-split (split-bearing cost > split-stripped cost)"

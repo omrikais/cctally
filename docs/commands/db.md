@@ -399,7 +399,9 @@ ahead.
   re-derivable (`cctally cache-sync --rebuild` rebuilds it). In normal
   operation a version-ahead cache.db **auto-heals** on the next
   cache-opening command (the dispatcher opts cache.db into in-place
-  recovery); `db recover --db cache` is the explicit, on-demand path.
+  recovery through `recover_version_ahead`, which is the opt-in that
+  distinguishes it from stats.db); `db recover --db cache` is the
+  explicit, on-demand path.
 
 ### Exit codes
 

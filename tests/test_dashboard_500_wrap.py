@@ -24,7 +24,7 @@ import pytest
 from conftest import load_script
 
 from tests._support_http import (
-    PRESENCE_BACKSTOP_SECONDS, remaining, start, stop,
+    PRESENCE_BACKSTOP_SECONDS, remaining, shorten_sse_keepalive, start, stop,
 )
 
 
@@ -81,6 +81,16 @@ def test_api_data_500_wrap(monkeypatch):
 
 def test_api_events_stream_error_logs_and_closes(monkeypatch):
     ns = load_script()
+    # AFTER `load_script()`, which drops and re-imports every `_cctally_*`
+    # sibling, and BEFORE `_boot(ns)` binds the server. Registering the
+    # connection with `stop()` is not enough on its own: the handler learns its
+    # client is gone only when the keep-alive write following
+    # `q.get(timeout=_SSE_KEEPALIVE_SECONDS)` fails, and the first write to a
+    # closed peer still succeeds, so it takes two periods. At the shipped
+    # fifteen seconds that is thirty — exactly `stop()`'s reap deadline, a
+    # margin of zero, and on a loaded runner the surviving-handler complaint
+    # can still displace the real failure.
+    shorten_sse_keepalive(ns, monkeypatch)
     dash, srv, t = _boot(ns)
 
     # (a) detect a leaked non-disconnect traceback via handle_error.
@@ -101,6 +111,7 @@ def test_api_events_stream_error_logs_and_closes(monkeypatch):
 
     monkeypatch.setattr(dash.DashboardHTTPHandler, "log_error", _rec_log_error)
 
+    c = r = None
     try:
         hub = dash.DashboardHTTPHandler.hub
         snap = ns["_empty_dashboard_snapshot"]()
@@ -157,4 +168,4 @@ def test_api_events_stream_error_logs_and_closes(monkeypatch):
         assert leaked == [], f"traceback leaked to handle_error: {leaked}"
     finally:
         srv.handle_error = orig_handle_error
-        stop(srv, t)
+        stop(srv, t, connections=[x for x in (c, r) if x is not None])

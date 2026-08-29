@@ -1515,7 +1515,12 @@ def _forecast_verdict_of(output) -> str:
     inputs = getattr(output, "inputs", None)
     if inputs is not None and getattr(inputs, "confidence", "high") == "low":
         return _FORECAST_VERDICT_LOW_CONF
-    high = float(getattr(output, "final_percent_high", 0.0))
+    high = getattr(output, "final_percent_high", 0.0)
+    if high is None:
+        # #661 S2 spec section 3.2: a right-censored reading publishes no
+        # projection, and the meter is at its cap by construction.
+        return _FORECAST_VERDICT_OVER
+    high = float(high)
     if high >= 100:
         return _FORECAST_VERDICT_OVER
     if high >= 90:
@@ -1538,25 +1543,38 @@ def _forecast_dashboard_verdict_of(output) -> str:
 def _forecast_projection_pcts(output) -> "tuple[float | None, float | None]":
     """Return (week_avg_projection_pct, recent_24h_projection_pct).
 
-    Decomposes the dual-method projections from ``r_avg`` / ``r_recent``
-    + ``inputs.p_now`` + ``inputs.remaining_hours``. Mirrors the routing
-    in ``snapshot_to_envelope``: recent-24h is ``None`` when ``r_recent``
-    is ``None`` or its projection equals the week-avg projection (no
-    new info — a second method that agrees with the first contributes
-    nothing to the user-facing range).
+    The week-average value is READ from ``ForecastOutput`` rather than
+    re-derived (#661 S2 spec section 3.3). It is the one selector's answer,
+    so it is the calibrated model's number where that basis was reached and
+    ``None`` where the kernel withheld it. Re-deriving
+    ``p_now + r_avg * remaining`` here published a second answer to the same
+    question: the committed ``over`` dashboard golden carried
+    ``week_avg_projection_pct: 126.0`` in the envelope while its own nested
+    ``forecast.explain`` block said the projection was withheld because the
+    meter was right-censored.
+
+    The recent-24h value is the SECOND method and stays derived, because the
+    kernel publishes only one selected projection. It is ``None`` when
+    ``r_recent`` is ``None`` — which includes every censored reading — or
+    when its projection equals the week-average one (no new info; a second
+    method that agrees with the first contributes nothing to the range).
     """
     if output is None:
         return None, None
     inputs = getattr(output, "inputs", None)
     if inputs is None:
         return None, None
-    p_now = getattr(inputs, "p_now", None)
+    from _lib_forecast import projection_base
+
+    week_avg_pct = getattr(output, "week_avg_projection_pct", None)
+    if getattr(output, "projection_basis", None) == "withheld":
+        # The kernel withheld the projection itself, so there is no second
+        # method to offer either: the recent-24h rate over a censored or
+        # empty meter would publish the very number the withholding removed.
+        return None, None
+    p_now = projection_base(inputs)
     rem = getattr(inputs, "remaining_hours", None)
-    r_avg = getattr(output, "r_avg", None)
     r_recent = getattr(output, "r_recent", None)
-    week_avg_pct = None
-    if p_now is not None and rem is not None and r_avg is not None:
-        week_avg_pct = p_now + r_avg * rem
     recent_pct = None
     if p_now is not None and rem is not None and r_recent is not None:
         candidate = p_now + r_recent * rem

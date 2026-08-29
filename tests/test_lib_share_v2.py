@@ -892,7 +892,7 @@ _S2_DARK_SURFACE_ROLES = ("bg", "table_header_bg", "table_row_alt", "grid",
 def _s2_template_dark_html(template_id: str) -> str:
     tpl = _S2_T.get_template(template_id)
     payload = _s2_json.loads(
-        (_HERE / "fixtures" / "share-v2" / tpl.panel / "panel_data.json")
+        (_HERE / "fixtures" / "share-v2" / tpl.panel / "panel_data.json")  # mirror-private-ok: callers carry _s2_needs_fixtures
         .read_text(encoding="utf-8"))
     for key in ("period_start", "period_end"):
         if isinstance(payload.get(key), str):

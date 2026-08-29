@@ -581,8 +581,14 @@ def test_the_alias_map_finds_the_local_module_bindings():
     """Non-vacuity for the alias form: the two bindings must still exist."""
     load_script()
     aliases = _module_aliases(_audited_function(_tui_source_tree()))
+    # Four since #661 S2: `_mrc` and `_qg` bind the metering-rate kernel and
+    # the quota glue for section 6.6's marker read, inside the
+    # `build.meter_rate_changes` phase. Their presence is what lets the audit
+    # attribute those calls to a module at all.
     assert aliases == {"_sc": "_lib_snapshot_cache",
-                       "cache_mod": "_cctally_cache"}, aliases
+                       "cache_mod": "_cctally_cache",
+                       "_mrc": "_lib_meter_rate_change",
+                       "_qg": "_cctally_quota_model"}, aliases
 
 
 def test_a_call_inside_a_manually_bracketed_phase_region_is_accepted():

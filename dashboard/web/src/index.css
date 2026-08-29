@@ -635,6 +635,26 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 .sup-fresh[data-freshness="aging"] { color: var(--accent-amber); }
 .sup-fresh[data-freshness="stale"] { color: var(--accent-red); font-weight: 800; }
 
+/* #671 — between the phone layout and the full three-zone desktop, the support
+   track is narrower than one complete label/value pair. At 768px the row had a
+   164px content box but needed 225px, while the non-wrapping value painted 35px
+   beyond the hero's overflow clip. Give usage and spend the first row and let
+   support own the second; each support row then has enough measured width to
+   retain its complete value without changing the <=640px compact layout or the
+   >=1101px reference layout. */
+@media (min-width: 641px) and (max-width: 1100px) {
+  .hero-strip { grid-template-columns: minmax(0, 1.35fr) minmax(0, 1.1fr); }
+  .hero-spent { border-right: 0; }
+  .hero-support {
+    display: grid;
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-2) var(--space-5);
+    border-top: 1px solid var(--border-soft);
+    border-right: 0;
+  }
+}
+
 /* -------- Bento board (#264 S1) -------- */
 /* The #248 two-tier tile/wide model is replaced by a height-matched 12-col
    bento. App partitions prefs.panelOrder into three height-class rows
@@ -1359,6 +1379,81 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
    the panel sets from the verdict class. */
 .fc-body { display: flex; flex-direction: column; gap: var(--space-3); }
 .fc-hero { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-1); }
+/* #661 S2 section 10.2, defect 1. Diagnosed in a real browser before this
+   rule was written: the overflowing element is `#panel-forecast >
+   .panel-body.fc-body` on the VERTICAL axis, the winning rule is
+   `.dash-grid .panel .panel-body { overflow-y: auto }` inside
+   `@media (min-width: 900px)`, and the height it overflows is the 368px
+   `grid-auto-rows` of `.bento-row.row-medium`. There was no
+   `#panel-forecast` override at all. Measured: a Claude tab whose source
+   publishes a degradation had `scrollHeight` 322 against `clientHeight` 287
+   — a 35px surplus, identical at 1440, 1280, 1100 and 960 — while healthy
+   fixtures measured 287 against 287, exactly full. The difference is the
+   `degraded` chip growing the hero from 67.9px to 87.8px plus a 17.4px
+   reason sentence.
+
+   The remedy does not fight the row height, which five other panels share.
+   The body keeps its three regions and stops being the scroller: the hero,
+   the reason sentence and the pace bar are PINNED, and the flexible region
+   below them owns the overflow. `scrollHeight` on the body therefore equals
+   `clientHeight` at every width and in both source states, which is the
+   acceptance criterion, and the surplus becomes a bounded scrollable region.
+
+   WHAT `scrollbar-gutter: stable` DOES AND DOES NOT DO, corrected after the
+   browser gate measured it (#661 S2 remediation, finding C3). The rule wins
+   — computed `scrollbar-gutter` reads `stable` — and it reserves a track
+   only on platforms that draw a classic scrollbar occupying layout space.
+   macOS draws overlay scrollbars, which occupy none, so `offsetWidth -
+   clientWidth` on `.fc-scroll` measured 0 at 1440, 1280, 1100 and 960 in all
+   three source states, and a control `<div>` with `overflow-y: scroll`
+   forced measured a scrollbar width of 0 on the same page. Chrome for
+   Android behaves the same way. An earlier revision of this comment claimed
+   the difference "is no longer 0 at every width"; that is false on those
+   platforms. The region SCROLLS correctly there — a trusted wheel event
+   moved `scrollTop` from 0 to 69, its full range, without moving the page —
+   so what remains is a discoverability limitation, not a reachability one,
+   and it is recorded in `docs/dashboard-gotchas.md` rather than papered over
+   with an unconditional fade that would lie whenever nothing overflows. The
+   declaration stays because it is correct and free on Windows and Linux. */
+.fc-hero { flex-shrink: 0; }
+.fc-body > .provider-section-reason { flex-shrink: 0; }
+.fc-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  /* The scroll region reproduces the spacing and the alignment its children
+     had as direct `.fc-body` items (#661 S2 remediation, finding C4). Moving
+     them into a plain block container silently dropped `.fc-body`'s 12px
+     `gap`, taking the separation between the foot and the budget block down
+     to `.fc-budget-block`'s own 8px margin, and dropped `.fc-budget-foot`'s
+     `margin-top: auto`, which bottom-aligned the pair wherever the body had
+     spare room. A column flex with the same gap restores both: the 12px gap
+     plus the 8px margin is the 20px the pair had before, and the base
+     `margin-top: auto` works again because its parent is a flex container.
+     Auto margins resolve to zero when free space is negative, so the
+     alignment cannot strand overflow above the scroll origin. */
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+/* Scrolling, not compressing: a flex item's default `flex-shrink: 1` would
+   squeeze these to fit the region instead of overflowing it, which is the
+   same defect `.fc-pace` had one level up. */
+.fc-scroll > * { flex-shrink: 0; }
+/* The panel body keeps the shipped `overflow-y: auto` (#661 S2 remediation,
+   finding C5). An `#panel-forecast` override forcing `hidden` stood here,
+   and it changed the failure mode rather than removing one: the pinned
+   region — hero, optional reason sentence, pace bar — sits OUTSIDE
+   `.fc-scroll`, so if it alone ever exceeds the 368px row the surplus was
+   cut off silently where `auto` would have scrolled it. `auto` satisfies the
+   acceptance criterion in every reachable state anyway, because `.fc-scroll`
+   is `flex: 1 1 auto; min-height: 0` and absorbs the whole surplus, leaving
+   the body's `scrollHeight` equal to its `clientHeight`; it only differs in
+   the state where clipping would lose content. §10.2 measured the hero at
+   87.8px degraded plus a 17.4px reason sentence against 287px of body, so
+   there is headroom today and this is a fail-safe rather than a fix. */
 /* #620 S1 D4 (F9) — the single-provider tile renders the SAME two fields the
    All-tab provider card does (`ForecastPanel`), so a stale or capability-
    limited source discloses that on its own tab too. `.fc-hero` is a column
@@ -1411,6 +1506,13 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
    Forecast tile fills its matched height instead of stranding a void. */
 .fc-pace {
   height: 6px;
+  /* #661 S2 section 10.2, defect 2, diagnosed in a real browser: `.fc-body`
+     is a column flex, so with no `flex-shrink: 0` this 6px bar was compressed
+     to 0px at 1440, 1280, 1100 and 960 whenever the body overflowed — the
+     pace bar disappeared exactly when the panel was over-full, which is when
+     it has the most to say. A declared height is not a floor in a flex
+     column; this is. */
+  flex-shrink: 0;
   border-radius: var(--radius-pill);
   background: rgba(255, 255, 255, 0.06);
   overflow: hidden;
@@ -1433,6 +1535,61 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   display: flex; flex-direction: column; gap: var(--space-1);
   margin-top: auto; padding-top: var(--space-2);
   border-top: 1px solid var(--border-soft);
+}
+/* The `margin-top: auto` above is KEPT inside `.fc-scroll`, which is a column
+   flex for exactly that reason (#661 S2 remediation, finding C4). An earlier
+   revision zeroed it here on the grounds that it "has nothing to push against
+   once the region scrolls"; that is true only while the region overflows, and
+   the flexbox rule for the other case is that an auto margin absorbs positive
+   free space and resolves to zero when free space is negative. So the push
+   returns wherever the card has room and disappears wherever it does not,
+   which is the shipped behaviour this restores. */
+
+/* The rate-change chip (#661 S2 section 6.6) sits beside the verdict chip and
+   borrows the verdict chip's geometry so the two read as one row rather than
+   two unrelated badges.
+
+   THE ROW IS A REAL ROW (#661 S2 remediation, finding C2). `.fc-hero` is a
+   column flex, so a chip added as a plain sibling stacked BELOW the verdict
+   chip and contradicted the sentence above: measured at 1440 in the degraded
+   state, the verdict chip sat at x=751, y=1781.8 and the `Δ rate` chip at
+   x=751, y=1827.7 — the same x, 45.9px apart vertically, identical at 1280,
+   1100 and 960. It also cost pinned height, which the panel has least of in
+   exactly that state: `.fc-hero` measured 113.75px with both the degraded
+   status chip and the rate chip present against 67.88px without them,
+   dropping `.fc-scroll` to 106px. `.fc-chiprow` wraps the verdict chip, the
+   source-status chip and the rate chip into one wrapping flex line, so they
+   share a row and the hero recovers a row of height. */
+.fc-chiprow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+}
+.fc-rate-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: var(--fs-eyebrow); font-weight: 600;
+  padding: 2px 8px; border-radius: var(--radius-pill);
+  border: 1px solid var(--accent-amber); color: var(--accent-amber);
+}
+.fc-rate-chip.severity-info { border-color: var(--text-dim); color: var(--text-dim); }
+.fc-rate-chip.severity-alarm { border-color: var(--accent-red); color: var(--accent-red); }
+/* The same vocabulary in the alerts modal's own rate-transition section and in
+   its toast, so one family reads the same on all three surfaces. */
+.chip-rate-change {
+  border: 1px solid var(--accent-amber); color: var(--accent-amber);
+  background: transparent;
+}
+.chip-rate-change.severity-info { border-color: var(--text-dim); color: var(--text-dim); }
+.chip-rate-change.severity-alarm { border-color: var(--accent-red); color: var(--accent-red); }
+.alerts-rate-change { margin-top: var(--space-4); }
+.alerts-rate-change-heading {
+  font-size: var(--fs-meta); color: var(--text-dim); font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.6px; margin: 0 0 var(--space-1);
+}
+.alerts-rate-change-note {
+  font-size: var(--fs-meta); color: var(--text-dim);
+  margin: 0 0 var(--space-2);
 }
 .fc-foot-line {
   display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
@@ -2142,6 +2299,13 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
    cyan accent so the section header matches the percent number's
    colour treatment elsewhere on the panel. */
 .m-sec.sec-5h    { color: var(--accent-cyan); }     /* CW 5h milestones */
+/* #661 S2 section 10 — the Forecast modal's Quota model section. Indigo
+   because every other accent already on that modal is taken: `sec-range` is
+   amber, `sec-rates` cyan, `sec-bud` magenta and `sec-wk` green, so a reused
+   colour would read as one of those sections rather than as its own. The
+   heading shipped with `sec-quota` on it and no rule at all, so it rendered
+   in the inherited colour while every sibling heading was tinted. */
+.m-sec.sec-quota { color: var(--accent-indigo); }   /* FC quota model */
 
 /* Round-3 / spec §5.3 — credit divider row inside the 5h milestone
    table. Pure visual differentiation; no logic depends on it.

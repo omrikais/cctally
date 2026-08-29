@@ -2,6 +2,7 @@
 from __future__ import annotations
 import types
 
+import ast
 import datetime
 import importlib.machinery
 import importlib.util
@@ -10,6 +11,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -583,7 +585,15 @@ def test_the_record_is_published_by_an_atomic_replace(
         calls.append((str(src), str(dst)))
         return real_replace(src, dst, **kwargs)
 
-    monkeypatch.setattr(gate.os, "replace", _spy)
+    # #630 S2 seam: patch the IMPORTER's reference, never the shared stdlib
+    # module object. `gate.os` IS `os`, so rebinding `replace` on it swapped
+    # the callable that every other importer and every concurrent thread in
+    # the process resolves, for the whole length of this body — the F7 class
+    # the isolation plugin's state detector exists to catch. It reported this
+    # site once that detector ran in the load-invariance lane (#638).
+    _iso_os = types.SimpleNamespace(**vars(gate.os))
+    _iso_os.replace = _spy
+    monkeypatch.setattr(gate, "os", _iso_os)
     _stub_successful_matrix(monkeypatch, gate, tmp_path)
     monkeypatch.setattr(gate, "_git_head", lambda root: "a" * 40)
     monkeypatch.setattr(gate, "_git_status", lambda root: "")
@@ -725,6 +735,96 @@ def test_the_matrix_is_advisory_and_still_printed():
     assert "GIT_OPTIONAL_LOCKS=0" in block
 
 
+# The three tracked copies of the release skill. The two generated projections
+# are included so a missed `bin/check-agent-workflows --sync` cannot leave a
+# stale claim shipping in the copy an agent actually loads. The waiver marker
+# has to sit INSIDE the statement's own source span, and that span covers the
+# WHOLE tuple, so an entry added here inherits it silently.
+_RELEASE_SKILL_COPIES = (  # mirror-private-ok
+    ".agent-workflows/skills/shared/release-cctally/SKILL.md",
+    ".agents/skills/release-cctally/SKILL.md",
+    ".claude/skills/release-cctally/SKILL.md",
+)
+
+#: Sentence-final punctuation followed by whitespace. Splitting on a bare
+#: period would cut "Gate 0.25" in half, because that period is followed by a
+#: digit rather than by whitespace.
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+#: The retired universal-quantifier claim. #630 S5 removed MATRIX_RC from the
+#: refusal predicate and left a sentence quantifying the refusal over all three
+#: outcomes, which is the exact form this asserts is gone (#658).
+_UNIVERSAL_REFUSAL = re.compile(
+    r"\b(any failure|each|all three|every failure)\b[^.!?]*refus\w*\s+the\s+cut",
+    re.I,
+)
+
+#: The carve-out the region must carry once it enumerates the third outcome.
+_NON_BLOCKING_MARKER = re.compile(
+    r"advisory|never changes the release exit status"
+    r"|does not change the release exit status",
+    re.I,
+)
+
+
+def _gate0_narrative(text):
+    """The prose between the overlap block and the Gate 0.25 section heading.
+
+    This is the region that describes what the block just printed, and it is
+    where the stale claim lived. Bounded on the left by the end of the overlap
+    block so the block's own comments — which are already correct — are not
+    what satisfies the assertions.
+    """
+    block = _overlap_block(text)
+    start = text.index(block) + len(block)
+    end = text.index("**Gate 0.25 —", start)
+    return text[start:end]
+
+
+@pytest.mark.parametrize("relative", _RELEASE_SKILL_COPIES)
+def test_the_gate0_narrative_states_which_gates_refuse_the_cut(relative):
+    """The narrative must not describe the three outcomes without the carve-out.
+
+    `test_the_matrix_is_advisory_and_still_printed` covers the executable
+    predicate and nothing covered the prose fourteen lines below it, so #630 S5
+    could change the predicate, leave the sentence claiming "any failure refuses
+    the cut", and ship a runbook that contradicts itself. An operator reading
+    that sentence would expect a red matrix to block, and would either abandon a
+    cut the script would have allowed or conclude the script is broken when it
+    does not refuse (#658).
+
+    A test cannot certify that prose is true. What it certifies here is
+    structural: the region enumerates all three outcomes, so it must also say
+    which of them refuse and which does not, and it must not carry the retired
+    universal-quantifier form.
+    """
+    path = REPO / relative
+    if not path.is_file():
+        pytest.skip("private release skill absent from public mirror")
+    region = _gate0_narrative(path.read_text(encoding="utf-8"))
+
+    # The region does enumerate the third outcome, which is what obliges it to
+    # state the carve-out. Were this to stop holding, the assertions below
+    # would be vacuous rather than failing.
+    assert "Gate 0.25" in region, region
+
+    # The positive half: it still says a failure refuses the cut, so a future
+    # edit cannot satisfy the carve-out by deleting the refusal statement.
+    assert re.search(r"refus\w*\s+the\s+cut", region, re.I), region
+
+    # The carve-out itself, attached to the matrix rather than stated loosely
+    # somewhere in the region.
+    carved = [
+        sentence
+        for sentence in _SENTENCE_SPLIT.split(region)
+        if "Gate 0.25" in sentence and _NON_BLOCKING_MARKER.search(sentence)
+    ]
+    assert carved, region
+
+    # The retired claim.
+    assert not _UNIVERSAL_REFUSAL.search(region), region
+
+
 # A module-level assignment rather than an inline parametrize tuple, so the
 # waiver marker below has a simple statement to scope itself to — a decorator
 # belongs to the function definition, which spans its whole body. These four
@@ -774,6 +874,7 @@ def _stub_release_root(tmp_path):
         'echo "remote $*" >> "$STUB_LOG"\n'
         'if [ "$1" = "--verify-receipt" ]; then exit "${STUB_RECEIPT_RC:-0}"; fi\n'
         'if [ "$1" = "--watch" ]; then\n'
+        '  [ -n "${STUB_GATE0_READY:-}" ] && : > "$STUB_GATE0_READY"\n'
         '  sleep "${STUB_GATE0_SLEEP:-0}"\n'
         '  printf \'{"receipt": {"runId": "RUN-1"}}\\n\'\n'
         '  exit "${STUB_GATE0_RC:-0}"\n'
@@ -787,6 +888,7 @@ def _stub_release_root(tmp_path):
         '  echo "{}" > "$STUB_RECORD_PATH"\n'
         '  echo "linux-matrix: release record $STUB_RECORD_PATH"\n'
         "fi\n"
+        '[ -n "${STUB_MATRIX_READY:-}" ] && : > "$STUB_MATRIX_READY"\n'
         'sleep "${STUB_MATRIX_SLEEP:-0}"\n'
         'exit "${STUB_MATRIX_RC:-0}"\n'
     )
@@ -830,7 +932,52 @@ def _stub_release_root(tmp_path):
     return root, stubs
 
 
-def _run_overlap_block(tmp_path, env_overrides, signal_after=None):
+#: The parent shell reaches this after its traps exist and both process-group
+#: ids are assigned (.agents/skills/release-cctally/SKILL.md:81-83, :104, :143,
+#: :146), which is the earliest point at which a signal can demonstrate that
+#: the trap reaps two LIVE gates.
+_WAIT_TARGET = 'if wait "$MATRIX_PGID"; then'
+
+#: Well above the 30-second readiness deadline, so a gate cannot finish on its
+#: own inside the window in which readiness is still being awaited. At the
+#: previous 20 seconds there was a ten-second band in which readiness was
+#: reported, the signal was sent, and `gate0.status` already existed.
+_OVERLAP_STUB_SLEEP = "60"
+_READINESS_DEADLINE_SECONDS = 30.0
+_READINESS_POLL_SECONDS = 0.01
+
+
+def _await_overlap_readiness(process, markers, log_path):
+    """Block until all three markers exist, the process dies, or 30s elapse."""
+    deadline = time.monotonic() + _READINESS_DEADLINE_SECONDS
+    while True:
+        missing = [name for name, path in markers.items() if not path.exists()]
+        if not missing:
+            return
+        if process.poll() is not None:
+            raise AssertionError(
+                "the overlap block exited (rc=%s) before reaching readiness; "
+                "missing %s\nstub log:\n%s"
+                % (process.returncode, missing, log_path.read_text()))
+        if time.monotonic() >= deadline:
+            process.kill()
+            process.wait(timeout=30)
+            raise AssertionError(
+                "overlap block did not reach interruptible wait within %.0fs "
+                "(missing: %s)\nstub log:\n%s"
+                % (_READINESS_DEADLINE_SECONDS, missing, log_path.read_text()))
+        time.sleep(_READINESS_POLL_SECONDS)
+
+
+def _run_overlap_block(tmp_path, env_overrides, signal_on_readiness=False):
+    """Run the release skill's overlap block against the stub gates.
+
+    `signal_on_readiness` is a flag, not a duration: when set, the caller waits
+    for all three readiness markers and then terminates the block. It replaced
+    a `signal_after=<seconds>` sleep in #659, so it is read for TRUTH — under
+    the old contract `0` meant "signal immediately", and an `is not None` test
+    carried over from it would make `False` signal too.
+    """
     skill = REPO / ".agents/skills/release-cctally/SKILL.md"
     if not skill.exists():
         pytest.skip("private release skill absent from public mirror")
@@ -838,6 +985,23 @@ def _run_overlap_block(tmp_path, env_overrides, signal_after=None):
     root, stubs = _stub_release_root(tmp_path)
     log = tmp_path / "stub.log"
     log.write_text("")
+    markers = {
+        "gate0": tmp_path / "gate0.ready",
+        "matrix": tmp_path / "matrix.ready",
+        "wait": tmp_path / "wait.ready",
+    }
+    if signal_on_readiness:
+        # Absolute, because `bash -c` runs with pytest's working directory —
+        # the repository root — while the gate stubs run after `cd
+        # "$RELEASE_ROOT"`. A relative marker would be written into the live
+        # tree from one of them and into the synthetic root from the other.
+        stale = [str(path) for path in markers.values() if path.exists()]
+        assert not stale, "stale readiness marker(s) present: %r" % stale
+        assert block.count(_WAIT_TARGET) == 1, (
+            "expected exactly one %r in the overlap block" % _WAIT_TARGET)
+        block = block.replace(
+            _WAIT_TARGET,
+            "touch %s\n  %s" % (shlex.quote(str(markers["wait"])), _WAIT_TARGET))
     env = dict(os.environ)
     env.update(
         {
@@ -847,6 +1011,8 @@ def _run_overlap_block(tmp_path, env_overrides, signal_after=None):
             "GATE0_STATUS": str(tmp_path / "gate0.status"),
             "STUB_LOG": str(log),
             "STUB_RECORD_PATH": str(tmp_path / "record.json"),
+            "STUB_GATE0_READY": str(markers["gate0"]),
+            "STUB_MATRIX_READY": str(markers["matrix"]),
             # The block `rm -f`s this path and then `tee`s through it, so an
             # unpinned default is shared state: xdist distributes this module's
             # tests across workers, and one invocation's rm can unlink the file
@@ -862,11 +1028,38 @@ def _run_overlap_block(tmp_path, env_overrides, signal_after=None):
         stderr=subprocess.STDOUT,
         text=True,
     )
-    if signal_after is not None:
-        time.sleep(signal_after)
+    if signal_on_readiness:
+        _await_overlap_readiness(process, markers, log)
         process.terminate()
     out, _ = process.communicate(timeout=120)
     return process.returncode, out, log.read_text()
+
+
+def test_the_readiness_substitution_matches_the_block_exactly_once():
+    """A future edit to SKILL.md must not silently turn the readiness wait into
+    a thirty-second timeout."""
+    skill = REPO / ".agents/skills/release-cctally/SKILL.md"
+    if not skill.exists():
+        pytest.skip("private release skill absent from public mirror")
+    block = _overlap_block(skill.read_text())
+    assert block.count(_WAIT_TARGET) == 1, (
+        "the readiness marker is injected before %r, which must be unique"
+        % _WAIT_TARGET)
+
+
+def test_a_stale_readiness_marker_is_refused_rather_than_believed(tmp_path):
+    """A leftover marker would let the wait return before the block reached
+    anything, which is the wall-clock defect wearing a different hat."""
+    skill = REPO / ".agents/skills/release-cctally/SKILL.md"
+    if not skill.exists():
+        pytest.skip("private release skill absent from public mirror")
+    (tmp_path / "gate0.ready").write_text("")
+    with pytest.raises(AssertionError, match="stale readiness marker"):
+        _run_overlap_block(
+            tmp_path,
+            {"STUB_GATE0_RC": "0", "STUB_MATRIX_RC": "0"},
+            signal_on_readiness=True,
+        )
 
 
 def test_overlap_block_waits_for_gate_zero_even_when_the_matrix_fails(tmp_path):
@@ -958,16 +1151,23 @@ def test_overlap_block_reports_success_when_all_three_pass(tmp_path):
 
 def test_overlap_block_reaps_both_gates_on_a_termination_signal(tmp_path):
     """An interrupt cancels both gates and reaps their children and containers;
-    the operator restarts rather than resumes."""
+    the operator restarts rather than resumes.
+
+    The signal is sent once the block has installed its traps, launched both
+    gates and reached its interruptible `wait` — observed, not assumed after a
+    fixed second (#659). The stub backstops sit at 60s against a 30s readiness
+    deadline, so no gate can complete inside the window in which readiness is
+    still being awaited.
+    """
     status, out, log = _run_overlap_block(
         tmp_path,
         {
-            "STUB_GATE0_SLEEP": "20",
-            "STUB_MATRIX_SLEEP": "20",
+            "STUB_GATE0_SLEEP": _OVERLAP_STUB_SLEEP,
+            "STUB_MATRIX_SLEEP": _OVERLAP_STUB_SLEEP,
             "STUB_GATE0_RC": "0",
             "STUB_MATRIX_RC": "0",
         },
-        signal_after=1.0,
+        signal_on_readiness=True,
     )
     assert status != 0
     assert "docker ps -aq --filter" in log
@@ -1119,11 +1319,733 @@ def test_base_images_are_digest_pinned_for_every_supported_python():
         assert len(reference.rsplit("sha256:", 1)[1]) == 64
 
 
-def test_image_records_cover_every_input_that_can_change_the_image():
+#: Path methods that mutate the path they are called on. `symlink_to` and
+#: `hardlink_to` belong here because each CREATES the path it is called on.
+_PATH_MUTATORS = frozenset({
+    "write_bytes", "write_text", "touch", "unlink", "mkdir",
+    "rename", "replace", "chmod", "rmdir", "symlink_to", "hardlink_to",
+})
+
+#: Free and dotted functions that mutate a path passed as an argument, and the
+#: argument positions each one can mutate. Every `_PATH_MUTATORS` name that has
+#: an `os` free spelling is carried here under that spelling — `chmod`,
+#: `unlink`, `mkdir`, `rmdir`, `rename`, `replace`, `symlink_to` as
+#: `os.symlink` and `hardlink_to` as `os.link` — so a mutation cannot escape
+#: the guard by choosing one syntax over the other. `os.utime` has no
+#: `_PATH_MUTATORS` counterpart and is here anyway, because a metadata write
+#: into a tracked file is the same observable mutation as a content write.
+#: `os.symlink` and `os.link` mutate only their SECOND argument: each creates
+#: the destination and requires the source to exist already. `open` is
+#: deliberately absent: it mutates only under a writing mode, which is a
+#: separate check.
+_FUNCTION_MUTATORS = {
+    "os.remove": (0,), "os.unlink": (0,), "os.rmdir": (0,),
+    "os.removedirs": (0,), "os.mkdir": (0,), "os.makedirs": (0,),
+    "os.truncate": (0,), "shutil.rmtree": (0,),
+    "os.chmod": (0,), "os.utime": (0,),
+    "os.rename": (0, 1), "os.replace": (0, 1), "shutil.move": (0, 1),
+    "os.symlink": (1,), "os.link": (1,),
+    "shutil.copy": (1,), "shutil.copy2": (1,), "shutil.copyfile": (1,),
+    "shutil.copytree": (1,),
+}
+
+_WRITING_MODE_FLAGS = ("w", "a", "x", "+")
+
+#: Every character a `builtins.open` mode string may contain. A literal outside
+#: this alphabet, or longer than four characters, is not a mode at all. The
+#: bound is four rather than three, the longest legal mode, so that a mode this
+#: comment failed to anticipate is admitted rather than read as a filename.
+_MODE_ALPHABET = frozenset("rwxab+tU")
+
+
+def _repository_writers(source):
+    """Every call in `source` that mutates a path rooted at the repository.
+
+    Extracted from the guard below so the guard's own scope can be tested
+    against sources it does not itself contain. Applied to this module it must
+    return an empty list; applied to a source carrying a known offender it must
+    name it.
+
+    ROOTEDNESS is resolved to a fixpoint over names, seeded from the MODULE's
+    own assignments and extended per function. The module seed matters: this
+    file binds `SCRIPT = REPO / "bin" / "cctally-test-linux-matrix"` at module
+    level, so a `SCRIPT.write_text(...)` anywhere in it is the most likely
+    future offender and a function-local walk never sees the binding at all.
+
+    Names are bound by more than `ast.Assign`. `for path in REPO.glob(...)`
+    binds through a `for` target and `with open(REPO / "x", "w") as handle`
+    through a `withitem`, and a collector that reads assignments alone reports
+    nothing on either.
+
+    MUTATION is any of four forms: a `_PATH_MUTATORS` method called on a rooted
+    expression; `open` as a free function on a rooted path under a writing
+    mode, taking the path from the first positional argument or `file=` and the
+    mode from the second or `mode=`; the same test applied to the bound
+    `rooted.open(...)`, whose mode is instead its FIRST positional argument;
+    and a `_FUNCTION_MUTATORS` entry called with a rooted path in a position it
+    mutates. The attribute set alone misses `open`, `os.remove` and
+    `shutil.rmtree` entirely. The two ATTRIBUTE tests run first, the
+    `_PATH_MUTATORS` one and then the bound `rooted.open(...)` one, and each
+    FALLS THROUGH rather than answering, because six `_FUNCTION_MUTATORS`
+    keys — `os.chmod`, `os.unlink`, `os.mkdir`, `os.rmdir`, `os.rename` and
+    `os.replace` — are dotted names whose attribute is also a `_PATH_MUTATORS`
+    entry, and an attribute test that answered would answer `False` for all six
+    on the rootedness of the module `os`. The free-`open` test runs after both
+    of them and ANSWERS in either direction, and the `_FUNCTION_MUTATORS` test
+    is last and terminal, so neither of those two can fall through.
+
+    `replace` is the one name shared by a path method and a string method, and
+    the two are told apart by ARITY: `pathlib.Path.replace(target)` takes one
+    positional argument and `str.replace(old, new[, count])` takes two or more,
+    so a `replace` call carrying two or more positional arguments is refused.
+    That is what lets rootedness propagate through a content read — the case
+    `test_the_write_guard_reaches_a_path_read_out_of_the_tree` pins — without
+    reporting `block.replace(old, new)` on a string read out of the tree.
+
+    THE ROOT IS MATCHED STRUCTURALLY — a `REPO` name, a `.REPO` attribute or a
+    `_repo_root()` call — rather than by looking for "REPO" in the unparsed
+    text. The textual form reports this module's own synthetic guard corpus,
+    because those sources are string literals whose text contains `REPO`.
+
+    COVERAGE IS NOT COMPLETE, AND THE COMPLEMENT IS OPEN RATHER THAN
+    ENUMERATED. The positive scope is stated above and is the whole of it: a
+    call reached by none of `_PATH_MUTATORS`, `_FUNCTION_MUTATORS` and the
+    three `open` spellings is silently unreported, and those two tables are the
+    entire inventory. `shutil.unpack_archive`, `shutil.make_archive`,
+    `ZipFile(...).extractall(rooted)`, `tarfile.open(...).extractall(rooted)`
+    and `tempfile.NamedTemporaryFile(dir=rooted)` are five such forms, and
+    naming them does not shorten the list either, because nothing bounds it.
+
+    Four forms were considered and DELIBERATELY left outside, and
+    `_GUARD_UNCOVERED_FORMS` pins those four so that widening the guard to
+    reach one of them fails a test until this paragraph is corrected too. A
+    mutator bound to a bare name by `from os import remove` or aliased by
+    `import shutil as sh` is not reported, because `_FUNCTION_MUTATORS` is
+    keyed on the dotted text the call site writes. A write performed by a child
+    process — `subprocess.run(["rm", "-f", str(REPO / "x")])` — is not
+    reported, because nothing in the call is a path mutation. A
+    descriptor-level `os.open(path, os.O_WRONLY)` is not reported, because its
+    flags are an integer expression and the writing-mode test reads a string
+    literal. A `_FUNCTION_MUTATORS` argument passed by keyword rather than by
+    position is not reported, because the table records positions. The
+    `subprocess` one matters most, because this module DOES spawn child
+    processes: a child that wrote into the tree would pass this guard silently.
+    Reading a shell argument vector for path mutation is a second guard rather
+    than a widening of this one, and no offender of that shape has appeared
+    yet.
+
+    THE INTERPROCEDURAL FORM IS THE ONE A READER WOULD WRONGLY ASSUME IS
+    COVERED. Rootedness is resolved per function and never crosses a call
+    boundary, so `_helper(REPO / "bin" / "x")` where `_helper` writes to its
+    own parameter is reported in neither function: the caller performs no
+    mutation, and the callee's parameter is not rooted. This module already
+    has helpers that take a path and write through it, so the shape is
+    reachable here rather than hypothetical.
+
+    ONE KNOWN FALSE-POSITIVE SHAPE is kept deliberately. Rootedness propagates
+    through a content read and carries no type, so any name derived from a
+    repository file is rooted whatever it holds. A zero-positional `.replace()`
+    on such a value — `stamp.replace(tzinfo=datetime.timezone.utc)` on a
+    `datetime` parsed out of a tracked file — is a `_PATH_MUTATORS` hit that
+    the arity rule does not refuse, because that rule refuses two or more
+    positional arguments. Nothing in this module writes that shape. Narrowing
+    rootedness by receiver kind is what opened the hole
+    `test_the_write_guard_reaches_a_path_read_out_of_the_tree` closes, so the
+    false positive is the cheaper of the two.
+    """
+    tree = ast.parse(source)
+
+    def _names_in(node):
+        return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+    def _mentions_the_root(node):
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and sub.id == "REPO":
+                return True
+            if isinstance(sub, ast.Attribute) and sub.attr == "REPO":
+                return True
+            if isinstance(sub, ast.Call) and getattr(
+                    sub.func, "attr", getattr(sub.func, "id", "")) == "_repo_root":
+                return True
+        return False
+
+    def _rooted(node, names):
+        if node is None:
+            return False
+        if _mentions_the_root(node):
+            return True
+        return bool(_names_in(node) & names)
+
+    def _bound_names(target):
+        if isinstance(target, ast.Name):
+            return {target.id}
+        found = set()
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                found |= _bound_names(element)
+        elif isinstance(target, ast.Starred):
+            found |= _bound_names(target.value)
+        return found
+
+    def _module_bindings():
+        pairs = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                pairs.extend((target, node.value) for target in node.targets)
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                pairs.append((node.target, node.value))
+        return pairs
+
+    def _bindings(scope):
+        pairs = []
+        for node in ast.walk(scope):
+            if isinstance(node, ast.Assign):
+                pairs.extend((target, node.value) for target in node.targets)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                if node.value is not None:
+                    pairs.append((node.target, node.value))
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                pairs.append((node.target, node.iter))
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        pairs.append((item.optional_vars, item.context_expr))
+        return pairs
+
+    def _resolve(pairs, seed):
+        names = set(seed)
+        changed = True
+        while changed:
+            changed = False
+            for target, value in pairs:
+                if not _rooted(value, names):
+                    continue
+                for name in _bound_names(target) - names:
+                    names.add(name)
+                    changed = True
+        return names
+
+    def _writing_mode(call, position):
+        """Whether the mode argument at `position` (or `mode=`) opens for write.
+
+        The literal must LOOK like a mode before its flags are read. The bound
+        `rooted.open(...)` branch takes the mode from the FIRST positional
+        argument, and other `open` methods put something else there:
+        `ZipFile(rooted).open("member.txt")` passes a member name, and a name
+        carrying an `x`, a `w`, an `a` or a `+` would otherwise be read as a
+        writing mode and reported as a repository write.
+        """
+        mode = call.args[position] if len(call.args) > position else next(
+            (kw.value for kw in call.keywords if kw.arg == "mode"), None)
+        literal = (mode.value if isinstance(mode, ast.Constant)
+                   and isinstance(mode.value, str) else "")
+        if len(literal) > 4 or not set(literal) <= _MODE_ALPHABET:
+            return False
+        return any(flag in literal for flag in _WRITING_MODE_FLAGS)
+
+    def _writes(call, names):
+        target = call.func
+        if isinstance(target, ast.Attribute):
+            # Every attribute test FALLS THROUGH when it does not match, because
+            # `os.chmod`, `os.unlink`, `os.mkdir`, `os.rmdir`, `os.rename` and
+            # `os.replace` are dotted names whose attribute is also a
+            # `_PATH_MUTATORS` entry. Returning the receiver's rootedness here
+            # answers `False` for all six — the receiver is the module `os` —
+            # and `_FUNCTION_MUTATORS` never gets to see them.
+            if target.attr in _PATH_MUTATORS and _rooted(target.value, names):
+                # `str.replace(old, new[, count])`, not `Path.replace(target)`.
+                if not (target.attr == "replace" and len(call.args) > 1):
+                    return True
+            if (target.attr == "open" and _writing_mode(call, 0)
+                    and _rooted(target.value, names)):
+                # `Path.open(mode, ...)` puts the mode FIRST; the free `open`
+                # puts it second, behind the path.
+                return True
+        rendered = ast.unparse(target)
+        if rendered == "open":
+            if not _writing_mode(call, 1):
+                return False
+            path = call.args[0] if call.args else next(
+                (kw.value for kw in call.keywords if kw.arg == "file"), None)
+            return _rooted(path, names)
+        positions = _FUNCTION_MUTATORS.get(rendered)
+        if positions is None:
+            return False
+        return any(_rooted(call.args[index], names)
+                   for index in positions if index < len(call.args))
+
+    def _innermost_owners():
+        """Each call's innermost enclosing function name.
+
+        A call inside a nested function is reached twice, because the outer
+        function is walked with `ast.walk` and that descends into the inner
+        one. Both visits are wanted — the outer scope is the only one that
+        resolves a name the inner function closes over — but the finding is
+        one finding, and it names the function the call is written in.
+        """
+        owners = {}
+
+        def _descend(node, name):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    _descend(child, child.name)
+                    continue
+                if isinstance(child, ast.Call):
+                    owners[child] = name
+                _descend(child, name)
+
+        _descend(tree, "<module>")
+        return owners
+
+    module_names = _resolve(_module_bindings(), set())
+    owners = _innermost_owners()
+    found = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        rooted = _resolve(_bindings(func), module_names)
+        for node in ast.walk(func):
+            if isinstance(node, ast.Call) and _writes(node, rooted):
+                found[(node.lineno, node.col_offset)] = "%s:%d %s" % (
+                    owners.get(node, func.name), node.lineno,
+                    ast.unparse(node))
+    # Source order, because `ast.walk` is breadth-first: a call nested inside a
+    # `with` is reported after the statements that follow it, which makes the
+    # findings read out of order and an expected list arbitrary.
+    return [text for _, text in sorted(found.items())]
+
+
+def test_no_test_in_this_module_writes_into_the_repository_tree():
+    """The #659 defect class. A test that mutates a tracked file is observable
+    by every concurrently scheduled xdist worker, and `write_bytes` truncates
+    before writing, so a reader can see an EMPTY file rather than a merely
+    different one.
+
+    The scope this applies is `_repository_writers` above, and the cases below
+    pin what that scope reaches. This assertion is the one that matters: no
+    call in THIS module writes into the tree.
+    """
+    offenders = _repository_writers(pathlib.Path(__file__).read_text())
+    assert offenders == [], (
+        "these mutate the live repository tree, which every concurrently "
+        "scheduled xdist worker can observe: %r" % (offenders,))
+
+
+#: The original #659 offender, reduced. Rootedness reaches `dockerfile` only
+#: through `root`, which is why the guard resolves names transitively.
+_GUARD_TRANSITIVE_LOCAL = """
+def test_image_records_change_when_the_dockerfile_changes():
     gate = _load_gate()
-    records = dict(gate._image_records("3.12", "2026-W34", gate._repo_root()))
+    root = gate._repo_root()
+    dockerfile = root / "bin" / "cctally-test-linux-matrix.Dockerfile"
+    original = dockerfile.read_bytes()
+    try:
+        dockerfile.write_bytes(original + b"# provoke a digest change")
+    finally:
+        dockerfile.write_bytes(original)
+"""
+
+#: The most likely FUTURE offender, and the one a function-local walk misses.
+_GUARD_MODULE_LEVEL_CONSTANT = """
+REPO = pathlib.Path(__file__).resolve().parents[1]
+SCRIPT = REPO / "bin" / "cctally-test-linux-matrix"
+
+def test_writes_through_the_module_constant():
+    SCRIPT.write_text("mutated")
+"""
+
+_GUARD_LOOP_TARGET = """
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+def test_writes_through_a_loop_target():
+    for path in REPO.glob("*.scratch"):
+        path.unlink()
+"""
+
+_GUARD_FREE_FUNCTION_MUTATORS = """
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+def test_writes_without_a_path_method():
+    with open(REPO / "bin" / "cctally-test-linux-matrix", "w") as handle:
+        handle.write("mutated")
+    os.remove(REPO / "bin" / "leftover")
+    shutil.rmtree(REPO / "scratch")
+"""
+
+#: `open` as a BOUND method, and the free `open` addressed entirely by
+#: keyword. Both are `open(rooted, "w")` wearing a different syntax.
+_GUARD_OPEN_VARIANTS = """
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+def test_writes_through_the_other_two_spellings_of_open():
+    with (REPO / "bin" / "cctally-test-linux-matrix").open("w") as handle:
+        handle.write("mutated")
+    with open(file=REPO / "bin" / "leftover", mode="a") as handle:
+        handle.write("appended")
+"""
+
+#: Link creation. Each of these CREATES the path it is called on, so a tracked
+#: file replaced by a symlink is the same observable defect as a rewrite.
+_GUARD_LINK_CREATORS = """
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+def test_creates_links_in_the_tree(tmp_path):
+    (REPO / "bin" / "soft").symlink_to(tmp_path / "elsewhere")
+    (REPO / "bin" / "hard").hardlink_to(tmp_path / "elsewhere")
+"""
+
+#: A write inside a nested function, through a name the inner function CLOSES
+#: OVER. `ast.walk` reaches the call from the outer function too, and the outer
+#: scope is the only one that resolves `target`, so the outer visit is the only
+#: one that reports. This case pins the NAMING rule, not the deduplication.
+_GUARD_NESTED_FUNCTION = """
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+def test_writes_from_a_closure():
+    target = REPO / "bin" / "cctally-test-linux-matrix"
+
+    def _mutate():
+        target.write_text("mutated")
+
+    _mutate()
+"""
+
+#: The same nesting over a MODULE-LEVEL constant, which is the case that
+#: actually exercises the deduplication. Every function's rooted set is seeded
+#: with the module's names, so `SCRIPT` resolves in the outer scope AND in the
+#: inner one, both visits report, and the collector emits the finding twice
+#: unless it is keyed by source position.
+_GUARD_NESTED_MODULE_CONSTANT = """
+REPO = pathlib.Path(__file__).resolve().parents[1]
+SCRIPT = REPO / "bin" / "cctally-test-linux-matrix"
+
+def test_writes_from_a_closure_over_a_module_constant():
+    def _mutate():
+        SCRIPT.write_text("mutated")
+
+    _mutate()
+"""
+
+#: The `os` free spellings of the path methods. A mutation must not escape the
+#: guard by being written as `os.chmod(p, ...)` rather than `p.chmod(...)`, and
+#: `os.symlink`/`os.link` create their SECOND argument, so a rooted source with
+#: a destination outside the tree is not a repository write.
+_GUARD_OS_FREE_MUTATORS = """
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+def test_writes_through_the_os_spellings(tmp_path):
+    os.chmod(REPO / "bin" / "cctally-test-linux-matrix", 0o755)
+    os.utime(REPO / "bin" / "cctally-test-linux-matrix", None)
+    os.unlink(REPO / "bin" / "leftover")
+    os.mkdir(REPO / "bin" / "created")
+    os.rmdir(REPO / "bin" / "obsolete")
+    os.rename(REPO / "bin" / "before", tmp_path / "after")
+    os.replace(tmp_path / "before", REPO / "bin" / "after")
+    os.symlink(tmp_path / "elsewhere", REPO / "bin" / "soft")
+    os.link(tmp_path / "elsewhere", REPO / "bin" / "hard")
+    os.symlink(REPO / "bin" / "cctally-test-linux-matrix", tmp_path / "copy")
+"""
+
+#: The false positive the mode-plausibility rule must suppress. `ZipFile.open`
+#: and `TarFile.extractfile` put a MEMBER NAME where `Path.open` puts the mode,
+#: and `member.txt` contains an `x`, so a flag test alone reads it as a write.
+_GUARD_NON_MODE_FIRST_ARGUMENT = """
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+def test_reads_a_zip_member_out_of_the_tree():
+    archive = zipfile.ZipFile(REPO / "bin" / "bundle.zip")
+    with archive.open("member.txt") as handle:
+        first = handle.read()
+    with archive.open("wax!") as handle:
+        second = handle.read()
+    with archive.open("r++++") as handle:
+        third = handle.read()
+    return first, second, third
+"""
+
+#: Five concrete examples of the documented OPEN complement. They are not a
+#: complete inventory; they pin that broadening the guard to cover one requires
+#: the coverage paragraph and the test to move together.
+_GUARD_OPEN_COMPLEMENT = """
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+def test_uses_mutators_outside_the_guard_inventory():
+    shutil.unpack_archive(REPO / "bundle.zip", REPO / "unpacked")
+    shutil.make_archive(str(REPO / "bundle"), "zip", REPO / "payload")
+    zipfile.ZipFile(REPO / "bundle.zip").extractall(REPO / "zip-out")
+    tarfile.open(REPO / "bundle.tar").extractall(REPO / "tar-out")
+    tempfile.NamedTemporaryFile(dir=REPO / "scratch")
+"""
+
+#: The false positive the `replace` arity rule must keep suppressing: a
+#: substitution on a string read out of the tree is `str.replace`, not
+#: `pathlib.Path.replace`.
+_GUARD_STRING_REPLACE = """
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+def test_substitutes_in_memory():
+    skill = REPO / ".agents/skills/release-cctally/SKILL.md"
+    block = _overlap_block(skill.read_text())
+    block = block.replace("marker", "touch marker")
+    original = (REPO / "bin" / "leftover").read_bytes()
+    trimmed = original.replace(b"a", b"b")
+    return block, trimmed
+"""
+
+#: Reads, and writes outside the tree. Neither is the guard's business.
+_GUARD_READS_AND_TMP_PATH = """
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+def test_reads_and_writes_elsewhere(tmp_path):
+    with open(REPO / "bin" / "cctally-test-linux-matrix") as handle:
+        handle.read()
+    root = tmp_path / "synthetic"
+    root.mkdir(parents=True)
+    for name in ("a", "b"):
+        (root / name).write_text("x")
+"""
+
+#: The hole the guard carried until the `replace` arity rule replaced the
+#: `_reads_content` narrowing that caused it.
+_GUARD_CONTENT_DERIVED_PATH = """
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+def test_writes_through_a_path_read_out_of_the_tree():
+    target = pathlib.Path((REPO / "bin" / "pointer").read_text())
+    target.write_text("mutated")
+"""
+
+#: The forms the docstring states are OUTSIDE the guard. Asserted so that the
+#: stated coverage and the real coverage cannot drift apart silently.
+_GUARD_UNCOVERED_FORMS = """
+from os import remove
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+def test_forms_the_guard_does_not_reach():
+    remove(REPO / "bin" / "leftover")
+    subprocess.run(["rm", "-f", str(REPO / "bin" / "leftover")])
+    os.close(os.open(REPO / "bin" / "leftover", os.O_WRONLY))
+    shutil.copy(REPO / "bin" / "a", dst=REPO / "bin" / "b")
+"""
+
+
+def test_the_write_guard_names_the_original_transitively_rooted_offender():
+    """The true positive the guard was built for, pinned against every later
+    widening. A widening that stops naming this is worse than the blind spots
+    it closes."""
+    assert _repository_writers(_GUARD_TRANSITIVE_LOCAL) == [
+        "test_image_records_change_when_the_dockerfile_changes:8"
+        " dockerfile.write_bytes(original + b'# provoke a digest change')",
+        "test_image_records_change_when_the_dockerfile_changes:10"
+        " dockerfile.write_bytes(original)",
+    ]
+
+
+def test_the_write_guard_sees_a_module_level_path_constant():
+    """Blind spot 1. `SCRIPT` is assigned at module level in this very file, so
+    a collector that walks only function bodies cannot resolve it and reports
+    nothing on the most likely future offender."""
+    assert _repository_writers(_GUARD_MODULE_LEVEL_CONSTANT) == [
+        "test_writes_through_the_module_constant:6 SCRIPT.write_text('mutated')",
+    ]
+
+
+def test_the_write_guard_sees_a_name_bound_by_a_loop_target():
+    """Blind spot 3. `for path in REPO.glob(...)` binds no `ast.Assign`."""
+    assert _repository_writers(_GUARD_LOOP_TARGET) == [
+        "test_writes_through_a_loop_target:6 path.unlink()",
+    ]
+
+
+def test_the_write_guard_sees_open_and_the_free_function_mutators():
+    """Blind spot 4. A mutator set of attribute methods alone leaves `open`,
+    `os.remove` and `shutil.rmtree` entirely outside the guard."""
+    assert _repository_writers(_GUARD_FREE_FUNCTION_MUTATORS) == [
+        "test_writes_without_a_path_method:5"
+        " open(REPO / 'bin' / 'cctally-test-linux-matrix', 'w')",
+        "test_writes_without_a_path_method:7 os.remove(REPO / 'bin' / 'leftover')",
+        "test_writes_without_a_path_method:8 shutil.rmtree(REPO / 'scratch')",
+    ]
+
+
+def test_the_write_guard_sees_both_other_spellings_of_open():
+    """Blind spot 5. The `open` branch keyed on the unparsed text `open`, so
+    the bound `(REPO / "x").open("w")` could not reach it at all, and the free
+    form read the path from `args[0]` after reading the mode from `mode=`,
+    which refuses `open(file=..., mode="w")` for having no positional path."""
+    assert _repository_writers(_GUARD_OPEN_VARIANTS) == [
+        "test_writes_through_the_other_two_spellings_of_open:5"
+        " (REPO / 'bin' / 'cctally-test-linux-matrix').open('w')",
+        "test_writes_through_the_other_two_spellings_of_open:7"
+        " open(file=REPO / 'bin' / 'leftover', mode='a')",
+    ]
+
+
+def test_the_write_guard_sees_link_creation_in_the_tree():
+    """Blind spot 6. `symlink_to` and `hardlink_to` create the path they are
+    called on, and neither was in the mutator set."""
+    assert _repository_writers(_GUARD_LINK_CREATORS) == [
+        "test_creates_links_in_the_tree:5"
+        " (REPO / 'bin' / 'soft').symlink_to(tmp_path / 'elsewhere')",
+        "test_creates_links_in_the_tree:6"
+        " (REPO / 'bin' / 'hard').hardlink_to(tmp_path / 'elsewhere')",
+    ]
+
+
+def test_the_write_guard_reports_a_nested_write_once_under_the_inner_function():
+    """Two properties, and they need two corpora because one case cannot prove
+    both.
+
+    NAMING. `ast.walk(tree)` yields the nested function too, and `ast.walk`
+    over the outer function descends into it, so the same call is reached
+    twice. Only the outer scope resolves a name the inner function CLOSES OVER,
+    so on `_GUARD_NESTED_FUNCTION` the inner visit resolves nothing and one
+    visit reports whatever the collector does about duplicates. What that case
+    pins is the name: `_innermost_owners` reports the finding under `_mutate`,
+    the function the call is written in, not under the test that encloses it.
+
+    DEDUPLICATION. `_GUARD_NESTED_MODULE_CONSTANT` is the case that exercises
+    it. Every function's rooted set is SEEDED with the module's names, so
+    `SCRIPT` resolves in the outer scope and in the inner one alike, both
+    visits report the same call, and the finding appears twice unless `found`
+    is keyed by `(lineno, col_offset)`.
+    """
+    assert _repository_writers(_GUARD_NESTED_FUNCTION) == [
+        "_mutate:8 target.write_text('mutated')",
+    ]
+    assert _repository_writers(_GUARD_NESTED_MODULE_CONSTANT) == [
+        "_mutate:7 SCRIPT.write_text('mutated')",
+    ]
+
+
+def test_the_write_guard_sees_the_os_free_spellings_of_the_path_methods():
+    """P3-5. `_PATH_MUTATORS` gained `symlink_to` and `hardlink_to`, and the
+    free spellings of the same mutations were not in `_FUNCTION_MUTATORS`.
+
+    Six of the table's keys are dotted names whose attribute is itself a
+    `_PATH_MUTATORS` entry, so this also pins the fall-through: an attribute
+    test that ANSWERED instead of falling through would report none of
+    `os.chmod`, `os.unlink`, `os.mkdir`, `os.rmdir`, `os.rename` or
+    `os.replace`, because their receiver is the module `os`.
+
+    The last line is the negative direction. `os.symlink(src, dst)` creates
+    `dst` and requires `src` to exist, so a rooted SOURCE is a read.
+    """
+    assert _repository_writers(_GUARD_OS_FREE_MUTATORS) == [
+        "test_writes_through_the_os_spellings:5"
+        " os.chmod(REPO / 'bin' / 'cctally-test-linux-matrix', 493)",
+        "test_writes_through_the_os_spellings:6"
+        " os.utime(REPO / 'bin' / 'cctally-test-linux-matrix', None)",
+        "test_writes_through_the_os_spellings:7"
+        " os.unlink(REPO / 'bin' / 'leftover')",
+        "test_writes_through_the_os_spellings:8"
+        " os.mkdir(REPO / 'bin' / 'created')",
+        "test_writes_through_the_os_spellings:9"
+        " os.rmdir(REPO / 'bin' / 'obsolete')",
+        "test_writes_through_the_os_spellings:10"
+        " os.rename(REPO / 'bin' / 'before', tmp_path / 'after')",
+        "test_writes_through_the_os_spellings:11"
+        " os.replace(tmp_path / 'before', REPO / 'bin' / 'after')",
+        "test_writes_through_the_os_spellings:12"
+        " os.symlink(tmp_path / 'elsewhere', REPO / 'bin' / 'soft')",
+        "test_writes_through_the_os_spellings:13"
+        " os.link(tmp_path / 'elsewhere', REPO / 'bin' / 'hard')",
+    ]
+
+
+def test_the_write_guard_does_not_read_a_zip_member_name_as_a_writing_mode():
+    """P3-2. The bound-`open` branch takes the mode from the FIRST positional
+    argument, which is where `ZipFile.open` puts a member name instead. A flag
+    test alone reads `member.txt` as a write, because it contains an `x`, and
+    reports a read out of the tree as a repository mutation.
+    """
+    assert _repository_writers(_GUARD_NON_MODE_FIRST_ARGUMENT) == []
+
+
+def test_the_write_guard_reports_neither_a_read_nor_a_write_outside_the_tree():
+    """The widening must not start reporting a `str.replace` or a
+    `bytes.replace` on content read out of the tree, an `open` for reading, or
+    a write under `tmp_path`."""
+    assert _repository_writers(_GUARD_STRING_REPLACE) == []
+    assert _repository_writers(_GUARD_READS_AND_TMP_PATH) == []
+    assert _repository_writers(_GUARD_OPEN_COMPLEMENT) == []
+
+
+def test_the_write_guard_reaches_a_path_read_out_of_the_tree():
+    """The hole #659's second review round closed.
+
+    Rootedness used to stop at a content read, so a path whose value came out
+    of a repository file escaped the guard. It no longer stops there, because
+    the one collision that narrowing existed to suppress — `str.replace`
+    against `pathlib.Path.replace` — is now told apart by arity instead:
+    `Path.replace(target)` takes one positional argument and
+    `str.replace(old, new[, count])` takes two or more.
+    """
+    assert _repository_writers(_GUARD_CONTENT_DERIVED_PATH) == [
+        "test_writes_through_a_path_read_out_of_the_tree:6"
+        " target.write_text('mutated')",
+    ]
+
+
+def test_the_write_guard_reports_none_of_the_forms_its_docstring_excludes():
+    """The stated coverage, asserted against the code that implements it.
+
+    A completeness claim broader than the guard is the #659 defect class in
+    documentation form. These four forms are excluded by name in
+    `_repository_writers`, and this pins the exclusion so that widening the
+    guard to reach one of them fails here until the docstring is corrected too.
+    """
+    assert _repository_writers(_GUARD_UNCOVERED_FORMS) == []
+
+
+#: Every file `_image_records` reads (bin/cctally-test-linux-matrix:211-254).
+#: A synthetic root missing any one of them makes `_image_records` raise.
+_IMAGE_INPUT_RELPATHS = (
+    "bin/cctally-test-linux-matrix.Dockerfile",
+    "bin/_lib-linux-matrix-manifest.sh",
+    "bin/cctally-test-linux-matrix-sampler.py",
+    "tests/requirements-dev.txt",
+    "dashboard/web/package.json",
+    "dashboard/web/package-lock.json",
+    "dashboard/web/.nvmrc",
+)
+
+
+def _synthetic_image_root(tmp_path):
+    """A copy of the real image inputs, which the test may then mutate.
+
+    Reads the live tree ONCE and writes only under `tmp_path`. Nothing in this
+    estate writes these files any more, which is what makes the single read
+    safe; before #659 this module's own Dockerfile test did.
+    """
+    root = tmp_path / "image-root"
+    for relative in _IMAGE_INPUT_RELPATHS:
+        destination = root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((REPO / relative).read_bytes())
+    return root
+
+
+def _pinned_records():
+    """A fixed record list for tests about `_resolve_image`, not about inputs.
+
+    Those tests concern immutable-ID selection, epoch rejection and build-once
+    behaviour. Pinning the records here rather than `_image_input_digest` keeps
+    the digest's framing and its link to the derived tag under test; inventory
+    fidelity stays with `test_image_records_cover_every_input_...`.
+    """
+    return [("fixture", "stable"), ("python", "3.12"), ("apt-epoch", "2026-W34")]
+
+
+def test_image_records_cover_every_input_that_can_change_the_image(tmp_path):
+    gate = _load_gate()
+    records = dict(gate._image_records("3.12", "2026-W34",
+                                       _synthetic_image_root(tmp_path)))
     for required in (
         "schema", "python", "platform", "distro", "base", "dockerfile",
+        # `manifest-script` and `sampler-script` were absent from this tuple
+        # until #659, so the test named for covering every input did not.
+        "manifest-script", "sampler-script",
         "requirements", "package-json", "package-lock", "nvmrc",
         "node-archive-sha256", "apt-packages", "sqlite-url", "sqlite-version",
         "sqlite-sha256", "sqlite-flags", "uid", "gid", "checkout", "apt-epoch",
@@ -1133,23 +2055,19 @@ def test_image_records_cover_every_input_that_can_change_the_image():
     assert records["python"] == "3.12"
 
 
-def test_image_records_change_when_the_dockerfile_changes():
+def test_image_records_change_when_the_dockerfile_changes(tmp_path):
     gate = _load_gate()
-    root = gate._repo_root()
+    root = _synthetic_image_root(tmp_path)
     before = gate._image_input_digest(gate._image_records("3.12", "2026-W34", root))
     dockerfile = root / "bin" / "cctally-test-linux-matrix.Dockerfile"
-    original = dockerfile.read_bytes()
-    try:
-        dockerfile.write_bytes(original + b"\n# provoke a digest change\n")
-        after = gate._image_input_digest(gate._image_records("3.12", "2026-W34", root))
-    finally:
-        dockerfile.write_bytes(original)
+    dockerfile.write_bytes(dockerfile.read_bytes() + b"\n# provoke a digest change\n")
+    after = gate._image_input_digest(gate._image_records("3.12", "2026-W34", root))
     assert before != after
 
 
-def test_the_freshness_epoch_is_part_of_the_image_key():
+def test_the_freshness_epoch_is_part_of_the_image_key(tmp_path):
     gate = _load_gate()
-    root = gate._repo_root()
+    root = _synthetic_image_root(tmp_path)
     this_week = gate._image_input_digest(gate._image_records("3.12", "2026-W34", root))
     next_week = gate._image_input_digest(gate._image_records("3.12", "2026-W35", root))
     assert this_week != next_week
@@ -1162,9 +2080,10 @@ def _fake_inspect(payload):
     return _inspect
 
 
-def test_resolve_image_returns_the_immutable_id_not_the_tag(monkeypatch):
+def test_resolve_image_returns_the_immutable_id_not_the_tag(monkeypatch, tmp_path):
     gate = _load_gate()
-    root = gate._repo_root()
+    monkeypatch.setattr(gate, "_image_records", lambda *a, **k: _pinned_records())
+    root = tmp_path
     digest = gate._image_input_digest(gate._image_records("3.12", "2026-W34", root))
     image_id = "sha256:" + "b" * 64
     monkeypatch.setattr(
@@ -1189,9 +2108,11 @@ def test_resolve_image_returns_the_immutable_id_not_the_tag(monkeypatch):
     assert gate._resolve_image("docker", "3.12", "2026-W34", root) == image_id
 
 
-def test_resolve_image_refuses_an_image_whose_input_label_disagrees(monkeypatch):
+def test_resolve_image_refuses_an_image_whose_input_label_disagrees(monkeypatch,
+                                                                    tmp_path):
     gate = _load_gate()
-    root = gate._repo_root()
+    monkeypatch.setattr(gate, "_image_records", lambda *a, **k: _pinned_records())
+    root = tmp_path
     monkeypatch.setattr(
         gate,
         "_inspect_image",
@@ -1207,13 +2128,17 @@ def test_resolve_image_refuses_an_image_whose_input_label_disagrees(monkeypatch)
         ),
     )
     monkeypatch.setattr(gate, "_build_image", lambda *a, **k: None)
-    with pytest.raises(gate.GateError):
+    # `match=` because `_resolve_image` compares the digest at
+    # bin/cctally-test-linux-matrix:553 and raises before the epoch check at
+    # :558, so a bare `raises(GateError)` cannot tell the two branches apart.
+    with pytest.raises(gate.GateError, match="records inputs"):
         gate._resolve_image("docker", "3.12", "2026-W34", root)
 
 
-def test_resolve_image_refuses_an_epoch_outside_the_bound(monkeypatch):
+def test_resolve_image_refuses_an_epoch_outside_the_bound(monkeypatch, tmp_path):
     gate = _load_gate()
-    root = gate._repo_root()
+    monkeypatch.setattr(gate, "_image_records", lambda *a, **k: _pinned_records())
+    root = tmp_path
     digest = gate._image_input_digest(gate._image_records("3.12", "2026-W34", root))
     monkeypatch.setattr(
         gate,
@@ -1230,13 +2155,17 @@ def test_resolve_image_refuses_an_epoch_outside_the_bound(monkeypatch):
         ),
     )
     monkeypatch.setattr(gate, "_build_image", lambda *a, **k: None)
-    with pytest.raises(gate.GateError):
+    # The epoch message, not merely a `GateError`: the digest branch above runs
+    # first, so without this the test was satisfied by the wrong refusal.
+    with pytest.raises(gate.GateError, match="apt freshness epoch"):
         gate._resolve_image("docker", "3.12", "2026-W34", root)
 
 
-def test_resolve_image_builds_exactly_once_when_the_derived_tag_is_missing(monkeypatch):
+def test_resolve_image_builds_exactly_once_when_the_derived_tag_is_missing(
+        monkeypatch, tmp_path):
     gate = _load_gate()
-    root = gate._repo_root()
+    monkeypatch.setattr(gate, "_image_records", lambda *a, **k: _pinned_records())
+    root = tmp_path
     digest = gate._image_input_digest(gate._image_records("3.12", "2026-W34", root))
     image_id = "sha256:" + "b" * 64
     states = iter(
@@ -1647,10 +2576,12 @@ def test_acceptance_mode_retains_the_container_and_mounts_the_metrics_directory(
     assert f"--cidfile {cidfile}" in rendered
     assert f"{metrics}:/metrics" in rendered
     body = command[-1]
-    # --durations=0 has no route into the hard-coded pytest invocation in
-    # bin/cctally-test-all, so acceptance mode injects it through PYTEST_ADDOPTS
-    # rather than editing the aggregator.
-    assert "PYTEST_ADDOPTS=--durations=0" in body
+    # #648 D7 sanitizes PYTEST_ADDOPTS out of both pytest execution legs,
+    # because `--ignore` through it narrowed an authoritative run that admission
+    # had observed in full. That closed the route this lane used, so the
+    # aggregator now recognises a variable that can only ADD a reporting flag.
+    assert "CCTALLY_PYTEST_DURATIONS=1" in body
+    assert "PYTEST_ADDOPTS" not in body
     assert gate.SAMPLER_CONTAINER_PATH in body
 
 

@@ -73,6 +73,15 @@ SELECT_ALLOWLIST = {
     ('"WHERE cache_create_tokens > 0 AND cache_create_1h_tokens IS NULL"'):
         "_validate_cache_rows completeness probe — counts unknown TTL splits; "
         "it never computes cost",
+    ('" cache_create_tokens, cache_create_1h_tokens, cache_read_tokens"'):
+        "the #661 quota token projection, in bin/_cctally_quota_model.py and "
+        "bin/build-quota-evidence-corpus.py and nowhere else today. It sums "
+        "WEIGHTED TOKEN UNITS for the subscription quota meter and never "
+        "computes USD, so the effective pricing tier does not enter its "
+        "arithmetic; it does fetch the 1h split, which its class weights do "
+        "use. Whether the quota meter itself weights fast-mode tokens "
+        "differently is an open question #661 S1 did not answer, recorded as "
+        "a residual rather than assumed either way",
 }
 
 

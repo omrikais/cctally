@@ -21,6 +21,11 @@ COMBOS=(
     "warn expressive   100x30"
     "ok   conventional 120x36"
     "over conventional 120x36"
+    # #661 S2 section 3.2 / section 13: the 100% right-censored path on EVERY
+    # consumer. `over` reads 92.4% and never reaches the cap, so no committed
+    # fixture exercised the withheld projection on any TUI render path.
+    "censored conventional 120x36"
+    "censored expressive   120x36"
     # v2 additions
     "filter_subscr conventional 120x36"
     "filter_empty  conventional 120x36"
@@ -28,6 +33,9 @@ COMBOS=(
     "search_opus   conventional 120x36"
     "modal_cw      conventional 120x36"
     "modal_fc      conventional 120x36"
+    # The explain modal over the censored underlay: the surface that stated
+    # `no 24h-prior sample` for a state whose cause is the censoring.
+    "modal_fc_censored conventional 120x36"
     "modal_tr      conventional 120x36"
     "modal_tr      conventional 100x30"
     "modal_se      conventional 120x36"

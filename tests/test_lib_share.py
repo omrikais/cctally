@@ -2739,7 +2739,8 @@ _S2_DEFAULT_TOP_N = {
 def _s2_panel_data(panel: str) -> dict:
     import json as _json
     payload = _json.loads(
-        (_S2_FIXTURES / panel / "panel_data.json").read_text(encoding="utf-8"))
+        (_S2_FIXTURES / panel / "panel_data.json").read_text(  # mirror-private-ok: callers carry _s2_needs_fixtures
+            encoding="utf-8"))
     out = dict(payload)
     for key in ("period_start", "period_end"):
         value = out.get(key)
@@ -5249,7 +5250,12 @@ _S2T_CORPUS_ROOTS = ("share", "share-v2", "source-aware", "budget")
 # was a whole family leaving the sweep unnoticed, and a floor cannot
 # observe that. Changing a count here is a deliberate act: a new golden
 # family is added to the census in the same commit that adds the family.
-_S2T_CORPUS_CENSUS = {"md": 133, "html": 122, "svg": 120}
+_S2T_CORPUS_CENSUS = {"md": 135, "html": 122, "svg": 120}
+# +2 md in #661 S2: `tests/fixtures/share/forecast-md-censored`, the
+# right-censored forecast artifact spec section 13 requires on every consumer,
+# and `tests/fixtures/share/forecast-md-zero-week`, its opposite end — spec
+# section 3.6 says a displayed ZERO is bounded rather than censored, so it
+# projects from the corrected point instead of withholding.
 # The files whose NAME carries no format token. They are what the previous
 # filename classifier could not see; counted so this sweep cannot quietly
 # stop reaching them.
