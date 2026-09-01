@@ -30,15 +30,15 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 </p>
 
 <!-- cctally:latest-stable:begin -->
-**Latest stable: v1.101.0** (2026-08-19)
+**Latest stable: v1.104.0** (2026-08-29)
 
-Highlights from the `v1.95.5` to `v1.101.0` stable upgrade:
+Highlights from the `v1.101.0` to `v1.104.0` stable upgrade:
 
-- Dashboard refreshes release their read lock on `cache.db` sooner, cutting the measured median hold from 3.40 seconds to 1.04. The published data is unchanged.
-- Every dashboard warning carries a button that opens the surface explaining it, the week, the five-hour block, the month, the project, or the forecast. A warning whose window has closed says so and opens nothing.
-- The dashboard's Projects table writes out what its two percentages mean under the week selector, where a phone can read it. `Used pp` is relabelled `Used pp (sum)`, and the caption names the denominator of `Cost share`.
+- `cctally quota` reports how much of your weekly quota your usage consumes and whether Anthropic has changed the metering rate, from a budget fitted to your own history rather than a shipped constant. See `docs/commands/quota.md`.
+- `cctally quota --json` publishes the fit, the current week's consumption and projection, the composition support radii and the detector's own bound under `schemaVersion` 1.
+- `cctally quota --reset-calibration` discards the stored calibration for one account, and `--since` and `--watch-from` narrow or override the window the analysis uses.
 
-[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.101.0)
+[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.104.0)
 <!-- cctally:latest-stable:end -->
 
 ## Quick start
