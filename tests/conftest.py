@@ -555,6 +555,7 @@ def _reset_perf_state():
             _perf.set_enabled(False)
             _perf.reset_thread()
             _perf._LAST_BACKEND_PERF = None
+            _perf._LAST_INGEST_PERF = None
         except Exception:
             pass
 
@@ -788,6 +789,22 @@ def redirect_paths(ns, monkeypatch, tmp_path):
     # the kernel patches above propagate directly — no extra block here.
 
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
+
+
+def redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path):
+    """Redirect state and keep non-retention transcript fixtures durable.
+
+    Conversation rebuilds deliberately force the configured retention pass.
+    Ingest, reingest, rollup, and reader tests use fixed JSONL timestamps and
+    are not retention tests, so leaving them on the production default makes
+    their expected rows expire as wall time advances. Dedicated retention tests
+    continue to use ``redirect_paths`` and exercise explicit windows.
+    """
+    redirect_paths(ns, monkeypatch, tmp_path)
+    ns["CONFIG_PATH"].write_text(
+        '{"conversation":{"retention_days":0}}\n',
+        encoding="utf-8",
+    )
 
 
 @pytest.fixture

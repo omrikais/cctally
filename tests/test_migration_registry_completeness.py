@@ -45,7 +45,7 @@ PER_MIGRATION_ROOT = (
 # module docstring).
 EXPECTED_STATS_COUNT = 13
 EXPECTED_CACHE_COUNT = 44
-EXPECTED_CONVERSATIONS_COUNT = 7
+EXPECTED_CONVERSATIONS_COUNT = 8
 
 # migration name -> its per-migration golden TEST MODULE (stem). The module must
 # declare ``IDEMPOTENCY_COVERED = True``. The historical mixed naming is why this
@@ -121,6 +121,7 @@ MANIFEST = {
     "005_conversation_account_dimension": "test_conversations_migration_005_per_migration_goldens",
     "006_backfill_codex_file_touches": "test_conversations_migration_006_per_migration_goldens",
     "007_codex_find_projection_v2_meta": "test_conversations_migration_007_per_migration_goldens",
+    "008_conversation_render_revision": "test_conversations_migration_008_per_migration_goldens",
 }
 
 # Golden dir names for conversations migrations carry a ``conversations_``

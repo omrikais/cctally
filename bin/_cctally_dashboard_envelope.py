@@ -1213,6 +1213,22 @@ def _cause_presentation(code):
     return out or None
 
 
+def _basis_presentation(basis):
+    """The shared two-register projection-basis copy, or None.
+
+    Separate from `_cause_presentation`: a basis describes a present figure's
+    provenance and never joins the withholding-cause vocabulary.
+    """
+    if not basis:
+        return None
+    try:
+        copy = sys.modules["cctally"]._load_sibling("_lib_quota_copy")
+    except Exception:                                  # noqa: BLE001
+        return None
+    out = copy.basis_presentation(basis)
+    return out or None
+
+
 def _forecast_quota_envelope(fc, cw, rate_change):
     """Spec §10's optional typed `forecast.quota` object.
 
@@ -1276,6 +1292,7 @@ def _forecast_quota_envelope(fc, cw, rate_change):
         calibration_code = calibration_code or "unavailable"
     return {
         "basis":              basis,
+        "basis_presentation": _basis_presentation(basis),
         "projection_pct":     projection,
         "right_censored":     bool(getattr(fc, "right_censored", False)),
         # The cause of a WITHHELD projection, and separately why the

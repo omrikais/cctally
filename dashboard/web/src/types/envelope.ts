@@ -621,6 +621,15 @@ export interface QuotaCausePresentation {
   long: string;
 }
 
+// #676: presentation for projection provenance, kept as a distinct semantic
+// type even though its wire fields match cause presentation. A basis names a
+// present figure's source; it is never a withholding cause.
+export interface QuotaBasisPresentation {
+  code: string;
+  short: string;
+  long: string;
+}
+
 // #661 S2 section 6.6: the DERIVED marker state. The active open regime has
 // a confirmed predecessor, and the marker shows for the whole of that
 // successor regime. Distinct from `meter_rate_changes`, which is the event
@@ -631,6 +640,12 @@ export interface QuotaRateChangeState {
   severity?: 'info' | 'warn' | 'alarm' | null;
   previous_units_per_point?: number | null;
   new_units_per_point?: number | null;
+  // #688. The successor regime's own calibration status. Declared rather
+  // than left undeclared because the TUI snapshot builder forwards the whole
+  // `active_rate_change` dict into `forecast.quota.rate_change`, so the key
+  // does reach this published surface, and an undeclared key that ships is
+  // worse than a declared one that is unused.
+  calibration_status?: string | null;
 }
 
 // #661 S2 section 10. Optional and additive: it sits under `forecast`
@@ -639,6 +654,8 @@ export interface QuotaRateChangeState {
 export interface ForecastQuotaEnvelope {
   // Which measurement produced `projection_pct`.
   basis: 'calibrated' | 'corrected-meter' | 'withheld' | null;
+  // Optional for compatibility with a tab carrying an older server snapshot.
+  basis_presentation?: QuotaBasisPresentation | null;
   projection_pct: number | null;
   right_censored: boolean;
   // Why the projection is WITHHELD. Null whenever one was published.

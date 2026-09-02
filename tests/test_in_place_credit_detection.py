@@ -1222,6 +1222,28 @@ def test_milestone_segment_assigned_when_event_active(ns):
             effective=effective,
             old_week_end_at=end_iso,
         )
+        # Post-reset climb evidence (2026-09-01 incident). A post-credit epoch
+        # may seed its milestone ladder only once it holds an observation
+        # floored strictly below the threshold being recorded, so a stale
+        # pre-credit replica can never open a fresh epoch — see
+        # tests/test_milestone_epoch_stale_seed.py. This test is about
+        # reset_event_id stamping, not about the seeding policy, so it seeds an
+        # evidence row directly. In production that row comes from the ordinary
+        # accept path recording a genuine post-credit reading — the auto-credit
+        # `_fire_in_place_credit` writes no synthetic snapshot of its own (only
+        # the manual record-credit op's `_apply_credit` does). A reset-to-zero
+        # therefore supplies it as a matter of course, but a >=25pp goodwill
+        # credit to a NON-ZERO level does not, which is the disclosed cost
+        # pinned by that module's T5 test.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T17:30:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=0.5,
+        )
         # Usage snapshot captured AFTER the credit moment.
         usage_id = _seed_usage_snapshot(
             conn,
@@ -1303,6 +1325,28 @@ def test_milestone_post_credit_threshold_lands_as_new_row(ns):
             new_week_end_at=end_iso,
             effective=effective,
             old_week_end_at=end_iso,
+        )
+        # Post-reset climb evidence (2026-09-01 incident). A post-credit epoch
+        # may seed its milestone ladder only once it holds an observation
+        # floored strictly below the threshold being recorded, so a stale
+        # pre-credit replica can never open a fresh epoch — see
+        # tests/test_milestone_epoch_stale_seed.py. This test is about
+        # reset_event_id stamping, not about the seeding policy, so it seeds an
+        # evidence row directly. In production that row comes from the ordinary
+        # accept path recording a genuine post-credit reading — the auto-credit
+        # `_fire_in_place_credit` writes no synthetic snapshot of its own (only
+        # the manual record-credit op's `_apply_credit` does). A reset-to-zero
+        # therefore supplies it as a matter of course, but a >=25pp goodwill
+        # credit to a NON-ZERO level does not, which is the disclosed cost
+        # pinned by that module's T5 test.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T17:30:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=0.5,
         )
         # New usage snapshot at 3%, captured post-event.
         usage_id = _seed_usage_snapshot(
@@ -1595,6 +1639,28 @@ def test_post_credit_alert_fires_independently(ns):
             effective=effective,
             old_week_end_at=end_iso,
         )
+        # Post-reset climb evidence (2026-09-01 incident). A post-credit epoch
+        # may seed its milestone ladder only once it holds an observation
+        # floored strictly below the threshold being recorded, so a stale
+        # pre-credit replica can never open a fresh epoch — see
+        # tests/test_milestone_epoch_stale_seed.py. This test is about
+        # reset_event_id stamping, not about the seeding policy, so it seeds an
+        # evidence row directly. In production that row comes from the ordinary
+        # accept path recording a genuine post-credit reading — the auto-credit
+        # `_fire_in_place_credit` writes no synthetic snapshot of its own (only
+        # the manual record-credit op's `_apply_credit` does). A reset-to-zero
+        # therefore supplies it as a matter of course, but a >=25pp goodwill
+        # credit to a NON-ZERO level does not, which is the disclosed cost
+        # pinned by that module's T5 test.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T17:30:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=0.5,
+        )
         usage_id = _seed_usage_snapshot(
             conn,
             captured_at_utc="2026-05-14T18:00:00Z",
@@ -1702,6 +1768,19 @@ def test_self_heal_probe_scoped_to_active_segment(ns, monkeypatch):
             week_start_at=week_start_at,
             week_end_at=end_iso,
             cost_usd=12.0,
+        )
+        # Post-reset climb evidence (2026-09-01 incident): the epoch needs an
+        # observation floored below the threshold before its ladder may be
+        # seeded. After a reset-to-zero the credited ~0 reading, recorded by the
+        # ordinary accept path, is exactly this row.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T17:30:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=0.0,
         )
         # Latest snapshot at 1% (post-credit) — but NO milestone row yet
         # in the post-credit segment. The live record-usage path will

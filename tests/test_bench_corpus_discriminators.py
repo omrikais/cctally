@@ -102,6 +102,18 @@ def test_the_cheap_profiles_carry_every_discriminator(scale, shared_corpus):
 
 
 @pytest.mark.parametrize("scale", ["tiny", "small"])
+def test_corpus_carries_both_provider_frontier_tickets(scale, shared_corpus):
+    """The no-op dashboard receipt must exercise the trusted fast-negative."""
+    import json
+    import _lib_ingest_frontier as frontier
+
+    marker = frontier.activity_marker_path(shared_corpus(scale))
+    rows = [json.loads(line) for line in marker.read_text().splitlines()]
+    assert {row["provider"] for row in rows} == {"claude", "codex"}
+    assert all(pathlib.Path(row["path"]).is_file() for row in rows)
+
+
+@pytest.mark.parametrize("scale", ["tiny", "small"])
 def test_the_cheap_profiles_realise_exactly_the_counts_they_declare(
     scale, shared_corpus
 ):
@@ -171,7 +183,7 @@ def test_large_declares_the_same_discriminators_as_the_cheap_profiles():
     bbf = _load_build_bench()
     discriminator_keys = {
         "codex_sessions", "codex_events_per_session", "codex_accounts",
-        "quota_windows", "colliding_basename",
+        "quota_windows", "colliding_basename", "history_rows",
     }
     profiles = {name: bbf.SCALES[name] for name in ("tiny", "small", "large")}
     for name, params in profiles.items():
@@ -179,6 +191,7 @@ def test_large_declares_the_same_discriminators_as_the_cheap_profiles():
             name, sorted(discriminator_keys - set(params)))
         assert params["codex_accounts"] >= 2
         assert params["colliding_basename"] is True
+        assert params["history_rows"] > 0
         # Enough sessions per Codex root that BOTH pool axes can fire: the
         # `local_index % 4` selector reaches the Spark model at 1 and the Spark
         # limit_name at 2, so a root with fewer than three sessions carries one

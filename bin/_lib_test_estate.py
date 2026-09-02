@@ -61,6 +61,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 __all__ = [
@@ -120,6 +121,8 @@ _ARTIFACT_KEYS = frozenset(
 _OVERLAY_KEYS = frozenset(
     {"schemaVersion", "publicDigest", "allowlistDigest"} | set(AXES)
 )
+_OVERLAY_OPTIONAL_KEYS = frozenset({"pytestExecution"})
+_PRIVATE_EXECUTION_KEYS = frozenset({"benchmarkAdditions"})
 
 # The two legs D7 declares. The `pytest` leg's share is the COMPLEMENT of every
 # other leg's, which cannot be written as a selector list, so it carries this
@@ -211,10 +214,10 @@ def _read_json(path):
         raise EstateError(f"estate artifact at {path} is not valid JSON: {exc}")
 
 
-def _require_keys(doc, allowed, what):
+def _require_keys(doc, allowed, what, optional=()):
     if not isinstance(doc, dict):
         raise EstateError(f"{what} must be a JSON object, not {type(doc).__name__}")
-    unknown = sorted(set(doc) - set(allowed))
+    unknown = sorted(set(doc) - set(allowed) - set(optional))
     if unknown:
         raise EstateError(f"{what} carries unknown key(s): {', '.join(unknown)}")
     missing = sorted(set(allowed) - set(doc))
@@ -576,7 +579,10 @@ def compose_private(public, overlay, expect_allowlist_digest=None):
     and a checker that could not compose without one would be broken exactly
     where the public profile is the only profile.
     """
-    _require_keys(overlay, _OVERLAY_KEYS, "the private estate overlay")
+    _require_keys(
+        overlay, _OVERLAY_KEYS, "the private estate overlay",
+        optional=_OVERLAY_OPTIONAL_KEYS,
+    )
     for field in ("publicDigest", "allowlistDigest"):
         if not isinstance(overlay[field], str) or not overlay[field]:
             raise EstateError(f"the private estate overlay records no {field}")
@@ -623,6 +629,48 @@ def compose_private(public, overlay, expect_allowlist_digest=None):
             removals.add(key)
         kept = [row for row in base if _row_key(row) not in removals]
         combined[axis] = _sorted_rows(kept + list(delta["additions"]))
+    private_execution = overlay.get(
+        "pytestExecution", {"benchmarkAdditions": []})
+    if (not isinstance(private_execution, dict)
+            or set(private_execution) != _PRIVATE_EXECUTION_KEYS):
+        raise EstateError(
+            "the private estate overlay's pytestExecution must carry exactly "
+            f"{sorted(_PRIVATE_EXECUTION_KEYS)}"
+        )
+    additions = private_execution["benchmarkAdditions"]
+    if not isinstance(additions, list):
+        raise EstateError(
+            "the private estate overlay's "
+            "pytestExecution.benchmarkAdditions must be a list"
+        )
+    if any(not isinstance(selector, str) or not selector for selector in additions):
+        raise EstateError(
+            "the private estate overlay's "
+            "pytestExecution.benchmarkAdditions carries an empty or non-string "
+            "selector"
+        )
+    if len(set(additions)) != len(additions):
+        raise EstateError(
+            "the private estate overlay's "
+            "pytestExecution.benchmarkAdditions carries a duplicate selector"
+        )
+    public_benchmark = public["pytestExecution"]["legs"][0]["selectors"]
+    overlap = sorted(set(public_benchmark) & set(additions))
+    if overlap:
+        raise EstateError(
+            "the private estate overlay adds benchmark selector(s) already "
+            f"public: {overlap}"
+        )
+    combined["pytestExecution"] = {
+        "legs": [
+            {
+                "name": leg["name"],
+                "selectors": list(leg["selectors"]) + (
+                    list(additions) if leg["name"] == "benchmark" else []),
+            }
+            for leg in public["pytestExecution"]["legs"]
+        ]
+    }
     return combined
 
 
@@ -664,13 +712,16 @@ HARMFUL = {
 }
 
 PROFILES = ("public", "private")
-CAUSES = ("retired", "reclassified")
+CAUSES = ("retired", "reclassified", "renamed")
 SKIPPED = "skipped"
 
 _LEDGER_DOC_KEYS = frozenset({"schemaVersion", "declarations"})
-_LEDGER_ENTRY_KEYS = frozenset({
-    "id", "axis", "profile", "cause", "reason", "rows", "predecessorDigest",
+_LEDGER_COMMON_ENTRY_KEYS = frozenset({
+    "id", "axis", "profile", "cause", "reason", "predecessorDigest",
 })
+_LEDGER_ROW_ENTRY_KEYS = _LEDGER_COMMON_ENTRY_KEYS | {"rows"}
+_LEDGER_RENAME_ENTRY_KEYS = _LEDGER_COMMON_ENTRY_KEYS | {"renames"}
+_RENAME_KEYS = frozenset({"from", "to"})
 
 _MISSING = object()
 
@@ -760,11 +811,21 @@ def _harmful_transitions(previous, current):
 
 
 def _declaration_rows(entry):
+    if entry.get("cause") == "renamed":
+        return [pair["from"] for pair in entry.get("renames") or []]
     return entry.get("rows") or []
 
 
+def _rename_successor(entry, token):
+    for pair in entry.get("renames") or []:
+        if pair["from"] == token:
+            return pair["to"]
+    return None
+
+
 def _covers(entry, axis, token, kind, previous_digest, profile,
-            other_profile_rows):
+            previous_profile_rows, current_profile_rows, other_profile_rows,
+            rename_successor_counts):
     """Whether one declaration authorizes one harmful row.
 
     Every clause is a conjunct, and the ``predecessorDigest`` clause is what
@@ -780,8 +841,25 @@ def _covers(entry, axis, token, kind, previous_digest, profile,
         return False
     if token not in _declaration_rows(entry):
         return False
-    if entry.get("cause") != "reclassified":
+    cause = entry.get("cause")
+    if cause == "retired":
         return True
+    if cause == "renamed":
+        # A rename is a claim about an identity that LEFT this profile and the
+        # new identity that arrived in the SAME transition.  Both clauses are
+        # load-bearing: accepting a surviving, pre-existing row as the
+        # successor would let an unrelated test conceal a real coverage loss;
+        # accepting two old rows that name one successor would do the same.
+        if kind != "removed" or HARMFUL[axis] != "removal":
+            return False
+        successor = _rename_successor(entry, token)
+        if successor is None or rename_successor_counts.get(successor) != 1:
+            return False
+        before = _axis_tokens(axis, previous_profile_rows.get(axis) or [])
+        after = _axis_tokens(axis, current_profile_rows.get(axis) or [])
+        return successor not in before and successor in after
+    if cause != "reclassified":
+        return False
     # A `reclassified` claim means the row moved ACROSS the mirror boundary, so
     # it can only describe a row that left this profile. On any other kind the
     # other-profile lookup is vacuous by construction: an added suppression and
@@ -847,9 +925,19 @@ def uncovered_transitions(previous, current, ledgers, profile,
     previous_digest = active_set_digest(previous)
     problems = []
     for axis, token, kind, description in _harmful_transitions(previous, current):
+        rename_successor_counts = collections.Counter(
+            pair["to"]
+            for entry in declarations
+            if entry.get("cause") == "renamed"
+            and entry.get("profile") == profile
+            and entry.get("axis") == axis
+            and entry.get("predecessorDigest") == previous_digest
+            for pair in entry.get("renames") or []
+        )
         if any(
             _covers(entry, axis, token, kind, previous_digest, profile,
-                    other_profile_rows)
+                    previous, current, other_profile_rows,
+                    rename_successor_counts)
             for entry in declarations
         ):
             continue
@@ -881,10 +969,11 @@ def _check_declaration(entry, index, what):
     where = f"{what} declaration #{index}"
     if not isinstance(entry, dict):
         raise EstateError(f"{where} is not an object")
-    unknown = sorted(set(entry) - _LEDGER_ENTRY_KEYS)
+    allowed = _LEDGER_ROW_ENTRY_KEYS | _LEDGER_RENAME_ENTRY_KEYS
+    unknown = sorted(set(entry) - allowed)
     if unknown:
         raise EstateError(f"{where} carries unknown key(s): {', '.join(unknown)}")
-    missing = sorted(_LEDGER_ENTRY_KEYS - set(entry))
+    missing = sorted(_LEDGER_COMMON_ENTRY_KEYS - set(entry))
     if missing:
         raise EstateError(f"{where} is missing key(s): {', '.join(missing)}")
     if not isinstance(entry["id"], str) or not entry["id"]:
@@ -898,15 +987,58 @@ def _check_declaration(entry, index, what):
             f"{where} names an unknown cause {entry['cause']!r}; "
             f"expected one of {list(CAUSES)}"
         )
+    expected = (_LEDGER_RENAME_ENTRY_KEYS
+                if entry["cause"] == "renamed"
+                else _LEDGER_ROW_ENTRY_KEYS)
+    unexpected_for_cause = sorted(set(entry) - expected)
+    missing_for_cause = sorted(expected - set(entry))
+    if unexpected_for_cause:
+        raise EstateError(
+            f"{where} carries key(s) invalid for cause {entry['cause']!r}: "
+            + ", ".join(unexpected_for_cause)
+        )
+    if missing_for_cause:
+        raise EstateError(
+            f"{where} is missing key(s) required for cause {entry['cause']!r}: "
+            + ", ".join(missing_for_cause)
+        )
     reason = entry["reason"]
     if not isinstance(reason, str) or not reason.strip():
         raise EstateError(f"{where} carries no reason")
-    rows = entry["rows"]
-    if not isinstance(rows, list) or not rows:
-        raise EstateError(f"{where} names no rows")
-    for row in rows:
-        if not isinstance(row, str) or not row:
-            raise EstateError(f"{where} names a non-string row: {row!r}")
+    if entry["cause"] == "renamed":
+        if HARMFUL[entry["axis"]] != "removal":
+            raise EstateError(
+                f"{where} uses renamed on {entry['axis']}, whose harmful "
+                "direction is not identity removal"
+            )
+        renames = entry["renames"]
+        if not isinstance(renames, list) or not renames:
+            raise EstateError(f"{where} names no renames")
+        sources = []
+        successors = []
+        for pair in renames:
+            if not isinstance(pair, dict) or set(pair) != _RENAME_KEYS:
+                raise EstateError(f"{where} carries a malformed rename: {pair!r}")
+            source = pair["from"]
+            successor = pair["to"]
+            if (not isinstance(source, str) or not source
+                    or not isinstance(successor, str) or not successor):
+                raise EstateError(f"{where} carries a non-string rename: {pair!r}")
+            if source == successor:
+                raise EstateError(f"{where} renames a row to itself: {source!r}")
+            sources.append(source)
+            successors.append(successor)
+        if len(sources) != len(set(sources)):
+            raise EstateError(f"{where} repeats a rename source")
+        if len(successors) != len(set(successors)):
+            raise EstateError(f"{where} maps more than one row to one successor")
+    else:
+        rows = entry["rows"]
+        if not isinstance(rows, list) or not rows:
+            raise EstateError(f"{where} names no rows")
+        for row in rows:
+            if not isinstance(row, str) or not row:
+                raise EstateError(f"{where} names a non-string row: {row!r}")
     digest = entry["predecessorDigest"]
     if digest is not None and (not isinstance(digest, str) or not digest):
         raise EstateError(f"{where} has a malformed predecessorDigest: {digest!r}")
@@ -1301,11 +1433,19 @@ def discover_live(repo):
                 f"{built.returncode}): {(built.stderr or built.stdout)[-2000:]}"
             )
         sets = type("EstateSets", (), {})()
-        sets.pytest_nodes = tuple(discovery.collect_pytest_nodes(repo))
-        sets.frontend_tests = tuple(
-            discovery.collect_frontend_tests(repo, runtime_dir=runtime))
-        sets.suppressions = tuple(
-            discovery.scan_suppressions(repo / "tests", base=repo))
+        # Pytest and frontend collection are independent subprocess trees.
+        # Serial collection pushed the projected-public-tree acceptance node
+        # beyond the authoritative suite's 120-second per-test cap as the
+        # estate grew. Overlap those two waits while the in-process AST
+        # suppression scan runs; result ordering remains fixed below.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pytest_nodes = pool.submit(discovery.collect_pytest_nodes, repo)
+            frontend_tests = pool.submit(
+                discovery.collect_frontend_tests, repo, runtime_dir=runtime)
+            sets.suppressions = tuple(
+                discovery.scan_suppressions(repo / "tests", base=repo))
+            sets.pytest_nodes = tuple(pytest_nodes.result())
+            sets.frontend_tests = tuple(frontend_tests.result())
     return live_axes(sets)
 
 

@@ -37,6 +37,7 @@ POST_OPEN_RECOVERY_ORIGINS = (
     "dashboard.conversation.codex_sync",
     "dashboard.refresh.claude_sync",
     "dashboard.refresh.codex_sync",
+    "dashboard.refresh.frontier_commit",
     "hook.claude.sync",
     "hook.codex_quota.sync",
     "setup.bootstrap.claude_sync",

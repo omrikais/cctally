@@ -2459,28 +2459,75 @@ def fold_claude_canonical(rows, token_map, cost_map, *,
 # _DOCTOR_MEMO precedent (the dashboard is a threading HTTP server).
 import threading as _threading
 from collections import OrderedDict as _OrderedDict
+from types import MappingProxyType as _MappingProxyType
+from _lib_retained_size import retained_size_bytes as _retained_size_bytes
 
 _ASM_MEMO_LOCK = _threading.Lock()
 _ASM_MEMO: "_OrderedDict" = _OrderedDict()   # key -> asm dict
 _ASM_MEMO_CAP = 4                            # main reader + comparison pair + 1 switch
+_ASM_MEMO_MAX_BYTES = 64 * 1024 * 1024
+_ASM_MEMO_SIZES = {}
+_ASM_MEMO_BYTES = 0
+_ASM_MEMO_EVICTIONS = 0
+_ASM_MEMO_FALLBACKS = 0
+_ASM_INFLIGHT = {}                           # key -> _AssemblyFlight
+_ASM_MEMO_EPOCH = 0                          # clear cannot be undone by a producer
+
+
+class _AssemblyFlight:
+    """One missing-key producer and any number of lock-free waiters."""
+
+    __slots__ = ("event", "result", "error")
+
+    def __init__(self):
+        self.event = _threading.Event()
+        self.result = None
+        self.error = None
 
 
 def _assemble_memo_clear() -> None:
     """Drop every memo entry (tests; and the non-authoritative bypass)."""
+    global _ASM_MEMO_EPOCH
+    global _ASM_MEMO_BYTES, _ASM_MEMO_EVICTIONS, _ASM_MEMO_FALLBACKS
     with _ASM_MEMO_LOCK:
         _ASM_MEMO.clear()
+        _ASM_MEMO_SIZES.clear()
+        _ASM_MEMO_BYTES = 0
+        _ASM_MEMO_EVICTIONS = 0
+        _ASM_MEMO_FALLBACKS = 0
+        # A producer may already be outside the lock doing SQLite work.  Its
+        # callers may finish their own pre-clear request, but it must not put
+        # that old revision back into the completed LRU after this boundary.
+        _ASM_MEMO_EPOCH += 1
+
+
+def conversation_assembly_cache_stats():
+    """Retained-byte evidence for completed Claude reader assemblies."""
+    with _ASM_MEMO_LOCK:
+        return _MappingProxyType({
+            "estimatedBytes": int(_ASM_MEMO_BYTES),
+            "maxBytes": int(_ASM_MEMO_MAX_BYTES),
+            "entryCount": len(_ASM_MEMO),
+            "maxEntries": int(_ASM_MEMO_CAP),
+            "evictionCount": int(_ASM_MEMO_EVICTIONS),
+            "fallbackCount": int(_ASM_MEMO_FALLBACKS),
+        })
 
 
 def _assemble_memo_key(conn, session_id):
-    """Return (session_id, msg_count, last_activity_utc, entry_mutation_seq), or
-    None to signal 'bypass the memo' — a missing rollup row or an unreadable
-    accounting ``cache_meta``. Split-store connections read that watermark
-    from the read-only ``cache_db`` attachment; legacy/bare test connections
-    retain the main-schema fallback. The caller has already confirmed the
-    rollup is authoritative."""
+    """Return a store/scope-qualified assembly revision, or ``None`` to bypass.
+
+    Split-store connections read the accounting watermark from the read-only
+    ``cache_db`` attachment; legacy/bare test connections retain the
+    main-schema fallback. Database and TEMP account-scope identity are part of
+    the key so equal rollup watermarks can never reuse another store's or
+    account's private transcript. The caller has already confirmed the rollup
+    is authoritative.
+    """
     try:
         row = conn.execute(
-            "SELECT msg_count, last_activity_utc FROM conversation_sessions "
+            "SELECT msg_count, last_activity_utc, render_revision "
+            "FROM conversation_sessions "
             "WHERE session_id=?", (session_id,)).fetchone()
     except sqlite3.OperationalError:
         return None
@@ -2496,7 +2543,43 @@ def _assemble_memo_key(conn, session_id):
     except sqlite3.OperationalError:
         return None
     seq = int(seq_row[0]) if seq_row and seq_row[0] is not None else 0
-    return (session_id, row[0], row[1], seq)
+
+    database_row = conn.execute(
+        "SELECT file FROM pragma_database_list WHERE name='main'"
+    ).fetchone()
+    database_path = database_row[0] if database_row else ""
+    if database_path:
+        try:
+            database_stat = os.stat(database_path)
+            database_identity = (
+                os.path.realpath(database_path),
+                int(database_stat.st_dev),
+                int(database_stat.st_ino),
+            )
+        except OSError:
+            # A path that disappeared between SQLite's connection open and the
+            # memo probe is not safe to share with a later incarnation.
+            database_identity = (database_path, "missing", id(conn))
+    else:
+        database_identity = (":memory:", id(conn))
+
+    try:
+        scope_row = conn.execute(
+            "SELECT account_key FROM temp._conversation_account_scope"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        scope_row = None
+    account_scope = scope_row[0] if scope_row else None
+
+    return (
+        database_identity,
+        account_scope,
+        session_id,
+        row[0],
+        row[1],
+        row[2],
+        seq,
+    )
 
 
 def _assemble_session_memoized(conn, session_id):
@@ -2512,14 +2595,61 @@ def _assemble_session_memoized(conn, session_id):
         if hit is not None:
             _ASM_MEMO.move_to_end(key)
             return hit
-    asm = _assemble_session(conn, session_id)
-    if asm is None:
-        return None                          # don't cache unknown-session negatives
+        flight = _ASM_INFLIGHT.get(key)
+        if flight is None:
+            flight = _AssemblyFlight()
+            _ASM_INFLIGHT[key] = flight
+            producer = True
+            producer_epoch = _ASM_MEMO_EPOCH
+        else:
+            producer = False
+
+    if not producer:
+        # Never hold the map/LRU lock while waiting.  A different session can
+        # assemble concurrently, and the producer must reacquire the lock to
+        # publish its terminal state.
+        flight.event.wait()
+        if flight.error is not None:
+            raise flight.error
+        return flight.result
+
+    try:
+        asm = _assemble_session(conn, session_id)
+    except BaseException as exc:  # wake every waiter before preserving failure
+        with _ASM_MEMO_LOCK:
+            flight.error = exc
+            _ASM_INFLIGHT.pop(key, None)
+            flight.event.set()
+        raise
+
+    entry_bytes = (
+        0 if asm is None else _retained_size_bytes(
+            (key, asm), stop_after=_ASM_MEMO_MAX_BYTES)
+    )
+    global _ASM_MEMO_BYTES, _ASM_MEMO_EVICTIONS, _ASM_MEMO_FALLBACKS
     with _ASM_MEMO_LOCK:
-        _ASM_MEMO[key] = asm
-        _ASM_MEMO.move_to_end(key)
-        while len(_ASM_MEMO) > _ASM_MEMO_CAP:
-            _ASM_MEMO.popitem(last=False)
+        # Unknown-session negatives stay uncached, matching the old contract.
+        # A clear that happened while the producer was outside the lock also
+        # suppresses publication, so rebuild/non-authoritative invalidation is
+        # a one-way boundary.
+        if asm is not None and producer_epoch == _ASM_MEMO_EPOCH:
+            if entry_bytes > _ASM_MEMO_MAX_BYTES:
+                _ASM_MEMO_FALLBACKS += 1
+            else:
+                while _ASM_MEMO and (
+                    len(_ASM_MEMO) >= _ASM_MEMO_CAP
+                    or _ASM_MEMO_BYTES + entry_bytes > _ASM_MEMO_MAX_BYTES
+                ):
+                    old_key, _old_value = _ASM_MEMO.popitem(last=False)
+                    _ASM_MEMO_BYTES -= _ASM_MEMO_SIZES.pop(old_key)
+                    _ASM_MEMO_EVICTIONS += 1
+                _ASM_MEMO[key] = asm
+                _ASM_MEMO_SIZES[key] = entry_bytes
+                _ASM_MEMO_BYTES += entry_bytes
+                _ASM_MEMO.move_to_end(key)
+        flight.result = asm
+        _ASM_INFLIGHT.pop(key, None)
+        flight.event.set()
     return asm
 
 

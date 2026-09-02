@@ -160,6 +160,20 @@ describe('the toast branches on the variant tag', () => {
     expect(toast?.querySelector('.toast--alert-threshold')).toBeNull();
   });
 
+  it('points at the evidence rather than promising a fitted budget', () => {
+    // #688: a transition is recorded whenever the detector qualifies,
+    // including when `cctally quota` withholds its own verdict, so the
+    // calibration behind this toast may have no fitted budget at all. The
+    // toast cannot receive the cause without a stats column and an epoch
+    // bump (#690), so it states what is true either way.
+    seed([], { firstTick: true });
+    seed([rateChange()], { firstTick: false });
+    const { container } = render(<Toast />);
+    const toast = container.querySelector('[data-testid="toast-meter-rate-change"]');
+    expect(toast?.textContent).not.toContain('fitted budget');
+    expect(toast?.textContent).toContain('for the evidence behind this change');
+  });
+
   it('carries the family’s EXPLICIT severity, never a threshold-derived one', () => {
     seed([], { firstTick: true });
     seed([rateChange({ severity: 'info' })], { firstTick: false });

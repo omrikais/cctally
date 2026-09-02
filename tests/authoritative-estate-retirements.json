@@ -133,6 +133,18 @@
       "rows": [
         "tests/test_fixture_builder_contract.py::test_the_remedy_states_the_prune_gap_conditionally"
       ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0019",
+      "predecessorDigest": "3f459a67b7449f36b9706c7e4dc21e30abc14d12f76cde3d7d1913311167778a",
+      "profile": "public",
+      "reason": "Two renames, no retired coverage. The old identifiers encoded #661 S2's deliberate abstention when a calibrated weekly projection existed. #672 replaces that residual contract: test_a4_projected1b_alert_uses_the_reachable_calibrated_basis now proves the alert retains and emits the numeric calibrated projection, and test_a4_the_twin_emits_on_a_reachable_calibrated_basis proves forecast and alert use the same basis. End-to-end calibrated firing coverage was also added in tests/test_projected_alerts.py. The cause is retired because the old identifiers exist in neither profile after the rename.",
+      "rows": [
+        "tests/test_projection_basis_selector.py::test_a4_projected1b_alert_abstains_when_it_cannot_reach_the_basis",
+        "tests/test_projection_basis_selector.py::test_a4_the_twin_still_abstains_on_a_reachable_calibrated_basis"
+      ]
     }
   ],
   "schemaVersion": 1

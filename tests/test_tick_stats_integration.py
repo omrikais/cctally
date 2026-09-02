@@ -17,13 +17,16 @@ measurement rather than by reading:
   no gate here may expect Codex work on a warm or idle tick.
 """
 import contextlib
+import dataclasses
 import importlib.machinery
 import importlib.util
 import json
+import os
 import pathlib
 import shutil
 import sqlite3
 import sys
+import types
 
 import pytest
 from conftest import load_script
@@ -104,6 +107,26 @@ def _private_corpus(data_dir, tmp_path):
     return private_root / pathlib.Path(data_dir).name
 
 
+def _private_frontier_corpus(data_dir, tmp_path, bbf):
+    """Copy then rederive cache paths so an exhaustive walk can certify it.
+
+    ``cache.db`` stores absolute source paths.  A plain private copy therefore
+    quite correctly sees the shared fixture paths as orphaned and withholds its
+    walk-complete sentinel.  Frontier integration tests need a genuinely
+    self-contained cache, not a copied database whose source estate lives
+    elsewhere.
+    """
+    corpus = _private_corpus(data_dir, tmp_path)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            assert cctally.sync_cache(conn, rebuild=True).full_walk_complete
+            assert cctally.sync_codex_cache(conn, rebuild=True).full_walk_complete
+        finally:
+            conn.close()
+    return corpus
+
+
 # ── §7.2 the exclusive split never exceeds the whole ────────────────────────
 
 
@@ -151,6 +174,60 @@ def test_one_refresh_writes_exactly_one_record(
     assert len(snap.records) == 1
     assert snap.standalone is None, (
         "the nested partial opened a standalone context inside a live tick")
+
+
+def test_refresh_retains_bounded_ingest_and_final_build_phase_trees(
+    small_corpus, monkeypatch, tmp_path,
+):
+    """The authoritative build must not overwrite ingest attribution (#680).
+
+    This drives the real refresh orchestration over both providers.  Requiring
+    nested names from the retained tree is non-vacuous: before #680 the final
+    snapshot reset the collector and no ingest tree was retained at all.
+    """
+    import _lib_perf as perf
+
+    bbf = _load_build_bench()
+    corpus = _private_corpus(small_corpus, tmp_path)
+    perf.set_enabled(True)
+    try:
+        ref, _hub = _run_refresh(
+            corpus, bbf, force_a2=True, monkeypatch=monkeypatch,
+        )
+        ingest = perf.last_ingest_perf()
+        build = perf.last_backend_perf()
+        assert ingest is not None, ref.get().last_sync_error
+        assert ingest["phases"]["name"] == "ingest"
+
+        def names(node):
+            return {node["name"]} | {
+                name
+                for child in node.get("children", ())
+                for name in names(child)
+            }
+
+        ingest_names = names(ingest["phases"])
+        assert {
+            "ingest.store_open",
+            "ingest.claude",
+            "ingest.codex",
+            "frontier",
+            "walk",
+            "accounting",
+            "projector",
+        } <= ingest_names
+        assert build is not None
+        assert build["phases"]["name"] == "snapshot"
+        record = __import__("_lib_tick_stats").snapshot().records[-1]
+        # The same seam is covered.  This test deliberately forces synchronous
+        # A2 builds inside ingest: the phase tree is inclusive wall time while
+        # TickContext subtracts those nested builds from its exclusive ingest
+        # total, so the aggregate is bounded by (not equal to) the tree root.
+        traced_ns = int(ingest["phases"]["elapsed_ms"] * 1_000_000)
+        assert 0 < record.ingest_ns <= traced_ns
+    finally:
+        perf.set_enabled(False)
+        perf.reset_thread()
 
 
 def test_no_sync_reports_ingest_ran_false_and_zero(small_corpus):
@@ -369,6 +446,7 @@ def test_a_successful_open_costs_no_counter_and_returns_the_connection(
             assert conn.execute("SELECT 1").fetchone() == (1,)
         finally:
             conn.close()
+
     assert sum(ts.snapshot().cache_open_failures.values()) == 0
 
 
@@ -587,6 +665,1324 @@ def test_the_period_is_the_gap_between_two_injected_final_publishes(
     assert records[1].publication == "final"
     ts.reset_for_tests()
 
+
+def test_ingest_frontier_caught_up_targeted_and_structural_fallback(
+    small_corpus, tmp_path, monkeypatch,
+):
+    """A trusted frontier skips, targets an append, and fails safe on structure."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_corpus(small_corpus, tmp_path)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            claude_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            codex_path = conn.execute(
+                "SELECT path FROM codex_session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            app_dir = pathlib.Path(corpus)
+            frontier.record_activity(app_dir, "claude", claude_path)
+            frontier.record_activity(app_dir, "codex", codex_path)
+            state = frontier.DashboardIngestFrontier(app_dir)
+            claude_roots = (pathlib.Path(claude_path).parent,)
+            codex_roots = (pathlib.Path(codex_path).parent,)
+            state.seed_provider("claude", conn, roots=claude_roots)
+            state.seed_provider("codex", conn, roots=codex_roots)
+
+            assert state.plan_provider(
+                "claude", conn, roots=claude_roots,
+            ).mode == "caught_up"
+            frontier.record_activity(app_dir, "claude", claude_path)
+            targeted = state.plan_provider(
+                "claude", conn, roots=claude_roots,
+            )
+            assert targeted.mode == "targeted"
+            assert targeted.paths == frozenset({claude_path})
+
+            pathlib.Path(claude_path).parent.touch()
+            assert state.plan_provider(
+                "claude", conn, roots=claude_roots,
+            ).mode == "full"
+
+            bounded = dict(state.memory_stats())
+            assert bounded["entryCount"] == 2
+            assert bounded["estimatedBytes"] <= bounded["maxBytes"]
+            monkeypatch.setattr(frontier, "FRONTIER_MAX_BYTES", 1)
+            assert not state.seed_provider("claude", conn, roots=claude_roots)
+            assert state.last_seed_failure["claude"] == "memory_budget"
+            assert state.plan_provider(
+                "claude", conn, roots=claude_roots).mode == "full"
+            assert dict(state.memory_stats())["fallbackCount"] == 1
+        finally:
+            conn.close()
+
+
+@pytest.mark.parametrize(
+    "frontier_class,open_db,source_table",
+    [
+        ("DashboardIngestFrontier", "open_cache_db", "session_files"),
+        (
+            "ConversationSyncFrontier",
+            "open_conversations_db",
+            "conversation_source_files",
+        ),
+    ],
+)
+def test_failed_pre_walk_cutoff_cannot_recapture_a_post_walk_boundary(
+    small_corpus, tmp_path, monkeypatch, frontier_class, open_db, source_table,
+):
+    """A failed cutoff must leave the completed full pass uncertified.
+
+    The production change this catches is treating the failed ``None`` result
+    as "capture a boundary now" during finalization.  The ticket written after
+    the failed capture models activity arriving while the full walk was in
+    flight; consuming it would make the next ordinary tick falsely caught up.
+    """
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = getattr(cctally, open_db)()
+        try:
+            source_path = conn.execute(
+                f"SELECT path FROM {source_table} WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            app_dir = pathlib.Path(corpus)
+            roots = (pathlib.Path(source_path).parent,)
+            state = getattr(frontier, frontier_class)(app_dir)
+            lock_path = frontier.activity_marker_path(app_dir).with_name(
+                "dashboard-ingest-activity.lock"
+            )
+            real_open = frontier.os.open
+            failed = {"value": False}
+
+            def fail_first_lock_open(path, flags, mode=0o777):
+                if not failed["value"] and os.fspath(path) == os.fspath(lock_path):
+                    failed["value"] = True
+                    raise OSError("forced cutoff acquisition failure")
+                return real_open(path, flags, mode)
+
+            monkeypatch.setattr(frontier.os, "open", fail_first_lock_open)
+            cutoff = state.capture_cutoff()
+            assert failed["value"], "the cutoff failure injection never fired"
+
+            assert frontier.record_activity(app_dir, "claude", source_path)
+            assert not state.seed_provider(
+                "claude", conn, roots=roots, cutoff=cutoff,
+            )
+            assert state.plan_provider(
+                "claude", conn, roots=roots,
+            ).mode == "full"
+        finally:
+            conn.close()
+
+
+def test_marker_replacement_read_binds_identity_and_bytes_to_one_descriptor(
+    small_corpus, tmp_path, monkeypatch,
+):
+    """Replacing the marker between path stat and open must force a full pass.
+
+    The replacement carries byte-identical content and length, so only binding
+    the identity and bytes to one opened descriptor can distinguish it.  A
+    split stat/open reader returns the old identity with the new file's empty
+    tail and incorrectly reports ``caught_up``.
+    """
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            app_dir = pathlib.Path(corpus)
+            roots = (pathlib.Path(source_path).parent,)
+            marker = frontier.activity_marker_path(app_dir)
+            assert frontier.record_activity(app_dir, "claude", source_path)
+            state = frontier.DashboardIngestFrontier(app_dir)
+            assert state.seed_provider("claude", conn, roots=roots)
+            assert state.plan_provider(
+                "claude", conn, roots=roots,
+            ).mode == "caught_up"
+
+            replacement = marker.with_name(marker.name + ".replacement")
+            replacement.write_bytes(marker.read_bytes())
+            real_open = pathlib.Path.open
+            raced = {"value": False}
+
+            def replace_before_open(path, *args, **kwargs):
+                if path == marker and not raced["value"]:
+                    raced["value"] = True
+                    replacement.replace(marker)
+                return real_open(path, *args, **kwargs)
+
+            monkeypatch.setattr(pathlib.Path, "open", replace_before_open)
+            plan = state.plan_provider("claude", conn, roots=roots)
+            assert raced["value"], "the marker replacement interleaving never fired"
+            assert plan.mode == "full"
+            assert plan.reason == "marker_replaced"
+        finally:
+            conn.close()
+
+
+def test_caught_up_frontier_never_requeries_the_session_file_estate(
+    small_corpus, tmp_path, monkeypatch,
+):
+    """The fast-negative may stat its saved directories, not walk DB paths."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_corpus(small_corpus, tmp_path)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            app_dir = pathlib.Path(corpus)
+            roots = (pathlib.Path(source_path).parent,)
+            frontier.record_activity(app_dir, "claude", source_path)
+            state = frontier.DashboardIngestFrontier(app_dir)
+            assert state.seed_provider("claude", conn, roots=roots)
+
+            def forbidden(*_args, **_kwargs):
+                raise AssertionError("caught-up path requeried every source path")
+
+            monkeypatch.setattr(frontier, "_source_paths", forbidden)
+            statements = []
+            conn.set_trace_callback(statements.append)
+            plan = state.plan_provider("claude", conn, roots=roots)
+            assert plan.mode == "caught_up"
+            state.commit_provider(plan, conn, roots=roots)
+            assert not any(
+                "session_files" in statement for statement in statements
+            ), statements
+        finally:
+            conn.set_trace_callback(None)
+            conn.close()
+
+
+def test_conversation_frontier_caught_up_and_targeted_use_transcript_cursors(
+    small_corpus, tmp_path,
+):
+    """Transcript sync owns an independent cursor over the shared activity log."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_conversations_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM conversation_source_files LIMIT 1"
+            ).fetchone()[0]
+            roots = (pathlib.Path(source_path).parent,)
+            app_dir = pathlib.Path(corpus)
+            frontier.record_activity(app_dir, "claude", source_path)
+            state = frontier.ConversationSyncFrontier(app_dir)
+            assert state.seed_provider("claude", conn, roots=roots)
+            assert state.plan_provider(
+                "claude", conn, roots=roots,
+            ).mode == "caught_up"
+
+            frontier.record_activity(app_dir, "claude", source_path)
+            plan = state.plan_provider("claude", conn, roots=roots)
+            assert plan.mode == "targeted"
+            assert plan.paths == frozenset({source_path})
+        finally:
+            conn.close()
+
+
+def test_conversation_frontier_caught_up_never_queries_all_source_paths(
+    small_corpus, tmp_path, monkeypatch,
+):
+    """The transcript fast-negative is O(saved directories), never O(files)."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_conversations_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM conversation_source_files LIMIT 1"
+            ).fetchone()[0]
+            roots = (pathlib.Path(source_path).parent,)
+            app_dir = pathlib.Path(corpus)
+            frontier.record_activity(app_dir, "claude", source_path)
+            state = frontier.ConversationSyncFrontier(app_dir)
+            assert state.seed_provider("claude", conn, roots=roots)
+
+            def forbidden(*_args, **_kwargs):
+                raise AssertionError("caught-up path queried transcript estate")
+
+            monkeypatch.setattr(frontier, "_conversation_source_paths", forbidden)
+            statements = []
+            conn.set_trace_callback(statements.append)
+            plan = state.plan_provider("claude", conn, roots=roots)
+            assert plan.mode == "caught_up"
+            state.commit_provider(plan, conn, roots=roots)
+            assert not any(
+                "conversation_source_files" in statement
+                or "codex_conversation_source_files" in statement
+                for statement in statements
+            ), statements
+        finally:
+            conn.set_trace_callback(None)
+            conn.close()
+
+
+def test_conversation_frontier_replacement_pending_and_cursor_gap_fail_full(
+    small_corpus, tmp_path,
+):
+    """No structural ambiguity may advance the transcript certificate."""
+    import _lib_ingest_frontier as frontier
+
+    clean = type("Stats", (), {
+        "lock_contended": False, "files_failed": 0,
+        "files_deferred_torn": 0, "deferred_reason": None,
+        "prune_refused": False, "budget_exhausted": False,
+        "maintenance_failed": False, "files_total": 0,
+        "files_processed": 0, "files_skipped_unchanged": 0,
+    })()
+    assert not frontier.conversation_sync_certifiable(
+        "targeted", clean, expected_paths=1)
+    clean.files_total = 2
+    clean.files_processed = 1
+    clean.files_skipped_unchanged = 1
+    assert frontier.conversation_sync_certifiable("full", clean)
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_conversations_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM conversation_source_files LIMIT 1"
+            ).fetchone()[0]
+            roots = (pathlib.Path(source_path).parent,)
+            app_dir = pathlib.Path(corpus)
+            frontier.record_activity(app_dir, "claude", source_path)
+            state = frontier.ConversationSyncFrontier(app_dir)
+            assert state.seed_provider("claude", conn, roots=roots)
+
+            conn.execute(
+                "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+                ("conversation_rebuild_claude_pending", "1"),
+            )
+            conn.commit()
+            assert state.plan_provider(
+                "claude", conn, roots=roots,
+            ).mode == "full"
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key=?",
+                ("conversation_rebuild_claude_pending",),
+            )
+            conn.commit()
+
+            frontier.record_activity(app_dir, "claude", source_path)
+            # Simulate a stored cursor beyond the physical file without
+            # mutating the shared benchmark source estate copied into this DB.
+            actual_size = pathlib.Path(source_path).stat().st_size
+            conn.execute(
+                "UPDATE conversation_source_files SET size_bytes=? WHERE path=?",
+                (actual_size + 1, source_path),
+            )
+            conn.commit()
+            assert state.plan_provider(
+                "claude", conn, roots=roots,
+            ).mode == "full"
+        finally:
+            conn.close()
+
+
+@pytest.mark.parametrize(
+    ("provider", "table"),
+    [
+        ("claude", "conversation_source_files"),
+        ("codex", "codex_conversation_source_files"),
+    ],
+)
+def test_conversation_frontier_same_size_source_replacement_requires_rebuild(
+    small_corpus, tmp_path, provider, table,
+):
+    """A ticketed same-size rewrite is replacement evidence, never unchanged."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_conversations_db()
+        try:
+            source_path = conn.execute(
+                f"SELECT path FROM {table} WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            path = pathlib.Path(source_path)
+            roots = (path.parent,)
+            app_dir = pathlib.Path(corpus)
+            frontier.record_activity(app_dir, provider, source_path)
+            state = frontier.ConversationSyncFrontier(app_dir)
+            assert state.seed_provider(provider, conn, roots=roots)
+
+            original = path.read_bytes()
+            replacement = bytes([original[0] ^ 1]) + original[1:]
+            path.write_bytes(replacement)
+            current = path.stat()
+            stored_mtime = conn.execute(
+                f"SELECT mtime_ns FROM {table} WHERE path=?", (source_path,),
+            ).fetchone()[0]
+            if current.st_mtime_ns == stored_mtime:
+                os.utime(
+                    path,
+                    ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000),
+                )
+            frontier.record_activity(app_dir, provider, source_path)
+
+            plan = state.plan_provider(provider, conn, roots=roots)
+            assert plan.mode == "full"
+            assert plan.reason == "source_replaced"
+        finally:
+            conn.close()
+
+
+def test_frontier_can_certificate_a_stably_missing_tracked_directory(
+    small_corpus, tmp_path,
+):
+    """A deletion already observed by the full seed remains a stable guard."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_corpus(small_corpus, tmp_path)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            app_dir = pathlib.Path(corpus)
+            missing_root = tmp_path / "already-removed-source-root"
+            frontier.record_activity(app_dir, "claude", source_path)
+            state = frontier.DashboardIngestFrontier(app_dir)
+            assert state.seed_provider(
+                "claude", conn, roots=(missing_root,)
+            ), state.last_seed_failure
+            assert state.plan_provider(
+                "claude", conn, roots=(missing_root,)
+            ).mode == "caught_up"
+        finally:
+            conn.close()
+
+
+def test_ingest_frontier_database_replacement_and_bad_marker_fail_full(
+    small_corpus, tmp_path,
+):
+    """Replacement and ambiguous activity can never certify caught-up state."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_corpus(small_corpus, tmp_path)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            row = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()
+            source_path = row[0]
+            app_dir = pathlib.Path(corpus)
+            frontier.record_activity(app_dir, "claude", source_path)
+            state = frontier.DashboardIngestFrontier(app_dir)
+            roots = (pathlib.Path(source_path).parent,)
+            state.seed_provider("claude", conn, roots=roots)
+            marker = frontier.activity_marker_path(app_dir)
+            with marker.open("ab") as fh:
+                fh.write(b"not-json\n")
+            assert state.plan_provider(
+                "claude", conn, roots=roots,
+            ).mode == "full"
+        finally:
+            conn.close()
+
+        # A new connection at the same pathname but a different inode must
+        # invalidate the certificate before any provider is skipped.
+        replacement = pathlib.Path(corpus) / "cache-replacement.db"
+        replacement.write_bytes((pathlib.Path(corpus) / "cache.db").read_bytes())
+        (pathlib.Path(corpus) / "cache.db").replace(
+            pathlib.Path(corpus) / "cache-old.db")
+        replacement.replace(pathlib.Path(corpus) / "cache.db")
+        conn = cctally.open_cache_db()
+        try:
+            assert state.plan_provider(
+                "claude", conn, roots=roots,
+            ).mode == "full"
+        finally:
+            conn.close()
+
+
+def test_ambiguous_activity_forces_one_full_pass_then_can_reseed(
+    small_corpus, tmp_path,
+):
+    """A pathless hook event is fail-safe without poisoning every later tick."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_corpus(small_corpus, tmp_path)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            app_dir = pathlib.Path(corpus)
+            roots = (pathlib.Path(source_path).parent,)
+            frontier.record_activity(app_dir, "claude", source_path)
+            state = frontier.DashboardIngestFrontier(app_dir)
+            assert state.seed_provider("claude", conn, roots=roots)
+
+            assert frontier.record_activity(app_dir, "claude", "")
+            plan = state.plan_provider("claude", conn, roots=roots)
+            assert plan.mode == "full"
+            assert plan.reason == "ambiguous_activity"
+
+            state.commit_provider(plan, conn, roots=roots)
+            assert state.plan_provider(
+                "claude", conn, roots=roots,
+            ).mode == "caught_up"
+        finally:
+            conn.close()
+
+
+def test_full_seed_preserves_activity_that_arrives_after_its_cutoff(
+    small_corpus, tmp_path,
+):
+    """A ticket written during a full walk belongs to the following tick."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_corpus(small_corpus, tmp_path)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            app_dir = pathlib.Path(corpus)
+            roots = (pathlib.Path(source_path).parent,)
+            frontier.record_activity(app_dir, "claude", source_path)
+            state = frontier.DashboardIngestFrontier(app_dir)
+            cutoff = state.capture_cutoff()
+
+            # Models an append after the full walk passed this file but before
+            # its successful result tried to mint a certificate.
+            frontier.record_activity(app_dir, "claude", source_path)
+            assert state.seed_provider(
+                "claude", conn, roots=roots, cutoff=cutoff,
+            )
+            plan = state.plan_provider("claude", conn, roots=roots)
+            assert plan.mode == "targeted"
+            assert plan.paths == frozenset({source_path})
+        finally:
+            conn.close()
+
+
+def test_full_seed_preserves_first_activity_when_marker_was_absent(
+    small_corpus, tmp_path,
+):
+    """An initially absent marker still has a pre-walk zero-byte cutoff."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_corpus(small_corpus, tmp_path)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            app_dir = pathlib.Path(corpus)
+            roots = (pathlib.Path(source_path).parent,)
+            marker = frontier.activity_marker_path(app_dir)
+            if marker.exists():
+                marker.unlink()
+            state = frontier.DashboardIngestFrontier(app_dir)
+            cutoff = state.capture_cutoff()
+            assert cutoff is not None
+            assert cutoff.end == 0
+
+            frontier.record_activity(app_dir, "claude", source_path)
+            assert state.seed_provider(
+                "claude", conn, roots=roots, cutoff=cutoff,
+            )
+            plan = state.plan_provider("claude", conn, roots=roots)
+            assert plan.mode == "targeted"
+            assert plan.paths == frozenset({source_path})
+        finally:
+            conn.close()
+
+
+def test_full_seed_rejects_a_malformed_marker_prefix(small_corpus, tmp_path):
+    """A full pass cannot certify over malformed pre-cutoff evidence."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_corpus(small_corpus, tmp_path)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            app_dir = pathlib.Path(corpus)
+            roots = (pathlib.Path(source_path).parent,)
+            frontier.record_activity(app_dir, "claude", source_path)
+            marker = frontier.activity_marker_path(app_dir)
+            marker.write_bytes(b"not-json\n" + marker.read_bytes())
+            state = frontier.DashboardIngestFrontier(app_dir)
+            cutoff = state.capture_cutoff()
+
+            assert not state.seed_provider(
+                "claude", conn, roots=roots, cutoff=cutoff,
+            )
+            assert "malformed" in state.last_seed_failure["claude"]
+        finally:
+            conn.close()
+
+
+@pytest.mark.parametrize("provider,table,complete_key", [
+    ("claude", "session_files", "claude_ingest_walk_complete"),
+    ("codex", "codex_session_files", "dashboard_codex_full_walk_complete"),
+])
+def test_missing_full_walk_sentinel_invalidates_a_same_inode_store(
+    small_corpus, tmp_path, provider, table, complete_key,
+):
+    """An interrupted destructive rebuild cannot retain its certificate."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            source_path = conn.execute(
+                f"SELECT path FROM {table} WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            app_dir = pathlib.Path(corpus)
+            roots = (pathlib.Path(source_path).parent,)
+            frontier.record_activity(app_dir, provider, source_path)
+            state = frontier.DashboardIngestFrontier(app_dir)
+            assert state.seed_provider(provider, conn, roots=roots)
+
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key=?", (complete_key,)
+            )
+            conn.commit()
+            plan = state.plan_provider(provider, conn, roots=roots)
+            assert plan.mode == "full"
+            assert plan.reason == "incomplete_store"
+        finally:
+            conn.close()
+
+
+@pytest.mark.parametrize("dirty", [
+    {"lock_contended": True},
+    {"files_failed": 1},
+    {"files_deferred_torn": 1},
+    {"maintenance_failed": True},
+    {"full_walk_complete": False},
+])
+def test_a_dirty_full_provider_result_can_never_mint_a_certificate(dirty):
+    import _lib_ingest_frontier as frontier
+
+    values = {
+        "lock_contended": False,
+        "files_failed": 0,
+        "files_deferred_torn": 0,
+        "deferred_reason": None,
+        "prune_refused": False,
+        "budget_exhausted": False,
+        "maintenance_failed": False,
+        "full_walk_complete": True,
+    }
+    values.update(dirty)
+    assert not frontier.provider_sync_certifiable(
+        "full", types.SimpleNamespace(**values)
+    )
+
+
+@pytest.mark.parametrize("invalid_kind", [
+    "directory",
+    "outside",
+    "relative",
+    "non_jsonl",
+    "symlink_escape",
+])
+def test_frontier_rejects_invalid_provider_targets_before_ingest(
+    small_corpus, tmp_path, invalid_kind,
+):
+    """Raw hook payloads are evidence, never filesystem authority."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            app_dir = pathlib.Path(corpus)
+            roots = (pathlib.Path(source_path).parent,)
+            outside = tmp_path / "unrelated.jsonl"
+            outside.write_text("{}\n")
+            if invalid_kind == "directory":
+                candidate = roots[0] / "directory.jsonl"
+                candidate.mkdir()
+                invalid = str(candidate)
+            elif invalid_kind == "outside":
+                invalid = str(outside)
+            elif invalid_kind == "relative":
+                invalid = "relative.jsonl"
+            elif invalid_kind == "non_jsonl":
+                candidate = roots[0] / "not-a-session.txt"
+                candidate.write_text("{}\n")
+                invalid = str(candidate)
+            else:
+                candidate = roots[0] / "escaped-session.jsonl"
+                candidate.symlink_to(outside)
+                invalid = str(candidate)
+            if invalid_kind in {"directory", "non_jsonl", "symlink_escape"}:
+                assert cctally.sync_cache(conn).full_walk_complete
+            frontier.record_activity(app_dir, "claude", source_path)
+            state = frontier.DashboardIngestFrontier(app_dir)
+            assert state.seed_provider("claude", conn, roots=roots)
+            frontier.record_activity(app_dir, "claude", invalid)
+            plan = state.plan_provider("claude", conn, roots=roots)
+            assert plan.mode == "full"
+            assert plan.reason == "target_outside_scope"
+        finally:
+            conn.close()
+
+
+def test_ingest_frontier_hook_maintenance_and_cursor_changes_fail_full(
+    small_corpus, tmp_path,
+):
+    """Every cheap source-of-truth guard invalidates before a provider skip."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_corpus(small_corpus, tmp_path)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            app_dir = pathlib.Path(corpus)
+            roots = (pathlib.Path(source_path).parent,)
+            guard = app_dir / "synthetic-hook-settings.json"
+            guard.write_text("{}")
+            frontier.record_activity(app_dir, "claude", source_path)
+            state = frontier.DashboardIngestFrontier(app_dir)
+
+            assert state.seed_provider(
+                "claude", conn, roots=roots, guard_paths=(guard,),
+            )
+            guard.write_text('{"changed":true}')
+            assert state.plan_provider(
+                "claude", conn, roots=roots, guard_paths=(guard,),
+            ).reason == "hook_config_changed"
+
+            assert state.seed_provider(
+                "claude", conn, roots=roots, guard_paths=(guard,),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+                ("conversation_backfill_pending", "1"),
+            )
+            conn.commit()
+            assert state.plan_provider(
+                "claude", conn, roots=roots, guard_paths=(guard,),
+            ).mode == "full"
+
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key='conversation_backfill_pending'"
+            )
+            conn.commit()
+            assert state.seed_provider(
+                "claude", conn, roots=roots, guard_paths=(guard,),
+            )
+            conn.execute(
+                "UPDATE session_files SET last_byte_offset=size_bytes+1 "
+                "WHERE path=?",
+                (source_path,),
+            )
+            conn.commit()
+            frontier.record_activity(app_dir, "claude", source_path)
+            assert state.plan_provider(
+                "claude", conn, roots=roots, guard_paths=(guard,),
+            ).reason == "cursor_gap"
+        finally:
+            conn.close()
+
+
+def test_frontier_refuses_to_seed_while_maintenance_is_pending(
+    small_corpus, tmp_path,
+):
+    """An already-present repair marker cannot become certified normal."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_corpus(small_corpus, tmp_path)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            app_dir = pathlib.Path(corpus)
+            roots = (pathlib.Path(source_path).parent,)
+            frontier.record_activity(app_dir, "claude", source_path)
+            conn.execute(
+                "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+                ("conversation_backfill_pending", "1"),
+            )
+            conn.commit()
+            state = frontier.DashboardIngestFrontier(app_dir)
+            assert not state.seed_provider("claude", conn, roots=roots)
+            assert state.last_seed_failure["claude"] == "maintenance_pending"
+
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key='conversation_backfill_pending'"
+            )
+            conn.commit()
+            assert state.seed_provider("claude", conn, roots=roots)
+        finally:
+            conn.close()
+
+
+def test_dashboard_tick_skips_caught_up_estates_and_ingests_append_immediately(
+    small_corpus, monkeypatch, tmp_path,
+):
+    """The real refresh uses the certificate and publishes a new row on tick 1."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        tui = cctally._cctally_tui
+        dash = cctally._load_sibling("_cctally_dashboard")
+        conn = cctally.open_cache_db()
+        try:
+            claude_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            codex_path = conn.execute(
+                "SELECT path FROM codex_session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        frontier.record_activity(pathlib.Path(corpus), "claude", claude_path)
+        frontier.record_activity(pathlib.Path(corpus), "codex", codex_path)
+
+        calls = {"claude": [], "codex": []}
+        real_claude = tui.sync_cache
+        real_codex = tui.sync_codex_cache
+
+        def claude_spy(conn, **kwargs):
+            calls["claude"].append(kwargs.get("only_paths"))
+            return real_claude(conn, **kwargs)
+
+        def codex_spy(conn, **kwargs):
+            calls["codex"].append(kwargs.get("only_paths"))
+            return real_codex(conn, **kwargs)
+
+        monkeypatch.setattr(tui, "sync_cache", claude_spy)
+        monkeypatch.setattr(tui, "sync_codex_cache", codex_spy)
+        ref = dash._SnapshotRef(tui._tui_empty_snapshot(bbf.CORPUS_CLOCK_UTC))
+        hub = _CapturingHub()
+        locked = tui._make_run_sync_now_locked(
+            ref=ref, hub=hub, pinned_now=bbf.CORPUS_CLOCK_UTC,
+            display_tz_pref_override=None, runtime_bind="127.0.0.1",
+        )
+
+        locked(False)  # establishes both trusted full-sync certificates
+        assert ref.get().last_sync_error is None
+        first_counts = {name: len(values) for name, values in calls.items()}
+        conn = cctally.open_cache_db()
+        try:
+            probe = locked._ingest_frontier.plan_provider(
+                "claude", conn,
+                roots=tuple(tui._cctally_core._resolve_claude_projects_dirs()),
+                guard_paths=(tui._cctally_core.CLAUDE_SETTINGS_PATH,),
+            )
+        finally:
+            conn.close()
+        assert probe.mode == "caught_up", (
+            probe.reason, locked._ingest_frontier.last_seed_failure,
+        )
+        locked(False)  # genuinely caught up: neither provider sync is called
+        assert {name: len(values) for name, values in calls.items()} == first_counts
+
+        conn = cctally.open_cache_db()
+        try:
+            before = conn.execute("SELECT COUNT(*) FROM session_entries").fetchone()[0]
+        finally:
+            conn.close()
+        row = {
+            "type": "assistant",
+            "uuid": "issue-680-a",
+            "parentUuid": None,
+            "sessionId": "issue-680-session",
+            "timestamp": bbf.CORPUS_CLOCK_UTC.isoformat(),
+            "cwd": "/bench/issue-680",
+            "gitBranch": "main",
+            "requestId": "issue-680-request",
+            "message": {
+                "id": "issue-680-message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5-20250929",
+                "content": "bounded append",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            },
+        }
+        with pathlib.Path(claude_path).open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+        frontier.record_activity(pathlib.Path(corpus), "claude", claude_path)
+        locked(False)
+        assert calls["claude"][-1] == {claude_path}
+        assert len(calls["codex"]) == first_counts["codex"]
+        conn = cctally.open_cache_db()
+        try:
+            after = conn.execute("SELECT COUNT(*) FROM session_entries").fetchone()[0]
+        finally:
+            conn.close()
+        assert after == before + 1
+        assert ref.get().last_sync_error is None
+
+
+@pytest.mark.parametrize("rotate", [False, True])
+def test_activity_marker_write_all_handles_regular_file_short_writes(
+    tmp_path, monkeypatch, rotate,
+):
+    """A successful hook ticket is one complete newline-delimited record."""
+    import _lib_ingest_frontier as frontier
+
+    app_dir = tmp_path / "app"
+    marker = frontier.activity_marker_path(app_dir)
+    monkeypatch.setattr(
+        frontier,
+        "_MARKER_ROTATE_BYTES",
+        0 if rotate else 1024 * 1024,
+    )
+    real_write = frontier.os.write
+    writes = []
+
+    def short_then_complete(fd, payload):
+        writes.append(len(payload))
+        if len(writes) == 1:
+            prefix = max(1, len(payload) // 2)
+            return real_write(fd, payload[:prefix])
+        return real_write(fd, payload)
+
+    monkeypatch.setattr(frontier.os, "write", short_then_complete)
+    assert frontier.record_activity(app_dir, "claude", "/tmp/session.jsonl")
+    raw = marker.read_bytes()
+    assert raw.endswith(b"\n")
+    assert json.loads(raw.decode("utf-8")) == {
+        "path": "/tmp/session.jsonl", "provider": "claude",
+    }
+    assert len(writes) >= 2
+
+
+@pytest.mark.parametrize(
+    "provider,table",
+    [
+        ("claude", "session_entries"),
+        ("codex", "codex_session_entries"),
+    ],
+)
+def test_failed_hook_ticket_publishes_same_file_append_on_first_normal_tick(
+    small_corpus, monkeypatch, tmp_path, provider, table,
+):
+    """Both hook paths fail closed to a real full ingest on tick one."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        tui = cctally._cctally_tui
+        dash = cctally._load_sibling("_cctally_dashboard")
+        record = cctally._load_sibling("_cctally_record")
+        conn = cctally.open_cache_db()
+        try:
+            claude_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            codex_path, codex_prior_total = conn.execute(
+                "SELECT path,last_total_tokens FROM codex_session_files "
+                "WHERE path LIKE '/%' AND last_total_tokens IS NOT NULL LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        paths = {"claude": claude_path, "codex": codex_path}
+        for source, source_path in paths.items():
+            assert frontier.record_activity(
+                pathlib.Path(corpus), source, source_path,
+            )
+
+        calls = {"claude": [], "codex": []}
+        real_claude = tui.sync_cache
+        real_codex = tui.sync_codex_cache
+
+        def claude_spy(conn, **kwargs):
+            calls["claude"].append(kwargs.get("only_paths"))
+            return real_claude(conn, **kwargs)
+
+        def codex_spy(conn, **kwargs):
+            calls["codex"].append(kwargs.get("only_paths"))
+            return real_codex(conn, **kwargs)
+
+        monkeypatch.setattr(tui, "sync_cache", claude_spy)
+        monkeypatch.setattr(tui, "sync_codex_cache", codex_spy)
+        ref = dash._SnapshotRef(tui._tui_empty_snapshot(bbf.CORPUS_CLOCK_UTC))
+        hub = _CapturingHub()
+        locked = tui._make_run_sync_now_locked(
+            ref=ref, hub=hub, pinned_now=bbf.CORPUS_CLOCK_UTC,
+            display_tz_pref_override=None, runtime_bind="127.0.0.1",
+        )
+
+        locked(False)
+        first_counts = {name: len(values) for name, values in calls.items()}
+        locked(False)
+        assert {name: len(values) for name, values in calls.items()} == first_counts
+
+        conn = cctally.open_cache_db()
+        try:
+            before = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        finally:
+            conn.close()
+
+        source_path = pathlib.Path(paths[provider])
+        if provider == "claude":
+            row = {
+                "type": "assistant",
+                "uuid": "issue-680-failed-ticket-claude",
+                "parentUuid": None,
+                "sessionId": "issue-680-failed-ticket-session",
+                "timestamp": bbf.CORPUS_CLOCK_UTC.isoformat(),
+                "cwd": "/bench/issue-680-failed-ticket",
+                "gitBranch": "main",
+                "requestId": "issue-680-failed-ticket-request",
+                "message": {
+                    "id": "issue-680-failed-ticket-message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-5-20250929",
+                    "content": "failed ticket first-tick publication",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            }
+        else:
+            row = {
+                "timestamp": bbf.CORPUS_CLOCK_UTC.isoformat(),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 200,
+                            "cached_input_tokens": 25,
+                            "output_tokens": 100,
+                            "reasoning_output_tokens": 25,
+                            "total_tokens": 300,
+                        },
+                        "total_token_usage": {
+                            "total_tokens": codex_prior_total + 300,
+                        },
+                    },
+                },
+            }
+        with source_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+        monkeypatch.setattr(
+            record,
+            "_hook_tick_read_stdin_event",
+            lambda: {"event": "Stop", "transcript_path": str(source_path)},
+        )
+
+        def fail_ticket_write(*_args, **_kwargs):
+            raise OSError("forced activity-ticket write failure")
+
+        real_record_activity = frontier.record_activity
+
+        def record_with_failed_write(*args, **kwargs):
+            real_write = frontier.os.write
+            frontier.os.write = fail_ticket_write
+            try:
+                return real_record_activity(*args, **kwargs)
+            finally:
+                frontier.os.write = real_write
+
+        monkeypatch.setattr(
+            frontier, "record_activity", record_with_failed_write,
+        )
+        args = types.SimpleNamespace(
+            explain=False,
+            foreground=(provider == "codex"),
+            no_oauth=False,
+            throttle_seconds=None,
+            event=None,
+            mock_oauth_response=None,
+            source=provider,
+        )
+        if provider == "codex":
+            monkeypatch.setattr(record, "_cmd_hook_tick_codex", lambda *a, **k: 0)
+        else:
+            monkeypatch.setattr(record.os, "fork", lambda: 12345)
+
+        assert cctally.cmd_hook_tick(args) == 0
+        assert not frontier.activity_marker_path(pathlib.Path(corpus)).exists()
+        monkeypatch.setattr(frontier, "record_activity", real_record_activity)
+
+        publishes_before = len(hub.published)
+        locked(False)
+        assert calls[provider][-1] is None, "failed activity must force a full pass"
+        assert len(hub.published) == publishes_before + 1
+        conn = cctally.open_cache_db()
+        try:
+            after = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        finally:
+            conn.close()
+        assert after == before + 1
+        assert ref.get().last_sync_error is None
+
+
+def test_dashboard_recovery_promotes_both_caught_up_providers_to_full(
+    small_corpus, monkeypatch, tmp_path,
+):
+    """A replacement shared cache must be rebuilt by both provider legs now."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        tui = cctally._cctally_tui
+        dash = cctally._load_sibling("_cctally_dashboard")
+        cache_mod = cctally._load_sibling("_cctally_cache")
+        conn = cctally.open_cache_db()
+        try:
+            claude_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            codex_path = conn.execute(
+                "SELECT path FROM codex_session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        frontier.record_activity(pathlib.Path(corpus), "claude", claude_path)
+        frontier.record_activity(pathlib.Path(corpus), "codex", codex_path)
+
+        calls = {"claude": [], "codex": []}
+        force_dirty_codex = {"value": False}
+        real_claude = tui.sync_cache
+        real_codex = tui.sync_codex_cache
+
+        def claude_spy(conn, **kwargs):
+            calls["claude"].append(kwargs.get("only_paths"))
+            return real_claude(conn, **kwargs)
+
+        def codex_spy(conn, **kwargs):
+            calls["codex"].append(kwargs.get("only_paths"))
+            stats = real_codex(conn, **kwargs)
+            if force_dirty_codex["value"]:
+                stats.maintenance_failed = True
+            return stats
+
+        monkeypatch.setattr(tui, "sync_cache", claude_spy)
+        monkeypatch.setattr(tui, "sync_codex_cache", codex_spy)
+        ref = dash._SnapshotRef(tui._tui_empty_snapshot(bbf.CORPUS_CLOCK_UTC))
+        locked = tui._make_run_sync_now_locked(
+            ref=ref, hub=_CapturingHub(), pinned_now=bbf.CORPUS_CLOCK_UTC,
+            display_tz_pref_override=None, runtime_bind="127.0.0.1",
+        )
+        locked(False)
+        calls = {"claude": [], "codex": []}
+
+        recovery_round = {"value": 0}
+
+        def replace_then_run(conn, operations, *, origins):
+            assert len(operations) == 3, (
+                "recovery plan dropped a provider or frontier finalizer")
+            recovery_round["value"] += 1
+            cache_path = pathlib.Path(corpus) / "cache.db"
+            suffix = recovery_round["value"]
+            replacement = pathlib.Path(corpus) / f"cache-recovery-copy-{suffix}.db"
+            conn.close()
+            shutil.copy2(cache_path, replacement)
+            cache_path.replace(
+                pathlib.Path(corpus) / f"cache-before-recovery-{suffix}.db")
+            replacement.replace(cache_path)
+            new_conn = cctally.open_cache_db()
+            if force_dirty_codex["value"]:
+                # Model an A2 publication after the tick captured its prior
+                # complete snapshot but before recovered finalization fails.
+                held = ref.get()
+                ref.set(dataclasses.replace(held, sessions=()))
+            return tuple(operation(new_conn) for operation in operations), new_conn
+
+        monkeypatch.setattr(
+            cache_mod, "_run_cache_plan_with_recovery", replace_then_run,
+        )
+        locked(False)
+        assert calls == {"claude": [None], "codex": [None]}
+        assert ref.get().last_sync_error is None
+
+        # A later recovered full pass that reports any dirty provider result
+        # must retain the last complete publication.  It may surface the error,
+        # but it cannot replace visible data with a partially rebuilt family.
+        prior = ref.get()
+        force_dirty_codex["value"] = True
+        calls = {"claude": [], "codex": []}
+        locked(False)
+        after = ref.get()
+        assert calls == {"claude": [None], "codex": [None]}
+        assert after.sessions == prior.sessions
+        assert after.trend == prior.trend
+        assert after.current_week == prior.current_week
+        assert after.last_sync_at == prior.last_sync_at
+        assert after.last_sync_error == (
+            "sync-cache: replacement cache ingest incomplete; "
+            "retaining the prior snapshot"
+        )
+
+
+def test_dashboard_second_recovery_failure_retains_complete_snapshot(
+    small_corpus, monkeypatch, tmp_path,
+):
+    """The real recover-once loop cannot publish its partial replacement."""
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        tui = cctally._cctally_tui
+        dash = cctally._load_sibling("_cctally_dashboard")
+        cache_mod = cctally._load_sibling("_cctally_cache")
+        ref = dash._SnapshotRef(tui._tui_empty_snapshot(bbf.CORPUS_CLOCK_UTC))
+        locked = tui._make_run_sync_now_locked(
+            ref=ref, hub=_CapturingHub(), pinned_now=bbf.CORPUS_CLOCK_UTC,
+            display_tz_pref_override=None, runtime_bind="127.0.0.1",
+        )
+        locked(False)
+        prior = ref.get()
+        assert prior.last_sync_error is None
+
+        calls = {"plan": 0, "recover": 0}
+
+        def fail_on_both_families(*args, **kwargs):
+            calls["plan"] += 1
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        monkeypatch.setattr(
+            locked._ingest_frontier, "plan_provider", fail_on_both_families,
+        )
+
+        def replace_once(exc, *, origin, active_conn):
+            calls["recover"] += 1
+            cache_path = pathlib.Path(corpus) / "cache.db"
+            replacement = pathlib.Path(corpus) / "cache-retry.db"
+            backup = pathlib.Path(corpus) / "cache-before-retry.db"
+            replacement_conn = sqlite3.connect(replacement)
+            try:
+                active_conn.backup(replacement_conn)
+                # Model the replacement after destructive rebuild started but
+                # before either provider completed. If the retry also fails,
+                # reading this family would visibly publish an empty partial.
+                replacement_conn.execute("DELETE FROM session_entries")
+                replacement_conn.execute("DELETE FROM codex_session_entries")
+                replacement_conn.execute(
+                    "DELETE FROM cache_meta WHERE key IN (?, ?)",
+                    (
+                        "claude_ingest_walk_complete",
+                        "dashboard_codex_full_walk_complete",
+                    ),
+                )
+                replacement_conn.commit()
+            finally:
+                replacement_conn.close()
+                active_conn.close()
+            cache_path.replace(backup)
+            replacement.replace(cache_path)
+            return True
+
+        monkeypatch.setattr(cache_mod, "_recover_corrupt_cache", replace_once)
+        locked(False)
+
+        after = ref.get()
+        assert calls == {"plan": 2, "recover": 1}
+        assert after.sessions == prior.sessions
+        assert after.trend == prior.trend
+        assert after.current_week == prior.current_week
+        assert after.last_sync_at == prior.last_sync_at
+        assert after.last_sync_error.startswith("sync-cache:")
+
+
+def test_frontier_database_failure_is_inside_the_shared_recovery_plan(
+    small_corpus, monkeypatch, tmp_path,
+):
+    """A corrupt guard query must reach the family recovery boundary."""
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        tui = cctally._cctally_tui
+        dash = cctally._load_sibling("_cctally_dashboard")
+        cache_mod = cctally._load_sibling("_cctally_cache")
+        ref = dash._SnapshotRef(tui._tui_empty_snapshot(bbf.CORPUS_CLOCK_UTC))
+        locked = tui._make_run_sync_now_locked(
+            ref=ref, hub=_CapturingHub(), pinned_now=bbf.CORPUS_CLOCK_UTC,
+            display_tz_pref_override=None, runtime_bind="127.0.0.1",
+        )
+        locked(False)
+        assert ref.get().last_sync_error is None
+
+        real_plan = locked._ingest_frontier.plan_provider
+        failed = {"value": False}
+
+        def fail_once(*args, **kwargs):
+            if not failed["value"]:
+                failed["value"] = True
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return real_plan(*args, **kwargs)
+
+        monkeypatch.setattr(locked._ingest_frontier, "plan_provider", fail_once)
+        observed = {"inside": False}
+
+        def recover_inside_plan(conn, operations, *, origins):
+            try:
+                operations[0](conn)
+            except sqlite3.DatabaseError:
+                observed["inside"] = True
+            return tuple(operation(conn) for operation in operations), conn
+
+        monkeypatch.setattr(
+            cache_mod, "_run_cache_plan_with_recovery", recover_inside_plan,
+        )
+        locked(False)
+        assert observed["inside"] is True
+        assert ref.get().last_sync_error is None
 
 # ── §7.5 non-regression ─────────────────────────────────────────────────────
 

@@ -975,13 +975,15 @@
                 {
                     "details": {
                         "active": false,
+                        "assessed": false,
+                        "calibration_status": null,
                         "effective_from": null,
                         "new_units_per_point": null,
                         "previous_units_per_point": null
                     },
                     "id": "quota.meter_drift",
                     "severity": "ok",
-                    "summary": "no change detected",
+                    "summary": "not assessed",
                     "title": "Metering rate"
                 },
                 {

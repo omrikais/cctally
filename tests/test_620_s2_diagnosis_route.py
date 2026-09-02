@@ -15,11 +15,13 @@ printing the report.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import datetime as dt
 import http.client
 import json
 import sys
 import threading
+from dataclasses import replace
 
 import pytest
 
@@ -28,11 +30,12 @@ from test_620_s2_diagnosis_sources import (  # reuse the seeded corpora
     WINDOW_END, WINDOW_START, _seed_claude, _seed_claude_blocks,
 )
 
-from tests._support_http import start, stop
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
 
 
 UTC = dt.timezone.utc
 _WINDOW = f"{WINDOW_START.date().isoformat()}..{WINDOW_END.date().isoformat()}"
+_WINDOW_QUERY = f"{_WINDOW}&tz=Etc%2FUTC"
 
 
 def _dash():
@@ -154,6 +157,79 @@ def test_route_is_registered_as_exact():
     assert entry[4] is False
 
 
+def test_single_flight_key_separates_every_build_and_authorization_axis():
+    """No selector or privacy variant may receive another request's report."""
+    ns = load_script()
+    sources = ns["_load_sibling"]("_cctally_diagnosis_sources")
+    base = sources.DiagnosisScope(
+        source="codex",
+        account_key="account-a",
+        window_start=WINDOW_START,
+        window_end=WINDOW_END,
+        effective_speed="standard",
+        display_tz="Etc/UTC",
+        label="current",
+    )
+    scopes = (
+        base,
+        replace(base, source="claude"),
+        replace(base, account_key="account-b"),
+        replace(
+            base,
+            window_start=WINDOW_START + dt.timedelta(hours=1),
+            window_end=WINDOW_END + dt.timedelta(hours=1),
+        ),
+        replace(base, effective_speed="fast"),
+        replace(base, display_tz="Asia/Jerusalem"),
+        replace(base, label="custom"),
+    )
+    keys = [
+        _dash()._diagnosis_flight_key(scope, True, False)
+        for scope in scopes
+    ]
+    keys.append(_dash()._diagnosis_flight_key(base, False, False))
+    keys.append(_dash()._diagnosis_flight_key(base, True, True))
+    assert len(set(keys)) == len(keys)
+
+
+def test_process_wide_admission_serializes_distinct_scopes():
+    """Different selectors do not coalesce, but still cannot multiply heaps."""
+    load_script()
+    admission = _dash()._DiagnosisAdmission()
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+
+    def _first():
+        first_entered.set()
+        assert release_first.wait(PRESENCE_BACKSTOP_SECONDS)
+        return "first"
+
+    def _second():
+        second_entered.set()
+        return "second"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            admission.run, ("scope-a", True, False), _first,
+        )
+        assert first_entered.wait(PRESENCE_BACKSTOP_SECONDS)
+        second = executor.submit(
+            admission.run, ("scope-b", True, False), _second,
+        )
+        with admission._changed:
+            assert admission._changed.wait_for(
+                lambda: len(admission._flights) == 2,
+                timeout=PRESENCE_BACKSTOP_SECONDS,
+            ), "the second diagnosis never registered for admission"
+            assert not second_entered.is_set(), (
+                "distinct diagnosis scopes ran concurrently"
+            )
+        release_first.set()
+        assert first.result() == "first"
+        assert second.result() == "second"
+
+
 def test_the_diagnosis_is_not_an_envelope_key(tmp_path, monkeypatch):
     """B8: the diagnosis is on-demand, never a per-tick envelope cost."""
     ns = load_script()
@@ -167,7 +243,7 @@ def test_the_diagnosis_is_not_an_envelope_key(tmp_path, monkeypatch):
 # --- the status mapping -------------------------------------------------
 
 def test_a_ranked_report_is_200(rich_server):
-    response = rich_server.get(f"/api/diagnosis?window={_WINDOW}")
+    response = rich_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}")
     assert response.status == 200, response.body
     payload = response.json
     assert payload["schemaVersion"] == 1
@@ -177,7 +253,7 @@ def test_a_ranked_report_is_200(rich_server):
 
 def test_valid_report_is_200_even_when_every_class_is_withheld(empty_server):
     """A withheld answer is a correct answer about what the store holds."""
-    response = empty_server.get(f"/api/diagnosis?window={_WINDOW}")
+    response = empty_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}")
     assert response.status == 200, response.body
     assert response.json["overallVerdict"] == "withheld"
 
@@ -190,7 +266,7 @@ def test_malformed_window_is_400(rich_server):
 
 def test_an_unresolvable_account_is_400(rich_server):
     response = rich_server.get(
-        f"/api/diagnosis?window={_WINDOW}&account=no-such-account")
+        f"/api/diagnosis?window={_WINDOW_QUERY}&account=no-such-account")
     assert response.status == 400, response.body
     assert response.json["code"] == "account_unresolved"
 
@@ -199,14 +275,14 @@ def test_account_with_source_all_is_400(rich_server):
     """Account keys are provider-scoped; one selector cannot address both.
     The CLI exits 2 on the same condition."""
     response = rich_server.get(
-        f"/api/diagnosis?window={_WINDOW}&source=all&account=x")
+        f"/api/diagnosis?window={_WINDOW_QUERY}&source=all&account=x")
     assert response.status == 400, response.body
 
 
 def test_an_unreadable_store_publishes_the_report_with_503(storeless_server):
     """The same condition the CLI turns into exit 3, and for the same reason
     the CLI still prints: a person needs to see the typed cause."""
-    response = storeless_server.get(f"/api/diagnosis?window={_WINDOW}")
+    response = storeless_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}")
     assert response.status == 503, response.body
     payload = response.json
     assert payload["overallCode"] == "provider_unavailable"
@@ -251,7 +327,7 @@ def test_generation_incoherent_is_503(rich_server, monkeypatch):
     probes = iter(["a", "b", "b", "c"] * 40)
     monkeypatch.setattr(sources, "_probe_component",
                         lambda *_a, **_kw: next(probes))
-    response = rich_server.get(f"/api/diagnosis?window={_WINDOW}")
+    response = rich_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}")
     assert response.status == 503, response.body
     assert response.json["code"] == "generation_incoherent"
 
@@ -265,7 +341,7 @@ def test_an_unexpected_exception_is_500_and_never_a_healthy_200(
         raise RuntimeError("boom")
 
     monkeypatch.setattr(sources, "build_diagnosis", _raises)
-    response = rich_server.get(f"/api/diagnosis?window={_WINDOW}")
+    response = rich_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}")
     assert response.status == 500, response.body
     assert "no_contributor_detected" not in response.body
     assert "contributor_detected" not in response.body
@@ -276,12 +352,12 @@ def test_an_unexpected_exception_is_500_and_never_a_healthy_200(
 def test_no_csrf_required_for_this_read_only_route(rich_server):
     """`_check_origin_csrf` is opt-in for mutating routes. This one mutates
     nothing, so a request carrying no Origin is served."""
-    response = rich_server.get(f"/api/diagnosis?window={_WINDOW}")
+    response = rich_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}")
     assert response.status == 200, response.body
 
 
 def test_response_sets_no_cache(rich_server):
-    response = rich_server.get(f"/api/diagnosis?window={_WINDOW}")
+    response = rich_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}")
     assert response.headers["Cache-Control"] == "no-cache"
     assert response.headers["Content-Type"].startswith("application/json")
 
@@ -290,8 +366,8 @@ def test_api_auth_applies_to_the_route(rich_server, monkeypatch):
     """`_require_api_auth` runs before dispatch, so the route inherits it."""
     handler = _dash().DashboardHTTPHandler
     monkeypatch.setattr(handler, "cctally_api_token", "sekret")
-    assert rich_server.get(f"/api/diagnosis?window={_WINDOW}").status == 401
-    ok = rich_server.get(f"/api/diagnosis?window={_WINDOW}",
+    assert rich_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}").status == 401
+    ok = rich_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}",
                          headers={"Authorization": "Bearer sekret"})
     assert ok.status == 200, ok.body
 
@@ -315,7 +391,7 @@ def test_the_route_never_opens_a_writable_store(rich_server, monkeypatch):
             return _real(*a, **k)
 
         monkeypatch.setitem(ns, name, _record)
-    response = rich_server.get(f"/api/diagnosis?window={_WINDOW}")
+    response = rich_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}")
     assert response.status == 200, response.body
     assert opened == []
 
@@ -323,9 +399,9 @@ def test_the_route_never_opens_a_writable_store(rich_server, monkeypatch):
 # --- selectors ----------------------------------------------------------
 
 def test_reveal_projects_widens_only_the_label(rich_server):
-    anonymized = rich_server.get(f"/api/diagnosis?window={_WINDOW}").json
+    anonymized = rich_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}").json
     revealed = rich_server.get(
-        f"/api/diagnosis?window={_WINDOW}&reveal_projects=1").json
+        f"/api/diagnosis?window={_WINDOW_QUERY}&reveal_projects=1").json
 
     def _projects(payload):
         return [row for result in payload["results"]
@@ -374,7 +450,78 @@ def test_a_malformed_bound_is_400(rich_server):
 
 
 def test_source_all_publishes_one_result_per_provider(rich_server):
-    response = rich_server.get(f"/api/diagnosis?window={_WINDOW}&source=all")
+    response = rich_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}&source=all")
     assert response.status == 200, response.body
     assert [r["source"] for r in response.json["results"]] == ["claude",
                                                                "codex"]
+
+
+def test_concurrent_identical_diagnoses_share_one_process_wide_build(
+    empty_server, monkeypatch,
+):
+    """Concurrent tabs cannot multiply the largest diagnosis process tree.
+
+    The real HTTP server supplies one request thread per client.  Holding the
+    first build open makes a second entry observable without relying on route
+    timing, while the ``source=all`` selector keeps the production worker
+    shape in scope.  Identical callers must join that in-flight result: one
+    admitted build means one isolated provider worker and one report heap.
+    """
+    sources = sys.modules["cctally"]._load_sibling(
+        "_cctally_diagnosis_sources"
+    )
+    real_build = sources.build_diagnosis
+    lock = threading.Lock()
+    first_entered = threading.Event()
+    another_entered = threading.Event()
+    release = threading.Event()
+    admission = _dash()._DiagnosisAdmission()
+    builds = 0
+    active = 0
+    peak_active = 0
+
+    def _blocked_build(*args, **kwargs):
+        nonlocal builds, active, peak_active
+        with lock:
+            builds += 1
+            active += 1
+            peak_active = max(peak_active, active)
+            if builds == 1:
+                first_entered.set()
+            else:
+                another_entered.set()
+        try:
+            assert release.wait(PRESENCE_BACKSTOP_SECONDS), (
+                "the concurrent-route test did not release"
+            )
+            return real_build(*args, **kwargs)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(sources, "build_diagnosis", _blocked_build)
+    monkeypatch.setattr(_dash(), "_DIAGNOSIS_ADMISSION", admission)
+    path = f"/api/diagnosis?window={_WINDOW_QUERY}&source=all"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        first = executor.submit(empty_server.get, path)
+        assert first_entered.wait(PRESENCE_BACKSTOP_SECONDS), (
+            "the first diagnosis never started"
+        )
+        followers = [executor.submit(empty_server.get, path) for _ in range(2)]
+        with admission._changed:
+            assert admission._changed.wait_for(
+                lambda: any(
+                    flight.callers == 3
+                    for flight in admission._flights.values()
+                ),
+                timeout=PRESENCE_BACKSTOP_SECONDS,
+            ), "the concurrent diagnosis callers did not all register"
+            assert not another_entered.is_set(), (
+                "more than one diagnosis build was admitted"
+            )
+        release.set()
+        responses = [first.result(), *(future.result() for future in followers)]
+
+    assert builds == 1, "identical concurrent requests were not single-flight"
+    assert peak_active == 1
+    assert [response.status for response in responses] == [200, 200, 200]

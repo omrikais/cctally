@@ -2,8 +2,8 @@
 cctally quota — weekly quota consumption and metering rate
 
 DATA
-  entries through            2026-08-28T00:30:00+00:00
-  analysis start             2026-07-25T00:00:00+00:00   (supported composition: 2026-07-25 onward)
+  entries through            2026-08-28T00:30:00Z
+  analysis start             2026-07-25T00:00:00Z   (supported composition: 2026-07-25 onward)
   eligible days              30   (0 withheld)
 
 CALIBRATION   effective blended weighted units per weekly point
@@ -13,7 +13,7 @@ CALIBRATION   effective blended weighted units per weekly point
   minus an unmeasured, workload-dependent amount.
 
 CURRENT WEEK
-  window                     2026-08-25T08:00:00+00:00 .. 2026-09-01T08:00:00+00:00
+  window                     2026-08-25T08:00:00Z .. 2026-09-01T08:00:00Z
   observed meter             15%
   modelled consumption       12.97%   [12.92% , 13.02%]
   headroom to 100%           87.03%   [86.98% , 87.08%]
@@ -21,7 +21,7 @@ CURRENT WEEK
   observed minus modelled    +2.03 points
 
 COMPOSITION SUPPORT   radii are EFFECTIVE: max(observed spread, materiality floor)
-  family radius              0.0200   (observed 0.0000)
+  family radius              0.0300   (observed 0.0000)
   token-class radius         0.0106   (observed 0.0000)
   out-of-scope: claude-fable-5, claude-mythos-5 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled
 
@@ -37,8 +37,8 @@ VERDICT   no-rate-change   (status ok, exit 0)
 cctally quota — weekly quota consumption and metering rate
 
 DATA
-  entries through            2026-08-28T00:30:00+00:00
-  analysis start             2026-07-25T00:00:00+00:00   (supported composition: 2026-07-25 onward)
+  entries through            2026-08-28T00:30:00Z
+  analysis start             2026-07-25T00:00:00Z   (supported composition: 2026-07-25 onward)
   eligible days              30   (0 withheld)
 
 CALIBRATION   effective blended weighted units per weekly point
@@ -48,7 +48,7 @@ CALIBRATION   effective blended weighted units per weekly point
   minus an unmeasured, workload-dependent amount.
 
 CURRENT WEEK
-  window                     2026-08-25T08:00:00+00:00 .. 2026-09-01T08:00:00+00:00
+  window                     2026-08-25T08:00:00Z .. 2026-09-01T08:00:00Z
   observed meter             15%
   modelled consumption       12.97%   [12.92% , 13.02%]
   headroom to 100%           87.03%   [86.98% , 87.08%]
@@ -56,7 +56,7 @@ CURRENT WEEK
   observed minus modelled    +2.03 points
 
 COMPOSITION SUPPORT   radii are EFFECTIVE: max(observed spread, materiality floor)
-  family radius              0.0200   (observed 0.0000)
+  family radius              0.0300   (observed 0.0000)
   token-class radius         0.0106   (observed 0.0000)
   out-of-scope: claude-fable-5, claude-mythos-5 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled
 

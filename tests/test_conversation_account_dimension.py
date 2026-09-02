@@ -140,8 +140,38 @@ def test_account_b_scope_excludes_account_a_from_same_session(tmp_path):
         conn.close()
 
 
+def test_claude_assembly_memo_never_crosses_account_scopes(tmp_path):
+    """Equal scoped rollup watermarks must not reuse another account's body."""
+    alpha_dir = tmp_path / "alpha"
+    bravo_dir = tmp_path / "bravo"
+    alpha_dir.mkdir()
+    bravo_dir.mkdir()
+    alpha = _open_scoped_fixture(alpha_dir, ACCOUNT_A)
+    bravo = _open_scoped_fixture(bravo_dir, ACCOUNT_B)
+    try:
+        # Make every pre-#682 memo-key field identical across the two scoped
+        # stores. Only store/account identity may distinguish the bodies.
+        for conn in (alpha, bravo):
+            conn.execute(
+                "UPDATE conversation_sessions "
+                "SET last_activity_utc='2026-08-04T10:00:00Z'"
+            )
+            conn.commit()
+        claude_query._assemble_memo_clear()
+        first = claude_query.get_conversation(alpha, "shared-session")
+        second = claude_query.get_conversation(bravo, "shared-session")
+        assert "alpha private message" in str(first)
+        assert "bravo private message" in str(second)
+        assert "alpha private message" not in str(second)
+    finally:
+        claude_query._assemble_memo_clear()
+        alpha.close()
+        bravo.close()
+
+
 def _open_scoped_codex_fixture(
     tmp_path: pathlib.Path, account_key: str, *, drop_persisted_rollup: bool = False,
+    scope: bool = True,
 ) -> sqlite3.Connection:
     cache_path = tmp_path / "cache-codex.db"
     cache_conn = sqlite3.connect(cache_path)
@@ -200,8 +230,27 @@ def _open_scoped_codex_fixture(
     if drop_persisted_rollup:
         conn.execute("DELETE FROM codex_conversation_rollups")
     conn.commit()
-    cache.scope_conversations_db_to_account(conn, account_key)
+    if scope:
+        cache.scope_conversations_db_to_account(conn, account_key)
     return conn
+
+
+def test_account_scope_does_not_advance_persistent_render_revision(tmp_path):
+    """A read scope may build TEMP rollups but must not mutate durable state."""
+    conn = _open_scoped_codex_fixture(tmp_path, ACCOUNT_A, scope=False)
+    try:
+        before = conn.execute(
+            "SELECT value FROM main.cache_meta "
+            "WHERE key='conversation_render_revision'"
+        ).fetchone()
+        cache.scope_conversations_db_to_account(conn, ACCOUNT_A)
+        after = conn.execute(
+            "SELECT value FROM main.cache_meta "
+            "WHERE key='conversation_render_revision'"
+        ).fetchone()
+        assert after == before
+    finally:
+        conn.close()
 
 
 def test_account_scope_filters_every_codex_leaf_in_shared_conversation(tmp_path):

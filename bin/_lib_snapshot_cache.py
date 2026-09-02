@@ -48,7 +48,9 @@ import datetime as dt
 import hashlib
 import os
 import sqlite3
+import sys
 import threading
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
@@ -61,6 +63,12 @@ from _cctally_core import parse_iso_datetime
 # still a TYPE_CHECKING-only hint). _lib_aggregators imports only _cctally_core,
 # so there is no import cycle.
 from _lib_aggregators import _fold_entry, _finalize_bucket, _new_bucket_acc
+from _lib_retained_size import (
+    RETAINED_SIZE_WORK_LOCK,
+    RETAINED_SIZE_WORKER_DUTY,
+    RetainedSizeCancelled,
+    retained_size_bytes,
+)
 
 if TYPE_CHECKING:  # type hints only — no runtime coupling to the aggregators
     from _lib_aggregators import BucketUsage, ClaudeSessionUsage
@@ -413,12 +421,110 @@ def reset_owner_thread() -> None:
     _OWNER_THREAD_IDENT = None
 
 
+def _restore_owner_thread(owner_ident: int | None) -> None:
+    """Restore the owner that was active before a lock-scoped helper."""
+    global _OWNER_THREAD_IDENT
+    _OWNER_THREAD_IDENT = owner_ident
+
+
 def _assert_owner() -> None:
     if _OWNER_THREAD_IDENT is not None and threading.get_ident() != _OWNER_THREAD_IDENT:
         raise RuntimeError(
             "snapshot-cache mutation from non-owner thread; rebuilds must "
             "run under sync_lock (see mark_owner_thread)"
         )
+
+
+# #684: the retained-memory verifier keys work to actual cache mutation, not
+# publisher ticks or wall-clock-derived data-version strings.  The first write
+# after a claimed generation advances the counter; subsequent writes coalesce
+# until the publisher submits one shallow container snapshot.  A later write
+# advances it again and cooperatively cancels the now-superseded walk.
+_SNAPSHOT_ACCELERATOR_DIRTY = True
+_SNAPSHOT_ACCELERATOR_DIRTY_LOCK = threading.Lock()
+_SNAPSHOT_ACCELERATOR_GENERATION = 0
+
+
+def _mark_snapshot_accelerators_dirty() -> None:
+    global _SNAPSHOT_ACCELERATOR_DIRTY
+    global _SNAPSHOT_ACCELERATOR_GENERATION
+    if _SNAPSHOT_ACCELERATOR_DIRTY:
+        return
+    with _SNAPSHOT_ACCELERATOR_DIRTY_LOCK:
+        if not _SNAPSHOT_ACCELERATOR_DIRTY:
+            _SNAPSHOT_ACCELERATOR_DIRTY = True
+            _SNAPSHOT_ACCELERATOR_GENERATION += 1
+
+
+def _take_snapshot_accelerator_dirty() -> int | None:
+    """Claim the coalesced mutation generation for one background walk."""
+    global _SNAPSHOT_ACCELERATOR_DIRTY
+    with _SNAPSHOT_ACCELERATOR_DIRTY_LOCK:
+        if not _SNAPSHOT_ACCELERATOR_DIRTY:
+            return None
+        _SNAPSHOT_ACCELERATOR_DIRTY = False
+        return int(_SNAPSHOT_ACCELERATOR_GENERATION)
+
+
+def _snapshot_retained_shape(value) -> tuple:
+    """Cheap replacement signature; deep truth is rechecked periodically."""
+    try:
+        length = len(value)
+    except (TypeError, AttributeError):
+        length = None
+    namespace = getattr(value, "__dict__", None)
+    children = ()
+    if isinstance(namespace, dict):
+        children = tuple(sorted(
+            (
+                str(key),
+                type(child).__name__,
+                sys.getsizeof(child),
+                len(child) if hasattr(child, "__len__") else None,
+            )
+            for key, child in namespace.items()
+        ))
+    return (type(value).__name__, sys.getsizeof(value), length, children)
+
+
+class _ObservedSnapshotDict(dict):
+    """Dictionary whose successful mutations invalidate aggregate sizing."""
+
+    def __init__(self, *args, always_mark_replacements=False, **kwargs):
+        self._always_mark_replacements = bool(always_mark_replacements)
+        super().__init__(*args, **kwargs)
+
+    def __setitem__(self, key, value):
+        existed = key in self
+        prior = self.get(key)
+        super().__setitem__(key, value)
+        if (
+            not existed
+            or self._always_mark_replacements
+            or _snapshot_retained_shape(prior) != _snapshot_retained_shape(value)
+        ):
+            _mark_snapshot_accelerators_dirty()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        _mark_snapshot_accelerators_dirty()
+
+    def clear(self):
+        if self:
+            super().clear()
+            _mark_snapshot_accelerators_dirty()
+
+    def pop(self, key, default=None):
+        existed = key in self
+        value = super().pop(key, default)
+        if existed:
+            _mark_snapshot_accelerators_dirty()
+        return value
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        if args or kwargs:
+            _mark_snapshot_accelerators_dirty()
 
 
 # === Task 0.4 — Group A bucket cache holder ================================
@@ -441,7 +547,8 @@ class BucketCache:
     """
 
     def __init__(self) -> None:
-        self._store: "dict[tuple[str, str], BucketUsage]" = {}
+        self._store: "dict[tuple[str, str], BucketUsage]" = (
+            _ObservedSnapshotDict())
 
     def get(self, builder_key: str, bucket_label: str) -> "BucketUsage | None":
         """Return the cached aggregate for this bucket, or None on a miss."""
@@ -493,7 +600,8 @@ class SessionCache:
     """
 
     def __init__(self) -> None:
-        self._store: "dict[str, ClaudeSessionUsage]" = {}
+        self._store: "dict[str, ClaudeSessionUsage]" = _ObservedSnapshotDict(
+            always_mark_replacements=True)
 
     def get_all(self) -> "dict[str, ClaudeSessionUsage]":
         """Return a shallow COPY of every cached session, keyed by identity.
@@ -546,7 +654,7 @@ class SessionCache:
 # assembled list each tick and never mutate a cached aggregate (Codex F7).
 
 _GROUP_A_CACHE = BucketCache()
-_GROUP_A_LAST_SEEN: "dict[str, dict]" = {}
+_GROUP_A_LAST_SEEN: "dict[str, dict]" = _ObservedSnapshotDict()
 
 
 def group_a_cache() -> BucketCache:
@@ -597,7 +705,7 @@ class CurrentBucketAccumulator:
     last_now: dt.datetime        # now_utc upper bound used to clamp the last fold
 
 
-_GROUP_A_CURRENT: "dict[str, CurrentBucketAccumulator]" = {}
+_GROUP_A_CURRENT: "dict[str, CurrentBucketAccumulator]" = _ObservedSnapshotDict()
 
 
 def reset_group_a_current_state() -> None:
@@ -947,7 +1055,7 @@ def affected_session_keys(
 # (Codex F7). Mutated ONLY on the sync thread (single-writer, like Group A).
 
 _SESSION_CACHE = SessionCache()
-_SESSION_LAST_SEEN: "dict" = {}
+_SESSION_LAST_SEEN: "dict" = _ObservedSnapshotDict()
 
 
 def session_cache() -> SessionCache:
@@ -983,7 +1091,7 @@ class CodexAccountingCacheResult:
     changed_new: tuple[object, ...] = ()
 
 
-_CODEX_ACCOUNTING_CACHE_STATE: dict[str, object] = {}
+_CODEX_ACCOUNTING_CACHE_STATE: dict[str, object] = _ObservedSnapshotDict()
 _CODEX_ACCOUNTING_MAX_DIRTY_PATHS = 300
 
 
@@ -1182,6 +1290,10 @@ def build_cached_codex_accounting(
     dirty_accounts = tuple(sorted(
         {str(account_of(entry)) for entry in (*changed_old, *changed_new)}
     ))
+    # A same-cardinality path replacement can change the deep retained graph
+    # while keeping the tuple's shallow shape. Mark this semantic replacement
+    # explicitly; the routine ``seq``/``end`` watermark updates below do not.
+    _mark_snapshot_accelerators_dirty()
     state["entries"] = entries
     state["seq"] = current_seq
     state["end"] = range_end
@@ -1248,7 +1360,8 @@ def build_cached_sessions(
                 # byte-identical to from-scratch even for an id-stable update.
                 for sess in reaggregate(last_seen_seq, affected):
                     _SESSION_CACHE.put(sess.session_id, sess)
-    _SESSION_LAST_SEEN.clear()
+    # Fixed-key watermark update. Clearing first would falsely classify every
+    # unchanged tick as retained-memory growth and cancel the deep verifier.
     _SESSION_LAST_SEEN["max_id"] = cur_max_id
     _SESSION_LAST_SEEN["max_seq"] = cur_max_seq
     _SESSION_LAST_SEEN["extra"] = extra_signature
@@ -1270,6 +1383,9 @@ def build_cached_sessions(
 DOCTOR_MEMO_TTL_S = 30.0
 
 _DOCTOR_MEMO_LOCK = threading.Lock()
+# Tiny, fixed-key TTL payload. Its routine 30-second clear/repopulate must not
+# cancel a production-scale accounting walk forever; the five-minute aggregate
+# remeasurement backstop still includes and verifies it.
 _DOCTOR_MEMO: "dict" = {}
 
 
@@ -1393,8 +1509,8 @@ def reset_dispatch_state() -> None:
 # each rebuild builds FRESH trend / forecast presentation objects and never
 # mutates a cached value (Codex F7).
 
-_WEEKREF_COST_CACHE: dict = {}          # {(week_start_iso, week_end_iso): cost_usd}
-_WEEKREF_COST_LAST_SEEN: dict = {}      # {"max_id": int, "reset_sig": tuple}
+_WEEKREF_COST_CACHE: dict = _ObservedSnapshotDict()
+_WEEKREF_COST_LAST_SEEN: dict = _ObservedSnapshotDict()
 
 
 def _weekref_key(week_start_at, week_end_at):
@@ -1532,9 +1648,9 @@ def reconcile_weekref_cache(cache_conn, *, max_entry_id, max_mutation_seq, reset
 # Single-writer (sync thread only), immutable values, fresh presentation each
 # tick — the Group A / weekref discipline (spec §6, Codex F7).
 
-_PROJECTS_ENV_WEEK_CACHE: dict = {}   # {(bucket_path, week_iso): agg}
-_PROJECTS_ENV_WEEK_TOTALS: dict = {}  # {week_iso: total_cost}  (also the registry)
-_PROJECTS_ENV_LAST_SEEN: dict = {}    # {"max_id", "max_wus_id", "sf_sig"}
+_PROJECTS_ENV_WEEK_CACHE: dict = _ObservedSnapshotDict()
+_PROJECTS_ENV_WEEK_TOTALS: dict = _ObservedSnapshotDict()
+_PROJECTS_ENV_LAST_SEEN: dict = _ObservedSnapshotDict()
 
 # #271 M4 (spec §20): the CURRENT-week per-project aggregate is re-folded from
 # scratch every warm tick (the closed weeks are already cache-served). This
@@ -1546,7 +1662,7 @@ _PROJECTS_ENV_LAST_SEEN: dict = {}    # {"max_id", "max_wus_id", "sf_sig"}
 # reachable from a published DataSnapshot (F7 — the snapshot holds the finalized
 # buckets, not the running `mut`). The `mut` is opaque here (the dashboard
 # packs/unpacks it — same "no dashboard import" discipline as `BucketCache`).
-_PROJECTS_ENV_CURRENT: dict = {"state": None}  # single-slot current-week fold
+_PROJECTS_ENV_CURRENT: dict = _ObservedSnapshotDict({"state": None})
 
 
 _PROJECTS_ENV_KEY_SEP = "|"
@@ -1973,8 +2089,8 @@ class BugKSegment(NamedTuple):
     entry_count: int
 
 
-_BUGK_SEGMENT_CACHE: dict = {}       # {(orig_start_utc_iso, eff_utc_iso): BugKSegment}
-_BUGK_SEGMENT_LAST_SEEN: dict = {}   # {"max_id": int, "reset_sig": tuple}
+_BUGK_SEGMENT_CACHE: dict = _ObservedSnapshotDict()
+_BUGK_SEGMENT_LAST_SEEN: dict = _ObservedSnapshotDict()
 
 
 def _bugk_key(original_start_at, effective_at):
@@ -2095,8 +2211,379 @@ def reconcile_bugk_cache(cache_conn, *, max_entry_id, max_mutation_seq, reset_si
 # / `reset_sig` / `sf_sig` / display-tz signals, mirroring
 # `reconcile_bugk_cache` + the projects-env `session_files_sig` leg.
 
-_CACHE_REPORT_DAY_CACHE: dict = {}    # {date_key: CachedCacheReportDay}
-_CACHE_REPORT_LAST_SEEN: dict = {}    # {max_id, max_seq, reset_sig, sf_sig, tz_key}
+_CACHE_REPORT_DAY_CACHE: dict = _ObservedSnapshotDict()
+_CACHE_REPORT_LAST_SEEN: dict = _ObservedSnapshotDict()
+
+
+# #684: one admission owner for every cross-build accelerator in this module.
+# The opaque last-published snapshot is deliberately not in this set: it is the
+# product state shared with the SSE hub, not an accelerator, and counting it
+# here would double-count the same object.  All historical bucket/session/
+# accounting/doctor caches and their invalidation watermarks are included.
+_SNAPSHOT_ACCELERATOR_MAX_BYTES = 384 * 1024 * 1024
+_SNAPSHOT_ACCELERATOR_MAX_ENTRIES = 500_000
+_SNAPSHOT_ACCELERATOR_STATS_LOCK = threading.Lock()
+_SNAPSHOT_ACCELERATOR_ESTIMATED_BYTES = 0
+_SNAPSHOT_ACCELERATOR_ENTRY_COUNT = 0
+_SNAPSHOT_ACCELERATOR_EVICTIONS = 0
+_SNAPSHOT_ACCELERATOR_FALLBACKS = 0
+_SNAPSHOT_ACCELERATOR_MEASUREMENT_ERRORS = 0
+_SNAPSHOT_ACCELERATOR_MEASURED_GENERATION = -1
+_SNAPSHOT_ACCELERATOR_LAST_MEASURED_MONOTONIC = 0.0
+_SNAPSHOT_ACCELERATOR_REMEASURE_SECONDS = 300.0
+_SNAPSHOT_MEMORY_COMPLETION_LOCK = None
+
+
+class _SnapshotMemoryWorker:
+    """One cooperative latest-generation retained-size walk."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._pending: tuple[int, tuple[dict, ...], int] | None = None
+        self._result: tuple[int, int | None, str | None] | None = None
+        self._latest_generation = -1
+        self._active_generation: int | None = None
+        self._stop = False
+        self._thread: threading.Thread | None = None
+        self._duty_wall = 0.0
+        self._duty_cpu = 0.0
+
+    def submit(
+        self, generation: int, roots: tuple[dict, ...], entry_count: int,
+    ) -> None:
+        with self._condition:
+            if self._stop:
+                return
+            self._latest_generation = int(generation)
+            self._pending = (int(generation), roots, int(entry_count))
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="cctally-snapshot-memory",
+                    daemon=True,
+                )
+                self._thread.start()
+            self._condition.notify()
+
+    def take_result(self) -> tuple[int, int | None, str | None] | None:
+        with self._condition:
+            result = self._result
+            self._result = None
+            return result
+
+    def _cooperate(self) -> bool:
+        with self._condition:
+            cancelled = (
+                self._stop
+                or self._active_generation != self._latest_generation
+            )
+        if cancelled:
+            return True
+        cpu_elapsed = time.thread_time() - self._duty_cpu
+        wall_elapsed = time.monotonic() - self._duty_wall
+        delay = (cpu_elapsed / RETAINED_SIZE_WORKER_DUTY) - wall_elapsed
+        if delay > 0:
+            time.sleep(min(delay, 0.01))
+        with self._condition:
+            return (
+                self._stop
+                or self._active_generation != self._latest_generation
+            )
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None and not self._stop:
+                    self._condition.wait()
+                if self._stop:
+                    return
+                generation, roots, entry_count = self._pending
+                self._pending = None
+                self._active_generation = generation
+            estimated: int | None = None
+            error: str | None = None
+            try:
+                while not RETAINED_SIZE_WORK_LOCK.acquire(timeout=0.05):
+                    if self._cooperate():
+                        raise RetainedSizeCancelled()
+                try:
+                    self._duty_wall = time.monotonic()
+                    self._duty_cpu = time.thread_time()
+                    estimated = retained_size_bytes(
+                        roots,
+                        stop_after=_SNAPSHOT_ACCELERATOR_MAX_BYTES,
+                        cancelled=self._cooperate,
+                    )
+                finally:
+                    RETAINED_SIZE_WORK_LOCK.release()
+            except RetainedSizeCancelled:
+                continue
+            except Exception as exc:  # noqa: BLE001 - keep the sole worker alive
+                error = f"{type(exc).__name__}: {exc}"
+            finally:
+                roots = ()
+            published = (
+                error is None
+                and estimated is not None
+                and _publish_snapshot_measurement(
+                    generation, int(estimated), entry_count)
+            )
+            enforced = False
+            completion_lock = _SNAPSHOT_MEMORY_COMPLETION_LOCK
+            if not published and completion_lock is not None:
+                with completion_lock:
+                    previous_owner = _OWNER_THREAD_IDENT
+                    mark_owner_thread()
+                    try:
+                        enforced = _enforce_snapshot_unsafe_completion(
+                            generation,
+                            None if estimated is None else int(estimated),
+                            error,
+                        )
+                    finally:
+                        _restore_owner_thread(previous_owner)
+            with self._condition:
+                self._active_generation = None
+                if (
+                    not published and not enforced
+                    and not self._stop
+                    and generation == self._latest_generation
+                ):
+                    self._result = (
+                        generation,
+                        None if estimated is None else int(estimated),
+                        error,
+                    )
+
+    def shutdown(self) -> bool:
+        with self._condition:
+            self._stop = True
+            self._pending = None
+            thread = self._thread
+            self._condition.notify_all()
+        if thread is not None:
+            thread.join(timeout=1.0)
+        return thread is None or not thread.is_alive()
+
+    def is_alive(self) -> bool:
+        with self._condition:
+            return self._thread is not None and self._thread.is_alive()
+
+
+_SNAPSHOT_MEMORY_WORKER = _SnapshotMemoryWorker()
+
+
+def set_snapshot_memory_completion_lock(lock) -> None:
+    """Bind unsafe verifier completions to the dashboard publisher lock."""
+    global _SNAPSHOT_MEMORY_COMPLETION_LOCK
+    _SNAPSHOT_MEMORY_COMPLETION_LOCK = lock
+
+
+def _enforce_snapshot_unsafe_completion(
+    generation: int, estimated: int | None, error: str | None,
+) -> bool:
+    """Evict a current over-cap/error result without awaiting another tick."""
+    if error is None and (
+        estimated is None or estimated <= _SNAPSHOT_ACCELERATOR_MAX_BYTES
+    ):
+        return False
+    with _SNAPSHOT_ACCELERATOR_DIRTY_LOCK:
+        if (
+            _SNAPSHOT_ACCELERATOR_DIRTY
+            or generation != _SNAPSHOT_ACCELERATOR_GENERATION
+        ):
+            return False
+    entry_count = _snapshot_accelerator_entry_count()
+    global _SNAPSHOT_ACCELERATOR_ESTIMATED_BYTES
+    global _SNAPSHOT_ACCELERATOR_ENTRY_COUNT
+    global _SNAPSHOT_ACCELERATOR_EVICTIONS
+    global _SNAPSHOT_ACCELERATOR_FALLBACKS
+    global _SNAPSHOT_ACCELERATOR_MEASUREMENT_ERRORS
+    with _SNAPSHOT_ACCELERATOR_STATS_LOCK:
+        _clear_snapshot_accelerators()
+        _SNAPSHOT_ACCELERATOR_EVICTIONS += entry_count
+        _SNAPSHOT_ACCELERATOR_FALLBACKS += 1
+        if error is not None:
+            _SNAPSHOT_ACCELERATOR_MEASUREMENT_ERRORS += 1
+        _SNAPSHOT_ACCELERATOR_ESTIMATED_BYTES = 0
+        _SNAPSHOT_ACCELERATOR_ENTRY_COUNT = _snapshot_accelerator_entry_count()
+    return True
+
+
+def _publish_snapshot_measurement(
+    generation: int, estimated: int, entry_count: int,
+) -> bool:
+    """Publish a safe under-cap result immediately, between publisher ticks."""
+    if estimated > _SNAPSHOT_ACCELERATOR_MAX_BYTES:
+        return False
+    with _SNAPSHOT_ACCELERATOR_DIRTY_LOCK:
+        if (
+            _SNAPSHOT_ACCELERATOR_DIRTY
+            or generation != _SNAPSHOT_ACCELERATOR_GENERATION
+        ):
+            return False
+    global _SNAPSHOT_ACCELERATOR_ESTIMATED_BYTES
+    global _SNAPSHOT_ACCELERATOR_ENTRY_COUNT
+    global _SNAPSHOT_ACCELERATOR_MEASURED_GENERATION
+    global _SNAPSHOT_ACCELERATOR_LAST_MEASURED_MONOTONIC
+    with _SNAPSHOT_ACCELERATOR_STATS_LOCK:
+        _SNAPSHOT_ACCELERATOR_ESTIMATED_BYTES = int(estimated)
+        _SNAPSHOT_ACCELERATOR_ENTRY_COUNT = int(entry_count)
+        _SNAPSHOT_ACCELERATOR_MEASURED_GENERATION = int(generation)
+        _SNAPSHOT_ACCELERATOR_LAST_MEASURED_MONOTONIC = time.monotonic()
+    return True
+
+
+def _snapshot_accelerator_roots() -> tuple[object, ...]:
+    """Every cross-build retained accelerator, in one drift-resistant list."""
+    return (
+        _GROUP_A_CACHE._store,
+        _GROUP_A_LAST_SEEN,
+        _GROUP_A_CURRENT,
+        _SESSION_CACHE._store,
+        _SESSION_LAST_SEEN,
+        _CODEX_ACCOUNTING_CACHE_STATE,
+        _DOCTOR_MEMO,
+        _WEEKREF_COST_CACHE,
+        _WEEKREF_COST_LAST_SEEN,
+        _PROJECTS_ENV_WEEK_CACHE,
+        _PROJECTS_ENV_WEEK_TOTALS,
+        _PROJECTS_ENV_LAST_SEEN,
+        _PROJECTS_ENV_CURRENT,
+        _BUGK_SEGMENT_CACHE,
+        _BUGK_SEGMENT_LAST_SEEN,
+        _CACHE_REPORT_DAY_CACHE,
+        _CACHE_REPORT_LAST_SEEN,
+    )
+
+
+def _snapshot_accelerator_entry_count() -> int:
+    return sum(len(root) for root in _snapshot_accelerator_roots())
+
+
+def _clear_snapshot_accelerators() -> None:
+    """Response-preserving overflow fallback: the next tick recomputes cold."""
+    for root in _snapshot_accelerator_roots():
+        root.clear()
+    # Preserve the single-slot mapping shape expected by its callers.
+    _PROJECTS_ENV_CURRENT["state"] = None
+
+
+def enforce_snapshot_accelerator_bounds(*, data_version: str) -> None:
+    """Admit the completed accelerator estate or discard it as one unit.
+
+    Called after a complete source build, when the just-built public snapshot
+    no longer depends on these mutable stores.  Overflow therefore changes only
+    next-tick reuse, never the response that triggered admission.
+    """
+    _assert_owner()
+    del data_version  # mutation generations, not render identity, own admission
+    entry_count = _snapshot_accelerator_entry_count()
+    global _SNAPSHOT_ACCELERATOR_ESTIMATED_BYTES
+    global _SNAPSHOT_ACCELERATOR_ENTRY_COUNT
+    global _SNAPSHOT_ACCELERATOR_EVICTIONS
+    global _SNAPSHOT_ACCELERATOR_FALLBACKS
+    global _SNAPSHOT_ACCELERATOR_MEASUREMENT_ERRORS
+    global _SNAPSHOT_ACCELERATOR_GENERATION
+    global _SNAPSHOT_ACCELERATOR_MEASURED_GENERATION
+    global _SNAPSHOT_ACCELERATOR_LAST_MEASURED_MONOTONIC
+    completed = _SNAPSHOT_MEMORY_WORKER.take_result()
+    with _SNAPSHOT_ACCELERATOR_STATS_LOCK:
+        last_measured = _SNAPSHOT_ACCELERATOR_LAST_MEASURED_MONOTONIC
+        last_measured_generation = _SNAPSHOT_ACCELERATOR_MEASURED_GENERATION
+    if (
+        last_measured > 0
+        and last_measured_generation == _SNAPSHOT_ACCELERATOR_GENERATION
+        and time.monotonic() - last_measured
+        >= _SNAPSHOT_ACCELERATOR_REMEASURE_SECONDS
+    ):
+        _mark_snapshot_accelerators_dirty()
+    with _SNAPSHOT_ACCELERATOR_DIRTY_LOCK:
+        current_generation = int(_SNAPSHOT_ACCELERATOR_GENERATION)
+        currently_dirty = bool(_SNAPSHOT_ACCELERATOR_DIRTY)
+    with _SNAPSHOT_ACCELERATOR_STATS_LOCK:
+        measured = (
+            None if completed is None or completed[1] is None
+            else int(completed[1])
+        )
+        measured_generation = -1 if completed is None else int(completed[0])
+        measurement_error = None if completed is None else completed[2]
+        result_is_current = (
+            measured_generation == current_generation and not currently_dirty)
+
+        if entry_count > _SNAPSHOT_ACCELERATOR_MAX_ENTRIES:
+            _clear_snapshot_accelerators()
+            _SNAPSHOT_ACCELERATOR_EVICTIONS += entry_count
+            _SNAPSHOT_ACCELERATOR_FALLBACKS += 1
+            _SNAPSHOT_ACCELERATOR_ESTIMATED_BYTES = 0
+            _SNAPSHOT_ACCELERATOR_ENTRY_COUNT = _snapshot_accelerator_entry_count()
+        elif result_is_current and measurement_error is not None:
+            _clear_snapshot_accelerators()
+            _SNAPSHOT_ACCELERATOR_EVICTIONS += entry_count
+            _SNAPSHOT_ACCELERATOR_FALLBACKS += 1
+            _SNAPSHOT_ACCELERATOR_MEASUREMENT_ERRORS += 1
+            _SNAPSHOT_ACCELERATOR_ESTIMATED_BYTES = 0
+            _SNAPSHOT_ACCELERATOR_ENTRY_COUNT = _snapshot_accelerator_entry_count()
+        elif (
+            result_is_current
+            and measured is not None
+            and measured > _SNAPSHOT_ACCELERATOR_MAX_BYTES
+        ):
+            _clear_snapshot_accelerators()
+            _SNAPSHOT_ACCELERATOR_EVICTIONS += entry_count
+            _SNAPSHOT_ACCELERATOR_FALLBACKS += 1
+            _SNAPSHOT_ACCELERATOR_ESTIMATED_BYTES = 0
+            _SNAPSHOT_ACCELERATOR_ENTRY_COUNT = _snapshot_accelerator_entry_count()
+        elif result_is_current and measured is not None:
+            _SNAPSHOT_ACCELERATOR_ESTIMATED_BYTES = measured
+            _SNAPSHOT_ACCELERATOR_ENTRY_COUNT = int(entry_count)
+            _SNAPSHOT_ACCELERATOR_MEASURED_GENERATION = measured_generation
+            _SNAPSHOT_ACCELERATOR_LAST_MEASURED_MONOTONIC = time.monotonic()
+        else:
+            _SNAPSHOT_ACCELERATOR_ENTRY_COUNT = int(entry_count)
+
+    generation = _take_snapshot_accelerator_dirty()
+    if generation is not None:
+        measured_entry_count = _snapshot_accelerator_entry_count()
+        _SNAPSHOT_MEMORY_WORKER.submit(
+            generation,
+            tuple(dict(root) for root in _snapshot_accelerator_roots()),
+            measured_entry_count,
+        )
+
+
+def snapshot_accelerator_memory_stats():
+    """Safe numeric diagnostics for the complete snapshot accelerator owner."""
+    with _SNAPSHOT_ACCELERATOR_STATS_LOCK:
+        return {
+            "estimatedBytes": int(_SNAPSHOT_ACCELERATOR_ESTIMATED_BYTES),
+            "maxBytes": int(_SNAPSHOT_ACCELERATOR_MAX_BYTES),
+            "entryCount": int(_SNAPSHOT_ACCELERATOR_ENTRY_COUNT),
+            "maxEntries": int(_SNAPSHOT_ACCELERATOR_MAX_ENTRIES),
+            "evictionCount": int(_SNAPSHOT_ACCELERATOR_EVICTIONS),
+            "fallbackCount": int(_SNAPSHOT_ACCELERATOR_FALLBACKS),
+            "measurementErrorCount": int(
+                _SNAPSHOT_ACCELERATOR_MEASUREMENT_ERRORS),
+            "measuredGeneration": int(
+                _SNAPSHOT_ACCELERATOR_MEASURED_GENERATION),
+            "currentGeneration": int(_SNAPSHOT_ACCELERATOR_GENERATION),
+            "measurementPending": int(
+                _SNAPSHOT_ACCELERATOR_MEASURED_GENERATION
+                != _SNAPSHOT_ACCELERATOR_GENERATION
+            ),
+            "workerAlive": int(
+                getattr(_SNAPSHOT_MEMORY_WORKER, "is_alive", lambda: False)()
+            ),
+        }
+
+
+def shutdown_snapshot_memory_worker() -> None:
+    """Cancel and join retained-size traversal before replacing its owner."""
+    global _SNAPSHOT_MEMORY_WORKER
+    worker = _SNAPSHOT_MEMORY_WORKER
+    if not worker.shutdown():
+        raise RuntimeError("snapshot memory verifier did not stop")
+    _SNAPSHOT_MEMORY_WORKER = _SnapshotMemoryWorker()
 
 
 def reset_cache_report_state():

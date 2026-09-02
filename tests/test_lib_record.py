@@ -1,10 +1,11 @@
 """Direct unit tests for bin/_lib_record.py (#279 S4 F3).
 
-Decision-table coverage for the seven record write-path kernels lifted out
-of cmd_record_usage / maybe_record_projected_alert. Each kernel mirrors the
-exact comparison operators of its source fragment; the tests pin the
-inclusive band bounds, the round(x, 1) clamp granularity, the `+ 1e-9`
-percent/threshold snap, and every branch of the weekly-debounce classifier.
+Decision-table coverage for the nine record write-path kernels lifted out
+of cmd_record_usage / maybe_record_projected_alert / maybe_record_milestone.
+Each kernel mirrors the exact comparison operators of its source fragment;
+the tests pin the inclusive band bounds, the round(x, 1) clamp granularity,
+the `+ 1e-9` percent/threshold snap, and every branch of the weekly-debounce
+classifier.
 """
 from __future__ import annotations
 
@@ -15,12 +16,16 @@ from _lib_record import (
     CONFIRM_RESET,
     FIRE_IMMEDIATE,
     NO_ACTION,
+    SNAPSHOT_ACCEPT,
+    SNAPSHOT_SKIP_CLAMP,
+    SNAPSHOT_SKIP_DEDUP,
     check_resets_at_plausibility,
     hwm_clamp_applies,
     hwm_file_next,
     milestone_coverage_owes,
     plan_five_hour_credit,
     plan_weekly_credit_debounce,
+    post_reset_seed_has_climb_evidence,
     projected_crossings,
 )
 
@@ -153,3 +158,56 @@ def test_projected_crossings_prescaled_pairs():
 def test_projected_crossings_1e9_snap():
     # a float sitting one ULP under the comparand still crosses (+ 1e-9)
     assert projected_crossings(89.99999999999999, [(90, 90.0)]) == [90]
+
+
+# ── Fragment 8: usage-snapshot fold outcome classification ─────────────────
+def test_snapshot_fold_reasons_are_three_distinct_values():
+    # `_pipeline_claude_usage` gates the weekly milestone derivation on
+    # `reason != SNAPSHOT_SKIP_CLAMP`, so the two skips must never collapse
+    # onto one value. A dedup skip that compared equal to the clamp constant
+    # would silence the self-heal that recovers a tick killed between the
+    # snapshot insert and the milestone insert.
+    assert len({SNAPSHOT_ACCEPT, SNAPSHOT_SKIP_CLAMP, SNAPSHOT_SKIP_DEDUP}) == 3
+    # The literal spellings are the pinned values: tests/test_writer_reroute.py
+    # asserts them by string at each `_usage_snapshot_fold_decision` outcome.
+    assert (SNAPSHOT_ACCEPT, SNAPSHOT_SKIP_CLAMP, SNAPSHOT_SKIP_DEDUP) == (
+        "accept", "clamp", "dedup")
+
+
+# ── Fragment 9: post-reset milestone-ladder seeding evidence ───────────────
+def test_post_reset_seed_requires_a_strictly_lower_observation():
+    # An in-epoch observation flooring BELOW the threshold is the observable
+    # evidence that the counter climbed from the reset onto it.
+    assert post_reset_seed_has_climb_evidence(0.4, 13)
+    assert post_reset_seed_has_climb_evidence(12.9, 13)
+    # Flooring EQUAL is not below (strict `<`): the epoch's lowest reading is
+    # already at the threshold, so nothing observed the climb onto it.
+    assert not post_reset_seed_has_climb_evidence(13.0, 13)
+    assert not post_reset_seed_has_climb_evidence(13.7, 13)
+    # Above the threshold cannot be evidence either.
+    assert not post_reset_seed_has_climb_evidence(20.0, 13)
+
+
+def test_post_reset_seed_refused_on_an_empty_epoch():
+    # `None` is what `SELECT MIN(weekly_percent)` yields for an epoch holding
+    # no observation in the window at all. The glue's sole call site usually
+    # puts the triggering capture's own row inside that window, but not
+    # always: the window's upper bound falls back to `as_of` when `saved`
+    # carries no `capturedAt`, and the stale-replica DELETE can remove the row
+    # between the snapshot write and this read. The kernel therefore decides
+    # the empty case rather than assuming it away, and it refuses — an epoch
+    # with nothing stored in it has observed no climb.
+    assert not post_reset_seed_has_climb_evidence(None, 13)
+    assert not post_reset_seed_has_climb_evidence(None, 1)
+
+
+def test_post_reset_seed_1e9_snap():
+    # The status line delivers percents as fraction-times-100, so 58% arrives
+    # as `0.58 * 100 == 57.99999999999999`. Without the `+ 1e-9` snap a stored
+    # replica of that value floors to 57, reads as "below 58", and WRONGLY
+    # licenses a fresh post-reset epoch to seed its ladder at 58 from a
+    # pre-credit reading — the exact fabrication this kernel exists to refuse.
+    assert not post_reset_seed_has_climb_evidence(57.99999999999999, 58)
+    # The snap must not swallow a whole percent: a genuine reading one percent
+    # lower is still evidence.
+    assert post_reset_seed_has_climb_evidence(56.99999999999999, 58)

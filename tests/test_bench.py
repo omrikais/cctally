@@ -87,6 +87,339 @@ def _load_bin(name):
     return _load_path(name.replace("-", "_"), name)
 
 
+def _load_dashboard_soak():
+    path = BIN.parent / "bench" / "dashboard-soak.py"
+    loader = importlib.machinery.SourceFileLoader("dashboard_soak", str(path))
+    spec = importlib.util.spec_from_loader("dashboard_soak", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _load_explain_benchmark():
+    path = BIN.parent / "bench" / "explain-benchmark.py"
+    loader = importlib.machinery.SourceFileLoader("explain_benchmark", str(path))
+    spec = importlib.util.spec_from_loader("explain_benchmark", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def test_explain_benchmark_gates_concurrent_workers_and_aggregate_rss():
+    bench = _load_explain_benchmark()
+    report = {
+        "cases": {
+            "claude": {"medianSeconds": 0.5, "p95Seconds": 1.0},
+            "all": {"medianSeconds": 1.0, "p95Seconds": 2.0},
+        },
+        "coldDashboard": {
+            "p95Seconds": 2.0,
+            "statuses": [200],
+            "canonicalParity": True,
+        },
+        "peakRssBytes": 100,
+        "singleDashboardProcessTree": {"peakRssBytes": 400},
+        "concurrentDashboard": {
+            "statuses": [200, 200, 200, 200],
+            "canonicalParity": True,
+            "uniqueBodyHashes": 1,
+            "peakDescendantProcesses": 3,
+            "descendantProcessCeiling": 3,
+            "peakRssBytes": 500,
+            "rssCeilingBytes": 600,
+        },
+        "providerPopulations": {
+            provider: {
+                "supportUnits": 1,
+                "baselineSupportUnits": 1,
+            }
+            for provider in ("claude", "codex")
+        },
+        "withheldProbe": {
+            "emptyAccountWithheldClasses": {"claude": 1, "codex": 1},
+            "privacyWithheldClasses": {"claude": 1, "codex": 1},
+        },
+        "conversationPopulations": {
+            "claudeSidechainMessages": 1,
+            "codexConversationEvents": 1,
+            "codexConversationMessages": 1,
+        },
+        "identityPopulations": {
+            "claudeMetaMessages": 1,
+            "claudeToolResultMessages": 1,
+            "claudeUnattributedEntries": 1,
+            "codexSubagentThreads": 1,
+            "codexRealAccounts": 2,
+        },
+    }
+    assert bench._performance_problems(report) == []
+
+    report["concurrentDashboard"]["peakDescendantProcesses"] = 4
+    report["concurrentDashboard"]["peakRssBytes"] = 601
+    problems = bench._performance_problems(report)
+    assert any("descendants 4 exceed 3" in problem for problem in problems)
+    assert any("RSS 601 exceeds 600" in problem for problem in problems)
+
+
+def test_dashboard_soak_gate_detects_slope_owner_and_duty_breaches():
+    soak = _load_dashboard_soak()
+    receipt = {
+        "ceilings": {
+            "processRssBytes": 1000,
+            "rssSlopeBytesPerSecond": 10,
+            "combinedCpuDuty": 0.75,
+            "apiP95Ms": 100,
+            "threadCount": 10,
+            "diskIoOpsPerSecond": 100,
+            "processCpuPercent": 100,
+        },
+        "samples": [
+            {"elapsedSeconds": 0, "rssBytes": 500, "threadCount": 2,
+             "cpuPercent": 20},
+            {"elapsedSeconds": 10, "rssBytes": 550, "threadCount": 2,
+             "cpuPercent": 20},
+            {"elapsedSeconds": 20, "rssBytes": 600, "threadCount": 2,
+             "cpuPercent": 20},
+            {"elapsedSeconds": 30, "rssBytes": 650, "threadCount": 2,
+             "cpuPercent": 20},
+            {"elapsedSeconds": 40, "rssBytes": 700, "threadCount": 2,
+             "cpuPercent": 20},
+            {"elapsedSeconds": 50, "rssBytes": 750, "threadCount": 2,
+             "cpuPercent": 20},
+        ],
+        "owners": {"quota": {
+            "estimatedBytes": 8, "maxBytes": 10,
+            "entryCount": 1, "maxEntries": 2,
+        }},
+        "combinedCpuDuty": 0.5,
+        "diskIoOpsPerSecond": 2.0,
+        "apiLatencyMs": [10, 20, 30],
+        "publishPeriodsNs": [1_000_000],
+        "conversationPeriodsNs": [2_000_000],
+        "reconnectLatencyMs": [3.0],
+        "railLatencyMs": [3.0],
+        "liveTailLatencyMs": [3.0],
+        "readerLatencyMs": [3.0],
+        "manualRefreshLatencyMs": [3.0],
+        "sqliteBefore": {"cache_size": -2000, "temp_store": 0},
+        "sqliteAfter": {"cache_size": -2000, "temp_store": 0},
+        "shutdown": {"clean": True, "rssReleased": True},
+        "stress": {
+            "privacyVariants": True,
+            "providerSourceAddRemove": True,
+            "accountIdentityRotation": True,
+            "diagnosisRecovered": True,
+            "cacheRebuild": True,
+            "bothProvidersConfigured": True,
+            "largeReader": True,
+            "manualRefresh": True,
+            "dedicatedLiveTail": True,
+            "memoryAdmissionMeasured": True,
+            "diagnosisTransient503Count": 1,
+        },
+    }
+    assert soak.evaluate_receipt(receipt) == []
+
+    broken = dict(receipt)
+    broken["owners"] = {"quota": {"estimatedBytes": 11, "maxBytes": 10}}
+    broken["combinedCpuDuty"] = 0.9
+    problems = soak.evaluate_receipt(broken)
+    assert any("quota" in problem for problem in problems)
+    assert any("combined" in problem for problem in problems)
+
+    disconnected = dict(receipt)
+    disconnected["stress"] = {
+        **receipt["stress"], "diagnosisTransient503Count": 0,
+    }
+    assert any(
+        "injected 503" in problem
+        for problem in soak.evaluate_receipt(disconnected)
+    )
+
+    stale = dict(receipt)
+    stale["memoryAdmission"] = {
+        "targetGenerations": {"snapshot": 8},
+        "measuredGenerations": {"snapshot": 7},
+    }
+    assert any(
+        "after stress generation 8" in problem
+        for problem in soak.evaluate_receipt(stale)
+    )
+
+    def slope_problems(values):
+        candidate = {
+            **receipt,
+            "samples": [
+                {
+                    "elapsedSeconds": index,
+                    "rssBytes": value,
+                    "threadCount": 2,
+                    "cpuPercent": 20,
+                }
+                for index, value in enumerate(values)
+            ],
+        }
+        return [
+            problem for problem in soak.evaluate_receipt(candidate)
+            if "RSS slope" in problem
+        ]
+
+    assert slope_problems([500] * 12) == []
+    assert slope_problems([
+        500 + (2 if index % 2 else -2) for index in range(20)
+    ]) == []
+    assert slope_problems([100 + 25 * index for index in range(12)])
+
+
+def test_dashboard_soak_uses_one_sided_slope_confidence_bound():
+    soak = _load_dashboard_soak()
+
+    flat = [
+        {"elapsedSeconds": i, "rssBytes": 1000}
+        for i in range(12)
+    ]
+    growing = [
+        {"elapsedSeconds": i, "rssBytes": 1000 + 25 * i}
+        for i in range(12)
+    ]
+    noisy_flat = [
+        {"elapsedSeconds": i, "rssBytes": 1000 + (2 if i % 2 else -2)}
+        for i in range(20)
+    ]
+    uncertain = [
+        {"elapsedSeconds": i, "rssBytes": 1000 + (200 if i % 2 else -200)}
+        for i in range(12)
+    ]
+
+    flat_bound = soak.linear_slope_confidence_bound(
+        flat, "elapsedSeconds", "rssBytes")
+    growing_bound = soak.linear_slope_confidence_bound(
+        growing, "elapsedSeconds", "rssBytes")
+    noisy_bound = soak.linear_slope_confidence_bound(
+        noisy_flat, "elapsedSeconds", "rssBytes")
+    uncertain_bound = soak.linear_slope_confidence_bound(
+        uncertain, "elapsedSeconds", "rssBytes")
+
+    assert flat_bound == {
+        "confidence": 0.95, "estimate": 0.0, "upper": 0.0, "samples": 12,
+    }
+    assert growing_bound is not None and growing_bound["upper"] >= 25.0
+    assert noisy_bound is not None and noisy_bound["upper"] < 10.0
+    assert uncertain_bound is not None
+    assert uncertain_bound["estimate"] < 10.0 < uncertain_bound["upper"]
+    assert soak.linear_slope_confidence_bound(
+        flat[:2], "elapsedSeconds", "rssBytes") is None
+    assert soak.linear_slope_confidence_bound(
+        [{"elapsedSeconds": 1, "rssBytes": i} for i in range(3)],
+        "elapsedSeconds", "rssBytes",
+    ) is None
+
+
+def test_dashboard_soak_uses_peak_owner_and_cpu_evidence():
+    soak = _load_dashboard_soak()
+    diagnostics = [
+        {"memory": {"owners": {"source": {
+            "estimatedBytes": 90, "maxBytes": 100,
+            "entryCount": 9, "maxEntries": 10,
+        }}}},
+        {"memory": {"owners": {"source": {
+            "estimatedBytes": 10, "maxBytes": 100,
+            "entryCount": 1, "maxEntries": 10,
+        }}}},
+    ]
+    owners = soak._peak_memory_owners(diagnostics)
+    assert owners["source"]["estimatedBytes"] == 90
+    assert owners["source"]["entryCount"] == 9
+
+
+def test_dashboard_soak_gate_fails_closed_on_missing_evidence():
+    soak = _load_dashboard_soak()
+    problems = soak.evaluate_receipt({})
+    assert any("process samples" in problem for problem in problems)
+    assert any("owners" in problem for problem in problems)
+    assert any("CPU duty" in problem for problem in problems)
+    assert any("publication cadence" in problem for problem in problems)
+
+
+def test_dashboard_soak_comparison_rejects_any_cadence_regression():
+    soak = _load_dashboard_soak()
+    comparison = {
+        "beforePublishP50Ms": 10, "afterPublishP50Ms": 11,
+        "beforePublishP95Ms": 20, "afterPublishP95Ms": 20,
+        "beforeConversationP50Ms": 10, "afterConversationP50Ms": 10,
+        "beforeConversationP95Ms": 20, "afterConversationP95Ms": 20,
+        "beforeReconnectP50Ms": 10, "afterReconnectP50Ms": 10,
+        "beforeReconnectP95Ms": 20, "afterReconnectP95Ms": 20,
+        "beforeRailP50Ms": 10, "afterRailP50Ms": 10,
+        "beforeRailP95Ms": 20, "afterRailP95Ms": 20,
+        "beforeLiveTailP50Ms": 10, "afterLiveTailP50Ms": 10,
+        "beforeLiveTailP95Ms": 20, "afterLiveTailP95Ms": 20,
+        "beforeReaderP50Ms": 10, "afterReaderP50Ms": 10,
+        "beforeReaderP95Ms": 20, "afterReaderP95Ms": 20,
+        "beforeManualRefreshP50Ms": 10, "afterManualRefreshP50Ms": 10,
+        "beforeManualRefreshP95Ms": 20, "afterManualRefreshP95Ms": 20,
+    }
+    problems = soak._comparison_problems(comparison)
+    assert problems == [
+        "Publish P50Ms slowed from 10.000ms to 11.000ms beyond 0.500ms tolerance"
+    ]
+
+
+def test_dashboard_soak_publish_tail_uses_measured_repeatability_floor():
+    soak = _load_dashboard_soak()
+    comparison = {}
+    for label in (
+        "Publish", "Conversation", "Reconnect", "Rail", "LiveTail",
+        "Reader", "ManualRefresh",
+    ):
+        for suffix in ("P50Ms", "P95Ms"):
+            comparison[f"before{label}{suffix}"] = 8000.0
+            comparison[f"after{label}{suffix}"] = 8000.0
+
+    comparison["afterPublishP95Ms"] = 9499.0
+    assert soak._comparison_problems(comparison) == []
+
+    comparison["afterPublishP95Ms"] = 9501.0
+    assert soak._comparison_problems(comparison) == [
+        "Publish P95Ms slowed from 8000.000ms to 9501.000ms "
+        "beyond 1500.000ms tolerance"
+    ]
+
+
+def test_dashboard_soak_other_sparse_tails_use_measured_noise_floors():
+    soak = _load_dashboard_soak()
+    comparison = {}
+    for label in (
+        "Publish", "Conversation", "Reconnect", "Rail", "LiveTail",
+        "Reader", "ManualRefresh",
+    ):
+        for suffix in ("P50Ms", "P95Ms"):
+            comparison[f"before{label}{suffix}"] = 5.0
+            comparison[f"after{label}{suffix}"] = 5.0
+
+    comparison["beforeConversationP95Ms"] = 6000.0
+    comparison["afterConversationP95Ms"] = 6999.0
+    comparison["afterRailP95Ms"] = 14.9
+    assert soak._comparison_problems(comparison) == []
+
+    comparison["afterConversationP95Ms"] = 7001.0
+    comparison["afterRailP95Ms"] = 15.1
+    assert soak._comparison_problems(comparison) == [
+        "Conversation P95Ms slowed from 6000.000ms to 7001.000ms "
+        "beyond 1000.000ms tolerance",
+        "Rail P95Ms slowed from 5.000ms to 15.100ms "
+        "beyond 10.000ms tolerance",
+    ]
+
+
+def test_dashboard_soak_can_materialize_a_baseline_ref(tmp_path):
+    soak = _load_dashboard_soak()
+    checkout = soak.materialize_checkout_ref("HEAD", tmp_path / "baseline")
+    assert checkout == (tmp_path / "baseline").resolve()
+    assert (checkout / "bin" / "cctally").is_file()
+    assert not (checkout / ".git").exists()
+
+
 # ── Task 1: generator determinism + corpus shape ──────────────────────────
 
 def test_generator_deterministic(tmp_path):
@@ -122,8 +455,11 @@ def test_corpus_shapes(tmp_path):
         ).fetchone()[0]
         assert models >= 2                        # model diversity for reconciles
         assert counts["claude_sidechain_messages"] > 0
+        assert counts["claude_meta_messages"] > 0
+        assert counts["claude_tool_result_messages"] > 0
         assert counts["codex_conversation_events"] > 0
         assert counts["codex_conversation_messages"] > 0
+        assert counts["codex_subagent_threads"] > 0
     finally:
         conn.close()
 
@@ -239,10 +575,11 @@ def test_marker_params_hash_covers_every_scale(tmp_path):
 
 # ── Task 2: runner JSON schema ────────────────────────────────────────────
 
-# The 15 registered benchmark families (spec §4.2), asserted here and in the
+# The 16 registered benchmarks (spec §4.2 + issue #680), asserted here and in the
 # bin/cctally-bench-test self-test.
 _EXPECTED_BENCHMARKS = {
     "snapshot.cold", "snapshot.warm", "snapshot.idle",
+    "frontier.caught_up",
     "sync.noop", "sync.delta",
     "conversations.page1", "conversations.sorted", "conversations.filtered",
     "search.cross_session", "find.in_conversation",
@@ -343,14 +680,16 @@ def test_realism_partial_args_error(tmp_path, data_dir, claude_dir):
 _EXPECTED_RUNG_KEYS = {
     "turn_count", "msg_count", "item_count",
     "assemble_ms", "detail_tail_ms", "detail_page_ms", "outline_ms",
-    "find_hit_ms", "open_pair_ms",
+    "find_hit_ms", "open_pair_ms", "hydrated_open_pair_ms", "invalidation_ms",
     "assembled_items_bytes", "page_bytes_200", "page_bytes_500",
-    "page_bytes_1000", "outline_bytes",
+    "page_bytes_1000", "outline_bytes", "initial_pair_bytes",
+    "hydrated_pair_bytes",
 }
 # Structural (deterministic) columns — everything else is a machine-variant ms.
 _STRUCTURAL_KEYS = {
     "turn_count", "msg_count", "item_count", "assembled_items_bytes",
     "page_bytes_200", "page_bytes_500", "page_bytes_1000", "outline_bytes",
+    "initial_pair_bytes", "hydrated_pair_bytes",
 }
 
 
@@ -364,8 +703,24 @@ def test_assembly_scan_structure_and_determinism(tmp_path):
     assert a["schemaVersion"] == 1
     assert a["ladder_scale"] == "small"
     for k in ("cctally_version", "machine_label", "dataset_counts", "rungs",
-              "visible_ms"):
+              "visible_ms", "conversation_store_bytes",
+              "conversation_sync_caught_up_ms", "conversation_sync_modes",
+              "conversation_sync_files", "metric_semantics",
+              "append_to_query_visible_ms", "append_sync_cpu_ms",
+              "append_sync_modes", "append_sync_files"):
         assert k in a, k
+    assert a["conversation_store_bytes"] > 0
+    assert a["conversation_sync_caught_up_ms"] >= 0
+    assert a["conversation_sync_modes"] == {
+        "claude": "caught_up", "codex": "caught_up"}
+    assert a["conversation_sync_files"] == {"claude": 0, "codex": 0}
+    assert a["append_to_query_visible_ms"] >= 0
+    assert a["append_sync_cpu_ms"] >= 0
+    assert a["append_sync_modes"] == {
+        "claude": "targeted", "codex": "caught_up"}
+    assert a["append_sync_files"] == {"claude": 1, "codex": 0}
+    assert "HTTP" in a["metric_semantics"]["open_pair_ms"]
+    assert "source append" in a["metric_semantics"]["invalidation_ms"]
     assert len(a["rungs"]) == len(ladder)
     for i, r in enumerate(a["rungs"]):
         assert set(r) == _EXPECTED_RUNG_KEYS, sorted(set(r) ^ _EXPECTED_RUNG_KEYS)
@@ -374,7 +729,8 @@ def test_assembly_scan_structure_and_determinism(tmp_path):
         assert r["msg_count"] == 2 * ladder[i], (i, r["msg_count"])
         assert r["item_count"] > 0
         # never assert absolute timings — only ordering sanity (non-negative).
-        for msk in ("assemble_ms", "outline_ms", "find_hit_ms", "open_pair_ms"):
+        for msk in ("assemble_ms", "outline_ms", "find_hit_ms", "open_pair_ms",
+                    "hydrated_open_pair_ms", "invalidation_ms"):
             assert r[msk] >= 0.0, msk
 
     # Structural columns are byte-stable across an independent second build.
@@ -385,6 +741,14 @@ def test_assembly_scan_structure_and_determinism(tmp_path):
         return [{k: r[k] for k in _STRUCTURAL_KEYS} for r in res["rungs"]]
 
     assert _structural(a) == _structural(b)
+
+    # The transcript frontier pass at the end of a scan must not retention-
+    # prune the fixed-date synthetic corpus and poison the matching marker.
+    # Reusing the exact same root is the operator/CI default path.
+    reused = bench.run_assembly_scan(
+        ladder_scale="small", iterations=1, root=tmp_path / "a",
+    )
+    assert _structural(reused) == _structural(a)
 
 
 def test_assembly_scan_incompatible_with_default_baseline_flags():

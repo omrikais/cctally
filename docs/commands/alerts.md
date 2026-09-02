@@ -37,6 +37,7 @@ Or in the dashboard: open Settings (`s`) → **Alerts** → **Claude alerts**
 ```
 alerts:
   enabled: false
+  projected_enabled: false
   weekly_thresholds: [90, 95]
   five_hour_thresholds: [90, 95]
 ```
@@ -45,6 +46,20 @@ When you enable alerts and start a fresh week, the first crossing of 90%
 fires once; the next crossing of 95% fires once. Re-crossings within the
 same window are deduped — `alerted_at IS NOT NULL` on the milestone row
 gates re-fire.
+
+## Projected weekly pace
+
+Set `alerts.projected_enabled` to `true` to receive a separate alert when the
+current subscription week's projected end value reaches 90% or 100%. The
+alert uses the same projection `cctally forecast` publishes: a supported
+`cctally quota` calibration supplies the model-backed value, while a week the
+calibration cannot support uses the corrected meter pace. A low-confidence
+forecast does not fire a projected alert.
+
+The calibration is read and the current week's retained entries are scanned
+on the recording path only when a fitted regime validates. The computed value
+is reused for the alert; it is not replaced by the meter and is not scanned a
+second time.
 
 ## Test the pipeline
 

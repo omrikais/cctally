@@ -4,6 +4,7 @@ import math
 
 import pytest
 
+import _lib_dashboard_json as dashboard_json
 from _lib_dashboard_json import encode_dashboard_json, normalize_dashboard_json
 
 
@@ -48,3 +49,34 @@ def test_encode_dashboard_json_does_not_coerce_unsupported_objects():
 def test_encode_dashboard_json_fails_on_nonfinite_mapping_keys():
     with pytest.raises(ValueError):
         encode_dashboard_json({math.inf: "not silently rewritten"})
+
+
+def test_capped_encoder_preserves_exact_wire_and_rejects_before_large_copy():
+    value = {
+        "ascii": "quote: \" slash: \\",
+        "unicode": "שלום 😀",
+        "controls": "\b\f\n\r\t\u0001",
+        "nested": [math.nan, True, None, 7, 1.25],
+    }
+    expected = encode_dashboard_json(value).encode("utf-8")
+
+    assert dashboard_json.encode_dashboard_json_bytes_capped(
+        value, max_bytes=len(expected),
+    ) == expected
+    assert dashboard_json.encode_dashboard_json_bytes_capped(
+        value, max_bytes=len(expected) - 1,
+    ) is None
+
+    # The source string exists before tracing. Rejecting it must not allocate
+    # a second escaped/encoded copy merely to discover that it is over cap.
+    oversized = {"body": "x" * (2 * 1024 * 1024)}
+    import tracemalloc
+    tracemalloc.start()
+    try:
+        assert dashboard_json.encode_dashboard_json_bytes_capped(
+            oversized, max_bytes=1024,
+        ) is None
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 256 * 1024

@@ -47,6 +47,7 @@ from tests._support_http import start, stop
 
 UTC = dt.timezone.utc
 _WINDOW = f"{WINDOW_START.date().isoformat()}..{WINDOW_END.date().isoformat()}"
+_WINDOW_QUERY = f"{_WINDOW}&tz=Etc%2FUTC"
 
 # A loopback IP literal is visible; a HOSTNAME is the DNS-rebinding vector the
 # gate rejects, so it is how a denied request is produced without binding this
@@ -198,7 +199,7 @@ def test_a_denied_request_returns_200_with_s2_classes_still_measured(
     """A whole-route 403 would discard accounting evidence the request IS
     authorized to see, and would contradict S2's partially-withheld contract.
     """
-    response = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW}",
+    response = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW_QUERY}",
                                  host=_DENIED_HOST)
     assert response.status == 200, response.body
     by_kind = _by_kind(response)
@@ -210,7 +211,7 @@ def test_a_denied_request_returns_200_with_s2_classes_still_measured(
 def test_the_same_request_from_a_loopback_host_measures_them(claude_server):
     """The discriminating half. Without it the test above would pass over a
     fixture that had nothing to measure in the first place."""
-    response = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW}",
+    response = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW_QUERY}",
                                  host="127.0.0.1")
     assert response.status == 200, response.body
     by_kind = _by_kind(response)
@@ -232,7 +233,7 @@ def test_a_denied_request_never_opens_the_conversations_store(
         return real(kind)
 
     monkeypatch.setattr(sources, "open_read_only", _spy)
-    response = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW}",
+    response = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW_QUERY}",
                                  host=_DENIED_HOST)
     assert response.status == 200, response.body
     assert "conversations" not in opened, opened
@@ -247,9 +248,9 @@ def test_a_denied_plan_publishes_no_conversations_generation_component(
     conversation bytes, so it publishes no `conversations` component — and its
     `generationId` differs from the allowed plan's, because the plan is part
     of the identity."""
-    denied = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW}",
+    denied = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW_QUERY}",
                                host=_DENIED_HOST).json
-    allowed = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW}",
+    allowed = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW_QUERY}",
                                 host="127.0.0.1").json
     assert "conversations" not in denied["results"][0]["generation"]
     assert "conversations" in allowed["results"][0]["generation"]
@@ -260,7 +261,7 @@ def test_a_denied_plan_publishes_no_conversations_generation_component(
 def test_codex_fanout_is_measured_on_a_denied_route(codex_server):
     """The Codex table of Section 3: fan-out reads only `cache.db`, so it
     needs no transcript authorization and none is claimed."""
-    response = codex_server.get(f"/api/diagnosis?source=codex&window={_WINDOW}",
+    response = codex_server.get(f"/api/diagnosis?source=codex&window={_WINDOW_QUERY}",
                                 host=_DENIED_HOST)
     assert response.status == 200, response.body
     by_kind = _by_kind(response)
@@ -349,7 +350,7 @@ def test_generation_incoherent_is_503_and_the_body_names_the_cause(
         return f"{component}:{counter['n']}"
 
     monkeypatch.setattr(sources, "_probe_component", _moving)
-    response = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW}",
+    response = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW_QUERY}",
                                  host="127.0.0.1")
     assert response.status == 503, response.body
     assert response.json["code"] == "generation_incoherent"

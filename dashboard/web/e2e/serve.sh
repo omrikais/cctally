@@ -134,18 +134,23 @@ mkdir -p "$CLAUDE_CONFIG_DIR/projects/-synthetic-session-d-reference"
 cp "$REPO_ROOT/tests/fixtures/codex-parity/v1/claude-seed/334-claude-thinking-reference.jsonl" \
    "$CLAUDE_CONFIG_DIR/projects/-synthetic-session-d-reference/"
 
-# 4) Disable the dashboard's update-check thread. It consults CONFIG, not the
+# 4) Keep fixed-timestamp conversation fixtures durable. Rebuilds deliberately
+#    run the configured retention pass, so the production default would make
+#    this non-retention suite expire as wall time advances.
+"$REPO_ROOT/bin/cctally" config set conversation.retention_days 0 >/dev/null
+
+# 5) Disable the dashboard's update-check thread. It consults CONFIG, not the
 #    environment (docs/updates-gotchas.md: `_should_show_update_banner` reads
 #    `config.update.check.enabled`), so a scratch env var can't turn it off — set
 #    the config key in the scratch data dir instead. Keeps the suite offline and
 #    off any update banner.
 "$REPO_ROOT/bin/cctally" config set update.check.enabled false >/dev/null
 
-# 5) Pre-prime both providers so the per-session rollups are authoritative
+# 6) Pre-prime both providers so the per-session rollups are authoritative
 #    before the first request — no cold-sync in-flux reads, no "indexing" notes.
 "$REPO_ROOT/bin/cctally" cache-sync --source all
 
-# 6) Serve. Sync stays ENABLED (no --no-sync) so the open reader live-tails via
+# 7) Serve. Sync stays ENABLED (no --no-sync) so the open reader live-tails via
 #    the targeted per-conversation ingest (scenario 3). exec so Playwright's
 #    teardown signal reaches the server directly.
 exec "$REPO_ROOT/bin/cctally" dashboard --port 8797 --host 127.0.0.1 --no-browser

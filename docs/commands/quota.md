@@ -24,6 +24,8 @@ Four disclosures follow from how that value was obtained, and none of them is a 
 
 **The coefficients were calibrated on Opus-5-dominated traffic.** The analysis start is therefore floored at 2026-07-25, the Opus 5 changeover, whatever `--since` you pass. Earlier history is a different metering era whose composition these coefficients have no validation for, and it is excluded rather than fitted. If your entire retained history predates that date the command reports `unvalidated-coefficient-era` and withholds.
 
+**Fast mode is paid outside the subscription quota.** Anthropic's [Fast mode documentation](https://code.claude.com/docs/en/fast-mode) says subscription fast-mode requests draw directly from usage credits even while plan quota remains, so rows recorded with `speed = fast` are excluded from the weekly-plan fit and counted in `health.fastModeEntriesExcluded`. Standard and unmarked rows keep their existing treatment.
+
 ## Flags
 
 | Flag | Effect |
@@ -60,7 +62,7 @@ A mid-week credit does not re-anchor the week when it comes from `record-credit`
 
 The command publishes two composition-support radii, one over the family shares and one over the raw token-class shares, and a day is supported only when it lies inside both. **Each published radius is the effective one: `max(observed spread, materiality floor)`.** The observed spread is published separately.
 
-This matters because the two can differ by everything. A single-model user's observed family spread is exactly `0.0`, and the effective radius is then the `0.02` family floor. Reading `0.02` as a measurement of that user's variation would be wrong in both directions: the observed variation is zero, and the number that decides support is not a measurement at all. The floor exists precisely so that a user who adds one percent of a second model is not locked out of their own calibration by a radius that collapsed to zero.
+This matters because the two can differ by everything. A single-model user's observed family spread is exactly `0.0`, and the effective radius is then the `0.03` family floor. Reading `0.03` as a measurement of that user's variation would be wrong in both directions: the observed variation is zero, and the number that decides support is not a measurement at all. The floor is the smallest clean bound above the corrected supported maximum of `0.0274`; the corrected empirical radius is `0.0934`, so the measured store's own outlier decision is unchanged. The floor exists precisely so that a user who adds a small share of a second model is not locked out of their own calibration by a radius that collapsed to zero.
 
 The terminal report prints both, labelled. The JSON publishes `composition.familyRadiusEffective` and `composition.familyRadiusEmpirical`, and the same pair for the token-class axis.
 
@@ -72,7 +74,11 @@ Updating the catalogue changes the constants payload, so `QUOTA_MODEL_CONSTANTS_
 
 ## When the metering rate changes
 
-A confirmed metering-rate transition is **recorded as a durable event the first time `quota` detects it**, whatever your alert configuration says. That is deliberate: the history exists from the first upgrade, so `cctally doctor`'s Quota category and this command both report the change with no configuration at all, and a user who later turns notification on finds the history already there rather than starting empty.
+A metering-rate transition is **recorded as a durable event when the detector confirms it**, whatever your alert configuration says. That is deliberate: the history exists from the first upgrade, so `cctally doctor`'s Quota category and this command both report the change with no configuration at all, and a user who later turns notification on finds the history already there rather than starting empty.
+
+Recording keys off the **detector**, not off this command's verdict, for one class of withholding reason. A transition is recorded even when `quota` withholds its own verdict, provided the reason concerns predicting forward rather than the trustworthiness of the detector's own inputs — concretely, when the current week's composition sits outside the support of the calibration it is measured against. It is **not** recorded when a day inside the **published window the successor era was classified over** was itself withheld for a reason that removes it from that population — a day whose model family does not participate in the weekly pool, a decisive watch day whose own composition is unsupported, or a day whose token split could not be computed. That check reads the successor window and nothing earlier, so a withheld day falling **before** the detected split does not refuse recording, even though the detector drops it from its rank-sum population too. Every other blocking condition refuses, including a blocking reason that withholds the verdict while the status stays healthy.
+
+So `doctor` reporting a rate change while `quota` withholds its verdict is not a contradiction. The two answer different questions: `doctor` reports durable history the detector qualified for, and `quota` refuses a **current predictive** verdict it cannot stand behind. A run in that state persists both regimes, stamps the successor with the withholding status, and keeps reporting the same status, verdict and exit code it reported before.
 
 The desktop **notification** is opt-in and off by default, like every other alert toggle, so an upgrade never produces a surprise popup. It needs two booleans in `~/.local/share/cctally/config.json`:
 
@@ -82,7 +88,13 @@ The desktop **notification** is opt-in and off by default, like every other aler
 
 `alerts.rate_change_enabled` alone does nothing, and neither does `alerts.enabled` alone — the same two-switch rule the Codex quota axis uses. Both are validated on read, and a non-boolean is a configuration error rather than a silently truthy value.
 
-The event is keyed on `(provider, account, effective instant)` and each key notifies exactly once. That promise is stated at exactly that precision: a revised detector can pick a different effective instant for the same underlying provider transition, and a store that grows a second account can turn a formerly merged identity into a real account key. Either produces a new key for a change you would call the same one.
+The event is keyed on `(provider, account, effective instant)` and each key gets **one dispatch opportunity**. That promise is stated at exactly that precision: a revised detector can pick a different effective instant for the same underlying provider transition, and a store that grows a second account can turn a formerly merged identity into a real account key. Either produces a new key for a change you would call the same one.
+
+"One dispatch opportunity" is weaker than "notifies exactly once", and the difference is worth stating because it is what you can actually rely on. A recording interrupted **before** its durable decision is marked — the ingest cycle rolling back after it appended, the process dying between the commit and the mark — is retried on the next `cctally quota` run, which is what a delivery record buys. An interruption **after** the mark is not retried: the mark is written before the notifier is reached, exactly as `alerted_at` is written before the notifier `Popen` for every other alert axis, so a notifier that fails or a process that dies during dispatch loses that one notification permanently. Two cases are not recovered at all: a notification owed before this feature shipped, because nothing in the store distinguishes a historical row that notified from one that did not, and a notification owed at the moment the delivery record is re-initialized (see below).
+
+The retry covers the accounts the run analysed plus the unattributed bucket, which is always retried whatever `--account` you gave, because that bucket records the absence of an account rather than a second one.
+
+On an install with more than one real account the notification's **title names the account** whose rate changed, using the same `[label]` prefix every other cctally alert carries. A transition recorded against the merged view — the bucket an install below the decoration threshold is analysed under — is named `Unattributed`, because that bucket records the absence of an account rather than a second one. On an install with one account, or none, the notification is exactly what it was before: no prefix, and every word unchanged.
 
 Two things never fire it: the first regime a new install fits, which has no predecessor to have changed from, and a recalculation under new pricing constants, which closes the old regime as stale rather than recording a rate transition.
 
@@ -102,6 +114,16 @@ The file is machine-owned internal state. It is not in `config get`/`config set`
 
 A file this build cannot parse, or one stamped with a schema version from a newer build, is **renamed aside with a timestamped suffix and reported** rather than overwritten. It may be the only surviving record of budgets whose source rows have since been pruned.
 
+### Where the notification-delivery record is stored
+
+`~/.local/share/cctally/quota-rate-change-notification-decisions.json`, with its own sibling lock. It records which `(provider, account, effective instant)` keys have already had a dispatch opportunity claimed, and it is a separate file from the calibration for the same reason the calibration is separate from both databases: a `stats.db` rebuild replays the journal, so a delivery record derived from journal events would come back empty and replay your whole notification history.
+
+It exists because a rate-change row can reach the store with no notification. An ingest cycle that appends its journal line and then rolls back leaves that line behind, and the next replay recreates the row with no way to notify from. `cctally quota` compares the recorded transitions against this record and delivers the ones that were never offered. On the first run after this feature ships the file is seeded with every transition already recorded, so upgrading does not announce your whole history at once.
+
+Deleting it is safe: the next `cctally quota` re-seeds it from the recorded transitions, at the cost named earlier — a notification that was genuinely still owed at the moment you deleted the file is seeded as already decided and is not delivered.
+
+Unlike the calibration, a delivery record this build cannot read is **left exactly as it is**, neither renamed aside nor overwritten, because the file is the only record of what has already been announced and both discarding it and reading it as empty would announce everything again. The run reports the file on stderr and skips the retry pass for that invocation. Rate changes are still recorded and still notified while it is unusable; only the retry of an earlier missed one waits until you repair or remove it.
+
 ## JSON
 
 Stamped through the shared envelope, camelCase, `schemaVersion: 1`. Top-level keys, with one analysed population:
@@ -117,9 +139,10 @@ composition — baseline/current share vectors, both effective radii,
               both empirical radii, radiusRule
 health      — entriesThrough, day counts, the eligibility fence,
               unattributed units and entries, the excluded in-progress day,
+              excluded fast-mode entries,
               unrecognised snapshot sources, any quarantine path
 method      — algorithmRevision, constantsFingerprint, verifiedAt,
-              supportedCompositionFrom, coefficientEras, detector,
+              supportedCompositionFrom, coefficientSupport, coefficientEras, detector,
               dedicatedPoolScope
 blocking    — the closed set of reasons that withheld the verdict
 ```
@@ -127,6 +150,8 @@ blocking    — the closed set of reasons that withheld the verdict
 Above one real account the per-account payloads appear under `accounts`, and the top level carries the worst status, verdict and exit code across them.
 
 Every calibration value takes the same evidence shape: `state` is `available` or `withheld`; an available value carries `value`, `interval`, `support` and `population`; a withheld one carries a typed `code` and no value at all. There is no confidence field on any of them, because the design never defined what a confidence would mean here.
+
+Every JSON timestamp is RFC 3339 UTC with a trailing `Z`, including timestamps read back from an older calibration file that used an explicit `+00:00` offset.
 
 `verdict` is the closed set `rate-change-detected | no-rate-change | withheld`. `status` is the closed set `ok`, `insufficient-history`, `fragmented-history`, `unstable-fit`, `local-history-incomplete`, `unsupported-model-mix`, `unvalidated-coefficient-era`, `token-split-unknown`, `stale`, `future`, `unavailable`.
 
@@ -137,6 +162,8 @@ Every calibration value takes the same evidence shape: `state` is `available` or
 `method.detector` carries `inputEligibleDays`, `scannedEligibleDays`, `truncatedEligibleDays`, `scanStartDate`, `maxAutoScanDays` and `historyTruncated`. The automatic scan is bounded to the most recent 64 eligible days, and that retained set is the complete rank-sum population — the mid-ranks, every admissible split and the Holm correction are all computed inside it. The bound exists because the exact conditional test costs roughly the fifth power of the population size: measured on the maintainer's host, 30 days took 0.011 seconds and 201 days took 373 seconds.
 
 A bounded exact scan is still valid evidence, so truncation is **not** a status and does not mark the calibration unhealthy. It is disclosed instead: when `historyTruncated` is true the terminal report states that only the most recent 64 of N eligible days were scanned and where the scan started.
+
+The two date bounds compose in a fixed order. The 2026-07-25 coefficient-era floor first removes unsupported history; the detector then takes at most the most recent 64 eligible days from what remains. The eligibility fence, including the baseline side of a confirmed split, is computed from that same bounded population, so pre-horizon volume cannot change which scanned days qualify.
 
 ## What is out of scope
 

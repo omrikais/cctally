@@ -207,6 +207,8 @@ def test_work_charges_open_both_syncs_prune_and_close(monkeypatch):
         "work must charge open+claude+codex+prune+close = 1+2+4+8+16"
     )
     assert recorded[0]["status"] == "ok"
+    assert recorded[0]["claude_mode"] == "full"
+    assert recorded[0]["codex_mode"] == "full"
 
 
 # --- criterion 3: the prune's placement ------------------------------------
@@ -322,6 +324,181 @@ def test_a_clean_pass_prunes_and_reports_ok(monkeypatch):
     counters = _install_pass_doubles(dash, monkeypatch)
     assert dash._conversation_sync_pass() == "ok"
     assert counters["prunes"] == 1
+
+
+def test_caught_up_frontier_skips_both_provider_syncs(monkeypatch):
+    """The steady-state pass must not enter either O(files) provider walk."""
+    dash = _dash()
+    counters = _install_pass_doubles(dash, monkeypatch)
+
+    class _Plan:
+        mode = "caught_up"
+        paths = frozenset()
+
+    class _FrontierModule:
+        @staticmethod
+        def conversation_sync_certifiable(mode, stats, **_kwargs):
+            return mode == "caught_up" and stats is None
+
+    class _Frontier:
+        def commit_provider(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        dash,
+        "_conversation_frontier_plans",
+        lambda _conn: (
+            _FrontierModule(), _Frontier(), object(),
+            {
+                "claude": ((), (), True),
+                "codex": ((), (), True),
+            },
+            {"claude": _Plan(), "codex": _Plan()},
+        ),
+    )
+    status = dash._conversation_sync_pass()
+    assert status == "ok"
+    assert status.modes == {"claude": "caught_up", "codex": "caught_up"}
+    assert status.files == {"claude": 0, "codex": 0}
+    assert counters["claude"] == 0
+    assert counters["prunes"] == 1
+
+
+def test_targeted_frontier_passes_only_ticketed_paths(monkeypatch):
+    dash = _dash()
+    counters = {"prunes": 0}
+
+    class _Conn:
+        def close(self):
+            pass
+
+    class _Plan:
+        def __init__(self, provider):
+            self.mode = "targeted"
+            self.paths = frozenset({f"/{provider}.jsonl"})
+
+    class _Stats:
+        lock_contended = False
+        files_failed = 0
+        files_deferred_torn = 0
+        deferred_reason = None
+        prune_refused = False
+        budget_exhausted = False
+        maintenance_failed = False
+
+    class _FrontierModule:
+        @staticmethod
+        def conversation_sync_certifiable(_mode, _stats, **_kwargs):
+            return True
+
+    committed = []
+
+    class _Frontier:
+        def commit_provider(self, plan, *_args, **_kwargs):
+            committed.append((plan.mode, plan.paths))
+
+    seen = {}
+    def _claude(_conn, **kwargs):
+        seen["claude"] = kwargs
+        return _Stats()
+
+    def _codex(_conn, **kwargs):
+        seen["codex"] = kwargs
+        return _Stats()
+
+    monkeypatch.setattr(dash, "open_conversations_db", lambda: _Conn())
+    monkeypatch.setattr(dash, "sync_claude_conversations", _claude)
+    monkeypatch.setattr(dash, "sync_codex_conversations", _codex)
+    monkeypatch.setattr(
+        dash, "_dashboard_maybe_prune_retention",
+        lambda: counters.__setitem__("prunes", counters["prunes"] + 1),
+    )
+    monkeypatch.setattr(
+        dash,
+        "_conversation_frontier_plans",
+        lambda _conn: (
+            _FrontierModule(), _Frontier(), object(),
+            {
+                "claude": ((), (), True),
+                "codex": ((), (), True),
+            },
+            {"claude": _Plan("claude"), "codex": _Plan("codex")},
+        ),
+    )
+
+    assert dash._conversation_sync_pass() == "ok"
+    assert seen["claude"]["only_paths"] == {"/claude.jsonl"}
+    assert seen["codex"]["only_paths"] == {"/codex.jsonl"}
+    assert len(committed) == 2
+    assert counters["prunes"] == 1
+
+
+def test_same_size_replacement_plan_rebuilds_only_affected_provider(monkeypatch):
+    """A source-replacement full plan must replay from zero, not size-skip."""
+    dash = _dash()
+
+    class _Conn:
+        def close(self):
+            pass
+
+    class _Plan:
+        paths = frozenset()
+        marker_end = 0
+
+        def __init__(self, provider, *, reason):
+            self.provider = provider
+            self.mode = "full"
+            self.reason = reason
+
+    class _Stats:
+        files_total = 1
+        files_processed = 1
+        files_skipped_unchanged = 0
+        lock_contended = False
+        files_failed = 0
+        files_deferred_torn = 0
+        deferred_reason = None
+        prune_refused = False
+        budget_exhausted = False
+        maintenance_failed = False
+
+    class _FrontierModule:
+        @staticmethod
+        def conversation_sync_certifiable(_mode, _stats, **_kwargs):
+            return True
+
+    class _Frontier:
+        def seed_provider(self, *_args, **_kwargs):
+            pass
+
+    seen = {}
+
+    def _sync(provider):
+        def _run(_conn, **kwargs):
+            seen[provider] = kwargs
+            return _Stats()
+        return _run
+
+    monkeypatch.setattr(dash, "open_conversations_db", lambda: _Conn())
+    monkeypatch.setattr(dash, "sync_claude_conversations", _sync("claude"))
+    monkeypatch.setattr(dash, "sync_codex_conversations", _sync("codex"))
+    monkeypatch.setattr(dash, "_dashboard_maybe_prune_retention", lambda: None)
+    monkeypatch.setattr(
+        dash,
+        "_conversation_frontier_plans",
+        lambda _conn: (
+            _FrontierModule(), _Frontier(), object(),
+            {"claude": ((), (), True), "codex": ((), (), True)},
+            {
+                "claude": _Plan("claude", reason="source_replaced"),
+                "codex": _Plan("codex", reason="unseeded"),
+            },
+        ),
+    )
+
+    assert dash._conversation_sync_pass() == "ok"
+    assert seen["claude"] == {"rebuild": True}
+    assert seen["codex"] == {}
 
 
 def test_an_escaping_pass_is_recorded_as_error_and_still_bounded():

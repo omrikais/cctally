@@ -76,7 +76,8 @@ never a zero, a dash, or an omitted row. Telling "measured and fast" apart
 from "not measured" is the point of the surface, and a zero cannot do it.
 
 **Tick cost.** The mean ingest time, the mean builder time, and the mean whole
-tick, plus the newest tick in full. The two halves are **mutually exclusive**:
+tick, the mean refresh-thread CPU time, its measured one-core duty, plus the
+newest tick in full. The two halves are **mutually exclusive**:
 nested time is subtracted in both directions, so a progressive-fill build that
 runs inside the ingest is counted once, as builder time, and subtracted from
 the ingest that contains it. `ingest_ns + builder_ns` is therefore always at
@@ -86,6 +87,13 @@ rather than being forced into either bucket.
 A tick that did not ingest — a `--no-sync` dashboard — reports `ingest_ran`
 false and zero, rather than null, because a null is indistinguishable from a
 missing measurement.
+
+Main-loop CPU duty is `sum(cpu_ns) / sum(period_ns)` over retained tick records
+that carry both values. `cpu_ns` comes from `time.thread_time_ns()` on the
+refresh thread; `period_ns` is the backward interval from the prior publication
+to this one, so that tick's CPU falls inside the period it is charged against.
+The process's first tick has no predecessor and contributes to neither sum.
+An older dashboard that publishes no CPU scalar reads `no samples yet`.
 
 **Cache pin.** The `cache.db` read transaction that the source build holds,
 stamped at its own `BEGIN` and `ROLLBACK` boundaries. It is reported as held
@@ -103,7 +111,9 @@ fill can run several builds and each opens its own pin.
 ingest into `conversations.db` — reported beside the first. The rows are the
 mean wall cost of a pass, the mean thread CPU time it consumed, the pass period
 as a median with its observed range, the measured one-core share, and a count
-per outcome (`ok`, `store_unavailable`, `error`).
+per outcome (`ok`, `store_unavailable`, `error`). It also reports each
+provider's pass modes (`caught_up`, `targeted`, `full`, `not_observed`) and the
+number of source files handed to its transcript ingester.
 
 The outcome describes the **store open and the two provider syncs** and nothing
 else. The retention prune runs after them and swallows its own failures, so a
@@ -125,10 +135,28 @@ pass's CPU falls inside its own period, so the figure is the loop's true duty
 over that span. Because numerator and denominator come from the same process,
 it is a measurement rather than a claim about machine speed.
 
+**Combined background work.** The report adds the main refresh duty and the
+conversation-sync duty over their retained populations. This is deliberately a
+conservative bound: the two rings are independent, so their exact sample spans
+need not align. The shipped ceiling is 75% of one core. A missing leg renders
+`not jointly sampled` rather than treating the absent measurement as zero.
+The cadence itself is unchanged; the number is evidence about work inside the
+existing periods, not permission to lengthen either period.
+
 `work >= interval` bounds that share at 50%; see the conversation loop's duty
 bound in [`backend-performance.md`](../backend-performance.md). An empty ring
 reads **`no samples yet`**, never a zero — and under `--no-sync` the thread is
 never started, so that is the correct and permanent reading in that mode.
+
+**Retained memory.** A numeric owner table reports estimated bytes, hard byte
+and entry ceilings, evictions, and oversize fallbacks for the process-local
+source/snapshot accelerators, conversation, outline-transfer, ingest-frontier,
+and hub-wide SSE delivery owners. It also reports the sum of those explicit
+ceilings, current server thread count, and the 1.5 GiB whole-process RSS
+ceiling. The values contain no cache keys, account identity, paths, or
+transcript content. An owner can serve an oversize response while
+declining to retain it; that increments `fallbackCount` and preserves the
+requested result instead of truncating it.
 
 **Dispatch mix.** Lifetime counts of `full`, `idle` and `degraded` ticks. The
 three sum to the number of completed refresh ticks. Both this and the Codex
@@ -163,6 +191,10 @@ isolating the nested build instead.
 `--trace off` disarms it the same way. The stored phase tree is not cleared by
 disarming, so the report states the instant that tree was generated — a stale
 tree reads as stale rather than as the last tick.
+
+The dashboard retains the standalone ingest tree separately from the final
+snapshot tree. The report names both generation instants, so the final build
+cannot overwrite the discovery/walk/accounting evidence that preceded it.
 
 ## JSON output
 

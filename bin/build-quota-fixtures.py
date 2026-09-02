@@ -110,7 +110,7 @@ class Store:
 
     def entry(self, at, *, model="claude-opus-5", fresh=0, output=0,
               cache_create=0, cache_1h=0, cache_read=0, account_key=None,
-              path="/p/a.jsonl"):
+              speed=None, path="/p/a.jsonl"):
         # Direct SQL rather than `seed_session_entry`, which carries no
         # `cache_create_1h_tokens` parameter. That column is the one the
         # kernel withholds a day over when it is NULL beside a positive
@@ -119,10 +119,10 @@ class Store:
             "INSERT INTO session_entries (source_path, line_offset,"
             " timestamp_utc, model, input_tokens, output_tokens,"
             " cache_create_tokens, cache_read_tokens, cache_create_1h_tokens,"
-            " account_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " account_key, speed) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (path, self.offset, fixture_timestamp_utc(at), model, int(fresh),
              int(output), int(cache_create), int(cache_read), cache_1h,
-             account_key))
+             account_key, speed))
         self.offset += 1
 
     def account(self, key, email, label=None):
@@ -311,6 +311,33 @@ def scenario_two_accounts(home: Path) -> None:
     store.close()
 
 
+def scenario_offset_credit_and_fast(home: Path) -> None:
+    """A mixed-offset credit boundary plus a usage-credit fast request."""
+    store = Store(home)
+    seed_series(store, days=30)
+    for effective in ("2026-07-25T02:00:00+03:00",
+                      "2026-07-25T03:00:00+03:00"):
+        store.stats.execute(
+            "INSERT INTO weekly_credit_floors (week_start_date,"
+            " effective_at_utc, observed_pre_credit_pct, applied_at_utc,"
+            " account_key) VALUES (?,?,?,?,?)",
+            ("2026-07-25", effective, 30.0, effective, "unattributed"))
+    store.entry(dt.datetime(2026, 8, 20, 12, tzinfo=UTC), fresh=50_000_000,
+                speed="fast", path="/p/fast.jsonl")
+    store.close()
+
+
+def scenario_malformed_retained_instant(home: Path) -> None:
+    """A malformed retained timestamp is withheld, never a traceback."""
+    store = Store(home)
+    seed_series(store, days=30)
+    store.stats.execute(
+        "UPDATE weekly_usage_snapshots SET captured_at_utc = ? WHERE id = ("
+        "SELECT MIN(id) FROM weekly_usage_snapshots)",
+        ("2026-13-45T00:00:00Z",))
+    store.close()
+
+
 SCENARIOS = {
     "01-steady-no-change": scenario_steady,
     "02-rate-change-confirmed": scenario_rate_change,
@@ -320,6 +347,8 @@ SCENARIOS = {
     "06-precedence-all-three": scenario_precedence,
     "07-recorded-prior-diverges": scenario_recorded_prior,
     "08-two-accounts": scenario_two_accounts,
+    "09-offset-credit-and-fast": scenario_offset_credit_and_fast,
+    "10-malformed-retained-instant": scenario_malformed_retained_instant,
 }
 
 

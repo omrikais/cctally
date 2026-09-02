@@ -12,7 +12,10 @@
 // the server's, and only the SENTENCE is lost. That matters because a
 // dashboard tab can outlive a server restart through `execvp`.
 
-import type { QuotaCausePresentation } from '../types/envelope';
+import type {
+  QuotaBasisPresentation,
+  QuotaCausePresentation,
+} from '../types/envelope';
 
 /**
  * The short token, derived from the machine code alone.
@@ -55,6 +58,24 @@ export function causeLong(
 ): string {
   if (presentation?.long) return presentation.long;
   return deriveShortFromCode(code);
+}
+
+/** The server-owned short register for projection provenance. */
+export function basisShort(
+  presentation: QuotaBasisPresentation | null | undefined,
+  basis: string | null | undefined,
+): string {
+  if (presentation?.short) return presentation.short;
+  return deriveShortFromCode(basis);
+}
+
+/** The server-owned long register for projection provenance. */
+export function basisLong(
+  presentation: QuotaBasisPresentation | null | undefined,
+  basis: string | null | undefined,
+): string {
+  if (presentation?.long) return presentation.long;
+  return deriveShortFromCode(basis);
 }
 
 /**

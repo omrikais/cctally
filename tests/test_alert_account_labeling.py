@@ -143,3 +143,200 @@ def test_no_prefix_when_single_real_account_R8(cc):
     assert "[solo]" not in joined
     # byte-identical title to the pre-#341 render (no bracket prefix at all)
     assert "[" not in joined.split("cctally")[0]
+
+
+# --------------------------------------------------------------------------
+# #697 — the metering-rate-change family takes the same R8 [label] prefix
+# --------------------------------------------------------------------------
+# The family's payload is built through its own kernel rather than as a dict
+# literal, so a change to `alert_payload`'s shape reaches these tests.
+#
+# These dispatch with an EXPLICIT UTC zone, unlike `_dispatch` above. The
+# family's body renders `effective_from` through `format_display_dt`, which
+# treats a `None` zone as HOST-LOCAL (`bin/_lib_display_tz.py:358`), so a
+# frozen argument list built without the pin reads `2026-08-24` on any host
+# west of UTC. The pin makes the freeze deterministic; it is not what is
+# under test, and `tests/test_meter_rate_change_default.py` already covers
+# the zone-sensitivity of this field.
+
+BOUNDARY_697 = "2026-08-25T00:00:00+00:00"
+
+
+def _rate_change_payload(account_key, *, provider="claude"):
+    import _lib_meter_rate_change as mrc
+    return mrc.alert_payload(mrc.RateChangeTransition(
+        provider=provider,
+        account_key=account_key,
+        effective_from=BOUNDARY_697,
+        previous_units_per_point=2_442_620.0,
+        new_units_per_point=1_665_096.0,
+        severity="alarm",
+        detected_at="2026-08-29T00:00:00+00:00",
+    ))
+
+
+def _dispatch_utc(cc, payload, sink):
+    from zoneinfo import ZoneInfo
+    import _cctally_alerts
+    return _cctally_alerts._dispatch_alert_notification(
+        payload,
+        popen_factory=(lambda args, **k: sink.append(list(args))),
+        mode="real", platform="linux",
+        which_on_path=lambda n: n == "notify-send",
+        tz=ZoneInfo("UTC"),
+    )
+
+
+#: The frozen one-and-zero-account argument list. HAND-WRITTEN, never derived
+#: from the code under test.
+#:
+#: `32` is the correct rounding: (1_665_096 - 2_442_620) / 2_442_620 * 100 is
+#: -31.8316, and "%.0f" of its absolute value is 32.
+#:
+#: `normal` is `_SEVERITY_URGENCY`'s DEFAULT for the `alarm` tier rather than
+#: an entry, because that table knows only the threshold axes' `critical`
+#: name for the third tier (`bin/_lib_alert_dispatch.py:26`). That is #701.
+#: When #701 lands this literal changes, and this comment is why.
+_UNDECORATED_ARGV_697 = [
+    "notify-send", "-u", "normal", "--",
+    "cctally - Claude metering rate changed",
+    "each meter point now covers 32% less usage\n"
+    "Effective 2026-08-25. Run `cctally quota` for the fitted budget "
+    "and its evidence.",
+]
+
+
+def test_697_rate_change_title_carries_the_label_when_decorated(cc):
+    ka = _acc("claude", "uuid-697-a")
+    kb = _acc("claude", "uuid-697-b")
+    _seed_claude([
+        dict(at="2026-07-01T00:00:00Z", account_key=ka, provider="claude",
+             email="a@x.com", label="alice", label_source="auto"),
+        dict(at="2026-07-02T00:00:00Z", account_key=kb, provider="claude",
+             email="b@x.com", label="bob", label_source="auto"),
+    ])
+    sink = []
+    assert _dispatch_utc(cc, _rate_change_payload(ka), sink) == "queued"
+    # The TITLE slot, not the joined argv: a match anywhere else would pass
+    # for a reason this test does not claim.
+    assert sink[0][4] == "[alice] cctally - Claude metering rate changed"
+
+
+def test_697_the_prefix_vendor_comes_from_the_payload_provider(cc):
+    # Codex is decorated and Claude is NOT. That asymmetry is what makes this
+    # case non-vacuous: `_alert_label_prefix` uses the resolved vendor only
+    # for the count gate, and `display_account_label` then resolves the label
+    # from the payload key's OWN provider. With Claude also decorated, a
+    # static `"meter_rate_change": "claude"` map entry would pass the gate and
+    # still render the correct Codex label, so this test would hold against
+    # the very implementation it exists to reject.
+    ca = _acc("codex", "uuid-697-cx-a")
+    cb = _acc("codex", "uuid-697-cx-b")
+    _seed_claude([
+        dict(at="2026-07-01T00:00:00Z", account_key=ca, provider="codex",
+             email="cx-a@x.com", label="carol", label_source="auto"),
+        dict(at="2026-07-02T00:00:00Z", account_key=cb, provider="codex",
+             email="cx-b@x.com", label="dave", label_source="auto"),
+    ])
+    sink = []
+    _dispatch_utc(cc, _rate_change_payload(ca, provider="codex"), sink)
+    assert sink[0][4] == "[carol] cctally - Codex metering rate changed"
+
+
+def test_697_the_unattributed_sentinel_renders_as_a_word(cc):
+    ka = _acc("claude", "uuid-697-s-a")
+    kb = _acc("claude", "uuid-697-s-b")
+    _seed_claude([
+        dict(at="2026-07-01T00:00:00Z", account_key=ka, provider="claude",
+             email="a@x.com", label="alice", label_source="auto"),
+        dict(at="2026-07-02T00:00:00Z", account_key=kb, provider="claude",
+             email="b@x.com", label="bob", label_source="auto"),
+    ])
+    sink = []
+    _dispatch_utc(cc, _rate_change_payload("unattributed"), sink)
+    assert sink[0][4] == "[Unattributed] cctally - Claude metering rate changed"
+
+
+def test_697_the_payload_provider_is_normalized_before_the_lookup(cc):
+    # `real_account_count` matches `accounts.provider` EXACTLY, so an
+    # unnormalized " Claude " matches no row, counts zero, and silently
+    # produces no prefix -- indistinguishable from correct undecorated
+    # behaviour, which is the defect class this issue closes.
+    ka = _acc("claude", "uuid-697-n-a")
+    kb = _acc("claude", "uuid-697-n-b")
+    _seed_claude([
+        dict(at="2026-07-01T00:00:00Z", account_key=ka, provider="claude",
+             email="a@x.com", label="alice", label_source="auto"),
+        dict(at="2026-07-02T00:00:00Z", account_key=kb, provider="claude",
+             email="b@x.com", label="bob", label_source="auto"),
+    ])
+    sink = []
+    _dispatch_utc(cc, _rate_change_payload(ka, provider=" Claude "), sink)
+    # A PREFIX check, not an equality: the copy builder renders the provider
+    # with `str(...).capitalize()`, and `" Claude ".capitalize()` is
+    # `" claude "` -- capitalize uppercases the first character, which here is
+    # a space, and lowercases the rest. The title after the prefix is
+    # therefore not the ordinary one, and asserting it whole would pin an
+    # artefact of the fixture rather than the behaviour under test.
+    assert sink[0][4].startswith("[alice] ")
+
+
+def test_697_one_real_account_is_byte_identical(cc):
+    ka = _acc("claude", "uuid-697-solo")
+    _seed_claude([
+        dict(at="2026-07-01T00:00:00Z", account_key=ka, provider="claude",
+             email="solo@x.com", label="solo", label_source="auto"),
+    ])
+    sink = []
+    _dispatch_utc(cc, _rate_change_payload(ka), sink)
+    assert sink[0] == _UNDECORATED_ARGV_697
+
+
+def test_697_zero_real_accounts_is_byte_identical(cc):
+    # The registry is materialized but EMPTY. Without `open_db` the helper
+    # returns early on the missing database and this would exercise that
+    # branch instead of the count gate. An implementation gating on
+    # `count == 1` rather than `<= 1` adds a prefix here and nowhere else.
+    cc.open_db().close()
+    sink = []
+    _dispatch_utc(cc, _rate_change_payload("unattributed"), sink)
+    assert sink[0] == _UNDECORATED_ARGV_697
+
+
+def test_697_a_provider_whose_str_raises_yields_no_prefix(cc):
+    # The never-raise contract, asserted on the HELPER rather than through
+    # dispatch. `_alert_text_meter_rate_change` calls `str()` on the same
+    # payload field and is not wrapped, so a hostile provider fails there
+    # first and a dispatch-level assertion would be testing that
+    # pre-existing gap instead of this change.
+    #
+    # What this pins is that the resolution sits INSIDE the guard. Revision 1
+    # of the spec placed it above the `try`, where this raises.
+    import _cctally_alerts
+    ka = _acc("claude", "uuid-697-r-a")
+    kb = _acc("claude", "uuid-697-r-b")
+    _seed_claude([
+        dict(at="2026-07-01T00:00:00Z", account_key=ka, provider="claude",
+             email="a@x.com", label="alice", label_source="auto"),
+        dict(at="2026-07-02T00:00:00Z", account_key=kb, provider="claude",
+             email="b@x.com", label="bob", label_source="auto"),
+    ])
+
+    class _Hostile:
+        def __str__(self):
+            raise RuntimeError("hostile provider")
+
+    assert _cctally_alerts._alert_label_prefix(
+        "meter_rate_change", ka, _Hostile()) == ""
+
+
+def test_697_axis_vendor_holds_exactly_the_seven_threshold_axes(cc):
+    # Structural, and the point is the ABSENCE. The mechanism decision is
+    # that this family resolves its vendor from the payload, so a
+    # `meter_rate_change` entry appearing here alongside a correct
+    # implementation would go unnoticed by every behavioural test above.
+    import _cctally_alerts
+    assert set(_cctally_alerts._AXIS_VENDOR) == {
+        "weekly", "five_hour", "budget", "projected",
+        "project_budget", "codex_budget", "quota",
+    }

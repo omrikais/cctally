@@ -29,6 +29,7 @@ etc.) are proven at the kernel level in ``tests/test_codex_conversation_normaliz
 from __future__ import annotations
 
 import datetime as dt
+import base64
 import json
 import pathlib
 import re
@@ -38,7 +39,7 @@ import threading
 import urllib.parse as _u
 from http.client import HTTPConnection
 
-from conftest import load_script, redirect_paths
+from conftest import load_script, redirect_paths_without_conversation_retention
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -110,7 +111,7 @@ def _boot(ns, tmp_path, monkeypatch, *, codex_scenarios=("modern-full",),
     """Seed a Codex provider + Claude sessions, start a dashboard. Returns
     ``(srv, provider_root, codex_keys, rollouts)`` where ``codex_keys`` maps a
     scenario name → its opaque ``v1.`` conversation key."""
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
     provider_root = tmp_path / "provider"
     rollouts = {}
@@ -287,6 +288,39 @@ def test_outline_prompts_find_v1_codex(tmp_path, monkeypatch):
         assert f["schema_version"] == 2
         assert f["semantics"] == "occurrence"
         assert "occurrences" in f["page"]
+    finally:
+        stop(srv, srv._test_thread)
+
+
+def test_progressive_outline_v1_codex_reconstructs_exact_body(tmp_path, monkeypatch):
+    ns = load_script()
+    srv, _root, keys, _r = _boot(ns, tmp_path, monkeypatch)
+    try:
+        port = srv.server_address[1]
+        path = _entity_path(keys["modern-full"], "/outline")
+        status, legacy_wire, _ = _get(port, path)
+        assert status == 200
+        status, initial, _ = _get_json(port, path + "?progressive=1")
+        assert status == 200
+        assert initial["progressive"] == 1
+        assert "summary" not in initial
+        transfer = initial["transfer"]
+        assert "total" not in transfer and "sha256" not in transfer
+
+        offset = 0
+        chunks = []
+        while True:
+            status, chunk, _ = _get_json(
+                port,
+                "/api/conversation/outline-transfer/"
+                f"{transfer['token']}?offset={offset}",
+            )
+            assert status == 200
+            chunks.append(base64.b64decode(chunk["chunk"]))
+            offset = chunk["next_offset"]
+            if chunk["done"]:
+                break
+        assert b"".join(chunks) == legacy_wire
     finally:
         stop(srv, srv._test_thread)
 

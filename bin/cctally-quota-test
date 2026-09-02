@@ -121,7 +121,7 @@ done
 # A skip predicate that matched everything would leave this harness reporting
 # a clean pass over nothing, which is the failure the manifest's minCases
 # floor also guards. Both are cheap; neither alone is a mechanism.
-if [ "$scenario_count" -lt 8 ]; then
+if [ "$scenario_count" -lt 10 ]; then
     echo "FAIL: only $scenario_count scenario(s) carried an input.env"
     fail_count=$((fail_count + 1))
 fi

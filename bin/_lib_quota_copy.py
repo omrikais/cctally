@@ -26,10 +26,10 @@ client shows the derived short token and no sentence. Never blank, which
 matters because a dashboard tab can outlive a server restart through
 `execvp` and will meet an older server's envelope.
 
-Pure: no I/O, no clock, no store. The vocabulary it covers is the closed
-15-member `EVIDENCE_CODES` union, and `tests/test_quota_copy_table.py`
-asserts both registers exist for every member — a code added to the kernel
-without copy fails there rather than rendering as a bare token in a modal.
+Pure: no I/O, no clock, no store. The cause vocabulary is the closed
+15-member `EVIDENCE_CODES` union, and the separate basis vocabulary names
+which measurement produced a projection. They share this rendering boundary
+but never one semantic union: a basis is not a withholding cause.
 """
 from __future__ import annotations
 
@@ -78,6 +78,15 @@ _LONG_FORM: dict = {
         "the stored calibration came from a newer cctally than this one",
     "unavailable":
         "no usable calibration could be read for this account",
+}
+
+#: Projection-basis copy in the same two registers, deliberately separate
+#: from `_LONG_FORM`. These values describe a PRESENT figure's provenance;
+#: they are not members of `EVIDENCE_CODES` and must never become causes.
+_BASIS_FORM: dict = {
+    "calibrated": {"short": "model", "long": "calibrated model"},
+    "corrected-meter": {"short": "meter", "long": "corrected meter"},
+    "withheld": {"short": "withheld", "long": "withheld"},
 }
 
 
@@ -129,3 +138,20 @@ def presentation(code) -> dict:
     if not text:
         return {}
     return {"code": text, "short": short_form(text), "long": long_form(text)}
+
+
+def basis_presentation(basis) -> dict:
+    """The two rendering registers for one projection basis.
+
+    Unknown future values degrade from their machine code instead of
+    rendering blank. Known values are curated because `calibrated` cannot be
+    mechanically derived into the short word `model`.
+    """
+    text = str(basis or "").strip()
+    if not text:
+        return {}
+    known = _BASIS_FORM.get(text)
+    if known is None:
+        fallback = derive_short_from_code(text)
+        return {"code": text, "short": fallback, "long": fallback}
+    return {"code": text, "short": known["short"], "long": known["long"]}

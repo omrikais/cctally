@@ -67,7 +67,7 @@ def test_session_source_paths_unknown_session_is_empty():
     assert cq.session_source_paths(c, "nope") == []
 
 
-from conftest import load_script, redirect_paths
+from conftest import load_script, redirect_paths_without_conversation_retention
 
 
 def _asst_line(uuid, msg_id, req_id, text, *, sid="s1",
@@ -86,7 +86,7 @@ def _asst_line(uuid, msg_id, req_id, text, *, sid="s1",
 @pytest.fixture
 def isolated(tmp_path, monkeypatch):
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)
     conn = ns["open_conversations_db"]()
@@ -222,12 +222,12 @@ def test_only_paths_parity_with_full_sync_for_that_file(isolated, tmp_path, monk
 
 def test_live_tail_default_on(tmp_path, monkeypatch):
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     assert ns["_config_known_value"]({}, "dashboard.live_tail") is True
 
 
 def test_live_tail_set_false_then_read(tmp_path, monkeypatch):
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     cfg = {"dashboard": {"live_tail": False}}
     assert ns["_config_known_value"](cfg, "dashboard.live_tail") is False

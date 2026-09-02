@@ -304,6 +304,7 @@ def flush_stderr(root):
 # fresh dict). Assignment is atomic under the GIL, so the HTTP reader thread
 # always sees a whole, immutable "last completed build".
 _LAST_BACKEND_PERF = None
+_LAST_INGEST_PERF = None
 
 
 def stash_last(root, *, generation=None, generated_at=None):
@@ -319,3 +320,24 @@ def stash_last(root, *, generation=None, generated_at=None):
 
 def last_backend_perf():
     return _LAST_BACKEND_PERF
+
+
+def stash_last_ingest(root, *, generated_at=None):
+    """Freeze the last completed dashboard ingest tree in its own slot.
+
+    The authoritative snapshot build resets the thread-local collector, so an
+    ingest tree cannot share ``_LAST_BACKEND_PERF`` without being overwritten
+    by the final build.  This is deliberately one bounded tree rather than a
+    phase tree per tick in the 64-record ring.
+    """
+    global _LAST_INGEST_PERF
+    if root is None:
+        return
+    _LAST_INGEST_PERF = {
+        "generated_at": generated_at,
+        "phases": root.to_dict(),
+    }
+
+
+def last_ingest_perf():
+    return _LAST_INGEST_PERF

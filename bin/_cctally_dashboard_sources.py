@@ -4,9 +4,13 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import pathlib
 import sqlite3
 import sys
+import threading
+import time
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType, SimpleNamespace
@@ -32,7 +36,14 @@ from _cctally_source_analytics import (
 )
 import _lib_log
 import _lib_accounts
+import _lib_perf
 import _lib_snapshot_cache
+from _lib_retained_size import (
+    RETAINED_SIZE_WORK_LOCK,
+    RETAINED_SIZE_WORKER_DUTY,
+    RetainedSizeCancelled,
+    retained_size_bytes,
+)
 from _lib_dashboard_sources import (
     CapabilityRecord,
     ProjectionCoherence,
@@ -86,7 +97,86 @@ from _lib_view_models import (
 UTC = dt.timezone.utc
 
 
-_CODEX_QUOTA_OBSERVATION_CACHE: dict[object, tuple[object, ...]] = {}
+_CODEX_SOURCE_ACCELERATOR_DIRTY = True
+_CODEX_SOURCE_ACCELERATOR_DIRTY_LOCK = threading.Lock()
+_CODEX_SOURCE_ACCELERATOR_GENERATION = 0
+_CACHE_MISSING = object()
+
+
+def _mark_codex_source_accelerators_dirty() -> None:
+    """Record the first mutation since the last aggregate admission pass."""
+    global _CODEX_SOURCE_ACCELERATOR_DIRTY
+    global _CODEX_SOURCE_ACCELERATOR_GENERATION
+    if _CODEX_SOURCE_ACCELERATOR_DIRTY:
+        return
+    with _CODEX_SOURCE_ACCELERATOR_DIRTY_LOCK:
+        if not _CODEX_SOURCE_ACCELERATOR_DIRTY:
+            _CODEX_SOURCE_ACCELERATOR_DIRTY = True
+            _CODEX_SOURCE_ACCELERATOR_GENERATION += 1
+
+
+class _ObservedCacheMixin:
+    """Make every retained-cache mutation visible to aggregate admission."""
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        _mark_codex_source_accelerators_dirty()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        _mark_codex_source_accelerators_dirty()
+
+    def clear(self):
+        if self:
+            super().clear()
+            _mark_codex_source_accelerators_dirty()
+
+    def pop(self, key, default=_CACHE_MISSING):
+        existed = key in self
+        if default is _CACHE_MISSING:
+            value = super().pop(key)
+        else:
+            value = super().pop(key, default)
+        if existed:
+            _mark_codex_source_accelerators_dirty()
+        return value
+
+    def popitem(self, *args, **kwargs):
+        value = super().popitem(*args, **kwargs)
+        _mark_codex_source_accelerators_dirty()
+        return value
+
+    def setdefault(self, key, default=None):
+        existed = key in self
+        value = super().setdefault(key, default)
+        if not existed:
+            _mark_codex_source_accelerators_dirty()
+        return value
+
+    def update(self, *args, **kwargs):
+        before = len(self)
+        super().update(*args, **kwargs)
+        if args or kwargs or len(self) != before:
+            _mark_codex_source_accelerators_dirty()
+
+
+class _ObservedDict(_ObservedCacheMixin, dict):
+    pass
+
+
+class _ObservedOrderedDict(_ObservedCacheMixin, OrderedDict):
+    pass
+
+
+_CODEX_QUOTA_OBSERVATION_MAX_ENTRIES = 32
+_CODEX_QUOTA_OBSERVATION_MAX_BYTES = 64 * 1024 * 1024
+_CODEX_QUOTA_OBSERVATION_CACHE: "OrderedDict[object, tuple[object, ...]]" = (
+    _ObservedOrderedDict())
+_CODEX_QUOTA_OBSERVATION_CACHE_SIZES: dict[object, int] = {}
+_CODEX_QUOTA_OBSERVATION_CACHE_BYTES = 0
+_CODEX_QUOTA_OBSERVATION_CACHE_EVICTIONS = 0
+_CODEX_QUOTA_OBSERVATION_CACHE_FALLBACKS = 0
+_CODEX_QUOTA_OBSERVATION_CACHE_LOCK = threading.Lock()
 
 
 def reset_codex_quota_observation_cache() -> None:
@@ -98,7 +188,51 @@ def reset_codex_quota_observation_cache() -> None:
     cold-reference comparisons use, and `_codex_source_caches` is what the
     build's own checkpoint/restore goes through.
     """
-    _CODEX_QUOTA_OBSERVATION_CACHE.clear()
+    global _CODEX_QUOTA_OBSERVATION_CACHE_BYTES
+    global _CODEX_QUOTA_OBSERVATION_CACHE_EVICTIONS
+    global _CODEX_QUOTA_OBSERVATION_CACHE_FALLBACKS
+    with _CODEX_QUOTA_OBSERVATION_CACHE_LOCK:
+        _CODEX_QUOTA_OBSERVATION_CACHE.clear()
+        _CODEX_QUOTA_OBSERVATION_CACHE_SIZES.clear()
+        _CODEX_QUOTA_OBSERVATION_CACHE_BYTES = 0
+        _CODEX_QUOTA_OBSERVATION_CACHE_EVICTIONS = 0
+        _CODEX_QUOTA_OBSERVATION_CACHE_FALLBACKS = 0
+
+
+def codex_quota_observation_cache_stats() -> Mapping[str, int]:
+    """Retained-byte admission and eviction evidence for the #618 memo."""
+    with _CODEX_QUOTA_OBSERVATION_CACHE_LOCK:
+        return MappingProxyType({
+            "estimatedBytes": int(_CODEX_QUOTA_OBSERVATION_CACHE_BYTES),
+            "maxBytes": int(_CODEX_QUOTA_OBSERVATION_MAX_BYTES),
+            "entryCount": len(_CODEX_QUOTA_OBSERVATION_CACHE),
+            "maxEntries": int(_CODEX_QUOTA_OBSERVATION_MAX_ENTRIES),
+            "evictionCount": int(_CODEX_QUOTA_OBSERVATION_CACHE_EVICTIONS),
+            "fallbackCount": int(_CODEX_QUOTA_OBSERVATION_CACHE_FALLBACKS),
+        })
+
+
+def _quota_observation_cache_checkpoint() -> tuple[dict, int, int, int]:
+    with _CODEX_QUOTA_OBSERVATION_CACHE_LOCK:
+        return (
+            dict(_CODEX_QUOTA_OBSERVATION_CACHE_SIZES),
+            int(_CODEX_QUOTA_OBSERVATION_CACHE_BYTES),
+            int(_CODEX_QUOTA_OBSERVATION_CACHE_EVICTIONS),
+            int(_CODEX_QUOTA_OBSERVATION_CACHE_FALLBACKS),
+        )
+
+
+def _restore_quota_observation_cache_checkpoint(checkpoint) -> None:
+    global _CODEX_QUOTA_OBSERVATION_CACHE_BYTES
+    global _CODEX_QUOTA_OBSERVATION_CACHE_EVICTIONS
+    global _CODEX_QUOTA_OBSERVATION_CACHE_FALLBACKS
+    sizes, retained_bytes, evictions, fallbacks = checkpoint
+    with _CODEX_QUOTA_OBSERVATION_CACHE_LOCK:
+        _CODEX_QUOTA_OBSERVATION_CACHE_SIZES.clear()
+        _CODEX_QUOTA_OBSERVATION_CACHE_SIZES.update(sizes)
+        _CODEX_QUOTA_OBSERVATION_CACHE_BYTES = int(retained_bytes)
+        _CODEX_QUOTA_OBSERVATION_CACHE_EVICTIONS = int(evictions)
+        _CODEX_QUOTA_OBSERVATION_CACHE_FALLBACKS = int(fallbacks)
 
 
 def _codex_quota_reuse_identity(
@@ -280,34 +414,40 @@ def _cached_codex_quota_observations(**kwargs) -> tuple[object, ...]:
         None if physical_groups is None else tuple(sorted(physical_groups)),
         bool(kwargs.get("latest_per_identity", False)),
     )
-    cached = _CODEX_QUOTA_OBSERVATION_CACHE.get(key)
-    if cached is not None:
-        return cached
+    with _CODEX_QUOTA_OBSERVATION_CACHE_LOCK:
+        cached = _CODEX_QUOTA_OBSERVATION_CACHE.get(key)
+        if cached is not None:
+            _CODEX_QUOTA_OBSERVATION_CACHE.move_to_end(key)
+            return cached
     loaded = tuple(load_codex_quota_observations(**kwargs))
-    # The written memory bound (#583 S5 spec §2.1 "Memory"). Now that this memo
-    # survives a build, "32 entries" is a bound on ENTRIES and says nothing on
-    # its own about rows, so the worst-case retained row count is stated here:
-    #
-    #   * at most 32 results are retained, and the whole memo is discarded on
-    #     reaching that count rather than evicted one entry at a time;
-    #   * a bounded dashboard read contributes at most
-    #     `DASHBOARD_QUOTA_OBSERVATION_LIMIT` (1,000) `QuotaObservation`s;
-    #   * the five-hour correlation read in `_quota_read_model` carries NO
-    #     `max_rows`. It is bounded only by one root's retained observations
-    #     captured at or after one weekly block's nominal start, which is the
-    #     term that actually sizes this cache, and it grows with the block's
-    #     age because an older block's nominal start reaches further back.
-    #     Measured on a store holding 276,391 Codex quota rows, over the seven
-    #     weekly blocks live at that instant: 15,129 observations for the
-    #     newest and 36,943 for the oldest. The worst case is therefore 32
-    #     times a population in the tens of thousands, not 32 times 1,000.
-    #   * the doctor's unbounded `latest_per_identity` read is NOT retained
-    #     here. `bin/_cctally_doctor.py` calls `load_codex_quota_observations`
-    #     directly rather than through this memo, so its all-history population
-    #     never enters this dict.
-    if len(_CODEX_QUOTA_OBSERVATION_CACHE) >= 32:
-        _CODEX_QUOTA_OBSERVATION_CACHE.clear()
-    _CODEX_QUOTA_OBSERVATION_CACHE[key] = loaded
+    entry_bytes = retained_size_bytes(
+        (key, loaded), stop_after=_CODEX_QUOTA_OBSERVATION_MAX_BYTES)
+    global _CODEX_QUOTA_OBSERVATION_CACHE_BYTES
+    global _CODEX_QUOTA_OBSERVATION_CACHE_EVICTIONS
+    global _CODEX_QUOTA_OBSERVATION_CACHE_FALLBACKS
+    with _CODEX_QUOTA_OBSERVATION_CACHE_LOCK:
+        # Another request may have filled this identity while the loader ran.
+        cached = _CODEX_QUOTA_OBSERVATION_CACHE.get(key)
+        if cached is not None:
+            _CODEX_QUOTA_OBSERVATION_CACHE.move_to_end(key)
+            return cached
+        if entry_bytes > _CODEX_QUOTA_OBSERVATION_MAX_BYTES:
+            _CODEX_QUOTA_OBSERVATION_CACHE_FALLBACKS += 1
+            return loaded
+        while _CODEX_QUOTA_OBSERVATION_CACHE and (
+            len(_CODEX_QUOTA_OBSERVATION_CACHE)
+                >= _CODEX_QUOTA_OBSERVATION_MAX_ENTRIES
+            or _CODEX_QUOTA_OBSERVATION_CACHE_BYTES + entry_bytes
+                > _CODEX_QUOTA_OBSERVATION_MAX_BYTES
+        ):
+            old_key, _old_value = _CODEX_QUOTA_OBSERVATION_CACHE.popitem(
+                last=False)
+            _CODEX_QUOTA_OBSERVATION_CACHE_BYTES -= (
+                _CODEX_QUOTA_OBSERVATION_CACHE_SIZES.pop(old_key))
+            _CODEX_QUOTA_OBSERVATION_CACHE_EVICTIONS += 1
+        _CODEX_QUOTA_OBSERVATION_CACHE[key] = loaded
+        _CODEX_QUOTA_OBSERVATION_CACHE_SIZES[key] = entry_bytes
+        _CODEX_QUOTA_OBSERVATION_CACHE_BYTES += entry_bytes
     return loaded
 SOURCE_HISTORY_LIMIT = 250
 DASHBOARD_QUOTA_OBSERVATION_LIMIT = 1000
@@ -1120,6 +1260,30 @@ class DashboardReadContext:
             raise ValueError("codex_budget must be a mapping or None")
 
 
+def _cache_database_identity(conn: sqlite3.Connection) -> tuple[object, ...]:
+    """Identity of the cache.db file currently backing ``conn``.
+
+    A pathname is not an identity: rebuild publishes a replacement at the same
+    pathname.  The device/inode pair makes every process memo fail closed on
+    that replacement.  In-memory and unreadable paths use the connection
+    object, which intentionally prevents reuse across a newly-opened handle.
+    """
+    try:
+        db_path = next(
+            str(row[2]) for row in conn.execute("PRAGMA database_list")
+            if str(row[1]) == "main"
+        )
+    except (sqlite3.Error, StopIteration):
+        return ("connection", id(conn))
+    if not db_path:
+        return ("connection", id(conn))
+    try:
+        stat = os.stat(db_path)
+    except OSError:
+        return ("path-unreadable", db_path, id(conn))
+    return ("file", db_path, int(stat.st_dev), int(stat.st_ino))
+
+
 _RESOURCE_ROWS = {
     "session": ("sessions", "rows"),
     "project": ("projects", "rows"),
@@ -1386,9 +1550,9 @@ def _period_wire(view: Any) -> dict[str, object]:
     }
 
 
-_CODEX_PERIOD_VIEW_CACHE: dict[object, tuple] = {}
-_CODEX_CACHE_REPORT_ROWS: dict[object, tuple] = {}
-_CODEX_SESSION_VIEW_CACHE: dict[object, tuple[object, Any]] = {}
+_CODEX_PERIOD_VIEW_CACHE: dict[object, tuple] = _ObservedDict()
+_CODEX_CACHE_REPORT_ROWS: dict[object, tuple] = _ObservedDict()
+_CODEX_SESSION_VIEW_CACHE: dict[object, tuple[object, Any]] = _ObservedDict()
 
 
 def _codex_session_row_key(row: object) -> tuple[str, str]:
@@ -3577,7 +3741,7 @@ def _alerts_wire(
     )[:SOURCE_HISTORY_LIMIT])
 
 
-_CODEX_PROJECT_LABEL_CACHE: dict[object, dict[str, object]] = {}
+_CODEX_PROJECT_LABEL_CACHE: dict[object, dict[str, object]] = _ObservedDict()
 
 
 def _cached_project_labeled_entries(
@@ -3661,7 +3825,7 @@ def _projects_wire(
     }
 
 
-_CODEX_PROJECT_WIRE_CACHE: dict[object, tuple] = {}
+_CODEX_PROJECT_WIRE_CACHE: dict[object, tuple] = _ObservedDict()
 
 
 def _cached_projects_wire(
@@ -3888,7 +4052,7 @@ def _partial_projects_wire(
     }
 
 
-_CODEX_ENTRY_ADAPTER_CACHE: dict[int, tuple[object, CodexEntry]] = {}
+_CODEX_ENTRY_ADAPTER_CACHE: dict[int, tuple[object, CodexEntry]] = _ObservedDict()
 
 
 def _codex_entries_from_accounting(entries: Iterable[object]) -> list[CodexEntry]:
@@ -4029,7 +4193,7 @@ def _build_codex_native_weekly_view(
     )
 
 
-_CODEX_WEEKLY_VIEW_CACHE: dict[object, tuple] = {}
+_CODEX_WEEKLY_VIEW_CACHE: dict[object, tuple] = _ObservedDict()
 
 
 def _codex_weekly_period_for_entry(
@@ -4198,6 +4362,9 @@ def _codex_accounts_wire(
     accounting_start: dt.datetime,
     accounting_end: dt.datetime,
     population: tuple[object, ...],
+    population_by_account: "Mapping[str, tuple[object, ...]] | None" = None,
+    account_versions: "Mapping[str, int] | None" = None,
+    population_signature: object | None = None,
 ) -> tuple[
     list[dict[str, object]], list[dict[str, object]], dict[str, object]
 ]:
@@ -4261,7 +4428,11 @@ def _codex_accounts_wire(
     # so the buckets are the sets those filters selected from, and it preserves
     # encounter order, which `_aggregate_codex_buckets` depends on for a
     # bucket's first-seen model order.
-    by_account = _codex_partition_by_account(population)
+    by_account = (
+        dict(population_by_account)
+        if population_by_account is not None
+        else _codex_partition_by_account(population)
+    )
 
     def _slice(
         account_key: str,
@@ -4350,13 +4521,35 @@ def _codex_accounts_wire(
     _codex_label_map = _cctally_account.display_label_map(
         context.stats_conn, "codex")
 
-    def _totals(rows: tuple[object, ...]) -> dict[str, object]:
+    def _totals(
+        account_key: str,
+        rows: tuple[object, ...],
+        window_signature: object,
+    ) -> dict[str, object]:
+        row_membership = (
+            len(rows),
+            None if not rows else int(
+                getattr(rows[0], "cache_entry_id", 0) or 0),
+            None if not rows else int(
+                getattr(rows[-1], "cache_entry_id", 0) or 0),
+        )
+        signature = (
+            population_signature,
+            int(account_versions.get(account_key, 0)),
+            window_signature,
+            row_membership,
+            context.display_tz_name,
+            context.speed,
+        ) if account_versions is not None and population_signature is not None else None
+        cached = _CODEX_ACCOUNT_CARD_TOTALS_CACHE.get(account_key)
+        if signature is not None and cached is not None and cached[0] == signature:
+            return cached[1]
         entries = _codex_entries_from_accounting(rows)
         cost = build_codex_daily_view(
             entries, now_utc=context.now_utc, tz_name=context.display_tz_name,
             speed=context.speed,
         ).total_cost_usd if entries else 0.0
-        return {
+        value = {
             "spendUsd": cost,
             "inputTokens": sum(e.input_tokens for e in entries),
             "cachedInputTokens": sum(e.cached_input_tokens for e in entries),
@@ -4364,6 +4557,20 @@ def _codex_accounts_wire(
             "reasoningOutputTokens": sum(e.reasoning_output_tokens for e in entries),
             "totalTokens": sum(e.total_tokens for e in entries),
         }
+        if signature is not None:
+            global _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS
+            admitted = (
+                account_key in _CODEX_ACCOUNT_CARD_TOTALS_CACHE
+                or (
+                    len(_CODEX_ACCOUNT_CARD_TOTALS_CACHE) + 1
+                ) * _CODEX_ACCOUNT_CARD_TOTAL_ESTIMATED_BYTES
+                <= _CODEX_ACCOUNT_CARD_TOTALS_MAX_BYTES
+            )
+            if admitted:
+                _CODEX_ACCOUNT_CARD_TOTALS_CACHE[account_key] = (signature, value)
+            else:
+                _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS += 1
+        return value
 
     accounts_wire: list[dict[str, object]] = []
     hero_cycles_wire: list[dict[str, object]] = []
@@ -4377,16 +4584,22 @@ def _codex_accounts_wire(
                 key, cyc.start_at, cycle_end,
                 source_root_keys=cyc.source_root_keys,
             )
-            totals = _totals(rows)
+            totals = _totals(key, rows, (
+                "cycle", cyc.start_at, cyc.resets_at,
+                tuple(cyc.source_root_keys)))
         elif is_unattributed:
-            totals = _totals(unattributed_window_rows)
+            totals = _totals(
+                key, unattributed_window_rows,
+                ("fallback",),
+            )
         else:
             # A real account without a live weekly cycle: totals over ONE
             # native cycle width ending now, so this card can be summed into a
             # week-labelled headline without overstating it (#564). No bars or
             # reset, because there is no live cycle to describe.
             rows = _slice(key, fallback_start, accounting_end)
-            totals = _totals(rows)
+            totals = _totals(
+                key, rows, ("fallback",))
         card: dict[str, object] = {
             "accountKey": key,
             "label": _codex_label_map.get(key) or _cctally_account.account_label(context.stats_conn, key),
@@ -4444,11 +4657,18 @@ def _codex_accounts_wire(
                 "cost_usd": totals["spendUsd"],
                 "total_tokens": totals["totalTokens"],
             })
+    for stale_key in set(_CODEX_ACCOUNT_CARD_TOTALS_CACHE) - set(ordered_keys):
+        _CODEX_ACCOUNT_CARD_TOTALS_CACHE.pop(stale_key, None)
     return accounts_wire, hero_cycles_wire, {
         "scope": "account_cycles",
         "status": "certified",
         "contributions": tuple(contributions),
     }
+
+
+_CODEX_ACCOUNT_CARD_TOTALS_CACHE: dict[
+    str, tuple[object, dict[str, object]]
+] = _ObservedDict()
 
 
 def _codex_partition_by_account(
@@ -4524,14 +4744,254 @@ def _codex_fold_visible_rows(
     )
 
 
+_CODEX_VISIBLE_POPULATION_MAX_BYTES = 128 * 1024 * 1024
+_CODEX_VISIBLE_POPULATION_CACHE: dict[str, object] = _ObservedDict()
+_CODEX_ACCOUNT_CARD_TOTALS_MAX_BYTES = 256 * 1024
+_CODEX_ACCOUNT_CARD_TOTAL_ESTIMATED_BYTES = 1024
+_CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS = 0
+
+
+def _codex_population_order_key(entry: object) -> tuple[object, ...]:
+    """The accounting carrier's canonical encounter order (#582)."""
+    return (
+        getattr(entry, "timestamp"),
+        str(getattr(entry, "source_root_key", "")),
+        str(getattr(entry, "conversation_key", "")),
+        int(getattr(entry, "cache_entry_id", 0) or 0),
+    )
+
+
+def _codex_visible_population_estimated_bytes(
+    rows: Iterable[object], entries: Iterable[CodexEntry], account_count: int,
+) -> int:
+    """Conservative retained-reference estimate for the one-generation memo.
+
+    Strings and immutable row values are already retained by the accounting
+    carrier or shared by the adapter cache.  This estimate charges both object
+    shells, four dict/tuple references per row, and per-account container
+    overhead.  It is deliberately stable and cheap enough to compute only on a
+    cold population; its role is a hard admission bound, not heap profiling.
+    """
+    row_values = tuple(rows)
+    adapted_values = tuple(entries)
+    return (
+        sum(sys.getsizeof(row) for row in row_values)
+        + sum(sys.getsizeof(entry) for entry in adapted_values)
+        + (len(row_values) * 8 * 4)
+        + (int(account_count) * 1024)
+        + 4096
+    )
+
+
+def codex_visible_population_cache_stats() -> Mapping[str, object]:
+    """Observed size/fallback counters for both new source caches."""
+    return MappingProxyType({
+        "estimatedBytes": int(
+            _CODEX_VISIBLE_POPULATION_CACHE.get("estimated_bytes", 0)),
+        "maxBytes": _CODEX_VISIBLE_POPULATION_MAX_BYTES,
+        "entryCount": int(
+            _CODEX_VISIBLE_POPULATION_CACHE.get("entry_count", 0)),
+        "fallbackCount": int(
+            _CODEX_VISIBLE_POPULATION_CACHE.get("fallback_count", 0)),
+        "accountCardEstimatedBytes": (
+            len(_CODEX_ACCOUNT_CARD_TOTALS_CACHE)
+            * _CODEX_ACCOUNT_CARD_TOTAL_ESTIMATED_BYTES
+        ),
+        "accountCardMaxBytes": _CODEX_ACCOUNT_CARD_TOTALS_MAX_BYTES,
+        "accountCardEntryCount": len(_CODEX_ACCOUNT_CARD_TOTALS_CACHE),
+        "accountCardFallbackCount": _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS,
+    })
+
+
+def _cached_codex_visible_rows(
+    rows: tuple[object, ...],
+    *,
+    changed_old: tuple[object, ...],
+    changed_new: tuple[object, ...],
+    semantic_signature: object,
+) -> "tuple[list[CodexEntry], dict[str, tuple[object, ...]], dict[str, tuple[CodexEntry, ...]], dict[str, int]]":
+    """Reuse the immutable visible population, updating only dirty accounts.
+
+    The durable accounting ledger supplies exact old/new path populations.  A
+    clean generation therefore returns the prior fold without visiting a row;
+    a dirty generation adapts only ``changed_new`` and rebuilds only accounts
+    named by either side of that delta.  The merged encounter order is restored
+    from the authoritative accounting tuple by integer-id lookup, so downstream
+    floating-point accumulation order remains byte-identical.
+
+    Rows without a durable positive id and populations above the byte budget
+    take the cold path and are not retained.  Both are complete invalidations,
+    never partial reuse.
+    """
+    state = _CODEX_VISIBLE_POPULATION_CACHE
+    prior_fallbacks = int(state.get("fallback_count", 0))
+    reusable = (
+        state.get("signature") == semantic_signature
+        and isinstance(state.get("rows_by_id"), dict)
+        and isinstance(state.get("entries_by_id"), dict)
+        and all(int(getattr(row, "cache_entry_id", 0) or 0) > 0 for row in rows)
+        and all(int(getattr(row, "cache_entry_id", 0) or 0) > 0
+                for row in (*changed_old, *changed_new))
+    )
+    if reusable and not changed_old and not changed_new:
+        return (
+            list(state["entries"]),
+            dict(state["rows_by_account"]),
+            dict(state["entries_by_account"]),
+            dict(state["account_versions"]),
+        )
+
+    if not reusable:
+        entries, rows_by_account, entries_by_account = _codex_fold_visible_rows(rows)
+        estimated_bytes = _codex_visible_population_estimated_bytes(
+            rows, entries, len(rows_by_account))
+        if (
+            estimated_bytes > _CODEX_VISIBLE_POPULATION_MAX_BYTES
+            or any(int(getattr(row, "cache_entry_id", 0) or 0) <= 0 for row in rows)
+        ):
+            state.clear()
+            state.update({
+                "fallback_count": prior_fallbacks + 1,
+                "estimated_bytes": 0,
+                "entry_count": 0,
+            })
+            return entries, rows_by_account, entries_by_account, {}
+        entry_by_id = {
+            int(getattr(row, "cache_entry_id")): entry
+            for row, entry in zip(rows, entries)
+        }
+        state.clear()
+        state.update({
+            "signature": semantic_signature,
+            "entries": tuple(entries),
+            "rows_by_id": {
+                int(getattr(row, "cache_entry_id")): row for row in rows
+            },
+            "entries_by_id": entry_by_id,
+            "rows_by_account": dict(rows_by_account),
+            "entries_by_account": dict(entries_by_account),
+            "account_versions": {key: 1 for key in rows_by_account},
+            "estimated_bytes": estimated_bytes,
+            "entry_count": len(rows),
+            "account_count": len(rows_by_account),
+            "fallback_count": prior_fallbacks,
+        })
+        return entries, rows_by_account, entries_by_account, dict(
+            state["account_versions"])
+
+    rows_by_id = dict(state["rows_by_id"])
+    entries_by_id = dict(state["entries_by_id"])
+    rows_by_account = dict(state["rows_by_account"])
+    entries_by_account = dict(state["entries_by_account"])
+    account_versions = dict(state["account_versions"])
+    estimated_bytes = int(state.get("estimated_bytes", 0))
+    prior_account_count = int(state.get("account_count", len(rows_by_account)))
+    affected: set[str] = set()
+    old_ids: set[int] = set()
+    for row in changed_old:
+        row_id = int(getattr(row, "cache_entry_id"))
+        old_ids.add(row_id)
+        affected.add(str(
+            getattr(row, "account_key", "") or _lib_accounts.UNATTRIBUTED))
+        prior_entry = entries_by_id.get(row_id)
+        estimated_bytes -= (
+            sys.getsizeof(row)
+            + (0 if prior_entry is None else sys.getsizeof(prior_entry))
+            + (8 * 4)
+        )
+        rows_by_id.pop(row_id, None)
+        entries_by_id.pop(row_id, None)
+    converted_new = _codex_entries_from_accounting(changed_new)
+    for row, converted in zip(changed_new, converted_new):
+        row_id = int(getattr(row, "cache_entry_id"))
+        key = str(
+            getattr(row, "account_key", "") or _lib_accounts.UNATTRIBUTED)
+        affected.add(key)
+        estimated_bytes += (
+            sys.getsizeof(row) + sys.getsizeof(converted) + (8 * 4)
+        )
+        rows_by_id[row_id] = row
+        entries_by_id[row_id] = converted
+
+    for key in affected:
+        retained_rows = [
+            row for row in rows_by_account.get(key, ())
+            if int(getattr(row, "cache_entry_id")) not in old_ids
+        ]
+        retained_entries = {
+            int(getattr(entry, "cache_entry_id")): entry
+            for entry in entries_by_account.get(key, ())
+            if int(getattr(entry, "cache_entry_id")) not in old_ids
+        }
+        for row, converted in zip(changed_new, converted_new):
+            if str(getattr(row, "account_key", "") or
+                   _lib_accounts.UNATTRIBUTED) == key:
+                retained_rows.append(row)
+                retained_entries[int(getattr(row, "cache_entry_id"))] = converted
+        retained_rows.sort(key=_codex_population_order_key)
+        if retained_rows:
+            rows_by_account[key] = tuple(retained_rows)
+            entries_by_account[key] = tuple(
+                retained_entries[int(getattr(row, "cache_entry_id"))]
+                for row in retained_rows
+            )
+        else:
+            rows_by_account.pop(key, None)
+            entries_by_account.pop(key, None)
+        account_versions[key] = int(account_versions.get(key, 0)) + 1
+
+    try:
+        entries = tuple(
+            entries_by_id[int(getattr(row, "cache_entry_id"))] for row in rows
+        )
+    except KeyError:
+        # An inconsistent delta must fail closed to the exact cold fold.
+        state.clear()
+        return _cached_codex_visible_rows(
+            rows,
+            changed_old=rows,
+            changed_new=rows,
+            semantic_signature=semantic_signature,
+        )
+    estimated_bytes += max(0, len(rows_by_account) - prior_account_count) * 1024
+    estimated_bytes = max(0, estimated_bytes)
+    if estimated_bytes > _CODEX_VISIBLE_POPULATION_MAX_BYTES:
+        state.clear()
+        state.update({
+            "fallback_count": prior_fallbacks + 1,
+            "estimated_bytes": 0,
+            "entry_count": 0,
+        })
+    else:
+        state.clear()
+        state.update({
+            "signature": semantic_signature,
+            "entries": entries,
+            "rows_by_id": rows_by_id,
+            "entries_by_id": entries_by_id,
+            "rows_by_account": rows_by_account,
+            "entries_by_account": entries_by_account,
+            "account_versions": account_versions,
+            "estimated_bytes": estimated_bytes,
+            "entry_count": len(rows),
+            "account_count": len(rows_by_account),
+            "fallback_count": prior_fallbacks,
+        })
+    return list(entries), rows_by_account, entries_by_account, account_versions
+
+
 _CODEX_ACCOUNT_SCOPE_CACHE: dict[
     str, tuple[object, dict[str, object]]
-] = {}
+] = _ObservedDict()
 
 
 def reset_codex_account_scope_cache() -> None:
     """Test/process reset for #582's immutable finalized account scopes."""
+    global _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS
     _CODEX_ACCOUNT_SCOPE_CACHE.clear()
+    _CODEX_VISIBLE_POPULATION_CACHE.clear()
+    _CODEX_ACCOUNT_CARD_TOTALS_CACHE.clear()
+    _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS = 0
     _CODEX_ENTRY_ADAPTER_CACHE.clear()
     _CODEX_PROJECT_LABEL_CACHE.clear()
     _CODEX_PERIOD_VIEW_CACHE.clear()
@@ -5058,9 +5518,341 @@ def _codex_source_caches() -> tuple[dict, ...]:
         _CODEX_PROJECT_LABEL_CACHE,
         _CODEX_PROJECT_WIRE_CACHE,
         _CODEX_ENTRY_ADAPTER_CACHE,
+        _CODEX_VISIBLE_POPULATION_CACHE,
+        _CODEX_ACCOUNT_CARD_TOTALS_CACHE,
         _CODEX_WEEKLY_VIEW_CACHE,
         _CODEX_ACCOUNT_SCOPE_CACHE,
     )
+
+
+_CODEX_SOURCE_ACCELERATOR_MAX_BYTES = 768 * 1024 * 1024
+_CODEX_SOURCE_ACCELERATOR_MAX_ENTRIES = 500_000
+_CODEX_SOURCE_ACCELERATOR_STATS_LOCK = threading.Lock()
+_CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES = 0
+_CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = 0
+_CODEX_SOURCE_ACCELERATOR_EVICTIONS = 0
+_CODEX_SOURCE_ACCELERATOR_FALLBACKS = 0
+_CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION = -1
+_CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS = 0
+_CODEX_SOURCE_MEMORY_COMPLETION_LOCK = None
+
+
+class _CodexSourceMemoryWorker:
+    """One latest-wins, cancellable retained-size verifier.
+
+    The source caches are shallow-copied at a successful build boundary.  The
+    worker traverses that immutable container snapshot so its multi-second
+    production-scale admission pass neither blocks the five-second publisher
+    nor races a live dict mutation.  A newer generation cancels the old walk;
+    shutdown uses the same cooperative cancellation path.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._pending: tuple[int, tuple[dict, ...]] | None = None
+        self._result: tuple[int, int | None, str | None] | None = None
+        self._latest_generation = -1
+        self._active_generation: int | None = None
+        self._stop = False
+        self._thread: threading.Thread | None = None
+        self._duty_wall = 0.0
+        self._duty_cpu = 0.0
+
+    def submit(self, generation: int, snapshot: tuple[dict, ...]) -> None:
+        with self._condition:
+            if self._stop:
+                return
+            self._latest_generation = int(generation)
+            self._pending = (int(generation), snapshot)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="cctally-source-memory",
+                    daemon=True,
+                )
+                self._thread.start()
+            self._condition.notify()
+
+    def take_result(self) -> tuple[int, int | None, str | None] | None:
+        with self._condition:
+            result = self._result
+            self._result = None
+            return result
+
+    def _cooperate(self) -> bool:
+        with self._condition:
+            cancelled = (
+                self._stop
+                or self._active_generation != self._latest_generation
+            )
+        if cancelled:
+            return True
+        cpu_elapsed = time.thread_time() - self._duty_cpu
+        wall_elapsed = time.monotonic() - self._duty_wall
+        delay = (cpu_elapsed / RETAINED_SIZE_WORKER_DUTY) - wall_elapsed
+        if delay > 0:
+            time.sleep(min(delay, 0.01))
+        with self._condition:
+            return (
+                self._stop
+                or self._active_generation != self._latest_generation
+            )
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None and not self._stop:
+                    self._condition.wait()
+                if self._stop:
+                    return
+                generation, snapshot = self._pending
+                self._pending = None
+                self._active_generation = generation
+            estimated: int | None = None
+            error: str | None = None
+            entry_count = sum(len(cache) for cache in snapshot)
+            try:
+                while not RETAINED_SIZE_WORK_LOCK.acquire(timeout=0.05):
+                    if self._cooperate():
+                        raise RetainedSizeCancelled()
+                try:
+                    self._duty_wall = time.monotonic()
+                    self._duty_cpu = time.thread_time()
+                    estimated = retained_size_bytes(
+                        snapshot,
+                        stop_after=_CODEX_SOURCE_ACCELERATOR_MAX_BYTES,
+                        cancelled=self._cooperate,
+                    )
+                finally:
+                    RETAINED_SIZE_WORK_LOCK.release()
+            except RetainedSizeCancelled:
+                continue
+            except Exception as exc:  # noqa: BLE001 - keep the sole worker alive
+                error = f"{type(exc).__name__}: {exc}"
+            finally:
+                snapshot = ()
+            published = (
+                error is None
+                and estimated is not None
+                and _publish_codex_source_measurement(
+                    generation, int(estimated), entry_count)
+            )
+            enforced = False
+            completion_lock = _CODEX_SOURCE_MEMORY_COMPLETION_LOCK
+            if not published and completion_lock is not None:
+                with completion_lock:
+                    enforced = _enforce_codex_source_unsafe_completion(
+                        generation,
+                        None if estimated is None else int(estimated),
+                        error,
+                    )
+            with self._condition:
+                self._active_generation = None
+                if (
+                    not published and not enforced
+                    and not self._stop
+                    and generation == self._latest_generation
+                ):
+                    self._result = (
+                        generation,
+                        None if estimated is None else int(estimated),
+                        error,
+                    )
+
+    def shutdown(self) -> bool:
+        with self._condition:
+            self._stop = True
+            self._pending = None
+            thread = self._thread
+            self._condition.notify_all()
+        if thread is not None:
+            thread.join(timeout=1.0)
+        return thread is None or not thread.is_alive()
+
+    def is_alive(self) -> bool:
+        with self._condition:
+            return self._thread is not None and self._thread.is_alive()
+
+
+_CODEX_SOURCE_MEMORY_WORKER = _CodexSourceMemoryWorker()
+
+
+def set_codex_source_memory_completion_lock(lock) -> None:
+    """Bind unsafe verifier completions to the dashboard publisher lock."""
+    global _CODEX_SOURCE_MEMORY_COMPLETION_LOCK
+    _CODEX_SOURCE_MEMORY_COMPLETION_LOCK = lock
+
+
+def _enforce_codex_source_unsafe_completion(
+    generation: int, estimated: int | None, error: str | None,
+) -> bool:
+    """Evict a current over-cap/error result without awaiting another tick."""
+    if error is None and (
+        estimated is None or estimated <= _CODEX_SOURCE_ACCELERATOR_MAX_BYTES
+    ):
+        return False
+    with _CODEX_SOURCE_ACCELERATOR_DIRTY_LOCK:
+        if (
+            _CODEX_SOURCE_ACCELERATOR_DIRTY
+            or generation != _CODEX_SOURCE_ACCELERATOR_GENERATION
+        ):
+            return False
+    caches = _codex_source_caches()
+    entry_count = sum(len(cache) for cache in caches)
+    global _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES
+    global _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT
+    global _CODEX_SOURCE_ACCELERATOR_EVICTIONS
+    global _CODEX_SOURCE_ACCELERATOR_FALLBACKS
+    global _CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS
+    with _CODEX_SOURCE_ACCELERATOR_STATS_LOCK:
+        reset_codex_quota_observation_cache()
+        for cache in caches[1:]:
+            cache.clear()
+        _CODEX_SOURCE_ACCELERATOR_EVICTIONS += entry_count
+        _CODEX_SOURCE_ACCELERATOR_FALLBACKS += 1
+        if error is not None:
+            _CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS += 1
+        _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES = 0
+        _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = 0
+    return True
+
+
+def _publish_codex_source_measurement(
+    generation: int, estimated: int, entry_count: int,
+) -> bool:
+    """Publish an under-cap current generation without waiting for a tick."""
+    if estimated > _CODEX_SOURCE_ACCELERATOR_MAX_BYTES:
+        return False
+    with _CODEX_SOURCE_ACCELERATOR_DIRTY_LOCK:
+        if (
+            _CODEX_SOURCE_ACCELERATOR_DIRTY
+            or generation != _CODEX_SOURCE_ACCELERATOR_GENERATION
+        ):
+            return False
+    global _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES
+    global _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT
+    global _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION
+    with _CODEX_SOURCE_ACCELERATOR_STATS_LOCK:
+        _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES = int(estimated)
+        _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = int(entry_count)
+        _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION = int(generation)
+    return True
+
+
+def _take_codex_source_accelerator_dirty() -> int | None:
+    """Claim one dirty generation for a serialized source-build admission."""
+    global _CODEX_SOURCE_ACCELERATOR_DIRTY
+    with _CODEX_SOURCE_ACCELERATOR_DIRTY_LOCK:
+        if not _CODEX_SOURCE_ACCELERATOR_DIRTY:
+            return None
+        _CODEX_SOURCE_ACCELERATOR_DIRTY = False
+        return int(_CODEX_SOURCE_ACCELERATOR_GENERATION)
+
+
+def _mark_codex_source_accelerators_clean() -> None:
+    global _CODEX_SOURCE_ACCELERATOR_DIRTY
+    with _CODEX_SOURCE_ACCELERATOR_DIRTY_LOCK:
+        _CODEX_SOURCE_ACCELERATOR_DIRTY = False
+
+
+def enforce_codex_source_accelerator_bounds() -> None:
+    """Schedule byte admission and apply completed results without cadence I/O."""
+    caches = _codex_source_caches()
+    entry_count = sum(len(cache) for cache in caches)
+    global _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES
+    global _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT
+    global _CODEX_SOURCE_ACCELERATOR_EVICTIONS
+    global _CODEX_SOURCE_ACCELERATOR_FALLBACKS
+    global _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION
+    global _CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS
+    completed = _CODEX_SOURCE_MEMORY_WORKER.take_result()
+    with _CODEX_SOURCE_ACCELERATOR_DIRTY_LOCK:
+        current_generation = int(_CODEX_SOURCE_ACCELERATOR_GENERATION)
+        currently_dirty = bool(_CODEX_SOURCE_ACCELERATOR_DIRTY)
+    measured = (
+        None if completed is None or completed[1] is None
+        else int(completed[1])
+    )
+    measured_generation = -1 if completed is None else int(completed[0])
+    measurement_error = None if completed is None else completed[2]
+    measurement_is_current = (
+        completed is not None
+        and measured_generation == current_generation
+        and not currently_dirty
+    )
+    with _CODEX_SOURCE_ACCELERATOR_STATS_LOCK:
+        if measurement_is_current and measurement_error is not None:
+            reset_codex_quota_observation_cache()
+            for cache in caches[1:]:
+                cache.clear()
+            _CODEX_SOURCE_ACCELERATOR_EVICTIONS += entry_count
+            _CODEX_SOURCE_ACCELERATOR_FALLBACKS += 1
+            _CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS += 1
+            _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES = 0
+            _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = 0
+        elif (
+            (measurement_is_current
+             and measured is not None
+             and measured > _CODEX_SOURCE_ACCELERATOR_MAX_BYTES)
+            or entry_count > _CODEX_SOURCE_ACCELERATOR_MAX_ENTRIES
+        ):
+            # The caller already owns the completed SourceDashboardState.  A
+            # cold next build preserves wire semantics and prevents any one
+            # history/account/root churn pattern from growing process state.
+            reset_codex_quota_observation_cache()
+            for cache in caches[1:]:
+                cache.clear()
+            _CODEX_SOURCE_ACCELERATOR_EVICTIONS += entry_count
+            _CODEX_SOURCE_ACCELERATOR_FALLBACKS += 1
+            _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES = 0
+            _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = 0
+        elif measured is not None:
+            _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES = measured
+            _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = int(entry_count)
+            _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION = measured_generation
+        else:
+            # Entry count is exact immediately; bytes remain the last complete
+            # generation until the latest-wins verifier publishes a result.
+            _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = int(entry_count)
+
+    generation = _take_codex_source_accelerator_dirty()
+    if generation is not None:
+        _CODEX_SOURCE_MEMORY_WORKER.submit(
+            generation, tuple(dict(cache) for cache in caches))
+
+
+def shutdown_codex_source_memory_worker() -> None:
+    """Cancel and join the one aggregate verifier during dashboard shutdown."""
+    global _CODEX_SOURCE_MEMORY_WORKER
+    worker = _CODEX_SOURCE_MEMORY_WORKER
+    if not worker.shutdown():
+        raise RuntimeError("Codex source memory verifier did not stop")
+    _CODEX_SOURCE_MEMORY_WORKER = _CodexSourceMemoryWorker()
+
+
+def codex_source_accelerator_memory_stats() -> Mapping[str, int]:
+    """Safe aggregate diagnostics for every source-build accelerator."""
+    with _CODEX_SOURCE_ACCELERATOR_STATS_LOCK:
+        return MappingProxyType({
+            "estimatedBytes": int(_CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES),
+            "maxBytes": int(_CODEX_SOURCE_ACCELERATOR_MAX_BYTES),
+            "entryCount": int(_CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT),
+            "maxEntries": int(_CODEX_SOURCE_ACCELERATOR_MAX_ENTRIES),
+            "evictionCount": int(_CODEX_SOURCE_ACCELERATOR_EVICTIONS),
+            "fallbackCount": int(_CODEX_SOURCE_ACCELERATOR_FALLBACKS),
+            "measurementErrorCount": int(
+                _CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS),
+            "measuredGeneration": int(
+                _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION),
+            "currentGeneration": int(_CODEX_SOURCE_ACCELERATOR_GENERATION),
+            "measurementPending": int(
+                _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION
+                != _CODEX_SOURCE_ACCELERATOR_GENERATION
+            ),
+            "workerAlive": int(
+                getattr(_CODEX_SOURCE_MEMORY_WORKER, "is_alive", lambda: False)()
+            ),
+        })
 
 
 def reset_codex_source_caches() -> None:
@@ -5071,9 +5863,21 @@ def reset_codex_source_caches() -> None:
     cache state too, which lives in ``_lib_snapshot_cache`` rather than in a
     dict here and is the other half of what a build retains.
     """
-    for cache in _codex_source_caches():
+    global _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS
+    global _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES
+    global _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT
+    global _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION
+    reset_codex_quota_observation_cache()
+    for cache in _codex_source_caches()[1:]:
         cache.clear()
+    _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS = 0
     _lib_snapshot_cache.reset_codex_accounting_cache_state()
+    with _CODEX_SOURCE_ACCELERATOR_STATS_LOCK:
+        _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES = 0
+        _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = 0
+    _mark_codex_source_accelerators_clean()
+    _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION = (
+        _CODEX_SOURCE_ACCELERATOR_GENERATION)
 
 
 @dataclass(frozen=True)
@@ -5110,6 +5914,7 @@ def _capture_codex_accounting(
                     context.speed,
                     tuple(str(root) for root in path_scope.roots),
                     active_roots,
+                    _cache_database_identity(context.cache_conn),
                 ),
                 load_all=lambda: load_qualified_codex_entries(
                     accounting_start,
@@ -5203,13 +6008,20 @@ class CodexSourceCapture:
     card_population: tuple[object, ...]
     breakdowns: Mapping
     cache_checkpoint: tuple[dict, ...]
+    quota_cache_stats_checkpoint: tuple[dict, int, int, int]
+    account_card_fallbacks_checkpoint: int
     accounting_checkpoint: object
 
 
 def _restore_codex_source_capture(capture: CodexSourceCapture) -> None:
+    global _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS
     for cache, prior in zip(_codex_source_caches(), capture.cache_checkpoint):
         cache.clear()
         cache.update(prior)
+    _restore_quota_observation_cache_checkpoint(
+        capture.quota_cache_stats_checkpoint)
+    _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS = (
+        capture.account_card_fallbacks_checkpoint)
     _lib_snapshot_cache.restore_codex_accounting_cache_state(
         capture.accounting_checkpoint)
 
@@ -5220,8 +6032,11 @@ def capture_codex_source_state(
     path_scope: object,
 ) -> CodexSourceCapture:
     """Capture Codex cache evidence without constructing public view models."""
+    global _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS
     caches = _codex_source_caches()
     cache_checkpoint = tuple(dict(cache) for cache in caches)
+    quota_cache_stats_checkpoint = _quota_observation_cache_checkpoint()
+    account_card_fallbacks_checkpoint = _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS
     accounting_checkpoint = (
         _lib_snapshot_cache.checkpoint_codex_accounting_cache_state()
     )
@@ -5231,19 +6046,21 @@ def capture_codex_source_state(
                 "SELECT source_root_key FROM codex_source_roots"
             )
         ))
-        quota_observations = tuple(_cached_codex_quota_observations(
-            source_root_keys=active_roots,
-            cache_conn=context.cache_conn,
-            stats_conn=context.stats_conn,
-            stats_identity=context.stats_identity,
-            memoize=False,
-            captured_at_or_after=(
-                context.now_utc - dt.timedelta(days=DASHBOARD_QUOTA_RECENT_DAYS)
-            ),
-            active_at=context.now_utc,
-            max_rows=DASHBOARD_QUOTA_OBSERVATION_LIMIT,
-        ))
-        projection_incoherent = not codex_projection_coherence(context).coherent
+        with _lib_perf.phase("source.quota"):
+            quota_observations = tuple(_cached_codex_quota_observations(
+                source_root_keys=active_roots,
+                cache_conn=context.cache_conn,
+                stats_conn=context.stats_conn,
+                stats_identity=context.stats_identity,
+                memoize=False,
+                captured_at_or_after=(
+                    context.now_utc - dt.timedelta(days=DASHBOARD_QUOTA_RECENT_DAYS)
+                ),
+                active_at=context.now_utc,
+                max_rows=DASHBOARD_QUOTA_OBSERVATION_LIMIT,
+            ))
+        with _lib_perf.phase("source.projection"):
+            projection_incoherent = not codex_projection_coherence(context).coherent
         ingest_backlog = _codex_ingest_backlog_wire(context.cache_conn)
         accounting_end = context.now_utc + dt.timedelta(microseconds=1)
         accounting_start = context.range_start
@@ -5256,19 +6073,20 @@ def capture_codex_source_state(
                 _warn_codex_budget_window_once("accounting_range")
             else:
                 accounting_start = min(accounting_start, budget_start)
-        health = load_codex_project_metadata_health(
-            cache_conn=context.cache_conn,
-            start=accounting_start,
-            end=accounting_end,
-        )
-        accounting = _capture_codex_accounting(
-            context,
-            accounting_start=accounting_start,
-            accounting_end=accounting_end,
-            active_roots=active_roots,
-            path_scope=path_scope,
-            metadata_incomplete=health.incomplete_rows > 0,
-        )
+        with _lib_perf.phase("source.accounting"):
+            health = load_codex_project_metadata_health(
+                cache_conn=context.cache_conn,
+                start=accounting_start,
+                end=accounting_end,
+            )
+            accounting = _capture_codex_accounting(
+                context,
+                accounting_start=accounting_start,
+                accounting_end=accounting_end,
+                active_roots=active_roots,
+                path_scope=path_scope,
+                metadata_incomplete=health.incomplete_rows > 0,
+            )
         try:
             accounting_exists = has_cached_codex_accounting_entries(
                 cache_conn=context.cache_conn)
@@ -5281,12 +6099,13 @@ def capture_codex_source_state(
             accounting_exists_error = exc
         conversation_metadata = MappingProxyType(
             _codex_conversation_metadata(context.cache_conn))
-        try:
-            import _cctally_account
-            decorated = _cctally_account.provider_is_decorated(
-                context.stats_conn, "codex")
-        except Exception:
-            decorated = False
+        with _lib_perf.phase("source.accounts"):
+            try:
+                import _cctally_account
+                decorated = _cctally_account.provider_is_decorated(
+                    context.stats_conn, "codex")
+            except Exception:
+                decorated = False
         card_population_start = accounting_start
         if decorated:
             card_population_start = min(
@@ -5318,8 +6137,9 @@ def capture_codex_source_state(
                 cache_conn=context.cache_conn,
             )
         )
-        breakdowns = _capture_quota_breakdown_evidence(
-            context, quota_observations)
+        with _lib_perf.phase("source.models"):
+            breakdowns = _capture_quota_breakdown_evidence(
+                context, quota_observations)
         return CodexSourceCapture(
             context=context,
             active_roots=active_roots,
@@ -5337,12 +6157,19 @@ def capture_codex_source_state(
             card_population=tuple(card_population),
             breakdowns=breakdowns,
             cache_checkpoint=cache_checkpoint,
+            quota_cache_stats_checkpoint=quota_cache_stats_checkpoint,
+            account_card_fallbacks_checkpoint=(
+                account_card_fallbacks_checkpoint),
             accounting_checkpoint=accounting_checkpoint,
         )
     except Exception:
         for cache, prior in zip(caches, cache_checkpoint):
             cache.clear()
             cache.update(prior)
+        _restore_quota_observation_cache_checkpoint(
+            quota_cache_stats_checkpoint)
+        _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS = (
+            account_card_fallbacks_checkpoint)
         _lib_snapshot_cache.restore_codex_accounting_cache_state(
             accounting_checkpoint)
         raise
@@ -5356,12 +6183,15 @@ def build_codex_source_state_from_capture(
 ) -> SourceDashboardState:
     """Fold one captured Codex generation without issuing cache SQL."""
     try:
-        return _build_codex_source_state(
-            capture.context,
-            data_version=data_version,
-            path_scope=path_scope,
-            capture=capture,
-        )
+        with _lib_perf.phase("source.serialization"):
+            result = _build_codex_source_state(
+                capture.context,
+                data_version=data_version,
+                path_scope=path_scope,
+                capture=capture,
+            )
+        enforce_codex_source_accelerator_bounds()
+        return result
     except Exception:
         _restore_codex_source_capture(capture)
         raise
@@ -5558,7 +6388,6 @@ def _build_codex_source_state(
     accounting_changed_new = accounting_capture.changed_new
     accounting_entries = accounting_capture.entries
     metadata_incomplete = accounting_capture.metadata_incomplete
-    budget_entries = _codex_entries_from_accounting(accounting_entries)
     cycles_all: list[CodexCycleBoundary] = []
     try:
         # Per-account list (#341 Task 2). ``cycles_all`` drives the per-account
@@ -5612,15 +6441,15 @@ def _build_codex_source_state(
             display_tz_name=context.display_tz_name,
             speed=context.speed,
         )
-    visible_accounting_entries = tuple(
-        entry for entry in accounting_entries
-        if context.range_start <= getattr(entry, "timestamp").astimezone(UTC) < accounting_end
-    )
-    # #566 §5.1 item 2: one pass over the visible rows produces the merged
-    # population and both per-account partitions. The children below reuse
-    # these instead of re-partitioning and re-adapting the same rows.
-    entries, visible_rows_by_account, visible_entries_by_account = (
-        _codex_fold_visible_rows(visible_accounting_entries)
+    visible_accounting_entries = (
+        accounting_entries
+        if accounting_start == context.range_start
+        else tuple(
+            entry for entry in accounting_entries
+            if context.range_start
+            <= getattr(entry, "timestamp").astimezone(UTC)
+            < accounting_end
+        )
     )
     changed_old_visible = tuple(
         entry for entry in accounting_changed_old
@@ -5629,6 +6458,51 @@ def _build_codex_source_state(
     changed_new_visible = tuple(
         entry for entry in accounting_changed_new
         if context.range_start <= entry.timestamp.astimezone(UTC) < accounting_end
+    )
+    population_signature = (
+        "codex-visible-population-v1",
+        _cache_database_identity(context.cache_conn),
+        context.range_start,
+        metadata_incomplete,
+        context.speed,
+        active_roots,
+    )
+    # #681: the durable path delta updates only the affected account partitions.
+    # A quota/stat-only generation returns the prior fold directly.  The parent
+    # tuple is restored in authoritative accounting encounter order, preserving
+    # every downstream floating-point and first-seen-model byte.
+    if metadata_incomplete:
+        # The cache-only carrier has no durable old/new path population.  Its
+        # full reload is therefore also the presentation fold: no process memo
+        # may interpret an empty delta as proof that an id-stable update did
+        # not happen. Every downstream aggregate cache has the same evidence
+        # gap, so use the established complete accounting reset rather than
+        # clearing only the two newest generations: period, weekly, project,
+        # session, cache-report and adapter memos would otherwise retain an
+        # id-stable update. Returning to qualified reads also starts cold.
+        reset_codex_account_scope_cache()
+        (
+            entries,
+            visible_rows_by_account,
+            visible_entries_by_account,
+        ) = _codex_fold_visible_rows(visible_accounting_entries)
+        visible_account_versions: dict[str, int] = {}
+    else:
+        (
+            entries,
+            visible_rows_by_account,
+            visible_entries_by_account,
+            visible_account_versions,
+        ) = _cached_codex_visible_rows(
+            visible_accounting_entries,
+            changed_old=changed_old_visible,
+            changed_new=changed_new_visible,
+            semantic_signature=population_signature,
+        )
+    budget_entries = (
+        entries
+        if accounting_start == context.range_start
+        else _codex_entries_from_accounting(accounting_entries)
     )
     changed_old_entries = tuple(_codex_entries_from_accounting(changed_old_visible))
     changed_new_entries = tuple(_codex_entries_from_accounting(changed_new_visible))
@@ -5903,6 +6777,26 @@ def _build_codex_source_state(
                 accounting_start=accounting_start,
                 accounting_end=accounting_end,
                 population=card_population,
+                population_by_account=(
+                    visible_rows_by_account
+                    if card_population is accounting_entries
+                    and accounting_start == context.range_start
+                    else None
+                ),
+                account_versions=(
+                    visible_account_versions
+                    if card_population is accounting_entries
+                    and accounting_start == context.range_start
+                    and visible_account_versions
+                    else None
+                ),
+                population_signature=(
+                    population_signature
+                    if card_population is accounting_entries
+                    and accounting_start == context.range_start
+                    and visible_account_versions
+                    else None
+                ),
             )
             # #416 §5.3: the per-account CHILDREN beside the merged parent. The
             # scope set is exactly the card set, so every chip the client can

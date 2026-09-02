@@ -53,7 +53,7 @@ def _chip_for_model(name: str) -> str:
 # Date the embedded pricing snapshots below were last verified against
 # vendor sources. Bump whenever CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING
 # is synced. Read by `pricing-check` + the release pre-flight staleness nudge.
-PRICING_SNAPSHOT_DATE = "2026-08-25"
+PRICING_SNAPSHOT_DATE = "2026-09-02"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 # Canonical machine-readable pricing source (Claude values + Codex values).
@@ -185,11 +185,24 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
 #   pricing pages and historical Mythos Preview at the explicit $25/$125
 #   Project Glasswing rate. The snapshot bump re-arms the existing conversation
 #   rollup pricing fingerprint; immutable journaled/stored facts stay unchanged.
+#   2026-09-02: added claude-fable-5-1 and claude-mythos-5-1 at $10/$50 per
+#   MTok with a $12.50 5-minute cache write, matching Fable 5 and Mythos 5.
+#   Their cache READ is $0.25 per MTok, which is 0.025x base input rather than
+#   the standard 0.1x. Anthropic's pricing page documents that rate for these
+#   two models in a footnote as their standard price, not as an introductory
+#   one, so the value is adopted here rather than suppressed in
+#   PRICING_DRIFT_ALLOWLIST. Verified against LiteLLM and the vendor pricing
+#   page on 2026-09-02. Anthropic's /v1/models lists claude-fable-5-1, so
+#   until now real Fable 5.1 usage was priced at zero with only a warning. 1M
+#   context at standard pricing, so NO above-200k tier.
 # Anthropic prices a cache WRITE by TTL: 1.25x base input for a 5-minute write,
-# 2x for a 1-hour write; reads are 0.1x under both. Documented as applying
+# 2x for a 1-hour write. Both WRITE multipliers are documented as applying
 # consistently across all supported models, so the 1h rate is DERIVED from
 # input_cost_per_token rather than stored per-model — a model added later
-# cannot silently miss it (#195).
+# cannot silently miss it (#195). Cache READS are NOT uniform and are NOT
+# derived: they are 0.1x base input on most models but 0.025x on Claude Fable
+# 5.1 and Claude Mythos 5.1, so the read rate stays stored per-model in
+# `cache_read_input_token_cost`, which represents a model-specific rate.
 CACHE_WRITE_1H_MULTIPLIER = 2.0
 
 CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
@@ -275,6 +288,13 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "cache_creation_input_token_cost": 1.25e-05,
         "cache_read_input_token_cost": 1e-06,
     },
+    "claude-fable-5-1": {
+        "input_cost_per_token": 1e-05,
+        "output_cost_per_token": 5e-05,
+        "cache_creation_input_token_cost": 1.25e-05,
+        # 0.025x base input, not the standard 0.1x — see the 2026-09-02 note.
+        "cache_read_input_token_cost": 2.5e-07,
+    },
     "claude-haiku-4-5": {
         "input_cost_per_token": 1e-06,
         "output_cost_per_token": 5e-06,
@@ -292,6 +312,13 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "output_cost_per_token": 5e-05,
         "cache_creation_input_token_cost": 1.25e-05,
         "cache_read_input_token_cost": 1e-06,
+    },
+    "claude-mythos-5-1": {
+        "input_cost_per_token": 1e-05,
+        "output_cost_per_token": 5e-05,
+        "cache_creation_input_token_cost": 1.25e-05,
+        # 0.025x base input, not the standard 0.1x — see the 2026-09-02 note.
+        "cache_read_input_token_cost": 2.5e-07,
     },
     "claude-mythos-preview": {
         "input_cost_per_token": 2.5e-05,

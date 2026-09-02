@@ -287,6 +287,12 @@ def test_ssehub_unsubscribe_removes_only_that_queue():
     hub.unsubscribe(q1)               # must not raise
     import queue as _queue
     hub.unsubscribe(_queue.Queue())   # never subscribed -> no-op, no raise
+    hub.close()
+    assert hub.latest() is None
+    assert hub.subscribe().empty(), (
+        "a closed hub must not retain a queue or seed the released snapshot")
+    hub.publish({"frame": "after-close"})
+    assert hub.latest() is None
 
 
 def test_ssehub_subscribe_seeds_last_frame():
@@ -355,7 +361,7 @@ def test_delivery_projects_once_per_variant_under_concurrent_access():
     ]
 
 
-def test_delivery_caches_true_and_false_variants_separately():
+def test_delivery_caches_true_and_false_variants_separately(monkeypatch):
     """A cache MISS for a valid `true` variant computes it.
 
     Only an INVALID privacy input normalizes to False, and that normalization
@@ -384,6 +390,23 @@ def test_delivery_caches_true_and_false_variants_separately():
     d.encoded((True, None, None, None), project)
     d.encoded((False, None, None, None), project)
     assert seen == [True, False]
+    bounded = dict(d.cache_stats())
+    assert bounded["entryCount"] == 2
+    assert bounded["estimatedBytes"] <= bounded["maxBytes"]
+
+    dashboard = ns["_cctally_dashboard"]
+    monkeypatch.setattr(dashboard, "_SSE_DELIVERY_MAX_BYTES", 1)
+    capped = ns["_SSEDelivery"](
+        snapshot=object(),
+        pinned_now_utc=dt.datetime.now(dt.timezone.utc),
+        pinned_monotonic=0.0,
+    )
+    first = capped.encoded((True, None, None, None), project)
+    second = capped.encoded((True, None, None, None), project)
+    assert second == first, "the cap changes reuse, never delivered bytes"
+    capped_stats = dict(capped.cache_stats())
+    assert capped_stats["entryCount"] == 0
+    assert capped_stats["fallbackCount"] == 2
 
 
 def test_canonical_oauth_key_separates_an_absent_config_from_an_empty_one():
@@ -425,6 +448,27 @@ def test_subscribe_seeds_a_fresh_delivery_not_the_stored_pin():
     assert seeded.snapshot is stored.snapshot
     assert seeded.pinned_monotonic > stored.pinned_monotonic
     assert seeded.pinned_now_utc >= stored.pinned_now_utc
+
+
+def test_subscriber_seed_deliveries_share_one_aggregate_frame_budget(monkeypatch):
+    """Reconnects cannot multiply the retained-frame cap per subscriber."""
+    ns = load_script()
+    dashboard = ns["_cctally_dashboard"]
+    monkeypatch.setattr(dashboard, "_SSE_DELIVERY_MAX_ENTRIES", 2)
+    hub = ns["SSEHub"]()
+    hub.publish(ns["_empty_dashboard_snapshot"]())
+
+    seeds = [hub.subscribe().get_nowait() for _ in range(6)]
+    for index, seed in enumerate(seeds):
+        seed.encoded(
+            (index, None, None, None),
+            lambda _key, index=index: f"frame-{index}".encode(),
+        )
+    stats = dict(hub.memory_stats())
+    assert stats["entryCount"] == 2
+    assert stats["maxEntries"] == 2
+    assert stats["evictionCount"] == 4
+    assert stats["estimatedBytes"] <= stats["maxBytes"]
 
 
 def test_publish_stores_a_delivery_and_latest_reads_it():
@@ -509,19 +553,16 @@ def _read_one_frame(response, deadline_s=3.0):
 
 
 def test_lagging_client_renders_only_the_newest_delivery():
-    """#583 S3 §5. The queue holds up to four deliveries and `publish` discards
-    only ONE oldest, so a slow client holds a backlog. Each delivery pins its
-    clock at publication, so replaying that backlog would render ages several
-    publish periods stale — a regression against projecting at consumption
-    time. The consumer drains to the newest instead.
-    """
+    """A stalled client retains one complete replacement, never four snapshots."""
     ns = load_script()
     hub = ns["SSEHub"]()
     q = hub.subscribe()          # `_last` is None here, so no seed frame
     for i in range(4):
         hub.publish(_Marker(i))
     first = q.get(timeout=PRESENCE_BACKSTOP_SECONDS)
-    assert first.snapshot.marker == 0, "precondition: the backlog starts stale"
+    assert first.snapshot.marker == 3, (
+        "latest-wins must happen at publication so a stalled subscriber owns "
+        "one delivery rather than a four-snapshot backlog")
     newest = ns["_drain_to_newest"](q, first)
     assert newest.snapshot.marker == 3
     # And the queue is empty afterwards: every stale delivery was discarded,
@@ -623,7 +664,11 @@ def test_shareable_delivery_caches_complete_frame_bytes_for_two_clients():
         delivery = hub.latest()
         received = [_read_one_frame(response).encode("utf-8")
                     for _, response in clients]
-        cached = list(delivery._cache.values())
+        cached = [
+            value
+            for (token, _variant), value in delivery._frame_cache._cache.items()
+            if token is delivery._cache_token
+        ]
         assert len(cached) == 1, cached
         assert isinstance(cached[0], bytes), type(cached[0])
         assert cached[0].startswith(b"event: update\ndata: {")

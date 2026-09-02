@@ -185,6 +185,38 @@ def test_npm_shim_reinstall_reconciles_duplicate_owned_handlers(runtime):
     assert hooks_path.read_bytes() == first_bytes
 
 
+@pytest.mark.parametrize("command,expected", [
+    ("/usr/local/bin/cctally hook-tick --foreground --source codex", True),
+    ("/opt/lib/node_modules/cctally/bin/cctally-npm-shim.js hook-tick "
+     "--foreground --source codex", True),
+    ("/usr/local/bin/not-cctally hook-tick --foreground --source codex", False),
+    ("/usr/local/bin/cctally hook-tick", False),
+])
+def test_dashboard_activity_trust_accepts_both_installed_entrypoint_names(
+    command, expected,
+):
+    import _lib_codex_hooks as hooks
+
+    assert hooks.is_dashboard_activity_codex_hook_command(command) is expected
+
+
+@pytest.mark.parametrize("handler,expected", [
+    ({"type": "command", "command":
+      "/usr/local/bin/cctally hook-tick --foreground --source codex"}, True),
+    ({"type": "prompt", "command":
+      "/usr/local/bin/cctally hook-tick --foreground --source codex"}, False),
+    ({"type": "command", "command":
+      "/bin/false /usr/local/bin/cctally hook-tick --foreground --source codex"},
+     False),
+])
+def test_dashboard_codex_trust_requires_an_executable_handler_shape(
+    handler, expected,
+):
+    import _lib_codex_hooks as hooks
+
+    assert hooks.is_dashboard_activity_codex_hook_handler(handler) is expected
+
+
 def test_codex_hook_write_uses_backup_atomic_permissions_and_status_json(runtime, capsys):
     ns, home = runtime
     binary = str(ns["_setup_resolve_hook_target"](ns["_setup_resolve_repo_root"]()))

@@ -789,6 +789,10 @@ def test_an_authoritative_pass_without_a_journal_clears_both_cursors(
     jr.append_record(_file_account(jl), now_utc=FIXED)
     jr.rehydrate_codex_journal_families(cache_conn)
     high_water = jr.journal_high_water()
+    revision_before_clear = int(cache_conn.execute(
+        "SELECT value FROM cache_meta "
+        "WHERE key='codex_window_attribution_revision'"
+    ).fetchone()[0])
     cache_conn.execute(
         "INSERT OR REPLACE INTO cache_meta(key, value) VALUES (?, ?)",
         (cache_mod.CODEX_FILE_ACCOUNT_CURSOR_KEY,
@@ -811,6 +815,14 @@ def test_an_authoritative_pass_without_a_journal_clears_both_cursors(
     assert cache_conn.execute(
         "SELECT COUNT(*) FROM codex_file_accounts").fetchone()[0] == 0
     assert _rows(cache_conn) == []
+    revision_after_clear = int(cache_conn.execute(
+        "SELECT value FROM cache_meta "
+        "WHERE key='codex_window_attribution_revision'"
+    ).fetchone()[0])
+    assert revision_after_clear > revision_before_clear, (
+        "an authoritative deletion-only convergence changes the quota "
+        "projection input and must invalidate the cross-build memo even when "
+        "there is no replacement assertion to bump the revision")
 
 
 def test_a_malformed_cursor_sorts_first_rather_than_raising(env):

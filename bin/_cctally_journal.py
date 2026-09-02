@@ -1295,6 +1295,32 @@ class IngestResult:
     # on a clean cycle. Authoritative callers never see this — their cycle
     # exception propagates.
     error: object = None
+    # #695: this cycle's meter_rate_change outcome, or None when no descriptor
+    # was passed. `deferred_alerts` alone is insufficient — with notifications
+    # off there is no payload, yet the identity was still decided and the
+    # caller must still mark the ledger.
+    meter_rate_change_result: object = None
+    deferred_alerts: list = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RateChangeRecordResult:
+    """What one `record_meter_rate_change` call did to one identity (#695).
+
+    THREE booleans, because the caller must tell three outcomes apart and a
+    single one cannot. `row_created` drives nothing on its own.
+    `notification_queued` says a payload is waiting in `deferred_alerts`.
+    `notification_decided` is the one the ledger keys on: it is true when this
+    call created the row, and when it took the owed branch and observed the
+    durable row — INCLUDING when notifications are off and nothing was
+    queued, because deciding not to notify is a decision. A duplicate or a
+    conflict decides nothing, or it would win the compare-and-set away from
+    the process that is actually going to dispatch.
+    """
+
+    row_created: bool = False
+    notification_queued: bool = False
+    notification_decided: bool = False
 
 
 @dataclass
@@ -1315,6 +1341,12 @@ class IngestContext:
     batch: list                     # decoded obs/op records this cycle
     config: object = None
     pending_alerts: list = field(default_factory=list)
+    # #695: the meter_rate_change family's post-commit payloads. Step 6 does
+    # NOT drain this — `_run_cycle` returns it, and `cmd_quota` dispatches only
+    # after winning the delivery ledger's compare-and-set. Invariant (iv) is
+    # unaffected: these payloads still originate in the live sink and step-4a
+    # replay still has no ctx to add to either list.
+    deferred_alerts: list = field(default_factory=list)
     events_emitted: int = 0
     # Design B (DB journal redesign §5.3 event+effects): the per-cycle
     # suppression map a reset/credit pipeline hook populates BEFORE it runs its
@@ -2811,7 +2843,18 @@ def rehydrate_codex_journal_families(
                 "DELETE FROM cache_meta WHERE key = ?",
                 (_cctally_cache.CODEX_FILE_ACCOUNT_CURSOR_KEY,))
         if authoritative and want_window_attributions:
+            before = cache_conn.total_changes
             cache_conn.execute("DELETE FROM codex_window_attributions")
+            window_rows_cleared = cache_conn.total_changes > before
+            if window_rows_cleared:
+                # The cross-build quota memo keys the semantic attribution
+                # revision, not the replay cursor.  With no replacement
+                # assertion, `_apply_window_attribution_records` has no chance
+                # to advance that revision, yet the authoritative empty result
+                # still changed the projection input.  Keep the invalidation in
+                # the same transaction as the deletion.
+                _cctally_cache.bump_codex_window_attribution_revision(
+                    cache_conn)
             # #500 review finding F10: the cursor describes a table that no
             # longer has any rows, so leaving it would let the NEXT delta pass
             # skip journal bytes on the strength of a claim this branch just
@@ -2820,11 +2863,14 @@ def rehydrate_codex_journal_families(
                 "DELETE FROM cache_meta WHERE key = ?",
                 (_cctally_cache.CODEX_WINDOW_ATTRIBUTION_CURSOR_KEY,))
         return CodexJournalRehydration(0, None, 0, 0, 0)
+    window_rows_cleared = False
     if authoritative:
         if want_file_accounts:
             cache_conn.execute("DELETE FROM codex_file_accounts")
         if want_window_attributions:
+            before = cache_conn.total_changes
             cache_conn.execute("DELETE FROM codex_window_attributions")
+            window_rows_cleared = cache_conn.total_changes > before
         # A clear-then-replay is only correct from the beginning of the journal.
         file_account_since = window_attribution_since = None
 
@@ -2858,6 +2904,7 @@ def rehydrate_codex_journal_families(
     segment_positions = {name: idx for idx, name in enumerate(segments)}
 
     applied = conflicts = attributed = skipped = 0
+    window_records_changed = False
     # Streamed, never materialized, for the reason above: this runs on the FIRST
     # ordinary sync of every cache.db while both cache flocks are held. The
     # cheap byte prefilters skip the JSON decode for every uninteresting line;
@@ -2892,6 +2939,14 @@ def rehydrate_codex_journal_families(
                 _apply_window_attribution_records(cache_conn, (rec,)))
             attributed += _asserted
             skipped += _skipped
+            window_records_changed = window_records_changed or bool(
+                _asserted or _retracted)
+    if window_rows_cleared and not window_records_changed:
+        # A replacement assertion/retraction advances the revision inside its
+        # applier.  The deletion-only authoritative outcome has no applier-side
+        # mutation, so advance it here instead.  This also covers a journal
+        # containing only malformed/skipped attribution records.
+        _cctally_cache.bump_codex_window_attribution_revision(cache_conn)
     if want_window_attributions and (
             authoritative or window_attribution_since != (str(hw[0]), int(hw[1]))):
         # Only when it actually moves. This runs on every ordinary Codex sync,
@@ -3307,18 +3362,29 @@ def _now_iso() -> str:
     )
 
 
-def _usage_snapshot_fold_decision(conn, payload) -> tuple[bool, object]:
+def _usage_snapshot_fold_decision(conn, payload) -> tuple[bool, object, str]:
     """The apply-time dedup for a Claude rate-limit obs — the exact predicate
     ported from `cmd_record_usage`'s insert guard (bin/_cctally_record.py), now
     at fold time (spec §4.5 / §5.3).
 
-    Returns `(skip, adjusted_five_hour_percent)`:
+    Returns `(skip, adjusted_five_hour_percent, reason)`:
       - reset-aware 7d HWM clamp (`_reset_aware_floor` + reset-aware MAX +
-        `hwm_clamp_applies`) → skip when a lower 7d % would be clamped;
+        `hwm_clamp_applies`) → skip when a lower 7d % would be clamped, with
+        reason `SNAPSHOT_SKIP_CLAMP`;
       - the 5h clamp adjusts `five_hour_percent` UP to the in-window MAX but
         never gates (mirrors the nested-else in the live code);
-      - dedup vs the latest snapshot in the week: both percents unchanged → skip.
-    """
+      - dedup vs the latest snapshot in the week: both percents unchanged → skip,
+        with reason `SNAPSHOT_SKIP_DEDUP`;
+      - otherwise accept, with reason `SNAPSHOT_ACCEPT`.
+
+    `reason` exists because the two skips mean OPPOSITE things about the
+    incoming observation and the stored row (see `_lib_record` Fragment 8): a
+    dedup skip AGREES with the stored row, so re-running the derivation
+    chokepoints against it heals a killed tick; a clamp skip CONTRADICTS it, so
+    deriving a weekly milestone from the higher stored value fabricates a
+    crossing. `_pipeline_claude_usage` gates the weekly milestone on it. The
+    reason is derived from the same `conn` state and payload as `skip` itself,
+    so it is exactly as replay-deterministic as the boolean it accompanies."""
     week_start_date = payload["week_start_date"]
     week_start_at = payload.get("week_start_at")
     week_end_at = payload.get("week_end_at")
@@ -3344,7 +3410,7 @@ def _usage_snapshot_fold_decision(conn, payload) -> tuple[bool, object]:
     ).fetchone()
     max_v = max_row[0] if max_row else None
     if _lib_record.hwm_clamp_applies(weekly_percent, max_v):
-        return True, five_hour_percent
+        return True, five_hour_percent, _lib_record.SNAPSHOT_SKIP_CLAMP
 
     adjusted_5h = five_hour_percent
     if five_hour_percent is not None and five_hour_window_key is not None:
@@ -3374,8 +3440,8 @@ def _usage_snapshot_fold_decision(conn, payload) -> tuple[bool, object]:
         if adjusted_5h is None or (
             last_5h is not None and float(last_5h) == float(adjusted_5h)
         ):
-            return True, adjusted_5h
-    return False, adjusted_5h
+            return True, adjusted_5h, _lib_record.SNAPSHOT_SKIP_DEDUP
+    return False, adjusted_5h, _lib_record.SNAPSHOT_ACCEPT
 
 
 # NOTE (rev 3): the direct obs -> weekly_usage_snapshots fold is GONE. That
@@ -4297,8 +4363,11 @@ def emit_model_a(ctx, *, kind, evt_id, table, columns, refs=None, at=None):
         decision = _classify_live_effective_event(ctx.conn, evt)
         if decision == CLASSIFY_CONFLICT:
             # No append, no metadata mutation — converge the row instead.
-            _record_dropped_conflict(ctx, evt)
-            _converge_row_from_effective(ctx.conn, evt_id, table=table)
+            selected = _record_dropped_conflict(ctx, evt)
+            _converge_and_report(
+                selected,
+                lambda: _converge_row_from_effective(
+                    ctx.conn, evt_id, table=table))
         else:
             # `new` AND `duplicate` both still append: crash-replay convergence
             # and two-bootstrap idempotency are built on that.
@@ -4386,10 +4455,11 @@ def _emit_harvest_row(ctx, spec, row):
 
     decision = _classify_live_effective_event(conn, evt)
     if decision == CLASSIFY_CONFLICT:
-        _record_dropped_conflict(ctx, evt)
-        _converge_row_from_effective(
-            conn, evt["id"], table=spec.table, rowid=row["id"]
-        )
+        selected = _record_dropped_conflict(ctx, evt)
+        _converge_and_report(
+            selected,
+            lambda: _converge_row_from_effective(
+                conn, evt["id"], table=spec.table, rowid=row["id"]))
         return evt
 
     append_record(evt)
@@ -4468,36 +4538,169 @@ PIPELINE.append(_pipeline_op_fold)
 
 
 def record_meter_rate_change(ctx, transition, *, notify: bool,
-                             created_at: str) -> bool:
+                             created_at: str,
+                             notification_owed: bool = False):
     """Steps 4 and 5 of spec §6.5, run INSIDE the cycle transaction.
 
     Journal-first (invariant i): the evt line is appended and fsync'd through
     the leaf `journal.lock` before the transaction containing its row commits,
-    exactly as `emit_model_a` does. The payload is a pure function of the
-    transition, so a crash-replayed duplicate line is byte-identical and folds
-    to a clean no-op.
+    exactly as `emit_model_a` does.
 
-    Returns whether THIS call created the row. A notification is queued only
-    then, and only when `notify` is true — §6.2 splits recording from
-    notifying, so the row exists from the first upgrade while the push follows
-    the existing default-off toggle. The queue is `ctx.pending_alerts`, which
-    step 6 drains AFTER the commit: committed-before-notify, and a crash
-    between the two loses at most one dispatch rather than recording an alert
-    that never happened.
+    TWO guards, and they catch inverse conditions (#689). The natural-key
+    recheck catches a committed physical latch whose effective metadata is not
+    yet populated. `_classify_live_effective_event` catches the inverse —
+    prior metadata with the row absent — and additionally tells an exact
+    duplicate apart from divergent same-revision content. Recovery re-offers
+    persisted pairs under a later command clock, and the payload includes that
+    clock, so without the classifier a retry would append a byte-different
+    line under an id the journal already holds. This was the only emit path in
+    this file that appended without classifying.
+
+    NEITHER the duplicate nor the conflict branch may rely on replay to
+    restore a missing row. `_preflight_live_events` omits a same-revision,
+    same-hash event from `to_apply`, and step 4a applies only what
+    `_record_live_effective_event` returns True for, which is NEW alone — so
+    the cursor advances past a duplicate and the row would stay absent.
+    `_converge_row_from_effective` cannot cover it either, because this
+    family's `_EVT_SPECS` entry has `table=None` and it returns
+    CONVERGE_DROPPED. So this function materializes its own row: from the
+    identical event on a duplicate, and from the PRIOR journaled event on a
+    conflict, never from the rejected candidate.
+
+    Returns a `RateChangeRecordResult`, not a boolean (#695). Three outcomes
+    have to be told apart: whether this call created the row, whether a
+    payload is waiting, and whether this call OWNS the dispatch decision for
+    this identity. `notification_decided` is the last of those, and the
+    caller's delivery ledger keys on it.
+
+    A notification is queued when this call created the row and `notify` is
+    true — §6.2 splits recording from notifying, so the row exists from the
+    first upgrade while the push follows the existing default-off toggle.
+
+    #695 CORRECTS this docstring's former claim that "existing effective
+    metadata proves this identity was journaled once and so already had its
+    notification". It does not. Step-4a replay of an orphan line — appended by
+    a cycle that then rolled back — creates the row with no `IngestContext`,
+    so invariant (iv) makes that replay structurally unable to queue anything.
+    The row exists and nobody was told. So an existing row now takes the owed
+    branch when, and only when, `notification_owed` says the live command's
+    delivery ledger holds no decision for this identity; the payload is then
+    rebuilt from the DURABLE ROW, which is what was actually recorded. An
+    ordinary duplicate and every conflict branch stay silent, because
+    re-notifying without that explicit intent would refire history.
+
+    The queue is `ctx.deferred_alerts`, which step 6 does NOT drain: this
+    family's dispatch is returned to `cmd_quota`, which fires it only after
+    winning the ledger's compare-and-set. Invariant (iv) is untouched — the
+    payload still originates in the live sink, post-commit, and replay still
+    has no ctx to add to either list.
     """
     mrc = _load_meter_rate_change()
+    existing = ctx.conn.execute(
+        "SELECT provider, account_key, effective_from,"
+        " previous_units_per_point, new_units_per_point, severity "
+        "FROM meter_rate_change_events "
+        "WHERE provider = ? AND account_key = ? AND effective_from = ? "
+        "LIMIT 1", transition.identity()).fetchone()
+    if existing is not None:
+        # #695. A row can reach this table with NO notification: step-4a
+        # replay of an orphan line creates it, and replay has no ctx to queue
+        # anything. So an existing row no longer proves a notification
+        # happened, and `notification_owed` is the live command's assertion
+        # that its delivery ledger holds no decision for this identity.
+        # Without that flag this stays silent, because an ordinary duplicate
+        # must not re-fire.
+        if not notification_owed:
+            return RateChangeRecordResult()
+        if not notify:
+            return RateChangeRecordResult(notification_decided=True)
+        # Rebuilt from the ROW rather than from the caller's descriptor: the
+        # sweep knows only the identity, so its descriptor carries placeholder
+        # rates and severity. `withholding_status` stays at its `None`
+        # default, because it describes the analysis that originally admitted
+        # the transition and a later run's analysis is not that one.
+        ctx.deferred_alerts.append(mrc.alert_payload(
+            mrc.RateChangeTransition(
+                provider=str(existing[0]),
+                account_key=str(existing[1]),
+                effective_from=str(existing[2]),
+                previous_units_per_point=float(existing[3]),
+                new_units_per_point=float(existing[4]),
+                severity=str(existing[5]),
+                detected_at=str(transition.detected_at))))
+        return RateChangeRecordResult(notification_queued=True,
+                                      notification_decided=True)
+    if notification_owed:
+        # #695. The owed sweep offers an IDENTITY whose durable row it read a
+        # moment ago, so its descriptor carries placeholder zero rates and an
+        # `info` severity that are never meant to be published. Reaching here
+        # means the row is gone — there is nothing to re-notify, and the
+        # placeholder must not be journaled as a real zero-rate change. This
+        # is what ENFORCES the claim `_owed_rate_change_transitions` makes;
+        # without it the prose asserts an invariant the code does not hold.
+        return RateChangeRecordResult()
     payload = mrc.event_payload(transition, created_at=created_at)
     eid = _lib_journal.evt_id(
         mrc.EVT_ID_PREFIX, transition.provider, transition.account_key,
         transition.effective_from)
     evt = _lib_journal.make_evt(
         kind=mrc.EVT_KIND, id=eid, at=created_at, payload=payload)
-    append_record(evt)
-    ctx.events_emitted += 1
-    created = _insert_meter_rate_change(ctx.conn, evt)
-    if created and notify:
-        ctx.pending_alerts.append(mrc.alert_payload(transition))
-    return created
+    decision = _classify_live_effective_event(ctx.conn, evt)
+    if decision == CLASSIFY_NEW:
+        append_record(evt)
+        ctx.events_emitted += 1
+        _record_new_effective_event(ctx.conn, evt)
+        created = _insert_meter_rate_change(ctx.conn, evt)
+        if created and notify:
+            ctx.deferred_alerts.append(mrc.alert_payload(transition))
+        return RateChangeRecordResult(
+            row_created=created,
+            notification_queued=bool(created and notify),
+            notification_decided=created)
+    if decision == CLASSIFY_CONFLICT:
+        selected = _record_dropped_conflict(ctx, evt)
+        _converge_and_report(
+            selected, lambda: _converge_meter_rate_change_row(ctx.conn, eid))
+        return RateChangeRecordResult()
+    _insert_meter_rate_change(ctx.conn, evt)
+    return RateChangeRecordResult()
+
+
+def _converge_meter_rate_change_row(conn, event_id) -> str:
+    """Materialize the withheld row from the PRIOR journaled event (#689).
+
+    The outcome is the INSERT's own answer, never an assumption that calling
+    it worked. `_insert_meter_rate_change` returns False for a payload
+    `_meter_rate_change_row` cannot normalise — a missing `provider` or
+    `effective_from`, or a non-numeric rate — and reporting
+    `CONVERGE_APPLIED` there would print a line claiming a convergence that
+    inserted nothing, which is exactly what acceptance 6 forbids. A False
+    return here cannot mean "a row already existed": the natural-key recheck
+    at the top of `record_meter_rate_change` ran inside this same transaction
+    and found none.
+    """
+    prior = _prior_meter_rate_change_event(conn, event_id)
+    if prior is None:
+        return CONVERGE_DROPPED
+    return (CONVERGE_APPLIED if _insert_meter_rate_change(conn, prior)
+            else CONVERGE_DROPPED)
+
+
+def _prior_meter_rate_change_event(conn, event_id):
+    """The prior effective event to materialize a withheld row from, or None.
+
+    A TOMBSTONED selection stores `event_json` as NULL and
+    `_effective_event_for_convergence` fails closed and raises on it. Here a
+    tombstone is a terminal negative latch rather than an error: a completed
+    correction saying this identity should have no row must not be undone by
+    materializing one.
+    """
+    row = conn.execute(
+        "SELECT status FROM journal_effective_events WHERE event_id = ?",
+        (event_id,)).fetchone()
+    if row is None or str(row[0]) != "active":
+        return None
+    return _effective_event_for_convergence(conn, event_id)
 
 
 def _load_meter_rate_change():
@@ -5268,9 +5471,16 @@ def _record_live_effective_event(conn, evt) -> bool:
     return False
 
 
-def _record_dropped_conflict(ctx, evt) -> None:
-    """Count + report one withheld emission (spec §8: a one-line stderr note per
-    dropped emission, and a count on the cycle summary)."""
+def _record_dropped_conflict(ctx, evt):
+    """Count one withheld emission and RETURN its selection, so the caller can
+    render the outcome once convergence has resolved (#689).
+
+    Spec §8 asks for a one-line stderr note per dropped emission and a count on
+    the cycle summary. Recording is separated from rendering because the
+    wording depends on whether a row was actually converged, and for a
+    `table=None` family nothing is. Doing both after convergence would lose the
+    `DroppedConflict` too when convergence raises, not merely the stderr line.
+    """
     selected = _lib_journal.resolve_effective_events([evt]).by_id[evt["id"]]
     ctx.conflicts_dropped.append(
         DroppedConflict(
@@ -5279,11 +5489,40 @@ def _record_dropped_conflict(ctx, evt) -> None:
             rejected_hash=selected.content_hash,
         )
     )
+    return selected
+
+
+def _report_dropped_conflict(selected, outcome) -> None:
+    """Spec §8's one-line stderr note, worded from what convergence did.
+
+    An unrecognised outcome takes the DROPPED wording, because the direction
+    of mistake that matters is claiming a convergence that did not happen.
+    """
+    tail = _CONVERGE_OUTCOME_WORDING.get(
+        outcome, _CONVERGE_OUTCOME_WORDING[CONVERGE_DROPPED])
     print(
         f"[journal] withheld a divergent emission for {selected.event_id} "
-        f"rev {selected.rev}; converged the row from the journaled event",
+        f"rev {selected.rev}; {tail}",
         file=sys.stderr,
     )
+
+
+def _converge_and_report(selected, converge):
+    """Run one convergence and render §8's line WHATEVER it does (#689).
+
+    The line is in a `finally`, so a convergence that fails closed still
+    leaves the diagnostic behind. Before the record/report split it did,
+    because the whole call ran ahead of convergence; the split moved the
+    rendering after the outcome was known and would otherwise have dropped
+    the line on exactly the path that most needs one. The exception is not
+    caught — it propagates through the `finally` unchanged.
+    """
+    outcome = CONVERGE_RAISED
+    try:
+        outcome = converge()
+    finally:
+        _report_dropped_conflict(selected, outcome)
+    return outcome
 
 
 def _effective_event_for_convergence(conn, event_id) -> dict:
@@ -5355,6 +5594,18 @@ def _evt_target_columns(conn, evt, spec) -> tuple:
 
 CONVERGE_DROPPED = "dropped"
 CONVERGE_APPLIED = "converged"
+#: Convergence raised rather than returning an outcome. Only `_converge_and_
+#: report`'s `finally` produces it, and the exception still propagates.
+CONVERGE_RAISED = "raised"
+
+#: §8's stderr tail per outcome. The APPLIED and DROPPED wordings are frozen —
+#: `tests/test_meter_rate_change_journal.py` asserts both verbatim.
+_CONVERGE_OUTCOME_WORDING: dict = {
+    CONVERGE_APPLIED: "converged the row from the journaled event",
+    CONVERGE_DROPPED: "the journaled event stands and there was no row to "
+                      "converge",
+    CONVERGE_RAISED: "convergence failed and the row was left unchanged",
+}
 
 
 def _converge_row_from_effective(conn, event_id, *, table=None, rowid=None) -> str:
@@ -6282,6 +6533,9 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
     # the next cycle's step 4a.
     ctx = IngestContext(conn=conn, batch=batch,
                         config=(_load_config_once() if batch else None))
+    # #695: None unless step 4b''' runs, so a cycle with no `meter_rate_change`
+    # descriptor reports exactly what it did before this change.
+    rate_change_result = None
     conn.execute("BEGIN IMMEDIATE")
     try:
         # 4a. Replay journal evt lines (a prior cycle's emission that landed past
@@ -6323,14 +6577,16 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
         # already decided under the calibration file's leaf lock and released
         # before any stats lock was taken (step 2), is journaled and applied
         # here — inside this transaction, journal-first, with its notification
-        # queued to `ctx.pending_alerts` for the post-commit dispatch below.
+        # queued to `ctx.deferred_alerts` for the CALLER to dispatch (#695).
         # It sits beside the Codex leg rather than in the pipeline because its
         # trigger is a persistence transition rather than a journal record.
         if meter_rate_change is not None:
-            record_meter_rate_change(
+            rate_change_result = record_meter_rate_change(
                 ctx, meter_rate_change["transition"],
                 notify=bool(meter_rate_change.get("notify")),
-                created_at=str(meter_rate_change["created_at"]))
+                created_at=str(meter_rate_change["created_at"]),
+                notification_owed=bool(
+                    meter_rate_change.get("notification_owed")))
         # 4c. Journal + stamp the natural-keyed rows the pipeline inserted.
         # Early-out (Task 6 gate P2): the ONLY source of `journal_id IS NULL`
         # rows is a Task-5 chokepoint called from a step-4b pipeline hook —
@@ -6397,7 +6653,9 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
     return IngestResult(ran=True, consumed=len(records), malformed=malformed,
                         events_emitted=ctx.events_emitted, alerts=alerts,
                         conflicts_dropped=(len(ctx.conflicts_dropped)
-                                           + len(preflight_conflicts)))
+                                           + len(preflight_conflicts)),
+                        meter_rate_change_result=rate_change_result,
+                        deferred_alerts=list(ctx.deferred_alerts))
 
 
 def _run_stats_ingest_once(

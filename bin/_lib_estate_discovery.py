@@ -1193,7 +1193,8 @@ def collect_frontend_tests(root, runtime_dir=None) -> list:
                 f"installed at {path}; run `npm ci` in dashboard/web"
             )
     vitest_result = _run_frontend(
-        [str(binaries["vitest"]), "list", "--json"], web, runtime_dir=runtime_dir,
+        [str(binaries["vitest"]), "list", "--json", "--pool=threads"],
+        web, runtime_dir=runtime_dir,
     )
     if vitest_result.returncode != 0:
         raise _frontend_failure(vitest_result, "vitest")

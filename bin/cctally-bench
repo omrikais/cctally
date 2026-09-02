@@ -8,9 +8,9 @@ the committed advisory baseline. A dev / maintainer tool (like
 and is never wired into ``cctally-test-all`` (the self-test
 ``bin/cctally-bench-test`` is; it asserts structure only, never timings).
 
-Six benchmark families (15 benchmarks) exercise the #268-#275 perf wins:
+Six benchmark families (16 benchmarks) exercise the #268-#275 and #680 perf wins:
   1. snapshot spine  — _tui_build_snapshot cold / warm / idle (precompute_envelope)
-  2. ingest          — sync_cache no-op over many files + a one-file delta
+  2. ingest          — caught-up frontier + sync_cache no-op / one-file delta
   3. conversations   — list_conversations page1 / sorted / filtered
   4. search / find   — search_conversations cross-session + find_in_conversation
   5. payload/outline — _assemble_session + get_conversation_outline (measure-only)
@@ -186,6 +186,9 @@ def _make_benchmarks(cctally, perf, now_utc=None):
         "ORDER BY size_bytes ASC, path LIMIT 1"
     )
     num_files = _scalar("SELECT COUNT(*) FROM cache_db.session_files") or 0
+    num_codex_files = _scalar(
+        "SELECT COUNT(*) FROM cache_db.codex_session_files"
+    ) or 0
 
     # ── family 1: snapshot spine ──
     def _snapshot():
@@ -219,6 +222,60 @@ def _make_benchmarks(cctally, perf, now_utc=None):
         return _snapshot()              # unchanged signature → reuse (near-zero)
 
     # ── family 2: ingest ──
+    frontier_mod = cctally._load_sibling("_lib_ingest_frontier")
+    frontier = frontier_mod.DashboardIngestFrontier(
+        cctally._cctally_core.APP_DIR)
+    claude_roots = tuple(cctally._cctally_core._resolve_claude_projects_dirs())
+    codex_roots = tuple(
+        root / "sessions" for root in cctally._codex_home_roots()
+    )
+    claude_guards = (cctally._cctally_core.CLAUDE_SETTINGS_PATH,)
+    codex_hooks = cctally._load_sibling("_lib_codex_hooks")
+    codex_guards = tuple(
+        root.hooks_path
+        for root in codex_hooks.codex_hook_roots(cctally._codex_home_roots())
+    )
+    seed_conn = cctally.open_cache_db()
+    try:
+        cutoff = frontier.capture_cutoff()
+        for provider, roots, guards in (
+            ("claude", claude_roots, claude_guards),
+            ("codex", codex_roots, codex_guards),
+        ):
+            if not frontier.seed_provider(
+                provider, seed_conn, roots=roots, guard_paths=guards,
+                trusted=True, cutoff=cutoff,
+            ):
+                raise RuntimeError(
+                    f"benchmark frontier could not seed {provider}: "
+                    f"{frontier.last_seed_failure.get(provider, 'unknown')}"
+                )
+    finally:
+        seed_conn.close()
+
+    def frontier_caught_up():
+        """Run the exact O(roots) validation used before an idle provider skip."""
+        conn = cctally.open_cache_db()
+        try:
+            plans = (
+                frontier.plan_provider(
+                    "claude", conn, roots=claude_roots,
+                    guard_paths=claude_guards,
+                ),
+                frontier.plan_provider(
+                    "codex", conn, roots=codex_roots,
+                    guard_paths=codex_guards,
+                ),
+            )
+        finally:
+            conn.close()
+        if any(plan.mode != "caught_up" for plan in plans):
+            raise RuntimeError(
+                "benchmark frontier stopped being caught up: "
+                + ", ".join(f"{plan.provider}={plan.reason}" for plan in plans)
+            )
+        return plans
+
     def sync_noop():
         conn = cctally.open_cache_db()
         try:
@@ -341,6 +398,8 @@ def _make_benchmarks(cctally, perf, now_utc=None):
         ("snapshot.cold", snapshot_cold, True, None),
         ("snapshot.warm", snapshot_warm, True, None),
         ("snapshot.idle", snapshot_idle, True, None),
+        ("frontier.caught_up", frontier_caught_up, False,
+         lambda _r: num_files + num_codex_files),
         ("sync.noop", sync_noop, False, lambda r: num_files),
         ("sync.delta", sync_delta, False, lambda r: 1 if delta_path else 0),
         ("conversations.page1", conv_page1, False, _len_conversations),
@@ -502,10 +561,14 @@ def run_assembly_scan(*, ladder_scale="small", iterations=DEFAULT_ITERATIONS,
     ``CCTALLY_DATA_DIR`` + ``CLAUDE_CONFIG_DIR`` (the B/M3 dual-env isolation).
 
     Per rung it records deterministic counts + payload bytes (goldenable) and
-    median-of-N wall-clock timings (advisory — the repeated-reassembly paths
-    ``detail_*``/``outline``/``find_hit``/``open_pair`` that drive the
-    materialization decision, since pagination caps payload bytes but NOT
-    assembly cost). Structural columns are stable run-to-run; timings are not.
+    median-of-N wall-clock timings. The legacy ``open_pair_ms`` key is a backend
+    detail-plus-existence-preflight probe; it does not claim HTTP or browser
+    latency. ``hydrated_open_pair_ms`` includes exact-outline construction. The
+    legacy ``invalidation_ms`` key is a synthetic render-revision cache miss;
+    the production-shaped source-append → activity ticket → targeted sync →
+    query-visible measurement is reported separately as
+    ``append_to_query_visible_ms``. Structural columns are stable run-to-run;
+    timings are advisory.
     """
     gen = _load_gen()
     scale = "assembly" if ladder_scale == "large" else "assembly-small"
@@ -545,6 +608,7 @@ def run_assembly_scan(*, ladder_scale="small", iterations=DEFAULT_ITERATIONS,
             turn_of = {}
 
         rungs = []
+        append_target = None
         for sid in sids:
             msg_count = conn.execute(
                 "SELECT msg_count FROM conversation_sessions WHERE session_id=?",
@@ -573,6 +637,36 @@ def run_assembly_scan(*, ladder_scale="small", iterations=DEFAULT_ITERATIONS,
                     cq.get_conversation(conn, sid, tail=True, limit=L)).encode())
             outline_bytes = len(json.dumps(
                 cq.get_conversation_outline(conn, sid)).encode())
+            outline_ticket_bytes = len(json.dumps({
+                "progressive": 1,
+                "transfer": {
+                    "token": "x" * 32,
+                    "chunk_size": 192 * 1024,
+                },
+            }).encode())
+
+            def _initial_open(s=sid):
+                cq._assemble_memo_clear()
+                result = cq.get_conversation(conn, s, tail=True, limit=200)
+                conn.execute(
+                    "SELECT 1 FROM conversation_messages "
+                    "WHERE session_id=? LIMIT 1", (s,),
+                ).fetchone()
+                return result
+
+            def _hydrated_open(s=sid):
+                cq._assemble_memo_clear()
+                detail = cq.get_conversation(conn, s, tail=True, limit=200)
+                outline = cq.get_conversation_outline(conn, s)
+                return detail, outline
+
+            def _invalidated_open(s=sid):
+                conn.execute(
+                    "UPDATE conversation_sessions "
+                    "SET render_revision=render_revision+1 WHERE session_id=?",
+                    (s,),
+                )
+                return cq.get_conversation(conn, s, tail=True, limit=200)
 
             # Advisory timings (median-of-N, warmup discarded). Bind sid per
             # loop via a default arg so the lambda captures THIS rung.
@@ -588,7 +682,9 @@ def run_assembly_scan(*, ladder_scale="small", iterations=DEFAULT_ITERATIONS,
                 lambda s=sid: cq.get_conversation_outline(conn, s), iterations)
             find_hit_ms = _time_median(
                 lambda s=sid: cq.find_in_conversation(conn, s, token), iterations)
-            open_pair_ms = detail_tail_ms + outline_ms
+            open_pair_ms = _time_median(_initial_open, iterations)
+            hydrated_open_pair_ms = _time_median(_hydrated_open, iterations)
+            invalidation_ms = _time_median(_invalidated_open, iterations)
 
             rungs.append({
                 "turn_count": turn_of.get(sid),
@@ -600,14 +696,145 @@ def run_assembly_scan(*, ladder_scale="small", iterations=DEFAULT_ITERATIONS,
                 "outline_ms": round(outline_ms, 4),
                 "find_hit_ms": round(find_hit_ms, 4),
                 "open_pair_ms": round(open_pair_ms, 4),
+                "hydrated_open_pair_ms": round(hydrated_open_pair_ms, 4),
+                "invalidation_ms": round(invalidation_ms, 4),
                 "assembled_items_bytes": assembled_items_bytes,
                 "page_bytes_200": page_bytes[200],
                 "page_bytes_500": page_bytes[500],
                 "page_bytes_1000": page_bytes[1000],
                 "outline_bytes": outline_bytes,
+                "initial_pair_bytes": page_bytes[200] + outline_ticket_bytes,
+                "hydrated_pair_bytes": page_bytes[200] + outline_bytes,
             })
+        append_target = conn.execute(
+            "SELECT s.session_id,m.source_path,m.uuid,m.cwd,m.git_branch "
+            "FROM conversation_sessions s "
+            "JOIN conversation_messages m ON m.session_id=s.session_id "
+            "WHERE m.source_path LIKE '/%' "
+            "ORDER BY s.msg_count DESC,m.byte_offset DESC LIMIT 1"
+        ).fetchone()
     finally:
         conn.close()
+
+    # Exercise the exact dashboard transcript pass after the ladder reads. The
+    # first pass advances/certifies the independent transcript frontier; every
+    # timed pass must then be a caught-up O(roots) validation with zero files.
+    dashboard = cctally._load_sibling("_cctally_dashboard")
+    first_sync = dashboard._conversation_sync_pass()
+    if first_sync != "ok":
+        raise RuntimeError(
+            f"conversation frontier bootstrap failed: {first_sync}")
+    conversation_sync_caught_up_ms = _time_median(
+        dashboard._conversation_sync_pass, iterations)
+    final_sync = dashboard._conversation_sync_pass()
+    sync_modes = dict(getattr(final_sync, "modes", {}))
+    sync_files = dict(getattr(final_sync, "files", {}))
+    if (final_sync != "ok"
+            or sync_modes != {"claude": "caught_up", "codex": "caught_up"}
+            or sync_files != {"claude": 0, "codex": 0}):
+        raise RuntimeError(
+            "conversation frontier did not stay caught up: "
+            f"status={final_sync} modes={sync_modes} files={sync_files}")
+
+    if append_target is None:
+        raise RuntimeError("assembly corpus has no appendable Claude source")
+    append_sid, append_path, parent_uuid, append_cwd, append_branch = append_target
+    append_path = pathlib.Path(append_path)
+    append_stat = append_path.stat()
+    append_size = append_stat.st_size
+    append_uuid = f"{append_sid}-bench-source-append"
+    append_marker = f"bench-source-append-{append_sid}"
+    append_record = {
+        "type": "user",
+        "uuid": append_uuid,
+        "parentUuid": parent_uuid,
+        "sessionId": append_sid,
+        "timestamp": gen._iso(50_000),
+        "cwd": append_cwd,
+        "gitBranch": append_branch,
+        "message": {"role": "user", "content": append_marker},
+    }
+    append_wall_start = time.perf_counter_ns()
+    append_cpu_start = time.process_time_ns()
+    frontier = cctally._load_sibling("_lib_ingest_frontier")
+    try:
+        with append_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(append_record) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        if not frontier.record_activity(
+            pathlib.Path(data_dir), "claude", str(append_path)
+        ):
+            raise RuntimeError("could not record benchmark Claude activity")
+        append_sync = dashboard._conversation_sync_pass()
+        append_modes = dict(getattr(append_sync, "modes", {}))
+        append_files = dict(getattr(append_sync, "files", {}))
+        if (append_sync != "ok"
+                or append_modes != {"claude": "targeted", "codex": "caught_up"}
+                or append_files != {"claude": 1, "codex": 0}):
+            raise RuntimeError(
+                "source append did not take the targeted transcript path: "
+                f"status={append_sync} modes={append_modes} files={append_files}")
+        visible_conn = cctally.open_conversations_db()
+        try:
+            visible = cq.find_in_conversation(
+                visible_conn, append_sid, append_marker)
+            if visible is None or int(visible.get("total", 0) or 0) != 1:
+                raise RuntimeError("source append was not query-visible")
+        finally:
+            visible_conn.close()
+        append_visible_ns = time.perf_counter_ns() - append_wall_start
+        append_cpu_ns = time.process_time_ns() - append_cpu_start
+    finally:
+        with append_path.open("r+b") as fh:
+            fh.truncate(append_size)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.utime(
+            append_path,
+            ns=(append_stat.st_atime_ns, append_stat.st_mtime_ns),
+        )
+        cleanup_conn = cctally.open_conversations_db()
+        try:
+            cleanup_conn.execute(
+                "DELETE FROM conversation_file_touches WHERE message_id IN "
+                "(SELECT id FROM conversation_messages "
+                "WHERE source_path=? AND uuid=?)",
+                (str(append_path), append_uuid),
+            )
+            cleanup_conn.execute(
+                "DELETE FROM conversation_messages WHERE source_path=? AND uuid=?",
+                (str(append_path), append_uuid),
+            )
+            cleanup_conn.execute(
+                "UPDATE conversation_source_files SET size_bytes=?,mtime_ns=?,"
+                "last_byte_offset=? WHERE path=?",
+                (append_size, append_stat.st_mtime_ns, append_size, str(append_path)),
+            )
+            cache_mod = cctally._load_sibling("_cctally_cache")
+            cache_mod._recompute_conversation_sessions(
+                cleanup_conn, {append_sid})
+            cleanup_conn.commit()
+        finally:
+            cleanup_conn.close()
+        cleanup_sync = dashboard._conversation_sync_pass()
+        cleanup_caught_up = dashboard._conversation_sync_pass()
+        if cleanup_sync != "ok" or cleanup_caught_up != "ok":
+            raise RuntimeError("could not restore benchmark append probe")
+        if dict(getattr(cleanup_caught_up, "modes", {})) != {
+            "claude": "caught_up", "codex": "caught_up"
+        }:
+            raise RuntimeError("benchmark append cleanup did not recertify")
+        cq._assemble_memo_clear()
+        restored_conn = cctally.open_conversations_db()
+        try:
+            restored = cq.find_in_conversation(
+                restored_conn, append_sid, append_marker)
+            if restored is not None and int(restored.get("total", 0) or 0):
+                raise RuntimeError("benchmark append cleanup left visible rows")
+        finally:
+            restored_conn.close()
+    conversation_store = pathlib.Path(data_dir) / "conversations.db"
 
     return {
         "schemaVersion": SCHEMA_VERSION,
@@ -615,6 +842,29 @@ def run_assembly_scan(*, ladder_scale="small", iterations=DEFAULT_ITERATIONS,
         "machine_label": _machine_label(),
         "ladder_scale": ladder_scale,
         "visible_ms": ASSEMBLY_VISIBLE_MS,
+        "conversation_store_bytes": conversation_store.stat().st_size,
+        "conversation_sync_caught_up_ms": round(
+            conversation_sync_caught_up_ms, 4),
+        "conversation_sync_modes": sync_modes,
+        "conversation_sync_files": sync_files,
+        "metric_semantics": {
+            "open_pair_ms": (
+                "Backend detail plus indexed existence preflight; excludes "
+                "HTTP, ticket serialization, transfer, and browser work."
+            ),
+            "invalidation_ms": (
+                "Synthetic render-revision cache miss; excludes source append, "
+                "transcript sync, and browser work."
+            ),
+            "append_to_query_visible_ms": (
+                "Source append through activity ticket and targeted transcript "
+                "sync until the appended message is query-visible."
+            ),
+        },
+        "append_to_query_visible_ms": round(append_visible_ns / 1e6, 4),
+        "append_sync_cpu_ms": round(append_cpu_ns / 1e6, 4),
+        "append_sync_modes": append_modes,
+        "append_sync_files": append_files,
         "dataset_counts": dcounts,
         "rungs": rungs,
     }
@@ -630,12 +880,16 @@ def render_assembly_table(result) -> str:
     )
     lines.append(
         f"dataset: {dc['sessions']:,} sessions · {dc['entries']:,} entries · "
-        f"{dc['messages']:,} messages"
+        f"{dc['messages']:,} messages · store "
+        f"{result['conversation_store_bytes']:,} bytes · caught-up sync "
+        f"{_fmt_ms(result['conversation_sync_caught_up_ms'])} · append→query "
+        f"{_fmt_ms(result['append_to_query_visible_ms'])}"
     )
-    lines.append("─" * 96)
+    lines.append("─" * 124)
     lines.append(
         f"{'turns':>7}{'msgs':>8}{'items':>7}{'assemble':>10}{'outline':>9}"
-        f"{'find':>9}{'open_pair':>11}{'items_b':>10}{'page1k_b':>10}"
+        f"{'find':>9}{'open_pair':>11}{'hydrated':>11}{'invalid':>10}"
+        f"{'initial_b':>11}{'hydrated_b':>12}"
     )
     for r in result["rungs"]:
         tc = "—" if r["turn_count"] is None else f"{r['turn_count']:,}"
@@ -643,7 +897,9 @@ def render_assembly_table(result) -> str:
             f"{tc:>7}{r['msg_count']:>8,}{r['item_count']:>7,}"
             f"{_fmt_ms(r['assemble_ms']):>10}{_fmt_ms(r['outline_ms']):>9}"
             f"{_fmt_ms(r['find_hit_ms']):>9}{_fmt_ms(r['open_pair_ms']):>11}"
-            f"{r['assembled_items_bytes']:>10,}{r['page_bytes_1000']:>10,}"
+            f"{_fmt_ms(r['hydrated_open_pair_ms']):>11}"
+            f"{_fmt_ms(r['invalidation_ms']):>10}"
+            f"{r['initial_pair_bytes']:>11,}{r['hydrated_pair_bytes']:>12,}"
         )
     return "\n".join(lines)
 

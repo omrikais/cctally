@@ -111,11 +111,12 @@ def test_fold_decision_accept_on_empty_week(ns):
     jr = _jr()
     conn = ns["open_db"]()
     try:
-        skip, adj = jr._usage_snapshot_fold_decision(conn, _payload(10.0))
+        skip, adj, reason = jr._usage_snapshot_fold_decision(conn, _payload(10.0))
     finally:
         conn.close()
     assert skip is False
     assert adj is None
+    assert reason == "accept"
 
 
 def test_fold_decision_clamp_skip_7d(ns):
@@ -128,10 +129,11 @@ def test_fold_decision_clamp_skip_7d(ns):
             conn, captured_at_utc="2026-01-04T08:00:00Z",
             week_start_date="2026-01-01", weekly_percent=50.0,
         )
-        skip, adj = jr._usage_snapshot_fold_decision(conn, _payload(40.0))
+        skip, adj, reason = jr._usage_snapshot_fold_decision(conn, _payload(40.0))
     finally:
         conn.close()
     assert skip is True
+    assert reason == "clamp"
 
 
 def test_fold_decision_5h_adjusts_up_never_gates(ns):
@@ -146,13 +148,14 @@ def test_fold_decision_5h_adjusts_up_never_gates(ns):
             week_start_date="2026-01-01", weekly_percent=10.0,
             five_hour_percent=20.0, five_hour_window_key=7770,
         )
-        skip, adj = jr._usage_snapshot_fold_decision(
+        skip, adj, reason = jr._usage_snapshot_fold_decision(
             conn, _payload(15.0, five_hour_percent=5.0, five_hour_window_key=7770)
         )
     finally:
         conn.close()
     assert skip is False
     assert adj == 20.0
+    assert reason == "accept"
 
 
 def test_fold_decision_dedup_skip(ns):
@@ -165,13 +168,14 @@ def test_fold_decision_dedup_skip(ns):
             week_start_date="2026-01-01", weekly_percent=30.0,
             five_hour_percent=8.0, five_hour_window_key=7771,
         )
-        skip, adj = jr._usage_snapshot_fold_decision(
+        skip, adj, reason = jr._usage_snapshot_fold_decision(
             conn, _payload(30.0, five_hour_percent=8.0, five_hour_window_key=7771)
         )
     finally:
         conn.close()
     assert skip is True
     assert adj == 8.0
+    assert reason == "dedup"
 
 
 # ==========================================================================

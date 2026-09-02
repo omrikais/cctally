@@ -71,6 +71,32 @@ def is_owned_codex_hook_command(command: object, binary: str) -> bool:
     )
 
 
+def is_dashboard_activity_codex_hook_command(command: object) -> bool:
+    """Whether a supported installed entrypoint emits the activity ticket.
+
+    Unlike setup ownership this is independent of today's executing package
+    layout: a dev checkout can audit hooks written by an npm installation, and
+    both entrypoints execute the same ``hook-tick`` parser after an upgrade.
+    """
+    tokens = _command_tokens(command)
+    return bool(
+        tokens
+        and len(tokens) == 5
+        and pathlib.Path(tokens[0]).is_absolute()
+        and pathlib.Path(tokens[0]).name in {"cctally", "cctally-npm-shim.js"}
+        and tokens[1:] == ["hook-tick", "--foreground", "--source", "codex"]
+    )
+
+
+def is_dashboard_activity_codex_hook_handler(handler: object) -> bool:
+    """Require the executable handler type as well as the exact command."""
+    return bool(
+        isinstance(handler, dict)
+        and handler.get("type") == "command"
+        and is_dashboard_activity_codex_hook_command(handler.get("command"))
+    )
+
+
 def _validate_document(document: object) -> dict:
     if not isinstance(document, dict):
         raise CodexHooksError("hooks.json must be a JSON object")

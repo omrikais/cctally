@@ -253,6 +253,7 @@ type ConversationReaderProps = {
   sessionId?: string;
   mobileBack?: boolean;
   outline?: ConversationOutline | null;
+  outlineLoading?: boolean;
   growthNonce?: number;
   live?: boolean;
 };
@@ -304,7 +305,7 @@ export function ProviderThreadNav({ detail, conversationRef }: { detail: Convers
   );
 }
 
-export function ConversationReader({ conversationRef: qualifiedRef, sessionId: legacySessionId, mobileBack, outline, growthNonce, live }: ConversationReaderProps) {
+export function ConversationReader({ conversationRef: qualifiedRef, sessionId: legacySessionId, mobileBack, outline, outlineLoading = false, growthNonce, live }: ConversationReaderProps) {
   const conversationRef = qualifiedRef ?? { source: 'claude', key: legacySessionId! };
   const qualifiedInput = qualifiedRef != null;
   const sessionId = conversationRef.key;
@@ -1292,6 +1293,15 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
       return;
     }
     if (!detail || detail.session_id !== sessionId) return; // cross-session transient: keep the pin
+    // #682 — the progressive outline transport intentionally leaves `outline`
+    // null while its bounded transfer is still hydrating. A deep link opened at
+    // the tail cannot infer direction without that full-session ordering: the
+    // legacy no-outline fallback sees the closed bottom edge and can falsely
+    // clear an early target as exhausted before the outline arrives. Keep the
+    // reader interactive, but defer only the jump until hydration settles. If
+    // outline loading ends in an error, `outlineLoading` becomes false and the
+    // established no-outline fallback remains available.
+    if (outlineLoading) return;
     // #463 S1 — a fresh jump supersedes any previous give-up message. Setting the
     // state it already holds is a no-op re-render, so this is safe on a re-fire.
     setJumpFailure(null);
@@ -1630,7 +1640,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     // post-load scrollToIndex re-fires once the target is paged into the render
     // list (a prepend can shift the virtual index without growing items.length).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jump, sessionId, detail?.items.length, hasMore, lastOp?.rev, forcedOpenKeys, focusMode, nodes, virtualFirstItemIndex]);
+  }, [jump, sessionId, detail?.items.length, hasMore, lastOp?.rev, forcedOpenKeys, focusMode, nodes, virtualFirstItemIndex, outlineLoading]);
 
   // Cancel any pending highlight-removal timer on unmount only (NOT on every
   // jump-effect re-run — that would strip the flash the instant the successful

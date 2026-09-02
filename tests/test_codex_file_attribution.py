@@ -496,11 +496,16 @@ def test_torn_auth_records_no_decision_and_no_op(ns, monkeypatch, tmp_path):
     try:
         stats = ns["sync_codex_cache"](cache)
         assert stats.files_deferred_torn == 1
+        assert stats.full_walk_complete is False
         assert stats.files_processed == 0
         assert _map_rows(cache) == []
         assert cache.execute(
             "SELECT COUNT(*) FROM codex_session_files WHERE path=?",
             (str(rollout),)).fetchone() == (0,)
+        assert cache.execute(
+            "SELECT COUNT(*) FROM cache_meta "
+            "WHERE key='dashboard_codex_full_walk_complete'"
+        ).fetchone() == (0,)
     finally:
         cache.close()
     assert _journal_ops(ns, "codex_file_account") == []
@@ -534,6 +539,7 @@ def test_journal_append_failure_defers_the_file_and_commits_no_dml(
         stats = ns["sync_codex_cache"](cache)
         assert stats.files_processed == 0
         assert stats.files_failed >= 1
+        assert stats.full_walk_complete is False
         assert cache.execute(
             "SELECT COUNT(*) FROM codex_session_entries").fetchone() == (0,)
         assert cache.execute(
@@ -543,6 +549,10 @@ def test_journal_append_failure_defers_the_file_and_commits_no_dml(
         assert cache.execute(
             "SELECT COUNT(*) FROM codex_session_files WHERE path=?",
             (str(rollout),)).fetchone() == (0,)
+        assert cache.execute(
+            "SELECT COUNT(*) FROM cache_meta "
+            "WHERE key='dashboard_codex_full_walk_complete'"
+        ).fetchone() == (0,)
     finally:
         cache.close()
 

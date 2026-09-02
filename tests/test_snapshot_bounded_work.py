@@ -21,8 +21,12 @@ The bounds cover:
 """
 from __future__ import annotations
 
-import sys
 import datetime as dt
+import subprocess
+import sys
+import threading
+import time
+import tracemalloc
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 
@@ -33,6 +37,7 @@ from test_dashboard_source_read_model import (  # noqa: E402
     START,
     _seeded_context,
 )
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 
 def _widen_corpus(cache, *, files=3, per_file=4, prefix="widened",
@@ -83,6 +88,169 @@ def _context(module, cache, stats, *, now_utc=None):
         cache_conn=cache, stats_conn=stats, range_start=START,
         now_utc=NOW if now_utc is None else now_utc, display_tz_name="UTC",
     )
+
+
+def test_retained_size_is_cycle_safe_and_stops_above_the_budget():
+    """The shared admission meter must be exact enough to fail closed cheaply."""
+    from _lib_retained_size import retained_size_bytes
+
+    shared = bytearray(4096)
+    value = {"left": shared, "right": shared}
+    value["cycle"] = value
+
+    full = retained_size_bytes(value)
+    assert full >= 4096
+    assert full < 8192, "shared references and cycles must be counted once"
+    assert retained_size_bytes(value, stop_after=1024) == 1025, (
+        "an over-budget value should stop at the fail-closed sentinel instead "
+        "of walking the rest of a production-scale object graph")
+
+
+def test_retained_size_visit_index_stays_below_the_background_memory_budget():
+    """A large exact traversal must not allocate a second Python-sized heap."""
+    # Measure in an otherwise idle interpreter. ``tracemalloc`` is
+    # process-global, so measuring in the xdist worker can charge allocations
+    # from background threads started by unrelated tests to this visit index.
+    # A Python ``set[int]`` for these IDs still peaks well above the independently
+    # budgeted 24 bytes per visited node in this isolated process.
+    script = """
+import sys
+import tracemalloc
+
+sys.path.insert(0, "bin")
+from _lib_retained_size import retained_size_bytes
+
+values = [bytearray() for _ in range(131_072)]
+tracemalloc.start()
+retained_size_bytes(values)
+_current, peak = tracemalloc.get_traced_memory()
+tracemalloc.stop()
+print(peak)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert int(result.stdout) <= 131_072 * 24
+
+
+def test_sparse_visit_ids_are_charged_to_the_enforced_budget():
+    """Sparse address dispersion cannot allocate unmeasured bitmap pages."""
+    from _lib_retained_size import retained_size_bytes
+
+    values = [bytearray() for _ in range(4096)]
+    synthetic_ids = {}
+
+    def sparse_object_id(value):
+        real = id(value)
+        if real not in synthetic_ids:
+            # One identity per bitmap page. The target graph itself stays well
+            # below the 1 MiB gate; only uncharged visit bookkeeping can grow.
+            synthetic_ids[real] = (len(synthetic_ids) + 1) << (3 + 15)
+        return synthetic_ids[real]
+
+    full = retained_size_bytes(values[:64])
+    assert retained_size_bytes(
+        values[:64], _object_id=sparse_object_id,
+    ) == full, "visit-index accounting must not change exact graph size"
+
+    budget = 1024 * 1024
+    tracemalloc.start()
+    try:
+        measured = retained_size_bytes(
+            values,
+            stop_after=budget,
+            _object_id=sparse_object_id,
+        )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert measured == budget + 1
+    assert peak <= budget + 256 * 1024
+
+
+def test_retained_size_background_pass_is_cooperatively_cancellable():
+    """Shutdown and superseding generations interrupt a large heap walk."""
+    from _lib_retained_size import RetainedSizeCancelled, retained_size_bytes
+
+    with pytest.raises(RetainedSizeCancelled):
+        retained_size_bytes(
+            [bytearray(8) for _ in range(2048)],
+            cancelled=lambda: True,
+        )
+
+
+def test_source_memory_worker_cancels_a_live_superseded_generation(monkeypatch):
+    """Latest-wins must interrupt the active walk, not only replace pending."""
+    import _cctally_dashboard_sources as module
+    from _lib_retained_size import RetainedSizeCancelled
+
+    started = threading.Event()
+    cancel_observed = threading.Event()
+
+    def controlled(value, *, stop_after, cancelled: callable):
+        generation = value[0]["generation"]
+        if generation == 1:
+            started.set()
+            while not cancelled():
+                time.sleep(0.001)
+            cancel_observed.set()
+            raise RetainedSizeCancelled()
+        return 222
+
+    monkeypatch.setattr(module, "retained_size_bytes", controlled)
+    worker = module._CodexSourceMemoryWorker()
+    worker.submit(1, ({"generation": 1},))
+    assert started.wait(PRESENCE_BACKSTOP_SECONDS)
+    worker.submit(2, ({"generation": 2},))
+
+    deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+    result = None
+    while result is None and time.monotonic() < deadline:
+        result = worker.take_result()
+        time.sleep(0.005)
+    assert result == (2, 222, None)
+    assert cancel_observed.is_set()
+    assert worker.shutdown()
+
+
+def test_source_memory_worker_reports_and_recovers_from_traversal_error(
+    monkeypatch,
+):
+    """One bad object graph cannot kill the sole verifier silently."""
+    import _cctally_dashboard_sources as module
+
+    calls = 0
+
+    def flaky(_value, *, stop_after, cancelled):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("synthetic traversal failure")
+        return 333
+
+    monkeypatch.setattr(module, "retained_size_bytes", flaky)
+    worker = module._CodexSourceMemoryWorker()
+    worker.submit(1, ({"generation": 1},))
+    deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+    first = None
+    while first is None and time.monotonic() < deadline:
+        first = worker.take_result()
+        time.sleep(0.005)
+    assert first is not None
+    assert first[0:2] == (1, None)
+    assert "synthetic traversal failure" in first[2]
+
+    worker.submit(2, ({"generation": 2},))
+    deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+    second = None
+    while second is None and time.monotonic() < deadline:
+        second = worker.take_result()
+        time.sleep(0.005)
+    assert second == (2, 333, None)
+    assert worker.shutdown()
 
 
 def test_the_path_memo_parses_once_per_distinct_session_file(
@@ -158,6 +326,319 @@ def test_no_account_child_re_adapts_the_visible_rows(source_env, monkeypatch):
 
     assert folds["n"] == 1, "the visible rows are folded exactly once"
     assert adapted_inside["n"] == 0
+
+
+def test_quota_only_rebuild_reuses_the_visible_accounting_population(
+    source_env, monkeypatch,
+):
+    """A stats/quota generation must not re-fold unchanged accounting rows.
+
+    ``data_version`` is the public generation carrier. Moving it while the
+    accounting ledger is unchanged models the source rebuild a quota/stat
+    mutation requests. The cold build must establish a non-empty population;
+    the second build must reuse that immutable accounting partition instead of
+    walking every retained entry before rebuilding the quota domains.
+    """
+    _ns, cache, stats, module = source_env
+    module.reset_codex_source_caches()
+    context = _context(module, cache, stats)
+    first = module.build_codex_source_state(
+        context, data_version="quota-generation-a")
+    assert first.data["periods"]["daily"]["rows"], (
+        "non-vacuity: the cold accounting population must publish rows")
+
+    folds: list[int] = []
+    real_fold = module._codex_fold_visible_rows
+
+    def recording_fold(entries):
+        values = tuple(entries)
+        folds.append(len(values))
+        return real_fold(values)
+
+    monkeypatch.setattr(module, "_codex_fold_visible_rows", recording_fold)
+    second = module.build_codex_source_state(
+        context, data_version="quota-generation-b")
+
+    assert second.data["periods"] == first.data["periods"]
+    assert folds == [], (
+        f"quota-only rebuild re-folded unchanged accounting populations: {folds}")
+
+
+def test_one_dirty_path_does_not_repartition_the_complete_card_population(
+    source_env, monkeypatch,
+):
+    """A path delta may rebuild its account, never repartition all history."""
+    from test_dashboard_accounts_wire import _complete_codex_thread_metadata
+
+    _ns, cache, stats, module = source_env
+    module.reset_codex_source_caches()
+    account_keys = _decorate_codex_source(
+        cache, stats, monkeypatch, module)
+    _complete_codex_thread_metadata(cache)
+    context = _context(module, cache, stats)
+    first = module.build_codex_source_state(
+        context, data_version="dirty-path-generation-a")
+    assert {card["accountKey"] for card in first.data["accounts"]} >= set(
+        account_keys), "non-vacuity: the decorated card surface was not reached"
+
+    template = cache.execute(
+        "SELECT source_path, timestamp_utc, session_id, model, input_tokens, "
+        "cached_input_tokens, output_tokens, reasoning_output_tokens, "
+        "total_tokens, source_root_key, conversation_key, account_key "
+        "FROM codex_session_entries WHERE account_key=? ORDER BY id LIMIT 1",
+        (account_keys[0],),
+    ).fetchone()
+    assert template is not None
+    source_path, *values = template
+    next_offset = cache.execute(
+        "SELECT COALESCE(MAX(line_offset), 0) + 1 "
+        "FROM codex_session_entries WHERE source_path=?",
+        (source_path,),
+    ).fetchone()[0]
+    cache.execute(
+        "INSERT INTO codex_session_entries "
+        "(source_path, line_offset, timestamp_utc, session_id, model, "
+        " input_tokens, cached_input_tokens, output_tokens, "
+        " reasoning_output_tokens, total_tokens, source_root_key, "
+        " conversation_key, account_key) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (source_path, next_offset, *values),
+    )
+    cache.commit()
+    dirty_path_rows = cache.execute(
+        "SELECT COUNT(*) FROM codex_session_entries WHERE source_path=?",
+        (source_path,),
+    ).fetchone()[0]
+    total_rows = cache.execute(
+        "SELECT COUNT(*) FROM codex_session_entries"
+    ).fetchone()[0]
+    assert total_rows > dirty_path_rows
+
+    walks: list[int] = []
+    real_partition = module._codex_partition_by_account
+
+    def recording_partition(entries):
+        values = tuple(entries)
+        walks.append(len(values))
+        return real_partition(values)
+
+    monkeypatch.setattr(
+        module, "_codex_partition_by_account", recording_partition)
+    second = module.build_codex_source_state(
+        context, data_version="dirty-path-generation-b")
+
+    assert second.data["accounts"] != first.data["accounts"], (
+        "non-vacuity: the dirty account card must move")
+    assert not walks or max(walks) <= dirty_path_rows, (
+        "one dirty path repartitioned the complete card population: "
+        f"walks={walks}, dirty_path_rows={dirty_path_rows}, total={total_rows}")
+
+
+def test_quota_only_rebuild_reuses_clean_account_card_totals(
+    source_env, monkeypatch,
+):
+    """Quota publication may move card bars without refolding card spend."""
+    from test_dashboard_accounts_wire import _complete_codex_thread_metadata
+
+    _ns, cache, stats, module = source_env
+    module.reset_codex_source_caches()
+    account_keys = _decorate_codex_source(
+        cache, stats, monkeypatch, module)
+    _complete_codex_thread_metadata(cache)
+    context = _context(module, cache, stats)
+    first = module.build_codex_source_state(
+        context, data_version="quota-card-generation-a")
+    assert len(first.data["accounts"]) >= 2
+
+    calls: list[int] = []
+    real = module.build_codex_daily_view
+    real_accounts = module._codex_accounts_wire
+    inside_accounts = {"value": False}
+
+    def account_call(*args, **kwargs):
+        inside_accounts["value"] = True
+        try:
+            return real_accounts(*args, **kwargs)
+        finally:
+            inside_accounts["value"] = False
+
+    def counting(entries, **kwargs):
+        values = tuple(entries)
+        if inside_accounts["value"]:
+            calls.append(len(values))
+        return real(values, **kwargs)
+
+    monkeypatch.setattr(module, "_codex_accounts_wire", account_call)
+    monkeypatch.setattr(module, "build_codex_daily_view", counting)
+    second = module.build_codex_source_state(
+        _context(module, cache, stats, now_utc=NOW + dt.timedelta(seconds=2)),
+        data_version="quota-card-generation-b")
+
+    total_fields = (
+        "spendUsd", "inputTokens", "cachedInputTokens", "outputTokens",
+        "reasoningOutputTokens", "totalTokens",
+    )
+    first_cards = {
+        card["accountKey"]: tuple(card[field] for field in total_fields)
+        for card in first.data["accounts"]
+        if card["accountKey"] in account_keys
+    }
+    second_cards = {
+        card["accountKey"]: tuple(card[field] for field in total_fields)
+        for card in second.data["accounts"]
+        if card["accountKey"] in account_keys
+    }
+    assert second_cards == first_cards
+    assert calls == [], f"clean account card totals were refolded: {calls}"
+
+
+def test_visible_population_cache_is_byte_bounded_and_observed(
+    source_env, monkeypatch,
+):
+    """An over-budget generation takes a complete cold fallback, never reuse."""
+    _ns, cache, stats, module = source_env
+    module.reset_codex_source_caches()
+    monkeypatch.setattr(module, "_CODEX_VISIBLE_POPULATION_MAX_BYTES", 1)
+    context = _context(module, cache, stats)
+
+    first = module.build_codex_source_state(
+        context, data_version="bounded-population-a")
+    stats_after_first = dict(module.codex_visible_population_cache_stats())
+    second = module.build_codex_source_state(
+        context, data_version="bounded-population-b")
+    stats_after_second = dict(module.codex_visible_population_cache_stats())
+
+    assert first.data["periods"] == second.data["periods"]
+    assert stats_after_first["estimatedBytes"] == 0
+    assert stats_after_first["maxBytes"] == 1
+    assert stats_after_first["entryCount"] == 0
+    assert stats_after_first["fallbackCount"] == 1
+    assert stats_after_first["accountCardEstimatedBytes"] == 0
+    assert stats_after_first["accountCardEntryCount"] == 0
+    assert stats_after_first["accountCardFallbackCount"] == 0
+    assert stats_after_second["fallbackCount"] == 2
+
+
+def test_metadata_incomplete_fallback_never_reuses_an_id_stable_update(
+    source_env,
+):
+    """An empty durable delta cannot certify the cache-only fallback."""
+    _ns, cache, stats, module = source_env
+    module.reset_codex_source_caches()
+    seed_id = cache.execute(
+        "SELECT id FROM codex_session_entries ORDER BY id LIMIT 1"
+    ).fetchone()[0]
+    cache.execute(
+        "UPDATE codex_session_entries SET conversation_key=NULL WHERE id=?",
+        (seed_id,),
+    )
+    cache.commit()
+    context = _context(module, cache, stats)
+    first = module.build_codex_source_state(
+        context, data_version="metadata-fallback-a")
+    assert any(
+        warning.code == "codex_metadata_incomplete"
+        for warning in first.warnings
+    ), "non-vacuity: fixture must exercise the cache-only fallback"
+
+    cache.execute(
+        "UPDATE codex_session_entries SET output_tokens=output_tokens+11, "
+        "total_tokens=total_tokens+11 WHERE id=?",
+        (seed_id,),
+    )
+    cache.commit()
+    warm = module.build_codex_source_state(
+        context, data_version="metadata-fallback-b")
+    assert warm.data["periods"] != first.data["periods"]
+
+    module.reset_codex_source_caches()
+    cold = module.build_codex_source_state(
+        context, data_version="metadata-fallback-b")
+    assert warm == cold
+
+
+def test_same_path_cache_replacement_cold_rebuilds_the_source_population(
+    source_env, monkeypatch, tmp_path,
+):
+    """The source population key includes file identity, not only pathname."""
+    import sqlite3
+    from test_dashboard_accounts_wire import _complete_codex_thread_metadata
+
+    _ns, cache, stats, module = source_env
+    module.reset_codex_source_caches()
+    _decorate_codex_source(cache, stats, monkeypatch, module)
+    _complete_codex_thread_metadata(cache)
+    first_context = _context(module, cache, stats)
+    first = module.build_codex_source_state(
+        first_context, data_version="before-replacement")
+    assert first.data["accounts"]
+    live_path = cache.execute("PRAGMA database_list").fetchone()[2]
+    replacement_path = tmp_path / "replacement-cache.db"
+    replacement = sqlite3.connect(replacement_path)
+    try:
+        cache.backup(replacement)
+        row_id = replacement.execute(
+            "SELECT id FROM codex_session_entries ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        replacement.execute(
+            "UPDATE codex_session_entries SET output_tokens=output_tokens+7, "
+            "total_tokens=total_tokens+7 WHERE id=?",
+            (row_id,),
+        )
+        replacement.commit()
+    finally:
+        replacement.close()
+    cache.close()
+    replacement_path.replace(live_path)
+    replaced = sqlite3.connect(live_path)
+    try:
+        folds: list[int] = []
+        real_fold = module._codex_fold_visible_rows
+
+        def recording_fold(entries):
+            values = tuple(entries)
+            folds.append(len(values))
+            return real_fold(values)
+
+        monkeypatch.setattr(module, "_codex_fold_visible_rows", recording_fold)
+        warm = module.build_codex_source_state(
+            _context(module, replaced, stats), data_version="after-replacement")
+        assert warm.data["periods"] != first.data["periods"]
+        assert warm.data["accounts"] != first.data["accounts"]
+        assert folds and folds[-1] > 0, (
+            "same-path replacement reused the superseded source population")
+
+        module.reset_codex_source_caches()
+        cold = module.build_codex_source_state(
+            _context(module, replaced, stats), data_version="after-replacement")
+        assert warm == cold
+    finally:
+        replaced.close()
+
+
+def test_account_card_cache_is_byte_bounded_and_observed(
+    source_env, monkeypatch,
+):
+    """Card totals fall back cold when their independent hard cap is full."""
+    from test_dashboard_accounts_wire import _complete_codex_thread_metadata
+
+    _ns, cache, stats, module = source_env
+    module.reset_codex_source_caches()
+    _decorate_codex_source(cache, stats, monkeypatch, module)
+    _complete_codex_thread_metadata(cache)
+    monkeypatch.setattr(module, "_CODEX_ACCOUNT_CARD_TOTALS_MAX_BYTES", 1)
+
+    first = module.build_codex_source_state(
+        _context(module, cache, stats), data_version="bounded-card-a")
+    observed = dict(module.codex_visible_population_cache_stats())
+    second = module.build_codex_source_state(
+        _context(module, cache, stats), data_version="bounded-card-b")
+
+    assert first.data["accounts"] == second.data["accounts"]
+    assert observed["accountCardEstimatedBytes"] == 0
+    assert observed["accountCardMaxBytes"] == 1
+    assert observed["accountCardEntryCount"] == 0
+    assert observed["accountCardFallbackCount"] >= 2
 
 
 def test_folded_codex_entries_are_safe_to_alias_between_parent_and_child(
@@ -655,6 +1136,34 @@ def test_failed_incremental_source_build_rolls_back_cache_generation(
     assert retry == cold
 
 
+def test_failed_source_build_rolls_back_account_card_fallback_counter(
+    source_env, monkeypatch,
+):
+    """An aborted capped-card build cannot publish an observation from itself."""
+    from test_dashboard_accounts_wire import _complete_codex_thread_metadata
+
+    _ns, cache, stats, module = source_env
+    module.reset_codex_source_caches()
+    _decorate_codex_source(cache, stats, monkeypatch, module)
+    _complete_codex_thread_metadata(cache)
+    monkeypatch.setattr(module, "_CODEX_ACCOUNT_CARD_TOTALS_MAX_BYTES", 1)
+
+    def fail_after_cards(*_args, **_kwargs):
+        assert module._CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS >= 2, (
+            "non-vacuity: capped account cards must fall back before failure")
+        raise RuntimeError("injected post-card failure")
+
+    monkeypatch.setattr(
+        module, "_codex_account_scopes_wire", fail_after_cards)
+    with pytest.raises(RuntimeError, match="injected post-card failure"):
+        module.build_codex_source_state(
+            _context(module, cache, stats), data_version="aborted-card-build")
+
+    observed = dict(module.codex_visible_population_cache_stats())
+    assert observed["accountCardFallbackCount"] == 0
+    assert observed["accountCardEntryCount"] == 0
+
+
 def test_the_bounded_quota_read_is_reissued_on_every_tick(
     source_env, monkeypatch,
 ):
@@ -1040,13 +1549,230 @@ def test_the_cold_reset_covers_every_cache_the_build_checkpoints(source_env):
     """
     ns, cache, stats, module = source_env
     caches = module._codex_source_caches()
-    assert len(caches) == 9, caches
+    assert len(caches) == 11, caches
+    assert module._CODEX_VISIBLE_POPULATION_CACHE in caches
+    assert module._CODEX_ACCOUNT_CARD_TOTALS_CACHE in caches
     module.build_codex_source_state(
         _context(module, cache, stats), data_version="warm")
     assert any(caches), "non-vacuity: a build must populate at least one cache"
     module.reset_codex_source_caches()
     assert not any(caches), (
         "reset_codex_source_caches left a checkpointed cache populated")
+
+
+def test_complete_source_accelerator_owner_fails_closed_on_entry_overflow(
+    source_env, monkeypatch,
+):
+    """All eleven caches share one numeric byte and entry admission owner."""
+    _ns, _cache, _stats, module = source_env
+    module.reset_codex_source_caches()
+    module._CODEX_PERIOD_VIEW_CACHE["one"] = object()
+    module._CODEX_ENTRY_ADAPTER_CACHE[2] = (object(), object())
+    monkeypatch.setattr(module, "_CODEX_SOURCE_ACCELERATOR_MAX_ENTRIES", 1)
+
+    module.enforce_codex_source_accelerator_bounds()
+
+    assert not any(module._codex_source_caches())
+    observed = dict(module.codex_source_accelerator_memory_stats())
+    assert observed["entryCount"] == 0
+    assert observed["maxEntries"] == 1
+    assert observed["fallbackCount"] >= 1
+
+
+@pytest.mark.parametrize("outcome", ["over-cap", "error"])
+def test_source_memory_worker_enforces_completion_without_another_publisher(
+    monkeypatch, outcome,
+):
+    """A current unsafe result owns its eviction, including frozen mode."""
+    import _cctally_dashboard_sources as module
+
+    worker = module._CodexSourceMemoryWorker()
+    monkeypatch.setattr(module, "_CODEX_SOURCE_MEMORY_WORKER", worker)
+    module.reset_codex_source_caches()
+    module.set_codex_source_memory_completion_lock(threading.Lock())
+
+    def measured(_value, **_kwargs):
+        if outcome == "error":
+            raise RuntimeError("measured failure")
+        return module._CODEX_SOURCE_ACCELERATOR_MAX_BYTES + 1
+
+    monkeypatch.setattr(module, "retained_size_bytes", measured)
+    module._CODEX_PERIOD_VIEW_CACHE["resident"] = object()
+    try:
+        module.enforce_codex_source_accelerator_bounds()
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+        while module._CODEX_PERIOD_VIEW_CACHE and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert not module._CODEX_PERIOD_VIEW_CACHE
+        observed = dict(module.codex_source_accelerator_memory_stats())
+        assert observed["fallbackCount"] >= 1
+        if outcome == "error":
+            assert observed["measurementErrorCount"] >= 1
+    finally:
+        worker.shutdown()
+        module.set_codex_source_memory_completion_lock(None)
+
+
+@pytest.mark.parametrize("outcome", ["over-cap", "error"])
+def test_snapshot_memory_worker_enforces_completion_without_another_publisher(
+    monkeypatch, outcome,
+):
+    """Snapshot accelerators are evicted on completion without a later tick."""
+    import _lib_snapshot_cache as snapshot
+
+    worker = snapshot._SnapshotMemoryWorker()
+    monkeypatch.setattr(snapshot, "_SNAPSHOT_MEMORY_WORKER", worker)
+    snapshot.reset_owner_thread()
+    snapshot.set_snapshot_memory_completion_lock(threading.Lock())
+
+    def measured(_value, **_kwargs):
+        if outcome == "error":
+            raise RuntimeError("measured failure")
+        return snapshot._SNAPSHOT_ACCELERATOR_MAX_BYTES + 1
+
+    monkeypatch.setattr(snapshot, "retained_size_bytes", measured)
+    snapshot._GROUP_A_CACHE._store[("daily", "resident")] = object()
+    try:
+        snapshot.enforce_snapshot_accelerator_bounds(data_version="frozen")
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+        while snapshot._GROUP_A_CACHE._store and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert not snapshot._GROUP_A_CACHE._store
+        observed = dict(snapshot.snapshot_accelerator_memory_stats())
+        assert observed["fallbackCount"] >= 1
+        if outcome == "error":
+            assert observed["measurementErrorCount"] >= 1
+        assert snapshot._OWNER_THREAD_IDENT is None
+        snapshot._assert_owner()
+    finally:
+        worker.shutdown()
+        snapshot.set_snapshot_memory_completion_lock(None)
+        snapshot.reset_owner_thread()
+
+
+def test_source_accelerator_admission_remeasures_only_mutated_generations(
+    source_env, monkeypatch,
+):
+    """Unchanged ticks do not rescan retained history; same-key writes do."""
+    _ns, _cache, _stats, module = source_env
+    module.reset_codex_source_caches()
+    submissions = []
+
+    class _Worker:
+        def submit(self, generation, snapshot):
+            submissions.append((generation, snapshot))
+
+        def take_result(self):
+            return None
+
+    monkeypatch.setattr(module, "_CODEX_SOURCE_MEMORY_WORKER", _Worker())
+    module._CODEX_PERIOD_VIEW_CACHE["one"] = object()
+
+    module.enforce_codex_source_accelerator_bounds()
+    module.enforce_codex_source_accelerator_bounds()
+    assert len(submissions) == 1
+
+    # A replacement can change retained bytes without moving entryCount.
+    module._CODEX_PERIOD_VIEW_CACHE["one"] = object()
+    module.enforce_codex_source_accelerator_bounds()
+    assert len(submissions) == 2
+    assert module.codex_source_accelerator_memory_stats()["entryCount"] == 1
+
+
+def test_complete_snapshot_accelerator_owner_fails_closed_on_entry_overflow(
+    monkeypatch,
+):
+    """History-proportional bucket/session/accounting caches cannot accrete."""
+    import _lib_snapshot_cache as snapshot
+
+    snapshot._GROUP_A_CACHE._store[("daily", "one")] = object()
+    snapshot._WEEKREF_COST_CACHE[("start", "end")] = 1.0
+    monkeypatch.setattr(snapshot, "_SNAPSHOT_ACCELERATOR_MAX_ENTRIES", 1)
+
+    snapshot.enforce_snapshot_accelerator_bounds(data_version="overflow")
+
+    deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+    while time.monotonic() < deadline:
+        snapshot.enforce_snapshot_accelerator_bounds(data_version="overflow")
+        if snapshot.snapshot_accelerator_memory_stats()["measurementPending"] == 0:
+            break
+        time.sleep(0.005)
+
+    observed = dict(snapshot.snapshot_accelerator_memory_stats())
+    assert observed["entryCount"] == 1  # the fixed {"state": None} slot
+    assert observed["maxEntries"] == 1
+    assert observed["fallbackCount"] >= 1
+    assert not snapshot._GROUP_A_CACHE._store
+    assert not snapshot._WEEKREF_COST_CACHE
+    assert observed["measuredGeneration"] == observed["currentGeneration"]
+    assert observed["measurementPending"] == 0
+
+
+def test_snapshot_admission_generations_follow_mutation_not_publisher_ticks(
+    monkeypatch,
+):
+    """An unchanged tick cannot starve a large background measurement."""
+    import _lib_snapshot_cache as snapshot
+
+    submissions = []
+
+    class _Worker:
+        def submit(self, generation, roots, entry_count):
+            submissions.append((generation, roots))
+
+        def take_result(self):
+            return None
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(snapshot, "_SNAPSHOT_MEMORY_WORKER", _Worker())
+    monkeypatch.setattr(snapshot, "_SNAPSHOT_ACCELERATOR_DIRTY", True)
+    monkeypatch.setattr(snapshot, "_SNAPSHOT_ACCELERATOR_GENERATION", 100)
+    monkeypatch.setattr(snapshot, "_SNAPSHOT_ACCELERATOR_MEASURED_GENERATION", 99)
+    snapshot.enforce_snapshot_accelerator_bounds(data_version="tick-a")
+    snapshot.enforce_snapshot_accelerator_bounds(data_version="tick-b")
+    assert [generation for generation, _roots in submissions] == [100]
+
+    snapshot._WEEKREF_COST_CACHE["same-key"] = bytearray(8)
+    snapshot._WEEKREF_COST_CACHE["same-key"] = bytearray(4096)
+    snapshot.enforce_snapshot_accelerator_bounds(data_version="tick-b")
+    assert [generation for generation, _roots in submissions] == [100, 101]
+    snapshot._WEEKREF_COST_CACHE.pop("same-key", None)
+
+
+def test_snapshot_routine_fixed_shape_watermarks_do_not_cancel_measurement(
+    monkeypatch,
+):
+    """Clock/cursor replacement is not a new retained-shape generation."""
+    import _lib_snapshot_cache as snapshot
+
+    snapshot._SESSION_LAST_SEEN["max_id"] = 1
+    snapshot._SESSION_LAST_SEEN["max_seq"] = 1
+    snapshot._SESSION_LAST_SEEN["extra"] = ("same-shape",)
+    monkeypatch.setattr(snapshot, "_SNAPSHOT_ACCELERATOR_DIRTY", False)
+    monkeypatch.setattr(snapshot, "_SNAPSHOT_ACCELERATOR_GENERATION", 200)
+
+    snapshot._SESSION_LAST_SEEN["max_id"] = 2
+    snapshot._SESSION_LAST_SEEN["max_seq"] = 2
+    snapshot._SESSION_LAST_SEEN["extra"] = ("other-text",)
+
+    assert snapshot._SNAPSHOT_ACCELERATOR_GENERATION == 200
+    assert snapshot._SNAPSHOT_ACCELERATOR_DIRTY is False
+
+
+def test_legacy_account_scope_reset_clears_the_new_source_caches(source_env):
+    """Existing cold-parity callers must not retain either #681 generation."""
+    _ns, _cache, _stats, module = source_env
+    module._CODEX_VISIBLE_POPULATION_CACHE["sentinel"] = object()
+    module._CODEX_ACCOUNT_CARD_TOTALS_CACHE["sentinel"] = (object(), {})
+    module._CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS = 3
+
+    module.reset_codex_account_scope_cache()
+
+    assert module._CODEX_VISIBLE_POPULATION_CACHE == {}
+    assert module._CODEX_ACCOUNT_CARD_TOTALS_CACHE == {}
+    assert module._CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS == 0
 
 
 def test_warm_reuse_equals_cold_rebuild_across_an_active_window_transition(
@@ -1720,6 +2446,41 @@ def test_a_clock_bearing_quota_read_establishes_no_identity(
     assert retained_bounded == [], (
         "the build retained its bounded read, whose key carries the tick "
         "instant and cannot be hit by the next build")
+
+
+def test_quota_observation_memo_is_byte_bounded_lru(source_env, monkeypatch):
+    """Large five-hour populations evict by retained bytes, never grow by rows."""
+    _ns, cache, stats, module = source_env
+    module.reset_codex_quota_observation_cache()
+    monkeypatch.setattr(
+        module, "_codex_quota_reuse_identity", lambda *_a, **_kw: ("stable",))
+    monkeypatch.setattr(
+        module, "load_codex_quota_observations",
+        lambda **kwargs: (bytearray(2048), str(kwargs.get("max_rows"))),
+    )
+    common = {"cache_conn": cache, "stats_conn": stats}
+    module._cached_codex_quota_observations(**common, max_rows=1)
+    one_entry_bytes = dict(
+        module.codex_quota_observation_cache_stats())["estimatedBytes"]
+    module.reset_codex_quota_observation_cache()
+    monkeypatch.setattr(
+        module, "_CODEX_QUOTA_OBSERVATION_MAX_BYTES", one_entry_bytes + 128)
+
+    module._cached_codex_quota_observations(**common, max_rows=1)
+    module._cached_codex_quota_observations(**common, max_rows=2)
+
+    stats_wire = dict(module.codex_quota_observation_cache_stats())
+    assert stats_wire["entryCount"] == 1
+    assert stats_wire["estimatedBytes"] <= stats_wire["maxBytes"]
+    assert stats_wire["evictionCount"] == 1
+    retained_keys = tuple(module._CODEX_QUOTA_OBSERVATION_CACHE)
+    assert retained_keys[0][5] == 2, "the most-recent value must survive"
+
+    monkeypatch.setattr(module, "_CODEX_QUOTA_OBSERVATION_MAX_BYTES", 1)
+    module._cached_codex_quota_observations(**common, max_rows=3)
+    capped = dict(module.codex_quota_observation_cache_stats())
+    assert capped["entryCount"] == 1, "an oversized value is served but not retained"
+    assert capped["fallbackCount"] == 1
 
 
 # ── Change 3: the doctor's quota-observation input reuse (#583 S5 §2.3) ──────

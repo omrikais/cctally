@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Structural / determinism self-test for the backend benchmark harness
 # (issue #276, M3 / Session B). Runs bin/cctally-bench at --scale small and
-# asserts the --json schema (all 15 benchmark families, finite ordered
+# asserts the --json schema (all 16 benchmarks, finite ordered
 # medians) + isolation (the real ~/.local/share/cctally and ~/.claude are
 # untouched). It NEVER asserts wall-clock timings — the only committed
 # timings live in bench/baselines/backend.json as advisory data.
@@ -86,6 +86,7 @@ for k in ("cctally_version", "machine_label", "scale", "seed",
     assert k in d, f"missing top-level key {k!r}"
 need = {
     "snapshot.cold", "snapshot.warm", "snapshot.idle",
+    "frontier.caught_up",
     "sync.noop", "sync.delta",
     "conversations.page1", "conversations.sorted", "conversations.filtered",
     "search.cross_session", "find.in_conversation",
@@ -126,6 +127,7 @@ for k in ("contract", "receipt"):
 c, receipt = d["contract"], d["receipt"]
 need = {
     "snapshot.cold", "snapshot.warm", "snapshot.idle",
+    "frontier.caught_up",
     "sync.noop", "sync.delta",
     "conversations.page1", "conversations.sorted", "conversations.filtered",
     "search.cross_session", "find.in_conversation",

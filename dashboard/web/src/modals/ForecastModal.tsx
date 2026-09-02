@@ -22,7 +22,7 @@ import type { Envelope, ForecastEnvelope, SourceName } from '../types/envelope';
 import { SourceChip } from '../panels/sourcePanel';
 import { providerAccentClass } from '../lib/providerAccent';
 import { dollarsPerPercentQualification, dollarsPerPercentReason } from '../lib/withheldCopy';
-import { causeLong, rateChangeSummary } from '../lib/quotaCopy';
+import { basisLong, causeLong, rateChangeSummary } from '../lib/quotaCopy';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { alertNavigation, envelopeNow, parseInstantMs } from '../lib/alertScope';
 import { followAlertTarget } from '../store/followAlertTarget';
@@ -177,7 +177,22 @@ export function resolvePillLayout(
     resolvedXPct: (p.pos / 110) * 100,
   }));
 
-  if (resolved.length < 2 || wrapWidthPx <= 0) {
+  if (wrapWidthPx <= 0) {
+    return { collapsed: false, pins: resolved };
+  }
+
+  // The track anchors an edge projection at 0% or 100%, but the pill is
+  // centered on that anchor. Pull every pill center inward by its own half
+  // width before resolving pair overlap so a lone extreme label cannot escape
+  // the wrapper (and the true anchor remains available for its leader).
+  for (const pin of resolved) {
+    const halfWidth = Math.min(pin.pillWidthPx / 2, wrapWidthPx / 2);
+    const trueX = (pin.trueXPct / 100) * wrapWidthPx;
+    const containedX = Math.max(halfWidth, Math.min(wrapWidthPx - halfWidth, trueX));
+    pin.resolvedXPct = (containedX / wrapWidthPx) * 100;
+  }
+
+  if (resolved.length < 2) {
     return { collapsed: false, pins: resolved };
   }
 
@@ -198,8 +213,8 @@ export function resolvePillLayout(
   const aHalf = a.pillWidthPx / 2;
   const bHalf = b.pillWidthPx / 2;
   const minCenterDist = aHalf + bHalf + minGapPx;
-  let ax = (a.trueXPct / 100) * wrapWidthPx;
-  let bx = (b.trueXPct / 100) * wrapWidthPx;
+  let ax = (a.resolvedXPct / 100) * wrapWidthPx;
+  let bx = (b.resolvedXPct / 100) * wrapWidthPx;
   if (bx - ax < minCenterDist) {
     const mid = (ax + bx) / 2;
     ax = mid - minCenterDist / 2;
@@ -694,11 +709,7 @@ export function QuotaSection({ env }: { env: Envelope | null }): JSX.Element | n
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   const quota = env?.forecast?.quota ?? null;
   if (quota == null) return null;
-  const basisLabel = quota.basis === 'calibrated'
-    ? 'calibrated model'
-    : quota.basis === 'corrected-meter'
-      ? 'corrected meter'
-      : 'withheld';
+  const basisLabel = basisLong(quota.basis_presentation, quota.basis);
   const rateChange = quota.rate_change;
   const rateSummary = rateChangeSummary(
     rateChange?.previous_units_per_point, rateChange?.new_units_per_point,

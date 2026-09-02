@@ -215,6 +215,11 @@ def test_d3_the_quota_object_states_its_basis_and_the_corrected_interval():
                                   forecast=_forecast(ns)))
     quota = env["forecast"]["quota"]
     assert quota["basis"] == "corrected-meter"
+    assert quota["basis_presentation"] == {
+        "code": "corrected-meter",
+        "short": "meter",
+        "long": "corrected meter",
+    }
     assert quota["right_censored"] is False
     assert quota["corrected_interval"] == {"lo": 39.0, "hi": 40.0}
     assert quota["projection_pct"] is not None

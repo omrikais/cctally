@@ -14,10 +14,12 @@ builder's keys and the TypeScript interface's fields agree exactly.
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import pathlib
 import re
 import sqlite3
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -191,3 +193,154 @@ def test_c3_the_envelope_declares_the_array_as_optional(ns):
     new client meeting an older server must tolerate the array's absence."""
     source = ENVELOPE_TS.read_text(encoding="utf-8")
     assert "meter_rate_changes?: MeterRateChangeEntry[];" in source
+
+
+# --------------------------------------------------------------------------
+# #688 — the withholding disclosure rides on the ALERT payload only
+# --------------------------------------------------------------------------
+CREATED_AT = "2026-08-29T00:00:00+00:00"
+WITHHELD_STATUS = "unsupported-model-mix"
+
+
+def _mrc(ns):
+    return ns["_load_sibling"]("_lib_meter_rate_change")
+
+
+def _ordinary(ns):
+    return _mrc(ns).RateChangeTransition(
+        provider="claude", account_key="unattributed",
+        effective_from=BOUNDARY,
+        previous_units_per_point=2_442_620.0,
+        new_units_per_point=1_665_096.0,
+        severity="alarm", detected_at="2026-08-29T00:00:00+00:00")
+
+
+def _withheld(ns):
+    return dataclasses.replace(_ordinary(ns),
+                               withholding_status=WITHHELD_STATUS)
+
+
+def test_688_alert_payload_always_carries_the_key(ns):
+    mrc = _mrc(ns)
+    ordinary = mrc.alert_payload(_ordinary(ns))
+    assert "withholding_status" in ordinary
+    assert ordinary["withholding_status"] is None
+    assert mrc.alert_payload(_withheld(ns))["withholding_status"] == \
+        WITHHELD_STATUS
+
+
+def test_688_the_journal_payload_is_unchanged(ns):
+    """The guard against reintroducing the divergent-hash hazard.
+
+    Event selection hashes the whole record and quarantines two revision-0
+    records that share an id and differ in hash, so a key added here would
+    quarantine any re-emission of an already-recorded identity — after a
+    calibration reset, a quarantine, or a file deletion followed by
+    re-detection.
+    """
+    mrc = _mrc(ns)
+    assert mrc.JOURNAL_IDENTITY_VERSION == 1
+    assert set(mrc.event_payload(_withheld(ns), created_at=CREATED_AT)) == {
+        "provider", "account_key", "effective_from",
+        "previous_units_per_point", "new_units_per_point", "severity",
+        "detected_at_utc", "created_at_utc", "journal_identity_version"}
+    # Stronger than a key-set check: the two payloads must be EQUAL, so a
+    # withheld transition and an ordinary one at the same key hash alike.
+    assert mrc.event_payload(_withheld(ns), created_at=CREATED_AT) == \
+        mrc.event_payload(_ordinary(ns), created_at=CREATED_AT)
+
+
+#: The canonical encoding of `event_payload` for `_ordinary` at `CREATED_AT`,
+#: and its content hash under `_lib_journal._sha256_canonical`. That is the
+#: same hash FUNCTION journal event selection uses, over a different ARGUMENT:
+#: selection hashes the whole record, and this hashes the payload alone.
+#: Computed once from the shipped implementation and pasted in. Do NOT
+#: recompute these from the code under test: a value read back from the
+#: implementation pins nothing.
+FROZEN_EVENT_JSON = (
+    '{"account_key":"unattributed",'
+    '"created_at_utc":"2026-08-29T00:00:00+00:00",'
+    '"detected_at_utc":"2026-08-29T00:00:00+00:00",'
+    '"effective_from":"2026-08-25T00:00:00+00:00",'
+    '"journal_identity_version":1,'
+    '"new_units_per_point":1665096.0,'
+    '"previous_units_per_point":2442620.0,'
+    '"provider":"claude",'
+    '"severity":"alarm"}'
+)
+FROZEN_EVENT_HASH = (
+    "sha256:317d4fbb5c5e6f79f12cf613067f7d67388c90546a21a7c2711de26854d80120")
+
+
+def test_689_the_event_bytes_are_frozen_exactly(ns):
+    """Acceptance 5 as an EXACT freeze, not a key check.
+
+    `test_688_the_journal_payload_is_unchanged` compares key sets and the
+    withheld-versus-ordinary equality, so it would not notice a changed VALUE
+    — a renamed severity vocabulary, a reformatted instant, a bumped identity
+    version. The family shipped in v1.104.0, so retained v1 events exist in
+    the wild: two revision-0 records sharing an id and differing in hash
+    quarantine each other, and #689 re-offers already-persisted identities by
+    design, so any change to these bytes would quarantine history rather than
+    merely alter a future line.
+    """
+    import json
+    import _lib_journal
+    mrc = _mrc(ns)
+    payload = mrc.event_payload(_ordinary(ns), created_at=CREATED_AT)
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True,
+                         ensure_ascii=False)
+    assert encoded == FROZEN_EVENT_JSON
+    assert _lib_journal._sha256_canonical(payload) == FROZEN_EVENT_HASH
+
+
+def test_688_the_identity_is_unchanged_by_the_withholding(ns):
+    assert _withheld(ns).identity() == _ordinary(ns).identity()
+
+
+def test_688_severity_is_unchanged_by_the_withholding(ns):
+    # Severity is a function of the observed size of the rate move, not of
+    # the calibration's confidence.
+    mrc = _mrc(ns)
+    assert mrc.alert_payload(_withheld(ns))["severity"] == \
+        mrc.alert_payload(_ordinary(ns))["severity"] == "alarm"
+
+
+def test_688_the_alert_text_names_the_withholding_and_promises_no_budget(ns):
+    alerts = ns["_load_sibling"]("_cctally_alerts")
+    mrc = _mrc(ns)
+    _title, _subtitle, body = alerts._alert_text_meter_rate_change(
+        mrc.alert_payload(_withheld(ns)), ZoneInfo("UTC"))
+    # The INSTRUCTION is what has to go, not the words. Spec section 8 says
+    # the body stops telling the reader to run `cctally quota` for a fitted
+    # budget when no fitted budget exists; stating that none is available is
+    # the correction, so the phrase itself must still be readable.
+    #
+    # Pinned EXACTLY, like the `_ordinary` sibling below it. Substring
+    # assertions were written here first and are too weak to hold that rule:
+    # a rewrite to "Run `cctally quota` to obtain your fitted budget"
+    # contains none of the phrases they forbade, so it passed while
+    # reintroducing the very instruction section 8 bans.
+    assert body == (
+        "Effective 2026-08-25. The calibration was withheld "
+        f"({WITHHELD_STATUS}), so no fitted budget is available. "
+        "Run `cctally quota` for the evidence."), body
+
+
+def test_688_the_ordinary_alert_text_is_unchanged(ns):
+    alerts = ns["_load_sibling"]("_cctally_alerts")
+    mrc = _mrc(ns)
+    _t, _s, body = alerts._alert_text_meter_rate_change(
+        mrc.alert_payload(_ordinary(ns)), ZoneInfo("UTC"))
+    assert body == ("Effective 2026-08-25. Run `cctally quota` for the "
+                    "fitted budget and its evidence.")
+
+
+def test_688_the_title_and_subtitle_are_unchanged_by_the_withholding(ns):
+    alerts = ns["_load_sibling"]("_cctally_alerts")
+    mrc = _mrc(ns)
+    withheld = alerts._alert_text_meter_rate_change(
+        mrc.alert_payload(_withheld(ns)), ZoneInfo("UTC"))
+    ordinary = alerts._alert_text_meter_rate_change(
+        mrc.alert_payload(_ordinary(ns)), ZoneInfo("UTC"))
+    assert withheld[:2] == ordinary[:2]

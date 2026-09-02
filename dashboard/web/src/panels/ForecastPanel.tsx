@@ -17,16 +17,8 @@ import {
 } from '../lib/dashboardPresentation';
 import { SourceChip } from './sourcePanel';
 import { BudgetComposition } from '../components/BudgetBlock';
-import { causeShort } from '../lib/quotaCopy';
+import { basisShort, causeShort } from '../lib/quotaCopy';
 import type { Envelope } from '../types/envelope';
-
-// #661 S2 sections 9 and 10 — how the panel names the basis its projection
-// came from. The vocabulary is the same one the status line prints, so a user
-// reading both surfaces reads one word for one thing.
-const BASIS_LABEL: Record<string, string> = {
-  calibrated: 'model',
-  'corrected-meter': 'meter',
-};
 
 /**
  * The one line the panel adds: which measurement produced the projection, or
@@ -47,7 +39,10 @@ export function forecastBasisLine(
       value: causeShort(quota.code_presentation, quota.code) || 'withheld',
     };
   }
-  return { label: 'Basis', value: BASIS_LABEL[quota.basis] ?? quota.basis };
+  return {
+    label: 'Basis',
+    value: basisShort(quota.basis_presentation, quota.basis),
+  };
 }
 
 // #416 QA P0 — the shared blank. A forecast is a claim about ONE quota

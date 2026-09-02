@@ -1022,8 +1022,18 @@ def _load_codex_quota_observations_for_doctor(*, force_cold: bool = False):
 
 
 _QUOTA_NO_CHANGE: dict = {
-    "active": False, "effective_from": None,
+    "active": False, "assessed": True, "effective_from": None,
     "previous_units_per_point": None, "new_units_per_point": None,
+    "calibration_status": None,
+}
+
+#: No regime pair was examined, so no transition claim is available either
+#: way (#688). Distinct from `_QUOTA_NO_CHANGE`, which is a real negative
+#: finding over regimes that exist.
+_QUOTA_NOT_ASSESSED: dict = {
+    "active": False, "assessed": False, "effective_from": None,
+    "previous_units_per_point": None, "new_units_per_point": None,
+    "calibration_status": None,
 }
 
 
@@ -1036,14 +1046,18 @@ def _gather_quota_rate_change(c, rejection=None) -> "dict | None":
     gather goes to the stored regimes rather than through the validated
     reader's default, which refuses that mark.
 
-    An ABSENT calibration is "no change detected", not "not assessed" — a
-    store with no fitted regime has no transition to report, and that is the
-    state of every install that has never run `cctally quota`. `None` is
-    reserved for a calibration that exists and could not be read, where the
-    sibling `quota.calibration` check is already WARNing about it.
+    An ABSENT calibration is "not assessed", NEVER "no change detected"
+    (#688). It was the latter until a real metering change was reported to a
+    user as a green all-clear: the fit was withheld, so no regime persisted,
+    so the calibration was absent, and this gather turned that absence into a
+    negative finding. A store with no fitted regime has no transition to
+    report AND no evidence that none occurred, and `docs/commands/quota.md`
+    forbids conflating the two. `None` is reserved for a calibration that
+    exists and could not be read, where the sibling `quota.calibration` check
+    is already WARNing about it; both render as not assessed.
     """
     if rejection == "calibration-absent":
-        return dict(_QUOTA_NO_CHANGE)
+        return dict(_QUOTA_NOT_ASSESSED)
     mrc = c._load_sibling("_lib_meter_rate_change")
     glue = c._load_sibling("_cctally_quota_model")
     loaded = glue.read_stored_state_readonly()
@@ -1053,7 +1067,7 @@ def _gather_quota_rate_change(c, rejection=None) -> "dict | None":
     active = mrc.active_rate_change(regimes)
     if active is None:
         return dict(_QUOTA_NO_CHANGE)
-    return active
+    return dict(active, assessed=True)
 
 
 def doctor_gather_state(

@@ -258,10 +258,14 @@ def _apply_midweek_reset_override(
     week_start_at: dt.datetime,
     week_end_at: dt.datetime,
     samples: list,
+    *,
+    now_utc: dt.datetime,
 ) -> tuple[dt.datetime, list]:
     """If the current week's end_at matches a recorded reset event's
-    ``new_week_end_at``, shift ``week_start_at`` to the effective reset
-    moment and drop pre-reset samples.
+    ``new_week_end_at`` and was detected by ``now_utc``, shift
+    ``week_start_at`` to the effective reset moment and drop pre-reset
+    samples. The detection bound keeps historical replay causal while leaving
+    the live path unchanged (live ``now_utc`` postdates retained events).
 
     Keeps callers (``_load_forecast_inputs``, ``_tui_build_current_week``)
     from reporting spent_usd summed across the pre-reset window.
@@ -276,8 +280,10 @@ def _apply_midweek_reset_override(
         ).isoformat(timespec="seconds")
         event_row = conn.execute(
             "SELECT effective_reset_at_utc FROM week_reset_events "
-            "WHERE new_week_end_at = ?",
-            (end_iso,),
+            "WHERE new_week_end_at = ? "
+            "  AND datetime(detected_at_utc) <= datetime(?) "
+            "ORDER BY datetime(detected_at_utc) DESC LIMIT 1",
+            (end_iso, now_utc.isoformat()),
         ).fetchone()
         if event_row and event_row["effective_reset_at_utc"]:
             reset_dt = parse_iso_datetime(
@@ -314,7 +320,7 @@ def _resolve_current_budget_window(conn, now_utc, *, account_key=None):
         return None
     week_start_at, week_end_at, samples = fetched
     week_start_at, _samples = _apply_midweek_reset_override(
-        conn, week_start_at, week_end_at, samples
+        conn, week_start_at, week_end_at, samples, now_utc=now_utc
     )
     return (week_start_at, week_end_at)
 
@@ -1158,8 +1164,10 @@ def _calibrated_week_detail(
         # A `CalibratedWeek`, never the two-value tuple this function returned
         # before it grew a dataclass. `_calibrated_projection` reads
         # `detail.projection_pct` off the result, so a tuple here raises
-        # `AttributeError` instead of withholding — the same defect class as
-        # `persist_and_detect`'s `None, None`.
+        # `AttributeError` instead of withholding — the same defect class as a
+        # `persist_and_detect` early return whose arity does not match the rest
+        # of the function. That function now returns THREE values, which is why
+        # its unreadable-state path returns `None, (), ()`.
         return CalibratedWeek(code="unavailable")
     read = qcg.read_calibration_file(account_key=account_key)
     if read.regime is None:
@@ -1295,7 +1303,7 @@ def _load_forecast_inputs(
     # reset moment and drop pre-reset samples so elapsed/remaining math
     # and spent_usd reflect the post-reset window only.
     week_start_at, samples = _apply_midweek_reset_override(
-        conn, week_start_at, week_end_at, samples
+        conn, week_start_at, week_end_at, samples, now_utc=now_utc
     )
 
     if not samples:
@@ -2542,7 +2550,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         if fetched is not None:
             _ws_at, _we_at, raw_samples = fetched
             _ws_at_shifted, samples = _apply_midweek_reset_override(
-                conn, _ws_at, _we_at, raw_samples
+                conn, _ws_at, _we_at, raw_samples, now_utc=now_utc
             )
             tz_render = getattr(args, "_resolved_tz", None)
             for cap_at, pct, _five_hr in samples:

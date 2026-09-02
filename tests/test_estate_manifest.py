@@ -4,6 +4,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import threading
 import types
 
 import pytest
@@ -139,6 +140,38 @@ def test_the_overlay_carries_removals_as_well_as_additions():
     }
     combined = mod.compose_private(pub, overlay)
     assert combined["pytestNodes"] == []
+
+
+def test_the_overlay_adds_a_private_only_serial_selector():
+    """Private wall-clock nodes extend the plan without breaking public CI."""
+    mod = _load()
+    public_node = "tests/test_public.py::test_fast"
+    bulk_node = "tests/test_public.py::test_bulk"
+    private_node = "tests/test_private.py::test_wall_clock"
+    pub = _artifact(
+        pytestNodes=[public_node, bulk_node],
+        pytestExecution={"legs": [
+            {"name": "benchmark", "selectors": [public_node]},
+            {"name": "pytest", "selectors": ["*complement*"]},
+        ]},
+    )
+    overlay = {
+        "schemaVersion": 1,
+        "publicDigest": mod.active_set_digest(pub),
+        "allowlistDigest": "x" * 64,
+        "pytestNodes": {"additions": [private_node], "removals": []},
+        "frontendTests": {"additions": [], "removals": []},
+        "suppressions": {"additions": [], "removals": []},
+        "pytestExecution": {"benchmarkAdditions": [private_node]},
+    }
+
+    combined = mod.compose_private(pub, overlay)
+    plan = mod.plan_execution(combined)
+
+    assert plan.selectors["benchmark"] == (
+        ("node", public_node), ("node", private_node))
+    assert set(plan.legs["benchmark"]) == {public_node, private_node}
+    assert plan.legs["pytest"] == (bulk_node,)
 
 
 def test_compose_private_refuses_a_removal_naming_an_absent_row():
@@ -297,6 +330,23 @@ def _ledger_entry(**over):
     return e
 
 
+def _rename_entry(**over):
+    e = {
+        "id": "R-0002",
+        "axis": "pytestNodes",
+        "profile": "public",
+        "cause": "renamed",
+        "reason": "the successor names the same live coverage truthfully",
+        "renames": [{
+            "from": "tests/test_a.py::test_old",
+            "to": "tests/test_a.py::test_new",
+        }],
+        "predecessorDigest": None,
+    }
+    e.update(over)
+    return e
+
+
 def test_removing_a_pytest_node_without_a_declaration_is_unauthorized():
     """#648 D3 -- the harmful direction on an identity axis is REMOVAL."""
     mod = _load()
@@ -319,6 +369,62 @@ def test_adding_a_pytest_node_is_free():
     prev = _artifact(pytestNodes=[])
     cur = _artifact(pytestNodes=["tests/test_a.py::test_one"])
     assert mod.validate_transition(prev, cur, [], "public") == []
+
+
+def test_a_verified_rename_authorizes_the_old_identity_removal():
+    """#674: a rename is recorded as a migration, not false retirement.
+
+    The successor must be a newly-added identity in the same transition.  This
+    makes the mapping evidence rather than prose attached to an unconditional
+    removal waiver.
+    """
+    mod = _load()
+    prev = _artifact(pytestNodes=["tests/test_a.py::test_old"])
+    cur = _artifact(pytestNodes=["tests/test_a.py::test_new"])
+    entry = _rename_entry(predecessorDigest=mod.active_set_digest(prev))
+    assert mod.validate_transition(prev, cur, [entry], "public") == []
+
+
+@pytest.mark.parametrize("current", [
+    [],
+    ["tests/test_a.py::test_preexisting"],
+])
+def test_a_rename_without_its_declared_new_successor_is_unauthorized(current):
+    mod = _load()
+    prev = _artifact(pytestNodes=["tests/test_a.py::test_old"])
+    cur = _artifact(pytestNodes=current)
+    entry = _rename_entry(predecessorDigest=mod.active_set_digest(prev))
+    assert mod.validate_transition(prev, cur, [entry], "public")
+
+
+def test_a_rename_cannot_point_at_an_identity_that_already_existed():
+    """An unrelated surviving test is not evidence that coverage was renamed."""
+    mod = _load()
+    prev = _artifact(pytestNodes=["tests/test_a.py::test_old",
+                                  "tests/test_a.py::test_new"])
+    cur = _artifact(pytestNodes=["tests/test_a.py::test_new"])
+    entry = _rename_entry(predecessorDigest=mod.active_set_digest(prev))
+    assert mod.validate_transition(prev, cur, [entry], "public")
+
+
+def test_two_removed_identities_cannot_claim_one_successor():
+    """A many-to-one declaration would conceal a real loss of coverage."""
+    mod = _load()
+    prev = _artifact(pytestNodes=["tests/test_a.py::test_old",
+                                  "tests/test_a.py::test_other_old"])
+    cur = _artifact(pytestNodes=["tests/test_a.py::test_new"])
+    entry = _rename_entry(
+        renames=[
+            {"from": "tests/test_a.py::test_old",
+             "to": "tests/test_a.py::test_new"},
+            {"from": "tests/test_a.py::test_other_old",
+             "to": "tests/test_a.py::test_new"},
+        ],
+        predecessorDigest=mod.active_set_digest(prev),
+    )
+    with pytest.raises(mod.EstateError):
+        mod.load_ledger_document({"schemaVersion": 1,
+                                  "declarations": [entry]})
 
 
 def test_ADDING_a_suppression_without_a_declaration_is_unauthorized():
@@ -571,7 +677,9 @@ def test_the_committed_ledgers_load_and_carry_validated_declarations():
         entries = mod.load_ledger(path)
         for entry in entries:
             assert entry["reason"].strip(), (name, entry["id"])
-            assert entry["rows"], (name, entry["id"])
+            payload = (entry["renames"] if entry["cause"] == "renamed"
+                       else entry["rows"])
+            assert payload, (name, entry["id"])
         loaded.append(entries)
     mod.merge_ledgers(*loaded)
 
@@ -665,6 +773,59 @@ def test_live_axes_passes_a_mapping_through_unchanged():
     mod = _load()
     given = {"pytestNodes": ["a"], "frontendTests": [], "suppressions": []}
     assert mod.live_axes(given) == given
+
+
+def test_live_discovery_overlaps_the_two_subprocess_collectors(
+        tmp_path, monkeypatch):
+    """Pytest and frontend collection are independent, expensive subprocesses.
+
+    Running them serially pushed the real projected-public-tree acceptance
+    test past the authoritative suite's 120-second per-node timeout. Each fake
+    collector therefore requires the other to have started before it returns;
+    a serial implementation fails instead of merely making this test slow.
+    """
+    mod = _load()
+    repo = tmp_path / "repo"
+    builder = repo / "bin" / "build-e2e-fixtures.py"
+    builder.parent.mkdir(parents=True)
+    builder.write_text("# fixture builder seam\n", encoding="utf-8")
+    pytest_started = threading.Event()
+    frontend_started = threading.Event()
+
+    class _Discovery:
+        @staticmethod
+        def collect_pytest_nodes(_repo):
+            pytest_started.set()
+            # timing-budget: the short wait is the concurrency assertion
+            assert frontend_started.wait(1.0), "frontend collection stayed serial"
+            return ["tests/test_a.py::test_one"]
+
+        @staticmethod
+        def collect_frontend_tests(_repo, runtime_dir):
+            assert runtime_dir.is_dir()
+            frontend_started.set()
+            # timing-budget: the short wait is the concurrency assertion
+            assert pytest_started.wait(1.0), "pytest collection stayed serial"
+            return [_Row(runner="vitest", id="a.test.ts > x",
+                         expected_status=None)]
+
+        @staticmethod
+        def scan_suppressions(_tests, base):
+            assert base == repo
+            return [_Row(key="tests/test_a.py::<module>::skip_call::x")]
+
+    monkeypatch.setattr(mod, "_load_discovery_kernel",
+                        lambda _repo: _Discovery)
+    monkeypatch.setattr(mod.subprocess, "run", lambda *args, **kwargs:
+                        types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+
+    assert mod.discover_live(repo) == {
+        "pytestNodes": ["tests/test_a.py::test_one"],
+        "frontendTests": [{"runner": "vitest", "id": "a.test.ts > x",
+                           "expectedStatus": None}],
+        "suppressions": [{"key": "tests/test_a.py::<module>::skip_call::x",
+                          "count": 1}],
+    }
 
 
 def test_compare_is_empty_when_the_record_and_the_tree_agree():

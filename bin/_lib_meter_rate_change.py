@@ -53,10 +53,16 @@ NOTABLE_DROP_FRACTION = 0.02
 class RateChangeTransition:
     """One confirmed predecessor-to-successor metering-rate transition.
 
-    Every field is carried into the journal payload, so the payload alone
-    suffices to reconstruct the row and a later deletion or quarantine of the
-    calibration file cannot affect a rebuild (§6.5 step 4). That is what makes
-    the latch survive a rebuild whose key originated in an unjournaled file.
+    Every field the ROW is made of is carried into the journal payload, so
+    the payload alone suffices to reconstruct the row and a later deletion or
+    quarantine of the calibration file cannot affect a rebuild (§6.5 step 4).
+    That is what makes the latch survive a rebuild whose key originated in an
+    unjournaled file.
+
+    `withholding_status` is the one field outside that set (#688). It is
+    notification disclosure rather than row content, it reaches only
+    `alert_payload`, and its own comment states why the journal payload must
+    stay byte-stable.
     """
 
     provider: str
@@ -66,6 +72,16 @@ class RateChangeTransition:
     new_units_per_point: float
     severity: str
     detected_at: str
+    #: The calibration status the run was withheld under, when the transition
+    #: was admitted by #688's detection-keyed path; `None` for every ordinary
+    #: transition. It is DISCLOSURE CONTEXT and nothing else: it is not part
+    #: of `identity()`, and it is deliberately absent from `event_payload`,
+    #: because event selection hashes the whole record and quarantines two
+    #: revision-0 records that share an id and differ in hash. A key added to
+    #: the journal payload would quarantine any re-emission of an
+    #: already-recorded identity. `alert_payload` is never journaled, so the
+    #: disclosure rides there instead.
+    withholding_status: "str | None" = None
 
     def identity(self) -> tuple:
         """The §6.3 key: `(provider, account identity, effectiveFrom)`.
@@ -165,6 +181,43 @@ def _adjacent_pairs(regimes) -> dict:
     return pairs
 
 
+def enumerate_transitions(regimes, *, provider, account_key,
+                          detected_at) -> tuple:
+    """EVERY qualified transition in one persisted state, oldest first.
+
+    This is the qualification, and `detect_transitions` is a freshness filter
+    over it. They must not be two qualifications: recovery (#689) enumerates
+    what is already persisted, and a pair it admitted but detection refused —
+    or the reverse — would record a transition the detector never confirmed.
+
+    `withholding_status` is deliberately left at its `None` default. It is
+    #688 disclosure captured at detection time from the analysis, and this
+    function sees only stored regimes.
+    """
+    pairs = _adjacent_pairs(regimes or ())
+    out: list = []
+    for start in sorted(pairs):
+        predecessor, successor = pairs[start]
+        previous = _finite_positive(predecessor.get("unitsPerPoint"))
+        new = _finite_positive(successor.get("unitsPerPoint"))
+        if previous is None or new is None:
+            # A pair whose rates are not both finite and positive describes
+            # no measurable transition. Recording it would publish two
+            # numbers the renderer would have to withhold anyway, and
+            # skipping it must not stop the walk over the remaining pairs.
+            continue
+        out.append(RateChangeTransition(
+            provider=str(provider),
+            account_key=str(account_key),
+            effective_from=start.isoformat(),
+            previous_units_per_point=previous,
+            new_units_per_point=new,
+            severity=transition_severity(previous, new),
+            detected_at=str(detected_at),
+        ))
+    return tuple(out)
+
+
 def detect_transitions(before_regimes, after_regimes, *, provider,
                        account_key, detected_at) -> tuple:
     """Every transition the persistence step just created, oldest first.
@@ -186,30 +239,20 @@ def detect_transitions(before_regimes, after_regimes, *, provider,
     at least once per key. Returning the whole list costs nothing, because
     `_insert_meter_rate_change` is an `INSERT OR IGNORE` over that same key
     and the caller records each descriptor through it.
+
+    The subtraction compares CANONICAL instants. `_adjacent_pairs` keys on a
+    parsed datetime normalised to UTC, and a descriptor's `effective_from` is
+    that key's `isoformat()`, so both sides agree on one spelling. Do not pass
+    those keys through `_instant`: it accepts only a string and returns None
+    for a datetime, which would empty the before set and re-emit everything.
     """
-    after_pairs = _adjacent_pairs(after_regimes or ())
-    before_pairs = _adjacent_pairs(before_regimes or ())
-    out: list = []
-    for start in sorted(s for s in after_pairs if s not in before_pairs):
-        predecessor, successor = after_pairs[start]
-        previous = _finite_positive(predecessor.get("unitsPerPoint"))
-        new = _finite_positive(successor.get("unitsPerPoint"))
-        if previous is None or new is None:
-            # A pair whose rates are not both finite and positive describes
-            # no measurable transition. Recording it would publish two
-            # numbers the renderer would have to withhold anyway, and
-            # skipping it must not stop the walk over the remaining pairs.
-            continue
-        out.append(RateChangeTransition(
-            provider=str(provider),
-            account_key=str(account_key),
-            effective_from=start.isoformat(),
-            previous_units_per_point=previous,
-            new_units_per_point=new,
-            severity=transition_severity(previous, new),
-            detected_at=str(detected_at),
-        ))
-    return tuple(out)
+    already = {start.isoformat()
+               for start in _adjacent_pairs(before_regimes or ())}
+    return tuple(
+        t for t in enumerate_transitions(
+            after_regimes, provider=provider, account_key=account_key,
+            detected_at=detected_at)
+        if t.effective_from not in already)
 
 
 def event_payload(transition: RateChangeTransition, *, created_at: str) -> dict:
@@ -217,8 +260,17 @@ def event_payload(transition: RateChangeTransition, *, created_at: str) -> dict:
 
     Self-sufficient by design: the row is reconstructible from this alone, so
     a later deletion or quarantine of the calibration file cannot affect a
-    rebuild. The payload is also a pure function of the transition, which is
-    what makes a crash-replayed duplicate line byte-identical to the original.
+    rebuild.
+
+    The payload is a pure function of the transition AND of `created_at`,
+    which the caller takes from the command clock. A crash-replayed duplicate
+    is still byte-identical, because replay re-reads the line that is already
+    on the journal rather than rebuilding this payload. A RE-EMISSION is not:
+    the same transition emitted by a later run carries a different
+    `created_at_utc` and `detected_at_utc` and therefore a different content
+    hash under the same event id. That is #689's hazard, and it is why
+    `record_meter_rate_change` classifies before it appends rather than
+    relying on this payload being reproducible.
     """
     return {
         "provider": transition.provider,
@@ -239,6 +291,13 @@ def alert_payload(transition: RateChangeTransition) -> dict:
     There is no `threshold` key, and there must not be one: the dispatch glue
     derives severity from a threshold when it finds one, and this family's
     severity is explicit. `severity` is therefore passed verbatim.
+
+    `withholding_status` is emitted ALWAYS, as a string or as JSON `null`,
+    following this repository's wire rule that a published key is nulled
+    rather than dropped (#688). It appears here and not in `event_payload`
+    because this payload is dispatched from `ctx.deferred_alerts` and is never
+    journaled, so adding it cannot make a re-emitted identity hash
+    differently from its retained line.
     """
     return {
         "axis": FAMILY,
@@ -248,6 +307,7 @@ def alert_payload(transition: RateChangeTransition) -> dict:
         "effective_from": transition.effective_from,
         "previous_units_per_point": transition.previous_units_per_point,
         "new_units_per_point": transition.new_units_per_point,
+        "withholding_status": transition.withholding_status,
     }
 
 
@@ -271,6 +331,11 @@ def active_rate_change(regimes) -> "dict | None":
     predecessor. The open regime is the one with no `effectiveUntil`; a store
     holding several is malformed and the LATEST is taken, which is the same
     choice the reader makes.
+
+    `calibration_status` is the SUCCESSOR regime's own status (#688). It is
+    reported because a successor that is not prediction-ready has no fitted
+    budget, and `doctor`'s remediation used to send that user to a command
+    that would refuse.
     """
     pairs = _adjacent_pairs(regimes or ())
     open_starts = [
@@ -291,4 +356,5 @@ def active_rate_change(regimes) -> "dict | None":
         "severity": (transition_severity(previous, new)
                      if previous is not None and new is not None
                      else SEVERITY_INFO),
+        "calibration_status": successor.get("status"),
     }

@@ -8,7 +8,7 @@ from _fts5_gate import require_fts5  # the ONE FTS5 capability gate (#630 S6)
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 import _cctally_db as db
 
-from conftest import load_script, redirect_paths
+from conftest import load_script, redirect_paths_without_conversation_retention
 
 def _fresh():
     conn = sqlite3.connect(":memory:")
@@ -255,7 +255,7 @@ def isolated(tmp_path, monkeypatch):
     also preserves the handful of accounting assertions in this suite.
     """
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)
     cache_conn = ns["open_cache_db"]()
@@ -563,7 +563,7 @@ def test_backfill_migration_stamped_not_run_on_fresh_install(tmp_path, monkeypat
     brand-new cache.db must leave 002 marked applied with conversation_messages
     empty and no error."""
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     # Fresh open: no JSONL on disk, brand-new cache.db.
     conn = ns["open_cache_db"]()
     try:

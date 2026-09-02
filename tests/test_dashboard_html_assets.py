@@ -15,6 +15,7 @@ pass the check.
 """
 from __future__ import annotations
 
+import gzip
 import http.client
 import threading
 from html.parser import HTMLParser
@@ -31,6 +32,7 @@ class _AssetExtractor(HTMLParser):
         super().__init__()
         self.scripts: list[str] = []
         self.stylesheets: list[str] = []
+        self.modulepreloads: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         a = {k: v for k, v in attrs}
@@ -43,6 +45,8 @@ class _AssetExtractor(HTMLParser):
             href = a.get("href")
             if href and "stylesheet" in rel.split():
                 self.stylesheets.append(href)
+            if href and "modulepreload" in rel.split():
+                self.modulepreloads.append(href)
 
 
 def _check(host: str, port: int, url_path: str) -> int:
@@ -95,3 +99,32 @@ def test_dashboard_html_references_all_resolvable_assets() -> None:
             )
     finally:
         stop(srv, t)
+
+
+def test_dashboard_shell_javascript_stays_within_cold_load_budget() -> None:
+    """Re-eagerly importing deferred features must breach the cold JS budget."""
+    ns = load_script()
+    html = (ns["STATIC_DIR"] / "dashboard.html").read_text()
+    extractor = _AssetExtractor()
+    extractor.feed(html)
+
+    scripts = [
+        ns["STATIC_DIR"] / url.removeprefix("/static/")
+        for url in extractor.scripts + extractor.modulepreloads
+        if url.startswith("/static/")
+    ]
+    assert scripts, "dashboard.html must load at least one local entry script"
+    missing = [str(path) for path in scripts if not path.is_file()]
+    assert missing == [], f"dashboard entry scripts are missing: {missing}"
+
+    raw_bytes = sum(path.stat().st_size for path in scripts)
+    gzip_bytes = sum(
+        len(gzip.compress(path.read_bytes(), compresslevel=6, mtime=0))
+        for path in scripts
+    )
+    assert raw_bytes <= 950_000, (
+        f"cold entry JavaScript is {raw_bytes:,} bytes; budget is 950,000"
+    )
+    assert gzip_bytes <= 280_000, (
+        f"cold entry JavaScript is {gzip_bytes:,} gzip bytes; budget is 280,000"
+    )

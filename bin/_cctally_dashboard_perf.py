@@ -47,6 +47,7 @@ _TRACE_PATH = "/api/debug/backend/trace"
 _REPORTED_REGIMES = ("active", "idle")
 
 _REGIME_LABELS = {"active": "Codex-active", "idle": "Codex-idle"}
+COMBINED_BACKGROUND_CPU_CEILING = 0.75
 
 
 def _cctally():
@@ -202,6 +203,36 @@ def _mean_or_none(values):
     return int(sum(values) / len(values)) if values else None
 
 
+def _cpu_duty(rows):
+    paired = [
+        (int(row.get("cpu_ns") or 0), int(row["period_ns"]))
+        for row in rows or ()
+        if row.get("cpu_ns") is not None
+        and row.get("period_ns") is not None
+        and int(row["period_ns"]) > 0
+    ]
+    if not paired:
+        return None
+    return sum(cpu for cpu, _period in paired) / sum(
+        period for _cpu, period in paired)
+
+
+def summarise_combined_background_duty(tick: dict) -> dict:
+    """Conservative sum of each loop's same-span one-core duty."""
+    main = _cpu_duty(tick.get("records") or ())
+    conversations = _cpu_duty(tick.get("conversation_sync") or ())
+    combined = None if main is None or conversations is None else (
+        main + conversations)
+    return {
+        "main": main,
+        "conversation": conversations,
+        "combined": combined,
+        "ceiling": COMBINED_BACKGROUND_CPU_CEILING,
+        "withinCeiling": None if combined is None else (
+            combined <= COMBINED_BACKGROUND_CPU_CEILING),
+    }
+
+
 def _median(values):
     import statistics
 
@@ -265,6 +296,17 @@ def _render_conversation_sync(tick: dict) -> list:
         statuses[key] = statuses.get(key, 0) + 1
     detail = " · ".join(f"{k} {v}" for k, v in sorted(statuses.items()))
     lines.append(f"  {'status':<14} {detail}")
+    for provider in ("claude", "codex"):
+        modes: dict = {}
+        files = 0
+        for record in rows:
+            mode = record.get(f"{provider}_mode") or "not_observed"
+            modes[mode] = modes.get(mode, 0) + 1
+            files += max(0, int(record.get(f"{provider}_files") or 0))
+        mode_detail = " · ".join(
+            f"{mode} {count}" for mode, count in sorted(modes.items()))
+        lines.append(
+            f"  {provider:<14} {mode_detail} · files {files}")
     return lines
 
 
@@ -316,6 +358,23 @@ def render_dashboard_perf(payload: dict) -> str:
             f"over {len(builder)} tick(s)")
         lines.append(
             f"  whole tick     mean {_millis(_mean_or_none(duration))}")
+        cpu = [int(r.get("cpu_ns") or 0) for r in records]
+        lines.append(
+            f"  thread cpu     mean {_millis(_mean_or_none(cpu))}")
+        paired_cpu = [
+            (int(r.get("cpu_ns") or 0), int(r["period_ns"]))
+            for r in records
+            if r.get("cpu_ns") is not None
+            and r.get("period_ns") is not None
+            and int(r["period_ns"]) > 0
+        ]
+        if paired_cpu:
+            duty = sum(value for value, _period in paired_cpu) / sum(
+                period for _value, period in paired_cpu
+            )
+            lines.append(f"  cpu duty       {duty * 100:.1f}% of one core")
+        else:
+            lines.append("  cpu duty       no samples yet")
         # #583 S5 §2.4: the cache.db read pin, measured at its own BEGIN and
         # ROLLBACK boundaries. Reported separately from `builder` because it
         # is a SUBSET of builder time rather than a third exclusive half, and
@@ -331,6 +390,7 @@ def render_dashboard_perf(payload: dict) -> str:
             f"{'/cold' if newest.get('cold') else '/warm'} "
             f"ingest {_millis(newest.get('ingest_ns'))} "
             f"builder {_millis(newest.get('builder_ns'))} "
+            f"cpu {_millis(newest.get('cpu_ns'))} "
             f"pin {_millis(newest.get('cache_pin_ns', 0) or 0)} "
             f"total {_millis(newest.get('duration_ns'))}")
     else:
@@ -342,6 +402,15 @@ def render_dashboard_perf(payload: dict) -> str:
             f"total {_millis(standalone.get('duration_ns'))} "
             f"(the last build made outside a refresh tick)")
     lines.extend(_render_conversation_sync(tick))
+    combined = summarise_combined_background_duty(tick)
+    lines.extend(["", "Combined background work"])
+    if combined["combined"] is None:
+        lines.append("  duty           not jointly sampled")
+    else:
+        verdict = "within" if combined["withinCeiling"] else "over"
+        lines.append(
+            f"  duty           {combined['combined'] * 100:.1f}% of one core · "
+            f"ceiling {combined['ceiling'] * 100:.1f}% · {verdict}")
     lines.append("")
 
     counts = tick.get("dispatch_counts") or {}
@@ -359,6 +428,24 @@ def render_dashboard_perf(payload: dict) -> str:
     else:
         lines.append("Group A cache-open failures   none")
 
+    memory = payload.get("memory") or {}
+    if memory:
+        lines.append("")
+        lines.append("Retained process memory")
+        lines.append(
+            "  owned          "
+            f"{int(memory.get('ownerEstimatedBytes', 0)) / 1048576:.1f} MiB "
+            f"of {int(memory.get('ownerCeilingBytes', 0)) / 1048576:.1f} MiB")
+        lines.append(
+            "  process cap    "
+            f"{int(memory.get('processCeilingBytes', 0)) / 1048576:.0f} MiB")
+        for name, row in sorted((memory.get("owners") or {}).items()):
+            lines.append(
+                f"  {name:<22} "
+                f"{int(row.get('estimatedBytes', 0)) / 1048576:.1f}/"
+                f"{int(row.get('maxBytes', 0)) / 1048576:.1f} MiB · "
+                f"entries {int(row.get('entryCount', 0))}")
+
     applied = tracing.get("applied")
     requested = tracing.get("requested")
     applies_at = tracing.get("applies_at", "none")
@@ -374,6 +461,12 @@ def render_dashboard_perf(payload: dict) -> str:
     else:
         lines.append("  no phase tree stored — arm one with "
                      "`cctally dashboard-perf --trace on`")
+    if payload.get("ingest_phases") is not None:
+        ingest = payload["ingest_phases"]
+        lines.append(
+            f"  ingest tree {ingest.get('elapsed_ms', 0):.1f}ms, generated at "
+            f"{payload.get('ingest_generated_at')}"
+        )
     return "\n".join(lines) + "\n"
 
 

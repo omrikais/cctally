@@ -57,6 +57,7 @@ PUBLICATIONS = ("final", "partial", "seed", "degraded")
 #: validation lives in the recorder rather than in the dataclass because a
 #: frozen field typed `str` enforces nothing on its own.
 CONVERSATION_STATUSES = ("ok", "store_unavailable", "error")
+CONVERSATION_MODES = ("caught_up", "targeted", "full", "not_observed")
 
 _INGEST = "ingest"
 _BUILD = "build"
@@ -82,6 +83,7 @@ class TickRecord:
     published_at: str
     period_ns: "int | None"
     cache_pin_ns: int
+    cpu_ns: int
 
     def as_wire(self) -> dict:
         return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
@@ -119,6 +121,10 @@ class ConversationSyncRecord:
     cpu_ns: int
     period_ns: "int | None"
     status: str
+    claude_mode: str
+    codex_mode: str
+    claude_files: int
+    codex_files: int
 
     def as_wire(self) -> dict:
         return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
@@ -233,14 +239,17 @@ class _Span:
 class TickContext:
     """A tick in progress. Thread-confined; only ``finish`` touches the lock."""
 
-    __slots__ = ("_now", "_standalone", "_started_ns", "_spans", "_finished",
+    __slots__ = ("_now", "_cpu_now", "_standalone", "_started_ns",
+                 "_started_cpu_ns", "_spans", "_finished",
                  "_ingest_ns", "_builder_ns", "_ingest_ran", "_dispatch",
                  "_codex_regime", "_publication", "_cold", "_cache_pin_ns")
 
-    def __init__(self, *, monotonic_ns, standalone: bool):
+    def __init__(self, *, monotonic_ns, thread_time_ns, standalone: bool):
         self._now = monotonic_ns
+        self._cpu_now = thread_time_ns
         self._standalone = standalone
         self._started_ns = monotonic_ns()
+        self._started_cpu_ns = thread_time_ns()
         self._spans: list[_Span] = []
         self._finished = False
         self._ingest_ns = 0
@@ -388,6 +397,7 @@ class TickContext:
         while self._spans:
             self._spans.pop().__exit__(None, None, None)
         ended_ns = self._now()
+        ended_cpu_ns = self._cpu_now()
         if getattr(_tls, "tick", None) is self:
             _tls.tick = None
 
@@ -419,6 +429,7 @@ class TickContext:
                 published_at=published_at,
                 period_ns=period,
                 cache_pin_ns=self._cache_pin_ns,
+                cpu_ns=max(0, ended_cpu_ns - self._started_cpu_ns),
             )
             if self._standalone:
                 _STATE = dataclasses.replace(prior, standalone=record)
@@ -442,7 +453,9 @@ class TickContext:
 
 
 def record_conversation_pass(
-    *, seq, started_ns, ended_ns, duration_ns, cpu_ns, status
+    *, seq, started_ns, ended_ns, duration_ns, cpu_ns, status,
+    claude_mode="not_observed", codex_mode="not_observed",
+    claude_files=0, codex_files=0,
 ) -> None:
     """Append one conversation sync pass to its ring, under the SHARED lock.
 
@@ -469,6 +482,10 @@ def record_conversation_pass(
     """
     global _STATE
     safe_status = status if status in CONVERSATION_STATUSES else "error"
+    safe_claude_mode = (
+        claude_mode if claude_mode in CONVERSATION_MODES else "not_observed")
+    safe_codex_mode = (
+        codex_mode if codex_mode in CONVERSATION_MODES else "not_observed")
     start = int(started_ns)
     record = ConversationSyncRecord(
         seq=int(seq),
@@ -478,6 +495,10 @@ def record_conversation_pass(
         cpu_ns=max(0, int(cpu_ns)),
         period_ns=None,
         status=safe_status,
+        claude_mode=safe_claude_mode,
+        codex_mode=safe_codex_mode,
+        claude_files=max(0, int(claude_files)),
+        codex_files=max(0, int(codex_files)),
     )
     with _LOCK:
         prior = _STATE
@@ -495,7 +516,9 @@ def record_conversation_pass(
         )
 
 
-def begin_tick(*, monotonic_ns=None, standalone: bool = False) -> TickContext:
+def begin_tick(
+    *, monotonic_ns=None, thread_time_ns=None, standalone: bool = False,
+) -> TickContext:
     """Open a tick context and make it ``current()`` on this thread.
 
     ``standalone`` records a ``tui --render-once`` or
@@ -505,6 +528,7 @@ def begin_tick(*, monotonic_ns=None, standalone: bool = False) -> TickContext:
     """
     ctx = TickContext(
         monotonic_ns=monotonic_ns or time.monotonic_ns,
+        thread_time_ns=thread_time_ns or time.thread_time_ns,
         standalone=standalone,
     )
     _tls.tick = ctx

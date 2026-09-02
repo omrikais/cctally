@@ -917,7 +917,7 @@
       "denominator": {
         "accountKey": null,
         "identity": "totalExplainedRetainedCost",
-        "populationDigest": "b3b10fbc8a64adbf3f729b338a507ab5",
+        "populationDigest": "7d0f5d591eaaea7dd21dc4171d2ec250",
         "source": "codex",
         "usd": {
           "population": {
@@ -942,10 +942,10 @@
       },
       "effectiveSpeed": null,
       "generation": {
-        "cache": "11373f6c84fb171ca3173269968135efd193ffcaccb703b44ea1b9374e740e8f",
-        "configuration": "f1abbd068a1b63d9ef3a211f7a2759b2334f06181d78e4bd5c3de1bac35b8d0f",
-        "generationId": "4f8ab259f3651752b50a01c41d233f1dc5c2e7b2c87c882ce777cb1af48b38a3",
-        "stats": "76483fdd22cdde27fb580717383708912c15bd3d2673510a51d89bb2957ab050"
+        "cache": "dc119063fbf553d240e22dde1b982970737d5b5b274146d305bdd8abd2267b2c",
+        "configuration": "dbaf644244020cf27ab6a24f3a1a5cc0110b9811a29139037eea8b6aaab5ecae",
+        "generationId": "289b15822905617a068d7dff0f7fabf19dba2620b7a813a8d5c19054e318bff6",
+        "stats": "650fd68dabc966c6e9cae5f171645cba20fca0d8b46b672ad02beff3b0e35f99"
       },
       "source": "codex",
       "verdict": "contributor_detected",

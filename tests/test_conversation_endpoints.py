@@ -11,11 +11,13 @@ The gate (anti-DNS-rebinding) is exercised by sending an explicit ``Host``
 header via ``HTTPConnection`` with ``skip_host=True``.
 """
 import datetime as dt
+import base64
 import json
 import pathlib
 import socketserver
 import sys
 import threading
+import time
 from http.client import HTTPConnection
 
 from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION
@@ -237,6 +239,16 @@ def _get(port, path, *, host=None):
     return status, body
 
 
+def _delete(port, path):
+    c = HTTPConnection("127.0.0.1", port, timeout=PRESENCE_BACKSTOP_SECONDS)
+    c.request("DELETE", path)
+    r = c.getresponse()
+    body = r.read()
+    status = r.status
+    c.close()
+    return status, body
+
+
 def _get_ct(port, path, *, host=None):
     """GET helper returning ``(status, content_type, body)`` — for routes whose
     Content-Type matters (e.g. the export route's ``text/markdown``)."""
@@ -371,6 +383,309 @@ def test_conversation_outline_route(tmp_path, monkeypatch):
         assert status == 403
     finally:
         stop(srv, srv._test_thread)
+
+
+def test_conversation_outline_progressive_reconstructs_legacy_body(tmp_path, monkeypatch):
+    """The bounded first response defers full outline work; transfer is exact."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        status, legacy_wire = _get(port, "/api/conversation/s1/outline")
+        assert status == 200
+        cq_mod = ns["_load_sibling"]("_lib_conversation_query")
+        transfer_mod = ns["_load_sibling"]("_cctally_dashboard_conversation")
+        opaque_token = "random-prefix-s1-random-suffix"
+        monkeypatch.setattr(
+            transfer_mod.secrets, "token_urlsafe", lambda _bytes: opaque_token)
+        original_outline = cq_mod.get_conversation_outline
+        calls = []
+
+        def _counted_outline(*args, **kwargs):
+            calls.append(1)
+            return original_outline(*args, **kwargs)
+
+        monkeypatch.setattr(cq_mod, "get_conversation_outline", _counted_outline)
+        status, initial_wire = _get(
+            port, "/api/conversation/s1/outline?progressive=1")
+        assert status == 200
+        assert len(initial_wire) <= 512 * 1024 + 2048
+        initial = json.loads(initial_wire)
+        assert initial["progressive"] == 1
+        assert "summary" not in initial
+        assert calls == []
+        transfer = initial["transfer"]
+        assert transfer["token"] == opaque_token, (
+            "the ticket must come only from the opaque random-token factory; "
+            "substring absence is invalid because random URL-safe output can "
+            "contain a short session id by chance")
+        assert "total" not in transfer and "sha256" not in transfer
+
+        offset = 0
+        chunks = []
+        while True:
+            status, chunk_wire = _get(
+                port,
+                f"/api/conversation/outline-transfer/{transfer['token']}?offset={offset}")
+            assert status == 200
+            chunk = json.loads(chunk_wire)
+            assert chunk["offset"] == offset
+            chunks.append(base64.b64decode(chunk["chunk"]))
+            offset = chunk["next_offset"]
+            if chunk["done"]:
+                break
+        assert calls == [1]
+        assert b"".join(chunks) == legacy_wire
+
+        status, _ = _get(
+            port,
+            f"/api/conversation/outline-transfer/{transfer['token']}?offset=999999")
+        assert status == 400
+        status, _ = _get(port, "/api/conversation/outline-transfer/missing?offset=0")
+        assert status == 410
+    finally:
+        stop(srv, srv._test_thread)
+
+
+def test_conversation_outline_progressive_preserves_claude_account_scope(
+    tmp_path, monkeypatch,
+):
+    """A transfer builder must hydrate the same account-scoped bytes as preflight."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    account_a = "a" * 32
+    account_b = "b" * 32
+    try:
+        cache_conn = ns["open_cache_db"]()
+        try:
+            cache_conn.execute(
+                "UPDATE session_entries SET account_key=? WHERE msg_id='m1'",
+                (account_b,),
+            )
+            cache_conn.commit()
+        finally:
+            cache_conn.close()
+        conn = ns["open_conversations_db"]()
+        try:
+            conn.execute(
+                "UPDATE conversation_messages SET account_key=? WHERE uuid='h1'",
+                (account_a,),
+            )
+            conn.execute(
+                "UPDATE conversation_messages SET account_key=? WHERE uuid='a1'",
+                (account_b,),
+            )
+            import _cctally_cache as cache_mod
+            cache_mod._recompute_conversation_sessions(conn, {"s1"})
+            conn.commit()
+        finally:
+            conn.close()
+
+        port = srv.server_address[1]
+        status, legacy_wire = _get(
+            port, f"/api/conversation/s1/outline?account={account_a}")
+        assert status == 200
+        assert b"hi" in legacy_wire
+        assert b"token limit" not in legacy_wire
+
+        status, initial_wire = _get(
+            port,
+            f"/api/conversation/s1/outline?progressive=1&account={account_a}",
+        )
+        assert status == 200
+        transfer = json.loads(initial_wire)["transfer"]
+        offset = 0
+        chunks = []
+        while True:
+            status, chunk_wire = _get(
+                port,
+                f"/api/conversation/outline-transfer/{transfer['token']}"
+                f"?offset={offset}",
+            )
+            assert status == 200
+            chunk = json.loads(chunk_wire)
+            chunks.append(base64.b64decode(chunk["chunk"]))
+            offset = chunk["next_offset"]
+            if chunk["done"]:
+                break
+        assert b"".join(chunks) == legacy_wire
+    finally:
+        stop(srv, srv._test_thread)
+
+
+def test_outline_transfer_cache_bounds_pending_tickets_and_evicts_oversize():
+    """Unmaterialized closures and rejected payloads cannot occupy the cache."""
+    ns = load_script()
+    transfer_mod = ns["_load_sibling"]("_cctally_dashboard_conversation")
+    with transfer_mod._OUTLINE_TRANSFERS_LOCK:
+        transfer_mod._OUTLINE_TRANSFERS.clear()
+        transfer_mod._OUTLINE_TRANSFERS_BYTES = 0
+    try:
+        tokens = [
+            transfer_mod._store_outline_transfer(lambda _handler: (True, {}))["token"]
+            for _ in range(transfer_mod._OUTLINE_TRANSFER_COUNT_CAP + 1)
+        ]
+        assert len(transfer_mod._OUTLINE_TRANSFERS) == (
+            transfer_mod._OUTLINE_TRANSFER_COUNT_CAP)
+        pending_stats = dict(transfer_mod.outline_transfer_cache_stats())
+        assert pending_stats["entryCount"] == (
+            transfer_mod._OUTLINE_TRANSFER_COUNT_CAP)
+        assert pending_stats["estimatedBytes"] <= pending_stats["maxBytes"]
+        assert transfer_mod._outline_transfer_builder(tokens[0]) is None
+
+        newest = tokens[-1]
+        assert transfer_mod._materialize_outline_transfer(
+            newest, b"x" * (transfer_mod._OUTLINE_TRANSFER_ITEM_CAP + 1)
+        ) == "too_large"
+        assert transfer_mod._outline_transfer_builder(newest) is None
+        assert dict(transfer_mod.outline_transfer_cache_stats())["fallbackCount"] == 1
+    finally:
+        with transfer_mod._OUTLINE_TRANSFERS_LOCK:
+            transfer_mod._OUTLINE_TRANSFERS.clear()
+            transfer_mod._OUTLINE_TRANSFERS_BYTES = 0
+
+
+def test_outline_transfer_concurrent_first_chunk_runs_one_builder(
+    tmp_path, monkeypatch,
+):
+    """Two readers of one token share one server-side materialization."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    transfer_mod = ns["_load_sibling"]("_cctally_dashboard_conversation")
+    entered = threading.Event()
+    release = threading.Event()
+    second_request_entered = threading.Event()
+    calls = []
+    request_count = 0
+    request_lock = threading.Lock()
+
+    def _builder(_handler, *args):
+        calls.append(1)
+        entered.set()
+        assert release.wait(PRESENCE_BACKSTOP_SECONDS)
+        return True, {"session_id": "shared", "turns": [], "stats": {}}
+
+    original = ns["DashboardHTTPHandler"]._handle_get_conversation_outline_transfer
+
+    def _counted_request(handler, path):
+        nonlocal request_count
+        with request_lock:
+            request_count += 1
+            if request_count == 2:
+                second_request_entered.set()
+        return original(handler, path)
+
+    monkeypatch.setattr(
+        ns["DashboardHTTPHandler"],
+        "_handle_get_conversation_outline_transfer",
+        _counted_request,
+    )
+    token = transfer_mod._store_outline_transfer(_builder)["token"]
+    path = f"/api/conversation/outline-transfer/{token}?offset=0"
+    results = []
+    workers = [
+        threading.Thread(target=lambda: results.append(_get(srv.server_address[1], path)))
+        for _ in range(2)
+    ]
+    try:
+        workers[0].start()
+        assert entered.wait(PRESENCE_BACKSTOP_SECONDS)
+        workers[1].start()
+        assert second_request_entered.wait(PRESENCE_BACKSTOP_SECONDS)
+        release.set()
+        for worker in workers:
+            worker.join(PRESENCE_BACKSTOP_SECONDS)
+            assert not worker.is_alive()
+        assert [status for status, _body in results] == [200, 200]
+        assert calls == [1]
+        assert len({json.loads(body)["sha256"] for _status, body in results}) == 1
+    finally:
+        release.set()
+        stop(srv, srv._test_thread)
+        with transfer_mod._OUTLINE_TRANSFERS_LOCK:
+            transfer_mod._OUTLINE_TRANSFERS.clear()
+            transfer_mod._OUTLINE_TRANSFERS_BYTES = 0
+
+
+def test_outline_transfer_delete_cancels_abandoned_server_work(
+    tmp_path, monkeypatch,
+):
+    """A browser abort explicitly cancels the one in-flight token owner."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    transfer_mod = ns["_load_sibling"]("_cctally_dashboard_conversation")
+    entered = threading.Event()
+    cancellation_seen = threading.Event()
+    fallback_release = threading.Event()
+
+    def _builder(_handler, *args):
+        cancelled = args[0] if args else (lambda: False)
+        entered.set()
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+        while time.monotonic() < deadline:
+            if cancelled():
+                cancellation_seen.set()
+                break
+            if fallback_release.wait(0.005):
+                break
+        return True, {"session_id": "abandoned", "turns": [], "stats": {}}
+
+    token = transfer_mod._store_outline_transfer(_builder)["token"]
+    path = f"/api/conversation/outline-transfer/{token}?offset=0"
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(_get(srv.server_address[1], path))
+    )
+    try:
+        worker.start()
+        assert entered.wait(PRESENCE_BACKSTOP_SECONDS)
+        status, _body = _delete(
+            srv.server_address[1],
+            f"/api/conversation/outline-transfer/{token}",
+        )
+        if status != 204:
+            fallback_release.set()
+        assert status == 204
+        assert cancellation_seen.wait(PRESENCE_BACKSTOP_SECONDS)
+        worker.join(PRESENCE_BACKSTOP_SECONDS)
+        assert not worker.is_alive()
+        assert result and result[0][0] == 410
+        assert transfer_mod._outline_transfer_builder(token) is None
+    finally:
+        fallback_release.set()
+        stop(srv, srv._test_thread)
+        with transfer_mod._OUTLINE_TRANSFERS_LOCK:
+            transfer_mod._OUTLINE_TRANSFERS.clear()
+            transfer_mod._OUTLINE_TRANSFERS_BYTES = 0
+
+
+def test_outline_transfer_obsolete_completion_cannot_replace_new_generation(
+    monkeypatch,
+):
+    """A cancelled builder cannot publish through a reused transfer token."""
+    ns = load_script()
+    transfer_mod = ns["_load_sibling"]("_cctally_dashboard_conversation")
+    monkeypatch.setattr(transfer_mod.secrets, "token_urlsafe", lambda _n: "fixed")
+
+    old_builder = lambda *_args: (True, {"generation": "old"})
+    new_builder = lambda *_args: (True, {"generation": "new"})
+    token = transfer_mod._store_outline_transfer(old_builder)["token"]
+    action, old_record, claimed_builder = transfer_mod._claim_outline_transfer(
+        token)
+    assert action == "build"
+    assert claimed_builder is old_builder
+
+    assert transfer_mod._store_outline_transfer(new_builder)["token"] == token
+    assert old_record.cancelled.is_set()
+    assert transfer_mod._materialize_outline_transfer(
+        token, b'"old"', claim=old_record,
+    ) == "expired"
+
+    action, new_record, claimed_builder = transfer_mod._claim_outline_transfer(
+        token)
+    assert action == "build"
+    assert new_record.builder is new_builder
+    assert claimed_builder is new_builder
 
 
 def test_conversation_export_route(tmp_path, monkeypatch):

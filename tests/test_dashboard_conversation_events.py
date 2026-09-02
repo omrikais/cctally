@@ -22,7 +22,7 @@ import threading
 import time
 from http.client import HTTPConnection
 
-from conftest import load_script, redirect_paths
+from conftest import load_script, redirect_paths_without_conversation_retention
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS, read_event, read_no_event, start, stop
 
 # A real model id from CLAUDE_MODEL_PRICING so token-derived cost is non-zero.
@@ -107,7 +107,7 @@ def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False,
     """Seed cache.db from a REAL JSONL file (session ``s1``) and start a
     server. Returns ``(srv, projects_dir, session_jsonl)``; caller must
     ``stop(srv, srv._test_thread)``."""
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
 
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"

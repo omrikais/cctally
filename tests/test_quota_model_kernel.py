@@ -9,6 +9,7 @@ has something to point at.
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import hashlib
 import json
@@ -42,6 +43,14 @@ def test_payload_carries_no_operator_budget():
     text = json.dumps(qm.constants_payload())
     for banned in ("budget", "promo", "weeklyTo5h", "2418964", "1612643"):
         assert banned.lower() not in text.lower()
+
+
+def test_the_supported_composition_floor_and_fast_mode_policy_are_fingerprinted():
+    policy = qm.constants_payload()["coefficientSupport"]
+    assert policy == {
+        "supportedCompositionFrom": "2026-07-25",
+        "fastModeParticipation": "usage-credits-only-excluded",
+    }
 
 
 def test_counts_stay_ints_and_thresholds_stay_floats_in_the_payload():
@@ -265,6 +274,36 @@ def test_mythos_drains_the_general_weekly_quota():
     # permanently withheld verdict.
     assert qm.family_participation("claude-mythos-5") == "general"
     assert qm.normalize_family("claude-mythos-preview") == "claude-mythos-5"
+
+
+def test_fable_and_mythos_point_releases_resolve_to_their_base_family():
+    # The -1 spellings are separate ids in CLAUDE_MODEL_PRICING because their
+    # cache-read rate differs, but they drain the weekly meter on the same
+    # terms as their base family, so they resolve to it rather than minting a
+    # family whose composition support would have to rebuild from nothing.
+    # Mutation: dropping either alias, which resolves the spelling to None and
+    # gives every week containing that usage an unsupported composition.
+    assert qm.normalize_family("claude-fable-5-1") == "claude-fable-5"
+    assert qm.normalize_family("claude-mythos-5-1") == "claude-mythos-5"
+    assert qm.family_participation(
+        qm.normalize_family("claude-fable-5-1")) == "general"
+    assert qm.family_participation(
+        qm.normalize_family("claude-mythos-5-1")) == "general"
+
+
+def test_a_day_of_only_fable_point_one_usage_is_not_withheld():
+    # The observable consequence of the aliases above: without them this day
+    # carries UNSUPPORTED_COMPOSITION and never reaches any fit, and its share
+    # is attributed to the base family rather than to a new one.
+    snaps = [_snap(1, 10.0), _snap(5, 20.0)]
+    segs = qm.build_segments(snaps, [])
+    e = qm.EntryRecord(at=DAY.replace(hour=3), model="claude-fable-5-1",
+                       fresh=1_000_000, output=0, cache_create_total=0,
+                       cache_1h=0, cache_read=0)
+    obs = qm.build_daily_series(segs, [e], now=DAY + dt.timedelta(days=2),
+                                newest_entry_at=DAY + dt.timedelta(days=2))
+    assert [o.cause for o in obs] == [None]
+    assert obs[0].family_shares == {"claude-fable-5": pytest.approx(1.0)}
 
 
 def test_mythos_participation_carries_its_operator_provenance():
@@ -1851,6 +1890,30 @@ def test_the_eligibility_fence_is_bounded_to_the_scan_horizon():
     assert a.diagnostics["withheldDays"] == 140
 
 
+def test_a_confirmed_splits_fence_is_also_bounded_to_the_scan_horizon():
+    # #669: the original pin covered only the no-split branch. The first 100
+    # days have the baseline's implied rate but much lower absolute volume;
+    # including them changes the adaptive volume fence despite the bounded
+    # detector correctly ignoring them.
+    old = [_obs(2, 2e6 * (1 + 0.001 * (i % 5)), i)
+           for i in range(100)]
+    baseline = [_obs(10, 10e6 * (1 + 0.001 * (i % 5)), 100 + i)
+                for i in range(61)]
+    watch = [_obs(10, 30e6 * (1 + 0.001 * (i % 3)), 161 + i)
+             for i in range(3)]
+    series = old + baseline + watch
+    detector = qm.detect_change(series)
+    assert detector.qualified is True
+    assert detector.split_date == OBS_EPOCH + dt.timedelta(days=161)
+    bounded = qm.eligibility_fence([o.units for o in baseline])
+    unbounded = qm.eligibility_fence([o.units for o in old + baseline])
+    assert bounded > unbounded * 4
+
+    analysis = _analyse(series)
+    assert analysis.diagnostics["eligibilityFence"] == pytest.approx(bounded)
+    assert analysis.diagnostics["withheldDays"] == len(old)
+
+
 # --- section 31: the two rules are independent ----------------------------
 def _sparse_run_series():
     """A confirmed change whose fourth watch day falls below the fence.
@@ -2103,10 +2166,10 @@ def test_the_token_class_floor_is_derived_from_the_coefficients():
 
 def test_the_effective_radius_is_the_larger_of_the_two():
     # A zero empirical radius is a real answer, not an undefined one.
-    assert qm.effective_radius(0.0, 0.02) == 0.02
-    assert qm.effective_radius(0.0694, 0.02) == pytest.approx(0.0694)
-    assert qm.effective_radius(None, 0.02) is None
-    assert qm.effective_radius(0.0694, None) == pytest.approx(0.0694)
+    assert qm.effective_radius(0.0, 0.03) == 0.03
+    assert qm.effective_radius(0.0934, 0.03) == pytest.approx(0.0934)
+    assert qm.effective_radius(None, 0.03) is None
+    assert qm.effective_radius(0.0934, None) == pytest.approx(0.0934)
     # A non-finite floor is no floor, never a radius that admits everything.
     assert qm.effective_radius(0.5, float("nan")) == pytest.approx(0.5)
     assert qm.effective_radius(0.5, float("inf")) == pytest.approx(0.5)
@@ -2115,29 +2178,29 @@ def test_the_effective_radius_is_the_larger_of_the_two():
 def test_the_mix_support_policy_is_fingerprinted():
     # Section 34: a persisted calibration must go stale when the policy moves.
     payload = qm.constants_payload()["mixSupport"]
-    assert payload["family_tv_floor"] == 0.02
+    assert payload["family_tv_floor"] == 0.03
     assert payload["token_class_max_relative_effect"] == 0.05
     assert payload["vector"] == "raw-quantity-share"
     assert payload["effective_radius"] == "max(empirical, floor)"
-    assert qm.QUOTA_MODEL_ALGORITHM_REVISION == 2
+    assert qm.QUOTA_MODEL_ALGORITHM_REVISION == 3
 
 
 def test_the_published_radii_are_the_effective_ones():
     # The radius that decides is the one published, and the empirical value it
     # was floored from is a diagnostic rather than lost.
     a = _analyse(_spread(10e6, 12))
-    assert a.family_radius == pytest.approx(0.02)
+    assert a.family_radius == pytest.approx(0.03)
     assert a.class_radius == pytest.approx(qm.token_class_floor({"fresh": 1.0}))
     assert a.diagnostics["familyRadiusEmpirical"] == pytest.approx(0.0)
     assert a.diagnostics["classRadiusEmpirical"] == pytest.approx(0.0)
 
 
 def test_the_family_floor_sits_below_the_measured_empirical_radius():
-    # 0.02 is the smallest clean bound above the measured supported maximum of
-    # 0.0156 and below the live empirical radius of 0.0694, so the measured
-    # store's own outlier decision is unchanged by the floor.
-    assert qm.effective_radius(0.0694, 0.02) == pytest.approx(0.0694)
-    assert 0.0156 < qm.MIX_SUPPORT["family_tv_floor"] < 0.0694
+    # 0.03 is the smallest clean bound above the corrected supported maximum
+    # of 0.0274 and below the corrected empirical radius of 0.0934, so the
+    # measured store's own outlier decision is unchanged by the floor.
+    assert qm.effective_radius(0.0934, 0.03) == pytest.approx(0.0934)
+    assert 0.0274 < qm.MIX_SUPPORT["family_tv_floor"] < 0.0934
 
 
 # --- section 35: the forecast population is the current regime ------------
@@ -2823,7 +2886,7 @@ def test_an_absent_current_week_figure_is_unavailable_not_no_local_history():
 
 def test_a_forecast_population_the_kernel_cannot_aggregate_is_unsupported():
     # Mutation: dropping the `forecast_probed and forecast_shares is None`
-    # limb of `_composition_unsupported`, which fails open.
+    # limb of `_composition_provenance`, which fails open.
     #
     # Section 40 made `forecast_population` required so the section 18 support
     # probe could not be silently disabled by omission. A population the
@@ -2857,3 +2920,350 @@ def test_the_blocking_reasons_are_published_as_a_typed_field():
     # A healthy run publishes an empty tuple, never None, so a consumer may
     # iterate it unconditionally.
     assert _analyse(_spread(10e6, 12)).blocking == ()
+
+
+# --------------------------------------------------------------------------
+# #688 — typed composition provenance
+#
+# `_composition_provenance` replaces `_composition_unsupported`, which
+# returned one boolean over five probes with opposite meanings. The permit
+# predicate below is control flow, so it needs to know WHICH probe fired.
+# --------------------------------------------------------------------------
+#: A baseline whose family shares never move and whose class shares vary by
+#: two percentage points, so the class radius is a real positive number. The
+#: same construction the token-class attack above uses.
+REF_DAYS = [
+    _obs(10, 10e6 + (i % 5) * 1e5, i,
+         family_shares=dict(_ATTACK_FAMILY),
+         class_shares=_class_mix(0.90 - (i % 5) * 0.005,
+                                 0.08 + (i % 5) * 0.005))
+    for i in range(20)
+]
+FC = qm.composition_centre([o.family_shares for o in REF_DAYS])
+CC = qm.composition_centre([o.class_shares for o in REF_DAYS])
+FR = qm.effective_radius(
+    qm.support_radius([o.family_shares for o in REF_DAYS], FC),
+    float(qm.MIX_SUPPORT["family_tv_floor"]))
+CR = qm.effective_radius(
+    qm.support_radius([o.class_shares for o in REF_DAYS], CC),
+    qm.token_class_floor(CC))
+
+#: A day inside BOTH radii, and a day outside the class radius only — the
+#: shape section 2.1 measured on the live store, where every decisive watch
+#: day sat inside both and only the forecast aggregate fell outside.
+INSIDE_DAY = _obs(10, 10e6, 20, family_shares=dict(_ATTACK_FAMILY),
+                  class_shares=_class_mix(0.90, 0.08))
+OUTLIER_DAY = _obs(10, 30e6, 21, family_shares=dict(_ATTACK_FAMILY),
+                   class_shares=_class_mix(0.10, 0.88))
+INSIDE_SHARES = (INSIDE_DAY.family_shares, INSIDE_DAY.class_shares)
+OUTLIER_SHARES = (OUTLIER_DAY.family_shares, OUTLIER_DAY.class_shares)
+
+
+def test_the_composition_provenance_twins_really_do_differ_on_one_axis():
+    # Without this the eight tests below could all be measuring an outlier
+    # that is outside both radii, or an "inside" day that is outside one, and
+    # every provenance assertion would still pass for the wrong reason.
+    assert qm.is_supported(*INSIDE_SHARES, FC, FR, CC, CR) is True
+    assert qm.is_supported(*OUTLIER_SHARES, FC, FR, CC, CR) is False
+    assert qm.tv_distance(OUTLIER_DAY.family_shares, FC) <= FR
+    assert qm.tv_distance(OUTLIER_DAY.class_shares, CC) > CR
+
+
+def test_a_decisive_day_outside_the_radius_is_named_decisive_day():
+    got = qm._composition_provenance(
+        confirmed=True, reference_days=REF_DAYS,
+        decisive_days=[OUTLIER_DAY], forecast_shares=INSIDE_SHARES,
+        forecast_probed=True, family_centre=FC, family_radius=FR,
+        class_centre=CC, class_radius=CR)
+    assert got == frozenset({qm.CompositionProvenance.DECISIVE_DAY})
+
+
+def test_the_forecast_aggregate_alone_is_named_forecast_aggregate():
+    got = qm._composition_provenance(
+        confirmed=True, reference_days=REF_DAYS,
+        decisive_days=[INSIDE_DAY], forecast_shares=OUTLIER_SHARES,
+        forecast_probed=True, family_centre=FC, family_radius=FR,
+        class_centre=CC, class_radius=CR)
+    assert got == frozenset({qm.CompositionProvenance.FORECAST_AGGREGATE})
+
+
+def test_both_probes_failing_names_both():
+    got = qm._composition_provenance(
+        confirmed=True, reference_days=REF_DAYS,
+        decisive_days=[OUTLIER_DAY], forecast_shares=OUTLIER_SHARES,
+        forecast_probed=True, family_centre=FC, family_radius=FR,
+        class_centre=CC, class_radius=CR)
+    assert got == frozenset({qm.CompositionProvenance.DECISIVE_DAY,
+                             qm.CompositionProvenance.FORECAST_AGGREGATE})
+
+
+def test_an_undefined_centre_is_named_undefined_reference():
+    got = qm._composition_provenance(
+        confirmed=True, reference_days=REF_DAYS, decisive_days=[],
+        forecast_shares=INSIDE_SHARES, forecast_probed=True,
+        family_centre=None, family_radius=FR,
+        class_centre=CC, class_radius=CR)
+    assert got == frozenset({qm.CompositionProvenance.UNDEFINED_REFERENCE})
+
+
+def test_a_probed_but_unaggregatable_forecast_is_named_as_such():
+    got = qm._composition_provenance(
+        confirmed=True, reference_days=REF_DAYS, decisive_days=[],
+        forecast_shares=None, forecast_probed=True,
+        family_centre=FC, family_radius=FR,
+        class_centre=CC, class_radius=CR)
+    assert got == frozenset(
+        {qm.CompositionProvenance.UNAGGREGATABLE_FORECAST})
+
+
+def test_no_reference_days_is_supported_and_names_nothing():
+    got = qm._composition_provenance(
+        confirmed=True, reference_days=[], decisive_days=[OUTLIER_DAY],
+        forecast_shares=OUTLIER_SHARES, forecast_probed=True,
+        family_centre=FC, family_radius=FR,
+        class_centre=CC, class_radius=CR)
+    assert got == frozenset()
+
+
+def test_an_undefined_radius_is_supported_and_names_nothing():
+    got = qm._composition_provenance(
+        confirmed=True, reference_days=REF_DAYS, decisive_days=[],
+        forecast_shares=INSIDE_SHARES, forecast_probed=True,
+        family_centre=FC, family_radius=None,
+        class_centre=CC, class_radius=None)
+    assert got == frozenset()
+
+
+def test_an_unconfirmed_run_never_probes_decisive_days():
+    got = qm._composition_provenance(
+        confirmed=False, reference_days=REF_DAYS,
+        decisive_days=[OUTLIER_DAY], forecast_shares=INSIDE_SHARES,
+        forecast_probed=True, family_centre=FC, family_radius=FR,
+        class_centre=CC, class_radius=CR)
+    assert got == frozenset()
+
+
+def test_the_provenance_vocabulary_is_closed_and_named():
+    # Section 4 names five origins. A member added without a decision in
+    # `transition_persistence_permitted` would silently permit or refuse.
+    assert {p.value for p in qm.CompositionProvenance} == {
+        "unsupported-family-day", "decisive-day", "forecast-aggregate",
+        "undefined-reference", "unaggregatable-forecast"}
+
+
+# --------------------------------------------------------------------------
+# #688 — the two typed fields `analyse` publishes
+# --------------------------------------------------------------------------
+#: One day withheld under `unsupported-composition`, inside the published
+#: window. That cause removes the day from the detector's own rank-sum
+#: population, which is why the permit predicate refuses on it.
+SERIES_WITH_ONE_UNKNOWN_FAMILY_DAY = _spread(10e6, 12) + [
+    _obs(10, 10e6, 12, cause=qm.WithholdingCause.UNSUPPORTED_COMPOSITION)]
+CLEAN_SERIES = _spread(10e6, 12)
+
+
+def test_analyse_publishes_the_causes_present_in_the_published_window():
+    result = _analyse(SERIES_WITH_ONE_UNKNOWN_FAMILY_DAY)
+    assert qm.WithholdingCause.UNSUPPORTED_COMPOSITION in \
+        result.detector_input_causes
+
+
+def test_analyse_publishes_no_causes_for_a_clean_window():
+    result = _analyse(CLEAN_SERIES)
+    assert result.detector_input_causes == frozenset()
+
+
+def test_analyse_publishes_the_composition_provenance():
+    # The outlier lives in the FORECAST POPULATION rather than in the series,
+    # because that is the population section 35 probes as one aggregate.
+    result = _analyse(CLEAN_SERIES, forecast_population=[_output_heavy(11)])
+    assert result.status is qm.CalibrationStatus.UNSUPPORTED_MODEL_MIX
+    assert result.composition_provenance == frozenset(
+        {qm.CompositionProvenance.FORECAST_AGGREGATE})
+
+
+def test_a_supported_analysis_publishes_an_empty_provenance():
+    # Empty, never None: a consumer that must fail closed on absence has to
+    # be able to tell "nothing fired" from "this path publishes nothing".
+    assert _analyse(CLEAN_SERIES).composition_provenance == frozenset()
+
+
+def test_the_published_causes_come_from_the_window_not_all_history():
+    # Section 30: a bad day the command neither fits nor scans decides
+    # nothing, and `detector_input_causes` must describe the same population
+    # `classify` was handed or the two would disagree about one analysis.
+    series = ([_obs(10, 10e6, 0,
+                    cause=qm.WithholdingCause.UNSUPPORTED_COMPOSITION)]
+              + _spread(10e6, 20, start=1)
+              + [_obs(10, 30e6 + i * 1e5, 21 + i) for i in range(6)])
+    result = _analyse(series)
+    assert result.detector.qualified is True
+    assert result.detector_input_causes == frozenset()
+
+
+def test_overlay_status_preserves_both_new_fields():
+    base = _analyse(CLEAN_SERIES, forecast_population=[_output_heavy(11)])
+    overlaid = qm.overlay_status(base, qm.CalibrationStatus.STALE)
+    assert overlaid.status is qm.CalibrationStatus.STALE
+    assert overlaid.detector_input_causes == base.detector_input_causes
+    assert overlaid.composition_provenance == base.composition_provenance
+
+
+# --------------------------------------------------------------------------
+# #688 — the permit set and the fail-closed admission helper
+# --------------------------------------------------------------------------
+#: 20 baseline days and 6 successor days, which is the shape the detector
+#: qualifies on. The forecast outlier below is what makes the status
+#: `unsupported-model-mix` while every decisive day stays inside both radii —
+#: the section 2 occurrence, reproduced.
+PERMITTED_SERIES = _spread(10e6, 20) + [_obs(10, 30e6 + i * 1e5, 20 + i)
+                                        for i in range(6)]
+
+
+def _permitted_analysis():
+    """The section 2 shape, produced by `analyse` rather than hand-built."""
+    return _analyse(PERMITTED_SERIES, forecast_population=[_output_heavy(22)])
+
+
+def test_the_permitted_shape_really_is_the_measured_occurrence():
+    # Grounding for every refusal test below: each one replaces exactly one
+    # field of this analysis, so if the base shape were not admissible they
+    # would all pass while proving nothing.
+    a = _permitted_analysis()
+    assert a.status is qm.CalibrationStatus.UNSUPPORTED_MODEL_MIX
+    assert a.verdict is qm.Verdict.WITHHELD
+    assert a.exit_code == 3
+    assert a.blocking == ()
+    assert a.detector.qualified is True
+    assert a.detector.split_date is not None
+    assert a.baseline_fit.state == "available"
+    assert a.watch_fit.state == "available"
+    assert a.detector_input_causes == frozenset()
+    assert a.composition_provenance == frozenset(
+        {qm.CompositionProvenance.FORECAST_AGGREGATE})
+    # Section 6 says `analyse` marks a successor that is not prediction-ready
+    # `detection-only`. Asserted HERE because this is the one permitted-shape
+    # test built by the real `analyse`; the persistence tests can only show
+    # that `_regime_from` copies whatever qualifications it is handed.
+    assert "detection-only" in a.watch_fit.qualifications
+
+
+def test_the_permit_set_is_exactly_unsupported_model_mix():
+    assert qm.TRANSITION_PERSISTENCE_PERMITTED_BLOCKING_STATUSES == (
+        qm.CalibrationStatus.UNSUPPORTED_MODEL_MIX,)
+
+
+def test_the_permit_set_is_a_subset_of_the_verdict_blocking_statuses():
+    # A status outside `VERDICT_BLOCKING_STATUSES` never withholds for its
+    # own sake, so permitting one here would describe a state that cannot
+    # occur and would hide the real admission rule.
+    assert set(qm.TRANSITION_PERSISTENCE_PERMITTED_BLOCKING_STATUSES) <= \
+        set(qm.VERDICT_BLOCKING_STATUSES)
+
+
+def test_resolve_outcome_is_unchanged_by_the_permit():
+    # The helper answers a separate question. `resolve_outcome` remains the
+    # sole authority over the verdict and the exit code, and the permitted
+    # status still withholds at exit 3.
+    assert qm.resolve_outcome(qm.CalibrationStatus.UNSUPPORTED_MODEL_MIX,
+                              change_detected=True) == (qm.Verdict.WITHHELD, 3)
+
+
+def test_the_permitted_shape_is_admitted():
+    assert qm.transition_persistence_permitted(_permitted_analysis()) is True
+
+
+@pytest.mark.parametrize("status", [
+    qm.CalibrationStatus.UNAVAILABLE, qm.CalibrationStatus.FUTURE,
+    qm.CalibrationStatus.STALE, qm.CalibrationStatus.TOKEN_SPLIT_UNKNOWN,
+    qm.CalibrationStatus.LOCAL_HISTORY_INCOMPLETE,
+    qm.CalibrationStatus.UNVALIDATED_COEFFICIENT_ERA,
+    qm.CalibrationStatus.FRAGMENTED_HISTORY,
+    qm.CalibrationStatus.UNSTABLE_FIT,
+    qm.CalibrationStatus.INSUFFICIENT_HISTORY,
+    qm.CalibrationStatus.OK,
+])
+def test_every_other_status_refuses(status):
+    assert qm.transition_persistence_permitted(
+        dataclasses.replace(_permitted_analysis(), status=status)) is False
+
+
+def test_a_blocking_reason_refuses_even_with_a_permitted_status():
+    # The case single-axis tests miss: `resolve_outcome` withholds on a
+    # blocking reason independently of the status, so every other condition
+    # here is satisfied and only `blocking` refuses.
+    assert qm.transition_persistence_permitted(dataclasses.replace(
+        _permitted_analysis(),
+        blocking=(qm.BlockingReason.SPARSE_DAY_IN_DECISIVE_RUN,))) is False
+
+
+@pytest.mark.parametrize("provenance", [
+    frozenset({qm.CompositionProvenance.DECISIVE_DAY}),
+    frozenset({qm.CompositionProvenance.UNSUPPORTED_FAMILY_DAY}),
+    frozenset({qm.CompositionProvenance.UNDEFINED_REFERENCE}),
+    frozenset({qm.CompositionProvenance.UNAGGREGATABLE_FORECAST}),
+    frozenset({qm.CompositionProvenance.FORECAST_AGGREGATE,
+               qm.CompositionProvenance.DECISIVE_DAY}),
+    frozenset({qm.CompositionProvenance.FORECAST_AGGREGATE,
+               qm.CompositionProvenance.UNAGGREGATABLE_FORECAST}),
+    frozenset(),
+])
+def test_only_the_lone_forecast_aggregate_permits(provenance):
+    assert qm.transition_persistence_permitted(dataclasses.replace(
+        _permitted_analysis(), composition_provenance=provenance)) is False
+
+
+def test_an_unsupported_composition_cause_refuses():
+    assert qm.transition_persistence_permitted(dataclasses.replace(
+        _permitted_analysis(),
+        detector_input_causes=frozenset(
+            {qm.WithholdingCause.UNSUPPORTED_COMPOSITION}))) is False
+
+
+@pytest.mark.parametrize("cause", [
+    qm.WithholdingCause.NO_LOCAL_HISTORY,
+    qm.WithholdingCause.SPARSE_LOCAL_HISTORY,
+    qm.WithholdingCause.TRANSITION_DAY,
+    qm.WithholdingCause.RIGHT_CENSORED,
+    qm.WithholdingCause.TOKEN_SPLIT_UNKNOWN,
+])
+def test_another_cause_in_the_window_does_not_by_itself_refuse(cause):
+    # Only `unsupported-composition` is the composition origin section 4
+    # refuses on. The other causes are already answered by the status axis,
+    # and refusing on them here would silently narrow the rule to nothing.
+    assert qm.transition_persistence_permitted(dataclasses.replace(
+        _permitted_analysis(),
+        detector_input_causes=frozenset({cause}))) is True
+
+
+@pytest.mark.parametrize("field", ["detector_input_causes",
+                                   "composition_provenance"])
+@pytest.mark.parametrize("value", [None, "forecast-aggregate", ["x"],
+                                   {"forecast-aggregate"},
+                                   frozenset({"forecast-aggregate"})])
+def test_a_missing_or_malformed_field_fails_closed(field, value):
+    # `CompositionProvenance` is a `str` enum, so
+    # `frozenset({"forecast-aggregate"}) == frozenset({FORECAST_AGGREGATE})`
+    # is TRUE. The equality alone therefore admits a set of bare strings, and
+    # the member type check is what refuses it.
+    assert qm.transition_persistence_permitted(dataclasses.replace(
+        _permitted_analysis(), **{field: value})) is False
+
+
+def test_an_unqualified_detector_refuses():
+    a = _permitted_analysis()
+    assert qm.transition_persistence_permitted(dataclasses.replace(
+        a, detector=dataclasses.replace(a.detector, qualified=False))) is False
+
+
+def test_a_qualified_detector_with_no_split_refuses():
+    a = _permitted_analysis()
+    assert qm.transition_persistence_permitted(dataclasses.replace(
+        a, detector=dataclasses.replace(a.detector,
+                                        split_date=None))) is False
+
+
+def test_a_non_withheld_verdict_refuses():
+    for verdict in (qm.Verdict.RATE_CHANGE_DETECTED, qm.Verdict.NO_RATE_CHANGE):
+        assert qm.transition_persistence_permitted(dataclasses.replace(
+            _permitted_analysis(), verdict=verdict)) is False

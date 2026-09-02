@@ -54,6 +54,7 @@ def test_run_sync_now_public_acquires_lock(monkeypatch, tmp_path):
         sync_lock=sync_lock, ref=ref, hub=hub, pinned_now=None,
         display_tz_pref_override=None,
     )
+    assert callable(public._locked_owner)
     public(skip_sync=False)
     # If the wrapper didn't release the lock, this acquire would block forever.
     acquired = sync_lock.acquire(blocking=False)

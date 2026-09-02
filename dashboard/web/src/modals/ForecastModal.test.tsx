@@ -16,6 +16,18 @@ const pins = () => [
 ];
 
 describe('resolvePillLayout', () => {
+  it('contains a single pill at the right edge inside the wrap', () => {
+    const single = [
+      { kind: 'wa', pos: 110, raw: 804, pillWidthPx: 56 },
+    ];
+    const r = resolvePillLayout(single as never, /*wrapPx*/ 680, 8);
+    expect(r.collapsed).toBe(false);
+    const [pin] = r.pins!;
+    const centerX = (pin.resolvedXPct / 100) * 680;
+    expect(centerX + pin.pillWidthPx / 2).toBeLessThanOrEqual(680);
+    expect(pin.resolvedXPct).toBeLessThan(pin.trueXPct);
+  });
+
   it('collapses to a range pill when both cannot fit (narrow wrap)', () => {
     const r = resolvePillLayout(pins() as never, /*wrapPx*/ 90, 8);
     expect(r.collapsed).toBe(true);

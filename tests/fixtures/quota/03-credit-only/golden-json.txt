@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-08-28T06:00:00+00:00",
+  "generatedAt": "2026-08-28T06:00:00Z",
   "status": "ok",
   "verdict": "no-rate-change",
   "exitCode": 0,
@@ -8,7 +8,7 @@
     "accountKey": null,
     "accountLabel": null,
     "merged": true,
-    "analysisStart": "2026-07-25T00:00:00+00:00",
+    "analysisStart": "2026-07-25T00:00:00Z",
     "invocation": "automatic"
   },
   "calibration": {
@@ -73,8 +73,8 @@
     }
   },
   "currentWeek": {
-    "start": "2026-08-25T08:00:00+00:00",
-    "end": "2026-09-01T08:00:00+00:00",
+    "start": "2026-08-25T08:00:00Z",
+    "end": "2026-09-01T08:00:00Z",
     "observedPercent": 15,
     "observedMinusModelled": 2.03194993947562,
     "consumption": {
@@ -161,14 +161,14 @@
         "output": 0.0
       }
     },
-    "familyRadiusEffective": 0.02,
+    "familyRadiusEffective": 0.03,
     "classRadiusEffective": 0.01057775709238613,
     "familyRadiusEmpirical": 0.0,
     "classRadiusEmpirical": 0.0,
     "radiusRule": "max(observed spread, materiality floor)"
   },
   "health": {
-    "entriesThrough": "2026-08-28T00:30:00+00:00",
+    "entriesThrough": "2026-08-28T00:30:00Z",
     "snapshots": 60,
     "segments": 6,
     "credits": 1,
@@ -182,14 +182,19 @@
     "rejectedNumericInputs": [],
     "unrecognisedSnapshotSources": {},
     "legacyDateOnlyWeekAnchors": 0,
+    "fastModeEntriesExcluded": 0,
     "storeCause": null,
     "calibrationFileQuarantinedTo": null
   },
   "method": {
-    "algorithmRevision": 2,
-    "constantsFingerprint": "1e2e74ff673bb32dc93d2cf582d5e84eb93fff9cfae39e4272edc25a30da25ee",
-    "verifiedAt": "2026-08-28",
+    "algorithmRevision": 3,
+    "constantsFingerprint": "70c36ec1a467e97bdfece624baa5e560762fdc89c2e0c041c6332f92f4ea6160",
+    "verifiedAt": "2026-08-29",
     "supportedCompositionFrom": "2026-07-25",
+    "coefficientSupport": {
+      "supportedCompositionFrom": "2026-07-25",
+      "fastModeParticipation": "usage-credits-only-excluded"
+    },
     "coefficientEras": [
       {
         "from": null,

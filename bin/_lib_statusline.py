@@ -452,33 +452,6 @@ _RATE_CHANGE_MARKER = "Δrate"
 #: figure that moves by hundreds of points between prompts.
 _PROJECTION_MIN_ELAPSED_HOURS = 24.0
 
-#: The short-register word for each selectable projection basis, keyed by the
-#: `ProjectionBasis` wire value.
-#:
-#: WHY THIS IS NOT IN `_lib_quota_copy` (#661 S2 remediation, finding E7). The
-#: review asked whether these two words are a fourth withheld-figure
-#: vocabulary, since neither is a member of `EVIDENCE_CODES` and neither has a
-#: copy-table entry. They are not, and the reading taken here is the one spec
-#: §8 states: the "short register" is a REGISTER — a short labelled token
-#: where the slot is fixed-width — rather than a closed set of cause codes.
-#: The basis is not a withholding cause; it names which measurement produced a
-#: figure that IS present, so it has no membership in that union by
-#: construction, and putting it in `_lib_quota_copy` would widen a module
-#: whose own docstring says it covers exactly those fifteen codes.
-#:
-#: What the review's concern gets right is the DUPLICATION: the same two words
-#: are spelled independently here and in `BASIS_LABEL` in
-#: `dashboard/web/src/panels/ForecastPanel.tsx`. Naming them once on each side
-#: does not merge them, so `tests/test_statusline_basis_vocabulary.py` pins
-#: the two spellings against each other. The Forecast MODAL deliberately uses
-#: the LONG forms ("calibrated model", "corrected meter"), which is §8's other
-#: register and not a third vocabulary.
-BASIS_SHORT_FORM: dict = {
-    "calibrated": "model",
-    "corrected-meter": "meter",
-}
-
-
 @dataclass(frozen=True)
 class _ProjectionInputs:
     """The duck-typed operand `select_projection_basis` reads.
@@ -542,12 +515,12 @@ def _seven_day_projection(seven_pct, seven_resets, now_epoch) -> Optional[str]:
         elapsed_hours=elapsed,
         remaining_hours=remaining,
     ))
+    copy = _load_lib("_lib_quota_copy")
     if selected.basis is fc.ProjectionBasis.WITHHELD:
         # A withholding is a statement about the READING and does not
         # depend on how much of the window has elapsed, so it is rendered
         # before the confidence gate below. A right-censored 100 is the
         # case: it has no point estimate at any point in the week.
-        copy = _load_lib("_lib_quota_copy")
         return f"→ {copy.short_form(selected.code)}"
     if elapsed < _PROJECTION_MIN_ELAPSED_HOURS:
         # Too early in the window for a pace to mean anything. The slot
@@ -555,7 +528,8 @@ def _seven_day_projection(seven_pct, seven_resets, now_epoch) -> Optional[str]:
         # for the same reason an unknown reset epoch does: there is nothing
         # to say, and a per-prompt line must not fill with non-statements.
         return None
-    basis = BASIS_SHORT_FORM.get(selected.basis.value, selected.basis.value)
+    basis = copy.basis_presentation(selected.basis.value).get(
+        "short", selected.basis.value)
     return f"→ {int(round(selected.value))}% {basis}"
 
 

@@ -1,75 +1,60 @@
-"""One vocabulary for the projection basis, across Python and TypeScript.
+"""One server-owned vocabulary for projection-basis presentation (#676).
 
-#661 S2 remediation, finding E7. Spec §9 says the surface states which
-measurement produced the projection "in the short register", and the status
-line prints `model` / `meter` while `ForecastPanel`'s `BASIS_LABEL` maps the
-same two wire values to the same two words. Neither is a member of
-`EVIDENCE_CODES` and neither has a `_lib_quota_copy` entry, which the review
-read as a possible fourth vocabulary.
-
-The reading taken, and recorded beside the table itself, is that §8's "short
-register" names a REGISTER rather than a closed set of cause codes: a basis is
-not a withholding cause, so it cannot be a member of that union. What the
-concern gets right is that the two words are spelled twice, once per language,
-with nothing holding them together. This module is that hold.
-
-It compares the two tables directly rather than asserting each against a
-literal, because two literals agreeing with a third say nothing about whether
-they agree with each other — but it also pins the words, because two tables
-that had drifted TOGETHER would satisfy a comparison alone.
+The shared Python table publishes both registers. The status line consumes its
+short register directly; the dashboard envelope carries both registers to the
+React panel and modal. No TypeScript table is parsed here because the client
+behavior is exercised by its own component tests.
 """
 from __future__ import annotations
-
-import pathlib
-import re
 
 import pytest
 
 from conftest import load_script
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-PANEL_TS = ROOT / "dashboard" / "web" / "src" / "panels" / "ForecastPanel.tsx"
-MODAL_TS = ROOT / "dashboard" / "web" / "src" / "modals" / "ForecastModal.tsx"
-
-
 def _python_table():
     ns = load_script()
-    return dict(ns["_load_sibling"]("_lib_statusline").BASIS_SHORT_FORM)
+    copy = ns["_load_sibling"]("_lib_quota_copy")
+    return {basis: dict(forms) for basis, forms in copy._BASIS_FORM.items()}
 
 
-def _typescript_table() -> dict:
-    """Parse `BASIS_LABEL`'s object literal out of the panel source."""
-    source = PANEL_TS.read_text(encoding="utf-8")
-    match = re.search(
-        r"const BASIS_LABEL:\s*Record<string,\s*string>\s*=\s*\{(.*?)\}",
-        source, re.S)
-    assert match, "BASIS_LABEL was renamed or reshaped in ForecastPanel.tsx"
-    body = match.group(1)
-    pairs = re.findall(r"'?([A-Za-z-]+)'?\s*:\s*'([^']+)'", body)
-    assert pairs, f"no entries parsed from BASIS_LABEL: {body!r}"
-    return dict(pairs)
+def test_the_two_tables_carry_the_same_words_for_the_same_bases(monkeypatch):
+    """Historical node name retained: the real contract is now that the two
+    Python producers observe the same shared table mutation."""
+    ns = load_script()
+    copy = ns["_load_sibling"]("_lib_quota_copy")
+    monkeypatch.setitem(
+        copy._BASIS_FORM["corrected-meter"], "short", "gauge")
+    monkeypatch.setitem(
+        copy._BASIS_FORM["corrected-meter"], "long", "corrected gauge")
 
+    statusline = ns["_load_sibling"]("_lib_statusline")
+    assert statusline._seven_day_projection(
+        40.0, 96 * 3600, 0) == "→ 92% gauge"
 
-def test_the_two_tables_carry_the_same_words_for_the_same_bases():
-    assert _python_table() == _typescript_table()
+    envelope = ns["_load_sibling"]("_cctally_dashboard_envelope")
+    assert envelope._basis_presentation("corrected-meter") == {
+        "code": "corrected-meter",
+        "short": "gauge",
+        "long": "corrected gauge",
+    }
 
 
 def test_the_words_are_the_ones_the_spec_and_the_docs_state():
     """Non-vacuity for the comparison above: two tables that drifted together
     would agree with each other and be wrong."""
     assert _python_table() == {
-        "calibrated": "model",
-        "corrected-meter": "meter",
+        "calibrated": {"short": "model", "long": "calibrated model"},
+        "corrected-meter": {"short": "meter", "long": "corrected meter"},
+        "withheld": {"short": "withheld", "long": "withheld"},
     }
 
 
 def test_every_selectable_basis_has_a_short_form():
-    """`withheld` is deliberately absent: that state renders the withholding
-    CAUSE through the copy table, not a basis word, on both surfaces."""
+    """Every enum member has presentation even though a withheld projection
+    renders its separate cause in the panel's value slot."""
     ns = load_script()
     fc = ns["_load_sibling"]("_lib_forecast")
-    selectable = {b.value for b in fc.ProjectionBasis
-                  if b is not fc.ProjectionBasis.WITHHELD}
+    selectable = {b.value for b in fc.ProjectionBasis}
     assert set(_python_table()) == selectable
 
 
@@ -86,10 +71,11 @@ def test_the_short_words_are_not_smuggled_into_the_cause_vocabulary(word):
 
 
 def test_the_modal_uses_the_long_register_rather_than_a_third_vocabulary():
-    """§8's other register, on the surface that has room for it. This is a
-    text tripwire, so it states what it can: the modal spells the long forms
-    and does not import the panel's short table."""
-    source = MODAL_TS.read_text(encoding="utf-8")
-    assert "'calibrated model'" in source
-    assert "'corrected meter'" in source
-    assert "BASIS_LABEL" not in source
+    """The dashboard wire carries the long register that its modal consumes.
+    React behavior is asserted in ForecastModal.quota.test.tsx."""
+    ns = load_script()
+    envelope = ns["_load_sibling"]("_cctally_dashboard_envelope")
+    assert envelope._basis_presentation("calibrated")["long"] == (
+        "calibrated model")
+    assert envelope._basis_presentation("corrected-meter")["long"] == (
+        "corrected meter")

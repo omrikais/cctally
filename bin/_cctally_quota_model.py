@@ -58,7 +58,8 @@ def eprint(*args, **kwargs):
 # ---------------------------------------------------------------------------
 #: First UTC date whose composition the shipped coefficients are validated
 #: for. Every observation before it is excluded from the analysis window.
-SUPPORTED_COMPOSITION_FROM: dt.date = dt.date(2026, 7, 25)
+SUPPORTED_COMPOSITION_FROM: dt.date = dt.date.fromisoformat(
+    qm.COEFFICIENT_SUPPORT["supportedCompositionFrom"])
 
 #: Provenance, so a later reader can re-test the boundary rather than inherit
 #: it. Each entry states the era, its state and where the state came from.
@@ -105,6 +106,10 @@ KNOWN_SNAPSHOT_SOURCES: frozenset = frozenset(
 # ---------------------------------------------------------------------------
 # Instants.
 # ---------------------------------------------------------------------------
+class MalformedRetainedInstant(ValueError):
+    """A retained timestamp cannot be interpreted as an instant."""
+
+
 def parse_instant(value, label: str = "timestamp"):
     """Parse a stored ISO-8601 string to an aware UTC datetime.
 
@@ -123,7 +128,12 @@ def parse_instant(value, label: str = "timestamp"):
         return None
     if text.endswith("Z") or text.endswith("z"):
         text = text[:-1] + "+00:00"
-    parsed = dt.datetime.fromisoformat(text)
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except (ValueError, OverflowError) as exc:
+        raise MalformedRetainedInstant(
+            f"{label}: retained value {value!r} is not an ISO-8601 instant"
+        ) from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
@@ -271,15 +281,12 @@ def _read_stats_component(conn, account_key, start):
             ("weekly_credit_floors", "effective_at_utc", "floor")):
         csql = f"SELECT {column} FROM {table} WHERE 1=1"
         cparams: list = []
-        if start is not None:
-            csql += f" AND {column} >= ?"
-            cparams.append(start.isoformat())
         cclause, cextra = _account_clause("account_key", account_key)
         csql += cclause
         cparams.extend(cextra)
         for (raw,) in conn.execute(csql, cparams):
             at = parse_instant(raw, column)
-            if at is not None:
+            if at is not None and (start is None or at >= start):
                 credits.append(qm.CreditRecord(at=at, kind=kind))
 
     diagnostics = {
@@ -299,7 +306,8 @@ def _read_cache_component(conn, account_key, start):
     """
     sql = (
         "SELECT timestamp_utc, model, input_tokens, output_tokens,"
-        " cache_create_tokens, cache_create_1h_tokens, cache_read_tokens"
+        " cache_create_tokens, cache_create_1h_tokens, cache_read_tokens,"
+        " speed"
         " FROM session_entries WHERE 1=1"
     )
     params: list = []
@@ -312,9 +320,13 @@ def _read_cache_component(conn, account_key, start):
     sql += " ORDER BY timestamp_utc, id"
 
     entries = []
+    fast_excluded = 0
     for row in conn.execute(sql, params):
         at = parse_instant(row[0], "timestamp_utc")
         if at is None:
+            continue
+        if row[7] == "fast":
+            fast_excluded += 1
             continue
         entries.append(qm.EntryRecord(
             at=at, model=str(row[1] or ""), fresh=row[2] or 0,
@@ -323,7 +335,7 @@ def _read_cache_component(conn, account_key, start):
     newest = parse_instant(
         conn.execute("SELECT MAX(timestamp_utc) FROM session_entries")
         .fetchone()[0], "timestamp_utc")
-    return entries, newest
+    return entries, newest, fast_excluded
 
 
 def _retained_snapshot_span(conn, account_key):
@@ -388,29 +400,28 @@ def load_population(account_key, *, since, now) -> LoadResult:
                               status=CalibrationStatus.UNAVAILABLE,
                               cause="store-unavailable")
 
-        try:
-            earliest, _latest = _retained_snapshot_span(
-                stats_conn, account_key)
-        except sqlite3.Error:
-            return LoadResult(analysis_start=start,
-                              status=CalibrationStatus.UNAVAILABLE,
-                              cause="store-unavailable")
-
         payload = None
         for attempt in (0, 1):
             before = _probe_bundle(stats_conn, cache_conn)
             try:
+                earliest, _latest = _retained_snapshot_span(
+                    stats_conn, account_key)
                 snapshots, credits, diagnostics = _read_stats_component(
                     stats_conn, account_key, start)
-                entries, newest = _read_cache_component(
+                entries, newest, fast_excluded = _read_cache_component(
                     cache_conn, account_key, start)
             except sqlite3.Error:
                 return LoadResult(analysis_start=start,
                                   status=CalibrationStatus.UNAVAILABLE,
                                   cause="store-unavailable")
+            except (MalformedRetainedInstant, ValueError, TypeError):
+                return LoadResult(analysis_start=start,
+                                  status=CalibrationStatus.UNAVAILABLE,
+                                  cause="malformed-retained-instant")
             after = _probe_bundle(stats_conn, cache_conn)
             if before == after:
-                payload = (snapshots, credits, diagnostics, entries, newest)
+                payload = (earliest, snapshots, credits, diagnostics,
+                           entries, newest, fast_excluded)
                 break
         if payload is None:
             # A store that moves twice while we read it is under active
@@ -428,9 +439,11 @@ def load_population(account_key, *, since, now) -> LoadResult:
                 except sqlite3.Error:
                     pass
 
-    snapshots, credits, diagnostics, entries, newest = payload
+    earliest, snapshots, credits, diagnostics, entries, newest, \
+        fast_excluded = payload
     diagnostics = dict(diagnostics)
     diagnostics["analysisStart"] = start.isoformat()
+    diagnostics["fastModeEntriesExcluded"] = fast_excluded
     if not snapshots and earliest is not None and earliest < start:
         # Retained history exists, and all of it predates the era the shipped
         # coefficients are validated for. That is not thin evidence: it is
@@ -624,7 +637,17 @@ def calibration_lock():
     write is millisecond-scale, so a brief wait is preferable to silently
     dropping a writer's update.
     """
-    path = calibration_lock_path()
+    with _leaf_lock(calibration_lock_path()):
+        yield
+
+
+@contextlib.contextmanager
+def _leaf_lock(path):
+    """A blocking exclusive `flock` on `path`, held for the yielded block.
+
+    LEAF means the same thing for every caller: nothing else may be held while
+    it is acquired, and it takes nothing else while held.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
     try:
@@ -695,17 +718,26 @@ def save_calibrations(state: dict) -> None:
     `_cctally_config.save_config` is a related precedent rather than the
     specification: it uses a PID-only temporary name at mode 0644 and does NOT
     fsync the parent directory, so a crash after the rename can lose the
-    rename itself. This protocol creates the temporary file with `O_EXCL`
-    under a name unique per process AND attempt, writes at 0600, fsyncs the
-    contents, `os.replace`s into position, and then fsyncs the parent
-    directory.
+    rename itself.
 
     The caller holds `calibration_lock()`.
     """
-    path = calibration_path()
+    _atomic_write_json(calibration_path(), state)
+
+
+def _atomic_write_json(path, document: dict) -> None:
+    """Create with `O_EXCL` under a name unique per process AND attempt, write
+    at 0600, fsync the contents, `os.replace` into position, then fsync the
+    parent directory.
+
+    Shared by the calibration state and the #695 delivery ledger. A partially
+    written ledger is indistinguishable from a malformed one and would
+    disable the delivery mechanism, so it gets the same protocol rather than
+    a weaker one. The caller holds that file's own leaf lock.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     _sweep_stale_temporaries(path)
-    payload = (json.dumps(state, indent=2) + "\n").encode("utf-8")
+    payload = (json.dumps(document, indent=2) + "\n").encode("utf-8")
     attempt = 0
     while True:
         tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{attempt}")
@@ -747,6 +779,187 @@ def _sweep_stale_temporaries(path) -> None:
                 candidate.unlink()
             except OSError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# #695 — the metering-rate notification-delivery ledger.
+#
+# The pure document semantics live in `bin/_lib_rate_change_delivery.py`. This
+# section owns the file, its leaf lock, the atomic write, the stats read that
+# says what has been recorded, the one-time seed and the compare-and-set.
+# ---------------------------------------------------------------------------
+def _rate_change_delivery():
+    """The pure ledger kernel, via the call-time sibling accessor."""
+    return _cctally()._load_sibling("_lib_rate_change_delivery")
+
+
+def delivery_path():
+    return _cctally_core.APP_DIR / _rate_change_delivery().FILENAME
+
+
+def delivery_lock_path():
+    return _cctally_core.APP_DIR / _rate_change_delivery().LOCK_FILENAME
+
+
+@contextlib.contextmanager
+def delivery_lock():
+    """Exclusive `flock` around the #695 delivery ledger.
+
+    LOCK ORDER: a LEAF, exactly like `calibration_lock`. It is legal to
+    acquire it after a stats lock has been taken and fully RELEASED — the law
+    forbids holding a later lock while acquiring an earlier one, not
+    re-acquiring a released leaf — and `cmd_quota` relies on that, because the
+    mark must follow the commit it describes.
+    """
+    with _leaf_lock(delivery_lock_path()):
+        yield
+
+
+@dataclasses.dataclass(frozen=True)
+class LoadedDelivery:
+    """The ledger, plus whether this run may use it.
+
+    `usable=False` is NOT "empty". An empty reading would make every recorded
+    identity look owed and fire the whole history, which is the failure the
+    ledger exists to prevent, so an unusable ledger suppresses the seed and
+    the sweep instead.
+    """
+
+    state: dict
+    usable: bool = True
+    reason: "str | None" = None
+    #: True when this run could not COMPLETE THE SEED even though the file
+    #: itself parsed. The remedy differs and must be reported differently: a
+    #: stats read that fails during a rebuild is the common case, and telling
+    #: the user to repair or remove a healthy ledger would be wrong advice.
+    seed_deferred: bool = False
+
+
+def load_delivery_state() -> LoadedDelivery:
+    """Read and validate the ledger. Never quarantines, never overwrites."""
+    d = _rate_change_delivery()
+    path = delivery_path()
+    if not path.exists():
+        return LoadedDelivery(d.empty_state())
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return LoadedDelivery(d.empty_state(), usable=False,
+                              reason=f"could not be read ({exc})")
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        return LoadedDelivery(d.empty_state(), usable=False,
+                              reason="is not valid JSON")
+    validated = d.validate(document)
+    if validated is None:
+        return LoadedDelivery(d.empty_state(), usable=False,
+                              reason="does not match the expected schema")
+    return LoadedDelivery(validated)
+
+
+def save_delivery_state(state: dict) -> None:
+    """Atomically replace the ledger. The caller holds `delivery_lock()`."""
+    _atomic_write_json(delivery_path(), state)
+
+
+def recorded_rate_change_identities(account_keys=None) -> tuple:
+    """Every `(provider, account_key, effective_from)` with a durable row.
+
+    The AUTHORITATIVE source of what has been recorded (#695 section 5.1).
+    The calibration file's enumerated pairs must not be used for this: a
+    `reset_calibration` or a quarantine removes them while the row survives,
+    which would strand an owed identity forever.
+
+    Raises on a store it cannot read; both callers decide what a failure
+    means, and neither may treat it as "nothing is recorded".
+    """
+    keys = None if account_keys is None else sorted(
+        {str(k) for k in account_keys})
+    if keys is not None and not keys:
+        return ()
+    conn = None
+    try:
+        conn = _cctally_core.open_db()
+        if keys is None:
+            rows = conn.execute(
+                "SELECT provider, account_key, effective_from "
+                "FROM meter_rate_change_events").fetchall()
+        else:
+            marks = ",".join("?" for _ in keys)
+            rows = conn.execute(
+                "SELECT provider, account_key, effective_from "
+                f"FROM meter_rate_change_events WHERE account_key IN ({marks})",
+                keys).fetchall()
+        return tuple(sorted(
+            (str(p), str(a), str(e)) for p, a, e in rows))
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def claim_delivery(identity) -> str:
+    """Compare and set one identity into the ledger. Returns a CLAIM_* code.
+
+    Only `CLAIM_WON` authorizes a dispatch. `CLAIM_WRITE_FAILED` deliberately
+    leaves the identity owed, so a later run retries it rather than losing the
+    notification to a transient write error.
+    """
+    d = _rate_change_delivery()
+    with delivery_lock():
+        loaded = load_delivery_state()
+        if not loaded.usable:
+            return d.CLAIM_UNUSABLE
+        if tuple(identity) in d.decided_set(loaded.state):
+            return d.CLAIM_ALREADY_DECIDED
+        try:
+            save_delivery_state(
+                d.with_decided(loaded.state, [tuple(identity)]))
+        except OSError:
+            return d.CLAIM_WRITE_FAILED
+        return d.CLAIM_WON
+
+
+def seed_delivery_state() -> LoadedDelivery:
+    """Mark every currently recorded identity as decided, once (#695 sec 4).
+
+    Without this, the first run of the upgraded binary sees every historical
+    row as owed and fires the whole history.
+
+    THREE phases, and the stats read sits between two separate lock holds
+    because the ledger lock is a leaf and may hold no database connection. The
+    phase-3 re-read is what makes two concurrent seeders safe: overwriting
+    with the phase-2 snapshot would discard a mark another process wrote in
+    between. A row a `hook-tick` inserts between phases 2 and 3 falls outside
+    the snapshot and is therefore SWEPT rather than seeded away, which is the
+    safe direction.
+
+    A stats failure leaves the flag unset and reports the ledger unusable for
+    this run, so the command degrades to no sweep rather than to an error.
+    """
+    from _cctally_db import StatsRebuildDeferred
+    d = _rate_change_delivery()
+    with delivery_lock():
+        loaded = load_delivery_state()
+        if not loaded.usable or loaded.state.get("seededFromStats"):
+            return loaded
+    try:
+        snapshot = recorded_rate_change_identities()
+    except (Exception, StatsRebuildDeferred) as exc:  # noqa: BLE001
+        return LoadedDelivery(
+            d.empty_state(), usable=False, seed_deferred=True,
+            reason=f"the recorded transitions could not be read ({exc})")
+    with delivery_lock():
+        loaded = load_delivery_state()
+        if not loaded.usable or loaded.state.get("seededFromStats"):
+            return loaded
+        state = d.with_decided(loaded.state, snapshot, seeded=True)
+        try:
+            save_delivery_state(state)
+        except OSError as exc:
+            return LoadedDelivery(d.empty_state(), usable=False,
+                                  reason=f"could not be written ({exc})")
+        return LoadedDelivery(state)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -865,6 +1078,10 @@ def reduce_state(stored: dict, analysis, mode: PersistMode) -> dict:
     * A stored regime under a different fingerprint is marked `stale` and a
       new regime is APPENDED; its own value is never rewritten, because that
       value was true under its own constants.
+    * A withheld analysis that `qm.transition_persistence_permitted` admits
+      persists both sides of the split exactly as a confirmed change does,
+      with the successor stamped under the withholding status (#688). This
+      is the one transition keyed off the DETECTOR rather than the verdict.
     * A non-trustworthy analysis writes nothing.
     """
     if mode.kind != "automatic":
@@ -876,6 +1093,15 @@ def reduce_state(stored: dict, analysis, mode: PersistMode) -> dict:
     fitted_ok = (analysis.status is CalibrationStatus.OK
                  and analysis.fitted.state == "available")
     successor_ok = (confirmed and analysis.watch_fit.state == "available")
+    # #688: the durable transition keys off DETECTION for the one class of
+    # withholding that concerns predicting forward. Additive rather than a
+    # replacement: a bare detector-only predicate would newly admit
+    # `fragmented-history` and `unstable-fit`, which `resolve_outcome`
+    # deliberately refuses.
+    permitted = (qm.transition_persistence_permitted(analysis)
+                 and analysis.watch_fit.state == "available")
+    confirmed = confirmed or permitted
+    successor_ok = successor_ok or permitted
     if not fitted_ok and not successor_ok:
         return stored
 
@@ -979,7 +1205,8 @@ def _alert_account_key(account_key) -> str:
 
 
 def persist_and_detect(analysis, mode: PersistMode) -> tuple:
-    """`(quarantine path or None, transitions)` under one lock.
+    """`(quarantine path or None, fresh_transitions, persisted_candidates)`
+    under one lock.
 
     The read, the reduction and the write all happen inside one exclusive
     lock, because the reducer is a read-modify-write and the atomic rename
@@ -992,6 +1219,19 @@ def persist_and_detect(analysis, mode: PersistMode) -> tuple:
     is RETURNED rather than acted on, because step 2 requires this leaf lock
     to be released before any stats lock is taken, and this function is the
     lock's whole extent.
+
+    THREE values, and the third is enumerated whether or not this run wrote
+    anything (#689). `fresh_transitions` is what the before-and-after
+    comparison produced and keeps its #688 `withholding_status` stamp.
+    `persisted_candidates` is every qualified adjacent pair in the
+    post-reduction state, with no freshness filter at all. A run that writes
+    nothing is exactly the run recovery depends on: the run that lost its
+    recording already wrote the regimes, so every later run finds the state
+    unchanged and produces no fresh descriptor for it.
+
+    Both sets are computed under this lock from the same post-write state.
+    Re-reading the file after the lock is released would let this run attach
+    its own timestamp and disclosure to a transition another process wrote.
     """
     with calibration_lock():
         loaded = load_calibrations(now=mode.now)
@@ -1002,20 +1242,118 @@ def persist_and_detect(analysis, mode: PersistMode) -> tuple:
             # permissions problem, an I/O error, or a concurrent quarantine
             # rename removing the primary name between the existence check
             # and the read. No transition is detectable without a before
-            # state, and "no transitions" is an empty sequence.
-            return None, ()
+            # state, and "no transitions" is an empty sequence. THREE
+            # elements, for the same reason: `cmd_quota` iterates the third
+            # as well.
+            return None, (), ()
         before = stored_regimes(loaded.state, mode.account_key)
         reduced = reduce_state(loaded.state, analysis, mode)
+        mrc = _cctally()._load_sibling("_lib_meter_rate_change")
+        account_key = _alert_account_key(mode.account_key)
+        detected_at = mode.now.astimezone(UTC).isoformat()
         transitions: tuple = ()
         if reduced is not loaded.state:
             save_calibrations(reduced)
-            mrc = _cctally()._load_sibling("_lib_meter_rate_change")
-            transitions = mrc.detect_transitions(
-                before, stored_regimes(reduced, mode.account_key),
-                provider="claude",
-                account_key=_alert_account_key(mode.account_key),
-                detected_at=mode.now.astimezone(UTC).isoformat())
-        return loaded.quarantined, transitions
+            # #688: `detect_transitions` compares two stored states and does
+            # not know WHY this run was admitted, so the disclosure is
+            # stamped onto what it returns rather than passed into it. The
+            # value is computed once, from the analysis, before the call.
+            withheld = (analysis.status.value
+                        if qm.transition_persistence_permitted(analysis)
+                        else None)
+            transitions = tuple(
+                dataclasses.replace(t, withholding_status=withheld)
+                for t in mrc.detect_transitions(
+                    before, stored_regimes(reduced, mode.account_key),
+                    provider="claude", account_key=account_key,
+                    detected_at=detected_at))
+        # #689: enumerated UNCONDITIONALLY, and that is the whole point. The
+        # run that lost its recording already wrote the regimes, so every
+        # later run finds the state unchanged and takes neither branch above.
+        # Recovery therefore cannot be derived from freshness; it comes from
+        # what is persisted right now.
+        candidates = mrc.enumerate_transitions(
+            stored_regimes(reduced, mode.account_key),
+            provider="claude", account_key=account_key,
+            detected_at=detected_at)
+        return loaded.quarantined, transitions, candidates
+
+
+#: Keys per presence query. Three bind parameters each, so this stays far
+#: below SQLite's variable limit however long the regime list grows.
+_PRESENCE_CHUNK = 200
+
+
+def unrecorded_rate_change_transitions(transitions) -> tuple:
+    """Those candidates with neither a durable row nor a terminal latch (#689).
+
+    TWO axes, because the physical row alone is not sufficient. A completed
+    tombstone or a higher revision legitimately leaves effective metadata with
+    no row; a row-only lookup would re-select that key on every run, reach a
+    revision mismatch in `_classify_live_effective_event`, and raise
+    `CorrectionRebuildRequired` — which defaults to `recovery_eligible=False`
+    and is not overridden at the raise site, so the command would print its
+    failure line on every invocation forever. No supported `db rederive`
+    family can target an `mrc:` event today, so this guard is defensive; it is
+    taken because it costs one column and the failure it prevents is
+    unbounded.
+
+    A metadata row that is ACTIVE at revision 0 with no physical row is NOT
+    terminal: that is the duplicate-with-missing-row case, and the emitter
+    materializes the row from the identical event. There is ONE exception,
+    and it is terminal for the same reason a tombstone is. Metadata carrying
+    no retained record (`event_json IS NULL`) cannot be materialized from:
+    the recovery run's payload carries a later clock, so it hashes
+    differently and classifies as a conflict, and
+    `_effective_event_for_convergence` then fails closed and raises
+    `JournalProtocolError`, which `record_rate_change_transition` absorbs
+    into its failure line. Re-offering the key would print that line on every
+    run forever, which is the unbounded failure this axis exists to prevent.
+
+    Unknown is treated as PRESENT, never absent. Returning no candidates on a
+    failure is what stops a store that cannot answer from driving an ingest
+    attempt on every run. That catch is defense for a race, for direct use of
+    this helper, and for an epoch-current store whose table is missing or
+    malformed — it is not what protects an ordinary pre-1011 command, which
+    raises `StatsRebuildDeferred` inside `load_population` long before this.
+    """
+    candidates = tuple(transitions)
+    if not candidates:
+        return ()
+    import _lib_journal
+    from _cctally_db import StatsRebuildDeferred
+    mrc = _cctally()._load_sibling("_lib_meter_rate_change")
+    conn = None
+    try:
+        conn = _cctally_core.open_db()
+        recorded: set = set()
+        for i in range(0, len(candidates), _PRESENCE_CHUNK):
+            chunk = candidates[i:i + _PRESENCE_CHUNK]
+            rows = ",".join("(?,?,?)" for _ in chunk)
+            params = [part for t in chunk for part in t.identity()]
+            for provider, account, effective in conn.execute(
+                    "SELECT provider, account_key, effective_from "
+                    "FROM meter_rate_change_events WHERE "
+                    f"(provider, account_key, effective_from) IN (VALUES {rows})",
+                    params):
+                recorded.add((str(provider), str(account), str(effective)))
+            by_id = {
+                _lib_journal.evt_id(mrc.EVT_ID_PREFIX, *t.identity()):
+                    t.identity() for t in chunk}
+            marks = ",".join("?" for _ in by_id)
+            for event_id, rev, status, event_json in conn.execute(
+                    "SELECT event_id, rev, status, event_json "
+                    "FROM journal_effective_events "
+                    f"WHERE event_id IN ({marks})", list(by_id)):
+                if (str(status) != "active" or int(rev) != 0
+                        or event_json is None):
+                    recorded.add(by_id[str(event_id)])
+        return tuple(t for t in candidates if t.identity() not in recorded)
+    except (Exception, StatsRebuildDeferred):   # noqa: BLE001
+        return ()
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def rate_change_notifications_enabled() -> bool:
@@ -1036,24 +1374,40 @@ def rate_change_notifications_enabled() -> bool:
     return bool(block.get("enabled")) and bool(block.get("rate_change_enabled"))
 
 
-def record_rate_change_transition(transition, *, now) -> bool:
-    """Steps 3 to 6 of spec §6.5. True when this call created the row.
+def record_rate_change_transition(transition, *, now,
+                                  notification_owed: bool = False):
+    """Steps 3 to 6 of spec §6.5. `(result, deferred)` for this identity, or
+    `None` when the cycle did not run or the store could not be written.
 
     `run_stats_ingest` is the sole stats writer and it enforces journal-first,
-    then commit, then notify — so the descriptor is passed THROUGH it rather
-    than written here. `mode="authoritative"` because the caller must observe
-    its own transition rather than leaving it to whichever process next holds
-    the ingest lock: a user who just ran `cctally quota` and saw the change
+    then commit — so the descriptor is passed THROUGH it rather than written
+    here. `mode="authoritative"` because the caller must observe its own
+    transition rather than leaving it to whichever process next holds the
+    ingest lock: a user who just ran `cctally quota` and saw the change
     reported would otherwise find no event recorded.
 
+    It no longer DISPATCHES (#695). The payload comes back on the result and
+    `_settle_rate_change` fires it only after winning the delivery ledger's
+    compare-and-set, which is what makes a lost dispatch recoverable instead
+    of terminal. Returning `bool(result.ran)` was never enough either: `ran`
+    reports that the cycle ran, not that anything happened to this identity.
+
+    `notification_owed` is the caller's assertion that its ledger holds no
+    decision for this identity, and it is the ONLY thing that lets an
+    already-recorded row notify.
+
     A stats index mid-epoch-rebuild, a busy lock or a corrupt store must not
-    turn `cctally quota` into an error: the calibration is
-    already persisted, and the transition is re-derivable from it on the next
-    run because `detect_transitions` compares the state before and after each
-    write — a run that wrote nothing produces no descriptor, so a missed
-    recording is recovered by the next run that does write. That is a real
-    gap, and it is the deliberate trade: the durable truth is the calibration
-    file plus the journal, and neither is lost.
+    turn `cctally quota` into an error: the calibration is already persisted,
+    and the command reports what it found.
+
+    A failed recording IS recovered, by a later run (#689). It is not
+    recovered by freshness: once this write has happened the pair is present
+    on both sides of every later comparison, so `detect_transitions` never
+    returns it again. It is recovered because `cmd_quota` also enumerates the
+    persisted adjacent pairs, resolves which already have a durable row or a
+    terminal latch, and re-offers only the rest. `record_meter_rate_change`
+    classifies before it appends, so re-offering a recorded identity under a
+    later command clock cannot append a second, byte-different line.
 
     The catch is `Exception` plus the two deferral signals, and NOT
     `BaseException` (#661 S2 Stage C review). `StatsRebuildDeferred` derives
@@ -1076,17 +1430,106 @@ def record_rate_change_transition(transition, *, now) -> bool:
                 "transition": transition,
                 "notify": rate_change_notifications_enabled(),
                 "created_at": now.astimezone(UTC).isoformat(),
+                "notification_owed": bool(notification_owed),
             },
         )
     except (Exception, StatsRebuildDeferred) as exc:   # noqa: BLE001
         eprint(f"quota: could not record the metering-rate change: {exc}")
-        return False
-    return bool(result.ran)
+        return None
+    if not result.ran:
+        return None
+    return result.meter_rate_change_result, list(result.deferred_alerts)
+
+
+def _settle_rate_change(transition, outcome, status) -> "str | None":
+    """Mark the ledger, then dispatch — never the other way round (#695 §6).
+
+    `alerted_at` is written before the notifier `Popen` for every other axis,
+    and this family follows that contract with the ledger standing in for the
+    column. The consequence is stated rather than hidden: a crash after the
+    mark is terminal, and a crash before it leaves the identity owed for the
+    next run.
+
+    An UNUSABLE ledger cannot elect a dispatcher, so the payload is dispatched
+    unmarked. Losing a notification is worse than the duplicate that a later
+    repaired ledger could produce, and §3.1 records both consequences that
+    degradation actually carries.
+
+    Returns the compare-and-set outcome when one was attempted, and None when
+    there was nothing to claim. The sweep stops on `unusable` (§3.2): a ledger
+    that cannot elect a dispatcher for this identity cannot elect one for the
+    next either, so continuing would drive a full authoritative ingest per
+    remaining identity and discard every result at the claim.
+    """
+    import _cctally_journal as jr
+    d = _rate_change_delivery()
+    if outcome is None:
+        return
+    result, deferred = outcome
+    if result is None or not result.notification_decided:
+        return
+    if not status.usable:
+        if deferred:
+            (jr.ALERT_DISPATCHER or jr._dispatch_pending_alerts)(deferred)
+        return
+    claim = claim_delivery(transition.identity())
+    if claim != d.CLAIM_WON:
+        return claim
+    if deferred:
+        (jr.ALERT_DISPATCHER or jr._dispatch_pending_alerts)(deferred)
+    return claim
+
+
+def _owed_rate_change_transitions(account_keys, status, *, now,
+                                  settled=()) -> tuple:
+    """Durable rows with no delivery decision, as descriptors (#695 §5.1).
+
+    Only the IDENTITY comes from here. Every other field of the alert is
+    reconstructed inside the emitter from the same durable row, because the
+    row is what was actually recorded; this descriptor exists to carry the
+    identity and the command clock through `run_stats_ingest`. The zero rates
+    and the `info` severity below are therefore never published — the
+    emitter's owed branch returns before `event_payload` on an existing row.
+
+    A stats read that fails yields NOTHING rather than raising: the command
+    reports what it found, and a store it cannot read is not an error path
+    here any more than it is in `unrecorded_rate_change_transitions`.
+
+    `settled` carries the identities this invocation already offered to
+    `_settle_rate_change`. They are excluded because the ledger snapshot is
+    taken once, before the account loop, so a mark the loop just wrote is not
+    in `status.state` and the identity would otherwise be re-offered here —
+    one wasted authoritative ingest, and a spurious `could not record` line if
+    that ingest happens to fail. A `write_failed` identity is excluded too:
+    §3.2 gives it to a LATER run, not to this one.
+    """
+    from _cctally_db import StatsRebuildDeferred
+    mrc = _cctally()._load_sibling("_lib_meter_rate_change")
+    d = _rate_change_delivery()
+    try:
+        recorded = recorded_rate_change_identities(account_keys)
+    except (Exception, StatsRebuildDeferred):          # noqa: BLE001
+        return ()
+    detected_at = now.astimezone(UTC).isoformat()
+    return tuple(
+        mrc.RateChangeTransition(
+            provider=provider, account_key=account, effective_from=effective,
+            previous_units_per_point=0.0, new_units_per_point=0.0,
+            severity=mrc.SEVERITY_INFO, detected_at=detected_at)
+        for provider, account, effective in d.owed(
+            recorded,
+            d.decided_set(status.state) | {tuple(i) for i in settled}))
 
 
 def persist(analysis, mode: PersistMode) -> "str | None":
-    """`persist_and_detect`'s quarantine half, for callers with no stats leg."""
-    quarantined, _transitions = persist_and_detect(analysis, mode)
+    """`persist_and_detect`'s quarantine half, for callers with no stats leg.
+
+    It unpacks all THREE values and deliberately discards both descriptor
+    collections (#689). This surface takes no stats leg at all — no presence
+    lookup, no ingest and no notification — so a caller reaching it gets the
+    calibration write and the quarantine path and nothing else.
+    """
+    quarantined, _fresh, _candidates = persist_and_detect(analysis, mode)
     return quarantined
 
 
@@ -1098,7 +1541,7 @@ def persist(analysis, mode: PersistMode) -> "str | None":
 #: the reason spec section 8 gives exit 1 to a confirmed change at all: a
 #: degraded leg never masks a finding. Below that, an unhealthy account
 #: outranks a merely thin one, because it names something to fix.
-EXIT_SEVERITY: dict = {0: 0, 4: 1, 3: 2, 1: 3}
+EXIT_SEVERITY: dict = {0: 0, 4: 1, 3: 2, 1: 3, 2: 4}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1229,7 +1672,7 @@ def analyse_account(account_key, *, now, since, watch_from,
     clean = qm.analyse(series, fingerprint_matches=True, **common)
     reported = clean
     if stale_prior and clean.status is not CalibrationStatus.OK:
-        reported = qm.analyse(series, fingerprint_matches=False, **common)
+        reported = qm.overlay_status(clean, CalibrationStatus.STALE)
     return AccountResult(
         account_key=account_key,
         label=account_display_label(account_key),
@@ -1244,7 +1687,8 @@ def _iso(value):
     if value is None:
         return None
     if isinstance(value, dt.datetime):
-        return value.astimezone(UTC).isoformat()
+        import _lib_json_envelope
+        return _lib_json_envelope._iso_z(value)
     return value.isoformat()
 
 
@@ -1274,6 +1718,9 @@ def _recorded_json(recorded, stale_prior) -> "dict | None":
     if recorded is None:
         return None
     out = dict(recorded)
+    for key in ("effectiveFrom", "effectiveUntil", "asOf"):
+        if out.get(key) is not None:
+            out[key] = _iso(parse_instant(out[key], key))
     out["fingerprintMatchesCurrent"] = not stale_prior
     return out
 
@@ -1346,6 +1793,8 @@ def account_payload(result: AccountResult) -> dict:
                 "unrecognisedSnapshotSources"),
             "legacyDateOnlyWeekAnchors": load.diagnostics.get(
                 "legacyDateOnlyWeekAnchors"),
+            "fastModeEntriesExcluded": load.diagnostics.get(
+                "fastModeEntriesExcluded"),
             "storeCause": load.cause,
             "calibrationFileQuarantinedTo": result.quarantined,
         },
@@ -1354,6 +1803,7 @@ def account_payload(result: AccountResult) -> dict:
             "constantsFingerprint": qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
             "verifiedAt": qm.QUOTA_MODEL_VERIFIED_AT,
             "supportedCompositionFrom": SUPPORTED_COMPOSITION_FROM.isoformat(),
+            "coefficientSupport": dict(qm.COEFFICIENT_SUPPORT),
             "coefficientEras": [dict(era) for era in COEFFICIENT_ERAS],
             "detector": detector,
             "dedicatedPoolScope": qm.DEDICATED_POOL_SCOPE_NOTE,
@@ -1563,6 +2013,7 @@ def cmd_quota(args) -> int:
     `insufficient-history` with `rate-change-detected` at exit 1 — which
     `STATUS_EXIT` maps to 4. Exit 2 is argument errors only.
     """
+    import _lib_accounts
     now = _cctally_core._command_as_of()
     try:
         since = parse_date_argument(getattr(args, "since", None), "--since")
@@ -1580,6 +2031,24 @@ def cmd_quota(args) -> int:
 
     decorated = accounts_are_decorated()
     loaded = load_calibrations(now=now)
+    # #695: once per invocation, before anything is recorded. A first run over
+    # a store that predates this change marks every existing identity decided,
+    # so the upgrade does not fire the whole history. `delivery` is carried
+    # rather than re-read, which is what keeps an unusable ledger to ONE
+    # stderr line per invocation instead of one per account.
+    delivery = seed_delivery_state()
+    if not delivery.usable and delivery.seed_deferred:
+        # The FILE is fine; this run could not finish seeding it. Repairing or
+        # removing a healthy ledger is the wrong remedy, and a stats read that
+        # fails during a rebuild is the common way to reach this.
+        eprint("quota: undelivered rate-change notifications will not be "
+               f"retried on this run: {delivery.reason}")
+    elif not delivery.usable:
+        eprint(f"quota: {delivery_path().name} {delivery.reason}; "
+               "undelivered rate-change notifications will not be retried "
+               "until it is repaired or removed")
+    swept_keys: list = []
+    settled: set = set()
     results = []
     for account_key in keys or [None]:
         result = analyse_account(
@@ -1594,9 +2063,11 @@ def cmd_quota(args) -> int:
         # §6.5 step 1-2: the descriptor is decided under the calibration
         # file's leaf lock, and that lock is released before any stats lock is
         # taken — `persist_and_detect` returns from its `with` block first.
-        quarantined, transitions = persist_and_detect(result.clean, mode)
+        quarantined, transitions, candidates = persist_and_detect(
+            result.clean, mode)
         quarantined = quarantined or loaded.quarantined
         results.append(dataclasses.replace(result, quarantined=quarantined))
+        swept_keys.append(_alert_account_key(account_key))
         for transition in transitions:
             # §6.5 steps 3-6: through the sole stats writer, so the append,
             # the row and the cursor commit together and the notification
@@ -1604,7 +2075,62 @@ def cmd_quota(args) -> int:
             # than one adjacent pair, and each is recorded: the row's UNIQUE
             # key dedups, so a pair a prior run already recorded folds to a
             # no-op rather than a second alert.
-            record_rate_change_transition(transition, now=now)
+            settled.add(transition.identity())
+            _settle_rate_change(
+                transition,
+                record_rate_change_transition(transition, now=now),
+                delivery)
+        # #689: a transition an EARLIER run persisted and then failed to
+        # record. It can never be fresh again, so it is recovered from the
+        # persisted state instead. Fresh descriptors are excluded because
+        # they were just recorded above, and only the remainder pays for the
+        # presence lookup.
+        fresh = {t.identity() for t in transitions}
+        for transition in unrecorded_rate_change_transitions(
+                tuple(c for c in candidates if c.identity() not in fresh)):
+            settled.add(transition.identity())
+            _settle_rate_change(
+                transition,
+                record_rate_change_transition(transition, now=now),
+                delivery)
+
+    # #696: the `unattributed` sentinel joins `swept_keys` on every
+    # successful analysis, bare or filtered, whatever accounts this run
+    # analysed. It is added unconditionally, but that is not a promise that
+    # the sweep RUNS — the `delivery.usable` gate below suppresses the whole
+    # sweep on a ledger this invocation could not read or seed, and the
+    # sentinel is suppressed with everything else.
+    # `resolve_accounts` decides which populations are ANALYSED, and it
+    # appends the sentinel only when `_unattributed_bucket_has_rows()` finds
+    # one in `weekly_usage_snapshots` — a different table from the
+    # `meter_rate_change_events` the sweep reads, and nothing keeps the two in
+    # step. An install that spent its single-account lifetime recording under
+    # `_alert_account_key(None)` and then grew a second account has sentinel
+    # rows and no sentinel snapshot, so every one of them would fall outside
+    # the sweep. `recorded_rate_change_identities` normalises its argument
+    # through a set, so a key the loop already appended folds to a no-op.
+    swept_keys.append(_lib_accounts.UNATTRIBUTED)
+
+    # #695: the owed sweep. It reads the DURABLE ROWS, restricted to the
+    # accounts this invocation analysed plus the always-swept `unattributed`
+    # sentinel, because `candidates` comes from the calibration file and a
+    # reset or a quarantine would strand an identity whose row still exists.
+    # It runs after the loop because it is one query over one account set
+    # rather than per-account work.
+    if delivery.usable:
+        for transition in _owed_rate_change_transitions(
+                swept_keys, delivery, now=now, settled=settled):
+            # §3.2: `unusable` suppresses the REST of the sweep. Another
+            # process can corrupt or truncate the ledger after this
+            # invocation's snapshot was taken, and every remaining identity
+            # would then pay for a full authoritative ingest whose result the
+            # claim discards.
+            if _settle_rate_change(
+                    transition,
+                    record_rate_change_transition(
+                        transition, now=now, notification_owed=True),
+                    delivery) == _rate_change_delivery().CLAIM_UNUSABLE:
+                break
 
     if getattr(args, "json", False):
         print(json.dumps(build_payload(results, now=now, decorated=decorated),

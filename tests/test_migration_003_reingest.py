@@ -27,7 +27,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 import _cctally_db as db
 
-from conftest import load_script, redirect_paths
+from conftest import load_script, redirect_paths_without_conversation_retention
 
 
 def _asst_tool_use_line(uuid, msg_id, req_id, tool_id, *,
@@ -53,7 +53,7 @@ def _asst_tool_use_line(uuid, msg_id, req_id, tool_id, *,
 @pytest.fixture
 def isolated(tmp_path, monkeypatch):
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)
     conn = ns["open_conversations_db"]()

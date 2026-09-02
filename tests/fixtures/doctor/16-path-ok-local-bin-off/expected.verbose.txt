@@ -261,12 +261,15 @@ Pricing
         unpriced: []
         fallback: []
 Quota
-  ✓ Metering rate            no change detected
+  ✓ Metering rate            not assessed
+      → Run `cctally quota` for the current assessment.
       details:
         active: False
+        assessed: False
         effective_from: None
         previous_units_per_point: None
         new_units_per_point: None
+        calibration_status: None
   ✓ Calibration              no calibration fitted yet
       details:
         rejection: calibration-absent

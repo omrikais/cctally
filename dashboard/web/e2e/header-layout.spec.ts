@@ -82,10 +82,12 @@ test('desktop status age changes do not move the header actions onto a second ro
     if (actions == null) throw new Error('topbar actions are missing');
     const brand = header.querySelector('.topbar-brand');
     if (brand == null) throw new Error('topbar brand is missing');
-    const version = document.createElement('span');
-    version.className = 'brand-version';
-    version.textContent = 'v1.92.3';
-    brand.append(version);
+    if (brand.querySelector('.brand-version') == null) {
+      const version = document.createElement('span');
+      version.className = 'brand-version';
+      version.textContent = 'v1.92.3';
+      brand.append(version);
+    }
     if (actions.querySelector('.source-status-chip') == null) {
       const sourceStatus = document.createElement('span');
       sourceStatus.className = 'source-status-chip';

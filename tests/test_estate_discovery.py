@@ -14,6 +14,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -857,6 +858,37 @@ def test_frontend_collection_reads_both_runners(tmp_path):
     assert by_runner["vitest"][0].id == "src/x.test.tsx::a > b"
     assert by_runner["vitest"][0].expected_status is None
     assert {r.expected_status for r in by_runner["playwright"]} == {"passed", "skipped"}
+
+
+def test_vitest_collection_uses_threads_instead_of_a_fork_tree(
+        tmp_path, monkeypatch):
+    """List mode must not multiply process pressure inside xdist.
+
+    The projected-public acceptance overlaps frontend and pytest collection.
+    Vitest's default fork pool made that one frontend subprocess fan out while
+    ten pytest workers were active. Its thread pool returns the same list-mode
+    payload without creating the extra process tree.
+    """
+    binaries = tmp_path / "dashboard" / "web" / "node_modules" / ".bin"
+    binaries.mkdir(parents=True)
+    for name in ("vitest", "playwright"):
+        runner = binaries / name
+        runner.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        runner.chmod(0o755)
+    calls = []
+
+    def fake_run(argv, cwd, runtime_dir=None):
+        calls.append(list(argv))
+        if argv[0].endswith("vitest"):
+            return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+        return types.SimpleNamespace(
+            returncode=0, stdout=json.dumps(_PLAYWRIGHT_PAYLOAD), stderr="")
+
+    monkeypatch.setattr(ED, "_run_frontend", fake_run)
+    ED.collect_frontend_tests(tmp_path)
+
+    assert calls[0][-3:] == ["list", "--json", "--pool=threads"]
+    assert "--pool=threads" not in calls[1]
 
 
 def test_a_playwright_exit_one_still_names_the_missing_precondition(tmp_path):

@@ -5,6 +5,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 import _cctally_db as db
 import _cctally_cache as cc
 import _lib_conversation_query as cq
+from _support_http import PRESENCE_BACKSTOP_SECONDS
 
 # A real model id from CLAUDE_MODEL_PRICING so token-derived cost is genuinely
 # non-zero (the plan's placeholder "opus" resolves to None -> $0, which can't
@@ -4503,6 +4504,81 @@ def test_memo_misses_on_entry_mutation_seq_bump():
     assert second is not first         # seq changed -> miss (Codex F1)
 
 
+def test_memo_misses_on_same_shape_replay_revision():
+    """Count and last timestamp can stay identical while rendered text moves."""
+    c = _conn(); _seed_memo_session(c)
+    cq._assemble_memo_clear()
+    first = cq._assemble_session_memoized(c, _MEMO_SID)
+    assert first["items"][-1]["text"] == "hello world"
+
+    # Model a source-file replacement/replay with the same logical shape and
+    # timestamp. The browse rollup's count/MAX watermark is unchanged, so only
+    # the render revision can invalidate the completed assembly.
+    c.execute(
+        "UPDATE conversation_messages SET text=? "
+        "WHERE session_id=? AND uuid=?",
+        ("replacement text", _MEMO_SID, f"{_MEMO_SID}-a"),
+    )
+    cc._recompute_conversation_sessions(c, [_MEMO_SID])
+    c.commit()
+
+    second = cq._assemble_session_memoized(c, _MEMO_SID)
+    assert second is not first
+    assert second["items"][-1]["text"] == "replacement text"
+
+
+def test_memo_misses_on_same_path_database_replacement(tmp_path):
+    """Equal logical watermarks cannot cross a new inode at the same path."""
+    seeded = _conn(); _seed_memo_session(seeded)
+    live_path = tmp_path / "conversations.db"
+    live = sqlite3.connect(live_path)
+    seeded.backup(live)
+    live.close(); seeded.close()
+
+    cq._assemble_memo_clear()
+    first_conn = sqlite3.connect(live_path)
+    first = cq._assemble_session_memoized(first_conn, _MEMO_SID)
+    assert first["items"][-1]["text"] == "hello world"
+    first_conn.close()
+
+    replacement_path = tmp_path / "replacement.db"
+    replacement = sqlite3.connect(replacement_path)
+    source = sqlite3.connect(live_path)
+    source.backup(replacement)
+    source.close()
+    replacement.execute(
+        "UPDATE conversation_messages SET text=? "
+        "WHERE session_id=? AND uuid=?",
+        ("new inode text", _MEMO_SID, f"{_MEMO_SID}-a"),
+    )
+    # Deliberately preserve every logical memo watermark.
+    replacement.commit(); replacement.close()
+    replacement_path.replace(live_path)
+
+    second_conn = sqlite3.connect(live_path)
+    try:
+        second = cq._assemble_session_memoized(second_conn, _MEMO_SID)
+        assert second["items"][-1]["text"] == "new inode text"
+        assert second is not first
+    finally:
+        cq._assemble_memo_clear()
+        second_conn.close()
+
+
+def test_rollup_recompute_stamps_monotonic_render_revision():
+    c = _conn(); _seed_memo_session(c)
+    first = c.execute(
+        "SELECT render_revision FROM conversation_sessions WHERE session_id=?",
+        (_MEMO_SID,),
+    ).fetchone()[0]
+    cc._recompute_conversation_sessions(c, [_MEMO_SID])
+    second = c.execute(
+        "SELECT render_revision FROM conversation_sessions WHERE session_id=?",
+        (_MEMO_SID,),
+    ).fetchone()[0]
+    assert second > first >= 1
+
+
 def test_memo_bypasses_and_clears_when_non_authoritative():
     c = _conn(); _seed_memo_session(c)
     cq._assemble_memo_clear()
@@ -4524,12 +4600,23 @@ def test_memo_bypasses_on_missing_rollup_row():
     assert len(cq._ASM_MEMO) == 0
 
 
-def test_memo_capacity_evicts_lru():
+def test_memo_capacity_evicts_lru(monkeypatch):
     c = _conn(); _seed_memo_multi(c)
     cq._assemble_memo_clear()
     for sid in _FIVE_SIDS:                       # cap is 4
         cq._assemble_session_memoized(c, sid)
     assert len(cq._ASM_MEMO) == 4
+    bounded = dict(cq.conversation_assembly_cache_stats())
+    assert bounded["estimatedBytes"] <= bounded["maxBytes"]
+    assert bounded["entryCount"] == 4
+
+    cq._assemble_memo_clear()
+    monkeypatch.setattr(cq, "_ASM_MEMO_MAX_BYTES", 1)
+    result = cq._assemble_session_memoized(c, _FIVE_SIDS[0])
+    assert result is not None, "the cap changes reuse, never the response"
+    capped = dict(cq.conversation_assembly_cache_stats())
+    assert capped["entryCount"] == 0
+    assert capped["fallbackCount"] == 1
 
 
 def test_memo_concurrent_access_safe(tmp_path):
@@ -4557,6 +4644,65 @@ def test_memo_concurrent_access_safe(tmp_path):
     for t in ts: t.start()
     for t in ts: t.join()
     assert not errs
+
+
+def test_memo_concurrent_cold_consumers_share_one_producer(tmp_path, monkeypatch):
+    """A real reader opens detail and outline concurrently.
+
+    Thread safety alone is insufficient: the pre-#682 memo released its lock
+    before calling the canonical assembler, so every cold caller observed the
+    same miss and independently assembled the whole session.  Hold the first
+    producer until every waiter has entered, then prove exactly one canonical
+    call served all four connections.
+    """
+    import threading
+
+    dbpath = tmp_path / "cache.db"
+    seed = sqlite3.connect(str(dbpath))
+    db._apply_cache_schema(seed)
+    _seed_memo_session(seed)
+    seed.close()
+    cq._assemble_memo_clear()
+
+    real = cq._assemble_session
+    producer_entered = threading.Event()
+    release_producer = threading.Event()
+    calls = {"n": 0}
+    calls_lock = threading.Lock()
+
+    def blocked(conn, sid):
+        with calls_lock:
+            calls["n"] += 1
+        producer_entered.set()
+        assert release_producer.wait(PRESENCE_BACKSTOP_SECONDS), (
+            "test producer was never released")
+        return real(conn, sid)
+
+    monkeypatch.setattr(cq, "_assemble_session", blocked)
+    results, errors = [], []
+
+    def worker():
+        conn = sqlite3.connect(str(dbpath))
+        try:
+            results.append(cq._assemble_session_memoized(conn, _MEMO_SID))
+        except Exception as exc:  # noqa: BLE001 - collected for assertion
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    assert producer_entered.wait(PRESENCE_BACKSTOP_SECONDS)
+    release_producer.set()
+    for thread in threads:
+        thread.join(PRESENCE_BACKSTOP_SECONDS)
+        assert not thread.is_alive()
+
+    assert not errors
+    assert len(results) == 4
+    assert calls["n"] == 1
+    assert all(result is results[0] for result in results)
 
 
 # ---------------------------------------------------------------------------

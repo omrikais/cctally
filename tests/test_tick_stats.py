@@ -65,6 +65,23 @@ def test_a_tick_that_named_no_dispatch_counts_as_degraded():
     assert sum(snap.dispatch_counts.values()) == snap.tick_seq == 1
 
 
+def test_a_tick_records_its_own_thread_cpu_time():
+    """CPU duty must use the refresh thread's clock, not wall duration."""
+    import _lib_tick_stats as ts
+    ts.reset_for_tests()
+    wall = iter((1_000, 9_000))
+    cpu = iter((100, 350))
+    tick = ts.begin_tick(
+        monotonic_ns=lambda: next(wall),
+        thread_time_ns=lambda: next(cpu),
+    )
+    tick.set_dispatch("idle")
+    tick.finish(published_ns=9_000, published_at="x")
+    record = ts.snapshot().records[-1]
+    assert record.duration_ns == 8_000
+    assert record.cpu_ns == 250
+
+
 def test_the_owned_state_stays_inside_its_budget():
     """Measured over a full ring of DISTINCT worst-case strings.
 
@@ -187,7 +204,8 @@ def test_the_conversation_record_carries_no_free_text_field():
     names = [f.name for f in dataclasses.fields(ts.ConversationSyncRecord)]
     assert names == [
         "seq", "started_ns", "ended_ns", "duration_ns",
-        "cpu_ns", "period_ns", "status",
+        "cpu_ns", "period_ns", "status", "claude_mode", "codex_mode",
+        "claude_files", "codex_files",
     ]
 
 

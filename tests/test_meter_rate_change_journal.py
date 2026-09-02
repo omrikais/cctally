@@ -8,7 +8,12 @@ file's leaf lock (§6.5 step 1), that lock is released before any stats lock
 (step 2), the descriptor is passed through `run_stats_ingest` (step 3), the
 event is appended and applied inside the stats transaction (step 4), a
 notification is queued only when the insert actually created a row (step 5),
-and dispatch happens after the commit (step 6).
+and dispatch happens after the commit (step 6). #695 moved step 6 for this ONE
+family: the payload comes back on `IngestResult.deferred_alerts` and
+`cmd_quota` dispatches it after winning its delivery ledger's compare-and-set,
+so a notification the cycle lost can be retried. Invariant (iv) is unchanged —
+step-4a replay still has no `IngestContext` and still cannot reach either
+sink.
 
 The key comes from an UNJOURNALED file, which is exactly why the payload must
 be self-sufficient: a later deletion or quarantine of `quota-calibrations.json`
@@ -66,6 +71,11 @@ def _transition(ns, **over):
     return mrc.RateChangeTransition(**fields)
 
 
+def _full_events(conn):
+    return [tuple(row) for row in conn.execute(
+        "SELECT * FROM meter_rate_change_events ORDER BY effective_from")]
+
+
 def _events(conn):
     return [tuple(row) for row in conn.execute(
         "SELECT provider, account_key, effective_from FROM "
@@ -82,12 +92,48 @@ def _seed_journal():
         now_utc=NOW)
 
 
-def _record(ns, transition, *, notify=False):
+def _ingest_context(ns, conn):
+    """A minimal `IngestContext` for driving the emitter directly.
+
+    The real cycle builds this at `bin/_cctally_journal.py:6231`; here only
+    the fields the emitter touches matter. `batch` has no default on the
+    dataclass, so it is passed explicitly — a stand-in object would make
+    these tests pass for the wrong reason, because the emitter reads
+    `ctx.conn`, `ctx.events_emitted`, `ctx.deferred_alerts` and
+    `ctx.conflicts_dropped`.
+    """
+    import _cctally_journal as jr
+    _seed_journal()
+    return jr.IngestContext(conn=conn, batch=[])
+
+
+def _mrc_evt(ns, transition, *, created_at):
+    """The evt the emitter builds, assembled the same way it does."""
+    import _lib_journal
+    mrc = _mrc(ns)
+    return _lib_journal.make_evt(
+        kind=mrc.EVT_KIND,
+        id=_lib_journal.evt_id(mrc.EVT_ID_PREFIX, *transition.identity()),
+        at=created_at,
+        payload=mrc.event_payload(transition, created_at=created_at))
+
+
+def _journal_line_count(ns) -> int:
+    """Total decoded journal lines across every segment."""
+    import _cctally_core
+    total = 0
+    for path in sorted((_cctally_core.APP_DIR / "journal").glob("*.jsonl")):
+        total += sum(1 for line in path.read_text().splitlines() if line.strip())
+    return total
+
+
+def _record(ns, transition, *, notify=False, notification_owed=False):
     import _cctally_journal as jr
     return jr.run_stats_ingest(
         mode="authoritative",
         meter_rate_change={"transition": transition, "notify": notify,
-                           "created_at": NOW.isoformat()})
+                           "created_at": NOW.isoformat(),
+                           "notification_owed": notification_owed})
 
 
 # --------------------------------------------------------------------------
@@ -229,6 +275,84 @@ def test_c2_mixed_offset_spellings_are_one_transition(ns):
         detected_at=NOW.isoformat())) == 1
 
 
+def test_c2_enumerate_returns_every_qualified_pair_oldest_first(ns):
+    """`enumerate_transitions` lists what IS persisted, with no freshness
+    comparison — that is what makes recovery possible after the write."""
+    mrc = _mrc(ns)
+    first = "2026-08-01T00:00:00+00:00"
+    second = "2026-08-25T00:00:00+00:00"
+    regimes = [
+        _regime(effectiveUntil=first, unitsPerPoint=3_000_000.0),
+        _regime(effectiveFrom=first, effectiveUntil=second,
+                unitsPerPoint=2_442_620.0),
+        _regime(effectiveFrom=second, unitsPerPoint=1_665_000.0),
+    ]
+    got = mrc.enumerate_transitions(
+        regimes, provider="claude", account_key="unattributed",
+        detected_at=NOW.isoformat())
+    assert [t.effective_from for t in got] == [first, second]
+    assert all(t.withholding_status is None for t in got)
+
+
+def test_c2_enumerate_applies_the_same_qualification_as_detection(ns):
+    """One qualification, not two. A stale predecessor and an unusable rate
+    must be excluded by BOTH, or recovery would record what detection
+    refused."""
+    mrc = _mrc(ns)
+    boundary = BOUNDARY
+    stale = [
+        _regime(effectiveUntil=boundary, status="stale"),
+        _regime(effectiveFrom=boundary, unitsPerPoint=1_665_000.0),
+    ]
+    unusable = [
+        _regime(effectiveUntil=boundary, unitsPerPoint=0.0),
+        _regime(effectiveFrom=boundary, unitsPerPoint=1_665_000.0),
+    ]
+    for regimes in (stale, unusable):
+        assert mrc.enumerate_transitions(
+            regimes, provider="claude", account_key="unattributed",
+            detected_at=NOW.isoformat()) == ()
+        assert mrc.detect_transitions(
+            [], regimes, provider="claude", account_key="unattributed",
+            detected_at=NOW.isoformat()) == ()
+
+
+def test_c2_detection_subtracts_on_the_canonical_instant_not_the_spelling(ns):
+    """The store holds mixed offset spellings of one instant, and the
+    subtraction must resolve them to one key.
+
+    BOTH orderings are asserted, and the pair is what makes the test
+    discriminating. A descriptor's `effective_from` is already canonical, so
+    comparing it against the raw `effectiveFrom` strings of the before state
+    only diverges when the BEFORE side carries the non-UTC spelling — with the
+    UTC spelling on that side the wrong comparison still matches and passes.
+    The reverse ordering is what catches the other mistake, passing
+    `_adjacent_pairs`' datetime keys through `_instant`: that returns None for
+    a datetime, emptying the before set and re-emitting every transition on
+    every run whichever way round the spellings fall.
+
+    Neither mistake changes any other observable, so only this test catches
+    them.
+    """
+    mrc = _mrc(ns)
+    utc = "2026-08-25T00:00:00+00:00"
+    offset = "2026-08-25T02:00:00+02:00"
+
+    def _state(boundary):
+        return [
+            _regime(effectiveUntil=boundary),
+            _regime(effectiveFrom=boundary, unitsPerPoint=1_665_000.0),
+        ]
+
+    for before_spelling, after_spelling in ((utc, offset), (offset, utc)):
+        assert mrc.detect_transitions(
+            _state(before_spelling), _state(after_spelling),
+            provider="claude", account_key="unattributed",
+            detected_at=NOW.isoformat()) == (), (
+                f"the same instant spelled {before_spelling} before and "
+                f"{after_spelling} after was treated as a fresh transition")
+
+
 def test_c2_the_severity_is_explicit_and_never_threshold_derived(ns):
     """§6.1: a rate transition has no percentage threshold, so the three
     tiers come from the direction and size of the change itself."""
@@ -279,17 +403,25 @@ def test_c2_latch_survives_a_stats_rebuild_from_the_journal_alone(ns):
 
 def test_c2_a_rebuild_does_not_refire_the_notifier(ns, monkeypatch):
     """Invariant (iv): replay folds evt lines with NO `IngestContext`, so it
-    is structurally unable to reach the dispatch sink."""
+    is structurally unable to reach EITHER dispatch sink.
+
+    #695 moved this family's payload from `ctx.pending_alerts` to
+    `ctx.deferred_alerts`, which `cmd_quota` drains rather than step 6. The
+    live recording below is therefore the positive control: it proves the
+    fixture really does produce a notifiable transition, so the rebuild's
+    silence on both channels afterwards is a fact about replay rather than
+    about a fixture that never had anything to fire.
+    """
     import _cctally_journal as jr
     dispatched: list = []
     monkeypatch.setattr(jr, "ALERT_DISPATCHER", dispatched.extend)
     _seed_journal()
-    _record(ns, _transition(ns), notify=True)
-    before = len(dispatched)
-    assert before == 1, dispatched
+    result = _record(ns, _transition(ns), notify=True)
+    assert len(result.deferred_alerts) == 1, result.deferred_alerts
+    assert dispatched == [], "step 6 dispatched a payload it must defer"
 
     jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
-    assert len(dispatched) == before, (
+    assert dispatched == [], (
         "the rebuild re-fired a notification for history")
 
 
@@ -300,11 +432,38 @@ def test_c2_a_second_recording_of_the_same_key_queues_nothing(ns, monkeypatch):
     dispatched: list = []
     monkeypatch.setattr(jr, "ALERT_DISPATCHER", dispatched.extend)
     _seed_journal()
-    _record(ns, _transition(ns), notify=True)
-    _record(ns, _transition(ns), notify=True)
-    assert len(dispatched) == 1, dispatched
+    first = _record(ns, _transition(ns), notify=True)
+    second = _record(ns, _transition(ns), notify=True)
+    assert len(first.deferred_alerts) == 1, first.deferred_alerts
+    assert second.deferred_alerts == [], second.deferred_alerts
+    assert dispatched == [], "step 6 dispatched a payload it must defer"
     conn = ns["open_db"]()
     try:
+        assert len(_events(conn)) == 1
+    finally:
+        conn.close()
+
+
+def test_c2_the_latch_insert_reports_creation_not_mere_execution(ns):
+    """§6.5 step 5's predicate, driven DIRECTLY at `_insert_meter_rate_change`.
+
+    It used to be reachable through two `run_stats_ingest` calls for one key:
+    the second insert was ignored, `rowcount` was 0, and no second
+    notification was queued. #689 put a natural-key recheck in front of the
+    emitter, so the second call now returns before the insert is reached and
+    that route can no longer exercise the predicate at all. Asserting it here
+    keeps `rowcount == 1` — rather than `lastrowid`, which is left over from a
+    previous insert when `INSERT OR IGNORE` ignores, or the mere existence of
+    a cursor — pinned by something.
+    """
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        evt = _mrc_evt(ns, _transition(ns), created_at=NOW.isoformat())
+        assert jr._insert_meter_rate_change(conn, evt) is True
+        assert jr._insert_meter_rate_change(conn, evt) is False, (
+            "an IGNORED insert was reported as a creation, which would queue "
+            "a second notification for one transition")
         assert len(_events(conn)) == 1
     finally:
         conn.close()
@@ -318,10 +477,14 @@ def test_c2_a_different_effective_instant_is_a_different_transition(ns,
     dispatched: list = []
     monkeypatch.setattr(jr, "ALERT_DISPATCHER", dispatched.extend)
     _seed_journal()
-    _record(ns, _transition(ns), notify=True)
-    _record(ns, _transition(ns, effective_from="2026-09-08T00:00:00+00:00"),
-            notify=True)
-    assert len(dispatched) == 2, dispatched
+    first = _record(ns, _transition(ns), notify=True)
+    second = _record(
+        ns, _transition(ns, effective_from="2026-09-08T00:00:00+00:00"),
+        notify=True)
+    assert len(first.deferred_alerts) == 1, first.deferred_alerts
+    assert len(second.deferred_alerts) == 1, (
+        "the latch swallowed a real second transition")
+    assert dispatched == [], "step 6 dispatched a payload it must defer"
 
 
 def test_c2_recording_never_queues_a_notification_without_the_toggle(
@@ -331,7 +494,12 @@ def test_c2_recording_never_queues_a_notification_without_the_toggle(
     dispatched: list = []
     monkeypatch.setattr(jr, "ALERT_DISPATCHER", dispatched.extend)
     _seed_journal()
-    _record(ns, _transition(ns), notify=False)
+    result = _record(ns, _transition(ns), notify=False)
+    # #695 moved this family's dispatch out of the cycle, so `dispatched` is
+    # now empty at EVERY toggle setting and asserting on it alone would hold
+    # just as well with `notify=True`. The queue is what the toggle governs.
+    assert result.deferred_alerts == [], (
+        "the toggle is off, so nothing may be queued for dispatch")
     assert dispatched == []
     conn = ns["open_db"]()
     try:
@@ -352,6 +520,572 @@ def test_c2_a_malformed_payload_folds_to_a_no_op_rather_than_raising(ns):
         jr._apply_meter_rate_change(conn, {"payload": None})
         jr._apply_meter_rate_change(conn, {})
         assert _events(conn) == []
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# The write boundary (#689 §6): classify before appending
+# --------------------------------------------------------------------------
+def test_c2_an_existing_row_short_circuits_before_any_append(ns):
+    """Guard 1 (#689). Recovery re-offers persisted pairs, so the emitter must
+    treat an existing physical latch as terminal BEFORE it builds or appends
+    anything — otherwise a retry under a later command clock appends a
+    byte-different line under an id the journal already holds."""
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        assert jr.record_meter_rate_change(
+            ctx, t, notify=True,
+            created_at=NOW.isoformat()).row_created is True
+        before_lines = _journal_line_count(ns)
+        emitted_before = ctx.events_emitted
+        ctx.deferred_alerts.clear()
+        assert jr.record_meter_rate_change(
+            ctx, t, notify=True,
+            created_at="2026-09-05T09:15:00+00:00").row_created is False
+        assert _journal_line_count(ns) == before_lines, (
+            "a retry appended a second line for an identity that already had "
+            "a row")
+        assert ctx.events_emitted == emitted_before
+        assert ctx.deferred_alerts == []
+    finally:
+        conn.close()
+
+
+def test_c2_a_row_with_no_effective_metadata_still_short_circuits(ns):
+    """Guard 1's UNIQUE condition — the one the classifier cannot cover.
+
+    Wherever effective metadata exists, the classifier already withholds the
+    append, so disabling the natural-key recheck changes nothing there. The
+    state it alone defends is a committed physical row with NO metadata, and
+    that is not hypothetical: v1.104.0 shipped this family appending without
+    `_record_new_effective_event`, so every rate change recorded by a released
+    binary is in exactly this state. With the recheck gone, such an identity
+    classifies as NEW and a second, byte-different line lands under an id the
+    journal already holds — the divergent-hash quarantine candidate.
+    """
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at=NOW.isoformat())
+        conn.execute(
+            "DELETE FROM journal_effective_events WHERE event_id LIKE 'mrc:%'")
+        lines = _journal_line_count(ns)
+        assert jr.record_meter_rate_change(
+            ctx, t, notify=True,
+            created_at="2026-09-05T09:15:00+00:00").row_created is False
+        assert _journal_line_count(ns) == lines, (
+            "a second, byte-different line was appended for an identity that "
+            "already had a row")
+        assert len(_events(conn)) == 1
+        assert ctx.deferred_alerts == [], (
+            "an already-recorded identity re-fired a notification")
+        assert ctx.conflicts_dropped == [], (
+            "the recheck must return before anything is built or classified")
+    finally:
+        conn.close()
+
+
+def test_c2_a_duplicate_materializes_the_row_and_does_not_append(ns):
+    """#689 review P1. An earlier draft appended here and relied on step-4a
+    replay to insert the row. Replay does NOT: `_preflight_live_events` omits
+    a same-rev/same-hash event from `to_apply`, and step 4a applies only what
+    `_record_live_effective_event` returns True for, which is NEW alone. So
+    the emitter materializes the row itself."""
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at=NOW.isoformat())
+        conn.execute("DELETE FROM meter_rate_change_events")
+        lines = _journal_line_count(ns)
+        assert jr.record_meter_rate_change(
+            ctx, t, notify=True,
+            created_at=NOW.isoformat()).row_created is False
+        assert _journal_line_count(ns) == lines, "the duplicate was appended"
+        assert len(_events(conn)) == 1, "the duplicate did not restore the row"
+        assert ctx.deferred_alerts == [], (
+            "a duplicate re-fired a notification for history")
+    finally:
+        conn.close()
+
+
+def test_c2_a_conflict_materializes_the_prior_event_not_the_candidate(ns):
+    """The row must converge to what the JOURNAL holds, never to the rejected
+    candidate. `_converge_row_from_effective` cannot do it for this family
+    because its `_EVT_SPECS` entry has `table=None`."""
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at=NOW.isoformat())
+        conn.execute("DELETE FROM meter_rate_change_events")
+        lines = _journal_line_count(ns)
+        later = "2026-09-05T09:15:00+00:00"
+        assert jr.record_meter_rate_change(
+            ctx, t, notify=True, created_at=later).row_created is False
+        assert _journal_line_count(ns) == lines, "a divergent line was appended"
+        rows = _full_events(conn)
+        assert len(rows) == 1
+        assert later not in str(rows[0]), (
+            "the row was materialized from the REJECTED candidate rather than "
+            "from the prior journaled event")
+        assert ctx.conflicts_dropped, "the dropped conflict was not recorded"
+        assert ctx.deferred_alerts == []
+    finally:
+        conn.close()
+
+
+def test_c2_a_tombstoned_prior_materializes_nothing(ns):
+    """A tombstone is a TERMINAL negative latch. A correction saying this
+    identity should have no row must not be undone by materializing one."""
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at=NOW.isoformat())
+        conn.execute("DELETE FROM meter_rate_change_events")
+        conn.execute(
+            "UPDATE journal_effective_events SET status = 'tombstone', "
+            "event_json = NULL WHERE event_id LIKE 'mrc:%'")
+        assert jr.record_meter_rate_change(
+            ctx, t, notify=True,
+            created_at="2026-09-05T09:15:00+00:00").row_created is False
+        assert _events(conn) == [], "a tombstoned identity was resurrected"
+    finally:
+        conn.close()
+
+
+def test_c2_a_retry_at_a_later_clock_leaves_the_journal_bytes_unchanged(ns):
+    """Spec test 6. The whole hazard is that the payload includes the command
+    clock, so a re-emission is not byte-identical. Assert the BYTES, not just
+    the line count: a second line under the same id with different timestamps
+    is the divergent-hash quarantine candidate #688 kept the payload frozen to
+    avoid."""
+    import _cctally_core
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at=NOW.isoformat())
+        segments = sorted((_cctally_core.APP_DIR / "journal").glob("*.jsonl"))
+        before = {p: p.read_bytes() for p in segments}
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at="2026-09-05T09:15:00+00:00")
+        after = {p: p.read_bytes() for p in
+                 sorted((_cctally_core.APP_DIR / "journal").glob("*.jsonl"))}
+        assert after == before, (
+            "a retry under a later command clock changed the journal bytes")
+        assert ctx.conflicts_dropped == [], (
+            "the retry reached the classifier and was withheld as a conflict; "
+            "the natural-key recheck must return before anything is built")
+        detected, created = conn.execute(
+            "SELECT detected_at_utc, created_at_utc "
+            "FROM meter_rate_change_events").fetchone()
+        assert created == NOW.isoformat(), (
+            "the retry's later clock overwrote the first event's created_at")
+        assert detected == NOW.isoformat(), (
+            "the retry's later clock overwrote the first event's detected_at")
+    finally:
+        conn.close()
+
+
+def test_c2_a_new_emission_writes_its_live_effective_metadata(ns, capsys):
+    """Spec test 9, BOTH clauses. Without the metadata write the live selector
+    does not know about an already-appended event, classification depends on a
+    later replay, and a divergent re-emission can still be classified NEW.
+
+    The second clause is the consequence the write exists for: the FOLLOWING
+    cycle reads the same line out of the journal and must classify it as a
+    DUPLICATE — neither re-applying it nor quarantining it. Both halves are
+    asserted, because they fail to different mutations. Non-application is
+    asserted by deleting the physical row first, since
+    `_apply_meter_rate_change` would restore it. Duplicate-rather-than-
+    conflict is asserted on the cycle's own conflict count, which is what a
+    change writing metadata under a different hash or status would break
+    while leaving the first clause and the row assertion untouched.
+    """
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        jr.record_meter_rate_change(
+            ctx, _transition(ns), notify=False, created_at=NOW.isoformat())
+        row = conn.execute(
+            "SELECT status FROM journal_effective_events "
+            "WHERE event_id LIKE 'mrc:%'").fetchone()
+        assert row is not None, (
+            "the emission wrote no effective metadata, so the next divergent "
+            "re-emission would classify as NEW")
+        assert str(row[0]) == "active"
+        # The cursor has not advanced — this context was driven directly — so
+        # the next real cycle re-reads the appended line from offset zero.
+        conn.execute("DELETE FROM meter_rate_change_events")
+        conn.commit()
+    finally:
+        conn.close()
+
+    capsys.readouterr()
+    result = jr.run_stats_ingest(mode="authoritative")
+    err = capsys.readouterr().err
+    assert result.conflicts_dropped == 0, (
+        "the following cycle quarantined this process's own emission, so the "
+        "metadata written does not describe the line appended")
+    assert "quarantined a divergent journal event" not in err
+
+    conn = ns["open_db"]()
+    try:
+        assert _events(conn) == [], (
+            "the following cycle re-applied the line this process appended; "
+            "step 4a must classify it as a duplicate")
+        rev, status = conn.execute(
+            "SELECT rev, status FROM journal_effective_events "
+            "WHERE event_id LIKE 'mrc:%'").fetchone()
+        assert (int(rev), str(status)) == (0, "active"), (
+            "the following cycle rewrote the metadata for its own emission")
+    finally:
+        conn.close()
+
+
+def test_c2_the_dropped_conflict_line_reports_an_insert_that_materialized_nothing(
+        ns, capsys):
+    """Acceptance 6, the third case: an ACTIVE prior that survives validation
+    and still materializes no row.
+
+    `_insert_meter_rate_change` returns False when `_meter_rate_change_row`
+    cannot normalise the payload — a missing `provider` or `effective_from`,
+    or a non-numeric rate. Claiming `CONVERGE_APPLIED` because the call was
+    made would print "converged the row from the journaled event" over an
+    insert that inserted nothing. The retained record is rewritten together
+    with its `content_hash`, because `_effective_event_for_convergence`
+    validates that hash and would otherwise raise before the insert is
+    reached.
+    """
+    import _cctally_journal as jr
+    import _lib_journal
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at=NOW.isoformat())
+        conn.execute("DELETE FROM meter_rate_change_events")
+        (event_id, event_json), = conn.execute(
+            "SELECT event_id, event_json FROM journal_effective_events "
+            "WHERE event_id LIKE 'mrc:%'").fetchall()
+        record = _lib_journal.decode_line(event_json.encode("utf-8"))
+        record["payload"]["previous_units_per_point"] = "not-a-number"
+        conn.execute(
+            "UPDATE journal_effective_events SET event_json = ?, "
+            "content_hash = ? WHERE event_id = ?",
+            (_lib_journal.encode_line(record).decode("utf-8").rstrip("\n"),
+             _lib_journal._sha256_canonical(record), event_id))
+        capsys.readouterr()
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at="2026-09-05T09:15:00+00:00")
+        err = capsys.readouterr().err
+        assert "withheld a divergent emission" in err
+        assert "converged the row from the journaled event" not in err, (
+            "the line claimed a convergence over an insert that materialized "
+            "nothing")
+        assert "no row to converge" in err
+        assert _events(conn) == []
+    finally:
+        conn.close()
+
+
+def test_c2_the_dropped_conflict_line_survives_a_convergence_that_raises(
+        ns, capsys):
+    """The diagnostic must not be lost on the path that most needs one.
+
+    Before the record/report split the whole `_record_dropped_conflict` call
+    ran ahead of convergence, so a convergence that raised still left a line
+    on stderr. Rendering the outcome only after convergence resolved would
+    drop the line exactly there — for the two pre-existing emit paths as well
+    as this one — which is why `_converge_and_report` prints from a `finally`.
+    The exception still propagates.
+    """
+    import _cctally_journal as jr
+    import _lib_journal
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at=NOW.isoformat())
+        conn.execute("DELETE FROM meter_rate_change_events")
+        # ACTIVE with no retained record: `_effective_event_for_convergence`
+        # fails closed and raises rather than returning something to stamp.
+        conn.execute(
+            "UPDATE journal_effective_events SET event_json = NULL "
+            "WHERE event_id LIKE 'mrc:%'")
+        capsys.readouterr()
+        with pytest.raises(_lib_journal.JournalProtocolError):
+            jr.record_meter_rate_change(
+                ctx, t, notify=False,
+                created_at="2026-09-05T09:15:00+00:00")
+        err = capsys.readouterr().err
+        assert "withheld a divergent emission" in err, (
+            "the diagnostic was lost because convergence raised")
+        assert "convergence failed and the row was left unchanged" in err
+        assert "converged the row from the journaled event" not in err, (
+            "the line claimed a convergence that raised instead")
+    finally:
+        conn.close()
+
+
+def test_c2_the_dropped_conflict_line_states_the_convergence_it_performed(
+        ns, capsys):
+    """Acceptance 6, the TRUE half.
+
+    The plan's draft required this path to claim no convergence, on the
+    premise that `_converge_row_from_effective` returns CONVERGE_DROPPED for a
+    `table=None` family. That premise is about the generic helper, and this
+    emitter no longer uses it: it materializes the row from the prior
+    journaled event itself, so on an ACTIVE prior a convergence really does
+    happen and saying so is true. The false claim is the tombstoned prior,
+    which the twin below owns.
+    """
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at=NOW.isoformat())
+        conn.execute("DELETE FROM meter_rate_change_events")
+        capsys.readouterr()
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at="2026-09-05T09:15:00+00:00")
+        err = capsys.readouterr().err
+        assert "withheld a divergent emission" in err
+        assert "converged the row from the journaled event" in err
+        assert len(_events(conn)) == 1, (
+            "the line claimed a convergence and no row was materialized")
+    finally:
+        conn.close()
+
+
+def test_c2_the_dropped_conflict_line_does_not_claim_an_absent_convergence(
+        ns, capsys):
+    """Acceptance 6, the FALSE half — the assertion the fixed wording failed.
+
+    A tombstoned prior is a terminal negative latch, so nothing is
+    materialized. The old line said "converged the row from the journaled
+    event" unconditionally, which was untrue exactly here.
+    """
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at=NOW.isoformat())
+        conn.execute("DELETE FROM meter_rate_change_events")
+        conn.execute(
+            "UPDATE journal_effective_events SET status = 'tombstone', "
+            "event_json = NULL WHERE event_id LIKE 'mrc:%'")
+        capsys.readouterr()
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at="2026-09-05T09:15:00+00:00")
+        err = capsys.readouterr().err
+        assert "withheld a divergent emission" in err
+        assert "converged the row from the journaled event" not in err, (
+            "the diagnostic claimed a convergence that did not happen")
+        assert "no row to converge" in err
+        assert _events(conn) == []
+    finally:
+        conn.close()
+
+
+def test_c2_a_dropped_conflict_is_recorded_even_when_convergence_raises(ns):
+    """Spec test 8's second half. `_record_dropped_conflict` appends to
+    `ctx.conflicts_dropped` BEFORE convergence is attempted, so a convergence
+    that fails closed still leaves the withheld emission counted. Moving the
+    whole call after convergence would have lost the in-memory record too, not
+    merely the stderr line."""
+    import _cctally_journal as jr
+    import _lib_journal
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at=NOW.isoformat())
+        conn.execute("DELETE FROM meter_rate_change_events")
+        # ACTIVE with no retained record: `_effective_event_for_convergence`
+        # fails closed and raises rather than returning something to stamp.
+        conn.execute(
+            "UPDATE journal_effective_events SET event_json = NULL "
+            "WHERE event_id LIKE 'mrc:%'")
+        with pytest.raises(_lib_journal.JournalProtocolError):
+            jr.record_meter_rate_change(
+                ctx, t, notify=False,
+                created_at="2026-09-05T09:15:00+00:00")
+        assert len(ctx.conflicts_dropped) == 1, (
+            "the withheld emission was not counted because convergence raised")
+        assert _events(conn) == []
+    finally:
+        conn.close()
+
+
+def test_c2_failure_b_self_heals_when_the_cycle_aborts_after_the_append(
+        ns, monkeypatch):
+    """A REGRESSION GUARD, not evidence of the #689 fix.
+
+    This is Failure B from the spec's §1.1 taxonomy: the line is appended and
+    the transaction then rolls back. A rollback cannot unwrite an append-only
+    line and the cursor did not advance, so the next fold of any kind re-reads
+    that line and recreates the row. That self-healing already worked before
+    #689, so this test PASSES against the unfixed code and proves nothing
+    about the defect. It is kept so that the recovery change does not silently
+    break the path, and it is labelled here so that a later reader does not
+    mistake it for coverage of #689 — which is Failure A, the ingest failing
+    BEFORE the append, and which does not self-heal.
+    """
+    import _cctally_journal as jr
+    dispatched: list = []
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER", dispatched.extend)
+    _seed_journal()
+    real_write_cursor = jr._write_cursor
+
+    def _abort(*_a, **_k):
+        raise sqlite3.OperationalError("aborted after the append")
+
+    monkeypatch.setattr(jr, "_write_cursor", _abort)
+    with pytest.raises(sqlite3.OperationalError):
+        _record(ns, _transition(ns), notify=True)
+    monkeypatch.setattr(jr, "_write_cursor", real_write_cursor)
+
+    conn = ns["open_db"]()
+    try:
+        assert _events(conn) == [], (
+            "the rolled-back transaction left its row behind")
+    finally:
+        conn.close()
+    assert dispatched == [], "an aborted cycle dispatched its notification"
+
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
+    conn = ns["open_db"]()
+    try:
+        assert _events(conn) == [("claude", "unattributed", BOUNDARY)], (
+            "the orphan event did not restore the row")
+    finally:
+        conn.close()
+    assert dispatched == [], (
+        "the replay dispatched a notification, which it has no ctx to do")
+
+    # Positive control. Since #695 moved this family's dispatch out of the
+    # cycle, both `dispatched == []` assertions above hold unconditionally,
+    # including for a fixture that never reached the code under test. This
+    # proves the observation channel is live and that a queued notification
+    # here is visible when one is genuinely produced.
+    fresh = _record(
+        ns, _transition(ns, effective_from="2026-09-08T00:00:00+00:00"),
+        notify=True)
+    assert len(fresh.deferred_alerts) == 1, (
+        "the fixture cannot observe a queued notification at all, so the "
+        "assertions above are vacuous")
+
+
+# --------------------------------------------------------------------------
+# The presence lookup (#689 §5.2)
+# --------------------------------------------------------------------------
+def test_c2_an_unanswerable_store_suppresses_every_candidate(ns, monkeypatch):
+    """Unknown is treated as PRESENT, never absent. A store that cannot answer
+    must not drive an ingest attempt on every run forever — which is what
+    returning the candidates as unrecorded would do."""
+    import _cctally_core
+    from _cctally_db import StatsRebuildDeferred
+    glue = ns["_load_sibling"]("_cctally_quota_model")
+    candidates = (_transition(ns),)
+
+    def _deferred():
+        raise StatsRebuildDeferred("spawned")
+
+    monkeypatch.setattr(_cctally_core, "open_db", _deferred)
+    assert glue.unrecorded_rate_change_transitions(candidates) == ()
+
+    def _no_table():
+        raise sqlite3.OperationalError(
+            "no such table: meter_rate_change_events")
+
+    monkeypatch.setattr(_cctally_core, "open_db", _no_table)
+    assert glue.unrecorded_rate_change_transitions(candidates) == ()
+
+
+def test_c2_an_answerable_store_reports_an_absent_candidate(ns):
+    """The non-vacuity twin of the suppression above: a store that CAN answer
+    must report a candidate with neither a row nor any metadata as absent, or
+    the helper would suppress everything and recovery would never happen."""
+    glue = ns["_load_sibling"]("_cctally_quota_model")
+    _seed_journal()
+    t = _transition(ns)
+    assert glue.unrecorded_rate_change_transitions((t,)) == (t,)
+
+
+def test_c2_a_terminal_latch_suppresses_recovery(ns):
+    """A tombstone or a higher revision is terminal. Without this axis the
+    lookup re-selects the key every run, `_classify_live_effective_event`
+    raises a non-recovery-eligible `CorrectionRebuildRequired`, and the
+    command prints its failure line forever."""
+    import _cctally_journal as jr
+    glue = ns["_load_sibling"]("_cctally_quota_model")
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at=NOW.isoformat())
+        conn.execute("DELETE FROM meter_rate_change_events")
+        conn.commit()
+        # Active at revision 0 with no row is NOT terminal: the emitter
+        # materializes it from the identical event.
+        assert glue.unrecorded_rate_change_transitions((t,)) == (t,)
+        conn.execute("UPDATE journal_effective_events SET status = 'tombstone'"
+                     " WHERE event_id LIKE 'mrc:%'")
+        conn.commit()
+        assert glue.unrecorded_rate_change_transitions((t,)) == ()
+        conn.execute(
+            "UPDATE journal_effective_events SET status = 'active', rev = 1"
+            " WHERE event_id LIKE 'mrc:%'")
+        conn.commit()
+        assert glue.unrecorded_rate_change_transitions((t,)) == ()
+    finally:
+        conn.close()
+
+
+def test_c2_a_recorded_row_suppresses_recovery(ns):
+    """The first axis on its own. The row is the ordinary latch, and it is
+    what stops a recorded transition from paying for an ingest on every run.
+    """
+    import _cctally_journal as jr
+    glue = ns["_load_sibling"]("_cctally_quota_model")
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        jr.record_meter_rate_change(
+            ctx, t, notify=False, created_at=NOW.isoformat())
+        conn.commit()
+        assert glue.unrecorded_rate_change_transitions((t,)) == ()
+        other = _transition(ns, effective_from="2026-09-08T00:00:00+00:00")
+        assert glue.unrecorded_rate_change_transitions((t, other)) == (other,), (
+            "the lookup suppressed a key it had never recorded")
     finally:
         conn.close()
 
@@ -398,14 +1132,17 @@ def test_c2_the_descriptor_is_returned_rather_than_acted_on_under_the_lock(
     mode = glue.PersistMode(
         kind="automatic", account_key=None, now=NOW, fingerprint="FP",
         regime_start=NOW)
-    quarantined, transitions = glue.persist_and_detect(object(), mode)
+    quarantined, fresh, candidates = glue.persist_and_detect(object(), mode)
 
     assert quarantined is None
     assert saved, "the reduced state was never written"
     mrc = _mrc(ns)
-    assert len(transitions) == 1, transitions
-    assert isinstance(transitions[0], mrc.RateChangeTransition), transitions
-    assert transitions[0].effective_from == BOUNDARY
+    assert len(fresh) == 1, fresh
+    assert isinstance(fresh[0], mrc.RateChangeTransition), fresh
+    assert fresh[0].effective_from == BOUNDARY
+    # #689: the persisted enumeration is returned too, and it is still only
+    # RETURNED — nothing below is recorded from inside the lock.
+    assert [c.effective_from for c in candidates] == [BOUNDARY], candidates
 
     conn = ns["open_db"]()
     try:
@@ -430,7 +1167,7 @@ def test_c2_a_deferred_stats_rebuild_is_absorbed_rather_than_raised(ns,
 
     monkeypatch.setattr(jr, "run_stats_ingest", _deferred)
     assert glue.record_rate_change_transition(
-        _transition(ns), now=NOW) is False
+        _transition(ns), now=NOW) is None
 
 
 @pytest.mark.parametrize("signal", [KeyboardInterrupt, SystemExit])
@@ -463,7 +1200,7 @@ def test_c2_an_ordinary_store_failure_is_still_absorbed(ns, monkeypatch):
 
     monkeypatch.setattr(jr, "run_stats_ingest", _boom)
     assert glue.record_rate_change_transition(
-        _transition(ns), now=NOW) is False
+        _transition(ns), now=NOW) is None
 
 
 def test_c2_the_alert_payload_carries_the_family_not_a_registry_axis(ns):
@@ -499,10 +1236,12 @@ def test_c2_an_unreadable_calibration_yields_an_iterable_second_element(
     mode = glue.PersistMode(
         kind="automatic", account_key=None, now=NOW, fingerprint="FP",
         regime_start=NOW)
-    quarantined, transitions = glue.persist_and_detect(object(), mode)
+    quarantined, fresh, candidates = glue.persist_and_detect(object(), mode)
     assert quarantined is None
-    # The literal consumer, spelled the way `cmd_quota` spells it.
-    assert [t for t in transitions] == []
+    # The literal consumer, spelled the way `cmd_quota` spells it — for BOTH
+    # descriptor collections, because `cmd_quota` iterates both (#689).
+    assert [t for t in fresh] == []
+    assert [t for t in candidates] == []
 
 
 def test_c2_an_unreadable_calibration_writes_nothing(ns, monkeypatch):
@@ -536,9 +1275,11 @@ def test_c2_no_return_path_of_persist_and_detect_yields_a_bare_none():
     happens to reach.
 
     A behavioural test proves the ONE path it drives. This reads every
-    `return` in the function and refuses a second element that is the literal
-    `None`, so a future early return added beside the unreadable one fails
-    here rather than at a user's terminal.
+    `return` in the function and refuses a literal `None` in either
+    descriptor position, so a future early return added beside the unreadable
+    one fails here rather than at a user's terminal. Both positions are
+    checked because `cmd_quota` iterates both (#689): the fresh descriptors
+    and the persisted candidates.
     """
     import ast
     import pathlib
@@ -554,10 +1295,117 @@ def test_c2_no_return_path_of_persist_and_detect_yields_a_bare_none():
     for node in returns:
         assert isinstance(node.value, ast.Tuple), (
             f"line {node.lineno}: persist_and_detect returns a non-tuple")
-        assert len(node.value.elts) == 2, (
+        assert len(node.value.elts) == 3, (
             f"line {node.lineno}: persist_and_detect returns "
-            f"{len(node.value.elts)} values, not 2")
-        second = node.value.elts[1]
-        assert not (isinstance(second, ast.Constant) and second.value is None), (
-            f"line {node.lineno}: the second element is a bare None, and "
-            f"`cmd_quota` iterates it")
+            f"{len(node.value.elts)} values, not 3")
+        for position, element in enumerate(node.value.elts[1:], start=2):
+            assert not (isinstance(element, ast.Constant)
+                        and element.value is None), (
+                f"line {node.lineno}: persist_and_detect returns None in "
+                f"position {position}; cmd_quota iterates it")
+
+
+# --------------------------------------------------------------------------
+# #695 — the emitter's result, the owed branch, and deferred dispatch
+# --------------------------------------------------------------------------
+def test_c5_a_new_recording_reports_created_and_decided(ns, monkeypatch):
+    """The ordinary path: the row is created and this call owns the decision."""
+    import _cctally_journal as jr
+    dispatched: list = []
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER", dispatched.extend)
+    _seed_journal()
+    result = _record(ns, _transition(ns), notify=True)
+    assert result.meter_rate_change_result.row_created is True
+    assert result.meter_rate_change_result.notification_decided is True
+    assert result.meter_rate_change_result.notification_queued is True
+
+
+def test_c5_the_payload_is_deferred_and_step_six_does_not_dispatch_it(
+        ns, monkeypatch):
+    """#695: this family's dispatch is returned to the command, so the ledger
+    can gate it. Invariant (iv) is untouched — the payload still originates in
+    the live context, post-commit."""
+    import _cctally_journal as jr
+    dispatched: list = []
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER", dispatched.extend)
+    _seed_journal()
+    result = _record(ns, _transition(ns), notify=True)
+    assert dispatched == [], "step 6 dispatched a payload it must defer"
+    assert result.alerts == []
+    assert len(result.deferred_alerts) == 1
+    assert result.deferred_alerts[0]["axis"] == "meter_rate_change"
+
+
+def test_c5_an_ordinary_duplicate_decides_nothing(ns, monkeypatch):
+    """Without an explicit owed intent, an existing row stays silent."""
+    import _cctally_journal as jr
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER", lambda _a: None)
+    _seed_journal()
+    _record(ns, _transition(ns), notify=True)
+    again = _record(ns, _transition(ns), notify=True)
+    assert again.meter_rate_change_result.row_created is False
+    assert again.meter_rate_change_result.notification_decided is False
+    assert again.deferred_alerts == []
+
+
+def test_c5_an_owed_intent_queues_from_the_durable_row(ns, monkeypatch):
+    """The #695 repair: the row exists, the notification does not."""
+    import _cctally_journal as jr
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER", lambda _a: None)
+    _seed_journal()
+    _record(ns, _transition(ns), notify=False)
+    owed = _record(ns, _transition(ns), notify=True, notification_owed=True)
+    assert owed.meter_rate_change_result.row_created is False
+    assert owed.meter_rate_change_result.notification_queued is True
+    assert owed.meter_rate_change_result.notification_decided is True
+    payload = owed.deferred_alerts[0]
+    assert payload["severity"] == "alarm"
+    assert payload["withholding_status"] is None, (
+        "a swept alert must not claim a disclosure it never observed")
+
+
+def test_c5_the_owed_payload_is_rebuilt_from_the_row_not_the_descriptor(
+        ns, monkeypatch):
+    """The sweep's descriptor carries placeholder rates and an `info`
+    severity, because only the IDENTITY is known before the row is read. A
+    payload built from that descriptor would publish zeros under the wrong
+    severity, so the emitter reads the durable row instead."""
+    import _cctally_journal as jr
+    mrc = _mrc(ns)
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER", lambda _a: None)
+    _seed_journal()
+    _record(ns, _transition(ns), notify=False)
+    placeholder = _transition(
+        ns, previous_units_per_point=0.0, new_units_per_point=0.0,
+        severity=mrc.SEVERITY_INFO)
+    owed = _record(ns, placeholder, notify=True, notification_owed=True)
+    payload = owed.deferred_alerts[0]
+    assert payload["severity"] == "alarm", (
+        "the placeholder severity reached the wire")
+    assert payload["previous_units_per_point"] == 2_442_620.0
+    assert payload["new_units_per_point"] == 1_685_000.0
+
+
+def test_c5_an_owed_intent_with_notifications_off_still_decides(
+        ns, monkeypatch):
+    """Deciding NOT to notify is a decision. Leaving it undecided would make
+    the identity owed forever and fire it the moment the toggle flips."""
+    import _cctally_journal as jr
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER", lambda _a: None)
+    _seed_journal()
+    _record(ns, _transition(ns), notify=False)
+    owed = _record(ns, _transition(ns), notify=False, notification_owed=True)
+    assert owed.meter_rate_change_result.notification_queued is False
+    assert owed.meter_rate_change_result.notification_decided is True
+    assert owed.deferred_alerts == []
+
+
+def test_c5_a_cycle_with_no_descriptor_carries_no_result(ns, monkeypatch):
+    """Every other cycle is byte-unchanged: both new fields stay at their
+    defaults, so no other family's behaviour moves."""
+    import _cctally_journal as jr
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER", lambda _a: None)
+    _seed_journal()
+    result = jr.run_stats_ingest(mode="authoritative")
+    assert result.meter_rate_change_result is None
+    assert result.deferred_alerts == []

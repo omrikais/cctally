@@ -187,8 +187,18 @@ function RateChangeToast({
       </div>
       <div className="toast--alert-title">{provider} metering rate changed</div>
       {summary && <div className="toast--alert-sub">{summary}</div>}
+      {/*
+        #688: a transition is recorded whenever the detector qualifies,
+        including when `cctally quota` withholds its own verdict, so the
+        calibration behind this toast may have no fitted budget at all.
+        Pointing at the evidence is true either way. The CAUSE is
+        deliberately not named here: this surface is fed from the stats row
+        rather than from the alert payload, so carrying `withholding_status`
+        would need a new column, its fold, the envelope builder, the
+        TypeScript variant and a stats epoch bump. That is #690.
+      */}
       <div className="toast--alert-body">
-        Run <code>cctally quota</code> for the fitted budget and its evidence.
+        Run <code>cctally quota</code> for the evidence behind this change.
       </div>
     </div>
   );

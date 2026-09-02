@@ -465,6 +465,22 @@ the providers differ. The comparison copy action fetches each whole export and
 emits separate `Run A · <source>` and `Run B · <source>` sections, never a
 combined transcript body.
 
+## Static delivery
+
+The dashboard shell is a mutable name and revalidates on every load. JavaScript
+and CSS beneath `/static/assets/` have content hashes in their names, so the
+server marks them immutable for one year. Text assets negotiate gzip, carry a
+representation-specific `ETag`, and send `Vary: Accept-Encoding`; a warm reload
+therefore revalidates the shell but does not retransmit unchanged application
+code. Other named resources, including the favicon and icon sprite, retain the
+shell's revalidation policy.
+
+The headline, source selector, sync status and dashboard panels stay in the
+initial application chunk. Conversations and detail modals load only when first
+opened. If a deployment replaces an old deferred chunk while a tab is still
+open, the dashboard keeps its shell visible and offers a full reload so the tab
+returns to one coherent build.
+
 ## Wire compression
 
 `GET /api/events` and `GET /api/data` compress their bodies with gzip when the

@@ -45,6 +45,49 @@ Ingest is the other hot path, shared by every JSONL-reading command through the 
 
 As of #279 S2, `cctally cache-sync` traces one shared `cache-sync` root with `sync_cache` (the Claude ingest) and `sync_codex_cache` (the Codex ingest) as children, so a single flushed tree carries both vendors. The Codex sync now carries the same coarse `flock`/`discover`/`walk` seams as the Claude sync (its `walk` counts `files_processed`, never per-row).
 
+The dashboard adds a writer-fed fast-negative in front of those plans. An
+exhaustive, clean provider sync may mint a process-local certificate only when
+its durable full-walk sentinel is present and the installed hook configuration
+contains the exact executable handler shape for every supported activity
+event. The journal cutoff is captured before that sync; activity appended while
+the walk runs therefore belongs to the following tick rather than being
+silently consumed by the new certificate. Later ticks consume the private
+bounded activity journal, compare the cache inode and schema, maintenance
+markers, hook-config identities, and the saved directory set, and inspect only
+ticketed cursors. A clean negative calls neither provider sync and performs no
+source-path query, glob, or whole-estate file stat. A ticket targets the named
+provider path on that same tick only after strict resolution proves it is an
+existing JSONL below a configured provider root.
+
+The certificate is deliberately fail-closed. A missing or malformed journal,
+journal replacement/truncation, an untrusted hook setup, schema or maintenance
+change, directory add/delete/rename, cursor gap, same-path database replacement,
+an incomplete full-walk sentinel, or recovery ambiguity takes the existing full
+path. A hook ticket-write failure removes the marker before the hook returns, so
+the next ordinary tick cannot reuse a caught-up certificate. A failed pre-walk
+cutoff remains a distinct non-certifiable result rather than being recaptured
+after the walk, and marker identity plus bytes are read from one descriptor so
+atomic replacement cannot splice two generations. Because `cache.db` is one
+physical family, a corruption recovery promotes both providers to full and
+restarts them against the replacement store in the same refresh. Publication
+stays on the last complete snapshot if either replacement-store result is
+contended, deferred, torn, failed, maintenance-failed, or otherwise
+non-certifiable. The journal paths and certificate identities are never
+published.
+
+`bin/cctally-bench` registers `frontier.caught_up` over a full-seeded two-
+provider store and reports the total tracked provider-file count beside the
+timing. This is the reproducible scaling discriminator: the baseline and
+tiny/small runs show whether the validator remains proportional to roots and
+tickets rather than silently returning to all retained rows.
+
+When tracing is armed, the standalone ingest tree is retained separately from
+the final snapshot tree instead of being overwritten by it. Its bounded seams
+are `ingest.store_open`, per-provider `frontier`/`flock`/`walk`, `accounting`,
+`projector`, and `recovery`. `build.source_bundle` separately attributes
+`source.store_open`, signature, quota, projection, accounting, accounts,
+models, serialization, and reconciliation. No phase is emitted per row.
+
 ### Cache-state diagnostics
 
 Core signature legs and accounting row counts are queryable from `cache.db`; transcript row counts and rebuild flags belong to `conversations.db`. They are **not** timed phases. `/api/debug/backend` computes the available diagnostics at request time even when tracing is off.
@@ -105,7 +148,7 @@ The phase collector answers a deep question and answers it only when the process
 
 So a second, always-on instrument sits beside it: `bin/_lib_tick_stats.py`, a stdlib-only leaf module holding an immutable, lock-guarded record of the last 64 ticks. Every update takes one module-level lock, constructs the complete replacement state under it, and rebinds a single global; readers take no lock. It deliberately does **not** copy `_LAST_BACKEND_PERF`'s bare rebind, which is safe only because that slot is written by whole replacement — a counter update is read-modify-write and would lose increments. The whole state is bounded at 64 records and 64 KiB, both asserted.
 
-Each record carries the tick's total duration, its **mutually exclusive** ingest and builder halves, its dispatch path (`full` / `idle` / `degraded`), its Codex regime (`active` / `idle` / `not_observed`), whether it was cold, and the instant it published. The two halves are exclusive in *both* directions: an A2 progress build runs synchronously inside `sync_cache`, so its time is subtracted from the enclosing ingest. Without that, `ingest_ns + builder_ns` can exceed the whole tick and the orchestration remainder means nothing.
+Each record carries the tick's total duration, its own thread CPU time, its **mutually exclusive** ingest and builder halves, its dispatch path (`full` / `idle` / `degraded`), its Codex regime (`active` / `idle` / `not_observed`), whether it was cold, and the instant it published. The two halves are exclusive in *both* directions: an A2 progress build runs synchronously inside `sync_cache`, so its time is subtracted from the enclosing ingest. Without that, `ingest_ns + builder_ns` can exceed the whole tick and the orchestration remainder means nothing. `cctally dashboard-perf` reports main-loop CPU duty as the sum of the measured tick-thread CPU divided by the same records' backward publish periods; the first record has no period and contributes to neither sum.
 
 Both classifications are **aggregated over the outer refresh**, not taken from the last build in it. Several builds can run inside one refresh and disagree, and last-write classification would file an expensive tick as an idle one. The Codex regime reads the realised source-leg decision at the `codex is None` predicate, never `CodexIngestStats.rows_changed` — a quota-only batch leaves `rows_changed` at zero while advancing `codex_physical_mutation_seq`, which forces a genuinely expensive rebuild that `rows_changed` would stamp as idle.
 
@@ -214,6 +257,68 @@ dirty build to request only the changed physical path, reuse precomputed costs,
 and reproduce the cold builder's full `SourceDashboardState` exactly. A mutant
 that forces the accounting cache cold must fail the bounded-path assertion.
 
+### Current-scale source composition
+
+The next increment keeps the immutable visible Codex population and its
+per-account partitions across source generations. The durable accounting path
+delta adapts and replaces only changed rows; a quota-only generation reuses the
+population unchanged. Account-card totals use the same per-account generation,
+while a changed account still runs the shipped period, session, project, cache,
+weekly and budget builders. Encounter order stays authoritative, so the
+optimization changes reuse boundaries rather than arithmetic. The cache admits
+at most 128 MiB by a conservative retained-reference estimate; an over-budget
+population, a row without a durable id, a cursor/full invalidation, an
+unqualified-metadata fallback, or a same-path `cache.db` replacement takes a
+complete cold path. Account-card totals have an independent 256 KiB admission
+cap and include the population file identity, account generation, window and
+row membership in their key; a refusal computes the card cold without retaining
+it. The established cold reset clears both generations.
+
+The acceptance corpus was the generated `large`, seed 42 fixture at fingerprint
+`7e4e38229503050ed1804ac4669efd3d25e7759e1261f915336d1caa5e74b931`:
+295,942 Claude entries, 150,000 Codex entries in 1,200 files, 2,402 quota rows
+and 5,000 sessions. Five fresh process runs on the pinned remote runner reported
+these advisory wall-clock distributions; p95 is nearest-rank and is therefore
+the maximum of five samples.
+
+| Dirty snapshot generation | Current main p50 / p95 / max | Incremental p50 / p95 / max | Publish period at p50 / p95 |
+|---|---:|---:|---:|
+| mixed Claude + one-row Codex append | 3.59 / 3.65 / 3.65 s | 3.41 / 3.53 / 3.53 s | 8.41 / 8.53 s |
+| quota-only | 2.92 / 2.95 / 2.95 s | 2.55 / 2.71 / 2.71 s | 7.55 / 7.71 s |
+| attribution-only path move | 5.11 / 5.14 / 5.14 s | 5.14 / 5.27 / 5.27 s | 10.14 / 10.27 s |
+
+The split rows use the same current benchmark driver against exact pre-change
+main and the implementation, with one generator-owned comparison root and the
+same fingerprint. Attribution moves one path between two existing accounts, so
+both account scopes are genuinely dirty; it is a correctness/invalidation
+split rather than a claimed speedup and remains within run variance of main.
+The issue's source-construction target is still met: matched attribution traces
+measured `build.source_bundle` at 3.915 s on main and 3.948 s after the change.
+The surrounding full-snapshot total is about 5.3 s because the independent
+doctor leg costs about 1.3 s. A traced mixed append measured 3.159 s in
+`build.source_bundle`, including 0.475 s accounting capture and 2.209 s post-pin
+source serialization. The publish periods above apply the unchanged #313
+formula `work + max(5 s, work)` rather than relaxing cadence.
+
+On the matched split corpus the warmed visible cache held 150,000 rows at an
+estimated 19,206,144 bytes against its 134,217,728-byte cap. The account-card
+totals cache held two entries at an estimated 2,048 bytes against its
+262,144-byte cap. Both reported zero fallbacks; each cache exposes its admitted
+bytes, entry count, cap and fallback count through the benchmark's observation
+surface.
+
+The exact-output gate remained the generated-corpus oracle: 168,401 bytes and
+stable SHA-256
+`709ca8cc2b2ec7e263b7342fcf28992a6b51fce76bdb1d6d4cd385c48c4db7a8`.
+Warm-versus-forced-cold tests cover one-path updates, full markers, cursor gaps,
+quota insert/update/delete/group moves, attribution revision, account registry
+changes, active-window transitions, rollback and same-path database
+replacement. The cache-pin bound continues to count captured change rows rather
+than the retained population. Finally, an isolated live dashboard changed its
+Codex Projects heading from `0 projects` to `1 projects` after an in-place row
+mutation arrived through the background build and SSE publication, with no
+browser warning or error.
+
 ## 8. The corpus envelope oracle (#583 S1)
 
 The two envelope references recorded above and in `docs/dashboard-gotchas.md`
@@ -241,11 +346,13 @@ directory reproduces a different hash by construction. The authoritative suite
 owns the canonical-root verification through the private
 `bin/cctally-envelope-oracle-test` harness.
 The full record, including the corpus fingerprint the hashes are keyed to, lives
-in `bench/baselines/envelope-oracle.json`. The current capture is 168,315 bytes
+in `bench/baselines/envelope-oracle.json`. The current capture is 168,401 bytes
 — read the sidecar for the exact figure — with rebuild-stable SHA-256
-`bafac0457e24059ecb6197001d07d5b0af94ddfa406169c36f81db4c75b8804b` over corpus
-fingerprint `9886d7d6b4bdc119c1f800aff7866fe7d5e39e2915d1c151736e55ee74ccbbdf`
-at generator version 7. #634 added the server-deduplicated
+`709ca8cc2b2ec7e263b7342fcf28992a6b51fce76bdb1d6d4cd385c48c4db7a8` over corpus
+fingerprint `237c5c48ea10ab69f822c0aff5666a071382418d78e6467aed7adc4e0f5e0aa2`
+at generator version 10. #683 added Claude meta/tool-result and Codex subagent
+discriminators: the corpus fingerprint and counts moved while the envelope byte
+count and stable digest did not. #634 added the server-deduplicated
 `session_counts_by_window` map to the three Claude Projects rows (and their
 provider-scoped mirrors); the corpus fingerprint stayed fixed, and a normalized
 structural diff contained exactly those six additions. #631 expanded the corpus
@@ -426,3 +533,93 @@ thirty-second hide/return cycles, versus roughly nine frames per minute avoided
 at the measured 6.5-second publish period. The ordinary multi-tab case is
 cheaper: one server stream, one JSON parse per frame, and structured clones to
 the active tabs.
+
+## 10. Retained-memory and combined-work ceilings
+
+The dashboard's process-local accelerators are bounded by both entry count and
+retained size. Retained size is measured cycle-safely with shared objects
+counted once; a measurement stops at `cap + 1`, so rejecting an oversize value
+does not require walking an arbitrarily large object graph. The production-size
+walker's exact visited-object index uses sparse pointer-aligned bitmap pages,
+rather than retaining one Python integer per object. Its allocation is measured
+separately and stops the walk above one quarter of the owner cap (with a 256 KiB
+floor for small focused callers), so adversarially sparse addresses cannot make
+admission itself escape the whole-process memory ceiling or weaken cache-byte
+accounting.
+The production-size Codex and snapshot-cache aggregates are shallow-copied at
+successful build boundaries and verified by one cancellable worker per owner.
+Each worker has
+one active generation and one latest-wins pending slot. A new retained-cache
+mutation cancels an active older generation as well as replacing the pending
+one; unchanged publisher ticks do not mint generations. The walker checks
+cancellation every 1,024 objects. Both owners share one process-wide traversal
+gate, and the active walker sleeps as needed to hold its measured thread CPU to
+25% of one core, leaving the publisher and conversation worker headroom.
+Snapshot-cache replacements use a cheap retained-shape signal and a five-minute
+full remeasurement backstop, so routine same-shaped current-bucket replacement
+cannot starve admission while same-key growth is still noticed. Successful
+under-cap measurements publish their numeric generation between ticks;
+overflow and traversal errors acquire the same publisher lock at completion,
+recheck that their generation is still current, and discard the accelerator
+estate immediately. They never depend on another publisher tick, including
+under `--no-sync`; stale completions cannot evict a newer generation. Shutdown
+cancels and proves both workers joined before replacing either owner. This keeps
+the multi-second heap
+traversals out of the five-second publisher while preserving
+complete-generation admission. Eviction is LRU.
+An object larger than its owner's byte budget is still returned to the caller
+but is not retained, preserving response semantics and live-tail correctness.
+
+| Owner | Entry ceiling | Byte ceiling |
+| --- | ---: | ---: |
+| Codex source accelerators (all 11 stores, including quota/visible/account adapters) | 500,000 total | 768 MiB total |
+| Snapshot accelerators (bucket/session/accounting/doctor/history caches) | 500,000 total | 384 MiB total |
+| Claude conversation assembly | 4 | 64 MiB |
+| Codex outline | 4 | 64 MiB |
+| Codex outline derivation | 4 | 32 MiB |
+| Progressive outline transfers | 128 | 64 MiB total; 32 MiB per body |
+| SSE delivery variants | 4 | 32 MiB |
+| Main ingest frontier | 2 provider states | 16 MiB |
+| Conversation ingest frontier | 2 provider states | 16 MiB |
+
+The aggregate Codex owner contains all eleven dictionaries a source build can
+reuse, including the quota memo's 64 MiB sub-cap, the visible population's
+128 MiB sub-cap, account-card decoration, and the entry adapter. The aggregate
+snapshot owner contains every history-proportional accelerator in
+`_lib_snapshot_cache`; on overflow the completed response is preserved and the
+next tick rebuilds cold. The loopback debug endpoint publishes the complete
+numeric owner inventory, measured/current generations, pending/error/worker
+state, its summed ceiling, server thread count, and a 1.5 GiB whole-process RSS
+ceiling. Keys, account values, source paths, and transcript content never enter
+those counters.
+
+SSE queues are latest-wins with one queued shared delivery per subscriber.
+Published and fresh-clock seed deliveries all admit frames through one hub-wide
+4-entry/32 MiB cache, so reconnects cannot multiply the cap per subscriber.
+Publication drains every older entry before enqueueing the new one; shutdown
+clears `_last`, every queue, and the subscriber registry. A disconnected
+browser is observable only when the next write reaches its dead socket, so the
+browser soak requires the subscriber count to settle to one within a bounded
+publish window rather than pretending that disconnect notification is
+synchronous.
+
+Cache invalidation remains exact: signature and watermark changes replace the
+relevant LRU entry; full rebuild and root/account changes re-key or discard the
+old population; an authoritative deletion-only Codex attribution pass advances
+its revision in the same transaction. Conversation assembly, outline, and the
+nested Codex event-derivation cache key the physical SQLite device/inode as well
+as the logical watermark, so a new database published at the same pathname
+cannot reuse the previous incarnation. Neither byte admission nor eviction may
+weaken those invalidations.
+
+`dashboard-perf` reports a conservative combined duty by adding the
+independently measured main and conversation-loop duties. The ceiling is 75%
+of one core. No cadence, freshness threshold, publication schedule, or
+live-tail interval was changed to meet it. The production-shaped acceptance
+harness is `bench/dashboard-soak.py`; the real-browser heap, DOM, and connection
+harness is `dashboard/web/e2e/memory-soak.spec.ts`.
+The backend soak's post-warm RSS gate uses the one-sided 95% upper confidence
+bound for the ordinary least-squares slope, not the raw fitted sign. It remains
+bounded by the unchanged `+4 MiB/min` ceiling and fails closed when the sample
+set cannot support the bound; growing, flat, and noisy-flat synthetic receipts
+pin the statistical contract.

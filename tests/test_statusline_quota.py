@@ -89,6 +89,16 @@ def test_d2_basis_is_stated_when_the_meter_is_used():
     assert "model" not in out
 
 
+def test_d2_the_meter_word_comes_from_the_shared_basis_copy(monkeypatch):
+    """A consumer-local basis map would keep printing `meter` after the
+    shared presentation changed, which is the drift #676 closes."""
+    ns = load_script()
+    copy = ns["_load_sibling"]("_lib_quota_copy")
+    monkeypatch.setitem(
+        copy._BASIS_FORM["corrected-meter"], "short", "gauge")
+    assert "→ 92% gauge" in _segment(ns)
+
+
 def test_d2_the_projection_measures_from_the_corrected_reading():
     """The discriminating twin of the test above. Projecting from the RAW
     40 would give 93.3% and round to 93; the corrected 39.5 gives 92.2%.

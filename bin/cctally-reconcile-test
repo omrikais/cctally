@@ -3132,17 +3132,12 @@ else
     fail_count=$((fail_count + 1))
 fi
 
-# ── PROJECTED1-b (abstention): the twin must not fire on the other basis ──
+# ── PROJECTED1-b: the alert retains the calibrated forecast basis ─────────
 #
-# #661 S2 spec section 3.3. `_weekly_pct_week_avg_projection` is snapshot-only
-# and the CALIBRATED basis needs the current week'"'"'s weighted units, so the
-# two consumers cannot always reach the same basis. A single equality
-# invariant would then be satisfiable only by testing the meter branch, which
-# is the opposite of what PROJECTED1 exists for. This leg asserts the twin
-# ABSTAINED, not that it matched — and guards its own non-vacuity by
-# requiring the forecast to be on the calibrated basis, because if the
-# forecast were also on the meter the abstention would pass for the wrong
-# reason.
+# The alert path already performs the calibrated week scan. It must retain
+# that numeric projection and match the forecast within 1e-9, rather than
+# reducing the result to a boolean and silently abstaining. Requiring the
+# forecast to be calibrated keeps the equality non-vacuous.
 #
 # The scenario HOME is a COPY carrying a calibration written from the
 # fixture'"'"'s own current-week composition, so the support test passes by
@@ -3169,14 +3164,14 @@ selection = fc.select_projection_basis(inputs)
 assert selection.basis is fc.ProjectionBasis.CALIBRATED, (
     "PROJECTED1-b VACUOUS: the forecast is on basis "
     f"{selection.basis.value!r} rather than the calibrated one, so an "
-    f"abstention assertion would pass for the wrong reason "
+    f"equality assertion would pass on the wrong basis "
     f"(cause: {inputs.calibrated_withheld_code!r})"
 )
-assert c._weekly_pct_week_avg_projection(conn, now) is None, (
-    "PROJECTED1-b: the snapshot-only twin returned a projection while the "
-    "forecast published a calibrated one; it must abstain rather than fire "
-    "on the corrected meter"
-)
+projected = c._weekly_pct_week_avg_projection(conn, now)
+assert projected is not None, (
+    "PROJECTED1-b: the alert discarded a reachable calibrated projection")
+assert abs(projected[0] - selection.value) < 1e-9, (
+    f"PROJECTED1-b: alert={projected[0]} forecast={selection.value}")
 '
 
 p1b_home="$SCRATCH_DIR/projected1b-home"
@@ -3190,7 +3185,7 @@ if [ -d "$fc_home" ] && cp -Rp "$fc_home" "$p1b_home" 2>/dev/null; then
         CCTALLY_DISABLE_DEV_AUTODETECT=1 \
         python3 "$REPO_ROOT/bin/_lib-reconcile-seed-calibration.py" 2>&1); rc_s=$?
     if [ $rc_s -ne 0 ]; then
-        echo "RECONCILE FAIL projected1b_alert_abstains forecast/projected-cap: could not seed a calibration: $seeded"
+        echo "RECONCILE FAIL projected1b_alert_eq_calibrated forecast/projected-cap: could not seed a calibration: $seeded"
         fail_count=$((fail_count + 1))
     else
         result=$(PROJECTED_BIN_DIR="$REPO_ROOT/bin" HOME="$p1b_home" \
@@ -3198,15 +3193,15 @@ if [ -d "$fc_home" ] && cp -Rp "$fc_home" "$p1b_home" 2>/dev/null; then
             CCTALLY_DISABLE_DEV_AUTODETECT=1 \
             python3 -c "$PROJECTED1B_PY" 2>&1); rc_py=$?
         if [ $rc_py -ne 0 ]; then
-            echo "RECONCILE FAIL projected1b_alert_abstains forecast/projected-cap: $result"
+            echo "RECONCILE FAIL projected1b_alert_eq_calibrated forecast/projected-cap: $result"
             fail_count=$((fail_count + 1))
         else
-            echo "PASS projected1b_alert_abstains forecast/projected-cap"
+            echo "PASS projected1b_alert_eq_calibrated forecast/projected-cap"
             pass_count=$((pass_count + 1))
         fi
     fi
 else
-    echo "RECONCILE FAIL projected1b_alert_abstains forecast/projected-cap: fixture missing"
+    echo "RECONCILE FAIL projected1b_alert_eq_calibrated forecast/projected-cap: fixture missing"
     fail_count=$((fail_count + 1))
 fi
 

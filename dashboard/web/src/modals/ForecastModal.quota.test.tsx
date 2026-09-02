@@ -10,6 +10,9 @@ import type { Envelope, ForecastQuotaEnvelope } from '../types/envelope';
 function quota(over: Partial<ForecastQuotaEnvelope> = {}): ForecastQuotaEnvelope {
   return {
     basis: 'calibrated',
+    basis_presentation: {
+      code: 'calibrated', short: 'model', long: 'calibrated model',
+    },
     projection_pct: 61,
     right_censored: false,
     code: null,
@@ -50,6 +53,19 @@ describe('the quota section', () => {
     expect(grid?.textContent).toContain('calibrated model');
     expect(grid?.textContent).toContain('34.0%');
     expect(grid?.textContent).toContain('66.0%');
+  });
+
+  it('uses the server long register instead of client-owned modal copy', () => {
+    const q = quota();
+    Object.assign(q, {
+      basis_presentation: {
+        code: 'calibrated', short: 'server model', long: 'server calibrated model',
+      },
+    });
+    const { container } = render(<QuotaSection env={envWith(q)} />);
+    expect(container.querySelector('#mfc-quota-basis')?.textContent).toBe(
+      'server calibrated model',
+    );
   });
 
   it('states what the meter reading covers, unbounded above when censored', () => {

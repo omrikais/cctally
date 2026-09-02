@@ -208,6 +208,21 @@ def test_an_absent_baseline_still_digests():
     assert pair([(1,)], None) == pair([(1,)], [])
 
 
+def test_pairing_precomputed_component_digests_is_byte_identical():
+    """Publishing can reuse the digests established under the probe pair.
+
+    The hot accounting row stream must not be serialized and hashed a second
+    time merely to bind the preceding window, but the generation identifier
+    remains byte-for-byte the one produced from the original row streams.
+    """
+    sources = _sources()
+    current = [(1, "current"), (2, None)]
+    baseline = [(3, "baseline")]
+    assert sources._digest_component_pair_from_digests(
+        sources._digest_rows(current), sources._digest_rows(baseline)
+    ) == sources._digest_component_pair(current, baseline)
+
+
 # --- 4.1 the read-only open ---------------------------------------------
 
 def test_conversations_opens_read_only_and_never_attaches_cache(

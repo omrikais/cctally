@@ -263,10 +263,12 @@ from _lib_record import (
     milestone_coverage_owes,
     hwm_file_next,
     projected_crossings,
+    post_reset_seed_has_climb_evidence,
     FIRE_IMMEDIATE,
     CONFIRM_RESET,
     CLEAR_MARKER,
     ARM_MARKER,
+    SNAPSHOT_SKIP_CLAMP,
 )
 
 # === #279 S4 F5: forwarding-shim wall collapse (the #50 treatment) =========
@@ -680,10 +682,11 @@ def maybe_record_milestone(
         # ``unixepoch_for_cross_offset_compare``).
         captured_at_iso = saved.get("capturedAt") or as_of or now_utc_iso()
         reset_event_id = 0
+        reset_effective_iso = None
         if week_end_at:
             seg_row = conn.execute(
                 """
-                SELECT id FROM week_reset_events
+                SELECT id, effective_reset_at_utc FROM week_reset_events
                  WHERE new_week_end_at = ?
                    AND account_key = ?
                    AND unixepoch(effective_reset_at_utc) <= unixepoch(?)
@@ -693,6 +696,7 @@ def maybe_record_milestone(
             ).fetchone()
             if seg_row is not None:
                 reset_event_id = int(seg_row["id"])
+                reset_effective_iso = seg_row["effective_reset_at_utc"]
 
         max_existing = get_max_milestone_for_week(
             conn, week_start_date, reset_event_id=reset_event_id,
@@ -700,6 +704,51 @@ def maybe_record_milestone(
         )
         if max_existing is not None and current_floor <= max_existing:
             return
+
+        # Seeding a POST-RESET epoch's ladder requires observed evidence of the
+        # climb. A fresh install or a fresh week is genuinely missing history,
+        # so seeding at `current_floor` is the only thing it can do — that is
+        # the `reset_event_id == 0` path and it is unchanged. A post-reset epoch
+        # is different: the reset event asserts the counter stood at the
+        # credited level at a known instant, so a first in-epoch observation
+        # high above it with no lower observation between the two is a stale
+        # pre-credit replica, not a crossing. Seeding from one is permanent
+        # damage, because milestones are forward-only within an epoch: on
+        # 2026-09-01 a fresh epoch was seeded at 13% from a replica the
+        # in-place-credit stale-replica DELETE had missed, so the epoch's
+        # ladder started at a threshold the meter said had not been crossed
+        # and every genuine crossing below 13 in that epoch was foreclosed.
+        #
+        # The evidence is a stored observation inside this epoch whose floored
+        # percent is strictly BELOW the threshold about to be recorded. It is
+        # deliberately NOT a tolerance band around `observed_pre_credit_pct`:
+        # that comparison is what let the stale replica survive in the first
+        # place (issue #703), and repeating it here would inherit the same
+        # failure mode. The epoch's lower bound is the governing event's own
+        # `effective_reset_at_utc`, which is the same instant `reset_event_id`
+        # was resolved against, so the window and the epoch cannot disagree.
+        if reset_event_id != 0 and max_existing is None:
+            # A bare aggregate SELECT always returns exactly one row, holding
+            # NULL when nothing matched, so there is no empty-result case to
+            # guard here — the kernel decides the NULL.
+            lowest_in_epoch = conn.execute(
+                "SELECT MIN(weekly_percent) FROM weekly_usage_snapshots "
+                "WHERE week_start_date = ? AND account_key = ? "
+                "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+                "  AND unixepoch(captured_at_utc) <= unixepoch(?)",
+                (week_start_date, account_key, reset_effective_iso,
+                 captured_at_iso),
+            ).fetchone()[0]
+            if not post_reset_seed_has_climb_evidence(
+                lowest_in_epoch, current_floor
+            ):
+                eprint(
+                    "[milestone] skipping this crossing — the post-reset "
+                    f"segment {reset_event_id} has no observation below "
+                    f"{current_floor}%, so a {current_floor}% seed would come "
+                    "from a stale pre-credit reading, not a climb"
+                )
+                return
 
         # Threshold crossed — sync cost before recording so the milestone
         # captures up-to-date cumulative cost, not a stale snapshot.
@@ -1493,19 +1542,15 @@ def maybe_record_codex_budget_milestone(
     return fired
 
 
-def _forecast_reaches_the_calibrated_basis(
-        now_utc, week_start_at, week_end_at, *, account_key=None) -> bool:
-    """True when the FORECAST would publish a model-backed projection here.
+def _forecast_calibrated_projection(
+        now_utc, week_start_at, week_end_at, *, account_key=None):
+    """Return the model-backed projection the forecast would publish here.
 
-    Spec section 3.3 conditions the twin's abstention on the alert path being
-    unable to reach "the basis the forecast published" — not on a regime
-    merely validating. Those are different questions, and the gap between
-    them is reachable: `apply_regime` re-tests support against THIS week's
-    population and rejects an unsupported or empty one, so a calibration can
-    validate while the forecast still falls back to the corrected meter. At
-    the start of every week the population is empty, and gating on
-    readability there returned `None` from the twin and silently disabled the
-    weekly 90%/100% projected alert.
+    `apply_regime` re-tests support against THIS week's population, so a
+    calibration can validate while the forecast still falls back to the
+    corrected meter. Retaining the numeric result instead of reducing it to a
+    boolean lets the alert fire on exactly the calibrated value the forecast
+    publishes, without a second week scan or a contradictory meter fallback.
 
     This calls the SAME helper the loader calls, with the SAME account key,
     so the two cannot answer differently. The earlier probe always read the
@@ -1513,8 +1558,8 @@ def _forecast_reaches_the_calibrated_basis(
     decorated multi-account install let the forecast publish a calibrated
     projection while the twin saw no merged regime and fired on the meter.
 
-    Any failure to reach the helper is reported as "not calibrated", which
-    keeps the twin firing rather than going quiet on an unrelated defect.
+    Any failure to reach the helper returns ``None`` and leaves the alert on
+    the corrected-meter fallback rather than making it go quiet.
 
     COST. This is NOT a cheap probe once a regime validates. `_calibrated_projection`
     reads the calibration file first — one small file read on every install
@@ -1539,14 +1584,14 @@ def _forecast_reaches_the_calibrated_basis(
         value, _code = _cctally()._load_sibling(
             "_cctally_forecast")._calibrated_projection(
                 now_utc, week_start_at, week_end_at, account_key=account_key)
-        return value is not None
+        return value
     except Exception:
-        return False
+        return None
 
 
 def _weekly_pct_week_avg_projection(conn, now_utc, *, account_key=None):
     """Compute the week-AVERAGE weekly-% projection for the current
-    subscription week from snapshots alone.
+    subscription week on the same selected basis as ``forecast``.
 
     ``account_key`` is an AFFORDANCE, not a threaded production value. The one
     shipped caller (the projected-alert leg in ``maybe_record_projected_alert``)
@@ -1554,20 +1599,19 @@ def _weekly_pct_week_avg_projection(conn, now_utc, *, account_key=None):
     ``_fetch_current_week_snapshots``, so the whole projected-alert path is
     account-blind today. Making it per-account is a #341 change to that leg
     rather than to this helper, and this session does not make it. The
-    parameter exists so the abstention gate below can be given the SAME key
+    parameter exists so the calibration call below can be given the SAME key
     the forecast loader would use once the leg is threaded.
 
     Returns ``(projected_pct, low_conf)`` or ``None`` when no current-week
-    snapshot resolves. The value is computed by the IDENTICAL formula +
-    IDENTICAL inputs that produce ``ForecastOutput.week_avg_projection_pct``
-    (``_load_forecast_inputs`` → ``_compute_forecast``): ``p_now`` / elapsed /
-    remaining come from ``_fetch_current_week_snapshots`` +
-    ``_apply_midweek_reset_override`` (the same reset-aware window resolution
-    forecast uses), ``r_avg = p_now / elapsed_hours`` (``p_week_start`` treated
-    as 0, matching the forecast kernel), and
-    ``projected = p_now + r_avg * remaining_hours``. The reconcile invariant
-    binds the fired value to forecast's ``week_avg_projection_pct`` within
-    1e-9, so the two MUST share the formula by construction.
+    snapshot resolves. The value follows the IDENTICAL basis selector and
+    inputs that produce ``ForecastOutput.week_avg_projection_pct``
+    (``_load_forecast_inputs`` → ``_compute_forecast``). A supported fitted
+    regime supplies the numeric calibrated projection from the alert path's
+    existing week scan. Otherwise ``p_now`` / elapsed / remaining come from
+    ``_fetch_current_week_snapshots`` + ``_apply_midweek_reset_override`` and
+    the corrected-meter fallback uses ``p_now + r_avg * remaining_hours``.
+    The reconcile invariant binds the fired value to forecast's
+    ``week_avg_projection_pct`` within 1e-9 on either basis.
 
     LOW CONF mirrors the displayed forecast confidence: ONE call to
     ``_assess_forecast_confidence(elapsed_hours, p_now, len(samples),
@@ -1580,8 +1624,8 @@ def _weekly_pct_week_avg_projection(conn, now_utc, *, account_key=None):
     needs no spend; the forecast kernel's ``week_avg_projection_pct`` is also
     spend-free), and never calls ``sync_cache``.
 
-    It is NOT, however, snapshot-only any more. The #661 S2 abstention gate
-    below calls ``_forecast_reaches_the_calibrated_basis``, which reads the
+    It is NOT, however, snapshot-only any more. The calibrated-basis selector
+    below calls ``_forecast_calibrated_projection``, which reads the
     calibration file and — when a regime validates — opens ``cache.db`` for a
     full current-week ``session_entries`` SELECT. See that helper's COST note.
     """
@@ -1590,23 +1634,8 @@ def _weekly_pct_week_avg_projection(conn, now_utc, *, account_key=None):
     if fetched is None:
         return None
     week_start_at, week_end_at, samples = fetched
-    # #661 S2 spec section 3.3, invariant PROJECTED1-b. This helper computes
-    # the week average from snapshots alone, and the calibrated basis needs
-    # the current week's weighted units. So when the FORECAST reaches that
-    # basis it publishes a model-backed projection this value cannot equal,
-    # and the twin ABSTAINS rather than firing on the corrected meter, which
-    # would alert on a number the screen does not show.
-    #
-    # The gate is the basis the forecast actually reached, resolved with the
-    # window this helper just resolved, so a calibration that validates but
-    # does not apply to this week's population leaves the twin firing. It
-    # never calls `analyse_account`: the probe reads the calibration file and,
-    # only when a regime validates, one bounded current-week query.
-    if _forecast_reaches_the_calibrated_basis(
-            now_utc, week_start_at, week_end_at, account_key=account_key):
-        return None
     week_start_at, samples = _apply_midweek_reset_override(
-        conn, week_start_at, week_end_at, samples
+        conn, week_start_at, week_end_at, samples, now_utc=now_utc
     )
     if not samples:
         return None
@@ -1618,8 +1647,9 @@ def _weekly_pct_week_avg_projection(conn, now_utc, *, account_key=None):
     # binds this value to `forecast --json`'s `week_avg_projection_pct`
     # within 1e-9, so the two must share the operand as well as the formula.
     # A right-censored reading has no corrected point and therefore no
-    # projection at all: the detector abstains rather than firing on a
-    # number the observation cannot supply.
+    # corrected-meter projection at all: the fallback withholds rather than
+    # firing on a number the observation cannot supply. A calibrated result
+    # returned above remains usable at a censored meter.
     # Imported HERE rather than at module scope, and NOT for a measured
     # saving. An earlier revision of this comment claimed the module-scope
     # form cost `record-usage` and `hook-tick` 18.5 ms per run, about 11 ms of
@@ -1637,12 +1667,6 @@ def _weekly_pct_week_avg_projection(conn, now_utc, *, account_key=None):
     _ensure_sibling_loaded("_lib_forecast")
     from _lib_forecast import corrected_percent_point
 
-    p_corrected = corrected_percent_point(p_now)
-    if p_corrected is None:
-        return None
-    r_avg = p_corrected / elapsed_hours if elapsed_hours > 0 else 0.0
-    projected_pct = p_corrected + r_avg * remaining_hours
-
     # Confidence comes from the predicate in one call, fourth trigger
     # included, so this LOW CONF gate == forecast's and glue no longer
     # downgrades a confidence the predicate returned (#620 S2 E3).
@@ -1651,6 +1675,17 @@ def _weekly_pct_week_avg_projection(conn, now_utc, *, account_key=None):
         elapsed_hours, p_now, len(samples),
         has_sample_ge_24h=any(s[0] <= target_24h for s in samples),
     )
+
+    calibrated = _forecast_calibrated_projection(
+        now_utc, week_start_at, week_end_at, account_key=account_key)
+    if calibrated is not None:
+        return (calibrated, confidence == "low")
+
+    p_corrected = corrected_percent_point(p_now)
+    if p_corrected is None:
+        return None
+    r_avg = p_corrected / elapsed_hours if elapsed_hours > 0 else 0.0
+    projected_pct = p_corrected + r_avg * remaining_hours
     return (projected_pct, confidence == "low")
 
 
@@ -1772,13 +1807,13 @@ def maybe_record_projected_alert(
     if own_conn:
         conn = open_db()
     try:
-        # ── weekly_pct leg (snapshot-only, cheap) ───────────────────────────
+        # ── weekly_pct leg (snapshots + optional calibrated week scan) ─────
         if weekly_on:
             w_window = _fetch_current_week_snapshots(conn, now_utc)
             if w_window is not None:
                 ws_at, we_at, samples = w_window
                 ws_at, _ = _apply_midweek_reset_override(
-                    conn, ws_at, we_at, samples
+                    conn, ws_at, we_at, samples, now_utc=now_utc
                 )
                 week_key = ws_at.isoformat(timespec="seconds")
                 levels = (90, 100)
@@ -5200,6 +5235,21 @@ def _cmd_hook_tick_codex(
     return 0
 
 
+def _record_dashboard_activity(provider: str, transcript_path: str) -> None:
+    """Write the hook ticket or invalidate every caught-up certificate."""
+    try:
+        frontier = _cctally()._load_sibling("_lib_ingest_frontier")
+        if not frontier.record_activity(
+            _cctally_core.APP_DIR, provider, str(transcript_path or ""),
+        ):
+            frontier.invalidate_activity_marker(_cctally_core.APP_DIR)
+    except Exception:
+        # Hook execution remains best-effort and always successful. A runtime
+        # directory that cannot be mutated offers no additional durable signal
+        # beyond this bounded attempt.
+        pass
+
+
 def cmd_hook_tick(args: argparse.Namespace) -> int:
     """Per-fire hook runtime (Section 3 of onboarding spec).
 
@@ -5225,6 +5275,7 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
         event = meta.get("event", "unknown") if isinstance(meta, dict) else "unknown"
         transcript = (
             meta.get("transcript_path", "") if isinstance(meta, dict) else "")
+        _record_dashboard_activity("codex", str(transcript or ""))
         return _cmd_hook_tick_codex(
             args, event=event, transcript_path=str(transcript or ""))
     explain = bool(getattr(args, "explain", False))
@@ -5258,6 +5309,9 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
         meta = _hook_tick_read_stdin_event()
         if forced_event:
             meta["event"] = forced_event
+    _record_dashboard_activity(
+        "claude", str(meta.get("transcript_path", "") or ""),
+    )
 
     # --- Step 1b: fork to background so CC's hook returns immediately ---
     # Parent returns 0 right away; child carries on with sync_cache + OAuth.
@@ -5986,7 +6040,7 @@ def _pipeline_claude_usage(ctx, rec):
     # 2. Accept/skip DECISION (clamp + dedup), made ONCE and journaled via the
     #    snapshot_accept evt (so replay never re-derives it — spec §5.3).
     import _cctally_journal as jr
-    skip, adjusted_5h = jr._usage_snapshot_fold_decision(conn, {
+    skip, adjusted_5h, skip_reason = jr._usage_snapshot_fold_decision(conn, {
         "week_start_date": week_start_date,
         "week_start_at": week_start_at,
         "week_end_at": week_end_at,
@@ -6062,15 +6116,27 @@ def _pipeline_claude_usage(ctx, rec):
     #    5h-milestone block_id read (P2-8). Idempotent under re-run on a dedup
     #    tick (INSERT OR IGNORE / upsert), so a flat tick that owes a milestone or
     #    crosses a $ threshold still derives it.
-    c.maybe_record_milestone(
-        saved, conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts,
-        journal=(ctx, rec["id"]), account_key=account_key,
-        retained_selection=c.WeekSelection(
-            week_start=dt.date.fromisoformat(week_start_date),
-            week_end=dt.date.fromisoformat(week_end_date),
-            start_iso_override=week_start_at,
-            end_iso_override=week_end_at,
-        ))
+    #    The one exception is a CLAMP skip. A dedup skip AGREES with the stored
+    #    row, so re-deriving against it is the self-heal; a clamp skip means the
+    #    incoming 7d percent is strictly BELOW the reset-aware in-window maximum,
+    #    so the observation CONTRADICTS `saved` and a weekly milestone derived
+    #    from `saved`'s higher percent records a crossing the meter says did not
+    #    happen. That is how the 2026-09-01 incident fabricated a 13% milestone
+    #    in a fresh post-credit epoch from a stale pre-credit replica, and
+    #    because milestones are forward-only within an epoch that row forecloses
+    #    every genuine crossing below it there. Only the WEEKLY milestone is
+    #    gated: the 5h block derivation below (and the window-rollover heal at
+    #    step 4') genuinely need the skip path.
+    if skip_reason != SNAPSHOT_SKIP_CLAMP:
+        c.maybe_record_milestone(
+            saved, conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts,
+            journal=(ctx, rec["id"]), account_key=account_key,
+            retained_selection=c.WeekSelection(
+                week_start=dt.date.fromisoformat(week_start_date),
+                week_end=dt.date.fromisoformat(week_end_date),
+                start_iso_override=week_start_at,
+                end_iso_override=week_end_at,
+            ))
     c.maybe_update_five_hour_block(
         saved, conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts,
         account_key=account_key, journal_ctx=ctx)

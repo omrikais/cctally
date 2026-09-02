@@ -18,6 +18,9 @@ import type {
 function quota(over: Partial<ForecastQuotaEnvelope> = {}): ForecastQuotaEnvelope {
   return {
     basis: 'corrected-meter',
+    basis_presentation: {
+      code: 'corrected-meter', short: 'meter', long: 'corrected meter',
+    },
     projection_pct: 88,
     right_censored: false,
     code: null,
@@ -89,10 +92,28 @@ describe('#661 S2 D4 — the basis line', () => {
   });
 
   it('says "model" when the calibrated basis was selected', () => {
-    const { container } = renderWith(quota({ basis: 'calibrated' }));
+    const { container } = renderWith(quota({
+      basis: 'calibrated',
+      basis_presentation: {
+        code: 'calibrated', short: 'model', long: 'calibrated model',
+      },
+    }));
     expect(
       container.querySelector('[data-testid="fc-basis-line"]')?.textContent,
     ).toContain('model');
+  });
+
+  it('uses the server short register instead of a client-owned basis word', () => {
+    const q = quota({ basis: 'calibrated' });
+    Object.assign(q, {
+      basis_presentation: {
+        code: 'calibrated', short: 'server model', long: 'server calibrated model',
+      },
+    });
+    const { container } = renderWith(q);
+    const text = container
+      .querySelector('[data-testid="fc-basis-line"]')?.textContent ?? '';
+    expect(text).toContain('server model');
   });
 
   it('renders the withholding cause in the short register', () => {

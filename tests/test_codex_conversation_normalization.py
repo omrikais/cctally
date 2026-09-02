@@ -205,6 +205,7 @@ def test_codex_conversation_rollups_schema_is_exact():
             ("project_label", "TEXT", 0),
             ("models_json", "TEXT", 0),
             ("title", "TEXT", 0),
+            ("render_revision", "INTEGER", 1),
         ]
         sql = _schema_sql(conn, "codex_conversation_rollups")
         assert "PRIMARY KEY" in sql
@@ -7053,6 +7054,207 @@ def test_outline_reads_under_one_snapshot(tmp_path, monkeypatch):
         conn.close()
 
 
+def test_outline_memo_reuses_revision_and_invalidates_same_shape(tmp_path, monkeypatch):
+    """#682: unchanged Codex outlines reuse; revision-only replay invalidates."""
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    real = q._outline_envelope
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    try:
+        q._codex_outline_memo_clear()
+        monkeypatch.setattr(q, "_outline_envelope", spy)
+        first = q.get_codex_conversation_outline(
+            conn, ck, effective_speed="standard")
+        second = q.get_codex_conversation_outline(
+            conn, ck, effective_speed="standard")
+        assert second == first
+        assert calls == [1]
+
+        conn.execute(
+            "UPDATE codex_conversation_rollups "
+            "SET render_revision=render_revision+1 WHERE conversation_key=?",
+            (ck,),
+        )
+        conn.commit()
+        third = q.get_codex_conversation_outline(
+            conn, ck, effective_speed="standard")
+        assert third == first
+        assert calls == [1, 1]
+        bounded = dict(q.codex_conversation_cache_stats())
+        assert bounded["outlineEntryCount"] == 2
+        assert bounded["outlineEstimatedBytes"] <= bounded["outlineMaxBytes"]
+
+        q._codex_outline_memo_clear()
+        monkeypatch.setattr(q, "_CODEX_OUTLINE_MEMO_MAX_BYTES", 1)
+        uncached = q.get_codex_conversation_outline(
+            conn, ck, effective_speed="standard")
+        assert uncached == first, "the byte cap changes reuse, never the wire"
+        capped = dict(q.codex_conversation_cache_stats())
+        assert capped["outlineEntryCount"] == 0
+        assert capped["outlineFallbackCount"] == 1
+    finally:
+        q._codex_outline_memo_clear()
+        conn.close()
+
+
+def test_outline_memo_separates_independent_databases(tmp_path, monkeypatch):
+    """Equal conversation/revision keys in two stores cannot share an outline."""
+    connections = []
+    for name in ("first", "second"):
+        conn = sqlite3.connect(tmp_path / f"{name}.sqlite")
+        conn.execute(
+            "CREATE TABLE codex_conversation_rollups "
+            "(conversation_key TEXT PRIMARY KEY, render_revision INTEGER NOT NULL)"
+        )
+        conn.execute("CREATE TABLE schema_migrations (name TEXT PRIMARY KEY)")
+        conn.execute(
+            "INSERT INTO schema_migrations VALUES (?)",
+            (q.CODEX_NORMALIZATION_MIGRATION,),
+        )
+        conn.execute(
+            "INSERT INTO codex_conversation_rollups VALUES ('v1.shared', 7)"
+        )
+        conn.commit()
+        connections.append(conn)
+
+    def identity_envelope(conn, _conversation_key, *, effective_speed):
+        path = conn.execute(
+            "SELECT file FROM pragma_database_list WHERE name='main'"
+        ).fetchone()[0]
+        return {"database": pathlib.Path(path).name, "speed": effective_speed}
+
+    monkeypatch.setattr(q, "_outline_envelope", identity_envelope)
+    try:
+        q._codex_outline_memo_clear()
+        first = q.get_codex_conversation_outline(
+            connections[0], "v1.shared", effective_speed="standard")
+        second = q.get_codex_conversation_outline(
+            connections[1], "v1.shared", effective_speed="standard")
+        assert first["database"] == "first.sqlite"
+        assert second["database"] == "second.sqlite"
+    finally:
+        q._codex_outline_memo_clear()
+        for conn in connections:
+            conn.close()
+
+
+def test_outline_memo_misses_on_same_path_database_replacement(tmp_path, monkeypatch):
+    """A new SQLite inode cannot reuse an equal logical outline key."""
+    live_path = tmp_path / "conversation.sqlite"
+
+    def make(path, marker):
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE codex_conversation_rollups "
+            "(conversation_key TEXT PRIMARY KEY, render_revision INTEGER NOT NULL)"
+        )
+        conn.execute("CREATE TABLE schema_migrations (name TEXT PRIMARY KEY)")
+        conn.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO schema_migrations VALUES (?)",
+            (q.CODEX_NORMALIZATION_MIGRATION,),
+        )
+        conn.execute("INSERT INTO codex_conversation_rollups VALUES ('v1.same', 7)")
+        conn.execute("INSERT INTO marker VALUES (?)", (marker,))
+        conn.commit(); conn.close()
+
+    def envelope(conn, _conversation_key, *, effective_speed):
+        return {"marker": conn.execute("SELECT value FROM marker").fetchone()[0]}
+
+    make(live_path, "old")
+    monkeypatch.setattr(q, "_outline_envelope", envelope)
+    q._codex_outline_memo_clear()
+    first_conn = sqlite3.connect(live_path)
+    first = q.get_codex_conversation_outline(
+        first_conn, "v1.same", effective_speed="standard")
+    first_conn.close()
+
+    replacement = tmp_path / "replacement.sqlite"
+    make(replacement, "new")
+    replacement.replace(live_path)
+    second_conn = sqlite3.connect(live_path)
+    try:
+        second = q.get_codex_conversation_outline(
+            second_conn, "v1.same", effective_speed="standard")
+        assert first == {"marker": "old"}
+        assert second == {"marker": "new"}
+    finally:
+        q._codex_outline_memo_clear()
+        second_conn.close()
+
+
+def test_outline_derivation_cache_is_store_qualified(tmp_path, monkeypatch):
+    """Nested event derivations cannot cross stores with colliding positions."""
+    from types import SimpleNamespace
+
+    connections = []
+    for marker in ("first", "second"):
+        conn = sqlite3.connect(tmp_path / f"{marker}.sqlite")
+        conn.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO marker VALUES (?)", (marker,))
+        conn.commit()
+        connections.append(conn)
+
+    row = SimpleNamespace(
+        source_path="same.jsonl", line_offset=1, kind="reasoning",
+        event_type=None, detail_json='{"reasoning": {}}',
+    )
+    monkeypatch.setattr(
+        q, "_outline_event_watermark", lambda _conn, _key, _prefix: (1, 1, 1))
+
+    def payloads(conn, _key, positions=None):
+        marker = conn.execute("SELECT value FROM marker").fetchone()[0]
+        return iter([(("same.jsonl", 1), "event", marker)])
+
+    monkeypatch.setattr(q, "_iter_row_payloads", payloads)
+    monkeypatch.setattr(
+        q.landmarks, "reasoning_heading_texts", lambda payload: (payload,))
+    q.reset_outline_derivation_cache()
+    try:
+        first = q._derive_outline_events(connections[0], "v1.same", [row])
+        second = q._derive_outline_events(connections[1], "v1.same", [row])
+        assert first.headings_by_position[("same.jsonl", 1)] == ("first",)
+        assert second.headings_by_position[("same.jsonl", 1)] == ("second",)
+    finally:
+        q.reset_outline_derivation_cache()
+        for conn in connections:
+            conn.close()
+
+
+def test_outline_memo_invalidates_accounting_mutation(tmp_path, monkeypatch):
+    """Late token finalization must invalidate an otherwise unchanged outline."""
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        q._codex_outline_memo_clear()
+        first = q.get_codex_conversation_outline(
+            conn, ck, effective_speed="standard")
+        before = first["stats"]["tokens"]["input"]
+        cache_path = conn.execute(
+            "SELECT file FROM pragma_database_list WHERE name='cache_db'"
+        ).fetchone()[0]
+        accounting = sqlite3.connect(cache_path)
+        try:
+            accounting.execute(
+                "UPDATE codex_session_entries SET input_tokens=input_tokens+100 "
+                "WHERE id=(SELECT MIN(id) FROM codex_session_entries "
+                "WHERE conversation_key=?)",
+                (ck,),
+            )
+            accounting.commit()
+        finally:
+            accounting.close()
+        second = q.get_codex_conversation_outline(
+            conn, ck, effective_speed="standard")
+        assert second["stats"]["tokens"]["input"] == before + 100
+    finally:
+        q._codex_outline_memo_clear()
+        conn.close()
+
+
 def test_outline_refuses_a_transaction_it_did_not_open(tmp_path, monkeypatch):
     """A foreign transaction is not a snapshot this route may borrow (§4.1).
 
@@ -7922,6 +8124,17 @@ def test_outline_payload_pass_is_watermark_cached_and_extends(tmp_path, monkeypa
         assert extended.errors_by_position == fresh.errors_by_position
         assert extended.headings_by_position == fresh.headings_by_position
         assert extended.patch_files_by_position == fresh.patch_files_by_position
+
+        q.reset_outline_derivation_cache()
+        original_budget = q._OUTLINE_DERIVATION_CACHE_MAX_BYTES
+        monkeypatch.setattr(q, "_OUTLINE_DERIVATION_CACHE_MAX_BYTES", 1)
+        capped_result = q._derive_outline_events(conn, ck, rows)
+        assert capped_result.errors_by_position == fresh.errors_by_position
+        capped_stats = dict(q.codex_conversation_cache_stats())
+        assert capped_stats["derivationEntryCount"] == 0
+        assert capped_stats["derivationFallbackCount"] == 1
+        monkeypatch.setattr(
+            q, "_OUTLINE_DERIVATION_CACHE_MAX_BYTES", original_budget)
 
         # A DELETE lowers the watermark, so the prefix check fails and the pass
         # recomputes rather than serving a verdict for evidence that is gone.

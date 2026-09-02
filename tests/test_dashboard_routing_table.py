@@ -27,6 +27,7 @@ def test_conversation_routes_precede_catch_all():
     for earlier in (
         "_handle_get_conversations",
         "_handle_get_conversation_search",
+        "_handle_get_conversation_outline_transfer",
         "_handle_get_conversation_payload",
         "_handle_get_conversation_media",
         "_handle_get_conversation_outline",
@@ -74,7 +75,7 @@ def test_conversation_perf_wraps_present():
     conversation = [e for e in wrapped
                     if str(e[1][0] if isinstance(e[1], tuple) else e[1])
                     .startswith("/api/conversation")]
-    assert len(conversation) == 12
+    assert len(conversation) == 13
     assert {e[3][0] for e in wrapped} == {"scope", "phase"}
 
 

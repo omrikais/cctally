@@ -636,3 +636,28 @@ def test_sync_codex_cache_runs_the_adoption_pass(ns, monkeypatch, tmp_path):
     _cctally_cache.sync_codex_cache(conn)
     assert calls, "sync_codex_cache never invoked the adoption pass"
     assert "touched" in calls[0]
+    conn.close()
+
+
+def test_post_walk_maintenance_failure_withholds_the_full_walk_sentinel(
+    ns, monkeypatch,
+):
+    """A best-effort rederivation failure is retryable, never certifiable."""
+    import _cctally_cache
+
+    def _fail(*_args, **_kwargs):
+        raise sqlite3.OperationalError("synthetic adoption failure")
+
+    monkeypatch.setattr(
+        _cctally_cache, "apply_codex_window_spend_adoption", _fail)
+    conn = ns["open_cache_db"]()
+    try:
+        stats = _cctally_cache.sync_codex_cache(conn)
+        assert stats.maintenance_failed is True
+        assert stats.full_walk_complete is False
+        assert conn.execute(
+            "SELECT COUNT(*) FROM cache_meta "
+            "WHERE key='dashboard_codex_full_walk_complete'"
+        ).fetchone() == (0,)
+    finally:
+        conn.close()

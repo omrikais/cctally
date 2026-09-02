@@ -1851,6 +1851,11 @@
     },
     "quota": {
       "basis": "withheld",
+      "basis_presentation": {
+        "code": "withheld",
+        "long": "withheld",
+        "short": "withheld"
+      },
       "calibrated_consumption_interval": null,
       "calibrated_consumption_pct": null,
       "calibrated_headroom_pct": null,
@@ -2581,6 +2586,11 @@
             },
             "quota": {
               "basis": "withheld",
+              "basis_presentation": {
+                "code": "withheld",
+                "long": "withheld",
+                "short": "withheld"
+              },
               "calibrated_consumption_interval": null,
               "calibrated_consumption_pct": null,
               "calibrated_headroom_pct": null,
@@ -3489,6 +3499,11 @@
             },
             "quota": {
               "basis": "withheld",
+              "basis_presentation": {
+                "code": "withheld",
+                "long": "withheld",
+                "short": "withheld"
+              },
               "calibrated_consumption_interval": null,
               "calibrated_consumption_pct": null,
               "calibrated_headroom_pct": null,

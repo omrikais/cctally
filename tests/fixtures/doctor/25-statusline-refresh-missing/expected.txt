@@ -68,7 +68,8 @@ Accounts
 Pricing
   ✓ Coverage                 all observed models priced
 Quota
-  ✓ Metering rate            no change detected
+  ✓ Metering rate            not assessed
+      → Run `cctally quota` for the current assessment.
   ✓ Calibration              no calibration fitted yet
 Safety
   ✓ Dashboard bind           config: loopback

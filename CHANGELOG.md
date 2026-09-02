@@ -5,6 +5,44 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.105.0] - 2026-09-02
+
+### Added
+- `cctally` prices Claude Fable 5.1 and Claude Mythos 5.1, including their cache reads at $0.25 per million tokens, so usage on either model is costed instead of contributing nothing with only a warning.
+
+### Changed
+- `cctally quota` counts Claude Fable 5.1 and Claude Mythos 5.1 as part of the Fable 5 and Mythos 5 families, so a week containing that usage no longer has its weekly-quota fit withheld as an unsupported model mix.
+- `cctally quota` refits your stored calibration once after this upgrade, because the set of model names it recognises has changed.
+- `cctally quota` excludes fast-mode requests that Anthropic bills to usage credits, and widens its family-composition support floor to the corrected empirical bound.
+- The dashboard's Forecast basis and `cctally statusline` use one vocabulary; the status line remains a meter-only hot path, while Forecast can name its calibrated model.
+- The dashboard's Conversation viewer opens long histories from a bounded, integrity-checked outline ticket, hydrates the exact account-scoped outline automatically, and skips unchanged transcript estates between updates.
+- `cctally dashboard` compresses and caches content-hashed assets and loads conversations and detail views only when opened, cutting cold JavaScript transfer while warm reloads reuse unchanged code.
+
+### Fixed
+- `cctally dashboard` shares a progressive outline's first-chunk build, cancels abandoned transfers, and rejects an oversized outline before allocating its encoded body.
+- `cctally dashboard` applies failed or over-limit background memory checks as soon as they finish, including while sync is paused, and its soak gate now distinguishes measured growth from noisy flat samples.
+- `cctally dashboard` keeps production-size cache admission checks inside the whole-process memory ceiling without shrinking or evicting the retained caches.
+- `cctally dashboard` stops loading a previous conversation's outline after you switch sessions, so the new reader stays current and avoids duplicate outline requests.
+- Concurrent dashboard Explain requests share identical in-flight work and admit only one diagnosis process tree at a time, so multiple tabs or LAN clients no longer multiply provider workers and transient memory.
+- `cctally dashboard` bounds retained source, snapshot, conversation, ingest, and SSE work; invalidates conversation caches after same-path database replacement; keeps the newest slow-tab update; and releases owners without slowing refreshes.
+- `cctally quota` now records a metering-rate change it detected earlier but could not store at the time, so a busy or rebuilding database no longer costs you that entry in your rate-change history permanently.
+- `cctally quota` delivers a metering-rate change notification that an interrupted write recorded but never announced, and remembers which ones it has announced, so upgrading never replays your whole rate-change history at once.
+- `cctally quota` retries a metering-rate notification that was recorded without an account attribution, including on a run narrowed with `--account`, so an install that later adds a second Claude account no longer loses that announcement.
+- A metering-rate change notification names the account whose rate changed, so two accounts changing rate no longer produce two identical popups. An install with one account, or none, sees exactly the notification it saw before.
+- `cctally explain` and the dashboard's Explain modal build current, baseline and conversation-derived evidence within their documented warm and cold latency budgets without caching a stale report or slowing dashboard updates.
+- `cctally doctor` reports `not assessed` rather than `no change detected` when no quota calibration has been fitted, so a withheld fit no longer reads as a confirmed all-clear about your metering rate.
+- `cctally quota` records the durable metering-rate history whenever its detector confirms a change, even when the fitted budget is withheld because this week's composition sits outside the calibration's support.
+- The metering-rate notification says the calibration was withheld, and names why, instead of promising a fitted budget it cannot supply.
+- `cctally doctor` stops telling you to run `cctally quota` for a fitted budget when the calibration behind the change has none, and names the withholding instead.
+- The dashboard's rate-change toast points at the evidence for a metering-rate change rather than promising a fitted budget.
+- `cctally dashboard` skips both provider file estates on caught-up ticks, falls back to a full pass when hook activity cannot be recorded, and reports the main refresh loop's measured CPU duty.
+- `cctally dashboard` reuses unchanged Codex accounting and account-card populations across quota and one-file updates, shortening active refreshes without changing cadence or freshness.
+- `cctally quota` withholds malformed retained timestamps without a traceback, filters offset-bearing credit times by their instant, and emits every JSON timestamp with a trailing `Z`.
+- Historical forecast replays ignore mid-week reset events until their recorded detection instant, so a future event can no longer erase the samples that were available at the replayed time.
+- Weekly projected-pace alerts use the same model-backed value as `cctally forecast` when a quota calibration applies, instead of silently stopping for calibrated users.
+- The dashboard's Forecast modal keeps an extreme projection label inside the card instead of clipping it at the 110% track edge.
+- `cctally record-usage` no longer fabricates a percent milestone from a stale pre-credit reading after Anthropic zeroes your weekly counter, so a fresh week's milestone ladder no longer opens at a percentage you never reached.
+
 ## [1.104.0] - 2026-08-29
 
 ### Added

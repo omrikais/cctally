@@ -25,6 +25,14 @@ def _boot(ns, tmp_path, monkeypatch, *, token=None):
     H.hub = ns["SSEHub"]()
     H.sync_lock = threading.Lock()
     H.run_sync_now = staticmethod(lambda: None)
+    H.ingest_frontier_stats = staticmethod(lambda: {
+        "estimatedBytes": 64,
+        "maxBytes": 1024,
+        "entryCount": 2,
+        "maxEntries": 2,
+        "evictionCount": 0,
+        "fallbackCount": 0,
+    })
     H.static_dir = ns["STATIC_DIR"]
     H.cctally_host = "127.0.0.1"
     H.cctally_expose_transcripts = False
@@ -149,18 +157,70 @@ def test_the_report_names_the_ingest_and_builder_halves_and_the_mix():
     }
     text = dp.render_dashboard_perf(payload)
     assert "ingest" in text and "builder" in text
-    # The all-ticks row is the flagship figure and must carry a figure
-    # whatever the regime partition does with the same records.
     all_ticks = [line for line in text.splitlines() if "all ticks" in line]
     assert len(all_ticks) == 1, text
-    assert "no samples yet" not in all_ticks[0], (
-        f"the all-ticks period was withheld despite a qualifying record: "
-        f"{all_ticks[0]!r}")
+    assert "no samples yet" not in all_ticks[0]
     assert "median" in all_ticks[0]
     assert "full" in text and "idle" in text and "degraded" in text
     assert "daily" in text and "1" in text
-    assert "next_authoritative_build" in text, "the pending arm must be visible"
+    assert "next_authoritative_build" in text
     ts.reset_for_tests()
+
+
+def test_the_report_names_main_tick_cpu_duty_over_the_same_periods():
+    load_script()
+    import _cctally_dashboard_perf as dp
+
+    payload = {
+        "tick": {
+            "dispatch_counts": {"idle": 2, "full": 0, "degraded": 0},
+            "cache_open_failures": {},
+            "tick_seq": 2,
+            "records": [
+                {"seq": 1, "duration_ns": 1_000_000_000,
+                 "cpu_ns": 500_000_000, "period_ns": None,
+                 "ingest_ran": True, "ingest_ns": 1, "builder_ns": 1,
+                 "dispatch": "idle", "codex_regime": "not_observed"},
+                {"seq": 2, "duration_ns": 1_000_000_000,
+                 "cpu_ns": 1_000_000_000, "period_ns": 4_000_000_000,
+                 "ingest_ran": True, "ingest_ns": 1, "builder_ns": 1,
+                 "dispatch": "idle", "codex_regime": "not_observed"},
+            ],
+            "standalone": None,
+            "conversation_sync": [
+                {"seq": 1, "duration_ns": 1, "cpu_ns": 1,
+                 "period_ns": None, "status": "ok"},
+                {"seq": 2, "duration_ns": 1, "cpu_ns": 500_000_000,
+                 "period_ns": 4_000_000_000, "status": "ok"},
+            ],
+        },
+        "tracing": {}, "phases": None, "generated_at": None,
+    }
+    text = dp.render_dashboard_perf(payload)
+    assert "cpu duty" in text
+    assert "25.0% of one core" in text
+    assert "Combined background work" in text
+    assert "37.5% of one core" in text
+    assert "ceiling 75.0%" in text
+
+
+def test_report_names_the_retained_ingest_tree_separately():
+    load_script()
+    import _cctally_dashboard_perf as dp
+
+    payload = {
+        "tick": {"dispatch_counts": {"idle": 1, "full": 0, "degraded": 0},
+                 "cache_open_failures": {}, "tick_seq": 1, "records": [],
+                 "standalone": None, "conversation_sync": []},
+        "tracing": {"requested": True, "applied": True, "applies_at": "none"},
+        "phases": {"name": "snapshot", "elapsed_ms": 10.0},
+        "generated_at": "2026-08-30T00:00:01+00:00",
+        "ingest_phases": {"name": "ingest", "elapsed_ms": 2.5},
+        "ingest_generated_at": "2026-08-30T00:00:00+00:00",
+    }
+    text = dp.render_dashboard_perf(payload)
+    assert "ingest tree 2.5ms" in text
+    assert "2026-08-30T00:00:00+00:00" in text
 
 
 # ── argument validation (exit 2) ────────────────────────────────────────────
@@ -244,6 +304,15 @@ def test_json_mode_stamps_the_envelope_and_passes_the_payload_through(
         # `diagnostic` is the server payload verbatim and explicitly opaque.
         assert payload["diagnostic"]["tick"]["tick_seq"] >= 0
         assert "tracing" in payload["diagnostic"]
+        memory = payload["diagnostic"]["memory"]
+        assert memory["ownerEstimatedBytes"] <= memory["ownerCeilingBytes"]
+        assert memory["processCeilingBytes"] == 1536 * 1024 * 1024
+        assert {
+            "codexSourceAccelerators", "snapshotAccelerators",
+            "claudeAssembly", "codexOutline",
+            "codexOutlineDerivation", "outlineTransfers", "sseDelivery",
+            "mainIngestFrontier",
+        } <= set(memory["owners"])
     finally:
         stop(srv, srv._test_thread)
 
@@ -364,10 +433,13 @@ def _conversation_payload(rows):
     }
 
 
-def _pass(seq, *, cpu_ns, period_ns, duration_ns, status="ok"):
+def _pass(seq, *, cpu_ns, period_ns, duration_ns, status="ok",
+          claude_mode=None, codex_mode=None, claude_files=0, codex_files=0):
     return {"seq": seq, "started_ns": 0, "ended_ns": duration_ns,
             "duration_ns": duration_ns, "cpu_ns": cpu_ns,
-            "period_ns": period_ns, "status": status}
+            "period_ns": period_ns, "status": status,
+            "claude_mode": claude_mode, "codex_mode": codex_mode,
+            "claude_files": claude_files, "codex_files": codex_files}
 
 
 class _VirtualClock:
@@ -610,13 +682,16 @@ def test_the_conversation_section_reports_wall_cpu_period_and_status():
         _pass(1, cpu_ns=1_000_000_000, period_ns=None,
               duration_ns=2_000_000_000),
         _pass(2, cpu_ns=1_000_000_000, period_ns=4_000_000_000,
-              duration_ns=2_000_000_000, status="store_unavailable"),
+              duration_ns=2_000_000_000, status="store_unavailable",
+              claude_mode="targeted", codex_mode="caught_up",
+              claude_files=2),
     ]
     out = "\n".join(dp._render_conversation_sync({"conversation_sync": rows}))
     assert "Conversation sync loop" in out
     assert "wall" in out and "thread cpu" in out
     assert "period" in out
     assert "store_unavailable 1" in out and "ok 1" in out
+    assert "targeted 1" in out and "caught_up 1" in out and "files 2" in out
 
 
 def test_the_conversation_section_appears_in_the_whole_report():

@@ -450,6 +450,34 @@ def test_x3_maps_physical_offsets_to_turns_over_prefetched_events(seam_store):
     assert folded == EXPECTED_CODEX_TURN_MAP
 
 
+def test_diagnosis_maps_only_target_offsets_without_loading_token_payloads(
+        seam_store):
+    """Diagnosis needs turns only for accounting offsets, not a second copy
+    of every retained token event and its JSON body.
+
+    The target-only fold must remain byte-for-byte equivalent to the canonical
+    full-event inference, including the resumed-segment late-anchor backfill.
+    """
+    codex_query = _codex_query()
+    kernel = _codex_kernel()
+    sources = importlib.import_module("_cctally_diagnosis_sources")
+    conn = _conv_conn(seam_store)
+    try:
+        events = codex_query._codex_file_events(conn, CODEX_PATH)
+    finally:
+        conn.close()
+    expected = kernel.fold_codex_event_turns(events)
+    targets = tuple(sorted(expected))
+    anchors = [
+        event for event in events
+        if (event.record_type in ("session_meta", "turn_context")
+            or event.turn_id is not None)
+    ]
+    assert sources._fold_codex_target_turns(anchors, targets) == {
+        offset: expected[offset] for offset in targets
+    }
+
+
 def test_x3_backfills_only_the_unanchored_prefix_since_the_last_session_meta(
         seam_store):
     """A resumed segment can expose its first native proof on a later

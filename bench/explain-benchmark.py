@@ -19,17 +19,52 @@ Run through the remote wrapper, never on the development machine:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import copy
+import hashlib
+import http.client
 import json
 import os
 import pathlib
+import re
+import selectors
 import statistics
 import subprocess
 import sys
+import threading
 import time
+import urllib.parse
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 BIN = REPO / "bin" / "cctally"
 BUILDER = REPO / "bin" / "build-bench-fixtures.py"
+
+CLAUDE_MEDIAN_BUDGET_SECONDS = 1.0
+CLAUDE_P95_BUDGET_SECONDS = 2.0
+ALL_MEDIAN_BUDGET_SECONDS = 2.0
+ALL_P95_BUDGET_SECONDS = 4.0
+# A fresh dashboard process's first on-demand All-provider request. Startup is
+# outside the span: the clock starts after the server has bound and ends after
+# the complete JSON body arrives. This is the user-facing cold-route ceiling.
+COLD_DASHBOARD_CEILING_SECONDS = 3.0
+# Aggregate resident bytes across the CLI parent and its isolated Codex child.
+PEAK_RSS_CEILING_BYTES = 2 * 1024 * 1024 * 1024
+# Four simultaneous tabs/clients exercise the process-wide route admission.
+# One All-provider build uses at most a resource tracker, a forkserver and the
+# isolated Codex provider worker.  The concurrent aggregate may carry four
+# response encodings, so allow 256 MiB above a separately measured one-request
+# DASHBOARD process tree while retaining the existing absolute 2 GiB ceiling.
+# The CLI uses a direct fork on platforms that support it; comparing the
+# dashboard's forkserver/spawn tree to that different process shape is invalid.
+CONCURRENT_DASHBOARD_REQUESTS = 4
+CONCURRENT_DESCENDANT_PROCESS_CEILING = 3
+CONCURRENT_RSS_OVER_SINGLE_ALLOWANCE_BYTES = 256 * 1024 * 1024
+# Two complete provider reports (current + baseline), including all seven
+# classes, execute 81 adapter statements on the over-cap adversarial corpus.
+# The fixed 96 ceiling leaves bounded schema-evolution headroom while the
+# dedicated width tests continue to prove the count does not scale with
+# sessions, threads or source files.
+ADVERSARIAL_QUERY_BUDGET = 96
 
 
 def _build_corpus(scale: str, seed: int, root: pathlib.Path) -> pathlib.Path:
@@ -139,8 +174,35 @@ def _provider_populations(argv: list[str], env: dict[str, str]) -> dict:
             "denominatorUsd": usd["value"],
             "denominatorCode": usd.get("code"),
             "supportUnits": coverage.get("supportUnits"),
+            "baselineSupportUnits": max([
+                int(row.get("baseline", {}).get("population", {}).get(
+                    "supportUnits") or 0)
+                for class_result in result.get("classes", [])
+                for row in class_result.get("rows", [])
+            ] or [0]),
+            "baselineAvailableRows": sum(
+                row.get("baseline", {}).get("state") == "available"
+                for class_result in result.get("classes", [])
+                for row in class_result.get("rows", [])
+            ),
+            "withheldFieldCount": _count_state(result, "withheld"),
         }
     return out
+
+
+def _count_state(value, state: str) -> int:
+    if isinstance(value, dict):
+        return (int(value.get("state") == state)
+                + sum(_count_state(item, state) for item in value.values()))
+    if isinstance(value, list):
+        return sum(_count_state(item, state) for item in value)
+    return 0
+
+
+def _count_withheld_classes(result: dict) -> int:
+    return sum(
+        class_result.get("verdict") == "withheld"
+        for class_result in result.get("classes", []))
 
 
 def _conversation_populations(data_dir: pathlib.Path) -> dict[str, int]:
@@ -166,17 +228,296 @@ def _conversation_populations(data_dir: pathlib.Path) -> dict[str, int]:
         conn.close()
 
 
-def _profile_phases(data_dir: pathlib.Path, root: pathlib.Path,
-                    window: str, runs: int) -> dict[str, float]:
-    """Time the diagnosis's own phases in-process, without the CLI startup.
+def _identity_populations(data_dir: pathlib.Path) -> dict[str, int]:
+    """Account, attribution and hard-history discriminators for the receipt."""
+    import sqlite3
 
-    The subprocess timings above are dominated by interpreter start and the
-    eager module loading every subcommand pays. This measures what the
-    diagnosis itself spends, split by the store it spends it on and by the
-    per-class shaping, so "which class dominates" is answered by measurement
-    rather than by reading the source.
-    """
+    conversations = data_dir / "conversations.db"
+    cache = data_dir / "cache.db"
+    conn = sqlite3.connect(f"file:{conversations}?mode=ro", uri=True)
+    try:
+        conn.execute("ATTACH DATABASE ? AS cache_db", (f"file:{cache}?mode=ro",))
+        one = lambda sql: int(conn.execute(sql).fetchone()[0])
+        return {
+            "claudeMetaMessages": one(
+                "SELECT COUNT(*) FROM conversation_messages "
+                "WHERE entry_type='meta'"),
+            "claudeToolResultMessages": one(
+                "SELECT COUNT(*) FROM conversation_messages "
+                "WHERE entry_type='tool_result'"),
+            "claudeUnattributedEntries": one(
+                "SELECT COUNT(*) FROM cache_db.session_entries "
+                "WHERE account_key IS NULL OR account_key='unattributed'"),
+            "codexRealAccounts": one(
+                "SELECT COUNT(DISTINCT account_key) "
+                "FROM cache_db.codex_session_entries "
+                "WHERE account_key IS NOT NULL AND account_key!='unattributed'"),
+            "codexUnattributedEntries": one(
+                "SELECT COUNT(*) FROM cache_db.codex_session_entries "
+                "WHERE account_key IS NULL OR account_key='unattributed'"),
+            "codexSubagentThreads": one(
+                "SELECT COUNT(*) FROM cache_db.codex_conversation_threads "
+                "WHERE root_thread_id='subagent'"),
+        }
+    finally:
+        conn.close()
+
+
+def _canonical_projection(payload: dict) -> dict:
+    """The public serializer's documented parity projection."""
+    projected = copy.deepcopy(payload)
+    projected.pop("measuredAt", None)
+    projected.pop("notes", None)
+    if isinstance(projected.get("window"), dict):
+        projected["window"].pop("label", None)
+    for result in projected.get("results", []):
+        for row in result.get("contributors", []):
+            row.pop("subjectLabel", None)
+        for class_result in result.get("classes", []):
+            for row in class_result.get("rows", []):
+                row.pop("subjectLabel", None)
+    return projected
+
+
+def _json_run(argv: list[str], env: dict[str, str]) -> dict:
+    completed = subprocess.run(
+        [sys.executable, str(BIN), *argv], capture_output=True, text=True,
+        env=env,
+    )
+    if completed.returncode != 0:
+        raise SystemExit(
+            f"JSON comparison command exited {completed.returncode}:\n"
+            f"{completed.stderr}")
+    return json.loads(completed.stdout)
+
+
+def _cold_dashboard_rounds(env: dict[str, str], window: str, rounds: int,
+                           cli_payload: dict) -> dict:
+    """First diagnosis request from fresh dashboard processes."""
+    samples: list[float] = []
+    statuses: list[int] = []
+    parity: list[bool] = []
+    query = urllib.parse.urlencode({"source": "all", "window": window})
+    for _ in range(max(1, rounds)):
+        proc = subprocess.Popen(
+            [sys.executable, str(BIN), "dashboard", "--port", "0",
+             "--host", "127.0.0.1", "--no-browser", "--no-sync",
+             "--tz", "Etc/UTC"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            bufsize=1, env=env,
+        )
+        selector = selectors.DefaultSelector()
+        assert proc.stdout is not None
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        port = None
+        deadline = time.monotonic() + 120.0
+        startup_lines = []
+        try:
+            while port is None and time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    break
+                for key, _mask in selector.select(timeout=0.2):
+                    line = key.fileobj.readline()
+                    if not line:
+                        continue
+                    startup_lines.append(line.rstrip())
+                    match = re.search(r"localhost:(\d+)", line)
+                    if match:
+                        port = int(match.group(1))
+                        break
+            if port is None:
+                stderr = proc.stderr.read() if proc.stderr is not None else ""
+                raise SystemExit(
+                    "dashboard did not bind for cold-route measurement: "
+                    f"stdout={startup_lines!r} stderr={stderr}")
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+            try:
+                started = time.perf_counter()
+                conn.request("GET", f"/api/diagnosis?{query}")
+                response = conn.getresponse()
+                body = response.read()
+                samples.append(time.perf_counter() - started)
+                statuses.append(response.status)
+                payload = json.loads(body)
+                parity.append(
+                    _canonical_projection(payload)
+                    == _canonical_projection(cli_payload))
+            finally:
+                conn.close()
+        finally:
+            selector.close()
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+    return {
+        "ceilingSeconds": COLD_DASHBOARD_CEILING_SECONDS,
+        "roundSeconds": [round(value, 4) for value in samples],
+        "medianSeconds": round(statistics.median(samples), 4),
+        "p95Seconds": round(_percentile(samples, 0.95), 4),
+        "statuses": statuses,
+        "canonicalParity": all(parity),
+    }
+
+
+def _peak_rss_run(argv: list[str], env: dict[str, str]) -> int:
+    """Sample aggregate RSS for the command's whole live process tree."""
+    proc = subprocess.Popen(
+        [sys.executable, str(BIN), *argv], stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, env=env,
+    )
+    peak_bytes = 0
+    while proc.poll() is None:
+        rss_bytes, _descendants = _process_tree_sample(proc.pid)
+        peak_bytes = max(peak_bytes, rss_bytes)
+        time.sleep(0.02)
+    stdout, stderr = proc.communicate()
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"RSS command exited {proc.returncode}:\n{stderr}\n{stdout}")
+    return peak_bytes
+
+
+def _process_tree_sample(root_pid: int) -> tuple[int, int]:
+    """Aggregate RSS bytes and descendant count for one live process tree."""
+    snapshot = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,rss="], capture_output=True,
+        text=True, check=True,
+    ).stdout
+    children: dict[int, list[int]] = {}
+    rss: dict[int, int] = {}
+    for line in snapshot.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        pid, ppid, kib = map(int, parts)
+        children.setdefault(ppid, []).append(pid)
+        rss[pid] = kib
+    pending = [root_pid]
+    tree: set[int] = set()
+    while pending:
+        pid = pending.pop()
+        if pid in tree:
+            continue
+        tree.add(pid)
+        pending.extend(children.get(pid, ()))
+    return sum(rss.get(pid, 0) for pid in tree) * 1024, max(0, len(tree) - 1)
+
+
+def _concurrent_dashboard_round(
+    env: dict[str, str], window: str, cli_payload: dict,
+    request_count: int = CONCURRENT_DASHBOARD_REQUESTS,
+) -> dict:
+    """Issue identical simultaneous route requests and bound their process tree."""
+    proc = subprocess.Popen(
+        [sys.executable, str(BIN), "dashboard", "--port", "0",
+         "--host", "127.0.0.1", "--no-browser", "--no-sync",
+         "--tz", "Etc/UTC"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        bufsize=1, env=env,
+    )
+    selector = selectors.DefaultSelector()
+    assert proc.stdout is not None
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    port = None
+    deadline = time.monotonic() + 120.0
+    startup_lines = []
+    try:
+        while port is None and time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            for key, _mask in selector.select(timeout=0.2):
+                line = key.fileobj.readline()
+                if not line:
+                    continue
+                startup_lines.append(line.rstrip())
+                match = re.search(r"localhost:(\d+)", line)
+                if match:
+                    port = int(match.group(1))
+                    break
+        if port is None:
+            stderr = proc.stderr.read() if proc.stderr is not None else ""
+            raise SystemExit(
+                "dashboard did not bind for concurrent-route measurement: "
+                f"stdout={startup_lines!r} stderr={stderr}")
+
+        query = urllib.parse.urlencode({"source": "all", "window": window})
+        gate = threading.Barrier(request_count + 1)
+
+        def _request():
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+            try:
+                gate.wait(timeout=10)
+                started = time.perf_counter()
+                conn.request("GET", f"/api/diagnosis?{query}")
+                response = conn.getresponse()
+                body = response.read()
+                return response.status, body, time.perf_counter() - started
+            finally:
+                conn.close()
+
+        peak_rss = 0
+        peak_descendants = 0
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=request_count) as executor:
+            futures = [executor.submit(_request) for _ in range(request_count)]
+            gate.wait(timeout=10)
+            while not all(future.done() for future in futures):
+                rss_bytes, descendants = _process_tree_sample(proc.pid)
+                peak_rss = max(peak_rss, rss_bytes)
+                peak_descendants = max(peak_descendants, descendants)
+                time.sleep(0.01)
+            results = [future.result() for future in futures]
+            rss_bytes, descendants = _process_tree_sample(proc.pid)
+            peak_rss = max(peak_rss, rss_bytes)
+            peak_descendants = max(peak_descendants, descendants)
+
+        statuses = [status for status, _body, _elapsed in results]
+        bodies = [body for _status, body, _elapsed in results]
+        parity = []
+        for body in bodies:
+            try:
+                payload = json.loads(body)
+            except (TypeError, ValueError):
+                parity.append(False)
+            else:
+                parity.append(
+                    _canonical_projection(payload)
+                    == _canonical_projection(cli_payload)
+                )
+        return {
+            "requestCount": request_count,
+            "statuses": statuses,
+            "elapsedSeconds": [
+                round(elapsed, 4) for _status, _body, elapsed in results
+            ],
+            "uniqueBodyHashes": len({
+                hashlib.sha256(body).hexdigest() for body in bodies
+            }),
+            "canonicalParity": all(parity),
+            "peakDescendantProcesses": peak_descendants,
+            "descendantProcessCeiling": CONCURRENT_DESCENDANT_PROCESS_CEILING,
+            "peakRssBytes": peak_rss,
+        }
+    finally:
+        selector.close()
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+
+
+def _profile_phases(data_dir: pathlib.Path, root: pathlib.Path,
+                    window: str, runs: int) -> dict[str, dict[str, float]]:
+    """Nested provider phases, outside the CLI's fixed startup cost."""
     import datetime as dt
+    import collections
     import types
 
     os.environ["CCTALLY_DATA_DIR"] = str(data_dir)
@@ -192,42 +533,163 @@ def _profile_phases(data_dir: pathlib.Path, root: pathlib.Path,
     import _cctally_core
     _cctally_core._init_paths_from_env()
     sources = module._load_sibling("_cctally_diagnosis_sources")
+    diagnosis = module._load_sibling("_cctally_diagnosis")
     kernel = sys.modules["_lib_diagnosis"]
 
     start_date, end_date = window.split("..")
+    low = dt.datetime.fromisoformat(start_date).replace(tzinfo=dt.timezone.utc)
+    high = (dt.datetime.fromisoformat(end_date).replace(
+        tzinfo=dt.timezone.utc) + dt.timedelta(days=1))
+    profiles = {}
+    for provider in ("claude", "codex"):
+        scope = sources.DiagnosisScope(
+            source=provider, account_key=None, window_start=low,
+            window_end=high, display_tz="UTC",
+        )
+        samples: dict[str, list[float]] = collections.defaultdict(list)
+        for _ in range(runs):
+            elapsed: dict[str, float] = collections.defaultdict(float)
+            real_open = sources.open_read_only
+            real_probe = sources._probe_component
+            real_read = sources._read_component
+            real_class = sources.load_class_facts
+
+            def _open(kind):
+                marker = time.perf_counter()
+                try:
+                    return real_open(kind)
+                finally:
+                    elapsed[f"storeOpen.{kind}"] += (
+                        time.perf_counter() - marker)
+
+            def _probe(component, bundle):
+                marker = time.perf_counter()
+                try:
+                    return real_probe(component, bundle)
+                finally:
+                    elapsed["generationProbes"] += (
+                        time.perf_counter() - marker)
+
+            def _read(component, read_scope, bundle):
+                half = ("current" if read_scope.window_start == scope.window_start
+                        else "baseline")
+                marker = time.perf_counter()
+                try:
+                    return real_read(component, read_scope, bundle)
+                finally:
+                    spent = time.perf_counter() - marker
+                    elapsed[f"{half}Evidence"] += spent
+                    elapsed[f"{half}Components.{component}"] += spent
+
+            def _class(bundle, read_scope, spec):
+                marker = time.perf_counter()
+                try:
+                    return real_class(bundle, read_scope, spec)
+                finally:
+                    spent = time.perf_counter() - marker
+                    elapsed["classShaping"] += spent
+                    elapsed[f"classes.{spec.kind}"] += spent
+
+            sources.open_read_only = _open
+            sources._probe_component = _probe
+            sources._read_component = _read
+            sources.load_class_facts = _class
+            marker = time.perf_counter()
+            try:
+                provider_result = sources.build_provider_diagnosis(
+                    scope, transcripts_visible=True)
+            finally:
+                elapsed["requestTotal"] = time.perf_counter() - marker
+                sources.open_read_only = real_open
+                sources._probe_component = real_probe
+                sources._read_component = real_read
+                sources.load_class_facts = real_class
+
+            report = kernel.build_report(
+                sources._iso_z(scope.window_end), scope.window(),
+                [provider_result])
+            marker = time.perf_counter()
+            diagnosis.diagnosis_to_wire(
+                report, scopes={
+                    provider: diagnosis._scope_for(
+                        sources, scope, provider)})
+            elapsed["serialization"] = time.perf_counter() - marker
+            accounted = sum(elapsed[name] for name in (
+                "generationProbes", "currentEvidence", "baselineEvidence",
+                "classShaping"))
+            elapsed["requestOverhead"] = max(
+                0.0, elapsed["requestTotal"] - accounted)
+            for name, value in elapsed.items():
+                samples[name].append(value)
+
+        profiles[provider] = {
+            name: round(statistics.median(values), 4)
+            for name, values in sorted(samples.items())
+        }
+    return profiles
+
+
+def _withheld_probe(data_dir: pathlib.Path, root: pathlib.Path,
+                    window: str) -> dict[str, dict[str, int]]:
+    """Privacy-denied applicability and typed empty-scope withholding."""
+    import datetime as dt
+
+    os.environ["CCTALLY_DATA_DIR"] = str(data_dir)
+    os.environ["CLAUDE_CONFIG_DIR"] = str(root / "claude")
+    os.environ["CCTALLY_DISABLE_DEV_AUTODETECT"] = "1"
+    os.environ["HOME"] = str(root / "home")
+    module = sys.modules.get("cctally")
+    if module is None or not hasattr(module, "_load_sibling"):
+        import types
+        module = types.ModuleType("cctally")
+        module.__file__ = str(BIN)
+        sys.modules["cctally"] = module
+        exec(compile(BIN.read_text(), str(BIN), "exec"), module.__dict__)
+    import _cctally_core
+    _cctally_core._init_paths_from_env()
+    sources = module._load_sibling("_cctally_diagnosis_sources")
+    diagnosis = module._load_sibling("_cctally_diagnosis")
+    start_date, end_date = window.split("..")
     scope = sources.DiagnosisScope(
-        source="claude", account_key=None,
+        source="all", account_key=None,
         window_start=dt.datetime.fromisoformat(start_date).replace(
             tzinfo=dt.timezone.utc),
         window_end=(dt.datetime.fromisoformat(end_date).replace(
             tzinfo=dt.timezone.utc) + dt.timedelta(days=1)),
         display_tz="UTC",
     )
-
-    phases: dict[str, list[float]] = {"generation": [], "classes": [],
-                                      "wire": []}
-    for _ in range(runs):
-        bundle = sources.StoreBundle(
-            scope, kernel.resolve_policy_plan(
-                scope.source, transcripts_visible=True))
-        try:
-            marker = time.perf_counter()
-            sources._establish(scope, bundle)
-            phases["generation"].append(time.perf_counter() - marker)
-            marker = time.perf_counter()
-            for spec in kernel.CONTRIBUTOR_REGISTRY:
-                sources.load_class_facts(bundle, scope, spec)
-            phases["classes"].append(time.perf_counter() - marker)
-        finally:
-            bundle.close()
-        marker = time.perf_counter()
-        report = sources.build_diagnosis(scope, measured_at=scope.window_end,
-                                         transcripts_visible=True)
-        module.diagnosis_to_wire(report)
-        phases["wire"].append(time.perf_counter() - marker)
-
-    return {name: round(statistics.median(values), 4)
-            for name, values in phases.items()}
+    privacy_report = sources.build_diagnosis(
+        scope, measured_at=scope.window_end, transcripts_visible=False)
+    scopes = {
+        result.source: diagnosis._scope_for(sources, scope, result.source)
+        for result in privacy_report.results
+    }
+    privacy_payload = diagnosis.diagnosis_to_wire(
+        privacy_report, scopes=scopes)
+    empty_scope = sources.DiagnosisScope(
+        source="all", account_key="benchmark-empty-account",
+        window_start=scope.window_start, window_end=scope.window_end,
+        display_tz="UTC",
+    )
+    empty_report = sources.build_diagnosis(
+        empty_scope, measured_at=scope.window_end, transcripts_visible=True)
+    empty_scopes = {
+        result.source: diagnosis._scope_for(
+            sources, empty_scope, result.source)
+        for result in empty_report.results
+    }
+    empty_payload = diagnosis.diagnosis_to_wire(
+        empty_report, scopes=empty_scopes)
+    return {
+        "privacyWithheldClasses": {
+            result["source"]: _count_withheld_classes(result)
+            for result in privacy_payload["results"]
+        },
+        "emptyAccountWithheldClasses": {
+            result["source"]: _count_withheld_classes(result)
+            for result in empty_payload["results"]
+        },
+    }
 
 
 # --- the three budget bounds (#620 S3 §6.8, C15) ------------------------
@@ -296,6 +758,12 @@ def _seed_adversarial(module, kernel) -> None:
             " VALUES (?,?,?,?,?,?,?)",
             ("/bench/long.jsonl", 0, 0, 0, "2026-08-10T00:00:00Z",
              "sess-long", "/repo/bench"))
+        cache.execute(
+            "INSERT OR IGNORE INTO session_files (path, size_bytes, mtime_ns,"
+            " last_byte_offset, last_ingested_at, session_id, project_path)"
+            " VALUES (?,?,?,?,?,?,?)",
+            ("/bench/normalize.jsonl", 0, 0, 0,
+             "2026-08-10T00:00:00Z", "sess-normalize", "/repo/bench"))
         cache.executemany(
             "INSERT INTO session_entries (source_path, line_offset,"
             " timestamp_utc, model, input_tokens, output_tokens,"
@@ -306,6 +774,20 @@ def _seed_adversarial(module, kernel) -> None:
               "claude-opus-4-20250514", 1000, 500, 40_000, 100, 0,
               "unattributed", f"msg-w{index}", f"req-w{index}")
              for index in range(30)])
+        # The normalize-over-cap conversation is a spending candidate. The
+        # optimized reader derives its candidate session set from the already
+        # established accounting population, so a transcript-only session is
+        # intentionally irrelevant to a cost diagnosis and would make this
+        # adversarial leg vacuous.
+        cache.execute(
+            "INSERT INTO session_entries (source_path, line_offset,"
+            " timestamp_utc, model, input_tokens, output_tokens,"
+            " cache_create_tokens, cache_read_tokens, cache_create_1h_tokens,"
+            " account_key, msg_id, req_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("/bench/normalize.jsonl", 1,
+             (start + dt.timedelta(hours=2)).isoformat(),
+             "claude-opus-4-20250514", 1000, 500, 100, 100, 0,
+             "unattributed", "norm-msg", "norm-req"))
         # The Codex half: in-window spend on one conversation whose source file
         # carries the long pre-window event history seeded below.
         cache.execute(
@@ -422,6 +904,7 @@ def _run_bounds(root: pathlib.Path) -> dict:
     # through, so the counts describe what the store actually returned rather
     # than what the source is believed to ask for.
     observed: dict[str, int] = {}
+    query_count = 0
     # The ALLOCATED share per session, captured from the allocator itself. The
     # seed budget is split across the sessions in the window, so "the seed scan
     # never parses beyond its allocated share" is a claim about that share and
@@ -444,6 +927,8 @@ def _run_bounds(root: pathlib.Path) -> dict:
     real_execute = sources._execute
 
     def _counting(conn, sql, params=()):
+        nonlocal query_count
+        query_count += 1
         rows = real_execute(conn, sql, params)
         # Counted PER SUBJECT, because that is the bound the design states:
         # every budget is allocated per session, per conversation or per source
@@ -453,7 +938,6 @@ def _run_bounds(root: pathlib.Path) -> dict:
         for label, template, key in (
             ("seed_scan", sources._CLAUDE_SEED_PREFIX_SQL, "session_id"),
             ("normalize", sources._CLAUDE_TURN_CANDIDATE_SQL, "session_id"),
-            ("codex_events", sources._CODEX_EVENTS_SQL, "source_path"),
         ):
             head = template.split("{placeholders}")[0]
             if sql.startswith(head):
@@ -462,6 +946,12 @@ def _run_bounds(root: pathlib.Path) -> dict:
                     per_subject[row[key]] = per_subject.get(row[key], 0) + 1
                 observed[label] = max(
                     [observed.get(label, 0), *per_subject.values()])
+        if sql.startswith(sources._CODEX_EVENT_BUDGET_TERM_SQL):
+            # One compound statement carries a bounded arm per physical file;
+            # every returned count is capped at allocated-share + 1.
+            observed["codex_events"] = max(
+                [observed.get("codex_events", 0),
+                 *(int(row["rows_read"]) for row in rows)])
         return rows
 
     sources._execute = _counting
@@ -490,6 +980,8 @@ def _run_bounds(root: pathlib.Path) -> dict:
     # exhausted without a second query per subject.
     seed_share = max(allocations.values(), default=0)
     bounds = {
+        "adapterQueries": query_count,
+        "adapterQueryBudget": ADVERSARIAL_QUERY_BUDGET,
         "seedSessions": len(allocations),
         "seedScanAllocatedShare": seed_share,
         "seedScanRowsParsed": observed.get("seed_scan", 0),
@@ -511,6 +1003,10 @@ def _run_bounds(root: pathlib.Path) -> dict:
         elif bounds[measured] > bounds[budget]:
             problems.append(f"{measured} {bounds[measured]} exceeds "
                             f"{bounds[budget]}")
+    if query_count > ADVERSARIAL_QUERY_BUDGET:
+        problems.append(
+            f"adapterQueries {query_count} exceeds "
+            f"{ADVERSARIAL_QUERY_BUDGET}")
 
     # And the verdict each case must render. A bound that held while the
     # subject was silently classified short or long would be worse than one
@@ -536,6 +1032,93 @@ def _percentile(values: list[float], fraction: float) -> float:
     return ordered[min(rank, len(ordered)) - 1]
 
 
+def _performance_problems(report: dict) -> list[str]:
+    """Fail-closed acceptance predicates for the published receipt."""
+    problems = []
+    budgets = {
+        "claude": (CLAUDE_MEDIAN_BUDGET_SECONDS,
+                   CLAUDE_P95_BUDGET_SECONDS),
+        "all": (ALL_MEDIAN_BUDGET_SECONDS, ALL_P95_BUDGET_SECONDS),
+    }
+    for case_name, (median_budget, p95_budget) in budgets.items():
+        case = report["cases"][case_name]
+        if case["medianSeconds"] > median_budget:
+            problems.append(
+                f"{case_name} median {case['medianSeconds']}s exceeds "
+                f"{median_budget}s")
+        if case["p95Seconds"] > p95_budget:
+            problems.append(
+                f"{case_name} p95 {case['p95Seconds']}s exceeds "
+                f"{p95_budget}s")
+    cold = report["coldDashboard"]
+    if cold["p95Seconds"] > COLD_DASHBOARD_CEILING_SECONDS:
+        problems.append(
+            f"cold dashboard p95 {cold['p95Seconds']}s exceeds "
+            f"{COLD_DASHBOARD_CEILING_SECONDS}s")
+    if any(status != 200 for status in cold["statuses"]):
+        problems.append(f"cold dashboard statuses were {cold['statuses']}")
+    if not cold["canonicalParity"]:
+        problems.append("CLI/dashboard canonical projection differs")
+    if report["peakRssBytes"] > PEAK_RSS_CEILING_BYTES:
+        problems.append(
+            f"peak RSS {report['peakRssBytes']} exceeds "
+            f"{PEAK_RSS_CEILING_BYTES}")
+    concurrent = report["concurrentDashboard"]
+    single_dashboard = report["singleDashboardProcessTree"]
+    if single_dashboard["peakRssBytes"] > PEAK_RSS_CEILING_BYTES:
+        problems.append(
+            "single dashboard process-tree RSS "
+            f"{single_dashboard['peakRssBytes']} exceeds "
+            f"{PEAK_RSS_CEILING_BYTES}")
+    if any(status != 200 for status in concurrent["statuses"]):
+        problems.append(
+            "concurrent dashboard statuses were "
+            f"{concurrent['statuses']}")
+    if not concurrent["canonicalParity"]:
+        problems.append("concurrent dashboard canonical projection differs")
+    if concurrent["uniqueBodyHashes"] != 1:
+        problems.append(
+            "identical concurrent dashboard requests did not share one body")
+    if (concurrent["peakDescendantProcesses"]
+            > concurrent["descendantProcessCeiling"]):
+        problems.append(
+            "concurrent dashboard descendants "
+            f"{concurrent['peakDescendantProcesses']} exceed "
+            f"{concurrent['descendantProcessCeiling']}")
+    if concurrent["peakRssBytes"] > concurrent["rssCeilingBytes"]:
+        problems.append(
+            f"concurrent dashboard RSS {concurrent['peakRssBytes']} exceeds "
+            f"{concurrent['rssCeilingBytes']}")
+    for provider in ("claude", "codex"):
+        population = report["providerPopulations"].get(provider, {})
+        if int(population.get("supportUnits") or 0) <= 0:
+            problems.append(f"{provider} current population is empty")
+        if int(population.get("baselineSupportUnits") or 0) <= 0:
+            problems.append(f"{provider} baseline population is empty")
+        withheld = report.get("withheldProbe", {})
+        if int(withheld.get("emptyAccountWithheldClasses", {}).get(
+                provider) or 0) <= 0:
+            problems.append(
+                f"{provider} empty-account corpus exercises no withheld class")
+        if int(withheld.get("privacyWithheldClasses", {}).get(
+                provider) or 0) <= 0:
+            problems.append(
+                f"{provider} privacy denial withholds no class")
+    conversation = report.get("conversationPopulations", {})
+    for key in ("claudeSidechainMessages", "codexConversationEvents",
+                "codexConversationMessages"):
+        if int(conversation.get(key) or 0) <= 0:
+            problems.append(f"{key} is empty")
+    identity = report.get("identityPopulations", {})
+    for key in ("claudeMetaMessages", "claudeToolResultMessages",
+                "claudeUnattributedEntries", "codexSubagentThreads"):
+        if int(identity.get(key) or 0) <= 0:
+            problems.append(f"{key} is empty")
+    if int(identity.get("codexRealAccounts") or 0) < 2:
+        problems.append("Codex corpus has fewer than two real accounts")
+    return problems
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scale", default="large")
@@ -555,7 +1138,8 @@ def main(argv=None) -> int:
              "because the synthetic corpus records no usage snapshots and so "
              "cannot resolve a subscription-week token.",
     )
-    parser.add_argument("--window-days", type=int, default=7)
+    parser.add_argument("--window-days", type=int, default=3)
+    parser.add_argument("--cold-rounds", type=int, default=3)
     parser.add_argument("--root", default=None)
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
@@ -604,6 +1188,11 @@ def main(argv=None) -> int:
     env["HOME"] = str(root / "home")
     env["TZ"] = "Etc/UTC"
     env["NO_COLOR"] = "1"
+    # Pin the read instant on both surfaces. The canonical parity projection
+    # excludes it, but an exact shared instant also prevents current-window
+    # liveness from changing between the CLI and dashboard reads.
+    end_date = window.split("..", 1)[1]
+    env["CCTALLY_AS_OF"] = f"{end_date}T23:59:59Z"
 
     report: dict[str, object] = {"scale": args.scale, "seed": args.seed,
                                  "runs": args.runs, "warmup": args.warmup,
@@ -621,13 +1210,14 @@ def main(argv=None) -> int:
         ["explain", "--source", "all", "--window", window, "--json"], env,
     )
     report["conversationPopulations"] = _conversation_populations(data_dir)
+    report["identityPopulations"] = _identity_populations(data_dir)
     # `startup` is not a diagnosis case. It times `cctally --version`, which
     # does the same interpreter start and the same eager module loading every
     # subcommand pays, and reads no store at all. Without it a median of
     # roughly a second reads as a second of diagnosis work, when most of it is
     # a fixed cost the diagnosis neither causes nor can remove.
     for label, source in (("startup", None), ("claude", "claude"),
-                          ("all", "all")):
+                          ("codex", "codex"), ("all", "all")):
         argv_case = (["--version"] if source is None else
                      ["explain", "--source", source, "--window", window,
                       "--json"])
@@ -702,6 +1292,29 @@ def main(argv=None) -> int:
     report["phaseProfileSeconds"] = _profile_phases(
         data_dir, root, window, min(args.runs, 10)
     )
+    report["withheldProbe"] = _withheld_probe(
+        data_dir, root, window)
+
+    all_argv = ["explain", "--source", "all", "--window", window, "--json"]
+    cli_payload = _json_run(all_argv, env)
+    report["coldDashboard"] = _cold_dashboard_rounds(
+        env, window, args.cold_rounds, cli_payload)
+    report["peakRssBytes"] = _peak_rss_run(all_argv, env)
+    report["peakRssCeilingBytes"] = PEAK_RSS_CEILING_BYTES
+    report["singleDashboardProcessTree"] = _concurrent_dashboard_round(
+        env, window, cli_payload, request_count=1)
+    report["concurrentDashboard"] = _concurrent_dashboard_round(
+        env, window, cli_payload)
+    report["concurrentDashboard"]["rssCeilingBytes"] = min(
+        PEAK_RSS_CEILING_BYTES,
+        report["singleDashboardProcessTree"]["peakRssBytes"]
+        + CONCURRENT_RSS_OVER_SINGLE_ALLOWANCE_BYTES,
+    )
+    report["concurrentDashboard"]["peakRssDeltaBytes"] = (
+        report["concurrentDashboard"]["peakRssBytes"]
+        - report["singleDashboardProcessTree"]["peakRssBytes"]
+    )
+    report["budgetProblems"] = _performance_problems(report)
 
     if args.json:
         print(json.dumps(report, indent=2))
@@ -721,7 +1334,15 @@ def main(argv=None) -> int:
                   f"exit {case['exitCodes']}")
         print(f"phase profile (in-process medians): "
               f"{report['phaseProfileSeconds']}")
-    return 0
+        print(f"cold dashboard: {report['coldDashboard']}")
+        print(f"peak RSS: {report['peakRssBytes']} bytes "
+              f"(ceiling {PEAK_RSS_CEILING_BYTES})")
+        print("single dashboard process tree: "
+              f"{report['singleDashboardProcessTree']}")
+        print(f"concurrent dashboard: {report['concurrentDashboard']}")
+    for problem in report["budgetProblems"]:
+        print(f"BUDGET FAILED: {problem}", file=sys.stderr)
+    return 1 if report["budgetProblems"] else 0
 
 
 if __name__ == "__main__":

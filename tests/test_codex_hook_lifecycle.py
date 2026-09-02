@@ -781,6 +781,124 @@ def test_codex_tick_drains_stdin_before_discovering_roots(runtime, monkeypatch):
     assert order == ["stdin", "roots"]
 
 
+def test_codex_hook_records_dashboard_activity_before_lifecycle_work(
+    runtime, monkeypatch,
+):
+    """The writer signal exists even when the lifecycle body later no-ops."""
+    ns, first, _second = runtime
+    transcript = first / "sessions" / "active.jsonl"
+    transcript.write_text("{}\n")
+    record = sys.modules["_cctally_record"]
+    monkeypatch.setattr(
+        record,
+        "_hook_tick_read_stdin_event",
+        lambda: {"event": "Stop", "transcript_path": str(transcript)},
+    )
+    monkeypatch.setattr(record, "_cmd_hook_tick_codex", lambda *a, **k: 0)
+
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+    import _lib_ingest_frontier as frontier
+    rows = [
+        json.loads(line)
+        for line in frontier.activity_marker_path(ns["APP_DIR"]).read_text().splitlines()
+    ]
+    assert rows[-1] == {"provider": "codex", "path": str(transcript)}
+
+
+def test_claude_hook_parent_records_dashboard_activity_before_return(
+    runtime, monkeypatch,
+):
+    """The detached Claude path tickets its transcript before the fork returns."""
+    ns, first, _second = runtime
+    transcript = first / "claude-active.jsonl"
+    transcript.write_text("{}\n")
+    record = sys.modules["_cctally_record"]
+    monkeypatch.setattr(
+        record,
+        "_hook_tick_read_stdin_event",
+        lambda: {"event": "Stop", "transcript_path": str(transcript)},
+    )
+    monkeypatch.setattr(record.os, "fork", lambda: 12345)
+    args = _hook_args(source="claude")
+    args.foreground = False
+
+    assert ns["cmd_hook_tick"](args) == 0
+    import _lib_ingest_frontier as frontier
+    rows = [
+        json.loads(line)
+        for line in frontier.activity_marker_path(ns["APP_DIR"]).read_text().splitlines()
+    ]
+    assert rows[-1] == {"provider": "claude", "path": str(transcript)}
+
+
+@pytest.mark.parametrize("source", ["claude", "codex"])
+def test_hook_ticket_failure_invalidates_the_dashboard_frontier(
+    runtime, monkeypatch, source,
+):
+    """A failed ticket write cannot leave a caught-up marker authoritative.
+
+    The production regression this catches is discarding
+    ``record_activity(False)`` at either hook entry point.  Removing the prior
+    marker is the fail-closed signal consumed by the dashboard's next ordinary
+    frontier plan; the hook itself remains a successful best-effort no-op.
+    """
+    ns, first, _second = runtime
+    transcript = first / "sessions" / f"{source}-active.jsonl"
+    transcript.write_text("{}\n")
+    record = sys.modules["_cctally_record"]
+    monkeypatch.setattr(
+        record,
+        "_hook_tick_read_stdin_event",
+        lambda: {"event": "Stop", "transcript_path": str(transcript)},
+    )
+    frontier = ns["_load_sibling"]("_lib_ingest_frontier")
+    marker = frontier.activity_marker_path(ns["APP_DIR"])
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps({"provider": source, "path": str(transcript)}) + "\n"
+    )
+
+    def fail_ticket_write(*_args, **_kwargs):
+        raise OSError("forced activity-ticket write failure")
+
+    real_record_activity = frontier.record_activity
+
+    def record_with_failed_write(*args, **kwargs):
+        real_write = frontier.os.write
+        frontier.os.write = fail_ticket_write
+        try:
+            return real_record_activity(*args, **kwargs)
+        finally:
+            frontier.os.write = real_write
+
+    monkeypatch.setattr(frontier, "record_activity", record_with_failed_write)
+
+    args = _hook_args(source=source)
+    if source == "codex":
+        monkeypatch.setattr(record, "_cmd_hook_tick_codex", lambda *a, **k: 0)
+    else:
+        args.foreground = False
+        monkeypatch.setattr(record.os, "fork", lambda: 12345)
+
+    assert ns["cmd_hook_tick"](args) == 0
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("handler,expected", [
+    ({"type": "command", "command": "/usr/local/bin/cctally hook-tick"}, True),
+    ({"type": "prompt", "command": "/usr/local/bin/cctally hook-tick"}, False),
+    ({"type": "command", "command":
+      "/bin/false /usr/local/bin/cctally hook-tick"}, False),
+    ({"type": "command", "command": "cctally hook-tick"}, False),
+])
+def test_dashboard_claude_trust_requires_exact_absolute_command(
+    handler, expected,
+):
+    import _lib_ingest_frontier as frontier
+
+    assert frontier.is_dashboard_activity_claude_hook_handler(handler) is expected
+
+
 # --------------------------------------------------------------------------
 # #341 Task 2 Step 7: throttle marker keys by (source_root_key, account_key).
 # --------------------------------------------------------------------------

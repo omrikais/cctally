@@ -1676,7 +1676,7 @@ def _tui_build_current_week(
     # Mirror the reset override applied by `_load_forecast_inputs` so the
     # Current Week card's spent_usd and $/1% reflect the post-reset window.
     week_start_at, samples = _apply_midweek_reset_override(
-        conn, week_start_at, week_end_at, samples
+        conn, week_start_at, week_end_at, samples, now_utc=now_utc
     )
     if not samples:
         return None
@@ -3533,7 +3533,8 @@ def _tui_build_source_bundle(
     read-only provider adaptation with no implicit sync or rollout fallback.
     """
     c = _cctally()
-    cache_conn = c.open_cache_db()
+    with _perf.phase("source.store_open"):
+        cache_conn = c.open_cache_db()
     cache_read_tx = False
     pin_started_ns: "int | None" = None
     codex_scope_cm = None
@@ -3654,14 +3655,15 @@ def _tui_build_source_bundle(
         # rare event and a rebuild is safe, so per-provider narrowing is not worth
         # the split.
         accounts_digest = accounts_identity_digest(stats_conn)
-        signature = c.compute_signature(
-            cache_conn,
-            stats_conn,
-            generation=c.current_generation(),
-            codex_stats_digest=stats_digest,
-            accounts_digest=accounts_digest,
-            claude_stats_digest=claude_digest,
-        )
+        with _perf.phase("source.signature"):
+            signature = c.compute_signature(
+                cache_conn,
+                stats_conn,
+                generation=c.current_generation(),
+                codex_stats_digest=stats_digest,
+                accounts_digest=accounts_digest,
+                claude_stats_digest=claude_digest,
+            )
         _acct_suffix = f":a{accounts_digest}" if accounts_digest else ""
         # public #5: the hook's budgeted ingest can change what the Codex
         # envelope owes without moving `codex_physical_mutation_seq` — a tick
@@ -4080,25 +4082,26 @@ def _tui_build_source_bundle(
         # The cache pin ended after carrier capture. These cheap post-build
         # signatures intentionally reject only stats-side movement; a cache
         # commit during the pure folds belongs to the next generation.
-        post_stats_digest = codex_stats_digest(stats_conn)
-        post_accounts_digest = accounts_identity_digest(stats_conn)
-        post_claude_digest = claude_stats_digest(stats_conn)
-        post_signature = c.compute_signature(
-            cache_conn,
-            stats_conn,
-            generation=c.current_generation(),
-            codex_stats_digest=post_stats_digest,
-            accounts_digest=post_accounts_digest,
-            claude_stats_digest=post_claude_digest,
-        )
-        stats_generation_moved = (
-            post_signature.max_wus_id != signature.max_wus_id
-            or post_signature.max_wcs_id != signature.max_wcs_id
-            or post_signature.reset_sig != signature.reset_sig
-            or post_stats_digest != stats_digest
-            or post_accounts_digest != accounts_digest
-            or post_claude_digest != claude_digest
-        )
+        with _perf.phase("source.reconciliation"):
+            post_stats_digest = codex_stats_digest(stats_conn)
+            post_accounts_digest = accounts_identity_digest(stats_conn)
+            post_claude_digest = claude_stats_digest(stats_conn)
+            post_signature = c.compute_signature(
+                cache_conn,
+                stats_conn,
+                generation=c.current_generation(),
+                codex_stats_digest=post_stats_digest,
+                accounts_digest=post_accounts_digest,
+                claude_stats_digest=post_claude_digest,
+            )
+            stats_generation_moved = (
+                post_signature.max_wus_id != signature.max_wus_id
+                or post_signature.max_wcs_id != signature.max_wcs_id
+                or post_signature.reset_sig != signature.reset_sig
+                or post_stats_digest != stats_digest
+                or post_accounts_digest != accounts_digest
+                or post_claude_digest != claude_digest
+            )
         if stats_generation_moved:
             if prior_bundle is not None:
                 return prior_bundle
@@ -8148,17 +8151,27 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
         # boundary instead. The span subtracts any ingest nested inside it.
         tick = _tick_stats.current()
         if tick is None:
-            return sys.modules["cctally"]._tui_build_snapshot(
+            snapshot = sys.modules["cctally"]._tui_build_snapshot(
                 now_utc=pinned_now, skip_sync=skip_sync,
                 display_tz_pref_override=display_tz_pref_override,
                 precompute_envelope=True, runtime_bind=runtime_bind,
             )
-        with tick.build_span():
-            return sys.modules["cctally"]._tui_build_snapshot(
-                now_utc=pinned_now, skip_sync=skip_sync,
-                display_tz_pref_override=display_tz_pref_override,
-                precompute_envelope=True, runtime_bind=runtime_bind,
-            )
+        else:
+            with tick.build_span():
+                snapshot = sys.modules["cctally"]._tui_build_snapshot(
+                    now_utc=pinned_now, skip_sync=skip_sync,
+                    display_tz_pref_override=display_tz_pref_override,
+                    precompute_envelope=True, runtime_bind=runtime_bind,
+                )
+        # #684: this is the complete dashboard publisher boundary. Schedule
+        # snapshot-cache admission only after every builder has finished; a
+        # source-local call can run before later builders mutate the estate and
+        # then idle dispatch may never revisit that source to submit the dirty
+        # generation.
+        _cctally()._load_sibling(
+            "_lib_snapshot_cache").enforce_snapshot_accelerator_bounds(
+                data_version="dashboard-publisher")
+        return snapshot
 
     def _locked(skip_sync: bool) -> None:
         # #279 S5 F6.3 (gate P1-1): arm the snapshot-cache owner-thread tripwire
@@ -8179,7 +8192,12 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 sync_error = None
                 # #583 S2 §6.1: the last SUCCESSFUL validation, read before
                 # A2's partial republishes can overwrite the held snapshot.
-                prior_sync_at = ref.get().last_sync_at
+                # Retain the complete pre-tick object itself. A2 progress
+                # publications replace ``ref`` during the walk, so rereading
+                # the reference after a dirty recovered family would retain a
+                # partial snapshot rather than this last complete one.
+                prior_snapshot = ref.get()
+                prior_sync_at = prior_snapshot.last_sync_at
                 start = _time.monotonic()
                 throttle = _A2ThrottleClock(_A2_PARTIAL_THROTTLE_S, start=start)
                 cb = _make_a2_progress_cb(
@@ -8187,57 +8205,282 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                     build_partial=lambda: _build(skip_sync=True),
                     throttle=throttle, monotonic=_time.monotonic,
                 )
-                cache_conn = _cctally().open_cache_db()
-                cache_mod = _cctally()._load_sibling("_cctally_cache")
-                # #583 S1 §1.3: the ingest span, opened through the
-                # contextmanager protocol rather than a `with` block so the
-                # long try/except/finally below is not reindented. The A2
-                # progress callback runs `build_partial()` SYNCHRONOUSLY inside
-                # this region, so the builder spans it opens nest here and
-                # their time is subtracted — without that, every progress build
-                # is counted once as ingest and again as builder and
-                # `ingest_ns + builder_ns` can exceed `duration_ns`. A span
-                # left open by an escaping exception is closed by
-                # `TickContext.finish`, so no try/finally is needed to bound it.
+                # The tick total and retained phase tree share this exact
+                # boundary: store open, frontier validation and provider work
+                # are all ingest.  Any synchronous A2 partial builds nest in
+                # the span and are subtracted by TickContext.
                 _ingest = tick.ingest_span()
                 _ingest.__enter__()
+                _perf.reset_thread()
+                _p_ingest = _perf.phase("ingest")
+                _p_ingest.__enter__()
+                cache_mod = _cctally()._load_sibling("_cctally_cache")
+                frontier_mod = _cctally()._load_sibling("_lib_ingest_frontier")
+                app_dir = _cctally_core.APP_DIR
+                frontier = getattr(_locked, "_ingest_frontier", None)
+                if (
+                    frontier is None
+                    or frontier.app_dir != app_dir
+                ):
+                    frontier = frontier_mod.DashboardIngestFrontier(app_dir)
+                    _locked._ingest_frontier = frontier
+
+                claude_roots = tuple(
+                    _cctally_core._resolve_claude_projects_dirs()
+                )
+                codex_roots = tuple(
+                    root / "sessions"
+                    for root in _cctally()._codex_home_roots()
+                )
+                claude_guards = (_cctally_core.CLAUDE_SETTINGS_PATH,)
                 try:
-                    # Under CCTALLY_PERF_TRACE the phase tree this standalone
-                    # sync_cache builds is intentionally NOT surfaced in the live
-                    # dashboard trace: the final _build(skip_sync=True) below runs
-                    # _tui_build_snapshot, which resets the thread perf stack, so
-                    # these phases never reach an emitter. §0's trace-attribution
-                    # target is `cctally-bench --trace`, which builds directly
-                    # (no decoupled standalone ingest) and keeps its phase tree.
+                    codex_hooks_mod = _cctally()._load_sibling("_lib_codex_hooks")
+                    hook_roots = codex_hooks_mod.codex_hook_roots(
+                        _cctally()._codex_home_roots())
+                    codex_guards = tuple(root.hooks_path for root in hook_roots)
+                except Exception:
+                    hook_roots = ()
+                    codex_guards = ()
+
+                def _claude_hooks_trusted():
+                    try:
+                        setup_mod = _cctally()._load_sibling("_cctally_setup")
+                        settings = setup_mod._load_claude_settings()
+                        hooks = settings.get("hooks", {})
+                        return all(
+                            any(
+                                frontier_mod.is_dashboard_activity_claude_hook_handler(
+                                    handler)
+                                for group in hooks.get(event, ())
+                                if isinstance(group, dict)
+                                for handler in group.get("hooks", ())
+                            )
+                            for event in _cctally().SETUP_HOOK_EVENTS
+                        )
+                    except Exception:
+                        return False
+
+                def _codex_hooks_trusted():
+                    try:
+                        trusted = bool(hook_roots)
+                        for hook_root in hook_roots:
+                            document = codex_hooks_mod._read_hooks_document(
+                                hook_root.hooks_path)
+                            hooks = document.get("hooks", {})
+                            for event in codex_hooks_mod.CODEX_HOOK_EVENTS:
+                                owned = sum(
+                                    1
+                                    for group in hooks.get(event, ())
+                                    if isinstance(group, dict)
+                                    for handler in group.get("hooks", ())
+                                    if codex_hooks_mod.is_dashboard_activity_codex_hook_handler(
+                                        handler)
+                                )
+                                trusted = trusted and owned >= 1
+                        return trusted
+                    except Exception:
+                        return False
+                cache_conn = None
+                publish_prior = False
+                initial_cache_identity = None
+                try:
+                    # The standalone ingest tree is frozen before the final
+                    # _build(skip_sync=True) resets the thread collector. A2
+                    # partial builds remain isolated by their own perf state,
+                    # so neither they nor the final snapshot can overwrite this
+                    # provider attribution.
                     # Dashboard S4's physical identity includes both providers.
                     # They are one recovery plan because quarantine replaces
                     # the shared physical family: corruption in the second leg
                     # must restart the first leg too.
-                    _, cache_conn = cache_mod._run_cache_plan_with_recovery(
-                        cache_conn,
-                        (
-                            lambda active_conn: sync_cache(
-                                active_conn, progress=cb
-                            ),
-                            lambda active_conn: sync_codex_cache(active_conn),
-                        ),
-                        origins=(
-                            "dashboard.refresh.claude_sync",
-                            "dashboard.refresh.codex_sync",
-                        ),
+                    with _perf.phase("ingest.store_open"):
+                        cache_conn = _cctally().open_cache_db()
+                    cutoff = frontier.capture_cutoff()
+                    initial_cache_stat = os.stat(_cctally_core.CACHE_DB_PATH)
+                    initial_cache_identity = (
+                        initial_cache_stat.st_dev,
+                        initial_cache_stat.st_ino,
                     )
+                    recovery_full = set()
+                    plans = {}
+                    effective_modes = {}
+                    trusted_results = {}
+                    result_by_provider = {}
+
+                    def _effective_mode(provider, plan, active_conn):
+                        if (
+                            frontier_mod._database_identity(active_conn)
+                            != initial_cache_identity
+                        ):
+                            recovery_full.add(provider)
+                            return "full"
+                        return plan.mode
+
+                    def _plan(provider, active_conn, roots, guards):
+                        with _perf.phase(f"ingest.{provider}"):
+                            with _perf.phase("frontier") as frontier_phase:
+                                plan = frontier.plan_provider(
+                                    provider, active_conn, roots=roots,
+                                    guard_paths=guards,
+                                )
+                                frontier_phase.set_meta(
+                                    result=plan.mode,
+                                    targets=len(plan.paths),
+                                )
+                        plans[provider] = plan
+                        mode = _effective_mode(provider, plan, active_conn)
+                        effective_modes[provider] = mode
+                        if mode == "full":
+                            trusted_results[provider] = (
+                                _claude_hooks_trusted()
+                                if provider == "claude"
+                                else _codex_hooks_trusted()
+                            )
+                        else:
+                            trusted_results[provider] = True
+                        return plan, mode
+
+                    def _claude_operation(active_conn):
+                        nonlocal publish_prior
+                        # This is the first leg of every recovery attempt.  A
+                        # failed later leg restarts the whole family here, so no
+                        # plan/result from the abandoned inode may leak into the
+                        # replacement's certification decision.
+                        publish_prior = False
+                        recovery_full.clear()
+                        plans.clear()
+                        effective_modes.clear()
+                        trusted_results.clear()
+                        result_by_provider.clear()
+                        plan, mode = _plan(
+                            "claude", active_conn, claude_roots,
+                            claude_guards,
+                        )
+                        if mode == "caught_up":
+                            result_by_provider["claude"] = None
+                            return None
+                        with _perf.phase("ingest.claude"):
+                            result = sync_cache(
+                                active_conn,
+                                progress=cb,
+                                only_paths=(
+                                    set(plan.paths)
+                                    if mode == "targeted" else None
+                                ),
+                            )
+                        result_by_provider["claude"] = result
+                        return result
+
+                    def _codex_operation(active_conn):
+                        plan, mode = _plan(
+                            "codex", active_conn, codex_roots,
+                            codex_guards,
+                        )
+                        if mode == "caught_up":
+                            result_by_provider["codex"] = None
+                            return None
+                        with _perf.phase("ingest.codex"):
+                            result = sync_codex_cache(
+                                active_conn,
+                                only_paths=(
+                                    set(plan.paths)
+                                    if mode == "targeted" else None
+                                ),
+                            )
+                        result_by_provider["codex"] = result
+                        return result
+
+                    def _finalize_frontier(active_conn):
+                        nonlocal publish_prior
+                        for provider, roots, guards in (
+                            ("claude", claude_roots, claude_guards),
+                            ("codex", codex_roots, codex_guards),
+                        ):
+                            plan = plans[provider]
+                            mode = effective_modes[provider]
+                            stats = result_by_provider.get(provider)
+                            certifiable = (
+                                frontier_mod.provider_sync_certifiable(
+                                    mode, stats)
+                            )
+                            if not certifiable:
+                                if provider in recovery_full:
+                                    publish_prior = True
+                                continue
+                            if mode == "full":
+                                seeded = frontier.seed_provider(
+                                    provider, active_conn, roots=roots,
+                                    guard_paths=guards,
+                                    trusted=trusted_results[provider],
+                                    cutoff=cutoff,
+                                )
+                                if provider in recovery_full and not seeded:
+                                    publish_prior = True
+                            else:
+                                frontier.commit_provider(
+                                    plan, active_conn, roots=roots,
+                                    guard_paths=guards,
+                                    trusted=trusted_results[provider],
+                                    cutoff=cutoff,
+                                )
+                        return None
+
+                    operations = (
+                        _claude_operation,
+                        _codex_operation,
+                        _finalize_frontier,
+                    )
+                    operation_origins = [
+                        "dashboard.refresh.claude_sync",
+                        "dashboard.refresh.codex_sync",
+                        "dashboard.refresh.frontier_commit",
+                    ]
+                    _results, cache_conn = cache_mod._run_cache_plan_with_recovery(
+                        cache_conn, operations, origins=operation_origins,
+                    )
+                    if publish_prior:
+                        sync_error = (
+                            "sync-cache: replacement cache ingest incomplete; "
+                            "retaining the prior snapshot"
+                        )
                 except Exception as exc:  # noqa: BLE001 — surfaced on the snap
+                    # A failed retry after cache-family recovery can escape
+                    # before finalization marks ``publish_prior``. Detect the
+                    # physical replacement directly and never build/publish
+                    # from that only-partially-rehydrated family.
+                    if initial_cache_identity is not None:
+                        try:
+                            current_stat = os.stat(_cctally_core.CACHE_DB_PATH)
+                            current_identity = (
+                                current_stat.st_dev, current_stat.st_ino,
+                            )
+                            publish_prior = (
+                                publish_prior
+                                or current_identity != initial_cache_identity
+                            )
+                        except OSError:
+                            publish_prior = True
                     sync_error = f"sync-cache: {exc}"
                 finally:
-                    cache_conn.close()
+                    if cache_conn is not None:
+                        cache_conn.close()
                 _ingest.__exit__(None, None, None)
+                _p_ingest.__exit__(None, None, None)
+                _perf.stash_last_ingest(
+                    _perf.current_root(),
+                    generated_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                )
                 # #583 S1 §2.2: the ONE place a pending trace-arm request is
                 # consumed. After the cache connection closes and immediately
                 # before the authoritative build, so a request landing
                 # mid-ingest cannot split one ingest across two tracing states,
                 # and A2 partial builds never consume it.
                 _perf.apply_pending()
-                snap = _build(skip_sync=True)  # final: hydrating=False (default)
+                snap = (
+                    prior_snapshot
+                    if publish_prior
+                    else _build(skip_sync=True)
+                )  # final: hydrating=False (default)
                 if sync_error is not None:
                     # Thread the standalone sync error into last_sync_error, sync
                     # error FIRST (mirrors the internal path where the `sync`
@@ -8355,6 +8598,10 @@ def _make_run_sync_now(*, sync_lock, ref, hub, pinned_now,
     def _public(skip_sync: bool) -> None:
         with sync_lock:
             locked(skip_sync)
+    # Dashboard diagnostics need the frontier retained by the periodic public
+    # wrapper. The independently-created manual locked closure owns a different
+    # frontier, so exposing this exact owner avoids reporting an idle zero.
+    _public._locked_owner = locked
     return _public
 
 

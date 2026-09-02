@@ -282,6 +282,19 @@ def test_cheap_seed_empty_data(monkeypatch, tmp_path):
 
 def test_no_sync_keeps_full_build(monkeypatch, tmp_path):
     ns = _load_with_fixture(monkeypatch, tmp_path, "ok")
+    submitted = []
+
+    class _SnapshotBounds:
+        @staticmethod
+        def enforce_snapshot_accelerator_bounds(**kwargs):
+            submitted.append(kwargs)
+
+    snapshot_cache = ns["_load_sibling"]("_lib_snapshot_cache")
+    monkeypatch.setattr(
+        snapshot_cache,
+        "enforce_snapshot_accelerator_bounds",
+        _SnapshotBounds.enforce_snapshot_accelerator_bounds,
+    )
     args = types.SimpleNamespace(no_sync=True, host="127.0.0.1")
     full = _dash_mod()._dashboard_initial_snapshot(
         args, pinned_now=OK_AS_OF, display_tz_pref_override=None,
@@ -293,6 +306,7 @@ def test_no_sync_keeps_full_build(monkeypatch, tmp_path):
     assert len(full.sessions) > 0
     env = ns["snapshot_to_envelope"](full, now_utc=OK_AS_OF)
     assert env["hydrating"] is False
+    assert submitted == [{"data_version": "dashboard-no-sync-initial"}]
 
 
 def test_cache_report_qa_state_requires_explicit_master_switch(monkeypatch, tmp_path):

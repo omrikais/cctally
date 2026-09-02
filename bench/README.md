@@ -52,7 +52,7 @@ Numbers will vary by hardware. The README's cited number was measured on macOS a
 
 ### What it measures
 
-Six benchmark families (15 benchmarks) exercise the paths the recent perf work optimized: the dashboard **snapshot** spine (`_tui_build_snapshot` with `precompute_envelope=True`) in three modes — **cold** (fresh accelerator state), **warm** (the dispatch signature moved, forcing a full rebuild with warm sub-caches), and **idle** (signature unchanged, so the reuse short-circuit engages and reads near-zero); cache **ingest** (`sync_cache` no-op over many files + a one-file delta); the **conversations** rail (`list_conversations` page-1, cost-sorted, and filtered); cross-session **search** + in-conversation **find**; **payload/outline** assembly (`_assemble_session` + `get_conversation_outline`, measurement-only); and the two warm **reconcile** helpers (projects-envelope + cache-report). Each benchmark runs `--iterations N` times, discards the first as warmup, and reports the median plus min/max — the in-process analogue of the `hyperfine` methodology above. Note that `search.cross_session` queries a term (`"benchmark"`) that matches **every** synthetic message by design, so its timing (and its large `count`) is a deterministic worst-case guard value — a stable ceiling to catch a regression in the search path — not a realistic user-search latency.
+Six benchmark families (16 benchmarks) exercise the paths the recent perf work optimized: the dashboard **snapshot** spine (`_tui_build_snapshot` with `precompute_envelope=True`) in three modes — **cold** (fresh accelerator state), **warm** (the dispatch signature moved, forcing a full rebuild with warm sub-caches), and **idle** (signature unchanged, so the reuse short-circuit engages and reads near-zero); cache **ingest**, including the exact two-provider `frontier.caught_up` validation over a previously full-seeded store plus `sync_cache` no-op and one-file delta; the **conversations** rail (`list_conversations` page-1, cost-sorted, and filtered); cross-session **search** + in-conversation **find**; **payload/outline** assembly (`_assemble_session` + `get_conversation_outline`, measurement-only); and the two warm **reconcile** helpers (projects-envelope + cache-report). The frontier row reports the total tracked provider-file count as its `count`, making tiny/small/large receipts directly comparable for the intended O(roots), not O(rows), scaling property. Each benchmark runs `--iterations N` times, discards the first as warmup, and reports the median plus min/max — the in-process analogue of the `hyperfine` methodology above. Note that `search.cross_session` queries a term (`"benchmark"`) that matches **every** synthetic message by design, so its timing (and its large `count`) is a deterministic worst-case guard value — a stable ceiling to catch a regression in the search path — not a realistic user-search latency.
 
 ### Fixture and scale
 
@@ -74,7 +74,18 @@ For an ad-hoc sanity check against real-shaped data, `--data-dir <copied CCTALLY
 
 ### Baseline, compare, and gate
 
-`bench/baselines/backend.json` is the committed baseline measured from a real `--scale large` run, and since #583 S1 it carries two top-level blocks. `contract` is structural and IS asserted: the exact benchmark-name set, the scale and seed, the corpus fingerprint, the generator version, and the dataset counts across both providers. `receipt` is advisory and is never asserted: the cctally version, the machine label, and the per-benchmark medians. `classify()` reads its numbers from `receipt` and still accepts the pre-S1 flat shape, so a baseline from an older checkout compares rather than reading as malformed. `--compare` diffs the current run against it, printing a per-benchmark Δ column and a verdict — `OK`, `REGRESSED` (over tolerance), `MISSING` (in the baseline but dropped from the current run), or `NEW` (added since the baseline) — and **exits 0** (advisory by default). `--gate` is the same but **exits non-zero** on any `REGRESSED`/`MISSING` or a malformed baseline, for a human enforcing locally or in a PR. A machine-label mismatch prints a loud banner and stays advisory (the compare is shown, but `--gate` does not fail on cross-machine numbers alone). `--update-baseline` reruns and overwrites the baseline, stamping the current version + machine label. The compare is **never** wired into `cctally-test-all`/CI: #271's ~100–130 ms machine-to-machine variance exceeds a real 40–60 ms regression, so a hard threshold would flap. `bin/cctally-bench-test` (auto-discovered by `cctally-test-all`) asserts only the structure — the `--json` schema, all 15 benchmark names, the committed baseline's `contract` block, and isolation — and **never** asserts a wall-clock timing. The baseline check reads the file directly and does **not** run the large benchmark.
+`bench/baselines/backend.json` is the committed baseline measured from a real `--scale large` run, and since #583 S1 it carries two top-level blocks. `contract` is structural and IS asserted: the exact benchmark-name set, the scale and seed, the corpus fingerprint, the generator version, and the dataset counts across both providers. `receipt` is advisory and is never asserted: the cctally version, the machine label, and the per-benchmark medians. `classify()` reads its numbers from `receipt` and still accepts the pre-S1 flat shape, so a baseline from an older checkout compares rather than reading as malformed. `--compare` diffs the current run against it, printing a per-benchmark Δ column and a verdict — `OK`, `REGRESSED` (over tolerance), `MISSING` (in the baseline but dropped from the current run), or `NEW` (added since the baseline) — and **exits 0** (advisory by default). `--gate` is the same but **exits non-zero** on any `REGRESSED`/`MISSING` or a malformed baseline, for a human enforcing locally or in a PR. A machine-label mismatch prints a loud banner and stays advisory (the compare is shown, but `--gate` does not fail on cross-machine numbers alone). `--update-baseline` reruns and overwrites the baseline, stamping the current version + machine label. The compare is **never** wired into `cctally-test-all`/CI: #271's ~100–130 ms machine-to-machine variance exceeds a real 40–60 ms regression, so a hard threshold would flap. `bin/cctally-bench-test` (auto-discovered by `cctally-test-all`) asserts only the structure — the `--json` schema, all 16 benchmark names, the committed baseline's `contract` block, and isolation — and **never** asserts a wall-clock timing. The baseline check reads the file directly and does **not** run the large benchmark.
+
+### Diagnosis latency (`explain-benchmark.py`)
+
+`python3 bench/explain-benchmark.py` is the fail-closed end-to-end receipt for `cctally explain` and the dashboard's `/api/diagnosis` route. Its default three-day window gives both the current and immediately preceding windows real support. The large corpus includes Claude sidechains, a 2,500-row injected meta/tool history, Codex normalized events and child threads, two unequal real Codex accounts, unattributed Claude rows and typed withheld cases. Three independent rounds each discard warmups and report Claude, Codex and All round medians plus pooled p95. A fresh dashboard process supplies the separate cold-route sample and canonical CLI/dashboard comparison; an extra All run samples aggregate RSS across the parent and isolated provider worker. The receipt also compares one dashboard request with four simultaneous identical requests, requiring one response body, canonical parity, at most one provider-worker protocol tree (three descendants including tracker/forkserver), and aggregate RSS within 256 MiB of the one-request dashboard baseline and below 2 GiB. `--bounds` builds over-cap adversarial stores and fails on the fixed query and per-subject row ceilings.
+
+Run it only through the remote wrapper:
+
+```bash
+bin/cctally-test-remote python3 bench/explain-benchmark.py --json
+bin/cctally-test-remote python3 bench/explain-benchmark.py --bounds --json
+```
 
 ### Assembly scan (`--assembly-scan`)
 
@@ -88,6 +99,69 @@ bin/cctally-bench --assembly-scan --assembly-ladder-scale large --json    # the 
 ```
 
 The committed `bench/baselines/assembly.json` is the maintainer-machine evidence run behind the materialization decision recorded in [docs/backend-performance.md §5](../docs/backend-performance.md) (the threshold where whole-session assembly crosses `ASSEMBLY_VISIBLE_MS` = 100 ms, and the go/no-go on building a `conversation_turns` table). Re-run the scan and compare against that baseline when the real-session size distribution shifts. An operator `--data-dir`/`--claude-dir` pair runs an advisory realism cross-check (largest real session per size bucket), non-committed.
+
+### Dashboard memory and background-work soak (`dashboard-soak.py`)
+
+`bench/dashboard-soak.py` launches the real dashboard against the deterministic
+large corpus, samples RSS, CPU, block I/O, server threads, disk footprint and
+numeric retained-owner counters, and
+stresses both providers through source add/remove, account rotation, cache
+rebuild, privacy variants, 21 manual synchronous refresh samples plus the
+queued path, rail and large
+conversation reads, diagnosis, main SSE reconnects and dedicated live-tail.
+It deliberately removes and restores the scratch stats store and requires the
+resulting diagnosis `503` to recover to a coherent `200`, plus unchanged SQLite
+`cache_size`/`temp_store`/`page_size`/`mmap_size`, a post-warm RSS slope whose
+one-sided 95% upper confidence bound stays below the unchanged +4 MiB/min
+ceiling,
+combined background duty below 75% of one core, whole-process sampled CPU below
+one core, and clean shutdown. Oversize or
+uncapped owner retention or missing evidence fails `--gate`. A paired run also
+gates main/conversation periods and rail/live-tail/reader/reconnect/manual p50
+and p95 against the baseline. The run waits up to 120 seconds after stress for
+asynchronous source and snapshot-memory generations newer than the final stress
+targets; a zero, pre-stress, failed or missing owner measurement fails closed.
+Owner and background-duty gates use the peak across stress diagnostics rather
+than only the final sample. Median cadence keeps a strict 5% margin. The
+sparse publish P95 uses `max(15%, 1.5 s)`, calibrated from an 8.30-9.66 s
+slope evaluator fails closed without enough samples and is pinned by growing,
+flat and noisy-flat synthetic receipts, so a harmless positive point estimate
+inside sampling noise does not masquerade as a demonstrated leak. The sparse
+publish P95 uses `max(15%, 1.5 s)`, calibrated from an 8.30-9.66 s
+sparse publish P95 uses `max(15%, 1.5 s)`, calibrated from an 8.30-9.66 s
+same-machine baseline spread across five identical paired runs; a 2.1 s
+regression still fails. Conversation P95 uses `max(15%, 1.0 s)`, covering the
+measured >0.9 s identical-baseline spread while its median remains at 5%.
+HTTP non-inferiority uses the larger of 10 ms or 5% so single-digit-millisecond
+socket and scheduler noise cannot decide the result.
+
+Run before and after in one command on the same remote host and seed.
+`--baseline-ref` materializes the committed baseline with `git archive` into
+temporary storage, so the comparison cannot mutate a worktree or accidentally
+cross hosts:
+
+```bash
+CCTALLY_REMOTE_HOST=<runner-alias> bin/cctally-test-remote \
+  bench/dashboard-soak.py --root /tmp/cctally-dashboard-paired \
+  --baseline-ref <baseline-sha> --duration-seconds 600 \
+  --output /tmp/cctally-dashboard-after.json --summary-only --gate
+```
+
+The companion real-browser pass is
+`dashboard/web/e2e/memory-soak.spec.ts`. It loops long and short conversation
+opens, reader/list/dashboard teardown, reload and EventSource reconnection,
+then forces Chromium GC and records heap, DOM, document, listener, interaction,
+subscriber, queued-delivery, and server-thread figures. The gate compares heap
+and DOM medians between consecutive post-warmup windows at matching retained-
+document counts, while document growth is gated separately, so a periodic
+reload phase cannot masquerade as a positive per-cycle leak; regression slopes
+remain diagnostic.
+Thirty cycles are the default and `CCTALLY_BROWSER_SOAK_CYCLES=120` selects a
+long pass.
+
+The committed prose does not freeze one transient receipt. Record the exact
+paired JSON used for an issue or release gate alongside its SHA; the corpus
+counts, seed, numeric ceilings and evaluator are the reproducible contract.
 
 ### Tunable constants
 

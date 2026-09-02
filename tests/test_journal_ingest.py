@@ -25,6 +25,7 @@ DISPATCHER seams to their defaults per test, so appending a synthetic hook to
 import datetime as dt
 import multiprocessing as mp
 import os
+import pathlib
 import threading
 import time
 
@@ -738,3 +739,172 @@ def test_op_weekly_credit_floor_folds(tmp_path, monkeypatch):
     # Idempotent re-fold.
     jr.run_stats_ingest(mode="authoritative")
     assert _count(ns, "weekly_credit_floors") == 1
+
+
+# --------------------------------------------------------------------------
+# (g) #689 — two processes recovering the same rate change (spec test 4)
+# --------------------------------------------------------------------------
+_BIN_DIR = str(pathlib.Path(__file__).resolve().parent.parent / "bin")
+MRC_RACE_EFFECTIVE_FROM = "2026-08-25T00:00:00+00:00"
+
+
+def _mrc_race_load(bin_dir, home_dir, data_dir):
+    """Import the binary as `cctally` inside a spawned child, against an
+    explicit data dir. The same shape `tests/test_writer_reroute.py`'s storm
+    workers use — a spawned child inherits no monkeypatched module attribute,
+    so the paths must come from the environment.
+
+    `_init_paths_from_env()` is called EXPLICITLY, and it is not optional
+    here. `spawn` re-imports this test module to resolve the child's target
+    function, and this module imports `_cctally_core` at its top, so the
+    kernel's path constants are already bound from the parent's inherited
+    environment by the time this function runs. Without the re-derivation the
+    child writes to the maintainer's real production directory and the
+    conftest write detector refuses.
+    """
+    import importlib.util
+    import os
+    import sys
+    from importlib.machinery import SourceFileLoader
+    os.environ["CCTALLY_DATA_DIR"] = data_dir
+    os.environ["HOME"] = home_dir
+    os.environ["TZ"] = "Etc/UTC"
+    os.environ["CCTALLY_DISABLE_DEV_AUTODETECT"] = "1"
+    os.environ["CCTALLY_DISABLE_UPDATE_CHECK"] = "1"
+    os.environ["CCTALLY_DISABLE_TELEMETRY"] = "1"
+    sys.path.insert(0, bin_dir)
+    import _cctally_core as _core
+    _core._init_paths_from_env()
+    loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
+    spec = importlib.util.spec_from_loader("cctally", loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["cctally"] = mod
+    loader.exec_module(mod)
+    _core._init_paths_from_env()
+    return mod
+
+
+def _mrc_race_transition(mod, detected_at):
+    mrc = mod._load_sibling("_lib_meter_rate_change")
+    return mrc.RateChangeTransition(
+        provider="claude", account_key="unattributed",
+        effective_from=MRC_RACE_EFFECTIVE_FROM,
+        previous_units_per_point=2_442_620.0,
+        new_units_per_point=1_665_000.0,
+        severity="alarm", detected_at=detected_at)
+
+
+def _mrc_race_setup(bin_dir, home_dir, data_dir, q):
+    """Create and migrate the stats index once, before either racer starts, so
+    the race under test is the recovery race and not a schema-creation race."""
+    try:
+        mod = _mrc_race_load(bin_dir, home_dir, data_dir)
+        import _cctally_core
+        conn = _cctally_core.open_db()
+        conn.close()
+        q.put(("ok", None))
+    except BaseException as exc:                       # noqa: BLE001
+        q.put((f"ERR:{type(exc).__name__}", str(exc)))
+
+
+def _mrc_race_worker(bin_dir, home_dir, data_dir, created_at, barrier, q):
+    """Look the identity up, WAIT for the sibling to have looked it up too,
+    then record it under this child's own clock."""
+    try:
+        mod = _mrc_race_load(bin_dir, home_dir, data_dir)
+        import _cctally_journal as _cjr
+        glue = mod._load_sibling("_cctally_quota_model")
+        transition = _mrc_race_transition(mod, created_at)
+        absent = glue.unrecorded_rate_change_transitions((transition,))
+        # The point of the test. Without the barrier the two lookups serialize
+        # by luck and the second one sees the row, which is the easy path
+        # rather than the race.
+        barrier.wait(PRESENCE_BACKSTOP_SECONDS)
+        if not absent:
+            q.put(("not-absent", created_at))
+            return
+        _cjr.run_stats_ingest(
+            mode="authoritative",
+            meter_rate_change={"transition": transition, "notify": False,
+                               "created_at": created_at})
+        q.put(("ok", created_at))
+    except BaseException as exc:                       # noqa: BLE001
+        q.put((f"ERR:{type(exc).__name__}", f"{created_at}: {exc}"))
+
+
+def test_689_two_processes_recovering_one_rate_change_write_one_line(tmp_path):
+    """#689 spec test 4, and it cannot honestly be a unit test.
+
+    The guarantee comes from cross-process `flock` serialization of
+    `journal.ingest.lock`, so a single-process test asserting it would be
+    pinning nothing. Both children see the identity ABSENT — the barrier
+    forces that — and then both attempt to record it under byte-different
+    command clocks. Exactly one journal line and exactly one row must exist.
+    """
+    import json as _json
+    import sqlite3 as _sqlite3
+
+    data_dir = tmp_path / "share"
+    home_dir = tmp_path / "home"
+    (home_dir / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    # ONE budget for the setup handoff, both racer handoffs and all three
+    # joins, not one each: three consecutive full backstops would exceed the
+    # 120-second pytest cap, so a wedged handoff would be killed before any
+    # assertion message could name what it had been waiting for.
+    deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS * 3
+    setup = ctx.Process(target=_mrc_race_setup,
+                        args=(_BIN_DIR, str(home_dir), str(data_dir), q))
+    setup.start()
+    status, detail = q.get(timeout=remaining(deadline))
+    setup.join(timeout=remaining(deadline))
+    assert status == "ok", f"setup failed: {detail}"
+
+    barrier = ctx.Barrier(2)
+    clocks = ("2026-08-29T12:00:00+00:00", "2026-08-29T13:00:00+00:00")
+    procs = []
+    for created_at in clocks:
+        p = ctx.Process(
+            target=_mrc_race_worker,
+            args=(_BIN_DIR, str(home_dir), str(data_dir), created_at,
+                  barrier, q))
+        p.start()
+        procs.append(p)
+    results = [q.get(timeout=remaining(deadline)) for _ in procs]
+    for p in procs:
+        p.join(timeout=remaining(deadline))
+
+    for status, detail in results:
+        assert status == "ok", f"child failed: {status} {detail}"
+    assert {detail for _s, detail in results} == set(clocks), (
+        "the two children did not run under byte-different command clocks")
+    for p in procs:
+        assert p.exitcode == 0, f"child exited {p.exitcode}"
+
+    event_id = f"mrc:claude:unattributed:{MRC_RACE_EFFECTIVE_FROM}"
+    lines = []
+    for segment in sorted((data_dir / "journal").glob("*.jsonl")):
+        for raw in segment.read_text(encoding="utf-8").splitlines():
+            if not raw.strip():
+                continue
+            try:
+                record = _json.loads(raw)
+            except ValueError:
+                continue
+            if record.get("id") == event_id:
+                lines.append(record)
+    assert len(lines) == 1, (
+        f"{len(lines)} journal lines were appended for one identity; a second "
+        "line under an existing id is the divergent-hash quarantine candidate")
+
+    conn = _sqlite3.connect(str(data_dir / "stats.db"))
+    try:
+        rows = conn.execute(
+            "SELECT provider, account_key, effective_from FROM "
+            "meter_rate_change_events").fetchall()
+    finally:
+        conn.close()
+    assert rows == [("claude", "unattributed", MRC_RACE_EFFECTIVE_FROM)], rows

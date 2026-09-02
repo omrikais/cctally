@@ -37,18 +37,24 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
+import pickle
 import re
 import shlex
 import sqlite3
 import sys
+import threading
+from collections import defaultdict
 from dataclasses import dataclass, field
+from functools import cached_property
 from types import MappingProxyType
-from typing import Any, Collection, Iterable, Mapping, Sequence
+from typing import Any, Collection, Iterable, Mapping, NamedTuple, Sequence
 
 import _cctally_core
 import _lib_accounts
 import _lib_codex_pools
 import _lib_diagnosis as kernel
+import _lib_pricing
 from _lib_diagnosis import (
     ClassResult, ContributorSpec, Denominator, DiagnosisWindow,
     EstablishmentError, EstablishmentFailure, PopulationCoverage,
@@ -181,11 +187,18 @@ def _parse_ts(raw: object) -> dt.datetime | None:
     if not isinstance(raw, str) or not raw:
         return None
     try:
-        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if raw.endswith("Z"):
+            # Codex's canonical store spelling. Avoid allocating a replaced
+            # string and normalizing an offset that is already known to be
+            # UTC on every accounting row in the hot scan.
+            return dt.datetime.fromisoformat(raw[:-1]).replace(tzinfo=UTC)
+        parsed = dt.datetime.fromisoformat(raw)
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
+        return parsed.replace(tzinfo=UTC)
+    if parsed.tzinfo is UTC:
+        return parsed
     return parsed.astimezone(UTC)
 
 
@@ -304,11 +317,25 @@ def _digest_component_pair(current_rows: Iterable[Sequence[Any]],
     current-window and its baseline-window row streams, and the two are
     domain-separated so a row moving between them is visible.
     """
+    return _digest_component_pair_from_digests(
+        _digest_rows(current_rows), _digest_rows(baseline_rows or ()))
+
+
+def _digest_component_pair_from_digests(
+        current_digest: str, baseline_digest: str | None) -> str:
+    """Bind two already-established component digests without rereading.
+
+    `_establish` computes each digest while its component is protected by the
+    before/after probe pair. Re-serializing the full accounting population at
+    publication time added a second 150K-row hash pass without observing any
+    new fact. Domain-separating those same subdigests is byte-identical to the
+    original row-stream helper above.
+    """
     digest = hashlib.sha256()
     digest.update(b"current=")
-    digest.update(_digest_rows(current_rows).encode())
+    digest.update(current_digest.encode())
     digest.update(b"\x1dbaseline=")
-    digest.update(_digest_rows(baseline_rows or ()).encode())
+    digest.update((baseline_digest or _digest_rows(())).encode())
     return digest.hexdigest()
 
 
@@ -443,18 +470,28 @@ def _digest_configuration(scope: DiagnosisScope) -> tuple[list, Any]:
 
 
 def _digest_rows(rows: Iterable[Sequence[Any]]) -> str:
+    """Digest a component's already-materialized primitive row stream.
+
+    Protocol 5 is deterministic for these tuples of SQLite/JSON primitives
+    and frames the values without delimiter collisions. Feeding the pickler
+    directly into SHA avoids both the per-cell Python string loop and a second
+    serialized copy proportional to the accounting population.
+    """
     digest = hashlib.sha256()
-    for row in rows:
-        digest.update(b"\x1e")
-        digest.update("\x1f".join("" if v is None else str(v)
-                                  for v in row).encode())
+
+    class _DigestWriter:
+        def write(self, data: bytes) -> int:
+            digest.update(data)
+            return len(data)
+
+    payload = rows if isinstance(rows, (list, tuple)) else tuple(rows)
+    pickle.Pickler(_DigestWriter(), protocol=5).dump(payload)
     return digest.hexdigest()
 
 
 # --- raw accounting facts ----------------------------------------------
 
-@dataclass(frozen=True)
-class AccountingEntry:
+class AccountingEntry(NamedTuple):
     """One priced accounting row, provider-neutral for the fold."""
 
     timestamp: dt.datetime
@@ -532,6 +569,16 @@ def _native_block_key(root_key: str, pool: str | None,
 
 
 @dataclass(frozen=True)
+class _PopulationIndex:
+    total_usd: float
+    observed_range: tuple[dt.datetime | None, dt.datetime | None]
+    coverage_counts: Mapping[str, int]
+    grouped_entries: Mapping[
+        str, tuple[dict[str, list[AccountingEntry]], dict[str, str]]]
+    population_digest: str
+
+
+@dataclass(frozen=True)
 class RawFacts:
     entries: tuple[AccountingEntry, ...] = ()
     blocks: tuple[NativeBlock, ...] = ()
@@ -542,12 +589,89 @@ class RawFacts:
     # past the window start from an install that simply did not exist then.
     store_horizon: dt.datetime | None = None
     unavailable_cause: str | None = None
+    population_digest_override: str | None = field(
+        default=None, repr=False, compare=False)
+
+    @cached_property
+    def _index(self) -> _PopulationIndex:
+        """Derive every provider-wide fold in one population traversal."""
+        grouped = {kind: defaultdict(list)
+                   for kind in ("model", "project", "session")}
+        labels = {kind: {} for kind in grouped}
+        model_groups = grouped["model"]
+        project_groups = grouped["project"]
+        session_groups = grouped["session"]
+        model_labels = labels["model"]
+        project_labels = labels["project"]
+        session_labels = labels["session"]
+        costs: list[float] = []
+        digest = (None if self.population_digest_override is not None
+                  else hashlib.sha256())
+        low: dt.datetime | None = None
+        high: dt.datetime | None = None
+        model_count = project_count = session_count = priced_count = 0
+        for entry in self.entries:
+            costs.append(entry.cost_usd)
+            if low is None or entry.timestamp < low:
+                low = entry.timestamp
+            if high is None or entry.timestamp > high:
+                high = entry.timestamp
+            model_count += bool(entry.model)
+            project_count += bool(entry.project_identity_resolved)
+            session_count += bool(entry.session_identity_resolved)
+            priced_count += not entry.is_fallback_pricing
+            if digest is not None:
+                digest.update((f"{_iso_z(entry.timestamp)}|{entry.model}|"
+                               f"{entry.session_key}|"
+                               f"{entry.cost_usd!r}").encode())
+            model_key = entry.model or "(unknown)"
+            if model_key not in model_groups:
+                model_labels[model_key] = model_key
+            model_groups[model_key].append(entry)
+            if entry.project_key not in project_groups:
+                project_labels[entry.project_key] = entry.project_label
+            project_groups[entry.project_key].append(entry)
+            if entry.session_key not in session_groups:
+                session_labels[entry.session_key] = entry.session_label
+            session_groups[entry.session_key].append(entry)
+        return _PopulationIndex(
+            total_usd=stable_sum(costs),
+            observed_range=(low, high),
+            coverage_counts=MappingProxyType({
+                "model": model_count,
+                "project": project_count,
+                "session": session_count,
+                "block": len(costs),
+                "priced": priced_count,
+            }),
+            grouped_entries=MappingProxyType({
+                kind: (grouped[kind], labels[kind]) for kind in grouped
+            }),
+            population_digest=(self.population_digest_override
+                               if self.population_digest_override is not None
+                               else digest.hexdigest()[:32]),
+        )
 
     @property
     def total_usd(self) -> float:
-        # `stable_sum` at every fold layer: `golden-json.txt` prints full float
-        # repr values, so a summation difference is a golden difference.
-        return stable_sum(e.cost_usd for e in self.entries)
+        return self._index.total_usd
+
+    @property
+    def observed_range(self) -> tuple[dt.datetime | None, dt.datetime | None]:
+        return self._index.observed_range
+
+    @property
+    def coverage_counts(self) -> Mapping[str, int]:
+        return self._index.coverage_counts
+
+    @property
+    def grouped_entries(self) -> Mapping[
+            str, tuple[dict[str, list[AccountingEntry]], dict[str, str]]]:
+        return self._index.grouped_entries
+
+    @property
+    def population_digest(self) -> str:
+        return self._index.population_digest
 
 
 # The "not yet asked" sentinel for the memoized schema-gap answer, because
@@ -587,6 +711,7 @@ class StoreBundle:
         # during establishment when the plan opened the conversations store,
         # so the digest and the rows describe one evaluation rather than two.
         self.s3_evaluations: dict | None = None
+        self.claude_window_sessions: tuple[str, ...] | None = None
         # Each S3 class's aggregate qualifying-cost share over the immediately
         # preceding equal-duration window. Absent means the baseline could not
         # be established, which is `baseline_insufficient`.
@@ -857,16 +982,12 @@ def _read_claude_blocks(scope: DiagnosisScope,
 # --- Codex accounting ---------------------------------------------------
 
 _CODEX_ENTRIES_SQL = """
-    SELECT entries.timestamp_utc, entries.session_id, entries.source_path,
+    SELECT entries.timestamp_utc, entries.source_path,
            entries.source_root_key, entries.conversation_key, entries.model,
            entries.account_key, entries.input_tokens,
            entries.cached_input_tokens, entries.output_tokens,
-           entries.reasoning_output_tokens, entries.total_tokens,
-           threads.cwd, threads.git_json
+           entries.reasoning_output_tokens
       FROM codex_session_entries AS entries
-      LEFT JOIN codex_conversation_threads AS threads
-        ON threads.conversation_key = entries.conversation_key
-       AND threads.source_root_key = entries.source_root_key
      WHERE entries.timestamp_utc >= ? AND entries.timestamp_utc < ?
 """
 
@@ -878,16 +999,12 @@ _CODEX_ENTRIES_SQL = """
 # per-turn capacity. `source_root_key` and `conversation_key` — the fan-out
 # join keys — are already in the frozen projection.
 _CODEX_ENTRIES_S3_SQL = """
-    SELECT entries.timestamp_utc, entries.session_id, entries.source_path,
+    SELECT entries.timestamp_utc, entries.source_path,
            entries.source_root_key, entries.conversation_key, entries.model,
            entries.account_key, entries.input_tokens,
            entries.cached_input_tokens, entries.output_tokens,
-           entries.reasoning_output_tokens, entries.total_tokens,
-           threads.cwd, threads.git_json, entries.line_offset
+           entries.reasoning_output_tokens, entries.line_offset
       FROM codex_session_entries AS entries
-      LEFT JOIN codex_conversation_threads AS threads
-        ON threads.conversation_key = entries.conversation_key
-       AND threads.source_root_key = entries.source_root_key
      WHERE entries.timestamp_utc >= ? AND entries.timestamp_utc < ?
 """
 
@@ -897,9 +1014,71 @@ _CODEX_RETENTION_SQL = """
 """
 
 
+def _compiled_codex_pricer(model: str, speed: str):
+    """Resolve one model's canonical pricing once for the hot range scan.
+
+    The returned function preserves `_calculate_codex_entry_cost`'s exact
+    arithmetic and warning contract. It only removes repeated model aliases,
+    dictionary lookups, rate extraction and fast-tier resolution from every
+    token event in the same diagnosis window.
+    """
+    pricing, is_fallback = _resolve_codex_pricing(model)
+    if pricing is None:
+        _lib_pricing._warn_unknown_codex_model(model)
+        return (lambda *_tokens: 0.0), is_fallback
+    if is_fallback:
+        _lib_pricing._warn_unknown_codex_model(model)
+
+    threshold = _lib_pricing.CODEX_TIERED_THRESHOLD
+    input_rate = pricing.get("input_cost_per_token", 0.0)
+    input_tier = pricing.get("input_cost_per_token_above_272k_tokens")
+    cache_rate = pricing.get("cache_read_input_token_cost", 0.0)
+    cache_tier = pricing.get(
+        "cache_read_input_token_cost_above_272k_tokens")
+    output_rate = pricing.get("output_cost_per_token", 0.0)
+    output_tier = pricing.get("output_cost_per_token_above_272k_tokens")
+    multiplier = (_lib_pricing._codex_fast_multiplier(model)
+                  if speed == "fast" else 1.0)
+
+    def _price(input_tokens: int, cached_input_tokens: int,
+               output_tokens: int,
+               reasoning_output_tokens: int) -> float:
+        del reasoning_output_tokens
+        non_cached_input = max(0, input_tokens - cached_input_tokens)
+        if non_cached_input <= 0 or not input_rate:
+            input_cost = 0.0
+        elif non_cached_input > threshold and input_tier is not None:
+            input_cost = (threshold * input_rate
+                          + (non_cached_input - threshold) * input_tier)
+        else:
+            input_cost = non_cached_input * input_rate
+        if cached_input_tokens <= 0 or not cache_rate:
+            cached_input_cost = 0.0
+        elif cached_input_tokens > threshold and cache_tier is not None:
+            cached_input_cost = (
+                threshold * cache_rate
+                + (cached_input_tokens - threshold) * cache_tier)
+        else:
+            cached_input_cost = cached_input_tokens * cache_rate
+        if output_tokens <= 0 or not output_rate:
+            output_cost = 0.0
+        elif output_tokens > threshold and output_tier is not None:
+            output_cost = (threshold * output_rate
+                           + (output_tokens - threshold) * output_tier)
+        else:
+            output_cost = output_tokens * output_rate
+        base = input_cost + cached_input_cost + output_cost
+        if speed == "fast":
+            base *= multiplier
+        return base
+
+    return _price, is_fallback
+
+
 def _read_codex_entries(scope: DiagnosisScope, conn: sqlite3.Connection,
                         plan: "kernel.ExecutionPlan"
-                        ) -> tuple[list[AccountingEntry], list[tuple]]:
+                        ) -> tuple[
+                            list[AccountingEntry], list[tuple], list]:
     params: list[Any] = [_iso_sql(scope.window_start), _iso_sql(scope.window_end)]
     expanded = plan.requires_s3_projection()
     # Every Codex query carries `account_key` (#341 / #373). A Codex read that
@@ -910,55 +1089,86 @@ def _read_codex_entries(scope: DiagnosisScope, conn: sqlite3.Connection,
          " entries.conversation_key ASC, entries.id ASC")
     rows = _execute(conn, sql, params)
 
+    # Thread metadata is conversation-shaped, not entry-shaped. Joining it
+    # onto the hot accounting range repeats the same cwd/git/topology strings
+    # once per token event (150,000 times in the acceptance corpus) before
+    # Python immediately deduplicates them again. Read the scoped thread set
+    # once under this component's same probe pair and reuse it for project
+    # attribution, the per-entry digest, and the fan-out evaluator.
+    scoped = sorted({str(row["conversation_key"]) for row in rows
+                     if row["conversation_key"]})
+    thread_rows = _read_codex_threads(conn, scoped)
+    threads = {str(row["conversation_key"]): row for row in thread_rows}
+
     c = _cctally()
     speed = scope.effective_speed or "standard"
+    pricers: dict[str, tuple[Any, bool]] = {}
     resolver_cache: dict[str, Any] = {}
+    projects: dict[str, tuple[str, str, bool]] = {}
+    for conversation_key, thread in threads.items():
+        cwd = thread["cwd"]
+        if isinstance(cwd, str) and cwd:
+            project = c._resolve_project_key(cwd, "git-root", resolver_cache)
+            projects[conversation_key] = (
+                project.bucket_path, project.display_key,
+                not project.is_unknown,
+            )
+        else:
+            projects[conversation_key] = ("(unassigned)", "(unassigned)",
+                                          False)
+    pools: dict[str, str | None] = {}
     entries: list[AccountingEntry] = []
     digest_rows: list[tuple] = []
     for row in rows:
         timestamp = _parse_ts(row["timestamp_utc"])
         if timestamp is None:
             continue
-        model = str(row["model"] or "")
-        cost = c._calculate_codex_entry_cost(
-            model, int(row["input_tokens"] or 0),
-            int(row["cached_input_tokens"] or 0),
-            int(row["output_tokens"] or 0),
-            int(row["reasoning_output_tokens"] or 0),
-            speed=speed,
+        model = row["model"] or ""
+        input_tokens = int(row["input_tokens"] or 0)
+        cached_input_tokens = int(row["cached_input_tokens"] or 0)
+        output_tokens = int(row["output_tokens"] or 0)
+        reasoning_output_tokens = int(row["reasoning_output_tokens"] or 0)
+        compiled = pricers.get(model)
+        if compiled is None:
+            compiled = _compiled_codex_pricer(model, speed)
+            pricers[model] = compiled
+        pricer, is_fallback = compiled
+        cost = pricer(
+            input_tokens, cached_input_tokens, output_tokens,
+            reasoning_output_tokens,
         )
-        _pricing, is_fallback = _resolve_codex_pricing(model)
-        cwd = row["cwd"]
-        if isinstance(cwd, str) and cwd:
-            project = c._resolve_project_key(cwd, "git-root", resolver_cache)
-            project_key, project_label = project.bucket_path, project.display_key
-            project_resolved = not project.is_unknown
-        else:
-            # Absent Codex project metadata reduces identityCoverage
-            # explicitly and never basename-merges distinct git roots.
-            project_key = project_label = "(unassigned)"
-            project_resolved = False
-        conversation_key = str(row["conversation_key"] or "")
+        conversation_key = row["conversation_key"] or ""
+        source_path = row["source_path"] or ""
+        root_key = row["source_root_key"] or ""
+        thread = threads.get(conversation_key)
+        cwd = thread["cwd"] if thread is not None else None
+        # Project identity is conversation metadata, so resolve it once per
+        # thread rather than once per token event. Absent metadata still
+        # reduces identityCoverage and never basename-merges git roots.
+        project_key, project_label, project_resolved = projects.get(
+            conversation_key, ("(unassigned)", "(unassigned)", False))
+        if model not in pools:
+            pools[model] = _lib_codex_pools.codex_model_scoped_quota_pool(model)
         entries.append(AccountingEntry(
             timestamp=timestamp,
             model=model,
             project_key=project_key,
             project_label=project_label,
-            session_key=conversation_key or str(row["source_path"] or "(unknown)"),
+            session_key=conversation_key or source_path or "(unknown)",
             session_label=conversation_key or "(unknown)",
-            root_key=str(row["source_root_key"] or ""),
-            pool=_lib_codex_pools.codex_model_scoped_quota_pool(model),
+            root_key=root_key,
+            pool=pools[model],
             cost_usd=cost,
-            input_tokens=int(row["input_tokens"] or 0),
-            output_tokens=int(row["output_tokens"] or 0),
-            cache_read_tokens=int(row["cached_input_tokens"] or 0),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cached_input_tokens,
             is_fallback_pricing=bool(is_fallback),
             project_identity_resolved=project_resolved,
             session_identity_resolved=bool(conversation_key),
             # The Codex legacy fallback prices the entry, so the model is
             # qualified rather than unpriceable.
             pricing_resolved=True,
-            source_path=str(row["source_path"] or ""),
+            source_path=source_path,
             line_offset=(row["line_offset"] if expanded else None),
         ))
         digest_row = (
@@ -966,12 +1176,11 @@ def _read_codex_entries(scope: DiagnosisScope, conn: sqlite3.Connection,
             row["conversation_key"], model, row["account_key"],
             row["input_tokens"], row["cached_input_tokens"],
             row["output_tokens"], row["reasoning_output_tokens"],
-            row["cwd"], row["git_json"],
         )
         if expanded:
             digest_row = digest_row + (row["source_path"], row["line_offset"])
         digest_rows.append(digest_row)
-    return entries, digest_rows
+    return entries, digest_rows, thread_rows
 
 
 _CODEX_BLOCKS_SQL = """
@@ -1059,18 +1268,16 @@ def _read_cache_component(scope: DiagnosisScope,
     thread_rows: list = []
     try:
         if scope.source == "codex":
-            entries, digest_rows = _read_codex_entries(scope, conn, bundle.plan)
+            entries, digest_rows, thread_rows = (
+                _read_codex_entries(scope, conn, bundle.plan)
+            )
             retention_sql = _CODEX_RETENTION_SQL
-            if bundle.plan.requires_s3_projection():
-                # The Codex fan-out signal lives in THIS store, so its rows
-                # belong to THIS component's digest. Read once here and handed
-                # to the evaluator: read only in the evaluator they would move
-                # a published verdict while the identifier stood still, and
-                # read in both places the digest could describe a different
-                # state from the answer.
-                thread_rows = _read_codex_threads(conn, entries)
-                digest_rows = list(digest_rows) + _codex_thread_digest_rows(
-                    thread_rows)
+            # Thread metadata drives project attribution on every plan and
+            # fan-out on the expanded plan. Digest each conversation-shaped
+            # fact once here instead of repeating cwd/git strings for every
+            # token event in that conversation.
+            digest_rows = list(digest_rows) + _codex_thread_digest_rows(
+                thread_rows)
         else:
             entries, digest_rows = _read_claude_entries(scope, conn, bundle.plan)
             retention_sql = _CLAUDE_RETENTION_SQL
@@ -1106,7 +1313,7 @@ def _read_cache_component(scope: DiagnosisScope,
 
 
 def _read_codex_threads(conn: sqlite3.Connection,
-                        entries: Sequence[AccountingEntry]) -> list:
+                        scoped: Sequence[str]) -> list:
     """The thread rows the Codex fan-out predicate resolves over.
 
     Seeded from the scoped in-window accounting keys, never by walking the
@@ -1119,8 +1326,6 @@ def _read_codex_threads(conn: sqlite3.Connection,
     row handed in twice presents itself as two matches under the complete
     identity, which is exactly the condition that makes a child unallocated.
     """
-    scoped = sorted({entry.session_key for entry in entries
-                     if entry.session_key})
     if not scoped:
         return []
     rows: dict[str, Any] = {}
@@ -1147,7 +1352,7 @@ def _codex_thread_digest_rows(thread_rows: Sequence[Any]) -> list[tuple]:
         (str(row["conversation_key"]), str(row["source_root_key"] or ""),
          str(row["native_thread_id"] or ""),
          str(row["root_thread_id"] or ""),
-         str(row["parent_thread_id"] or ""),
+         str(row["parent_thread_id"] or ""), row["cwd"], row["git_json"],
          row["context_window"])
         for row in thread_rows
     ]
@@ -1714,35 +1919,58 @@ _CODEX_EVENT_COLUMNS = (
 # entry. The budget is allocated per source file so no file starves another,
 # and a file that exhausts its share yields NO turn map at all — a truncated
 # read would produce a wrong map rather than a missing one.
-_CODEX_EVENTS_SQL = """
-    SELECT source_path, line_offset, source_root_key, conversation_key,
-           native_thread_id, root_thread_id, parent_thread_id, timestamp_utc,
-           record_type, event_type, turn_id, call_id, payload_json, rank FROM (
-        SELECT source_path, line_offset, source_root_key, conversation_key,
-               native_thread_id, root_thread_id, parent_thread_id,
-               timestamp_utc, record_type, event_type, turn_id, call_id,
-               payload_json,
-               ROW_NUMBER() OVER (PARTITION BY source_path
-                                  ORDER BY line_offset ASC) AS rank
-          FROM codex_conversation_events
-         WHERE source_path IN ({placeholders})
+_CODEX_EVENT_FILTER = """
            AND (record_type IN ('session_meta', 'turn_context')
                 OR turn_id IS NOT NULL
                 OR event_type = 'token_count')
-    ) WHERE rank <= ?
+"""
+
+# Read at most ONE row beyond each file's allocated share. A grouped COUNT
+# scans every token event even though the only question is whether the file
+# exceeds its cap. Repeating this term under one `UNION ALL` keeps the probe
+# set-wise while letting the source-path/offset index stop each arm at its
+# first conclusive row. The decision remains exact: `share + 1` rows means the
+# whole file is starved, while at most `share` means every relevant row fit.
+_CODEX_EVENT_BUDGET_TERM_SQL = """
+    SELECT ? AS source_path, COUNT(*) AS rows_read
+      FROM (
+        SELECT 1
+          FROM codex_conversation_events
+         WHERE source_path = ?
+""" + _CODEX_EVENT_FILTER + """
+         ORDER BY line_offset ASC
+         LIMIT ?
+      )
+"""
+
+# Three bindings per compound arm stay below SQLite's historical 999-variable
+# ceiling, and below its 500-term compound-select ceiling too.
+_CODEX_EVENT_BUDGET_CHUNK = 300
+
+# Only lifecycle anchors can change the inferred turn. Accounting offsets are
+# merged against these rows in Python, so token_count payloads never cross the
+# SQLite boundary merely to inherit the current turn.
+_CODEX_EVENT_ANCHORS_SQL = """
+    SELECT source_path, line_offset, source_root_key, conversation_key,
+           native_thread_id, root_thread_id, parent_thread_id, timestamp_utc,
+           record_type, event_type, turn_id, call_id, payload_json
+      FROM codex_conversation_events
+     WHERE source_path IN ({placeholders})
+       AND (record_type IN ('session_meta', 'turn_context')
+            OR turn_id IS NOT NULL)
      ORDER BY source_path ASC, line_offset ASC
 """
 
 _CODEX_THREADS_BY_KEY_SQL = """
     SELECT conversation_key, source_root_key, native_thread_id,
-           root_thread_id, parent_thread_id, context_window
+           root_thread_id, parent_thread_id, cwd, git_json, context_window
       FROM codex_conversation_threads
      WHERE conversation_key IN ({placeholders})
 """
 
 _CODEX_THREADS_BY_NATIVE_SQL = """
     SELECT conversation_key, source_root_key, native_thread_id,
-           root_thread_id, parent_thread_id, context_window
+           root_thread_id, parent_thread_id, cwd, git_json, context_window
       FROM codex_conversation_threads
      WHERE native_thread_id IN ({placeholders})
 """
@@ -1784,7 +2012,8 @@ _CONVERSATIONS_STATEMENTS: dict[str, tuple[str, ...]] = {
     ),
     "codex": (
         _CODEX_PROMPT_CANDIDATE_SQL,
-        _CODEX_EVENTS_SQL,
+        _CODEX_EVENT_BUDGET_TERM_SQL,
+        _CODEX_EVENT_ANCHORS_SQL,
     ),
 }
 
@@ -2070,6 +2299,25 @@ def _fanout_gaps(unallocated: Sequence[Any],
 
 # --- 2.2 prompt-cache churn, Claude only --------------------------------
 
+def _claude_window_session_ids(scope: DiagnosisScope, bundle: StoreBundle,
+                               conversations: sqlite3.Connection
+                               ) -> tuple[str, ...]:
+    """The shared conversation population for this provider/window bundle."""
+    if bundle.claude_window_sessions is None:
+        # Seed and normalization budgets are divided over the COMPLETE
+        # transcript population, not only sessions carrying priced entries.
+        # A transcript-only session can therefore change another session's
+        # share even though it can never contribute a ranked dollar. Replacing
+        # this set with the accounting population changes typed withholding,
+        # so the complete range scan is part of the evidence contract.
+        bounds = [_iso_sql(scope.window_start), _iso_sql(scope.window_end)]
+        bundle.claude_window_sessions = tuple(sorted(
+            str(row[0]) for row in _execute(
+                conversations, _CLAUDE_WINDOW_SESSIONS_SQL, bounds)
+        ))
+    return bundle.claude_window_sessions
+
+
 def _evaluate_cache_churn(scope: DiagnosisScope, bundle: StoreBundle,
                           conversations: sqlite3.Connection) -> _S3Evaluation:
     """Flag every in-window turn that re-created the bulk of its cached prefix.
@@ -2085,16 +2333,25 @@ def _evaluate_cache_churn(scope: DiagnosisScope, bundle: StoreBundle,
     query = _conversation_query()
     facts = bundle.facts
     bounds = [_iso_sql(scope.window_start), _iso_sql(scope.window_end)]
-    sessions = sorted(
-        str(row[0]) for row in
-        _execute(conversations, _CLAUDE_WINDOW_SESSIONS_SQL, bounds)
-    )
-    if not sessions:
+    all_sessions = _claude_window_session_ids(scope, bundle, conversations)
+    if not all_sessions:
         return _unestablished()
 
-    allocation = allocate_scan_budget(sessions,
+    allocation = allocate_scan_budget(all_sessions,
                                       kernel.DIAGNOSIS_SEED_SCAN_BUDGET_ROWS)
-    largest = max(allocation.values(), default=0)
+    # Preserve the complete-population allocation above, then avoid loading
+    # seed/window bodies for transcript-only sessions when accounting already
+    # resolved the exact sessions that can contribute a ranked dollar. The
+    # empty-accounting fallback keeps the prior typed outcome for older or
+    # partially populated stores.
+    spending_sessions = {
+        entry.session_key for entry in facts.entries
+        if entry.session_identity_resolved and entry.session_key
+    }
+    sessions = tuple(
+        session for session in all_sessions if session in spending_sessions
+    ) if spending_sessions else all_sessions
+    largest = max((allocation[session] for session in sessions), default=0)
     prefix: dict[str, list] = {session: [] for session in sessions}
     overflowed: set[str] = set()
     for chunk in _chunks(sessions):
@@ -2174,7 +2431,7 @@ def _evaluate_cache_churn(scope: DiagnosisScope, bundle: StoreBundle,
             wasted.append(query._cache_failure_wasted_usd(
                 model, lost, speed=speed))
 
-    known = set(sessions)
+    known = set(all_sessions)
     seeded = set(streams)
     candidates = [entry for entry in facts.entries
                   if entry.session_key in known]
@@ -2231,14 +2488,20 @@ def _short_context_evaluation(facts: RawFacts, *, known: Sequence[str],
     """Shape one provider's decided conversations into the class result."""
     known_set = set(known)
     qualifying_set = set(qualifying)
-    candidates = [entry for entry in facts.entries
-                  if entry.session_key in known_set]
-    evaluated = [entry for entry in candidates
-                 if entry.session_key not in unevaluable]
-    if _nothing_evaluable(candidates, evaluated):
+    by_session, _labels = facts.grouped_entries["session"]
+    candidate_count = sum(len(by_session.get(key, ())) for key in known_set)
+    evaluated = tuple(
+        entry
+        for key in known_set if key not in unevaluable
+        for entry in by_session.get(key, ())
+    )
+    if candidate_count and not evaluated:
         return _unestablished(sorted(set(unevaluable.values())))
-    matched = [entry for entry in evaluated
-               if entry.session_key in qualifying_set]
+    matched = tuple(
+        entry
+        for key in qualifying_set if key not in unevaluable
+        for entry in by_session.get(key, ())
+    )
     member_turns = [turn_counts[key] for key in qualifying_set
                     if key in turn_counts]
     members = sorted((fractions[key], key) for key in qualifying_set
@@ -2257,9 +2520,9 @@ def _short_context_evaluation(facts: RawFacts, *, known: Sequence[str],
                                         qualifications=marks)
     return _S3Evaluation(
         established=True,
-        qualifying=tuple(matched),
-        evaluated=tuple(evaluated),
-        candidate_count=len(candidates),
+        qualifying=matched,
+        evaluated=evaluated,
+        candidate_count=candidate_count,
         gap_codes=tuple(sorted(set(unevaluable.values()))),
         evidence={
             "conversationCount": _EvidenceValue(value=len(qualifying_set)),
@@ -2298,10 +2561,7 @@ def _evaluate_claude_short_high_context(scope: DiagnosisScope,
     """
     facts = bundle.facts
     bounds = [_iso_sql(scope.window_start), _iso_sql(scope.window_end)]
-    sessions = sorted(
-        str(row[0]) for row in
-        _execute(conversations, _CLAUDE_WINDOW_SESSIONS_SQL, bounds)
-    )
+    sessions = _claude_window_session_ids(scope, bundle, conversations)
     if not sessions:
         return _unestablished()
 
@@ -2433,6 +2693,85 @@ def _codex_turn_capacities(events: Sequence[Any]) -> dict[str, int]:
     return capacities
 
 
+def _fold_codex_target_turns(events: Sequence[Any],
+                             target_offsets: Sequence[int]) -> dict[int, str | None]:
+    """Infer turns only at selected physical offsets.
+
+    Rows without a native turn anchor never change the lifecycle state. The
+    old diagnosis nevertheless loaded every token-count payload, constructed
+    a ``CodexPhysicalEvent`` for it, parsed its JSON, and then threw every map
+    entry away except the accounting offsets. This merge walks the retained
+    lifecycle anchors and the already-known accounting offsets directly.
+
+    The pending list preserves the canonical late-anchor rule: a later native
+    proof backfills only the unanchored prefix since the latest
+    ``session_meta``. A ``task_started`` anchor establishes the turn forward
+    but does not backfill that prefix.
+    """
+    ordered_events = sorted(events, key=lambda event: int(event.line_offset))
+    targets = sorted({int(offset) for offset in target_offsets})
+    result: dict[int, str | None] = {}
+    pending: list[int] = []
+    current: str | None = None
+    target_index = 0
+
+    def _record_until(limit: int, *, inclusive: bool = False) -> None:
+        nonlocal target_index
+        while target_index < len(targets):
+            offset = targets[target_index]
+            if offset > limit or (offset == limit and not inclusive):
+                break
+            if current is None:
+                pending.append(offset)
+            else:
+                result[offset] = current
+            target_index += 1
+
+    for event in ordered_events:
+        offset = int(event.line_offset)
+        _record_until(offset)
+        record_type = getattr(event, "record_type", None)
+        event_type = getattr(event, "event_type", None)
+        explicit = getattr(event, "turn_id", None)
+        if explicit is None and record_type == "turn_context":
+            try:
+                obj = json.loads(getattr(event, "payload_json", "") or "{}")
+            except (ValueError, TypeError):
+                obj = {}
+            payload = obj.get("payload") if isinstance(obj, Mapping) else None
+            candidate = payload.get("turn_id") if isinstance(payload, Mapping) else None
+            explicit = candidate if isinstance(candidate, str) and candidate else None
+        if record_type == "session_meta":
+            # A later anchor cannot cross this segment boundary. Pending
+            # targets from the preceding segment stay unresolved.
+            for target in pending:
+                result[target] = None
+            pending.clear()
+            current = None
+        elif explicit is not None:
+            is_late = (record_type != "turn_context"
+                       and event_type != "task_started")
+            if current is None and is_late:
+                for target in pending:
+                    result[target] = str(explicit)
+            else:
+                for target in pending:
+                    result[target] = None
+            pending.clear()
+            current = str(explicit)
+        if (record_type == "session_meta" and target_index < len(targets)
+                and targets[target_index] == offset):
+            result[offset] = None
+            target_index += 1
+        else:
+            _record_until(offset, inclusive=True)
+
+    _record_until(targets[-1] if targets else -1, inclusive=True)
+    for target in pending:
+        result[target] = None
+    return {offset: result.get(offset) for offset in targets}
+
+
 def _codex_threads_for(cache: sqlite3.Connection, sql: str,
                        values: Sequence[str]) -> list:
     rows: list = []
@@ -2456,8 +2795,8 @@ def _evaluate_codex_short_high_context(scope: DiagnosisScope,
     Codex, not only the fan-out class.
     """
     facts = bundle.facts
-    scoped = sorted({entry.session_key for entry in facts.entries
-                     if entry.session_key})
+    by_conversation, _labels = facts.grouped_entries["session"]
+    scoped = sorted(key for key in by_conversation if key)
     if not scoped:
         return _unestablished()
     threads = {str(row["conversation_key"]): row
@@ -2491,13 +2830,13 @@ def _evaluate_codex_short_high_context(scope: DiagnosisScope,
                 candidate_rows.get(key, []))
         return prompt_counts[key]
 
-    by_conversation: dict[str, list] = {}
+    targets_by_path: dict[str, list[int]] = {}
     for entry in facts.entries:
-        by_conversation.setdefault(entry.session_key, []).append(entry)
-    paths = sorted({entry.source_path for entry in facts.entries
-                    if entry.source_path})
-    turn_maps, capacities, starved = _codex_turn_attribution(conversations,
-                                                             paths)
+        if entry.source_path and entry.line_offset is not None:
+            targets_by_path.setdefault(entry.source_path, []).append(
+                int(entry.line_offset))
+    turn_maps, capacities, starved = _codex_turn_attribution(
+        conversations, targets_by_path)
 
     maximum = kernel.DIAGNOSIS_SHORT_CONVERSATION_MAX_HUMAN_TURNS
     unevaluable: dict[str, str] = {}
@@ -2570,7 +2909,7 @@ def _evaluate_codex_short_high_context(scope: DiagnosisScope,
 
 
 def _codex_turn_attribution(conversations: sqlite3.Connection,
-                            paths: Sequence[str]):
+                            targets_by_path: Mapping[str, Sequence[int]]):
     """`(turn_maps, capacities, starved)` over the budgeted event inference.
 
     A file that exhausts its share yields NO turn map: a truncated read would
@@ -2580,29 +2919,37 @@ def _codex_turn_attribution(conversations: sqlite3.Connection,
     turn_maps: dict[str, dict] = {}
     capacities: dict[str, int] = {}
     starved: set[str] = set()
+    paths = sorted(targets_by_path)
     if not paths:
         return turn_maps, capacities, starved
-    codex_kernel = _cctally()._load_sibling("_lib_codex_conversation")
     physical = _cctally()._load_sibling("_lib_jsonl").CodexPhysicalEvent
     allocation = allocate_scan_budget(
         list(paths), kernel.DIAGNOSIS_CODEX_EVENT_SCAN_BUDGET_ROWS)
     per_file = kernel.DIAGNOSIS_CODEX_EVENT_SCAN_PER_FILE_ROWS
     allocation = {path: min(share, per_file)
                   for path, share in allocation.items()}
-    largest = max(allocation.values(), default=0)
-    grouped: dict[str, list] = {path: [] for path in paths}
-    for chunk in _chunks(list(paths)):
-        sql = _CODEX_EVENTS_SQL.format(placeholders=_placeholders(len(chunk)))
-        for row in _execute(conversations, sql, list(chunk) + [largest + 1]):
+    for chunk in _chunks(paths, _CODEX_EVENT_BUDGET_CHUNK):
+        sql = "\nUNION ALL\n".join(
+            _CODEX_EVENT_BUDGET_TERM_SQL for _path in chunk)
+        params: list[Any] = []
+        for path in chunk:
+            params.extend((path, path, allocation.get(path, 0) + 1))
+        for row in _execute(conversations, sql, params):
+            path = str(row["source_path"])
+            if int(row["rows_read"]) > allocation.get(path, 0):
+                starved.add(path)
+    grouped: dict[str, list] = {path: [] for path in paths if path not in starved}
+    eligible = sorted(grouped)
+    for chunk in _chunks(eligible):
+        sql = _CODEX_EVENT_ANCHORS_SQL.format(
+            placeholders=_placeholders(len(chunk)))
+        for row in _execute(conversations, sql, list(chunk)):
             grouped.setdefault(str(row["source_path"]), []).append(row)
     for path, rows in grouped.items():
-        share = allocation.get(path, 0)
-        if any(int(row["rank"]) > share for row in rows):
-            starved.add(path)
-            continue
         events = [physical(*[row[column] for column in _CODEX_EVENT_COLUMNS])
                   for row in rows]
-        turn_maps[path] = codex_kernel.fold_codex_event_turns(events)
+        turn_maps[path] = _fold_codex_target_turns(
+            events, targets_by_path.get(path, ()))
         capacities.update(_codex_turn_capacities(events))
     return turn_maps, capacities, starved
 
@@ -2695,10 +3042,7 @@ def _evaluate_claude_fanout(scope: DiagnosisScope, bundle: StoreBundle,
     query = _conversation_query()
     facts = bundle.facts
     bounds = [_iso_sql(scope.window_start), _iso_sql(scope.window_end)]
-    sessions = sorted(
-        str(row[0]) for row in
-        _execute(conversations, _CLAUDE_WINDOW_SESSIONS_SQL, bounds)
-    )
+    sessions = _claude_window_session_ids(scope, bundle, conversations)
     if not sessions:
         return _unestablished()
     assistant_rows: dict[str, list] = {}
@@ -2778,8 +3122,8 @@ def _evaluate_codex_fanout(scope: DiagnosisScope,
     weaker pair.
     """
     facts = bundle.facts
-    scoped = sorted({entry.session_key for entry in facts.entries
-                     if entry.session_key})
+    by_conversation, _labels = facts.grouped_entries["session"]
+    scoped = sorted(key for key in by_conversation if key)
     if not scoped:
         return _unestablished()
     # The thread rows come from the `cache` component that read and DIGESTED
@@ -2800,31 +3144,33 @@ def _evaluate_codex_fanout(scope: DiagnosisScope,
     unresolvable = set(fanout.unallocated)
     unreadable = set(fanout.ambiguous)
 
-    candidates = list(facts.entries)
+    candidates = facts.entries
     allocated: list = []
     unallocated: list = []
     ambiguous: list = []
     bucket_rows: dict[str, list] = {}
-    for entry in candidates:
-        key = entry.session_key
+    for key, session_entries in by_conversation.items():
         if key in unreadable:
             # The origin category could not be read at all, so this is not
             # known subagent spend and its dollars are published nowhere.
-            ambiguous.append(entry)
+            ambiguous.extend(session_entries)
             continue
         if key in unresolvable:
-            unallocated.append(entry)
+            unallocated.extend(session_entries)
             continue
         group = fanout.parents.get(key)
         if group is None or group not in qualifying_groups:
             continue
-        if entry.root_key != group[0]:
+        matching = [entry for entry in session_entries
+                    if entry.root_key == group[0]]
+        if len(matching) != len(session_entries):
             # The join is `(source_root_key, conversation_key)`, and a key
             # that reached a different root is not this child's spend.
-            unallocated.append(entry)
-            continue
-        allocated.append(entry)
-        bucket_rows.setdefault(key, []).append(entry)
+            unallocated.extend(entry for entry in session_entries
+                               if entry.root_key != group[0])
+        if matching:
+            allocated.extend(matching)
+            bucket_rows[key] = matching
     bucket_usd = {key: stable_sum(entry.cost_usd for entry in rows)
                   for key, rows in bucket_rows.items()}
     return _fanout_evidence(
@@ -3066,6 +3412,15 @@ def _establish(scope: DiagnosisScope, bundle: StoreBundle) -> StoreBundle:
         _read_with_probe(component)
     cache_payload = payloads.get("cache") or {}
     stats_payload = payloads.get("stats") or {}
+    # The cache component already hashes every accounting row read for this
+    # exact provider/window under its probe pair. Re-hashing a second,
+    # lossy projection of the same 150K-entry population for the denominator
+    # identifier added CPU and no independent coherence. Domain-separate the
+    # established component digest so the public population identifier stays
+    # opaque and remains distinct from the generation component value.
+    cache_digest = _digest_rows(rows["cache"])
+    population_digest = hashlib.sha256(
+        b"diagnosis-population\x00" + cache_digest.encode()).hexdigest()[:32]
     # The accounting facts are assembled BEFORE the conversations component,
     # because that component digests the facts the three conversation-derived
     # evaluators publish and every one of them divides transcript structure
@@ -3078,6 +3433,7 @@ def _establish(scope: DiagnosisScope, bundle: StoreBundle) -> StoreBundle:
         retained_end=cache_payload.get("retained_end"),
         store_horizon=stats_payload.get("store_horizon"),
         unavailable_cause=cache_payload.get("unavailable_cause"),
+        population_digest_override=population_digest,
     )
     # A class denied in plan stage 1 is SETTLED, so the store it would have
     # needed is never opened, probed or digested. The conversations component
@@ -3117,7 +3473,7 @@ def _establish(scope: DiagnosisScope, bundle: StoreBundle) -> StoreBundle:
     bundle.component_rows = rows
     bundle.vector = GenerationVector(
         stats=_digest_rows(rows["stats"]),
-        cache=_digest_rows(rows["cache"]),
+        cache=cache_digest,
         configuration=_digest_rows(rows["configuration"]),
         conversations=(_digest_rows(rows["conversations"])
                        if "conversations" in rows else None),
@@ -3163,19 +3519,25 @@ def _coverage_for(scope: DiagnosisScope, facts: RawFacts,
     """
     total_usd = facts.total_usd
     total_count = len(facts.entries)
-    observed = [e.timestamp for e in facts.entries]
-    attributed_usd = stable_sum(e.cost_usd for e in attributed)
+    observed_start, observed_end = facts.observed_range
     attributed_count = len(attributed)
-    identity_resolved = sum(1 for e in attributed
-                            if _identity_resolved(e, identity_kind))
-    priced_without_fallback = sum(
-        1 for e in attributed if not e.is_fallback_pricing
-    )
+    if attributed is facts.entries:
+        attributed_usd = total_usd
+        identity_resolved = facts.coverage_counts.get(identity_kind,
+                                                       attributed_count)
+        priced_without_fallback = facts.coverage_counts["priced"]
+    else:
+        attributed_usd = stable_sum(e.cost_usd for e in attributed)
+        identity_resolved = sum(1 for e in attributed
+                                if _identity_resolved(e, identity_kind))
+        priced_without_fallback = sum(
+            1 for e in attributed if not e.is_fallback_pricing
+        )
     return PopulationCoverage(
         requested_start=scope.window_start_iso,
         requested_end=scope.window_end_iso,
-        observed_start=_iso_z(min(observed)) if observed else None,
-        observed_end=_iso_z(max(observed)) if observed else None,
+        observed_start=_iso_z(observed_start) if observed_start else None,
+        observed_end=_iso_z(observed_end) if observed_end else None,
         count_coverage=(attributed_count / total_count) if total_count else None,
         usd_coverage=(attributed_usd / total_usd) if total_usd > 0 else None,
         identity_coverage=((identity_resolved / attributed_count)
@@ -3191,7 +3553,7 @@ def _coverage_for(scope: DiagnosisScope, facts: RawFacts,
 # Handed out BY REFERENCE to every S3 coverage object, so it is wrapped rather
 # than copied: a plain dict would let one caller mutate the map every other
 # coverage object is publishing.
-_S3_DIMENSIONS: Mapping[str, str] = MappingProxyType({
+_S3_DIMENSIONS: Mapping[str, str] = kernel.FrozenDict({
     "countCoverage": "evaluated entries / all in-window provider entries",
     "usdCoverage": "evaluated USD / all in-window provider USD",
     "identityCoverage": "evaluated entries whose subject identity resolved "
@@ -3230,7 +3592,7 @@ def s3_coverage(scope: DiagnosisScope, facts: RawFacts, *,
     """
     total_usd = facts.total_usd
     total_count = len(facts.entries)
-    observed = [e.timestamp for e in facts.entries]
+    observed_start, observed_end = facts.observed_range
     evaluated_usd = stable_sum(e.cost_usd for e in evaluated)
     evaluated_count = len(evaluated)
     identity_resolved = sum(1 for e in evaluated
@@ -3241,8 +3603,8 @@ def s3_coverage(scope: DiagnosisScope, facts: RawFacts, *,
     return PopulationCoverage(
         requested_start=scope.window_start_iso,
         requested_end=scope.window_end_iso,
-        observed_start=_iso_z(min(observed)) if observed else None,
-        observed_end=_iso_z(max(observed)) if observed else None,
+        observed_start=_iso_z(observed_start) if observed_start else None,
+        observed_end=_iso_z(observed_end) if observed_end else None,
         count_coverage=(evaluated_count / total_count) if total_count else None,
         usd_coverage=(evaluated_usd / total_usd) if total_usd > 0 else None,
         identity_coverage=((identity_resolved / evaluated_count)
@@ -3513,7 +3875,7 @@ def _baseline_lookup(bundle: StoreBundle, scope: DiagnosisScope,
         return _block_lookup, None
 
     if spec.kind == "session_concentration":
-        grouped, _labels = _group_entries(baseline.entries, "session")
+        grouped, _labels = baseline.grouped_entries["session"]
         top = max(
             (stable_sum(e.cost_usd for e in rows) / total
              for rows in grouped.values()),
@@ -3526,7 +3888,7 @@ def _baseline_lookup(bundle: StoreBundle, scope: DiagnosisScope,
         return _session_lookup, None
 
     kind = "model" if spec.kind == "model_mix" else "project"
-    grouped, _labels = _group_entries(baseline.entries, kind)
+    grouped, _labels = baseline.grouped_entries[kind]
     shares = {key: stable_sum(e.cost_usd for e in rows) / total
               for key, rows in grouped.items()}
 
@@ -3765,13 +4127,13 @@ def _load_class_facts_inner(bundle: StoreBundle, scope: DiagnosisScope,
         return ClassFacts(spec.kind, subjects, population, facts.total_usd)
 
     kind = _identity_kind_for(spec)
-    grouped, labels = _group_entries(facts.entries, kind)
+    grouped, labels = facts.grouped_entries[kind]
     subjects = tuple(
         _subject_from_group(key, labels[key], rows,
                             _baseline_for(key, None), baseline_code)
         for key, rows in grouped.items()
     )
-    attributed = list(facts.entries)
+    attributed = facts.entries
 
     gap_codes: tuple[str, ...] = ()
     preempting: str | None = None
@@ -3797,11 +4159,7 @@ def _load_class_facts_inner(bundle: StoreBundle, scope: DiagnosisScope,
 # --- the assembled diagnosis -------------------------------------------
 
 def _population_digest(facts: RawFacts) -> str:
-    digest = hashlib.sha256()
-    for entry in facts.entries:
-        digest.update(f"{_iso_z(entry.timestamp)}|{entry.model}|"
-                      f"{entry.session_key}|{entry.cost_usd!r}".encode())
-    return digest.hexdigest()[:32]
+    return facts.population_digest
 
 
 def _next_step_context(scope: DiagnosisScope) -> dict[str, str]:
@@ -3836,13 +4194,13 @@ def build_provider_diagnosis(scope: DiagnosisScope, *,
                                         transcripts_visible=transcripts_visible)
     with StoreBundle(scope, policy) as bundle:
         _establish(scope, bundle)
-        baseline_rows: dict[str, list] = {}
+        baseline_vector: GenerationVector | None = None
         preceding = scope.preceding()
         try:
             with StoreBundle(preceding, policy) as baseline_bundle:
                 _establish(preceding, baseline_bundle)
                 bundle.baseline = baseline_bundle.facts
-                baseline_rows = dict(baseline_bundle.component_rows)
+                baseline_vector = baseline_bundle.vector
                 # The S3 comparator is the preceding window's aggregate
                 # qualifying-cost share, so it is computed while that bundle
                 # is still open — its stores close with the block.
@@ -3870,7 +4228,7 @@ def build_provider_diagnosis(scope: DiagnosisScope, *,
             )
         else:
             coverage = _coverage_for(
-                scope, bundle.facts, attributed=list(bundle.facts.entries),
+                scope, bundle.facts, attributed=bundle.facts.entries,
                 identity_kind="model",
             )
         denominator_usd = (
@@ -3913,17 +4271,21 @@ def build_provider_diagnosis(scope: DiagnosisScope, *,
         # Each component digest binds BOTH windows, so a baseline that moved
         # while the current window stood still moves the identifier too.
         published = GenerationVector(
-            stats=_digest_component_pair(bundle.component_rows.get("stats", []),
-                                         baseline_rows.get("stats")),
-            cache=_digest_component_pair(bundle.component_rows.get("cache", []),
-                                         baseline_rows.get("cache")),
-            configuration=_digest_component_pair(
-                bundle.component_rows.get("configuration", []),
-                baseline_rows.get("configuration")),
+            stats=_digest_component_pair_from_digests(
+                bundle.vector.stats,
+                baseline_vector.stats if baseline_vector else None),
+            cache=_digest_component_pair_from_digests(
+                bundle.vector.cache,
+                baseline_vector.cache if baseline_vector else None),
+            configuration=_digest_component_pair_from_digests(
+                bundle.vector.configuration,
+                baseline_vector.configuration if baseline_vector else None),
             conversations=(
-                _digest_component_pair(bundle.component_rows["conversations"],
-                                       baseline_rows.get("conversations"))
-                if "conversations" in bundle.component_rows else None),
+                _digest_component_pair_from_digests(
+                    bundle.vector.conversations,
+                    (baseline_vector.conversations
+                     if baseline_vector else None))
+                if bundle.vector.conversations is not None else None),
         )
         return kernel.build_provider_result(
             source=scope.source,
@@ -3935,6 +4297,101 @@ def build_provider_diagnosis(scope: DiagnosisScope, *,
             coverage=coverage,
             plan=established,
         )
+
+
+def _build_provider_task(args) -> kernel.ProviderResult:
+    """Pickle-safe provider build for the independent `all` branches."""
+    scope, transcripts_visible = args
+    try:
+        result = build_provider_diagnosis(
+            scope, transcripts_visible=transcripts_visible)
+    except EstablishmentFailure as exc:
+        if exc.code != EstablishmentError.STORE_UNAVAILABLE.value:
+            raise
+        result = _unavailable_provider_result(
+            scope, detail=exc.message,
+            transcripts_visible=transcripts_visible)
+    return result
+
+
+def _start_forked_provider(args) -> tuple[int, int]:
+    """Fork before any provider store opens; return `(pid, read_fd)`."""
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            payload = (True, _build_provider_task(args))
+        except EstablishmentFailure as exc:
+            payload = (False, "establishment", exc.code, exc.message)
+        except BaseException as exc:
+            payload = (False, "unexpected", type(exc).__name__, str(exc))
+        try:
+            with os.fdopen(write_fd, "wb") as stream:
+                pickle.dump(payload, stream, protocol=5)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    return pid, read_fd
+
+
+def _finish_forked_provider(worker: tuple[int, int]):
+    pid, read_fd = worker
+    try:
+        with os.fdopen(read_fd, "rb") as stream:
+            payload = pickle.load(stream)
+    finally:
+        _waited_pid, status = os.waitpid(pid, 0)
+    if not payload[0]:
+        if payload[1] == "establishment":
+            raise EstablishmentFailure(payload[2], payload[3])
+        raise RuntimeError(f"{payload[2]}: {payload[3]}")
+    if status != 0:
+        raise RuntimeError(f"diagnosis provider worker exited {status}")
+    return payload[1]
+
+
+def _spawn_worker_init(cctally_path: str,
+                       store_paths: Mapping[str, str]) -> None:
+    """Initialize a safe spawned/forkserver dashboard worker."""
+    import importlib.machinery
+    import importlib.util
+    import pathlib
+
+    # The canonical entry point is deliberately extensionless (`bin/cctally`),
+    # so `spec_from_file_location` cannot infer a loader from its suffix.
+    # Name the source loader explicitly; this executes the same file the
+    # parent loaded instead of copying another import surface into the worker.
+    loader = importlib.machinery.SourceFileLoader("cctally", cctally_path)
+    spec = importlib.util.spec_from_loader("cctally", loader)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load cctally worker from {cctally_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cctally"] = module
+    spec.loader.exec_module(module)
+    for name, raw in store_paths.items():
+        setattr(_cctally_core, name, pathlib.Path(raw))
+
+
+def _build_isolated_provider(args):
+    """Run one provider in a portable, one-shot safe process worker."""
+    import concurrent.futures
+    import multiprocessing
+
+    c = _cctally()
+    paths = {
+        name: str(getattr(_cctally_core, name))
+        for name in ("CACHE_DB_PATH", "DB_PATH",
+                     "CONVERSATIONS_DB_PATH", "CONFIG_PATH")
+    }
+    methods = multiprocessing.get_all_start_methods()
+    method = "forkserver" if "forkserver" in methods else "spawn"
+    with concurrent.futures.ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=multiprocessing.get_context(method),
+            initializer=_spawn_worker_init,
+            initargs=(str(c.__file__), paths)) as executor:
+        return executor.submit(_build_provider_task, args).result()
 
 
 def build_diagnosis(scope: DiagnosisScope,
@@ -3953,8 +4410,7 @@ def build_diagnosis(scope: DiagnosisScope,
     now = measured_at or dt.datetime.now(UTC)
     sources = (("claude", "codex") if scope.source == "all"
                else (scope.source,))
-    results = []
-    for source in sources:
+    def _build_one(source: str) -> kernel.ProviderResult:
         provider_scope = DiagnosisScope(
             source=source,
             account_key=scope.account_key,
@@ -3965,8 +4421,8 @@ def build_diagnosis(scope: DiagnosisScope,
             label=scope.label,
         )
         try:
-            results.append(build_provider_diagnosis(
-                provider_scope, transcripts_visible=transcripts_visible))
+            return build_provider_diagnosis(
+                provider_scope, transcripts_visible=transcripts_visible)
         except EstablishmentFailure as exc:
             # A store that cannot be OPENED withholds its provider rather than
             # ending the request, whether or not a second provider was
@@ -3977,9 +4433,66 @@ def build_diagnosis(scope: DiagnosisScope,
             # two-provider user a report and exit 0, from one condition.
             if exc.code != EstablishmentError.STORE_UNAVAILABLE.value:
                 raise
-            results.append(_unavailable_provider_result(
+            return _unavailable_provider_result(
                 provider_scope, detail=exc.message,
-                transcripts_visible=transcripts_visible))
+                transcripts_visible=transcripts_visible)
+
+    if len(sources) == 1:
+        results = [_build_one(sources[0])]
+    else:
+        # Provider stores, denominators and generation vectors are deliberately
+        # independent under `all`. Reading them in series made the combined
+        # latency the SUM of the Claude and Codex paths while adding no
+        # consistency guarantee. `map` preserves the canonical Claude/Codex
+        # result order even when Codex finishes first.
+        tasks = [(
+            DiagnosisScope(
+                source=source,
+                account_key=scope.account_key,
+                window_start=scope.window_start,
+                window_end=scope.window_end,
+                effective_speed=(scope.effective_speed
+                                 if source == "codex" else None),
+                display_tz=scope.display_tz,
+                label=scope.label,
+            ), transcripts_visible,
+        ) for source in sources]
+        # Keep Claude in the already-loaded parent and isolate only the much
+        # larger Codex fold. This retains true CPU overlap without paying to
+        # fork and pickle both branches; canonical order remains Claude then
+        # Codex regardless of which finishes first.
+        # Fork before opening either provider's stores. The child owns Codex;
+        # the parent builds Claude while it runs, then reads one compact result.
+        if (threading.current_thread() is threading.main_thread()
+                and hasattr(os, "fork")):
+            codex_worker = _start_forked_provider(tasks[1])
+            try:
+                claude_result = _build_one("claude")
+            except BaseException:
+                # Drain the pipe and reap the already-running child before
+                # preserving the parent failure. Without this path an early
+                # Claude establishment error leaves either a zombie or a
+                # child blocked while writing its result into a full pipe.
+                try:
+                    _finish_forked_provider(codex_worker)
+                except BaseException:
+                    pass
+                raise
+            codex_result = _finish_forked_provider(codex_worker)
+        else:
+            # `os.fork()` from ThreadingHTTPServer's request thread is not a
+            # safe operation. A one-shot forkserver worker gives the route the
+            # same CPU isolation without retaining a second full diagnosis
+            # heap between requests or adding any periodic work.
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1) as launcher:
+                codex_future = launcher.submit(
+                    _build_isolated_provider, tasks[1])
+                claude_result = _build_one("claude")
+                codex_result = codex_future.result()
+        results = [claude_result, codex_result]
     return kernel.build_report(_iso_z(now), scope.window(), results)
 
 

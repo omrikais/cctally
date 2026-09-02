@@ -1,11 +1,10 @@
 """#661 S2 Task A4 — one projection selector, two PROJECTED1 invariants.
 
 Spec section 3.3. The forecast and the projected-pace alert twin must publish
-the same number when they can reach the same basis, and the twin must ABSTAIN
-rather than fall back to the other basis when it cannot. A single equality
-invariant would be satisfiable only by testing the meter branch, which is the
-opposite of what PROJECTED1 exists for, so it splits in two and each leg
-carries its own non-vacuity guard.
+the same number when they can reach the same basis. A calibrated alert reuses
+the projection its existing week scan produced; when calibration cannot apply,
+both consumers fall back to the corrected meter. Each leg carries its own
+non-vacuity guard so equality cannot pass on the wrong basis.
 """
 from __future__ import annotations
 
@@ -195,8 +194,9 @@ def store(mod):
     conn.close()
 
 
-def _forecast_selection(mod, conn, now):
-    inputs = mod._load_forecast_inputs(conn, now, skip_sync=True)
+def _forecast_selection(mod, conn, now, *, account_key=None):
+    inputs = mod._load_forecast_inputs(
+        conn, now, skip_sync=True, account_key=account_key)
     assert inputs is not None
     return fc.select_projection_basis(inputs)
 
@@ -239,7 +239,7 @@ def test_a4_projected1a_both_sides_are_on_the_meter_basis(store, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# PROJECTED1-b — abstention when the twin cannot reach the forecast's basis
+# PROJECTED1-b — retain the calibrated basis the alert path already computed
 # --------------------------------------------------------------------------
 def _calibrated_store(mod, conn, monkeypatch):
     _seed_snapshots(conn, [(0, 2.0), (48, 8.0), (76, 12.0), (84, 40.0)])
@@ -249,20 +249,60 @@ def _calibrated_store(mod, conn, monkeypatch):
     return WEEK_START + dt.timedelta(hours=84)
 
 
-def test_a4_projected1b_alert_abstains_when_it_cannot_reach_the_basis(
+def test_a4_projected1b_alert_uses_the_reachable_calibrated_basis(
         store, monkeypatch):
-    """The forecast publishes a CALIBRATED projection while the snapshot-only
-    twin cannot reach one. The twin must abstain, not fire on the meter."""
+    """The alert path already performs the calibrated week scan, so it must
+    retain that projection rather than discard it and silently abstain."""
     mod, conn = store
     now = _calibrated_store(mod, conn, monkeypatch)
-    assert _forecast_selection(mod, conn, now).basis is \
-        fc.ProjectionBasis.CALIBRATED
-    assert mod._weekly_pct_week_avg_projection(conn, now) is None
+    selected = _forecast_selection(mod, conn, now)
+    assert selected.basis is fc.ProjectionBasis.CALIBRATED
+    projected = mod._weekly_pct_week_avg_projection(conn, now)
+    assert projected is not None
+    assert projected[0] == pytest.approx(selected.value)
+
+
+def test_historical_forecast_ignores_reset_until_its_detection_instant(
+        store, monkeypatch):
+    """A replay sees only reset events detected by that instant, comparing
+    mixed-offset timestamps as instants. At the inclusive detection boundary
+    the same reset becomes eligible and re-anchors the forecast window."""
+    mod, conn = store
+    _seed_snapshots(conn, [(0, 2.0), (48, 8.0), (84, 12.0)])
+    monkeypatch.setattr(mod, "_sum_cost_for_range", lambda *a, **k: 20.0)
+
+    effective = WEEK_START + dt.timedelta(hours=72)
+    detected = WEEK_START + dt.timedelta(hours=96)
+    detected_offset = detected.astimezone(
+        dt.timezone(dt.timedelta(hours=-4))).isoformat()
+    end_iso = mod._normalize_week_boundary_dt(WEEK_START + dt.timedelta(
+        hours=WEEK_HOURS)).isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT INTO week_reset_events "
+        "(detected_at_utc, old_week_end_at, new_week_end_at, "
+        " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+        (detected_offset,
+         (WEEK_START + dt.timedelta(hours=144)).isoformat(),
+         end_iso,
+         effective.astimezone(
+             dt.timezone(dt.timedelta(hours=5))).isoformat()),
+    )
+    conn.commit()
+
+    before = mod._load_forecast_inputs(
+        conn, WEEK_START + dt.timedelta(hours=60), skip_sync=True)
+    assert before is not None
+    assert before.week_start_at == WEEK_START
+
+    at_detection = mod._load_forecast_inputs(
+        conn, detected, skip_sync=True)
+    assert at_detection is not None
+    assert at_detection.week_start_at == effective
 
 
 def test_a4_projected1b_is_not_vacuous(store, monkeypatch):
     """Guard the guard: if the forecast were also on the meter basis, the
-    abstention assertion would pass for the wrong reason."""
+    calibrated equality assertion would pass for the wrong reason."""
     mod, conn = store
     now = _calibrated_store(mod, conn, monkeypatch)
     assert _forecast_selection(mod, conn, now).basis is not \
@@ -270,8 +310,7 @@ def test_a4_projected1b_is_not_vacuous(store, monkeypatch):
 
 
 def test_a4_the_twin_still_fires_without_a_calibration(store, monkeypatch):
-    """Guard the abstention: it must be caused by the calibration, not by the
-    seeded population. The same store WITHOUT the calibration file projects."""
+    """The same store without a calibration remains on the meter basis."""
     mod, conn = store
     now = _calibrated_store(mod, conn, monkeypatch)
     import _cctally_core
@@ -404,18 +443,18 @@ def test_a4_the_json_calibration_code_is_null_on_the_calibrated_basis(
 
 
 # --------------------------------------------------------------------------
-# PROJECTED1-b abstains on the BASIS, not on readability (spec §3.3, R4/R5)
+# PROJECTED1-b selects the BASIS, not mere calibration readability
 # --------------------------------------------------------------------------
 def test_a4_the_twin_fires_when_the_forecast_falls_back_to_the_meter(
         store, monkeypatch):
-    """Spec section 3.3 conditions abstention on the alert path being unable
-    to reach THE BASIS THE FORECAST PUBLISHED, not on a regime validating.
+    """Basis selection depends on what this week's population supports, not
+    merely on whether a stored regime validates.
 
     Here a calibration validates but this week's population is outside its
     recorded radii, so the forecast is on `corrected-meter` — a basis the
-    snapshot-only twin reaches perfectly well. Abstaining anyway silently
-    disabled the weekly 90%/100% projected alert, and `EMPTY_POPULATION`
-    makes that reachable at the start of every week.
+    alert path reaches perfectly well. Withholding anyway would silently
+    disable the weekly 90%/100% projected alert, and `EMPTY_POPULATION` makes
+    that reachable at the start of every week.
     """
     mod, conn = store
     _seed_snapshots(conn, [(0, 2.0), (48, 8.0), (76, 12.0), (84, 40.0)])
@@ -441,7 +480,7 @@ def test_a4_the_twin_fires_when_the_forecast_falls_back_to_the_meter(
         "be on the basis the twin can reach, or this proves nothing"
     proj = mod._weekly_pct_week_avg_projection(conn, now)
     assert proj is not None, (
-        "the twin abstained on a basis it can reach; the projected weekly "
+        "the twin withheld a basis it can reach; the projected weekly "
         "alert would never fire")
 
 
@@ -459,14 +498,16 @@ def test_a4_the_twin_fires_on_an_empty_population(store, monkeypatch):
     assert mod._weekly_pct_week_avg_projection(conn, now) is not None
 
 
-def test_a4_the_twin_still_abstains_on_a_reachable_calibrated_basis(
+def test_a4_the_twin_emits_on_a_reachable_calibrated_basis(
         store, monkeypatch):
-    """Guard the two above: the abstention is not simply gone."""
+    """A reachable calibrated basis produces the same alert value."""
     mod, conn = store
     now = _calibrated_store(mod, conn, monkeypatch)
-    assert _forecast_selection(mod, conn, now).basis is \
-        fc.ProjectionBasis.CALIBRATED
-    assert mod._weekly_pct_week_avg_projection(conn, now) is None
+    selected = _forecast_selection(mod, conn, now)
+    assert selected.basis is fc.ProjectionBasis.CALIBRATED
+    projected = mod._weekly_pct_week_avg_projection(conn, now)
+    assert projected is not None
+    assert projected[0] == pytest.approx(selected.value)
 
 
 def test_a4_the_twin_reads_the_calibration_for_the_account_it_was_given(
@@ -484,10 +525,23 @@ def test_a4_the_twin_reads_the_calibration_for_the_account_it_was_given(
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["accounts"] = {"acct-a": payload["accounts"]["*"]}
     path.write_text(json.dumps(payload), encoding="utf-8")
+    conn.execute(
+        "UPDATE weekly_usage_snapshots SET account_key = 'acct-a'")
+    conn.commit()
+    cache = mod._load_sibling("_cctally_cache").open_cache_db()
+    try:
+        cache.execute("UPDATE session_entries SET account_key = 'acct-a'")
+        cache.commit()
+    finally:
+        cache.close()
 
     # Merged: no regime, so the forecast is on the meter and so is the twin.
     assert mod._weekly_pct_week_avg_projection(conn, now) is not None
-    # The account that owns the regime: the forecast reaches the calibrated
-    # basis, so the twin must abstain rather than fire on the other one.
-    assert mod._weekly_pct_week_avg_projection(
-        conn, now, account_key="acct-a") is None
+    # The account that owns the regime: the alert uses that account's own
+    # calibrated projection rather than the merged meter fallback.
+    selected = _forecast_selection(mod, conn, now, account_key="acct-a")
+    account_projected = mod._weekly_pct_week_avg_projection(
+        conn, now, account_key="acct-a")
+    assert account_projected is not None
+    assert selected.basis is fc.ProjectionBasis.CALIBRATED
+    assert account_projected[0] == pytest.approx(selected.value)

@@ -201,6 +201,7 @@ _lib_codex_conversation = _load_lib("_lib_codex_conversation")
 # stdlib leaf, same shape as `_lib_codex_pools`, so it loads here rather than
 # through a bare import that would depend on ``bin/`` being on ``sys.path``.
 _lib_codex_account_adoption = _load_lib("_lib_codex_account_adoption")
+_ingest_frontier = _load_lib("_lib_ingest_frontier")
 
 # Opt-in backend phase-instrumentation collector (issue #276, Session A). Pure
 # stdlib leaf; near-noop when CCTALLY_PERF_TRACE is unset (phase() returns a
@@ -2142,6 +2143,10 @@ def _clear_codex_derived_rows(conn: sqlite3.Connection) -> bool:
             "('codex_accounting_bulk_clear', '1')"
         )
     try:
+        conn.execute(
+            "DELETE FROM cache_meta WHERE key=?",
+            (_ingest_frontier.CODEX_FULL_WALK_COMPLETE_KEY,),
+        )
         conn.execute("DELETE FROM codex_session_entries")
     finally:
         if _has_accounting_ledger:
@@ -2272,6 +2277,11 @@ COVERAGE_WRITER_ACTIONS: "dict[str, str]" = {
     # it is a property of the observation's population rather than of the
     # observation.
     "_cctally_cache.CodexResetAnchorResolver.apply_pending_merges": "preserve",
+    # Maintainer-only snapshot measurement mutates a copied cache, never the
+    # live store. Its quota-only scenario models the production writer contract
+    # by bumping `codex_physical_mutation_seq` in the same transaction as the
+    # value update, so any copied certificate is invalid on the sequence axis.
+    "cctally-snapshot-measure.mutate_quota_only": "preserve",
     # The two attribution-map leaves. Both materialize a decision that was
     # journaled fail-closed before the call, and neither deletes, so no caller
     # can reach them in a way that breaks coverage. The action belongs to the
@@ -2646,7 +2656,25 @@ def _insert_codex_normalized_rows(
         )
 
 
-def _recompute_codex_rollups(conn: sqlite3.Connection, conversation_keys) -> None:
+def _next_conversation_render_revision(conn: sqlite3.Connection) -> int:
+    """Reserve one monotonic revision inside the caller's transaction."""
+    row = conn.execute(
+        "SELECT value FROM cache_meta WHERE key='conversation_render_revision'"
+    ).fetchone()
+    try:
+        revision = int(row[0]) + 1 if row is not None else 1
+    except (TypeError, ValueError):
+        revision = 1
+    _set_cache_meta(conn, "conversation_render_revision", str(revision))
+    return revision
+
+
+def _recompute_codex_rollups(
+    conn: sqlite3.Connection,
+    conversation_keys,
+    *,
+    advance_render_revision: bool = True,
+) -> None:
     """Recompute-affected-or-delete the rollup for each conversation (§3.2).
 
     A rollup is a pure function of surviving codex_conversation_messages (+ thread
@@ -2656,7 +2684,14 @@ def _recompute_codex_rollups(conn: sqlite3.Connection, conversation_keys) -> Non
     survives.
     """
     kern = _lib_codex_conversation
-    for conversation_key in {key for key in conversation_keys if key}:
+    keys = {key for key in conversation_keys if key}
+    if not keys:
+        return
+    render_revision = (
+        _next_conversation_render_revision(conn)
+        if advance_render_revision else 0
+    )
+    for conversation_key in keys:
         rows = _load_codex_normalized_rows(conn, conversation_key)
         if not rows:
             conn.execute(
@@ -2688,25 +2723,34 @@ def _recompute_codex_rollups(conn: sqlite3.Connection, conversation_keys) -> Non
             "INSERT INTO codex_conversation_rollups "
             "(conversation_key, source_root_key, parent_thread_id, item_count, "
             " started_utc, last_activity_utc, project_key, project_label, "
-            " models_json, title) VALUES (?,?,?,?,?,?,?,?,?,?) "
+            " models_json, title, render_revision) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(conversation_key) DO UPDATE SET "
             " source_root_key=excluded.source_root_key, "
             " parent_thread_id=excluded.parent_thread_id, "
             " item_count=excluded.item_count, started_utc=excluded.started_utc, "
             " last_activity_utc=excluded.last_activity_utc, "
             " project_key=excluded.project_key, project_label=excluded.project_label, "
-            " models_json=excluded.models_json, title=excluded.title",
+            " models_json=excluded.models_json, title=excluded.title, "
+            " render_revision=excluded.render_revision",
             (conversation_key, source_root_key, parent_thread_id, item_count,
-             started, last_activity, project_key, project_label, models_json, title),
+             started, last_activity, project_key, project_label, models_json, title,
+             render_revision),
         )
 
 
-def _replay_codex_normalization(conn: sqlite3.Connection) -> None:
+def _replay_codex_normalization(
+    conn: sqlite3.Connection,
+    *,
+    advance_render_revision: bool = True,
+) -> None:
     """Re-derive ALL normalized rows/touches/rollups from stored
     codex_conversation_events, per file in (source_path ASC, line_offset ASC)
     order (migration 025). Runs inside the caller's transaction — the caller
     full-clears first (§3.4 helper) and owns the commit. Deterministic order +
-    the plain rowid alias make a re-run byte-idempotent."""
+    the plain rowid alias make a re-run byte-idempotent. The legacy cache
+    migration passes ``advance_render_revision=False`` because a crash-before-
+    stamp retry must not mutate the new invalidation frontier; ordinary retained
+    replay keeps the default and invalidates readers."""
     kern = _lib_codex_conversation
     events_by_file: dict[str, list] = {}
     accounts_by_file: dict[str, dict[tuple[str, int], str | None]] = {}
@@ -2743,7 +2787,10 @@ def _replay_codex_normalization(conn: sqlite3.Connection) -> None:
             accounts_by_file[source_path] if has_account else None,
         )
         affected.update(r.conversation_key for r in result.rows)
-    _recompute_codex_rollups(conn, affected)
+    _recompute_codex_rollups(
+        conn, affected,
+        advance_render_revision=advance_render_revision,
+    )
     # Migration 025 still replays this helper against legacy cache.db fixtures,
     # where the conversations-only #482 projection table does not exist. Live
     # conversations.db replays must refresh the projection, but the historical
@@ -3350,6 +3397,8 @@ class IngestStats:
     lines_malformed: int = 0
     assistant_lines_skipped: int = 0
     skip_reasons: dict = field(default_factory=dict)
+    full_walk_complete: bool = False
+    maintenance_failed: bool = False
 
     @property
     def targeted_clean(self) -> bool:
@@ -3865,6 +3914,17 @@ def sync_cache(
         # confirmed-current file still counts as walked.
         walk_clean = True
 
+        # The marker certifies the MOST RECENT exhaustive walk, not merely some
+        # historical clean walk.  Retire it before an ordinary full pass too;
+        # any early return or per-file failure must leave the store visibly
+        # incomplete until this same call reaches the clean end-of-walk write.
+        if not targeted and not rebuild:
+            conn.execute(
+                "DELETE FROM cache_meta "
+                "WHERE key='claude_ingest_walk_complete'"
+            )
+            conn.commit()
+
         if rebuild:
             # Clear INSIDE the lock — a concurrent rebuild that lost the
             # race would otherwise have wiped this cache before bailing,
@@ -4172,20 +4232,21 @@ def sync_cache(
             _consume_file_touches(conn)
         _p_backfills.__exit__(None, None, None)
 
-        with _perf.phase("discover") as _p_disc:
-            if targeted:
-                # A requested path that vanished (session rotated/deleted
-                # mid-live-tail) is deliberately DROPPED here without flagging
-                # failure: marking files_failed would wedge the watch loop's
-                # targeted_clean advance forever for a file that will never
-                # return; the orphan-prune path owns its stale rows on the next
-                # full sync. Pinned by tests/test_cache_accepted_behaviors.py
-                # (#279 S3 F4).
-                paths = [pathlib.Path(p) for p in only_paths if pathlib.Path(p).is_file()]
-            else:
-                paths = list(_iter_claude_jsonl_files())
-            stats.files_total = len(paths)
-            _p_disc.set_count(len(paths))
+        with _perf.phase("frontier"):
+            with _perf.phase("discover") as _p_disc:
+                if targeted:
+                    # A requested path that vanished (session rotated/deleted
+                    # mid-live-tail) is deliberately DROPPED here without flagging
+                    # failure: marking files_failed would wedge the watch loop's
+                    # targeted_clean advance forever for a file that will never
+                    # return; the orphan-prune path owns its stale rows on the next
+                    # full sync. Pinned by tests/test_cache_accepted_behaviors.py
+                    # (#279 S3 F4).
+                    paths = [pathlib.Path(p) for p in only_paths if pathlib.Path(p).is_file()]
+                else:
+                    paths = list(_iter_claude_jsonl_files())
+                stats.files_total = len(paths)
+                _p_disc.set_count(len(paths))
 
         # This SELECT does NOT open an implicit transaction (Python's
         # sqlite3 module only BEGINs on DML). Do NOT add any INSERT/
@@ -4694,23 +4755,23 @@ def sync_cache(
         # ~1 session/tick). Both recomputes derive COUNT/MIN/MAX from the same
         # rows the rail's old live aggregate read, so the rollup stays
         # byte-identical to that aggregate.
-        with _perf.phase("recompute.conversation_sessions"):
-            # #302: auto-invalidate the rollup's MATERIALIZED cost when the
-            # embedded pricing snapshot changed since it was last derived. Runs
-            # BEFORE the pending check so a mismatch arms the same durable flag
-            # the full-recompute path already consumes below (self-heal on a
-            # pricing sync / cctally upgrade, no manual `cache-sync --rebuild`).
-            _arm_rollup_backfill_on_pricing_change(conn)
-            if _conversation_sessions_backfill_pending(conn):
-                _recompute_conversation_sessions(conn)
-                conn.execute(
-                    "DELETE FROM cache_meta "
-                    "WHERE key='conversation_sessions_backfill_pending'"
-                )
-                conn.commit()
-            elif touched_sessions:
-                _recompute_conversation_sessions(conn, touched_sessions)
-                conn.commit()
+        with _perf.phase("accounting"):
+            with _perf.phase("recompute.conversation_sessions"):
+                # #302: auto-invalidate the rollup's MATERIALIZED cost when the
+                # embedded pricing snapshot changed since it was last derived.
+                # Runs BEFORE the pending check so a mismatch arms the same
+                # durable flag the full-recompute path already consumes below.
+                _arm_rollup_backfill_on_pricing_change(conn)
+                if _conversation_sessions_backfill_pending(conn):
+                    _recompute_conversation_sessions(conn)
+                    conn.execute(
+                        "DELETE FROM cache_meta "
+                        "WHERE key='conversation_sessions_backfill_pending'"
+                    )
+                    conn.commit()
+                elif touched_sessions:
+                    _recompute_conversation_sessions(conn, touched_sessions)
+                    conn.commit()
 
         # Walk-complete sentinel write (cctally-dev#93, D5a). Still inside the
         # held fcntl lock, before the finally-unlock. Only when the entire walk
@@ -4735,6 +4796,7 @@ def sync_cache(
                 (_cctally_db_sib.CACHE_CREATION_SPLIT_REWALK_KEY,),
             )
             conn.commit()
+            stats.full_walk_complete = True
         # #279 S2 F1: rolling parse-health record. Anomaly-delta-gated so
         # steady-state (incl. targeted live-tail) syncs stay zero-write;
         # targeted syncs still accumulate — they ingest real new bytes.
@@ -5073,7 +5135,9 @@ def _arm_rollup_backfill_on_pricing_change(conn) -> None:
     conn.commit()
 
 
-def _recompute_conversation_sessions(conn, session_ids=None) -> None:
+def _recompute_conversation_sessions(
+    conn, session_ids=None, *, advance_render_revision: bool = True,
+) -> None:
     """Recompute the ``conversation_sessions`` browse-rail rollup from
     ``conversation_messages``. The caller holds the cache.db.lock flock and owns
     the commit (this helper never commits).
@@ -5094,7 +5158,14 @@ def _recompute_conversation_sessions(conn, session_ids=None) -> None:
     The recomputed COUNT/MIN/MAX are byte-identical to the rail's prior live
     aggregate over the same rows — that is the load-bearing invariant
     (assert_rollup_matches_live in the maintenance test pins it)."""
-    if session_ids is None:
+    ids = None if session_ids is None else [s for s in session_ids if s is not None]
+    if ids == []:
+        return
+    render_revision = (
+        _next_conversation_render_revision(conn)
+        if advance_render_revision else 0
+    )
+    if ids is None:
         conn.execute("DELETE FROM conversation_sessions")
         conn.execute(
             "INSERT INTO conversation_sessions "
@@ -5102,8 +5173,11 @@ def _recompute_conversation_sessions(conn, session_ids=None) -> None:
             + _CONV_SESSIONS_SELECT + " GROUP BY session_id"
         )
         _fill_conversation_sessions_filter_columns(conn, None)
+        conn.execute(
+            "UPDATE conversation_sessions SET render_revision=?",
+            (render_revision,),
+        )
         return
-    ids = [s for s in session_ids if s is not None]
     for i in range(0, len(ids), 400):
         chunk = ids[i:i + 400]
         placeholders = ",".join("?" for _ in chunk)
@@ -5117,6 +5191,11 @@ def _recompute_conversation_sessions(conn, session_ids=None) -> None:
             + _CONV_SESSIONS_SELECT
             + f" AND session_id IN ({placeholders}) GROUP BY session_id",
             chunk,
+        )
+        conn.execute(
+            f"UPDATE conversation_sessions SET render_revision=? "
+            f"WHERE session_id IN ({placeholders})",
+            (render_revision, *chunk),
         )
     _fill_conversation_sessions_filter_columns(conn, ids)
 
@@ -6019,6 +6098,8 @@ class CodexIngestStats:
     backlog_files: int = 0
     backlog_bytes: int = 0
     budget_exhausted: bool = False
+    full_walk_complete: bool = False
+    maintenance_failed: bool = False
 
     @property
     def targeted_clean(self) -> bool:
@@ -6531,6 +6612,16 @@ def sync_codex_cache(
             raise ValueError(
                 "sync_codex_cache: budget_seconds is incompatible with rebuild")
 
+        # As on the Claude side, this sentinel describes the latest exhaustive
+        # pass.  Clear it before any full-pass decline or walk can occur, then
+        # restore it only after every file and maintenance leg certifies clean.
+        if not targeted:
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key=?",
+                (_ingest_frontier.CODEX_FULL_WALK_COMPLETE_KEY,),
+            )
+            conn.commit()
+
         # A pending byte-zero replay is consumed HERE, not by the migration that
         # armed it, so the rebuild path below captures `rebuild_known_identities`
         # before clearing. A migration that cleared `codex_session_files`
@@ -6794,13 +6885,14 @@ def sync_codex_cache(
         # Pure read (glob + is_file only); safe to run before the SELECT and
         # the per-file loop, where no cache.db write lock may be held. Targeted
         # mode qualifies ONLY the requested paths — never a tree walk (§5.1).
-        with _perf.phase("discover") as _p_disc:
-            if targeted:
-                files = _qualify_codex_targets(only_paths)
-            else:
-                files = _discover_codex_files_with_roots()
-            stats.files_total = len(files)
-            _p_disc.set_count(len(files))
+        with _perf.phase("frontier"):
+            with _perf.phase("discover") as _p_disc:
+                if targeted:
+                    files = _qualify_codex_targets(only_paths)
+                else:
+                    files = _discover_codex_files_with_roots()
+                stats.files_total = len(files)
+                _p_disc.set_count(len(files))
 
         # Scope the cache to the CURRENT root set (issue #108), but only from
         # positive filesystem evidence (#485). A recognized new root still
@@ -7067,8 +7159,7 @@ def sync_codex_cache(
                 st = jp.stat()
             except OSError as exc:
                 eprint(f"[codex-cache] stat failed for {jp}: {exc}")
-                if targeted:
-                    stats.files_failed += 1  # §5.1 I/O decline → call dirty
+                stats.files_failed += 1
                 continue
 
             size = st.st_size
@@ -7483,8 +7574,7 @@ def sync_codex_cache(
             except OSError as exc:
                 eprint(f"[codex-cache] could not read {jp}: {exc}")
                 anchor_resolver.discard_uncommitted_file()
-                if targeted:
-                    stats.files_failed += 1  # §5.1 I/O decline → call dirty
+                stats.files_failed += 1
                 continue
 
             # Pull terminal session_id/model from the iterator's tracker.
@@ -7860,8 +7950,9 @@ def sync_codex_cache(
         # entries the triggers just wrote. Best-effort, like the adoption below:
         # the resolution is fully re-derivable on the next sync.
         try:
-            resolved_models = _cctally_db_sib.backfill_codex_quota_observed_model(
-                conn)
+            with _perf.phase("accounting"):
+                resolved_models = _cctally_db_sib.backfill_codex_quota_observed_model(
+                    conn)
             if resolved_models:
                 _bump_codex_physical_mutation_seq(conn)
             conn.commit()
@@ -7869,6 +7960,7 @@ def sync_codex_cache(
             conn.rollback()
             if _cctally_db_sib._is_sqlite_corruption_error(exc):
                 raise
+            stats.maintenance_failed = True
             eprint("[cache-sync] could not resolve Codex quota model "
                    f"attribution: {exc}")
         # Window-scoped spend adoption (spec
@@ -7880,8 +7972,9 @@ def sync_codex_cache(
         # the stamp is fully re-derivable, so the next sync (or the migration)
         # repeats it.
         try:
-            adopted = apply_codex_window_spend_adoption(
-                conn, touched=None if rebuild else adoption_spans)
+            with _perf.phase("accounting"):
+                adopted = apply_codex_window_spend_adoption(
+                    conn, touched=None if rebuild else adoption_spans)
             conn.commit()
             # Terse, and silent on zero: a rebuild re-derives every row and so
             # legitimately re-stamps the same population each time, which would
@@ -7895,6 +7988,7 @@ def sync_codex_cache(
                 # Classified family corruption belongs to the shared recovery
                 # boundary, never to a best-effort local except.
                 raise
+            stats.maintenance_failed = True
             eprint(f"[cache-sync] could not adopt Codex window spend: {exc}")
         # #500 §7.1: the STANDING half of operator attribution. The condition it
         # repairs is created by ordinary ingest, not only by an operator command
@@ -7907,7 +8001,8 @@ def sync_codex_cache(
         # rows it restores are one committed generation. Costs a store with no
         # attribution records one indexed read; best-effort, like the pass above.
         try:
-            restored, readopted = reconcile_codex_window_attribution_spend(conn)
+            with _perf.phase("accounting"):
+                restored, readopted = reconcile_codex_window_attribution_spend(conn)
             conn.commit()
             if restored:
                 eprint(f"[cache-sync] restored {restored} Codex row(s) whose "
@@ -7917,6 +8012,7 @@ def sync_codex_cache(
             conn.rollback()
             if _cctally_db_sib._is_sqlite_corruption_error(exc):
                 raise
+            stats.maintenance_failed = True
             eprint("[cache-sync] could not reconcile Codex window "
                    f"attribution spend: {exc}")
         # #582: keep only a generous mutation-sequence tail. A dashboard that
@@ -7997,6 +8093,24 @@ def sync_codex_cache(
                         deferred_cert_sigs = dict(certificate[1])
                     else:
                         project_after_unlock = True
+        stats.full_walk_complete = bool(
+            not targeted
+            and walk_complete
+            and stats.files_failed == 0
+            and stats.files_deferred_torn == 0
+            and not stats.prune_refused
+            and not stats.maintenance_failed
+            and (
+                stats.files_processed + stats.files_skipped_unchanged
+                == stats.files_total
+            )
+        )
+        if stats.full_walk_complete:
+            conn.execute(
+                "INSERT OR IGNORE INTO cache_meta(key,value) VALUES(?, '1')",
+                (_ingest_frontier.CODEX_FULL_WALK_COMPLETE_KEY,),
+            )
+            conn.commit()
     finally:
         release_cache_writer_flocks(held_writer_flocks)
 
@@ -8012,15 +8126,17 @@ def sync_codex_cache(
         from _cctally_quota import _stats_projection_signatures_match
         stats_conn = _cctally_core.open_db()
         try:
-            if not _stats_projection_signatures_match(
-                stats_conn, deferred_cert_roots, deferred_cert_sigs or {}
-            ):
-                project_after_unlock = True
+            with _perf.phase("projector"):
+                if not _stats_projection_signatures_match(
+                    stats_conn, deferred_cert_roots, deferred_cert_sigs or {}
+                ):
+                    project_after_unlock = True
         finally:
             stats_conn.close()
     if project_after_unlock and quota_reconcile == "auto":
         from _cctally_quota import reconcile_codex_quota_projection
-        reconcile_codex_quota_projection()
+        with _perf.phase("projector"):
+            reconcile_codex_quota_projection()
     return stats
 
 
@@ -9295,11 +9411,12 @@ def _run_cache_plan_with_recovery(
             ):
                 active.close()
                 raise
-            if not _recover_corrupt_cache(
-                exc, origin=origin, active_conn=active,
-            ):
-                raise
-            active = open_cache_db()
+            with _perf.phase("recovery"):
+                if not _recover_corrupt_cache(
+                    exc, origin=origin, active_conn=active,
+                ):
+                    raise
+                active = open_cache_db()
             _cache_storm_test_pause("cache_repair_recreated")
             recovered = True
         except BaseException:
@@ -9889,11 +10006,14 @@ def scope_conversations_db_to_account(
             project_key       TEXT,
             project_label     TEXT,
             models_json       TEXT,
-            title             TEXT
+            title             TEXT,
+            render_revision   INTEGER NOT NULL DEFAULT 0
         );
         """
     )
-    _recompute_conversation_sessions(conn)
+    # These are read-scope TEMP projections. They must neither consume nor
+    # advance the durable render frontier used by writer recomputes.
+    _recompute_conversation_sessions(conn, advance_render_revision=False)
     codex_keys = {
         row[0]
         for row in conn.execute(
@@ -9920,7 +10040,9 @@ def scope_conversations_db_to_account(
             safe_project_attribution[conversation_key] = (
                 _codex_conversation_project_attribution(*thread)
             )
-    _recompute_codex_rollups(conn, codex_keys)
+    _recompute_codex_rollups(
+        conn, codex_keys, advance_render_revision=False,
+    )
     # Project identity is safe conversation-level enrichment: it is already
     # visible on the unqualified rail and contains only an opaque key plus the
     # derived display label. Preserve those two fields for conversations that

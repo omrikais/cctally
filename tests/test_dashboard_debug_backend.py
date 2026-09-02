@@ -90,9 +90,12 @@ def test_debug_backend_shape_over_loopback(monkeypatch, tmp_path):
         assert status == 200
         payload = json.loads(body)
         assert payload["schemaVersion"] == 1
-        assert set(payload) >= {"version", "dataset", "cache_state", "phases"}
+        assert set(payload) >= {
+            "version", "dataset", "cache_state", "phases", "ingest_phases",
+        }
         # tracing off in tests -> phases null + note
         assert payload["phases"] is None
+        assert payload["ingest_phases"] is None
         assert payload["note"] == "tracing_disabled"
         assert isinstance(payload["dataset"], dict)
         assert isinstance(payload["cache_state"], dict)
@@ -266,7 +269,7 @@ def test_debug_backend_reports_the_tick_record_with_tracing_off(
             "seq", "started_ns", "ended_ns", "duration_ns", "ingest_ran",
             "ingest_ns", "builder_ns", "dispatch", "codex_regime",
             "publication", "cold", "published_ns", "published_at", "period_ns",
-            "cache_pin_ns",
+            "cache_pin_ns", "cpu_ns",
         }, f"the wire names drifted from spec §1.1: {sorted(record)}"
         assert record["dispatch"] == "full"
         assert record["codex_regime"] == "active"
@@ -289,6 +292,39 @@ def test_debug_backend_reports_the_tick_record_with_tracing_off(
     finally:
         ts.reset_for_tests()
         stop(srv, srv._test_thread)
+
+
+def test_debug_backend_retains_ingest_tree_without_leaking_metadata(
+    monkeypatch, tmp_path,
+):
+    import _lib_perf as perf
+
+    ns = load_script()
+    perf.set_enabled(True)
+    try:
+        perf.reset_thread()
+        with perf.phase("ingest"):
+            with perf.phase("frontier") as phase:
+                phase.set_count(12)
+                phase.set_meta(result="caught_up")
+        perf.stash_last_ingest(
+            perf.current_root(), generated_at="2026-08-30T00:00:00+00:00",
+        )
+        srv = _boot(ns, tmp_path, monkeypatch)
+        try:
+            status, body = _get(srv.server_address[1], "/api/debug/backend")
+            assert status == 200
+            payload = json.loads(body)
+            assert payload["ingest_phases"]["name"] == "ingest"
+            encoded = json.dumps(payload["ingest_phases"])
+            assert "/" not in encoded
+            assert "caught_up" in encoded
+            assert "2026-08-30" not in encoded
+        finally:
+            stop(srv, srv._test_thread)
+    finally:
+        perf.set_enabled(False)
+        perf.reset_thread()
 
 
 def test_the_tick_record_leaks_no_path_and_no_prose(monkeypatch, tmp_path):
@@ -329,6 +365,8 @@ def test_debug_backend_publishes_conversation_passes_via_the_real_recorder(
         seq=2, started_ns=4_000_000_000, ended_ns=5_000_000_000,
         duration_ns=1_000_000_000, cpu_ns=500_000_000,
         status="store_unavailable",
+        claude_mode="targeted", codex_mode="caught_up",
+        claude_files=1, codex_files=0,
     )
     srv = _boot(ns, tmp_path, monkeypatch)
     try:
@@ -346,7 +384,8 @@ def test_debug_backend_publishes_conversation_passes_via_the_real_recorder(
         for row in rows:
             assert set(row) == {
                 "seq", "started_ns", "ended_ns", "duration_ns",
-                "cpu_ns", "period_ns", "status",
+                "cpu_ns", "period_ns", "status", "claude_mode", "codex_mode",
+                "claude_files", "codex_files",
             }, "no field may carry free text"
             for value in row.values():
                 assert isinstance(value, (int, str, type(None)))

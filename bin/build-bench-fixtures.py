@@ -68,11 +68,13 @@ _WORDS = [
 # user+assistant rows so msg_count ~= 2 * turns. Tunable after the first
 # evidence run (a change here busts ONLY the `assembly` scratch cache via the
 # marker's params_hash — Codex F5).
-ASSEMBLY_TURN_LADDER = [250, 500, 1000, 2000, 4000, 8000]   # full evidence run
+ASSEMBLY_TURN_LADDER = [250, 500, 1000, 2000, 4000, 8000, 10000]  # > live max
 ASSEMBLY_TURN_LADDER_SMALL = [10, 40]                        # fast self-test
 
-# Bump when _emit_corpus changes what it writes for a given params dict.
-GENERATOR_VERSION = 7
+# Bump when the generated corpus or its runtime policy changes for a given
+# params dict. Version 10 pins transcript retention off so a production-shaped
+# frontier pass cannot prune the fixture's deliberately fixed-date evidence.
+GENERATOR_VERSION = 10
 
 SCALES = {
     # The cheap end of the >=10x pair (#583 S1, spec §7.1). `tiny` and `small`
@@ -91,6 +93,7 @@ SCALES = {
         "codex_accounts": 2,
         "quota_windows": 20,
         "colliding_basename": True,
+        "history_rows": 40,
     },
     # The self-test + fast local iteration profile, at the scale spec §4.2 asks
     # for (roughly 4K Claude / 1.5K Codex entries; §5 calls it a 5.5K-entry
@@ -109,6 +112,7 @@ SCALES = {
         "codex_accounts": 2,
         "quota_windows": 120,
         "colliding_basename": True,
+        "history_rows": 400,
     },
     # The committed-baseline scale (issue's ~300K-entry target, tuned to a
     # practical build time — see bench/README.md and the committed baseline's
@@ -123,14 +127,23 @@ SCALES = {
         "codex_accounts": 2,
         "quota_windows": 2400,
         "colliding_basename": True,
+        "history_rows": 2500,
     },
     # Session C (M5): one session per ladder rung (NOT uniform sessions). The
     # `ladder` key routes _emit_corpus to the per-session turn list; the marker
     # carries a params_hash over this shape so a ladder edit busts ONLY this
     # scale. Used internally by `cctally-bench --assembly-scan`, never a `--scale`
     # choice for the default suite.
-    "assembly": {"ladder": ASSEMBLY_TURN_LADDER, "projects": 3},
-    "assembly-small": {"ladder": ASSEMBLY_TURN_LADDER_SMALL, "projects": 2},
+    "assembly": {
+        "ladder": ASSEMBLY_TURN_LADDER, "projects": 3,
+        "codex_sessions": 1, "codex_events_per_session": 2,
+        "codex_accounts": 1, "quota_windows": 2,
+    },
+    "assembly-small": {
+        "ladder": ASSEMBLY_TURN_LADDER_SMALL, "projects": 2,
+        "codex_sessions": 1, "codex_events_per_session": 2,
+        "codex_accounts": 1, "quota_windows": 2,
+    },
 }
 
 
@@ -160,6 +173,7 @@ def emit_session_jsonl(
     base_minute,
     git_branch,
     is_sidechain=False,
+    history_rows=0,
 ) -> None:
     """Write one session's JSONL rows: paired user + assistant turns in the
     minimal real shape ``_lib_conversation.parse_message_row`` +
@@ -170,6 +184,46 @@ def emit_session_jsonl(
     path = pathlib.Path(path)
     rows = []
     prev_uuid = None
+    # The first benchmark session carries a deliberately long injected-meta
+    # and tool-result prefix. Neither row creates accounting spend, but both
+    # are real retained conversation history. This prevents the diagnosis
+    # receipt from timing only clean alternating prompt/reply transcripts and
+    # makes the normalize-budget withholding path non-vacuous at `large`.
+    for h in range(history_rows):
+        meta_uuid = f"{session_id}-meta{h}"
+        rows.append({
+            "type": "user",
+            "uuid": meta_uuid,
+            "parentUuid": prev_uuid,
+            "sessionId": session_id,
+            "timestamp": _iso(base_minute - 2 * (history_rows - h)),
+            "cwd": cwd,
+            "gitBranch": git_branch,
+            "isMeta": True,
+            "message": {
+                "role": "user",
+                "content": "<local-command-stdout>benchmark meta</local-command-stdout>",
+            },
+        })
+        tool_uuid = f"{session_id}-tool{h}"
+        rows.append({
+            "type": "user",
+            "uuid": tool_uuid,
+            "parentUuid": meta_uuid,
+            "sessionId": session_id,
+            "timestamp": _iso(base_minute - 2 * (history_rows - h) + 1),
+            "cwd": cwd,
+            "gitBranch": git_branch,
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": f"bench-tool-{h}",
+                    "content": "benchmark tool output",
+                }],
+            },
+        })
+        prev_uuid = tool_uuid
     for t in range(n_turns):
         u_uuid = f"{session_id}-u{t}"
         rows.append({
@@ -271,6 +325,7 @@ def _emit_corpus(projects_dir: pathlib.Path, params: dict, rng: random.Random) -
             base_minute=i * 100,
             git_branch=f"branch-{i % 4}",
             is_sidechain=(i % 10 == 1),
+            history_rows=(int(params.get("history_rows", 0)) if i == 0 else 0),
         )
 
 
@@ -468,18 +523,24 @@ def expected_counts(params: dict) -> dict:
     turn_counts = _turn_counts(params)
     plan = _codex_emission_plan(params)
     events = max(int(params.get("codex_events_per_session", 1)), 1)
+    history_rows = int(params.get("history_rows", 0))
+    subagent_threads = sum(
+        1 for item in plan if item.local_index % 10 in (1, 2))
     return {
         "sessions": len(turn_counts),
         "entries": sum(turn_counts),
-        "messages": 2 * sum(turn_counts),
+        "messages": 2 * sum(turn_counts) + 2 * history_rows,
         "claude_sidechain_messages": 2 * sum(
             turns for index, turns in enumerate(turn_counts)
             if index % 10 == 1),
+        "claude_meta_messages": history_rows,
+        "claude_tool_result_messages": history_rows,
         "codex_entries": len(plan) * events,
         "codex_files": len(plan),
         # session_meta + turn_context + one real prompt + token_count events.
         "codex_conversation_events": len(plan) * (events + 3),
         "codex_conversation_messages": len(plan),
+        "codex_subagent_threads": subagent_threads,
         "quota_windows": 2 * sum(item.quota_events for item in plan),
     }
 
@@ -551,6 +612,12 @@ def _codex_base_minute(session_index: int, total: int, events: int) -> int:
     return (session_index * span) // max(total, 1)
 
 
+def _codex_session_id(session_index: int) -> str:
+    """The native id shared by emission and deterministic child pointers."""
+    return (f"{session_index:08d}-0000-4000-8000-"
+            f"{session_index:012d}")
+
+
 def _emit_codex_session(
     root: pathlib.Path, *, session_index: int, local_index: int, events: int,
     quota_events: int, used_base: float, token_scale: int, cwd: str,
@@ -582,8 +649,10 @@ def _emit_codex_session(
             _CODEX_MODELS[session_index % len(_CODEX_MODELS)],
             _CODEX_STANDARD_LIMIT_NAME)
 
-    session_id = (f"{session_index:08d}-0000-4000-8000-"
-                  f"{session_index:012d}")
+    session_id = _codex_session_id(session_index)
+    is_child = local_index % 10 in (1, 2)
+    parent_session_id = _codex_session_id(
+        session_index - (local_index % 10)) if is_child else None
     day = session_index % 28 + 1
     path = (root / "sessions" / "2026" / "01" / f"{day:02d}"
             / f"rollout-{session_index}.jsonl")
@@ -618,7 +687,8 @@ def _emit_codex_session(
             "cwd": cwd,
             "model": model,
             "source": "codex",
-            "thread_source": "user",
+            "thread_source": "subagent" if is_child else "user",
+            **({"forked_from_id": parent_session_id} if is_child else {}),
         }},
         {"timestamp": _iso(base_minute + 1), "type": "turn_context",
          "payload": {"model": model,
@@ -1066,6 +1136,10 @@ def _build_fixture(*, scale: str, seed: int, root,
             _clear_previous_corpus(root, data_dir)
             _write_root_sentinel(root)
             projects.mkdir(parents=True, exist_ok=True)
+            (data_dir / "config.json").write_text(
+                json.dumps({"conversation": {"retention_days": 0}}, sort_keys=True)
+                + "\n"
+            )
             _emit_corpus(projects, SCALES[scale], random.Random(seed))
             conn = cctally.open_cache_db()
             try:
@@ -1074,12 +1148,62 @@ def _build_fixture(*, scale: str, seed: int, root,
                 conn.close()
             _emit_codex_corpus(
                 codex_roots, SCALES[scale], random.Random(seed + 1))
+            # #680: trustworthy writer-fed invalidation needs the corresponding
+            # hook configuration, not merely a historical activity ticket.
+            # These are deterministic synthetic configs under the corpus HOME;
+            # no operator settings are read or changed.
+            claude_settings = home_dir / ".claude" / "settings.json"
+            claude_settings.parent.mkdir(parents=True, exist_ok=True)
+            claude_settings.write_text(json.dumps({
+                "hooks": {
+                    event: [{
+                        "matcher": "*" if event == "PostToolBatch" else "",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "/usr/local/bin/cctally hook-tick",
+                        }],
+                    }]
+                    for event in cctally.SETUP_HOOK_EVENTS
+                },
+            }, sort_keys=True))
+            for codex_root in codex_roots:
+                (codex_root / "hooks.json").write_text(json.dumps({
+                    "hooks": {
+                        event: [{"hooks": [{
+                            "type": "command",
+                            "command": (
+                                "/usr/local/bin/cctally hook-tick --foreground "
+                                "--source codex"
+                            ),
+                            "timeout": 30,
+                        }]}]
+                        for event in ("Stop", "SubagentStop")
+                    },
+                }, sort_keys=True))
             if codex_roots:
                 conn = cctally.open_cache_db()
                 try:
                     cctally.sync_codex_cache(conn)
                 finally:
                     conn.close()
+            # #680: the production-shaped dashboard frontier is writer-fed.
+            # Seed one trusted event for each provider so a benchmark can run
+            # a full validating tick followed by a genuine caught-up tick;
+            # paths stay private runtime material and never enter semantic_hash.
+            import _lib_ingest_frontier
+            claude_ticket = next(projects.glob("**/*.jsonl"))
+            _lib_ingest_frontier.record_activity(
+                data_dir, "claude", str(claude_ticket),
+            )
+            if codex_roots:
+                codex_ticket = next(
+                    path
+                    for root_dir in codex_roots
+                    for path in (root_dir / "sessions").glob("**/*.jsonl")
+                )
+                _lib_ingest_frontier.record_activity(
+                    data_dir, "codex", str(codex_ticket),
+                )
             conn = cctally.open_conversations_db()
             try:
                 cctally.sync_claude_conversations(conn)
@@ -1163,12 +1287,20 @@ def dataset_counts(conn: sqlite3.Connection) -> dict:
         "messages": n("SELECT COUNT(*) FROM conversation_messages"),
         "claude_sidechain_messages": n(
             "SELECT COUNT(*) FROM conversation_messages WHERE is_sidechain=1"),
+        "claude_meta_messages": n(
+            "SELECT COUNT(*) FROM conversation_messages WHERE entry_type='meta'"),
+        "claude_tool_result_messages": n(
+            "SELECT COUNT(*) FROM conversation_messages "
+            "WHERE entry_type='tool_result'"),
         "codex_entries": n("SELECT COUNT(*) FROM cache_db.codex_session_entries"),
         "codex_files": n("SELECT COUNT(*) FROM cache_db.codex_session_files"),
         "codex_conversation_events": n(
             "SELECT COUNT(*) FROM codex_conversation_events"),
         "codex_conversation_messages": n(
             "SELECT COUNT(*) FROM codex_conversation_messages"),
+        "codex_subagent_threads": n(
+            "SELECT COUNT(*) FROM cache_db.codex_conversation_threads "
+            "WHERE root_thread_id='subagent'"),
         "quota_windows": n("SELECT COUNT(*) FROM cache_db.quota_window_snapshots"),
     }
 

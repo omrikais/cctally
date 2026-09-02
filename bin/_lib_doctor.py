@@ -3664,6 +3664,27 @@ def _check_quota_calibration(s: DoctorState) -> CheckResult:
     )
 
 
+def _quota_meter_not_assessed() -> CheckResult:
+    """No regime pair was examined, so neither transition claim is available.
+
+    Distinct from `no change detected`, which is a finding over regimes that
+    exist (#688).
+    """
+    return CheckResult(
+        id="quota.meter_drift", title="Metering rate",
+        severity="ok", summary="not assessed",
+        remediation="Run `cctally quota` for the current assessment.",
+        # The regime fields are NULLED, never dropped: this is a published
+        # JSON surface, and a consumer reading `effective_from` should find
+        # it absent-valued rather than absent. `calibration_status` joins
+        # them under the same rule (#688).
+        details={"active": False, "assessed": False, "effective_from": None,
+                 "previous_units_per_point": None,
+                 "new_units_per_point": None,
+                 "calibration_status": None},
+    )
+
+
 def _check_quota_meter_drift(s: DoctorState) -> CheckResult:
     """OK-with-detail, stating whether §6.6's marker predicate holds.
 
@@ -3671,21 +3692,48 @@ def _check_quota_meter_drift(s: DoctorState) -> CheckResult:
     confirmed predecessor, and the marker shows for the whole of that
     successor regime. A rate change is the provider's behaviour rather than a
     cctally malfunction, so this check states it and never warns.
+
+    The NEGATIVE finding alone is fail-closed behind `assessed` (#688). "No
+    regime was fitted" and "the fitted regimes hold no transition between
+    them" are different claims, and `docs/commands/quota.md` forbids
+    reporting the first as the second. A state must therefore say it examined
+    a regime pair before this check reports `no change detected` on its
+    behalf; a state that merely omits the claim is not assessed, because that
+    omission is how a confirmed rate change reached a user as a green
+    all-clear.
+
+    The gate is deliberately asymmetric, because the harmful direction is not
+    the same on both branches. An ACTIVE transition is itself proof that the
+    regime pair was examined, so gating it on a second, separate claim buys
+    nothing and risks suppressing a real change — the worse of the two
+    failures. Only the claim that asserts something about ABSENT evidence has
+    to earn it.
+
+    The REMEDIATION branches on the successor regime's own calibration
+    status (#688). A successor that is not prediction-ready has no fitted
+    budget, so the older single remediation sent that user to a command that
+    would refuse. That was already wrong for an `insufficient-history`
+    successor before #688 made `unsupported-model-mix` reachable here too.
+    The status is forwarded by `active_rate_change` rather than read from the
+    regimes here, because this kernel does not read regimes and the glue
+    already owns that conversion.
     """
     state = s.quota_rate_change
     if not state:
-        return CheckResult(
-            id="quota.meter_drift", title="Metering rate",
-            severity="ok", summary="not assessed",
-            remediation=None, details={"active": False},
-        )
+        return _quota_meter_not_assessed()
+    active = bool(state.get("active"))
+    if not active and not state.get("assessed"):
+        return _quota_meter_not_assessed()
+    calibration_status = state.get("calibration_status")
     details = {
-        "active": bool(state.get("active")),
+        "active": active,
+        "assessed": True,
         "effective_from": state.get("effective_from"),
         "previous_units_per_point": state.get("previous_units_per_point"),
         "new_units_per_point": state.get("new_units_per_point"),
+        "calibration_status": calibration_status,
     }
-    if not details["active"]:
+    if not active:
         return CheckResult(
             id="quota.meter_drift", title="Metering rate",
             severity="ok", summary="no change detected",
@@ -3699,10 +3747,18 @@ def _check_quota_meter_drift(s: DoctorState) -> CheckResult:
     effective = _utc_day_label(details["effective_from"])
     summary = (f"rate changed {effective} UTC" if effective
                else "rate changed")
+    if calibration_status == "ok":
+        remediation = "Run `cctally quota` for the fitted budget."
+    elif calibration_status:
+        remediation = (f"No fitted budget is available "
+                       f"({calibration_status}). Run `cctally quota` for the "
+                       f"evidence.")
+    else:
+        remediation = "Run `cctally quota` for the evidence."
     return CheckResult(
         id="quota.meter_drift", title="Metering rate",
         severity="ok", summary=summary,
-        remediation="Run `cctally quota` for the fitted budget.",
+        remediation=remediation,
         details=details,
     )
 

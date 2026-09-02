@@ -266,6 +266,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import gzip
+import hashlib
 import hmac
 import io
 import json
@@ -286,11 +287,13 @@ import urllib.parse
 import urllib.request
 import webbrowser as _wb
 import zlib
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from _lib_retained_size import retained_size_bytes
 
 
 class _QuietThreadingHTTPServer(ThreadingHTTPServer):
@@ -319,6 +322,84 @@ class _QuietThreadingHTTPServer(ThreadingHTTPServer):
             # benign on a local dashboard. #279 S1 F3 adds socket.timeout.
             return
         super().handle_error(request, client_address)
+
+
+@dataclass
+class _DiagnosisFlight:
+    """One exact-scope diagnosis shared by concurrent request threads."""
+
+    done: threading.Event = field(default_factory=threading.Event)
+    result: Any = None
+    error: BaseException | None = None
+    callers: int = 0
+
+
+def _diagnosis_flight_key(
+    scope, transcripts_visible: bool, reveal_projects: bool,
+) -> tuple[Any, bool, bool]:
+    """The complete build-authorization identity for one diagnosis request.
+
+    ``DiagnosisScope`` is frozen and includes source, account, half-open range,
+    effective speed, display timezone and label.  Transcript visibility is a
+    separate authorization input to plan stage 1, so it must be part of the
+    identity even when every other selector matches.  Project reveal changes
+    the response shaping and is included so the admission covers both the
+    transient fact populations and their complete wire projection.
+    """
+    return scope, bool(transcripts_visible), bool(reveal_projects)
+
+
+class _DiagnosisAdmission:
+    """One process-wide diagnosis build with exact-scope single-flight.
+
+    ``ThreadingHTTPServer`` admits one thread per tab/client.  The diagnosis's
+    All-provider path can in turn launch an isolated Codex worker and retain
+    both providers' largest transient populations.  A process-wide admission
+    slot bounds that process tree; the flight table prevents identical queued
+    callers from repeating the same read once admitted.  Completed reports are
+    never retained, so this adds no stale report cache or periodic work.
+    """
+
+    def __init__(self) -> None:
+        self._changed = threading.Condition()
+        self._admission = threading.BoundedSemaphore(1)
+        self._flights: dict[tuple[Any, bool, bool], _DiagnosisFlight] = {}
+
+    def run(self, key: tuple[Any, bool, bool], build):
+        with self._changed:
+            flight = self._flights.get(key)
+            owner = flight is None
+            if owner:
+                flight = _DiagnosisFlight()
+                self._flights[key] = flight
+            flight.callers += 1
+            self._changed.notify_all()
+
+        if not owner:
+            flight.done.wait()
+            if flight.error is not None:
+                raise flight.error
+            return flight.result
+
+        try:
+            with self._admission:
+                result = build()
+            with self._changed:
+                flight.result = result
+            return result
+        except BaseException as exc:
+            with self._changed:
+                flight.error = exc
+            raise
+        finally:
+            with self._changed:
+                if self._flights.get(key) is flight:
+                    del self._flights[key]
+                flight.done.set()
+                self._changed.notify_all()
+
+
+_DIAGNOSIS_ADMISSION = _DiagnosisAdmission()
 
 
 def _cctally():
@@ -589,6 +670,7 @@ _ensure_sibling_loaded("_cctally_dashboard_sources")
 from _cctally_dashboard_sources import (
     SourceCapabilityUnavailable,
     SourceResourceNotFound,
+    shutdown_codex_source_memory_worker,
     source_detail_lookup,
 )
 from _lib_dashboard_sources import dashboard_resource_key
@@ -1463,7 +1545,7 @@ from _cctally_dashboard_conversation import (
     _CONV_FIND_KINDS,
     _BadConversationFilter,
     _cached_file_sigs,
-    # query plumbing + eleven handler impls (the class delegators call these)
+    # query plumbing + handler impls (the class delegators call these)
     _conversation_query_impl,
     _parse_search_kind_impl,
     _run_conversation_query_impl,
@@ -1475,6 +1557,8 @@ from _cctally_dashboard_conversation import (
     _handle_get_conversation_search_impl,
     _handle_get_conversation_payload_impl,
     _handle_get_conversation_outline_impl,
+    _handle_get_conversation_outline_transfer_impl,
+    _handle_delete_conversation_outline_transfer_impl,
     _handle_get_conversation_prompts_impl,
     _handle_get_conversation_export_impl,
     _handle_get_conversation_anon_map_impl,
@@ -1796,6 +1880,111 @@ def _dashboard_maybe_prune_retention() -> None:
         pass
 
 
+def _conversation_frontier_context():
+    """Roots, hook guards and trust decisions for transcript fast-negatives.
+
+    This mirrors the main ingest frontier's evidence contract.  It is kept at
+    call time because tests and dev instances redirect every path after module
+    import, and because Codex hook roots are provider-root dependent.
+    """
+    frontier_mod = _cctally()._load_sibling("_lib_ingest_frontier")
+    claude_roots = tuple(_cctally_core._resolve_claude_projects_dirs())
+    codex_homes = tuple(_cctally()._codex_home_roots())
+    codex_roots = tuple(root / "sessions" for root in codex_homes)
+    claude_guards = (_cctally_core.CLAUDE_SETTINGS_PATH,)
+
+    try:
+        codex_hooks_mod = _cctally()._load_sibling("_lib_codex_hooks")
+        hook_roots = codex_hooks_mod.codex_hook_roots(codex_homes)
+        codex_guards = tuple(root.hooks_path for root in hook_roots)
+    except Exception:
+        codex_hooks_mod = None
+        hook_roots = ()
+        codex_guards = ()
+
+    def claude_trusted():
+        try:
+            setup_mod = _cctally()._load_sibling("_cctally_setup")
+            settings = setup_mod._load_claude_settings()
+            hooks = settings.get("hooks", {})
+            return all(
+                any(
+                    frontier_mod.is_dashboard_activity_claude_hook_handler(handler)
+                    for group in hooks.get(event, ())
+                    if isinstance(group, dict)
+                    for handler in group.get("hooks", ())
+                )
+                for event in _cctally().SETUP_HOOK_EVENTS
+            )
+        except Exception:
+            return False
+
+    def codex_trusted():
+        if codex_hooks_mod is None:
+            return False
+        try:
+            trusted = bool(hook_roots)
+            for hook_root in hook_roots:
+                document = codex_hooks_mod._read_hooks_document(
+                    hook_root.hooks_path)
+                hooks = document.get("hooks", {})
+                for event in codex_hooks_mod.CODEX_HOOK_EVENTS:
+                    owned = sum(
+                        1
+                        for group in hooks.get(event, ())
+                        if isinstance(group, dict)
+                        for handler in group.get("hooks", ())
+                        if codex_hooks_mod.is_dashboard_activity_codex_hook_handler(
+                            handler)
+                    )
+                    trusted = trusted and owned >= 1
+            return trusted
+        except Exception:
+            return False
+
+    return frontier_mod, {
+        "claude": (claude_roots, claude_guards, claude_trusted()),
+        "codex": (codex_roots, codex_guards, codex_trusted()),
+    }
+
+
+def _conversation_frontier_plans(conn):
+    """Return `(frontier, cutoff, context, plans)` or None for safe full work."""
+    try:
+        # A lightweight fake connection used by the scheduling algebra tests
+        # has no `execute`; production connections always do.  The fallback is
+        # the pre-#682 full pass, never a skipped sync.
+        if not callable(getattr(conn, "execute", None)):
+            return None
+        frontier_mod, context = _conversation_frontier_context()
+        app_dir = _cctally_core.APP_DIR
+        frontier = getattr(_conversation_sync_pass, "_frontier", None)
+        if frontier is None or frontier.app_dir != app_dir:
+            frontier = frontier_mod.ConversationSyncFrontier(app_dir)
+            _conversation_sync_pass._frontier = frontier
+        cutoff = frontier.capture_cutoff()
+        plans = {
+            provider: frontier.plan_provider(
+                provider, conn, roots=roots, guard_paths=guards)
+            for provider, (roots, guards, _trusted) in context.items()
+        }
+        return frontier_mod, frontier, cutoff, context, plans
+    except Exception:
+        # Missing/malformed evidence is not a background-worker failure.  It is
+        # authorization for the original exhaustive pass.
+        return None
+
+
+class _ConversationPassStatus(str):
+    """Validated status string carrying fixed-size pass diagnostics."""
+
+    def __new__(cls, status, *, modes=None, files=None):
+        obj = str.__new__(cls, status)
+        obj.modes = dict(modes or {})
+        obj.files = dict(files or {})
+        return obj
+
+
 def _conversation_sync_pass() -> str:
     """One WHOLE transcript-ingest pass (#583 S4 / F5).
 
@@ -1830,11 +2019,65 @@ def _conversation_sync_pass() -> str:
         conn = open_conversations_db()
     except (OSError, sqlite3.DatabaseError) as exc:
         eprint(f"[conversations] background sync unavailable: {exc}")
-        return "store_unavailable"
+        return _ConversationPassStatus("store_unavailable")
     status = "ok"
+    modes = {"claude": "not_observed", "codex": "not_observed"}
+    files = {"claude": 0, "codex": 0}
     try:
-        sync_claude_conversations(conn)
-        sync_codex_conversations(conn)
+        planned = _conversation_frontier_plans(conn)
+        results = {}
+        if planned is None:
+            modes = {"claude": "full", "codex": "full"}
+            results["claude"] = sync_claude_conversations(conn)
+            results["codex"] = sync_codex_conversations(conn)
+        else:
+            frontier_mod, frontier, cutoff, context, plans = planned
+            modes = {
+                provider: plans[provider].mode
+                for provider in ("claude", "codex")
+            }
+            for provider, sync_fn in (
+                ("claude", sync_claude_conversations),
+                ("codex", sync_codex_conversations),
+            ):
+                plan = plans[provider]
+                if plan.mode == "caught_up":
+                    results[provider] = None
+                    continue
+                sync_kwargs = {}
+                if plan.mode == "targeted":
+                    sync_kwargs["only_paths"] = set(plan.paths)
+                elif plan.reason == "source_replaced":
+                    # Conversation ingesters deliberately size-skip ordinary
+                    # same-length files. A ticketed mtime change at the stored
+                    # size is therefore replacement evidence and needs the
+                    # provider's from-zero replay before it can be certified.
+                    sync_kwargs["rebuild"] = True
+                results[provider] = sync_fn(conn, **sync_kwargs)
+
+            files = {
+                provider: int(getattr(results.get(provider), "files_total", 0) or 0)
+                for provider in ("claude", "codex")
+            }
+
+            certifiable = all(
+                frontier_mod.conversation_sync_certifiable(
+                    plans[provider].mode, results.get(provider),
+                    expected_paths=len(plans[provider].paths))
+                for provider in ("claude", "codex")
+            )
+            if certifiable:
+                for provider in ("claude", "codex"):
+                    roots, guards, trusted = context[provider]
+                    plan = plans[provider]
+                    if plan.mode == "full":
+                        frontier.seed_provider(
+                            provider, conn, roots=roots,
+                            guard_paths=guards, trusted=trusted, cutoff=cutoff)
+                    else:
+                        frontier.commit_provider(
+                            plan, conn, roots=roots, guard_paths=guards,
+                            trusted=trusted, cutoff=cutoff)
     except (OSError, sqlite3.DatabaseError) as exc:
         eprint(f"[conversations] background sync unavailable: {exc}")
         status = "store_unavailable"
@@ -1854,7 +2097,11 @@ def _conversation_sync_pass() -> str:
         except Exception:  # noqa: BLE001
             pass
     _dashboard_maybe_prune_retention()
-    return status
+    for provider in ("claude", "codex"):
+        if provider in results:
+            files[provider] = int(
+                getattr(results.get(provider), "files_total", 0) or 0)
+    return _ConversationPassStatus(status, modes=modes, files=files)
 
 
 def _conversation_sync_loop(
@@ -1907,6 +2154,12 @@ def _conversation_sync_loop(
                 # interval that preceded it would shift the denominator by one
                 # pass and publish a share with no upper bound.
                 status=status,
+                claude_mode=getattr(status, "modes", {}).get(
+                    "claude", "not_observed"),
+                codex_mode=getattr(status, "modes", {}).get(
+                    "codex", "not_observed"),
+                claude_files=getattr(status, "files", {}).get("claude", 0),
+                codex_files=getattr(status, "files", {}).get("codex", 0),
             )
         deadline = _conversation_next_deadline(t0, interval, work)
         remaining = deadline - monotonic()
@@ -2584,6 +2837,71 @@ class _SnapshotRef:
             self._restamp_locked()
 
 
+_SSE_DELIVERY_MAX_ENTRIES = 4
+_SSE_DELIVERY_MAX_BYTES = 32 * 1024 * 1024
+
+
+class _SSEFrameCache:
+    """One aggregate retained-frame owner for every delivery in an SSE hub.
+
+    Publications and per-subscriber fresh-clock seeds are distinct delivery
+    objects, but their encoded frames share this ONE admission budget.  Thus a
+    reconnect storm can evict older variants, never multiply the 32 MiB cap by
+    the number of subscribers.
+    """
+
+    def __init__(self) -> None:
+        self._cache: "OrderedDict[object, bytes]" = OrderedDict()
+        self._sizes: dict[object, int] = {}
+        self._bytes = 0
+        self._evictions = 0
+        self._fallbacks = 0
+        self._lock = threading.Lock()
+
+    def stats(self) -> Mapping[str, int]:
+        with self._lock:
+            return {
+                "estimatedBytes": int(self._bytes),
+                "maxBytes": int(_SSE_DELIVERY_MAX_BYTES),
+                "entryCount": len(self._cache),
+                "maxEntries": int(_SSE_DELIVERY_MAX_ENTRIES),
+                "evictionCount": int(self._evictions),
+                "fallbackCount": int(self._fallbacks),
+            }
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+            self._sizes.clear()
+            self._bytes = 0
+
+    def encoded(self, cache_key, project_fn) -> bytes:
+        hit = self._cache.get(cache_key)
+        if hit is not None:
+            return hit
+        with self._lock:
+            hit = self._cache.get(cache_key)
+            if hit is not None:
+                return hit
+            built = project_fn(cache_key[1])
+            entry_bytes = retained_size_bytes(
+                (cache_key, built), stop_after=_SSE_DELIVERY_MAX_BYTES)
+            if entry_bytes > _SSE_DELIVERY_MAX_BYTES:
+                self._fallbacks += 1
+                return built
+            while self._cache and (
+                len(self._cache) >= _SSE_DELIVERY_MAX_ENTRIES
+                or self._bytes + entry_bytes > _SSE_DELIVERY_MAX_BYTES
+            ):
+                old_key, _old_value = self._cache.popitem(last=False)
+                self._bytes -= self._sizes.pop(old_key)
+                self._evictions += 1
+            self._cache[cache_key] = built
+            self._sizes[cache_key] = entry_bytes
+            self._bytes += entry_bytes
+            return built
+
+
 class _SSEDelivery:
     """One publication, projected and encoded at most once per variant.
 
@@ -2612,14 +2930,19 @@ class _SSEDelivery:
     """
 
     __slots__ = ("snapshot", "pinned_now_utc", "pinned_monotonic",
-                 "_cache", "_lock")
+                 "_frame_cache", "_cache_token")
 
-    def __init__(self, snapshot, pinned_now_utc, pinned_monotonic) -> None:
+    def __init__(
+        self, snapshot, pinned_now_utc, pinned_monotonic, *, frame_cache=None,
+    ) -> None:
         self.snapshot = snapshot
         self.pinned_now_utc = pinned_now_utc
         self.pinned_monotonic = pinned_monotonic
-        self._cache: dict = {}
-        self._lock = threading.Lock()
+        self._frame_cache = frame_cache or _SSEFrameCache()
+        self._cache_token = object()
+
+    def cache_stats(self) -> Mapping[str, int]:
+        return self._frame_cache.stats()
 
     def encoded(self, variant_key, project_fn) -> bytes:
         """Return complete SSE frame bytes for ``variant_key``, building once.
@@ -2633,16 +2956,8 @@ class _SSEDelivery:
         before the key is built. Those are different situations and conflating
         them either leaks or breaks the gate.
         """
-        hit = self._cache.get(variant_key)
-        if hit is not None:
-            return hit
-        with self._lock:
-            hit = self._cache.get(variant_key)
-            if hit is not None:
-                return hit
-            built = project_fn(variant_key)
-            self._cache[variant_key] = built
-            return built
+        return self._frame_cache.encoded(
+            (self._cache_token, variant_key), project_fn)
 
 
 # #583 S3 §5. A distinct slot for "no oauth_usage configuration at all", so it
@@ -2745,17 +3060,11 @@ def _delivery_is_shareable(snapshot) -> bool:
 def _drain_to_newest(q, first):
     """Return the newest delivery queued on ``q``, discarding older ones.
 
-    #583 S3 §5. ``SSEHub`` uses a four-slot queue and ``publish`` discards only
-    ONE oldest entry when full, so a client that falls behind holds a backlog
-    of up to four deliveries. Each delivery pins its clock at publication, so
-    replaying that backlog would render ages several publish periods stale — a
-    regression against the present behaviour, where each frame is projected at
-    consumption time and its ages are therefore current.
-
-    The fix is on the CONSUMER side deliberately: ``SSEHub.publish`` is
-    governed by Preserve 4 and the A2 publication tests depend on its
-    behaviour, so it is not modified. Draining here is the latest-wins
-    behaviour the hub's own docstring already describes.
+    #583 S3 §5 originally allowed a four-delivery backlog. #684 reduces the
+    default queue to one shared delivery and also drains here, so an explicitly
+    larger test/integration queue still preserves the same latest-wins rule.
+    Each delivery pins its clock at publication; replaying any backlog would
+    render ages several publish periods stale.
 
     ``first`` is the item the caller already took off the queue with its own
     blocking ``get``, so the ``queue.Empty`` keep-alive path stays where it is.
@@ -2780,16 +3089,19 @@ class SSEHub:
     #583 S3 §5: what the queues carry is a `_SSEDelivery` wrapping the
     published snapshot, not the snapshot itself, so one tick projects and
     encodes once per variant instead of once per connected client. The
-    queueing behaviour below — size, latest-wins discard, lock discipline — is
-    unchanged and is governed by Preserve 4.
+    queueing behaviour below is latest-wins and non-blocking. #684 caps the
+    default at one queued delivery per subscriber and releases every retained
+    delivery during shutdown.
     """
 
-    def __init__(self, maxsize: int = 4) -> None:
+    def __init__(self, maxsize: int = 1) -> None:
         import threading
         import queue as _queue
         self._lock = threading.Lock()
         self._queues: list[_queue.Queue] = []
         self._maxsize = maxsize
+        self._closed = False
+        self._frame_cache = _SSEFrameCache()
         # Held so we can send the current state to a newly-subscribed
         # client without waiting for the next sync tick.
         self._last: object | None = None
@@ -2798,6 +3110,8 @@ class SSEHub:
         import queue as _queue
         q = _queue.Queue(maxsize=self._maxsize)
         with self._lock:
+            if self._closed:
+                return q
             self._queues.append(q)
             if self._last is not None:
                 # Seed the new subscriber so it renders immediately.
@@ -2809,6 +3123,7 @@ class SSEHub:
                     snapshot=self._last.snapshot,
                     pinned_now_utc=dt.datetime.now(dt.timezone.utc),
                     pinned_monotonic=time.monotonic(),
+                    frame_cache=self._frame_cache,
                 )
                 try:
                     q.put_nowait(seed)
@@ -2834,8 +3149,40 @@ class SSEHub:
             except ValueError:
                 pass
 
+    def close(self) -> None:
+        """Release the last snapshot and every queued delivery at shutdown."""
+        import queue as _queue
+        with self._lock:
+            self._closed = True
+            self._last = None
+            self._frame_cache.clear()
+            for q in self._queues:
+                while True:
+                    try:
+                        q.get_nowait()
+                    except _queue.Empty:
+                        break
+            self._queues.clear()
+
+    def memory_stats(self) -> Mapping[str, int]:
+        """Bounded delivery ownership; snapshots are shared across queues."""
+        with self._lock:
+            latest = self._last
+            subscribers = len(self._queues)
+            queued = sum(q.qsize() for q in self._queues)
+        delivery = self._frame_cache.stats()
+        return {
+            **delivery,
+            "subscriberCount": subscribers,
+            "queuedDeliveryCount": queued,
+            "maxQueuedPerSubscriber": self._maxsize,
+        }
+
     def publish(self, snapshot) -> None:
         import queue as _queue
+        with self._lock:
+            if self._closed:
+                return
         # #583 S3 §5: wrap ONCE, outside the hub lock, so every queue and
         # `_last` share one projection cache for this tick. Built before the
         # lock because construction must not run under it.
@@ -2843,16 +3190,18 @@ class SSEHub:
             snapshot=snapshot,
             pinned_now_utc=dt.datetime.now(dt.timezone.utc),
             pinned_monotonic=time.monotonic(),
+            frame_cache=self._frame_cache,
         )
         with self._lock:
+            if self._closed:
+                return
             self._last = delivery
-            # Latest-wins coalescing (#278 §2.6): every published snapshot is a
-            # COMPLETE state replacement, so a client only ever needs the
-            # newest. On a full queue drop the STALE queued frame and enqueue
-            # the newest, so a slow subscriber (e.g. one filled by A2's rapid
-            # partial republishes) still converges to the final hydrating=false
-            # frame instead of dropping it — and a lagging client jumps to the
-            # current state rather than replaying stale frames.
+            # Latest-wins coalescing (#278 §2.6, tightened by #684): every
+            # published snapshot is a COMPLETE state replacement, so a client
+            # only ever needs the newest. Discard every queued delivery before
+            # enqueuing the replacement. Doing this only after a four-slot queue
+            # became full let each stalled client retain four full snapshots;
+            # consumer-side draining fixed freshness but not retained memory.
             #
             # Held under the hub lock so concurrent producers (the sync tick +
             # the update-check thread) can't interleave a get/put on the same
@@ -2861,20 +3210,17 @@ class SSEHub:
             # consumer only ever get()s (never puts), so after we make room the
             # re-put cannot lose to it.
             for q in self._queues:
+                while True:
+                    try:
+                        q.get_nowait()
+                    except _queue.Empty:
+                        break
                 try:
                     q.put_nowait(delivery)
                 except _queue.Full:
-                    try:
-                        q.get_nowait()  # discard the oldest, stale frame
-                    except _queue.Empty:
-                        pass
-                    try:
-                        q.put_nowait(delivery)
-                    except _queue.Full:
-                        # Defensive: a consumer racing between our get and put
-                        # could only have removed items, so this is unreachable
-                        # under the lock — but never raise out of publish().
-                        pass
+                    # Defensive: only this publisher writes while holding the
+                    # hub lock; a consumer can remove but never add an item.
+                    pass
 
 
 def _format_url(host: str, port: int) -> str:
@@ -7053,6 +7399,119 @@ def _debug_tool_version() -> str:
         return "unknown"
 
 
+_DASHBOARD_PROCESS_MEMORY_CEILING_BYTES = 1536 * 1024 * 1024
+
+
+def _debug_memory_owner(stats, *, prefix: str = "") -> dict:
+    """Normalize one owner's safe numeric counters for the debug endpoint."""
+    source = dict(stats or {})
+    def field(name, default=0):
+        key = f"{prefix}{name}" if prefix else name[0].lower() + name[1:]
+        return max(0, int(source.get(key, default) or 0))
+    return {
+        "estimatedBytes": field("EstimatedBytes"),
+        "maxBytes": field("MaxBytes"),
+        "entryCount": field("EntryCount"),
+        "maxEntries": field("MaxEntries"),
+        "evictionCount": field("EvictionCount"),
+        "fallbackCount": field("FallbackCount"),
+    }
+
+
+def _debug_retained_memory(hub, *, main_frontier_stats=None) -> dict:
+    """Numeric retained-owner ceilings; never values, keys or source paths."""
+    owners: dict[str, dict] = {}
+    sources = sys.modules.get("_cctally_dashboard_sources")
+    if sources is not None:
+        source_stats = dict(
+            sources.codex_source_accelerator_memory_stats())
+        owners["codexSourceAccelerators"] = _debug_memory_owner(source_stats)
+        owners["codexSourceAccelerators"].update({
+            "measuredGeneration": int(
+                source_stats.get("measuredGeneration", -1)),
+            "currentGeneration": int(
+                source_stats.get("currentGeneration", 0)),
+            "measurementPending": int(
+                source_stats.get("measurementPending", 1)),
+            "measurementErrorCount": int(
+                source_stats.get("measurementErrorCount", 0)),
+            "workerAlive": int(source_stats.get("workerAlive", 0)),
+        })
+
+    cctally = sys.modules.get("cctally")
+    loader = getattr(cctally, "_load_sibling", None)
+    if callable(loader):
+        try:
+            snapshot_stats = dict(
+                loader("_lib_snapshot_cache").snapshot_accelerator_memory_stats())
+            owners["snapshotAccelerators"] = _debug_memory_owner(snapshot_stats)
+            owners["snapshotAccelerators"].update({
+                "measuredGeneration": int(
+                    snapshot_stats.get("measuredGeneration", -1)),
+                "currentGeneration": int(
+                    snapshot_stats.get("currentGeneration", 0)),
+                "measurementPending": int(
+                    snapshot_stats.get("measurementPending", 1)),
+                "measurementErrorCount": int(
+                    snapshot_stats.get("measurementErrorCount", 0)),
+                "workerAlive": int(snapshot_stats.get("workerAlive", 0)),
+            })
+        except Exception:
+            pass
+        try:
+            owners["claudeAssembly"] = _debug_memory_owner(
+                loader("_lib_conversation_query").conversation_assembly_cache_stats())
+        except Exception:
+            pass
+        try:
+            codex_stats = loader(
+                "_lib_codex_conversation_query").codex_conversation_cache_stats()
+            owners["codexOutline"] = _debug_memory_owner(
+                codex_stats, prefix="outline")
+            owners["codexOutlineDerivation"] = _debug_memory_owner(
+                codex_stats, prefix="derivation")
+        except Exception:
+            pass
+        try:
+            owners["outlineTransfers"] = _debug_memory_owner(
+                loader("_cctally_dashboard_conversation").outline_transfer_cache_stats())
+        except Exception:
+            pass
+
+    sse_stats = hub.memory_stats() if hub is not None else {
+        "estimatedBytes": 0, "maxBytes": _SSE_DELIVERY_MAX_BYTES,
+    }
+    owners["sseDelivery"] = _debug_memory_owner(sse_stats)
+    owners["sseDelivery"].update({
+        "subscriberCount": int(sse_stats.get("subscriberCount", 0) or 0),
+        "queuedDeliveryCount": int(sse_stats.get("queuedDeliveryCount", 0) or 0),
+        "maxQueuedPerSubscriber": int(
+            sse_stats.get("maxQueuedPerSubscriber", 1) or 1),
+    })
+
+    if callable(main_frontier_stats):
+        try:
+            stats = main_frontier_stats()
+            if stats is not None:
+                owners["mainIngestFrontier"] = _debug_memory_owner(stats)
+        except Exception:
+            pass
+    conversation_frontier = getattr(_conversation_sync_pass, "_frontier", None)
+    if conversation_frontier is not None:
+        owners["conversationIngestFrontier"] = _debug_memory_owner(
+            conversation_frontier.memory_stats())
+
+    return {
+        "ownerEstimatedBytes": sum(
+            row["estimatedBytes"] for row in owners.values()),
+        "ownerCeilingBytes": sum(row["maxBytes"] for row in owners.values()),
+        "processCeilingBytes": _DASHBOARD_PROCESS_MEMORY_CEILING_BYTES,
+        "threadCount": threading.active_count(),
+        "maxThreadCount": 64,
+        "owners": owners,
+    }
+
+
 # === Table-driven route dispatch (#279 S5 F5, spec §7) =====================
 # Ordered, first-match-wins tables — evaluated top-to-bottom so semantics are
 # if/elif-identical to the pre-S5 chains. Each entry is
@@ -7099,6 +7558,9 @@ _GET_ROUTES = (
      ("scope", "endpoint.conversations"), False),
     ("exact", "/api/conversation/search", "_handle_get_conversation_search",
      ("scope", "endpoint.conversation_search"), False),
+    ("prefix", "/api/conversation/outline-transfer/",
+     "_handle_get_conversation_outline_transfer",
+     ("scope", "endpoint.conversation_outline_transfer"), True),
     ("prefix+suffix", ("/api/conversation/", "/payload"),
      "_handle_get_conversation_payload",
      ("phase", "endpoint.conversation_payload"), True),
@@ -7145,6 +7607,8 @@ _POST_ROUTES = (
 )
 
 _DELETE_ROUTES = (
+    ("prefix", "/api/conversation/outline-transfer/",
+     "_handle_delete_conversation_outline_transfer", None, True),
     ("prefix", "/api/share/presets/", "_handle_share_presets_delete", None, False),
     ("exact", "/api/share/history", "_handle_share_history_delete", None, False),
 )
@@ -7735,6 +8199,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         if not self._require_debug_backend_allowed():
             return
         last = self._perf_gate().last_backend_perf()
+        last_ingest = self._perf_gate().last_ingest_perf()
         dataset: dict = {}
         cache_state: dict = {}
         try:
@@ -7758,12 +8223,19 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         perf = self._perf_gate()
         tick_state = _lib_tick_stats.snapshot()
         requested, applied = perf.pending_state()
+        memory = _debug_retained_memory(
+            type(self).hub,
+            main_frontier_stats=getattr(
+                type(self), "ingest_frontier_stats", None),
+        )
         body = {
             "schemaVersion": 1,
             "version": _debug_tool_version(),
             "generated_at": (last or {}).get("generated_at"),
             "dataset": dataset,
             "phases": (last or {}).get("phases"),
+            "ingest_phases": (last_ingest or {}).get("phases"),
+            "ingest_generated_at": (last_ingest or {}).get("generated_at"),
             # #583 S1 §3.1 asked for the stored tree's instant beside
             # `phases`, so a GET after `--trace off` cannot present an old tree
             # as current — disabling tracing does not clear the stored tree.
@@ -7795,6 +8267,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             },
             "cache_state": cache_state,
             "sources": sources,
+            "memory": memory,
+            "activity": self.snapshot_ref.activity(),
             # Additive, and named rather than folded into `cache_state`: a
             # stats fault is not cache state, and #496 S3 §8 exists because a
             # stats failure reported as a cache one sends the user to
@@ -8876,6 +9350,38 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             ".json": "application/json; charset=utf-8",
         }.get(p.suffix.lower(), "application/octet-stream")
 
+    @staticmethod
+    def _is_hashed_static_asset(path: pathlib.Path) -> bool:
+        """Whether Vite made ``path`` content-addressed and immutable.
+
+        Only files beneath the build's ``assets`` directory qualify.  Root
+        resources such as ``dashboard.html``, ``icons.svg`` and the favicon
+        keep their mutable-name revalidation contract even if a future name
+        happens to contain a dash.
+        """
+        return (
+            path.parent.name == "assets"
+            and re.fullmatch(
+                r".+-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+", path.name
+            )
+            is not None
+        )
+
+    @staticmethod
+    def _etag_matches(if_none_match: str | None, etag: str) -> bool:
+        """Apply GET/HEAD weak comparison to an ``If-None-Match`` list."""
+        if not if_none_match:
+            return False
+        for candidate in if_none_match.split(","):
+            candidate = candidate.strip()
+            if candidate == "*":
+                return True
+            if candidate.startswith("W/"):
+                candidate = candidate[2:].lstrip()
+            if candidate == etag:
+                return True
+        return False
+
     def _serve_static_file(self, path: pathlib.Path, ctype: str) -> None:
         try:
             body = path.read_bytes()
@@ -8885,12 +9391,45 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         except IsADirectoryError:
             self.send_error(404, "not found")
             return
+
+        compressible = (
+            ctype.startswith("text/")
+            or ctype.startswith("application/javascript")
+            or ctype.startswith("image/svg+xml")
+        )
+        gzip_on = compressible and _accepts_gzip(
+            self.headers.get("Accept-Encoding")
+        )
+        encoded = gzip.compress(body, compresslevel=6, mtime=0) if gzip_on else body
+        etag = f'"{hashlib.sha256(encoded).hexdigest()}"'
+        cache_control = (
+            "public, max-age=31536000, immutable"
+            if self._is_hashed_static_asset(path)
+            else "no-cache"
+        )
+
+        if self._etag_matches(self.headers.get("If-None-Match"), etag):
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", cache_control)
+            if compressible:
+                self.send_header("Vary", "Accept-Encoding")
+            if gzip_on:
+                self.send_header("Content-Encoding", "gzip")
+            self.end_headers()
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", cache_control)
+        self.send_header("ETag", etag)
+        if compressible:
+            self.send_header("Vary", "Accept-Encoding")
+        if gzip_on:
+            self.send_header("Content-Encoding", "gzip")
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(encoded)
 
     def _serve_api_data(self) -> None:
         # #583 S3 §6/§7. TWO phases. Preparation may answer a JSON 500 because
@@ -9229,9 +9768,38 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 # describes what actually ran rather than what was intended.
                 # The predicate itself is untouched (D-E) — this composes it,
                 # it does not change it.
-                report = sources.build_diagnosis(
-                    scope, measured_at=now_utc,
-                    transcripts_visible=self._transcripts_visible_to_request(),
+                transcripts_visible = self._transcripts_visible_to_request()
+                flight_key = _diagnosis_flight_key(
+                    scope, transcripts_visible, reveal,
+                )
+
+                def _prepare_diagnosis():
+                    report = sources.build_diagnosis(
+                        scope,
+                        measured_at=now_utc,
+                        transcripts_visible=transcripts_visible,
+                    )
+                    scopes = {
+                        result.source: diagnosis._scope_for(
+                            sources, scope, result.source,
+                        )
+                        for result in report.results
+                    }
+                    body = diagnosis.diagnosis_to_wire(
+                        report,
+                        scopes=scopes,
+                        reveal_projects=reveal,
+                    )
+                    status = (
+                        503
+                        if kernel.unreadable_store_is_terminal(report)
+                        else 200
+                    )
+                    return status, body
+
+                status, body = _DIAGNOSIS_ADMISSION.run(
+                    flight_key,
+                    _prepare_diagnosis,
                 )
             except _DiagnosisSelectorError as exc:
                 self._send_diagnosis_json(
@@ -9262,12 +9830,6 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     status, {"error": exc.message, "code": exc.code})
                 return
 
-            scopes = {result.source: diagnosis._scope_for(sources, scope,
-                                                          result.source)
-                      for result in report.results}
-            body = diagnosis.diagnosis_to_wire(report, scopes=scopes,
-                                               reveal_projects=reveal)
-            status = 503 if kernel.unreadable_store_is_terminal(report) else 200
         except Exception as exc:  # noqa: BLE001
             self.log_error("/api/diagnosis failed before commit: %r", exc)
             self._send_diagnosis_json(500, {"error": "internal error"})
@@ -9479,6 +10041,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 
     def _handle_get_conversation_outline(self, path: str) -> None:
         return _handle_get_conversation_outline_impl(self, path)
+
+    def _handle_get_conversation_outline_transfer(self, path: str) -> None:
+        return _handle_get_conversation_outline_transfer_impl(self, path)
+
+    def _handle_delete_conversation_outline_transfer(self, path: str) -> None:
+        return _handle_delete_conversation_outline_transfer_impl(self, path)
 
     def _handle_get_conversation_prompts(self, path: str) -> None:
         return _handle_get_conversation_prompts_impl(self, path)
@@ -10405,11 +10973,18 @@ def _dashboard_initial_snapshot_once(
         # Route _tui_build_snapshot through the cctally module (its re-export)
         # so ``monkeypatch.setitem(ns, "_tui_build_snapshot", spy)`` in tests
         # propagates — identical to the pre-change call form.
-        return c._tui_build_snapshot(
+        snapshot = c._tui_build_snapshot(
             now_utc=pinned_now, skip_sync=True,
             display_tz_pref_override=display_tz_pref_override,
             precompute_envelope=True, runtime_bind=getattr(args, "host", None),
         )
+        # Frozen mode has no background publisher, so this initial full build
+        # is also its only retained snapshot. Submit it explicitly to the same
+        # asynchronous owner verifier used by ordinary publisher ticks.
+        c._load_sibling(
+            "_lib_snapshot_cache").enforce_snapshot_accelerator_bounds(
+                data_version="dashboard-no-sync-initial")
+        return snapshot
 
     import time as _time
     now_utc = pinned_now or dt.datetime.now(dt.timezone.utc)
@@ -10702,10 +11277,20 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         print(f"dashboard: pruned {_heal.pruned_files} orphaned cache file(s) "
               f"from removed sessions on startup", flush=True)
 
-    initial = _dashboard_initial_snapshot(
-        args, pinned_now=pinned_now,
-        display_tz_pref_override=display_tz_pref_override,
-    )
+    # #709: background retained-size verifiers own fail-closed completion.
+    # Bind both owners to the same publisher lock before the initial build so
+    # --no-sync cannot strand an over-cap/error result waiting for a next tick.
+    sync_lock = threading.Lock()
+    source_memory_module = _cctally()._load_sibling(
+        "_cctally_dashboard_sources")
+    snapshot_memory_module = _cctally()._load_sibling("_lib_snapshot_cache")
+    source_memory_module.set_codex_source_memory_completion_lock(sync_lock)
+    snapshot_memory_module.set_snapshot_memory_completion_lock(sync_lock)
+    with sync_lock:
+        initial = _dashboard_initial_snapshot(
+            args, pinned_now=pinned_now,
+            display_tz_pref_override=display_tz_pref_override,
+        )
     if args.no_sync:
         # No background refresher will run, so surfacing a ticking
         # "synced Ns ago" chip would be misleading. Clear the monotonic
@@ -10733,8 +11318,6 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     # where nothing would drain that queue, so a manual request there waits on
     # a blocking acquire instead. The lock inside _run_sync_now is what
     # actually prevents overlap.
-    sync_lock = threading.Lock()
-
     # Build the two variants up front. The locked variant is exposed on the
     # handler so /api/sync paths that already hold sync_lock (e.g. for
     # multi-step refresh-then-rebuild) can reuse the snapshot-publish body
@@ -10778,6 +11361,18 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     DashboardHTTPHandler.run_sync_now_locked = staticmethod(
         lambda: _run_sync_now_locked(skip_sync=args.no_sync)
     )
+    def _main_frontier_stats():
+        periodic_owner = getattr(_run_sync_now, "_locked_owner", None)
+        frontier = getattr(periodic_owner, "_ingest_frontier", None)
+        if frontier is None:
+            frontier = getattr(_run_sync_now_locked, "_ingest_frontier", None)
+        return None if frontier is None else frontier.memory_stats()
+
+    # Static callback preserves the exact closure that owns the frontier. A
+    # plain function assigned to the handler class is a descriptor and may be
+    # rebound when the debug route reads it from a request instance.
+    DashboardHTTPHandler.ingest_frontier_stats = staticmethod(
+        _main_frontier_stats)
 
     # Background rebuilder — reuses the TUI's proven sync thread with a
     # small shim that delegates the sync body to _run_sync_now (so POST
@@ -10940,7 +11535,25 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         if conversation_sync_thread is not None:
             conversation_sync_thread.join(timeout=2)
         update_check_stop.set()
+        memory_shutdown_errors = []
+        try:
+            shutdown_codex_source_memory_worker()
+        except Exception as exc:  # noqa: BLE001 - finish server cleanup first
+            memory_shutdown_errors.append(exc)
+        try:
+            _cctally()._load_sibling(
+                "_lib_snapshot_cache").shutdown_snapshot_memory_worker()
+        except Exception as exc:  # noqa: BLE001 - finish server cleanup first
+            memory_shutdown_errors.append(exc)
+        source_memory_module.set_codex_source_memory_completion_lock(None)
+        snapshot_memory_module.set_snapshot_memory_completion_lock(None)
         srv.shutdown()
         http_thread.join(timeout=2)
+        hub.close()
+        if memory_shutdown_errors:
+            raise RuntimeError(
+                "dashboard memory verifier shutdown failed: "
+                + "; ".join(str(exc) for exc in memory_shutdown_errors)
+            )
         print("dashboard: stopped", flush=True)
     return 0

@@ -241,7 +241,9 @@ def test_every_return_path_of_the_producer_yields_a_calibrated_week():
     caller `_calibrated_projection` reads `detail.projection_pct`. One early
     return still yielded the two-value tuple the pre-`CalibratedWeek` shape
     used, which raises `AttributeError` rather than withholding — the same
-    defect class as `persist_and_detect`'s `None, None`.
+    defect class as a `persist_and_detect` early return whose arity does not
+    match the rest of the function. That function now returns THREE values,
+    and its unreadable-state path returns `None, (), ()` for this reason.
     """
     import ast
     # Resolved from `_cctally_core`, which is imported at module scope, rather

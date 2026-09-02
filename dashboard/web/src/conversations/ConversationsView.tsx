@@ -71,7 +71,7 @@ export function ConversationsView() {
   // outline hook and (via props) the reader's useConversation.
   const liveSid = compare !== null ? null : selected;
   const { growthNonce, live } = useConversationLiveTail(liveSid);
-  const { outline } = useConversationOutline(liveSid, { growthNonce, live });
+  const { outline, loading: outlineLoading } = useConversationOutline(liveSid, { growthNonce, live });
 
   useKeymap(CONVERSATIONS_BINDINGS);
   // #217 S4 / I-1.5 — Cmd/Ctrl+F intercept (capture-phase; the central keymap
@@ -155,7 +155,7 @@ export function ConversationsView() {
         {comparePick != null || selected == null
           ? <ConversationRail />
           : <>
-              <ConversationReader conversationRef={selected} outline={outline} growthNonce={growthNonce} live={live} mobileBack />
+              <ConversationReader conversationRef={selected} outline={outline} outlineLoading={outlineLoading} growthNonce={growthNonce} live={live} mobileBack />
               {outlineSheet(selected)}
             </>}
       </div>
@@ -174,7 +174,7 @@ export function ConversationsView() {
     >
       <ConversationRail />
       {selected != null
-        ? <ConversationReader conversationRef={selected} outline={outline} growthNonce={growthNonce} live={live} />
+        ? <ConversationReader conversationRef={selected} outline={outline} outlineLoading={outlineLoading} growthNonce={growthNonce} live={live} />
         : <div className="conv-reader conv-reader--empty">
             <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true"><ChatIcon /></span>
               <div className="conv-state-title">Select a conversation</div>

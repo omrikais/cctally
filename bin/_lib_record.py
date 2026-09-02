@@ -17,6 +17,7 @@ Spec: docs/superpowers/specs/2026-07-09-279-s4-record-kernelization-design.md
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -177,3 +178,52 @@ def projected_crossings(value: float, levels) -> list:
     per-threshold filter).
     """
     return [t for (t, comparand) in levels if value + 1e-9 >= comparand]
+
+
+# ── Fragment 8: usage-snapshot fold outcome classification ─────────────────
+#: The three outcomes of ``_cctally_journal._usage_snapshot_fold_decision``.
+#: ACCEPT journals a ``snapshot_accept`` evt. The two SKIPs both suppress that
+#: insert, but they mean OPPOSITE things about the incoming observation and the
+#: stored row, so the glue must be able to tell them apart:
+#:
+#:   * ``SNAPSHOT_SKIP_DEDUP`` — the incoming observation AGREES with the latest
+#:     stored row (both percents unchanged). Re-running the derivation
+#:     chokepoints against that row is correct; it is what heals a tick killed
+#:     between the snapshot insert and the milestone insert.
+#:   * ``SNAPSHOT_SKIP_CLAMP`` — the incoming 7d percent is strictly BELOW the
+#:     reset-aware in-window maximum, so the observation CONTRADICTS the stored
+#:     row. Deriving a weekly milestone from the higher stored value would
+#:     record a crossing the meter says did not happen.
+SNAPSHOT_ACCEPT = "accept"
+SNAPSHOT_SKIP_CLAMP = "clamp"
+SNAPSHOT_SKIP_DEDUP = "dedup"
+
+
+# ── Fragment 9: post-reset milestone-ladder seeding evidence ───────────────
+def post_reset_seed_has_climb_evidence(lowest_in_epoch_pct, current_floor: int) -> bool:
+    """Return True when a post-reset epoch may seed its milestone ladder at
+    ``current_floor``.
+
+    ``lowest_in_epoch_pct`` is the smallest ``weekly_percent`` stored for this
+    week and account at-or-after the governing reset event's effective instant
+    (``None`` when the epoch holds no observation at all). The seed is allowed
+    only when some in-epoch observation floors STRICTLY below the threshold
+    being recorded — the observable evidence that the counter climbed from the
+    reset to here.
+
+    Glue call site: ``maybe_record_milestone`` (bin/_cctally_record.py), on the
+    ``reset_event_id != 0 and max_existing is None`` branch only. The ``+ 1e-9``
+    snap matches the one the glue applies to ``current_floor`` itself, so a
+    percent one ULP below an integer classifies the same on both sides.
+
+    The ``None`` leg is the kernel's own contract for an empty epoch, not a
+    frequently-taken branch: at that call site the triggering capture's own row
+    usually sits inside the query window and makes the ``MIN`` non-NULL. It is
+    still reachable, because the window's upper bound falls back to ``as_of``
+    when ``saved`` carries no ``capturedAt``, and because the stale-replica
+    DELETE can remove the row between the snapshot write and this read. An
+    epoch holding no stored observation has observed no climb, so it refuses.
+    """
+    if lowest_in_epoch_pct is None:
+        return False
+    return math.floor(float(lowest_in_epoch_pct) + 1e-9) < current_floor

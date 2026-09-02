@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import importlib
 import json
+import pickle
 import sqlite3
 import sys
 
@@ -29,6 +30,15 @@ COMPACTION_BODY = (
     "This session is being continued from a previous conversation that ran "
     "out of context. The conversation is summarized below:"
 )
+
+
+def test_frozen_evidence_mapping_is_immutable_and_pickle_safe():
+    original = kernel.FrozenDict({"humanTurns": 3})
+    restored = pickle.loads(pickle.dumps(original, protocol=5))
+    assert restored == original
+    assert isinstance(restored, kernel.FrozenDict)
+    with pytest.raises(TypeError, match="frozen mapping"):
+        restored["humanTurns"] = 4
 
 
 def _sources():
@@ -213,6 +223,59 @@ def test_the_claude_projection_does_not_scale_its_query_count_with_sessions(
     # and would pass against a deliberate N+1.
     assert len(conn.statements) >= 3, conn.statements
     assert len(conn.statements) <= 12, conn.statements
+
+
+def test_claude_candidate_sessions_reuse_the_accounting_population(
+        tmp_path, monkeypatch):
+    """Complete allocation does not force transcript-only body reads.
+
+    The full transcript population decides each spending session's fixed scan
+    share, while the accounting population decides which session bodies can
+    contribute a ranked dollar and therefore need loading.
+    """
+    ns = _stores(tmp_path, monkeypatch)
+    _seed_context_conversation(
+        ns, session="sess-spending", humans=2, replies=[LARGE_REQUEST])
+    conv = ns["open_conversations_db"]()
+    try:
+        _insert_message(
+            conv, session_id="sess-transcript-only", offset=900,
+            entry_type="assistant", text="reply", blocks=_blocks("reply"),
+            at=WINDOW_START + dt.timedelta(hours=3),
+            source_path="/tmp/projects/transcript-only.jsonl", model=OPUS,
+            msg_id="only-m", req_id="only-r")
+        conv.commit()
+    finally:
+        conv.close()
+    sources = _sources()
+    scope = _scope()
+    bundle = sources.StoreBundle(
+        scope, kernel.resolve_policy_plan(scope.source,
+                                          transcripts_visible=True))
+    body_params = []
+    real_execute = sources._execute
+
+    def _spy(conn, sql, params=()):
+        if ("FROM conversation_messages" in sql
+                and "session_id IN (" in sql
+                and not sql.startswith("EXPLAIN")):
+            body_params.append(tuple(params))
+        return real_execute(conn, sql, params)
+
+    try:
+        sources._establish(scope, bundle)
+        bundle.claude_window_sessions = None
+        conn = sources.open_read_only("conversations")
+        try:
+            monkeypatch.setattr(sources, "_execute", _spy)
+            sources._evaluate_cache_churn(scope, bundle, conn)
+        finally:
+            conn.close()
+    finally:
+        bundle.close()
+    assert body_params, "non-vacuity: seed/window body statements must run"
+    assert all("sess-spending" in params for params in body_params)
+    assert all("sess-transcript-only" not in params for params in body_params)
 
 
 def test_the_codex_projection_does_not_scale_its_query_count_with_threads(
@@ -2529,6 +2592,9 @@ def _conversations_statements_executed(sources, scope, monkeypatch):
 
 def _is_format_instance(template: str, actual: str) -> bool:
     """Whether `actual` is `template` with `{placeholders}` filled in."""
+    compound = actual.split("\nUNION ALL\n")
+    if len(compound) > 1 and all(term == template for term in compound):
+        return True
     parts = template.split("{placeholders}")
     position = 0
     for index, part in enumerate(parts):
@@ -2587,6 +2653,27 @@ def test_every_codex_conversations_statement_is_declared(
     for sql in seen:
         assert any(_is_format_instance(template, sql)
                    for template in declared), sql[:160]
+
+
+def test_claude_session_population_is_read_once_per_window(
+        tmp_path, monkeypatch):
+    """Three conversation classes share one provider/window population."""
+    ns = _stores(tmp_path, monkeypatch)
+    _seed_churn(ns, compaction_before_window=False)
+    sources = _sources()
+    calls = 0
+    real_execute = sources._execute
+
+    def _counting(conn, sql, params=()):
+        nonlocal calls
+        if sql == sources._CLAUDE_WINDOW_SESSIONS_SQL:
+            calls += 1
+        return real_execute(conn, sql, params)
+
+    monkeypatch.setattr(sources, "_execute", _counting)
+    sources.build_provider_diagnosis(_scope("claude"),
+                                     transcripts_visible=True)
+    assert calls == 2  # current and preceding half-open windows
 
 
 def test_an_unrecognised_source_fails_loudly_rather_than_open(

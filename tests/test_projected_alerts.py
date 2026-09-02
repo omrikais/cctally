@@ -31,6 +31,7 @@ import json
 
 import pytest
 
+import _lib_quota_model as qm
 from conftest import load_script, redirect_paths
 
 
@@ -106,6 +107,50 @@ def _high_conf_samples(p_now):
     """A sample set yielding HIGH forecast confidence at AS_OF (84h elapsed):
     >=3 samples, a sample >=24h old, p_now >= 2."""
     return [(1.0, p_now * 0.2), (24.0, p_now * 0.5), (83.0, p_now)]
+
+
+def _seed_calibrated_week(ns, *, units_per_point=2_000_000.0):
+    """Seed a supported current-week population and its matching regime."""
+    cache_mod = ns["_load_sibling"]("_cctally_cache")
+    cache = cache_mod.open_cache_db()
+    try:
+        for index, offset_hours in enumerate((10, 50)):
+            cache.execute(
+                "INSERT INTO session_entries(source_path, line_offset,"
+                " timestamp_utc, model, input_tokens, output_tokens,"
+                " cache_create_tokens, cache_create_1h_tokens,"
+                " cache_read_tokens) VALUES (?,?,?,?,?,?,?,?,?)",
+                (f"/fx/projected-calibrated-{index}.jsonl", index,
+                 _iso(WEEK_START + dt.timedelta(hours=offset_hours)),
+                 "claude-opus-5", 50_000_000, 0, 0, 0, 0))
+        cache.commit()
+    finally:
+        cache.close()
+
+    import _cctally_core
+    payload = {
+        "schemaVersion": 1,
+        "accounts": {"*": {"regimes": [{
+            "effectiveFrom": _iso(WEEK_START - dt.timedelta(days=30)),
+            "effectiveUntil": None,
+            "fingerprint": qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
+            "algorithmRevision": qm.QUOTA_MODEL_ALGORITHM_REVISION,
+            "unitsPerPoint": units_per_point,
+            "interval": {"lo": units_per_point * 0.9,
+                         "hi": units_per_point * 1.1},
+            "support": {"days": 26, "segments": 4},
+            "status": "ok",
+            "asOf": _iso(WEEK_START),
+            "qualifications": [],
+            "familyShares": {"claude-opus-5": 1.0},
+            "classShares": {"fresh": 1.0, "output": 0.0,
+                            "cache_1h": 0.0, "cache_read": 0.0},
+            "familyRadius": 0.02,
+            "classRadius": 0.05,
+        }]}},
+    }
+    path = _cctally_core.APP_DIR / "quota-calibrations.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _write_config(ns, *, alerts=None, budget=None):
@@ -235,6 +280,24 @@ def test_weekly_pct_fires_on_week_average_crossing(ns, monkeypatch):
     assert all(p["axis"] == "projected" for p, _ in captured)
     assert all(p["metric"] == "weekly_pct" for p, _ in captured)
     assert all(mode == "real" for _, mode in captured)
+
+
+def test_weekly_pct_fires_on_the_calibrated_forecast_value(ns, monkeypatch):
+    """A validated calibration replaces, rather than silences, the weekly
+    projected alert. The retained value is the same model-backed projection
+    the forecast selects and is deliberately different from the meter pace."""
+    _seed_snapshots(ns, _high_conf_samples(40.0))
+    _seed_calibrated_week(ns)
+    _write_config(ns, alerts={"enabled": True, "projected_enabled": True})
+    captured = _patch_dispatch(ns, monkeypatch)
+
+    ns["maybe_record_projected_alert"]({})
+
+    rows = _rows(ns)
+    assert [r["threshold"] for r in rows] == [90, 100]
+    assert all(r["projected_value"] == pytest.approx(100.0) for r in rows)
+    assert all(r["projected_value"] != pytest.approx(79.0) for r in rows)
+    assert {p["projected_value"] for p, _mode in captured} == {100.0}
 
 
 def test_weekly_pct_does_not_fire_when_week_average_below_threshold(ns, monkeypatch):

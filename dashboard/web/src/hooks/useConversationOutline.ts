@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { fetchJson } from '../lib/fetchJson';
+import { fetchJson, isAbortError } from '../lib/fetchJson';
 import { useSnapshot } from './useSnapshot';
 import { revalToken } from '../lib/revalToken';
 import { conversationEntityUrl } from '../lib/conversationTransport';
@@ -12,6 +12,107 @@ import {
   type ConversationRef,
   type ConversationRefInput,
 } from '../types/conversation';
+
+type ProgressiveTransfer = {
+  token: string;
+  total?: number;
+  sha256?: string;
+  chunk_size: number;
+};
+
+type ProgressiveOutline<T> = {
+  progressive: 1;
+  summary?: T;
+  transfer: ProgressiveTransfer;
+};
+
+type TransferChunk = {
+  offset: number;
+  next_offset: number;
+  total: number;
+  sha256: string;
+  done: boolean;
+  chunk: string;
+};
+
+function isProgressiveOutline<T>(body: T | ProgressiveOutline<T>): body is ProgressiveOutline<T> {
+  return typeof body === 'object' && body !== null
+    && (body as { progressive?: unknown }).progressive === 1;
+}
+
+function decodeBase64(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  // WebCrypto's BufferSource excludes SharedArrayBuffer in the pinned DOM
+  // types. Copy into an owned ArrayBuffer so both browser bytes and the
+  // compile-time contract are unambiguous.
+  const owned = new Uint8Array(bytes.byteLength);
+  owned.set(bytes);
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', owned.buffer);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function throwIfAborted(signal: AbortSignal) {
+  if (signal.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+}
+
+async function cancelOutlineTransfer(token: string): Promise<void> {
+  try {
+    await fetch(
+      `/api/conversation/outline-transfer/${encodeURIComponent(token)}`,
+      { method: 'DELETE', keepalive: true },
+    );
+  } catch {
+    // Best effort only: the server's TTL remains the fallback cleanup path.
+  }
+}
+
+async function hydrateOutlineTransfer<T>(
+  transfer: ProgressiveTransfer,
+  signal: AbortSignal,
+): Promise<T> {
+  const parts: Uint8Array[] = [];
+  let received = 0;
+  let total = transfer.total;
+  let sha256 = transfer.sha256;
+  try {
+    while (total === undefined || received < total) {
+      throwIfAborted(signal);
+      const chunk = await fetchJson<TransferChunk>(
+        `/api/conversation/outline-transfer/${encodeURIComponent(transfer.token)}?offset=${received}`,
+        signal,
+      );
+      throwIfAborted(signal);
+      if (total === undefined) total = chunk.total;
+      if (sha256 === undefined) sha256 = chunk.sha256;
+      if (chunk.offset !== received || chunk.total !== total
+          || chunk.sha256 !== sha256 || chunk.next_offset <= received) {
+        throw new Error('Invalid outline transfer');
+      }
+      const bytes = decodeBase64(chunk.chunk);
+      if (received + bytes.length !== chunk.next_offset) throw new Error('Invalid outline chunk');
+      parts.push(bytes);
+      received = chunk.next_offset;
+      if (chunk.done !== (received === total)) throw new Error('Invalid outline completion');
+    }
+    const all = new Uint8Array(received);
+    let offset = 0;
+    for (const part of parts) { all.set(part, offset); offset += part.length; }
+    if (sha256 === undefined || !/^[0-9a-f]{64}$/.test(sha256)
+        || await sha256Hex(all) !== sha256) {
+      throw new Error('Invalid outline digest');
+    }
+    return JSON.parse(new TextDecoder().decode(all)) as T;
+  } catch (error) {
+    void cancelOutlineTransfer(transfer.token);
+    throw error;
+  }
+}
 
 // #177 S5 — full-session outline + stats. Owns its OWN SSE tick subscription
 // (Codex F3: useConversation only tail-polls once fully paged), with the same
@@ -50,6 +151,8 @@ export function useConversationOutline(
   const outlineRef = useRef<ConversationOutline | null>(null);
   const fetchingRef = useRef(false);
   const pendingRef = useRef(false);
+  const requestGenerationRef = useRef(0);
+  const controllerRef = useRef<AbortController | null>(null);
 
   const refetch = useCallback(async () => {
     // Coalesce a tick that lands mid-fetch into ONE trailing replay (the
@@ -58,56 +161,113 @@ export function useConversationOutline(
     const key = identityRef.current;
     const ref = conversationRefRef.current;
     if (!key || !ref) return;
+    const generation = requestGenerationRef.current + 1;
+    requestGenerationRef.current = generation;
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    const ownsRequest = () => requestGenerationRef.current === generation
+      && identityRef.current === key
+      && !controller.signal.aborted;
     fetchingRef.current = true;
     try {
-      const body = isQualifiedConversationRef(ref)
-        ? await Promise.all([
-            fetchJson<Parameters<typeof adaptQualifiedOutline>[1]>(conversationEntityUrl(ref, 'outline')),
-            ref.source === 'claude'
-              ? fetchJson<{ prompts?: { item_key: string; text: string }[] }>(conversationEntityUrl(ref, 'prompts'))
-              : Promise.resolve(null),
-          ]).then(([rawOutline, rawPrompts]) => adaptQualifiedOutline(
-            ref,
-            rawOutline,
-            {},
-            rawPrompts ? new Set((rawPrompts.prompts ?? []).map((prompt) => prompt.item_key)) : undefined,
-          ))
-        : await fetchJson<ConversationOutline>(conversationEntityUrl(ref, 'outline'));
-      if (identityRef.current !== key) return;   // session switched mid-fetch — drop
-      outlineRef.current = body;
-      setOutline(body); setError(null); setLoading(false);
+      const outlineUrl = conversationEntityUrl(ref, 'outline', { progressive: 1 });
+      if (isQualifiedConversationRef(ref)) {
+        type RawQualified = Parameters<typeof adaptQualifiedOutline>[1];
+        const raw = await fetchJson<RawQualified | ProgressiveOutline<RawQualified>>(
+          outlineUrl,
+          controller.signal,
+        );
+        if (!ownsRequest()) return;
+        const progressive = isProgressiveOutline(raw);
+        const summaryRaw = progressive ? raw.summary : raw;
+        let body: ConversationOutline;
+        if (summaryRaw !== undefined) {
+          body = adaptQualifiedOutline(ref, summaryRaw);
+          if (!ownsRequest()) return;
+          outlineRef.current = body;
+          setOutline(body); setError(null); setLoading(false);
+        }
+
+        const fullRaw = progressive
+          ? await hydrateOutlineTransfer<RawQualified>(raw.transfer, controller.signal)
+          : summaryRaw as RawQualified;
+        const rawPrompts = ref.source === 'claude'
+          ? await fetchJson<{ prompts?: { item_key: string; text: string }[] }>(
+              conversationEntityUrl(ref, 'prompts'),
+              controller.signal,
+            )
+          : null;
+        body = adaptQualifiedOutline(
+          ref,
+          fullRaw,
+          {},
+          rawPrompts ? new Set((rawPrompts.prompts ?? []).map((prompt) => prompt.item_key)) : undefined,
+        );
+        if (!ownsRequest()) return;
+        outlineRef.current = body;
+        setOutline(body); setError(null); setLoading(false);
+      } else {
+        const raw = await fetchJson<ConversationOutline | ProgressiveOutline<ConversationOutline>>(
+          outlineUrl,
+          controller.signal,
+        );
+        if (!ownsRequest()) return;
+        const progressive = isProgressiveOutline(raw);
+        let body: ConversationOutline;
+        if (progressive) {
+          if (raw.summary !== undefined) {
+            body = raw.summary;
+            if (!ownsRequest()) return;
+            outlineRef.current = body;
+            setOutline(body); setError(null); setLoading(false);
+          }
+          body = await hydrateOutlineTransfer<ConversationOutline>(raw.transfer, controller.signal);
+        } else {
+          body = raw;
+        }
+        if (!ownsRequest()) return;
+        outlineRef.current = body;
+        setOutline(body); setError(null); setLoading(false);
+      }
     } catch (e) {
-      // Deliberate no-AbortController choice (#184): the single-in-flight guard
-      // (`fetchingRef`) already prevents overlapping requests, and the
-      // `sessionRef.current !== sid` check below drops any stale response a
-      // session switch left in flight — so there is no fetch to abort and no
-      // AbortError to special-case. A genuine fetch failure for the CURRENT
-      // session degrades to the inline error banner.
-      if (identityRef.current !== key) return;
+      // A session switch aborts the obsolete progressive transfer. Only a
+      // genuine fetch failure for the CURRENT session reaches the inline error
+      // banner; aborts and stale generations are silent.
+      if (isAbortError(e)) return;
+      if (!ownsRequest()) return;
       setError(e instanceof ConversationNormalizationPending
         ? 'Conversation indexing is still finishing.'
         : "Couldn't load the outline."); setLoading(false);
     } finally {
-      fetchingRef.current = false;
-      if (pendingRef.current) { pendingRef.current = false; void refetch(); }
+      if (requestGenerationRef.current === generation) {
+        controllerRef.current = null;
+        fetchingRef.current = false;
+        if (pendingRef.current) { pendingRef.current = false; void refetch(); }
+      }
     }
   }, []);
 
   useEffect(() => {
+    controllerRef.current?.abort();
+    requestGenerationRef.current += 1;
     identityRef.current = identityKey;
     conversationRefRef.current = conversationRef;
     outlineRef.current = null;
-    // Clear the in-flight/coalesce guards on a session switch: a fetch still in
-    // flight for the OLD session must not block the NEW session's fetch (its
-    // late response is dropped by the sessionRef guard, and the pending-replay
-    // would otherwise re-issue against the new session anyway). Without this the
-    // new session would stall behind a never-resolving stale fetch.
+    // Clear the in-flight/coalesce guards on a session switch. The generation
+    // invalidation above prevents the old request's `finally` from clearing the
+    // new request's flags, while aborting stops obsolete progressive chunks.
     fetchingRef.current = false;
     pendingRef.current = false;
     setOutline(null); setError(null);
     if (!conversationRef) { setLoading(false); return; }
     setLoading(true);
     void refetch();
+    return () => {
+      controllerRef.current?.abort();
+      requestGenerationRef.current += 1;
+      fetchingRef.current = false;
+      pendingRef.current = false;
+    };
   }, [identityKey, refetch]);
 
   const env = useSnapshot();

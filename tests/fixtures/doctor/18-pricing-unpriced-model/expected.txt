@@ -69,7 +69,8 @@ Pricing
   ⚠ Coverage                 1 unpriced (Claude $0)
       → Run `cctally pricing-check`, then update CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING in bin/_lib_pricing.py
 Quota
-  ✓ Metering rate            no change detected
+  ✓ Metering rate            not assessed
+      → Run `cctally quota` for the current assessment.
   ✓ Calibration              no calibration fitted yet
 Safety
   ✓ Dashboard bind           config: loopback

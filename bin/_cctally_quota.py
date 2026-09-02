@@ -317,6 +317,11 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     "_cctally_dashboard.py": 3,
     "_cctally_dashboard_envelope.py": 5,
     "_cctally_db.py": 7,
+    # NOT a read. The worker-loader failure says `cannot load cctally worker
+    # from {path}`, which the case-insensitive `FROM\s+{` pattern cannot tell
+    # from a dynamic SQL target. The module's SQL table names remain literal,
+    # so no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
+    "_cctally_diagnosis_sources.py": 1,
     "_cctally_doctor.py": 1,
     "_cctally_five_hour.py": 1,
     "_cctally_journal.py": 18,
@@ -331,9 +336,19 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     "_cctally_release.py": 4,
     "_cctally_setup.py": 3,
     "_cctally_tui.py": 1,
+    # One, in `_codex_rollup_revision`: the table is selected from a hardcoded
+    # pair of Codex conversation rollups. Neither is a quota projection table,
+    # so no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
+    "_lib_codex_conversation_query.py": 1,
     "_lib_conversation_query.py": 1,
     "_lib_conversation_retention.py": 2,
     "_lib_doctor.py": 1,
+    # Three: `_target_has_cursor_gap` selects one of the two accounting source
+    # tables, while `_conversation_source_paths` and `_conversation_target_risk`
+    # select one of the two transcript source tables. Every choice is hardcoded;
+    # none is a quota projection table, so no
+    # `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
+    "_lib_ingest_frontier.py": 3,
     "_lib_snapshot_cache.py": 1,
     "_lib_subscription_weeks.py": 1,
     # NOT a read. `bin/_lib_test_estate.py` opens no database and issues no SQL;

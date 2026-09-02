@@ -1,4 +1,4 @@
-import { useMemo, useSyncExternalStore } from 'react';
+import { lazy, useMemo, useSyncExternalStore } from 'react';
 import { Header } from './components/Header';
 import { HeroStrip } from './components/HeroStrip';
 import { Footer } from './components/Footer';
@@ -7,12 +7,7 @@ import { SettingsOverlay } from './components/SettingsOverlay';
 import { Toast } from './components/Toast';
 import { PanelHost } from './components/PanelHost';
 import { PanelGridDnd } from './components/PanelGridDnd';
-import { DoctorModal } from './components/DoctorModal';
-import { UpdateModal } from './components/UpdateModal';
-import { ModalRoot } from './modals/ModalRoot';
-import { SourceDetailModal } from './modals/SourceDetailModal';
 import { ShareModalRoot } from './share/ShareModalRoot';
-import { ConversationsView } from './conversations/ConversationsView';
 import { getState, subscribeStore } from './store/store';
 import { useSnapshot } from './hooks/useSnapshot';
 import { useConnectionStatus } from './hooks/useConnectionStatus';
@@ -24,6 +19,31 @@ import { resolveSourceView } from './store/sourceView';
 import { deriveVisiblePanelOrder } from './lib/visiblePanelOrder';
 import { useBoardMode } from './hooks/useBoardMode';
 import { BoardModeContext } from './lib/boardModeContext';
+import { FeatureLoadBoundary } from './components/FeatureLoadBoundary';
+
+const ConversationsView = lazy(() =>
+  import('./conversations/ConversationsView').then((module) => ({
+    default: module.ConversationsView,
+  })),
+);
+const ModalRoot = lazy(() =>
+  import('./modals/ModalRoot').then((module) => ({ default: module.ModalRoot })),
+);
+const SourceDetailModal = lazy(() =>
+  import('./modals/SourceDetailModal').then((module) => ({
+    default: module.SourceDetailModal,
+  })),
+);
+const UpdateModal = lazy(() =>
+  import('./components/UpdateModal').then((module) => ({
+    default: module.UpdateModal,
+  })),
+);
+const DoctorModal = lazy(() =>
+  import('./components/DoctorModal').then((module) => ({
+    default: module.DoctorModal,
+  })),
+);
 
 export function App() {
   // Stable items array for the sortable grid. dnd-kit's rectSortingStrategy
@@ -41,12 +61,28 @@ export function App() {
   // map back into it (see the store's REORDER/SWAP handlers).
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   // Conversation viewer (spec §4). Swap the app BODY on the top-level
-  // view mode; Header/Footer/overlays/modals stay mounted outside the
-  // conditional so the always-on chrome (switcher, sync chip, settings,
-  // help, doctor, toasts) works in both views. ConversationsView mounts
+  // view mode; Header/Footer/overlays/modals stay outside the conditional so
+  // the always-on chrome (switcher, sync chip, settings, help, doctor, toasts)
+  // works in both views. ConversationsView mounts
   // its own view-aware keymap bindings only while active, so the dashboard
   // panel digits/letters can't fire over the unmounted grid.
   const view = useSyncExternalStore(subscribeStore, () => getState().view);
+  const openModal = useSyncExternalStore(
+    subscribeStore,
+    () => getState().openModal,
+  );
+  const openSourceDetail = useSyncExternalStore(
+    subscribeStore,
+    () => getState().openSourceDetail,
+  );
+  const updateModalOpen = useSyncExternalStore(
+    subscribeStore,
+    () => getState().update.modalOpen,
+  );
+  const doctorModalOpen = useSyncExternalStore(
+    subscribeStore,
+    () => getState().doctorModalOpen,
+  );
   // B2/B3 (#207): connection / bootstrap state drives the dashboard body —
   // a cold-start skeleton grid (loading), a shared error banner (failed
   // bootstrap), or the live grid with a stale banner + dim overlay when a
@@ -93,7 +129,9 @@ export function App() {
           focus inside the region, not merely the scroll position. */}
       <main id="main-content" tabIndex={-1}>
         {view === 'conversations' ? (
-          <ConversationsView />
+          <FeatureLoadBoundary name="Conversations">
+            <ConversationsView />
+          </FeatureLoadBoundary>
         ) : appState === 'loading' ? (
           <SkeletonGrid mode={boardModeValue} />
         ) : appState === 'error' ? (
@@ -139,21 +177,36 @@ export function App() {
       <Footer />
       <HelpOverlay />
       <SettingsOverlay />
-      <ModalRoot />
+      {openModal ? (
+        <FeatureLoadBoundary name="Dashboard detail">
+          <ModalRoot />
+        </FeatureLoadBoundary>
+      ) : null}
       {/* #294 S5 §5.6 — the qualified source-detail modal (Codex/All source
           rows). Renders nothing when state.openSourceDetail === null. */}
-      <SourceDetailModal />
+      {openSourceDetail ? (
+        <FeatureLoadBoundary name="Source detail">
+          <SourceDetailModal />
+        </FeatureLoadBoundary>
+      ) : null}
       {/* Share modal layer (spec §6.1) — separate from <ModalRoot> so
           the share modal layers ABOVE any open panel modal. Renders
           nothing when state.shareModal === null. */}
       <ShareModalRoot />
-      <UpdateModal />
-      {/* Doctor modal layer (spec §6.3) — mounted for the app's
-          lifetime; its own `doctorModalOpen` flag (NOT openModal)
-          gates the chrome so the composite `d` keymap guard in
+      {updateModalOpen ? (
+        <FeatureLoadBoundary name="Update">
+          <UpdateModal />
+        </FeatureLoadBoundary>
+      ) : null}
+      {/* Doctor modal layer (spec §6.3) — its own `doctorModalOpen` flag
+          (NOT openModal) gates the deferred mount so the composite `d` keymap guard in
           main.tsx can read it alongside update.modalOpen + inputMode
           per spec §6.4 (Codex M5). */}
-      <DoctorModal />
+      {doctorModalOpen ? (
+        <FeatureLoadBoundary name="Doctor">
+          <DoctorModal />
+        </FeatureLoadBoundary>
+      ) : null}
       <Toast />
     </>
   );

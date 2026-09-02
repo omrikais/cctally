@@ -95,6 +95,51 @@ def test_populated_conversations_db_adopts_without_data_change(ns):
         conn2.close()
 
 
+def test_existing_conversations_db_adds_render_revision_columns(ns):
+    """A current pre-#682 store upgrades before transcript replay writes."""
+    conn = ns["open_conversations_db"](attach_cache=False)
+    conn.execute(
+        "INSERT INTO conversation_sessions "
+        "(session_id,msg_count,started_utc,last_activity_utc,project_label,"
+        "models_json,title) "
+        "VALUES ('claude-key',1,'2026-01-01T00:00:00Z',"
+        "'2026-01-01T00:01:00Z','project','[]','Claude')"
+    )
+    conn.execute(
+        "INSERT INTO codex_conversation_rollups "
+        "(conversation_key,source_root_key,item_count,started_utc,"
+        "last_activity_utc,project_key,project_label,models_json,title) "
+        "VALUES ('codex-key','root',1,'2026-01-01T00:00:00Z',"
+        "'2026-01-01T00:01:00Z','/project','project','[]','Codex')"
+    )
+    conn.execute("ALTER TABLE conversation_sessions DROP COLUMN render_revision")
+    conn.execute(
+        "ALTER TABLE codex_conversation_rollups DROP COLUMN render_revision"
+    )
+    conn.execute(
+        "DELETE FROM schema_migrations "
+        "WHERE name='008_conversation_render_revision'"
+    )
+    conn.execute("PRAGMA user_version = 7")
+    conn.commit()
+    conn.close()
+
+    upgraded = ns["open_conversations_db"](attach_cache=False)
+    try:
+        for table in ("conversation_sessions", "codex_conversation_rollups"):
+            columns = {
+                row[1] for row in upgraded.execute(f"PRAGMA table_info({table})")
+            }
+            assert "render_revision" in columns
+            assert upgraded.execute(
+                f"SELECT render_revision FROM {table}"
+            ).fetchone() == (0,)
+        assert _user_version(upgraded) == _head(ns)
+        assert "008_conversation_render_revision" in _applied_markers(upgraded)
+    finally:
+        upgraded.close()
+
+
 def test_db_status_json_lists_conversations_registry(ns, capsys):
     """``db status --json`` enumerates conversations.db alongside stats/cache."""
     rc = ns["cmd_db_status"](argparse.Namespace(json=True))

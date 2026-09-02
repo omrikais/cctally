@@ -20,19 +20,11 @@ relative error is `(predicted - actual) / actual`, and the summary reports its
 median absolute value, its p90, its worst case, its signed median, and the
 same four broken down by which `dollars_per_percent_source` branch fired.
 
-#670 SCOPING. `_apply_midweek_reset_override` matches `week_reset_events` on
-`new_week_end_at` with no reference to `detected_at_utc`, so a historical
-replay applies a reset nobody had detected yet at the instant being replayed.
-This harness therefore restricts that lookup to the event the shipped helper
-would have matched for THE WEEK UNDER EVALUATION, and only skips the override
-when that event was detected after `t`. Both axes are recorded in the
-artifact, because a run whose scoping is not stated is not reproducible.
-
-An earlier revision counted every `week_reset_events` row in the store with a
-later `detected_at_utc` and skipped the override on any of them. On a
-historical replay that is nearly every early decision point, so the harness
-recorded a scoping it did not implement and Stage B's acceptance evidence
-would have rested on it.
+#670 SCOPING. `_apply_midweek_reset_override` matches `week_reset_events` for
+THE WEEK UNDER EVALUATION and restricts the event to one detected by the
+historical replay instant. Both axes are recorded in the artifact, because a
+run whose scoping is not stated is not reproducible. The shipped loader owns
+that causal boundary; this harness no longer monkeypatches a parallel lookup.
 
 WEEK COALESCING. The store spells one physical week many ways. Hour-level
 normalisation removes most of that, but not all: two windows can claim the
@@ -551,43 +543,6 @@ def _decision_points(start, end):
     return points
 
 
-def _scoped_reset_override(module, conn, at):
-    """`_apply_midweek_reset_override` restricted to resets DETECTED by `at`.
-
-    Returns a replacement callable. The shipped helper matches
-    `week_reset_events` on `new_week_end_at` with no reference to
-    `detected_at_utc`, which on a historical replay applies a reset the
-    instant being replayed had not seen yet (#670). This is the harness's own
-    scoping, not a change to the shipped behaviour.
-
-    The count is over the SAME row the shipped helper would have matched for
-    this week, not over the whole store. A store-global count skips the
-    override whenever any reset anywhere was detected later, which on a
-    replay of completed weeks is nearly every decision point.
-    """
-    original = module._apply_midweek_reset_override
-
-    def scoped(conn_arg, week_start_at, week_end_at, samples):
-        try:
-            end_iso = module._normalize_week_boundary_dt(
-                week_end_at.astimezone(UTC)).isoformat(timespec="seconds")
-            undetected = conn_arg.execute(
-                "SELECT COUNT(*) FROM week_reset_events"
-                " WHERE new_week_end_at = ?"
-                "   AND datetime(detected_at_utc) > datetime(?)",
-                (end_iso, at.isoformat())).fetchone()[0]
-        except Exception:
-            undetected = 0
-        if undetected:
-            # THIS week's reset had not been detected at this instant, so it
-            # must not re-anchor the window. The shipped helper cannot express
-            # that, so the override is skipped for this point.
-            return week_start_at, samples
-        return original(conn_arg, week_start_at, week_end_at, samples)
-
-    return scoped
-
-
 def _measure(module, conn, now, account_key):
     """`(week_rows, point_rows)` over the store's completed weeks."""
     weeks = _completed_weeks(module, conn, now, account_key)
@@ -611,17 +566,12 @@ def _measure(module, conn, now, account_key):
 
 
 def _measure_point(module, conn, at, week_end, final_percent, account_key):
-    original = module._apply_midweek_reset_override
-    module._apply_midweek_reset_override = _scoped_reset_override(
-        module, conn, at)
     try:
         inputs = module._load_forecast_inputs(
             conn, at, skip_sync=True, account_key=account_key)
     except Exception as exc:                       # noqa: BLE001
         return {"at": at.isoformat(), "usable": False,
                 "cause": f"load-failed: {type(exc).__name__}"}
-    finally:
-        module._apply_midweek_reset_override = original
     if inputs is None:
         return {"at": at.isoformat(), "usable": False,
                 "cause": "no-current-week-snapshot"}

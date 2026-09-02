@@ -21,7 +21,7 @@ import time
 import urllib.parse as _u
 from http.client import HTTPConnection
 
-from conftest import load_script, redirect_paths
+from conftest import load_script, redirect_paths_without_conversation_retention
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS, read_event, read_no_event, start, stop
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -93,7 +93,7 @@ def _boot_codex(ns, tmp_path, monkeypatch, *, scenario="modern-full",
                 no_sync=False, fast=False):
     """Seed a Codex conversation and start a dashboard. Returns
     ``(srv, provider_root, rollout, conversation_key)``."""
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     provider_root = tmp_path / "provider"
     rollout = provider_root / "sessions" / "2026" / "07" / "15" / "rollout.jsonl"
     rollout.parent.mkdir(parents=True)
@@ -234,7 +234,7 @@ def test_qualified_claude_key_speaks_conversation_key(tmp_path, monkeypatch):
     """A v1.claude key reuses the Claude mechanics internally but speaks the
     qualified conversationKey vocabulary (never sessionId)."""
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True)
     jsonl = projects / "s1.jsonl"
@@ -324,7 +324,7 @@ def test_unrelated_conversation_growth_does_not_emit(tmp_path, monkeypatch):
     """Growing a DIFFERENT conversation's file must not emit on this stream —
     emission keys on the watched files' per-path cursors, never a global seq."""
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     provider_root = tmp_path / "provider"
     a = provider_root / "sessions" / "2026" / "07" / "15" / "a.jsonl"
     b = provider_root / "sessions" / "2026" / "07" / "16" / "b.jsonl"

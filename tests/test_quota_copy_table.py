@@ -90,6 +90,25 @@ def test_d1_presentation_carries_the_code_beside_the_renderings():
     assert set(out) == {"code", "short", "long"}
 
 
+@pytest.mark.parametrize(("basis", "short", "long"), [
+    ("calibrated", "model", "calibrated model"),
+    ("corrected-meter", "meter", "corrected meter"),
+    ("withheld", "withheld", "withheld"),
+])
+def test_projection_basis_has_one_two_register_presentation(
+        basis, short, long):
+    """A change that leaves basis wording in a status-line or dashboard
+    consumer instead of this table must fail at the shared boundary."""
+    ns = load_script()
+    copy = _copy(ns)
+    render = getattr(copy, "basis_presentation", lambda _basis: None)
+    assert render(basis) == {
+        "code": basis,
+        "short": short,
+        "long": long,
+    }
+
+
 def test_d1_json_keeps_the_machine_code():
     """Section 8: the wire keeps the machine code and ADDS presentation
     fields. Full sentences do not replace machine codes in `--json`."""

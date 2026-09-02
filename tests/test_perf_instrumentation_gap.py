@@ -126,6 +126,22 @@ def test_source_bundle_and_envelope_projection_attribute(monkeypatch, tmp_path):
         injected_ms = _INJECTED_S * 1000.0
         assert children["build.source_bundle"] >= injected_ms
         assert children["envelope.legacy_projection"] >= injected_ms
+        bundle = next(
+            child for child in root.get("children", ())
+            if child["name"] == "build.source_bundle"
+        )
+        bundle_names = _flatten_names(bundle, set())
+        assert {
+            "source.store_open",
+            "source.signature",
+            "source.accounting",
+            "source.quota",
+            "source.accounts",
+            "source.models",
+            "source.projection",
+            "source.serialization",
+            "source.reconciliation",
+        } <= bundle_names
     finally:
         perf.set_enabled(False)
         perf.reset_thread()

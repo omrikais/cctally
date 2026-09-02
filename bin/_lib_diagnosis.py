@@ -20,8 +20,27 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
+
+
+class FrozenDict(dict):
+    """A small pickle-safe immutable mapping for cross-process results."""
+
+    @staticmethod
+    def _immutable(*_args, **_kwargs):
+        raise TypeError("frozen mapping")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable
+
+    def __reduce__(self):
+        return FrozenDict, (dict(self),)
 
 
 # --- versioned constants ------------------------------------------------
@@ -886,7 +905,7 @@ def _build_row(spec: ContributorSpec, subject: SubjectFacts,
         # An immutable view, so the mapping a caller receives cannot be
         # mutated through the row. Empty for every S2 class, which is what
         # keeps `_row_to_wire` from emitting the key at all.
-        evidence=(MappingProxyType(dict(evidence)) if evidence else {}),
+        evidence=(FrozenDict(evidence) if evidence else {}),
     )
 
 

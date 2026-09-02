@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import importlib
+import os
 import sqlite3
 import sys
 
@@ -645,6 +646,28 @@ def test_pool_classification_goes_through_the_one_home():
 
 # --- pricing qualification ---------------------------------------------
 
+@pytest.mark.parametrize("model", (
+    STANDARD_MODEL,
+    "gpt-5.4-2026-03-05",
+    "a-model-from-the-future",
+))
+@pytest.mark.parametrize("speed", ("standard", "fast"))
+@pytest.mark.parametrize("tokens", (
+    (1000, 100, 500, 20),
+    (272_000, 10_000, 272_000, 1000),
+    (400_000, 300_000, 400_000, 2000),
+))
+def test_the_compiled_codex_pricer_is_exactly_the_canonical_cost(
+        model, speed, tokens):
+    """The hot reader may resolve rates once, but it may not reprice."""
+    ns = load_script()
+    pricer, is_fallback = _sources()._compiled_codex_pricer(model, speed)
+
+    assert pricer(*tokens) == ns["_calculate_codex_entry_cost"](
+        model, *tokens, speed=speed)
+    assert is_fallback is ns["_is_codex_fallback"](model)
+
+
 def test_is_fallback_pricing_survives_into_the_subject(tmp_path, monkeypatch):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
@@ -780,6 +803,116 @@ def test_build_diagnosis_returns_one_result_per_provider(claude_store):
     report = _sources().build_diagnosis(_scope(source="all"),
                                         transcripts_visible=True)
     assert [r.source for r in report.results] == ["claude", "codex"]
+
+
+def test_all_builds_independent_providers_concurrently_in_stable_order(
+        monkeypatch):
+    """The combined latency budget is not the sum of two read-only folds."""
+    sources = _sources()
+    events = []
+
+    def _provider(scope, *, transcripts_visible):
+        assert transcripts_visible is True
+        events.append(f"build:{scope.source}")
+        return scope.source
+
+    def _start(args):
+        scope, visible = args
+        assert scope.source == "codex"
+        assert visible is True
+        events.append("start:codex")
+        return "worker"
+
+    def _finish(worker):
+        assert worker == "worker"
+        events.append("finish:codex")
+        return "codex"
+
+    monkeypatch.setattr(sources, "build_provider_diagnosis", _provider)
+    monkeypatch.setattr(sources, "_start_forked_provider", _start)
+    monkeypatch.setattr(sources, "_finish_forked_provider", _finish)
+    monkeypatch.setattr(
+        sources.kernel, "build_report",
+        lambda measured_at, window, results: list(results),
+    )
+    assert sources.build_diagnosis(
+        _scope(source="all"), transcripts_visible=True
+    ) == ["claude", "codex"]
+    assert events == ["start:codex", "build:claude", "finish:codex"]
+
+
+def test_all_reaps_the_codex_worker_when_the_parent_provider_fails(
+        monkeypatch):
+    sources = _sources()
+    events = []
+
+    monkeypatch.setattr(
+        sources, "_start_forked_provider",
+        lambda _args: events.append("start") or "worker",
+    )
+
+    def _finish(worker):
+        assert worker == "worker"
+        events.append("finish")
+        return "codex"
+
+    def _provider(scope, *, transcripts_visible):
+        assert transcripts_visible is True
+        if scope.source == "claude":
+            raise ValueError("parent failed")
+        return scope.source
+
+    monkeypatch.setattr(sources, "_finish_forked_provider", _finish)
+    monkeypatch.setattr(sources, "build_provider_diagnosis", _provider)
+    with pytest.raises(ValueError, match="parent failed"):
+        sources.build_diagnosis(
+            _scope(source="all"), transcripts_visible=True)
+    assert events == ["start", "finish"]
+
+
+def test_forked_provider_preserves_a_typed_establishment_failure(monkeypatch):
+    sources = _sources()
+
+    def _fail(_args):
+        raise sources.EstablishmentFailure(
+            "generation_incoherent", "store changed")
+
+    monkeypatch.setattr(sources, "_build_provider_task", _fail)
+    worker = sources._start_forked_provider((None, True))
+    with pytest.raises(sources.EstablishmentFailure) as exc:
+        sources._finish_forked_provider(worker)
+    assert exc.value.code == "generation_incoherent"
+    assert exc.value.message == "store changed"
+
+
+def test_all_uses_the_portable_isolated_worker_when_fork_is_unavailable(
+        monkeypatch):
+    sources = _sources()
+    events = []
+
+    def _isolated(args):
+        scope, visible = args
+        assert scope.source == "codex"
+        assert visible is True
+        events.append("isolated:codex")
+        return "codex"
+
+    def _provider(scope, *, transcripts_visible):
+        assert transcripts_visible is True
+        events.append(f"build:{scope.source}")
+        return scope.source
+
+    monkeypatch.delattr(sources.os, "fork", raising=False)
+    monkeypatch.setattr(sources, "_build_isolated_provider", _isolated)
+    monkeypatch.setattr(sources, "build_provider_diagnosis", _provider)
+    monkeypatch.setattr(
+        sources.kernel, "build_report",
+        lambda measured_at, window, results: list(results),
+    )
+    assert sources.build_diagnosis(
+        _scope(source="all"), transcripts_visible=True
+    ) == ["claude", "codex"]
+    assert sorted(events) == ["build:claude", "isolated:codex"]
 
 
 def test_build_diagnosis_publishes_the_generation_on_each_result(claude_store):

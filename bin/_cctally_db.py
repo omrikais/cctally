@@ -4545,7 +4545,8 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             cache_rebuild_count INTEGER NOT NULL DEFAULT 0,
             git_branch          TEXT,
             models_json         TEXT,
-            title               TEXT
+            title               TEXT,
+            render_revision     INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_conv_sessions_recent
             ON conversation_sessions(last_activity_utc DESC, session_id DESC);
@@ -4828,7 +4829,8 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             project_key       TEXT,
             project_label     TEXT,
             models_json       TEXT,
-            title             TEXT
+            title             TEXT,
+            render_revision   INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_codex_conv_rollups_recent
             ON codex_conversation_rollups(last_activity_utc DESC, conversation_key DESC);
@@ -5041,6 +5043,15 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "conversation_sessions", "git_branch", "TEXT")
     add_column_if_missing(conn, "conversation_sessions", "models_json", "TEXT")
     add_column_if_missing(conn, "conversation_sessions", "title", "TEXT")
+    # #682: one monotonic invalidation frontier per derived conversation.
+    # Column additions remain in the idempotent schema path; the existing
+    # rollup recompute chokepoints populate them on the first affected sync.
+    add_column_if_missing(
+        conn, "conversation_sessions", "render_revision",
+        "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(
+        conn, "codex_conversation_rollups", "render_revision",
+        "INTEGER NOT NULL DEFAULT 0")
     # #320: quota pool identity cannot depend on transcript events after the
     # store split. Stamp the active model directly on each compact physical
     # quota observation. Existing caches receive the nullable column here; 028
@@ -5720,6 +5731,20 @@ def _conv_007_codex_find_projection_v2_meta(conn: sqlite3.Connection) -> None:
         conn.commit()
     finally:
         _release_cache_db_writer_flocks(held)
+
+
+@conversations_migration("008_conversation_render_revision")
+def _conv_008_conversation_render_revision(conn: sqlite3.Connection) -> None:
+    """Add monotonic assembly-revision columns to existing transcript stores."""
+    add_column_if_missing(
+        conn, "conversation_sessions", "render_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    add_column_if_missing(
+        conn, "codex_conversation_rollups", "render_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    conn.commit()
 
 
 # #177 S6: the consolidated multi-column external-content FTS5 table that
@@ -7471,7 +7496,9 @@ def _025_codex_conversation_normalization(conn: sqlite3.Connection) -> None:
             # remains as the replay source), then re-derive from it.
             _codex_conversation_fts_full_clear(conn)
             import _cctally_cache
-            _cctally_cache._replay_codex_normalization(conn)
+            _cctally_cache._replay_codex_normalization(
+                conn, advance_render_revision=False,
+            )
             conn.commit()
         except Exception:
             conn.rollback()

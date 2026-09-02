@@ -674,6 +674,11 @@
     },
     "quota": {
       "basis": "corrected-meter",
+      "basis_presentation": {
+        "code": "corrected-meter",
+        "long": "corrected meter",
+        "short": "meter"
+      },
       "calibrated_consumption_interval": null,
       "calibrated_consumption_pct": null,
       "calibrated_headroom_pct": null,
@@ -1019,6 +1024,11 @@
             },
             "quota": {
               "basis": "corrected-meter",
+              "basis_presentation": {
+                "code": "corrected-meter",
+                "long": "corrected meter",
+                "short": "meter"
+              },
               "calibrated_consumption_interval": null,
               "calibrated_consumption_pct": null,
               "calibrated_headroom_pct": null,
@@ -1172,6 +1182,11 @@
             },
             "quota": {
               "basis": "corrected-meter",
+              "basis_presentation": {
+                "code": "corrected-meter",
+                "long": "corrected meter",
+                "short": "meter"
+              },
               "calibrated_consumption_interval": null,
               "calibrated_consumption_pct": null,
               "calibrated_headroom_pct": null,

@@ -7183,6 +7183,93 @@ def build_per_migration_conversations_007_codex_find_projection_v2_meta(
             lock.unlink()
 
 
+def build_per_migration_conversations_008_conversation_render_revision(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for #682's assembly revision columns."""
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "008_conversation_render_revision"
+
+    if pre.exists():
+        pre.unlink()
+    register_fixture_db(pre)
+    mod = _load_db_module()
+    conn = sqlite3.connect(pre)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        mod._apply_conversations_schema(conn)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+        )
+        for name in (
+            "001_adopt_schema_version_marker",
+            "002_codex_thread_source_inference_replay",
+            "003_background_mcp_result_replay",
+            "004_codex_find_projection",
+            "005_conversation_account_dimension",
+            "006_backfill_codex_file_touches",
+            "007_codex_find_projection_v2_meta",
+        ):
+            conn.execute(
+                "INSERT INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+                (name, TS_STATS_FIVE_APPLIED),
+            )
+        conn.execute(
+            "INSERT INTO conversation_sessions "
+            "(session_id,msg_count,started_utc,last_activity_utc,project_label,"
+            "models_json,title,render_revision) "
+            "VALUES ('claude-key',1,'2026-01-01T00:00:00Z',"
+            "'2026-01-01T00:01:00Z','project','[]','Claude',41)"
+        )
+        conn.execute(
+            "INSERT INTO codex_conversation_rollups "
+            "(conversation_key,source_root_key,item_count,started_utc,"
+            "last_activity_utc,project_key,project_label,models_json,title,"
+            "render_revision) VALUES ('codex-key','root',1,"
+            "'2026-01-01T00:00:00Z','2026-01-01T00:01:00Z','/project',"
+            "'project','[]','Codex',42)"
+        )
+        conn.execute("ALTER TABLE conversation_sessions DROP COLUMN render_revision")
+        conn.execute(
+            "ALTER TABLE codex_conversation_rollups DROP COLUMN render_revision"
+        )
+        conn.execute("PRAGMA user_version=7")
+        conn.commit()
+    finally:
+        conn.close()
+
+    if post.exists():
+        post.unlink()
+    import shutil
+    shutil.copy(pre, post)
+    register_fixture_db(post)
+    handler = next(
+        (m.handler for m in mod._CONVERSATIONS_MIGRATIONS if m.name == migration),
+        None,
+    )
+    if handler is None:
+        raise SystemExit(f"conversations migration {migration} not registered")
+    conn = sqlite3.connect(post)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        handler(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+            (migration, TS_STATS_FIVE_APPLIED),
+        )
+        conn.execute("PRAGMA user_version=8")
+        conn.commit()
+    finally:
+        conn.close()
+    for suffix in (".lock", ".codex.lock"):
+        lock = post.with_name(post.name + suffix)
+        if lock.exists():
+            lock.unlink()
+
+
 
 def build_per_migration_002_five_hour_block_projects_backfill_v1(
     scenario_dir: Path,
@@ -7888,6 +7975,10 @@ def main() -> int:
     build_per_migration_conversations_007_codex_find_projection_v2_meta(
         FIXTURES_ROOT / "per-migration"
         / "conversations_007_codex_find_projection_v2_meta"
+    )
+    build_per_migration_conversations_008_conversation_render_revision(
+        FIXTURES_ROOT / "per-migration"
+        / "conversations_008_conversation_render_revision"
     )
     build_per_migration_036_codex_quota_window_identity_index(
         FIXTURES_ROOT / "per-migration"

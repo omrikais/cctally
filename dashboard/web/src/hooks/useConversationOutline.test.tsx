@@ -1,5 +1,6 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { useConversationOutline } from './useConversationOutline';
 
 // Mock the snapshot store so we can drive `generated_at` (the SSE-tick signal
@@ -29,6 +30,10 @@ function outline(session_id: string, over: Record<string, unknown> = {}) {
 function mockOnce(body: unknown, status = 200) {
   (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: status < 400, status, json: async () => body } as Response);
 }
+
+function sha256(bytes: Uint8Array) {
+  return createHash('sha256').update(bytes).digest('hex');
+}
 beforeEach(() => { globalThis.fetch = vi.fn(); mockGeneratedAt = 't0'; mockDataVersion = undefined; });
 afterEach(() => vi.restoreAllMocks());
 
@@ -38,6 +43,100 @@ function bumpTick(rerender: () => void, tag: string) {
 }
 
 describe('useConversationOutline', () => {
+  it('keeps the outline loading while hydrating the exact bounded transfer (#682)', async () => {
+    const full = outline('s', { stats: { ...outline('s').stats, cost_usd: 2 } });
+    const bytes = new TextEncoder().encode(JSON.stringify(full));
+    const encoded = btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(''));
+    let resolveChunk!: () => void;
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation((rawUrl: string) => {
+      const url = String(rawUrl);
+      if (url.includes('/outline-transfer/')) {
+        return new Promise((resolve) => {
+          resolveChunk = () => resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({
+              offset: 0, next_offset: bytes.length, total: bytes.length,
+              sha256: sha256(bytes), done: true, chunk: encoded,
+            }),
+          } as Response);
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          progressive: 1,
+          transfer: { token: 'opaque', chunk_size: 196608 },
+        }),
+      } as Response);
+    });
+
+    const { result } = renderHook(() => useConversationOutline('s'));
+    await waitFor(() => expect(resolveChunk).toBeTypeOf('function'));
+    expect(result.current.outline).toBeNull();
+    expect(result.current.loading).toBe(true);
+    await act(async () => { resolveChunk(); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.outline?.stats.cost_usd).toBe(2));
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.map(([url]) => String(url))).toEqual([
+      expect.stringContaining('/outline?progressive=1'),
+      '/api/conversation/outline-transfer/opaque?offset=0',
+    ]);
+  });
+
+  it('rejects a transfer whose bytes do not match the advertised SHA-256 (#682)', async () => {
+    const full = outline('s');
+    const bytes = new TextEncoder().encode(JSON.stringify(full));
+    const tampered = bytes.slice();
+    const costNeedle = new TextEncoder().encode('"cost_usd":0');
+    let costOffset = -1;
+    for (let i = 0; i <= tampered.length - costNeedle.length; i += 1) {
+      if (costNeedle.every((byte, j) => tampered[i + j] === byte)) {
+        costOffset = i + costNeedle.length - 1;
+        break;
+      }
+    }
+    expect(costOffset).toBeGreaterThanOrEqual(0);
+    tampered[costOffset] = '1'.charCodeAt(0);
+    const encoded = btoa(Array.from(tampered, (byte) => String.fromCharCode(byte)).join(''));
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation((rawUrl: string) => {
+      const url = String(rawUrl);
+      const body = url.includes('/outline-transfer/')
+        ? {
+            offset: 0, next_offset: tampered.length, total: tampered.length,
+            sha256: sha256(bytes), done: true, chunk: encoded,
+          }
+        : { progressive: 1, transfer: { token: 'opaque', chunk_size: 196608 } };
+      return Promise.resolve({ ok: true, status: 200, json: async () => body } as Response);
+    });
+
+    const { result } = renderHook(() => useConversationOutline('s'));
+    await waitFor(() => expect(result.current.error).toBe("Couldn't load the outline."));
+    expect(result.current.outline).toBeNull();
+  });
+
+  it('rejects a changed digest even when every chunk repeats it (#682)', async () => {
+    const full = outline('s');
+    const bytes = new TextEncoder().encode(JSON.stringify(full));
+    const encoded = btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(''));
+    const digest = sha256(bytes);
+    const wrongDigest = `${digest.slice(0, -1)}${digest.endsWith('0') ? '1' : '0'}`;
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation((rawUrl: string) => {
+      const url = String(rawUrl);
+      const body = url.includes('/outline-transfer/')
+        ? {
+            offset: 0, next_offset: bytes.length, total: bytes.length,
+            sha256: wrongDigest, done: true, chunk: encoded,
+          }
+        : { progressive: 1, transfer: { token: 'opaque', chunk_size: 196608 } };
+      return Promise.resolve({ ok: true, status: 200, json: async () => body } as Response);
+    });
+
+    const { result } = renderHook(() => useConversationOutline('s'));
+    await waitFor(() => expect(result.current.error).toBe("Couldn't load the outline."));
+    expect(result.current.outline).toBeNull();
+  });
+
   it('fetches the outline on a session id', async () => {
     mockOnce(outline('s'));
     const { result } = renderHook(() => useConversationOutline('s'));
@@ -224,6 +323,130 @@ describe('useConversationOutline', () => {
     // Now resolve the stale s1 fetch — it must be dropped.
     await act(async () => { resolveS1(outline('s1')); for (let i = 0; i < 4; i++) await Promise.resolve(); });
     expect(result.current.outline?.session_id).toBe('s2');
+  });
+
+  it('keeps progressive request ownership when the session switches mid-transfer (#682)', async () => {
+    const oldBytes = new TextEncoder().encode(JSON.stringify(outline('s1')));
+    const oldSplit = Math.floor(oldBytes.length / 2);
+    const newBytes = new TextEncoder().encode(JSON.stringify(outline('s2')));
+    const encode = (bytes: Uint8Array) => btoa(
+      Array.from(bytes, (byte) => String.fromCharCode(byte)).join(''));
+    let resolveOldFirst!: () => void;
+    let oldSignal: AbortSignal | undefined;
+    let resolveNewChunk!: () => void;
+    let oldContinuationCount = 0;
+    let oldCancellationCount = 0;
+    let newOutlineCount = 0;
+
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation(
+      (rawUrl: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(rawUrl);
+        if (url.includes('/api/conversation/s1/outline')) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({
+              progressive: 1,
+              transfer: { token: 'old', chunk_size: oldSplit },
+            }),
+          } as Response);
+        }
+        if (url === '/api/conversation/outline-transfer/old?offset=0') {
+          oldSignal = init?.signal ?? undefined;
+          return new Promise((resolve) => {
+            resolveOldFirst = () => resolve({
+              ok: true,
+              status: 200,
+              json: async () => ({
+                offset: 0,
+                next_offset: oldSplit,
+                total: oldBytes.length,
+                sha256: sha256(oldBytes),
+                done: false,
+                chunk: encode(oldBytes.slice(0, oldSplit)),
+              }),
+            } as Response);
+          });
+        }
+        if (url === `/api/conversation/outline-transfer/old?offset=${oldSplit}`) {
+          oldContinuationCount += 1;
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({
+              offset: oldSplit,
+              next_offset: oldBytes.length,
+              total: oldBytes.length,
+              sha256: sha256(oldBytes),
+              done: true,
+              chunk: encode(oldBytes.slice(oldSplit)),
+            }),
+          } as Response);
+        }
+        if (url === '/api/conversation/outline-transfer/old'
+            && init?.method === 'DELETE') {
+          oldCancellationCount += 1;
+          expect(init.keepalive).toBe(true);
+          return Promise.resolve({ ok: true, status: 204 } as Response);
+        }
+        if (url.includes('/api/conversation/s2/outline')) {
+          newOutlineCount += 1;
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({
+              progressive: 1,
+              summary: outline('s2'),
+              transfer: { token: 'new', chunk_size: newBytes.length },
+            }),
+          } as Response);
+        }
+        if (url === '/api/conversation/outline-transfer/new?offset=0') {
+          return new Promise((resolve) => {
+            resolveNewChunk = () => resolve({
+              ok: true,
+              status: 200,
+              json: async () => ({
+                offset: 0,
+                next_offset: newBytes.length,
+                total: newBytes.length,
+                sha256: sha256(newBytes),
+                done: true,
+                chunk: encode(newBytes),
+              }),
+            } as Response);
+          });
+        }
+        throw new Error(`Unexpected fetch: ${url}`);
+      });
+
+    const { result, rerender, unmount } = renderHook(
+      ({ sid }) => useConversationOutline(sid),
+      { initialProps: { sid: 's1' as string | null } },
+    );
+    await waitFor(() => expect(resolveOldFirst).toBeTypeOf('function'));
+
+    rerender({ sid: 's2' });
+    await waitFor(() => expect(result.current.outline?.session_id).toBe('s2'));
+    await waitFor(() => expect(resolveNewChunk).toBeTypeOf('function'));
+
+    await act(async () => {
+      resolveOldFirst();
+      for (let i = 0; i < 8; i += 1) await Promise.resolve();
+    });
+    await act(async () => {
+      mockGeneratedAt = 't1';
+      rerender({ sid: 's2' });
+      await Promise.resolve();
+    });
+
+    expect(oldSignal?.aborted).toBe(true);
+    expect(oldContinuationCount).toBe(0);
+    expect(oldCancellationCount).toBe(1);
+    expect(newOutlineCount).toBe(1);
+
+    unmount();
+    resolveNewChunk();
   });
 
   // #300 — the non-live fallback must gate on the change signal (data_version),

@@ -74,17 +74,17 @@ Five `|`-delimited segments, left to right:
 
 The 7d slot carries the projected end-of-week percent and names the
 measurement it came from. `→ 58% meter` says the week is on course for 58%
-and that the figure came from the corrected meter reading; `→ 58% model`
-would say it came from the fitted quota model.
+and that the figure came from the corrected meter reading.
 
-**This surface is basis-aware, not always model-backed, and today the basis
-is always the meter.** Producing a calibrated projection needs a whole-week
-scan of the entry cache, and the status line runs once per prompt, so it
-never opens `cache.db` for quota and never calls the analysis
-[`quota`](quota.md) runs. What it does read is the calibration file, once,
-with no lock and no throttle. The word in the slot is the basis the shared
-selector actually chose, so it would say `model` on the day that basis
-becomes cheap rather than needing a second edit here.
+**This surface is deliberately meter-only.** Producing a calibrated
+projection needs a whole-week scan of the entry cache, and the status line
+runs once per prompt, so it never opens `cache.db` for quota and never calls
+the analysis [`quota`](quota.md) runs. Its projection therefore always uses
+the corrected meter; use [`forecast`](forecast.md) or [`quota`](quota.md) for
+the fitted-model view. The projection-basis word still comes from the shared
+short-form vocabulary used by the dashboard, so the two surfaces cannot
+silently acquire different names for the meter. The separate `Δrate` marker
+does read the calibration file once, with no lock and no throttle.
 
 The reading is CORRECTED before it is projected. A displayed 40 means the
 week consumed somewhere in `[39, 40)`, so the pace is measured from 39.5.

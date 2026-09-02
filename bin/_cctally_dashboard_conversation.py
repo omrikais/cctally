@@ -42,6 +42,13 @@ import re
 import socket
 import sqlite3
 import sys
+import base64
+import collections
+import dataclasses
+import hashlib
+import secrets
+import threading
+import time
 
 from _cctally_cache import (
     open_cache_db,
@@ -51,7 +58,11 @@ from _cctally_cache import (
     sync_codex_conversations,
     _codex_provider_roots,
 )
-from _lib_dashboard_json import encode_dashboard_json
+from _lib_dashboard_json import (
+    encode_dashboard_json,
+    encode_dashboard_json_bytes_capped,
+)
+from _lib_retained_size import retained_size_bytes
 
 # Live-tail watch-loop tuning — used ONLY by _handle_get_conversation_events_impl
 # below, so moved here with the events handler (spec §4.1 / §6).
@@ -59,6 +70,224 @@ _LIVE_TAIL_POLL_INTERVAL = 1.0      # seconds between stat polls of the open fil
 _LIVE_TAIL_DEBOUNCE = 0.25          # settle window after first detected growth
 _LIVE_TAIL_KEEPALIVE = 15.0         # idle keep-alive cadence (proxy guard)
 _LIVE_TAIL_FILE_RESET_EVERY = 10    # re-resolve the session file set every N cycles
+
+
+# #682 — progressive outline transport.  The canonical outline remains the
+# legacy endpoint body; an opt-in request gets a constant-size opaque transfer
+# ticket. The first bounded chunk request materializes the canonical body, so
+# the initial reader response never waits on or transfers the whole outline.
+# Keeping the cache process-local avoids a second durable transcript surface.
+_OUTLINE_TRANSFER_CHUNK = 192 * 1024
+_OUTLINE_TRANSFER_ITEM_CAP = 32 * 1024 * 1024
+_OUTLINE_TRANSFER_TOTAL_CAP = 64 * 1024 * 1024
+_OUTLINE_TRANSFER_COUNT_CAP = 128
+_OUTLINE_TRANSFER_TTL = 120.0
+_OUTLINE_TRANSFERS = collections.OrderedDict()
+_OUTLINE_TRANSFERS_BYTES = 0
+_OUTLINE_TRANSFERS_EVICTIONS = 0
+_OUTLINE_TRANSFERS_FALLBACKS = 0
+_OUTLINE_TRANSFERS_LOCK = threading.Lock()
+
+
+@dataclasses.dataclass
+class _OutlineTransferRecord:
+    created: float
+    builder: object
+    payload: bytes | None = None
+    digest: str | None = None
+    state: str = "pending"
+    cancelled: threading.Event = dataclasses.field(default_factory=threading.Event)
+    ready: threading.Event = dataclasses.field(default_factory=threading.Event)
+
+
+def _outline_transfer_estimated_bytes_locked() -> int:
+    return retained_size_bytes(
+        _OUTLINE_TRANSFERS, stop_after=_OUTLINE_TRANSFER_TOTAL_CAP)
+
+
+def outline_transfer_cache_stats():
+    with _OUTLINE_TRANSFERS_LOCK:
+        return {
+            "estimatedBytes": _outline_transfer_estimated_bytes_locked(),
+            "maxBytes": _OUTLINE_TRANSFER_TOTAL_CAP,
+            "payloadBytes": int(_OUTLINE_TRANSFERS_BYTES),
+            "entryCount": len(_OUTLINE_TRANSFERS),
+            "maxEntries": _OUTLINE_TRANSFER_COUNT_CAP,
+            "evictionCount": int(_OUTLINE_TRANSFERS_EVICTIONS),
+            "fallbackCount": int(_OUTLINE_TRANSFERS_FALLBACKS),
+        }
+
+
+def _drop_outline_transfer_locked(token):
+    """Remove one transfer and keep the materialized-byte count exact."""
+    global _OUTLINE_TRANSFERS_BYTES
+    record = _OUTLINE_TRANSFERS.pop(token, None)
+    if record is not None:
+        if record.payload is not None:
+            _OUTLINE_TRANSFERS_BYTES -= len(record.payload)
+        record.cancelled.set()
+        record.ready.set()
+    return record
+
+
+def _prune_outline_transfers_locked(now):
+    expired = [token for token, record in _OUTLINE_TRANSFERS.items()
+               if now - record.created > _OUTLINE_TRANSFER_TTL]
+    for token in expired:
+        _drop_outline_transfer_locked(token)
+
+
+def _store_outline_transfer(builder):
+    """Store a lazy canonical-body builder and return opaque metadata."""
+    global _OUTLINE_TRANSFERS_BYTES, _OUTLINE_TRANSFERS_EVICTIONS
+    now = time.monotonic()
+    token = secrets.token_urlsafe(24)
+    with _OUTLINE_TRANSFERS_LOCK:
+        _prune_outline_transfers_locked(now)
+        # A deterministic token factory in tests, or a vanishingly unlikely
+        # production collision, cancels the prior generation before replacement.
+        _drop_outline_transfer_locked(token)
+        _OUTLINE_TRANSFERS[token] = _OutlineTransferRecord(now, builder)
+        while _OUTLINE_TRANSFERS and (
+            len(_OUTLINE_TRANSFERS) > _OUTLINE_TRANSFER_COUNT_CAP
+            or _outline_transfer_estimated_bytes_locked()
+                > _OUTLINE_TRANSFER_TOTAL_CAP
+        ):
+            _drop_outline_transfer_locked(next(iter(_OUTLINE_TRANSFERS)))
+            _OUTLINE_TRANSFERS_EVICTIONS += 1
+    return {"token": token, "chunk_size": _OUTLINE_TRANSFER_CHUNK}
+
+
+def _claim_outline_transfer(token):
+    """Atomically claim a pending builder or join its in-flight generation."""
+    now = time.monotonic()
+    with _OUTLINE_TRANSFERS_LOCK:
+        _prune_outline_transfers_locked(now)
+        record = _OUTLINE_TRANSFERS.get(token)
+        if record is None:
+            return None
+        _OUTLINE_TRANSFERS.move_to_end(token)
+        if record.payload is not None:
+            return "ready", record, None
+        if record.state == "pending":
+            record.state = "building"
+            return "build", record, record.builder
+        return "wait", record, None
+
+
+def _outline_transfer_builder(token):
+    """Compatibility probe: claim one builder, ``False`` if joined/ready."""
+    claim = _claim_outline_transfer(token)
+    if claim is None:
+        return None
+    action, _record, builder = claim
+    return builder if action == "build" else False
+
+
+def _materialize_outline_transfer(token, payload, *, claim=None):
+    """Publish immutable canonical bytes into a still-live lazy transfer."""
+    global _OUTLINE_TRANSFERS_BYTES
+    global _OUTLINE_TRANSFERS_EVICTIONS, _OUTLINE_TRANSFERS_FALLBACKS
+    if len(payload) > _OUTLINE_TRANSFER_ITEM_CAP:
+        with _OUTLINE_TRANSFERS_LOCK:
+            current = _OUTLINE_TRANSFERS.get(token)
+            if current is not None and (claim is None or current is claim):
+                _drop_outline_transfer_locked(token)
+                _OUTLINE_TRANSFERS_FALLBACKS += 1
+        return "too_large"
+    now = time.monotonic()
+    digest = hashlib.sha256(payload).hexdigest()
+    with _OUTLINE_TRANSFERS_LOCK:
+        _prune_outline_transfers_locked(now)
+        record = _OUTLINE_TRANSFERS.get(token)
+        if record is None or (claim is not None and record is not claim):
+            return "expired"
+        if record.cancelled.is_set():
+            return "expired"
+        if record.payload is not None:
+            return "ready"
+        while (_OUTLINE_TRANSFERS and
+               _OUTLINE_TRANSFERS_BYTES + len(payload) > _OUTLINE_TRANSFER_TOTAL_CAP):
+            victim = next(
+                ((old_token, old_record)
+                 for old_token, old_record in _OUTLINE_TRANSFERS.items()
+                 if old_token != token),
+                None,
+            )
+            if victim is None:
+                break
+            old_token, _old_record = victim
+            _drop_outline_transfer_locked(old_token)
+            _OUTLINE_TRANSFERS_EVICTIONS += 1
+        record.payload = payload
+        record.digest = digest
+        record.builder = None
+        record.state = "ready"
+        _OUTLINE_TRANSFERS_BYTES += len(payload)
+        while (_OUTLINE_TRANSFERS
+               and _outline_transfer_estimated_bytes_locked()
+               > _OUTLINE_TRANSFER_TOTAL_CAP):
+            victim = next(
+                (old_token for old_token in _OUTLINE_TRANSFERS
+                 if old_token != token),
+                None,
+            )
+            if victim is None:
+                _drop_outline_transfer_locked(token)
+                _OUTLINE_TRANSFERS_FALLBACKS += 1
+                return "too_large"
+            _drop_outline_transfer_locked(victim)
+            _OUTLINE_TRANSFERS_EVICTIONS += 1
+        record.ready.set()
+    return "ready"
+
+
+def _cancel_outline_transfer(token, *, claim=None) -> bool:
+    """Cancel one exact transfer generation and wake every joined reader."""
+    with _OUTLINE_TRANSFERS_LOCK:
+        current = _OUTLINE_TRANSFERS.get(token)
+        if current is None or (claim is not None and current is not claim):
+            return False
+        _drop_outline_transfer_locked(token)
+        return True
+
+
+def _reject_outline_transfer_too_large(token, *, claim) -> bool:
+    """Drop one exact over-cap generation without allocating a sentinel body."""
+    global _OUTLINE_TRANSFERS_FALLBACKS
+    with _OUTLINE_TRANSFERS_LOCK:
+        current = _OUTLINE_TRANSFERS.get(token)
+        if current is None or current is not claim:
+            return False
+        _drop_outline_transfer_locked(token)
+        _OUTLINE_TRANSFERS_FALLBACKS += 1
+        return True
+
+
+def _read_outline_transfer(token, offset):
+    """Return one immutable chunk, or ``None`` when the token is gone."""
+    now = time.monotonic()
+    with _OUTLINE_TRANSFERS_LOCK:
+        _prune_outline_transfers_locked(now)
+        record = _OUTLINE_TRANSFERS.get(token)
+        if record is None:
+            return None
+        payload, digest = record.payload, record.digest
+        _OUTLINE_TRANSFERS.move_to_end(token)
+    if payload is None:
+        return None
+    if offset < 0 or offset > len(payload):
+        raise ValueError("offset out of range")
+    chunk = payload[offset:offset + _OUTLINE_TRANSFER_CHUNK]
+    next_offset = offset + len(chunk)
+    return {
+        "offset": offset,
+        "next_offset": next_offset,
+        "total": len(payload),
+        "sha256": digest,
+        "done": next_offset == len(payload),
+        "chunk": base64.b64encode(chunk).decode("ascii"),
+    }
 
 
 # Module-local forwarders for the two generic query-string helpers that STAY
@@ -450,7 +679,9 @@ def _parse_search_kind_impl(handler, q, valid=_CONV_SEARCH_KINDS):
         return None
     return kind
 
-def _run_conversation_query_impl(handler, kernel_call, log_label):
+def _run_conversation_query_impl(
+    handler, kernel_call, log_label, *, cancelled=None,
+):
     """Open conversations.db, run ``kernel_call(conn)``, close.
 
     Collapses the triplicated open-store → try/except/finally → 500
@@ -487,12 +718,25 @@ def _run_conversation_query_impl(handler, kernel_call, log_label):
                 handler._respond_json(400, {"error": "invalid account"})
                 return False, None
             scope_conversations_db_to_account(conn, account_vals[0])
+        if cancelled is not None:
+            conn.set_progress_handler(lambda: 1 if cancelled() else 0, 1000)
+            if cancelled():
+                return None, None
         body = kernel_call(conn)
+        if cancelled is not None and cancelled():
+            return None, None
     except Exception as exc:  # noqa: BLE001
+        if cancelled is not None and cancelled():
+            return None, None
         handler.log_error("%s failed: %r", log_label, exc)
         handler._respond_json(500, {"error": f"{type(exc).__name__}: {exc}"})
         return False, None
     finally:
+        if cancelled is not None:
+            try:
+                conn.set_progress_handler(None, 0)
+            except sqlite3.Error:
+                pass
         conn.close()
     return True, body
 
@@ -1261,6 +1505,12 @@ def _handle_get_conversation_outline_impl(handler, path: str) -> None:
     if not handler._require_transcripts_allowed():
         return
     import urllib.parse as _u
+    query = _u.parse_qs(_u.urlsplit(handler.path).query, keep_blank_values=True)
+    progressive_values = query.get("progressive")
+    if progressive_values is not None and progressive_values != ["1"]:
+        handler._respond_json(400, {"error": "invalid progressive param"})
+        return
+    progressive = progressive_values == ["1"]
     session_id = _u.unquote(path[len("/api/conversation/"):-len("/outline")])
     if not session_id:
         handler.send_error(404, "conversation not found")
@@ -1268,11 +1518,75 @@ def _handle_get_conversation_outline_impl(handler, path: str) -> None:
     if session_id.startswith("v1."):
         speed = _resolve_effective_speed()
         disp = _conversation_dispatch()
-        _serve_qualified_entity(
-            handler,
-            lambda conn: disp.neutral_outline(
-                conn, session_id, effective_speed=speed),
+        if not progressive:
+            ok, body = handler._run_conversation_query(
+                lambda conn: disp.neutral_outline(
+                    conn, session_id, effective_speed=speed),
+                "/api/conversation/outline")
+            if not ok:
+                return
+            _respond_qualified_json(handler, body)
+            return
+        ok, preflight = handler._run_conversation_query(
+            lambda conn: disp.neutral_events_preflight(conn, session_id),
             "/api/conversation/outline")
+        if not ok:
+            return
+        if (preflight or {}).get("status") != "ok":
+            _respond_qualified_json(handler, preflight)
+            return
+        account_values = query.get("account")
+        account_key = account_values[0] if account_values else None
+
+        def _build_qualified(transfer_handler, cancelled):
+            def _query(conn):
+                if account_key is not None:
+                    scope_conversations_db_to_account(conn, account_key)
+                return disp.neutral_outline(
+                    conn, session_id, effective_speed=speed)
+            return _run_conversation_query_impl(
+                transfer_handler,
+                _query,
+                "/api/conversation/outline-transfer",
+                cancelled=cancelled,
+            )
+
+        handler._respond_json(200, {
+            "progressive": 1,
+            "transfer": _store_outline_transfer(_build_qualified),
+        })
+        return
+    if progressive:
+        ok, exists = handler._run_conversation_query(
+            lambda conn: conn.execute(
+                "SELECT 1 FROM conversation_messages WHERE session_id=? LIMIT 1",
+                (session_id,),
+            ).fetchone() is not None,
+            "/api/conversation/outline")
+        if not ok:
+            return
+        if not exists:
+            handler.send_error(404, "conversation not found")
+            return
+
+        def _build_bare(transfer_handler, cancelled):
+            def _query(conn):
+                account_values = query.get("account")
+                if account_values:
+                    scope_conversations_db_to_account(conn, account_values[0])
+                return transfer_handler._conversation_query(
+                ).get_conversation_outline(conn, session_id)
+            return _run_conversation_query_impl(
+                transfer_handler,
+                _query,
+                "/api/conversation/outline-transfer",
+                cancelled=cancelled,
+            )
+
+        handler._respond_json(200, {
+            "progressive": 1,
+            "transfer": _store_outline_transfer(_build_bare),
+        })
         return
     ok, body = handler._run_conversation_query(
         lambda conn: handler._conversation_query().get_conversation_outline(conn, session_id),
@@ -1283,6 +1597,86 @@ def _handle_get_conversation_outline_impl(handler, path: str) -> None:
         handler.send_error(404, "conversation not found")
         return
     handler._respond_json(200, body)
+
+
+def _handle_get_conversation_outline_transfer_impl(handler, path: str) -> None:
+    """Serve one bounded chunk from an opaque, immutable outline transfer."""
+    if not handler._require_transcripts_allowed():
+        return
+    import urllib.parse as _u
+    token = _u.unquote(path[len("/api/conversation/outline-transfer/"):])
+    if not token or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+        handler._respond_json(410, {"error": "outline transfer expired"})
+        return
+    parsed = _u.parse_qs(_u.urlsplit(handler.path).query, keep_blank_values=True)
+    values = parsed.get("offset")
+    if values is None:
+        offset = 0
+    elif len(values) != 1 or not values[0].isascii() or not values[0].isdigit():
+        handler._respond_json(400, {"error": "invalid offset"})
+        return
+    else:
+        offset = int(values[0])
+    claim = _claim_outline_transfer(token)
+    if claim is None:
+        handler._respond_json(410, {"error": "outline transfer expired"})
+        return
+    action, record, builder = claim
+    if action == "build":
+        ok, full_body = builder(handler, record.cancelled.is_set)
+        if ok is None:
+            handler._respond_json(410, {"error": "outline transfer expired"})
+            return
+        if not ok:
+            _cancel_outline_transfer(token, claim=record)
+            return
+        if full_body is None:
+            _cancel_outline_transfer(token, claim=record)
+            handler._respond_json(410, {"error": "outline transfer expired"})
+            return
+        payload = encode_dashboard_json_bytes_capped(
+            full_body, max_bytes=_OUTLINE_TRANSFER_ITEM_CAP)
+        if payload is None:
+            _reject_outline_transfer_too_large(token, claim=record)
+            state = "too_large"
+        else:
+            state = _materialize_outline_transfer(token, payload, claim=record)
+        if state == "too_large":
+            handler._respond_json(
+                413, {"error": "outline exceeds progressive transfer limit"})
+            return
+        if state == "expired":
+            handler._respond_json(410, {"error": "outline transfer expired"})
+            return
+    elif action == "wait":
+        record.ready.wait(_OUTLINE_TRANSFER_TTL)
+        if record.cancelled.is_set() or record.payload is None:
+            handler._respond_json(410, {"error": "outline transfer expired"})
+            return
+    try:
+        body = _read_outline_transfer(token, offset)
+    except ValueError:
+        handler._respond_json(400, {"error": "offset out of range"})
+        return
+    if body is None:
+        handler._respond_json(410, {"error": "outline transfer expired"})
+        return
+    handler._respond_json(200, body)
+
+
+def _handle_delete_conversation_outline_transfer_impl(handler, path: str) -> None:
+    """Best-effort cancellation for a browser-abandoned progressive token."""
+    if not handler._require_transcripts_allowed():
+        return
+    import urllib.parse as _u
+    token = _u.unquote(path[len("/api/conversation/outline-transfer/"):])
+    if not token or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+        handler._respond_json(400, {"error": "invalid outline transfer token"})
+        return
+    _cancel_outline_transfer(token)
+    handler.send_response(204)
+    handler.send_header("Content-Length", "0")
+    handler.end_headers()
 
 def _handle_get_conversation_prompts_impl(handler, path: str) -> None:
     """``GET /api/conversation/<sid>/prompts`` — ordered main-thread human

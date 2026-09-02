@@ -66,7 +66,15 @@ def _detector(glue, *, split=None, qualified=False):
 
 
 def _analysis(glue, *, status=None, verdict=None, exit_code=0, fitted=None,
-              baseline=None, watch=None, detector=None):
+              baseline=None, watch=None, detector=None, blocking=(),
+              detector_input_causes=None, composition_provenance=None):
+    """One constructed analysis.
+
+    #688: the two typed fields are populated EXPLICITLY and default to the
+    supported-and-clean values, so an existing test cannot accidentally start
+    permitting the exceptional persistence path. A test that wants the
+    permitted shape passes `composition_provenance` deliberately.
+    """
     qm = glue.qm
     status = status if status is not None else qm.CalibrationStatus.OK
     verdict = verdict if verdict is not None else qm.Verdict.NO_RATE_CHANGE
@@ -80,7 +88,11 @@ def _analysis(glue, *, status=None, verdict=None, exit_code=0, fitted=None,
         class_shares={"fresh": 1.0}, current_family_shares={},
         current_class_shares={}, family_radius=0.02, class_radius=0.0105,
         detector=detector if detector is not None else _detector(glue),
-        blocking=(), diagnostics={})
+        blocking=tuple(blocking), diagnostics={},
+        detector_input_causes=(frozenset() if detector_input_causes is None
+                               else detector_input_causes),
+        composition_provenance=(frozenset() if composition_provenance is None
+                                else composition_provenance))
 
 
 def _mode(glue, kind="automatic", account_key=None):
@@ -365,6 +377,25 @@ def test_concurrent_writers_do_not_lose_each_others_updates(glue, tmp_path):
     assert len(state["accounts"]["acct-b"]["regimes"]) == 6
 
 
+def test_the_calibration_lock_requests_exclusive_flock(glue, monkeypatch):
+    """The concurrency contract must not depend on scheduler overlap.
+
+    Two spawned writers can run one after the other even when the lock is
+    accidentally shared, making the end-state test pass by luck. This pins the
+    operating-system request the context manager makes while still exercising
+    its enter/yield/exit behavior.
+    """
+    operations = []
+
+    def record(_fd, operation):
+        operations.append(operation)
+
+    monkeypatch.setattr(glue.fcntl, "flock", record)
+    with glue.calibration_lock():
+        assert operations == [glue.fcntl.LOCK_EX]
+    assert operations == [glue.fcntl.LOCK_EX, glue.fcntl.LOCK_UN]
+
+
 def test_a_confirmed_change_whose_successor_cannot_be_fitted_writes_nothing(
         glue):
     """The guard `reduce_state` opens with is load-bearing for its own
@@ -388,3 +419,178 @@ def test_a_confirmed_change_whose_successor_cannot_be_fitted_writes_nothing(
         watch=_withheld(glue),
         detector=_detector(glue, split=dt.date(2026, 8, 25), qualified=True))
     assert glue.reduce_state(first, hollow, _mode(glue)) is first
+
+
+# --------------------------------------------------------------------------
+# #688 — the second admission path
+#
+# `reduce_state` derives `confirmed` from the VERDICT, and `resolve_outcome`
+# withholds the verdict for every blocking status. The durable history
+# therefore depended on a trustworthy fit while `docs/commands/quota.md`
+# promised it from the first detection. These pin the exception and, more
+# importantly, everything it must still refuse.
+# --------------------------------------------------------------------------
+SPLIT = dt.date(2026, 8, 25)
+SPLIT_ISO = dt.datetime.combine(SPLIT, dt.time(0), tzinfo=UTC).isoformat()
+
+
+def _permitted_analysis(glue, **kw):
+    """The section 2 occurrence: a qualified detector, a withheld verdict,
+    both fits available, and a forecast-aggregate composition finding."""
+    qm = glue.qm
+    args = dict(
+        status=qm.CalibrationStatus.UNSUPPORTED_MODEL_MIX,
+        verdict=qm.Verdict.WITHHELD, exit_code=3,
+        fitted=_withheld(glue, "unsupported-model-mix"),
+        baseline=_evidence(glue, 2_442_620.0, days=26,
+                           qualifications=("superseded",)),
+        watch=_evidence(glue, 1_665_096.0, days=4,
+                        qualifications=("successor-regime", "detection-only")),
+        detector=_detector(glue, split=SPLIT, qualified=True),
+        composition_provenance=frozenset(
+            {qm.CompositionProvenance.FORECAST_AGGREGATE}))
+    args.update(kw)
+    return _analysis(glue, **args)
+
+
+def _ordinary_confirmed_analysis(glue):
+    qm = glue.qm
+    return _analysis(
+        glue, status=qm.CalibrationStatus.INSUFFICIENT_HISTORY,
+        verdict=qm.Verdict.RATE_CHANGE_DETECTED, exit_code=1,
+        fitted=_withheld(glue),
+        baseline=_evidence(glue, 2_050_000.0, days=26),
+        watch=_evidence(glue, 1_700_000.0, days=3),
+        detector=_detector(glue, split=SPLIT, qualified=True))
+
+
+def test_688_the_permitted_withheld_shape_persists_both_regimes(glue):
+    state = glue.reduce_state(glue.empty_calibration_state(),
+                              _permitted_analysis(glue), _mode(glue))
+    regimes = _regimes(state, glue)
+    assert len(regimes) == 2
+    baseline, successor = regimes
+    # The baseline is stamped `ok`: `baseline_fit` describes the pre-split
+    # population independently, and a support failure in the successor does
+    # not retroactively degrade it.
+    assert baseline["status"] == "ok"
+    assert baseline["effectiveUntil"] == SPLIT_ISO
+    assert successor["status"] == "unsupported-model-mix"
+    assert successor["effectiveFrom"] == SPLIT_ISO
+    assert successor["effectiveUntil"] is None
+    assert "detection-only" in successor["qualifications"]
+
+
+def test_688_the_permitted_shape_yields_exactly_one_descriptor(glue):
+    # Cold store: no adjacent pair before, one after.
+    _quarantined, fresh, candidates = glue.persist_and_detect(
+        _permitted_analysis(glue), _mode(glue))
+    assert len(fresh) == 1
+    assert fresh[0].effective_from == SPLIT_ISO
+    assert fresh[0].withholding_status == "unsupported-model-mix"
+    # #689: the persisted enumeration is a separate collection, and on this
+    # run it names the same pair the freshness comparison just produced.
+    assert [c.effective_from for c in candidates] == [SPLIT_ISO]
+    assert all(c.withholding_status is None for c in candidates), (
+        "the enumeration must not carry the disclosure; it sees only stored "
+        "regimes")
+
+
+def test_688_a_second_run_yields_no_further_descriptor(glue):
+    glue.persist_and_detect(_permitted_analysis(glue), _mode(glue))
+    _quarantined, fresh, candidates = glue.persist_and_detect(
+        _permitted_analysis(glue), _mode(glue))
+    assert fresh == ()
+    # #689: the run that writes nothing is exactly the run recovery depends
+    # on, so the third element must still name the persisted pair.
+    assert [c.effective_from for c in candidates] == [SPLIT_ISO]
+
+
+def test_688_a_successor_status_flip_yields_no_second_descriptor(glue):
+    glue.persist_and_detect(_permitted_analysis(glue), _mode(glue))
+    healed = _permitted_analysis(
+        glue, status=glue.qm.CalibrationStatus.OK,
+        verdict=glue.qm.Verdict.RATE_CHANGE_DETECTED, exit_code=1)
+    _quarantined, fresh, candidates = glue.persist_and_detect(
+        healed, _mode(glue))
+    assert fresh == ()
+    assert [c.effective_from for c in candidates] == [SPLIT_ISO]
+
+
+def test_688_an_ordinary_confirmed_transition_carries_no_withholding_status(
+        glue):
+    _quarantined, fresh, _candidates = glue.persist_and_detect(
+        _ordinary_confirmed_analysis(glue), _mode(glue))
+    assert len(fresh) == 1
+    assert fresh[0].withholding_status is None
+
+
+@pytest.mark.parametrize("status_name", [
+    "UNAVAILABLE", "FUTURE", "STALE", "TOKEN_SPLIT_UNKNOWN",
+    "LOCAL_HISTORY_INCOMPLETE", "UNVALIDATED_COEFFICIENT_ERA",
+    "FRAGMENTED_HISTORY", "UNSTABLE_FIT",
+])
+def test_688_each_refusing_status_writes_nothing(glue, status_name):
+    """Every other admission prerequisite is satisfied, so each of these
+    refuses for its own status rather than incidentally."""
+    stored = glue.empty_calibration_state()
+    analysis = _permitted_analysis(
+        glue, status=getattr(glue.qm.CalibrationStatus, status_name))
+    assert glue.reduce_state(stored, analysis, _mode(glue)) is stored
+
+
+def test_688_a_blocking_reason_with_a_permitted_status_writes_nothing(glue):
+    # `resolve_outcome` withholds on a non-empty reason tuple independently
+    # of the status, so this combination satisfies every other condition and
+    # testing the two axes separately does not cover it.
+    stored = glue.empty_calibration_state()
+    analysis = _permitted_analysis(
+        glue,
+        blocking=(glue.qm.BlockingReason.SPARSE_DAY_IN_DECISIVE_RUN,))
+    assert glue.reduce_state(stored, analysis, _mode(glue)) is stored
+
+
+def test_688_a_decisive_day_provenance_writes_nothing(glue):
+    # The decisive-day probe guards DETECTION, so a composition finding it
+    # raised says the step itself may be an artefact.
+    stored = glue.empty_calibration_state()
+    analysis = _permitted_analysis(
+        glue, composition_provenance=frozenset(
+            {glue.qm.CompositionProvenance.DECISIVE_DAY}))
+    assert glue.reduce_state(stored, analysis, _mode(glue)) is stored
+
+
+def test_688_an_unsupported_composition_cause_writes_nothing(glue):
+    # A withheld day is excluded from the detector's rank-sum population, so
+    # this origin removes evidence from detection itself.
+    stored = glue.empty_calibration_state()
+    analysis = _permitted_analysis(
+        glue, detector_input_causes=frozenset(
+            {glue.qm.WithholdingCause.UNSUPPORTED_COMPOSITION}))
+    assert glue.reduce_state(stored, analysis, _mode(glue)) is stored
+
+
+def test_688_a_withheld_successor_fit_writes_nothing(glue):
+    """The permitted path still needs a successor to persist.
+
+    Without the `watch_fit` limb this input closes the predecessor and
+    appends a baseline while opening no successor, which is the same defect
+    `test_a_confirmed_change_whose_successor_cannot_be_fitted_writes_nothing`
+    pins on the verdict-derived path.
+    """
+    stored = glue.empty_calibration_state()
+    analysis = _permitted_analysis(glue, watch=_withheld(glue))
+    assert glue.reduce_state(stored, analysis, _mode(glue)) is stored
+
+
+def test_688_a_diagnostic_run_still_writes_nothing_on_the_permitted_shape(
+        glue):
+    stored = glue.empty_calibration_state()
+    assert glue.reduce_state(stored, _permitted_analysis(glue),
+                             _mode(glue, kind="diagnostic")) is stored
+
+
+def test_688_a_foreign_analysis_object_refuses_rather_than_raising(glue):
+    """`persist_and_detect` is public glue and its `analysis` argument is not
+    type-checked, so the permit predicate has to be total over any input."""
+    assert glue.qm.transition_persistence_permitted(object()) is False

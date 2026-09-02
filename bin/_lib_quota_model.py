@@ -75,9 +75,15 @@ FAMILY_ALIASES: dict[str, str] = {
     "claude-3-5-haiku": "claude-3-5-haiku",
     "claude-3-5-haiku-latest": "claude-3-5-haiku",
     "claude-3-haiku": "claude-3-haiku",
-    # Fable / Mythos
+    # Fable / Mythos. The -1 point releases are distinct ids in
+    # CLAUDE_MODEL_PRICING because their cache-read rate is 0.025x base input
+    # rather than 0.1x, but they drain the weekly meter on the same terms as
+    # the family they follow, so they resolve to it instead of minting a
+    # family whose composition support would have to rebuild from nothing.
     "claude-fable-5": "claude-fable-5",
+    "claude-fable-5-1": "claude-fable-5",
     "claude-mythos-5": "claude-mythos-5",
+    "claude-mythos-5-1": "claude-mythos-5",
     "claude-mythos-preview": "claude-mythos-5",
 }
 
@@ -168,8 +174,17 @@ MIX_SUPPORT: dict[str, object] = {
     "axes": ("family", "token_class"),
     "vector": "raw-quantity-share",
     "effective_radius": "max(empirical, floor)",
-    "family_tv_floor": 0.02,
+    "family_tv_floor": 0.03,
     "token_class_max_relative_effect": 0.05,
+}
+
+#: Producer policy that changes which retained requests the fitted model
+#: represents. It is fingerprinted with the arithmetic because moving the era
+#: floor or admitting another billing class changes the fitted answer just as
+#: surely as editing a coefficient does.
+COEFFICIENT_SUPPORT: dict[str, str] = {
+    "supportedCompositionFrom": "2026-07-25",
+    "fastModeParticipation": "usage-credits-only-excluded",
 }
 
 #: The reading-to-interval rule of section 4. Bumped when that rule changes.
@@ -198,8 +213,8 @@ DEDICATED_POOL_SCOPE_NOTE: str = (
     "also drain dedicated pools; only general-quota draining is modelled"
 )
 
-QUOTA_MODEL_ALGORITHM_REVISION: int = 2
-QUOTA_MODEL_VERIFIED_AT: str = "2026-08-28"
+QUOTA_MODEL_ALGORITHM_REVISION: int = 3
+QUOTA_MODEL_VERIFIED_AT: str = "2026-08-29"
 
 
 def constants_payload() -> dict:
@@ -221,6 +236,7 @@ def constants_payload() -> dict:
         "detector": dict(DETECTOR),
         "trust": dict(TRUST),
         "mixSupport": dict(MIX_SUPPORT),
+        "coefficientSupport": dict(COEFFICIENT_SUPPORT),
     }
 
 
@@ -236,7 +252,7 @@ def constants_fingerprint() -> str:
 #: constant above without re-pinning this line is caught rather than silently
 #: invalidating every persisted calibration.
 QUOTA_MODEL_CONSTANTS_FINGERPRINT: str = (
-    "1e2e74ff673bb32dc93d2cf582d5e84eb93fff9cfae39e4272edc25a30da25ee"
+    "70c36ec1a467e97bdfece624baa5e560762fdc89c2e0c041c6332f92f4ea6160"
 )
 
 
@@ -332,6 +348,37 @@ class Verdict(str, enum.Enum):
     WITHHELD = "withheld"
 
 
+class CompositionProvenance(str, enum.Enum):
+    """Which probe produced `unsupported-model-mix` (#688 section 4).
+
+    A FOURTH closed vocabulary. The status name reaches `classify` from five
+    distinct origins whose meanings are opposite, and
+    `_composition_unsupported` discarded which one applied by returning a
+    bare boolean. `transition_persistence_permitted` is control flow over
+    that distinction, so it must read a typed member rather than a string.
+
+    `UNSUPPORTED_FAMILY_DAY` is the one origin `_composition_provenance` does
+    not produce: it names a day whose model family does not participate in
+    the general weekly pool, which `analyse` withholds under
+    `WithholdingCause.UNSUPPORTED_COMPOSITION` and `classify` maps to the
+    status. It is a member here so that a caller which does file it, and the
+    permit predicate which must refuse it, both name the same value.
+
+    Do NOT read that member as the route by which origin one is refused.
+    `transition_persistence_permitted` refuses it on the CAUSE axis, by
+    finding `WithholdingCause.UNSUPPORTED_COMPOSITION` among the published
+    window's causes. The provenance axis describes only what the composition
+    test itself decided, and the composition test never sees that day —
+    `analyse` withholds it earlier.
+    """
+
+    UNSUPPORTED_FAMILY_DAY = "unsupported-family-day"
+    DECISIVE_DAY = "decisive-day"
+    FORECAST_AGGREGATE = "forecast-aggregate"
+    UNDEFINED_REFERENCE = "undefined-reference"
+    UNAGGREGATABLE_FORECAST = "unaggregatable-forecast"
+
+
 class BlockingReason(str, enum.Enum):
     """Why the verdict is withheld although the status does not withhold it.
 
@@ -399,6 +446,16 @@ VERDICT_BLOCKING_STATUSES: tuple[CalibrationStatus, ...] = (
     CalibrationStatus.LOCAL_HISTORY_INCOMPLETE,
     CalibrationStatus.UNSUPPORTED_MODEL_MIX,
     CalibrationStatus.UNVALIDATED_COEFFICIENT_ERA,
+)
+
+
+#: The blocking statuses under which a QUALIFIED detector may still persist
+#: its regimes and record a durable transition (#688). A permit set rather
+#: than a refuse set, so a blocking status added later refuses by default.
+#: Membership is necessary and not sufficient: the status name alone cannot
+#: say which probe produced it, which is what `composition_provenance` is for.
+TRANSITION_PERSISTENCE_PERMITTED_BLOCKING_STATUSES: tuple = (
+    CalibrationStatus.UNSUPPORTED_MODEL_MIX,
 )
 
 
@@ -1893,7 +1950,7 @@ class QuotaAnalysis:
     current_class_shares: dict
     #: The EFFECTIVE radii of section 34, which are
     #: `max(empirical, floor)` -- NOT the measured spread. A single-model
-    #: user's measured 0.0 appears here as the 0.02 family floor, so a
+    #: user's measured 0.0 appears here as the 0.03 family floor, so a
     #: renderer must not label these as observed quantities. The empirical
     #: values are published separately as `familyRadiusEmpirical` and
     #: `classRadiusEmpirical` in `diagnostics`.
@@ -1907,12 +1964,125 @@ class QuotaAnalysis:
     #: reason is added.
     blocking: tuple
     diagnostics: dict
+    #: The withholding causes present in the published window this analysis
+    #: was classified over, and which probes inside the composition test
+    #: fired (#688). Both are TYPED because `transition_persistence_permitted`
+    #: is control flow: the status alone cannot distinguish a cause that
+    #: removed days from the detector's own population from one that only
+    #: bears on projecting forward. They are not diagnostics, and a consumer
+    #: must never re-derive either from the `diagnostics` strings.
+    #:
+    #: `None` means an analysis built by a path that does not publish them.
+    #: Every consumer must REFUSE on that rather than assume, because the
+    #: harmful direction on this axis is permitting.
+    detector_input_causes: frozenset | None = None
+    composition_provenance: frozenset | None = None
 
 
-def _composition_unsupported(*, confirmed, reference_days, decisive_days,
-                             forecast_probed=False,
-                             forecast_shares, family_centre, family_radius,
-                             class_centre, class_radius) -> bool:
+def overlay_status(analysis: QuotaAnalysis,
+                   contributed: CalibrationStatus) -> QuotaAnalysis:
+    """Merge one late status without recomputing the exact detector.
+
+    The glue uses this for a stale persisted prior. The prior affects
+    publication only when the fresh fit is already non-trustworthy. Re-running
+    ``analyse`` merely to add that status doubled the bounded scan on every
+    post-upgrade thin history; replacing the already-withheld publication
+    fields is equivalent and keeps the statistical pass single-shot.
+    """
+    status = worst_status((analysis.status, contributed))
+    if status is analysis.status:
+        return analysis
+    if status is CalibrationStatus.OK:
+        raise ValueError("a status overlay cannot improve an analysis")
+    verdict, exit_code = resolve_outcome(
+        status, change_detected=analysis.detector.qualified,
+        blocking=analysis.blocking)
+
+    def withheld(field):
+        return evidence_withheld(status, field.population,
+                                 field.qualifications)
+
+    return dataclasses.replace(
+        analysis, status=status, verdict=verdict, exit_code=exit_code,
+        fitted=withheld(analysis.fitted),
+        consumption=withheld(analysis.consumption),
+        projection=withheld(analysis.projection),
+        headroom=withheld(analysis.headroom),
+    )
+
+
+def transition_persistence_permitted(analysis) -> bool:
+    """Whether a withheld analysis may still persist and record (#688).
+
+    `reduce_state` derives its own `confirmed` from the VERDICT, and
+    `resolve_outcome` forces the verdict to withheld for every blocking
+    status and for any blocking reason. That made the durable history depend
+    on a trustworthy fit while the documentation promised it from the first
+    detection. This function is the exception, and it is deliberately narrow.
+
+    `blocking` must be EMPTY. `resolve_outcome` withholds on a non-empty
+    reason tuple independently of the status, so a sparse day in the decisive
+    run combined with a forward-looking composition status satisfies every
+    other condition here and would otherwise persist.
+
+    Both typed fields must be PRESENT and well-formed. An analysis built by a
+    path that does not publish them cannot be judged, and the harmful
+    direction is permitting, so absence refuses. The member type checks are
+    not defensive noise: `CompositionProvenance` is a `str` enum, so a
+    frozenset of bare strings compares EQUAL to the permitted set and the
+    final equality alone would admit it.
+
+    `resolve_outcome` is not touched. It remains the sole authority over the
+    verdict and the exit code, and this answers a separate question about
+    persistence.
+
+    The argument's own TYPE is checked first, which makes this predicate
+    TOTAL over any input. Read that as a statement about this axis only, not
+    as a claim to protect the command: `persist_and_detect` calls
+    `reduce_state` BEFORE it reaches here, and `reduce_state` dereferences
+    `analysis.verdict` unguarded, so a foreign object raises there first and
+    the run fails anyway. What actually reaches this line with a stub is a
+    test that monkeypatches `reduce_state` away. The check earns its place by
+    keeping the harmful direction closed rather than by preventing a crash.
+
+    One constraint follows from that check being an `isinstance`. It resolves
+    `QuotaAnalysis` as THIS module generation defines it. Production has a
+    single generation, because `_load_sibling` returns the `sys.modules`
+    entry and the only production caller passes an analysis this same module
+    produced. Under pytest, `conftest.load_script` can create a second
+    generation, and an analysis built by one passed to the other's glue would
+    be refused SILENTLY rather than raising. Keep a test's analysis and its
+    glue on one generation.
+    """
+    if not isinstance(analysis, QuotaAnalysis):
+        return False
+    if analysis.verdict is not Verdict.WITHHELD:
+        return False
+    if tuple(analysis.blocking or ()):
+        return False
+    if analysis.status not in TRANSITION_PERSISTENCE_PERMITTED_BLOCKING_STATUSES:
+        return False
+    detector = analysis.detector
+    if detector is None or not detector.qualified \
+            or detector.split_date is None:
+        return False
+    causes = analysis.detector_input_causes
+    if not isinstance(causes, frozenset) or not all(
+            isinstance(c, WithholdingCause) for c in causes):
+        return False
+    if WithholdingCause.UNSUPPORTED_COMPOSITION in causes:
+        return False
+    provenance = analysis.composition_provenance
+    if not isinstance(provenance, frozenset) or not all(
+            isinstance(p, CompositionProvenance) for p in provenance):
+        return False
+    return provenance == frozenset({CompositionProvenance.FORECAST_AGGREGATE})
+
+
+def _composition_provenance(*, confirmed, reference_days, decisive_days,
+                            forecast_probed=False,
+                            forecast_shares, family_centre, family_radius,
+                            class_centre, class_radius) -> frozenset:
     """Apply section 18's two-radius test, which section 25 requires.
 
     Two probes, because section 18 names two populations:
@@ -1936,13 +2106,20 @@ def _composition_unsupported(*, confirmed, reference_days, decisive_days,
     not: it means the reference population held fewer than two observations,
     which is thin evidence rather than a mix finding, and reporting it as one
     would move a thin population from exit 4 to exit 3.
+
+    The return is TYPED PROVENANCE rather than a boolean (#688 section 4).
+    An empty frozenset means supported; every other value names which of the
+    probes above fired. The status decision is unchanged, because the caller
+    branches on truthiness, but a boolean discarded the one distinction the
+    persistence permit needs: the decisive-day probe guards DETECTION and the
+    forecast probe guards PROJECTION, and they must be answered differently.
     """
     if not reference_days:
-        return False
+        return frozenset()
     if family_centre is None or class_centre is None:
-        return True
+        return frozenset({CompositionProvenance.UNDEFINED_REFERENCE})
     if family_radius is None or class_radius is None:
-        return False
+        return frozenset()
     # A population that WAS probed but could not be aggregated is unsupported,
     # not exempt. Every entry from an unrecognised family contributes no
     # units, so `aggregate_composition` returns None and the probe list would
@@ -1950,16 +2127,20 @@ def _composition_unsupported(*, confirmed, reference_days, decisive_days,
     # omitted `forecast_population` would, which is what section 40 made that
     # parameter required to prevent.
     if forecast_probed and forecast_shares is None:
-        return True
-    probes = [(o.family_shares, o.class_shares)
-              for o in (decisive_days if confirmed else ())]
+        return frozenset({CompositionProvenance.UNAGGREGATABLE_FORECAST})
+    found = set()
+    for o in (decisive_days if confirmed else ()):
+        if not is_supported(o.family_shares, o.class_shares, family_centre,
+                            family_radius, class_centre, class_radius):
+            found.add(CompositionProvenance.DECISIVE_DAY)
+            break
     if forecast_shares is not None:
-        probes.append(forecast_shares)
-    return any(
-        not is_supported(family_shares, class_shares, family_centre,
-                         family_radius, class_centre, class_radius)
-        for family_shares, class_shares in probes
-    )
+        forecast_family_shares, forecast_class_shares = forecast_shares
+        if not is_supported(forecast_family_shares, forecast_class_shares,
+                            family_centre, family_radius, class_centre,
+                            class_radius):
+            found.add(CompositionProvenance.FORECAST_AGGREGATE)
+    return frozenset(found)
 
 
 def analyse(series, *, now, newest_at, forecast_population,
@@ -2096,12 +2277,13 @@ def analyse(series, *, now, newest_at, forecast_population,
                        if probed_entries else None)
 
     contributed = list(extra_statuses)
-    if _composition_unsupported(
-            confirmed=confirmed, reference_days=reference_days,
-            decisive_days=published_days, forecast_shares=forecast_shares,
-            forecast_probed=bool(probed_entries),
-            family_centre=family_centre, family_radius=family_radius,
-            class_centre=class_centre, class_radius=class_radius):
+    composition_provenance = _composition_provenance(
+        confirmed=confirmed, reference_days=reference_days,
+        decisive_days=published_days, forecast_shares=forecast_shares,
+        forecast_probed=bool(probed_entries),
+        family_centre=family_centre, family_radius=family_radius,
+        class_centre=class_centre, class_radius=class_radius)
+    if composition_provenance:
         contributed.append(CalibrationStatus.UNSUPPORTED_MODEL_MIX)
     if confirmed:
         window_start = detector.split_date
@@ -2271,6 +2453,11 @@ def analyse(series, *, now, newest_at, forecast_population,
         current_class_shares=current_class_centre or {},
         family_radius=family_radius, class_radius=class_radius,
         detector=detector, blocking=tuple(blocking), diagnostics=merged,
+        # From the SAME published `window` that was passed to `classify`, so
+        # the two describe one population and cannot drift apart.
+        detector_input_causes=frozenset(
+            o.cause for o in window if o.cause is not None),
+        composition_provenance=composition_provenance,
     )
 
 

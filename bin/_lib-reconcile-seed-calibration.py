@@ -49,7 +49,7 @@ def main() -> int:
             return 1
         week_start_at, week_end_at, samples = fetched
         week_start_at, samples = c._apply_midweek_reset_override(
-            conn, week_start_at, week_end_at, samples)
+            conn, week_start_at, week_end_at, samples, now_utc=now)
     finally:
         conn.close()
 

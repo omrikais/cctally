@@ -5,7 +5,10 @@ import os
 import sqlite3
 import pytest
 
-from conftest import load_script, redirect_paths  # type: ignore
+from conftest import (  # type: ignore
+    load_script,
+    redirect_paths_without_conversation_retention,
+)
 
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
 
@@ -44,7 +47,7 @@ def env(tmp_path, monkeypatch):
     already ingested once into conversation_messages. Returns
     (cache_mod, conn, projects, paths)."""
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     import _cctally_cache as cache_mod          # same module object load_script loaded
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)
@@ -198,7 +201,7 @@ def test_dashboard_initial_snapshot_never_syncs(monkeypatch, tmp_path):
     skip_sync=True — so it likewise never ingests before the bind."""
     import types
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     import cctally  # the loaded main module namespace
     import _cctally_tui as tui
     import _cctally_dashboard as dash
@@ -264,7 +267,7 @@ def test_real_server_binds_and_serves_before_sync_completes(tmp_path, monkeypatc
     not wait on sync_cache. A pre-#179 ordering (sync before bind) would make the
     port unreachable until the event released."""
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
 
     HandlerCls = ns["DashboardHTTPHandler"]
     SnapshotRef = ns["_SnapshotRef"]
@@ -348,7 +351,7 @@ def test_real_cmd_dashboard_binds_before_background_sync_completes(tmp_path, mon
     background sync would hang the worker on the blocked sync, so the bind event
     would never fire within the join timeout."""
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
     import _cctally_dashboard as dash   # same module object load_script loaded
 
@@ -513,7 +516,7 @@ def test_017_flag_consumed_by_sync_and_shared_flag_untouched(tmp_path, monkeypat
     """sync_cache consumes the DISTINCT nested-agent reingest flag (clears it via
     the offset-0 backfill) and never arms/clears the SHARED flag in its place."""
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     import _cctally_cache as cache_mod
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)
@@ -541,7 +544,7 @@ def test_017_grandchild_over_16kb_relinks_after_reingest(tmp_path, monkeypatch):
     after ingest (the structured stamp runs over the full raw), and STILL links
     after a forced offset-0 reingest (the migration-017 backfill path)."""
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     import _cctally_cache as cache_mod
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)

@@ -29,6 +29,7 @@ import re
 import sqlite3
 import threading
 from collections import deque
+from types import MappingProxyType
 
 import _lib_codex_conversation as kern
 import _lib_codex_landmarks as landmarks
@@ -51,6 +52,7 @@ from _lib_conversation import _strip_ansi
 from _lib_conversation_query import (
     _FULL_PAYLOAD_CEILING, _first_nonblank_line, _parse_outline_ts)
 from _lib_pricing import _calculate_codex_entry_cost
+from _lib_retained_size import retained_size_bytes
 
 # ── constants ────────────────────────────────────────────────────────────────
 
@@ -529,15 +531,51 @@ _S4_OUTCOME_EVENTS = frozenset(
 # In-process only, so no cross-version staleness is possible: the binary that
 # filled an entry is the binary that reads it.
 _OUTLINE_DERIVATION_CACHE_MAX = 4
-_outline_derivation_cache: "collections.OrderedDict[str, dict]" = (
+_OUTLINE_DERIVATION_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_outline_derivation_cache: "collections.OrderedDict[object, dict]" = (
     collections.OrderedDict())
 _outline_derivation_lock = threading.Lock()
+_outline_derivation_cache_sizes: dict[str, int] = {}
+_outline_derivation_cache_bytes = 0
+_outline_derivation_cache_evictions = 0
+_outline_derivation_cache_fallbacks = 0
+
+
+def _database_incarnation(conn: sqlite3.Connection) -> object:
+    """Physical main-database identity for process-local retained reuse.
+
+    A pathname is not an incarnation: rebuild/recovery publishes a new SQLite
+    inode at the same name.  Including the inode prevents a completed outline
+    or its nested event derivation from crossing that replacement boundary.
+    """
+    row = conn.execute(
+        "SELECT file FROM pragma_database_list WHERE name='main'"
+    ).fetchone()
+    path = str(row[0] or "") if row else ""
+    if not path:
+        return (":memory:", id(conn))
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return (path, "missing", id(conn))
+    return (os.path.realpath(path), int(stat.st_dev), int(stat.st_ino))
 
 
 def reset_outline_derivation_cache() -> None:
-    """Drop every cached derivation. For tests and for measurement runs."""
+    """Drop every cached outline derivation. For tests and measurement runs."""
+    global _outline_derivation_cache_bytes
+    global _outline_derivation_cache_evictions
+    global _outline_derivation_cache_fallbacks
     with _outline_derivation_lock:
         _outline_derivation_cache.clear()
+        _outline_derivation_cache_sizes.clear()
+        _outline_derivation_cache_bytes = 0
+        _outline_derivation_cache_evictions = 0
+        _outline_derivation_cache_fallbacks = 0
+    # The full-envelope memo sits in front of this position cache. A reset that
+    # left it populated would make the documented measurement/test reset a
+    # no-op until some independent writer revision happened to change.
+    _codex_outline_memo_clear()
 
 
 def _outline_event_watermark(
@@ -605,8 +643,9 @@ def _derive_outline_events(
     if not wanted:
         return derivation
 
+    cache_key = (_database_incarnation(conn), conversation_key)
     with _outline_derivation_lock:
-        entry = _outline_derivation_cache.get(conversation_key)
+        entry = _outline_derivation_cache.get(cache_key)
     count, max_id, prefix = _outline_event_watermark(
         conn, conversation_key, entry["max_id"] if entry else None)
     reusable = (entry is not None
@@ -657,14 +696,40 @@ def _derive_outline_events(
     # rather than a half-filled one. The value is the object just returned: it
     # is never mutated again, because the next extension copies its three maps
     # into a fresh `EventDerivation` above rather than adding to this one.
+    cache_entry = {
+        "count": count, "max_id": max_id,
+        "covered": covered | wanted, "derivation": derivation,
+    }
+    entry_bytes = retained_size_bytes(
+        (cache_key, cache_entry),
+        stop_after=_OUTLINE_DERIVATION_CACHE_MAX_BYTES,
+    )
+    global _outline_derivation_cache_bytes
+    global _outline_derivation_cache_evictions
+    global _outline_derivation_cache_fallbacks
     with _outline_derivation_lock:
-        _outline_derivation_cache[conversation_key] = {
-            "count": count, "max_id": max_id,
-            "covered": covered | wanted, "derivation": derivation,
-        }
-        _outline_derivation_cache.move_to_end(conversation_key)
-        while len(_outline_derivation_cache) > _OUTLINE_DERIVATION_CACHE_MAX:
-            _outline_derivation_cache.popitem(last=False)
+        prior_size = _outline_derivation_cache_sizes.pop(cache_key, 0)
+        if prior_size:
+            _outline_derivation_cache_bytes -= prior_size
+        _outline_derivation_cache.pop(cache_key, None)
+        if entry_bytes > _OUTLINE_DERIVATION_CACHE_MAX_BYTES:
+            _outline_derivation_cache_fallbacks += 1
+        else:
+            while _outline_derivation_cache and (
+                len(_outline_derivation_cache)
+                    >= _OUTLINE_DERIVATION_CACHE_MAX
+                or _outline_derivation_cache_bytes + entry_bytes
+                    > _OUTLINE_DERIVATION_CACHE_MAX_BYTES
+            ):
+                old_key, _old_entry = _outline_derivation_cache.popitem(
+                    last=False)
+                _outline_derivation_cache_bytes -= (
+                    _outline_derivation_cache_sizes.pop(old_key))
+                _outline_derivation_cache_evictions += 1
+            _outline_derivation_cache[cache_key] = cache_entry
+            _outline_derivation_cache_sizes[cache_key] = entry_bytes
+            _outline_derivation_cache_bytes += entry_bytes
+            _outline_derivation_cache.move_to_end(cache_key)
     return derivation
 
 
@@ -2579,6 +2644,187 @@ def _read_snapshot(conn: sqlite3.Connection):
         conn.rollback()
 
 
+_CODEX_OUTLINE_MEMO_LOCK = threading.Lock()
+_CODEX_OUTLINE_MEMO = collections.OrderedDict()
+_CODEX_OUTLINE_MEMO_CAP = 4
+_CODEX_OUTLINE_MEMO_MAX_BYTES = 64 * 1024 * 1024
+_CODEX_OUTLINE_MEMO_SIZES = {}
+_CODEX_OUTLINE_MEMO_BYTES = 0
+_CODEX_OUTLINE_MEMO_EVICTIONS = 0
+_CODEX_OUTLINE_MEMO_FALLBACKS = 0
+_CODEX_OUTLINE_INFLIGHT = {}
+_CODEX_OUTLINE_MEMO_EPOCH = 0
+
+
+class _CodexOutlineFlight:
+    __slots__ = ("event", "result", "error")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.result = None
+        self.error = None
+
+
+def _codex_outline_memo_clear() -> None:
+    """Drop completed outline reuse without allowing an old flight to return."""
+    global _CODEX_OUTLINE_MEMO_EPOCH
+    global _CODEX_OUTLINE_MEMO_BYTES
+    global _CODEX_OUTLINE_MEMO_EVICTIONS
+    global _CODEX_OUTLINE_MEMO_FALLBACKS
+    with _CODEX_OUTLINE_MEMO_LOCK:
+        _CODEX_OUTLINE_MEMO.clear()
+        _CODEX_OUTLINE_MEMO_SIZES.clear()
+        _CODEX_OUTLINE_MEMO_BYTES = 0
+        _CODEX_OUTLINE_MEMO_EVICTIONS = 0
+        _CODEX_OUTLINE_MEMO_FALLBACKS = 0
+        _CODEX_OUTLINE_MEMO_EPOCH += 1
+
+
+def codex_conversation_cache_stats():
+    """Retained-byte evidence for Codex outline and derivation reuse."""
+    with _CODEX_OUTLINE_MEMO_LOCK:
+        outline = {
+            "outlineEstimatedBytes": int(_CODEX_OUTLINE_MEMO_BYTES),
+            "outlineMaxBytes": int(_CODEX_OUTLINE_MEMO_MAX_BYTES),
+            "outlineEntryCount": len(_CODEX_OUTLINE_MEMO),
+            "outlineMaxEntries": int(_CODEX_OUTLINE_MEMO_CAP),
+            "outlineEvictionCount": int(_CODEX_OUTLINE_MEMO_EVICTIONS),
+            "outlineFallbackCount": int(_CODEX_OUTLINE_MEMO_FALLBACKS),
+        }
+    with _outline_derivation_lock:
+        outline.update({
+            "derivationEstimatedBytes": int(_outline_derivation_cache_bytes),
+            "derivationMaxBytes": int(_OUTLINE_DERIVATION_CACHE_MAX_BYTES),
+            "derivationEntryCount": len(_outline_derivation_cache),
+            "derivationMaxEntries": int(_OUTLINE_DERIVATION_CACHE_MAX),
+            "derivationEvictionCount": int(
+                _outline_derivation_cache_evictions),
+            "derivationFallbackCount": int(
+                _outline_derivation_cache_fallbacks),
+        })
+    return MappingProxyType(outline)
+
+
+def _codex_outline_memo_key(conn, conversation_key, effective_speed):
+    if not codex_normalization_authoritative(conn):
+        _codex_outline_memo_clear()
+        return None
+    try:
+        row = conn.execute(
+            "SELECT render_revision FROM codex_conversation_rollups "
+            "WHERE conversation_key=?", (conversation_key,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+
+    database_identity = _database_incarnation(conn)
+
+    try:
+        scope_row = conn.execute(
+            "SELECT account_key FROM temp._conversation_account_scope"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        scope_row = None
+    account_scope = scope_row[0] if scope_row else None
+
+    # The rollup revision is the writer-owned invalidation frontier. The cheap
+    # event watermark additionally preserves read-your-writes correctness for
+    # maintenance/tests that mutate retained payload evidence directly instead
+    # of passing through the rollup writer.
+    try:
+        event_count, event_max_id = conn.execute(
+            "SELECT COUNT(*),MAX(id) FROM codex_conversation_events "
+            "WHERE conversation_key=?", (conversation_key,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        event_count = event_max_id = None
+
+    try:
+        schemas = {db_row[1] for db_row in conn.execute("PRAGMA database_list")}
+        meta_schema = "cache_db" if "cache_db" in schemas else "main"
+        seq_row = conn.execute(
+            f"SELECT value FROM {meta_schema}.cache_meta "
+            "WHERE key='codex_accounting_mutation_seq'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        seq_row = None
+    accounting_revision = int(seq_row[0]) if seq_row else 0
+
+    return (
+        database_identity,
+        account_scope,
+        conversation_key,
+        int(row[0]),
+        event_count,
+        event_max_id,
+        accounting_revision,
+        effective_speed,
+    )
+
+
+def _codex_outline_memoized(conn, conversation_key, effective_speed):
+    key = _codex_outline_memo_key(conn, conversation_key, effective_speed)
+    if key is None:
+        return _outline_envelope(
+            conn, conversation_key, effective_speed=effective_speed)
+    with _CODEX_OUTLINE_MEMO_LOCK:
+        hit = _CODEX_OUTLINE_MEMO.get(key)
+        if hit is not None:
+            _CODEX_OUTLINE_MEMO.move_to_end(key)
+            return hit
+        flight = _CODEX_OUTLINE_INFLIGHT.get(key)
+        if flight is None:
+            flight = _CodexOutlineFlight()
+            _CODEX_OUTLINE_INFLIGHT[key] = flight
+            producer = True
+            producer_epoch = _CODEX_OUTLINE_MEMO_EPOCH
+        else:
+            producer = False
+    if not producer:
+        flight.event.wait()
+        if flight.error is not None:
+            raise flight.error
+        return flight.result
+    try:
+        body = _outline_envelope(
+            conn, conversation_key, effective_speed=effective_speed)
+    except BaseException as exc:
+        with _CODEX_OUTLINE_MEMO_LOCK:
+            flight.error = exc
+            _CODEX_OUTLINE_INFLIGHT.pop(key, None)
+            flight.event.set()
+        raise
+    entry_bytes = retained_size_bytes(
+        (key, body), stop_after=_CODEX_OUTLINE_MEMO_MAX_BYTES)
+    global _CODEX_OUTLINE_MEMO_BYTES
+    global _CODEX_OUTLINE_MEMO_EVICTIONS
+    global _CODEX_OUTLINE_MEMO_FALLBACKS
+    with _CODEX_OUTLINE_MEMO_LOCK:
+        flight.result = body
+        if producer_epoch == _CODEX_OUTLINE_MEMO_EPOCH:
+            if entry_bytes > _CODEX_OUTLINE_MEMO_MAX_BYTES:
+                _CODEX_OUTLINE_MEMO_FALLBACKS += 1
+            else:
+                while _CODEX_OUTLINE_MEMO and (
+                    len(_CODEX_OUTLINE_MEMO) >= _CODEX_OUTLINE_MEMO_CAP
+                    or _CODEX_OUTLINE_MEMO_BYTES + entry_bytes
+                        > _CODEX_OUTLINE_MEMO_MAX_BYTES
+                ):
+                    old_key, _old_body = _CODEX_OUTLINE_MEMO.popitem(last=False)
+                    _CODEX_OUTLINE_MEMO_BYTES -= (
+                        _CODEX_OUTLINE_MEMO_SIZES.pop(old_key))
+                    _CODEX_OUTLINE_MEMO_EVICTIONS += 1
+                _CODEX_OUTLINE_MEMO[key] = body
+                _CODEX_OUTLINE_MEMO_SIZES[key] = entry_bytes
+                _CODEX_OUTLINE_MEMO_BYTES += entry_bytes
+                _CODEX_OUTLINE_MEMO.move_to_end(key)
+        _CODEX_OUTLINE_INFLIGHT.pop(key, None)
+        flight.event.set()
+    return body
+
+
 def get_codex_conversation_outline(
     conn: sqlite3.Connection, conversation_key: str, *, effective_speed: str
 ) -> dict:
@@ -2613,8 +2859,8 @@ def get_codex_conversation_outline(
     corpus's 896 tool failures, so read-time is not a preference here.
     """
     with _read_snapshot(conn):
-        return _outline_envelope(
-            conn, conversation_key, effective_speed=effective_speed)
+        return _codex_outline_memoized(
+            conn, conversation_key, effective_speed)
 
 
 def _outline_envelope(

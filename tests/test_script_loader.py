@@ -307,7 +307,10 @@ def test_an_alternate_identity_load_evicts_no_sibling():
 #     in different states. Exhausting the bound REPORTS rather than drops: a
 #     bound that silently discards a chain is the blind spot, not the fix for
 #     it. Substitution is structural, over AST nodes; the textual regex it
-#     replaces rewrote names inside f-strings and string literals too.
+#     replaces rewrote names inside f-strings and string literals too. Call
+#     sites are associated by the bare callee name, including attribute calls;
+#     that deliberately lets ``obj.load(...)`` reach ``def load(...)`` and can
+#     only over-report rather than hide a loader.
 #
 #   * SHARED SOURCE KERNEL (``_loader_sites_in_source``). The matcher takes
 #     source TEXT, so the generated-child detector runs the identical rule over
@@ -643,24 +646,35 @@ def _reduce_candidates(candidates, base=None):
     second is not a fact about the program. A name resolves to the
     cctally-bearing candidate if any is one; to a determinate non-cctally
     stand-in when EVERY candidate is a concrete other path; and otherwise to
-    undeterminable.
+    undeterminable. Multi-bound names are revisited to a fixed point, because
+    one may depend on another that becomes determinate later in the candidate
+    map; insertion order is not evidence about the program either.
     """
     settled = dict(base or {})
     settled.update({
         name: nodes[0] if len(nodes) == 1 else None
         for name, nodes in candidates.items()
     })
-    for name, nodes in candidates.items():
-        if len(nodes) == 1:
-            continue
-        evidence = [
-            _path_evidence(node, settled) if node is not None else UNKNOWN_EVIDENCE
-            for node in nodes
-        ]
-        if CCTALLY_EVIDENCE in evidence:
-            settled[name] = nodes[evidence.index(CCTALLY_EVIDENCE)]
-        elif evidence and all(value == OTHER_EVIDENCE for value in evidence):
-            settled[name] = _OTHER_BINDING
+    unresolved = {
+        name: nodes for name, nodes in candidates.items() if len(nodes) > 1
+    }
+    while unresolved:
+        resolved = {}
+        for name, nodes in unresolved.items():
+            evidence = [
+                _path_evidence(node, settled)
+                if node is not None else UNKNOWN_EVIDENCE
+                for node in nodes
+            ]
+            if CCTALLY_EVIDENCE in evidence:
+                resolved[name] = nodes[evidence.index(CCTALLY_EVIDENCE)]
+            elif evidence and all(value == OTHER_EVIDENCE for value in evidence):
+                resolved[name] = _OTHER_BINDING
+        if not resolved:
+            break
+        settled.update(resolved)
+        for name in resolved:
+            del unresolved[name]
     return {name: settled[name] for name in candidates}
 
 
@@ -765,7 +779,7 @@ def _parametrize_bindings(function, module_bindings):
     return _reduce_candidates(candidates, module_bindings)
 
 
-def _scope_bindings(scope):
+def _scope_bindings(scope, base=None):
     """Map every name ``scope`` binds to the expression it is bound to.
 
     A value of ``None`` means the name is bound by a form whose value cannot be
@@ -776,10 +790,13 @@ def _scope_bindings(scope):
     Rebinding is not "last one in the AST wins", because one branch may bind
     ``bin/cctally`` and another a different path, and which one the parser saw
     second is not a fact about the program. A name bound more than once
-    resolves to the cctally-bearing expression if any of them is one, and
-    otherwise to ``None``.
+    resolves to the cctally-bearing expression if any of them is one, to a
+    determinate OTHER stand-in when every candidate is another path, and
+    otherwise to ``None``. A loop over a literal sequence follows the same
+    bounded name chain as parametrization.
     """
     candidates = {}
+    loops = []
 
     def record(name, value):
         candidates.setdefault(name, []).append(value)
@@ -809,17 +826,7 @@ def _scope_bindings(scope):
         elif isinstance(node, ast.NamedExpr):
             bind(node.target, node.value)
         elif isinstance(node, (ast.For, ast.AsyncFor)):
-            elements = (
-                node.iter.elts
-                if isinstance(node.iter, (ast.Tuple, ast.List, ast.Set))
-                else None
-            )
-            if elements:
-                for element in elements:
-                    bind(node.target, element)
-            else:
-                for name in _bound_names(node.target):
-                    record(name, None)
+            loops.append((node.target, node.iter))
         elif isinstance(node, ast.AugAssign):
             for name in _bound_names(node.target):
                 record(name, None)
@@ -837,7 +844,18 @@ def _scope_bindings(scope):
             if node.rest:
                 record(node.rest, None)
 
-    return _reduce_candidates(candidates)
+    loop_bindings = dict(base or {})
+    loop_bindings.update(_reduce_candidates(candidates, base))
+    for target, iterable in loops:
+        elements = _literal_sequence(iterable, loop_bindings)
+        if elements:
+            for element in elements:
+                bind(target, element)
+        else:
+            for name in _bound_names(target):
+                record(name, None)
+
+    return _reduce_candidates(candidates, base)
 
 
 #: Text-assembling callees. A method here is literal text only when its
@@ -1139,7 +1157,7 @@ def _loader_sites_in_source(source, label):
             return {}
         key = id(function)
         if key not in scope_cache:
-            scope_cache[key] = _scope_bindings(function)
+            scope_cache[key] = _scope_bindings(function, module_bindings)
         return scope_cache[key]
 
     merged_cache = {}
@@ -1147,10 +1165,10 @@ def _loader_sites_in_source(source, label):
     def bindings_for(function):
         """Module bindings with ``function``'s own locals layered over them.
 
-        Parameter DEFAULTS are deliberately absent here. A default is a value
-        the CALL SITE supplies by omitting the argument, so resolving it at the
-        loader call would report the generic helper's own line instead of the
-        site that has to change.
+        Parameter DEFAULTS are deliberately absent here. Calls layer them under
+        explicitly supplied arguments so the outer site remains the reported
+        site. When a helper has no call sites at all, ``resolve_outward`` uses
+        the defaults there because they are the only supplied values available.
         """
         if function is None:
             return module_bindings
@@ -1229,7 +1247,15 @@ def _loader_sites_in_source(source, label):
                     stack + (function,), depth + 1,
                 ))
         if considered == 0:
-            found = [report_line]
+            call_sites = calls_by_name.get(function.name, ())
+            if not call_sites:
+                default_identity = _rebind(identity_expr, parameters, defaults)
+                default_path = _rebind(path_expr, parameters, defaults)
+                verdict = _determine(
+                    default_identity, default_path, bindings_for(function))
+                found = [] if verdict == "no" else [report_line]
+            else:
+                found = [report_line]
         memo[key] = found
         return found
 
@@ -1349,6 +1375,8 @@ def _candidate_snippets(tree):
                 else:
                     slot += 1
                     parts.append(f"_CCTALLY_PLACEHOLDER_{slot}")
+                    if isinstance(value, ast.FormattedValue):
+                        stack.extend(ast.iter_child_nodes(value))
             yield "".join(parts)
             continue
         chunk = _string_constant(node)
@@ -1399,8 +1427,9 @@ def _snippet_readings(snippet):
 
     A child program is routinely INDENTED inside a `textwrap.dedent(...)` block
     and routinely a `.format` template, and neither reading parses as written.
-    Every reading that parses is matched and the largest site count wins, so
-    the order these are tried in cannot hide a loader.
+    Every reading that parses is matched and the union of its site identities
+    is retained. Taking only the largest count discards which sites each
+    reading found and makes correctness depend on an informal dominance proof.
     """
     readings = [snippet]
     dedented = textwrap.dedent(snippet)
@@ -1431,16 +1460,15 @@ def _embedded_loader_sites(path):
     for snippet in _candidate_snippets(ast.parse(path.read_text(encoding="utf-8"))):
         if "\n" not in snippet:
             continue
-        best = 0
+        sites = set()
         for reading in _snippet_readings(snippet):
             try:
-                sites = _loader_sites_in_source(reading, "<embedded>")
-            except (SyntaxError, ValueError, RecursionError):
+                sites.update(_loader_sites_in_source(reading, "<embedded>"))
+            except (SyntaxError, ValueError):
                 # Not a program in this reading. This is the candidacy test,
                 # not an error path.
                 continue
-            best = max(best, len(sites))
-        total += best
+        total += len(sites)
     return total
 
 
@@ -1474,6 +1502,12 @@ def _estate_python_files():
 _CHILD_PROCESS_LOADERS = {
     "test_rebuild_heal.py": "_load_cctally_in_child, run in a multiprocessing child",
     "test_writer_reroute.py": "_storm_worker and _storm_drain_count, both children",
+    # #689's cross-process recovery race. Same class as its two siblings: a
+    # `spawn` child, so it inherits no monkeypatched attribute and must bind
+    # the paths from the environment itself. It inserts `bin/` on its own
+    # `sys.path` and never `tests/`, so reaching `_script_loader` would mean
+    # adding a path insertion for a helper that would then do nothing.
+    "test_journal_ingest.py": "_mrc_race_load, run in a multiprocessing child",
 }
 
 #: Fixture DATA under ``tests/fixtures/`` that loads ``bin/cctally`` at its own
@@ -1784,6 +1818,35 @@ def test_a_name_bound_differently_in_two_branches_is_not_last_one_wins():
     assert _evidence_of("SCRIPT", prelude) == CCTALLY_EVIDENCE
 
 
+def test_multi_bound_names_are_reduced_to_a_fixed_point():
+    """A later multi-bound name must settle an earlier dependent name.
+
+    The single-pass reducer visits ``TARGET`` before ``RESOLVED`` here. The
+    former therefore stayed UNKNOWN even after the latter became a determinate
+    OTHER, making a safe non-cctally loader look indeterminate and report.
+    """
+    assert _sites(
+        _LOADER_PRELUDE
+        + "def test_a(flag):\n"
+          "    if flag:\n        TARGET = RESOLVED\n"
+          "    else:\n        TARGET = RESOLVED\n"
+          "    if flag:\n        RESOLVED = ROOT / 'bin' / 'cctally-bench'\n"
+          "    else:\n        RESOLVED = ROOT / 'bin' / 'cctally-release'\n"
+          "    return SourceFileLoader('shadow', TARGET).load_module()\n"
+    ) == []
+
+
+def test_for_target_follows_a_name_bound_to_a_literal_sequence():
+    """Loop bindings and parametrization share the same literal-sequence rule."""
+    assert _sites(
+        _LOADER_PRELUDE
+        + "BUILDERS = (ROOT / 'bin' / 'cctally-bench', ROOT / 'bin' / 'cctally-release')\n"
+          "def test_a():\n"
+          "    for target in BUILDERS:\n"
+          "        SourceFileLoader('shadow', target).load_module()\n"
+    ) == []
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # The determination, and the outward call-site recursion that feeds it.
 # ──────────────────────────────────────────────────────────────────────────
@@ -1905,6 +1968,20 @@ def test_a_parameter_default_counts_as_a_supplied_value():
           "    return SourceFileLoader(n, p).load_module()\n"
           "def test_a():\n    return _load('shadow')\n"
     ) == ["probe.py:8"]
+
+
+def test_an_uncalled_helper_resolves_its_parameter_defaults():
+    """With no caller, the definition's defaults are the only supplied values."""
+    assert _sites(
+        _LOADER_PRELUDE
+        + "def _load(n='shadow', p=str(ROOT / 'bin' / 'cctally-bench')):\n"
+          "    return SourceFileLoader(n, p).load_module()\n"
+    ) == []
+    assert _sites(
+        _LOADER_PRELUDE
+        + "def _load(n='shadow', p=str(SCRIPT)):\n"
+          "    return SourceFileLoader(n, p).load_module()\n"
+    ) == ["probe.py:6"]
 
 
 def test_a_local_alias_of_a_parameter_resolves_through_the_call_site():
@@ -2301,6 +2378,39 @@ def test_an_fstring_child_has_its_placeholders_substituted_not_dropped(tmp_path)
     ) == 1
 
 
+def test_a_string_literal_nested_inside_an_fstring_slot_is_scanned(tmp_path):
+    assert _embedded_count(
+        tmp_path,
+        "CHILD = f\"\"\"{'''\n"
+        "import runpy\n"
+        "runpy.run_path('/repo/bin/cctally')\n"
+        "'''}\"\"\"\n",
+    ) == 1
+
+
+def test_embedded_readings_union_site_identities(monkeypatch, tmp_path):
+    """Different valid readings contribute sites rather than competing by count."""
+    def fake_sites(source, _label):
+        if "{path}" in source:
+            return ["<embedded>:2"]
+        return ["<embedded>:3"]
+
+    monkeypatch.setitem(globals(), "_loader_sites_in_source", fake_sites)
+    assert _embedded_count(
+        tmp_path,
+        "CHILD = '''\nSourceFileLoader('cctally', {path})\n'''\n",
+    ) == 2
+
+
+def test_an_embedded_matcher_recursion_error_fails_loud(monkeypatch, tmp_path):
+    def overflow(_source, _label):
+        raise RecursionError("synthetic matcher overflow")
+
+    monkeypatch.setitem(globals(), "_loader_sites_in_source", overflow)
+    with pytest.raises(RecursionError, match="synthetic matcher overflow"):
+        _embedded_count(tmp_path, "CHILD = '''\npass\n'''\n")
+
+
 @pytest.mark.parametrize("relative,expected", [
     ("_script_loader.py", True),
     ("conftest.py", True),
@@ -2325,7 +2435,7 @@ def test_the_estate_has_one_loader_implementation():
 
     Enumerated from the tree so a new hand-rolled copy is caught rather than a
     known one re-checked. Four classes are exempt and every one is named: the
-    primitive itself, the two modules whose loader runs inside a child process
+    primitive itself, the three modules whose loader runs inside a child process
     (``_CHILD_PROCESS_LOADERS``), the six fixture files a separate ``cctally``
     process executes (``_STANDALONE_FIXTURE_LOADERS``), and the thirteen that
     embed the loader inside source written out for another interpreter, which
@@ -2349,12 +2459,12 @@ def test_the_estate_has_one_loader_implementation():
 def test_every_estate_loader_call_reaches_a_determinate_answer():
     """AC12, as an assertion rather than a one-off measurement.
 
-    The estate holds 157 loader calls. Nine of them load `bin/cctally`, spread
-    across eight files because `test_writer_reroute.py` holds two — at `:1384`
-    and `:1418` — and every one of those eight files is already exempt. So
+    The estate holds 174 loader calls. Eleven of them load `bin/cctally`,
+    spread across ten files because `test_writer_reroute.py` holds two, and
+    every one of those ten files is already exempt. So
     every OTHER call must resolve to a determinate NO, not to `indeterminate`,
     which the guard reports. That is what the whole-estate scan states here:
-    with the exempt files INCLUDED, the matcher reports those eight files and
+    with the exempt files INCLUDED, the matcher reports those ten files and
     no others. The offender test above cannot say this, because it skips the
     exempt files before it looks at them, so a false positive inside one would
     be invisible to it.
@@ -2384,7 +2494,7 @@ def test_every_estate_loader_call_reaches_a_determinate_answer():
             reported[path.relative_to(tests_dir).as_posix()] = sites
     assert scanned >= 100, (
         f"only {scanned} loader calls were found under tests/, where the "
-        "measurement was 157; a matcher that recognizes nothing passes every "
+        "measurement was 174; a matcher that recognizes nothing passes every "
         "other assertion in this module vacuously"
     )
     unexpected = sorted(r for r in reported if not _is_exempt(r))
@@ -2401,7 +2511,7 @@ def test_every_estate_loader_call_reaches_a_determinate_answer():
 
 
 def test_the_child_process_carve_out_still_describes_the_tree():
-    """The two exempted modules must still hold the loader the exemption names.
+    """The three exempted modules must still hold the loader the exemption names.
 
     An exemption that outlives what it exempts is a hole rather than a decision,
     so this half of the carve-out is checked here: each named module still

@@ -318,6 +318,12 @@ Following a warning re-measures its window against live data rather than reconst
 
 The route is read-only and is deliberately not an envelope key: it is a surface most ticks never display, and an envelope key would pay its cost on every tick. Status codes and selectors are in [`dashboard`](dashboard.md#endpoints).
 
+### Latency and boundedness
+
+The maintained large-corpus budgets are a 1.0-second warm median and 2.0-second pooled p95 for Claude, and a 2.0-second warm median and 4.0-second pooled p95 for `--source all`. A fresh dashboard process's first complete `GET /api/diagnosis?source=all` response has a separate **3.0-second ceiling**, measured after the HTTP server has bound; dashboard startup is not hidden inside that request figure.
+
+These are on-demand budgets, not permission to serve an older answer. Diagnosis has no report cache or periodic precomputation, reads the current and preceding half-open windows under the generation probe protocol above, and does not change the dashboard's refresh interval. The reproducible maintainer receipt is `bin/cctally-test-remote python3 bench/explain-benchmark.py`; it fails when a target, canonical CLI/dashboard parity, current/baseline non-vacuity, cold-route status, row/query cap or aggregate parent-and-worker RSS ceiling is missed.
+
 ## Implementation
 
 The diagnosis is a pure kernel, `bin/_lib_diagnosis.py`, and every store read goes through a single adapter, `bin/_cctally_diagnosis_sources.py`. That adapter opens each database read-only (SQLite `mode=ro`), reports a `{stats, cache, configuration}` generation vector so an incoherent set of sources is refused rather than blended, and owns the Codex pool-compatible block join. The CLI and the one `diagnosis_to_wire` adapter that renders the JSON envelope live in `bin/_cctally_diagnosis.py`. A report-establishment failure is raised as an `EstablishmentFailure`, which is always exit 3.

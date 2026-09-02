@@ -149,8 +149,9 @@ def _alert_text_meter_rate_change(payload: dict, tz) -> tuple[str, str, str]:
     is no threshold to name, which is the whole reason this family is not an
     `AXIS_REGISTRY` member.
 
-    Two DELIBERATE divergences from the threshold builders, both recorded in
-    `docs/alerts-gotchas.md` (#661 S2 Stage C review, F7b):
+    THREE deliberate divergences from the threshold builders, all recorded
+    in `docs/alerts-gotchas.md` (#661 S2 Stage C review, F7b; the third
+    added by #688):
 
     * The body does not end with `_with_next_step`. That helper derives its
       affordance through `alert_next_step_command`, which branches on
@@ -159,7 +160,20 @@ def _alert_text_meter_rate_change(payload: dict, tz) -> tuple[str, str, str]:
       directly instead.
     * This builder and `_alert_text_quota` above it live in this glue module
       rather than in the pure `_lib_alerts_payload` kernel, which holds the
-      other five. That is the placement both non-registry families use.
+      other six. That is the placement both non-registry families use.
+    * The BODY varies on a payload field, which no threshold builder does.
+      #688 records a transition whenever the detector qualifies, including
+      when the command's own verdict is withheld for a reason that bears on
+      predicting forward, so a recorded transition may sit beside a verdict
+      `cctally quota` refuses. Sending that user to a fitted budget that
+      does not exist is a false instruction, so the body names the
+      withholding instead and points at the evidence.
+
+    NOT a fourth divergence (#697): the standard R8 `[<label>] ` title prefix
+    is applied DOWNSTREAM by `_dispatch_alert_notification`, which resolves the
+    account registry from this payload's own `provider` field rather than from
+    `_AXIS_VENDOR`. The prefix is shared behaviour every axis takes, so this
+    builder keeps its signature and its return and never learns about accounts.
 
     `effective_from` IS routed through `format_display_dt`. It is a clock
     instant, not a calendar day, so the carve-out `_alert_text_weekly`
@@ -183,10 +197,13 @@ def _alert_text_meter_rate_change(payload: dict, tz) -> tuple[str, str, str]:
             raw, tz, fmt="%Y-%m-%d", suffix=False) if raw else ""
     except ValueError:
         effective = ""
-    body = (
-        f"Effective {effective}. Run `cctally quota` for the fitted budget "
-        f"and its evidence." if effective else
-        "Run `cctally quota` for the fitted budget and its evidence.")
+    withheld = payload.get("withholding_status")
+    if withheld:
+        tail = (f"The calibration was withheld ({withheld}), so no fitted "
+                f"budget is available. Run `cctally quota` for the evidence.")
+    else:
+        tail = "Run `cctally quota` for the fitted budget and its evidence."
+    body = f"Effective {effective}. {tail}" if effective else tail
     return f"cctally - {provider} metering rate changed", subtitle, body
 
 
@@ -227,7 +244,8 @@ _AXIS_VENDOR = {
 }
 
 
-def _alert_label_prefix(axis: str, account_key: "str | None") -> str:
+def _alert_label_prefix(axis: str, account_key: "str | None",
+                        provider: "object | None" = None) -> str:
     """Return ``"[<label>] "`` for an account-specific crossing when the vendor
     has >1 real account (R8), else ``""``. Best-effort + never-raise: a missing
     DB / read error / vendor-wide (`*`) row yields no prefix, so a ≤1-real-account
@@ -236,13 +254,26 @@ def _alert_label_prefix(axis: str, account_key: "str | None") -> str:
     Delegates the R8 gate + label precedence to the single-definition helpers
     ``_cctally_account.real_account_count`` / ``account_label`` (P2-CQ1) so the
     ">1 real account" trigger and the key->label map have exactly one home; this
-    wrapper only opens the RO connection and stays best-effort/never-raise."""
+    wrapper only opens the RO connection and stays best-effort/never-raise.
+
+    #697: the VENDOR comes from the payload's own ``provider`` when it carries
+    one, and from ``_AXIS_VENDOR`` otherwise. The metering-rate-change family
+    is the only payload that carries the key, and it is authoritative there —
+    the family's visible title is derived from that same field, so a static map
+    entry could send a Codex title to Claude's registry with nothing reporting
+    the disagreement. The lookup is normalized because ``real_account_count``
+    matches ``accounts.provider`` exactly, and an unmatched provider degrades
+    silently to no prefix. The whole resolution sits INSIDE the guard so that a
+    provider whose ``__str__`` raises cannot escape the never-raise contract.
+    """
     if not account_key or account_key == _lib_accounts.VENDOR_WIDE:
         return ""
-    vendor = _AXIS_VENDOR.get(axis)
-    if vendor is None:
-        return ""
     try:
+        vendor = str(provider).strip().lower() if provider is not None else ""
+        if not vendor:
+            vendor = _AXIS_VENDOR.get(axis)
+        if vendor is None:
+            return ""
         import sqlite3 as _sq
         import _cctally_account
         db_path = _cctally_core.DB_PATH
@@ -355,8 +386,10 @@ def _dispatch_alert_notification(
     # R8 label prefix (#341): an account-specific crossing gains a `[<label>] `
     # title prefix ONLY when the vendor has >1 real account. Byte-identical at
     # <=1 real account (empty prefix). Applied to the notification title only.
+    # #697: the vendor whose registry is counted comes from the payload's own
+    # `provider` when it carries one, and from `_AXIS_VENDOR` otherwise.
     account_key = payload.get("account_key")
-    title = _alert_label_prefix(axis, account_key) + title
+    title = _alert_label_prefix(axis, account_key, payload.get("provider")) + title
 
     # Severity (3-tier) drives both the notify-send urgency token and the
     # trailing log column. A missing threshold (defensive — shouldn't happen for
