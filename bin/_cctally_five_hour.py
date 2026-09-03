@@ -351,13 +351,52 @@ def _load_recorded_five_hour_windows(
             # rendered as a phantom heuristic "~" row).
             credit_moments: list[dt.datetime] = []
             try:
+                # #703 + #707 §6.2: EVERY credit contributes a discontinuity
+                # moment, so the `old_week_end_at = effective_reset_at_utc`
+                # filter is gone. It selected only the automatic in-place shape,
+                # and a MANUAL credit leaves both boundary columns NULL — so a
+                # `record-credit` week produced no moment here at all and its
+                # overlapping canonical blocks still resolved by dropping one,
+                # leaving the phantom heuristic row this code exists to remove.
+                # The instant is the ACCOUNTING one, matching every other
+                # accounting read.
+                #
+                # This scan is account-BLIND, and deliberately stays so — but
+                # not for the reason first recorded here. That reason said no
+                # caller holds an account key, and it is false: the statusline
+                # resolves `_statusline_active_account()` and scopes its 7d
+                # clamp legs to it in the same render, then calls this function
+                # without one. The decision stands on the other two grounds. The
+                # canonical-block query above is account-blind, and so are the
+                # session entries these moments disambiguate, because `blocks`
+                # is a ccusage drop-in with no account axis at all. Scoping only
+                # this leg would make the truncation moments disagree with the
+                # anchors and the entries they are truncating; scoping the
+                # subsystem is a change to `blocks` itself.
+                #
+                # Two consequences are stated rather than left implicit. The
+                # widened selection admits manual credits and other accounts'
+                # credits as block-truncation points. And a moment can only be
+                # used when it falls in `[next_bs, rs]` for a canonical pair
+                # inside `[range_start, range_end]`; since a stored block start
+                # is at most one block duration before its own reset, every
+                # usable moment lies in `[range_start - BLOCK_DURATION,
+                # range_end]`, so the scan is bounded to exactly that and stops
+                # loading every credit ever recorded.
+                credit_scan_start = (
+                    range_start - _c.BLOCK_DURATION).isoformat()
+                credit_scan_end = range_end.isoformat()
                 credit_rows = conn.execute(
-                    "SELECT effective_reset_at_utc "
-                    "FROM week_reset_events "
-                    "WHERE old_week_end_at = effective_reset_at_utc"
+                    "SELECT COALESCE(observed_at_utc, effective_reset_at_utc) "
+                    "         AS accounting_at "
+                    "  FROM week_reset_events "
+                    " WHERE accounting_at IS NOT NULL "
+                    "   AND unixepoch(accounting_at) >= unixepoch(?) "
+                    "   AND unixepoch(accounting_at) <= unixepoch(?)",
+                    (credit_scan_start, credit_scan_end),
                 ).fetchall()
                 for c in credit_rows:
-                    raw = c["effective_reset_at_utc"]
+                    raw = c["accounting_at"]
                     try:
                         d = dt.datetime.fromisoformat(str(raw))
                     except ValueError:
@@ -1647,12 +1686,20 @@ def _backfill_five_hour_blocks(
                 # suffixes (block_start_at is host-local; week_start_at /
                 # effective_reset_at_utc are ``+00:00``); see the live-path
                 # comment for rationale.
+                # #703 + #707: the ACCOUNTING instant, so a block is flagged as
+                # crossing the moment the counter actually moved rather than the
+                # hour it is displayed at — the floored instant can fall in the
+                # previous block.
                 cross_row = conn.execute(
                     """
                     SELECT 1 FROM week_reset_events
                      WHERE account_key = ?
-                       AND unixepoch(effective_reset_at_utc) >= unixepoch(?)
-                       AND unixepoch(effective_reset_at_utc) <= unixepoch(?)
+                       AND unixepoch(COALESCE(observed_at_utc,
+                                              effective_reset_at_utc))
+                           >= unixepoch(?)
+                       AND unixepoch(COALESCE(observed_at_utc,
+                                              effective_reset_at_utc))
+                           <= unixepoch(?)
                      LIMIT 1
                     """,
                     (acct, block_start_at, last_obs),

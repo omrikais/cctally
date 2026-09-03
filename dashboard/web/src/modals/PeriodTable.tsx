@@ -9,6 +9,7 @@ import type { ModelCostRow, PeriodRow } from '../types/envelope';
 import { PeriodAccountChips } from '../components/PeriodAccountChips';
 import { modelChipStyle } from '../lib/model';
 import { logicalModelKey } from '../lib/modelColor';
+import { dollarPerPctWithheldCell } from '../lib/dollarPerPctCell';
 
 interface Props {
   rows: PeriodRow[];
@@ -155,7 +156,16 @@ export function PeriodTable({
               <td><ModelsCell models={r.models} /></td>
               <td className="num">{fmt.usd2(r.cost_usd)}</td>
               {variant === 'weekly' && <td className="num">{fmt.pct0(r.used_pct)}</td>}
-              {variant === 'weekly' && <td className="num">{fmt.usd2(r.dollar_per_pct)}</td>}
+              {/* #703 + #707 §6.3 — a withheld ratio names its cause here too.
+                  The detail card to the left of this table already did, and an
+                  em-dash beside it read as "no usage recorded", which is a
+                  different and wrong statement about a credited week. */}
+              {variant === 'weekly' && (
+                <td className="num">
+                  {dollarPerPctWithheldCell(r.dollar_per_pct, r.dollar_per_pct_withheld)
+                    ?? fmt.usd2(r.dollar_per_pct)}
+                </td>
+              )}
               <td className={deltaCellCls(r.delta_cost_pct)}>{fmt.deltaPct(r.delta_cost_pct)}</td>
             </tr>
           );

@@ -18,6 +18,8 @@ import socketserver
 import sys
 import threading
 import time
+
+import pytest
 from http.client import HTTPConnection
 
 from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION
@@ -2392,3 +2394,120 @@ def test_conversation_anon_map_route(tmp_path, monkeypatch):
         assert st == 403
     finally:
         stop(srv, srv._test_thread)
+
+
+# ── live-tail accounting (the viewer's cost comes from the accounting store) ──
+
+
+def _conversation_module():
+    return load_script()["_load_sibling"]("_cctally_dashboard_conversation")
+
+
+def test_the_live_tail_accounting_helper_targets_only_the_changed_paths(
+    monkeypatch,
+):
+    """The tail advances exactly what it saw grow, and always closes the store.
+
+    A live tail resolves the set of source files that changed this cycle. The
+    accounting ingest must be targeted at that set: a bare walk here would put
+    the whole provider estate on the SSE cycle, which is the cost the dashboard
+    frontier exists to avoid.
+    """
+    mod = _conversation_module()
+    closed = []
+
+    class _Conn:
+        def close(self):
+            closed.append(True)
+
+    conn = _Conn()
+    monkeypatch.setattr(mod, "open_cache_db", lambda: conn)
+    seen = {}
+
+    def _sync(active, *, only_paths):
+        seen["conn"] = active
+        seen["paths"] = only_paths
+
+    class _Handler:
+        def log_error(self, *_args):
+            raise AssertionError("a successful sync must log nothing")
+
+    mod._advance_live_tail_accounting(
+        _Handler(), ["/a.jsonl", "/b.jsonl"], _sync, "codex")
+
+    assert seen["conn"] is conn
+    assert seen["paths"] == {"/a.jsonl", "/b.jsonl"}
+    assert closed == [True], "the accounting connection was left open"
+
+
+@pytest.mark.parametrize("failing", ["open", "sync"])
+def test_a_failed_live_tail_accounting_sync_never_breaks_the_stream(
+    monkeypatch, failing,
+):
+    """Cost is an enhancement to the tail, never a precondition for it.
+
+    Stalling the turns a reader is watching is strictly worse than showing them
+    beside a stale figure, so both the store open and the ingest must be inside
+    the guard. The injected failure is deliberately not a ``sqlite3`` error:
+    narrowing the catch to database errors would let an ``OSError`` from opening
+    the store escape and kill the stream.
+    """
+    mod = _conversation_module()
+    closed = []
+
+    class _Conn:
+        def close(self):
+            closed.append(True)
+
+    def _open():
+        if failing == "open":
+            raise RuntimeError("accounting store unavailable")
+        return _Conn()
+
+    def _sync(_active, *, only_paths):
+        raise RuntimeError("forced ingest failure")
+
+    monkeypatch.setattr(mod, "open_cache_db", _open)
+    logged = []
+
+    class _Handler:
+        def log_error(self, fmt, *args):
+            logged.append(fmt % args)
+
+    mod._advance_live_tail_accounting(_Handler(), ["/a.jsonl"], _sync, "codex")
+
+    assert logged, "a swallowed accounting failure must still be logged"
+    assert "accounting sync failed" in logged[0]
+    if failing == "sync":
+        assert closed == [True], "the connection leaked on the failure path"
+
+
+def test_every_live_tail_ingest_advances_accounting():
+    """No live-tail route may advance the transcript alone.
+
+    Claude turn cost is read from ``session_entries`` and Codex from
+    ``codex_session_entries``, both in the accounting store, so a route that
+    ingests only the transcript streams new turns whose cost never moves. The
+    count is pinned as well as the predicate: a fourth route added later fails
+    here rather than passing because the three known ones are still correct.
+    """
+    import ast
+
+    mod = _conversation_module()
+    tree = ast.parse(pathlib.Path(mod.__file__).read_text())
+    ingests = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_ingest"
+    ]
+    assert len(ingests) == 3, (
+        "the live-tail route set changed; give the new route an accounting "
+        f"advance and update this count: {[n.lineno for n in ingests]}"
+    )
+    for fn in ingests:
+        called = {
+            node.func.id for node in ast.walk(fn)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert called & {"_advance_live_tail_accounting", "sync_codex_cache"}, (
+            f"the _ingest at line {fn.lineno} advances no accounting store"
+        )

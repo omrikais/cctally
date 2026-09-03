@@ -296,11 +296,12 @@ def test_claude_week_index_enumerates_newest_first_with_counts(ns):
         conn.close()
 
     starts = [e["start_at_utc"] for e in idx]
-    # Newest-first, cost-only 2026-04-24 excluded, reset split retained.
+    # Newest-first, cost-only 2026-04-24 excluded. ONE entry per subscription
+    # week (#703 + #707 §6.1): the credited 2026-05-01 week used to appear
+    # twice, cut at the credit instant, for a week whose boundaries never moved.
     assert starts == [
         "2026-05-15T00:00:00Z",
         "2026-05-08T00:00:00Z",
-        "2026-05-04T12:00:00Z",
         "2026-05-01T00:00:00Z",
     ]
 
@@ -362,10 +363,9 @@ def test_claude_week_index_survives_a_milestone_only_week_with_no_boundaries(ns)
         conn.close()
 
     starts = [e["start_at_utc"] for e in idx]
-    assert starts[:4] == [
+    assert starts[:3] == [
         "2026-05-15T00:00:00Z",
         "2026-05-08T00:00:00Z",
-        "2026-05-04T12:00:00Z",
         "2026-05-01T00:00:00Z",
     ], "the boundary-carrying weeks must still be enumerated"
 
@@ -408,7 +408,14 @@ def test_claude_week_index_usage_only_week_zero_milestones(ns):
     assert b["block_count"] == 1  # straddler intersects week B too
 
 
-def test_claude_reset_defined_week_emits_two_opaque_cycle_entries(ns):
+def test_a_credited_week_is_one_navigable_entry_holding_two_segments(ns):
+    """This asserted TWO entries for one week until #703 + #707 §6.1.
+
+    A credit is a counter discontinuity inside an unchanged window, so there is
+    one week to navigate to. The two ladders it holds are a grouping inside the
+    entry — `segment_count`, and the detail's `segments` — rather than two
+    entries in the navigation.
+    """
     import _cctally_milestone_history as mh
 
     conn = ns["open_db"]()
@@ -423,49 +430,57 @@ def test_claude_reset_defined_week_emits_two_opaque_cycle_entries(ns):
         if e["start_at_utc"] < "2026-05-08T00:00:00Z"
         and e["end_at_utc"] > "2026-05-01T00:00:00Z"
     ]
-    assert len(c_entries) == 2
-    assert len({e["key"] for e in c_entries}) == 2
-    assert all(e["key"].startswith("milestone_cycle:") for e in c_entries)
-    assert all("2026-05-01" not in e["key"] for e in c_entries)
-    assert [(e["start_at_utc"], e["end_at_utc"]) for e in c_entries] == [
-        ("2026-05-04T12:00:00Z", "2026-05-08T00:00:00Z"),
-        ("2026-05-01T00:00:00Z", "2026-05-04T12:00:00Z"),
-    ]
-    assert [e["milestone_count"] for e in c_entries] == [2, 2]
-    assert all(e["segment_count"] == 1 for e in c_entries)
+    assert len(c_entries) == 1, [
+        (e["start_at_utc"], e["end_at_utc"]) for e in c_entries]
+    assert c_entries[0]["key"].startswith("milestone_cycle:")
+    assert (c_entries[0]["start_at_utc"], c_entries[0]["end_at_utc"]) == (
+        "2026-05-01T00:00:00Z", "2026-05-08T00:00:00Z")
+    assert c_entries[0]["milestone_count"] == 4
+    assert c_entries[0]["segment_count"] == 2
 
 
 # ── Task 1: Claude week detail ─────────────────────────────────────────
 
 
-def test_claude_cycle_detail_selects_only_its_reset_cohort(ns):
+def test_the_detail_groups_a_credited_weeks_ladders_by_epoch(ns):
+    """Two ladders, each starting at its own floor, kept apart.
+
+    Concatenated into one list they would read as a single ladder that goes
+    backwards — 1, 2, 1, 2 — which is exactly what a ladder must never do.
+    """
     import _cctally_milestone_history as mh
 
     conn = ns["open_db"]()
     try:
         _seed_full(conn)
-        entries = [
+        entry = next(
             e for e in mh.build_claude_week_index(conn)
             if e["start_at_utc"] < "2026-05-08T00:00:00Z"
             and e["end_at_utc"] > "2026-05-01T00:00:00Z"
-        ]
-        post = mh.build_claude_week_detail(conn, entries[0]["key"])
-        pre = mh.build_claude_week_detail(conn, entries[1]["key"])
+        )
+        detail = mh.build_claude_week_detail(conn, entry["key"])
     finally:
         conn.close()
 
-    assert post is not None and pre is not None
-    assert post["key"] != pre["key"]
-    assert len(post["segments"]) == len(pre["segments"]) == 1
-    assert [m["percent"] for m in post["segments"][0]["milestones"]] == [1, 2]
-    assert [m["percent"] for m in pre["segments"][0]["milestones"]] == [1, 2]
-    assert post["segments"][0]["milestones"][0]["cumulative_usd"] == 0.5
-    assert post["dividers"] == pre["dividers"] == []
-    assert post["segments"][0]["key"].startswith("milestone_segment:")
-    assert "reset_event_id" not in post["segments"][0]
+    assert detail is not None
+    assert len(detail["segments"]) == 2, detail["segments"]
+    assert [[m["percent"] for m in seg["milestones"]]
+            for seg in detail["segments"]] == [[1, 2], [1, 2]]
+    keys = [seg["key"] for seg in detail["segments"]]
+    assert len(set(keys)) == 2, keys
+    assert all(k.startswith("milestone_segment:") for k in keys)
+    # One divider per segment after the first — the credit that opened the
+    # second ladder. This asserted an empty list until the #703 + #707 QA pass:
+    # the client draws its `⚡ CREDIT` row from `dividers[si - 1]`, so an empty
+    # list left the two ladders rendering as one table whose percent column
+    # restarted partway down with no separator.
+    assert [
+        (d["effective_at_utc"], d["prior_percent"]) for d in detail["dividers"]
+    ] == [("2026-05-04T12:00:00Z", 40.0)], detail["dividers"]
+    assert all("reset_event_id" not in seg for seg in detail["segments"])
 
 
-def test_claude_production_shaped_98_rows_split_43_55_with_exact_blocks(ns):
+def test_claude_production_shaped_98_rows_are_one_entry_of_two_segments(ns):
     import _cctally_milestone_history as mh
 
     start = "2026-07-11T05:00:00+00:00"
@@ -513,16 +528,17 @@ def test_claude_production_shaped_98_rows_split_43_55_with_exact_blocks(ns):
     finally:
         conn.close()
 
-    assert [entry["milestone_count"] for entry in entries] == [55, 43]
-    assert [len(detail["segments"][0]["milestones"]) for detail in details] == [55, 43]
-    assert [[b["five_hour_window_key"] for b in detail["blocks"]] for detail in details] == [
-        [716, 717],
-        [711, 716],
-    ]
-    assert [entry["block_count"] for entry in entries] == [2, 2]
+    # ONE entry over the whole week, holding both ladders and every block.
+    assert [entry["milestone_count"] for entry in entries] == [98]
+    assert [entry["segment_count"] for entry in entries] == [2]
+    assert [[len(seg["milestones"]) for seg in detail["segments"]]
+            for detail in details] == [[43, 55]]
+    assert [[b["five_hour_window_key"] for b in detail["blocks"]]
+            for detail in details] == [[711, 716, 717]]
+    assert [entry["block_count"] for entry in entries] == [3]
 
 
-def test_claude_early_reanchor_same_storage_bucket_emits_post_cycle(ns):
+def test_claude_early_reanchor_same_storage_bucket_is_one_entry(ns):
     import _cctally_milestone_history as mh
 
     start = "2026-04-13T14:00:00+00:00"
@@ -559,11 +575,12 @@ def test_claude_early_reanchor_same_storage_bucket_emits_post_cycle(ns):
     finally:
         conn.close()
 
+    # The early re-anchor kept both boundaries under one `week_start_date`, and
+    # that bucket is ONE entry over its full retained span.
     assert [(e["start_at_utc"], e["end_at_utc"]) for e in entries] == [
-        ("2026-04-17T13:00:00Z", "2026-04-20T14:00:00Z"),
-        ("2026-04-13T14:00:00Z", "2026-04-17T13:00:00Z"),
+        ("2026-04-13T14:00:00Z", "2026-04-20T14:00:00Z"),
     ]
-    assert [e["milestone_count"] for e in entries] == [1, 0]
+    assert [e["milestone_count"] for e in entries] == [1]
     assert entries[0]["is_current"] is True
     assert post is not None
     assert [m["percent"] for m in post["segments"][0]["milestones"]] == [1]
@@ -1464,7 +1481,7 @@ def test_api_milestones_claude_week_200(tmp_path, monkeypatch):
         stop(srv, srv._test_thread)
 
 
-def test_api_milestones_claude_reset_cycles_fetch_independently(tmp_path, monkeypatch):
+def test_api_milestones_a_credited_week_fetches_both_segments(tmp_path, monkeypatch):
     ns = load_script()
     srv = _boot_milestones_server(ns, tmp_path, monkeypatch, seed=_seed_full)
     try:
@@ -1477,6 +1494,7 @@ def test_api_milestones_claude_reset_cycles_fetch_independently(tmp_path, monkey
             ]
         finally:
             conn.close()
+        assert len(keys) == 1, keys
         bodies = []
         for key in keys:
             status, body = _get(
@@ -1484,8 +1502,12 @@ def test_api_milestones_claude_reset_cycles_fetch_independently(tmp_path, monkey
             )
             assert status == 200, (status, body)
             bodies.append(body)
-        assert [len(body["segments"][0]["milestones"]) for body in bodies] == [2, 2]
-        assert all(body["dividers"] == [] for body in bodies)
+        assert [[len(seg["milestones"]) for seg in body["segments"]]
+                for body in bodies] == [[2, 2]]
+        # The divider reaches the client over the wire, not just out of the
+        # builder: it is what the modal draws between the two ladders.
+        assert [len(body["dividers"]) for body in bodies] == [1]
+        assert bodies[0]["dividers"][0]["prior_percent"] == 40.0
     finally:
         stop(srv, srv._test_thread)
 

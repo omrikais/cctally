@@ -1399,31 +1399,56 @@ def _doctor_gather_state_impl(
                     # post_credit_milestone_count == 0.
                     # unixepoch() normalizes the cross-offset comparison.
                     try:
+                        # #703 + #707 §6.2: select by the canonical WEEK and the
+                        # ACCOUNT, not by `new_week_end_at`. A manual credit
+                        # leaves both boundary columns NULL, so the boundary
+                        # join found no snapshot and every `record-credit` week
+                        # was silently skipped by this check. The instant is the
+                        # accounting one, matching every other accounting read.
                         credit_rows = conn.execute(
                             """
                             SELECT wre.id AS event_id,
-                                   wre.new_week_end_at AS end_at,
-                                   wre.effective_reset_at_utc AS effective
+                                   wre.week_start_date AS week_start_date,
+                                   wre.account_key AS account_key,
+                                   wre.new_week_end_at AS end_at
                               FROM week_reset_events wre
-                             WHERE unixepoch(wre.effective_reset_at_utc)
+                             WHERE unixepoch(COALESCE(wre.observed_at_utc,
+                                                      wre.effective_reset_at_utc))
                                    <= unixepoch(?)
                             """,
                             (now_utc_iso(),),
                         ).fetchall()
                         credited_weeks = []
                         for cr in credit_rows:
-                            end_at = cr[1]
-                            evt_id = cr[0]
-                            latest = conn.execute(
-                                """
-                                SELECT week_start_date, weekly_percent
-                                  FROM weekly_usage_snapshots
-                                 WHERE week_end_at = ?
-                                 ORDER BY captured_at_utc DESC, id DESC
-                                 LIMIT 1
-                                """,
-                                (end_at,),
-                            ).fetchone()
+                            evt_id = cr["event_id"]
+                            # A row that predates `week_start_date` carries only
+                            # the boundary, so that join is the fallback for
+                            # exactly those rows and nothing else.
+                            if cr["week_start_date"]:
+                                latest = conn.execute(
+                                    """
+                                    SELECT week_start_date, weekly_percent
+                                      FROM weekly_usage_snapshots
+                                     WHERE week_start_date = ?
+                                       AND account_key = ?
+                                     ORDER BY captured_at_utc DESC, id DESC
+                                     LIMIT 1
+                                    """,
+                                    (cr["week_start_date"], cr["account_key"]),
+                                ).fetchone()
+                            elif cr["end_at"]:
+                                latest = conn.execute(
+                                    """
+                                    SELECT week_start_date, weekly_percent
+                                      FROM weekly_usage_snapshots
+                                     WHERE week_end_at = ?
+                                     ORDER BY captured_at_utc DESC, id DESC
+                                     LIMIT 1
+                                    """,
+                                    (cr["end_at"],),
+                                ).fetchone()
+                            else:
+                                latest = None
                             if latest is None or latest[0] is None:
                                 continue
                             ws = latest[0]

@@ -260,34 +260,77 @@ def _apply_midweek_reset_override(
     samples: list,
     *,
     now_utc: dt.datetime,
+    account_key: "str | None" = None,
 ) -> tuple[dt.datetime, list]:
-    """If the current week's end_at matches a recorded reset event's
-    ``new_week_end_at`` and was detected by ``now_utc``, shift
-    ``week_start_at`` to the effective reset moment and drop pre-reset
-    samples. The detection bound keeps historical replay causal while leaving
-    the live path unchanged (live ``now_utc`` postdates retained events).
+    """Move the RATE window to the latest credit epoch inside this week.
 
-    Keeps callers (``_load_forecast_inputs``, ``_tui_build_current_week``)
-    from reporting spent_usd summed across the pre-reset window.
+    A credit is a counter discontinuity, so a rate measured across it is
+    measured over two different counters. This shifts ``week_start_at`` to the
+    credit's accounting instant and drops the samples before it, leaving the
+    caller with one epoch's climb over one epoch's elapsed time.
 
-    Returns the (possibly-shifted) ``week_start_at`` and a
-    (possibly-filtered) samples list. On any SQL or parse error, returns
-    the inputs unchanged — the override is best-effort.
+    It is the RATE window and not the spend window. Spec §6.2 keeps the budget
+    and spend range at the full week, because the money was spent inside one
+    unchanged subscription window whatever the counter did;
+    ``_resolve_current_budget_window`` therefore does not call this.
+
+    #703 + #707 changes three things about the row it selects.
+
+    The instant is ``COALESCE(observed_at_utc, effective_reset_at_utc)``, the
+    ACCOUNTING instant. The effective one is hour-floored and display-only, and
+    starting the rate window at the floor puts up to an hour of pre-credit climb
+    inside the new epoch.
+
+    The match is by the WEEK — literally ``week_start_date``, the same predicate
+    ``_reset_aware_floor`` and ``_week_segment_boundaries`` use, and reached the
+    same way: the boundary and instant-range arms run only for a row that
+    records no week, so they can never re-narrow the selection for a row that
+    does. A manual credit leaves both boundary columns NULL, so the boundary
+    predicate could not see one at all and a `record-credit` week measured its
+    rate straight across the credit. Matching on an instant range instead of the
+    week is the same narrowing ``_reset_aware_floor`` was corrected for, and it
+    is benign here only because this function wants the latest credit.
+
+    And the read is account-scoped, so one account's credit does not move
+    another account's rate window.
+
+    The ``detected_at_utc`` bound is unchanged and still keeps historical replay
+    causal: a credit detected after the replayed instant must not erase samples
+    that were available at that instant. Ordering is by the accounting instant,
+    because a later-detected credit can carry an earlier one.
+
+    Returns the (possibly-shifted) ``week_start_at`` and a (possibly-filtered)
+    samples list. On any SQL or parse error, returns the inputs unchanged — the
+    override is best-effort.
     """
     try:
         end_iso = _normalize_week_boundary_dt(
             week_end_at.astimezone(dt.timezone.utc)
         ).isoformat(timespec="seconds")
+        acct_pred = "" if account_key is None else " AND account_key = ?"
+        acct_param: tuple = () if account_key is None else (account_key,)
         event_row = conn.execute(
-            "SELECT effective_reset_at_utc FROM week_reset_events "
-            "WHERE new_week_end_at = ? "
-            "  AND datetime(detected_at_utc) <= datetime(?) "
-            "ORDER BY datetime(detected_at_utc) DESC LIMIT 1",
-            (end_iso, now_utc.isoformat()),
+            "SELECT COALESCE(observed_at_utc, effective_reset_at_utc) "
+            "         AS accounting_at "
+            "  FROM week_reset_events "
+            " WHERE ( week_start_date = ? "
+            "         OR ( week_start_date IS NULL "
+            "              AND ( new_week_end_at = ? "
+            "                    OR ( unixepoch(effective_reset_at_utc) "
+            "                         >= unixepoch(?) "
+            "                         AND unixepoch(effective_reset_at_utc) "
+            "                             < unixepoch(?) ) ) ) )"
+            + acct_pred +
+            "   AND accounting_at IS NOT NULL "
+            "   AND datetime(detected_at_utc) <= datetime(?) "
+            " ORDER BY unixepoch(accounting_at) DESC LIMIT 1",
+            (week_start_at.date().isoformat(), end_iso,
+             week_start_at.isoformat(), end_iso) + acct_param
+            + (now_utc.isoformat(),),
         ).fetchone()
-        if event_row and event_row["effective_reset_at_utc"]:
+        if event_row and event_row["accounting_at"]:
             reset_dt = parse_iso_datetime(
-                event_row["effective_reset_at_utc"], "reset_event.effective"
+                event_row["accounting_at"], "reset_event.accounting"
             )
             if reset_dt > week_start_at:
                 week_start_at = reset_dt
@@ -298,17 +341,15 @@ def _apply_midweek_reset_override(
 
 
 def _resolve_current_budget_window(conn, now_utc, *, account_key=None):
-    """Return ``(effective_week_start_dt, week_end_dt)`` for the subscription
-    week containing ``now_utc``, honoring a mid-week reset re-anchor; or
-    ``None`` if no snapshot exists yet.
+    """Return ``(week_start_dt, week_end_dt)`` for the subscription week
+    containing ``now_utc``, or ``None`` if no snapshot exists yet.
 
     ``account_key`` (#341, spec §6 `*`-anchor): scopes the window to one
     account's snapshots (passed through to ``_fetch_current_week_snapshots``).
     ``None`` = merged / byte-identical.
 
-    Reuses the SAME reset-aware resolution forecast/weekly use
-    (``_fetch_current_week_snapshots`` + ``_apply_midweek_reset_override``)
-    so the budget display window and the alert-firing window (Task 3) agree.
+    Reuses ``_fetch_current_week_snapshots`` so the budget display window and
+    the alert-firing window (Task 3) agree.
     Unlike forecast's ``_load_forecast_inputs``, this does NOT short-circuit
     on an empty samples list — budget computes live spend from
     ``session_entries`` regardless of whether a usage snapshot landed inside
@@ -318,10 +359,12 @@ def _resolve_current_budget_window(conn, now_utc, *, account_key=None):
     fetched = _fetch_current_week_snapshots(conn, now_utc, account_key=account_key)
     if fetched is None:
         return None
-    week_start_at, week_end_at, samples = fetched
-    week_start_at, _samples = _apply_midweek_reset_override(
-        conn, week_start_at, week_end_at, samples, now_utc=now_utc
-    )
+    week_start_at, week_end_at, _samples = fetched
+    # #703 + #707 §6.2: the budget window is the FULL week. A credit is a
+    # counter discontinuity inside an unchanged subscription window, and the
+    # money was spent inside that window whatever the counter did — so a credit
+    # must not truncate the range the spend is summed over or the target it is
+    # compared against. Only the RATE window moves to the credit epoch.
     return (week_start_at, week_end_at)
 
 
@@ -462,6 +505,23 @@ def _boundary_table_present(conn, table: str) -> bool:
         raise BoundaryRecordsUnreadable(table) from exc
 
 
+def _boundary_table_has_journal_id(conn, table: str) -> bool:
+    """Whether `table` carries `journal_id`.
+
+    `journal_id` is an ALTER-added column, so a store that predates it — and a
+    hand-built fixture table — genuinely lacks it. Selecting it unconditionally
+    turns that into a failed read, which withholds the whole week; the
+    identifier is only used to dedup one credit recorded in two tables, so its
+    absence costs nothing but that dedup.
+    """
+    try:
+        return any(
+            str(row[1]) == "journal_id"
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall())
+    except sqlite3.Error as exc:
+        raise BoundaryRecordsUnreadable(table) from exc
+
+
 def _week_segment_boundaries(conn, week_start_at, week_end_at,
                              week_start_date, *, account_key=None):
     """The recorded reset and credit instants strictly inside the week.
@@ -493,17 +553,57 @@ def _week_segment_boundaries(conn, week_start_at, week_end_at,
     acct = "" if account_key is None else " AND account_key = ?"
     acct_p: tuple = () if account_key is None else (account_key,)
     stamps: list = []
+    # The unified rows' journal identifiers, so the retained
+    # `weekly_credit_floors` leg below can tell a credit it already has
+    # from one it does not.
+    unified_journal_ids: set = set()
     if _boundary_table_present(conn, "week_reset_events"):
         try:
-            stamps += [
-                (row[0], "reset") for row in conn.execute(
-                    "SELECT effective_reset_at_utc FROM week_reset_events"
-                    " WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?)"
-                    "   AND unixepoch(effective_reset_at_utc) <  unixepoch(?)"
-                    + acct,
-                    (week_start_at.isoformat(), week_end_at.isoformat())
-                    + acct_p,
-                ).fetchall()]
+            # #703 + #707: the two kinds now live in ONE table, so the kind is
+            # read from the row's shape. Both boundary columns NULL is the
+            # same-window credit — a counter discontinuity inside an unchanged
+            # window, which is what `weekly_credit_floors` used to hold and what
+            # `record-credit` writes. Anything else moved or cut a boundary and
+            # is a reset. The distinction is load-bearing here: the caller names
+            # the kind in its withholding cause, and a credit wins a shared
+            # instant because it is the one that writes the synthetic baseline
+            # the next segment is measured from.
+            # The instant is the ACCOUNTING one, so this reducer's segment
+            # boundaries land where `_reset_aware_floor` and the epoch resolver
+            # put them. The effective instant is hour-floored and display-only,
+            # and a segment measured from the floor starts up to an hour before
+            # the credit it names.
+            #
+            # Selection is by the week's own identity, with the instant range
+            # kept for a row that predates `week_start_date`. The range alone
+            # is the narrowing `_reset_aware_floor` also had to shed: a manual
+            # credit's hour-floored instant can precede the week bounds the
+            # caller passes.
+            has_jid = _boundary_table_has_journal_id(
+                conn, "week_reset_events")
+            rows = conn.execute(
+                "SELECT COALESCE(observed_at_utc, effective_reset_at_utc)"
+                "         AS accounting_at,"
+                "       old_week_end_at, new_week_end_at"
+                + (", journal_id" if has_jid else ", NULL AS journal_id") +
+                "  FROM week_reset_events"
+                " WHERE ( week_start_date = ?"
+                "         OR ( week_start_date IS NULL"
+                "              AND unixepoch(effective_reset_at_utc)"
+                "                  >= unixepoch(?)"
+                "              AND unixepoch(effective_reset_at_utc)"
+                "                  <  unixepoch(?) ) )"
+                + acct,
+                (week_start_date, week_start_at.isoformat(),
+                 week_end_at.isoformat()) + acct_p,
+            ).fetchall()
+            for row in rows:
+                stamps.append((
+                    row[0],
+                    "credit" if (row[1] is None and row[2] is None)
+                    else "reset"))
+                if row[3]:
+                    unified_journal_ids.add(row[3])
         except sqlite3.Error as exc:
             raise BoundaryRecordsUnreadable("week_reset_events") from exc
     if _boundary_table_present(conn, "weekly_credit_floors"):
@@ -520,12 +620,33 @@ def _week_segment_boundaries(conn, week_start_at, week_end_at,
             # rather than nearly true.
             raise BoundaryRecordsUnreadable("weekly_credit_floors")
         try:
+            # #703 + #707: one credit, one boundary. The two tables record the
+            # same credit under DIFFERENT instants — the floors row carries the
+            # hour-floored effective one and the unified row the exact observed
+            # one — so an instant-keyed dedup cannot see that they are the same
+            # credit and would emit two boundaries for it. `journal_id` can: the
+            # cutover stamps the floors row with the op that exported it, and
+            # that op's fold stamps the unified row with the same identifier.
+            #
+            # The state is believed unreachable — the cutover leaves the
+            # bootstrap segment INSIDE the cursor, so those ops fold only on a
+            # rebuild, and a rebuild materializes `weekly_credit_floors` empty —
+            # but "believed unreachable" is not a reason to produce a wrong
+            # segmentation if it is reached. This leg is retained for exactly
+            # one transitional state and is otherwise dead, so the cost of the
+            # guard is one column.
+            floor_has_jid = _boundary_table_has_journal_id(
+                conn, "weekly_credit_floors")
             stamps += [
                 (row[0], "credit") for row in conn.execute(
-                    "SELECT effective_at_utc FROM weekly_credit_floors"
+                    "SELECT effective_at_utc"
+                    + (", journal_id" if floor_has_jid
+                       else ", NULL AS journal_id") +
+                    "  FROM weekly_credit_floors"
                     " WHERE week_start_date = ?" + acct,
                     (week_start_date,) + acct_p,
-                ).fetchall()]
+                ).fetchall()
+                if not row[1] or row[1] not in unified_journal_ids]
         except sqlite3.Error as exc:
             raise BoundaryRecordsUnreadable("weekly_credit_floors") from exc
     found: dict = {}
@@ -1936,6 +2057,15 @@ _REPORT_PARTIAL_LEGEND = (
     "~ marks a week shorter than the nominal 7 days, so its $ / 1% is not "
     "directly comparable with a full week's."
 )
+#: #703 + #707 §6.4. A credited week renders as ONE row on its original
+#: boundaries, so without a marker nothing on screen explains a low percent late
+#: in a heavy week. Same vocabulary as `~` above and the 5h view's `⚡`.
+_REPORT_CREDIT_MARK = "+"
+_REPORT_CREDIT_LEGEND = (
+    "+ marks a week in which Anthropic credited the counter. The week keeps "
+    "its own boundaries; its $ / 1% is measured from the credit forward, over "
+    "the climb since it."
+)
 
 
 def _report_row_is_partial_week(row: "dict") -> bool:
@@ -2019,10 +2149,20 @@ def render_report_terminal(payload: "dict", *, tz) -> str:
     )
     table_rows: list[list[str]] = []
     any_partial = False
+    any_credited = False
     for idx, row in enumerate(display_trend, start=1):
         percent = "n/a" if row["weeklyPercent"] is None else f"{row['weeklyPercent']:.2f}%"
         cost = "n/a" if row["weeklyCostUSD"] is None else f"${row['weeklyCostUSD']:.6f}"
-        dpp = "n/a" if row["dollarsPerPercent"] is None else f"${row['dollarsPerPercent']:.6f}"
+        if row["dollarsPerPercent"] is not None:
+            dpp = f"${row['dollarsPerPercent']:.6f}"
+        elif row.get("dollarsPerPercentWithheld"):
+            # A withheld quantity prints its CAUSE rather than a misleading
+            # figure — the `explain` command's rule (#703 + #707 §6.3). "n/a"
+            # here would read as "no usage recorded", which is a different and
+            # wrong statement about a week that holds a credit.
+            dpp = row["dollarsPerPercentWithheld"]
+        else:
+            dpp = "n/a"
         week_window = c._format_week_window(
             row.get("weekStartDate"),
             row.get("weekEndDate"),
@@ -2034,7 +2174,12 @@ def render_report_terminal(payload: "dict", *, tz) -> str:
         # table of full weeks keeps its bytes apart from that column's width.
         partial = _report_row_is_partial_week(row)
         any_partial = any_partial or partial
-        index_cell = f"{_REPORT_PARTIAL_MARK}{idx}" if partial else str(idx)
+        credited = bool(row.get("credited"))
+        any_credited = any_credited or credited
+        index_cell = (
+            f"{_REPORT_PARTIAL_MARK if partial else ''}"
+            f"{_REPORT_CREDIT_MARK if credited else ''}{idx}"
+        )
         table_rows.append(
             [
                 index_cell,
@@ -2069,6 +2214,8 @@ def render_report_terminal(payload: "dict", *, tz) -> str:
     # gains no line at all.
     if any_partial:
         blocks.append(_REPORT_PARTIAL_LEGEND)
+    if any_credited:
+        blocks.append(_REPORT_CREDIT_LEGEND)
     return "\n".join(blocks)
 
 
@@ -2265,6 +2412,14 @@ def cmd_report(args: argparse.Namespace) -> int:
                     round(r.dollars_per_percent, 9)
                     if r.dollars_per_percent is not None else None
                 ),
+                # #703 + #707 §6.4/§6.6: additive under the additive-evolution
+                # rule, so no `schemaVersion` bump. `credited` says a credit
+                # occurred inside the window; `dollarsPerPercentWithheld` names
+                # the cause when the ratio is absent BECAUSE the epoch does not
+                # support a divisor, which a bare null cannot distinguish from
+                # "no usage recorded".
+                "credited": bool(r.credited),
+                "dollarsPerPercentWithheld": r.dpp_withheld_cause,
                 "usageCapturedAt": r.usage_captured_at,
                 "costCapturedAt": r.cost_captured_at,
                 "asOf": r.as_of,

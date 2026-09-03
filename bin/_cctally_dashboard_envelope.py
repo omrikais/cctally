@@ -1326,6 +1326,30 @@ def _forecast_quota_envelope(fc, cw, rate_change):
     }
 
 
+def _trend_withheld_key(row) -> dict:
+    """The `dollar_per_pct_withheld` key for one trend row, or no key at all.
+
+    #703 + #707 §6.3. `build_trend_view` resolves the cause per week, and both
+    trend arrays feed a `$/1%` column — ``weeks`` the panel's, ``history`` the
+    modal's. Without the cause the column renders the em-dash that reads as "no
+    usage recorded", which is a different and wrong statement about a week that
+    holds a credit.
+
+    The key is OMITTED rather than published as null when nothing is withheld,
+    the way the session rows' ``title`` key is. The client's
+    ``withheldDollarPerPctLabel`` treats an absent key and a null one
+    identically, a week that withholds nothing is the overwhelming majority,
+    and publishing the null on all twenty rows of the two arrays would move
+    every committed dashboard golden and the corpus-wide envelope oracle to
+    carry a value no consumer can distinguish from its absence.
+
+    ``getattr`` tolerates the minimal trend shapes — SimpleNamespace test rows,
+    older fixtures — that the sibling ``cost_usd`` key already tolerates.
+    """
+    cause = getattr(row, "dpp_withheld_cause", None)
+    return {} if cause is None else {"dollar_per_pct_withheld": cause}
+
+
 def _header_rate_and_delta(current_rate, current_week_start, trend):
     """`(dollar_per_pct, vs_last_week_delta)` from ONE current operand.
 
@@ -1595,22 +1619,39 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     week_lbl: "str | None" = None
     reset_at_utc: "dt.datetime | None" = None
     week_start_at_utc: "dt.datetime | None" = None
+    nominal_week_start_at_utc: "dt.datetime | None" = None
     if cw is not None:
         ws = getattr(cw, "week_start_at", None)
         we = getattr(cw, "week_end_at", None)
+        # #703 + #707 §6.1/§6.4 — the LABEL names the week, not the credit.
+        # `week_start_at` is the rate anchor and moves to the credit instant on
+        # a credited week, which is intended for the `$/1%` numerator and wrong
+        # for the window a person is shown: a credit moves no boundary.
+        # Labelling from it made the hero read `WEEK USAGE · Apr 16–Apr 20` over
+        # a week running Apr 13–Apr 20, over milestone rows dated before Apr 16,
+        # and against the credit tooltip's own promise that the week keeps its
+        # own boundaries.
+        #
+        # `displayed_week_start_at` falls back to the rate anchor, so legacy and
+        # fixture snapshots that construct `TuiCurrentWeek` without the field
+        # render exactly what they rendered before.
+        from _lib_view_models import displayed_week_start_at
+        ws_label = displayed_week_start_at(cw)
         # Full window "Apr 13–20" so the dashboard matches the TUI/report
         # headers and doesn't hide month crossings (e.g. "Apr 27–May 03").
         # En-dash U+2013 matches the TUI format at cmd_tui.
-        if ws is not None and we is not None:
+        if ws_label is not None and we is not None:
             week_lbl = (
-                f"{format_display_dt(ws, resolved_tz_obj, fmt='%b %d', suffix=False)}"
+                f"{format_display_dt(ws_label, resolved_tz_obj, fmt='%b %d', suffix=False)}"
                 f"–"
                 f"{format_display_dt(we, resolved_tz_obj, fmt='%b %d', suffix=False)}"
             )
-        elif ws is not None:
-            week_lbl = format_display_dt(ws, resolved_tz_obj, fmt='%b %d', suffix=False)
+        elif ws_label is not None:
+            week_lbl = format_display_dt(
+                ws_label, resolved_tz_obj, fmt='%b %d', suffix=False)
         reset_at_utc = we
         week_start_at_utc = ws
+        nominal_week_start_at_utc = ws_label
 
     # Header forecast_pct should match the projection that drove the
     # verdict pill next to it. The View (issue #57) carries the
@@ -1648,6 +1689,13 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
             "models":                 list(r.models),
             "week_start_at":          r.week_start_at,
             "week_end_at":            r.week_end_at,
+            # #703 + #707 §6.4/§6.6: additive, so no `schemaVersion` bump. The
+            # week no longer splits, so `credited` is what explains a low
+            # percent late in a heavy week; the withheld cause distinguishes
+            # "the epoch supports no divisor" from "no usage recorded", which a
+            # bare null cannot.
+            "credited":               r.credited,
+            "dollar_per_pct_withheld": r.dollar_per_pct_withheld_cause,
         }
 
     def _monthly_row_to_dict(r: "MonthlyPeriodRow") -> dict:
@@ -2045,13 +2093,32 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                 # serializing, the same way `five_hour_block` does.
                 "total_tokens":             getattr(cw, "total_tokens", 0),
                 "dollar_per_pct":           cw.dollars_per_percent,
-                # #556 S1 §3.5 — the effective cycle start, the companion of
-                # the already-published `reset_at_utc` end. Composition needs
-                # BOTH bounds to label the Claude leg's period, and the source
-                # version needs them to detect a nominal rollover (§3.6).
-                # Effective, not nominal: `_tui_build_current_week` stores this
-                # AFTER `_apply_midweek_reset_override`.
+                # #703 + #707 §6.3 — why the ratio above is null on a credited
+                # week. Additive and optional, the same shape the weekly rows
+                # publish, so the two surfaces on one screen state one cause.
+                # Without it the hero rendered `$0.000` beside `spent $0.00`,
+                # which is the misleading figure the withholding rule exists to
+                # replace. `getattr` keeps legacy fixture modules that construct
+                # `TuiCurrentWeek` without the field serializing.
+                "dollar_per_pct_withheld":  getattr(
+                    cw, "dpp_withheld_cause", None),
+                # #556 S1 §3.5/§3.6 — the RATE cycle start, the companion of
+                # the already-published `reset_at_utc` end.
+                # `_tui_build_current_week` stores this AFTER
+                # `_apply_midweek_reset_override`, so on a credited week it is
+                # the credit instant. The source version detects a nominal
+                # rollover from it (§3.6), and the Projects panel and its drill
+                # anchor their grid on it (#620).
                 "week_start_at":            _iso_z(week_start_at_utc),
+                # #703 + #707 §6.2 — the week's OWN start, which is the range
+                # `spent_usd` above covers. Published because composition labels
+                # the Claude leg's period over exactly the spend that leg
+                # reports, and `week_start_at` stopped being that bound when
+                # spend moved back to the full week: a leg built from it named a
+                # four-day window `Claude subscription week` and reported a full
+                # week's spend inside it. Additive and optional, so an older
+                # client and an older reader both keep working.
+                "nominal_week_start_at":    _iso_z(nominal_week_start_at_utc),
                 "reset_at_utc":             _iso_z(reset_at_utc),
                 "reset_in_sec":
                     None if reset_at_utc is None
@@ -2137,6 +2204,7 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                         # that predate this nullable field. ``None`` when the
                         # week has no cost snapshot.
                         "cost_usd":       round(_wc, 4) if (_wc := getattr(w, "weekly_cost_usd", None)) is not None else None,
+                        **_trend_withheld_key(w),
                     }
                     for w in snap.trend
                 ],
@@ -2151,6 +2219,7 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                         # #264 S3: additive weekly cost (see weeks[] above; same
                         # getattr tolerance for minimal/older trend shapes).
                         "cost_usd":       round(_wc, 4) if (_wc := getattr(w, "weekly_cost_usd", None)) is not None else None,
+                        **_trend_withheld_key(w),
                     }
                     for w in (snap.weekly_history or [])
                 ],

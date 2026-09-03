@@ -53,6 +53,7 @@ import time
 from _cctally_cache import (
     open_cache_db,
     scope_conversations_db_to_account,
+    sync_cache,
     sync_codex_cache,
     sync_claude_conversations,
     sync_codex_conversations,
@@ -63,6 +64,38 @@ from _lib_dashboard_json import (
     encode_dashboard_json_bytes_capped,
 )
 from _lib_retained_size import retained_size_bytes
+
+
+def _advance_live_tail_accounting(handler, changed, sync, label):
+    """Advance the accounting cache for paths a live tail just saw grow.
+
+    A conversation's rendered cost comes from the accounting store -- Claude
+    turns from ``session_entries``, Codex from ``codex_session_entries`` -- and
+    the periodic dashboard tick owns it.  A tail that advanced only the
+    transcript therefore streamed new turns whose cost stayed frozen at the last
+    ordinary tick's value, which reads as ``$0.00`` for a whole session whenever
+    that tick was certified caught up.  The ingest is targeted at exactly the
+    paths the tail resolved as changed, so this costs one file, never a walk.
+
+    Cost is an enhancement to the stream and never a precondition for it: a
+    contended or failed accounting write is logged and the transcript still
+    advances, because stalling the turns a reader is watching is strictly worse
+    than showing them beside a stale figure.  Callers that genuinely depend on
+    the accounting result -- the account-scoped Codex tail, which needs the
+    physical account-range decision committed before transcript ingest -- must
+    do their own ordered sync instead of calling this.
+    """
+    try:
+        accounting = open_cache_db()
+        try:
+            sync(accounting, only_paths=set(changed))
+        finally:
+            accounting.close()
+    except Exception as exc:  # noqa: BLE001
+        handler.log_error(
+            "api/conversation/events %s accounting sync failed: %r",
+            label, exc,
+        )
 
 # Live-tail watch-loop tuning — used ONLY by _handle_get_conversation_events_impl
 # below, so moved here with the events handler (spec §4.1 / §6).
@@ -1104,6 +1137,7 @@ def _bare_conversation_events(
         return cq.session_source_paths(conn, session_id) if conn else []
 
     def _ingest(changed):
+        _advance_live_tail_accounting(handler, changed, sync_cache, "claude")
         if account_key is None:
             return sync_claude_conversations(conn, only_paths=set(changed))
         before = conn.execute(
@@ -1274,6 +1308,8 @@ def _qualified_conversation_events(
 
         def _ingest(changed):
             if account_key is None:
+                _advance_live_tail_accounting(
+                    handler, changed, sync_codex_cache, "codex")
                 return sync_codex_conversations(conn, only_paths=set(changed))
             before = conn.execute(
                 "SELECT COUNT(*),MAX(id) FROM codex_conversation_messages "
@@ -1317,6 +1353,8 @@ def _qualified_conversation_events(
             return cq.session_source_paths(conn, native)
 
         def _ingest(changed):
+            _advance_live_tail_accounting(
+                handler, changed, sync_cache, "claude")
             if account_key is None:
                 return sync_claude_conversations(conn, only_paths=set(changed))
             before = conn.execute(

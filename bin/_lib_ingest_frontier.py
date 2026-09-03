@@ -7,6 +7,11 @@ every JSONL file.  Directory identity covers add/delete/rename; database and
 schema identity cover replacement/migration.  Missing, malformed, truncated,
 or otherwise ambiguous evidence always returns ``full``.
 
+Every one of those guards needs a writer to move something.  A provider whose
+hooks never run therefore holds its certificate while its sources grow, so a
+certificate also expires purely on elapsed time after
+``FRONTIER_CERTIFICATE_MAX_AGE_SECONDS``.
+
 The activity journal is private runtime state.  Diagnostic surfaces publish
 only the bounded ``mode``/``reason`` enums and counts, never its paths.
 """
@@ -17,6 +22,7 @@ import fcntl
 import os
 import pathlib
 import shlex
+import time
 from dataclasses import dataclass
 from _lib_retained_size import retained_size_bytes
 
@@ -25,6 +31,21 @@ _MARKER_LOCK_NAME = "dashboard-ingest-activity.lock"
 _MARKER_ROTATE_BYTES = 4 * 1024 * 1024
 _PROVIDERS = frozenset({"claude", "codex"})
 FRONTIER_MAX_BYTES = 16 * 1024 * 1024
+# Upper bound on how long one certificate may stand without an exhaustive
+# walk.  Every other guard compares evidence some writer must produce -- a hook
+# ticket, a directory mtime, a schema bump -- and appending to an
+# already-tracked file moves none of them.  Elapsed time is the only evidence
+# that accrues without anyone's cooperation, so this bound is what makes the
+# worst-case staleness finite when a provider's hooks are absent, disabled or
+# untrusted.  One walk per interval per provider is the whole cost.
+#
+# 120s measured against the operator's production store (2,854 Codex rollouts,
+# 197k accounting entries), where one accounting-only walk costs 2.1-23.1s with
+# a ~7s median.  That is roughly 6% of one core, against ~12% at 60s and the
+# ~44% the unconditional per-tick walk this replaced was measured at.  A live
+# tail advances its own conversation's accounting directly, so this bound is
+# the safety net for surfaces nobody is watching, not the interactive path.
+FRONTIER_CERTIFICATE_MAX_AGE_SECONDS = 120.0
 CODEX_FULL_WALK_COMPLETE_KEY = "dashboard_codex_full_walk_complete"
 _COMPLETE_KEYS = {
     "claude": "claude_ingest_walk_complete",
@@ -63,6 +84,15 @@ _CONVERSATION_PENDING_META_KEYS = (
     "codex_conversation_replay_from_zero_pending",
     "codex_find_projection_backfill_pending",
 )
+
+
+def _now() -> float:
+    """Monotonic seconds used to age certificates; never a wall clock.
+
+    Certificates are process-local, so a monotonic source keeps the bound
+    correct across system clock steps, suspend/resume and timezone changes.
+    """
+    return time.monotonic()
 
 
 def activity_marker_path(app_dir: pathlib.Path) -> pathlib.Path:
@@ -210,6 +240,10 @@ class _ProviderState:
     pending_identity: tuple[str, ...]
     directory_identity: dict[str, tuple[int, int, int, int]]
     guard_identity: dict[str, tuple[int, int, int, int]]
+    # Monotonic timestamp of the exhaustive walk this certificate rests on.
+    # The default is deliberately far in the past so a state built without one
+    # is already expired rather than trusted forever.
+    seeded_at: float = 0.0
 
 
 def _frontier_memory_stats(owner):
@@ -548,6 +582,7 @@ class DashboardIngestFrontier:
                 pending_identity=pending_identity,
                 directory_identity=_directory_identity(conn, provider, roots),
                 guard_identity=_guard_identity(guard_paths),
+                seeded_at=_now(),
             )
             if not _admit_frontier_state(self, provider, candidate):
                 return False
@@ -562,6 +597,11 @@ class DashboardIngestFrontier:
         state = self._states.get(provider)
         if state is None:
             return FrontierPlan(provider, "full", reason="unseeded")
+        # Checked before every other guard: an expired certificate needs a full
+        # walk whatever the remaining evidence says, and answering here keeps
+        # the expiry itself free of database and filesystem work.
+        if _now() - state.seeded_at >= FRONTIER_CERTIFICATE_MAX_AGE_SECONDS:
+            return FrontierPlan(provider, "full", reason="certificate_expired")
         marker = activity_marker_path(self.app_dir)
         try:
             if _database_identity(conn) != state.db_identity:
@@ -803,6 +843,7 @@ class ConversationSyncFrontier:
                 directory_identity=_conversation_directory_identity(
                     conn, provider, roots),
                 guard_identity=_guard_identity(guard_paths),
+                seeded_at=_now(),
             )
             if not _admit_frontier_state(self, provider, candidate):
                 return False
@@ -817,6 +858,11 @@ class ConversationSyncFrontier:
         state = self._states.get(provider)
         if state is None:
             return FrontierPlan(provider, "full", reason="unseeded")
+        # Checked before every other guard: an expired certificate needs a full
+        # walk whatever the remaining evidence says, and answering here keeps
+        # the expiry itself free of database and filesystem work.
+        if _now() - state.seeded_at >= FRONTIER_CERTIFICATE_MAX_AGE_SECONDS:
+            return FrontierPlan(provider, "full", reason="certificate_expired")
         marker = activity_marker_path(self.app_dir)
         try:
             if _database_identity(conn) != state.db_identity:

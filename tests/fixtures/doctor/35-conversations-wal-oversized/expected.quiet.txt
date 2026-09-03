@@ -9,7 +9,7 @@ Hooks
 Auth
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Pending migrations       57 pending
+  ⚠ Pending migrations       58 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ⚠ conversations.db WAL size oversized — conversations.db WAL far above its cap
       → Run `cctally db checkpoint --db conversations` to drain the WAL.

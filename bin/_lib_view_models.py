@@ -75,7 +75,7 @@ from __future__ import annotations
 import datetime as dt
 import pathlib
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dc_replace
 from typing import Any
 
 
@@ -149,6 +149,15 @@ class TuiTrendRow:
     range_start_iso: str | None = None
     range_end_iso: str | None = None
     freshness: dict | None = None             # {label, captured_at, age_seconds}
+    # ---- #703 + #707 §6.3/§6.4 ----
+    #: A credit occurred inside this window. Without it nothing on screen
+    #: explains a low percent late in a heavy week, because the week no longer
+    #: splits.
+    credited: bool = False
+    #: Why `dollars_per_percent` is None on a credited week, or None when it is
+    #: not withheld. A withheld quantity prints its cause rather than a
+    #: misleading `$0.00`, following the `explain` command's rule.
+    dpp_withheld_cause: str | None = None
 
 
 @dataclass
@@ -173,6 +182,13 @@ class WeeklyPeriodRow:
     models: list[dict[str, Any]]
     week_start_at: str                  # ISO-8601 with tz, from SubWeek.start_ts
     week_end_at: str                    # ISO-8601 with tz, from SubWeek.end_ts
+    # ---- #703 + #707 §6.3/§6.4 ----
+    #: A credit occurred inside this window. The week no longer splits, so
+    #: without this nothing explains a low percent late in a heavy week.
+    credited: bool = False
+    #: Why `dollar_per_pct` is None on a credited week, or None when it is not
+    #: withheld.
+    dollar_per_pct_withheld_cause: str | None = None
 
 
 @dataclass
@@ -622,6 +638,7 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
     parse_iso = _cct_core.parse_iso_datetime
     make_ref = _cct_core.make_week_ref
     get_usage = _cct_core.get_latest_usage_for_week
+    c = _cctally()
 
     # Build asc overlay + asc WeeklyPeriodRow list first; reverse later.
     asc_overlay: list = []
@@ -655,7 +672,12 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
         used_pct = None
         if usage_row is not None and usage_row["weekly_percent"] is not None:
             used_pct = float(usage_row["weekly_percent"])
-        dpp = (b.cost_usd / used_pct) if (used_pct and used_pct > 0) else None
+        # #703 + #707 §6.3: on a credited week both halves of the ratio come
+        # from the epoch. The displayed `cost_usd` stays the full week's spend.
+        credit = c._week_ref_credit_epoch(conn, ref, account_key=account_key)
+        dpp, dpp_withheld = _dollars_per_percent_for_week(
+            c, ref, credit=credit, percent=used_pct, cost_usd=b.cost_usd,
+            account_key=account_key, skip_sync=True)
         asc_overlay.append((used_pct, dpp))
 
         # delta_cost_pct vs the prior (older) bucket. asc order: prior
@@ -692,6 +714,8 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
             ),
             week_start_at=sw.start_ts,
             week_end_at=sw.end_ts,
+            credited=credit is not None,
+            dollar_per_pct_withheld_cause=dpp_withheld,
         ))
         total_cost += b.cost_usd
         total_tok += b.total_tokens
@@ -759,6 +783,81 @@ class TrendView:
     period_start: "dt.datetime | None" = None
     period_end: "dt.datetime | None" = None
     display_tz_label: str = ""
+
+
+
+#: Why a credited week's `$/1%` is withheld. A withheld quantity prints its
+#: cause rather than a misleading `$0.00`, which is the `explain` command's rule
+#: and the reason a rendered ratio can never come from a divisor the epoch does
+#: not support.
+DPP_WITHHELD_NO_CLIMB = "no-climb-since-credit"
+
+
+def displayed_week_start_at(cw):
+    """The instant every DISPLAYED current-week window is built from (§6.1/§6.2).
+
+    ``TuiCurrentWeek.week_start_at`` is the RATE anchor. On a credited week it
+    moves to the credit's accounting instant, which is the range the `$/1%`
+    numerator, the Projects grid and the Blocks panel are taken over, because a
+    credit is a counter discontinuity and a rate measured across one is measured
+    over two different counters.
+
+    Nothing a person READS is that range. §6.1 keeps the week's own boundaries,
+    because a credit moves none; §6.2 keeps spend and budget at the full week,
+    because the money was spent inside one unchanged subscription window whatever
+    the counter did. So the week label, the headline spend, and the spend's own
+    decompositions all start here instead.
+
+    Read through ``getattr``: legacy fixture modules and render-level test
+    doubles construct a current-week object without the field, and they must keep
+    rendering exactly what they rendered before.
+    """
+    return getattr(cw, "nominal_week_start_at", None) or getattr(
+        cw, "week_start_at", None)
+
+
+def _dollars_per_percent_for_week(
+    c, week_ref, *, credit, percent, cost_usd, account_key, skip_sync,
+):
+    """The `$/1%` for one week, and the cause when it is withheld (§6.3).
+
+    An UNCREDITED week keeps the existing full-week numerator over the absolute
+    stored percent, unchanged, so no golden without a credit moves.
+
+    A CREDITED week takes both halves from the epoch:
+
+        numerator   = cost over [credit instant, week end]
+        denominator = current_pct - observed_post_credit_pct
+
+    When the denominator is zero or negative — the counter has not yet climbed
+    past the level it was credited to — the ratio is WITHHELD with a typed cause
+    rather than rendered.
+
+    A credit that records no landing level is a row written before #707, and
+    there is no honest divisor to build from it. Such a week falls back to the
+    full-week ratio, which is exactly what it rendered before this change.
+    """
+    if cost_usd is None or percent is None:
+        return None, None
+    if credit is None or credit["observed_post_credit_pct"] is None:
+        if percent > 0:
+            return cost_usd / percent, None
+        return None, None
+    landed = float(credit["observed_post_credit_pct"])
+    denominator = percent - landed
+    if denominator <= 0:
+        return None, DPP_WITHHELD_NO_CLIMB
+    accounting_at = credit["accounting_at"]
+    if not accounting_at or not week_ref.week_end_at:
+        if percent > 0:
+            return cost_usd / percent, None
+        return None, None
+    epoch_ref = dc_replace(week_ref, week_start_at=accounting_at)
+    numerator = c._compute_cost_for_weekref(
+        epoch_ref, skip_sync=skip_sync, account_key=account_key)
+    if numerator is None:
+        return None, None
+    return numerator / denominator, None
 
 
 def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
@@ -844,13 +943,12 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
     # week_refs come newest-first from get_recent_weeks; reverse.
     chrono = list(reversed(week_refs))
 
-    # Split-key set (Bug D): credited weeks appear twice in week_refs
-    # with identical WeekRef.key. Pin as_of_utc=week_end_at for those
-    # so each segment finds its own latest snapshot.
-    split_keys = {
-        r.key for r in week_refs
-        if sum(1 for x in week_refs if x.key == r.key) > 1
-    }
+    # The Bug-D split-key set is gone with the split it existed for. A credited
+    # week used to appear twice in `week_refs` under one `WeekRef.key`, and each
+    # duplicate needed `as_of_utc` pinned to its own end to find its own latest
+    # snapshot. #703 + #707 §6.1 stopped synthesizing the second reference, and
+    # `get_recent_weeks` groups by `week_start_date`, so the key is unique by
+    # construction and the set could only ever be empty.
 
     try:
         _fresh_cfg = c._get_oauth_usage_config(c.load_config())
@@ -859,15 +957,11 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
 
     intermediate: list = []
     for week_ref in chrono:
-        usage = get_usage(
-            conn, week_ref,
-            as_of_utc=(
-                week_ref.week_end_at if week_ref.key in split_keys else None
-            ),
-            account_key=account_key,
-        )
+        usage = get_usage(conn, week_ref, account_key=account_key)
         usage_captured_at = usage["captured_at_utc"] if usage else None
-        if c._week_ref_has_reset_event(conn, week_ref):
+        credit = c._week_ref_credit_epoch(
+            conn, week_ref, account_key=account_key)
+        if credit is not None:
             if (
                 use_weekref_cost_cache
                 and week_ref.week_start_at
@@ -914,13 +1008,23 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
                 else None
             )
         percent = float(usage["weekly_percent"]) if usage else None
-        ratio = (
-            cost_usd / percent
-            if (cost_usd is not None and percent and percent > 0)
-            else None
-        )
+        # #703 + #707 §6.3. For a CREDITED week both halves of the ratio come
+        # from the epoch, not just the numerator. Pairing post-credit spend with
+        # the absolute stored percent is wrong: if a credit lands at 2% and the
+        # counter climbs to 3%, that spend bought ONE percentage point, not
+        # three, and dividing by three understates the rate threefold.
+        # Immediately after a credit the absolute divisor is the landing level
+        # itself against approximately zero spend.
+        #
+        # The displayed total cost stays the FULL week's spend (§6.3), so the
+        # numerator here is a separate computation over the epoch's own range.
+        ratio, withheld = _dollars_per_percent_for_week(
+            c, week_ref, credit=credit, percent=percent, cost_usd=cost_usd,
+            account_key=account_key, skip_sync=skip_sync)
         intermediate.append({
             "week_ref": week_ref,
+            "credited": credit is not None,
+            "dpp_withheld_cause": withheld,
             "used_pct": percent,
             "cost_usd": cost_usd,
             "dpp": ratio,
@@ -1021,6 +1125,8 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
             as_of=as_of,
             range_start_iso=range_start_iso,
             range_end_iso=range_end_iso,
+            credited=bool(d["credited"]),
+            dpp_withheld_cause=d["dpp_withheld_cause"],
             freshness=freshness,
         ))
         if dpp is not None:

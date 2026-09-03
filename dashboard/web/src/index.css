@@ -564,6 +564,16 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   font-weight: inherit;
 }
 .hero-ingest-backlog-label-compact { display: none; }
+/* #703 + #707 §6.3 — the `$ / 1%` cause on the hero's spend zone. Scoped under
+   `.hs-sub` so it beats the bright metric treatment `.hs-sub span` gives every
+   other value in that line, and amber for the same "this needs explaining" role
+   the `Credited` pill carries. It replaces the figure, so it must not read as
+   one. */
+.hs-sub .hero-dpp-withheld {
+  color: var(--accent-amber);
+  font-weight: 600;
+  font-variant-numeric: normal;
+}
 /* #556 S1 A7 — the same deliberate-absence treatment `.hu-num` already had.
    Without it the em-dash rendered in the bright accent-green of a real figure,
    which reads as a value rather than as an intentional blank. */
@@ -2416,6 +2426,18 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 .mcw-mini .s .v { font-weight: 700; font-size: var(--fs-data); margin-left: 6px; color: var(--text); }
 .mcw-mini .s .v.v-magenta { color: var(--accent-magenta); }
 .mcw-mini .s .v.v-cyan    { color: var(--accent-cyan); }
+/* #703 + #707 §6.3 — the `$/1%` cell when the epoch supports no divisor. It
+   holds the CAUSE, so it takes the amber "this needs explaining" role the
+   `Credited` pill and the weekly detail card's own withheld cell already carry,
+   and it drops to prose weight: at `--fs-data` / 700 a 21-character phrase
+   would dominate a row of short figures. Placed after the two colour variants
+   it replaces. */
+.mcw-mini .s .v.withheld {
+  color: var(--accent-amber);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  font-variant-numeric: normal;
+}
 
 /* #564 — the per-account cycle table's fallback qualifier. It sits under the
    figure in the same numeric cell, in the dim eyebrow vocabulary the table's
@@ -3583,6 +3605,19 @@ mark.current {
   letter-spacing: 0.5px; text-transform: uppercase; font-weight: 700;
 }
 
+/* Weekly panel + weekly detail card — "[CREDITED]" pill on a week Anthropic
+   credited the counter inside (#703 + #707 §6.4). Same geometry as
+   `.pill-current` beside it, and a distinct amber fill so the two read as two
+   different statements about the row rather than one repeated badge. Amber is
+   the same "this needs explaining" role it already carries on `.chip-stale`. */
+.pill-credited {
+  display: inline-block; margin-left: 6px; font-size: 9px;
+  padding: 1px 6px; border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--accent-amber) 18%, transparent);
+  color: var(--accent-amber);
+  letter-spacing: 0.5px; text-transform: uppercase; font-weight: 700;
+}
+
 /* Weekly / Monthly panels — Δ-vs-prior chip (panel rows + modal big line). */
 .delta {
   font-size: var(--fs-eyebrow); padding: 1px 6px; border-radius: var(--radius-xs);
@@ -3724,6 +3759,41 @@ mark.current {
 .detail-card .stats2 .s { font-size: var(--fs-meta); }
 .detail-card .stats2 .k { color: var(--text-dim); margin-right: 6px; }
 .detail-card .stats2 .v { color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums; }
+/* The `$/1%` value when the epoch supports no divisor (#703 + #707 §6.3). It
+   renders the CAUSE, so it is prose rather than a figure: tabular figures would
+   letter-space it oddly, and the em-dash it replaces read as "no usage
+   recorded", which is a different and wrong statement about a credited week.
+   Placed after the base rule it overrides rather than relying on specificity
+   alone. */
+.detail-card .stats2 .v.withheld {
+  color: var(--accent-amber); font-weight: 600; font-variant-numeric: normal;
+}
+/* The cell that holds that cause, rather than a figure. The weekly variant
+   fills two of the five tracks, so a 21-character phrase was confined to an
+   85px track and wrapped to three lines with a word orphaned on the label line,
+   while ~255px of grid sat empty to its right. `2 / -1` gives it every track
+   after `Used %` at desktop and resolves to the same single track it already
+   had inside the mobile `1fr 1fr` grid, so no media query is involved. */
+.detail-card .stats2 .s-wide { grid-column: 2 / -1; }
+
+/* #703 + #707 §6.3 — the `$/1%` TABLE cell when the epoch supports no divisor,
+   on all three tables that render that column: the Weekly modal's own table,
+   the `$/1%` Trend panel and the Trend modal. It holds the SHORT cause, so it
+   takes the same amber "this needs explaining" role the `Credited` pill and the
+   detail card's own withheld cell carry, and it drops the tabular figures the
+   surrounding cells use, which letter-space prose oddly.
+
+   No `white-space: nowrap`. Table layout is auto here, so the column's floor is
+   its longest single word (`climb`, `Withheld`) and the table cannot overflow
+   its container at any width; forcing the whole phrase onto one line would
+   remove that floor and push the table wide instead. The one width the column
+   never has to survive is the phone: the Weekly table hides columns 4 and 5
+   there, and the trend composition drops to one section at 640px. */
+.dpp-withheld {
+  color: var(--accent-amber);
+  font-weight: 600;
+  font-variant-numeric: normal;
+}
 
 .history-table { width: 100%; border-collapse: collapse; font-size: var(--fs-meta); }
 .history-table thead th {

@@ -190,6 +190,132 @@ def add_column_if_missing(
     return True
 
 
+# --------------------------------------------------------------------------
+# week_reset_events reshape for the unified credit record (#703 + #707)
+# --------------------------------------------------------------------------
+#
+# The unified credit record changed `week_reset_events` in three ways that
+# `CREATE TABLE IF NOT EXISTS` cannot deliver to a store whose table already
+# exists: six fact columns were added, both boundary columns became nullable,
+# and the row constraint moved from the boundary pair to
+# `(account_key, credit_key)`. Only a rename-recreate-copy applies all three.
+#
+# The epoch bump alone covers ONE of the two upgrade paths. A store above
+# `LEGACY_STATS_HEAD` defers to a rebuild that materializes a fresh scratch
+# index through the current DDL, so it arrives correct. A PRE-CUTOVER store at
+# `user_version <= 13` takes the other path: the schema apply is a no-op
+# against the table that is already there, the cutover stamps the new epoch in
+# place, and every later open fast-returns at the epoch gate before any schema
+# work runs. Without this reshape such a store REPORTS the current epoch while
+# missing every fact column and keeping both NOT NULL boundaries — a state with
+# no path back, in which the manual credit fold, the automatic fold and every
+# fact read raise.
+#
+# `add_column_if_missing` is not sufficient on its own, because it cannot relax
+# a NOT NULL constraint or replace a UNIQUE, and the manual fold inserts NULL
+# into both boundary columns.
+#
+# Split in two so the canonical DDL has exactly one copy — the one in
+# `_cctally_core.open_db`. `begin_week_reset_events_reshape` renames the legacy
+# table out of the way; the caller's own `CREATE TABLE IF NOT EXISTS` then
+# builds the current shape; `finish_week_reset_events_reshape` copies the rows
+# across and drops the legacy table. `sqlite_master.sql` for the recreated
+# table is therefore byte-identical to a freshly created one, which the rebuild
+# validator's schema fingerprint requires.
+
+#: Where the pre-reshape table is parked between the two halves. A leftover
+#: under this name means a previous attempt crashed after the rename; the next
+#: open resumes from it rather than starting over.
+WEEK_RESET_EVENTS_RESHAPE_OLD = "week_reset_events_pre_1012"
+
+#: Presence of these decides whether a reshape is needed. They arrived together
+#: with the nullability and constraint changes, so any store missing them is a
+#: store that predates all three.
+_WEEK_RESET_EVENTS_FACT_COLUMNS = frozenset({
+    "week_start_date", "observed_at_utc", "confirming_capture_at_utc",
+    "observed_post_credit_pct", "credit_key", "credit_order",
+})
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone() is not None
+
+
+def begin_week_reset_events_reshape(conn: sqlite3.Connection) -> bool:
+    """Park a pre-#703 `week_reset_events` aside; return whether one is parked.
+
+    Returns True when the caller must call `finish_week_reset_events_reshape`
+    after creating the current-shape table — either because this call renamed a
+    legacy table, or because a previous attempt already did and crashed before
+    copying.
+    """
+    if _table_exists(conn, WEEK_RESET_EVENTS_RESHAPE_OLD):
+        return True
+    if not _table_exists(conn, "week_reset_events"):
+        return False
+    cols = {
+        str(r[1])
+        for r in conn.execute("PRAGMA table_info(week_reset_events)").fetchall()
+    }
+    if _WEEK_RESET_EVENTS_FACT_COLUMNS <= cols:
+        return False
+    conn.execute(
+        f"ALTER TABLE week_reset_events "
+        f"RENAME TO {WEEK_RESET_EVENTS_RESHAPE_OLD}"
+    )
+    return True
+
+
+def finish_week_reset_events_reshape(conn: sqlite3.Connection) -> None:
+    """Copy the parked rows into the current-shape table and drop the parked one.
+
+    `id` is copied explicitly. `percent_milestones.reset_event_id` names a
+    credit by that identifier and the foreign keys in this codebase are
+    documentation-only, so letting AUTOINCREMENT renumber the rows would
+    silently re-point every milestone at a different credit with nothing
+    raising.
+
+    Columns present only on the legacy table are dropped and columns present
+    only on the new one arrive NULL, which is the honest value: NULL on a fact
+    column means the row predates the change, exactly as it does for a legacy
+    `wr:` event replayed on the rebuild path.
+
+    The parked table's indexes followed it through the rename and still hold
+    the `idx_week_reset_events_*` names, so `DROP TABLE` here is what frees
+    those names for the caller's own `CREATE INDEX IF NOT EXISTS` to rebuild
+    them against the new table. Dropping them any later would leave the new
+    table unindexed while the statements that would have built them no-op.
+    """
+    if not _table_exists(conn, WEEK_RESET_EVENTS_RESHAPE_OLD):
+        return
+    old_cols = [
+        str(r[1])
+        for r in conn.execute(
+            f"PRAGMA table_info({WEEK_RESET_EVENTS_RESHAPE_OLD})").fetchall()
+    ]
+    new_cols = {
+        str(r[1])
+        for r in conn.execute("PRAGMA table_info(week_reset_events)").fetchall()
+    }
+    shared = [name for name in old_cols if name in new_cols]
+    projection = ", ".join(f'"{name}"' for name in shared)
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            f"INSERT INTO week_reset_events ({projection}) "
+            f"SELECT {projection} FROM {WEEK_RESET_EVENTS_RESHAPE_OLD}"
+        )
+        conn.execute(f"DROP TABLE {WEEK_RESET_EVENTS_RESHAPE_OLD}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 # === Region 2: Migration framework + dispatcher (was bin/cctally:10952-11229) ===
 
 _MIGRATION_NAME_RE = re.compile(r"^\d{3}_[a-z0-9_]+$")
@@ -3381,6 +3507,13 @@ def _migration_observed_pre_credit_pct(conn: sqlite3.Connection) -> None:
         switches from ``round(weekly_percent,1) = round(?,1)`` to
         ``ABS(weekly_percent - ?) < 1.0``.
 
+    That companion predicate is HISTORY, not current behaviour: #703 + #707
+    replaced the tolerance band with the evidence rules in
+    ``bin/_lib_credit_selection.py``, because the band compared the stored
+    percent against a remembered level rather than against evidence. The column
+    this migration adds is still written and still read; only the predicate that
+    consumed it changed.
+
     Idempotent: a second invocation finds the column already present
     and returns. Empty-column fast path: when the live CREATE TABLE
     already carries the column (fresh install), return without an ALTER
@@ -4206,10 +4339,18 @@ def _apply_codex_accounting_change_ledger(conn: sqlite3.Connection) -> None:
 class SchemaDeliveryObject(NamedTuple):
     """One re-derivable schema object declared by a version-gated apply.
 
-    ``kind`` is one of ``table``, ``view``, ``trigger`` or ``index``.  The two
-    store registries and their structural tests cover every explicit object of
-    those kinds, including virtual tables while excluding SQLite-created FTS
-    shadow objects.
+    ``kind`` is one of ``table``, ``view``, ``trigger``, ``index`` or
+    ``column``.  The two store registries and their structural tests cover
+    every explicit object of those kinds, including virtual tables while
+    excluding SQLite-created FTS shadow objects.
+
+    A ``column`` record is named ``<table>.<column>`` and covers exactly the
+    columns a schema apply declares with ``add_column_if_missing``.  Those
+    are the columns whose delivery depends on the version gate, because a
+    store created from scratch receives them from the CREATE TABLE body
+    instead.  #682 added two such declarations with no companion migration,
+    the head never moved, and every already-current store kept the old table
+    shape while the shipped code assumed the new one.
 
     ``ensure_helper`` names the shared module-level function that owns the DDL,
     or is ``None`` when the statement is written inline in the schema body.
@@ -4243,6 +4384,42 @@ class SchemaDeliveryObject(NamedTuple):
 #: identity so even a same-kind remove-one/add-one substitution fails.
 CACHE_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
     # ── frozen baseline: audited objects without handler-owned delivery DDL ──
+    # Columns predating this registry's column kind. Every one was verified
+    # present in a real production cache.db stamped at head 44, so the
+    # baseline is an observation rather than an assumption. Several arrived
+    # alongside a migration that backfilled their VALUES, but no handler owns
+    # the ALTER itself, so naming one here would fail the delivery assertion.
+    SchemaDeliveryObject("column", "codex_session_entries.account_key", None, None),
+    SchemaDeliveryObject("column", "codex_session_entries.conversation_key", None, None),
+    SchemaDeliveryObject("column", "codex_session_entries.source_root_key", None, None),
+    SchemaDeliveryObject("column", "codex_session_files.account_key", None, None),
+    SchemaDeliveryObject("column", "codex_session_files.last_conversation_key", None, None),
+    SchemaDeliveryObject("column", "codex_session_files.last_native_thread_id", None, None),
+    SchemaDeliveryObject("column", "codex_session_files.last_parent_thread_id", None, None),
+    SchemaDeliveryObject("column", "codex_session_files.last_root_thread_id", None, None),
+    SchemaDeliveryObject("column", "codex_session_files.last_turn_id", None, None),
+    SchemaDeliveryObject("column", "codex_session_files.source_root_key", None, None),
+    SchemaDeliveryObject("column", "conversation_messages.attribution_plugin", None, None),
+    SchemaDeliveryObject("column", "conversation_messages.attribution_skill", None, None),
+    SchemaDeliveryObject("column", "conversation_messages.search_thinking", None, None),
+    SchemaDeliveryObject("column", "conversation_messages.search_tool", None, None),
+    SchemaDeliveryObject("column", "conversation_messages.source_tool_use_id", None, None),
+    SchemaDeliveryObject("column", "conversation_messages.stop_reason", None, None),
+    SchemaDeliveryObject("column", "conversation_sessions.git_branch", None, None),
+    SchemaDeliveryObject("column", "conversation_sessions.models_json", None, None),
+    SchemaDeliveryObject("column", "conversation_sessions.title", None, None),
+    SchemaDeliveryObject("column", "quota_window_snapshots.account_key", None, None),
+    SchemaDeliveryObject("column", "quota_window_snapshots.canonical_resets_at_utc", None, None),
+    SchemaDeliveryObject("column", "quota_window_snapshots.observed_model", None, None),
+    SchemaDeliveryObject("column", "session_entries.account_key", None, None),
+    SchemaDeliveryObject("column", "session_entries.cache_create_1h_tokens", None, None),
+    SchemaDeliveryObject("column", "session_entries.cache_create_5m_tokens", None, None),
+    SchemaDeliveryObject("column", "session_entries.mutation_min_ts", None, None),
+    SchemaDeliveryObject("column", "session_entries.mutation_seq", None, None),
+    SchemaDeliveryObject("column", "session_entries.speed", None, None),
+    SchemaDeliveryObject("column", "session_files.account_key", None, None),
+    SchemaDeliveryObject("column", "session_files.project_path", None, None),
+    SchemaDeliveryObject("column", "session_files.session_id", None, None),
     SchemaDeliveryObject("index", "idx_codex_conv_msgs_conversation", None, None),
     SchemaDeliveryObject("index", "idx_codex_conv_msgs_source", None, None),
     SchemaDeliveryObject("index", "idx_codex_conv_rollups_recent", None, None),
@@ -4301,6 +4478,15 @@ CACHE_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
     SchemaDeliveryObject("trigger", "conv_title_fts_ai", None, None),
     SchemaDeliveryObject("trigger", "conv_title_fts_au", None, None),
     # ── post-baseline: each migration owns the object's delivery DDL ──
+    SchemaDeliveryObject(
+        "column", "codex_session_files.ingest_complete", None,
+        "038_codex_session_files_ingest_complete"),
+    SchemaDeliveryObject(
+        "column", "codex_conversation_rollups.render_revision", None,
+        "045_conversation_render_revision_columns"),
+    SchemaDeliveryObject(
+        "column", "conversation_sessions.render_revision", None,
+        "045_conversation_render_revision_columns"),
     SchemaDeliveryObject(
         "index", "idx_entries_physical", None,
         "020_session_entries_physical_unique"),
@@ -5368,6 +5554,22 @@ def _apply_codex_find_projection_schema(conn: sqlite3.Connection) -> None:
 #: projection is the one audited family with handler-owned delivery DDL.
 CONVERSATIONS_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
     # ── frozen baseline: audited objects without handler-owned delivery DDL ──
+    # Same column-kind baseline rule as the cache registry above. This store is
+    # projected from the cache schema, so most of these are the same physical
+    # declarations scoped to the tables conversations.db actually carries; all
+    # twelve were verified present in a real production conversations.db.
+    SchemaDeliveryObject("column", "codex_conversation_events.account_key", None, None),
+    SchemaDeliveryObject("column", "codex_conversation_messages.account_key", None, None),
+    SchemaDeliveryObject("column", "conversation_messages.account_key", None, None),
+    SchemaDeliveryObject("column", "conversation_messages.attribution_plugin", None, None),
+    SchemaDeliveryObject("column", "conversation_messages.attribution_skill", None, None),
+    SchemaDeliveryObject("column", "conversation_messages.search_thinking", None, None),
+    SchemaDeliveryObject("column", "conversation_messages.search_tool", None, None),
+    SchemaDeliveryObject("column", "conversation_messages.source_tool_use_id", None, None),
+    SchemaDeliveryObject("column", "conversation_messages.stop_reason", None, None),
+    SchemaDeliveryObject("column", "conversation_sessions.git_branch", None, None),
+    SchemaDeliveryObject("column", "conversation_sessions.models_json", None, None),
+    SchemaDeliveryObject("column", "conversation_sessions.title", None, None),
     SchemaDeliveryObject(
         "index", "idx_codex_conv_messages_account_conversation", None, None),
     SchemaDeliveryObject("index", "idx_codex_conv_msgs_conversation", None, None),
@@ -5411,7 +5613,13 @@ CONVERSATIONS_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
     SchemaDeliveryObject("trigger", "conv_title_fts_ad", None, None),
     SchemaDeliveryObject("trigger", "conv_title_fts_ai", None, None),
     SchemaDeliveryObject("trigger", "conv_title_fts_au", None, None),
-    # ── post-baseline: migration 004 owns the shared projection helper ──
+    # ── post-baseline: each migration owns the object's delivery DDL ──
+    SchemaDeliveryObject(
+        "column", "codex_conversation_rollups.render_revision", None,
+        "008_conversation_render_revision"),
+    SchemaDeliveryObject(
+        "column", "conversation_sessions.render_revision", None,
+        "008_conversation_render_revision"),
     SchemaDeliveryObject(
         "index", "idx_codex_find_projection_conversation_order",
         "_apply_codex_find_projection_schema", "004_codex_find_projection"),
@@ -8482,6 +8690,60 @@ def _044_codex_accounting_change_ledger(conn: sqlite3.Connection) -> None:
     The DDL is idempotent and the dispatcher owns the applied marker.
     """
     _apply_codex_accounting_change_ledger(conn)
+    conn.commit()
+
+
+@cache_migration("045_conversation_render_revision_columns")
+def _045_conversation_render_revision_columns(conn: sqlite3.Connection) -> None:
+    """Deliver #682's two ``render_revision`` columns to an existing store.
+
+    ``_apply_cache_schema`` already declares both columns with
+    ``add_column_if_missing``, so a store created from scratch has them. That
+    schema pass is VERSION-GATED though: ``open_cache_db`` runs it only when
+    ``PRAGMA user_version`` differs from ``len(_CACHE_MIGRATIONS)``. #682
+    shipped the two declarations with no companion migration, so the head never
+    moved, an already-current store never re-ran the apply, and the columns
+    reached new installs only. Registering here bumps the head, which is the
+    same mechanism migrations 029, 031 and 044 rely on and is stated there in
+    the same words.
+
+    The consequence on an unmigrated store was total rather than partial:
+    ``_recompute_conversation_sessions`` runs
+    ``UPDATE conversation_sessions SET render_revision=?`` on every sync, that
+    statement cannot be prepared against the old shape, and so every
+    ``sync_cache`` failed with ``no such column: render_revision`` while the
+    dashboard showed a permanent ``server sync error``.
+
+    No backfill is needed. ``render_revision`` is a monotonic invalidation
+    frontier whose whole purpose is to force re-assembly, and the DEFAULT 0 the
+    column arrives with is already the value that marks every existing row as
+    needing one. The rollup recompute chokepoints advance it from there.
+
+    Both tables are checked for existence first, because their absence is a
+    reachable state rather than a corrupt one: cache migration 028 removes
+    the legacy transcript objects, and ``open_cache_db`` recreates them only
+    afterwards. ``add_column_if_missing`` raises on a missing table, so an
+    unguarded ALTER here would turn that ordinary state into a migration
+    failure with a rendered error banner. Skipping is correct rather than
+    merely safe: a table created later is created by the schema apply, whose
+    CREATE TABLE body already carries the column.
+
+    The ``add_column_if_missing`` pair below is a defensive re-assert, not the
+    primary delivery path, exactly as migration 031 re-asserts its two tables:
+    it keeps the handler self-contained if the schema apply's ordering ever
+    drifts, it is what the per-migration golden exercises, and it is what
+    ``tests/test_cache_schema_delivery.py`` matches against this migration's
+    two registry records. Re-running is a no-op. NO self-stamp — the dispatcher
+    central-stamps on a clean return (#140).
+    """
+    if _table_exists(conn, "conversation_sessions"):
+        add_column_if_missing(
+            conn, "conversation_sessions", "render_revision",
+            "INTEGER NOT NULL DEFAULT 0")
+    if _table_exists(conn, "codex_conversation_rollups"):
+        add_column_if_missing(
+            conn, "codex_conversation_rollups", "render_revision",
+            "INTEGER NOT NULL DEFAULT 0")
     conn.commit()
 
 

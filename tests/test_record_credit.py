@@ -251,24 +251,33 @@ def _weekly_reads(ns):
 
 
 def test_apply_happy_path_s1(ns, monkeypatch):
-    """S1 (M2): --to 31 --yes writes a weekly_credit_floors row, NO
-    week_reset_events row, forces hwm-7d, inserts a source='record-credit'
-    snapshot, and the reset-aware HWM reads 31."""
+    """S1: --to 31 --yes writes ONE unified credit record, forces hwm-7d,
+    inserts a source='record-credit' snapshot, and the reset-aware HWM reads 31.
+
+    #703 + #707 moved that record from `weekly_credit_floors` to
+    `week_reset_events`, which is the single durable representation of an
+    Anthropic weekly credit and is what lets a manual credit open a milestone
+    epoch. The same-window rule is unchanged and is now carried by the NULL
+    boundary columns rather than by the row's absence — see
+    `test_s12_no_reanchor`."""
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
     conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
     rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
     assert rc == 0
     conn = ns["open_db"]()
-    # M2: a weekly_credit_floors row, NOT a week_reset_events row.
     fl = conn.execute(
-        "SELECT effective_at_utc, observed_pre_credit_pct "
-        "FROM weekly_credit_floors WHERE week_start_date=?",
+        "SELECT effective_reset_at_utc, observed_pre_credit_pct, "
+        "       observed_post_credit_pct, journal_id "
+        "FROM week_reset_events WHERE week_start_date=?",
         ("2026-06-13",)).fetchone()
     assert fl is not None and float(fl[1]) == 46.0
     assert fl[0] == "2026-06-19T14:00:00+00:00"   # floored to hour, UTC spelling
-    n_events = conn.execute(
-        "SELECT COUNT(*) FROM week_reset_events").fetchone()[0]
-    assert n_events == 0, "record-credit must NOT write a week_reset_events row (M2)"
+    assert float(fl[2]) == 31.0
+    assert fl[3], "the op fold must identify the row with the op's id"
+    n_floors = conn.execute(
+        "SELECT COUNT(*) FROM weekly_credit_floors").fetchone()[0]
+    assert n_floors == 0, (
+        "weekly_credit_floors is no longer a second materialization")
     snap = conn.execute("SELECT weekly_percent, source FROM weekly_usage_snapshots "
                         "WHERE source='record-credit'").fetchone()
     assert snap is not None and float(snap[0]) == 31.0
@@ -343,8 +352,8 @@ def test_apply_stores_effective_in_utc_on_non_utc_host(ns, monkeypatch):
     assert rc == 0
     conn = ns["open_db"]()
     fl = conn.execute(
-        "SELECT effective_at_utc, unixepoch(effective_at_utc) "
-        "FROM weekly_credit_floors WHERE week_start_date=?",
+        "SELECT effective_reset_at_utc, unixepoch(effective_reset_at_utc) "
+        "FROM week_reset_events WHERE week_start_date=?",
         ("2026-06-13",)).fetchone()
     conn.close()
     assert fl is not None
@@ -357,17 +366,25 @@ def test_apply_stores_effective_in_utc_on_non_utc_host(ns, monkeypatch):
 
 
 def test_s12_no_reanchor(ns, monkeypatch):
-    """S12 (M2-defining): after a credit, NO week_reset_events row exists AND
-    the current-week window start stays the ORIGINAL week_start_at, not the
-    credit moment — proves "same week" (no re-anchor)."""
+    """S12 (defining): after a credit the current-week window start stays the
+    ORIGINAL week_start_at, not the credit moment — "same week", no re-anchor.
+
+    #703 + #707: the credit now HAS a `week_reset_events` row, so what carries
+    the rule is the row's shape rather than its absence. Both boundary columns
+    are NULL, which is the honest value for a credit that moved no boundary and
+    is also what keeps the display layer from truncating or restarting the
+    week."""
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
     conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
     rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
     assert rc == 0
     conn = ns["open_db"]()
     try:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM week_reset_events").fetchone()[0] == 0
+        boundaries = conn.execute(
+            "SELECT old_week_end_at, new_week_end_at FROM week_reset_events"
+        ).fetchall()
+        assert len(boundaries) == 1, list(boundaries)
+        assert boundaries[0][0] is None and boundaries[0][1] is None
         # The window start the forecast/weekly current-week resolver returns
         # must be the original 2026-06-13 anchor, NOT the credit moment.
         fetched = ns["_fetch_current_week_snapshots"](
@@ -580,12 +597,17 @@ def test_s8_completion_path_after_half_apply(ns, monkeypatch):
     [14:00,15:00) pre-credit replay leaks into the floored MAX."""
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
     conn = ns["open_db"](); _seed_week(ns, conn)
-    # Simulate crash between 4a and 4d: floor row only, NO synthetic snapshot.
+    # Simulate crash between 4a and 4d: the credit record only, NO synthetic
+    # snapshot. #703 + #707: that record is a `week_reset_events` row carrying
+    # the op's `journal_id`, which is what marks it as a MANUAL credit.
     conn.execute(
-        "INSERT INTO weekly_credit_floors (week_start_date, effective_at_utc,"
-        " observed_pre_credit_pct, applied_at_utc) VALUES (?,?,?,?)",
-        ("2026-06-13", "2026-06-19T14:00:00+00:00", 46.0,
-         "2026-06-19T14:00:00Z"))
+        "INSERT INTO week_reset_events (week_start_date, detected_at_utc,"
+        " old_week_end_at, new_week_end_at, effective_reset_at_utc,"
+        " observed_pre_credit_pct, journal_id, credit_key, credit_order)"
+        " VALUES (?,?,?,?,?,?,?,?,?)",
+        ("2026-06-13", "2026-06-19T14:00:00Z", None, None,
+         "2026-06-19T14:00:00+00:00", 46.0, "o:halfapplied", "o:halfapplied",
+         1781748000))
     conn.commit(); conn.close()
     assert _weekly_reads(ns) != 31.0                  # half-applied (no snapshot)
     # Rerun an HOUR later — no --force; default --from reads the floor's
@@ -598,7 +620,7 @@ def test_s8_completion_path_after_half_apply(ns, monkeypatch):
     conn = ns["open_db"]()
     try:
         rows = conn.execute(
-            "SELECT effective_at_utc FROM weekly_credit_floors "
+            "SELECT effective_reset_at_utc FROM week_reset_events "
             "WHERE week_start_date=?", ("2026-06-13",)).fetchall()
     finally:
         conn.close()
@@ -821,3 +843,444 @@ def test_record_credit_help_smoke():
     )
     assert proc.returncode == 0
     assert "--to" in proc.stdout
+
+
+# ── #703 + #707: `--force` replaces ONE occurrence, not the week ────────
+
+def _two_credits(ns, monkeypatch):
+    """Two manual credits in one week, at two different hours.
+
+    Plain `record-credit` at an instant no credit already occupies ADDS an
+    occurrence. It used to refuse outright, because one credit per week was all
+    `weekly_credit_floors` could be asked for through this command's
+    classification — and unifying onto `week_reset_events` would have REGRESSED
+    the manual path, which is why identity moved off the boundaries.
+    """
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T18:00:00Z")
+    conn = ns["open_db"]()
+    _seed_week(ns, conn)
+    conn.close()
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, from_pct=46.0, to=31.0,
+        at="2026-06-19T14:37:00Z", week="2026-06-13")) == 0
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, from_pct=40.0, to=20.0,
+        at="2026-06-19T16:20:00Z", week="2026-06-13")) == 0
+
+
+def _credit_rows(ns):
+    conn = ns["open_db"]()
+    try:
+        return conn.execute(
+            "SELECT effective_reset_at_utc, credit_key, "
+            "       observed_pre_credit_pct, observed_post_credit_pct "
+            "FROM week_reset_events ORDER BY credit_order").fetchall()
+    finally:
+        conn.close()
+
+
+def test_plain_record_credit_adds_another_occurrence(ns, monkeypatch):
+    _two_credits(ns, monkeypatch)
+    rows = _credit_rows(ns)
+    assert len(rows) == 2, [dict(r) for r in rows]
+    assert [r["effective_reset_at_utc"] for r in rows] == [
+        "2026-06-19T14:00:00+00:00", "2026-06-19T16:00:00+00:00"]
+    assert rows[0]["credit_key"] != rows[1]["credit_key"]
+
+
+def test_force_replaces_one_occurrence_not_the_week(ns, monkeypatch):
+    _two_credits(ns, monkeypatch)
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, force=True, from_pct=40.0, to=15.0,
+        at="2026-06-19T16:20:00Z", week="2026-06-13")) == 0
+    rows = _credit_rows(ns)
+    assert len(rows) == 2, (
+        "the other credit in the week was deleted: "
+        f"{[dict(r) for r in rows]}")
+    effectives = [r["effective_reset_at_utc"] for r in rows]
+    assert "2026-06-19T14:00:00+00:00" in effectives, (
+        "the untargeted credit was removed")
+    replaced = [r for r in rows
+                if r["effective_reset_at_utc"] == "2026-06-19T16:00:00+00:00"]
+    assert len(replaced) == 1, [dict(r) for r in rows]
+    assert replaced[0]["observed_post_credit_pct"] == 15.0
+
+
+def test_force_leaves_one_synthetic_snapshot_per_surviving_credit(
+    ns, monkeypatch
+):
+    """The replacement removes the replaced occurrence's OWN synthetic snapshot
+    and nothing else's."""
+    _two_credits(ns, monkeypatch)
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, force=True, from_pct=40.0, to=15.0,
+        at="2026-06-19T16:20:00Z", week="2026-06-13")) == 0
+    conn = ns["open_db"]()
+    try:
+        syn = sorted(
+            r["weekly_percent"] for r in conn.execute(
+                "SELECT weekly_percent FROM weekly_usage_snapshots "
+                "WHERE source = 'record-credit'"))
+    finally:
+        conn.close()
+    assert syn == [15.0, 31.0], syn
+
+
+def test_force_without_an_exact_target_refuses(ns, monkeypatch):
+    """`--at` names the occurrence to replace. An instant no credit occupies
+    names nothing, and replacing the whole week instead is what this change
+    exists to stop."""
+    _two_credits(ns, monkeypatch)
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, force=True, from_pct=40.0, to=15.0,
+        at="2026-06-19T04:00:00Z", week="2026-06-13")) == 2
+    assert len(_credit_rows(ns)) == 2
+
+
+def test_force_refuses_when_several_legacy_rows_share_the_instant(
+    ns, monkeypatch
+):
+    """A keyless row predates this change and cannot be told apart from
+    another keyless row at the same instant, so the replacement refuses rather
+    than picking one."""
+    _two_credits(ns, monkeypatch)
+    conn = ns["open_db"]()
+    try:
+        for suffix in ("a", "b"):
+            conn.execute(
+                "INSERT INTO week_reset_events "
+                "(week_start_date, detected_at_utc, old_week_end_at, "
+                " new_week_end_at, effective_reset_at_utc, "
+                " observed_pre_credit_pct, journal_id) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ("2026-06-13", "2026-06-19T12:05:00Z", None, None,
+                 "2026-06-19T12:00:00+00:00", 50.0, f"b:legacy:{suffix}"))
+        conn.commit()
+    finally:
+        conn.close()
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, force=True, from_pct=50.0, to=10.0,
+        at="2026-06-19T12:30:00Z", week="2026-06-13")) == 2
+    assert len(_credit_rows(ns)) == 4
+
+
+def test_the_plan_names_the_occurrence_it_replaces(ns, monkeypatch):
+    _two_credits(ns, monkeypatch)
+    rows = _credit_rows(ns)
+    target_key = [r["credit_key"] for r in rows
+                  if r["effective_reset_at_utc"]
+                  == "2026-06-19T16:00:00+00:00"][0]
+    conn = ns["open_db"]()
+    try:
+        ws_at, we_at = ns["_get_canonical_boundary_for_date"](
+            conn, "2026-06-13")
+    finally:
+        conn.close()
+    plan = ns["_build_credit_plan"](
+        week_start_date="2026-06-13", week_start_at=ws_at, week_end_at=we_at,
+        from_pct=40.0, from_source="explicit", to_pct=15.0,
+        at_dt=dt.datetime(2026, 6, 19, 16, 20, tzinfo=dt.timezone.utc),
+        now=dt.datetime(2026, 6, 19, 18, 0, tzinfo=dt.timezone.utc),
+        replaces_credit_key=target_key,
+    )
+    assert plan.replaces_credit_key == target_key
+    # Absent on every non-replacing path.
+    plain = ns["_build_credit_plan"](
+        week_start_date="2026-06-13", week_start_at=ws_at, week_end_at=we_at,
+        from_pct=40.0, from_source="explicit", to_pct=15.0,
+        at_dt=dt.datetime(2026, 6, 19, 16, 20, tzinfo=dt.timezone.utc),
+        now=dt.datetime(2026, 6, 19, 18, 0, tzinfo=dt.timezone.utc),
+    )
+    assert plain.replaces_credit_key is None
+
+
+# ── #703 + #707: the replaced occurrence's dependents fold AFTER them ────
+
+
+def _payloads_of_kind(kind):
+    """Every journal payload of `kind`, oldest segment first."""
+    import os
+    import _cctally_core
+    import _cctally_journal as jr
+    import _lib_journal as J
+    found = []
+    for seg in jr.list_segments():
+        seg_path = _cctally_core.JOURNAL_DIR / seg
+        for _n, _o, raw in jr._iter_segment_lines(
+                seg_path, 0, os.path.getsize(seg_path)):
+            rec = J.decode_line(raw)
+            if rec is None:
+                continue
+            payload = rec.get("payload") or {}
+            if payload.get("kind") == kind:
+                found.append(payload)
+    return found
+
+
+def _attach_dependent_milestone(ns, effective_at):
+    """Give the credit at `effective_at` one journal-identified dependent."""
+    conn = ns["open_db"]()
+    try:
+        event_id = int(conn.execute(
+            "SELECT id FROM week_reset_events "
+            "WHERE effective_reset_at_utc = ?", (effective_at,)).fetchone()[0])
+        conn.execute(
+            "INSERT INTO percent_milestones "
+            "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
+            " week_end_at, percent_threshold, cumulative_cost_usd, "
+            " marginal_cost_usd, usage_snapshot_id, cost_snapshot_id, "
+            " reset_event_id, journal_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("2026-06-19T17:00:00Z", "2026-06-13", "2026-06-20", WS_AT, WE_AT,
+             21, 4.0, None, 1, 0, event_id, "pm:o:dependent"))
+        conn.commit()
+        return event_id
+    finally:
+        conn.close()
+
+
+def test_force_removes_the_replaced_credits_dependents_at_fold_order_70(
+    ns, monkeypatch
+):
+    """The dependent removal rides the order-70 family, not the order-50 one.
+
+    Both milestone families fold at 60. Naming a dependent in the order-50
+    `weekly_credit_effects` payload therefore ran its DELETE against a table a
+    rebuild or a rederive had not filled yet. It appeared to work only because
+    the milestone's own `reset_event_ref` named the record the SAME event
+    deleted at 50, so the reference did not resolve and the row was dropped
+    against a NOT NULL column — a coincidence of two unrelated mechanisms that
+    inverts the moment either changes.
+    """
+    _two_credits(ns, monkeypatch)
+    _attach_dependent_milestone(ns, "2026-06-19T16:00:00+00:00")
+
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, force=True, from_pct=40.0, to=15.0,
+        at="2026-06-19T16:20:00Z", week="2026-06-13")) == 0
+
+    naming = [p for p in _payloads_of_kind("weekly_replica_suppression")
+              if "pm:o:dependent" in (p.get("milestones") or [])]
+    assert len(naming) == 1, (
+        "the replaced occurrence's dependent was not named on the order-70 "
+        f"family: {_payloads_of_kind('weekly_replica_suppression')!r}")
+    assert naming[0]["credit_key"] is not None
+    assert naming[0]["snapshots"] == []
+
+    import _cctally_journal as jr
+    assert jr.fold_order_for("weekly_replica_suppression") > \
+        jr.fold_order_for("percent_milestone")
+    assert jr.fold_order_for("weekly_replica_suppression") > \
+        jr.fold_order_for("five_hour_milestone")
+
+    stragglers = [p for p in _payloads_of_kind("weekly_credit_effects")
+                  if p.get("milestone_suppression")]
+    assert stragglers == [], (
+        "a dependent removal is still being written onto the order-50 family: "
+        f"{stragglers!r}")
+
+    conn = ns["open_db"]()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM percent_milestones "
+            "WHERE journal_id = 'pm:o:dependent'").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def _tick_usage(ns, monkeypatch, *, at, percent):
+    monkeypatch.setenv("CCTALLY_AS_OF", at)
+    monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
+    return ns["cmd_record_usage"](argparse.Namespace(
+        percent=percent,
+        resets_at=int(dt.datetime.fromisoformat(WE_AT).timestamp()),
+        five_hour_percent=None, five_hour_resets_at=None,
+        week_start_name=None))
+
+
+def test_the_replaced_credits_dependent_stays_deleted_after_a_rebuild(
+    ns, monkeypatch
+):
+    """The behavioral half of the fold-order claim.
+
+    The test above reads the emitted payloads and the fold-order constants; both
+    are structure, and structure can be right while the rebuild still puts the
+    row back. Nothing ran `rebuild_stats_index` after a `--force` and looked.
+
+    The dependent here is a REAL journaled milestone derived from a real usage
+    tick, not a hand-inserted row. That distinction is the whole test: a
+    hand-inserted row carries no journal line, so a rebuild would drop it
+    whatever the fold order was, and the assertion would hold for the wrong
+    reason.
+    """
+    _two_credits(ns, monkeypatch)
+    assert _tick_usage(ns, monkeypatch, at="2026-06-19T17:00:00Z",
+                       percent=25.0) == 0
+
+    conn = ns["open_db"]()
+    try:
+        replaced_id = int(conn.execute(
+            "SELECT id FROM week_reset_events "
+            "WHERE effective_reset_at_utc = ?",
+            ("2026-06-19T16:00:00+00:00",)).fetchone()[0])
+        dependent = conn.execute(
+            "SELECT journal_id FROM percent_milestones "
+            "WHERE reset_event_id = ?", (replaced_id,)).fetchall()
+        assert [r["journal_id"] for r in dependent] == [
+            "pm:unattributed:2026-06-13:o:d0969906e800dc8b:25"], (
+            [dict(r) for r in dependent])
+    finally:
+        conn.close()
+
+    def _surviving():
+        conn = ns["open_db"]()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM percent_milestones "
+                "WHERE journal_id = ?",
+                ("pm:unattributed:2026-06-13:o:d0969906e800dc8b:25",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    import _cctally_journal as jr
+
+    # The control. A rebuild re-materializes this milestone from its journal
+    # line, so the assertion after the replacement is about the removal rather
+    # than about a row a rebuild would have dropped anyway.
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
+    assert _surviving() == 1, (
+        "the dependent does not survive a rebuild on its own, so the check "
+        "below would pass whatever the removal did")
+
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T18:00:00Z")
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, force=True, from_pct=40.0, to=15.0,
+        at="2026-06-19T16:20:00Z", week="2026-06-13")) == 0
+    assert _surviving() == 0, "the replacement did not remove the dependent"
+
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
+    assert _surviving() == 0, (
+        "the rebuild put the replaced credit's dependent back: the removal "
+        "folds at an order the milestone family has not reached yet")
+
+
+def test_a_plain_record_credit_names_no_dependent_removal(ns, monkeypatch):
+    """Only a replacement removes anything. A plain run ADDS an occurrence."""
+    _two_credits(ns, monkeypatch)
+    assert _payloads_of_kind("weekly_replica_suppression") == []
+
+
+# ── #703 + #707: manual identity keys on the UNFLOORED instant ───────────
+
+
+def test_two_manual_credits_inside_one_hour_both_persist(ns, monkeypatch):
+    """Spec §3.1: two distinct ops admit two credits in the same week OR the
+    same hour, and §9 lists that pair as a required case.
+
+    The manual path used to key its occurrence lookup on
+    `floor_to_hour(--at)`, so a second credit anywhere inside the same hour was
+    read as a repeat of the first and refused. `observed_at_utc` is defined as
+    the exact asserted instant, and that is what names an occurrence — only a
+    genuinely identical instant is indistinguishable from a double-run.
+    """
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T18:00:00Z")
+    conn = ns["open_db"]()
+    _seed_week(ns, conn)
+    conn.close()
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, from_pct=46.0, to=31.0,
+        at="2026-06-19T14:05:00Z", week="2026-06-13")) == 0
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, from_pct=31.0, to=12.0,
+        at="2026-06-19T14:47:00Z", week="2026-06-13")) == 0
+
+    rows = _credit_rows(ns)
+    assert len(rows) == 2, (
+        "the second credit inside the same hour was refused: "
+        f"{[dict(r) for r in rows]}")
+    assert rows[0]["credit_key"] != rows[1]["credit_key"]
+    conn = ns["open_db"]()
+    try:
+        observed = sorted(
+            r["observed_at_utc"] for r in conn.execute(
+                "SELECT observed_at_utc FROM week_reset_events"))
+    finally:
+        conn.close()
+    assert observed == ["2026-06-19T14:05:00Z", "2026-06-19T14:47:00Z"]
+
+
+def test_a_second_credit_at_the_identical_instant_is_still_refused(
+    ns, monkeypatch
+):
+    """That case really is indistinguishable from a double-run, and the
+    refusal text's "--at another instant" escape stays correct."""
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T18:00:00Z")
+    conn = ns["open_db"]()
+    _seed_week(ns, conn)
+    conn.close()
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, from_pct=46.0, to=31.0,
+        at="2026-06-19T14:05:00Z", week="2026-06-13")) == 0
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, from_pct=31.0, to=12.0,
+        at="2026-06-19T14:05:00Z", week="2026-06-13")) == 2
+    assert len(_credit_rows(ns)) == 1
+
+
+def test_force_names_the_occurrence_by_its_exact_instant(ns, monkeypatch):
+    """With two credits inside one hour, `--at` must reach exactly one."""
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T18:00:00Z")
+    conn = ns["open_db"]()
+    _seed_week(ns, conn)
+    conn.close()
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, from_pct=46.0, to=31.0,
+        at="2026-06-19T14:05:00Z", week="2026-06-13")) == 0
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, from_pct=31.0, to=12.0,
+        at="2026-06-19T14:47:00Z", week="2026-06-13")) == 0
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, force=True, from_pct=31.0, to=8.0,
+        at="2026-06-19T14:47:00Z", week="2026-06-13")) == 0
+
+    conn = ns["open_db"]()
+    try:
+        landed = sorted(
+            (r["observed_at_utc"], r["observed_post_credit_pct"])
+            for r in conn.execute(
+                "SELECT observed_at_utc, observed_post_credit_pct "
+                "FROM week_reset_events"))
+    finally:
+        conn.close()
+    assert landed == [
+        ("2026-06-19T14:05:00Z", 31.0),
+        ("2026-06-19T14:47:00Z", 8.0),
+    ], landed
+
+
+def test_force_still_reaches_a_legacy_credit_at_hour_granularity(
+    ns, monkeypatch
+):
+    """A row written before `observed_at_utc` existed carries only the
+    hour-floored effective instant, so an exact-instant-only predicate would
+    make it unreachable. The hour arm is the fallback, used only when no row
+    matches the exact instant."""
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T18:00:00Z")
+    conn = ns["open_db"]()
+    _seed_week(ns, conn)
+    conn.execute(
+        "INSERT INTO week_reset_events "
+        "(week_start_date, detected_at_utc, old_week_end_at, new_week_end_at, "
+        " effective_reset_at_utc, observed_pre_credit_pct, credit_key, "
+        " journal_id) VALUES (?,?,?,?,?,?,?,?)",
+        ("2026-06-13", "2026-06-19T12:05:00Z", None, None,
+         "2026-06-19T12:00:00+00:00", 50.0, "o:legacycredit",
+         "o:legacycredit"))
+    conn.commit()
+    conn.close()
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, force=True, from_pct=50.0, to=10.0,
+        at="2026-06-19T12:30:00Z", week="2026-06-13")) == 0
+    rows = _credit_rows(ns)
+    assert len(rows) == 1, [dict(r) for r in rows]
+    assert rows[0]["observed_post_credit_pct"] == 10.0

@@ -1732,17 +1732,21 @@ def _build_statusline_injections(warn_once):
                     # MAX to snapshots captured at/after the latest reset
                     # effective WITHIN this window.
                     #
-                    # The floor is the LATEST in-week effective across BOTH
-                    # `week_reset_events` (Anthropic resets / >=25pp auto-
-                    # credits) and `weekly_credit_floors` (manual `record-
-                    # credit` partial credits — record-credit M2, #209): a
-                    # partial credit lowers the clamp floor WITHOUT re-
-                    # anchoring the week, so without the credit-floor leg the
-                    # statusline would re-clamp the post-credit 31% back UP to
-                    # the stale pre-credit 46% peak. `_reset_aware_floor`
-                    # unions both legs with `unixepoch()` ordering (mixed
-                    # Z / +00:00 offset spellings; lexical MAX would misorder
-                    # them — same rule as the 5h-block cross-reset flag).
+                    # The floor is the LATEST accounting instant of any credit
+                    # in this week. Since #703 + #707 that is one table:
+                    # `week_reset_events` holds manual `record-credit` partial
+                    # credits and automatic ones alike, and a credit of either
+                    # kind lowers the clamp floor WITHOUT re-anchoring the week.
+                    # Without the floor the statusline would re-clamp the
+                    # post-credit 31% back UP to the stale pre-credit 46% peak.
+                    # The instant is `COALESCE(observed_at_utc,
+                    # effective_reset_at_utc)`: the effective one is
+                    # hour-floored and display-only, and flooring on it puts
+                    # genuine pre-credit readings inside the epoch, which is the
+                    # 2026-09-01 incident. `_reset_aware_floor` orders with
+                    # `unixepoch()` (mixed Z / +00:00 offset spellings; lexical
+                    # MAX would misorder them — same rule as the 5h-block
+                    # cross-reset flag).
                     floor_iso = c._reset_aware_floor(
                         conn, week_start_date,
                         week_start_dt.isoformat(), week_end_dt.isoformat(),

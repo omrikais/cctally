@@ -4,6 +4,7 @@ import { Modal } from './Modal';
 import { ShareIcon } from '../components/ShareIcon';
 import { SortableHeader } from '../components/SortableHeader';
 import { fmt } from '../lib/fmt';
+import { dollarPerPctWithheldCell } from '../lib/dollarPerPctCell';
 import { applyTableSort, type SortOverride } from '../lib/tableSort';
 import { trendColumns, type TrendTableRow } from '../lib/trendColumns';
 import { buildTrendHistoryData, type TrendChartDatum } from '../store/selectors';
@@ -590,6 +591,12 @@ function CanonicalTrendModal({
               const usedTxt = r.used_pct != null ? Math.round(r.used_pct) + '%' : 'Unavailable';
               const dppTxt =
                 r.dollar_per_pct != null ? '$' + r.dollar_per_pct.toFixed(2) : 'Unavailable';
+              // #703 + #707 §6.3 — a credited week whose counter has not
+              // climbed since the credit gets its CAUSE here. `Unavailable`
+              // reads as "no usage recorded", which is the same wrong
+              // statement the em-dash made on the two other `$/1%` tables.
+              const dppWithheld =
+                dollarPerPctWithheldCell(r.dollar_per_pct, r.dollar_per_pct_withheld);
               const d = renderDelta(r.delta);
               return (
                 <tr
@@ -602,7 +609,7 @@ function CanonicalTrendModal({
                   </td>
                   <td className="num c-cost">{fmt.usd2(r.cost_usd)}</td>
                   <td className={`num usedpct${r.used_pct == null ? ' m-unavailable' : ''}`}>{usedTxt}</td>
-                  <td className={`num dpp${r.dollar_per_pct == null ? ' m-unavailable' : ''}`}>{dppTxt}</td>
+                  <td className={`num dpp${r.dollar_per_pct == null && dppWithheld == null ? ' m-unavailable' : ''}`}>{dppWithheld ?? dppTxt}</td>
                   <td className={`num delta ${d.cls}`}>{d.text}</td>
                 </tr>
               );

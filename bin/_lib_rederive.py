@@ -58,6 +58,14 @@ _EVT_CLASSIFICATIONS = {
         "rederived", "as-of-bounded Claude cache cost"),
     "weekly_credit_effects": KindClassification(
         "rederived", "record-credit destructive effects"),
+    # #703 + #707 §5.4: the durable late-replica removal. `rederived` rather
+    # than `retained`, deliberately — a rederive re-runs the selection over the
+    # retained raw observations, so it must be able to ADD an event a live pass
+    # missed, SUPERSEDE one whose target set was computed under the old
+    # predicate, or TOMBSTONE one that should never have removed a genuine row.
+    # `retained` would freeze a wrong deletion forever.
+    "weekly_replica_suppression": KindClassification(
+        "rederived", "durable Claude late-replica suppression"),
     "week_reset": KindClassification(
         "rederived", "Claude weekly reset or credit decision"),
     "five_hour_credit": KindClassification(

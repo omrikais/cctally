@@ -25,8 +25,16 @@ def _close_conns():
 def _conn_with_floor_tables():
     """In-memory conn carrying just the two tables _reset_aware_floor reads."""
     conn = sqlite3.connect(":memory:")
+    # #703 + #707: the two boundary columns are part of production's shape, and
+    # the boundary reducer reads them to tell a same-window CREDIT (both NULL)
+    # from a RESET now that both kinds live in this one table. `week_start_date`
+    # and `observed_at_utc` came with the same change: the floor selects a row
+    # by the week it names and reads the EXACT observation instant rather than
+    # the hour-floored display one.
     conn.execute(
-        "CREATE TABLE week_reset_events (effective_reset_at_utc TEXT)"
+        "CREATE TABLE week_reset_events (effective_reset_at_utc TEXT, "
+        "old_week_end_at TEXT, new_week_end_at TEXT, week_start_date TEXT, "
+        "observed_at_utc TEXT)"
     )
     conn.execute(
         "CREATE TABLE weekly_credit_floors "
@@ -73,7 +81,8 @@ def test_mixed_null_bounds_do_not_suppress_reset_leg():
     for the SAME week that carries a reset event, must still floor."""
     conn = _conn_with_floor_tables()
     conn.execute(
-        "INSERT INTO week_reset_events VALUES (?)", ("2026-06-04T00:00:00Z",)
+        "INSERT INTO week_reset_events (effective_reset_at_utc) VALUES (?)",
+        ("2026-06-04T00:00:00Z",)
     )
     rows = [
         # NULL bounds first (legacy) -> must not cache a reset-inert floor

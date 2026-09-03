@@ -5,6 +5,38 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.106.0] - 2026-09-03
+
+### Changed
+- `cctally record-credit --force` replaces the single credit `--at` names instead of clearing the whole week, and refuses when `--at` names none. Recording a second credit in one week needs no `--force`: rerun with a different `--at`.
+- A week Anthropic credited in place renders as one row on its own boundaries, instead of two rows split at the credit. A credit that also moved the week's declared end is marked, but still renders on the windows the API stated.
+- The dashboard's Current Week header and modal name the week's own boundaries on a credited week, instead of the window that starts at the credit.
+- A credited week's row is marked `+` in `cctally report` and `cctally weekly`, so a low `Used %` beside a week's worth of spend has a visible explanation.
+- The dashboard's Weekly panel and its week detail mark a credited week, and the week detail, the Current Week card and its modal name why `$/1%` is withheld instead of the em-dash or `$0.000` you cannot tell from a week with no usage.
+- The dashboard's `$/1%` tables — the Weekly modal's week list, the `$/1% Trend` panel and its modal — say `No climb` for a credited week whose ratio is withheld, instead of the em-dash you cannot tell from a week with no usage.
+- `$/1%` for a credited week is measured from the credit forward, over the climb since it. With no climb yet the figure is withheld and names why. Uncredited weeks are unchanged.
+- The dashboard's Current Week card, the TUI header and a shared Current Week recap report a credited week's whole spend, matching the week they name and the Weekly card beside them. Only `$/1%` is measured from the credit forward.
+- `cctally milestone` history lists a credited week once instead of once per credit, and its detail separates the week's percent ladders with a row naming each credit and the level it dropped from.
+
+### Fixed
+- A conversation open in the viewer updates its own cost as its turns stream, for both Claude and Codex. The live tail advanced the transcript but not the accounting the cost is read from.
+- A Codex conversation's cost no longer reads `$0.00` long after its turns finish. The dashboard now re-scans each provider at least every two minutes, so accounting stays current even when that provider's activity hooks never fire.
+- Upgrading an existing installation to v1.105.0 left every background sync failing and the dashboard stuck on `server sync error`. The two columns that release added now reach an existing database, not only a freshly created one.
+- After Anthropic zeroes your weekly counter, every 7d surface lowers on the next status-line tick. A reading captured in the same hour no longer holds the week at its pre-credit percentage, and no manual command is needed.
+- A goodwill credit to a non-zero level records that level's own percent milestone. Before, the ladder for the new period opened one percent late, and `cctally percent-breakdown` was missing its first row.
+- `cctally percent-breakdown`, the TUI's milestone panel and the milestone writer agree on which credit a percent belongs to, including after a database rebuild and for a credit recorded with `cctally record-credit`.
+- A percent milestone crossed after a credit reports the cost spent since that credit. After a credit recorded with `cctally record-credit` it reported the whole week's spend, which made the first post-credit `$/1%` figure far too high.
+- `cctally record-credit` no longer deletes genuine usage recorded between the moment you assert with `--at` and the moment you run the command.
+- On an install with more than one Claude account, a reset detected for one account no longer records a credit for another, and no longer discards the first account's pending detection.
+- `cctally forecast` measures its rate from the latest credit rather than across it, including one you recorded yourself. `cctally budget` keeps summing the whole week, because the money was spent inside one unchanged window.
+- `cctally doctor`'s post-credit milestone check now sees a week credited with `cctally record-credit`, which it silently skipped before.
+- `cctally record-credit` accepts a second credit inside the same hour as the first. Only a credit at the identical instant is still refused, because that is indistinguishable from running the command twice.
+- An install upgrading from a version that predates the append-only journal now gets the current weekly-credit table shape, instead of reporting the new database version while missing the columns a credit needs.
+- `cctally record-credit --force` no longer leaves a replaced credit's percent milestones behind after a database rebuild, and `cctally record-usage` no longer leaves a removed stale reading's five-hour milestones pointing at it.
+- `cctally` no longer records a second, automatically-shaped credit for a large credit you already recorded with `cctally record-credit`.
+- A stale pre-credit reading replayed by the status line after a credit is removed on the next tick that contradicts it, instead of holding every 7d surface at the old percentage and provoking a second, phantom credit.
+- On an install with more than one Claude account, `cctally record-credit` no longer names another account's credit when refusing, and no longer finishes another account's interrupted credit as though it were yours.
+
 ## [1.105.0] - 2026-09-02
 
 ### Added

@@ -8,6 +8,7 @@ import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
 import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
+import { dollarPerPctWithheldCell } from '../lib/dollarPerPctCell';
 import { applyTableSort } from '../lib/tableSort';
 import { trendColumns, type TrendTableRow } from '../lib/trendColumns';
 import type { TrendChartDatum } from '../store/selectors';
@@ -134,8 +135,12 @@ function TrendSection({
                       : w.label}
                   </td>
                   <td className="num">{fmt.pct0(w.used_pct)}</td>
+                  {/* #703 + #707 §6.3 — a withheld ratio names its cause. An
+                      em-dash reads as "no usage recorded", which is a different
+                      and wrong statement about a week that holds a credit. */}
                   <td className={'num' + (w.is_current ? '' : ' dollar')}>
-                    {fmt.usd2(w.dollar_per_pct)}
+                    {dollarPerPctWithheldCell(w.dollar_per_pct, w.dollar_per_pct_withheld)
+                      ?? fmt.usd2(w.dollar_per_pct)}
                   </td>
                   <td className={'num ' + fmt.deltaCls(w.delta, w.is_current)}>
                     {fmt.delta(w.delta)}

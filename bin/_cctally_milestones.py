@@ -318,6 +318,78 @@ def get_max_milestone_for_week(
     return None
 
 
+def get_max_journaled_milestone_for_segment(
+    conn: sqlite3.Connection,
+    week_start_date: str,
+    *,
+    reset_event_id: int = 0,
+    account_key: str,
+) -> "int | None":
+    """The highest threshold this segment has ever JOURNALED, or None.
+
+    A milestone identity is ``pm:<account>:<week>:<epoch ref>:<threshold>`` and
+    the journal is append-only, so once a threshold has been journaled for a
+    segment it can never be journaled again with different content: a second
+    emission at the same revision is a same-revision divergence, which the
+    selector quarantines and the live emitter withholds.
+
+    That matters because a milestone row CAN disappear from the table without
+    its event disappearing from the journal. The `weekly_replica_suppression`
+    applier removes the dependent milestones of a stale replica it deletes, and
+    a `record-credit --force` removes the dependents of the occurrence it
+    replaces. The table then reports no threshold for the segment while the
+    journal still holds them, and a later genuine crossing of one of those
+    thresholds derives a row whose harvest cannot be journaled and whose
+    convergence cannot succeed either — the event it would converge to
+    references the very snapshot that was deleted, so its `usage_snapshot_id`
+    resolves to NULL against a NOT NULL column and the whole ingest cycle
+    aborts.
+
+    So the segment's forward-only high-water mark is the higher of what the
+    table holds and what the journal has already recorded. The consequence is
+    stated rather than hidden: a threshold whose milestone was suppressed stays
+    unrecorded for that segment. It cannot be re-recorded honestly under the
+    identity it already spent, and leaving the fabricated row in place instead
+    would be the #706 defect — a milestone the meter never crossed, blocking the
+    ladder underneath it.
+
+    Returns None when the segment has journaled nothing, when the governing
+    credit is not itself journaled yet (its own harvest happens first, in
+    dependency order), or when the metadata table is unavailable.
+    """
+    if int(reset_event_id) == 0:
+        ref = "0"
+    else:
+        row = conn.execute(
+            "SELECT journal_id FROM week_reset_events WHERE id = ?",
+            (int(reset_event_id),),
+        ).fetchone()
+        ref = row[0] if row is not None else None
+        if not ref:
+            return None
+    prefix = f"pm:{account_key}:{week_start_date}:{ref}:"
+    # `b:weekly_usage_snapshots:<rowid>` is a legal credit key, so a prefix can
+    # contain `_`. Escaped, or LIKE would treat it as a single-character
+    # wildcard and reach a neighbouring segment.
+    pattern = (prefix.replace("\\", "\\\\")
+                     .replace("%", "\\%")
+                     .replace("_", "\\_")) + "%"
+    try:
+        row = conn.execute(
+            "SELECT MAX(CAST(substr(event_id, ?) AS INTEGER)) AS max_pct "
+            "  FROM journal_effective_events "
+            " WHERE status = 'active' "
+            "   AND event_id LIKE ? ESCAPE '\\' "
+            "   AND substr(event_id, ?) GLOB '[0-9]*'",
+            (len(prefix) + 1, pattern, len(prefix) + 1),
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        return None
+    if row and row["max_pct"] is not None:
+        return int(row["max_pct"])
+    return None
+
+
 def get_milestone_cost_for_week(
     conn: sqlite3.Connection,
     week_start_date: str,

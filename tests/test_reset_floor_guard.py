@@ -100,6 +100,16 @@ ALLOWLIST: dict[tuple[str, str], tuple[str, str]] = {
     ("_lib_diff_kernel.py", "_diff_resolve_used_pct"):
         (WIRED, "docstring occurrence; the executable max is Python-side via "
                 "_floored_week_max (pinned in MUST_CALL_FLOOR). #290."),
+    ("_lib_credit_selection.py", "resolve_replica_level"):
+        (EXEMPT, "#703 + #707 §5.1: the max this takes is deliberately the "
+                 "PRE-credit peak — every row captured BEFORE the credit's own "
+                 "observation instant. Routing it through _reset_aware_floor "
+                 "would floor it at that same credit and return the "
+                 "post-credit level, which is the opposite quantity: this "
+                 "value exists to say what level a stale replay reproduces, "
+                 "and a replay reproduces what the counter held before the "
+                 "credit. It never renders and never clamps a written value; "
+                 "its only consumer is the recurring replica sweep"),
 }
 
 # Authoritative wired-verification list: the executable clamp sites that MUST
@@ -296,11 +306,18 @@ def _boundary_conn():
     single subscription week, at two DIFFERENT instants."""
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE week_reset_events "
-                 "(effective_reset_at_utc TEXT)")
+                 "(effective_reset_at_utc TEXT, old_week_end_at TEXT,"
+                 " new_week_end_at TEXT, week_start_date TEXT,"
+                 " observed_at_utc TEXT)")
     conn.execute("CREATE TABLE weekly_credit_floors "
                  "(week_start_date TEXT, effective_at_utc TEXT)")
-    conn.execute("INSERT INTO week_reset_events VALUES (?)",
-                 (RESET_AT.isoformat(),))
+    # A RESET moved a boundary, so both boundary columns are set — that shape
+    # is what distinguishes it from the same-window credit beside it.
+    conn.execute("INSERT INTO week_reset_events "
+                 "(effective_reset_at_utc, old_week_end_at, new_week_end_at) "
+                 "VALUES (?, ?, ?)",
+                 (RESET_AT.isoformat(),
+                  "2026-06-08T00:00:00+00:00", "2026-06-10T00:00:00+00:00"))
     conn.execute("INSERT INTO weekly_credit_floors VALUES (?, ?)",
                  ("2026-06-01", CREDIT_AT.isoformat()))
     return conn

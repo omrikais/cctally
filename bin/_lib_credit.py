@@ -61,8 +61,14 @@ class CreditPlan:
     from_pct: float
     from_source: str          # "hwm" | "explicit" | "prior_credit"
     to_pct: float
-    effective_iso: str        # weekly_credit_floors.effective_at_utc (floored to hour)
+    effective_iso: str        # the credit record's effective instant (floored to hour)
     captured_iso: str         # synthetic snapshot captured_at_utc (un-floored), 'Z'
+    #: #703 + #707: the `credit_key` of the occurrence a `--force` re-record
+    #: REPLACES. `--force` used to replace the whole week, which cannot coexist
+    #: with several credits per week; it now replaces exactly the one occurrence
+    #: `--at` names, and this field is what names it to the effects path. None on
+    #: every other path, including a plain re-record, which ADDS an occurrence.
+    replaces_credit_key: "str | None" = None
 
 
 def _parse_credit_at(value, now):
@@ -81,7 +87,7 @@ def _parse_credit_at(value, now):
 
 def _build_credit_plan(*, week_start_date, week_start_at, week_end_at,
                        from_pct, from_source, to_pct, at_dt, now,
-                       effective_override=None):
+                       effective_override=None, replaces_credit_key=None):
     """Validate inputs and build a CreditPlan. Pure (no DB/file I/O).
     Raises ValueError(msg) on any violation — caller maps to exit 2.
 
@@ -130,4 +136,5 @@ def _build_credit_plan(*, week_start_date, week_start_at, week_end_at,
         to_pct=to_pct,
         effective_iso=effective_iso,
         captured_iso=at_dt.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        replaces_credit_key=replaces_credit_key,
     )

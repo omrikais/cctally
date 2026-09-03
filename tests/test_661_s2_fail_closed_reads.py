@@ -118,8 +118,12 @@ def _forecast():
 
 def _credited_week_conn(*, drop_credit_floors=False):
     conn = sqlite3.connect(":memory:")
+    # #703 + #707: the boundary reducer reads the two boundary columns to tell
+    # a same-window CREDIT (both NULL) from a RESET.
     conn.execute("CREATE TABLE week_reset_events ("
-                 " effective_reset_at_utc TEXT, account_key TEXT)")
+                 " effective_reset_at_utc TEXT, old_week_end_at TEXT,"
+                 " new_week_end_at TEXT, account_key TEXT,"
+                 " week_start_date TEXT, observed_at_utc TEXT)")
     if not drop_credit_floors:
         conn.execute("CREATE TABLE weekly_credit_floors ("
                      " week_start_date TEXT, effective_at_utc TEXT,"
@@ -245,8 +249,15 @@ def test_a_reset_created_segment_names_the_reset_not_a_credit():
     module = _forecast()
     conn = _credited_week_conn(drop_credit_floors=True)
     try:
-        conn.execute("INSERT INTO week_reset_events VALUES (?,?)",
-                     (CREDIT_AT.isoformat(), "acct"))
+        # A RESET: it moved a boundary, so both boundary columns are set. Since
+        # #703 + #707 both kinds live in this table and the row's shape is what
+        # the reducer classifies on, so a row with NULL boundaries here would be
+        # a same-window CREDIT and would name the other record.
+        conn.execute("INSERT INTO week_reset_events "
+                     "(effective_reset_at_utc, old_week_end_at, "
+                     " new_week_end_at, account_key) VALUES (?,?,?,?)",
+                     (CREDIT_AT.isoformat(), WEEK_END.isoformat(),
+                      (WEEK_END + dt.timedelta(days=2)).isoformat(), "acct"))
         movement = module._realized_week_movement(
             conn, WEEK_START, WEEK_END, "2026-06-01", [
                 ((WEEK_START + dt.timedelta(hours=24)).isoformat(), 46.0,
@@ -293,7 +304,9 @@ def _candidate_conn():
     conn.execute("CREATE TABLE weekly_credit_floors (week_start_date TEXT,"
                  " effective_at_utc TEXT)")
     conn.execute("CREATE TABLE week_reset_events "
-                 "(effective_reset_at_utc TEXT)")
+                 "(effective_reset_at_utc TEXT, old_week_end_at TEXT,"
+                 " new_week_end_at TEXT, week_start_date TEXT,"
+                 " observed_at_utc TEXT)")
     for start in CANDIDATE_STARTS:
         end = start + dt.timedelta(days=7)
         for hours, pct in ((24, 20.0), (120, 40.0)):

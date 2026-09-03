@@ -211,11 +211,11 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 44,
+                            "registry_size": 45,
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1011,
+                            "epoch": 1012,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -276,7 +276,8 @@
                                     "041_codex_quota_unresolved_model_index",
                                     "042_codex_entries_root_path_index",
                                     "043_codex_window_attributions",
-                                    "044_codex_accounting_change_ledger"
+                                    "044_codex_accounting_change_ledger",
+                                    "045_conversation_render_revision_columns"
                                 ],
                                 "skipped": []
                             },
@@ -541,13 +542,17 @@
                             [
                                 "cache.db",
                                 "044_codex_accounting_change_ledger"
+                            ],
+                            [
+                                "cache.db",
+                                "045_conversation_render_revision_columns"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "56 pending",
+                    "summary": "57 pending",
                     "title": "Pending migrations"
                 },
                 {

@@ -68,6 +68,29 @@ def _literal_object_keys(literal: str) -> "set[tuple[str, str]]":
     }
 
 
+def _column_keys(source: str) -> "set[tuple[str, str]]":
+    """Columns a schema body declares with ``add_column_if_missing``.
+
+    These are the ONLY columns the delivery contract covers, and deliberately
+    so. A store created from scratch receives every column from its CREATE
+    TABLE body, so the columns whose arrival depends on the version-gated
+    schema apply re-running are exactly the ones written as an explicit
+    ``add_column_if_missing`` call. Reading the columns out of a live
+    projection instead would return every column of every table and could not
+    tell the two origins apart.
+    """
+    return {
+        ("column", f"{node.args[1].value}.{node.args[2].value}")
+        for node in ast.walk(_source_tree(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "add_column_if_missing"
+        and len(node.args) >= 3
+        and all(isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                for arg in node.args[1:3])
+    }
+
+
 def _source_tree(source: str) -> ast.AST:
     return ast.parse(textwrap.dedent(source))
 
@@ -93,7 +116,7 @@ def schema_object_keys(db, fn, *, transitive: bool, seen=None):
         return set()
     seen.add(fn.__name__)
     source = inspect.getsource(fn)
-    keys = set()
+    keys = _column_keys(source)
     for literal in _string_constants(source):
         keys |= _literal_object_keys(literal)
     called_names = _called_names(source)
@@ -141,6 +164,14 @@ def declared_schema_object_keys(db, fn):
                 "AND name NOT LIKE 'sqlite_%'"
             )
         }
+        conn_tables = list(conn.execute(
+            "SELECT name FROM sqlite_schema WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%'"
+        ))
+        table_info = {
+            table: list(conn.execute(f'PRAGMA table_info("{table}")'))
+            for (table,) in conn_tables
+        }
     finally:
         conn.close()
     live = {
@@ -158,7 +189,52 @@ def declared_schema_object_keys(db, fn):
     # These explicit objects are deliberately absent when the linked SQLite
     # lacks FTS5. They remain part of the declared schema contract and registry;
     # unlike the shadow tables above, their names occur in source-owned DDL.
-    return live | (candidates & _CONDITIONAL_FTS_OBJECTS)
+    # Columns need BOTH halves, for the same reason the other kinds do.
+    # Static discovery decides WHICH columns are under contract: only an
+    # explicit ``add_column_if_missing`` names a column whose arrival depends
+    # on the version-gated apply re-running, and a PRAGMA sweep alone cannot
+    # tell such a column from one the CREATE TABLE body already carried. The
+    # live projection then scopes that set to THIS store: the conversations
+    # apply reaches the cache apply transitively, so without the intersection
+    # its declared set would inherit every cache-only column.
+    live_columns = {
+        ("column", f"{table}.{row[1]}")
+        for (table,) in conn_tables
+        for row in table_info[table]
+    }
+    declared_columns = {
+        key for key in candidates if key[0] == "column"
+    } & live_columns
+    return live | declared_columns | (candidates & _CONDITIONAL_FTS_OBJECTS)
+
+
+def assert_every_column_declaration_is_literal(fn, *, store):
+    """Every ``add_column_if_missing`` in a schema body names literal strings.
+
+    ``_column_keys`` can only see a call whose table and column are string
+    constants. A call built from variables would add a real column to fresh
+    stores while staying invisible to the registry, which is precisely the
+    delivery gap the registry exists to close, so the escape is forbidden
+    rather than merely documented.
+    """
+    source = inspect.getsource(fn)
+    offenders = [
+        ast.unparse(node)
+        for node in ast.walk(_source_tree(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "add_column_if_missing"
+        and not (
+            len(node.args) >= 3
+            and all(isinstance(arg, ast.Constant)
+                    and isinstance(arg.value, str)
+                    for arg in node.args[1:3])
+        )
+    ]
+    assert not offenders, (
+        f"{store} declares columns the delivery scanner cannot see: "
+        f"{offenders}. Write the table and column as literal strings."
+    )
 
 
 def assert_registry_matches_schema(db, fn, records, *, store):

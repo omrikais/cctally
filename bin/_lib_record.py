@@ -200,16 +200,46 @@ SNAPSHOT_SKIP_DEDUP = "dedup"
 
 
 # ── Fragment 9: post-reset milestone-ladder seeding evidence ───────────────
-def post_reset_seed_has_climb_evidence(lowest_in_epoch_pct, current_floor: int) -> bool:
+def post_reset_seed_has_climb_evidence(
+    lowest_in_epoch_pct, current_floor: int, *, post_credit_pct=None
+) -> bool:
     """Return True when a post-reset epoch may seed its milestone ladder at
     ``current_floor``.
 
     ``lowest_in_epoch_pct`` is the smallest ``weekly_percent`` stored for this
-    week and account at-or-after the governing reset event's effective instant
-    (``None`` when the epoch holds no observation at all). The seed is allowed
-    only when some in-epoch observation floors STRICTLY below the threshold
-    being recorded — the observable evidence that the counter climbed from the
-    reset to here.
+    week and account at-or-after the governing credit's accounting instant
+    (``None`` when the epoch holds no observation at all). ``post_credit_pct``
+    is where the credit RECORDED that the counter landed, or ``None`` for a row
+    that predates that column or whose source genuinely lacked the fact.
+
+    Two rules, and which applies depends on the evidence the row carries
+    (#703 + #707 §5.2).
+
+    POST-CREDIT FACT PRESENT — admit iff the epoch's lowest reading is AT OR
+    BELOW the credited level. The credit itself says where the counter stood, so
+    a reading at that level is the epoch's own starting point rather than an
+    unexplained high one, and the threshold it crosses is real. This is what
+    #707 repairs. A reset-to-zero always satisfied the older rule for free,
+    because the credited ~0 reading floors below every threshold above it; a
+    goodwill credit to a NON-zero level never did, so the level Anthropic
+    credited to lost its own threshold and the ladder opened one threshold late.
+
+    POST-CREDIT FACT ABSENT — admit iff the epoch's lowest reading floors
+    STRICTLY BELOW the threshold being recorded. This is the #706 rule and it is
+    unchanged. Without a recorded landing level there is nothing to compare
+    against, so the only admissible evidence is an observation of the climb
+    itself.
+
+    NO OBSERVATION AT ALL — refuse, under either rule. An epoch holding nothing
+    has observed no climb, and seeding from nothing is the fabrication this
+    kernel exists to prevent: milestones are forward-only within an epoch, so a
+    fabricated seed permanently forecloses every genuine crossing below it. On
+    2026-09-01 a fresh epoch was seeded at 13% from a stale pre-credit replica,
+    and the genuine 1%, 2% and 3% crossings could never be recorded.
+
+    Neither rule is a tolerance band around ``observed_pre_credit_pct``. That
+    comparison is what let the stale replica survive in the first place (#703),
+    and repeating it here would inherit the same failure mode.
 
     Glue call site: ``maybe_record_milestone`` (bin/_cctally_record.py), on the
     ``reset_event_id != 0 and max_existing is None`` branch only. The ``+ 1e-9``
@@ -221,9 +251,11 @@ def post_reset_seed_has_climb_evidence(lowest_in_epoch_pct, current_floor: int) 
     usually sits inside the query window and makes the ``MIN`` non-NULL. It is
     still reachable, because the window's upper bound falls back to ``as_of``
     when ``saved`` carries no ``capturedAt``, and because the stale-replica
-    DELETE can remove the row between the snapshot write and this read. An
-    epoch holding no stored observation has observed no climb, so it refuses.
+    removal can take the row between the snapshot write and this read.
     """
     if lowest_in_epoch_pct is None:
         return False
-    return math.floor(float(lowest_in_epoch_pct) + 1e-9) < current_floor
+    lowest = math.floor(float(lowest_in_epoch_pct) + 1e-9)
+    if post_credit_pct is not None:
+        return lowest <= math.floor(float(post_credit_pct) + 1e-9)
+    return lowest < current_floor

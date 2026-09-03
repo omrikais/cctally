@@ -397,9 +397,11 @@ def _load_week_snapshots(
     bucket instead of splitting and silently dropping the higher value.
 
     Reset-aware (record-credit M2, #209): each week's MAX is restricted to
-    snapshots captured at-or-after that week's latest in-place clamp floor
-    (`_reset_aware_floor`, the union of `week_reset_events` +
-    `weekly_credit_floors`). Without this, a credited week's per-project Used %
+    snapshots captured at-or-after that week's latest accounting floor
+    (`_reset_aware_floor` over the unified `week_reset_events`, which since
+    #703 + #707 holds manual and automatic credits alike and floors on the
+    EXACT observation instant rather than the hour-floored display one).
+    Without this, a credited week's per-project Used %
     would read the stale pre-credit peak (e.g. 46) instead of the post-credit
     value (e.g. 31) — the same floor the statusline / write-clamp / `--from`
     helper apply (spec §4a, test S15). The floor compare uses `unixepoch()` on

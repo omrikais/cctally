@@ -156,6 +156,21 @@ def _capture_phases(name, body, perf, has_own_root):
 
 # ── benchmark registry ───────────────────────────────────────────────────
 
+def _suspend_frontier_expiry(cctally):
+    """Hold ingest certificates open for the length of a measurement run.
+
+    ``FRONTIER_CERTIFICATE_MAX_AGE_SECONDS`` bounds how long one certificate
+    may stand without an exhaustive walk.  The scenarios below time the
+    caught-up validation itself, so a run whose timing loops outlast that bound
+    would silently measure a forced full walk instead.  Suspending it keeps the
+    measured quantity the validation cost; the bound's own cost is one walk per
+    interval, which the full-walk scenarios already measure separately.
+    """
+    frontier_mod = cctally._load_sibling("_lib_ingest_frontier")
+    frontier_mod.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS = float("inf")
+    return frontier_mod
+
+
 def _make_benchmarks(cctally, perf, now_utc=None):
     """Build the registry. Returns ``(benchmarks, cleanup)`` where each
     benchmark is ``(name, body, has_own_root, count_of)`` and ``cleanup`` closes
@@ -222,7 +237,7 @@ def _make_benchmarks(cctally, perf, now_utc=None):
         return _snapshot()              # unchanged signature → reuse (near-zero)
 
     # ── family 2: ingest ──
-    frontier_mod = cctally._load_sibling("_lib_ingest_frontier")
+    frontier_mod = _suspend_frontier_expiry(cctally)
     frontier = frontier_mod.DashboardIngestFrontier(
         cctally._cctally_core.APP_DIR)
     claude_roots = tuple(cctally._cctally_core._resolve_claude_projects_dirs())
@@ -719,6 +734,7 @@ def run_assembly_scan(*, ladder_scale="small", iterations=DEFAULT_ITERATIONS,
     # Exercise the exact dashboard transcript pass after the ladder reads. The
     # first pass advances/certifies the independent transcript frontier; every
     # timed pass must then be a caught-up O(roots) validation with zero files.
+    _suspend_frontier_expiry(cctally)
     dashboard = cctally._load_sibling("_cctally_dashboard")
     first_sync = dashboard._conversation_sync_pass()
     if first_sync != "ok":

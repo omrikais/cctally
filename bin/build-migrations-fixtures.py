@@ -6605,6 +6605,97 @@ def build_per_migration_044_codex_accounting_change_ledger(
     _build_post(pre, post)
 
 
+def build_per_migration_045_conversation_render_revision_columns(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for #682's render_revision column delivery.
+
+    ``pre.sqlite`` is a genuine 044-head install: the schema apply that shipped
+    in v1.105.0 declared both columns, but no migration bumped the head, so an
+    already-current store kept the older table shape. Dropping the two columns
+    after applying the current schema reproduces that shape exactly, and both
+    tables carry a row so the golden shows the column arriving over existing
+    data at its DEFAULT of 0.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "045_conversation_render_revision_columns"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill",
+                         "040_codex_quota_physical_group_index",
+                         "041_codex_quota_unresolved_model_index",
+                         "042_codex_entries_root_path_index",
+                         "043_codex_window_attributions",
+                         "044_codex_accounting_change_ledger"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            conn.execute(
+                "INSERT INTO conversation_sessions "
+                "(session_id, msg_count, started_utc, last_activity_utc) "
+                "VALUES ('session-a', 3, ?, ?)",
+                ("2026-08-01T00:00:00Z", "2026-08-01T01:00:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO codex_conversation_rollups "
+                "(conversation_key, source_root_key, item_count, started_utc) "
+                "VALUES ('v1.thread-a', 'rk', 2, ?)",
+                ("2026-08-01T00:00:00Z",),
+            )
+            for table in ("conversation_sessions", "codex_conversation_rollups"):
+                conn.execute(
+                    f"ALTER TABLE {table} DROP COLUMN render_revision"
+                )
+            conn.execute("PRAGMA user_version=44")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=45")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def _apply_conversations_schema_v1_fixture(mod, conn: sqlite3.Connection) -> None:
     """Build a historical conversations 001-004 schema-helper state.
 
@@ -8014,6 +8105,10 @@ def main() -> int:
     build_per_migration_044_codex_accounting_change_ledger(
         FIXTURES_ROOT / "per-migration"
         / "044_codex_accounting_change_ledger"
+    )
+    build_per_migration_045_conversation_render_revision_columns(
+        FIXTURES_ROOT / "per-migration"
+        / "045_conversation_render_revision_columns"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0

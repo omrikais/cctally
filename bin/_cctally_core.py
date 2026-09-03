@@ -410,7 +410,21 @@ _init_paths_from_env()
 # install and the table would simply never appear. `quota_alert_arming` is the
 # precedent the family follows — a journaled STATE record whose boundary
 # survives a rebuild, so history cannot re-fire.
-STATS_INDEX_EPOCH = 1011
+# 1011 -> 1012 (#703 + #707): the unified Anthropic credit record. Adds the six
+# `week_reset_events` fact columns (`week_start_date`, `observed_at_utc`,
+# `confirming_capture_at_utc`, `observed_post_credit_pct`, `credit_key`,
+# `credit_order`) and relaxes `old_week_end_at` / `new_week_end_at` to NULL. On
+# a store ABOVE `LEGACY_STATS_HEAD` the bump alone delivers all of that, because
+# an epoch mismatch resolves by rebuilding the disposable index from the journal
+# against the new DDL. A PRE-CUTOVER store at `user_version <= 13` takes the
+# in-place cutover path instead and reaches this epoch with its existing table
+# untouched, so that path additionally runs the rename-recreate-copy in
+# `begin_week_reset_events_reshape` / `finish_week_reset_events_reshape`.
+# It is an epoch bump and NOT a stats migration for the two reasons every
+# bump since 1005 carries: the 13-entry registry is frozen, AND an epoch-current
+# open returns before any schema work, so a `@stats_migration` handler would
+# never run on an upgraded install and the columns would simply never appear.
+STATS_INDEX_EPOCH = 1012
 LEGACY_STATS_HEAD = 13
 
 #: #496 S1 F1. A NEW branch, for a state that cannot occur before the
@@ -1783,6 +1797,8 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     # Enforced by tests/test_kernel_extraction_invariants.py
     # test_core_accessor_use_is_bounded (lands in I2).
     add_column_if_missing = c.add_column_if_missing
+    _begin_week_reset_events_reshape = c.begin_week_reset_events_reshape
+    _finish_week_reset_events_reshape = c.finish_week_reset_events_reshape
     _canonical_5h_window_key = c._canonical_5h_window_key
     _backfill_week_reset_events = c._backfill_week_reset_events
     _backfill_five_hour_blocks = c._backfill_five_hour_blocks
@@ -2217,23 +2233,111 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         # start — preventing the API's -7d-derived new week from overlapping
         # the old week. Inserted by cmd_record_usage on detection; read by
         # _apply_reset_events_to_weekrefs and the cost live-recompute path.
+        # #703 + #707: this table is now the SINGLE durable representation of an
+        # Anthropic weekly credit, and it defines an accounting epoch only —
+        # never a display boundary. The six fact columns below are declared HERE
+        # rather than added by `add_column_if_missing`, because this is an epoch
+        # bump: an epoch-current open returns before any schema work, so a
+        # conditional column addition would never run on an upgraded install.
+        #
+        # The epoch bump alone covers only ONE of the two upgrade paths. A store
+        # ABOVE `LEGACY_STATS_HEAD` defers to a rebuild that materializes a fresh
+        # scratch index through this DDL, so it arrives correct. A PRE-CUTOVER
+        # store at `user_version <= 13` reaches this line with the table already
+        # present, where `CREATE TABLE IF NOT EXISTS` is a no-op; the cutover
+        # below then stamps the new epoch in place and every later open
+        # fast-returns before any schema work. `begin_week_reset_events_reshape`
+        # parks such a table aside so this CREATE builds the current shape, and
+        # `finish_week_reset_events_reshape` (right after the `account_key`
+        # guard) copies the rows back and drops the parked table. Without it the
+        # store reports the current epoch while missing every fact column and
+        # keeping both NOT NULL boundaries, which no later open can repair.
+        #
+        #   week_start_date            the week the credit belongs to, so the
+        #                              unified table is queryable by week without
+        #                              going through a boundary column.
+        #   observed_at_utc            the exact instant the post-credit state was
+        #                              first observed, in the SAME clock domain as
+        #                              `weekly_usage_snapshots.captured_at_utc`
+        #                              (the column it filters). NOT the detection
+        #                              clock — the ingest path separates the two,
+        #                              and comparing across the domains back-dates
+        #                              the epoch (the #703 incident).
+        #   confirming_capture_at_utc  the capture instant of the observation that
+        #                              confirmed the credit; closes the upper end
+        #                              of the automatic stale-replica bracket.
+        #   observed_post_credit_pct   where the counter landed.
+        #   credit_key                 the row's durable identity, derived from the
+        #                              SOURCE journal record and never from the
+        #                              boundaries. Several credits per week are
+        #                              representable because of it.
+        #   credit_order               that same source record's own journal
+        #                              instant, in Unix epoch seconds. NOT the
+        #                              absolute journal sequence position: that
+        #                              numbering exists but returns None on many
+        #                              ordinary ticks, and a durable column cannot
+        #                              be populated by something sometimes
+        #                              unavailable. NOT the fold position of the
+        #                              derived row either — a fold order expresses
+        #                              dependency, not occurrence. The instant is
+        #                              a fact OF THE SOURCE RECORD, so a rebuild
+        #                              reproduces it byte-identically and it orders
+        #                              by occurrence. Two known losses, both
+        #                              deliberate: two source instants inside one
+        #                              second tie and fall through to
+        #                              `credit_key DESC`, which is content-hash
+        #                              rather than chronological order; and under a
+        #                              backward clock step instant order and append
+        #                              order disagree.
+        #
+        # `old_week_end_at` / `new_week_end_at` are legacy provenance now and are
+        # NULLABLE: a cutover-exported `weekly_credit_floor` op cannot supply them
+        # (`weekly_credit_floors` retains no week-end timestamp), and NULL is the
+        # honest value for a row that never had them. NULL on any new column means
+        # the row predates this change or its source genuinely lacked the fact;
+        # every accounting read falls back through
+        # COALESCE(observed_at_utc, effective_reset_at_utc).
+        _wre_reshaping = _begin_week_reset_events_reshape(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS week_reset_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 detected_at_utc        TEXT NOT NULL,
-                old_week_end_at        TEXT NOT NULL,
-                new_week_end_at        TEXT NOT NULL,
+                old_week_end_at        TEXT,
+                new_week_end_at        TEXT,
                 effective_reset_at_utc TEXT NOT NULL,
                 observed_pre_credit_pct REAL,
                 account_key TEXT NOT NULL DEFAULT 'unattributed',
-                UNIQUE(account_key, old_week_end_at, new_week_end_at)
+                week_start_date           TEXT,
+                observed_at_utc           TEXT,
+                confirming_capture_at_utc TEXT,
+                observed_post_credit_pct  REAL,
+                credit_key                TEXT,
+                credit_order              INTEGER,
+                -- Identity is the SOURCE record, not the boundaries. Keyed on
+                -- the boundary pair, a second credit in one week had nowhere to
+                -- live: two credits inside one hour collide outright, because
+                -- `effective_reset_at_utc` is hour-floored. `credit_key` is NULL
+                -- for a row that predates this change, and SQLite treats NULLs
+                -- as distinct under UNIQUE, so legacy rows neither collide with
+                -- each other nor with a keyed one. Replay idempotence does not
+                -- rest on this constraint either way: every fold inserts with
+                -- `journal_id` set, and that column carries its own partial
+                -- UNIQUE index.
+                UNIQUE(account_key, credit_key)
             )
             """
         )
         add_column_if_missing(
             conn, "week_reset_events", "account_key",
             "TEXT NOT NULL DEFAULT 'unattributed'")
+        if _wre_reshaping:
+            # `journal_id` is added here rather than by the loop further down so
+            # the copy can carry it: a parked row's logical identity must reach
+            # the new table, or harvest would re-emit every already-journaled
+            # credit as a fresh `wr:` event. The loop below then no-ops on it.
+            add_column_if_missing(conn, "week_reset_events", "journal_id", "TEXT")
+            _finish_week_reset_events_reshape(conn)
         _backfill_week_reset_events(conn)
 
         # ── five_hour_reset_events (Anthropic-issued in-place 5h credits) ──
@@ -3064,9 +3168,8 @@ def _reset_aware_floor(
     *,
     account_key: str | None,
 ) -> str | None:
-    """Return the latest in-week clamp floor (an ISO timestamp) across BOTH
-    `week_reset_events` and `weekly_credit_floors`, or None when neither has a
-    row for this week.
+    """Return the latest in-week accounting floor (an ISO timestamp), or None
+    when this week has no credit.
 
     ``account_key`` (#341, review finding 11): MANDATORY account context — no
     silent global fallback. A real key scopes both legs to that account's
@@ -3075,40 +3178,68 @@ def _reset_aware_floor(
     analytics floor path, byte-identical to today on a single-account install.
 
     This is the single chokepoint the four MAX-clamp sites consult to floor the
-    current 7d % to the most-recent in-place credit / reset effective moment
+    current 7d % to the most-recent in-place credit / reset moment
     (record-credit M2, issue #209, spec §4a):
       - statusline `_hwm_clamp` 7d (bin/_cctally_statusline.py)
       - the record-usage write-site monotonic clamp (bin/_cctally_record.py)
       - `_resolve_reset_aware_hwm` (the --from default helper)
       - `project`'s `_load_week_snapshots` per-week MAX (bin/_cctally_project.py)
 
-    A `week_reset_events` row counts iff its `effective_reset_at_utc` falls in
-    `[week_start_at, week_end_at)`; a `weekly_credit_floors` row counts iff its
-    `week_start_date` matches (record-credit always stamps `effective_at_utc`
-    inside the week, validated at plan-build time).
+    #703 + #707 §5.3: the floor is ``COALESCE(observed_at_utc,
+    effective_reset_at_utc)``, NOT the effective instant. The effective instant
+    is hour-floored and display-only, and that rounding is what back-dated the
+    2026-09-01 incident's epoch: the credit was first observed at 17:59:41, the
+    row recorded 17:00:00, and a genuine 13.0 snapshot captured at 17:33:38 fell
+    inside the accounting window, held the maximum, and made every later genuine
+    reading look like a regression. NULL on the exact instant means the row
+    predates this change, and such a row keeps the only instant it has.
+
+    A row counts iff it belongs to this WEEK. That is `week_start_date` for a
+    row that records it, and the `[week_start_at, week_end_at)` range only for a
+    row that predates the column. The range alone is a narrowing this helper
+    must not inherit from the reset-event leg it replaces: the display layer
+    overrides `week_start_at` to a credit's own effective instant, so an EARLIER
+    credit in the same week falls outside the range the caller passes. The
+    `weekly_credit_floors` leg this collapses had no time bound at all and found
+    it; keying on the week's identity keeps that.
+
+    The `weekly_credit_floors` leg is retained for exactly one state and is
+    otherwise dead. The in-place cutover EXPORTS that table to a bootstrap
+    segment and stamps `journal_id` on its rows, but it does not re-fold them,
+    so between a legacy store's cutover and its first rebuild the credit exists
+    only there. Nothing writes the table any more — the `weekly_credit_floor` op
+    folds into `week_reset_events` — and a rebuilt index does not carry the rows
+    at all, so on every other store this leg matches nothing. It cannot lower a
+    floor either: for one credit present in both tables the unified row's exact
+    instant is at or after the floored one, and the latest wins.
 
     The latest floor wins via `ORDER BY unixepoch(floor_at) DESC LIMIT 1` —
-    `unixepoch()`, NOT a textual `MAX(...)`: the two legs carry mixed offset
+    `unixepoch()`, NOT a textual `MAX(...)`: the legs carry mixed offset
     spellings (`Z` / `+00:00`), and a lexical MAX would silently mis-order them
     on a non-UTC host (the same gotcha as the statusline clamp / 5h-block
     cross-reset flag; see the comment at bin/_cctally_statusline.py)."""
     acct_pred = "" if account_key is None else " AND account_key = ?"
-    reset_params: tuple = (week_start_at, week_end_at) + (
-        () if account_key is None else (account_key,))
-    floor_params: tuple = (week_start_date,) + (
-        () if account_key is None else (account_key,))
+    acct_param: tuple = () if account_key is None else (account_key,)
+    reset_params: tuple = (
+        (week_start_date, week_start_at, week_end_at) + acct_param)
+    floor_params: tuple = (week_start_date,) + acct_param
     row = conn.execute(
         f"""
         SELECT floor_at FROM (
-            SELECT effective_reset_at_utc AS floor_at
+            SELECT COALESCE(observed_at_utc, effective_reset_at_utc) AS floor_at
               FROM week_reset_events
-             WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?)
-               AND unixepoch(effective_reset_at_utc) <  unixepoch(?){acct_pred}
+             WHERE (
+                     week_start_date = ?
+                     OR (week_start_date IS NULL
+                         AND unixepoch(effective_reset_at_utc) >= unixepoch(?)
+                         AND unixepoch(effective_reset_at_utc) <  unixepoch(?))
+                   ){acct_pred}
             UNION ALL
             SELECT effective_at_utc AS floor_at
               FROM weekly_credit_floors
              WHERE week_start_date = ?{acct_pred}
         )
+        WHERE floor_at IS NOT NULL
         ORDER BY unixepoch(floor_at) DESC
         LIMIT 1
         """,

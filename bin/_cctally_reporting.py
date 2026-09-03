@@ -434,8 +434,23 @@ def cmd_weekly(args: argparse.Namespace) -> int:
             display_tz=args._resolved_tz, as_of_utc=as_of_utc, mode=args.mode,
             account_key=acct_key,
         )
+        # #703 + #707 §6.4: which of these weeks holds a credit. Resolved on
+        # this connection, because the renderers take none.
+        credited_weeks = c._credited_week_keys(
+            conn, weeks, account_key=acct_key)
     finally:
         conn.close()
+    # §6.3: the CAUSE of a withheld `$/1%`, by bucket key. `view.rows` is
+    # index-parallel with `view.aggregated` — `build_weekly_view` raises rather
+    # than letting the two desynchronize — so the bucket key is the join.
+    # Without this the terminal cell was an em-dash and the JSON carried no
+    # cause at all, and an em-dash reads as "no usage recorded", which is a
+    # different and wrong statement about a week that holds a credit.
+    withheld_by_week = {
+        b.bucket: r.dollar_per_pct_withheld_cause
+        for b, r in zip(view.aggregated, view.rows)
+        if r.dollar_per_pct_withheld_cause
+    }
     buckets = list(reversed(view.aggregated))
     overlay = list(reversed(view.overlay))
 
@@ -476,6 +491,8 @@ def cmd_weekly(args: argparse.Namespace) -> int:
         print(c._weekly_to_json(
             buckets, weeks, overlay,
             extra=c.account_json_fields(acct_key),  # #341 R8 decoration
+            credited_weeks=credited_weeks,
+            withheld_by_week=withheld_by_week,
         ))
         return 0
 
@@ -490,6 +507,8 @@ def cmd_weekly(args: argparse.Namespace) -> int:
         compact_split_fn=c._daily_compact_split,
         breakdown=args.breakdown,
         compact=getattr(args, "compact", False),
+        credited_weeks=credited_weeks,
+        withheld_by_week=withheld_by_week,
     ))
     return 0
 

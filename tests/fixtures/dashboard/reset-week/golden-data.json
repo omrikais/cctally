@@ -221,6 +221,7 @@
   },
   "current_week": {
     "dollar_per_pct": 1.602222222222222,
+    "dollar_per_pct_withheld": null,
     "five_hour_block": null,
     "five_hour_milestones": [],
     "five_hour_pct": null,
@@ -268,6 +269,7 @@
         "percent": 5
       }
     ],
+    "nominal_week_start_at": "2026-04-13T14:00:00Z",
     "reset_at_utc": "2026-04-20T14:00:00Z",
     "reset_in_sec": 0,
     "spent_usd": 7.209999999999999,
@@ -276,24 +278,13 @@
     "week_index": [
       {
         "block_count": 0,
-        "detail_stamp": "546943a02c138a59",
+        "detail_stamp": "3e2370ce31e55d99",
         "end_at_utc": "2026-04-20T14:00:00Z",
         "is_current": true,
-        "key": "milestone_cycle:aZdZxAXXphSd6kEd7WGBxWDlX2Uv6opMPHlqn42hguQ",
-        "label": "Apr 17\u2013Apr 20",
+        "key": "milestone_cycle:Zc1ylvwKaIGcW_AdgkGd6JXX7QUUhY-nufvRJeRy9Xk",
+        "label": "Apr 13\u2013Apr 20",
         "milestone_count": 5,
         "segment_count": 1,
-        "start_at_utc": "2026-04-17T13:00:00Z"
-      },
-      {
-        "block_count": 0,
-        "detail_stamp": "9d6c40e1f6663986",
-        "end_at_utc": "2026-04-17T13:00:00Z",
-        "is_current": false,
-        "key": "milestone_cycle:_iSnVfr_YQYBaFcecKJyJK5dRhKCjLE9NGJMvrxktZs",
-        "label": "Apr 13\u2013Apr 17",
-        "milestone_count": 0,
-        "segment_count": 0,
         "start_at_utc": "2026-04-13T14:00:00Z"
       },
       {
@@ -946,7 +937,7 @@
     "forecast_verdict": "ok",
     "used_pct": 5.0,
     "vs_last_week_delta": null,
-    "week_label": "Apr 17\u2013Apr 20"
+    "week_label": "Apr 13\u2013Apr 20"
   },
   "hydrating": false,
   "last_sync_at": null,
@@ -1025,7 +1016,7 @@
       ],
       "total_cost_usd": 7.209999999999999,
       "week_label": "wk Apr 13",
-      "week_start_at": "2026-04-13T00:00:00Z",
+      "week_start_at": "2026-04-13T14:00:00Z",
       "week_start_date": "2026-04-13"
     },
     "trend": {
@@ -1351,7 +1342,7 @@
                 "end_at": "2026-04-20T14:00:00Z",
                 "kind": "subscription_week",
                 "label": "Claude subscription week",
-                "start_at": "2026-04-17T13:00:00Z"
+                "start_at": "2026-04-13T14:00:00Z"
               },
               "scope": "provider_cycle",
               "state": "current",
@@ -1561,6 +1552,7 @@
           "cost_usd": 7.209999999999999,
           "current_week": {
             "dollar_per_pct": 1.602222222222222,
+            "dollar_per_pct_withheld": null,
             "five_hour_block": null,
             "five_hour_milestones": [],
             "five_hour_pct": null,
@@ -1608,6 +1600,7 @@
                 "percent": 5
               }
             ],
+            "nominal_week_start_at": "2026-04-13T14:00:00Z",
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 172800,
             "spent_usd": 7.209999999999999,
@@ -1616,24 +1609,13 @@
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "546943a02c138a59",
+                "detail_stamp": "3e2370ce31e55d99",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "is_current": true,
-                "key": "milestone_cycle:aZdZxAXXphSd6kEd7WGBxWDlX2Uv6opMPHlqn42hguQ",
-                "label": "Apr 17\u2013Apr 20",
+                "key": "milestone_cycle:Zc1ylvwKaIGcW_AdgkGd6JXX7QUUhY-nufvRJeRy9Xk",
+                "label": "Apr 13\u2013Apr 20",
                 "milestone_count": 5,
                 "segment_count": 1,
-                "start_at_utc": "2026-04-17T13:00:00Z"
-              },
-              {
-                "block_count": 0,
-                "detail_stamp": "9d6c40e1f6663986",
-                "end_at_utc": "2026-04-17T13:00:00Z",
-                "is_current": false,
-                "key": "milestone_cycle:_iSnVfr_YQYBaFcecKJyJK5dRhKCjLE9NGJMvrxktZs",
-                "label": "Apr 13\u2013Apr 17",
-                "milestone_count": 0,
-                "segment_count": 0,
                 "start_at_utc": "2026-04-13T14:00:00Z"
               },
               {
@@ -1786,7 +1768,7 @@
             "forecast_verdict": "ok",
             "used_pct": 5.0,
             "vs_last_week_delta": null,
-            "week_label": "Apr 17\u2013Apr 20"
+            "week_label": "Apr 13\u2013Apr 20"
           },
           "total_tokens": 1522000,
           "trend": {
@@ -2899,9 +2881,44 @@
               {
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
+                "cost_usd": 7.209999999999999,
+                "credited": true,
+                "delta_cost_pct": -0.5994444444444444,
+                "dollar_per_pct": 1.4419999999999997,
+                "dollar_per_pct_withheld": null,
+                "input_tokens": 1340000,
+                "is_current": true,
+                "label": "04-13",
+                "models": [
+                  {
+                    "chip": "sonnet",
+                    "cost_pct": 84.0499306518724,
+                    "cost_usd": 6.06,
+                    "display": "sonnet-4-6",
+                    "model": "claude-sonnet-4-6"
+                  },
+                  {
+                    "chip": "opus",
+                    "cost_pct": 15.950069348127602,
+                    "cost_usd": 1.15,
+                    "display": "opus-4-7",
+                    "model": "claude-opus-4-7"
+                  }
+                ],
+                "output_tokens": 182000,
+                "total_tokens": 1522000,
+                "used_pct": 5.0,
+                "week_end_at": "2026-04-20T14:00:00+00:00",
+                "week_start_at": "2026-04-13T14:00:00Z"
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
                 "cost_usd": 18.0,
+                "credited": false,
                 "delta_cost_pct": 0.0,
                 "dollar_per_pct": 0.47368421052631576,
+                "dollar_per_pct_withheld": null,
                 "input_tokens": 3000000,
                 "is_current": false,
                 "label": "04-06",
@@ -2924,8 +2941,10 @@
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
                 "cost_usd": 18.0,
+                "credited": false,
                 "delta_cost_pct": 0.0,
                 "dollar_per_pct": 0.47368421052631576,
+                "dollar_per_pct_withheld": null,
                 "input_tokens": 3000000,
                 "is_current": false,
                 "label": "03-30",
@@ -2948,8 +2967,10 @@
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
                 "cost_usd": 18.0,
+                "credited": false,
                 "delta_cost_pct": 0.0,
                 "dollar_per_pct": 0.47368421052631576,
+                "dollar_per_pct_withheld": null,
                 "input_tokens": 3000000,
                 "is_current": false,
                 "label": "03-23",
@@ -2972,8 +2993,10 @@
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
                 "cost_usd": 18.0,
+                "credited": false,
                 "delta_cost_pct": null,
                 "dollar_per_pct": 0.47368421052631576,
+                "dollar_per_pct_withheld": null,
                 "input_tokens": 3000000,
                 "is_current": false,
                 "label": "03-16",
@@ -2993,8 +3016,8 @@
                 "week_start_at": "2026-03-16T14:00:00Z"
               }
             ],
-            "total_cost_usd": 72.0,
-            "total_tokens": 14400000
+            "total_cost_usd": 79.21,
+            "total_tokens": 15922000
           }
         },
         "projects": {
@@ -3045,7 +3068,7 @@
             ],
             "total_cost_usd": 7.209999999999999,
             "week_label": "wk Apr 13",
-            "week_start_at": "2026-04-13T00:00:00Z",
+            "week_start_at": "2026-04-13T14:00:00Z",
             "week_start_date": "2026-04-13"
           },
           "rows": [
@@ -3325,6 +3348,7 @@
           ],
           "current_week": {
             "dollar_per_pct": 1.602222222222222,
+            "dollar_per_pct_withheld": null,
             "five_hour_block": null,
             "five_hour_pct": null,
             "five_hour_resets_in_sec": null,
@@ -3334,6 +3358,7 @@
               "label": "fresh"
             },
             "last_snapshot_age_sec": 0,
+            "nominal_week_start_at": "2026-04-13T14:00:00Z",
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 172800,
             "spent_usd": 7.209999999999999,
@@ -3342,24 +3367,13 @@
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "546943a02c138a59",
+                "detail_stamp": "3e2370ce31e55d99",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "is_current": true,
-                "key": "milestone_cycle:aZdZxAXXphSd6kEd7WGBxWDlX2Uv6opMPHlqn42hguQ",
-                "label": "Apr 17\u2013Apr 20",
+                "key": "milestone_cycle:Zc1ylvwKaIGcW_AdgkGd6JXX7QUUhY-nufvRJeRy9Xk",
+                "label": "Apr 13\u2013Apr 20",
                 "milestone_count": 5,
                 "segment_count": 1,
-                "start_at_utc": "2026-04-17T13:00:00Z"
-              },
-              {
-                "block_count": 0,
-                "detail_stamp": "9d6c40e1f6663986",
-                "end_at_utc": "2026-04-17T13:00:00Z",
-                "is_current": false,
-                "key": "milestone_cycle:_iSnVfr_YQYBaFcecKJyJK5dRhKCjLE9NGJMvrxktZs",
-                "label": "Apr 13\u2013Apr 17",
-                "milestone_count": 0,
-                "segment_count": 0,
                 "start_at_utc": "2026-04-13T14:00:00Z"
               },
               {
@@ -3848,9 +3862,44 @@
       {
         "cache_creation_tokens": 0,
         "cache_read_tokens": 0,
+        "cost_usd": 7.209999999999999,
+        "credited": true,
+        "delta_cost_pct": -0.5994444444444444,
+        "dollar_per_pct": 1.4419999999999997,
+        "dollar_per_pct_withheld": null,
+        "input_tokens": 1340000,
+        "is_current": true,
+        "label": "04-13",
+        "models": [
+          {
+            "chip": "sonnet",
+            "cost_pct": 84.0499306518724,
+            "cost_usd": 6.06,
+            "display": "sonnet-4-6",
+            "model": "claude-sonnet-4-6"
+          },
+          {
+            "chip": "opus",
+            "cost_pct": 15.950069348127602,
+            "cost_usd": 1.15,
+            "display": "opus-4-7",
+            "model": "claude-opus-4-7"
+          }
+        ],
+        "output_tokens": 182000,
+        "total_tokens": 1522000,
+        "used_pct": 5.0,
+        "week_end_at": "2026-04-20T14:00:00+00:00",
+        "week_start_at": "2026-04-13T14:00:00Z"
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
         "cost_usd": 18.0,
+        "credited": false,
         "delta_cost_pct": 0.0,
         "dollar_per_pct": 0.47368421052631576,
+        "dollar_per_pct_withheld": null,
         "input_tokens": 3000000,
         "is_current": false,
         "label": "04-06",
@@ -3873,8 +3922,10 @@
         "cache_creation_tokens": 0,
         "cache_read_tokens": 0,
         "cost_usd": 18.0,
+        "credited": false,
         "delta_cost_pct": 0.0,
         "dollar_per_pct": 0.47368421052631576,
+        "dollar_per_pct_withheld": null,
         "input_tokens": 3000000,
         "is_current": false,
         "label": "03-30",
@@ -3897,8 +3948,10 @@
         "cache_creation_tokens": 0,
         "cache_read_tokens": 0,
         "cost_usd": 18.0,
+        "credited": false,
         "delta_cost_pct": 0.0,
         "dollar_per_pct": 0.47368421052631576,
+        "dollar_per_pct_withheld": null,
         "input_tokens": 3000000,
         "is_current": false,
         "label": "03-23",
@@ -3921,8 +3974,10 @@
         "cache_creation_tokens": 0,
         "cache_read_tokens": 0,
         "cost_usd": 18.0,
+        "credited": false,
         "delta_cost_pct": null,
         "dollar_per_pct": 0.47368421052631576,
+        "dollar_per_pct_withheld": null,
         "input_tokens": 3000000,
         "is_current": false,
         "label": "03-16",
@@ -3942,7 +3997,7 @@
         "week_start_at": "2026-03-16T14:00:00Z"
       }
     ],
-    "total_cost_usd": 72.0,
-    "total_tokens": 14400000
+    "total_cost_usd": 79.21,
+    "total_tokens": 15922000
   }
 }

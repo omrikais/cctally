@@ -3,6 +3,8 @@ import pytest
 
 from conftest import load_script
 from schema_delivery_helpers import (
+    _column_keys,
+    assert_every_column_declaration_is_literal,
     _literal_object_keys,
     assert_frozen_baseline,
     assert_migration_delivery,
@@ -71,6 +73,37 @@ trigger:conv_fts_au
 trigger:conv_title_fts_ad
 trigger:conv_title_fts_ai
 trigger:conv_title_fts_au
+column:codex_session_entries.account_key
+column:codex_session_entries.conversation_key
+column:codex_session_entries.source_root_key
+column:codex_session_files.account_key
+column:codex_session_files.last_conversation_key
+column:codex_session_files.last_native_thread_id
+column:codex_session_files.last_parent_thread_id
+column:codex_session_files.last_root_thread_id
+column:codex_session_files.last_turn_id
+column:codex_session_files.source_root_key
+column:conversation_messages.attribution_plugin
+column:conversation_messages.attribution_skill
+column:conversation_messages.search_thinking
+column:conversation_messages.search_tool
+column:conversation_messages.source_tool_use_id
+column:conversation_messages.stop_reason
+column:conversation_sessions.git_branch
+column:conversation_sessions.models_json
+column:conversation_sessions.title
+column:quota_window_snapshots.account_key
+column:quota_window_snapshots.canonical_resets_at_utc
+column:quota_window_snapshots.observed_model
+column:session_entries.account_key
+column:session_entries.cache_create_1h_tokens
+column:session_entries.cache_create_5m_tokens
+column:session_entries.mutation_min_ts
+column:session_entries.mutation_seq
+column:session_entries.speed
+column:session_files.account_key
+column:session_files.project_path
+column:session_files.session_id
 """.split()
 )
 
@@ -103,7 +136,9 @@ def test_cache_scan_is_non_vacuous_for_every_supported_kind(db):
     assert ("table", "session_entries") in declared
     assert ("index", "idx_codex_entries_root_path") in declared
     assert ("trigger", "trg_codex_accounting_ins") in declared
-    assert {kind for kind, _name in declared} == {"index", "table", "trigger"}
+    assert ("column", "session_entries.speed") in declared
+    assert {kind for kind, _name in declared} == {
+        "column", "index", "table", "trigger"}
 
 
 @pytest.mark.parametrize(
@@ -156,6 +191,28 @@ def test_the_566_index_keeps_its_delivery_path(db):
     assert record.kind == "index"
     assert record.introduced_by == "042_codex_entries_root_path_index"
     assert record.ensure_helper == "_apply_codex_entries_root_path_index"
+
+
+def test_column_scanner_reads_a_literal_declaration():
+    source = (
+        "def probe(conn):\n"
+        "    add_column_if_missing(conn, 'probe_table', 'probe_col', 'TEXT')\n"
+    )
+    assert _column_keys(source) == {("column", "probe_table.probe_col")}
+
+
+def test_column_scanner_is_blind_to_a_dynamic_declaration():
+    """Pins WHY the literal-args guard below has to exist."""
+    source = (
+        "def probe(conn, table):\n"
+        "    add_column_if_missing(conn, table, 'probe_col', 'TEXT')\n"
+    )
+    assert _column_keys(source) == set()
+
+
+def test_every_column_declaration_is_visible_to_the_scanner(db):
+    assert_every_column_declaration_is_literal(
+        db._apply_cache_schema, store="cache.db")
 
 
 if __name__ == "__main__":  # pragma: no cover

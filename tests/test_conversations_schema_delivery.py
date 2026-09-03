@@ -3,6 +3,8 @@ import pytest
 
 from conftest import load_script
 from schema_delivery_helpers import (
+    _column_keys,
+    assert_every_column_declaration_is_literal,
     assert_frozen_baseline,
     assert_migration_delivery,
     assert_registry_matches_schema,
@@ -53,6 +55,18 @@ trigger:conv_fts_au
 trigger:conv_title_fts_ad
 trigger:conv_title_fts_ai
 trigger:conv_title_fts_au
+column:codex_conversation_events.account_key
+column:codex_conversation_messages.account_key
+column:conversation_messages.account_key
+column:conversation_messages.attribution_plugin
+column:conversation_messages.attribution_skill
+column:conversation_messages.search_thinking
+column:conversation_messages.search_tool
+column:conversation_messages.source_tool_use_id
+column:conversation_messages.stop_reason
+column:conversation_sessions.git_branch
+column:conversation_sessions.models_json
+column:conversation_sessions.title
 """.split()
 )
 
@@ -89,7 +103,9 @@ def test_conversations_scan_is_non_vacuous_for_every_supported_kind(db):
     assert ("table", "conversation_source_files") in declared
     assert ("index", "idx_conv_messages_account_session") in declared
     assert ("trigger", "codex_find_projection_message_ad") in declared
-    assert {kind for kind, _name in declared} == {"index", "table", "trigger"}
+    assert ("column", "conversation_messages.account_key") in declared
+    assert {kind for kind, _name in declared} == {
+        "column", "index", "table", "trigger"}
 
 
 def test_conversations_post_baseline_objects_have_real_migration_delivery(db):
@@ -104,6 +120,28 @@ def test_conversations_frozen_baseline_has_not_grown(db):
         db.CONVERSATIONS_REDERIVABLE_OBJECTS, EXPECTED_BASELINE,
         store="conversations.db",
     )
+
+
+def test_column_scanner_reads_a_literal_declaration():
+    source = (
+        "def probe(conn):\n"
+        "    add_column_if_missing(conn, 'probe_table', 'probe_col', 'TEXT')\n"
+    )
+    assert _column_keys(source) == {("column", "probe_table.probe_col")}
+
+
+def test_column_scanner_is_blind_to_a_dynamic_declaration():
+    """Pins WHY the literal-args guard below has to exist."""
+    source = (
+        "def probe(conn, table):\n"
+        "    add_column_if_missing(conn, table, 'probe_col', 'TEXT')\n"
+    )
+    assert _column_keys(source) == set()
+
+
+def test_every_column_declaration_is_visible_to_the_scanner(db):
+    assert_every_column_declaration_is_literal(
+        db._apply_conversations_schema, store="conversations.db")
 
 
 if __name__ == "__main__":  # pragma: no cover

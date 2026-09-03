@@ -510,15 +510,12 @@ from _cctally_cache import (
 from _lib_snapshot_cache import (
     build_cached_group_a,
     bump_generation,
-    cached_bugk_segment,
     reset_bugk_segment_state,
     reset_cache_report_state,
     reset_group_a_state,
     reset_projects_env_state,
     reset_session_cache_state,
     reset_weekref_cost_state,
-    BugKSegment,
-    _bugk_key,
     _max_id as _snapshot_max_id,
     _reset_sig as _snapshot_reset_sig,
 )
@@ -3623,19 +3620,20 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
                                     now_utc: "dt.datetime",
                                     *, n: int = 12,
                                     skip_sync: bool = False,
-                                    use_group_a_cache: bool = False,
-                                    use_bugk_segment_cache: bool = False) -> "list[WeeklyPeriodRow]":
+                                    use_group_a_cache: bool = False) -> "list[WeeklyPeriodRow]":
     """Latest n subscription weeks as WeeklyPeriodRow, newest-first.
 
-    Thin builder-using prelude + Bug-K pre-credit synthesis on top of
-    ``view.rows``. ``build_weekly_view`` (in ``bin/_lib_view_models.py``)
-    owns the bucket+overlay walk — this function calls it, swaps two
-    presentation fields (``label`` ← ``display_start_date`` for post-
-    early-reset weeks; ``is_current`` ← SubWeek-containing-now_utc with
-    snapshot fallback so the "Now" pill tracks wall time), layers Bug-K
-    pre-credit synthesized rows over the natural rows, then recomputes
-    ``delta_cost_pct`` newest-first so the synthesized rows participate
-    in the deltas.
+    Thin builder-using prelude on top of ``view.rows``. ``build_weekly_view``
+    (in ``bin/_lib_view_models.py``) owns the bucket+overlay walk — this
+    function calls it, swaps two presentation fields (``label`` ←
+    ``display_start_date`` for post-early-reset weeks; ``is_current`` ←
+    SubWeek-containing-now_utc with snapshot fallback so the "Now" pill tracks
+    wall time), then computes ``delta_cost_pct`` newest-first.
+
+    It used to layer a synthesized pre-credit row over the natural rows, because
+    the credited week's own row covered only the post-credit interval. #703 +
+    #707 §6.1 removed both halves of that: an Anthropic reset never changes the
+    week's boundaries, so the natural row already covers the whole week.
 
     Note: weekly bucketing intentionally does NOT take ``display_tz`` —
     SubWeek bucket keys come from server-anchored stored anchors and the
@@ -3749,219 +3747,14 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
         r.delta_cost_pct = None
         rows_oldest_first.append(r)
 
-    # Bug K (v1.7.2 round-5): synthesize a pre-credit segment row for
-    # each in-place credit event. Without this the credited week shows
-    # ONLY the post-credit segment ($134 on live data) and the bulk of
-    # the week's cost (~$372 in entries before the credit moment) is
-    # invisible to the user.
-    #
-    # _apply_reset_events_to_subweeks shifts the credited SubWeek's
-    # start_ts to ``effective_reset_at_utc``, so _aggregate_weekly's
-    # bucket for that SubWeek already covers ONLY the post-credit
-    # interval. We rebuild the pre-credit bucket here by fetching the
-    # ``[original_start, effective)`` window directly (#268: no longer a
-    # wide ``entries`` list on the cached path) and re-aggregating cost /
-    # tokens / per-model.
-    #
-    # The pre-credit row's ``used_pct`` comes from the
-    # weekly_usage_snapshots row captured at-or-before the credit
-    # moment (the pre-credit peak the user reached); fall back to None
-    # if no snapshot was recorded before the credit fired.
-    in_place_credits = conn.execute(
-        "SELECT new_week_end_at, effective_reset_at_utc "
-        "FROM week_reset_events "
-        "WHERE old_week_end_at = effective_reset_at_utc"
-    ).fetchall()
-    if in_place_credits:
-        _lib_pricing = sys.modules.get("_lib_pricing")
-        if _lib_pricing is None:
-            import importlib.util as _ilu, pathlib as _pl
-            _p = _pl.Path(__file__).resolve().parent / "_lib_pricing.py"
-            _spec = _ilu.spec_from_file_location("_lib_pricing", _p)
-            _lib_pricing = _ilu.module_from_spec(_spec)
-            sys.modules["_lib_pricing"] = _lib_pricing
-            _spec.loader.exec_module(_lib_pricing)
-        _calc = _lib_pricing._calculate_entry_cost
-
-        insertions: list[tuple[int, WeeklyPeriodRow]] = []
-        for ev in in_place_credits:
-            try:
-                eff_dt = parse_iso_datetime(
-                    ev["effective_reset_at_utc"], "credit.eff"
-                )
-                new_end_dt = parse_iso_datetime(
-                    ev["new_week_end_at"], "credit.new_end"
-                )
-            except ValueError:
-                continue
-            # Find the SubWeek whose end_ts equals new_week_end_at (the
-            # post-credit segment); its start_ts has already been
-            # shifted to ``effective`` by _apply_reset_events_to_subweeks.
-            post_sw = None
-            for w in weeks:
-                try:
-                    w_end = parse_iso_datetime(w.end_ts, "sw.end")
-                except ValueError:
-                    continue
-                if w_end == new_end_dt:
-                    post_sw = w
-                    break
-            if post_sw is None:
-                continue
-
-            # Original start instant: take the EARLIEST recorded
-            # week_start_at for this week_start_date. The post-credit
-            # SubWeek's start_ts is the shifted value (= effective); the
-            # MIN over weekly_usage_snapshots gives us the original
-            # API-derived start before the override fired.
-            orig_row = conn.execute(
-                "SELECT MIN(week_start_at) AS ws "
-                "FROM weekly_usage_snapshots "
-                "WHERE week_start_date = ? AND week_start_at IS NOT NULL",
-                (post_sw.start_date.isoformat(),),
-            ).fetchone()
-            if orig_row is None or orig_row["ws"] is None:
-                continue
-            try:
-                original_start_iso = str(orig_row["ws"])
-                original_start_dt = parse_iso_datetime(
-                    original_start_iso, "credit.original_start"
-                )
-            except ValueError:
-                continue
-            if original_start_dt >= eff_dt:
-                # No pre-credit interval to aggregate.
-                continue
-
-            # Aggregate entries in [original_start, effective). Fetch this
-            # window directly (skip_sync=True — the rebuild already ingested,
-            # or the fallback's wide fetch above did) rather than filtering a
-            # wide `entries` list, so Bug-K works identically on the cached
-            # path (where no wide entry list exists) and the fallback path.
-            #
-            # #271 §18: the [original_start, effective) window is a CLOSED past
-            # interval (effective is a historical credit moment), so this folded
-            # aggregate is IMMUTABLE — cache it byte-identically (the same
-            # "re-aggregate immutable history every tick" pattern the #269
-            # weekref cost cache fixed). `_compute_pre_segment` is the exact
-            # from-scratch fetch+fold closure; on the sync thread
-            # (`use_bugk_segment_cache=True`) it routes through
-            # `cached_bugk_segment` (get-or-compute over the canonical window
-            # key), on EVERY other caller (CLI / share / tests / reconcile-
-            # failed) it computes directly — byte-unchanged. The `used_pct`
-            # snapshot query + WeeklyPeriodRow build BELOW always rerun fresh
-            # from the segment (do NOT cache the row — Codex-BK-5).
-            def _compute_pre_segment(_orig=original_start_dt, _eff=eff_dt):
-                pi = po = pcc = pcr = 0
-                pcost = 0.0
-                pmodels: dict[str, float] = {}
-                pcount = 0
-                for e in get_entries(_orig, _eff, skip_sync=True):
-                    if _orig <= e.timestamp < _eff:
-                        usage = e.usage
-                        pi  += usage.get("input_tokens", 0)
-                        po  += usage.get("output_tokens", 0)
-                        pcc += usage.get("cache_creation_input_tokens", 0)
-                        pcr += usage.get("cache_read_input_tokens", 0)
-                        c = _calc(
-                            e.model, usage, mode="auto", cost_usd=e.cost_usd,
-                        )
-                        pcost += c
-                        pmodels[e.model] = pmodels.get(e.model, 0.0) + c
-                        pcount += 1
-                # Codex-BK-4: freeze `models` as a tuple of (model, cost) in
-                # first-seen (dict-insertion) order so the row's stable cost-desc
-                # sort tie-order can't be mutated after caching.
-                return BugKSegment(
-                    input=pi, output=po, cache_create=pcc, cache_read=pcr,
-                    cost=pcost, models=tuple(pmodels.items()), entry_count=pcount,
-                )
-
-            if use_bugk_segment_cache:
-                seg = cached_bugk_segment(
-                    key=_bugk_key(original_start_dt, eff_dt),
-                    compute=_compute_pre_segment,
-                )
-            else:
-                seg = _compute_pre_segment()
-            pre_input = seg.input
-            pre_output = seg.output
-            pre_cc = seg.cache_create
-            pre_cr = seg.cache_read
-            pre_cost = seg.cost
-            pre_models = seg.models  # ((model, cost), ...) in first-seen order
-            pre_entry_count = seg.entry_count
-            if pre_entry_count == 0 and pre_cost <= 0:
-                # No measurable pre-credit activity — skip insertion.
-                continue
-
-            # Pre-credit used_pct: latest snapshot at-or-before the
-            # credit moment for this week_start_date.
-            pre_usage = conn.execute(
-                "SELECT weekly_percent FROM weekly_usage_snapshots "
-                "WHERE week_start_date = ? "
-                "  AND unixepoch(captured_at_utc) <= unixepoch(?) "
-                "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
-                (post_sw.start_date.isoformat(), ev["effective_reset_at_utc"]),
-            ).fetchone()
-            pre_used_pct: float | None = None
-            if pre_usage is not None and pre_usage["weekly_percent"] is not None:
-                pre_used_pct = float(pre_usage["weekly_percent"])
-            pre_dpp = (
-                pre_cost / pre_used_pct
-                if pre_used_pct and pre_used_pct > 0 else None
-            )
-
-            pre_total = pre_input + pre_output + pre_cc + pre_cr
-            # `pre_models` is a first-seen-order tuple of (model, cost); the
-            # stable cost-desc sort preserves that tie-order byte-for-byte,
-            # identical to the pre-#271 `sorted(dict.items(), ...)`.
-            pre_model_breakdowns = [
-                {"modelName": m, "cost": c}
-                for m, c in sorted(pre_models, key=lambda kv: -kv[1])
-            ]
-            pre_label = original_start_dt.strftime("%m-%d")
-            pre_row = WeeklyPeriodRow(
-                label=pre_label,
-                cost_usd=pre_cost,
-                total_tokens=pre_total,
-                input_tokens=pre_input,
-                output_tokens=pre_output,
-                cache_creation_tokens=pre_cc,
-                cache_read_tokens=pre_cr,
-                used_pct=pre_used_pct,
-                dollar_per_pct=pre_dpp,
-                delta_cost_pct=None,
-                # Pre-credit segment is historical even though it
-                # shares the bucket date with the live week.
-                is_current=False,
-                models=_model_breakdowns_to_models(
-                    pre_model_breakdowns, pre_cost
-                ),
-                week_start_at=original_start_iso,
-                week_end_at=ev["effective_reset_at_utc"],
-            )
-
-            # Find post-credit row's index and insert pre-credit BEFORE
-            # it (chronological order: pre then post in oldest-first).
-            post_idx = None
-            for i, r in enumerate(rows_oldest_first):
-                if r.week_start_at == post_sw.start_ts and r.week_end_at == post_sw.end_ts:
-                    post_idx = i
-                    break
-            if post_idx is None:
-                # The post-credit row may have been dropped by
-                # _aggregate_weekly (no entries in the post-credit
-                # interval) — append at the most-recent slot so the
-                # pre-credit segment still surfaces.
-                insertions.append((len(rows_oldest_first), pre_row))
-            else:
-                insertions.append((post_idx, pre_row))
-
-        # Apply insertions in REVERSE index order so prior insertions
-        # don't shift the indices of later ones.
-        for idx, pre_row in sorted(insertions, key=lambda t: -t[0]):
-            rows_oldest_first.insert(idx, pre_row)
+    # #703 + #707 §6.1: the pre-credit segment row is gone. It existed because
+    # `_apply_reset_events_to_subweeks` shifted the credited week's `start_ts`
+    # to the credit moment, so the panel's bucket covered only the post-credit
+    # interval and the bulk of the week's spend was invisible. That shift is
+    # gone — an Anthropic reset never changes the week's boundaries — so the
+    # single row already covers the whole week and a second one would double it.
+    # The credit still shows: the row carries the marker §6.4 describes, and the
+    # accounting segments remain in the milestone and drill-down data.
 
     # Reverse so caller gets newest-first; compute delta_cost_pct vs the
     # immediately older row in that orientation.

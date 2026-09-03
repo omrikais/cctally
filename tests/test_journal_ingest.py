@@ -277,20 +277,29 @@ def _pm_with_reset_hook(jr):
     """Synthetic hook: insert a week_reset_events row (natural-keyed, journal_id
     NULL) AND a percent_milestones row referencing it via reset_event_id. Both
     are harvested (journal_id NULL => inserted this cycle); the pm's evt id must
-    embed the reset event's LOGICAL id, resolved by harvest order."""
+    embed the reset event's LOGICAL id, resolved by harvest order.
+
+    The reset row carries a `credit_key` derived from the observation, exactly
+    as the real detector does since #703 + #707. That is what makes the
+    `INSERT OR IGNORE` idempotent across the crash and the recovery run: identity
+    is `(account_key, credit_key)` now, and SQLite treats two NULL keys as
+    distinct, so a keyless row would be inserted twice and harvest would then
+    try to stamp the same natural-key id onto both."""
     def hook(ctx, rec):
         if rec.get("t") != "obs":
             return
         conn = ctx.conn
+        credit_key = f"sa:{rec['id']}"
         conn.execute(
             "INSERT OR IGNORE INTO week_reset_events "
             "(detected_at_utc, old_week_end_at, new_week_end_at, "
-            " effective_reset_at_utc, observed_pre_credit_pct) VALUES (?,?,?,?,?)",
-            (rec["at"], _OLD_END, _NEW_END, _OLD_END, 46.0),
+            " effective_reset_at_utc, observed_pre_credit_pct, "
+            " credit_key, credit_order) VALUES (?,?,?,?,?,?,?)",
+            (rec["at"], _OLD_END, _NEW_END, _OLD_END, 46.0, credit_key, 1),
         )
         rid = conn.execute(
-            "SELECT id FROM week_reset_events WHERE new_week_end_at = ?",
-            (_NEW_END,),
+            "SELECT id FROM week_reset_events WHERE credit_key = ?",
+            (credit_key,),
         ).fetchone()[0]
         conn.execute(
             "INSERT OR IGNORE INTO percent_milestones "
@@ -310,7 +319,8 @@ def test_harvest_crash_convergence_percent_milestone(tmp_path, monkeypatch):
     jr, J = _siblings()
     jr.PIPELINE.append(_pm_with_reset_hook(jr))
 
-    jr.append_record(_usage_obs(J, 57.0), now_utc=FIXED)
+    obs = _usage_obs(J, 57.0)
+    jr.append_record(obs, now_utc=FIXED)
 
     orig_write_cursor = jr._write_cursor
     jr._write_cursor = _crash_write_cursor()
@@ -340,10 +350,10 @@ def test_harvest_crash_convergence_percent_milestone(tmp_path, monkeypatch):
         ).fetchone()
     finally:
         conn.close()
-    # #341: harvest evt ids now lead with account_key (the unstamped obs defaults
-    # to the reserved sentinel) — the id stays a bijection with the extended
-    # UNIQUE key.
-    assert wr["journal_id"] == "wr:unattributed:%s:%s" % (_OLD_END, _NEW_END)
+    # #341: harvest evt ids lead with account_key (the unstamped obs defaults to
+    # the reserved sentinel) — the id stays a bijection with the extended UNIQUE
+    # key, which #703 + #707 moved onto `credit_key`.
+    assert wr["journal_id"] == "wr:unattributed:sa:%s" % obs["id"]
     # pm's reset FK resolves to the wr rowid; its id embeds the wr LOGICAL id.
     assert pm["reset_event_id"] == wr["id"]
     assert pm["journal_id"] == "pm:unattributed:2026-07-19:%s:57" % wr["journal_id"]
@@ -726,9 +736,11 @@ def test_op_weekly_credit_floor_folds(tmp_path, monkeypatch):
     jr.run_stats_ingest(mode="authoritative")
     conn = ns["open_db"]()
     try:
+        # #703 + #707: the op fold materializes the unified credit record in
+        # `week_reset_events`, not a second row in `weekly_credit_floors`.
         row = conn.execute(
             "SELECT journal_id, week_start_date, observed_pre_credit_pct "
-            "FROM weekly_credit_floors"
+            "FROM week_reset_events"
         ).fetchone()
     finally:
         conn.close()
@@ -738,7 +750,7 @@ def test_op_weekly_credit_floor_folds(tmp_path, monkeypatch):
 
     # Idempotent re-fold.
     jr.run_stats_ingest(mode="authoritative")
-    assert _count(ns, "weekly_credit_floors") == 1
+    assert _count(ns, "week_reset_events") == 1
 
 
 # --------------------------------------------------------------------------

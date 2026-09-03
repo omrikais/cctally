@@ -4,6 +4,9 @@ import { useDisplayTz } from '../hooks/useDisplayTz';
 import { ModelCostBars } from './ModelCostBars';
 import type { DailyPanelRow, PeriodRow } from '../types/envelope';
 import { modelChipStyle } from '../lib/model';
+import {
+  CREDIT_MARKER_LABEL, CREDIT_MARKER_TITLE, withheldDollarPerPctLabel,
+} from '../lib/creditMarker';
 
 interface Props {
   row: PeriodRow;
@@ -79,6 +82,13 @@ export function PeriodDetailCard({
   // "Today" for daily; "Now" for weekly/monthly. Only rendered when
   // is_current is true (today's date / current week / current month).
   const currentLabel = variant === 'daily' ? 'Today' : 'Now';
+  // Only a weekly row carries a `$/1%` at all, so only a weekly row can
+  // withhold one. A rendered ratio always wins: the server publishes a cause
+  // alongside a value on no path, and preferring the value keeps a stale cause
+  // from replacing a figure that is present.
+  const withheldLabel = variant === 'weekly' && row.dollar_per_pct == null
+    ? withheldDollarPerPctLabel(row.dollar_per_pct_withheld)
+    : null;
   return (
     <div className={`detail-card ${accentClass}`}>
       <div className="head">
@@ -93,6 +103,11 @@ export function PeriodDetailCard({
           )}
           {row.label}
           {row.is_current && <span className="pill-current">{currentLabel}</span>}
+          {variant === 'weekly' && row.credited && (
+            <span className="pill-credited" title={CREDIT_MARKER_TITLE}>
+              {CREDIT_MARKER_LABEL}
+            </span>
+          )}
         </div>
         <div>
           <span className="cost" style={{ color: 'var(--text)', fontWeight: 700 }}>{fmt.usd2(row.cost_usd)}</span>
@@ -146,7 +161,24 @@ export function PeriodDetailCard({
       {variant === 'weekly' && (
         <div className="stats2">
           <div className="s"><span className="k">Used %</span><span className="v">{fmt.pct0(row.used_pct)}</span></div>
-          <div className="s"><span className="k">$/1%</span><span className="v">{fmt.usd2(row.dollar_per_pct)}</span></div>
+          {/* The weekly variant fills two of this grid's five tracks, so the
+              `$/1%` cell is 85px wide at desktop. A figure fits; a 21-character
+              cause wrapped to three lines with a word orphaned on the label
+              line, tripling the row's height while ~255px of grid sat empty to
+              its right. `s-wide` gives the prose cell the rest of the row.
+              Not a media query: at the mobile breakpoint the grid is already
+              `1fr 1fr` and `2 / -1` resolves to the same single track it has
+              today, where the cause reads well in two lines. */}
+          <div className={`s${withheldLabel != null ? ' s-wide' : ''}`}>
+            <span className="k">$/1%</span>
+            {/* #703 + #707 §6.3 — a withheld ratio prints its CAUSE, following
+                the `explain` command's rule. `fmt.usd2(null)` renders an
+                em-dash, which reads as "no usage recorded" and is a different,
+                wrong statement about a week that holds a credit. */}
+            {withheldLabel != null
+              ? <span className="v withheld" title={CREDIT_MARKER_TITLE}>{withheldLabel}</span>
+              : <span className="v">{fmt.usd2(row.dollar_per_pct)}</span>}
+          </div>
         </div>
       )}
     </div>

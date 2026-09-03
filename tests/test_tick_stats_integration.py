@@ -1465,6 +1465,193 @@ def test_frontier_refuses_to_seed_while_maintenance_is_pending(
             conn.close()
 
 
+def _align_source_cursor(conn, table, source_path):
+    """Make the store's recorded cursor agree with the file now on disk.
+
+    The frontier corpus copies the transcript store rather than rebuilding it,
+    so a recorded ``mtime_ns`` can disagree with the copy and classify an
+    ordinary append target as a replacement.  Replacement and cursor-gap
+    detection are pinned by their own tests; the age-bound tests below must not
+    inherit that variable from whatever ran before them.
+    """
+    stat = pathlib.Path(source_path).stat()
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    assignments = ["size_bytes=?", "last_byte_offset=?"]
+    values = [stat.st_size, stat.st_size]
+    if "mtime_ns" in columns:
+        assignments.append("mtime_ns=?")
+        values.append(stat.st_mtime_ns)
+    conn.execute(
+        f"UPDATE {table} SET {', '.join(assignments)} WHERE path=?",
+        (*values, source_path),
+    )
+    conn.commit()
+
+
+class _FrozenClock:
+    """A monotonic clock a test advances deliberately."""
+
+    def __init__(self, start=1_000.0):
+        self.value = float(start)
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += float(seconds)
+
+
+_AGE_BOUND_FRONTIERS = [
+    ("DashboardIngestFrontier", "open_cache_db", "session_files"),
+    (
+        "ConversationSyncFrontier",
+        "open_conversations_db",
+        "conversation_source_files",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "frontier_class,open_db,source_table", _AGE_BOUND_FRONTIERS)
+def test_an_unchanged_certificate_expires_once_it_reaches_its_maximum_age(
+    small_corpus, tmp_path, monkeypatch, frontier_class, open_db, source_table,
+):
+    """Staleness is bounded by elapsed time, not only by writer-supplied evidence.
+
+    Every other guard compares evidence that some writer must produce: a hook
+    ticket, a directory mtime, a schema version, a cursor.  When the hook that
+    writes tickets never runs at all, appending to an already-tracked source
+    file moves none of them, so the certificate stays authoritative for as long
+    as the process lives.  The age bound is the only check that fires without
+    any writer's cooperation, so it is what makes worst-case staleness finite.
+    """
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    clock = _FrozenClock()
+    monkeypatch.setattr(frontier, "_now", clock)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = getattr(cctally, open_db)()
+        try:
+            source_path = conn.execute(
+                f"SELECT path FROM {source_table} WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            roots = (pathlib.Path(source_path).parent,)
+            app_dir = pathlib.Path(corpus)
+            state = getattr(frontier, frontier_class)(app_dir)
+            assert state.seed_provider("claude", conn, roots=roots)
+
+            bound = frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS
+            clock.advance(bound * 0.5)
+            assert state.plan_provider(
+                "claude", conn, roots=roots,
+            ).mode == "caught_up", (
+                "a certificate inside its age bound must still skip the walk, "
+                "or the bound has destroyed the fast negative outright"
+            )
+
+            clock.advance(bound * 0.5)
+            expired = state.plan_provider("claude", conn, roots=roots)
+            assert expired.mode == "full"
+            assert expired.reason == "certificate_expired"
+        finally:
+            conn.close()
+
+
+@pytest.mark.parametrize(
+    "frontier_class,open_db,source_table", _AGE_BOUND_FRONTIERS)
+@pytest.mark.parametrize("commit_mode", ["caught_up", "targeted"])
+def test_committing_a_non_full_plan_never_postpones_the_age_bound(
+    small_corpus, tmp_path, monkeypatch,
+    frontier_class, open_db, source_table, commit_mode,
+):
+    """Only an exhaustive walk may restart the clock.
+
+    A caught-up commit advances the marker cursor, and a targeted commit also
+    refreshes the cheap guards, but neither one reads any source file the
+    tickets did not name.  Restarting the age on either would let a steady tick
+    rate, or a steady ticket stream over one busy file, defer the exhaustive
+    walk forever -- reinstating exactly the unbounded staleness this bound
+    exists to remove.
+    """
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    clock = _FrozenClock()
+    monkeypatch.setattr(frontier, "_now", clock)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = getattr(cctally, open_db)()
+        try:
+            source_path = conn.execute(
+                f"SELECT path FROM {source_table} WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            roots = (pathlib.Path(source_path).parent,)
+            app_dir = pathlib.Path(corpus)
+            if commit_mode == "targeted":
+                _align_source_cursor(conn, source_table, source_path)
+            state = getattr(frontier, frontier_class)(app_dir)
+            assert state.seed_provider("claude", conn, roots=roots)
+
+            half = frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS / 2.0
+            clock.advance(half)
+            if commit_mode == "targeted":
+                assert frontier.record_activity(app_dir, "claude", source_path)
+            plan = state.plan_provider("claude", conn, roots=roots)
+            assert plan.mode == commit_mode, plan.reason
+            state.commit_provider(plan, conn, roots=roots)
+
+            clock.advance(half)
+            expired = state.plan_provider("claude", conn, roots=roots)
+            assert expired.mode == "full", (
+                f"a committed {commit_mode} plan restarted the age bound"
+            )
+            assert expired.reason == "certificate_expired"
+        finally:
+            conn.close()
+
+
+@pytest.mark.parametrize(
+    "frontier_class,open_db,source_table", _AGE_BOUND_FRONTIERS)
+def test_the_full_pass_an_expired_certificate_forces_restarts_the_age_bound(
+    small_corpus, tmp_path, monkeypatch, frontier_class, open_db, source_table,
+):
+    """Expiry costs one walk, not the fast negative itself.
+
+    Committing the forced full plan reseeds the provider, so the very next tick
+    is cheap again.  Without this the bound would degrade into an unconditional
+    full pass on every tick once the first certificate aged out.
+    """
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    clock = _FrozenClock()
+    monkeypatch.setattr(frontier, "_now", clock)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = getattr(cctally, open_db)()
+        try:
+            source_path = conn.execute(
+                f"SELECT path FROM {source_table} WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            roots = (pathlib.Path(source_path).parent,)
+            app_dir = pathlib.Path(corpus)
+            state = getattr(frontier, frontier_class)(app_dir)
+            assert state.seed_provider("claude", conn, roots=roots)
+
+            clock.advance(frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS)
+            forced = state.plan_provider("claude", conn, roots=roots)
+            assert forced.mode == "full"
+            state.commit_provider(forced, conn, roots=roots)
+
+            assert state.plan_provider(
+                "claude", conn, roots=roots,
+            ).mode == "caught_up"
+        finally:
+            conn.close()
+
+
 def test_dashboard_tick_skips_caught_up_estates_and_ingests_append_immediately(
     small_corpus, monkeypatch, tmp_path,
 ):

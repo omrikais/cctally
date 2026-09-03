@@ -430,17 +430,26 @@ def test_a_percentage_decrease_alone_never_forks_a_segment():
     assert len(qm.build_segments(snaps, [])) == 1
 
 
-def test_an_authoritative_reset_forks_and_reanchors():
+def test_an_authoritative_credit_forks_without_reanchoring():
+    """#703 + #707 §2: an Anthropic credit of ANY size leaves the week's
+    boundaries where they were, so it cuts a segment and re-anchors nothing.
+
+    This test used to assert the opposite for a >=25pp credit, which is the
+    behaviour that grew a second `weekly` row for one unchanged subscription
+    week in the 2026-09-01 incident.
+    """
     snaps = [_snap(h, p) for h, p in ((1, 10.0), (5, 20.0))]
-    cr = [qm.CreditRecord(DAY.replace(hour=3), "reset")]
+    cr = [qm.CreditRecord(DAY.replace(hour=3), "credit")]
     segs = qm.build_segments(snaps, cr)
-    assert len(segs) == 2 and segs[1].restarted is True
-    assert segs[1].week_anchor == DAY.replace(hour=3)
+    assert len(segs) == 2
+    assert segs[1].restarted is False
+    assert segs[1].week_anchor == segs[0].week_anchor
+    assert segs[1].week_anchor != qm.canonical_week_anchor(DAY.replace(hour=3))
 
 
-def test_a_floor_credit_forks_without_reanchoring_the_week():
-    # `record-credit` deliberately does not re-anchor, unlike a >=25pp
-    # auto-credit. Mutation: treating both credit paths the same.
+def test_a_credit_forks_without_reanchoring_the_week():
+    # No credit re-anchors (#703 + #707 §2). Mutation: anchoring the successor
+    # from the credit instant.
     #
     # The two rows carry DIFFERENT raw week-start spellings that canonicalize
     # to one anchor, and that anchor is neither the module default nor the
@@ -453,7 +462,7 @@ def test_a_floor_credit_forks_without_reanchoring_the_week():
     credit_at = DAY.replace(hour=3)
     snaps = [qm.SnapshotRecord(DAY.replace(hour=1), jitter_a, 10.0, "api", 1),
              qm.SnapshotRecord(DAY.replace(hour=5), jitter_b, 20.0, "api", 2)]
-    segs = qm.build_segments(snaps, [qm.CreditRecord(credit_at, "floor")])
+    segs = qm.build_segments(snaps, [qm.CreditRecord(credit_at, "credit")])
     assert len(segs) == 2
     assert segs[1].restarted is False
     assert segs[0].week_anchor == expected
@@ -485,13 +494,16 @@ def test_the_snapshot_tie_break_falls_through_to_ascending_rowid():
     assert [r.rowid for r in segs[0].rows] == [3, 7]
 
 
-def test_a_reset_credit_straddling_the_rounding_boundary_forks_once():
-    # Section 27. A reset anchors the successor from the credit instant while
-    # the next row is compared against its OWN canonical anchor, so a credit
-    # at 03:29 (rounding down to 03:00) with post-reset rows recording 03:31
-    # (rounding up to 04:00) forked a spurious third segment that also lost
-    # `restarted`. Section 2 measured a 29-minute spread of anchor spellings,
-    # so straddling the boundary is realistic.
+def test_a_credit_straddling_the_rounding_boundary_forks_once():
+    # Section 27. Anchoring the successor from the credit instant while the next
+    # row was compared against its OWN canonical anchor made a credit at 03:29
+    # (rounding down to 03:00) with post-credit rows recording 03:31 (rounding
+    # up to 04:00) fork a spurious third segment. Section 2 measured a 29-minute
+    # spread of anchor spellings, so straddling the boundary is realistic.
+    #
+    # #703 + #707 removed the credit-derived anchor entirely, so the successor
+    # keeps the row's own anchor and the two can no longer disagree. The single
+    # fork is still what this pins.
     old_week = dt.datetime(2026, 7, 25, 8, 0, tzinfo=UTC)
     new_week = dt.datetime(2026, 8, 1, 3, 31, tzinfo=UTC)
     credit_at = dt.datetime(2026, 8, 1, 3, 29, tzinfo=UTC)
@@ -502,45 +514,30 @@ def test_a_reset_credit_straddling_the_rounding_boundary_forks_once():
     rows += [qm.SnapshotRecord(dt.datetime(2026, 8, 1, h, tzinfo=UTC),
                                new_week, p, "api", n + 2)
              for n, (h, p) in enumerate(((4, 3.0), (5, 6.0), (6, 9.0)))]
-    segs = qm.build_segments(rows, [qm.CreditRecord(credit_at, "reset")])
+    segs = qm.build_segments(rows, [qm.CreditRecord(credit_at, "credit")])
     assert len(segs) == 2
-    assert segs[1].restarted is True
-    assert segs[1].week_anchor == dt.datetime(2026, 8, 1, 3, tzinfo=UTC)
+    assert segs[1].restarted is False
+    assert segs[1].week_anchor == qm.canonical_week_anchor(new_week)
     assert len(segs[1].rows) == 3
 
 
-def test_a_reset_followed_by_a_floor_between_two_rows_still_reanchors():
-    # Section 27: the loop kept only the LAST crossed credit, so a reset
-    # followed by a floor was filed as a floor and the week was not
-    # re-anchored — which section 5 keeps deliberately distinct.
+def test_several_credits_between_two_rows_fork_once_without_reanchoring():
+    """Section 27's kind-preference rule is gone with the kinds.
+
+    The loop used to prefer the last RESET among several spanned credits over
+    the last credit, because a reset re-anchored and a floor did not. No credit
+    re-anchors now, so there is no stronger kind to prefer and the successor
+    keeps the row's own anchor whatever the order.
+    """
     rows = [_snap(1, 40.0), _snap(5, 6.0)]
-    credits = [qm.CreditRecord(DAY.replace(hour=2), "reset"),
-               qm.CreditRecord(DAY.replace(hour=3), "floor")]
-    segs = qm.build_segments(rows, credits)
-    assert len(segs) == 2
-    assert segs[1].restarted is True
-    assert segs[1].week_anchor == DAY.replace(hour=2)
-
-
-def test_a_floor_followed_by_a_reset_reanchors_from_the_reset():
-    # The mirror order, so the fix cannot be "always take the first credit".
-    rows = [_snap(1, 40.0), _snap(5, 6.0)]
-    credits = [qm.CreditRecord(DAY.replace(hour=2), "floor"),
-               qm.CreditRecord(DAY.replace(hour=3), "reset")]
-    segs = qm.build_segments(rows, credits)
-    assert len(segs) == 2
-    assert segs[1].restarted is True
-    assert segs[1].week_anchor == DAY.replace(hour=3)
-
-
-def test_two_floor_credits_between_two_rows_fork_once_without_reanchoring():
-    rows = [_snap(1, 40.0), _snap(5, 6.0)]
-    credits = [qm.CreditRecord(DAY.replace(hour=2), "floor"),
-               qm.CreditRecord(DAY.replace(hour=3), "floor")]
+    credits = [qm.CreditRecord(DAY.replace(hour=2), "credit"),
+               qm.CreditRecord(DAY.replace(hour=3), "credit")]
     segs = qm.build_segments(rows, credits)
     assert len(segs) == 2
     assert segs[1].restarted is False
     assert segs[1].week_anchor == segs[0].week_anchor
+    assert segs[1].week_anchor != qm.canonical_week_anchor(DAY.replace(hour=2))
+    assert segs[1].week_anchor != qm.canonical_week_anchor(DAY.replace(hour=3))
 
 
 def test_a_new_week_anchor_forks_a_segment():

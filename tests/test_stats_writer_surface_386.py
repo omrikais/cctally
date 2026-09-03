@@ -144,7 +144,12 @@ FROZEN_WRITE_SITES = {
         "projected_milestones": 1,
         "schema_migrations": 8,
         "schema_migrations_skipped": 4,
-        "week_reset_events": 1,
+        # #703 + #707 review: 1 -> 3. The `week_reset_events` reshape a
+        # pre-cutover store needs adds an `ALTER TABLE … RENAME TO` and a
+        # `DROP TABLE` of the parked copy; its `INSERT … SELECT` is a
+        # dynamic-target site and is counted below instead. All three run inside
+        # `_apply_schema` under `stats_open_time_guard`.
+        "week_reset_events": 3,
         "weekly_cost_snapshots": 2,
         "weekly_usage_snapshots": 2,
     },
@@ -171,6 +176,14 @@ FROZEN_WRITE_SITES = {
     "_cctally_journal.py": {
         "accounts": 8,
         "five_hour_blocks": 1,
+        # #703 + #707 review: the FIRST literal write against this table from
+        # this module — the `weekly_replica_suppression` applier's 5h dependent
+        # DELETE. `five_hour_milestones.usage_snapshot_id` references
+        # `weekly_usage_snapshots` through a column of the same name
+        # `percent_milestones` uses, so removing a snapshot without it left a
+        # dangling reference nothing reports. Reached only through `_apply_evt`,
+        # under the same scope as the two DELETEs beside it.
+        "five_hour_milestones": 1,
         "journal_cursor": 1,
         "journal_effective_events": 5,
         # Four: `_replace_protocol_violations`' DELETE + INSERT pair — the ONE
@@ -202,8 +215,33 @@ FROZEN_WRITE_SITES = {
         # regime, in the same transaction that re-materializes the projection —
         # so a crash between them cannot leave a cleared flag over a projection
         # that was never rewritten.
+        # #703 + #707 §5.4: the `weekly_replica_suppression` applier's two
+        # DELETEs — dependent milestones first, snapshots second. They are the
+        # durable replacement for a raw DELETE that ran in
+        # `bin/_cctally_record.py` and was never journaled, so a late replica
+        # was deleted live and restored by every rebuild. The applier is reached
+        # only through `_apply_evt`, so live calls run inside `_run_cycle`'s
+        # sanctioned ingest scope and rebuild/rederive calls target their
+        # private scratch index under the corresponding maintenance or rederive
+        # scope.
+        # Two: the `weekly_replica_suppression` applier's dependent-milestone
+        # DELETE, and the one `_apply_weekly_credit_effects` gained when
+        # `--force` narrowed from "replace the week" to "replace the ONE
+        # occurrence --at names" — a replaced credit's dependent milestones go
+        # with it, because the foreign keys here are documentation-only.
+        "percent_milestones": 2,
+        "weekly_usage_snapshots": 1,
         "stats_quota_projection_state": 2,
-        "weekly_credit_floors": 1,
+        # #703 + #707: the `--force` re-record's destructive clear deletes the
+        # PRIOR credit record by its logical id. That record moved from
+        # `weekly_credit_floors` to `week_reset_events` when the two tables were
+        # unified, so this one site moved with it — it is the same statement
+        # against the same concept, in the same sanctioned scope (the fold
+        # applier runs inside the ingest cycle's `BEGIN IMMEDIATE`). The
+        # unified INSERT itself is a dynamic-target site through
+        # `_insert_or_ignore` and is counted there, exactly as the floor INSERT
+        # was.
+        "week_reset_events": 1,
     },
     "_cctally_milestones.py": {
         "budget_milestones": 3,
@@ -233,8 +271,11 @@ FROZEN_WRITE_SITES = {
         "percent_milestones": 1,
         "project_budget_milestones": 1,
         "projected_milestones": 1,
+        # #703 + #707 removed `_apply_credit`'s own floor INSERT. The credit
+        # record is written by the op fold alone now, which is what "one
+        # materialization of one credit" means; a second INSERT here would be
+        # the second materialization the unification removes.
         "week_reset_events": 2,
-        "weekly_credit_floors": 1,
         "weekly_usage_snapshots": 6,
     },
     "_cctally_store.py": {
@@ -283,7 +324,11 @@ FROZEN_WRITE_SITES = {
 #: table nor a dynamic target.
 FROZEN_DYNAMIC_SITES = {
     "_cctally_cache.py": 1,
-    "_cctally_db.py": 9,
+    # 9 -> 10 (#703 + #707 review): the `week_reset_events` reshape's
+    # `INSERT … SELECT` over the surviving column intersection, whose projection
+    # is built from `PRAGMA table_info` and is therefore a dynamic target. It
+    # runs inside `_apply_schema` under `stats_open_time_guard`.
+    "_cctally_db.py": 10,
     "_cctally_journal.py": 9,
     "_cctally_store.py": 1,
 }

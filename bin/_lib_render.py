@@ -859,6 +859,8 @@ def _weekly_to_json(
     week_pct_overlay: list[tuple[float | None, float | None]],
     *,
     extra: "dict | None" = None,
+    credited_weeks: "set[str] | None" = None,
+    withheld_by_week: "dict[str, str] | None" = None,
 ) -> str:
     """Serialize weekly rollup to JSON.
 
@@ -915,6 +917,14 @@ def _weekly_to_json(
             "totalCost": bucket.cost_usd,
             "usedPct": pct,
             "dollarsPerPercent": dpc,
+            # #703 + #707 \u00a76.4/\u00a76.6: additive, so no `schemaVersion` bump.
+            "credited": bool(credited_weeks and bucket.bucket in credited_weeks),
+            # \u00a76.3: a null `dollarsPerPercent` on a credited week means the
+            # epoch supports no divisor, and this names WHICH cause. A bare null
+            # cannot distinguish that from "no usage recorded", which is what
+            # `report` already publishes as `dollarsPerPercentWithheld`.
+            "dollarsPerPercentWithheld": (
+                (withheld_by_week or {}).get(bucket.bucket)),
             "modelsUsed": bucket.models,
             "modelBreakdowns": bucket.model_breakdowns,
         })
@@ -1588,6 +1598,40 @@ def _render_bucket_table(
     return "\n".join(lines)
 
 
+#: #703 + #707 §6.3. The `$/1%` column is fixed at ten characters in compact
+#: mode and the renderer does not truncate an over-long cell — it lets it
+#: overflow, which widens that one row past every other row in the table. So a
+#: withheld cause is rendered through this map, whose every value is at most
+#: eight characters, and an unrecognized cause falls back to a short generic
+#: word rather than being pasted in at whatever length it happens to have. The
+#: exact typed cause is published unabbreviated by `weekly --json` and by
+#: `report`, whose table sizes its columns from content.
+_DPP_WITHHELD_CELL = {
+    "no-climb-since-credit": "no climb",
+}
+_DPP_WITHHELD_FALLBACK = "withheld"
+
+
+def _withheld_cell_text(cause: "str | None", em_dash: str) -> str:
+    """The `$/1%` cell for a week whose ratio the epoch does not support.
+
+    An em-dash here reads as "no usage recorded", which is a different and wrong
+    statement about a week that holds a credit, so a withheld ratio prints its
+    cause instead — the `explain` command's rule, and what `report` already
+    does in the same column.
+    """
+    if not cause:
+        return em_dash
+    return _DPP_WITHHELD_CELL.get(cause, _DPP_WITHHELD_FALLBACK)
+
+
+#: #703 + #707 §6.4. The prefix `weekly` puts on a credited week's Week cell,
+#: in the vocabulary of the existing `~` heuristic-anchor and `⚡` crossed-reset
+#: prefixes. `report` carries its own copy as `_REPORT_CREDIT_MARK`, because it
+#: marks a row index rather than a date and the two renderers share no module.
+CREDIT_MARKER = "+"
+
+
 def _render_weekly_table(
     buckets: list[BucketUsage],
     week_pct_overlay: list[tuple[float | None, float | None]],
@@ -1596,6 +1640,8 @@ def _render_weekly_table(
     compact_split_fn: Callable[[str], str],
     breakdown: bool = False,
     compact: bool = False,
+    credited_weeks: "set[str] | None" = None,
+    withheld_by_week: "dict[str, str] | None" = None,
 ) -> str:
     """Render weekly bucket aggregates as a ccusage-style ANSI table.
 
@@ -1620,6 +1666,14 @@ def _render_weekly_table(
     `compact` forces compact layout regardless of terminal width
     (Session A `--compact` flag; spec \u00a77.6.1). Mirrors the same kwarg
     on `_render_bucket_table` (Review-A P3-1).
+
+    `credited_weeks` is the set of bucket keys whose week holds an Anthropic
+    credit (#703 + #707 \u00a76.4). Such a week renders as ONE row on its original
+    boundaries, so without a marker nothing on screen explains a low `Used %`
+    late in a heavy week. The marker is a `+` prefix on the Week cell, in the
+    vocabulary of the existing `~` heuristic-anchor and `\u26a1` crossed-reset
+    prefixes. `None` marks nothing, which is what every caller without a
+    database connection passes.
     """
     assert len(week_pct_overlay) == len(buckets), (
         f"week_pct_overlay length {len(week_pct_overlay)} does not match "
@@ -1676,7 +1730,11 @@ def _render_weekly_table(
         models_text = "\n".join(f"- {m}" for m in short_models) if short_models else ""
         used_pct, dpc = week_pct_overlay[i]
         used_pct_text = f"{used_pct:.1f}%" if used_pct is not None else em_dash
-        dpc_text = f"{dpc:.3f}" if dpc is not None else em_dash
+        if dpc is not None:
+            dpc_text = f"{dpc:.3f}"
+        else:
+            dpc_text = _withheld_cell_text(
+                (withheld_by_week or {}).get(d.bucket), em_dash)
         # Render the Week column from display_start_date — equals d.bucket
         # for non-reset weeks; shifted forward for post-early-reset weeks.
         # The bucket-aggregation contract guarantees a SubWeek for every
@@ -1685,6 +1743,8 @@ def _render_weekly_table(
         # StopIteration call site at _dashboard_build_weekly_periods.
         sw = week_by_key[d.bucket]
         display_label = sw.display_start_date.isoformat()
+        if credited_weeks and d.bucket in credited_weeks:
+            display_label = f"{CREDIT_MARKER}{display_label}"
         data_cells = [
             (display_label, None),
             (models_text, None),
@@ -1813,9 +1873,17 @@ def _render_weekly_table(
         return text.split("\n") if text else [""]
 
     def _split_bucket_if_compact(text: str) -> str:
-        if compact_mode:
-            return compact_split_fn(text)
-        return text
+        if not compact_mode:
+            return text
+        # The credit marker decorates the date; it is not part of it.
+        # `compact_split_fn` matches a bare `YYYY-MM-DD`, so splitting the
+        # marked string fails to match and leaves an eleven-character cell
+        # in the ten-character compact Week column, which widens that one
+        # row past every other row in the table.
+        if text.startswith(CREDIT_MARKER):
+            return CREDIT_MARKER + compact_split_fn(
+                text[len(CREDIT_MARKER):])
+        return compact_split_fn(text)
 
     display_rows: list[tuple[list[list[tuple[str, Any]]], str]] = []
     for cells, row_type in raw_rows:

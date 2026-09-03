@@ -969,7 +969,7 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
             # current index as a mismatch; keep this in lockstep with core
             # (#496 S5b §6.1). It stays a literal because this kernel is pure and
             # must not import `_cctally_core`.
-            epoch = 1011
+            epoch = 1012
         mismatch = uv > legacy_head and uv != epoch
         return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
                 "mismatch": mismatch}

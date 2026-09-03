@@ -206,6 +206,8 @@ def _cctally():
 # === Honest imports from extracted homes ===================================
 # Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3.
 import _cctally_core
+# Pure stdlib kernel; the ONE credit-epoch resolver (#703 + #707 §5.3).
+import _lib_credit_selection
 from _cctally_core import (
     eprint,
     parse_iso_datetime,
@@ -897,6 +899,29 @@ class TuiCurrentWeek:
     # set. Appended last with a default so fixture modules that construct
     # `TuiCurrentWeek` positionally stay valid.
     total_tokens: int = 0
+    # ---- #703 + #707 §6.3/§6.4 ----
+    # Why `dollars_per_percent` is None on a credited week, or None when it is
+    # not withheld. A withheld quantity prints its cause rather than a
+    # misleading `$0.00`, following the `explain` command's rule.
+    dpp_withheld_cause: "str | None" = None
+    # The week's OWN start, before `_apply_midweek_reset_override` moved
+    # `week_start_at` to the credit instant. `week_start_at` is the RATE anchor
+    # — the range the `$/1%` numerator is taken over, and the instant the
+    # Projects grid and the Blocks panel locate the week by — and a credited
+    # week's rate legitimately starts at the credit, because a rate measured
+    # across a counter discontinuity is measured over two different counters.
+    #
+    # Neither the window a person is shown nor the money reported inside it is
+    # that range. A credit moves no boundary (§6.1), and spend stays at the full
+    # week because it was spent inside one unchanged subscription window whatever
+    # the counter did (§6.2). One field cannot answer both questions, and while
+    # it tried, the hero read `WEEK USAGE · Apr 16–Apr 20` over a week running
+    # Apr 13–Apr 20 whose first listed milestone was dated Apr 13, and then
+    # reported only the post-credit part of that week's spend beneath it.
+    #
+    # Read it through `displayed_week_start_at`, never directly, so every
+    # renderer and every legacy object resolves it one way.
+    nominal_week_start_at: "dt.datetime | None" = None
 
 
 # ---- View-model row dataclasses moved to bin/_lib_view_models.py ----
@@ -928,6 +953,18 @@ from _lib_view_models import (  # noqa: E402
 # render sites, which is how a censored reading reached the screen as a
 # number the kernel had already withheld.
 from _lib_view_models import _forecast_projection_pcts  # noqa: E402
+
+# The ONE name for the cause a credited week's `$/1%` is withheld under
+# (#703 + #707 §6.3). The Current Week card computes its own ratio, so it must
+# withhold under the same cause as the weekly row it sits beside — a second
+# spelling would put two names for one state on one screen.
+from _lib_view_models import DPP_WITHHELD_NO_CLIMB  # noqa: E402
+
+# The ONE instant every DISPLAYED current-week window is built from (#703 +
+# #707 §6.1/§6.2). `cw.week_start_at` is the rate anchor and moves to the credit
+# instant, so a renderer that formats it names a window narrower than the week
+# it is describing.
+from _lib_view_models import displayed_week_start_at  # noqa: E402
 
 
 @dataclass
@@ -978,24 +1015,23 @@ def _tui_build_percent_milestones(
         if latest is None:
             return []
 
-    # Resolve active segment via the canonical end_at.
+    # Resolve the active credit epoch through the ONE shared resolver
+    # (#703 + #707 §5.3), so the TUI shows the epoch the writer stamped. Keyed
+    # on the WEEK: a manual credit leaves both boundary columns NULL, so the old
+    # `new_week_end_at` lookup could not see one, and ordered by the accounting
+    # instant rather than by a row identifier a rebuild reassigns.
     active_segment = 0
-    if latest["week_end_at"]:
-        try:
-            canon_end = _canonicalize_optional_iso(
-                latest["week_end_at"], "tui.pm.cur"
-            )
-        except (AttributeError, ValueError):
-            canon_end = None
-        if canon_end:
-            seg_row = conn.execute(
-                "SELECT id FROM week_reset_events "
-                "WHERE new_week_end_at = ? "
-                "ORDER BY id DESC LIMIT 1",
-                (canon_end,),
-            ).fetchone()
-            if seg_row is not None:
-                active_segment = int(seg_row["id"])
+    try:
+        canon_end = _canonicalize_optional_iso(
+            latest["week_end_at"], "tui.pm.cur"
+        ) if latest["week_end_at"] else None
+    except (AttributeError, ValueError):
+        canon_end = None
+    seg_row = _lib_credit_selection.resolve_weekly_credit_epoch(
+        conn, week_start_date=latest["week_start_date"], account_key=None,
+        captured_at=_cctally_core.now_utc_iso(), week_end_at=canon_end)
+    if seg_row is not None:
+        active_segment = int(seg_row["id"])
 
     rows = [
         r for r in get_milestones_for_week(conn, latest["week_start_date"])
@@ -1657,6 +1693,70 @@ class RuntimeState:
         )
 
 
+def _week_credit_epoch_for_current_week(
+    conn: sqlite3.Connection,
+    nominal_week_start_at: dt.datetime,
+    week_end_at: dt.datetime,
+    now_utc: dt.datetime,
+):
+    """The credit governing the current week right now, or None (§5.3).
+
+    Resolved through the ONE shared resolver every accounting reader uses, so
+    this card can never show a different epoch from the one the writer stamped
+    or the one the Weekly panel divides by.
+
+    Keyed on the NOMINAL start's date. `week_start_at` after
+    `_apply_midweek_reset_override` is the credit instant, and its `.date()` no
+    longer matches the `week_start_date` a credit row records — the same trap
+    `_tui_build_percent_milestones` documents.
+
+    Bounded at `now_utc` rather than at the week's end, matching the causality
+    bound the override itself applies: a credit is governing only once it has
+    been observed.
+    """
+    try:
+        return _lib_credit_selection.resolve_weekly_credit_epoch(
+            conn,
+            week_start_date=nominal_week_start_at.date().isoformat(),
+            account_key=None,
+            captured_at=now_utc.isoformat(),
+            week_end_at=_canonicalize_optional_iso(
+                week_end_at.isoformat(), "tui.cw.end"),
+            week_start_at=_canonicalize_optional_iso(
+                nominal_week_start_at.isoformat(), "tui.cw.start"),
+        )
+    except (sqlite3.Error, ValueError):
+        # A store with no `week_reset_events`, or one predating the credit
+        # columns, has recorded no credit — the honest answer is "none" rather
+        # than taking down the whole Current Week card.
+        return None
+
+
+def _credit_epoch_instant(credit):
+    """The credit's ACCOUNTING instant, or None when it cannot be read.
+
+    The one instant §5.3 resolves a capture's epoch against, and therefore the
+    start of the range the `$/1%` numerator covers. Taken from the resolved
+    epoch row rather than from `week_start_at` after
+    `_apply_midweek_reset_override`, so this card and the Weekly row beside it
+    measure the numerator over a range resolved one way by one query.
+
+    `None` on a row whose instant does not parse. The caller then keeps the
+    whole-week ratio, which is the same fallback `_dollars_per_percent_for_week`
+    takes and is honest now that `spent_usd` covers the whole week.
+    """
+    try:
+        raw = credit["accounting_at"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if not raw:
+        return None
+    try:
+        return parse_iso_datetime(raw, "credit.accounting_at")
+    except (ValueError, TypeError):
+        return None
+
+
 def _tui_build_current_week(
     conn: sqlite3.Connection,
     now_utc: dt.datetime,
@@ -1673,6 +1773,11 @@ def _tui_build_current_week(
     week_start_at, week_end_at, samples = fetched
     if not samples:
         return None
+    # The week's own start, kept before the override moves the accounting
+    # anchor. Every DISPLAYED window comes from this one (#703 + #707 §6.1: a
+    # credit moves no boundary), while the accounting range below keeps the
+    # credit instant.
+    nominal_week_start_at = week_start_at
     # Mirror the reset override applied by `_load_forecast_inputs` so the
     # Current Week card's spent_usd and $/1% reflect the post-reset window.
     week_start_at, samples = _apply_midweek_reset_override(
@@ -1688,12 +1793,21 @@ def _tui_build_current_week(
     latest = samples[-1]
     used_pct = float(latest[1])
     five_hr_pct = float(latest[2]) if latest[2] is not None else None
-    # #556 S1 §3.3: one walk yields both halves. The range is whatever
-    # `spent_usd` already used — taken AFTER `_apply_midweek_reset_override`
-    # above, so a mid-week reset shortens the accumulation and the published
-    # period together.
+    # #556 S1 §3.3: one walk yields both halves, so the published `spent_usd`
+    # and `total_tokens` describe exactly one entry set.
+    #
+    # #703 + #707 §6.2: that set is the WHOLE week. `_apply_midweek_reset_override`
+    # moved `week_start_at` above, and it says in its own docstring that it moves
+    # the rate window and not the spend window — the money was spent inside one
+    # unchanged subscription window whatever the counter did. Accumulating from
+    # the moved anchor reported part of the week's spend under a header naming
+    # the whole of it, which is the same label-versus-figure defect the week
+    # label itself was corrected for, on a different field. It also disagreed
+    # with the Weekly card beside it on one screen, because
+    # `_dollars_per_percent_for_week` publishes the full week's cost for the same
+    # week and takes only the RATIO from the epoch.
     spent, total_tokens = _sum_cost_and_tokens_for_range(
-        week_start_at, now_utc, mode="auto", skip_sync=skip_sync
+        nominal_week_start_at, now_utc, mode="auto", skip_sync=skip_sync
     )
     # #661 S2 spec section 3.4. This card computes its own `spent / used_pct`
     # independently of the forecast kernel, so a correction confined to that
@@ -1706,6 +1820,46 @@ def _tui_build_current_week(
     used_pct_corrected = corrected_percent_point(used_pct)
     dpp_divisor = used_pct if used_pct_corrected is None else used_pct_corrected
     dpp = (spent / dpp_divisor) if used_pct > 0 else None
+    # #703 + #707 §6.3. On a credited week BOTH halves of the ratio come from
+    # the epoch, and they are the only two quantities on this card that do.
+    #
+    # The divisor is the CLIMB since the credit. Dividing by the ABSOLUTE stored
+    # percent is the exact pairing §6.3 names as wrong: a credit landing at 22
+    # with the counter now at 24 bought two percentage points, not twenty-four.
+    # When the counter has not climbed past the level it was credited to, the
+    # ratio is withheld with a typed cause rather than rendered as a misleading
+    # `$0.000`.
+    #
+    # The numerator is the cost from the credit's ACCOUNTING instant forward,
+    # read from the epoch row itself rather than inferred from the shifted
+    # `week_start_at`, so this figure and the Weekly row's are taken over one
+    # range resolved one way. `spent` is deliberately NOT that number any more:
+    # it is the whole week's, per §6.2.
+    #
+    # The climb is a DIFFERENCE of two displayed readings, so neither operand
+    # takes the #661 S2 floor correction applied above: correcting one side of a
+    # subtraction is not defensible, and `_dollars_per_percent_for_week` — the
+    # weekly surface this figure sits beside on the same screen — subtracts the
+    # two stored readings as they are. The two must agree.
+    dpp_withheld_cause = None
+    credit = _week_credit_epoch_for_current_week(
+        conn, nominal_week_start_at, week_end_at, now_utc)
+    if credit is not None and credit["observed_post_credit_pct"] is not None:
+        climb = used_pct - float(credit["observed_post_credit_pct"])
+        if climb > 0:
+            # The cache is warm after the accumulation above, so this second
+            # walk suppresses its own ingest — the pattern `_load_forecast_inputs`
+            # uses for its downstream cost lookups. It runs ONLY on a credited
+            # week whose counter has climbed; every other week keeps one walk.
+            epoch_start = _credit_epoch_instant(credit)
+            if epoch_start is not None:
+                epoch_spent, _epoch_tokens = _sum_cost_and_tokens_for_range(
+                    epoch_start, now_utc, mode="auto", skip_sync=True,
+                )
+                dpp = epoch_spent / climb
+        else:
+            dpp = None
+            dpp_withheld_cause = DPP_WITHHELD_NO_CLIMB
     # Collect every textual variant of week_start_at that parses to the same
     # instant — mirrors `_fetch_current_week_snapshots` lines 9199-9210 so
     # legacy local-offset rows and newly UTC-canonicalized rows both contribute.
@@ -1774,6 +1928,8 @@ def _tui_build_current_week(
             conn, current_used_pct=used_pct, now_utc=now_utc,
         ),
         total_tokens=total_tokens,
+        dpp_withheld_cause=dpp_withheld_cause,
+        nominal_week_start_at=nominal_week_start_at,
     )
 
 
@@ -4550,15 +4706,6 @@ def _tui_build_snapshot_once(
         # `reconcile_projects_env_cache` succeeds. Off ⇒ `_build_projects_envelope`
         # does the full-window walk (CLI / drill / test byte-identical).
         use_projects_env_cache = False
-        # ── #271 M3: Bug-K pre-credit segment cache (spec §18) ──────────────
-        # A DEDICATED flag (Codex-BK-2 — NOT piggybacked on `use_group_a_cache`):
-        # OFF by default, flipped ON only on the dashboard sync-thread NON-IDLE
-        # path after the once-per-rebuild `reconcile_bugk_cache` succeeds. Off ⇒
-        # the Weekly builder's Bug-K synthesis re-folds the closed pre-credit
-        # window directly each tick (CLI / share / test byte-identical). A
-        # failed/absent reconcile must fall back to direct compute, never reuse
-        # stale segment state.
-        use_bugk_segment_cache = False
         # ── #272: cache-report per-day cache (spec §5/§6) ───────────────────
         # Same gating: OFF by default, flipped ON only on the dashboard
         # sync-thread NON-IDLE path after the once-per-rebuild
@@ -4722,12 +4869,17 @@ def _tui_build_snapshot_once(
                             )
                             use_projects_env_cache = True
                             _pr.set_meta(hit=True)
-                        # #271 M3: reconcile the Bug-K pre-credit segment cache
-                        # with the SAME short-lived cache conn (its watermark
-                        # query lives in cache.db), using the dispatch-signature
-                        # legs already computed. Only after this succeeds does
-                        # `_dashboard_build_weekly_periods` opt into the cache
-                        # below (`use_bugk_segment_cache=True`).
+                        # #271 M3: reconcile the Bug-K pre-credit segment
+                        # cache. #703 + #707 §6.1 retired its only consumer —
+                        # the Weekly panel no longer synthesizes a pre-credit
+                        # row, because an Anthropic reset never changes the
+                        # week's boundaries and the natural row already covers
+                        # the whole week — so the cache it reconciles is now
+                        # always empty. The reconcile is retained rather than
+                        # torn out here: it is one leg of the published perf
+                        # trace, and removing the cache subsystem touches the
+                        # dashboard caching estate this change does not
+                        # otherwise move.
                         with _perf.phase("reconcile.bugk") as _pr:
                             _pr.set_meta(hit=False)
                             _sc.reconcile_bugk_cache(
@@ -4736,7 +4888,6 @@ def _tui_build_snapshot_once(
                                 max_mutation_seq=dispatch_sig.entry_mutation_seq,
                                 reset_sig=dispatch_sig.reset_sig,
                             )
-                            use_bugk_segment_cache = True
                             _pr.set_meta(hit=True)
                         # #272: reconcile the cache-report per-day cache with the
                         # SAME short-lived cache conn (its watermark query +
@@ -4870,7 +5021,6 @@ def _tui_build_snapshot_once(
                 weekly_periods = _dashboard_build_weekly_periods(
                     conn, now_utc, n=12, skip_sync=skip_sync,
                     use_group_a_cache=True,
-                    use_bugk_segment_cache=use_bugk_segment_cache,
                 )
                 # ``stable_sum`` (math.fsum) returns float ``0.0`` on empty rows,
                 # so the envelope stays byte-stable with the pre-fix ``0.0`` shape
@@ -6888,7 +7038,7 @@ def _tui_header_strip_a(
             fcst_pct = ("\u2014" if fc.final_percent_high is None
                         else f"{int(round(fc.final_percent_high))}%")
         hdr = preview_prefix + (
-            f"{{bright.b}}Week {format_display_dt(cw.week_start_at, runtime.display_tz, fmt='%b %d', suffix=False)}–{format_display_dt(cw.week_end_at, runtime.display_tz, fmt='%b %d', suffix=False)}{{/}} "
+            f"{{bright.b}}Week {format_display_dt(displayed_week_start_at(cw), runtime.display_tz, fmt='%b %d', suffix=False)}–{format_display_dt(cw.week_end_at, runtime.display_tz, fmt='%b %d', suffix=False)}{{/}} "
             f"{{faint}}│{{/}} Used {{{used_cls}.b}}{cw.used_pct:.1f}%{{/}} "
             f"{{dim}}(5h {int(cw.five_hour_pct or 0)}%){{/}} {{faint}}│{{/}} "
             f"$/1% {{bright}}{dpp_str}{{/}} {{faint}}│{{/}} "
@@ -7316,7 +7466,7 @@ def _tui_render_variant_b(
         reset_days = reset_secs // 86400
         reset_hrs = (reset_secs % 86400) // 3600
         sub = (
-            f" {{bright.b}}Week {format_display_dt(cw.week_start_at, runtime.display_tz, fmt='%b %d', suffix=False)}–"
+            f" {{bright.b}}Week {format_display_dt(displayed_week_start_at(cw), runtime.display_tz, fmt='%b %d', suffix=False)}–"
             f"{format_display_dt(cw.week_end_at, runtime.display_tz, fmt='%b %d', suffix=False)}{{/}}   "
             f"{{dim}}${cw.spent_usd:.2f} spent · $/1% {dpp_str} · "
             f"resets in {reset_days}d {reset_hrs}h{{/}}"
@@ -7713,7 +7863,7 @@ def _tui_modal_current_week(snap, runtime, width):
     cumul = cw.spent_usd
     header = [
         "",
-        f"  {{dim}}Week{{/}} {{b}}{format_display_dt(cw.week_start_at, runtime.display_tz, fmt='%b %d', suffix=False)} – {format_display_dt(cw.week_end_at, runtime.display_tz, fmt='%b %d', suffix=False)}{{/}}   "
+        f"  {{dim}}Week{{/}} {{b}}{format_display_dt(displayed_week_start_at(cw), runtime.display_tz, fmt='%b %d', suffix=False)} – {format_display_dt(cw.week_end_at, runtime.display_tz, fmt='%b %d', suffix=False)}{{/}}   "
         f"{{dim}}milestones reached{{/}} {{warn.b}}{len(milestones)}{{/}}",
         f"  {{dim}}avg $/1%{{/}} {{b}}{avg_dpp_str}{{/}}     {{dim}}cumulative{{/}} {{b}}${cumul:.2f}{{/}}",
         "",

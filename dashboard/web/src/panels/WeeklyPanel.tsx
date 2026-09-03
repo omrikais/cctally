@@ -16,6 +16,7 @@ import { cardRegionClick } from '../lib/cardRegion';
 import { presentationPeriodRows, presentationProviders } from '../lib/dashboardPresentation';
 import type { PeriodRow } from '../types/envelope';
 import { modelChipStyle } from '../lib/model';
+import { CREDIT_MARKER_LABEL, CREDIT_MARKER_TITLE } from '../lib/creditMarker';
 import { PeriodAccountChips } from '../components/PeriodAccountChips';
 import { providerLegs, weeklySpan } from '../lib/periodFooter';
 import { formatSpan } from '../lib/projectWindow';
@@ -43,6 +44,13 @@ function Row({ r, isFirstMount, reduced }: { r: PeriodRow; isFirstMount: boolean
           <PeriodAccountChips labels={r.account_labels} />
           {r.label}
           {r.is_current && <span className="pill-current">Now</span>}
+          {/* #703 + #707 §6.4 — the week no longer splits, so without this
+              nothing on screen explains a low Used % late in a heavy week. */}
+          {r.credited && (
+            <span className="pill-credited" title={CREDIT_MARKER_TITLE}>
+              {CREDIT_MARKER_LABEL}
+            </span>
+          )}
         </span>
         <span className="right">
           <span className="cost">{fmt.usd2(r.cost_usd)}</span>

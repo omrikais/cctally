@@ -44,7 +44,7 @@ PER_MIGRATION_ROOT = (
 # Pinned registry sizes. Bump the matching one when a migration ships (see
 # module docstring).
 EXPECTED_STATS_COUNT = 13
-EXPECTED_CACHE_COUNT = 44
+EXPECTED_CACHE_COUNT = 45
 EXPECTED_CONVERSATIONS_COUNT = 8
 
 # migration name -> its per-migration golden TEST MODULE (stem). The module must
@@ -113,6 +113,7 @@ MANIFEST = {
     "042_codex_entries_root_path_index": "test_cache_migration_042_root_path_index",
     "043_codex_window_attributions": "test_cache_migration_043_per_migration_goldens",
     "044_codex_accounting_change_ledger": "test_cache_migration_044_per_migration_goldens",
+    "045_conversation_render_revision_columns": "test_cache_migration_045_per_migration_goldens",
     # ── conversations registry (DB journal redesign spec §7.2) ──
     "001_adopt_schema_version_marker": "test_conversations_migration_001_per_migration_goldens",
     "002_codex_thread_source_inference_replay": "test_conversations_migration_002_per_migration_goldens",

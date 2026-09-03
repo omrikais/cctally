@@ -790,15 +790,18 @@ class SnapshotRecord:
 
 @dataclasses.dataclass(frozen=True)
 class CreditRecord:
-    """An authoritative credit instant.
+    """An authoritative credit instant. Never inferred from a meter decrease.
 
-    `kind` is "reset" for a `week_reset_events` row, which re-anchors the
-    logical week, or "floor" for a `weekly_credit_floors` row, which does not.
-    Never inferred from a meter decrease.
+    `kind` carried the two-table distinction — "reset" for a
+    `week_reset_events` row, which re-anchored the logical week, and "floor" for
+    a `weekly_credit_floors` row, which did not. #703 + #707 removed both halves
+    of that: the two tables are one, and an Anthropic credit never re-anchors a
+    week whatever its size. The field survives as a shape, with `"credit"` its
+    only produced value; `build_segments` no longer branches on it.
     """
 
     at: "dt.datetime"
-    kind: str
+    kind: str = "credit"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -872,22 +875,24 @@ def build_segments(snapshots, credits) -> list[Segment]:
     decreases against 10 authoritative credit instants, so two thirds of the
     research script's forks were unsupported.
 
-    A "reset" credit opens a newly anchored logical week, because a >=25pp
-    auto-credit re-anchors the week. A "floor" credit opens a new segment
-    retaining the existing week identity, because `record-credit` deliberately
-    does not re-anchor. When SEVERAL credits fall between two consecutive
-    snapshots the last RESET among them wins, not simply the last credit: a
-    reset followed by a floor is still a re-anchoring, and filing it as a
-    floor would silently merge the two paths section 5 keeps distinct.
+    EVERY credit opens a new segment retaining the existing week identity
+    (#703 + #707 §2 and §6.2). A credit of any size is a counter discontinuity
+    inside an UNCHANGED window: whatever Anthropic does to the counter, the week
+    keeps its original start and end and only the running percent steps down. So
+    the old "reset" branch — anchoring the successor from the credit instant and
+    marking it `restarted` — is gone, along with the rule that made the last
+    reset among several spanned credits win. `restarted` is consequently always
+    False for an Anthropic credit; the field is retained so the segment shape
+    does not change under its readers.
 
     The segment's published `week_anchor` and the value a week change is
-    detected against are tracked separately. A reset anchors the successor
-    from the CREDIT instant while the store's own rows carry their own
-    spelling of the new boundary, and the two round to different hours
-    whenever the credit straddles the half-hour — a credit at 03:29 with
-    post-reset rows recording 03:31 gives 03:00 and 04:00. Comparing later
-    rows against the credit-derived value forked a spurious third segment
-    that also lost `restarted`.
+    detected against are still tracked separately. That separation was needed
+    because a credit-derived anchor and the store's own spelling of a boundary
+    round to different hours whenever the credit straddles the half-hour, and
+    comparing later rows against the credit-derived value forked a spurious
+    third segment. Nothing derives an anchor from a credit any more, so the two
+    now always agree — the separation is kept because it costs nothing and its
+    absence is what the spurious fork was made of.
     """
     for row in snapshots:
         require_aware(row.at, "snapshot.at")
@@ -907,19 +912,20 @@ def build_segments(snapshots, credits) -> list[Segment]:
         if prev_at is not None:
             spanned = [c for c in cuts if prev_at < c.at <= row.at]
             if spanned:
-                resets = [c for c in spanned if c.kind == "reset"]
-                crossed = resets[-1] if resets else spanned[-1]
+                # The LAST credit spanned, with no kind preference: every
+                # credit cuts a segment and none re-anchors, so there is no
+                # longer a stronger and a weaker kind to choose between.
+                crossed = spanned[-1]
         if current and (row_anchor != anchor_ref or crossed is not None):
             segments.append(
                 Segment(len(segments), anchor, tuple(current), restarted)
             )
             current = []
-            if crossed is not None and crossed.kind == "reset":
-                anchor = canonical_week_anchor(crossed.at)
-                restarted = True
-            else:
-                anchor = row_anchor
-                restarted = False
+            # The successor keeps the ROW's own week anchor. Anchoring it from
+            # the credit instant is what re-anchored a week Anthropic never
+            # moved.
+            anchor = row_anchor
+            restarted = False
             anchor_ref = row_anchor
         elif not current:
             anchor = row_anchor

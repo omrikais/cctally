@@ -720,7 +720,13 @@ def _build_current_week_share_panel_data(options: dict,
             "week_start_date":    _share_now_utc().strftime("%Y-%m-%d"),
             "display_tz":         options.get("display_tz", "Etc/UTC"),
         }
-    week_start = getattr(cw, "week_start_at", None)
+    # #703 + #707 §6.2 — the week's OWN start, not the rate anchor. It dates
+    # this card, clips `daily_progression`, and bounds `top_projects`, and all
+    # three describe `kpi_cost_usd`, which is the whole week's spend. Anchoring
+    # them at a credit instant would date the card at the credit while reporting
+    # the week's money, and would decompose that money over part of its range.
+    from _lib_view_models import displayed_week_start_at
+    week_start = displayed_week_start_at(cw)
     week_end = getattr(cw, "week_end_at", None)
     week_start_date = (
         week_start.strftime("%Y-%m-%d") if isinstance(week_start, dt.datetime)

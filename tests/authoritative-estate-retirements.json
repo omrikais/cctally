@@ -145,6 +145,72 @@
         "tests/test_projection_basis_selector.py::test_a4_projected1b_alert_abstains_when_it_cannot_reach_the_basis",
         "tests/test_projection_basis_selector.py::test_a4_the_twin_still_abstains_on_a_reachable_calibrated_basis"
       ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0028",
+      "predecessorDigest": "ef82ee417352d7979d43b62c98adbe191a86364ab3d40a595d8e49eb4efe80f6",
+      "profile": "public",
+      "reason": "The #703 + #707 same-window credit work retired these behaviours, so the tests that pinned them are gone or renamed. Four groups. (1) The DISPLAY split: an Anthropic reset never changes the week's boundaries, so `_apply_reset_events_to_weekrefs` and its SubWeek sibling no longer truncate the pre-credit week, re-anchor the post-credit one or synthesize a second reference. Every identifier naming a synthesized pre-credit row, a two-row credited week, a post-credit current-row disambiguation or a display start moved to the credit moment names a behaviour that no longer exists; each was rewritten in place under a name describing what the surface does now. (2) The dashboard's Bug-K pre-credit segment cache had exactly one consumer \u2014 that synthesized row \u2014 so its three real-builder parity tests went with it. (3) The MILESTONE-HISTORY index lists a credited week once instead of once per credit, with the detail grouping the week's ladders by epoch, so the tests asserting two opaque cycle entries and a per-cohort detail were rewritten around the new shape. (4) The two `test_journal_revisions` parametrizations and the six `test_quota_model_kernel` cases carry the epoch constant or the retired `weekly_credit_floors` fork in their identifiers: the epoch moved 1011 to 1012, and a manual credit is a `week_reset_events` row now rather than a floor, so both sets are collected under new identifiers. Two `test_in_place_credit_detection` cleanup cases named the 1.0pp tolerance band the evidence bracket replaced. No coverage was dropped: every group above is rewritten in the same module, and the estate's added rows are those rewrites.",
+      "rows": [
+        "tests/test_dashboard_period_builders.py::test_dashboard_weekly_period_uses_display_date_after_reset",
+        "tests/test_dashboard_period_builders.py::test_dashboard_weekly_synthesizes_pre_credit_row",
+        "tests/test_dashboard_rebuild_parity.py::test_bugk_segment_cache_late_ingest_recomputes",
+        "tests/test_dashboard_rebuild_parity.py::test_bugk_segment_cache_parity",
+        "tests/test_dashboard_rebuild_parity.py::test_bugk_segment_cache_warm_no_refetch",
+        "tests/test_in_place_credit_detection.py::test_apply_reset_events_does_not_split_for_boundary_shift",
+        "tests/test_in_place_credit_detection.py::test_apply_reset_events_synthesizes_pre_credit_ref",
+        "tests/test_in_place_credit_detection.py::test_cmd_report_current_row_picks_post_credit_for_credited_week",
+        "tests/test_in_place_credit_detection.py::test_credit_branch_cleanup_tolerates_rounding_drift",
+        "tests/test_in_place_credit_detection.py::test_credit_branch_defensive_cleanup_removes_stale_replays",
+        "tests/test_in_place_credit_detection.py::test_trend_table_shows_pre_credit_row",
+        "tests/test_in_place_credit_detection.py::test_tui_build_trend_credited_week_shows_pre_credit_segment",
+        "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1011]",
+        "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1011-1011]",
+        "tests/test_milestone_epoch_stale_seed.py::test_goodwill_credit_to_a_nonzero_level_loses_that_levels_threshold",
+        "tests/test_milestone_epoch_stale_seed.py::test_the_fix_does_not_recover_the_crossings_the_replica_suppresses",
+        "tests/test_milestone_history.py::test_api_milestones_claude_reset_cycles_fetch_independently",
+        "tests/test_milestone_history.py::test_claude_cycle_detail_selects_only_its_reset_cohort",
+        "tests/test_milestone_history.py::test_claude_early_reanchor_same_storage_bucket_emits_post_cycle",
+        "tests/test_milestone_history.py::test_claude_production_shaped_98_rows_split_43_55_with_exact_blocks",
+        "tests/test_milestone_history.py::test_claude_reset_defined_week_emits_two_opaque_cycle_entries",
+        "tests/test_quota_model_kernel.py::test_a_floor_credit_forks_without_reanchoring_the_week",
+        "tests/test_quota_model_kernel.py::test_a_floor_followed_by_a_reset_reanchors_from_the_reset",
+        "tests/test_quota_model_kernel.py::test_a_reset_credit_straddling_the_rounding_boundary_forks_once",
+        "tests/test_quota_model_kernel.py::test_a_reset_followed_by_a_floor_between_two_rows_still_reanchors",
+        "tests/test_quota_model_kernel.py::test_an_authoritative_reset_forks_and_reanchors",
+        "tests/test_quota_model_kernel.py::test_two_floor_credits_between_two_rows_fork_once_without_reanchoring",
+        "tests/test_subweek_display_dates.py::test_apply_reset_events_overrides_post_reset_display_start_date"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0030",
+      "predecessorDigest": "fd973b373567f40ce24eef9744076de653b0c6842caa4b813e48539579d64adf",
+      "profile": "public",
+      "reason": "The name and the docstring of `test_apply_reset_events_leaves_both_sub_weeks_alone` stated the opposite of one of its own assertions. They said every sub-week is returned as it came, while the body asserted that the pre-reset week's `end_ts` WAS rewritten - carried forward to the boundary the API's own later statement moved it to, which is the one rewrite #703 + #707 keeps. The identifier moves to a name that describes what the function does, test_apply_reset_events_never_cuts_a_sub_week_at_the_credit, and the docstring now states the surviving rewrite explicitly. The body and every assertion are unchanged, so no coverage moved with the name.",
+      "renames": [
+        {
+          "from": "tests/test_subweek_display_dates.py::test_apply_reset_events_leaves_both_sub_weeks_alone",
+          "to": "tests/test_subweek_display_dates.py::test_apply_reset_events_never_cuts_a_sub_week_at_the_credit"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0032",
+      "predecessorDigest": "f53adf3452ee805edec009bf2aba24c11bc931fef1d06433805c10e2e6f56339",
+      "profile": "public",
+      "reason": "The name `test_the_accounting_anchor_stays_at_the_credit` and its docstring both asserted a claim that stopped being true one commit later. They called `TuiCurrentWeek.week_start_at` the ACCOUNTING anchor and said the range `spent_usd` covers starts at the credit, which is what spec section 6.2 forbids in two sentences: spend and budget range stays the full week, and a credited week's displayed total cost is the full week's spend. What the field really anchors is the RATE - the `$/1%` numerator, the nominal-rollover version fragment and the #620 Projects grid and Blocks panel windows - and all of that is unchanged and still asserted. The identifier therefore moves to test_the_rate_anchor_stays_at_the_credit and the docstring now states which quantities take that instant and which take the week's own start. Every assertion in the body is unchanged, so no coverage moved with the name.",
+      "renames": [
+        {
+          "from": "tests/test_credited_week_dashboard_surfaces.py::test_the_accounting_anchor_stays_at_the_credit",
+          "to": "tests/test_credited_week_dashboard_surfaces.py::test_the_rate_anchor_stays_at_the_credit"
+        }
+      ]
     }
   ],
   "schemaVersion": 1

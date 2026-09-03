@@ -299,6 +299,12 @@ run_credit_scenario () {
 # drive record-usage at 2% with the same end_at. Assert: one
 # week_reset_events row keyed on old==new==end_at, one new snapshot row
 # at 2% via the reset-aware clamp, hwm-7d force-written to 2.0.
+#
+# #703 + #707 adds three assertions to it: the row records where the counter
+# LANDED (2%, which is what lets the credited level keep its own threshold),
+# it records the EXACT observation instant in the capture clock domain, and
+# the week boundary is unchanged. And the credited level's milestone is
+# recorded — the cost #706 accepted and #707 repays.
 IFS= read -r -d '' scenario_py <<'PY' || true
 import importlib.util, os, pathlib, sys, argparse, datetime as dt
 from importlib.machinery import SourceFileLoader
@@ -351,6 +357,37 @@ try:
         "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE weekly_percent = 2.0"
     ).fetchone()[0]
     assert cnt == 1, f"2pct snapshots={cnt}"
+    facts = conn.execute(
+        "SELECT id, observed_post_credit_pct, observed_at_utc, "
+        "       confirming_capture_at_utc, week_start_date "
+        "FROM week_reset_events"
+    ).fetchone()
+    assert facts["observed_post_credit_pct"] == 2.0, dict(facts)
+    assert facts["week_start_date"] == ws, dict(facts)
+    # The EXACT capture instant, not the hour-floored display one. It must be
+    # strictly after the floored instant, or the epoch reaches back before
+    # observations that are still legitimately pre-credit.
+    obs = facts["observed_at_utc"]
+    assert obs is not None, dict(facts)
+    assert mod.parse_iso_datetime(obs, "obs") > mod.parse_iso_datetime(
+        events[0]["effective_reset_at_utc"], "eff"), dict(facts)
+    # The immediate leg's triggering observation is also its confirmation.
+    assert facts["confirming_capture_at_utc"] == obs, dict(facts)
+    # The week is NOT re-anchored: the snapshot still carries the original
+    # boundary the API reported.
+    snap_end = conn.execute(
+        "SELECT week_end_at FROM weekly_usage_snapshots "
+        "WHERE weekly_percent = 2.0"
+    ).fetchone()[0]
+    assert snap_end == end_iso, snap_end
+    # The credited level keeps its own threshold (#707).
+    ladder = [
+        r[0] for r in conn.execute(
+            "SELECT percent_threshold FROM percent_milestones "
+            "WHERE reset_event_id = ? ORDER BY percent_threshold",
+            (int(facts["id"]),))
+    ]
+    assert ladder == [2], f"ladder={ladder}"
 finally:
     conn.close()
 parts = (mod.APP_DIR / "hwm-7d").read_text().strip().split()

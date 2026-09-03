@@ -10,10 +10,11 @@
 # TEXTUAL output (preview / --json envelope), never raw .db bytes.
 #
 # Determinism: CCTALLY_AS_OF pins "now"; TZ=Etc/UTC. M2 (#209): a credit
-# writes a weekly_credit_floors row (NOT a week_reset_events row) — the week
-# is NOT re-anchored. weekly_credit_floors.applied_at_utc is stamped via
-# wall-clock now_utc_iso() (audit-only, not in any clamp/display/--json), so
-# goldens carry only effectiveAtUtc and never applied_at_utc.
+# writes a week_reset_events row since #703 + #707 unified the representation,
+# and that row defines an accounting epoch only — the week is still NOT
+# re-anchored. Its applied_at_utc is stamped via wall-clock now_utc_iso()
+# (audit-only, not in any clamp/display/--json), so goldens carry only
+# effectiveAtUtc and never applied_at_utc.
 #
 # Scenarios (spec §6):
 #   S1  surface — --to 31 --yes applies; `report` then renders 31% for the

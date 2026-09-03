@@ -210,73 +210,159 @@ def _apply_overlap_clamp_to_subweeks(weeks: list[SubWeek]) -> list[SubWeek]:
 
 
 def _apply_reset_events_to_subweeks(
-    conn: sqlite3.Connection, weeks: list[SubWeek]
+    conn: sqlite3.Connection, weeks: list[SubWeek], *,
+    account_key: "str | None" = None,
 ) -> list[SubWeek]:
-    """Override SubWeek boundaries with reset-event effective moments.
+    """Return the sub-weeks unchanged. A credit is not a display boundary.
 
-    Same semantics as `_apply_reset_events_to_weekrefs` but for SubWeek:
-      - SubWeek whose end_ts equals event.old_week_end_at (instant)
-        is the PRE-reset week → end_ts := effective_reset_at_utc
-        and end_date := (reset_dt - 1s).astimezone().date()
-      - SubWeek whose end_ts equals event.new_week_end_at (instant)
-        is the POST-reset week → start_ts := effective_reset_at_utc
-        (start_date kept; it is the bucket key + lookup key for
-        weekly_usage_snapshots.week_start_date).
+    The SubWeek sibling of ``_apply_reset_events_to_weekrefs``, and it changed
+    for the same reason (#703 + #707 §2). It used to truncate the pre-reset
+    sub-week at the credit moment and re-anchor the post-reset one's
+    ``start_ts`` to it, so ``cctally weekly`` grew a second row for one
+    unchanged subscription week.
 
-    Compares by parsed datetime instant — SubWeek.{start,end}_ts are
-    raw snapshot strings that may be written in non-UTC offsets while
-    `week_reset_events.{old,new}_week_end_at` are canonicalized UTC.
+    A boundary CHANGE is left alone, and that is a deliberate retreat from the
+    spec's §7. The rule there is to recover the original cadence and coalesce
+    the linked references into it, and every formulation of that tried here
+    broke something a reader would notice: pulling the moved week's end back to
+    the original one left every entry between the two ends inside no window at
+    all and the week's spend vanished; keeping the later end produced a
+    ten-day "week"; and merging the two references reported one week's counter
+    against the other's key. §7 asserts the coalescing in one clause and never
+    says which week's usage key the merged row reports, which window its cost is
+    taken over, or where spend recorded after the original end goes — and those
+    are the questions that decide it. Until they are answered, a reference the
+    API moved renders on the window it recorded, untruncated and un-re-anchored,
+    which already satisfies §2's "stop re-anchoring the display window".
+
+    What it DOES still do is normalize to one sub-week per start instant. That
+    is the pipeline's contract rather than a symptom this producer exhibits —
+    see ``_merge_sub_weeks_sharing_a_start`` for what the builder already
+    guarantees. No window is rewritten and no boundary is invented.
+
+    And it EXTENDS a sub-week whose end is the boundary a change moved off. The
+    two boundary columns of a changed-boundary row are the same week's end as
+    the API stated it before and after the change, and §2 says that is one week,
+    not two — so the week ends at the later statement. Without this a credited
+    week ends where the API's earlier word put it while its own later snapshots
+    sit outside, and the dashboard's Projects panel reported the week as empty.
+    Nothing is truncated, nothing is re-anchored, and an in-place credit cannot
+    reach it, because its ``old_week_end_at`` is the floored credit instant and
+    no sub-week ends there.
+
+    ``account_key`` (§6.2a): a real key scopes the event read to that account.
+    The caller ``_compute_subscription_weeks`` carries one and scopes its own
+    snapshot read, so the sub-weeks handed in belong to one account — but this
+    read used to span every account, and on a multi-account install account B's
+    boundary-change credit then carried account A's week end forward, moving A's
+    cost window and its ``usedPercent`` bucket. ``None`` is the explicit merged
+    read, byte-identical on a single-account install.
     """
-    rows = conn.execute(
-        "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
-        "FROM week_reset_events"
-    ).fetchall()
-    if not rows:
-        return weeks
-    parsed_events: list[tuple[dt.datetime, dt.datetime, str]] = []
+    return _merge_sub_weeks_sharing_a_start(
+        _extend_sub_weeks_past_a_moved_boundary(
+            conn, weeks, account_key=account_key))
+
+
+def _extend_sub_weeks_past_a_moved_boundary(
+    conn: sqlite3.Connection, weeks: list, *,
+    account_key: "str | None" = None,
+) -> list:
+    """Carry a sub-week's end forward to the boundary a change moved it to."""
+    acct_sql = "" if account_key is None else " WHERE account_key = ?"
+    acct_params: tuple = () if account_key is None else (account_key,)
+    try:
+        rows = conn.execute(
+            "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
+            "FROM week_reset_events" + acct_sql,
+            acct_params,
+        ).fetchall()
+    except sqlite3.Error:
+        return list(weeks)
+    moved: dict = {}
     for r in rows:
+        if not r["old_week_end_at"] or not r["new_week_end_at"]:
+            continue
         try:
             old_dt = parse_iso_datetime(r["old_week_end_at"], "evt.old_end")
             new_dt = parse_iso_datetime(r["new_week_end_at"], "evt.new_end")
-        except ValueError:
+            eff_dt = parse_iso_datetime(
+                r["effective_reset_at_utc"], "evt.effective")
+        except (TypeError, ValueError):
             continue
-        parsed_events.append((old_dt, new_dt, r["effective_reset_at_utc"]))
-    if not parsed_events:
-        return weeks
+        # An in-place credit writes `old == effective`; it moved no boundary.
+        if int(old_dt.timestamp()) == int(eff_dt.timestamp()):
+            continue
+        if int(new_dt.timestamp()) <= int(old_dt.timestamp()):
+            continue
+        key = int(old_dt.timestamp())
+        if key not in moved or new_dt > moved[key]:
+            moved[key] = new_dt
+    if not moved:
+        return list(weeks)
 
-    out: list[SubWeek] = []
+    out: list = []
     for w in weeks:
-        new_w = w
         try:
             end_dt = parse_iso_datetime(w.end_ts, "subweek.end_ts")
-        except ValueError:
+        except (TypeError, ValueError):
             out.append(w)
             continue
-        for old_dt, new_dt, reset_at in parsed_events:
-            if end_dt == old_dt:
-                try:
-                    reset_dt = parse_iso_datetime(reset_at, "evt.eff")
-                except ValueError:
-                    continue
-                # internal fallback: host-local intentional
-                new_end_date = (reset_dt - dt.timedelta(seconds=1)).astimezone().date()
-                new_w = replace(new_w, end_ts=reset_at, end_date=new_end_date)
-            if end_dt == new_dt:
-                try:
-                    reset_dt = parse_iso_datetime(reset_at, "evt.eff")
-                except ValueError:
-                    continue
-                # internal fallback: host-local intentional
-                new_display_start = reset_dt.astimezone().date()
-                new_w = replace(
-                    new_w,
-                    start_ts=reset_at,
-                    display_start_date=new_display_start,
-                )
-                # start_date intentionally NOT touched — it is the bucket /
-                # lookup key into weekly_usage_snapshots.week_start_date.
-        out.append(new_w)
+        target = moved.get(int(end_dt.timestamp()))
+        if target is None:
+            out.append(w)
+            continue
+        out.append(replace(
+            w,
+            end_ts=target.isoformat(timespec="seconds"),
+            # internal fallback: host-local intentional
+            end_date=(target - dt.timedelta(seconds=1)).astimezone().date(),
+        ))
     return out
+
+
+def _merge_sub_weeks_sharing_a_start(weeks: list) -> list:
+    """One sub-week per start instant, ending at the latest of their ends.
+
+    A defensive normalizer over the pipeline's contract, NOT a fix for a symptom
+    this producer exhibits. ``_compute_subscription_weeks`` locates each week by
+    a ``bisect_left`` match over sorted start instants and its re-anchor loop
+    skips a candidate at or before the current one, so it emits at most one
+    sub-week per start instant already. Seeding two ``week_start_date`` groups
+    under one ``week_start_at`` produces a single sub-week from the builder, with
+    the second group's bounds dropped before this function is reached; the
+    earlier claim here that two such sub-weeks reach the dashboard's Projects
+    panel and it picks the shorter one describes a state the builder cannot
+    produce.
+
+    What it does guard is the contract itself: every consumer that locates "the
+    week containing this instant" by a sorted start list would pick arbitrarily
+    between two entries sharing a start, so this keeps the invariant true for any
+    future producer rather than leaving it unstated.
+
+    Keys on epoch seconds rather than on the string: one instant is spelled two
+    ways across producers (``Z`` against ``+00:00``), and two spellings of one
+    anchor would not fold into each other.
+    """
+    def _instant(value):
+        try:
+            return int(parse_iso_datetime(value, "subweek.instant").timestamp())
+        except (TypeError, ValueError):
+            return None
+
+    best: dict = {}
+    order: list = []
+    for w in weeks:
+        key = _instant(w.start_ts)
+        if key is None:
+            key = ("~unparseable", id(w))
+        if key not in best:
+            best[key] = w
+            order.append(key)
+            continue
+        prior = best[key]
+        if (_instant(w.end_ts) or 0) > (_instant(prior.end_ts) or 0):
+            best[key] = replace(prior, end_ts=w.end_ts, end_date=w.end_date)
+    return [best[key] for key in order]
 
 
 def subscription_window_probe_range(
@@ -515,7 +601,8 @@ def _compute_subscription_weeks(
                 current = natural_next
 
         return _apply_overlap_clamp_to_subweeks(
-            _apply_reset_events_to_subweeks(conn, weeks)
+            _apply_reset_events_to_subweeks(
+                conn, weeks, account_key=account_key)
         )
 
     # Case A2 (spec A1.6 Step 1 fallback): no usage snapshots, but a

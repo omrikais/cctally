@@ -215,22 +215,25 @@ def _codex_ingest_backlog_sig(conn: sqlite3.Connection) -> str:
 
 
 def _reset_sig(conn: sqlite3.Connection) -> tuple[int, int]:
-    """Change-signal over the two reset-event tables combined (spec §3).
+    """Change-signal over the credit / reset table (spec §3).
 
     A credit / reset re-shapes a PAST weekly bucket with NO new
     `session_entries` row, so the composite signature must cover it.
-    Uses `(COUNT(*), MAX(rowid))` over `week_reset_events` +
-    `weekly_credit_floors`: the count catches inserts, the max-rowid
-    catches the (rare) case where a delete+insert keeps the count level.
-    `rowid` aliases the tables' `INTEGER PRIMARY KEY id`. Returns (0, 0)
-    on a fresh DB where the tables are absent.
+    Uses `(COUNT(*), MAX(rowid))` over `week_reset_events`: the count catches
+    inserts, the max-rowid catches the (rare) case where a delete+insert keeps
+    the count level. `rowid` aliases the table's `INTEGER PRIMARY KEY id`.
+    Returns (0, 0) on a fresh DB where the table is absent.
+
+    #703 + #707 collapsed the second leg away. `weekly_credit_floors` was the
+    other place a credit could live, and it is not any more: the
+    `weekly_credit_floor` op folds into `week_reset_events`, a rebuilt index
+    does not carry the table's rows at all, and nothing writes it. A leg over a
+    table nothing writes can never signal a change, so keeping it would only
+    make the signature look like it covers something it does not.
     """
     try:
         row = conn.execute(
-            "SELECT (SELECT COUNT(*) FROM week_reset_events)"
-            "     + (SELECT COUNT(*) FROM weekly_credit_floors),"
-            "       (SELECT COALESCE(MAX(rowid), 0) FROM week_reset_events)"
-            "     + (SELECT COALESCE(MAX(rowid), 0) FROM weekly_credit_floors)"
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM week_reset_events"
         ).fetchone()
         return (int(row[0]), int(row[1]))
     except sqlite3.Error:

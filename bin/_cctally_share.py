@@ -20,7 +20,7 @@ import sys
 import _lib_changelog  # module-qualified: _lib_changelog._read_latest_changelog_version()
 from _lib_display_tz import _resolve_tz, format_display_dt, resolve_display_tz_name
 from _lib_fmt import stable_sum
-from _lib_render import _project_disambiguate_labels
+from _lib_render import CREDIT_MARKER, _project_disambiguate_labels
 
 
 # ============================================================
@@ -440,6 +440,16 @@ def _build_report_snapshot(
         used_pct_raw = r.used_pct
         cost_raw = r.weekly_cost_usd
         dpp_raw = r.dollars_per_percent
+        # #703 + #707 §6.3/§6.4. A shared artifact of a credited week used to
+        # lose both halves of what makes it readable: the marker that says a
+        # credit happened inside the window, and the CAUSE of a `$/1%` the
+        # epoch does not support. The terminal table carries both, and an
+        # artifact is the shareable form of that table. The marker is the same
+        # `+` prefix the terminal uses; it rides the Week cell here because a
+        # share table has no row-index column to put it in.
+        if getattr(r, "credited", False):
+            week_label = f"{CREDIT_MARKER}{week_label}"
+        withheld_cause = getattr(r, "dpp_withheld_cause", None)
         snap_rows.append(_lib_share.Row(cells={
             "week": _lib_share.TextCell(week_label),
             "used": (
@@ -451,8 +461,8 @@ def _build_report_snapshot(
                 if cost_raw is not None else _lib_share.TextCell("—")
             ),
             "dpp": (
-                _lib_share.MoneyCell(float(dpp_raw))
-                if dpp_raw is not None else _lib_share.TextCell("—")
+                _lib_share.MoneyCell(float(dpp_raw)) if dpp_raw is not None
+                else _lib_share.TextCell(withheld_cause or "—")
             ),
         }))
         # Skip chart points for weeks with no $/% sample — the polyline
@@ -804,6 +814,12 @@ def _build_weekly_snapshot(
     # so BarChart bars are chronological.
     rows = list(reversed(view.aggregated))
     overlay = list(reversed(view.overlay))
+    # #703 + #707 §6.4. `view.rows` is index-parallel with `view.aggregated`
+    # (`build_weekly_view` raises rather than letting the two desynchronize), so
+    # reversing it in lockstep keeps the credit marker on the week that holds
+    # the credit. Without it a shared `weekly` artifact lost the marker
+    # entirely, and nothing in it explained a low `% Used` late in a heavy week.
+    view_rows = list(reversed(view.rows))
     _lib_share = _share_load_lib()
     columns_list: list = [
         _lib_share.ColumnSpec(key="week", label="Week Start", align="left"),
@@ -849,6 +865,8 @@ def _build_weekly_snapshot(
                 week_label = bucket
         else:
             week_label = "—"
+        if i < len(view_rows) and getattr(view_rows[i], "credited", False):
+            week_label = f"{CREDIT_MARKER}{week_label}"
         cost_usd = float(getattr(r, "cost_usd", 0.0) or 0.0)
         total_tokens = int(getattr(r, "total_tokens", 0) or 0)
         # `used_pct` is None when the week lacks a `weekly_usage_snapshots`

@@ -75,6 +75,20 @@ contended, deferred, torn, failed, maintenance-failed, or otherwise
 non-certifiable. The journal paths and certificate identities are never
 published.
 
+Every guard above compares evidence that some writer must produce. A provider
+whose hooks are absent, disabled, or untrusted by its host application appends
+to files the store already tracks without moving any of them, so its
+certificate would otherwise stand for the life of the process. A certificate
+therefore also expires on elapsed time alone, after
+`FRONTIER_CERTIFICATE_MAX_AGE_SECONDS` (120 monotonic seconds) measured from the
+exhaustive walk it rests on. The expiry is checked before any database or
+filesystem work and reports the `certificate_expired` reason. This bounds
+worst-case staleness at one interval regardless of hook liveness, at a cost of
+one full walk per interval per provider. Only an exhaustive walk restarts that
+clock: committing a caught-up or targeted plan advances the journal cursor
+without reading any source the tickets did not name, so neither a steady tick
+rate nor a steady ticket stream over one busy file can defer the walk.
+
 `bin/cctally-bench` registers `frontier.caught_up` over a full-seeded two-
 provider store and reports the total tracked provider-file count beside the
 timing. This is the reproducible scaling discriminator: the baseline and

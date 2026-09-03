@@ -341,12 +341,18 @@ def create_stats_db(path: Path) -> None:
             CREATE TABLE week_reset_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 detected_at_utc        TEXT NOT NULL,
-                old_week_end_at        TEXT NOT NULL,
-                new_week_end_at        TEXT NOT NULL,
+                old_week_end_at        TEXT,
+                new_week_end_at        TEXT,
                 effective_reset_at_utc TEXT NOT NULL,
                 observed_pre_credit_pct REAL,
                 account_key            TEXT NOT NULL DEFAULT 'unattributed',
-                UNIQUE(account_key, old_week_end_at, new_week_end_at)
+                week_start_date           TEXT,
+                observed_at_utc           TEXT,
+                confirming_capture_at_utc TEXT,
+                observed_post_credit_pct  REAL,
+                credit_key                TEXT,
+                credit_order              INTEGER,
+                UNIQUE(account_key, credit_key)
             );
 
             CREATE TABLE five_hour_blocks (
@@ -610,11 +616,18 @@ def _self_test_create_stats_db() -> None:
         missing = expected - tables
         assert not missing, f"missing tables: {missing}"
         # Column-presence check — week_reset_events.observed_pre_credit_pct
-        # (record-credit M2) is the known drift this head-sync closes.
+        # (record-credit M2) is the known drift this head-sync closes, and the
+        # six #703/#707 credit-fact columns are the second (epoch 1012).
         wre_cols = {r[1] for r in conn.execute(
             "PRAGMA table_info(week_reset_events)")}
-        assert "observed_pre_credit_pct" in wre_cols, \
-            "week_reset_events.observed_pre_credit_pct missing (drift vs _cctally_core)"
+        wre_expected = {
+            "observed_pre_credit_pct", "week_start_date", "observed_at_utc",
+            "confirming_capture_at_utc", "observed_post_credit_pct",
+            "credit_key", "credit_order",
+        }
+        wre_missing = wre_expected - wre_cols
+        assert not wre_missing, \
+            f"week_reset_events columns missing (drift vs _cctally_core): {sorted(wre_missing)}"
     print("OK: create_stats_db")
 
 
@@ -1076,8 +1089,11 @@ def seed_week_reset_event(
     (_backfill_week_reset_events) inserts. Use this in fixtures that need
     to exercise mid-week-reset boundary overrides applied by
     `_apply_reset_events_to_subweeks` / `_apply_reset_events_to_weekrefs`.
-    `INSERT OR IGNORE` matches production: UNIQUE(old_week_end_at,
-    new_week_end_at) protects against double-inserts."""
+    `INSERT OR IGNORE` matches production. The constraint that protects
+    against a double-insert is UNIQUE(account_key, credit_key) since
+    #703 + #707 moved credit identity off the week boundaries; a fixture row
+    written here leaves `credit_key` NULL, and SQLite treats NULLs as distinct,
+    so two such rows coexist exactly as two legacy rows do."""
     conn.execute(
         "INSERT OR IGNORE INTO week_reset_events "
         "(detected_at_utc, old_week_end_at, new_week_end_at, "

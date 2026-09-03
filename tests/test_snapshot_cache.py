@@ -215,9 +215,17 @@ def test_signature_advances_per_table(tmp_cache, tmp_stats):
     s3 = compute_signature(tmp_cache, tmp_stats, generation=0)
     assert s3 != s2b and s3.reset_sig != s2b.reset_sig
 
-    _insert_credit_floor(tmp_stats)  # credit floors also feed reset_sig
+    # #703 + #707 collapsed the second leg away. `weekly_credit_floors` was the
+    # other place a credit could live and it is not any more: the
+    # `weekly_credit_floor` op folds into `week_reset_events`, a rebuilt index
+    # does not carry the table's rows at all, and nothing writes it. A leg over
+    # a table nothing writes can never signal a change, so keeping it would only
+    # make the signature look like it covers something it does not.
+    _insert_credit_floor(tmp_stats)
     s3b = compute_signature(tmp_cache, tmp_stats, generation=0)
-    assert s3b != s3 and s3b.reset_sig != s3.reset_sig
+    assert s3b == s3, (
+        "the signature still reads a table nothing writes: "
+        f"{s3b.reset_sig} vs {s3.reset_sig}")
 
     _insert_codex_entry(tmp_cache, "2026-07-04T11:00:00Z")
     s3c = compute_signature(tmp_cache, tmp_stats, generation=0)

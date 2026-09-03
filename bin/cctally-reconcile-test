@@ -4040,9 +4040,13 @@ UPCT_AS_OF="2026-06-29T12:00:00Z"
 
 # Seed one scenario HOME's stats.db + cache.db. Inline heredoc (self-contained,
 # deterministic) using the _fixture_builders seed helpers; the
-# weekly_credit_floors row is raw SQL naming all four required columns
-# (week_start_date, effective_at_utc, observed_pre_credit_pct, applied_at_utc —
-# no shared helper exists, YAGNI for one consumer; spec §2.1 / Codex finding 13).
+# credit row is raw SQL naming the columns a manual credit records — #703 + #707
+# unified it onto `week_reset_events`, and no shared helper exists (YAGNI for one
+# consumer; spec §2.1 / Codex finding 13). It must NOT name `journal_id`:
+# `create_stats_db` builds the table without that column, which `_apply_schema`
+# adds in a later additive pass, so naming it aborts the whole seeding
+# transaction and leaves an EMPTY store that every surface then reads as "no
+# current week".
 upct_seed_reader () {
     local scenario="$1" datadir="$2"
     mkdir -p "$datadir"
@@ -4114,11 +4118,23 @@ with sqlite3.connect(stats) as c:
             new_week_end_at="2026-07-02T10:00:00+00:00",
             effective_reset_at_utc="2026-06-27T10:00:00+00:00")
     if scenario == "credit":
+        # #703 + #707: a manual credit is a `week_reset_events` row whose two
+        # boundary columns are NULL. That shape is what marks it MANUAL — the
+        # credit moved no boundary, and a non-NULL value here would re-anchor
+        # the week the scenario asserts is unchanged. `journal_id` stays NULL
+        # like every other seeded row: this store has no journal, and stamping a
+        # logical id no journal line produces would make the index disagree with
+        # its own prefix.
         c.execute(
-            "INSERT INTO weekly_credit_floors "
-            "(week_start_date, effective_at_utc, observed_pre_credit_pct, "
-            " applied_at_utc) VALUES (?,?,?,?)",
-            (wsd, "2026-06-27T10:00:00+00:00", 46.0, "2026-06-27T10:05:00Z"))
+            "INSERT INTO week_reset_events "
+            "(week_start_date, detected_at_utc, old_week_end_at, "
+            " new_week_end_at, effective_reset_at_utc, "
+            " observed_pre_credit_pct, observed_post_credit_pct, "
+            " credit_key, credit_order) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (wsd, "2026-06-27T10:05:00Z", None, None,
+             "2026-06-27T10:00:00+00:00", 46.0, 33.0,
+             "o:upctcredit", 1782036300))
     c.commit()
 
 # One in-window cache session entry (after the reset/credit effective) so

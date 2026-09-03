@@ -201,6 +201,48 @@ def test_post_reset_seed_refused_on_an_empty_epoch():
     assert not post_reset_seed_has_climb_evidence(None, 1)
 
 
+def test_post_reset_seed_admits_at_or_below_the_credited_level():
+    """#707: when the credit RECORDED where the counter landed, a reading at
+    that level is the epoch's own starting point and the threshold it crosses is
+    real. The older rule wanted an observation strictly below the threshold,
+    which a goodwill credit to a non-zero level can never supply — its first
+    in-epoch reading IS the credited level — so that level lost its own
+    threshold and the ladder opened one threshold late."""
+    assert post_reset_seed_has_climb_evidence(2.0, 2, post_credit_pct=2.0)
+    assert post_reset_seed_has_climb_evidence(1.0, 2, post_credit_pct=2.0)
+    # Above the credited level is not the epoch's starting point, and the #706
+    # incident is exactly that shape: an in-epoch minimum of 13 against a
+    # credited 0.
+    assert not post_reset_seed_has_climb_evidence(13.0, 13, post_credit_pct=0.0)
+    assert not post_reset_seed_has_climb_evidence(3.0, 3, post_credit_pct=2.0)
+
+
+def test_post_reset_seed_falls_back_to_the_706_rule_without_the_fact():
+    """A row that predates `observed_post_credit_pct`, or whose source genuinely
+    lacked it, has nothing to compare against — so the only admissible evidence
+    is an observation of the climb itself. `None` must not be read as 0."""
+    assert not post_reset_seed_has_climb_evidence(13.0, 13, post_credit_pct=None)
+    assert post_reset_seed_has_climb_evidence(12.9, 13, post_credit_pct=None)
+
+
+def test_post_reset_seed_refuses_an_empty_epoch_under_either_rule():
+    """Seeding from nothing is the fabrication this kernel exists to prevent,
+    and recording a landing level does not make an absent observation into
+    evidence."""
+    assert not post_reset_seed_has_climb_evidence(None, 2, post_credit_pct=2.0)
+    assert not post_reset_seed_has_climb_evidence(None, 2, post_credit_pct=None)
+
+
+def test_post_reset_seed_snaps_the_credited_level_too():
+    """The status line delivers percents as fraction-times-100, so a credited 2%
+    can arrive as `0.02 * 100`. Both sides of the comparison snap, or a stored
+    2.0 would read as above a credited 1.9999999999999998."""
+    assert post_reset_seed_has_climb_evidence(
+        2.0, 2, post_credit_pct=1.9999999999999998)
+    assert post_reset_seed_has_climb_evidence(
+        1.9999999999999998, 2, post_credit_pct=2.0)
+
+
 def test_post_reset_seed_1e9_snap():
     # The status line delivers percents as fraction-times-100, so 58% arrives
     # as `0.58 * 100 == 57.99999999999999`. Without the `+ 1e-9` snap a stored

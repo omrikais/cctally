@@ -52,9 +52,14 @@ def _conn(*, with_source_columns=True):
     conn.execute(
         "CREATE TABLE weekly_credit_floors (week_start_date TEXT, "
         "effective_at_utc TEXT, account_key TEXT)")
+    # The two boundary columns are part of production's shape and #703 + #707
+    # made them load-bearing here: the reducer reads them to tell a same-window
+    # CREDIT (both NULL) from a RESET, now that both kinds live in this one
+    # table. A fixture without them makes every read fail closed.
     conn.execute(
         "CREATE TABLE week_reset_events (effective_reset_at_utc TEXT, "
-        "account_key TEXT)")
+        "old_week_end_at TEXT, new_week_end_at TEXT, account_key TEXT, "
+        "week_start_date TEXT, observed_at_utc TEXT)")
     return conn
 
 
@@ -66,9 +71,26 @@ def _credit(conn, *, hours):
 
 
 def _reset(conn, *, hours):
+    """A RESET: it moved a boundary, so both boundary columns are set."""
     conn.execute(
-        "INSERT INTO week_reset_events VALUES (?, 'unattributed')",
-        ((WEEK_START + dt.timedelta(hours=hours)).isoformat(),))
+        "INSERT INTO week_reset_events (effective_reset_at_utc, "
+        " old_week_end_at, new_week_end_at, account_key, week_start_date) "
+        "VALUES (?, ?, ?, 'unattributed', ?)",
+        ((WEEK_START + dt.timedelta(hours=hours)).isoformat(),
+         (WEEK_START + dt.timedelta(days=7)).isoformat(),
+         (WEEK_START + dt.timedelta(days=9)).isoformat(),
+         WEEK_START_DATE))
+
+
+def _unified_credit(conn, *, hours):
+    """A same-window CREDIT as #703 + #707 records it: one `week_reset_events`
+    row whose two boundary columns are NULL, because the window did not move."""
+    conn.execute(
+        "INSERT INTO week_reset_events (effective_reset_at_utc, "
+        " old_week_end_at, new_week_end_at, account_key, week_start_date) "
+        "VALUES (?, NULL, NULL, 'unattributed', ?)",
+        ((WEEK_START + dt.timedelta(hours=hours)).isoformat(),
+         WEEK_START_DATE))
 
 
 def _readings(*rows):
@@ -246,6 +268,35 @@ def test_b1_segments_at_a_reset_boundary_too():
     conn.close()
 
 
+def test_b1_a_unified_credit_row_is_a_credit_boundary_not_a_reset():
+    """#703 + #707 moved a manual credit into `week_reset_events`, so the kind
+    is read from the row's SHAPE: both boundary columns NULL is a same-window
+    credit, because the window did not move. The kind is not cosmetic — the
+    caller names it in the withholding cause, and a credit wins a shared instant
+    because it is the record that writes the synthetic baseline the next segment
+    is measured from. Classifying it as a reset would point a reader at the
+    wrong record.
+    """
+    conn = _conn()
+    _unified_credit(conn, hours=72)
+    out = _movement(conn, _readings((24, 46.0), (120, 31.0)))
+    assert out.points is None
+    assert out.withheld_cause == "credit-baseline-absent"
+    conn.close()
+
+
+def test_b1_a_unified_credit_row_still_segments_the_week():
+    """The same row with its baseline present segments and measures from it,
+    exactly as a `weekly_credit_floors` row did."""
+    conn = _conn()
+    _unified_credit(conn, hours=72)
+    out = _movement(conn, _readings(
+        (24, 46.0), (72, 0.0, 72), (120, 31.0)))
+    assert out.points == pytest.approx(46.0 + 31.0)
+    assert out.withheld_cause is None
+    conn.close()
+
+
 def test_b1_a_boundary_outside_the_week_does_not_segment_it():
     conn = _conn()
     conn.execute(
@@ -305,3 +356,78 @@ def test_b1_readings_are_ordered_by_instant_not_by_row_order():
     out = _movement(conn, rows)
     assert out.points == pytest.approx(44.0)
     conn.close()
+
+
+# ── #703 + #707: one credit recorded twice is still ONE boundary ────────────
+
+
+def _both_tables_conn():
+    """A cutover-window shape: both tables carry `journal_id`."""
+    conn = _conn()
+    conn.execute("ALTER TABLE week_reset_events ADD COLUMN journal_id TEXT")
+    conn.execute("ALTER TABLE weekly_credit_floors ADD COLUMN journal_id TEXT")
+    return conn
+
+
+def _segment_boundaries(conn):
+    return _mod()._week_segment_boundaries(
+        conn, week_start_date=WEEK_START_DATE, week_start_at=WEEK_START,
+        week_end_at=WEEK_END, account_key=None)
+
+
+def test_a_credit_present_in_both_tables_is_one_boundary():
+    """The cutover-window question, pinned rather than left to belief.
+
+    The cutover exports `weekly_credit_floors` rows as ops and stamps them; the
+    op's fold writes the unified `week_reset_events` row under the SAME
+    `journal_id`. The two tables therefore record one credit under DIFFERENT
+    instants — the floors row carries the hour-floored effective one, the
+    unified row the exact observed one — so an instant-keyed dedup cannot see
+    that they are the same credit and would segment the week twice for it.
+
+    The state is believed unreachable, because the cutover leaves its bootstrap
+    segment inside the cursor and those ops fold only on a rebuild, which
+    materializes `weekly_credit_floors` empty. That belief is not a reason to
+    produce a wrong segmentation if it turns out to be wrong.
+    """
+    conn = _both_tables_conn()
+    try:
+        conn.execute(
+            "INSERT INTO week_reset_events (effective_reset_at_utc, "
+            " old_week_end_at, new_week_end_at, account_key, week_start_date, "
+            " observed_at_utc, journal_id) "
+            "VALUES (?, NULL, NULL, 'unattributed', ?, ?, 'o:cutover')",
+            ((WEEK_START + dt.timedelta(hours=48)).isoformat(),
+             WEEK_START_DATE,
+             (WEEK_START + dt.timedelta(hours=48, minutes=12)).isoformat()))
+        conn.execute(
+            "INSERT INTO weekly_credit_floors "
+            "(week_start_date, effective_at_utc, account_key, journal_id) "
+            "VALUES (?, ?, 'unattributed', 'o:cutover')",
+            (WEEK_START_DATE,
+             (WEEK_START + dt.timedelta(hours=48)).isoformat()))
+        conn.commit()
+        got = _segment_boundaries(conn)
+    finally:
+        conn.close()
+    assert len(got) == 1, got
+    assert got[0][1] == "credit", got
+
+
+def test_a_floor_row_with_no_unified_twin_still_segments():
+    """The retained leg is not disabled — a cutover-window store whose credit
+    exists ONLY in `weekly_credit_floors` still segments its week."""
+    conn = _both_tables_conn()
+    try:
+        conn.execute(
+            "INSERT INTO weekly_credit_floors "
+            "(week_start_date, effective_at_utc, account_key, journal_id) "
+            "VALUES (?, ?, 'unattributed', 'o:cutover')",
+            (WEEK_START_DATE,
+             (WEEK_START + dt.timedelta(hours=48)).isoformat()))
+        conn.commit()
+        got = _segment_boundaries(conn)
+    finally:
+        conn.close()
+    assert len(got) == 1, got
+    assert got[0][1] == "credit", got

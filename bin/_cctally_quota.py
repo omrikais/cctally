@@ -316,7 +316,12 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     "_cctally_core.py": 2,
     "_cctally_dashboard.py": 3,
     "_cctally_dashboard_envelope.py": 5,
-    "_cctally_db.py": 7,
+    # 7 -> 8 (#703 + #707 review): the `week_reset_events` reshape's
+    # `SELECT {projection} FROM week_reset_events_pre_1012`, whose projection is
+    # the surviving column intersection read from `PRAGMA table_info`. Its
+    # target is the parked copy of one table and never a projection family, so
+    # no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
+    "_cctally_db.py": 8,
     # NOT a read. The worker-loader failure says `cannot load cctally worker
     # from {path}`, which the case-insensitive `FROM\s+{` pattern cannot tell
     # from a dynamic SQL target. The module's SQL table names remain literal,
@@ -332,7 +337,12 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # so no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
     "_cctally_quota_model.py": 1,
     "_cctally_quota.py": 1,
-    "_cctally_record.py": 1,
+    # 1 -> 2 (#703 + #707 review): `_apply_credit`'s `_dependents(table)`
+    # reads the milestones of a replaced credit's removed synthetic snapshots
+    # from a hardcoded pair — `percent_milestones` and `five_hour_milestones`.
+    # Neither is a quota projection family, so no
+    # `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
+    "_cctally_record.py": 2,
     "_cctally_release.py": 4,
     "_cctally_setup.py": 3,
     "_cctally_tui.py": 1,

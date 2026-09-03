@@ -93,9 +93,16 @@ def _track_connections(monkeypatch):
 
 # --- canonical logical dump (spec §10; ORDER BY natural key; drop rowid FKs) ---
 
+# `weekly_credit_floors` is deliberately NOT in this tuple, and neither table
+# holding a credit record is compared row-for-row. #703 + #707 unified the two,
+# so a rebuild MIGRATES a pre-cutover floor row into `week_reset_events` — the
+# live and rebuilt databases genuinely differ there, by design, and that
+# migration is the upgrade path rather than a divergence. `_credit_records`
+# below compares the facts instead, across both tables and on both sides, so a
+# credit that changed or vanished is still caught.
 _DUMP_TABLES = (
     "weekly_usage_snapshots", "weekly_cost_snapshots", "week_reset_events",
-    "five_hour_reset_events", "weekly_credit_floors", "percent_milestones",
+    "five_hour_reset_events", "percent_milestones",
     "five_hour_milestones", "budget_milestones", "projected_milestones",
     "project_budget_milestones",
     # quota_alert_arming (§5.3 "state") — folded by natural-key upsert; carries
@@ -115,8 +122,51 @@ def _table_rows(conn, table, where=""):
     return sorted(rows, key=lambda x: tuple(str(v) for v in x))
 
 
+#: The prefix a cutover-exported credit floor's op id carries. A
+#: `week_reset_events` row folded from one is the MIGRATED shape.
+_MIGRATED_CREDIT_PREFIX = "legacy:b:weekly_credit_floors:"
+
+
+def _credit_records(conn):
+    """Every credit on file, as the facts a credit has, from BOTH tables.
+
+    A pre-cutover `weekly_credit_floors` row and the `week_reset_events` row a
+    rebuild folds it into are the same credit recorded in two places, so
+    comparing the tables row-for-row would report the deliberate migration as a
+    divergence. These four facts are what both shapes carry, so the comparison
+    still fails when a credit appears, disappears, or changes.
+    """
+    out = [
+        (r[0], r[1], r[2], r[3])
+        for r in conn.execute(
+            "SELECT week_start_date, effective_at_utc, "
+            "       observed_pre_credit_pct, account_key "
+            "  FROM weekly_credit_floors")
+    ]
+    out += [
+        (r[0], r[1], r[2], r[3])
+        for r in conn.execute(
+            "SELECT week_start_date, effective_reset_at_utc, "
+            "       observed_pre_credit_pct, account_key "
+            "  FROM week_reset_events")
+    ]
+    return sorted(out, key=lambda x: tuple(str(v) for v in x))
+
+
 def _canonical_dump(conn):
-    return {t: _table_rows(conn, t) for t in _DUMP_TABLES}
+    dump = {t: _table_rows(conn, t) for t in _DUMP_TABLES}
+    # Drop the migrated rows from the row-for-row comparison; `credit_records`
+    # covers them on both sides.
+    cols = [d[1] for d in conn.execute("PRAGMA table_info(week_reset_events)")]
+    keep = [c for c in cols if c not in _DROP_COLS]
+    key_at = keep.index("credit_key")
+    dump["week_reset_events"] = [
+        row for row in dump["week_reset_events"]
+        if not (isinstance(row[key_at], str)
+                and row[key_at].startswith(_MIGRATED_CREDIT_PREFIX))
+    ]
+    dump["credit_records"] = _credit_records(conn)
+    return dump
 
 
 def _block_map(conn, where=""):
@@ -365,7 +415,7 @@ def test_stats_registry_is_frozen_at_13(ns):
 
 def test_epoch_constants(ns):
     core = _core()
-    assert core.STATS_INDEX_EPOCH == 1011  # #661 S2 meter-rate-change events
+    assert core.STATS_INDEX_EPOCH == 1012  # #703/#707 unified credit record
     assert core.LEGACY_STATS_HEAD == 13
 
 

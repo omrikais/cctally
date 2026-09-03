@@ -25,6 +25,7 @@ import { codexLiveQuotaKeys } from '../lib/dashboardPresentation';
 import { combinedPresentation, warningForDomain } from '../lib/sourceGating';
 import { SourceChip } from '../panels/sourcePanel';
 import { fetchWeekDetail, stepWeek } from './milestoneHistory';
+import { CREDIT_MARKER_TITLE, withheldDollarPerPctLabel } from '../lib/creditMarker';
 import type {
   CodexQuotaMilestoneRow,
   CodexSourceData,
@@ -1119,6 +1120,14 @@ function ClaudeCurrentWeekModal({
   let heroPct: number | null | undefined = cw?.used_pct;
   let spent: number | null | undefined = cw?.spent_usd;
   let dpp: number | null | undefined = cw?.dollar_per_pct;
+  // #703 + #707 §6.3 — the typed cause a credited week's ratio is withheld
+  // under. Current-week only: the historic branch below derives its own ratio
+  // from the fetched ladder, so a cause published for the LIVE week would
+  // describe a figure this modal did not compute. The cause is preferred only
+  // when there is no figure, so a published rate always wins.
+  const withheldDpp = !isHistoric && cw?.dollar_per_pct == null
+    ? withheldDollarPerPctLabel(cw?.dollar_per_pct_withheld)
+    : null;
   let resetCell = cw?.reset_at_utc;
   if (isHistoric && detail) {
     const lastSeg = detail.segments[detail.segments.length - 1];
@@ -1301,7 +1310,20 @@ function ClaudeCurrentWeekModal({
             </div>
             <div className="s">
               <span className="k">$ / 1%</span>
-              <span className="v v-cyan" id={singleId('mcw-dpp')}>{fmt.usd3(dpp)}</span>
+              {/* A withheld ratio prints its CAUSE. `fmt.usd3(null)` renders an
+                  em-dash and a zero numerator renders `$0.000`; both read as a
+                  measured quantity on a week that holds a credit. */}
+              {withheldDpp != null
+                ? (
+                  <span
+                    className="v withheld"
+                    id={singleId('mcw-dpp')}
+                    title={CREDIT_MARKER_TITLE}
+                  >
+                    {withheldDpp}
+                  </span>
+                )
+                : <span className="v v-cyan" id={singleId('mcw-dpp')}>{fmt.usd3(dpp)}</span>}
             </div>
             <div className="s">
               <span className="k">reset</span>
