@@ -27,9 +27,6 @@ from _cctally_core import (
     parse_date_str,
 )
 
-# Pure stdlib kernel; the ONE credit-epoch resolver (#703 + #707 §5.3).
-import _lib_credit_selection
-
 
 def _cctally():
     """Call-time accessor to the cctally module namespace (ns-patchable)."""
@@ -135,13 +132,10 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
             (week_start + dt.timedelta(days=6)).isoformat()
         )
 
-        # #703 + #707 §6.1: the header shows the ORIGINAL week and the body
-        # keeps the epoch. `_apply_reset_events_to_weekrefs` used to narrow this
-        # header to the post-credit segment; it no longer rewrites a credited
-        # week's boundaries at all, because an Anthropic reset never changes
-        # them. It is still called, because a boundary CHANGE really did move
-        # the API's declared end and the header must show the window the week
-        # ran on rather than the one the API moved to.
+        # Apply reset-event boundary rewrites (same path get_recent_weeks
+        # uses) so the display header shows the effective window — e.g.
+        # a post-reset short week shows "2026-04-23..2026-04-25" rather
+        # than the backdated API-derived "2026-04-18..2026-04-25".
         canon_start, canon_end = c._get_canonical_boundary_for_date(conn, week_start_date)
         display_start_iso = canon_start
         display_end_iso = canon_end
@@ -160,12 +154,13 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
             except ValueError:
                 pass
 
-        # The BODY keeps the epoch: the milestone listing is narrowed to the
-        # active (latest) segment, so the ladder shown is the one the credit
-        # opened rather than a concatenation of two ladders that each start at
-        # their own floor. Sentinel ``0`` covers pre-credit / no-event weeks;
-        # pre-005 DBs that didn't have the column also default to 0 via the
-        # migration's ALTER DEFAULT.
+        # v1.7.2 segment filter: when a week_reset_events row exists for
+        # the current ``week_end_at``, narrow the milestone listing to
+        # the active (latest) segment so a credited week's header (which
+        # already reflects the post-credit window via the canon-boundary
+        # rewrite above) is coherent with the body. Sentinel ``0`` covers
+        # pre-credit / no-event weeks; pre-005 DBs that didn't have the
+        # column also default to 0 via the migration's ALTER DEFAULT.
         active_segment = 0
         canon_end_for_lookup = None
         latest_end_row = conn.execute(
@@ -178,16 +173,15 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
             canon_end_for_lookup = _canonicalize_optional_iso(
                 latest_end_row["week_end_at"], "pb.cur"
             )
-        # #703 + #707 §5.3: the ONE shared resolver, so this reader shows the
-        # epoch the writer stamped. Keyed on the WEEK — a manual credit leaves
-        # both boundary columns NULL, so the old `new_week_end_at` lookup could
-        # not see one — and ordered by the accounting instant rather than by a
-        # row identifier a rebuild reassigns.
-        seg_row = _lib_credit_selection.resolve_weekly_credit_epoch(
-            conn, week_start_date=week_start_date, account_key=acct_key,
-            captured_at=now_utc_iso(), week_end_at=canon_end_for_lookup)
-        if seg_row is not None:
-            active_segment = int(seg_row["id"])
+        if canon_end_for_lookup:
+            seg_row = conn.execute(
+                "SELECT id FROM week_reset_events "
+                "WHERE new_week_end_at = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (canon_end_for_lookup,),
+            ).fetchone()
+            if seg_row is not None:
+                active_segment = int(seg_row["id"])
 
         milestones = [
             m for m in c.get_milestones_for_week(

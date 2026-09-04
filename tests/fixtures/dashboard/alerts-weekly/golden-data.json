@@ -158,7 +158,6 @@
   },
   "current_week": {
     "dollar_per_pct": 0.012727272727272728,
-    "dollar_per_pct_withheld": null,
     "five_hour_block": null,
     "five_hour_milestones": [],
     "five_hour_pct": null,
@@ -178,7 +177,6 @@
         "percent": 90
       }
     ],
-    "nominal_week_start_at": "2026-04-13T14:00:00Z",
     "reset_at_utc": "2026-04-20T14:00:00Z",
     "reset_in_sec": 0,
     "spent_usd": 0.63,
@@ -1256,7 +1254,6 @@
           "cost_usd": 0.63,
           "current_week": {
             "dollar_per_pct": 0.012727272727272728,
-            "dollar_per_pct_withheld": null,
             "five_hour_block": null,
             "five_hour_milestones": [],
             "five_hour_pct": null,
@@ -1276,7 +1273,6 @@
                 "percent": 90
               }
             ],
-            "nominal_week_start_at": "2026-04-13T14:00:00Z",
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 345600,
             "spent_usd": 0.63,
@@ -2363,10 +2359,8 @@
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
                 "cost_usd": 0.63,
-                "credited": false,
                 "delta_cost_pct": null,
                 "dollar_per_pct": 0.0126,
-                "dollar_per_pct_withheld": null,
                 "input_tokens": 120000,
                 "is_current": true,
                 "label": "04-13",
@@ -2490,7 +2484,6 @@
           ],
           "current_week": {
             "dollar_per_pct": 0.012727272727272728,
-            "dollar_per_pct_withheld": null,
             "five_hour_block": null,
             "five_hour_pct": null,
             "five_hour_resets_in_sec": null,
@@ -2500,7 +2493,6 @@
               "label": "fresh"
             },
             "last_snapshot_age_sec": 0,
-            "nominal_week_start_at": "2026-04-13T14:00:00Z",
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 345600,
             "spent_usd": 0.63,
@@ -2799,10 +2791,8 @@
         "cache_creation_tokens": 0,
         "cache_read_tokens": 0,
         "cost_usd": 0.63,
-        "credited": false,
         "delta_cost_pct": null,
         "dollar_per_pct": 0.0126,
-        "dollar_per_pct_withheld": null,
         "input_tokens": 120000,
         "is_current": true,
         "label": "04-13",

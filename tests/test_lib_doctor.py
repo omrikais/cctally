@@ -134,6 +134,16 @@ def test_doctor_state_has_required_fields():
         # non-mutating calibration reader.
         "quota_calibration",
         "quota_rate_change",
+        # #705: the conversation rollup's refused-pricing-write record, plus
+        # the stored fingerprint that separates an ordinary refusal from a
+        # value no version can parse. TWO stores carry both, because the
+        # ordered-write guard runs on the cache.db connection in `sync_cache`
+        # and on the conversations.db connection in
+        # `sync_claude_conversations`.
+        "conversation_rollup_pricing_refusal",
+        "conversation_rollup_pricing_fp",
+        "cache_rollup_pricing_refusal",
+        "cache_rollup_pricing_fp",
     }
     assert fields == expected, fields ^ expected
 
@@ -1736,3 +1746,288 @@ def test_new_checks_registered_and_run():
     rep = L.run_checks(_state())
     ids = {c.id for cat in rep.categories for c in cat.checks}
     assert {"data.parse_health", "db.integrity", "db.lock_state"} <= ids
+
+
+def test_rollup_writer_check_is_ok_with_no_refusal():
+    s = _state()
+    s = dc.replace(s, conversation_rollup_pricing_refusal=None)
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.id == "pricing.conversation_rollup_writer"
+    assert r.severity == "ok"
+
+
+def test_rollup_writer_check_warns_and_names_both_versions():
+    s = dc.replace(_state(), conversation_rollup_pricing_refusal={
+        "process_snapshot_date": "2026-08-25",
+        "store_snapshot_date": "2026-09-02",
+        "first_refused_at_utc": "2026-09-03T08:00:00Z",
+    })
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.severity == "warn"
+    assert r.details["process_snapshot_date"] == "2026-08-25"
+    assert r.details["store_snapshot_date"] == "2026-09-02"
+
+
+def test_a_malformed_refusal_record_warns_rather_than_degrading_to_ok():
+    # Nearby doctor JSON parsing discards malformed values silently. A record
+    # that exists but cannot be read is still evidence the guard fired, so it
+    # must not read as "no refusal".
+    # Mutation: returning OK on the unparseable branch.
+    s = dc.replace(_state(),
+                   conversation_rollup_pricing_refusal={"__malformed__": True})
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.severity == "warn"
+    assert "process_snapshot_date" not in (r.details or {})
+
+
+def test_the_rollup_writer_check_can_never_fail():
+    # Mutation: severity="fail" on any branch, which would move doctor's exit
+    # code from 0 to 2 for a condition that means the safety net WORKED.
+    for record in (None,
+                   {"process_snapshot_date": "a", "store_snapshot_date": "b",
+                    "first_refused_at_utc": "c"},
+                   {"__malformed__": True}):
+        s = dc.replace(_state(), conversation_rollup_pricing_refusal=record)
+        assert L._check_pricing_conversation_rollup_writer(s).severity != "fail"
+
+
+def test_the_rollup_writer_check_is_registered_under_pricing():
+    report = L.run_checks(_state())
+    pricing = next(c for c in report.categories if c.id == "pricing")
+    assert "pricing.conversation_rollup_writer" in {
+        check.id for check in pricing.checks}
+
+
+# --- #705 FIX-E: an unparseable stored fingerprint has no ordinary exit ------
+# _pricing_write_authorized fails closed on a value that is not an ISO date, on
+# EITHER side, and that decision is deliberate. The consequence is that no
+# version can write the rollup, the refusal arms the backfill flag, and the
+# documented remedy ("run the same or a newer cctally") does not apply — a
+# `cache-sync --rebuild` is refused too. The state is reachable only through
+# corruption or a future fingerprint format, but it is unbounded, so doctor
+# must name it and name the step that actually gets out of it.
+
+
+def _unparseable_fp_state(**extra):
+    return dc.replace(_state(),
+                      conversation_rollup_pricing_fp="v2/2026-09-02", **extra)
+
+
+def test_an_unparseable_stored_fingerprint_gets_its_own_summary_and_remedy():
+    # Mutation: reporting the ordinary refusal wording, whose remedy (restart or
+    # upgrade the writing process) does nothing at all in this state.
+    s = _unparseable_fp_state(conversation_rollup_pricing_refusal={
+        "process_snapshot_date": "2026-09-02",
+        "store_snapshot_date": "v2/2026-09-02",
+        "first_refused_at_utc": "2026-09-03T08:00:00Z",
+    })
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.severity == "warn"
+    assert r.remediation == L.ROLLUP_WRITER_UNPARSEABLE_FP_REMEDIATION
+    assert r.remediation != L.ROLLUP_WRITER_REFUSAL_REMEDIATION
+    assert r.details["stored_fingerprint"] == "v2/2026-09-02"
+
+
+def test_an_unparseable_stored_fingerprint_warns_before_any_refusal_is_recorded():
+    # The store is already unwritable by every version at this point, so waiting
+    # for a refusal record to appear would delay the only actionable diagnosis.
+    # Mutation: gating the unparseable branch behind `if record`.
+    r = L._check_pricing_conversation_rollup_writer(
+        _unparseable_fp_state(conversation_rollup_pricing_refusal=None))
+    assert r.severity == "warn"
+    assert r.remediation == L.ROLLUP_WRITER_UNPARSEABLE_FP_REMEDIATION
+
+
+def test_a_parseable_stored_fingerprint_keeps_the_ordinary_refusal_remedy():
+    # The ordinary case must not be dragged into the new branch: an old process
+    # against a newer store IS fixed by restarting or upgrading it.
+    # Mutation: treating any recorded fingerprint as unparseable.
+    s = dc.replace(_state(),
+                   conversation_rollup_pricing_fp="2026-09-30",
+                   conversation_rollup_pricing_refusal={
+                       "process_snapshot_date": "2026-08-25",
+                       "store_snapshot_date": "2026-09-30",
+                       "first_refused_at_utc": "2026-09-03T08:00:00Z"})
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.remediation == L.ROLLUP_WRITER_REFUSAL_REMEDIATION
+    assert r.details["store_snapshot_date"] == "2026-09-30"
+
+
+def test_an_absent_or_empty_fingerprint_is_not_unparseable():
+    # Absent and empty both mean "a fresh store with nothing to protect", which
+    # _pricing_write_authorized already treats as older. Reporting them as
+    # corruption would WARN on every install that has never synced.
+    # Mutation: `if not _fp_is_comparable(fp)` without the emptiness guard.
+    for value in (None, ""):
+        r = L._check_pricing_conversation_rollup_writer(
+            dc.replace(_state(), conversation_rollup_pricing_fp=value,
+                       conversation_rollup_pricing_refusal=None))
+        assert r.severity == "ok", value
+
+
+def test_the_unparseable_fingerprint_branch_still_cannot_fail():
+    # The check's exit-code contract is unchanged: this is still a degraded but
+    # usable store, so it must never move doctor's exit code from 0 to 2.
+    # Mutation: severity="fail" on the new branch.
+    for record in (None, {"__malformed__": True},
+                   {"process_snapshot_date": "a", "store_snapshot_date": "b",
+                    "first_refused_at_utc": "c"}):
+        r = L._check_pricing_conversation_rollup_writer(
+            _unparseable_fp_state(conversation_rollup_pricing_refusal=record))
+        assert r.severity == "warn"
+
+
+def test_the_rollup_writer_remediations_match_the_documented_ones():
+    """`docs/commands/doctor.md` is where an operator reads the recovery step,
+    and `_lib_doctor` is where the running command prints it. Nothing else
+    compares the two, so a reworded remediation could leave the documented
+    recovery describing a step the command no longer names — and for the
+    unparseable-fingerprint state the documented step is the ONLY way out.
+
+    Mutation: rewording either remediation without updating the other.
+    """
+    doc = (pathlib.Path(__file__).resolve().parent.parent
+           / "docs" / "commands" / "doctor.md").read_text()
+    assert L.ROLLUP_WRITER_REFUSAL_REMEDIATION in doc
+    assert L.ROLLUP_WRITER_UNPARSEABLE_FP_REMEDIATION in doc
+
+
+# --- #705 FIX-2: the guard protects two stores, so the check reads two -------
+# `sync_cache` runs `_arm_rollup_backfill_on_pricing_change` and the recompute
+# on the cache.db connection; `sync_claude_conversations` runs them on the
+# conversations.db connection. Both files therefore carry their own
+# `conversation_sessions_pricing_fp` and their own refusal record. Reading only
+# conversations.db reported OK for every refusal latched by a process that runs
+# `sync_cache` and never opens the conversation store — `hook-tick`,
+# `statusline`, `daily`, `report`.
+
+
+def _refusal(process="2026-08-25", store="2026-09-30"):
+    return {"process_snapshot_date": process, "store_snapshot_date": store,
+            "first_refused_at_utc": "2026-09-03T08:00:00Z"}
+
+
+def test_a_refusal_latched_only_in_cache_db_is_still_reported():
+    # Mutation: dropping the cache.db leg, which is how every hook-tick-only
+    # refusal read as "no refused pricing write recorded".
+    s = dc.replace(_state(),
+                   conversation_rollup_pricing_refusal=None,
+                   conversation_rollup_pricing_fp=None,
+                   cache_rollup_pricing_refusal=_refusal(),
+                   cache_rollup_pricing_fp="2026-09-30")
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.severity == "warn"
+    assert r.details["store"] == "cache.db"
+    assert r.details["process_snapshot_date"] == "2026-08-25"
+
+
+def test_the_reported_refusal_names_the_store_it_came_from():
+    # An operator clearing an unwritable fingerprint has to know which file's
+    # cache_meta row to delete, and the two stores diverge routinely.
+    # Mutation: reporting a refusal without naming its store.
+    s = dc.replace(_state(),
+                   conversation_rollup_pricing_refusal=_refusal(),
+                   conversation_rollup_pricing_fp="2026-09-30",
+                   cache_rollup_pricing_refusal=None,
+                   cache_rollup_pricing_fp=None)
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.details["store"] == "conversations.db"
+
+
+def test_an_unparseable_fingerprint_in_cache_db_gets_the_same_remedy():
+    # The state with no ordinary exit is reachable in either store.
+    # Mutation: classifying only the conversations fingerprint.
+    s = dc.replace(_state(),
+                   conversation_rollup_pricing_fp="2026-09-02",
+                   conversation_rollup_pricing_refusal=None,
+                   cache_rollup_pricing_fp="v2/2026-09-02",
+                   cache_rollup_pricing_refusal=None)
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.severity == "warn"
+    assert r.remediation == L.ROLLUP_WRITER_UNPARSEABLE_FP_REMEDIATION
+    assert r.details["store"] == "cache.db"
+    assert r.details["stored_fingerprint"] == "v2/2026-09-02"
+
+
+def test_both_stores_clean_is_still_ok_with_empty_details():
+    # The OK branch is what every doctor golden records, so it must keep its
+    # exact shape while the check grows a second store.
+    # Mutation: emitting a store name on the OK branch.
+    s = dc.replace(_state(),
+                   conversation_rollup_pricing_refusal=None,
+                   conversation_rollup_pricing_fp="2026-09-02",
+                   cache_rollup_pricing_refusal=None,
+                   cache_rollup_pricing_fp="2026-09-02")
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.severity == "ok"
+    assert r.details == {}
+
+
+def test_the_two_store_check_can_never_fail():
+    # Mutation: severity="fail" on either store's branch.
+    for extra in (
+        dict(cache_rollup_pricing_refusal=_refusal()),
+        dict(cache_rollup_pricing_fp="v2/2026-09-02"),
+        dict(cache_rollup_pricing_refusal={"__malformed__": True}),
+    ):
+        r = L._check_pricing_conversation_rollup_writer(
+            dc.replace(_state(), **extra))
+        assert r.severity == "warn", extra
+
+
+# --- #705 FIX-8: the unparseable branch must keep the dates it has -----------
+
+
+def test_an_unparseable_fingerprint_keeps_the_refusal_dates():
+    """The unparseable branch precedes the record branch, so returning only
+    `stored_fingerprint` discarded `process_snapshot_date` and
+    `first_refused_at_utc` for a store that carries both. Those two are what
+    say WHICH process is refusing and how long it has been refusing, and a
+    `--json` consumer has no other source for them.
+
+    Mutation: returning `{"store": …, "stored_fingerprint": …}` alone.
+    """
+    s = dc.replace(_state(),
+                   conversation_rollup_pricing_fp="v2/2026-09-02",
+                   conversation_rollup_pricing_refusal=_refusal(
+                       process="2026-09-02", store="v2/2026-09-02"))
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.details["stored_fingerprint"] == "v2/2026-09-02"
+    assert r.details["process_snapshot_date"] == "2026-09-02"
+    assert r.details["first_refused_at_utc"] == "2026-09-03T08:00:00Z"
+
+
+def test_an_unparseable_fingerprint_with_an_unreadable_record_adds_no_dates():
+    # A record that exists but cannot be parsed has no dates to merge, and
+    # inventing keys with None values would read as "gathered and absent".
+    # Mutation: merging the record dict unconditionally.
+    s = dc.replace(_state(),
+                   conversation_rollup_pricing_fp="v2/2026-09-02",
+                   conversation_rollup_pricing_refusal={"__malformed__": True})
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert "process_snapshot_date" not in r.details
+
+
+# --- #705 FIX-3: the check classifies exactly what the guard acts on ---------
+
+
+def test_the_check_classifies_fingerprints_the_way_the_shared_predicate_does():
+    """`_lib_doctor` had its own `date.fromisoformat` of the fingerprint
+    contract, and it coerced with `str()` where the guard did not. Both now
+    call `_lib_pricing.pricing_fingerprint_is_comparable`, and this pins the
+    check to that one answer.
+
+    Mutation: reintroducing a private parse in `_lib_doctor`.
+    """
+    import _lib_pricing  # noqa: PLC0415
+
+    for value in (None, "", "2026-09-02", "not-a-date", 20260902):
+        r = L._check_pricing_conversation_rollup_writer(
+            dc.replace(_state(), conversation_rollup_pricing_fp=value,
+                       conversation_rollup_pricing_refusal=None,
+                       cache_rollup_pricing_fp=None,
+                       cache_rollup_pricing_refusal=None))
+        reported_unparseable = (
+            r.remediation == L.ROLLUP_WRITER_UNPARSEABLE_FP_REMEDIATION)
+        assert reported_unparseable is not \
+            _lib_pricing.pricing_fingerprint_is_comparable(value), value

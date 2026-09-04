@@ -42,7 +42,6 @@ from dataclasses import dataclass, field, replace as _dc_replace
 
 import _cctally_core
 import _lib_accounts
-import _lib_credit_identity
 import _lib_cache_coverage
 import _lib_journal
 import _lib_journal_router
@@ -3453,84 +3452,19 @@ def _usage_snapshot_fold_decision(conn, payload) -> tuple[bool, object, str]:
 
 
 def _apply_op_weekly_credit_floor(conn, record) -> None:
-    """Fold a `record-credit` `op` into `week_reset_events` (#703 + #707).
-
-    `record-credit` keeps emitting this op kind, so no already-written journal
-    line changes meaning; what moved is the table the fold materializes into.
-    `week_reset_events` is the single durable representation of an Anthropic
-    weekly credit, and `weekly_credit_floors` stops being a second
-    materialization of the same concept. Unifying is also what lets a manual
-    credit restart the milestone ladder: `percent_milestones.reset_event_id`'s
-    derived reference resolves only through `week_reset_events`, and that
-    missing foreign key is why a manual credit opened no milestone epoch before.
-
-    `journal_id` is the op's identifier, so the row is journal-identified from
-    the moment it exists. Harvest scans `journal_id IS NULL`, so it never
-    re-emits this row as a `wr:` event. `INSERT OR IGNORE` dedups on
-    `journal_id`'s partial UNIQUE index and on `UNIQUE(account_key, credit_key)`.
-
-    BOTH boundary columns are NULL, and that is the whole rule this design
-    encodes: an Anthropic credit is a counter discontinuity inside an UNCHANGED
-    window, so a manual credit has no boundary change to record. A non-NULL
-    boundary here would make the display layer truncate the week or restart it.
-
-    Two legacy op shapes reach this applier and they are not alike (spec §7).
-
-    A RUNTIME-JOURNALED op carries the full `CreditPlan`, whose `captured_iso`
-    and `to_pct` are exactly the exact-instant and post-credit facts the unified
-    row records. Treating every old op as fact-less would needlessly drop such
-    installs back onto the hour-floored instant and the #706 fallback after
-    upgrade, losing the credited threshold for credits that recorded everything
-    needed to keep it.
-
-    A CUTOVER-EXPORTED op is the genuinely impoverished shape: the cutover
-    exports `weekly_credit_floors` rows directly, and that table retains no
-    week-end timestamp and no post-credit level. Its fact columns stay NULL and
-    its key is the `legacy:` form. Nothing is inferred that the source does not
-    carry.
-
-    `confirming_capture_at_utc` is NULL on both shapes. A retroactive manual
-    assertion has no confirming observation — which is why the manual
-    stale-replica rule has no upper bracket end (spec §5.1).
-    """
+    """Fold a `record-credit` `op` into `weekly_credit_floors` (spec §5.3
+    "fold op"). `INSERT OR IGNORE` dedups on both `journal_id` and the table's
+    own `UNIQUE(week_start_date, effective_at_utc)`."""
     payload = record["payload"]
-    plan = payload.get("plan")
-    runtime = isinstance(plan, dict)
-    # A COMPLETION op finishes a credit that a crash left half-applied — the
-    # command reuses the existing record's effective instant rather than
-    # flooring a fresh one, and it names that record here. It is the SAME
-    # credit, so it takes the SAME identity and the INSERT below becomes an
-    # idempotent retry rather than a second credit. Without this a recovery
-    # would file a duplicate, because the completion op is a distinct record
-    # with a distinct content digest.
-    completes = payload.get("completes_credit_key")
-    source = _lib_credit_identity.CreditSource(
-        kind="manual" if runtime else "legacy",
-        identity=record["id"],
-        order=_lib_credit_identity.credit_order_from_instant(
-            payload.get("applied_at_utc") or record["at"]),
-    )
-    credit_key = (
-        completes if isinstance(completes, str) and completes
-        else _lib_credit_identity.derive_credit_key(source))
-    _insert_or_ignore(conn, "week_reset_events", {
+    _insert_or_ignore(conn, "weekly_credit_floors", {
         "journal_id": record["id"],
-        "detected_at_utc": payload.get("applied_at_utc", record["at"]),
-        "old_week_end_at": None,
-        "new_week_end_at": None,
-        "effective_reset_at_utc": payload["effective_at_utc"],
+        "week_start_date": payload["week_start_date"],
+        "effective_at_utc": payload["effective_at_utc"],
         "observed_pre_credit_pct": float(payload["observed_pre_credit_pct"]),
+        "applied_at_utc": payload.get("applied_at_utc", record["at"]),
         # Two-shaped stamp (#341 rev 4.1): evt/op carry account_key in the
         # payload. Default to the sentinel for legacy ops written pre-#341.
         "account_key": payload.get("account_key") or _lib_accounts.UNATTRIBUTED,
-        "week_start_date": payload["week_start_date"],
-        "observed_at_utc": plan.get("captured_iso") if runtime else None,
-        "confirming_capture_at_utc": None,
-        "observed_post_credit_pct": (
-            float(plan["to_pct"]) if runtime and plan.get("to_pct") is not None
-            else None),
-        "credit_key": credit_key,
-        "credit_order": _lib_credit_identity.derive_credit_order(source),
     })
 
 
@@ -3751,15 +3685,8 @@ _CLASSIFIER_VENDOR_TAGGED_KINDS = frozenset(("budget",))
 # normalise. Filing it under `_EVT_KIND_PROVIDER` would claim a fixed vendor
 # for a family whose provider is a payload field, which is the failure the
 # vendor-tagged case exists to avoid.
-# `weekly_replica_suppression` (#703 + #707 §5.4) is EXEMPT for both reasons at
-# once. It is effects-only, like `weekly_credit_effects`: it inserts no target
-# row, and it deletes snapshots and milestones by their globally-unique
-# `journal_id`, which is an account-agnostic key. And it is new with epoch 1012,
-# like `meter_rate_change`, so no unstamped legacy line of this kind can exist
-# for the classifier to normalise — every emission carries `payload.account_key`
-# from the first one.
 _CLASSIFIER_EXEMPT_KINDS = frozenset((
-    "weekly_credit_effects", "meter_rate_change", "weekly_replica_suppression"))
+    "weekly_credit_effects", "meter_rate_change"))
 
 
 def classify_legacy_provider(record) -> str | None:
@@ -3961,53 +3888,31 @@ def _derived_fk_value(conn, ref_table, lookup_col, lookup_value, account_key):
 
 
 def _apply_weekly_credit_effects(conn, evt, *, projection_writes=True):
-    """Apply a `weekly_credit_effects` evt (spec §5.3 event+effects).
-
-    The credit RECORD itself is written by the op fold; this vehicle carries the
-    credit's DESTRUCTIVE effects: delete the stale-replica snapshots by their
-    logical `journal_id` (idempotent — deleting an already-absent id is a clean
-    no-op), then force the HWM floor file down (mirrors `_apply_credit` step 4b;
-    an idempotent overwrite). The synthetic post-credit snapshots ride their own
+    """Apply a `weekly_credit_effects` evt (spec §5.3 event+effects). The
+    same-window sub-25pp credit writes NO reset row, so its DESTRUCTIVE effects
+    ride this vehicle: delete the stale-replica snapshots by their logical
+    `journal_id` (idempotent — deleting an already-absent id is a clean no-op),
+    then force the HWM floor file down (mirrors `_apply_credit` step 4b; an
+    idempotent overwrite). The synthetic post-credit snapshots ride their own
     `snapshot_accept` evts. Effects-only — no target-table row, so no journal_id
     of its own; convergence is the natural idempotence of DELETE + overwrite.
 
     A ``--force`` re-record's destructive clear (the ingest-path replacement for
     ``_force_clear_credit``) rides the SAME evt: ``suppression`` also carries the
-    replaced occurrence's synthetic snapshots' `journal_id`s (deleted from the
-    same ``weekly_usage_snapshots`` table), and ``floor_suppression`` carries the
-    replaced occurrence's credit record. Those rows live in ``week_reset_events``
-    since #703 + #707 unified the two tables, and never include the new op's own
-    row, which the op fold owns. Both delete by logical id, so replay reproduces
-    the clear deterministically and idempotently; the NEW credit record + NEW
-    synthetic are keyed by the current op's id and never appear in either list,
-    so this effect is order-independent w.r.t. them (spec §5.3).
-
-    The replaced occurrence's DEPENDENT milestones do NOT ride this evt. This
-    family folds at order 50 and both milestone families fold at 60, so the
-    DELETE would run against a table a rebuild had not filled yet; they ride the
-    order-70 ``weekly_replica_suppression`` family instead."""
+    OLD command-owned synthetic snapshots' `journal_id`s (deleted from the same
+    ``weekly_usage_snapshots`` table), and ``floor_suppression`` carries the OLD
+    ``weekly_credit_floors`` rows' `journal_id`s (the prior credit's floor,
+    NEVER the new op's own floor — the op fold owns that). Both delete by logical
+    id, so replay reproduces the clear deterministically and idempotently; the
+    NEW floor + NEW synthetic are keyed by the current op's id and never appear
+    in either list, so this effect is order-independent w.r.t. them (spec §5.3)."""
     payload = evt.get("payload") or {}
     table = payload.get("suppression_table", "weekly_usage_snapshots")
-    # Dependents first (#703 + #707): a milestone whose credit record is removed
-    # dangles silently, because this codebase's foreign keys are
-    # documentation-only.
-    #
-    # NOTHING WRITES `milestone_suppression` ANY MORE. This family folds at
-    # order 50 and both milestone families fold at 60, so on a rebuild or a
-    # rederive this DELETE ran against a table the fold had not filled yet — the
-    # live-only/rebuild-undone class §5.4 exists to remove. The removal moved to
-    # the order-70 `weekly_replica_suppression` family. The leg is kept because
-    # a line carrying the field may already have been appended, and applying it
-    # live still removes the row it names; it must not be treated as the durable
-    # mechanism.
-    for logical_id in (payload.get("milestone_suppression") or []):
-        conn.execute(
-            "DELETE FROM percent_milestones WHERE journal_id = ?", (logical_id,))
     for logical_id in (payload.get("suppression") or []):
         conn.execute(f"DELETE FROM {table} WHERE journal_id = ?", (logical_id,))
     for logical_id in (payload.get("floor_suppression") or []):
         conn.execute(
-            "DELETE FROM week_reset_events WHERE journal_id = ?", (logical_id,))
+            "DELETE FROM weekly_credit_floors WHERE journal_id = ?", (logical_id,))
     floor = payload.get("hwm_floor")
     if floor and projection_writes:
         try:
@@ -4016,78 +3921,6 @@ def _apply_weekly_credit_effects(conn, evt, *, projection_writes=True):
             )
         except OSError:
             pass
-    return None
-
-
-def replica_suppression_target_digest(
-        snapshots, milestones, five_hour_milestones=()) -> str:
-    """The `target_set_digest` component of a `weekly_replica_suppression` id.
-
-    Two passes that select the SAME targets for the same credit must produce the
-    same event, so a crash-replayed pass converges instead of appending a second
-    line; two passes that select DIFFERENT targets must produce different
-    events, so a later replica is not silently folded into an earlier pass's
-    already-effective record. A digest over the sorted logical ids gives both.
-
-    `five_hour_milestones` is omitted from the digest payload when it is empty,
-    so a target set with no 5h dependent hashes exactly as it did before that
-    third leg existed. Every event already written keeps its id, and a pass that
-    reselects the same snapshots converges on it rather than appending a second
-    line beside it.
-    """
-    body = {"snapshots": sorted(snapshots), "milestones": sorted(milestones)}
-    if five_hour_milestones:
-        body["five_hour_milestones"] = sorted(five_hour_milestones)
-    payload = json.dumps(body, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-
-
-def _apply_weekly_replica_suppression(conn, evt):
-    """Apply a `weekly_replica_suppression` evt (#703 + #707 §5.4).
-
-    Two producers reach this family, and both need the same thing from it: a
-    removal that outlives a rebuild, applied after every family whose rows it
-    removes has been materialized.
-
-    The first is the durable defence against a stale high reading that arrives
-    AFTER a credit. The automatic suppression that rides the credit's own event
-    captures its target list only when the event row is FIRST inserted, and the
-    physical delete that runs on every later detector pass was unjournaled;
-    replay can only reproduce identifiers already in the original event's
-    payload, and a rebuild deliberately never re-runs the detector or the clamp.
-    A late replica was therefore deleted live and restored by every subsequent
-    rebuild.
-
-    The second is a `record-credit --force` replacement, whose dependent
-    milestones must go with the occurrence it replaces. Those milestones fold at
-    order 60, so naming them in the `weekly_credit_effects` payload at order 50
-    ran their DELETE against a table a rebuild had not filled yet.
-
-    Effects-only: no target-table row, so no `journal_id` of its own.
-    Convergence is the natural idempotence of DELETE — removing an
-    already-absent logical id is a clean no-op.
-
-    Order matters and is the reason this family folds at 70 rather than beside
-    the credit at 30: dependent milestones go first and snapshots second. This
-    codebase's foreign keys are documentation-only, so a milestone left pointing
-    at a deleted snapshot would dangle silently rather than raise. Both milestone
-    tables reference `weekly_usage_snapshots` — `percent_milestones` through
-    `usage_snapshot_id` and `five_hour_milestones` through a column of the same
-    name — so removing a snapshot without both is what leaves a dangling
-    reference nothing reports.
-    """
-    payload = evt.get("payload") or {}
-    for logical_id in (payload.get("milestones") or []):
-        conn.execute(
-            "DELETE FROM percent_milestones WHERE journal_id = ?", (logical_id,))
-    for logical_id in (payload.get("five_hour_milestones") or []):
-        conn.execute(
-            "DELETE FROM five_hour_milestones WHERE journal_id = ?",
-            (logical_id,))
-    for logical_id in (payload.get("snapshots") or []):
-        conn.execute(
-            "DELETE FROM weekly_usage_snapshots WHERE journal_id = ?",
-            (logical_id,))
     return None
 
 
@@ -4379,14 +4212,9 @@ def _apply_evt(conn, evt, *, projection_writes=True):
 # window / week / threshold produce DISTINCT evt ids). account_key is also a
 # plain payload column, so the generic fold round-trips it back onto the row.
 _HARVEST_SPECS = [
-    # #703 + #707: the natural key follows the row constraint onto
-    # `(account_key, credit_key)`. It has to: the opaque evt id is a bijection
-    # with the row, and the boundary pair stopped identifying one when several
-    # credits per week became representable. `id_parts` also keys
-    # `ctx.suppression_map`, so the live capture site keys on the same pair.
     _HarvestSpec(
         "week_reset_events", "week_reset", "wr",
-        id_parts=("account_key", "credit_key"),
+        id_parts=("account_key", "old_week_end_at", "new_week_end_at"),
         at_column="detected_at_utc", order=30, suppression=True,
     ),
     _HarvestSpec(
@@ -4475,12 +4303,6 @@ _EVT_SPECS = {
     # state families rather than implying a dependency it does not have.
     "meter_rate_change": _EvtSpec(
         None, order=43, applier=_apply_meter_rate_change),
-    # #703 + #707 §5.4. Effects-only and LAST: a rebuild materializes snapshots
-    # (order 10) and the milestones that reference them (order 60) first, and
-    # this replays the removal on top of both. Folding it earlier would let the
-    # milestone fold re-create a dependent of a snapshot this event removed.
-    "weekly_replica_suppression": _EvtSpec(
-        None, order=70, applier=_apply_weekly_replica_suppression),
 }
 for _hs in _HARVEST_SPECS:
     if _hs.children:
@@ -5047,20 +4869,9 @@ def reconcile_budget_config(validated_budget, *, axes, touched_projects=None):
 _UNKNOWN_EVT_SPEC = _EvtSpec(None, order=999)
 
 
-def fold_order_for(kind: str) -> int:
-    """The fold order of one evt kind, by name.
-
-    The dependency order the rebuild and the replay both sort by. Exposed
-    because the ordering between families is a contract in its own right — the
-    `weekly_replica_suppression` family is only durable if it folds AFTER the
-    snapshot and milestone families it removes rows from — and a contract that
-    can only be read out of a dict literal is one nothing can assert.
-    """
-    return (_EVT_SPECS.get(kind) or _UNKNOWN_EVT_SPEC).order
-
-
 def _fold_order(evt) -> int:
-    return fold_order_for((evt.get("payload") or {}).get("kind"))
+    kind = (evt.get("payload") or {}).get("kind")
+    return (_EVT_SPECS.get(kind) or _UNKNOWN_EVT_SPEC).order
 
 
 def _replace_protocol_violations(conn, rows) -> None:
@@ -5752,8 +5563,7 @@ def _effective_event_for_convergence(conn, event_id) -> dict:
 
 # Effect keys that ride an evt payload but are NOT target-table columns.
 _EVT_EFFECT_KEYS = frozenset(
-    {"kind", "suppression", "suppression_table", "floor_suppression",
-     "milestone_suppression", "hwm_floor"}
+    {"kind", "suppression", "suppression_table", "floor_suppression", "hwm_floor"}
 )
 
 
@@ -7673,7 +7483,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
 # omitted column, constraint, partial predicate, or index definition.  An epoch
 # schema change must update this contract alongside STATS_INDEX_EPOCH.
 _REBUILD_SCHEMA_FINGERPRINT = (
-    "e581bd1f63ef4ce2ab60cac493e8d24ea61097823c6229752e90bf47d176efe5"
+    "472e77f23b289eb9141c2b318b94f24e98d509a73a9063568fbd66b04013ead3"
 )
 
 

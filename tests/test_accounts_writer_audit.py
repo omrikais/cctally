@@ -35,11 +35,7 @@ REAL_ACCOUNT_TABLES = frozenset({
     "weekly_usage_snapshots", "weekly_cost_snapshots", "percent_milestones",
     "week_reset_events", "five_hour_reset_events", "five_hour_blocks",
     "five_hour_milestones", "five_hour_block_models", "five_hour_block_projects",
-    # `weekly_credit_floors` left this set with #703 + #707. It is no longer
-    # written by anything: the manual credit it used to hold is a
-    # `week_reset_events` row now, and this audit fails closed when an audited
-    # table has no INSERT anywhere in the audited modules — correctly, because
-    # a table nobody writes cannot have its account stamp checked.
+    "weekly_credit_floors",
     # Codex quota real-account families (#341 Task 2/3, spec §2): each carries
     # account_key in its (source_root_key, account_key, …)-qualified UNIQUE.
     "quota_window_blocks", "quota_percent_milestones", "quota_threshold_events",

@@ -8,7 +8,6 @@ import { humanizeAge } from '../lib/syncFreshness';
 import { heroFreshnessLabel } from '../lib/heroFreshness';
 import { cardRegionClick } from '../lib/cardRegion';
 import { joinCodexQuotaLabels } from '../lib/sourceRows';
-import { CREDIT_MARKER_TITLE, withheldDollarPerPctLabel } from '../lib/creditMarker';
 import { combinedHeading, combinedPresentation, warningForDomain } from '../lib/sourceGating';
 import { resolveSourceView } from '../store/sourceView';
 import { useAccountScope } from '../hooks/useScopedSnapshot';
@@ -279,10 +278,6 @@ function SharedHero({
         // from rounded card values: the canonical merged value is a different
         // accounting scope and cannot be borrowed while focused.
         dollarPerPct={accounts == null ? h?.dollar_per_pct : null}
-        // #703 + #707 §6.3 — carried on the SAME branch as the figure it
-        // replaces, so a focused or per-account hero (which shows no merged
-        // rate at all) never renders a cause for a metric it is not showing.
-        dollarPerPctWithheld={accounts == null ? cw?.dollar_per_pct_withheld : null}
         forecastPct={accounts == null ? h?.forecast_pct : null}
         // #661 S2 section 10.1 — the shared Claude/All branch brought into
         // line with the Codex branch below, which has always guarded its
@@ -876,7 +871,6 @@ function CanonicalHero({
   spentLabelSpoken = DEFAULT_SPENT_LABEL_SPOKEN,
   perAccountNote = null,
   withheldUsedPct = false,
-  dollarPerPctWithheld = null,
 }: {
   weekLabel: string | null | undefined;
   usedPct: number | null | undefined;
@@ -892,11 +886,6 @@ function CanonicalHero({
   freshness: FreshnessEnvelope | null;
   showFiveHour: boolean;
   unavailableReason?: string | null;
-  // #703 + #707 §6.3 — the typed cause a credited week's `$ / 1%` is withheld
-  // under. It replaces the figure rather than qualifying it, because there is
-  // no divisor the epoch supports; `$0.000` in that slot is a claim about the
-  // week that the data does not make.
-  dollarPerPctWithheld?: string | null;
   // #350 — disclosure for a hero whose values ARE present but whose bounding
   // quota evidence is stale. Distinct from `unavailableReason`, which explains
   // an ABSENT hero; when both apply the unavailable reason wins.
@@ -934,12 +923,6 @@ function CanonicalHero({
   // slots have their own focused answers.
   withheldUsedPct?: boolean;
 }) {
-  // The cause wins only when there is no figure to show: the server publishes a
-  // value and a cause together on no path, and preferring the value keeps a
-  // stale cause from replacing a rate that is present.
-  const withheldDpp = dollarPerPct == null
-    ? withheldDollarPerPctLabel(dollarPerPctWithheld)
-    : null;
   // #416 QA P2-D — a bare em-dash reads as missing data, not as a deliberate
   // blank. The reset slot already carried the caption; `Forecast @ reset`,
   // `$/1% vs last week` and `$/1% used` did not, so the QA gate's honest read
@@ -1031,25 +1014,9 @@ function CanonicalHero({
         <div className="hs-label">{spentLabel}</div>
         <HeroSpendFigure amount={spentUsd} />
         <div className="hs-sub">
-          {/* #703 + #707 §6.3 — a withheld ratio prints its CAUSE. This slot
-              rendered `$0.000 / 1% used` beside `SPENT THIS WEEK $0.00` on a
-              week whose counter had not climbed past the level Anthropic
-              credited it to, which reads as a measured rate of zero rather
-              than as a figure the epoch cannot support. The `·` separator is
-              the dashboard's own vocabulary (`WEEK USAGE · Apr 13–Apr 20`), so
-              the metric stays named and the cause reads as prose beside it. */}
-          {withheldDpp != null
-            ? (
-              <>
-                $ / 1%{' · '}
-                <span className="hero-dpp-withheld" title={CREDIT_MARKER_TITLE}>
-                  {withheldDpp}
-                </span>
-              </>
-            )
-            : perAccountValue == null
-              ? <><span>{fmt.usd2(dollarPerPct)}</span> / 1% used</>
-              : <>$ / 1% used {perAccountValue}</>}
+          {perAccountValue == null
+            ? <><span>{fmt.usd2(dollarPerPct)}</span> / 1% used</>
+            : <>$ / 1% used {perAccountValue}</>}
         </div>
         {/* public #5 QA P2 — a second `hs-sub` line: the zone's own dim
             `--fs-meta` / `--text-dim` vocabulary. The #459 responsive spans

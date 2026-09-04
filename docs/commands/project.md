@@ -111,6 +111,10 @@ says it is describing.
 An explicit `--since` / `--until` range is unaffected: those instants are the
 ones you asked for and are used verbatim.
 
+**A credited week counts as TWO intervals.** An Anthropic quota reset leaves a week's boundaries where they are but ends one billing cycle and begins another inside it, so a week credited in place is two subscription intervals. `--weeks N` counts intervals, which means a credited week consumes two of the N slots and the range reaches less far back in calendar time than N times seven days. That is deliberate: a segment IS a billing cycle, so counting segments is counting cycles, and it is what [`report`](report.md) and [`weekly`](weekly.md) already render for the same week. `weeksInRange` and `rangeStart` both reflect the segment count.
+
+One consequence is visible in the attribution figures. The post-credit segment starts at the credit instant, which matches no snapshot's `week_start_at`, so it reports no snapshot and `totals.weeklyAttributionAvailable` goes false on a window containing a credited week. The pre-credit segment does match, and its contribution is the week's reset-aware-floored percentage rather than the pre-credit peak that `weekly` shows on the same segment. That difference is a known limitation of the per-`week_start_date` snapshot lookup, tracked separately; the figures here are correct against that lookup, not against `weekly`'s per-segment one.
+
 ## Claude `Used %`
 
 `Used %` is a project's **modelled weekly quota** wherever the fitted

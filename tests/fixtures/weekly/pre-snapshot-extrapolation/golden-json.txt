@@ -15,8 +15,6 @@
       "totalCost": 2.25,
       "usedPct": null,
       "dollarsPerPercent": null,
-      "credited": false,
-      "dollarsPerPercentWithheld": null,
       "modelsUsed": [
         "claude-opus-4-7"
       ],
@@ -45,8 +43,6 @@
       "totalCost": 2.25,
       "usedPct": null,
       "dollarsPerPercent": null,
-      "credited": false,
-      "dollarsPerPercentWithheld": null,
       "modelsUsed": [
         "claude-opus-4-7"
       ],
@@ -75,8 +71,6 @@
       "totalCost": 2.25,
       "usedPct": null,
       "dollarsPerPercent": null,
-      "credited": false,
-      "dollarsPerPercentWithheld": null,
       "modelsUsed": [
         "claude-opus-4-7"
       ],
@@ -105,8 +99,6 @@
       "totalCost": 2.25,
       "usedPct": 15.0,
       "dollarsPerPercent": 0.15,
-      "credited": false,
-      "dollarsPerPercentWithheld": null,
       "modelsUsed": [
         "claude-opus-4-7"
       ],

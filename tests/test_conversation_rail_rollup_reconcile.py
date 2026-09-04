@@ -317,3 +317,60 @@ def test_recent_rollup_read_uses_index_no_temp_btree(tmp_path, monkeypatch):
         assert "USE TEMP B-TREE" not in text.upper(), text
     finally:
         conn.close()
+
+
+def test_a_refused_pricing_write_leaves_new_sessions_visible_and_degraded(
+        tmp_path, monkeypatch):
+    """#705: the degrade path the ordered-write guard relies on.
+
+    Precondition is the crash window the guard is designed around: a NEWER
+    process derived the rollup, armed the durable backfill for its own pricing
+    change, and died. A stale successor then ingests a new session and is
+    refused the rollup write. It must write no materialized row for that
+    session, and the rail must keep the session visible through the retained
+    live aggregate while the cost axis degrades through the signal the UI
+    already surfaces.
+
+    This adds no production code. It pins the behaviour the refusal reuses
+    rather than inventing a new one, which is exactly why it is expected to
+    pass on its first run.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _bin_on_path(ns)
+    cc, cq = _cc(ns), _cq(ns)
+
+    conn = ns["open_cache_db"]()
+    try:
+        _seed(conn)
+        cc._recompute_conversation_sessions(conn)
+        conn.commit()
+
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+            ("conversation_sessions_pricing_fp", "2026-09-30"))
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta(key,value) "
+            "VALUES('conversation_sessions_backfill_pending','1')")
+        conn.commit()
+
+        _msg(conn, session_id="s9", uuid="g0", source_path="g.jsonl",
+             byte_offset=0, timestamp_utc="2026-06-10T00:00:00Z",
+             entry_type="human", text="a brand new session",
+             cwd="/home/u/proj", git_branch="main")
+        conn.commit()
+
+        monkeypatch.setattr(cc, "PRICING_SNAPSHOT_DATE", "2026-08-25")
+        assert cc._recompute_conversation_sessions(conn, {"s9"}) is False
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_sessions WHERE session_id='s9'"
+        ).fetchone()[0] == 0, "a refused process writes no rollup row at all"
+
+        recent = cq.list_conversations(conn, sort="recent", limit=50, offset=0)
+        assert "s9" in {r["session_id"] for r in recent["conversations"]}, \
+            "the live fallback must keep a newly ingested session visible"
+        assert cq.list_conversations(
+            conn, sort="cost", limit=50, offset=0
+        )["page"].get("sort_degraded") is True
+    finally:
+        conn.close()

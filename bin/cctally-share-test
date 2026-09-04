@@ -99,6 +99,11 @@ for scenario_dir in "$FIXTURES_DIR"/*/; do
         daily-md-desc)         cmd="daily";            fmt="md";   theme="light"; extra="--order desc" ;;
         monthly-md)            cmd="monthly";          fmt="md";   theme="light" ;;
         weekly-md)             cmd="weekly";           fmt="md";   theme="light" ;;
+        # Reset-event coverage (#703/#707 review F3): same command and flags
+        # as weekly-md; the fixture's stats.db carries a `week_reset_events`
+        # row, so the Week Start cell and the stated period start both move
+        # to the post-reset week's `display_start_date`.
+        weekly-md-reset)       cmd="weekly";           fmt="md";   theme="light" ;;
         weekly-html)           cmd="weekly";           fmt="html"; theme="light" ;;
         weekly-svg-breakdown)  cmd="weekly";           fmt="svg";  theme="light"; extra="--breakdown" ;;
         forecast-md)           cmd="forecast";         fmt="md";   theme="light"; extra="--no-sync" ;;

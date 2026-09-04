@@ -577,3 +577,129 @@ def test_setup_compute_symlink_state_dangling_symlink(tmp_path):
                          env=env, capture_output=True, text=True, check=True)
     payload = json.loads(res.stdout)
     assert payload["state"] == "wrong"
+
+
+def _seed_rollup_refusal(home: pathlib.Path, raw: str):
+    """Seed a raw conversation_sessions_pricing_write_refused value in the
+    conversations store the gather reads (#705)."""
+    _seed_rollup_cache(home, rollup_rows=1, msg_sessions=1)
+    sys.path.insert(0, str(REPO / "bin"))
+    import _cctally_db as db  # noqa: PLC0415
+    cdir = home / ".local" / "share" / "cctally"
+    conn = sqlite3.connect(str(cdir / "conversations.db"))
+    try:
+        db._set_cache_meta(
+            conn, "conversation_sessions_pricing_write_refused", raw)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_gather_reads_the_conversation_rollup_pricing_refusal(tmp_path):
+    """#705: a refusal record in the conversations cache_meta reaches
+    DoctorState so the pricing check can report it."""
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    _seed_rollup_refusal(tmp_path, json.dumps({
+        "process_snapshot_date": "2026-08-25",
+        "store_snapshot_date": "2026-09-02",
+        "first_refused_at_utc": "2026-09-03T08:00:00Z",
+    }))
+    st = _run_gather(tmp_path)
+    record = st["conversation_rollup_pricing_refusal"]
+    assert record["process_snapshot_date"] == "2026-08-25"
+    assert record["store_snapshot_date"] == "2026-09-02"
+
+
+def test_gather_marks_an_unreadable_refusal_record_rather_than_dropping_it(
+        tmp_path):
+    """A record that exists but cannot be parsed is still evidence the guard
+    fired, so the gather must not degrade it to None the way the sibling Codex
+    prune-refusal read does.
+
+    Mutation: swallowing the parse error and leaving the field None.
+    """
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    _seed_rollup_refusal(tmp_path, "{not json")
+    st = _run_gather(tmp_path)
+    assert st["conversation_rollup_pricing_refusal"] == {"__malformed__": True}
+
+
+def test_gather_reads_the_conversation_rollup_pricing_fingerprint(tmp_path):
+    """#705: the STORED fingerprint reaches DoctorState too, not just the
+    refusal record. It is what lets `pricing.conversation_rollup_writer`
+    separate an ordinary stale-process refusal from a stored value no version
+    can parse — the state whose only exit is clearing that one cache_meta row.
+
+    Mutation: gathering only the refusal record.
+    """
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    _seed_rollup_cache(tmp_path, rollup_rows=1, msg_sessions=1)
+    sys.path.insert(0, str(REPO / "bin"))
+    import _cctally_db as db  # noqa: PLC0415
+    conn = sqlite3.connect(
+        str(tmp_path / ".local" / "share" / "cctally" / "conversations.db"))
+    try:
+        db._set_cache_meta(conn, "conversation_sessions_pricing_fp", "v2/2026-09-02")
+        conn.commit()
+    finally:
+        conn.close()
+    st = _run_gather(tmp_path)
+    assert st["conversation_rollup_pricing_fp"] == "v2/2026-09-02"
+
+
+def _seed_cache_db_rollup_meta(home: pathlib.Path, **rows: str):
+    """Write raw cache_meta rows into the cache.db the gather probes (#705).
+
+    The maintenance lock has to exist because `doctor_gather_state` gates every
+    cache.db probe on it, exactly as `_seed_codex_project_metadata_cache` does.
+    """
+    sys.path.insert(0, str(REPO / "bin"))
+    import _cctally_db as db  # noqa: PLC0415
+    cdir = home / ".local" / "share" / "cctally"
+    cdir.mkdir(parents=True, exist_ok=True)
+    (cdir / "cache.db.maintenance.lock").touch()
+    conn = sqlite3.connect(str(cdir / "cache.db"))
+    try:
+        db._apply_cache_schema(conn)
+        for key, value in rows.items():
+            db._set_cache_meta(conn, key, value)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_gather_reads_the_cache_db_rollup_pricing_refusal(tmp_path):
+    """#705: the ordered-write guard runs on the cache.db connection too, so a
+    refusal latched by a process that never opens conversations.db —
+    `hook-tick`, `statusline`, `daily`, `report` — lives only in cache.db.
+    Reading conversations.db alone reported OK for every one of them.
+
+    Mutation: gathering the two #705 keys from conversations.db only.
+    """
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    _seed_cache_db_rollup_meta(
+        tmp_path,
+        conversation_sessions_pricing_write_refused=json.dumps({
+            "process_snapshot_date": "2026-08-25",
+            "store_snapshot_date": "2026-09-30",
+            "first_refused_at_utc": "2026-09-03T08:00:00Z",
+        }),
+        conversation_sessions_pricing_fp="2026-09-30",
+    )
+    st = _run_gather(tmp_path)
+    assert st["cache_rollup_pricing_refusal"]["process_snapshot_date"] == \
+        "2026-08-25"
+    assert st["cache_rollup_pricing_fp"] == "2026-09-30"
+
+
+def test_gather_marks_an_unreadable_cache_db_refusal_record(tmp_path):
+    """A record that exists but cannot be parsed is evidence the guard fired,
+    in cache.db exactly as in conversations.db.
+
+    Mutation: swallowing the parse error on the cache.db leg only.
+    """
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    _seed_cache_db_rollup_meta(
+        tmp_path, conversation_sessions_pricing_write_refused="{not json")
+    st = _run_gather(tmp_path)
+    assert st["cache_rollup_pricing_refusal"] == {"__malformed__": True}

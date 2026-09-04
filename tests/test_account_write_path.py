@@ -85,14 +85,10 @@ def _credit_args(**over):
 
 
 def _floor_account(cc):
-    """The account stamped on the manual credit's record.
-
-    #703 + #707 unified that record onto `week_reset_events`; the stamp and
-    everything this module asserts about it are unchanged."""
     conn = cc.open_db()
     try:
         row = conn.execute(
-            "SELECT account_key FROM week_reset_events "
+            "SELECT account_key FROM weekly_credit_floors "
             "WHERE week_start_date=?", ("2026-06-13",)).fetchone()
         return row[0] if row is not None else None
     finally:

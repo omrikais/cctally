@@ -431,19 +431,17 @@ def test_harvest_attaches_suppression_list_to_reset_evt(ns):
         conn.execute(
             "INSERT INTO week_reset_events "
             "(detected_at_utc, old_week_end_at, new_week_end_at, "
-            " effective_reset_at_utc, credit_key, credit_order) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
             ("2026-01-04T12:00:00Z", "2026-01-04T09:00:00+00:00",
-             "2026-01-08T00:00:00+00:00", "2026-01-04T09:00:00+00:00",
-             "sa:o:harvestwr", 41),
+             "2026-01-08T00:00:00+00:00", "2026-01-04T09:00:00+00:00"),
         )
         ctx = jr.IngestContext(conn=conn, batch=[])
-        # The wr harvest id_parts (and thus the suppression_map key) lead with
-        # account_key (#341, seeded row defaults to the sentinel) and identify
-        # the credit by `credit_key` rather than by the week boundaries
-        # (#703 + #707).
-        ctx.suppression_map[("unattributed", "sa:o:harvestwr")] = [
-            "b:weekly_usage_snapshots:5", "b:weekly_usage_snapshots:6"]
+        # #341: the wr harvest id_parts (and thus the suppression_map key) now
+        # lead with account_key — the seeded row defaults to the sentinel.
+        ctx.suppression_map[
+            ("unattributed", "2026-01-04T09:00:00+00:00",
+             "2026-01-08T00:00:00+00:00")
+        ] = ["b:weekly_usage_snapshots:5", "b:weekly_usage_snapshots:6"]
         jr._harvest(ctx)
         conn.commit()
     finally:
@@ -453,8 +451,10 @@ def test_harvest_attaches_suppression_list_to_reset_evt(ns):
     assert evt["payload"]["suppression"] == [
         "b:weekly_usage_snapshots:5", "b:weekly_usage_snapshots:6"
     ]
-    # id stays the pure natural key — suppression is NOT an id component.
-    assert evt["id"] == "wr:unattributed:sa:o:harvestwr"
+    # id stays the pure natural key — suppression is NOT an id component. #341:
+    # the natural key now leads with account_key (unstamped row -> sentinel).
+    assert evt["id"] == (
+        "wr:unattributed:2026-01-04T09:00:00+00:00:2026-01-08T00:00:00+00:00")
 
 
 def test_reset_fold_applier_inserts_row_and_replays_suppression(ns):
@@ -805,8 +805,7 @@ def test_live_dispatches_once_replay_never(ns, monkeypatch):
 # a fresh-DB replay reproduces the floor + synthetic + suppression.
 def _credit_op(J, op_at="2026-01-04T09:00:05Z", *, from_pct=60.0, to_pct=40.0,
                plan_effective="2026-01-04T08:00:00+00:00",
-               op_effective="2026-01-04T09:00:00+00:00", forced=False,
-               replaces_credit_key=None):
+               op_effective="2026-01-04T09:00:00+00:00", forced=False):
     # P3 hardening: `plan.effective_iso` (what `_apply_credit` uses for the wce
     # suppression predicate + synthetic) is DIVERGED from the op's top-level
     # `effective_at_utc` (what the op fold stamps on the floor row) — proving the
@@ -823,11 +822,6 @@ def _credit_op(J, op_at="2026-01-04T09:00:05Z", *, from_pct=60.0, to_pct=40.0,
         "effective_iso": plan_effective,
         "captured_iso": op_at,
     }
-    if replaces_credit_key is not None:
-        # #703 + #707: `--force` replaces the ONE occurrence this names, so the
-        # clear finds nothing without it. Omitted by default, which is also the
-        # shape of every op line written before the field existed.
-        plan["replaces_credit_key"] = replaces_credit_key
     return J.make_op(at=op_at, src="record-credit", payload={
         "kind": "weekly_credit_floor",
         "week_start_date": "2026-01-01",
@@ -841,11 +835,7 @@ def _credit_op(J, op_at="2026-01-04T09:00:05Z", *, from_pct=60.0, to_pct=40.0,
 
 
 def _seed_doomed_pre_credit(conn):
-    # Captured AFTER the op's asserted instant (`plan.captured_iso`, 09:00:05Z).
-    # #703 + #707 §5.1 anchors the manual rule on the asserted instant rather
-    # than on the hour-floored effective one, so a row captured BEFORE the
-    # assertion is history the assertion never claimed to supersede and is kept.
-    _seed_snapshot(conn, captured_at_utc="2026-01-04T09:00:06Z",
+    _seed_snapshot(conn, captured_at_utc="2026-01-04T09:00:03Z",
                    week_start_date="2026-01-01", weekly_percent=60.0,
                    week_end_at="2026-01-07T23:59:59+00:00")
     conn.execute(
@@ -870,11 +860,9 @@ def test_record_credit_op_hook_end_to_end_and_replay(ns):
 
     conn = ns["open_db"]()
     try:
-        # #703 + #707: the credit RECORD is a `week_reset_events` row now.
         floor = conn.execute(
-            "SELECT week_start_date, effective_reset_at_utc, "
-            " observed_pre_credit_pct, journal_id FROM week_reset_events"
-        ).fetchall()
+            "SELECT week_start_date, effective_at_utc, observed_pre_credit_pct, "
+            " journal_id FROM weekly_credit_floors").fetchall()
         doomed = conn.execute(
             "SELECT COUNT(*) FROM weekly_usage_snapshots "
             "WHERE journal_id = 'sa:pre'").fetchone()[0]
@@ -884,11 +872,10 @@ def test_record_credit_op_hook_end_to_end_and_replay(ns):
     finally:
         conn.close()
 
-    # Option (i) proof: exactly ONE credit record, journal_id == the op line id
+    # Option (i) proof: exactly ONE floor row, journal_id == the op line id
     # (written by the built-in op fold, NOT by _apply_credit).
     assert len(floor) == 1
-    assert floor[0][3] == op["id"], (
-        "the credit record's journal_id is the op line id (op fold owns it)")
+    assert floor[0][3] == op["id"], "floor journal_id is the op line id (op fold owns it)"
     assert floor[0][0] == "2026-01-01" and float(floor[0][2]) == 60.0
     # Destructive effect applied: doomed pre-credit row gone; synthetic present.
     assert doomed == 0, "stale-replica pre-credit snapshot suppressed"
@@ -914,7 +901,7 @@ def test_record_credit_op_hook_end_to_end_and_replay(ns):
                 jr._apply_evt(fresh, line)
         fresh.commit()
         f_floor = fresh.execute(
-            "SELECT journal_id FROM week_reset_events").fetchall()
+            "SELECT journal_id FROM weekly_credit_floors").fetchall()
         f_doomed = fresh.execute(
             "SELECT COUNT(*) FROM weekly_usage_snapshots "
             "WHERE journal_id = 'sa:pre'").fetchone()[0]
@@ -923,8 +910,7 @@ def test_record_credit_op_hook_end_to_end_and_replay(ns):
             (f"sa:{op['id']}:syn:0",)).fetchone()[0]
     finally:
         fresh.close()
-    assert len(f_floor) == 1 and f_floor[0][0] == op["id"], (
-        "replay credit-record journal_id matches")
+    assert len(f_floor) == 1 and f_floor[0][0] == op["id"], "replay floor journal_id matches"
     assert f_doomed == 0, "replay re-applies the suppression"
     assert f_syn == 1, "replay reinserts the synthetic snapshot"
 
@@ -1254,19 +1240,16 @@ def test_force_clear_rerecord_journals_clear_and_replays(ns):
     # synthetic, installs floor2 + synthetic2(30). from_pct=50 so the stale-replay
     # doomed set does NOT overlap synthetic1(40) — the clear is the ONLY thing
     # removing synthetic1.
-    # #703 + #707: `--force` replaces one NAMED occurrence. The op fold keys a
-    # manual credit on the op's own id, so op1's `credit_key` is op1's id.
     op2 = _credit_op(J, op_at="2026-01-04T10:00:05Z", from_pct=50.0, to_pct=30.0,
                      plan_effective="2026-01-04T10:00:00+00:00",
-                     op_effective="2026-01-04T10:00:00+00:00", forced=True,
-                     replaces_credit_key=op1["id"])
+                     op_effective="2026-01-04T10:00:00+00:00", forced=True)
     jr.append_record(op2, now_utc=FIXED)
     jr.run_stats_ingest(mode="authoritative")
 
     conn = ns["open_db"]()
     try:
         floors = conn.execute(
-            "SELECT journal_id FROM week_reset_events ORDER BY id").fetchall()
+            "SELECT journal_id FROM weekly_credit_floors ORDER BY id").fetchall()
         syn = conn.execute(
             "SELECT weekly_percent, journal_id FROM weekly_usage_snapshots "
             "WHERE source = 'record-credit' ORDER BY id").fetchall()
@@ -1274,19 +1257,18 @@ def test_force_clear_rerecord_journals_clear_and_replays(ns):
             "SELECT COUNT(*) FROM weekly_usage_snapshots "
             "WHERE journal_id = ?", (f"sa:{op1['id']}:syn:0",)).fetchone()[0]
         old_floor = conn.execute(
-            "SELECT COUNT(*) FROM week_reset_events WHERE journal_id = ?",
+            "SELECT COUNT(*) FROM weekly_credit_floors WHERE journal_id = ?",
             (op1["id"],)).fetchone()[0]
     finally:
         conn.close()
 
-    # Exactly ONE credit record (op2's, non-NULL journal_id) and ONE synthetic
-    # (30). #703 + #707 unified that record onto `week_reset_events`.
+    # Exactly ONE floor (op2's, non-NULL journal_id) and ONE synthetic (30).
     assert len(floors) == 1 and floors[0][0] == op2["id"]
     assert len(syn) == 1 and float(syn[0][0]) == 30.0
     assert syn[0][1] == f"sa:{op2['id']}:syn:0"
     # op1's floor + synthetic were cleared.
     assert old_syn == 0, "--force cleared the OLD synthetic snapshot"
-    assert old_floor == 0, "--force cleared the OLD credit record"
+    assert old_floor == 0, "--force cleared the OLD credit floor"
 
     # The wce2 evt carries the clear: floor_suppression = [op1 floor id],
     # suppression contains the old synthetic id.
@@ -1309,14 +1291,13 @@ def test_force_clear_rerecord_journals_clear_and_replays(ns):
                 jr._apply_evt(fresh, line)
         fresh.commit()
         f_floors = fresh.execute(
-            "SELECT journal_id FROM week_reset_events").fetchall()
+            "SELECT journal_id FROM weekly_credit_floors").fetchall()
         f_syn = fresh.execute(
             "SELECT weekly_percent, journal_id FROM weekly_usage_snapshots "
             "WHERE source = 'record-credit'").fetchall()
     finally:
         fresh.close()
-    assert len(f_floors) == 1 and f_floors[0][0] == op2["id"], (
-        "replay: one credit record (op2)")
+    assert len(f_floors) == 1 and f_floors[0][0] == op2["id"], "replay: one floor (op2)"
     assert len(f_syn) == 1 and float(f_syn[0][0]) == 30.0, "replay: one synthetic (30)"
 
 

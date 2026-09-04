@@ -20,7 +20,6 @@ import types
 
 import pytest
 
-from _lib_credit_identity import CreditSource, derive_credit_key
 from conftest import load_script, redirect_paths
 
 
@@ -275,21 +274,15 @@ def test_fire_in_place_credit_wr_suppression_capture(ns):
               week_start_date=week_start_date, weekly_percent=60.0,
               week_end_at=cur_end_canon, journal_id="sa:seed-wr")
         ctx = jr.IngestContext(conn=conn, batch=[])
-        source = CreditSource(kind="immediate", identity="sa:o:fire", order=5)
         ns["_fire_in_place_credit"](
             conn, week_start_date, cur_end_canon, 20.0,
             observed_pre_credit_pct=60.0, effective_dt=effective_dt,
             as_of=_PAST, commit=False, ctx=ctx,
-            credit_source=source,
-            observed_at_utc="2026-01-04T09:00:03+00:00",
-            confirming_capture_at_utc="2026-01-04T09:00:03+00:00",
         )
-        # The suppression_map key is derived from the harvest `id_parts`, which
-        # #341 led with account_key and #703 + #707 moved onto the credit's own
-        # identity: (account_key, credit_key). The account defaults to the
-        # reserved sentinel because none was passed.
+        # #341: the wr suppression_map key leads with account_key (defaults to
+        # the reserved sentinel — no account passed).
         assert ctx.suppression_map == {
-            ("unattributed", "sa:o:fire"): ["sa:seed-wr"]
+            ("unattributed", effective_iso, cur_end_canon): ["sa:seed-wr"]
         }
     finally:
         conn.close()
@@ -305,20 +298,15 @@ def test_fire_in_place_credit_wr_suppression_empty_on_replay(ns):
         _seed(conn, captured_at_utc="2026-01-04T09:00:03Z",
               week_start_date=week_start_date, weekly_percent=60.0,
               week_end_at=cur_end_canon, journal_id="sa:seed-wr")
-        # A row for THIS credit already exists -> `already is not None` -> the
-        # INSERT + capture block is skipped entirely. #703 + #707: the row is
-        # recognised by its `credit_key`, not by the week boundary, so the seed
-        # carries the same source identity the fire below derives.
-        source = CreditSource(kind="immediate", identity="sa:o:replay", order=5)
+        # A reset row for this new_week_end already exists -> `already is not
+        # None` -> the INSERT + capture block is skipped entirely.
         conn.execute(
             "INSERT INTO week_reset_events "
             "(detected_at_utc, old_week_end_at, new_week_end_at, "
-            " effective_reset_at_utc, observed_pre_credit_pct, "
-            " credit_key, credit_order) "
-            "VALUES (?,?,?,?,?,?,?)",
+            " effective_reset_at_utc, observed_pre_credit_pct) "
+            "VALUES (?,?,?,?,?)",
             ("2026-01-04T08:00:00Z", "2026-01-04T09:00:00+00:00",
-             cur_end_canon, "2026-01-04T09:00:00+00:00", 60.0,
-             derive_credit_key(source), 5),
+             cur_end_canon, "2026-01-04T09:00:00+00:00", 60.0),
         )
         conn.commit()
         ctx = jr.IngestContext(conn=conn, batch=[])
@@ -326,9 +314,6 @@ def test_fire_in_place_credit_wr_suppression_empty_on_replay(ns):
             conn, week_start_date, cur_end_canon, 20.0,
             observed_pre_credit_pct=60.0, effective_dt=effective_dt,
             as_of=_PAST, commit=False, ctx=ctx,
-            credit_source=source,
-            observed_at_utc="2026-01-04T09:00:03+00:00",
-            confirming_capture_at_utc="2026-01-04T09:00:03+00:00",
         )
         assert ctx.suppression_map == {}, (
             "an already-present reset must NOT re-capture suppression")
@@ -359,13 +344,9 @@ def test_apply_credit_ctx_emits_wce_and_synthetic(ns):
     plan = _credit_plan()
     conn = ns["open_db"]()
     try:
-        # A doomed pre-credit replay carrying a journal_id -> the wce
-        # suppression list. Captured AFTER `plan.captured_iso` (09:00:05Z) and
-        # still reading at the asserted pre-credit level: #703 + #707 §5.1
-        # anchors the manual rule on the asserted instant rather than on the
-        # hour-floored effective one, and selects on the LEVEL rather than on a
-        # tolerance band.
-        _seed(conn, captured_at_utc="2026-01-04T09:00:06Z",
+        # A doomed pre-credit replay (>= effective, within 1pp of from_pct)
+        # carrying a journal_id -> the wce suppression list.
+        _seed(conn, captured_at_utc="2026-01-04T09:00:03Z",
               week_start_date="2026-01-01", weekly_percent=60.0,
               week_end_at="2026-01-07T23:59:59+00:00", journal_id="sa:seed-pre")
         ctx = jr.IngestContext(conn=conn, batch=[])

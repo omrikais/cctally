@@ -206,7 +206,7 @@
   },
   "method": {
     "algorithmRevision": 3,
-    "constantsFingerprint": "70c36ec1a467e97bdfece624baa5e560762fdc89c2e0c041c6332f92f4ea6160",
+    "constantsFingerprint": "0cd932a7f8caa5d9bec7010ed5d800935e5c78332ae060c1142650943512a24a",
     "verifiedAt": "2026-08-29",
     "supportedCompositionFrom": "2026-07-25",
     "coefficientSupport": {
@@ -243,7 +243,7 @@
       "maxAutoScanDays": 64,
       "historyTruncated": false
     },
-    "dedicatedPoolScope": "out-of-scope: claude-fable-5, claude-mythos-5 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled"
+    "dedicatedPoolScope": "out-of-scope: claude-fable-5, claude-fable-5-1, claude-mythos-5, claude-mythos-5-1 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled"
   },
   "blocking": []
 }

@@ -512,30 +512,11 @@ export interface CurrentWeekEnvelope {
   // `spent_usd`, so the two halves describe exactly one entry set. Optional for
   // pre-v5 envelopes.
   total_tokens?: number | null;
-  // #556 S1 §3.5/§3.6 — the RATE cycle start, beside the already-published end
-  // (`reset_at_utc`). Taken after `_apply_midweek_reset_override`, so on a
-  // credited week it is the credit instant: the range the `$/1%` numerator is
-  // taken over, the bound the source version detects a nominal rollover from,
-  // and the anchor the Projects grid and its drill build their window on.
-  //
-  // It is NEITHER the window a person is shown NOR the range `spent_usd`
-  // covers. A credit moves no boundary (#703 + #707 §6.1), and spend stays at
-  // the full week (§6.2); the displayed window is `header.week_label`, built
-  // server-side from `nominal_week_start_at` below.
+  // #556 S1 §3.5 — the effective cycle START, beside the already-published end
+  // (`reset_at_utc`). Taken after `_apply_midweek_reset_override`, so a mid-week
+  // reset shortens the range and the published period together. Composition
+  // labels the Claude leg's period from the pair.
   week_start_at?: string | null;
-  // #703 + #707 §6.2 — the week's OWN start, which is the range `spent_usd`
-  // covers. Composition labels the Claude leg's period from this bound and
-  // `reset_at_utc`, so the leg names exactly the cycle whose spend it reports.
-  // Optional: an older server omits it and the leg falls back to
-  // `week_start_at`, which is the same instant on every uncredited week.
-  nominal_week_start_at?: string | null;
-  // #703 + #707 §6.3 — why `dollar_per_pct` above is null on a credited week.
-  // The same shape and the same cause vocabulary the weekly rows publish, so
-  // the hero and the Weekly card on one screen state one cause rather than one
-  // stating a cause and the other a misleading `$0.000`. Optional: an older
-  // server omits it, and the in-place update path lets an old client meet a
-  // newer one without reloading the JavaScript.
-  dollar_per_pct_withheld?: string | null;
 }
 
 // ── Hero-modal historical milestones (spec §1a/§1c/§2/§3) ──────────────
@@ -576,15 +557,7 @@ export interface WeekDetailPayload {
   is_current: boolean;
   detail_stamp: string;
   segments: { key: string; milestones: Milestone[] | CodexQuotaMilestoneRow[] }[];
-  // One entry per segment AFTER the first — the credit that opened that ladder.
-  // Index-aligned with `segments[1:]`, so the renderer reads `dividers[si - 1]`.
-  // `effective_at_utc` carries the credit's ACCOUNTING instant, which is the one
-  // that decides which segment a milestone joins; the hour-floored display
-  // instant can sit earlier than the pre-credit row above the divider. An entry
-  // is `null` when the epoch resolves to no retained credit row: dropping it
-  // would shift every later divider onto the wrong ladder, so the slot is kept
-  // and the renderer draws nothing for it.
-  dividers: ({ effective_at_utc: string; prior_percent: number | null } | null)[];
+  dividers: { effective_at_utc: string; prior_percent: number | null }[];
   blocks: WeekDetailBlock[];
 }
 
@@ -753,12 +726,6 @@ export interface TrendRow {
   // Client-resolved labels for every account contributing to a pooled Codex
   // native weekly row. Omitted for Claude, focused, and undecorated rows.
   account_labels?: string[];
-  // #703 + #707 §6.3 — why `dollar_per_pct` above is null on a credited week.
-  // The same cause vocabulary the weekly rows publish, because the `$/1%`
-  // column of this table has the same em-dash problem theirs did. The server
-  // OMITS the key when nothing is withheld, which is the common case, so the
-  // type is optional as well as nullable.
-  dollar_per_pct_withheld?: string | null;
 }
 
 export interface SessionsEnvelope {
@@ -961,14 +928,6 @@ export interface PeriodRow {
   cache_hit_pct?: number | null;       // v2.3 — populated by daily variant only for v1
   codex_tokens?: CodexNativeTokens;
   account_labels?: string[];
-  // #703 + #707 §6.4/§6.6 — additive, Claude weekly rows only, so no
-  // `envelope_version` moves and a Codex row simply carries neither.
-  //: An Anthropic credit occurred inside this window. The week no longer
-  //: splits, so this is what explains a low `used_pct` late in a heavy week.
-  credited?: boolean;
-  //: Why `dollar_per_pct` is null on a credited week. Distinguishes "the epoch
-  //: supports no divisor" from "no usage recorded", which a bare null cannot.
-  dollar_per_pct_withheld?: string | null;
 }
 
 export interface WeeklyEnvelope {

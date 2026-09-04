@@ -644,21 +644,7 @@ def _build_mid_week_reset(out: Path) -> None:
     _write_input_env(
         scenario_dir,
         percent=91.0,
-        extra={
-            "NEW_RESETS_AT": str(new_resets_at_epoch),
-            # PIN THE CAPTURE CLOCK. Without it `captured_at_utc` is the
-            # runner's wall clock while every other instant in this scenario is
-            # analytic, so the tick's capture drifts past the seeded credit's
-            # effective instant as real time passes. Once it does, the credit
-            # governs the capture, the milestone recorder resolves the
-            # post-reset segment, and #706's seeding guard correctly refuses to
-            # open that segment at 90 from a single 91% reading with no observed
-            # climb — so the scenario stopped asserting what it was written to
-            # assert and started asserting the guard, on a schedule. Pinned, the
-            # capture is `AS_OF`, which precedes the credit, and the crossing is
-            # the ordinary in-week one this scenario is about.
-            "EXTRA_ENV_CCTALLY_TEST_PIN_CAPTURE": "1",
-        },
+        extra={"NEW_RESETS_AT": str(new_resets_at_epoch)},
     )
     _write_gitignore(scenario_dir)
 

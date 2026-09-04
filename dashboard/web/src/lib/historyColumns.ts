@@ -16,11 +16,6 @@ export interface HistoryTableRow {
   delta_cost_pct: number | null;
   models: ModelCostRow[];
   account_labels?: string[];
-  // #703 + #707 §6.3 — why `dollar_per_pct` above is null on a credited week.
-  // The decoration must carry it: this table renders the `$/1%` column, and
-  // without the cause the cell falls back to the em-dash that reads as "no
-  // usage recorded" — a different and wrong statement about a credited week.
-  dollar_per_pct_withheld?: string | null;
 }
 
 export type HistoryVariant = 'week' | 'month';

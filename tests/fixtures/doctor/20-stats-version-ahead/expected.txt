@@ -22,7 +22,7 @@ Database
   ✓ stats.db                 version 99 / 13 known
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
-  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1012) — no journal data available
+  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1011) — no journal data available
       → Restore the journal/ directory from backup, then run `cctally db rebuild --db stats`
   ✓ Migrations               0/58 applied
   ⚠ Pending migrations       58 pending
@@ -67,6 +67,7 @@ Accounts
   ✓ Codex window attribution no operator window attribution recorded
 Pricing
   ✓ Coverage                 all observed models priced
+  ✓ Rollup writer            no refused pricing write recorded
 Quota
   ✓ Metering rate            not assessed
       → Run `cctally quota` for the current assessment.
@@ -82,4 +83,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 58 OK · 6 WARN · 0 FAIL
+Summary: 59 OK · 6 WARN · 0 FAIL

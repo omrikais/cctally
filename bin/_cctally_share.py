@@ -20,7 +20,7 @@ import sys
 import _lib_changelog  # module-qualified: _lib_changelog._read_latest_changelog_version()
 from _lib_display_tz import _resolve_tz, format_display_dt, resolve_display_tz_name
 from _lib_fmt import stable_sum
-from _lib_render import CREDIT_MARKER, _project_disambiguate_labels
+from _lib_render import _project_disambiguate_labels
 
 
 # ============================================================
@@ -440,16 +440,6 @@ def _build_report_snapshot(
         used_pct_raw = r.used_pct
         cost_raw = r.weekly_cost_usd
         dpp_raw = r.dollars_per_percent
-        # #703 + #707 §6.3/§6.4. A shared artifact of a credited week used to
-        # lose both halves of what makes it readable: the marker that says a
-        # credit happened inside the window, and the CAUSE of a `$/1%` the
-        # epoch does not support. The terminal table carries both, and an
-        # artifact is the shareable form of that table. The marker is the same
-        # `+` prefix the terminal uses; it rides the Week cell here because a
-        # share table has no row-index column to put it in.
-        if getattr(r, "credited", False):
-            week_label = f"{CREDIT_MARKER}{week_label}"
-        withheld_cause = getattr(r, "dpp_withheld_cause", None)
         snap_rows.append(_lib_share.Row(cells={
             "week": _lib_share.TextCell(week_label),
             "used": (
@@ -461,8 +451,8 @@ def _build_report_snapshot(
                 if cost_raw is not None else _lib_share.TextCell("—")
             ),
             "dpp": (
-                _lib_share.MoneyCell(float(dpp_raw)) if dpp_raw is not None
-                else _lib_share.TextCell(withheld_cause or "—")
+                _lib_share.MoneyCell(float(dpp_raw))
+                if dpp_raw is not None else _lib_share.TextCell("—")
             ),
         }))
         # Skip chart points for weeks with no $/% sample — the polyline
@@ -493,7 +483,9 @@ def _build_report_snapshot(
         _lib_share.Totalled(label="Avg $/%", value=f"${avg_dpp:,.2f}"),
     )
     if rows:
-        title = f"Weekly $ / % trend — last {len(rows)} weeks"
+        # "cycles", not "weeks": a row is a billing cycle, and a week
+        # credited in place supplies two of them.
+        title = f"Weekly $ / % trend — last {len(rows)} cycles"
     else:
         title = "Weekly $ / % trend — no data"
     period_label = _share_period_label(period_start, period_end, display_tz)
@@ -767,6 +759,7 @@ def _build_weekly_snapshot(
     version: str,
     breakdown_model: bool,
     since_explicit: bool,
+    weeks: "list | None" = None,
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally weekly`.
 
@@ -776,8 +769,22 @@ def _build_weekly_snapshot(
     chronological iteration so BarChart bars render left-to-right
     with time.
 
-    Each bucket carries `bucket` (week_start_date as "YYYY-MM-DD"),
-    `cost_usd`, `total_tokens`, and `model_breakdowns` (list[dict]
+    `weeks` is the `list[SubWeek]` the view was built over. It supplies the
+    Week Start label, because `BucketUsage.bucket` is the SubWeek's
+    `segment_key` (a UTC instant) rather than a date: the two billing cycles
+    of an in-place-credited week share one `start_date`, so the bucket key
+    cannot be that date. The label is `display_start_date`, each segment's
+    own user-facing start, which is what the terminal table's Week column
+    and the dashboard panel already render. Reading `start_date` here — the
+    value this builder used while the bucket key WAS that date — would print
+    the two segments of a credited week under one identical label, in the one
+    table that has no second column to tell them apart. The two fields are
+    equal on every week no reset touched, so no shipped artifact moves.
+    Omitting `weeks` falls back to reading the bucket key as a date, which is
+    what the builder's own unit tests supply.
+
+    Each bucket carries `cost_usd`, `total_tokens`, and `model_breakdowns`
+    (list[dict]
     sorted by cost desc, each `{modelName, ..., cost}`). Either
     overlay component may be `None` for a week with no captured
     snapshot — surfaces in the snapshot row as a `0.0` PercentCell so
@@ -814,12 +821,6 @@ def _build_weekly_snapshot(
     # so BarChart bars are chronological.
     rows = list(reversed(view.aggregated))
     overlay = list(reversed(view.overlay))
-    # #703 + #707 §6.4. `view.rows` is index-parallel with `view.aggregated`
-    # (`build_weekly_view` raises rather than letting the two desynchronize), so
-    # reversing it in lockstep keeps the credit marker on the week that holds
-    # the credit. Without it a shared `weekly` artifact lost the marker
-    # entirely, and nothing in it explained a low `% Used` late in a heavy week.
-    view_rows = list(reversed(view.rows))
     _lib_share = _share_load_lib()
     columns_list: list = [
         _lib_share.ColumnSpec(key="week", label="Week Start", align="left"),
@@ -852,21 +853,31 @@ def _build_weekly_snapshot(
     chart_pts: list = []
     displayed_period_dates: list[dt.date] = []
     stacks: dict[str, list] = {}
+    # Bucket key -> the segment's own display start date. The bucket key is a
+    # segment identity, not a date, so the date has to come off the SubWeek.
+    week_start_dates: dict = {}
+    for w in (weeks or ()):
+        key = getattr(w, "segment_key", None)
+        start_date = getattr(w, "display_start_date", None)
+        if isinstance(key, str) and isinstance(start_date, dt.date):
+            week_start_dates[key] = start_date
     for i, r in enumerate(rows):
-        # `BucketUsage.bucket` is typed `str` ("YYYY-MM-DD"); guard against
-        # empty / unparseable but skip the dead `dt.date` branch.
         bucket = getattr(r, "bucket", None)
-        if isinstance(bucket, str) and bucket:
+        parsed_date = week_start_dates.get(bucket) if isinstance(bucket, str) else None
+        if parsed_date is None and isinstance(bucket, str) and bucket:
+            # No `weeks` supplied: the caller is still handing over a
+            # date-shaped bucket key. Guard against an unparseable one.
             try:
                 parsed_date = dt.date.fromisoformat(bucket)
-                week_label = parsed_date.isoformat()
-                displayed_period_dates.append(parsed_date)
             except ValueError:
-                week_label = bucket
+                parsed_date = None
+        if parsed_date is not None:
+            week_label = parsed_date.isoformat()
+            displayed_period_dates.append(parsed_date)
+        elif isinstance(bucket, str) and bucket:
+            week_label = bucket
         else:
             week_label = "—"
-        if i < len(view_rows) and getattr(view_rows[i], "credited", False):
-            week_label = f"{CREDIT_MARKER}{week_label}"
         cost_usd = float(getattr(r, "cost_usd", 0.0) or 0.0)
         total_tokens = int(getattr(r, "total_tokens", 0) or 0)
         # `used_pct` is None when the week lacks a `weekly_usage_snapshots`
@@ -924,7 +935,9 @@ def _build_weekly_snapshot(
     peak_pct = max(pct_values, default=0.0)
     totals = (
         _lib_share.Totalled(label="Sum", value=f"${sum_cost:,.2f}"),
-        _lib_share.Totalled(label="Avg %/wk", value=f"{avg_pct:.1f}%"),
+        # Averaged over ROWS, which are billing cycles — a credited week
+        # contributes two of them, so the label names the cycle.
+        _lib_share.Totalled(label="Avg %/cycle", value=f"{avg_pct:.1f}%"),
         _lib_share.Totalled(label="Peak %", value=f"{peak_pct:.1f}%"),
     )
     period_start = _share_resolve_period_start(
@@ -934,7 +947,7 @@ def _build_weekly_snapshot(
         display_tz=display_tz,
     )
     title = (
-        f"Weekly usage — last {len(rows)} weeks"
+        f"Weekly usage — last {len(rows)} cycles"
         if rows
         else "Weekly usage — no data"
     )

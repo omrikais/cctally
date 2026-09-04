@@ -859,8 +859,6 @@ def _weekly_to_json(
     week_pct_overlay: list[tuple[float | None, float | None]],
     *,
     extra: "dict | None" = None,
-    credited_weeks: "set[str] | None" = None,
-    withheld_by_week: "dict[str, str] | None" = None,
 ) -> str:
     """Serialize weekly rollup to JSON.
 
@@ -887,8 +885,10 @@ def _weekly_to_json(
         f"week_pct_overlay length {len(week_pct_overlay)} does not match "
         f"buckets length {len(buckets)} — caller contract violated"
     )
-    # Build dict lookup from week-start-date ISO → SubWeek for metadata.
-    week_by_key = {w.start_date.isoformat(): w for w in weeks}
+    # Build dict lookup from segment key → SubWeek for metadata. NOT
+    # `start_date`: the two billing cycles of an in-place-credited week share
+    # it, and both legitimately emit the same `"week"` value below.
+    week_by_key = {w.segment_key: w for w in weeks}
 
     weekly_list: list[dict[str, Any]] = []
     tot_input = tot_cache_c = tot_cache_r = tot_output = tot_total = 0
@@ -904,7 +904,11 @@ def _weekly_to_json(
             )
         pct, dpc = week_pct_overlay[i]
         weekly_list.append({
-            "week": bucket.bucket,
+            # `week` stays the SubWeek's `start_date` — the billing-cycle join
+            # key into `weekly_usage_snapshots.week_start_date`, which a credit
+            # never moves. Sourced from the SubWeek now that `bucket.bucket` is
+            # the segment key. Row identity is the pair (week, weekStartAt).
+            "week": w.start_date.isoformat(),
             "displayWeek": w.display_start_date.isoformat(),
             "weekStartAt": w.start_ts,
             "weekEndAt": w.end_ts,
@@ -917,14 +921,6 @@ def _weekly_to_json(
             "totalCost": bucket.cost_usd,
             "usedPct": pct,
             "dollarsPerPercent": dpc,
-            # #703 + #707 \u00a76.4/\u00a76.6: additive, so no `schemaVersion` bump.
-            "credited": bool(credited_weeks and bucket.bucket in credited_weeks),
-            # \u00a76.3: a null `dollarsPerPercent` on a credited week means the
-            # epoch supports no divisor, and this names WHICH cause. A bare null
-            # cannot distinguish that from "no usage recorded", which is what
-            # `report` already publishes as `dollarsPerPercentWithheld`.
-            "dollarsPerPercentWithheld": (
-                (withheld_by_week or {}).get(bucket.bucket)),
             "modelsUsed": bucket.models,
             "modelBreakdowns": bucket.model_breakdowns,
         })
@@ -1598,40 +1594,6 @@ def _render_bucket_table(
     return "\n".join(lines)
 
 
-#: #703 + #707 §6.3. The `$/1%` column is fixed at ten characters in compact
-#: mode and the renderer does not truncate an over-long cell — it lets it
-#: overflow, which widens that one row past every other row in the table. So a
-#: withheld cause is rendered through this map, whose every value is at most
-#: eight characters, and an unrecognized cause falls back to a short generic
-#: word rather than being pasted in at whatever length it happens to have. The
-#: exact typed cause is published unabbreviated by `weekly --json` and by
-#: `report`, whose table sizes its columns from content.
-_DPP_WITHHELD_CELL = {
-    "no-climb-since-credit": "no climb",
-}
-_DPP_WITHHELD_FALLBACK = "withheld"
-
-
-def _withheld_cell_text(cause: "str | None", em_dash: str) -> str:
-    """The `$/1%` cell for a week whose ratio the epoch does not support.
-
-    An em-dash here reads as "no usage recorded", which is a different and wrong
-    statement about a week that holds a credit, so a withheld ratio prints its
-    cause instead — the `explain` command's rule, and what `report` already
-    does in the same column.
-    """
-    if not cause:
-        return em_dash
-    return _DPP_WITHHELD_CELL.get(cause, _DPP_WITHHELD_FALLBACK)
-
-
-#: #703 + #707 §6.4. The prefix `weekly` puts on a credited week's Week cell,
-#: in the vocabulary of the existing `~` heuristic-anchor and `⚡` crossed-reset
-#: prefixes. `report` carries its own copy as `_REPORT_CREDIT_MARK`, because it
-#: marks a row index rather than a date and the two renderers share no module.
-CREDIT_MARKER = "+"
-
-
 def _render_weekly_table(
     buckets: list[BucketUsage],
     week_pct_overlay: list[tuple[float | None, float | None]],
@@ -1640,13 +1602,11 @@ def _render_weekly_table(
     compact_split_fn: Callable[[str], str],
     breakdown: bool = False,
     compact: bool = False,
-    credited_weeks: "set[str] | None" = None,
-    withheld_by_week: "dict[str, str] | None" = None,
 ) -> str:
     """Render weekly bucket aggregates as a ccusage-style ANSI table.
 
     `weeks` is the parallel `SubWeek` metadata list \u2014 each `bucket.bucket`
-    key (`start_date.isoformat()`) maps to one `SubWeek` via a local
+    key (`SubWeek.segment_key`) maps to one `SubWeek` via a local
     lookup. The Week column is rendered from `display_start_date` so that
     post-early-reset weeks show their effective start (e.g., 2026-04-13)
     rather than the API-derived backdated `start_date` (e.g., 2026-04-11);
@@ -1666,23 +1626,16 @@ def _render_weekly_table(
     `compact` forces compact layout regardless of terminal width
     (Session A `--compact` flag; spec \u00a77.6.1). Mirrors the same kwarg
     on `_render_bucket_table` (Review-A P3-1).
-
-    `credited_weeks` is the set of bucket keys whose week holds an Anthropic
-    credit (#703 + #707 \u00a76.4). Such a week renders as ONE row on its original
-    boundaries, so without a marker nothing on screen explains a low `Used %`
-    late in a heavy week. The marker is a `+` prefix on the Week cell, in the
-    vocabulary of the existing `~` heuristic-anchor and `\u26a1` crossed-reset
-    prefixes. `None` marks nothing, which is what every caller without a
-    database connection passes.
     """
     assert len(week_pct_overlay) == len(buckets), (
         f"week_pct_overlay length {len(week_pct_overlay)} does not match "
         f"buckets length {len(buckets)} — caller contract violated"
     )
-    # Lookup map for the Week-cell label: bucket key (= API-derived
-    # start_date) → SubWeek, so we can read display_start_date without
-    # changing the bucket aggregation key.
-    week_by_key = {w.start_date.isoformat(): w for w in weeks}
+    # Lookup map for the Week-cell label: bucket key (= the segment's
+    # `segment_key`) → SubWeek, so we can read display_start_date. Keying on
+    # `start_date` would collapse the two billing cycles of an
+    # in-place-credited week onto one another.
+    week_by_key = {w.segment_key: w for w in weeks}
     first_col_name = "Week"
     title_suffix = "Weekly"
 
@@ -1730,11 +1683,7 @@ def _render_weekly_table(
         models_text = "\n".join(f"- {m}" for m in short_models) if short_models else ""
         used_pct, dpc = week_pct_overlay[i]
         used_pct_text = f"{used_pct:.1f}%" if used_pct is not None else em_dash
-        if dpc is not None:
-            dpc_text = f"{dpc:.3f}"
-        else:
-            dpc_text = _withheld_cell_text(
-                (withheld_by_week or {}).get(d.bucket), em_dash)
+        dpc_text = f"{dpc:.3f}" if dpc is not None else em_dash
         # Render the Week column from display_start_date — equals d.bucket
         # for non-reset weeks; shifted forward for post-early-reset weeks.
         # The bucket-aggregation contract guarantees a SubWeek for every
@@ -1743,8 +1692,6 @@ def _render_weekly_table(
         # StopIteration call site at _dashboard_build_weekly_periods.
         sw = week_by_key[d.bucket]
         display_label = sw.display_start_date.isoformat()
-        if credited_weeks and d.bucket in credited_weeks:
-            display_label = f"{CREDIT_MARKER}{display_label}"
         data_cells = [
             (display_label, None),
             (models_text, None),
@@ -1873,17 +1820,9 @@ def _render_weekly_table(
         return text.split("\n") if text else [""]
 
     def _split_bucket_if_compact(text: str) -> str:
-        if not compact_mode:
-            return text
-        # The credit marker decorates the date; it is not part of it.
-        # `compact_split_fn` matches a bare `YYYY-MM-DD`, so splitting the
-        # marked string fails to match and leaves an eleven-character cell
-        # in the ten-character compact Week column, which widens that one
-        # row past every other row in the table.
-        if text.startswith(CREDIT_MARKER):
-            return CREDIT_MARKER + compact_split_fn(
-                text[len(CREDIT_MARKER):])
-        return compact_split_fn(text)
+        if compact_mode:
+            return compact_split_fn(text)
+        return text
 
     display_rows: list[tuple[list[list[tuple[str, Any]]], str]] = []
     for cells, row_type in raw_rows:

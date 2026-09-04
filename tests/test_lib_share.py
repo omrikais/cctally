@@ -1804,49 +1804,6 @@ def test_report_builder_renders_none_metrics_as_em_dash():
     assert isinstance(r2.cells["dpp"], _lib_share.TextCell)
 
 
-def test_report_share_marks_a_credited_week_and_names_its_withheld_cause():
-    """#703 + #707 §6.3/§6.4 — a shared artifact carries both halves.
-
-    A share artifact is the shareable form of the terminal table, and the
-    terminal marks a credited week and prints the cause of a `$/1%` its epoch
-    does not support. Without this the artifact lost both: nothing in it
-    explained a low `% Used` late in a heavy week, and the withheld ratio was an
-    em-dash indistinguishable from a week with no usage recorded.
-    """
-    TuiTrendRow = _cctally.TuiTrendRow
-    TrendView = _cctally.TrendView
-    trend_rows = (
-        TuiTrendRow(
-            week_label="Aug 29",
-            week_start_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
-            used_pct=3.0, dollars_per_percent=None, delta_dpp=None,
-            spark_height=1, is_current=True,
-            week_start_date=datetime(2026, 8, 29).date(),
-            weekly_cost_usd=500.0,
-            credited=True, dpp_withheld_cause="no-climb-since-credit",
-        ),
-        TuiTrendRow(
-            week_label="Aug 22",
-            week_start_at=datetime(2026, 8, 22, tzinfo=timezone.utc),
-            used_pct=40.0, dollars_per_percent=1.25, delta_dpp=None,
-            spark_height=1, is_current=False,
-            week_start_date=datetime(2026, 8, 22).date(),
-            weekly_cost_usd=50.0,
-        ),
-    )
-    snap = _cctally._build_report_snapshot(
-        TrendView(rows=trend_rows, avg_dollars_per_pct=None),
-        period_start=datetime(2026, 8, 22, tzinfo=timezone.utc),
-        period_end=datetime(2026, 9, 5, tzinfo=timezone.utc),
-        display_tz="UTC", version="9.9.9",
-    )
-    credited, plain = snap.rows
-    assert credited.cells["week"].text == "+2026-08-29"
-    assert credited.cells["dpp"].text == "no-climb-since-credit"
-    assert plain.cells["week"].text == "2026-08-22"
-    assert isinstance(plain.cells["dpp"], _lib_share.MoneyCell)
-
-
 def test_report_builder_skips_none_dpp_from_chart_and_avg():
     """Chart points with None dpp must be skipped, not rendered as 0.
 
@@ -5293,12 +5250,17 @@ _S2T_CORPUS_ROOTS = ("share", "share-v2", "source-aware", "budget")
 # was a whole family leaving the sweep unnoticed, and a floor cannot
 # observe that. Changing a count here is a deliberate act: a new golden
 # family is added to the census in the same commit that adds the family.
-_S2T_CORPUS_CENSUS = {"md": 135, "html": 122, "svg": 120}
+_S2T_CORPUS_CENSUS = {"md": 136, "html": 122, "svg": 120}
 # +2 md in #661 S2: `tests/fixtures/share/forecast-md-censored`, the
 # right-censored forecast artifact spec section 13 requires on every consumer,
 # and `tests/fixtures/share/forecast-md-zero-week`, its opposite end — spec
 # section 3.6 says a displayed ZERO is bounded rather than censored, so it
 # projects from the corrected point instead of withholding.
+# +1 md for the credited-week review: `tests/fixtures/share/weekly-md-reset`,
+# the only share fixture whose week carries a `week_reset_events` row. The
+# weekly artifact labels each row by `display_start_date`, which diverges from
+# `SubWeek.start_date` on any post-early-reset week, and no other share
+# fixture reaches that divergence.
 # The files whose NAME carries no format token. They are what the previous
 # filename classifier could not see; counted so this sweep cannot quietly
 # stop reaching them.

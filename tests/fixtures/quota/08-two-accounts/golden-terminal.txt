@@ -23,7 +23,7 @@ CURRENT WEEK
 COMPOSITION SUPPORT   radii are EFFECTIVE: max(observed spread, materiality floor)
   family radius              0.0300   (observed 0.0000)
   token-class radius         0.0106   (observed 0.0000)
-  out-of-scope: claude-fable-5, claude-mythos-5 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled
+  out-of-scope: claude-fable-5, claude-fable-5-1, claude-mythos-5, claude-mythos-5-1 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled
 
 DETECTOR
   split                      none
@@ -58,7 +58,7 @@ CURRENT WEEK
 COMPOSITION SUPPORT   radii are EFFECTIVE: max(observed spread, materiality floor)
   family radius              0.0300   (observed 0.0000)
   token-class radius         0.0106   (observed 0.0000)
-  out-of-scope: claude-fable-5, claude-mythos-5 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled
+  out-of-scope: claude-fable-5, claude-fable-5-1, claude-mythos-5, claude-mythos-5-1 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled
 
 DETECTOR
   split                      none

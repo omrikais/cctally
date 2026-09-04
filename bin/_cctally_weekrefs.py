@@ -41,11 +41,6 @@ from _cctally_core import (
     parse_iso_datetime,
 )
 
-# Pure stdlib kernels; no cross-sibling I/O and no `cctally` back-import.
-import _lib_credit_identity
-import _lib_credit_selection
-import _lib_journal
-
 
 def _cctally():
     """Resolve the current `cctally` module at call-time."""
@@ -55,32 +50,19 @@ def _cctally():
 def _get_canonical_boundary_for_date(
     conn: sqlite3.Connection,
     week_start_date_str: str,
-    *,
-    account_key: "str | None" = None,
 ) -> tuple[str | None, str | None]:
-    """Return the first established (week_start_at, week_end_at) for a week.
-
-    ``account_key`` (#703 + #707 §6.2a): a real key scopes the read to that
-    account's snapshots. ``get_recent_weeks(account_key=…)`` scoped its initial
-    rows and then called this helper WITHOUT the account, so the boundary one
-    account's week was anchored on could come from another account's snapshot —
-    and the credit cadence, marker and cost basis all follow that anchor.
-    ``None`` is the explicit merged read, byte-identical on a single-account
-    install and the shape every existing caller keeps.
-    """
-    acct_pred = "" if account_key is None else " AND account_key = ?"
-    acct_param: tuple = () if account_key is None else (account_key,)
+    """Return the first established (week_start_at, week_end_at) for a week."""
     row = conn.execute(
-        f"""
+        """
         SELECT week_start_at, week_end_at
         FROM weekly_usage_snapshots
-        WHERE week_start_date = ?{acct_pred}
+        WHERE week_start_date = ?
           AND week_start_at IS NOT NULL AND week_start_at != ''
           AND week_end_at IS NOT NULL AND week_end_at != ''
         ORDER BY captured_at_utc ASC, id ASC
         LIMIT 1
         """,
-        (week_start_date_str,) + acct_param,
+        (week_start_date_str,),
     ).fetchone()
     if row:
         start_at = _canonicalize_optional_iso(row["week_start_at"], "weekStartAt")
@@ -123,8 +105,7 @@ def get_recent_weeks(
     refs: list[WeekRef] = []
     for row in rows:
         date_str = row["week_start_date"]
-        canon_start, canon_end = _get_canonical_boundary_for_date(
-            conn, date_str, account_key=account_key)
+        canon_start, canon_end = _get_canonical_boundary_for_date(conn, date_str)
         try:
             ref = make_week_ref(
                 week_start_date=date_str,
@@ -140,48 +121,153 @@ def get_recent_weeks(
     # moment, so the clamp becomes a no-op for them; for installs with no
     # reset events the clamp still does all the work it did before.
     return _apply_overlap_clamp_to_weekrefs(
-        _apply_reset_events_to_weekrefs(conn, refs, account_key=account_key)
+        _apply_reset_events_to_weekrefs(conn, refs)
     )
 
 
 def _apply_reset_events_to_weekrefs(
-    conn: sqlite3.Connection, refs: list[WeekRef], *,
-    account_key: "str | None" = None,
+    conn: sqlite3.Connection, refs: list[WeekRef]
 ) -> list[WeekRef]:
-    """Return the references unchanged. A credit is not a display boundary.
+    """Override API-derived boundaries with reset-event effective moments.
 
-    #703 + #707 §2 is the rule: an Anthropic reset never changes the week's
-    boundaries. Whatever Anthropic does to the counter — a partial goodwill
-    credit, a full zeroing, an early reset — the window keeps its original start
-    and end, and only the running 7d percent steps down.
+    For each row in week_reset_events:
+      - A ref whose week_end_at matches `old_week_end_at` was the PRE-reset
+        week: its API-declared end is in the future but Anthropic cut it
+        early. Override ref.week_end_at = effective_reset_at_utc so display
+        shows the real cut-off.
+      - A ref whose week_end_at matches `new_week_end_at` is the POST-reset
+        week: its API-derived start (= new resets_at - 7d) backdates into
+        the pre-reset week. Override ref.week_start_at = effective_reset_at_utc
+        so the new week starts at the actual reset moment.
+      - **In-place credit (v1.7.2 round-3, Bug B).** Detected via the row
+        shape ``old_week_end_at == effective_reset_at_utc`` (the live and
+        backfill detection paths both write this shape — see
+        ``test_event_row_old_is_effective_not_cur_end``). For these events,
+        the credited week's ref matches ``new_week_end_at`` (the original
+        resets_at is unchanged), so the post-credit override above
+        rewrites ``week_start_at`` to ``effective``. But the pre-credit
+        segment of the SAME week — where the user spent the bulk of their
+        usage before the credit — is dropped, because no other ref in
+        ``refs`` carries ``week_end_at == effective``. Synthesize a
+        pre-credit ref alongside the post-credit one: its
+        ``week_start_at`` stays at the ref's original API-derived value,
+        its ``week_end_at`` becomes ``effective`` (closes the pre-credit
+        segment). Credited weeks render as TWO trend rows downstream.
 
-    This function used to do the opposite three times over. It truncated the
-    pre-credit week at the credit moment, it re-anchored the post-credit week's
-    start to that moment, and for an in-place credit it SYNTHESIZED a second
-    reference, so one unchanged subscription week rendered as two rows. A credit
-    defines an ACCOUNTING EPOCH — a milestone ladder segment, a cost range, a
-    high-water-mark floor — which every accounting read consults through
-    `_lib_credit_selection`, and it defines no display boundary at all.
-
-    A boundary CHANGE is left alone, and that is a deliberate retreat from the
-    spec's §7. The rule there is to recover the original cadence and coalesce
-    the linked references into it, and every formulation of that tried here
-    broke something a reader would notice: pulling the moved week's end back to
-    the original one left every entry between the two ends inside no window at
-    all and the week's spend vanished; keeping the later end produced a
-    ten-day "week"; and merging the two references reported one week's counter
-    against the other's key. §7 asserts the coalescing in one clause and never
-    says which week's usage key the merged row reports, which window its cost is
-    taken over, or where spend recorded after the original end goes — and those
-    are the questions that decide it. Until they are answered, a reference the
-    API moved renders on the window it recorded, untruncated and un-re-anchored,
-    which already satisfies §2's "stop re-anchoring the display window".
-
-    Kept as a call site rather than deleted, because every display consumer
-    routes through it and a future cadence decision belongs here. ``conn`` and
-    ``account_key`` are unused for the same reason.
+    The ref's `week_start` (date) and `key` fields are intentionally left at
+    the API-derived values — they're the lookup keys for
+    weekly_usage_snapshots / weekly_cost_snapshots. Only the display-facing
+    `week_start_at` / `week_end_at` (and the derived `week_end` date) shift.
+    Both the pre-credit and post-credit synthesized refs share the same
+    `key` so downstream per-segment readers
+    (``cmd_percent_breakdown`` / dashboard milestone panel) can still
+    filter milestones by ``reset_event_id`` against the same lookup keys.
     """
-    return list(refs)
+    events = conn.execute(
+        "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
+        "FROM week_reset_events"
+    ).fetchall()
+    if not events:
+        return refs
+    # Keyed by PARSED INSTANT, not by the raw column text. `week_reset_events`
+    # holds whatever spelling the writing path stored, while a WeekRef's
+    # `week_end_at` has already been canonicalized to UTC by `make_week_ref`.
+    # A raw-string map therefore misses an event row written in a non-UTC
+    # offset, and the miss is silent: the credited week renders as one row
+    # here while `_apply_reset_events_to_subweeks`, which has always compared
+    # parsed instants, renders two.
+    # `test_subweek_and_weekref_appliers_agree_on_every_event_shape` is the
+    # tie between the twins and covers exactly that spelling.
+    pre_map: dict = {}
+    post_map: dict = {}
+    # In-place credit events have `old == effective` (the row shape the
+    # live + backfill detection paths agree on). Project the set of
+    # `new_week_end_at` instants for those events so we can detect them
+    # while iterating refs and split the credited week into TWO refs. The
+    # shape test itself stays a raw-string compare, because both columns come
+    # from the same write and the subweeks twin compares them the same way.
+    in_place_credit_new_ends: set = set()
+    for e in events:
+        effective = e["effective_reset_at_utc"]
+        try:
+            old_dt = parse_iso_datetime(
+                e["old_week_end_at"], "reset_event.old_end"
+            )
+        except ValueError:
+            old_dt = None
+        try:
+            new_dt = parse_iso_datetime(
+                e["new_week_end_at"], "reset_event.new_end"
+            )
+        except ValueError:
+            new_dt = None
+        if old_dt is not None:
+            pre_map[old_dt] = effective
+        if new_dt is not None:
+            post_map[new_dt] = effective
+            if e["old_week_end_at"] == effective:
+                in_place_credit_new_ends.add(new_dt)
+    out: list[WeekRef] = []
+    for ref in refs:
+        new_ref = ref
+        ref_end_dt = None
+        if ref.week_end_at:
+            try:
+                ref_end_dt = parse_iso_datetime(
+                    ref.week_end_at, "ref.week_end_at"
+                )
+            except ValueError:
+                ref_end_dt = None
+        if ref_end_dt is not None and ref_end_dt in pre_map:
+            reset_at = pre_map[ref_end_dt]
+            try:
+                reset_dt = parse_iso_datetime(reset_at, "reset_event.effective")
+                # internal fallback: host-local intentional
+                new_end_date = (reset_dt - dt.timedelta(seconds=1)).astimezone().date()
+                new_ref = replace(new_ref, week_end_at=reset_at, week_end=new_end_date)
+            except ValueError:
+                pass
+        if ref_end_dt is not None and ref_end_dt in post_map:
+            reset_at = post_map[ref_end_dt]
+            # In-place credit: synthesize a pre-credit ref FIRST so it
+            # lands in `out` before the post-credit ref. The pre-credit
+            # ref keeps the ORIGINAL API-derived week_start_at; only its
+            # week_end_at shifts to `effective`. The post-credit ref
+            # (constructed below via the standard `replace`) carries
+            # week_start_at = effective, week_end_at = original.
+            # Order: pre-credit BEFORE post-credit so chronological
+            # iteration in cmd_report's trend table renders them
+            # naturally (older segment above the newer one in DESC
+            # ordering: post-credit is "more recent" so the post-credit
+            # row should come FIRST in the DESC list — but the original
+            # ref was already in DESC position, and we insert pre-credit
+            # AFTER the post-credit. Concretely: post-credit takes the
+            # ref's original slot; pre-credit goes one slot later).
+            if ref_end_dt in in_place_credit_new_ends:
+                try:
+                    reset_dt = parse_iso_datetime(
+                        reset_at, "reset_event.effective"
+                    )
+                    pre_end_date = (
+                        # internal fallback: host-local intentional
+                        reset_dt - dt.timedelta(seconds=1)
+                    ).astimezone().date()
+                    pre_credit_ref = replace(
+                        ref,
+                        week_end_at=reset_at,
+                        week_end=pre_end_date,
+                    )
+                except ValueError:
+                    pre_credit_ref = None
+            else:
+                pre_credit_ref = None
+            new_ref = replace(new_ref, week_start_at=reset_at)
+            out.append(new_ref)
+            if pre_credit_ref is not None:
+                out.append(pre_credit_ref)
+            continue
+        out.append(new_ref)
+    return out
 
 
 # === #269 M4.4 — backfill-rescan process guard ==============================
@@ -246,133 +332,11 @@ def _backfill_reset_events_signature(
     return (int(max_wus), wre)
 
 
-def _backfill_credit_identity(row):
-    """The ``CreditSource`` for a credit the backfill derives from ``row``.
-
-    The source is the TRIGGERING snapshot. Its journal identity is its
-    ``journal_id`` when the journal has stamped one, and its pre-cutover
-    ``b:weekly_usage_snapshots:<rowid>`` bootstrap identity otherwise — the same
-    two shapes the cutover itself exports, so a rebuilt store derives the same
-    key. ``credit_order`` is that snapshot's capture instant, which is the
-    instant the source record occupies in the journal's own ordering.
-    """
-    identity = row["journal_id"] or _lib_journal.bootstrap_id(
-        "weekly_usage_snapshots", int(row["id"]))
-    return _lib_credit_identity.CreditSource(
-        kind="backfill",
-        identity=identity,
-        order=_lib_credit_identity.credit_order_from_instant(
-            row["captured_at_utc"]),
-    )
-
-
-def _manual_coverage_lower_bound(prior_captured):
-    """The earliest instant a manual credit may carry and still cover this drop.
-
-    The drop was measured between two consecutive observations, so a manual
-    credit that records it lies between them. The lower bound is floored to the
-    hour because a manual row written before ``observed_at_utc`` existed carries
-    only the hour-floored effective instant, which can precede the earlier
-    observation by up to an hour. Returns ``None`` when there is no earlier
-    observation to bound against, which disables the check rather than widening
-    it to the whole week.
-    """
-    if not prior_captured:
-        return None
-    try:
-        parsed = parse_iso_datetime(prior_captured, "backfill.prior_capture")
-    except ValueError:
-        return None
-    return _cctally()._floor_to_hour(
-        parsed.astimezone(dt.timezone.utc)).isoformat(timespec="seconds")
-
-
-def _backfill_credit_already_recorded(conn, *, account_key, credit_key,
-                                      new_week_end_at, effective_iso,
-                                      week_start_date=None,
-                                      observed_from=None, observed_to=None):
-    """True when this credit is already represented in ``week_reset_events``.
-
-    Three lookups, deliberately, because the table holds three kinds of row.
-
-    The first is the exact ``(account_key, credit_key)`` identity, which is what
-    replaced the singleton gate. That gate matched on ``new_week_end_at`` alone
-    and therefore suppressed EVERY later credit in the same week, which is the
-    defect being removed (#703 + #707 spec section 3.1).
-
-    The second is the legacy compatibility exception the spec allows: a row
-    written before this change carries no ``credit_key`` at all, so identity
-    cannot find it, and re-inserting would double-count a credit already on
-    file. It is matched on the retained facts a keyless row and this scan can
-    both produce — the account, the new-week boundary, and the effective
-    instant, the last through ``unixepoch()`` because the two producers spell
-    the offset differently.
-
-    Two retained facts are deliberately NOT in that predicate. The detection
-    instant is written from the DETECTION clock by the live path and from the
-    CAPTURE clock by this scan, so requiring equality would make every
-    live-written legacy credit look new here and duplicate it. ``old_week_end_at``
-    is excluded for the reason the pre-existing pre-check documented: a pre-fix
-    store may hold ``(cur_end, cur_end)`` for the same credit this scan writes as
-    ``(effective_iso, cur_end)``. The exception is scoped to keyless rows, so it
-    can never suppress a second credit that carries an identity.
-
-    The third is a MANUAL credit already covering this drop. Neither lookup
-    above can see one: ``record-credit``'s key comes from its op and never
-    equals a snapshot-derived key, and the keyless arm requires a NULL key a
-    manual row does not have. So a manual credit of 25pp or more was recorded
-    twice — once by the command, and again by this scan off the command's own
-    synthetic post-credit snapshot, which presents exactly the drop this scan
-    fires on. Before unification the duplicate at least landed in a different
-    table; now both rows sit in ``week_reset_events`` and the week grows a
-    second accounting epoch nobody recorded.
-
-    A manual credit covers this drop when its accounting instant falls between
-    the two observations the drop was measured across. The lower bound is
-    floored to the hour because a manual row written before ``observed_at_utc``
-    existed carries only the hour-floored effective instant, which can precede
-    the earlier observation by up to an hour; flooring the bound too keeps such
-    a row reachable without widening the window into an earlier credit's.
-    """
-    if credit_key is not None:
-        found = conn.execute(
-            "SELECT 1 FROM week_reset_events "
-            "WHERE account_key = ? AND credit_key = ? LIMIT 1",
-            (account_key, credit_key),
-        ).fetchone()
-        if found is not None:
-            return True
-    legacy = conn.execute(
-        "SELECT 1 FROM week_reset_events "
-        "WHERE credit_key IS NULL AND account_key = ? "
-        "  AND new_week_end_at = ? "
-        "  AND unixepoch(effective_reset_at_utc) = unixepoch(?) LIMIT 1",
-        (account_key, new_week_end_at, effective_iso),
-    ).fetchone()
-    if legacy is not None:
-        return True
-    if week_start_date is None or observed_from is None or observed_to is None:
-        return False
-    manual = conn.execute(
-        "SELECT 1 FROM week_reset_events "
-        "WHERE account_key = ? AND week_start_date = ? "
-        "  AND old_week_end_at IS NULL AND new_week_end_at IS NULL "
-        "  AND unixepoch(COALESCE(observed_at_utc, effective_reset_at_utc)) "
-        "      >= unixepoch(?) "
-        "  AND unixepoch(COALESCE(observed_at_utc, effective_reset_at_utc)) "
-        "      <= unixepoch(?) LIMIT 1",
-        (account_key, week_start_date, observed_from, observed_to),
-    ).fetchone()
-    return manual is not None
-
-
-
 def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
     """One-shot scan over historical snapshots to synthesize reset events
     for past mid-week resets the tool lived through before this feature
-    shipped. Idempotent via UNIQUE(account_key, credit_key) + INSERT OR IGNORE,
-    the identity #703 + #707 moved the row onto so several credits per week
-    became representable — safe to re-run, safe to ship alongside the DDL.
+    shipped. Idempotent via UNIQUE(old_week_end_at, new_week_end_at) +
+    INSERT OR IGNORE — safe to re-run, safe to ship alongside the DDL.
 
     Rule mirrors the runtime detection in cmd_record_usage: when a new
     week_end_at arrives in a snapshot whose captured_at_utc is still
@@ -414,14 +378,7 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
                 return
     try:
         rows = conn.execute(
-            # #703 + #707: `id` and `journal_id` come along because the credit's
-            # `credit_key` is derived from the TRIGGERING SNAPSHOT's journal
-            # identity — its `journal_id`, or its pre-cutover
-            # `b:weekly_usage_snapshots:<rowid>` bootstrap identity when the row
-            # predates the journal. `week_start_date` comes along because the
-            # unified credit row records the week it belongs to.
-            "SELECT id, journal_id, captured_at_utc, week_start_date, "
-            "       week_end_at, weekly_percent, account_key "
+            "SELECT captured_at_utc, week_end_at, weekly_percent, account_key "
             "FROM weekly_usage_snapshots "
             "WHERE week_end_at IS NOT NULL "
             "ORDER BY account_key ASC, captured_at_utc ASC, id ASC"
@@ -437,7 +394,6 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
     prior_end = None
     prior_pct: float | None = None
     prior_account = None
-    prior_captured: str | None = None
     for row in rows:
         cur_end_raw = row["week_end_at"]
         cur_pct = row["weekly_percent"]
@@ -446,7 +402,6 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
             # New account partition — do not compare across the boundary.
             prior_end = None
             prior_pct = None
-            prior_captured = None
             prior_account = cur_account
         if not cur_end_raw:
             continue
@@ -463,7 +418,6 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
             except ValueError:
                 prior_end = cur_end
                 prior_pct = cur_pct
-                prior_captured = row["captured_at_utc"]
                 continue
             # Real mid-week reset needs three signals:
             # 1. Boundary shifted (already checked).
@@ -483,28 +437,13 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
                 # units). A reset at 18:08Z becomes 18:00Z in the event
                 # row, rendering as "21:00" local instead of "21:08".
                 effective_iso = c._floor_to_hour(captured_dt).isoformat(timespec="seconds")
-                source = _backfill_credit_identity(row)
-                credit_key = _lib_credit_identity.derive_credit_key(source)
-                if not _backfill_credit_already_recorded(
-                    conn, account_key=cur_account, credit_key=credit_key,
-                    new_week_end_at=cur_end, effective_iso=effective_iso,
-                    week_start_date=row["week_start_date"],
-                    observed_from=_manual_coverage_lower_bound(prior_captured),
-                    observed_to=row["captured_at_utc"],
-                ):
-                    conn.execute(
-                        "INSERT OR IGNORE INTO week_reset_events "
-                        "(detected_at_utc, old_week_end_at, new_week_end_at, "
-                        " effective_reset_at_utc, account_key, week_start_date, "
-                        " observed_at_utc, confirming_capture_at_utc, "
-                        " observed_post_credit_pct, credit_key, credit_order) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (row["captured_at_utc"], prior_end, cur_end,
-                         effective_iso, cur_account, row["week_start_date"],
-                         row["captured_at_utc"], row["captured_at_utc"],
-                         cur_pct, credit_key,
-                         _lib_credit_identity.derive_credit_order(source)),
-                    )
+                conn.execute(
+                    "INSERT OR IGNORE INTO week_reset_events "
+                    "(detected_at_utc, old_week_end_at, new_week_end_at, "
+                    " effective_reset_at_utc, account_key) VALUES (?, ?, ?, ?, ?)",
+                    (row["captured_at_utc"], prior_end, cur_end, effective_iso,
+                     cur_account),
+                )
         elif prior_end and cur_end == prior_end:
             # In-place credit branch (v1.7.2). Mirrors the live detection
             # in cmd_record_usage: same end_at across two captures + ≥25pp
@@ -518,13 +457,30 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
             except ValueError:
                 prior_end = cur_end
                 prior_pct = cur_pct
-                prior_captured = row["captured_at_utc"]
                 continue
             if (
                 captured_dt < prior_end_dt
                 and prior_pct is not None and cur_pct is not None
                 and _is_reset_drop(prior_pct, cur_pct, allow_reset_to_zero=False)
             ):
+                # Pre-check on ``new_week_end_at`` (mirrors the live
+                # detection path's pre-check). Necessary because the
+                # UNIQUE(old, new) constraint alone WON'T dedup against
+                # legacy/broken-shape rows: pre-fix DBs may have
+                # ``(cur_end, cur_end)`` rows for the same credit that
+                # the new shape writes as ``(effective_iso, cur_end)``.
+                # Without this pre-check, the backfill writes a second
+                # row for the same credit on every open_db() call after
+                # upgrade. (See round-2 review Bug 1.)
+                already = conn.execute(
+                    "SELECT 1 FROM week_reset_events "
+                    "WHERE new_week_end_at = ? AND account_key = ? LIMIT 1",
+                    (cur_end, cur_account),
+                ).fetchone()
+                if already is not None:
+                    prior_end = cur_end
+                    prior_pct = cur_pct
+                    continue
                 # Canonicalize to UTC before isoformat so the stored
                 # offset is `+00:00`, matching the live detection path
                 # (cmd_record_usage uses now_utc which is already UTC).
@@ -547,31 +503,15 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
                 # bin/_cctally_record.py for the full rationale; in
                 # short, old==new collapses the credited week to a
                 # zero-width window in _apply_reset_events_to_weekrefs.
-                source = _backfill_credit_identity(row)
-                credit_key = _lib_credit_identity.derive_credit_key(source)
-                if not _backfill_credit_already_recorded(
-                    conn, account_key=cur_account, credit_key=credit_key,
-                    new_week_end_at=cur_end, effective_iso=effective_iso,
-                    week_start_date=row["week_start_date"],
-                    observed_from=_manual_coverage_lower_bound(prior_captured),
-                    observed_to=row["captured_at_utc"],
-                ):
-                    conn.execute(
-                        "INSERT OR IGNORE INTO week_reset_events "
-                        "(detected_at_utc, old_week_end_at, new_week_end_at, "
-                        " effective_reset_at_utc, account_key, week_start_date, "
-                        " observed_at_utc, confirming_capture_at_utc, "
-                        " observed_post_credit_pct, credit_key, credit_order) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (row["captured_at_utc"], effective_iso, cur_end,
-                         effective_iso, cur_account, row["week_start_date"],
-                         row["captured_at_utc"], row["captured_at_utc"],
-                         cur_pct, credit_key,
-                         _lib_credit_identity.derive_credit_order(source)),
-                    )
+                conn.execute(
+                    "INSERT OR IGNORE INTO week_reset_events "
+                    "(detected_at_utc, old_week_end_at, new_week_end_at, "
+                    " effective_reset_at_utc, account_key) VALUES (?, ?, ?, ?, ?)",
+                    (row["captured_at_utc"], effective_iso, cur_end, effective_iso,
+                     cur_account),
+                )
         prior_end = cur_end
         prior_pct = cur_pct
-        prior_captured = row["captured_at_utc"]
     # Flush implicit transaction so callers using explicit BEGIN
     # (e.g. _backfill_five_hour_blocks) don't trip "cannot start a
     # transaction within a transaction".
@@ -649,90 +589,24 @@ def _is_reset_drop(
     return cur <= _RESET_ZERO_FLOOR_PCT and drop >= _RESET_ZERO_MIN_DROP_PCT
 
 
-def _week_ref_credit_epoch(
-    conn: sqlite3.Connection, ref: WeekRef, *,
-    account_key: "str | None" = None,
-):
-    """The credit epoch governing this week's latest state, or None.
-
-    #703 + #707 §6.3. This replaces a predicate that asked whether the
-    reference's boundaries had been REWRITTEN — `effective_reset_at_utc IN
-    (week_start_at, week_end_at)` — and that question is now unanswerable for
-    two independent reasons. A manual credit moves no boundary, so it never
-    matched at all, which is why a `record-credit` week measured its cost and
-    its ratio straight across the credit. And §6.1 stopped the display layer
-    rewriting boundaries for automatic credits too, after which nothing equals
-    any `effective_reset_at_utc` and every credited week fell back to the cached
-    full-week path.
-
-    The question the callers actually have is whether this week holds a credit,
-    and if so which one governs, so that is what this returns: the row, through
-    the same shared resolver every accounting reader uses, so a reader can never
-    show a different epoch from the one the writer stamped.
-
-    The capture bound is the week's own end, because these callers ask about the
-    week's latest state rather than about one observation.
-    """
-    week_start_date = ref.week_start.isoformat() if ref.week_start else None
-    if not week_start_date:
-        return None
-    captured_at = ref.week_end_at
-    if not captured_at:
-        return None
-    try:
-        return _lib_credit_selection.resolve_weekly_credit_epoch(
-            conn, week_start_date=week_start_date, account_key=account_key,
-            captured_at=captured_at, week_end_at=ref.week_end_at,
-            week_start_at=ref.week_start_at)
-    except sqlite3.Error:
-        # A store with no `week_reset_events`, or one that predates the credit
-        # columns, has recorded no credit — so the honest answer is "none"
-        # rather than taking down every weekly render. A store that HAS a
-        # credit answers it; nothing is guessed either way.
-        return None
-
-
 def _week_ref_has_reset_event(
-    conn: sqlite3.Connection, ref: WeekRef, *,
-    account_key: "str | None" = None,
+    conn: sqlite3.Connection, ref: WeekRef
 ) -> bool:
-    """Whether a credit occurred inside `ref`'s week.
-
-    Lets cost callers bypass the `weekly_cost_snapshots` cache — computed over
-    the whole week — and recompute live over the epoch's own range instead. The
-    name is kept because every call site reads it as a question about the week,
-    which is what it now answers.
+    """Return True if `ref`'s effective boundaries were rewritten by a
+    reset event (the ref went through _apply_reset_events_to_weekrefs
+    and either its start or end now equals some effective_reset_at_utc).
+    Lets cost callers bypass the weekly_cost_snapshots cache (which was
+    computed over API-derived range) and recompute live over the
+    effective range instead.
     """
-    return _week_ref_credit_epoch(
-        conn, ref, account_key=account_key) is not None
-
-
-def _credited_week_keys(
-    conn: sqlite3.Connection, weeks, *, account_key: "str | None" = None,
-) -> set:
-    """The bucket keys of the sub-weeks that hold a credit (#703 + #707 §6.4).
-
-    ``weeks`` is a list of ``SubWeek``. The key returned is
-    ``start_date.isoformat()`` — the bucket and lookup key every weekly renderer
-    already indexes by — so a renderer marks a row without needing a connection
-    of its own.
-
-    Resolved through the shared epoch resolver, so a marker can never disagree
-    with the epoch the accounting reads used.
-    """
-    out: set = set()
-    for week in weeks:
-        start_date = getattr(week, "start_date", None)
-        end_ts = getattr(week, "end_ts", None)
-        if start_date is None or not end_ts:
-            continue
-        row = _lib_credit_selection.resolve_weekly_credit_epoch(
-            conn, week_start_date=start_date.isoformat(),
-            account_key=account_key, captured_at=end_ts, week_end_at=end_ts,
-            week_start_at=getattr(week, "start_ts", None))
-        if row is not None:
-            out.add(start_date.isoformat())
-    return out
+    if not ref.week_start_at and not ref.week_end_at:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM week_reset_events "
+        "WHERE effective_reset_at_utc IN (?, ?) LIMIT 1",
+        (ref.week_start_at, ref.week_end_at),
+    ).fetchone()
+    return row is not None
 
 
 def _compute_cost_for_weekref(

@@ -580,6 +580,140 @@ def build_reset_event_rebucketing():
     (scenario_dir / "input.env").write_text(f'AS_OF="{_iso(as_of)}"\n')
 
 
+def build_in_place_credit_split():
+    """Scenario: an in-place weekly credit ends one billing cycle and begins
+    another INSIDE the week, so the week renders as TWO rows.
+
+    The credit does NOT move the week's boundaries, which is what makes this
+    shape distinct from `reset-event-rebucketing`: `old_week_end_at` equals
+    `effective_reset_at_utc` (the detector's in-place-credit row shape) and
+    `new_week_end_at` is the week's own unchanged end, so both segments share
+    ONE `week_start_date` — the join key into `weekly_usage_snapshots`.
+
+    Shape:
+        AS_OF                = 2026-06-12T12:00Z
+        week-1 (uncredited): start_at = 2026-05-29T15:00Z
+                             end_at   = 2026-06-05T15:00Z, pct 40.0
+        week-2 (credited):   start_at = 2026-06-05T15:00Z
+                             end_at   = 2026-06-12T15:00Z
+                             pct 71.0 captured 06-10T08:00Z (pre-credit peak)
+                             pct 12.0 captured 06-10T09:30Z (post-credit)
+        credit event:        old_week_end_at        = 2026-06-10T09:00+00:00
+                             new_week_end_at        = 2026-06-12T15:00+00:00
+                             effective_reset_at_utc = 2026-06-10T09:00+00:00
+
+    Expected: week-2 emits two rows sharing `week` = 2026-06-05 —
+    [06-05T15:00Z, 06-10T09:00Z) at 71.0% and [06-10T09:00Z, 06-12T15:00Z) at
+    12.0%. Before the applier learned the split, the pre-credit interval had
+    no SubWeek at all and its two entries were dropped from the table AND from
+    `totals`.
+
+    Two shaping constraints, both learned the hard way from this fixture:
+
+    1. The seeded event uses the CANONICAL `+00:00` spelling, not `Z`.
+       `_backfill_week_reset_events` runs on every `open_db()` and would
+       otherwise synthesize its OWN in-place-credit row for these snapshots:
+       its `already` pre-check compares `account_key = NULL`, which is never
+       true in SQL, so `UNIQUE(old_week_end_at, new_week_end_at)` is the only
+       thing that dedups — and it only recognizes the duplicate when the
+       spellings match. Same reasoning as `build-dashboard-fixtures.py`'s
+       `reset-week`.
+    2. `effective` is `_floor_to_hour(post-credit capture)`, and that capture
+       sits STRICTLY AFTER it (09:30 vs 09:00). Both halves matter: the floor
+       is what the detector would compute, and the strict inequality is what
+       lets the pre-credit segment's `captured_at_utc <= effective` lookup
+       resolve to the 71.0 peak instead of the post-credit 12.0.
+    """
+    scenario_dir = FIXTURES_DIR / "in-place-credit-split"
+    db_dir = scenario_dir / ".local/share/cctally"
+    db_dir.mkdir(parents=True, exist_ok=True)
+
+    def _canon(d: dt.datetime) -> str:
+        """The `+00:00` spelling `_canonicalize_optional_iso` / the backfill's
+        `_floor_to_hour(...).isoformat(timespec="seconds")` produce."""
+        return d.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
+
+    as_of = dt.datetime(2026, 6, 12, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+    wk1_start = dt.datetime(2026, 5, 29, 15, 0, 0, tzinfo=dt.timezone.utc)
+    wk1_end   = dt.datetime(2026, 6,  5, 15, 0, 0, tzinfo=dt.timezone.utc)
+    wk2_start = wk1_end
+    wk2_end   = dt.datetime(2026, 6, 12, 15, 0, 0, tzinfo=dt.timezone.utc)
+    effective = dt.datetime(2026, 6, 10,  9, 0, 0, tzinfo=dt.timezone.utc)
+    pre_capture  = dt.datetime(2026, 6, 10, 8,  0, 0, tzinfo=dt.timezone.utc)
+    post_capture = dt.datetime(2026, 6, 10, 9, 30, 0, tzinfo=dt.timezone.utc)
+
+    create_stats_db(db_dir / "stats.db")
+    with sqlite3.connect(db_dir / "stats.db") as conn:
+        seed_weekly_usage_snapshot(
+            conn,
+            captured_at_utc=_iso(wk1_start + dt.timedelta(days=3)),
+            week_start_date=wk1_start.date().isoformat(),
+            week_end_date=wk1_end.date().isoformat(),
+            week_start_at=_iso(wk1_start),
+            week_end_at=_iso(wk1_end),
+            weekly_percent=40.0,
+        )
+        # Both credited-week snapshots carry the SAME week_start_at /
+        # week_end_at — the credit leaves the boundaries alone. The 71 → 12
+        # drop across them is the in-place-credit signal.
+        seed_weekly_usage_snapshot(
+            conn,
+            captured_at_utc=_iso(pre_capture),
+            week_start_date=wk2_start.date().isoformat(),
+            week_end_date=wk2_end.date().isoformat(),
+            week_start_at=_iso(wk2_start),
+            week_end_at=_iso(wk2_end),
+            weekly_percent=71.0,
+        )
+        seed_weekly_usage_snapshot(
+            conn,
+            captured_at_utc=_iso(post_capture),
+            week_start_date=wk2_start.date().isoformat(),
+            week_end_date=wk2_end.date().isoformat(),
+            week_start_at=_iso(wk2_start),
+            week_end_at=_iso(wk2_end),
+            weekly_percent=12.0,
+        )
+        seed_week_reset_event(
+            conn,
+            detected_at_utc=_canon(post_capture),
+            old_week_end_at=_canon(effective),   # == effective: in-place credit
+            new_week_end_at=_canon(wk2_end),
+            effective_reset_at_utc=_canon(effective),
+        )
+
+    create_cache_db(db_dir / "cache.db")
+    with sqlite3.connect(db_dir / "cache.db") as conn:
+        seed_session_file(
+            conn,
+            path="/fake/jsonl/ipc.jsonl",
+            session_id="ipc-session",
+            project_path="/fake/repos/ipc",
+        )
+        # One entry in week-1, two in the pre-credit segment, one in the
+        # post-credit segment. The pre-credit pair is the demonstrative
+        # population: it is what fell into the gap before the split existed.
+        for i, ts in enumerate([
+            dt.datetime(2026, 6,  1, 12, 0, 0, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 6,  7, 12, 0, 0, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 6,  9, 12, 0, 0, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 6, 11, 10, 0, 0, tzinfo=dt.timezone.utc),
+        ]):
+            seed_session_entry(
+                conn,
+                source_path="/fake/jsonl/ipc.jsonl",
+                line_offset=i,
+                timestamp_utc=_iso(ts),
+                model="claude-opus-4-7",
+                input_tokens=400_000,
+                output_tokens=40_000,
+            )
+        conn.commit()
+
+    (scenario_dir / "input.env").write_text(f'AS_OF="{_iso(as_of)}"\n')
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -605,4 +739,5 @@ if __name__ == "__main__":
     build_breakdown_per_model()
     build_empty_range()
     build_reset_event_rebucketing()
+    build_in_place_credit_split()
     print(f"Built fixtures under {FIXTURES_DIR}")

@@ -15,8 +15,6 @@
       "totalCost": 8.1,
       "usedPct": 50.0,
       "dollarsPerPercent": 0.162,
-      "credited": false,
-      "dollarsPerPercentWithheld": null,
       "modelsUsed": [
         "claude-opus-4-7",
         "claude-sonnet-4-6",

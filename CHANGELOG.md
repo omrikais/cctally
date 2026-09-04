@@ -5,6 +5,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.107.0] - 2026-09-04
+
+### Changed
+- The same-window weekly credit model introduced in 1.106.0 is reverted. A week is anchored to its billing cycle again, and a recorded credit no longer rewrites the week in place or withholds the `$/1%` figure.
+- Upgrading from 1.106.0 rebuilds the disposable stats index once. On a large store that took about a minute here, and commands report that a rebuild is running until it finishes.
+- `claude-fable-5-1` and `claude-mythos-5-1` each count as their own model family in the weekly quota model, instead of being pooled with the model they follow. Your quota calibration refits once on the next `cctally quota` run.
+- `cctally doctor` separates the one refused-pricing-write state that restarting cctally cannot clear — a recorded pricing date it cannot read — from the ordinary one, and names the step that does clear it.
+- A shared `cctally weekly` artifact labels each row by the date its cycle began, matching the terminal table and the dashboard. On a week Anthropic reset early, that label and the artifact's stated period both move forward.
+- The dashboard's Projects panel counts a credited week as the two billing cycles it is, so its week grid covers fewer calendar days for the same week count.
+- The `cctally weekly` and `cctally report` artifacts, the dashboard's Weekly panel footer and the Weekly modal title all count billing cycles rather than weeks, because a credited week supplies two rows. `Avg %/wk` is now `Avg %/cycle`.
+
+### Fixed
+- `cctally weekly` renders a week credited in place as two rows, one per billing cycle, matching `cctally report`. The cycle before the credit had no row at all, and its spend was missing from the table and from `--json` totals.
+- The dashboard's Weekly panel and the TUI show both cycles of a credited week from one source, so a week's two rows can no longer disagree with the panel total beside them.
+- `cctally project` counts a credited week as the two billing cycles it is, so `--weeks N` spans a shorter calendar range there. `attributedUsedPercent` rises, because the cycle before the credit matches its usage snapshot again.
+- A `cctally dashboard` left running across a pricing update can no longer overwrite corrected conversation cost from the table it started with. It keeps ingesting, your conversations stay listed, and `cctally doctor` says to restart it.
+- `cctally doctor` reports a refused conversation-cost write from any process that hit it, including short-lived ones like the status line and `cctally daily` that never open the conversation store.
+- `cctally cache-sync --rebuild` says it did nothing when it may not rewrite conversation cost, instead of reporting `0 processed` and exiting 0. It names both reasons: a stored pricing table newer than this one, or one that is not a date.
+- `cctally doctor`'s refused-pricing-write warning clears once cctally is running current with the store, including after a refused `cctally cache-sync --rebuild`. That refusal previously left a warning the documented remedy could not clear.
+
 ## [1.106.0] - 2026-09-03
 
 ### Changed

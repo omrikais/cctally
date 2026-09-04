@@ -311,7 +311,12 @@ def _aggregate_weekly(
     handing off to `_aggregate_buckets`, which does not itself tolerate a
     `None` key — it would place a `None` key in the dict and then blow up
     on the final `sorted(by_bucket.keys())`). The returned
-    `BucketUsage.bucket` equals the week's `start_date.isoformat()`.
+    `BucketUsage.bucket` equals the week's `segment_key` — the
+    UTC-canonicalized `start_ts` instant, NOT `start_date.isoformat()`.
+    An in-place weekly credit splits one week into two billing cycles that
+    share `start_date`, and keying on the shared date folded the pair into a
+    single bucket carrying both costs. Consumers that need the snapshot join
+    key read `SubWeek.start_date` off the matching SubWeek instead.
     First-match-wins for overlapping SubWeeks (can occur at Anthropic
     reset-day-drift boundaries — see `_compute_subscription_weeks`).
     """
@@ -326,7 +331,7 @@ def _aggregate_weekly(
     for w in weeks:
         start_dt = parse_iso_datetime(w.start_ts, "week.start_ts")
         end_dt = parse_iso_datetime(w.end_ts, "week.end_ts")
-        parsed_bounds.append((start_dt, end_dt, w.start_date.isoformat()))
+        parsed_bounds.append((start_dt, end_dt, w.segment_key))
 
     starts = [b[0] for b in parsed_bounds]
 

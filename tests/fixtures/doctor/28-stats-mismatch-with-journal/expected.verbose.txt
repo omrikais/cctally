@@ -69,10 +69,10 @@ Database
         stats_quick_check: ok
         cache_quick_check: None
         conversations_quick_check: None
-  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1012) — rebuilds from journal
+  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1011) — rebuilds from journal
       → Auto-heals by journal rebuild on next command; if it persists, run `cctally db rebuild --db stats`
       details:
-        stats.db: {'user_version': 99, 'legacy_head': 13, 'epoch': 1012, 'mismatch': True, 'journal_present': True, 'journal_has_bytes': True}
+        stats.db: {'user_version': 99, 'legacy_head': 13, 'epoch': 1011, 'mismatch': True, 'journal_present': True, 'journal_has_bytes': True}
         cache.db: {'user_version': 0, 'registry_size': 45, 'ahead': False}
   ✓ Migrations               0/58 applied
       details:
@@ -264,6 +264,7 @@ Pricing
       details:
         unpriced: []
         fallback: []
+  ✓ Rollup writer            no refused pricing write recorded
 Quota
   ✓ Metering rate            not assessed
       → Run `cctally quota` for the current assessment.
@@ -305,4 +306,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 58 OK · 6 WARN · 0 FAIL
+Summary: 59 OK · 6 WARN · 0 FAIL

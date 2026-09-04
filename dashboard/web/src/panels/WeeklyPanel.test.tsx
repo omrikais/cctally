@@ -106,10 +106,10 @@ describe('<WeeklyPanel /> (#264 S2)', () => {
     expect(document.querySelector('#panel-weekly .model-stack')?.children.length).toBe(3);
   });
 
-  it('renders the whole-window footer total (all 4 weeks)', () => {
+  it('renders the whole-window footer total (all 4 cycles)', () => {
     render(<WeeklyPanel />);
     const foot = document.querySelector('#panel-weekly .panel-foot');
-    expect(foot?.textContent).toMatch(/4w total/);
+    expect(foot?.textContent).toMatch(/4 cycles total/);
     expect(foot?.textContent).toMatch(/\$145\.00/);
   });
 
@@ -157,7 +157,7 @@ describe('#293 S3 — stacked summary window', () => {
     const more = document.querySelector('#panel-weekly .period-foot-more') as HTMLButtonElement;
     expect(more).toBeTruthy();
     expect(more.textContent).toContain('+1 more');
-    expect(more.getAttribute('aria-label')).toBe('Show all 4 weeks');
+    expect(more.getAttribute('aria-label')).toBe('Show all 4 cycles');
     expect(document.querySelector('#panel-weekly .period-foot .total')?.textContent).toContain('145');
   });
 

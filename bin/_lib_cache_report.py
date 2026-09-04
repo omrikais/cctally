@@ -425,8 +425,11 @@ def _compute_entry_cache_dollars(
     # #195: the write premium is TTL-dependent. Split the creation tokens the
     # same way _cache_create_cost does — 1h portion against the 2x rate, the
     # REMAINDER against today's create_rate — so Wasted $/Net $ cannot disagree
-    # with the total cost the pricing kernel reports. Cache reads remain 0.1x
-    # of the effective base rate, so fast mode scales their absolute savings.
+    # with the total cost the pricing kernel reports. The two WRITE multipliers
+    # are uniform and derived; cache READS are model-specific and stored per
+    # model (0.1x of base input for most models, 0.025x for the 5.1 point
+    # releases), so `base_for_read` is read from the model's own rate and fast
+    # mode scales the resulting absolute savings.
     h = 0 if cache_1h_tokens is None else max(
         0, min(int(cache_1h_tokens), cache_creation_tokens))
     if h == 0:

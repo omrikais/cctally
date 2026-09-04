@@ -176,23 +176,14 @@ def test_skipped_crossing_is_recorded_on_the_next_healthy_tick(ns, monkeypatch):
 def test_reset_week_attribution_failure_does_not_abort_the_ingest_cycle(
     ns, monkeypatch
 ):
-    """On a CREDITED week the cost is live-computed instead of read from a
+    """On a reset-affected week the cost is live-computed instead of read from a
     snapshot. That read is account-scoped too, so it can raise the same
     fail-closed exception — which on the passed-conn (ingest) path used to
-    re-raise and roll back the whole cycle.
-
-    The live-compute branch is reached by an actual credit row rather than by
-    stubbing `_week_ref_has_reset_event`, because #703 + #707 removed that gate
-    from the decision: the authoritative condition is the epoch the crossing is
-    filed under. The credit records a landing level at or below the crossing's
-    own reading, so the seeding guard admits and the skip under test is the
-    fail-closed one rather than a refusal for another reason.
-    """
+    re-raise and roll back the whole cycle."""
     monkeypatch.setitem(ns, "cmd_sync_week", lambda *a, **k: 0)
-    calls = []
+    monkeypatch.setitem(ns, "_week_ref_has_reset_event", lambda *a, **k: True)
 
     def _boom(*a, **k):
-        calls.append(a)
         raise _cache_mod().AccountAttributionUnavailable(
             "account attribution unavailable (cache required): concurrent ingest")
 
@@ -201,16 +192,6 @@ def test_reset_week_attribution_failure_does_not_abort_the_ingest_cycle(
     conn = ns["open_db"]()
     try:
         snap_id = _seed(conn)
-        conn.execute(
-            "INSERT INTO week_reset_events "
-            "(detected_at_utc, old_week_end_at, new_week_end_at, "
-            " effective_reset_at_utc, observed_pre_credit_pct, account_key, "
-            " week_start_date, observed_at_utc, observed_post_credit_pct, "
-            " credit_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            ("2026-01-04T08:30:00Z", None, None, "2026-01-04T08:00:00+00:00",
-             46.0, "unattributed", _WEEK_START, "2026-01-04T08:30:00Z", 6.0,
-             "o:creditop"))
-        conn.commit()
         conn.execute("BEGIN IMMEDIATE")
         ns["maybe_record_milestone"](_saved(snap_id), conn=conn, as_of=_AS_OF)
         conn.commit()
@@ -218,7 +199,4 @@ def test_reset_week_attribution_failure_does_not_abort_the_ingest_cycle(
     finally:
         conn.close()
 
-    assert calls, (
-        "the live-compute branch was never reached, so this test would pass "
-        "for a reason other than the fail-closed skip")
     assert row is None

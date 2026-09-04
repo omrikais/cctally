@@ -75,15 +75,17 @@ FAMILY_ALIASES: dict[str, str] = {
     "claude-3-5-haiku": "claude-3-5-haiku",
     "claude-3-5-haiku-latest": "claude-3-5-haiku",
     "claude-3-haiku": "claude-3-haiku",
-    # Fable / Mythos. The -1 point releases are distinct ids in
-    # CLAUDE_MODEL_PRICING because their cache-read rate is 0.025x base input
-    # rather than 0.1x, but they drain the weekly meter on the same terms as
-    # the family they follow, so they resolve to it instead of minting a
-    # family whose composition support would have to rebuild from nothing.
+    # Fable / Mythos. Each -1 point release is its OWN canonical family
+    # (#704). Pooling it into the family it follows would assert that per-unit
+    # consumption is EQUAL, which the operator's statement about the meter does
+    # not establish, and it would make a Fable 5 to 5.1 substitution invisible
+    # on the one axis built to notice it. A preview is a different case:
+    # claude-mythos-preview stays pooled into claude-mythos-5, because a
+    # preview of a model is not a successor to one.
     "claude-fable-5": "claude-fable-5",
-    "claude-fable-5-1": "claude-fable-5",
+    "claude-fable-5-1": "claude-fable-5-1",
     "claude-mythos-5": "claude-mythos-5",
-    "claude-mythos-5-1": "claude-mythos-5",
+    "claude-mythos-5-1": "claude-mythos-5-1",
     "claude-mythos-preview": "claude-mythos-5",
 }
 
@@ -109,7 +111,9 @@ FAMILY_PARTICIPATION: dict[str, str] = {
     "claude-3-5-haiku": "general",
     "claude-3-haiku": "general",
     "claude-fable-5": "general",
+    "claude-fable-5-1": "general",
     "claude-mythos-5": "general",
+    "claude-mythos-5-1": "general",
 }
 
 #: Where each classification came from, so a later reader can re-test it
@@ -127,6 +131,17 @@ FAMILY_PROVENANCE: dict[str, str] = {
         "general weekly meter, on the same terms as claude-fable-5; only "
         "the general draining is modelled. Both spellings are real, priced "
         "families in CLAUDE_MODEL_PRICING launched alongside Fable 5"
+    ),
+    "claude-fable-5-1": (
+        "operator-supplied 2026-09-01, dedicated-pool participation "
+        "confirmed 2026-09-03: drains a dedicated pool AND the general "
+        "weekly meter on the same terms as claude-fable-5, and both consume "
+        "it quickly; only the general draining is modelled"
+    ),
+    "claude-mythos-5-1": (
+        "operator-supplied 2026-09-03: drains a dedicated pool AND the "
+        "general weekly meter on the same terms as claude-mythos-5; only "
+        "the general draining is modelled"
     ),
 }
 
@@ -209,8 +224,9 @@ def max_fit_population_days() -> int:
 #: pool AS WELL as the general weekly meter, and only the general draining is
 #: modelled here.
 DEDICATED_POOL_SCOPE_NOTE: str = (
-    "out-of-scope: claude-fable-5, claude-mythos-5 and claude-mythos-preview "
-    "also drain dedicated pools; only general-quota draining is modelled"
+    "out-of-scope: claude-fable-5, claude-fable-5-1, claude-mythos-5, "
+    "claude-mythos-5-1 and claude-mythos-preview also drain dedicated pools; "
+    "only general-quota draining is modelled"
 )
 
 QUOTA_MODEL_ALGORITHM_REVISION: int = 3
@@ -252,7 +268,7 @@ def constants_fingerprint() -> str:
 #: constant above without re-pinning this line is caught rather than silently
 #: invalidating every persisted calibration.
 QUOTA_MODEL_CONSTANTS_FINGERPRINT: str = (
-    "70c36ec1a467e97bdfece624baa5e560762fdc89c2e0c041c6332f92f4ea6160"
+    "0cd932a7f8caa5d9bec7010ed5d800935e5c78332ae060c1142650943512a24a"
 )
 
 
@@ -790,18 +806,15 @@ class SnapshotRecord:
 
 @dataclasses.dataclass(frozen=True)
 class CreditRecord:
-    """An authoritative credit instant. Never inferred from a meter decrease.
+    """An authoritative credit instant.
 
-    `kind` carried the two-table distinction — "reset" for a
-    `week_reset_events` row, which re-anchored the logical week, and "floor" for
-    a `weekly_credit_floors` row, which did not. #703 + #707 removed both halves
-    of that: the two tables are one, and an Anthropic credit never re-anchors a
-    week whatever its size. The field survives as a shape, with `"credit"` its
-    only produced value; `build_segments` no longer branches on it.
+    `kind` is "reset" for a `week_reset_events` row, which re-anchors the
+    logical week, or "floor" for a `weekly_credit_floors` row, which does not.
+    Never inferred from a meter decrease.
     """
 
     at: "dt.datetime"
-    kind: str = "credit"
+    kind: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -875,24 +888,22 @@ def build_segments(snapshots, credits) -> list[Segment]:
     decreases against 10 authoritative credit instants, so two thirds of the
     research script's forks were unsupported.
 
-    EVERY credit opens a new segment retaining the existing week identity
-    (#703 + #707 §2 and §6.2). A credit of any size is a counter discontinuity
-    inside an UNCHANGED window: whatever Anthropic does to the counter, the week
-    keeps its original start and end and only the running percent steps down. So
-    the old "reset" branch — anchoring the successor from the credit instant and
-    marking it `restarted` — is gone, along with the rule that made the last
-    reset among several spanned credits win. `restarted` is consequently always
-    False for an Anthropic credit; the field is retained so the segment shape
-    does not change under its readers.
+    A "reset" credit opens a newly anchored logical week, because a >=25pp
+    auto-credit re-anchors the week. A "floor" credit opens a new segment
+    retaining the existing week identity, because `record-credit` deliberately
+    does not re-anchor. When SEVERAL credits fall between two consecutive
+    snapshots the last RESET among them wins, not simply the last credit: a
+    reset followed by a floor is still a re-anchoring, and filing it as a
+    floor would silently merge the two paths section 5 keeps distinct.
 
     The segment's published `week_anchor` and the value a week change is
-    detected against are still tracked separately. That separation was needed
-    because a credit-derived anchor and the store's own spelling of a boundary
-    round to different hours whenever the credit straddles the half-hour, and
-    comparing later rows against the credit-derived value forked a spurious
-    third segment. Nothing derives an anchor from a credit any more, so the two
-    now always agree — the separation is kept because it costs nothing and its
-    absence is what the spurious fork was made of.
+    detected against are tracked separately. A reset anchors the successor
+    from the CREDIT instant while the store's own rows carry their own
+    spelling of the new boundary, and the two round to different hours
+    whenever the credit straddles the half-hour — a credit at 03:29 with
+    post-reset rows recording 03:31 gives 03:00 and 04:00. Comparing later
+    rows against the credit-derived value forked a spurious third segment
+    that also lost `restarted`.
     """
     for row in snapshots:
         require_aware(row.at, "snapshot.at")
@@ -912,20 +923,19 @@ def build_segments(snapshots, credits) -> list[Segment]:
         if prev_at is not None:
             spanned = [c for c in cuts if prev_at < c.at <= row.at]
             if spanned:
-                # The LAST credit spanned, with no kind preference: every
-                # credit cuts a segment and none re-anchors, so there is no
-                # longer a stronger and a weaker kind to choose between.
-                crossed = spanned[-1]
+                resets = [c for c in spanned if c.kind == "reset"]
+                crossed = resets[-1] if resets else spanned[-1]
         if current and (row_anchor != anchor_ref or crossed is not None):
             segments.append(
                 Segment(len(segments), anchor, tuple(current), restarted)
             )
             current = []
-            # The successor keeps the ROW's own week anchor. Anchoring it from
-            # the credit instant is what re-anchored a week Anthropic never
-            # moved.
-            anchor = row_anchor
-            restarted = False
+            if crossed is not None and crossed.kind == "reset":
+                anchor = canonical_week_anchor(crossed.at)
+                restarted = True
+            else:
+                anchor = row_anchor
+                restarted = False
             anchor_ref = row_anchor
         elif not current:
             anchor = row_anchor

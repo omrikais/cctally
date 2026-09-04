@@ -58,14 +58,20 @@ def test_no_suppression_expires_before_the_pricing_snapshot_date():
 # Vendor-verified per-MTok rates for the current Claude generation, as
 # (input, output, 5-minute cache write, cache read) per-token costs, taken from
 # platform.claude.com/docs/en/about-claude/pricing at PRICING_SNAPSHOT_DATE.
-# Cache tiers follow the documented multipliers (5-minute write 1.25x base
-# input, 1-hour write 2x, read 0.1x). Mythos Preview retains its historical
+# The two WRITE multipliers are uniform and derived (5-minute write 1.25x base
+# input, 1-hour write 2x). Cache READS are model-specific and are therefore
+# stored per model: the two 5.1 point releases read at 0.025x base input rather
+# than the 0.1x every other current model uses, and pinning that fourth column
+# is the only thing that stops a later edit normalizing it back. Mythos Preview
+# retains its historical
 # Project Glasswing rate even though Mythos 5 succeeded it. Extend this map when
 # Anthropic ships a model.
 _CURRENT_GENERATION_RATES = {
     "claude-fable-5":   (1e-05,  5e-05,   1.25e-05, 1e-06),
+    "claude-fable-5-1": (1e-05,  5e-05,   1.25e-05, 2.5e-07),
     "claude-haiku-4-5": (1e-06,  5e-06,   1.25e-06, 1e-07),
     "claude-mythos-5":  (1e-05,  5e-05,   1.25e-05, 1e-06),
+    "claude-mythos-5-1": (1e-05, 5e-05,   1.25e-05, 2.5e-07),
     "claude-opus-4-8":  (5e-06,  2.5e-05, 6.25e-06, 5e-07),
     "claude-opus-5":    (5e-06,  2.5e-05, 6.25e-06, 5e-07),
     "claude-sonnet-5":  (2e-06,  1e-05,   2.5e-06,  2e-07),

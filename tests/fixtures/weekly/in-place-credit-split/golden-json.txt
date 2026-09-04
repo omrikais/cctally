@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "weekly": [
+    {
+      "week": "2026-05-29",
+      "displayWeek": "2026-05-29",
+      "weekStartAt": "2026-05-29T15:00:00Z",
+      "weekEndAt": "2026-06-05T15:00:00Z",
+      "weekSource": "snapshot",
+      "inputTokens": 400000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 40000,
+      "totalTokens": 440000,
+      "totalCost": 3.0,
+      "usedPct": 40.0,
+      "dollarsPerPercent": 0.075,
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 400000,
+          "outputTokens": 40000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 3.0
+        }
+      ]
+    },
+    {
+      "week": "2026-06-05",
+      "displayWeek": "2026-06-05",
+      "weekStartAt": "2026-06-05T15:00:00Z",
+      "weekEndAt": "2026-06-10T09:00:00+00:00",
+      "weekSource": "snapshot",
+      "inputTokens": 800000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 80000,
+      "totalTokens": 880000,
+      "totalCost": 6.0,
+      "usedPct": 71.0,
+      "dollarsPerPercent": 0.08450704225352113,
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 800000,
+          "outputTokens": 80000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 6.0
+        }
+      ]
+    },
+    {
+      "week": "2026-06-05",
+      "displayWeek": "2026-06-10",
+      "weekStartAt": "2026-06-10T09:00:00+00:00",
+      "weekEndAt": "2026-06-12T15:00:00Z",
+      "weekSource": "snapshot",
+      "inputTokens": 400000,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "outputTokens": 40000,
+      "totalTokens": 440000,
+      "totalCost": 3.0,
+      "usedPct": 12.0,
+      "dollarsPerPercent": 0.25,
+      "modelsUsed": [
+        "claude-opus-4-7"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-7",
+          "inputTokens": 400000,
+          "outputTokens": 40000,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 3.0
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "inputTokens": 1600000,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 0,
+    "outputTokens": 160000,
+    "totalTokens": 1760000,
+    "totalCost": 12.0
+  }
+}

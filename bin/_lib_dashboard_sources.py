@@ -505,17 +505,9 @@ _PROVIDER_LABELS: Mapping[str, str] = MappingProxyType(
     {"claude": "Claude", "codex": "Codex"},
 )
 _LEG_PERIOD_KINDS: Mapping[str, tuple[str, str, str, str]] = MappingProxyType({
-    # provider -> (kind, label, hero container key, (start keys, end key))
-    #
-    # The start slot is a comma-separated preference order, first present wins.
-    # Claude's leg reports `hero.cost_usd`, which is the WHOLE subscription
-    # week's spend (#703 + #707 §6.2), so the bound that names its period is the
-    # week's own start. `week_start_at` is the rate anchor and moves to the
-    # credit instant on a credited week; it stays as the fallback for an
-    # envelope built before `nominal_week_start_at` was published, where the two
-    # are the same instant on every uncredited week anyway.
+    # provider -> (kind, label, hero container key, (start key, end key))
     "claude": ("subscription_week", "Claude subscription week",
-               "current_week", "nominal_week_start_at,week_start_at|reset_at_utc"),
+               "current_week", "week_start_at|reset_at_utc"),
     "codex": ("native_7_day_cycle", "Codex native 7-day cycle",
               "cycle", "start_at|resets_at"),
 })
@@ -817,12 +809,8 @@ def _leg_period(
     container = hero.get(container_key) if isinstance(hero, Mapping) else None
     if not isinstance(container, Mapping):
         return None
-    start_keys, end_key = bound_keys.split("|")
-    start_at = None
-    for start_key in start_keys.split(","):
-        start_at = _period_instant(container.get(start_key))
-        if start_at is not None:
-            break
+    start_key, end_key = bound_keys.split("|")
+    start_at = _period_instant(container.get(start_key))
     end_at = _period_instant(container.get(end_key))
     if start_at is None or end_at is None:
         return None

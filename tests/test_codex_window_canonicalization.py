@@ -1092,10 +1092,9 @@ def test_the_stats_index_epoch_tripwire(stats_ns):
     state adds three `journal_selector_*` tables plus the reserved
     `stats_quota_projection_state`, so 1008 -> 1009. #538 advances to 1010 for
     the rollback-journal transition without another schema change, and #661 S2
-    advances to 1011 for the `meter_rate_change_events` table. #703 + #707
-    advances to 1012 for the unified `week_reset_events` credit record."""
+    advances to 1011 for the `meter_rate_change_events` table."""
     import _cctally_core
-    assert _cctally_core.STATS_INDEX_EPOCH == 1012
+    assert _cctally_core.STATS_INDEX_EPOCH == 1011
 
 
 # --------------------------------------------------------------------------

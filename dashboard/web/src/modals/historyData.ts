@@ -52,7 +52,6 @@ export function decorateHistoryRows(rows: PeriodRow[], variant: HistoryVariant):
     used_pct: r.used_pct,
     dollar_per_pct: r.dollar_per_pct,
     delta_cost_pct: r.delta_cost_pct,
-    dollar_per_pct_withheld: r.dollar_per_pct_withheld,
     models: r.models,
     ...(r.account_labels ? { account_labels: r.account_labels } : {}),
   }));

@@ -17,6 +17,7 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 """
 from __future__ import annotations
 
+import datetime as dt
 import re
 import sys
 from typing import Any
@@ -53,8 +54,51 @@ def _chip_for_model(name: str) -> str:
 # Date the embedded pricing snapshots below were last verified against
 # vendor sources. Bump whenever CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING
 # is synced. Read by `pricing-check` + the release pre-flight staleness nudge.
+#
+# CONTRACT (#705): a pricing revision must always ADVANCE this date. A second
+# revision within one UTC day therefore takes the NEXT day's date rather than
+# repeating one. The reason is the ordered-write guard in
+# `_cctally_cache._pricing_write_authorized`, which compares this value to the
+# fingerprint a store recorded and refuses a write from an older process. That
+# comparison is day-granular by construction, so two revisions sharing a date
+# compare equal and the older process is authorized to write.
 PRICING_SNAPSHOT_DATE = "2026-09-02"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
+
+
+def parse_pricing_fingerprint(value):
+    """Parse a recorded pricing fingerprint into a ``datetime.date``, or return
+    None when it cannot be ordered against PRICING_SNAPSHOT_DATE (#705).
+
+    THE single parse of that contract. It has two callers that must never
+    disagree: `_cctally_cache._pricing_write_authorized`, which refuses a write
+    it cannot order, and `_lib_doctor._check_pricing_conversation_rollup_writer`,
+    which reports which of the two refusal states a store is in. They were two
+    separate `date.fromisoformat` calls, and they had already diverged — the
+    doctor one coerced with `str()`, so on Python 3.11+ an integer fingerprint
+    parsed there as a basic-format ISO date and raised TypeError in the guard.
+    Doctor then printed the ordinary "restart or upgrade the writing process"
+    remedy for a store no version can write.
+
+    A non-string is therefore NOT coerced. The value is passed to
+    `date.fromisoformat` exactly as the store returned it.
+    """
+    try:
+        return dt.date.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def pricing_fingerprint_is_comparable(value) -> bool:
+    """Whether a stored fingerprint is one the ordered-write guard can order.
+
+    Absent and empty are comparable: the guard treats both as older than
+    anything, which is the ordinary state of a store that has never recorded a
+    fingerprint, not a corrupt one.
+    """
+    if not value:
+        return True
+    return parse_pricing_fingerprint(value) is not None
 
 # Canonical machine-readable pricing source (Claude values + Codex values).
 LITELLM_PRICES_URL = (

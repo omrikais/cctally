@@ -67,6 +67,7 @@ Accounts
   ✓ Codex window attribution no operator window attribution recorded
 Pricing
   ✓ Coverage                 all observed models priced
+  ✓ Rollup writer            no refused pricing write recorded
 Quota
   ✓ Metering rate            not assessed
       → Run `cctally quota` for the current assessment.
@@ -82,4 +83,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 58 OK · 5 WARN · 1 FAIL
+Summary: 59 OK · 5 WARN · 1 FAIL

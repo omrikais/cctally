@@ -203,18 +203,12 @@ def _linked_reset_events(conn: sqlite3.Connection, key: str) -> list:
 
 
 def _derive_claude_reset_cycles(conn: sqlite3.Connection, refs: list) -> list:
-    """One navigable entry per storage bucket, over its full retained span.
+    """Expand storage buckets into provider reset-defined cycles.
 
-    #703 + #707 §6.1. This used to CUT each bucket at every credit instant and
-    emit one reference per resulting cycle, so a credited week appeared in the
-    index two or three times. A credit is a counter discontinuity inside an
-    unchanged window, so there is one week to navigate to and the ladder inside
-    it is grouped by epoch in the DETAIL rather than split in the index.
-
-    The retained boundary span is still what defines the entry, because a
-    bucket's own reference can be narrower than the history it holds: an early
-    re-anchor keeps both boundaries under one ``week_start_date`` and only the
-    later one reaches ``get_recent_weeks``.
+    ``get_recent_weeks`` can split an in-place credit, but an early re-anchor
+    whose old and new boundaries both remain under one ``week_start_date``
+    only exposes the pre-reset half. The retained snapshot boundary set plus
+    ``week_reset_events`` is the authoritative reset ledger for both shapes.
     """
     out: list = []
     by_key: dict = {}
@@ -226,12 +220,21 @@ def _derive_claude_reset_cycles(conn: sqlite3.Connection, refs: list) -> list:
             out.append(template)
             continue
         start, end = outer
-        out.append(replace(
-            template,
-            week_start_at=start.isoformat(timespec="seconds"),
-            week_end_at=end.isoformat(timespec="seconds"),
-            week_end=(end - dt.timedelta(seconds=1)).date(),
-        ))
+        cuts = []
+        for event in _linked_reset_events(conn, key):
+            effective = _parse_optional_iso(event["effective_reset_at_utc"])
+            if effective is not None and start < effective < end:
+                cuts.append(effective)
+        boundaries = [start, *sorted(set(cuts)), end]
+        cycles = []
+        for cycle_start, cycle_end in zip(boundaries, boundaries[1:]):
+            cycles.append(replace(
+                template,
+                week_start_at=cycle_start.isoformat(timespec="seconds"),
+                week_end_at=cycle_end.isoformat(timespec="seconds"),
+                week_end=(cycle_end - dt.timedelta(seconds=1)).date(),
+            ))
+        out.extend(reversed(cycles))
     return _cctally()._apply_overlap_clamp_to_weekrefs(out)
 
 
@@ -283,33 +286,40 @@ def _claude_cycle_key(ref) -> str:
 
 
 def _claude_cycle_rows(conn: sqlite3.Connection, ref) -> list:
-    """Every milestone in this week, across every epoch (#703 + #707 §6.1).
-
-    This used to resolve the ONE epoch whose effective instant equalled the
-    reference's own start and return only its rows, which was coherent only
-    while the index cut a week into per-credit cycles. There is one entry per
-    week now, so the entry holds the whole week's ladder and the epoch is a
-    GROUPING inside it — `reset_event_id` on each row — rather than a filter
-    over it.
-
-    Ordered by epoch first so a consumer walking the list sees each segment's
-    ladder contiguously, and by the crossing instant inside a segment.
-    """
+    cohort_id = 0
+    if ref.week_start_at:
+        row = conn.execute(
+            "SELECT e.id FROM week_reset_events e "
+            "WHERE unixepoch(e.effective_reset_at_utc)=unixepoch(?) "
+            "AND (EXISTS ("
+            "  SELECT 1 FROM weekly_usage_snapshots s "
+            "  WHERE s.week_start_date=? AND ("
+            "    unixepoch(s.week_end_at)=unixepoch(e.old_week_end_at) OR "
+            "    unixepoch(s.week_end_at)=unixepoch(e.new_week_end_at)"
+            "  )"
+            ") OR EXISTS ("
+            "  SELECT 1 FROM percent_milestones m "
+            "  WHERE m.week_start_date=? AND ("
+            "    unixepoch(m.week_end_at)=unixepoch(e.old_week_end_at) OR "
+            "    unixepoch(m.week_end_at)=unixepoch(e.new_week_end_at)"
+            "  )"
+            ")) ORDER BY e.id DESC LIMIT 1",
+            (ref.week_start_at, ref.key, ref.key),
+        ).fetchone()
+        if row is not None:
+            cohort_id = int(row[0])
     return conn.execute(
         "SELECT * FROM percent_milestones WHERE week_start_date=? "
-        "ORDER BY reset_event_id ASC, unixepoch(captured_at_utc) ASC, "
-        "         percent_threshold ASC",
-        (ref.key,),
+        "AND reset_event_id=? "
+        "ORDER BY unixepoch(captured_at_utc) ASC, percent_threshold ASC",
+        (ref.key, cohort_id),
     ).fetchall()
 
 
 def _index_entry(conn, ref, current_cycle_key, tz) -> dict:
     rows = _claude_cycle_rows(conn, ref)
     milestone_count = len(rows)
-    # One segment per epoch present in the week's ladder. It was always 1,
-    # because the index cut the week into one entry per epoch; the entry covers
-    # the whole week now, so the count is what says how many ladders it holds.
-    segment_count = len({int(r["reset_event_id"] or 0) for r in rows})
+    segment_count = 1 if rows else 0
     max_captured = max((r["captured_at_utc"] for r in rows), default=None)
     start_z = _to_iso_z(ref.week_start_at)
     end_z = _to_iso_z(ref.week_end_at)
@@ -334,9 +344,8 @@ def _index_entry(conn, ref, current_cycle_key, tz) -> dict:
 def build_claude_week_index(conn: sqlite3.Connection) -> list:
     """Newest-first navigable Claude week index (spec §1a, §3).
 
-    ONE entry per subscription week (#703 + #707 §6.1). It used to be one per
-    effective reset-defined cycle, so a credited week appeared two or three
-    times in the navigation — for a week whose boundaries never moved.
+    One entry per effective reset-defined cycle. Multiple cycles may share one
+    storage ``week_start_date`` but always have distinct opaque keys.
     """
     refs = _navigable_claude_refs(conn)
     current_key = _current_claude_week_key(conn)
@@ -429,75 +438,8 @@ def _build_blocks(conn: sqlite3.Connection, start_iso, end_iso) -> list:
     return out
 
 
-def _group_rows_by_epoch(rows):
-    """``[(reset_event_id, rows)]`` in first-seen order.
-
-    First-seen rather than sorted, because the caller's query already orders by
-    `reset_event_id` and re-sorting here would silently accept a caller that
-    stopped doing so.
-    """
-    out: list = []
-    index: dict = {}
-    for row in rows:
-        epoch_id = int(row["reset_event_id"] or 0)
-        if epoch_id not in index:
-            index[epoch_id] = []
-            out.append((epoch_id, index[epoch_id]))
-        index[epoch_id].append(row)
-    return out
-
-
-def _load_week_dividers(conn: sqlite3.Connection, epoch_ids) -> list:
-    """One divider per segment AFTER the first, in segment order.
-
-    The client draws the full-width ``⚡ CREDIT`` row from ``dividers[si - 1]``,
-    so this list is index-aligned with ``segments[1:]`` by construction: a
-    shorter list would pair a credit with the wrong ladder, and an empty one
-    (what this returned before) makes the divider branch unreachable and leaves
-    two ladders rendering as a single table whose percent column restarts
-    partway down with no separator.
-
-    The published instant is the ACCOUNTING one, ``COALESCE(observed_at_utc,
-    effective_reset_at_utc)``, and the wire key keeps the name the client
-    already reads. The accounting instant is the one that decides which segment
-    a milestone joins (§5.3 resolves a capture's epoch against it), so it is the
-    real boundary between the two ladders. ``effective_reset_at_utc`` is
-    hour-floored and can sit up to an hour earlier, which would print a divider
-    timestamped BEFORE the pre-credit row above it — the same backwards reading
-    the grouping exists to prevent.
-
-    An epoch id that resolves to no row contributes ``None`` rather than being
-    dropped, because dropping it would shift every later divider onto the wrong
-    segment. The client's own ``if (d)`` guard renders nothing for it.
-    """
-    ids = [int(e) for e in epoch_ids]
-    if not ids:
-        return []
-    placeholders = ",".join("?" * len(ids))
-    rows = conn.execute(
-        "SELECT id, observed_pre_credit_pct, "
-        "       COALESCE(observed_at_utc, effective_reset_at_utc) "
-        "         AS accounting_at "
-        "  FROM week_reset_events WHERE id IN (" + placeholders + ")",
-        tuple(ids),
-    ).fetchall()
-    by_id = {int(r["id"]): r for r in rows}
-    out: list = []
-    for epoch_id in ids:
-        row = by_id.get(epoch_id)
-        if row is None or not row["accounting_at"]:
-            out.append(None)
-            continue
-        prior = row["observed_pre_credit_pct"]
-        out.append({
-            "effective_at_utc": _to_iso_z(row["accounting_at"]),
-            "prior_percent": None if prior is None else float(prior),
-        })
-    return out
-
-
 def build_claude_week_detail(conn: sqlite3.Connection, key: str) -> "dict | None":
-    """Complete payload for one Claude subscription week, grouped by epoch."""
+    """Complete payload for one reset-defined Claude cycle."""
     refs = _navigable_claude_refs(conn)
     ref = next((candidate for candidate in refs if _claude_cycle_key(candidate) == key), None)
     if ref is None:
@@ -506,32 +448,13 @@ def build_claude_week_detail(conn: sqlite3.Connection, key: str) -> "dict | None
     rows = _claude_cycle_rows(conn, ref)
     # Same absent-boundary case `_claude_cycle_key` handles, and this call runs
     # unconditionally, ahead of the `if rows` guard below.
-    # #703 + #707 §6.1: the DETAIL groups by epoch. One entry covers the whole
-    # week now, and a credited week holds two ladders that each start at their
-    # own floor — concatenating them into one list would read as a single
-    # ladder that goes backwards. `_claude_cycle_rows` returns the rows already
-    # ordered by `reset_event_id`, so the grouping preserves that order.
-    #
-    # The segment key still carries the reference's boundaries plus the epoch,
-    # so two segments of one week can never collide, and a week with exactly
-    # one epoch keeps the shape it had.
-    segments = []
-    epoch_ids: list = []
-    for epoch_id, group in _group_rows_by_epoch(rows):
-        epoch_ids.append(epoch_id)
-        segments.append({
-            "key": dashboard_resource_key(
-                "milestone_segment", "claude", ref.key,
-                ref.week_start_at or None, ref.week_end_at or None,
-                str(epoch_id),
-            ),
-            "milestones": [_shape_weekly_milestone(r) for r in group],
-        })
-    # The credit that OPENED each segment after the first. The rows are ordered
-    # by `reset_event_id`, and the pre-credit sentinel 0 sorts first, so the
-    # tail of `epoch_ids` is exactly the credited epochs in the order their
-    # ladders appear.
-    dividers = _load_week_dividers(conn, epoch_ids[1:])
+    segment_key = dashboard_resource_key(
+        "milestone_segment", "claude", ref.key,
+        ref.week_start_at or None, ref.week_end_at or None,
+    )
+    segments = ([{"key": segment_key,
+                  "milestones": [_shape_weekly_milestone(r) for r in rows]}]
+                if rows else [])
     blocks = _build_blocks(conn, entry["start_at_utc"], entry["end_at_utc"])
 
     return {
@@ -543,7 +466,7 @@ def build_claude_week_detail(conn: sqlite3.Connection, key: str) -> "dict | None
         "is_current": entry["is_current"],
         "detail_stamp": entry["detail_stamp"],
         "segments": segments,
-        "dividers": dividers,
+        "dividers": [],
         "blocks": blocks,
     }
 
@@ -1192,12 +1115,6 @@ def build_codex_cycle_detail(
             ),
             "milestones": milestones,
         }],
-        # One divider per segment after the first, which for a single segment is
-        # none. A Codex weekly reset ENDS the cycle rather than crediting a
-        # counter inside one, so a Codex cycle holds exactly one ladder and
-        # there is no in-cycle boundary to draw. The Claude path publishes a
-        # populated list for the same rule; this list is empty because the rule
-        # yields nothing here, not because the site was left unimplemented.
         "dividers": [],
         "blocks": blocks,
     }

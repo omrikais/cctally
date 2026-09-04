@@ -28,8 +28,8 @@
     }
   },
   "envelope": {
-    "bytes": 168609,
-    "stable_sha256": "5ed605bc4fd80cf5b099d97cca0c71110bc8acde87bc789f2fe9f1c8622cf04e",
+    "bytes": 168401,
+    "stable_sha256": "709ca8cc2b2ec7e263b7342fcf28992a6b51fce76bdb1d6d4cd385c48c4db7a8",
     "stable_excludes": [
       "data_version",
       "doctor",

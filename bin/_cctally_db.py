@@ -190,132 +190,6 @@ def add_column_if_missing(
     return True
 
 
-# --------------------------------------------------------------------------
-# week_reset_events reshape for the unified credit record (#703 + #707)
-# --------------------------------------------------------------------------
-#
-# The unified credit record changed `week_reset_events` in three ways that
-# `CREATE TABLE IF NOT EXISTS` cannot deliver to a store whose table already
-# exists: six fact columns were added, both boundary columns became nullable,
-# and the row constraint moved from the boundary pair to
-# `(account_key, credit_key)`. Only a rename-recreate-copy applies all three.
-#
-# The epoch bump alone covers ONE of the two upgrade paths. A store above
-# `LEGACY_STATS_HEAD` defers to a rebuild that materializes a fresh scratch
-# index through the current DDL, so it arrives correct. A PRE-CUTOVER store at
-# `user_version <= 13` takes the other path: the schema apply is a no-op
-# against the table that is already there, the cutover stamps the new epoch in
-# place, and every later open fast-returns at the epoch gate before any schema
-# work runs. Without this reshape such a store REPORTS the current epoch while
-# missing every fact column and keeping both NOT NULL boundaries — a state with
-# no path back, in which the manual credit fold, the automatic fold and every
-# fact read raise.
-#
-# `add_column_if_missing` is not sufficient on its own, because it cannot relax
-# a NOT NULL constraint or replace a UNIQUE, and the manual fold inserts NULL
-# into both boundary columns.
-#
-# Split in two so the canonical DDL has exactly one copy — the one in
-# `_cctally_core.open_db`. `begin_week_reset_events_reshape` renames the legacy
-# table out of the way; the caller's own `CREATE TABLE IF NOT EXISTS` then
-# builds the current shape; `finish_week_reset_events_reshape` copies the rows
-# across and drops the legacy table. `sqlite_master.sql` for the recreated
-# table is therefore byte-identical to a freshly created one, which the rebuild
-# validator's schema fingerprint requires.
-
-#: Where the pre-reshape table is parked between the two halves. A leftover
-#: under this name means a previous attempt crashed after the rename; the next
-#: open resumes from it rather than starting over.
-WEEK_RESET_EVENTS_RESHAPE_OLD = "week_reset_events_pre_1012"
-
-#: Presence of these decides whether a reshape is needed. They arrived together
-#: with the nullability and constraint changes, so any store missing them is a
-#: store that predates all three.
-_WEEK_RESET_EVENTS_FACT_COLUMNS = frozenset({
-    "week_start_date", "observed_at_utc", "confirming_capture_at_utc",
-    "observed_post_credit_pct", "credit_key", "credit_order",
-})
-
-
-def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-    ).fetchone() is not None
-
-
-def begin_week_reset_events_reshape(conn: sqlite3.Connection) -> bool:
-    """Park a pre-#703 `week_reset_events` aside; return whether one is parked.
-
-    Returns True when the caller must call `finish_week_reset_events_reshape`
-    after creating the current-shape table — either because this call renamed a
-    legacy table, or because a previous attempt already did and crashed before
-    copying.
-    """
-    if _table_exists(conn, WEEK_RESET_EVENTS_RESHAPE_OLD):
-        return True
-    if not _table_exists(conn, "week_reset_events"):
-        return False
-    cols = {
-        str(r[1])
-        for r in conn.execute("PRAGMA table_info(week_reset_events)").fetchall()
-    }
-    if _WEEK_RESET_EVENTS_FACT_COLUMNS <= cols:
-        return False
-    conn.execute(
-        f"ALTER TABLE week_reset_events "
-        f"RENAME TO {WEEK_RESET_EVENTS_RESHAPE_OLD}"
-    )
-    return True
-
-
-def finish_week_reset_events_reshape(conn: sqlite3.Connection) -> None:
-    """Copy the parked rows into the current-shape table and drop the parked one.
-
-    `id` is copied explicitly. `percent_milestones.reset_event_id` names a
-    credit by that identifier and the foreign keys in this codebase are
-    documentation-only, so letting AUTOINCREMENT renumber the rows would
-    silently re-point every milestone at a different credit with nothing
-    raising.
-
-    Columns present only on the legacy table are dropped and columns present
-    only on the new one arrive NULL, which is the honest value: NULL on a fact
-    column means the row predates the change, exactly as it does for a legacy
-    `wr:` event replayed on the rebuild path.
-
-    The parked table's indexes followed it through the rename and still hold
-    the `idx_week_reset_events_*` names, so `DROP TABLE` here is what frees
-    those names for the caller's own `CREATE INDEX IF NOT EXISTS` to rebuild
-    them against the new table. Dropping them any later would leave the new
-    table unindexed while the statements that would have built them no-op.
-    """
-    if not _table_exists(conn, WEEK_RESET_EVENTS_RESHAPE_OLD):
-        return
-    old_cols = [
-        str(r[1])
-        for r in conn.execute(
-            f"PRAGMA table_info({WEEK_RESET_EVENTS_RESHAPE_OLD})").fetchall()
-    ]
-    new_cols = {
-        str(r[1])
-        for r in conn.execute("PRAGMA table_info(week_reset_events)").fetchall()
-    }
-    shared = [name for name in old_cols if name in new_cols]
-    projection = ", ".join(f'"{name}"' for name in shared)
-    if conn.in_transaction:
-        conn.commit()
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        conn.execute(
-            f"INSERT INTO week_reset_events ({projection}) "
-            f"SELECT {projection} FROM {WEEK_RESET_EVENTS_RESHAPE_OLD}"
-        )
-        conn.execute(f"DROP TABLE {WEEK_RESET_EVENTS_RESHAPE_OLD}")
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-
-
 # === Region 2: Migration framework + dispatcher (was bin/cctally:10952-11229) ===
 
 _MIGRATION_NAME_RE = re.compile(r"^\d{3}_[a-z0-9_]+$")
@@ -531,6 +405,12 @@ _SQLITE_CORRUPTION_MESSAGES = (
     "file is not a database",
     "malformed database schema",
 )
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone() is not None
 
 
 def _is_sqlite_corruption_error(value: object) -> bool:
@@ -3506,13 +3386,6 @@ def _migration_observed_pre_credit_pct(conn: sqlite3.Connection) -> None:
         ``observed_pre_credit_pct = prior_pct``; race-defensive DELETE
         switches from ``round(weekly_percent,1) = round(?,1)`` to
         ``ABS(weekly_percent - ?) < 1.0``.
-
-    That companion predicate is HISTORY, not current behaviour: #703 + #707
-    replaced the tolerance band with the evidence rules in
-    ``bin/_lib_credit_selection.py``, because the band compared the stored
-    percent against a remembered level rather than against evidence. The column
-    this migration adds is still written and still read; only the predicate that
-    consumed it changed.
 
     Idempotent: a second invocation finds the column already present
     and returns. Empty-column fast path: when the live CREATE TABLE

@@ -58,7 +58,14 @@ function weeklyVocabulary(source: DashboardSelection) {
       column: 'Provider period', nav: 'provider period' as const,
     };
   }
-  return { plural: 'weeks', noun: 'week', window: 'Subscription window', column: 'Week', nav: undefined };
+  // Claude counts in CYCLES for the same reason `WeeklyPanel` does: a quota
+  // credit ends one billing cycle and begins another inside the same week, so
+  // "last 12 weeks" would name twelve weeks over a shorter span. The column
+  // counts in cycles too, because it shows each row's own start and the
+  // second segment of a credited week starts at the credit, not at the week.
+  // Only `window` stays week-flavoured: that names the subscription window,
+  // which the credit genuinely does not rename.
+  return { plural: 'cycles', noun: 'cycle', window: 'Subscription window', column: 'Cycle', nav: undefined };
 }
 
 interface Keyed { key: string; nav: PeriodNavRow; period: PeriodRow; }

@@ -126,10 +126,6 @@ export interface TrendChartDatum {
   spark_height?: number | null;
   cost_usd?: number | null;   // S3 (#264): weekly cost, for the modal Cost column
   account_labels?: string[];
-  // #703 + #707 §6.3 — why `dollar_per_pct` is null on a credited week. The
-  // `$/1%` column of both trend tables renders it; an em-dash there reads as
-  // "no usage recorded", which is wrong about a week that holds a credit.
-  dollar_per_pct_withheld?: string | null;
 }
 
 export function buildTrendSparkData(env: Envelope | null): TrendChartDatum[] {
@@ -148,7 +144,6 @@ export function buildTrendSparkData(env: Envelope | null): TrendChartDatum[] {
     is_current: w.is_current,
     spark_height: trend.spark_heights?.[i],
     cost_usd: w.cost_usd ?? null,
-    dollar_per_pct_withheld: w.dollar_per_pct_withheld ?? null,
     ...(w.account_labels ? { account_labels: w.account_labels } : {}),
   }));
 }
@@ -163,7 +158,6 @@ export function buildTrendHistoryData(env: Envelope | null): TrendChartDatum[] {
     delta: w.delta,
     is_current: w.is_current,
     cost_usd: w.cost_usd ?? null,
-    dollar_per_pct_withheld: w.dollar_per_pct_withheld ?? null,
     ...(w.account_labels ? { account_labels: w.account_labels } : {}),
   }));
 }

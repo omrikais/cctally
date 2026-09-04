@@ -276,25 +276,29 @@ def test_mythos_drains_the_general_weekly_quota():
     assert qm.normalize_family("claude-mythos-preview") == "claude-mythos-5"
 
 
-def test_fable_and_mythos_point_releases_resolve_to_their_base_family():
-    # The -1 spellings are separate ids in CLAUDE_MODEL_PRICING because their
-    # cache-read rate differs, but they drain the weekly meter on the same
-    # terms as their base family, so they resolve to it rather than minting a
-    # family whose composition support would have to rebuild from nothing.
-    # Mutation: dropping either alias, which resolves the spelling to None and
-    # gives every week containing that usage an unsupported composition.
-    assert qm.normalize_family("claude-fable-5-1") == "claude-fable-5"
-    assert qm.normalize_family("claude-mythos-5-1") == "claude-mythos-5"
-    assert qm.family_participation(
-        qm.normalize_family("claude-fable-5-1")) == "general"
-    assert qm.family_participation(
-        qm.normalize_family("claude-mythos-5-1")) == "general"
+def test_fable_and_mythos_point_releases_are_their_own_families():
+    # Pooling would assert that per-unit consumption is EQUAL, which the
+    # operator's statement about the meter does not establish, and it would
+    # make a Fable 5 to 5.1 substitution invisible on the one axis built to
+    # notice it. Mutation: aliasing either -1 spelling onto its base family.
+    assert qm.normalize_family("claude-fable-5-1") == "claude-fable-5-1"
+    assert qm.normalize_family("claude-mythos-5-1") == "claude-mythos-5-1"
+    assert qm.family_participation("claude-fable-5-1") == "general"
+    assert qm.family_participation("claude-mythos-5-1") == "general"
+    assert qm.normalize_family("claude-mythos-preview") == "claude-mythos-5"
+
+
+def test_point_release_participation_carries_its_operator_provenance():
+    # Mutation: promoting either family to "general" without recording where
+    # the fact came from, which is what FAMILY_PROVENANCE exists to prevent.
+    for family in ("claude-fable-5-1", "claude-mythos-5-1"):
+        assert "operator-supplied" in qm.FAMILY_PROVENANCE[family]
 
 
 def test_a_day_of_only_fable_point_one_usage_is_not_withheld():
-    # The observable consequence of the aliases above: without them this day
-    # carries UNSUPPORTED_COMPOSITION and never reaches any fit, and its share
-    # is attributed to the base family rather than to a new one.
+    # The observable consequence of the catalogue entries above: without them
+    # this day carries UNSUPPORTED_COMPOSITION and never reaches any fit, and
+    # the share is attributed to the 5.1 family in its own right.
     snaps = [_snap(1, 10.0), _snap(5, 20.0)]
     segs = qm.build_segments(snaps, [])
     e = qm.EntryRecord(at=DAY.replace(hour=3), model="claude-fable-5-1",
@@ -303,7 +307,7 @@ def test_a_day_of_only_fable_point_one_usage_is_not_withheld():
     obs = qm.build_daily_series(segs, [e], now=DAY + dt.timedelta(days=2),
                                 newest_entry_at=DAY + dt.timedelta(days=2))
     assert [o.cause for o in obs] == [None]
-    assert obs[0].family_shares == {"claude-fable-5": pytest.approx(1.0)}
+    assert obs[0].family_shares == {"claude-fable-5-1": pytest.approx(1.0)}
 
 
 def test_mythos_participation_carries_its_operator_provenance():
@@ -430,26 +434,17 @@ def test_a_percentage_decrease_alone_never_forks_a_segment():
     assert len(qm.build_segments(snaps, [])) == 1
 
 
-def test_an_authoritative_credit_forks_without_reanchoring():
-    """#703 + #707 §2: an Anthropic credit of ANY size leaves the week's
-    boundaries where they were, so it cuts a segment and re-anchors nothing.
-
-    This test used to assert the opposite for a >=25pp credit, which is the
-    behaviour that grew a second `weekly` row for one unchanged subscription
-    week in the 2026-09-01 incident.
-    """
+def test_an_authoritative_reset_forks_and_reanchors():
     snaps = [_snap(h, p) for h, p in ((1, 10.0), (5, 20.0))]
-    cr = [qm.CreditRecord(DAY.replace(hour=3), "credit")]
+    cr = [qm.CreditRecord(DAY.replace(hour=3), "reset")]
     segs = qm.build_segments(snaps, cr)
-    assert len(segs) == 2
-    assert segs[1].restarted is False
-    assert segs[1].week_anchor == segs[0].week_anchor
-    assert segs[1].week_anchor != qm.canonical_week_anchor(DAY.replace(hour=3))
+    assert len(segs) == 2 and segs[1].restarted is True
+    assert segs[1].week_anchor == DAY.replace(hour=3)
 
 
-def test_a_credit_forks_without_reanchoring_the_week():
-    # No credit re-anchors (#703 + #707 §2). Mutation: anchoring the successor
-    # from the credit instant.
+def test_a_floor_credit_forks_without_reanchoring_the_week():
+    # `record-credit` deliberately does not re-anchor, unlike a >=25pp
+    # auto-credit. Mutation: treating both credit paths the same.
     #
     # The two rows carry DIFFERENT raw week-start spellings that canonicalize
     # to one anchor, and that anchor is neither the module default nor the
@@ -462,7 +457,7 @@ def test_a_credit_forks_without_reanchoring_the_week():
     credit_at = DAY.replace(hour=3)
     snaps = [qm.SnapshotRecord(DAY.replace(hour=1), jitter_a, 10.0, "api", 1),
              qm.SnapshotRecord(DAY.replace(hour=5), jitter_b, 20.0, "api", 2)]
-    segs = qm.build_segments(snaps, [qm.CreditRecord(credit_at, "credit")])
+    segs = qm.build_segments(snaps, [qm.CreditRecord(credit_at, "floor")])
     assert len(segs) == 2
     assert segs[1].restarted is False
     assert segs[0].week_anchor == expected
@@ -494,16 +489,13 @@ def test_the_snapshot_tie_break_falls_through_to_ascending_rowid():
     assert [r.rowid for r in segs[0].rows] == [3, 7]
 
 
-def test_a_credit_straddling_the_rounding_boundary_forks_once():
-    # Section 27. Anchoring the successor from the credit instant while the next
-    # row was compared against its OWN canonical anchor made a credit at 03:29
-    # (rounding down to 03:00) with post-credit rows recording 03:31 (rounding
-    # up to 04:00) fork a spurious third segment. Section 2 measured a 29-minute
-    # spread of anchor spellings, so straddling the boundary is realistic.
-    #
-    # #703 + #707 removed the credit-derived anchor entirely, so the successor
-    # keeps the row's own anchor and the two can no longer disagree. The single
-    # fork is still what this pins.
+def test_a_reset_credit_straddling_the_rounding_boundary_forks_once():
+    # Section 27. A reset anchors the successor from the credit instant while
+    # the next row is compared against its OWN canonical anchor, so a credit
+    # at 03:29 (rounding down to 03:00) with post-reset rows recording 03:31
+    # (rounding up to 04:00) forked a spurious third segment that also lost
+    # `restarted`. Section 2 measured a 29-minute spread of anchor spellings,
+    # so straddling the boundary is realistic.
     old_week = dt.datetime(2026, 7, 25, 8, 0, tzinfo=UTC)
     new_week = dt.datetime(2026, 8, 1, 3, 31, tzinfo=UTC)
     credit_at = dt.datetime(2026, 8, 1, 3, 29, tzinfo=UTC)
@@ -514,30 +506,45 @@ def test_a_credit_straddling_the_rounding_boundary_forks_once():
     rows += [qm.SnapshotRecord(dt.datetime(2026, 8, 1, h, tzinfo=UTC),
                                new_week, p, "api", n + 2)
              for n, (h, p) in enumerate(((4, 3.0), (5, 6.0), (6, 9.0)))]
-    segs = qm.build_segments(rows, [qm.CreditRecord(credit_at, "credit")])
+    segs = qm.build_segments(rows, [qm.CreditRecord(credit_at, "reset")])
     assert len(segs) == 2
-    assert segs[1].restarted is False
-    assert segs[1].week_anchor == qm.canonical_week_anchor(new_week)
+    assert segs[1].restarted is True
+    assert segs[1].week_anchor == dt.datetime(2026, 8, 1, 3, tzinfo=UTC)
     assert len(segs[1].rows) == 3
 
 
-def test_several_credits_between_two_rows_fork_once_without_reanchoring():
-    """Section 27's kind-preference rule is gone with the kinds.
-
-    The loop used to prefer the last RESET among several spanned credits over
-    the last credit, because a reset re-anchored and a floor did not. No credit
-    re-anchors now, so there is no stronger kind to prefer and the successor
-    keeps the row's own anchor whatever the order.
-    """
+def test_a_reset_followed_by_a_floor_between_two_rows_still_reanchors():
+    # Section 27: the loop kept only the LAST crossed credit, so a reset
+    # followed by a floor was filed as a floor and the week was not
+    # re-anchored — which section 5 keeps deliberately distinct.
     rows = [_snap(1, 40.0), _snap(5, 6.0)]
-    credits = [qm.CreditRecord(DAY.replace(hour=2), "credit"),
-               qm.CreditRecord(DAY.replace(hour=3), "credit")]
+    credits = [qm.CreditRecord(DAY.replace(hour=2), "reset"),
+               qm.CreditRecord(DAY.replace(hour=3), "floor")]
+    segs = qm.build_segments(rows, credits)
+    assert len(segs) == 2
+    assert segs[1].restarted is True
+    assert segs[1].week_anchor == DAY.replace(hour=2)
+
+
+def test_a_floor_followed_by_a_reset_reanchors_from_the_reset():
+    # The mirror order, so the fix cannot be "always take the first credit".
+    rows = [_snap(1, 40.0), _snap(5, 6.0)]
+    credits = [qm.CreditRecord(DAY.replace(hour=2), "floor"),
+               qm.CreditRecord(DAY.replace(hour=3), "reset")]
+    segs = qm.build_segments(rows, credits)
+    assert len(segs) == 2
+    assert segs[1].restarted is True
+    assert segs[1].week_anchor == DAY.replace(hour=3)
+
+
+def test_two_floor_credits_between_two_rows_fork_once_without_reanchoring():
+    rows = [_snap(1, 40.0), _snap(5, 6.0)]
+    credits = [qm.CreditRecord(DAY.replace(hour=2), "floor"),
+               qm.CreditRecord(DAY.replace(hour=3), "floor")]
     segs = qm.build_segments(rows, credits)
     assert len(segs) == 2
     assert segs[1].restarted is False
     assert segs[1].week_anchor == segs[0].week_anchor
-    assert segs[1].week_anchor != qm.canonical_week_anchor(DAY.replace(hour=2))
-    assert segs[1].week_anchor != qm.canonical_week_anchor(DAY.replace(hour=3))
 
 
 def test_a_new_week_anchor_forks_a_segment():

@@ -213,22 +213,13 @@ def test_apply_credit_as_of_and_txn_neutral(ns):
     try:
         ns["_apply_credit"](conn, plan, as_of=_THREE_DAYS_AGO, commit=False)
         assert conn.in_transaction, "commit=False must leave the txn uncommitted"
-        # The synthetic post-credit snapshot lands on the CALLER's connection,
-        # uncommitted, which is what txn-neutrality means on this path.
         row = conn.execute(
-            "SELECT weekly_percent FROM weekly_usage_snapshots "
-            "WHERE week_start_date = ? AND source = 'record-credit'",
+            "SELECT applied_at_utc FROM weekly_credit_floors "
+            "WHERE week_start_date = ?",
             ("2026-01-01",),
         ).fetchone()
         assert row is not None
-        assert float(row[0]) == 40.0
-        # #703 + #707: `_apply_credit` no longer materializes the credit RECORD
-        # at all. The op fold owns it, and it stamps `as_of` there; a second
-        # INSERT here would be the second materialization unification removes.
-        assert conn.execute(
-            "SELECT COUNT(*) FROM weekly_credit_floors").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM week_reset_events").fetchone()[0] == 0
+        assert row[0] == _THREE_DAYS_AGO
     finally:
         conn.close()
 

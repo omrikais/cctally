@@ -71,7 +71,7 @@ Database
         conversations_quick_check: None
   ✓ Version ahead            none ahead
       details:
-        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1012, 'mismatch': False}
+        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1011, 'mismatch': False}
         cache.db: {'user_version': 0, 'registry_size': 45, 'ahead': False}
   ✓ Migrations               0/58 applied
       details:
@@ -260,6 +260,7 @@ Pricing
       details:
         unpriced: []
         fallback: []
+  ✓ Rollup writer            no refused pricing write recorded
 Quota
   ✓ Metering rate            not assessed
       → Run `cctally quota` for the current assessment.
@@ -301,4 +302,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 59 OK · 5 WARN · 0 FAIL
+Summary: 60 OK · 5 WARN · 0 FAIL

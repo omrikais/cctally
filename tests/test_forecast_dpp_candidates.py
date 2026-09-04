@@ -56,14 +56,8 @@ def _conn():
     conn.execute(
         "CREATE TABLE weekly_credit_floors (week_start_date TEXT,"
         " effective_at_utc TEXT)")
-    # #703 + #707 added the accounting facts the boundary reducer reads:
-    # `week_start_date` selects a credit by the WEEK it names, and
-    # `observed_at_utc` is the EXACT instant a segment boundary sits at. A
-    # fixture without them makes every read fail closed.
     conn.execute(
-        "CREATE TABLE week_reset_events (effective_reset_at_utc TEXT,"
-        " old_week_end_at TEXT, new_week_end_at TEXT,"
-        " week_start_date TEXT, observed_at_utc TEXT)")
+        "CREATE TABLE week_reset_events (effective_reset_at_utc TEXT)")
     return conn
 
 

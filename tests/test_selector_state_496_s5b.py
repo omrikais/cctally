@@ -46,7 +46,7 @@ def _open_stats(core, tmp_path, name="scratch-stats.db"):
 def test_current_epoch_creates_the_four_selector_tables(core, tmp_path):
     conn = _open_stats(core, tmp_path)
     try:
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1012
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1011
         names = {
             row[0]
             for row in conn.execute(

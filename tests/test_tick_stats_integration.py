@@ -115,8 +115,17 @@ def _private_frontier_corpus(data_dir, tmp_path, bbf):
     walk-complete sentinel.  Frontier integration tests need a genuinely
     self-contained cache, not a copied database whose source estate lives
     elsewhere.
+
+    ``conversations.db`` is rederived for the same reason and one more: the
+    frontier tests take their ``roots`` from ``conversation_source_files.path``,
+    so a copied conversations database aims them at the SESSION-SCOPED corpus
+    that every xdist worker shares.  ``plan_provider`` stats those roots, and a
+    write by any other worker then trips its ``filesystem_changed`` guard and
+    degrades the plan to ``full`` — a cross-worker race whose victim is
+    whichever test happens to be between its seed and its plan.
     """
     corpus = _private_corpus(data_dir, tmp_path)
+    private_root = pathlib.Path(corpus).parent
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -124,6 +133,27 @@ def _private_frontier_corpus(data_dir, tmp_path, bbf):
             assert cctally.sync_codex_cache(conn, rebuild=True).full_walk_complete
         finally:
             conn.close()
+        conv = cctally.open_conversations_db()
+        try:
+            cctally.sync_claude_conversations(conv, rebuild=True)
+            cctally.sync_codex_conversations(conv, rebuild=True)
+            # Fail here, deterministically, rather than inside whichever test
+            # later draws a root from this table: a path outside the private
+            # tree IS the cross-worker race, and it is invisible at the point
+            # it actually causes a failure.
+            stray = [
+                row[0]
+                for row in conv.execute(
+                    "SELECT path FROM conversation_source_files WHERE path LIKE '/%'"
+                )
+                if not str(row[0]).startswith(str(private_root))
+            ]
+            assert not stray, (
+                "conversation_source_files still points outside the private "
+                f"corpus {private_root}: {stray[:3]}"
+            )
+        finally:
+            conv.close()
     return corpus
 
 

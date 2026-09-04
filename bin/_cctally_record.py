@@ -173,7 +173,7 @@ import re
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass, field, replace as dc_replace
+from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 
@@ -203,9 +203,6 @@ from _cctally_core import (
     _as_of_or_command,
 )
 import _lib_accounts  # pure stdlib kernel; UNATTRIBUTED sentinel default (#341)
-import _lib_credit_identity  # pure stdlib kernel; credit_key / credit_order (#703)
-import _lib_credit_selection  # pure stdlib kernel; the two replica selectors (#703)
-import _lib_journal  # pure stdlib kernel; evt_id natural-key builder
 from _lib_five_hour import _canonical_5h_window_key, five_hour_milestone_range
 from _lib_pricing import _calculate_entry_cost, claude_usage_dict
 from _lib_codex_hooks import (
@@ -343,11 +340,6 @@ def get_latest_cost_for_week(*args, **kwargs):
 
 def get_max_milestone_for_week(*args, **kwargs):
     return sys.modules["cctally"].get_max_milestone_for_week(*args, **kwargs)
-
-
-def get_max_journaled_milestone_for_segment(*args, **kwargs):
-    return sys.modules["cctally"].get_max_journaled_milestone_for_segment(
-        *args, **kwargs)
 
 
 def get_milestone_cost_for_week(*args, **kwargs):
@@ -681,50 +673,35 @@ def maybe_record_milestone(
     if own_conn:
         conn = open_db()
     try:
-        # Resolve the credit epoch governing THIS captured moment, through the
-        # ONE shared resolver (#703 + #707 §5.3). 0 stays the pre-credit /
-        # no-credit sentinel.
-        #
-        # Two things changed here and both were defects. The lookup was keyed on
-        # `new_week_end_at`, which a MANUAL credit leaves NULL — so a manual
-        # credit opened no epoch at all, which is the missing reference
-        # unification removes. And it ordered by `id DESC`, which a rebuild
-        # reassigns and which the rebuild's fold-family sort can put in the
-        # opposite order from the real chronology, so a reader could show a
-        # different epoch from the one this writer stamped.
+        # Resolve the active segment for THIS captured moment. The segment
+        # is the latest week_reset_events row keyed on week_end_at whose
+        # effective_reset_at_utc <= captured_at; 0 = pre-credit / no-event
+        # sentinel. ``unixepoch()`` normalizes the comparison across mixed
+        # +00:00 / Z offsets (see precedent at bin/cctally:_compute_block_totals
+        # cross-reset detection; also project gotcha
+        # ``unixepoch_for_cross_offset_compare``).
         captured_at_iso = saved.get("capturedAt") or as_of or now_utc_iso()
         reset_event_id = 0
         reset_effective_iso = None
-        seg_row = _lib_credit_selection.resolve_weekly_credit_epoch(
-            conn, week_start_date=week_start_date, account_key=account_key,
-            captured_at=captured_at_iso, week_end_at=week_end_at)
-        if seg_row is not None:
-            reset_event_id = int(seg_row["id"])
-            # The ACCOUNTING instant, not the hour-floored display one: the
-            # seeding guard and the cost range both measure from where the
-            # credit was observed.
-            reset_effective_iso = seg_row["accounting_at"]
+        if week_end_at:
+            seg_row = conn.execute(
+                """
+                SELECT id, effective_reset_at_utc FROM week_reset_events
+                 WHERE new_week_end_at = ?
+                   AND account_key = ?
+                   AND unixepoch(effective_reset_at_utc) <= unixepoch(?)
+                 ORDER BY id DESC LIMIT 1
+                """,
+                (week_end_at, account_key, captured_at_iso),
+            ).fetchone()
+            if seg_row is not None:
+                reset_event_id = int(seg_row["id"])
+                reset_effective_iso = seg_row["effective_reset_at_utc"]
 
         max_existing = get_max_milestone_for_week(
             conn, week_start_date, reset_event_id=reset_event_id,
             account_key=account_key,
         )
-        # A milestone row can leave the table without its event leaving the
-        # journal: the `weekly_replica_suppression` applier removes the
-        # dependents of a stale replica, and `--force` removes the dependents of
-        # the occurrence it replaces. The segment's forward-only mark is
-        # therefore the higher of the two, because re-deriving a threshold whose
-        # identity is already journaled produces a same-revision divergence that
-        # the emitter withholds and whose convergence cannot succeed — the
-        # journaled event references the deleted snapshot. See
-        # `get_max_journaled_milestone_for_segment` for the cost this pays.
-        journaled_max = get_max_journaled_milestone_for_segment(
-            conn, week_start_date, reset_event_id=reset_event_id,
-            account_key=account_key,
-        )
-        if journaled_max is not None:
-            max_existing = (journaled_max if max_existing is None
-                            else max(max_existing, journaled_max))
         if max_existing is not None and current_floor <= max_existing:
             return
 
@@ -742,20 +719,14 @@ def maybe_record_milestone(
         # ladder started at a threshold the meter said had not been crossed
         # and every genuine crossing below 13 in that epoch was foreclosed.
         #
-        # The evidence is a stored observation inside this epoch, compared
-        # against what the credit RECORDED (#703 + #707 §5.2). When the row
-        # carries `observed_post_credit_pct` the comparison is "at or below the
-        # credited level", because the credit itself says where the counter
-        # stood; when it does not, the comparison falls back to the #706 rule of
-        # "strictly below the threshold being recorded". Neither is a tolerance
-        # band around `observed_pre_credit_pct`: that comparison is what let the
-        # stale replica survive in the first place (issue #703).
-        #
-        # The epoch's lower bound is the governing credit's ACCOUNTING instant —
-        # `COALESCE(observed_at_utc, effective_reset_at_utc)`, the same value
-        # `reset_event_id` was resolved against — so the window and the epoch
-        # cannot disagree. Using the hour-floored display instant here is what
-        # placed a genuine pre-credit reading inside the epoch on 2026-09-01.
+        # The evidence is a stored observation inside this epoch whose floored
+        # percent is strictly BELOW the threshold about to be recorded. It is
+        # deliberately NOT a tolerance band around `observed_pre_credit_pct`:
+        # that comparison is what let the stale replica survive in the first
+        # place (issue #703), and repeating it here would inherit the same
+        # failure mode. The epoch's lower bound is the governing event's own
+        # `effective_reset_at_utc`, which is the same instant `reset_event_id`
+        # was resolved against, so the window and the epoch cannot disagree.
         if reset_event_id != 0 and max_existing is None:
             # A bare aggregate SELECT always returns exactly one row, holding
             # NULL when nothing matched, so there is no empty-result case to
@@ -768,17 +739,14 @@ def maybe_record_milestone(
                 (week_start_date, account_key, reset_effective_iso,
                  captured_at_iso),
             ).fetchone()[0]
-            landed = seg_row["observed_post_credit_pct"] if seg_row else None
             if not post_reset_seed_has_climb_evidence(
-                lowest_in_epoch, current_floor, post_credit_pct=landed
+                lowest_in_epoch, current_floor
             ):
-                bound = (f"at or below the credited {landed}%"
-                         if landed is not None else f"below {current_floor}%")
                 eprint(
                     "[milestone] skipping this crossing — the post-reset "
-                    f"segment {reset_event_id} has no observation {bound}, so "
-                    f"a {current_floor}% seed would come from a stale "
-                    "pre-credit reading, not a climb"
+                    f"segment {reset_event_id} has no observation below "
+                    f"{current_floor}%, so a {current_floor}% seed would come "
+                    "from a stale pre-credit reading, not a climb"
                 )
                 return
 
@@ -840,37 +808,21 @@ def maybe_record_milestone(
             week_end_at=week_end_at,
         )
 
-        # For a CREDITED week the cached weekly_cost_snapshots row covers the
-        # whole week, so a crossing recorded after the credit would carry the
-        # whole week's spend. Live-compute over the epoch's own range instead,
-        # so the milestone captures cost from the credit forward.
-        #
-        # #703 + #707: the authoritative condition is `reset_event_id != 0` —
-        # the epoch this crossing is actually being filed under — and the range
-        # is built directly from that epoch's ACCOUNTING instant to the
-        # unchanged week end. It used to be `_week_ref_has_reset_event` over a
-        # reference `_apply_reset_events_to_weekrefs` had rewritten, which is
-        # wrong twice over. That rewrite matches on the boundary columns, so it
-        # never saw a MANUAL credit (both NULL, because a manual credit moved no
-        # boundary) and every milestone after one carried the full week's spend.
-        # And the display stops splitting a credited week, after which the
-        # reference keeps its original start, nothing equals any
-        # `effective_reset_at_utc`, and the same full-week fallback would take
-        # over for automatic credits too. Segment 0 keeps the cached path.
-        #
-        # The range START is the accounting instant, not the hour-floored
-        # display one: measuring from the floor would attribute up to an hour of
-        # pre-credit spend to the new epoch. The range END is the week's own
-        # end, because a credit is a counter discontinuity inside an UNCHANGED
-        # window; `as_of` clamps it to the retained triggering observation clock
-        # exactly as before (#410 Task A).
-        if reset_event_id != 0 and reset_effective_iso:
+        # For reset-affected weeks, the cached weekly_cost_snapshots row
+        # covers the API-derived range (which for a post-reset week
+        # backdates into the old window). Live-compute over the effective
+        # range so the milestone captures cost from the reset moment
+        # forward, not from the phantom backdated start.
+        effective_ref = week_ref
+        adjusted = _apply_reset_events_to_weekrefs(conn, [week_ref])
+        if adjusted:
+            effective_ref = adjusted[0]
+
+        if _week_ref_has_reset_event(conn, effective_ref):
             import _cctally_cache  # fail-closed attribution guard (#341)
-            accounting_ref = dc_replace(
-                week_ref, week_start_at=reset_effective_iso)
             try:
                 live_cost = _compute_cost_for_weekref(
-                    accounting_ref,
+                    effective_ref,
                     account_key=account_key,
                     as_of=as_of,
                 )
@@ -2894,14 +2846,9 @@ def maybe_update_five_hour_block(
                    AND (is_closed = 0 OR journal_id IS NULL)
                    AND (
                      EXISTS (
-                       -- #703 + #707: the ACCOUNTING instant, so a block is
-                       -- flagged as crossing the moment the counter actually
-                       -- moved rather than the hour it is displayed at. The
-                       -- hour-floored instant can fall in the previous block.
                        SELECT 1 FROM week_reset_events e
                         WHERE e.account_key = five_hour_blocks.account_key
-                          AND unixepoch(COALESCE(e.observed_at_utc,
-                                                 e.effective_reset_at_utc))
+                          AND unixepoch(e.effective_reset_at_utc)
                               BETWEEN unixepoch(five_hour_blocks.block_start_at)
                                   AND unixepoch(five_hour_blocks.last_observed_at_utc)
                      )
@@ -2992,189 +2939,79 @@ def maybe_update_five_hour_block(
 _RESET_ZERO_MARKER_NAME = "pending-reset-zero-7d"
 
 
-def _reset_zero_marker_path(account_key=None):
-    """The marker file for one account, or the legacy shared one.
-
-    #703 + #707 §6.2a: the arm belongs to ONE account and there used to be a
-    single file for all of them, so a second account's tick both confirmed off
-    the first account's baseline and — once the confirm was scoped — OVERWROTE
-    the first account's arm by arming its own. One file per account removes both
-    without a read-modify-write, so two accounts arming concurrently cannot lose
-    each other's arm.
-
-    ``account_key`` ``None`` names the LEGACY shared file, which is what a
-    binary this install is upgrading from wrote. It is read as a fallback and
-    matches any account; nothing writes it any more.
-
-    The suffix is sanitized because it becomes a filename. Account keys are hex
-    digests or the ``unattributed`` sentinel today, so the substitution is a
-    guard rather than a transformation that fires.
-    """
-    base = _cctally_core.APP_DIR / _RESET_ZERO_MARKER_NAME
-    if not account_key:
-        return base
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(account_key))
-    return base.with_name(f"{_RESET_ZERO_MARKER_NAME}.{safe}")
-
-
-_MARKER_ABSENT = "-"
+def _reset_zero_marker_path():
+    return _cctally_core.APP_DIR / _RESET_ZERO_MARKER_NAME
 
 
 def _arm_reset_zero_marker(week_start_date, cur_end_canon, *,
-                           baseline_pct, first_zero_iso,
-                           first_zero_capture_iso=None,
-                           first_zero_identity=None,
-                           account_key=None):
+                           baseline_pct, first_zero_iso):
     """Persist the pending reset-to-zero candidate. ``first_zero_iso`` MUST be
     the ``_command_as_of()`` clock value (it becomes the effective anchor on
-    confirm), NOT wall-clock.
-
-    ``first_zero_capture_iso`` and ``first_zero_identity`` are the two facts
-    #703 + #707 need from the FIRST zero and that the confirming tick can no
-    longer see. The capture instant is the credit's `observed_at_utc`, which
-    must be in the same clock domain as `weekly_usage_snapshots.captured_at_utc`
-    because that is the column it filters; the identity is the observation's
-    journal identity, from which the credit's `credit_key` is derived. Both were
-    previously discarded on the confirm leg, which is why the epoch anchored on
-    the hour floor and back-dated before observations that were still
-    legitimately pre-credit.
-
-    ``account_key`` (#703 + #707 §6.2a) is the account the arm belongs to. There
-    is ONE marker file, so without it a zero arriving for a DIFFERENT account
-    matched the arm and confirmed a credit built from the first account's
-    baseline — and cleared the marker, leaving the account that genuinely lost
-    its counter unrepaired on the very tick that should have repaired it.
-
-    Every absent field is written as a literal ``-``, so the field count stays
-    fixed and a whitespace split keeps working. Account keys are hex digests or
-    the ``unattributed`` sentinel, so none contains whitespace."""
+    confirm), NOT wall-clock."""
     try:
-        _reset_zero_marker_path(account_key).write_text(
+        _reset_zero_marker_path().write_text(
             f"{week_start_date} {cur_end_canon} "
-            f"{float(baseline_pct)} {first_zero_iso} "
-            f"{first_zero_capture_iso or _MARKER_ABSENT} "
-            f"{first_zero_identity or _MARKER_ABSENT} "
-            f"{account_key or _MARKER_ABSENT}\n"
+            f"{float(baseline_pct)} {first_zero_iso}\n"
         )
     except OSError:
-        # The per-account arm was NOT written, so the legacy one is still the
-        # only arm this install has. Retiring it here destroyed the arm the
-        # failed write was meant to replace, and the swallowed OSError meant
-        # nothing said so.
-        return
-    _retire_legacy_reset_zero_marker(account_key)
+        pass
 
 
-def _retire_legacy_reset_zero_marker(account_key):
-    """Remove the pre-account shared marker once a per-account one exists.
-
-    Left in place it would keep matching every account whose own file is absent,
-    forever. It is only ever written by the binary an install is upgrading from,
-    so it exists for at most the one tick that spans the upgrade — during which
-    a legacy arm for a DIFFERENT account is lost. That is the bounded cost of
-    not leaving a permanently account-blind marker behind.
-    """
-    if not account_key:
-        return
+def _clear_reset_zero_marker():
     try:
         _reset_zero_marker_path().unlink(missing_ok=True)
     except OSError:
         pass
 
 
-def _clear_reset_zero_marker(account_key=None):
+def _read_reset_zero_marker():
+    """Return ``(week_start_date, cur_end_canon, baseline_pct, first_zero_iso)``
+    or ``None`` when missing / empty / garbled. Validates ALL fields (arity,
+    float baseline, parseable timestamp) so a malformed marker re-arms cleanly
+    rather than wedging the confirm path."""
     try:
-        _reset_zero_marker_path(account_key).unlink(missing_ok=True)
+        raw = _reset_zero_marker_path().read_text().strip()
     except OSError:
-        pass
-    _retire_legacy_reset_zero_marker(account_key)
-
-
-def _read_reset_zero_marker(account_key=None):
-    """Return ``(week_start_date, cur_end_canon, baseline_pct, first_zero_iso,
-    first_zero_capture_iso, first_zero_identity, account_key)`` or ``None`` when
-    missing / empty / garbled. Validates ALL fields (arity, float baseline,
-    parseable timestamps) so a malformed marker re-arms cleanly rather than
-    wedging the confirm path.
-
-    Three arities are accepted, and the shorter two are the shapes a binary an
-    install is upgrading FROM wrote: four fields predate the exact-instant and
-    identity facts, six predate the account. Each is read with the missing
-    fields ``None`` rather than rejected, because rejecting one would drop a
-    genuine armed reset on the single tick that spans the upgrade. The confirm
-    leg falls back to the confirming observation for the two facts, and treats a
-    marker with no recorded account as matching any account — which is exactly
-    what it did before the field existed."""
-    raw = ""
-    for path in (_reset_zero_marker_path(account_key),
-                 _reset_zero_marker_path()):
-        try:
-            raw = path.read_text().strip()
-        except OSError:
-            raw = ""
-        if raw:
-            break
+        return None
     if not raw:
         return None
     parts = raw.split()
-    if len(parts) not in (4, 6, 7):
+    if len(parts) != 4:
         return None
-    week_start_date, cur_end_canon, baseline_raw, first_zero_iso = parts[:4]
-    capture_iso = identity = account_key = None
-    if len(parts) >= 6:
-        capture_iso, identity = parts[4], parts[5]
-        capture_iso = None if capture_iso == _MARKER_ABSENT else capture_iso
-        identity = None if identity == _MARKER_ABSENT else identity
-    if len(parts) == 7:
-        account_key = None if parts[6] == _MARKER_ABSENT else parts[6]
+    week_start_date, cur_end_canon, baseline_raw, first_zero_iso = parts
     try:
         baseline_pct = float(baseline_raw)
     except ValueError:
         return None
     try:
         parse_iso_datetime(first_zero_iso, "reset_zero_marker.first_zero")
-        if capture_iso is not None:
-            parse_iso_datetime(capture_iso, "reset_zero_marker.first_capture")
     except ValueError:
         return None
-    return (week_start_date, cur_end_canon, baseline_pct, first_zero_iso,
-            capture_iso, identity, account_key)
+    return (week_start_date, cur_end_canon, baseline_pct, first_zero_iso)
 
 
-def _projection_read_reset_zero_marker(ctx, account_key=None):
-    # Only the `("reset_zero_marker", account_key)` key exists. A bare
-    # `"reset_zero_marker"` fallback was carried here for "a replay whose
-    # earlier records armed before the account was part of the state key", but
-    # projection state lives for one cycle and nothing has ever written the
-    # plain key — so the fallback was unreachable, and had it ever returned a
-    # value the confirm leg's `marker[6]` would have raised `IndexError` on the
-    # six-tuple it described.
+def _projection_read_reset_zero_marker(ctx):
     if ctx is not None and not ctx.projection_writes:
-        return ctx.projection_state.get(
-            ("reset_zero_marker", account_key))
-    return _read_reset_zero_marker(account_key)
+        return ctx.projection_state.get("reset_zero_marker")
+    return _read_reset_zero_marker()
 
 
-def _projection_clear_reset_zero_marker(ctx, account_key=None):
+def _projection_clear_reset_zero_marker(ctx):
     if ctx is not None and not ctx.projection_writes:
-        ctx.projection_state.pop(("reset_zero_marker", account_key), None)
+        ctx.projection_state.pop("reset_zero_marker", None)
         return
-    _clear_reset_zero_marker(account_key)
+    _clear_reset_zero_marker()
 
 
 def _projection_arm_reset_zero_marker(
     ctx, week_start_date, cur_end_canon, *, baseline_pct, first_zero_iso,
-    first_zero_capture_iso=None, first_zero_identity=None, account_key=None,
 ):
     if ctx is not None and not ctx.projection_writes:
-        ctx.projection_state[("reset_zero_marker", account_key)] = (
+        ctx.projection_state["reset_zero_marker"] = (
             week_start_date,
             cur_end_canon,
             float(baseline_pct),
             first_zero_iso,
-            first_zero_capture_iso,
-            first_zero_identity,
-            account_key,
         )
         return
     _arm_reset_zero_marker(
@@ -3182,9 +3019,6 @@ def _projection_arm_reset_zero_marker(
         cur_end_canon,
         baseline_pct=baseline_pct,
         first_zero_iso=first_zero_iso,
-        first_zero_capture_iso=first_zero_capture_iso,
-        first_zero_identity=first_zero_identity,
-        account_key=account_key,
     )
 
 
@@ -3194,215 +3028,10 @@ def _projection_arm_reset_zero_marker(
 # (``cmd_record_credit``) resolve them unchanged.
 
 
-def _automatic_replicas(conn, *, week_start_date, account_key, observed_at,
-                        confirming_capture_at, post_credit_pct):
-    """The automatic bracket, with the one guard the bracket itself cannot make.
-
-    Both instants are evidence. When either is absent there is no bracket, and
-    the honest answer is to select nothing rather than to substitute a
-    timestamp: the only substitute available is the hour-floored effective
-    instant, and reaching back to it is precisely the back-dating §4 removed.
-    A caller with no observation instants is one whose source record carried
-    none, and every production leg supplies both.
-    """
-    if not observed_at or not confirming_capture_at:
-        return []
-    return _lib_credit_selection.select_automatic_replicas(
-        conn, week_start_date=week_start_date, account_key=account_key,
-        observed_at=observed_at, confirming_capture_at=confirming_capture_at,
-        post_credit_pct=float(post_credit_pct))
-
-
-def _sweep_late_replicas(conn, *, week_start_date, account_key, observed_pct,
-                         capture_iso, as_of, ctx, source_identity):
-    """Section 5.4's recurring pass: run the replica selectors on EVERY tick.
-
-    A credit fires exactly once. The immediate leg needs a drop against
-    ``prior_pct`` and the debounced leg clears its marker on confirmation, so
-    ``_fire_in_place_credit`` — the only caller of the bracket selector before
-    this function existed — runs once per credit and the bracket is evaluated
-    once, one second wide on the immediate leg. A replay that arrives minutes
-    later was therefore never selected at all, which is the second half of the
-    2026-09-01 incident: every 7d surface reads the pre-credit value again, and
-    on the next genuine tick that value is ``prior_pct``, so the drop back to
-    the credited level fires a phantom second credit and restarts the milestone
-    ladder.
-
-    Two selections, and they are bounded differently because the evidence
-    differs. Inside ``[observed_at, confirming_capture_at]`` the credit's own
-    two bounding observations are the evidence, so that leg runs unconditionally
-    and catches a row stamped inside the bracket but written after the fire.
-    After the confirmation there is no bracket, and the evidence is THIS tick's
-    reading: within one accounting epoch the weekly counter never falls, so a
-    stored row at or above the pre-credit level followed by a lower in-epoch
-    reading cannot also be true.
-
-    Ordering is load-bearing. This runs BEFORE ``detect_reset_and_credit`` reads
-    ``prior``, so the removed replica cannot be mistaken for the pre-credit
-    baseline of a credit that never happened.
-
-    A MANUAL credit reaches only the second of the two legs, and it must reach
-    it. The manual fold writes ``confirming_capture_at_utc`` NULL by design,
-    because a retroactive assertion has no confirming observation, and requiring
-    that column returned this function early for every manual epoch. §5.4 does
-    not exclude a manual epoch, and the failure it names is exactly what
-    followed: after `record-credit`, a replayed high reading was admitted by the
-    write clamp, stood, became ``prior_pct`` on the next genuine tick, and the
-    drop back to the credited level fired a phantom automatic credit that opened
-    a second epoch and restarted the milestone ladder. The bracket leg still
-    needs both instants and is still skipped without them; the contradicted-level
-    leg takes the asserted credit instant as its replay floor.
-
-    Nothing is synthesized. A credit row that records no observation instant, or
-    no level to compare against, selects nothing — exactly as
-    ``_automatic_replicas`` refuses to substitute the hour-floored instant.
-    """
-    epoch = _lib_credit_selection.resolve_weekly_credit_epoch(
-        conn, week_start_date=week_start_date, account_key=account_key,
-        captured_at=capture_iso)
-    if epoch is None:
-        return
-    observed_at = epoch["observed_at_utc"]
-    confirming_at = epoch["confirming_capture_at_utc"]
-    post_credit_pct = epoch["observed_post_credit_pct"]
-    if not observed_at:
-        return
-    doomed: dict = {}
-    if confirming_at and post_credit_pct is not None:
-        doomed = {
-            int(row["id"]): row
-            for row in _lib_credit_selection.select_automatic_replicas(
-                conn, week_start_date=week_start_date,
-                account_key=account_key, observed_at=observed_at,
-                confirming_capture_at=confirming_at,
-                post_credit_pct=float(post_credit_pct))
-        }
-    level = _lib_credit_selection.resolve_replica_level(
-        conn, week_start_date=week_start_date, account_key=account_key,
-        observed_at=observed_at,
-        observed_pre_credit_pct=epoch["observed_pre_credit_pct"])
-    # The contradiction is tested at the granularity the store ADMITS at, not
-    # exactly. `hwm_clamp_applies` compares `round(x, 1)` on both sides, so a
-    # reading up to about 0.05pp below the recorded maximum is stored — the
-    # weekly counter therefore CAN dip inside one epoch, which is a real
-    # counterexample to the invariant this rule rests on. Compared exactly, such
-    # a dip crossing `replica_level` supplied a false contradiction and deleted
-    # the genuine row just above it. Reusing the clamp's own predicate means a
-    # value the clamp let through can never trigger a removal.
-    if level is not None and hwm_clamp_applies(float(observed_pct), level):
-        for row in _lib_credit_selection.select_contradicted_replicas(
-                conn, week_start_date=week_start_date,
-                account_key=account_key,
-                replay_floor_capture_at=(confirming_at or observed_at),
-                replica_level=level, contradicting_capture_at=capture_iso):
-            doomed.setdefault(int(row["id"]), row)
-    if not doomed:
-        return
-    _suppress_replica_snapshots(
-        conn, [doomed[key] for key in sorted(doomed)], ctx=ctx,
-        account_key=account_key, credit_key=epoch["credit_key"],
-        confirming_identity=source_identity, at=as_of)
-
-
-def _suppress_replica_snapshots(conn, doomed_rows, *, ctx, account_key,
-                                credit_key, confirming_identity, at):
-    """Remove the selected stale-replica snapshots and their dependents.
-
-    #703 + #707 §5.4. On the INGEST path the removal is journaled as one
-    immutable, effects-only `weekly_replica_suppression` event, keyed on
-    ``(account_key, credit_key, confirming_observation_id, target_set_digest)``.
-    Its applier is what physically deletes, and it folds at order 70 — after the
-    snapshot family at 10 and the milestone family at 60 — so a rebuild
-    materializes both and then replays the removal on top of them. That is the
-    whole point: the previous mechanism captured its target list ONLY when the
-    credit's event row was first inserted, so every later detector pass deleted
-    rows the next rebuild restored.
-
-    Dependent milestones are named in the event alongside the snapshots. They
-    have to be: a milestone whose `usage_snapshot_id` points at a removed
-    snapshot dangles silently, because this codebase's foreign keys are
-    documentation-only.
-
-    BOTH milestone tables are dependents, not just `percent_milestones`.
-    `five_hour_milestones.usage_snapshot_id` references the same snapshot table
-    through a column of the same name, so a late replica that crossed a 5h
-    threshold before it was removed would otherwise lose its weekly snapshot
-    while its 5h milestone survived pointing at a gone row.
-
-    Two rows are deleted inline rather than journaled, and both are rows a
-    journal cannot describe. A row with a NULL `journal_id` has no logical id to
-    name in an event; a rebuild does not re-materialize it either, so deleting
-    it physically is already durable. And when there is no ``ctx`` there is no
-    journal to append to at all — the legacy non-ingest path, which production
-    does not take.
-    """
-    if not doomed_rows:
-        return
-    identified = sorted({r[1] for r in doomed_rows if r[1]})
-    unidentified = [int(r[0]) for r in doomed_rows if not r[1]]
-    journaled = bool(identified) and ctx is not None and bool(credit_key)
-
-    if journaled:
-        placeholders = ",".join("?" for _ in doomed_rows)
-        doomed_ids = tuple(int(r[0]) for r in doomed_rows)
-
-        def _dependents(table):
-            return sorted({
-                row[0]
-                for row in conn.execute(
-                    f"SELECT journal_id FROM {table} "
-                    f"WHERE usage_snapshot_id IN ({placeholders}) "
-                    "  AND journal_id IS NOT NULL",
-                    doomed_ids,
-                ).fetchall()
-                if row[0]
-            })
-
-        milestones = _dependents("percent_milestones")
-        five_hour = _dependents("five_hour_milestones")
-        import _cctally_journal as _jr
-        digest = _jr.replica_suppression_target_digest(
-            identified, milestones, five_hour)
-        columns = {
-            "account_key": account_key,
-            "credit_key": credit_key,
-            "confirming_observation_id": confirming_identity,
-            "snapshots": identified,
-            "milestones": milestones,
-        }
-        # Omitted when empty, exactly as the digest omits it: a target set with
-        # no 5h dependent produces the payload it produced before this leg
-        # existed, so nothing already written is superseded by a shape change
-        # alone.
-        if five_hour:
-            columns["five_hour_milestones"] = five_hour
-        _jr.emit_model_a(
-            ctx,
-            kind="weekly_replica_suppression",
-            evt_id=_lib_journal.evt_id(
-                "wrs", account_key, credit_key,
-                confirming_identity or "-", digest),
-            table=None,
-            columns=columns,
-            at=at,
-        )
-    else:
-        unidentified = [int(r[0]) for r in doomed_rows]
-
-    for rowid in unidentified:
-        conn.execute(
-            "DELETE FROM weekly_usage_snapshots WHERE id = ?", (rowid,))
-
-
-
 def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
                           *, observed_pre_credit_pct, effective_dt,
                           as_of=None, commit=True, ctx=None,
-                          account_key=_lib_accounts.UNATTRIBUTED,
-                          credit_source=None,
-                          observed_at_utc=None,
-                          confirming_capture_at_utc=None,
-                          confirming_identity=None):
+                          account_key=_lib_accounts.UNATTRIBUTED):
     """Emit/refresh the in-place weekly-credit artifacts (issue #19 + #128).
     Shared by the immediate >=25pp path and the debounced reset-to-zero
     confirmation path.
@@ -3435,64 +3064,16 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
 
     ``effective_dt`` is the (already-resolved) reset moment; the immediate path
     passes ``_floor_to_hour(now_utc)``, the debounced path passes the floored
-    first-zero instant from the marker.
-
-    #703 + #707. ``credit_source`` is the journal record that caused this credit
-    (see ``_lib_credit_identity``); it supplies ``credit_key`` and
-    ``credit_order``, which replace the boundary pair as the row's identity.
-    ``observed_at_utc`` is the exact instant the post-credit state was first
-    observed and ``confirming_capture_at_utc`` the capture instant of the
-    observation that confirmed it — BOTH in the capture clock domain, because
-    they filter ``weekly_usage_snapshots.captured_at_utc``. ``effective_dt``
-    stays hour-floored and becomes display-only: one timestamp cannot serve both
-    human rounding and evidence membership, which is what back-dated the epoch
-    in the 2026-09-01 incident. A caller that supplies no source leaves all
-    three columns NULL, which is the honest value for a row whose source
-    genuinely lacked the fact; nothing is synthesized."""
+    first-zero instant from the marker."""
     effective_iso = effective_dt.isoformat(timespec="seconds")
-    # A MANUAL credit is recognised everywhere by its row SHAPE: both boundary
-    # columns NULL. `_manual_credits_at`, `_manual_credits_in_week`,
-    # `_EXISTING_MANUAL_CREDIT_SQL` and `_week_segment_boundaries` all classify
-    # on it, and the predicate is total only while no automatic leg writes NULL
-    # there. That is an assumption about every future caller of this function,
-    # so state it as a refusal rather than leaving it to convention: a single
-    # automatic leg passing a missing boundary would silently reclassify its
-    # rows as manual across all four helpers, with nothing raising.
-    if not effective_iso or not cur_end_canon:
-        raise ValueError(
-            "an automatic weekly credit must carry both boundary columns; "
-            f"got old={effective_iso!r} new={cur_end_canon!r}. Only a manual "
-            "record-credit writes the NULL-boundary shape, and every helper "
-            "that tells the two apart reads exactly that shape.")
-    credit_key = credit_order = None
-    if credit_source is not None:
-        credit_key = _lib_credit_identity.derive_credit_key(credit_source)
-        credit_order = _lib_credit_identity.derive_credit_order(credit_source)
-    # Pre-check keyed on the row's IDENTITY. It used to key on
-    # `new_week_end_at` alone, which suppressed every later credit in the same
-    # week — the gate that made several credits per week unrepresentable.
-    # UNIQUE(account_key, credit_key) also dedups, but the pre-check avoids a
-    # useless write attempt and keeps logs clean.
-    if credit_key is not None:
-        already = conn.execute(
-            "SELECT 1 FROM week_reset_events "
-            "WHERE account_key = ? AND credit_key = ? LIMIT 1",
-            (account_key, credit_key),
-        ).fetchone()
-    else:
-        # No source record means no `credit_key`, and SQLite treats NULLs as
-        # DISTINCT under UNIQUE — so `UNIQUE(account_key, credit_key)` stops
-        # deduping here and every pass would append another row. Fall back to
-        # the boundary pair, which is the only identity such a row has and is
-        # exactly what the pre-change gate used. This does not reintroduce the
-        # singleton gate: it is reachable only when nothing named a source, and
-        # the keyed branch above never consults a boundary.
-        already = conn.execute(
-            "SELECT 1 FROM week_reset_events "
-            "WHERE account_key = ? AND credit_key IS NULL "
-            "  AND old_week_end_at = ? AND new_week_end_at = ? LIMIT 1",
-            (account_key, effective_iso, cur_end_canon),
-        ).fetchone()
+    # Pre-check keyed on new_week_end_at: suppress a duplicate event row across
+    # ticks. UNIQUE(old, new) also dedups, but the pre-check avoids a useless
+    # write attempt and keeps logs clean.
+    already = conn.execute(
+        "SELECT 1 FROM week_reset_events "
+        "WHERE new_week_end_at = ? AND account_key = ? LIMIT 1",
+        (cur_end_canon, account_key),
+    ).fetchone()
     if already is None:
         # Row shape: old=effective_iso, new=cur_end_canon (DISTINCT) so only
         # post_map fires on the credited week in _apply_reset_events_to_weekrefs
@@ -3501,14 +3082,10 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
         ins_wr = conn.execute(
             "INSERT OR IGNORE INTO week_reset_events "
             "(detected_at_utc, old_week_end_at, new_week_end_at, "
-            " effective_reset_at_utc, observed_pre_credit_pct, account_key, "
-            " week_start_date, observed_at_utc, confirming_capture_at_utc, "
-            " observed_post_credit_pct, credit_key, credit_order) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " effective_reset_at_utc, observed_pre_credit_pct, account_key) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (as_of or now_utc_iso(), effective_iso, cur_end_canon,
-             effective_iso, float(observed_pre_credit_pct), account_key,
-             week_start_date, observed_at_utc, confirming_capture_at_utc,
-             float(weekly_percent), credit_key, credit_order),
+             effective_iso, float(observed_pre_credit_pct), account_key),
         )
         # Design B (§5.3 event+effects): on the ingest path, capture the doomed
         # stale-replica snapshots' journal_ids BEFORE the pivot-2 DELETE (SAME
@@ -3517,17 +3094,19 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
         # (rowcount == 1) so a crash-replayed reset never re-suppresses; ctx=None
         # (legacy) captures nothing.
         if ctx is not None and ins_wr.rowcount == 1:
-            doomed = _automatic_replicas(
-                conn, week_start_date=week_start_date, account_key=account_key,
-                observed_at=observed_at_utc,
-                confirming_capture_at=confirming_capture_at_utc,
-                post_credit_pct=weekly_percent)
-            # The suppression_map key is derived from the harvest `id_parts`
-            # by `_build_harvest_evt`, so it follows them onto
-            # (account_key, credit_key) (#703 + #707; #341 put account_key
-            # first).
-            ctx.suppression_map[(account_key, credit_key)] = [
-                r["journal_id"] for r in doomed if r["journal_id"]
+            doomed = conn.execute(
+                "SELECT journal_id FROM weekly_usage_snapshots "
+                "WHERE week_start_date = ? AND account_key = ? "
+                "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+                "  AND ABS(weekly_percent - ?) <= 1.0",
+                (week_start_date, account_key, effective_iso,
+                 float(observed_pre_credit_pct)),
+            ).fetchall()
+            # #341: the wr harvest id_parts now lead with account_key, so the
+            # suppression_map key (which _build_harvest_evt derives from id_parts)
+            # must match: (account_key, old_week_end_at, new_week_end_at).
+            ctx.suppression_map[(account_key, effective_iso, cur_end_canon)] = [
+                r[0] for r in doomed
             ]
         if commit:
             conn.commit()
@@ -3543,37 +3122,26 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
             pass
     # Unconditional pivot 2: race-defensive cleanup of stale pre-credit replays
     # (external claude-statusline can replay pre-credit --percent values that
-    # land after the credit and dominate the reset-aware clamp).
+    # land captured_at >= effective with pct ~= baseline and dominate the
+    # reset-aware clamp). 1.0pp tolerance band absorbs rounding drift; both
+    # sides wrapped in unixepoch() for offset robustness.
     #
-    # #703 + #707 §5.1: the SELECTION is the evidence bracket in
-    # `_lib_credit_selection`, not the 1.0pp tolerance band that used to be
-    # written out here and again at the capture above. The band compared the
-    # stored percent against a REMEMBERED pre-credit level, and on the debounced
-    # leg that level is the armed marker's baseline while the rows to remove
-    # hold what was written — two different quantities. In the 2026-09-01
-    # incident they differed by exactly 1.0, the strict band excluded every row,
-    # and the DELETE did nothing.
-    #
-    # #703 + #707 §5.4: the removal is JOURNALED. It used to be a raw DELETE,
-    # and the capture that made it replayable happened only when the credit's
-    # own event row was first inserted — so every LATER pass deleted rows that
-    # the next rebuild put straight back, permanently. The
-    # `weekly_replica_suppression` event records the exact logical ids removed,
-    # folds after the snapshot and milestone families, and is therefore the
-    # thing a rebuild replays.
+    # The bound is INCLUSIVE. On the debounced leg `observed_pre_credit_pct` is
+    # the armed marker's baseline, while the rows being removed hold whatever
+    # the status line last wrote — two different quantities, which is exactly
+    # the drift this band exists to absorb. A strict `<` excludes the drift
+    # bound itself, so on 2026-09-01 a baseline of 14.0 against stored replays
+    # of 13.0 matched nothing, the stale rows survived, and they provoked a
+    # second phantom credit. The manual path keeps `<`: it compares against the
+    # level the operator asserted, so the two quantities are one.
     try:
-        doomed_rows = _automatic_replicas(
-            conn, week_start_date=week_start_date, account_key=account_key,
-            observed_at=observed_at_utc,
-            confirming_capture_at=confirming_capture_at_utc,
-            post_credit_pct=weekly_percent)
-        _suppress_replica_snapshots(
-            conn, doomed_rows, ctx=ctx, account_key=account_key,
-            credit_key=credit_key,
-            confirming_identity=(confirming_identity
-                                 or (credit_source.identity
-                                     if credit_source else None)),
-            at=(as_of or now_utc_iso()),
+        conn.execute(
+            "DELETE FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? AND account_key = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+            "  AND ABS(weekly_percent - ?) <= 1.0",
+            (week_start_date, account_key, effective_iso,
+             float(observed_pre_credit_pct)),
         )
         if commit:
             conn.commit()
@@ -3584,8 +3152,7 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
 def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                             weekly_percent, five_hour_window_key,
                             five_hour_percent, as_of=None, commit=True,
-                            ctx=None, account_key=_lib_accounts.UNATTRIBUTED,
-                            source_identity=None, capture_at=None):
+                            ctx=None, account_key=_lib_accounts.UNATTRIBUTED):
     """Detect + record weekly and 5h reset/credit artifacts for one usage
     observation (extracted from ``cmd_record_usage``; DB journal redesign
     §5.2.3).
@@ -3621,31 +3188,9 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
       DELETE's doomed ``journal_id``s into ``ctx.suppression_map`` BEFORE
       deleting (Design B event+effects, §5.3), keyed on the reset row's
       harvest natural key. Legacy (``ctx=None``) captures nothing.
-    - ``source_identity`` / ``capture_at`` (#703 + #707, default ``None``):
-      the triggering observation's journal identity and its payload capture
-      instant. The identity becomes the credit's ``credit_key`` and its journal
-      instant becomes ``credit_order``; the capture instant becomes
-      ``observed_at_utc`` / ``confirming_capture_at_utc``, which must be in the
-      capture clock domain because they filter
-      ``weekly_usage_snapshots.captured_at_utc``. A caller that supplies
-      neither leaves those columns NULL rather than synthesizing them.
     """
     c = _cctally()
     now_utc = _as_of_or_command(as_of)
-    # The observation's own capture instant. `as_of` is the DETECTION clock and
-    # the two are deliberately separated on the ingest path, so falling back to
-    # it here is a last resort for a caller that supplies no payload capture —
-    # never the preferred value (spec §4).
-    capture_iso = capture_at or now_utc.isoformat(timespec="seconds")
-    immediate_source = (
-        _lib_credit_identity.CreditSource(
-            kind="immediate",
-            identity=source_identity,
-            order=_lib_credit_identity.credit_order_from_instant(
-                as_of or now_utc.isoformat(timespec="seconds")),
-        )
-        if source_identity else None
-    )
     # Mid-week reset detection. When `resets_at` advances before the
     # previously-declared reset actually fires (Anthropic-initiated
     # goodwill reset, or any API-side shift), record one week_reset_events
@@ -3661,15 +3206,6 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
     # against week_reset_events (self-healing, see helper for rationale).
     try:
         cur_end_canon = _canonicalize_optional_iso(week_end_at, "record.cur")
-        # #703 + #707 §5.4: the recurring replica pass, before `prior` is read.
-        # A replay left standing becomes the pre-credit baseline of a credit
-        # that never happened, so removing it has to precede the read that would
-        # believe it.
-        _sweep_late_replicas(
-            conn, week_start_date=week_start_date, account_key=account_key,
-            observed_pct=weekly_percent, capture_iso=capture_iso,
-            as_of=(as_of or now_utc_iso()), ctx=ctx,
-            source_identity=source_identity)
         prior = conn.execute(
             "SELECT week_end_at, weekly_percent FROM weekly_usage_snapshots "
             "WHERE week_end_at IS NOT NULL AND account_key = ? "
@@ -3704,32 +3240,13 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                     # boundary, aligned with Anthropic's hour-only
                     # resets_at values).
                     effective_iso = _floor_to_hour(now_utc).isoformat(timespec="seconds")
-                    # #703 + #707: this branch records a credit too, so it
-                    # carries the same facts and the same identity as the
-                    # in-place legs. The triggering observation is both the
-                    # first post-credit observation and its confirmation, so
-                    # the bracket is one capture instant wide. `credit_key` is
-                    # NULL only when the caller supplied no source, and the
-                    # boundary columns stay as written because they remain this
-                    # row's provenance.
                     conn.execute(
                         "INSERT OR IGNORE INTO week_reset_events "
                         "(detected_at_utc, old_week_end_at, new_week_end_at, "
-                        " effective_reset_at_utc, account_key, "
-                        " week_start_date, observed_at_utc, "
-                        " confirming_capture_at_utc, observed_post_credit_pct, "
-                        " credit_key, credit_order) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        " effective_reset_at_utc, account_key) "
+                        "VALUES (?, ?, ?, ?, ?)",
                         ((as_of or now_utc_iso()), prior_end_canon, cur_end_canon,
-                         effective_iso, account_key,
-                         week_start_date, capture_iso, capture_iso,
-                         float(weekly_percent),
-                         (_lib_credit_identity.derive_credit_key(
-                             immediate_source)
-                          if immediate_source else None),
-                         (_lib_credit_identity.derive_credit_order(
-                             immediate_source)
-                          if immediate_source else None)),
+                         effective_iso, account_key),
                     )
                     # (inline commit removed — the function commits once at the
                     # end on the legacy path; the ingest cycle owns the commit.)
@@ -3752,26 +3269,11 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                     # then the glue below executes the decided I/O. The 5
                     # branch outcomes (fire-immediate / confirm / clear /
                     # arm / none) map 1:1 to the pre-extraction structure.
-                    marker = _projection_read_reset_zero_marker(ctx, account_key)
-                    # #703 + #707 §6.2a: the arm belongs to ONE account. There
-                    # is a single marker file, so without this comparison a zero
-                    # arriving for a DIFFERENT account matched the arm and
-                    # confirmed a credit built from the first account's
-                    # baseline — and cleared the marker, leaving the account
-                    # that genuinely lost its counter unrepaired.
-                    #
-                    # A marker with no recorded account was written by the
-                    # binary this install is upgrading from. It matches any
-                    # account, which is what it did before the field existed;
-                    # rejecting it would drop a genuine armed reset on the one
-                    # tick that spans the upgrade.
-                    marker_account = marker[6] if marker is not None else None
+                    marker = _projection_read_reset_zero_marker(ctx)
                     armed = (
                         marker is not None
                         and marker[0] == week_start_date
                         and marker[1] == cur_end_canon
-                        and (marker_account is None
-                             or marker_account == account_key)
                     )
                     decision = plan_weekly_credit_debounce(
                         prior_pct, weekly_percent,
@@ -3784,18 +3286,13 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                     if decision == FIRE_IMMEDIATE:
                         # >=25pp goodwill credit — fire immediately, never
                         # debounced. Clear any pending arm (now moot).
-                        _projection_clear_reset_zero_marker(
-                            ctx, account_key)
+                        _projection_clear_reset_zero_marker(ctx)
                         _fire_in_place_credit(
                             conn, week_start_date, cur_end_canon, weekly_percent,
                             observed_pre_credit_pct=float(prior_pct),
                             effective_dt=_floor_to_hour(now_utc),
                             as_of=as_of, commit=commit, ctx=ctx,
                             account_key=account_key,
-                            credit_source=immediate_source,
-                            observed_at_utc=capture_iso,
-                            confirming_capture_at_utc=capture_iso,
-                            confirming_identity=source_identity,
                         )
                     elif decision == CONFIRM_RESET:
                         # Second reading stayed low → confirm. Anchor the
@@ -3804,27 +3301,6 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                         first_zero_dt = parse_iso_datetime(
                             marker[3], "reset_zero_marker.first_zero"
                         ).astimezone(dt.timezone.utc)
-                        # #703 + #707: the credit is anchored on the FIRST
-                        # zero, so both its identity and its exact capture
-                        # instant come from that observation, retained in the
-                        # marker. `effective_dt` stays the hour floor and is
-                        # display-only. A pre-#703 four-field marker retained
-                        # neither fact; it falls back to the CONFIRMING
-                        # observation, which is the only source that tick has,
-                        # and which is off by the debounce interval rather than
-                        # by the hour floor.
-                        first_zero_capture = marker[4] or capture_iso
-                        first_zero_identity = marker[5] or source_identity
-                        debounced_source = (
-                            _lib_credit_identity.CreditSource(
-                                kind="debounced",
-                                identity=first_zero_identity,
-                                order=(
-                                    _lib_credit_identity
-                                    .credit_order_from_instant(marker[3])),
-                            )
-                            if first_zero_identity else None
-                        )
                         _fire_in_place_credit(
                             conn, week_start_date, cur_end_canon,
                             weekly_percent,
@@ -3832,24 +3308,15 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                             effective_dt=_floor_to_hour(first_zero_dt),
                             as_of=as_of, commit=commit, ctx=ctx,
                             account_key=account_key,
-                            credit_source=debounced_source,
-                            observed_at_utc=first_zero_capture,
-                            confirming_capture_at_utc=capture_iso,
-                            # The CONFIRMING observation, which is this tick's
-                            # own record — not the first zero the credit is
-                            # anchored on.
-                            confirming_identity=source_identity,
                         )
                         # Clear ONLY after the fire completes (P2a): a
                         # mid-fire crash leaves the marker armed so the next
                         # zero re-confirms + re-runs the idempotent pivots.
-                        _projection_clear_reset_zero_marker(
-                            ctx, account_key)
+                        _projection_clear_reset_zero_marker(ctx)
                     elif decision == CLEAR_MARKER:
                         # Recovered toward baseline → transient zero, not a
                         # reset. Clear, do not fire.
-                        _projection_clear_reset_zero_marker(
-                            ctx, account_key)
+                        _projection_clear_reset_zero_marker(ctx)
                     elif decision == ARM_MARKER:
                         # First ~0 → arm; do NOT fire. The write clamp
                         # suppresses this 0 (no event row yet), so the prior
@@ -3862,16 +3329,6 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                             week_start_date, cur_end_canon,
                             baseline_pct=float(prior_pct),
                             first_zero_iso=now_utc.isoformat(timespec="seconds"),
-                            # #703 + #707: retain the first zero's EXACT
-                            # capture instant and its journal identity. The
-                            # confirming tick cannot see either, and the hour
-                            # floor it used instead back-dated the epoch before
-                            # observations that were still pre-credit.
-                            first_zero_capture_iso=capture_iso,
-                            first_zero_identity=source_identity,
-                            # The account the arm belongs to, so a zero for a
-                            # different account cannot confirm it.
-                            account_key=account_key,
                         )
                     # else NO_ACTION: not a reset shape and not armed →
                     #     nothing. A non-matching stale marker is inert
@@ -4161,13 +3618,11 @@ def _resolve_reset_aware_hwm(conn, week_start_date, week_start_at, week_end_at,
                              *, account_key):
     """The floored MAX(weekly_percent) the statusline _hwm_clamp computes:
     MAX over snapshots captured at/after the latest in-week clamp floor. The
-    floor is `_reset_aware_floor`, which reads the unified `week_reset_events`
-    table: a manual credit is a row there now, so it lowers the resolved HWM
-    without re-anchoring the week. (`weekly_credit_floors` survives inside that
-    helper for one transitional state only — a cutover-exported store before its
-    first rebuild — and is not a second materialization of a credit.) Used both
-    as the `--from` default and as the assertion source of truth in the
-    record-credit tests.
+    floor is the latest effective across BOTH `week_reset_events` and
+    `weekly_credit_floors` (`_reset_aware_floor`) so a manual partial credit
+    (record-credit M2, #209) lowers the resolved HWM without re-anchoring the
+    week — used both as the `--from` default and as the assertion source of
+    truth in the record-credit tests.
 
     ``account_key`` (#341): MANDATORY account context (no silent global
     fallback). A real key scopes the HWM to one account; ``None`` is the
@@ -4282,90 +3737,85 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
                   commit=True, ctx=None, id_base=None, forced=False,
                   account_key=_lib_accounts.UNATTRIBUTED):
     """Apply the M2 same-window partial-credit artifacts (record-credit, #209,
-    spec §4).
+    spec §4). Unlike the >=25pp auto-credit path (`_fire_in_place_credit`), this
+    writes NO `week_reset_events` row — the window-resolution code never sees a
+    credit, so the week is NOT re-anchored. It only lowers the clamp floor.
 
-    #703 + #707 unified the representation: a manual credit IS a
-    ``week_reset_events`` row now, written by the op fold
-    ``_apply_op_weekly_credit_floor`` and never by this function. What the row
-    does changed with it — it defines an accounting epoch and never a display
-    boundary — so the week is still not re-anchored, and unification is also
-    what lets a manual credit restart the milestone ladder:
-    ``percent_milestones.reset_event_id`` resolves only through
-    ``week_reset_events``, and that missing reference is why a manual credit
-    opened no epoch before. This function applies the credit's EFFECTS: the
-    clamp floor, the stale-replay removal and the synthetic post-credit
-    snapshot.
-
-    ``account_key`` (#341): stamps the credit record + the
+    ``account_key`` (#341): stamps the ``weekly_credit_floors`` row + the
     synthetic snapshot and scopes the stale-replay DELETE to the account.
 
     Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
-    ``commit=False`` folds the stale-replay DELETE + synthetic snapshot into the
-    caller's transaction (the ingester's cycle) instead of committing inline;
-    ``as_of`` (ISO-Z) stamps the credit record's ``applied_at_utc`` in place of
-    wall clock (the reset moment stays ``plan.effective_iso``). Both defaults
-    keep the legacy behavior.
+    ``commit=False`` folds the floor INSERT + stale-replay DELETE + synthetic
+    snapshot into the caller's transaction (the ingester's cycle) instead of
+    committing inline; ``as_of`` (ISO-Z) stamps ``weekly_credit_floors``'
+    ``applied_at_utc`` in place of wall clock (the reset moment stays
+    ``plan.effective_iso``). Both defaults keep the legacy behavior.
 
-    Design B/event+effects seam (§5.3): on the ingest path (``ctx`` passed,
-    ``id_base`` = the triggering ``record-credit`` op's journal id) the
-    DESTRUCTIVE effects ride a ``weekly_credit_effects`` Model-A evt
-    (``wce:<id_base>``) carrying the stale-replica suppression list (the doomed
-    snapshots' ``journal_id``s, captured with the SAME predicate as the DELETE)
-    + the forced ``hwm_floor``; the synthetic post-credit snapshot rides its own
-    ``snapshot_accept`` evt (``sa:<id_base>:syn:0``) because
-    ``weekly_usage_snapshots`` is written ONLY via ``snapshot_accept`` now
-    (rev-3 emission rule). ``emit_model_a`` applies each evt through the same
-    fold replay uses, so the inline hwm/DELETE/synthetic are SKIPPED on the
-    ingest path (the evt appliers do them). ``ctx=None`` (legacy) keeps the
-    inline path verbatim.
+    Design B/event+effects seam (§5.3): the same-window sub-25pp credit writes
+    NO reset row, so on the ingest path (``ctx`` passed, ``id_base`` = the
+    triggering ``record-credit`` op's journal id) its DESTRUCTIVE effects ride a
+    ``weekly_credit_effects`` Model-A evt (``wce:<id_base>``) carrying the
+    stale-replica suppression list (the doomed snapshots' ``journal_id``s,
+    captured with the SAME predicate as the DELETE) + the forced ``hwm_floor``;
+    the synthetic post-credit snapshot rides its own ``snapshot_accept`` evt
+    (``sa:<id_base>:syn:0``) because ``weekly_usage_snapshots`` is written ONLY
+    via ``snapshot_accept`` now (rev-3 emission rule). ``emit_model_a`` applies
+    each evt through the same fold replay uses, so the inline hwm/DELETE/synthetic
+    are SKIPPED on the ingest path (the evt appliers do them). ``ctx=None``
+    (legacy) keeps the inline path verbatim.
 
-    ``forced`` (ingest path only) journals the ``--force`` re-record's
-    destructive clear that legacy ``_force_clear_credit`` did inline. It is
-    scoped to the ONE occurrence ``plan.replaces_credit_key`` names, not to the
-    week: the ``wce`` evt's ``suppression`` list widens to delete that
-    occurrence's own synthetic snapshots and its ``floor_suppression`` list
-    deletes that occurrence's ``week_reset_events`` row, both by logical
-    ``journal_id``. The occurrence's DEPENDENT milestones ride a separate
-    ``weekly_replica_suppression`` evt instead, because that family folds at
-    order 70 and both milestone families fold at 60 — naming them on the
-    order-50 ``wce`` would delete them before the fold that creates them. The
-    NEW credit row (op fold, ``journal_id = id_base``) and NEW synthetic
-    (``sa:<id_base>:syn:0``) are excluded from every list, so the clear is
-    order-independent and idempotent.
+    ``forced`` (ingest path only) journals the ``--force`` re-record's destructive
+    clear that legacy ``_force_clear_credit`` did inline: the ``wce`` evt's
+    ``suppression`` list widens to also delete this week's OLD command-owned
+    synthetic snapshots and a ``floor_suppression`` list deletes its OLD
+    ``weekly_credit_floors`` rows (both by logical ``journal_id``), so a
+    ``--force`` re-record replays deterministically. The NEW floor (op fold,
+    ``journal_id = id_base``) and NEW synthetic (``sa:<id_base>:syn:0``) are
+    excluded from both lists, so the clear is order-independent and idempotent.
 
     Side-effect ordering mirrors `_fire_in_place_credit`'s discipline: the
-    credit record's own INSERT OR IGNORE (in the op fold) is dedup-gated by
-    UNIQUE(account_key, credit_key), but the hwm force-write, stale-replay
-    DELETE, and synthetic-snapshot INSERT run UNCONDITIONALLY so a rerun
-    finishes a crash-half-applied credit (memory:
-    project_dedup_must_not_gate_side_effects). All are individually idempotent
-    (file overwrite; DELETE on a stable predicate; the synthetic snapshot is
-    re-INSERTed only after a ``--force`` re-record's destructive clear or on the
-    completion path where none exists yet).
+    INSERT OR IGNORE of the floor row is dedup-gated by UNIQUE(week_start_date,
+    effective_at_utc), but the hwm force-write, stale-replay DELETE, and
+    synthetic-snapshot INSERT run UNCONDITIONALLY so a rerun finishes a crash-
+    half-applied credit (memory: project_dedup_must_not_gate_side_effects). All
+    are individually idempotent (file overwrite; DELETE on a stable predicate;
+    the synthetic snapshot is re-INSERTed only after a ``--force`` re-record's
+    destructive clear or on the completion path where none exists yet).
 
-    `plan.effective_iso` is `floor_to_hour(at)` and is DISPLAY-ONLY. The exact
-    asserted instant is `plan.captured_iso`, which the fold stores as
-    `observed_at_utc` and which names the occurrence: one timestamp cannot serve
-    both human rounding and evidence membership, and asking it to is what
-    back-dated the epoch in the 2026-09-01 incident. parse_iso_datetime returns
-    a host-local-offset aware datetime; convert to UTC so the effective instant
+    `plan.effective_iso` is `floor_to_hour(at)`. parse_iso_datetime returns a
+    host-local-offset aware datetime; convert to UTC so `effective_at_utc`
     persists with a +00:00 spelling, not a host offset, in the `*_utc` column.
     On the completion / --force re-apply path the CALLER passes a `plan` whose
-    `effective_iso` is the EXISTING credit row's effective instant (NOT a fresh
+    `effective_iso` is the EXISTING floor row's `effective_at_utc` (NOT a fresh
     floor_to_hour(now)) — spec §4a completion-effective reuse."""
     c = _cctally()
     effective_dt = parse_iso_datetime(plan.effective_iso, "effective").astimezone(dt.timezone.utc)
     effective_iso = effective_dt.isoformat(timespec="seconds")
     pre_credit = float(plan.from_pct)
 
-    # 4a. The credit RECORD is written by the built-in op fold
-    # `_apply_op_weekly_credit_floor`, which runs FIRST per record from the
-    # record-credit `op` line and stamps `journal_id = record["id"]`. Since
-    # #703 + #707 that fold inserts the unified `week_reset_events` row rather
-    # than a `weekly_credit_floors` row, and it is the SOLE writer of the credit
-    # record on either path. `_apply_credit` no longer inserts anything of its
-    # own here: a second INSERT would be a second materialization of one credit,
-    # which is exactly what unification removes.
+    # 4a. INSERT the credit floor (no week_reset_events row — the whole point).
+    # LEGACY-ONLY (Option (i), 6e): on the ingest path (`ctx` passed) the floor
+    # row is written by the built-in op fold `_apply_op_weekly_credit_floor`,
+    # which runs FIRST per record from the record-credit `op` line and stamps
+    # `journal_id = record["id"]` — so the floor row is journal-identified and
+    # rebuild-replayable, and the op fold is the SOLE `weekly_credit_floors`
+    # writer on the ingest path. `_apply_credit`'s own INSERT here would race the
+    # op fold for the UNIQUE(week_start_date, effective_at_utc) slot and leave a
+    # NULL-`journal_id` row on the losing INSERT; gating it on `ctx is None`
+    # makes the "op fold owns the floor" invariant explicit and keeps the floor's
+    # journal_id unambiguous. On the legacy path (`ctx=None`) the INSERT is
+    # idempotent via that same UNIQUE.
+    if ctx is None:
+        conn.execute(
+            "INSERT OR IGNORE INTO weekly_credit_floors "
+            "(week_start_date, effective_at_utc, observed_pre_credit_pct, "
+            " applied_at_utc, account_key) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (plan.week_start_date, effective_iso, pre_credit,
+             as_of or now_utc_iso(), account_key),
+        )
+        if commit:
+            conn.commit()
 
     if ctx is None:
         # ── Legacy inline path (verbatim) ──────────────────────────────────
@@ -4379,24 +3829,18 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
         except OSError:
             pass
 
-        # 4c. Stale-replay DELETE: drop replays still reading at the asserted
-        # pre-credit level that land at or after the ASSERTED instant (the
-        # gotcha_statusline_replay_race_after_credit defense).
-        #
-        # #703 + #707 §5.1: the manual rule, not the automatic bracket, and not
-        # the 1.0pp band either path used to carry. A retroactive assertion has
-        # no confirming observation to close an upper end, so a bracket here
-        # would delete genuine climb between the asserted instant and the
-        # command — 46 to 31 at 10:00, real usage through 32, 33 and 35,
-        # recorded at 14:00. The LEVEL is what tells a replay from a climb.
+        # 4c. Stale-replay DELETE: drop pre-credit-valued replays that land
+        # at/after the floor (the gotcha_statusline_replay_race_after_credit
+        # defense; same 1.0pp band as the auto path). unixepoch() on both sides
+        # for offset safety.
         try:
-            for row in _lib_credit_selection.select_manual_replicas(
-                    conn, week_start_date=plan.week_start_date,
-                    account_key=account_key, observed_at=plan.captured_iso,
-                    from_pct=pre_credit):
-                conn.execute(
-                    "DELETE FROM weekly_usage_snapshots WHERE id = ?",
-                    (int(row["id"]),))
+            conn.execute(
+                "DELETE FROM weekly_usage_snapshots "
+                "WHERE week_start_date = ? AND account_key = ? "
+                "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+                "  AND ABS(weekly_percent - ?) < 1.0",
+                (plan.week_start_date, account_key, effective_iso, pre_credit),
+            )
             if commit:
                 conn.commit()
         except sqlite3.DatabaseError as exc:
@@ -4411,37 +3855,32 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
         # inline. Capture the doomed stale-replica journal_ids BEFORE the effect
         # applies its DELETE (SAME predicate as the legacy 4c DELETE).
         import _cctally_journal as _jr
-        # The SAME manual rule the legacy 4c DELETE uses, from the one selector
-        # (#703 + #707 §5.1) — the capture and the removal cannot drift when
-        # both read one function.
-        #
         # Exclude THIS op's OWN synthetic ids (`sa:<id_base>:syn:%`) from the
-        # capture, by deterministic id — NOT merely by emission timing (6g P2 /
-        # Task 7 Item 0, the sibling of the `old_syn` forced-path fix below). A
-        # credit to a level at or above `from_pct` cannot happen, but the
-        # exclusion is not about the level: under crash-replay (evts fsync'd,
-        # COMMIT lost) the next cycle replays `sa:<id_base>:syn:0` at fold order
-        # 10 BEFORE step 4b re-runs `_apply_credit`, so a timing-only capture
-        # would re-fold the just-replayed NEW synthetic into a second `wce`
-        # whose suppression deletes the very row it must preserve when a rebuild
-        # folds all snapshot_accept before all wce. The prefix exclusion makes
-        # `supp` a PURE FUNCTION of the op — identical whether or not the new
-        # synthetic has been replayed — and applies on the NON-force path too
-        # (`supp = doomed` here, before `if forced:`).
-        own_synthetic_prefix = f"sa:{id_base}:syn:"
-        doomed = [
-            r for r in _lib_credit_selection.select_manual_replicas(
-                conn, week_start_date=plan.week_start_date,
-                account_key=account_key, observed_at=plan.captured_iso,
-                from_pct=pre_credit)
-            if r["journal_id"]
-            and not r["journal_id"].startswith(own_synthetic_prefix)
-        ]
-        supp = [r["journal_id"] for r in doomed]
+        # doomed stale-replica capture, by deterministic id — NOT merely by
+        # emission timing (6g P2 / Task 7 Item 0, the sibling of the `old_syn`
+        # forced-path fix below). A sub-1.0pp credit (legal) puts the synthetic
+        # (at `plan.to_pct`) INSIDE this band (`ABS(weekly_percent - from_pct) <
+        # 1.0`); under crash-replay (evts fsync'd, COMMIT lost) the next cycle
+        # replays `sa:<id_base>:syn:0` at fold order 10 BEFORE step 4b re-runs
+        # `_apply_credit`, so a timing-only capture would re-fold the just-replayed
+        # NEW synthetic into a second `wce` whose suppression deletes the very row
+        # it must preserve when a rebuild folds all snapshot_accept before all wce.
+        # The prefix exclusion makes `supp` a PURE FUNCTION of the op — identical
+        # whether or not the new synthetic has been replayed — and applies on the
+        # NON-force path too (`supp = doomed` here, before `if forced:`).
+        # (`id_base` is a content digest `o:<hex>`, no LIKE metacharacters.)
+        doomed = conn.execute(
+            "SELECT journal_id FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? AND account_key = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+            "  AND ABS(weekly_percent - ?) < 1.0 "
+            "  AND journal_id IS NOT NULL "
+            "  AND journal_id NOT LIKE 'sa:' || ? || ':syn:%'",
+            (plan.week_start_date, account_key, effective_iso, pre_credit,
+             id_base),
+        ).fetchall()
+        supp = [r[0] for r in doomed]
         floor_supp: list = []
-        milestone_supp: list = []
-        five_hour_milestone_supp: list = []
-        replaces_key = None
         # `--force` re-record: journal the destructive clear that legacy
         # `_force_clear_credit` did inline (delete this week's command-owned
         # synthetic snapshots + its credit-floor rows). Ride the SAME wce
@@ -4463,92 +3902,26 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
             # whether or not the new synthetic has been replayed — mirroring the
             # floor list's `journal_id != id_base` filter below. (`id_base` is a
             # content digest `o:<hex>`, no LIKE metacharacters.)
-            # #703 + #707: the clear is scoped to the ONE occurrence
-            # `plan.replaces_credit_key` names. It used to take the whole week —
-            # every prior synthetic and every prior floor row — which cannot
-            # coexist with several credits per week, and which silently removed
-            # credits the user never named. The replaced occurrence's row is
-            # found by its identity; its synthetic snapshot is the one keyed on
-            # that row's own op id (`sa:<op>:syn:%`), never the whole week's
-            # `source = 'record-credit'` set; and its DEPENDENT milestones go
-            # with it, because this codebase's foreign keys are
-            # documentation-only and a milestone pointing at a removed credit
-            # would dangle silently.
-            # `getattr`, not attribute access: an op line written before this
-            # field existed replays through here, and its plan has no such
-            # attribute. A legacy forced op then names no occurrence and clears
-            # nothing, which is the conservative direction — it leaves a row
-            # standing rather than removing one nobody named.
-            replaces_key = getattr(plan, "replaces_credit_key", None)
-            replaced = conn.execute(
-                "SELECT id, journal_id FROM week_reset_events "
+            old_syn = conn.execute(
+                "SELECT journal_id FROM weekly_usage_snapshots "
                 "WHERE week_start_date = ? AND account_key = ? "
-                "  AND old_week_end_at IS NULL AND new_week_end_at IS NULL "
-                "  AND credit_key = ? AND journal_id IS NOT NULL "
-                "  AND journal_id != ?",
-                (plan.week_start_date, account_key, replaces_key, id_base),
-            ).fetchone() if replaces_key else None
-            if replaced is not None:
-                old_syn_rows = conn.execute(
-                    "SELECT id, journal_id FROM weekly_usage_snapshots "
-                    "WHERE week_start_date = ? AND account_key = ? "
-                    "  AND source = 'record-credit' "
-                    "  AND journal_id IS NOT NULL "
-                    "  AND journal_id LIKE 'sa:' || ? || ':syn:%'",
-                    (plan.week_start_date, account_key, replaced["journal_id"]),
-                ).fetchall()
-                supp.extend(r["journal_id"] for r in old_syn_rows
-                            if r["journal_id"] not in supp)
-                # Dependents of the replaced occurrence, from BOTH directions a
-                # dependent can point: a weekly milestone whose epoch IS the
-                # replaced credit, and a milestone of either kind whose
-                # `usage_snapshot_id` names one of the synthetic snapshots being
-                # removed with it. Every foreign key here is
-                # documentation-only, so anything left behind dangles silently.
-                syn_ids = tuple(int(r["id"]) for r in old_syn_rows)
-                dependents = {
-                    r["journal_id"]
-                    for r in conn.execute(
-                        "SELECT journal_id FROM percent_milestones "
-                        "WHERE reset_event_id = ? AND journal_id IS NOT NULL",
-                        (int(replaced["id"]),),
-                    ).fetchall()
-                }
-                five_hour_dependents: set = set()
-                if syn_ids:
-                    holes = ",".join("?" for _ in syn_ids)
-                    dependents |= {
-                        r["journal_id"]
-                        for r in conn.execute(
-                            "SELECT journal_id FROM percent_milestones "
-                            f"WHERE usage_snapshot_id IN ({holes}) "
-                            "  AND journal_id IS NOT NULL", syn_ids).fetchall()
-                    }
-                    five_hour_dependents = {
-                        r["journal_id"]
-                        for r in conn.execute(
-                            "SELECT journal_id FROM five_hour_milestones "
-                            f"WHERE usage_snapshot_id IN ({holes}) "
-                            "  AND journal_id IS NOT NULL", syn_ids).fetchall()
-                    }
-                milestone_supp = sorted(dependents)
-                five_hour_milestone_supp = sorted(five_hour_dependents)
-                floor_supp = [replaced["journal_id"]]
+                "  AND source = 'record-credit' "
+                "  AND journal_id IS NOT NULL "
+                "  AND journal_id NOT LIKE 'sa:' || ? || ':syn:%'",
+                (plan.week_start_date, account_key, id_base),
+            ).fetchall()
+            supp.extend(r[0] for r in old_syn if r[0] not in supp)
+            old_floors = conn.execute(
+                "SELECT journal_id FROM weekly_credit_floors "
+                "WHERE week_start_date = ? AND account_key = ? "
+                "  AND journal_id IS NOT NULL AND journal_id != ?",
+                (plan.week_start_date, account_key, id_base),
+            ).fetchall()
+            floor_supp = [r[0] for r in old_floors]
         # wce evt (effects-only, table=None): snapshot suppression list + floor
         # suppression list (--force clear) + forced hwm floor. emit_model_a
         # appends+fsyncs the line then applies it via `_apply_weekly_credit_effects`
         # (DELETE by journal_id from both tables + hwm-7d write).
-        #
-        # The dependent-milestone removal is NOT here. This family folds at
-        # order 50 and both milestone families fold at 60, so a rebuild or a
-        # rederive would run that DELETE against a table it had not filled yet —
-        # the same live-only/rebuild-undone class §5.4 exists to remove. It
-        # appeared to work only because the milestone's own `reset_event_ref`
-        # named the record this event deletes at 50, so the reference failed to
-        # resolve and the row was dropped against a NOT NULL column. That is a
-        # coincidence of two unrelated mechanisms and it inverts the moment
-        # either one changes. The removal rides the order-70
-        # `weekly_replica_suppression` family below instead.
         _jr.emit_model_a(
             ctx,
             kind="weekly_credit_effects",
@@ -4565,31 +3938,6 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
             },
             at=(as_of or plan.captured_iso),
         )
-        if milestone_supp or five_hour_milestone_supp:
-            # The replaced occurrence's dependents, on the one family that folds
-            # after the families it removes rows from. Keyed on the replaced
-            # occurrence and on the op doing the replacing, so a crash-replayed
-            # cycle converges on the same line rather than appending a second.
-            digest = _jr.replica_suppression_target_digest(
-                (), milestone_supp, five_hour_milestone_supp)
-            columns = {
-                "account_key": account_key,
-                "credit_key": replaces_key,
-                "confirming_observation_id": id_base,
-                "snapshots": [],
-                "milestones": milestone_supp,
-            }
-            if five_hour_milestone_supp:
-                columns["five_hour_milestones"] = five_hour_milestone_supp
-            _jr.emit_model_a(
-                ctx,
-                kind="weekly_replica_suppression",
-                evt_id=_lib_journal.evt_id(
-                    "wrs", account_key, replaces_key, id_base, digest),
-                table=None,
-                columns=columns,
-                at=(as_of or plan.captured_iso),
-            )
         # Synthetic post-credit snapshot as a snapshot_accept evt (the only
         # writer of weekly_usage_snapshots on the ingest path). Route it through
         # `_insert_credit_snapshot(journal=...)` — the SOLE synthetic writer on
@@ -4600,26 +3948,23 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
             journal=(ctx, f"sa:{id_base}:syn:0"), account_key=account_key)
 
     # 4e. Clear a stale same-week reset-zero marker so the next record-usage
-    # tick can't confirm a phantom reset-to-zero off it. Scoped to the credited
-    # account (#703 + #707 §6.2a): a manual credit for one account must not
-    # disarm another account's pending reset.
-    _projection_clear_reset_zero_marker(ctx, account_key)
+    # tick can't confirm a phantom reset-to-zero off it.
+    _projection_clear_reset_zero_marker(ctx)
 
 
 def _count_stale_replays(conn, plan):
-    """Count the rows the credit's stale-replay removal will touch.
-
-    For the preview and the `--json` `staleReplaysDeleted` field, so it MUST
-    read the same selector the removal does (#703 + #707 §5.1): a preview
-    computed from its own predicate is a preview of a different command.
-
-    Account-blind (`account_key=None`), matching the preview's `hwm_before`
-    read: the preview is shown before the account is resolved, and the merged
-    count is byte-identical on a single-account install.
-    """
-    return len(_lib_credit_selection.select_manual_replicas(
-        conn, week_start_date=plan.week_start_date, account_key=None,
-        observed_at=plan.captured_iso, from_pct=plan.from_pct))
+    """Count the pre-credit replay rows the _apply_credit stale-replay DELETE
+    (step 4c, inline) will touch (captured at/after the credit moment within a
+    1.0pp band of from), for the preview / --json `staleReplaysDeleted` field.
+    Read-only."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM weekly_usage_snapshots "
+        " WHERE week_start_date = ? "
+        "   AND unixepoch(captured_at_utc) >= unixepoch(?) "
+        "   AND ABS(weekly_percent - ?) < 1.0",
+        (plan.week_start_date, plan.effective_iso, float(plan.from_pct)),
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
 
 
 def _credit_preview_text(plan, *, stale_replays, dry_run):
@@ -4641,17 +3986,13 @@ def _credit_preview_text(plan, *, stale_replays, dry_run):
         f"  effective:     {eff_dt.strftime('%Y-%m-%d %H:%M')} UTC  "
         f"(floored from {cap_dt.strftime('%Y-%m-%d %H:%M')})",
         "  writes:",
-        f"    + credit record         (effective={plan.effective_iso}, "
+        f"    + weekly_credit_floors  (effective={plan.effective_iso}, "
         f"pre_credit={plan.from_pct:g})",
         f"    ~ hwm-7d                {plan.from_pct:g} -> {plan.to_pct:g}",
         f"    - stale replays         {stale_replays} rows",
         f"    + snapshot              captured={plan.captured_iso}, "
         f"weekly_percent={plan.to_pct:g}",
-        # The old wording named the mechanism — "no week_reset_events row" —
-        # and #703 + #707 made it false: a manual credit IS such a row now,
-        # with both boundary columns NULL because it moved no boundary. The
-        # replacement states the effect, which is what the note was for.
-        "  note: same week — the window keeps its own boundaries",
+        "  note: same week — no window re-anchor (no week_reset_events row)",
     ]
     if dry_run:
         lines.append("  (dry-run — nothing written)")
@@ -4689,270 +4030,6 @@ def _credit_json(plan, *, applied, dry_run, forced, stale_replays, hwm_before):
     }
 
 
-def _credit_account_clause(account_key):
-    """Scope a manual-credit query to one account, or explicitly to all.
-
-    ``None`` is a deliberate merged read for a caller with no account context,
-    never a silent global fallback (#703 + #707 §6.2a)."""
-    if account_key is None:
-        return "", ()
-    return " AND account_key = ?", (account_key,)
-
-
-_MANUAL_CREDIT_PROJECTION = (
-    "SELECT id, credit_key, journal_id, "
-    "       effective_reset_at_utc AS effective_at_utc, "
-    "       observed_at_utc, observed_pre_credit_pct "
-    "  FROM week_reset_events "
-)
-
-
-def _manual_credits_at(conn, week_start_date, at_iso, effective_iso, *,
-                       account_key):
-    """Every manual credit for this ACCOUNT'S week at the instant ``--at`` names.
-
-    ``account_key`` is MANDATORY (#703 + #707 §6.2a). Unscoped, account B naming
-    its own instant was refused by a message describing account A's credit, and
-    the ambiguity refusal counted another account's rows.
-
-    `--at` names ONE occurrence, and the instant that names it is the UNFLOORED
-    one. `effective_reset_at_utc` stays hour-floored and display-only, so
-    matching on it made every credit inside one hour the same occurrence: a
-    second `record-credit` at 14:47 was read as a repeat of the one at 14:05 and
-    refused, even though spec §3.1 admits two credits in the same hour whenever
-    two distinct ops produced them. Only a genuinely identical instant is
-    indistinguishable from a double-run, and that case keeps its refusal.
-
-    Two arms, tried in order rather than unioned. A row written since
-    `observed_at_utc` existed is named by that exact instant. A row that
-    predates the column carries only the hour-floored effective instant, so an
-    exact-only predicate would leave it unreachable by `--force`; the hour arm
-    reaches it, and runs ONLY when no row matched exactly, so an exact match
-    never becomes an ambiguity refusal merely because a legacy row shares its
-    hour.
-
-    `unixepoch()` on both sides because the producers spell the offset
-    differently (`Z` against `+00:00`), which a textual comparison would
-    silently disagree about on a non-UTC host.
-    """
-    acct_sql, acct_params = _credit_account_clause(account_key)
-    exact = conn.execute(
-        _MANUAL_CREDIT_PROJECTION +
-        " WHERE week_start_date = ?" + acct_sql +
-        "   AND old_week_end_at IS NULL AND new_week_end_at IS NULL "
-        "   AND observed_at_utc IS NOT NULL "
-        "   AND unixepoch(observed_at_utc) = unixepoch(?) "
-        " ORDER BY id",
-        (week_start_date,) + acct_params + (at_iso,),
-    ).fetchall()
-    if exact:
-        return exact
-    return conn.execute(
-        _MANUAL_CREDIT_PROJECTION +
-        " WHERE week_start_date = ?" + acct_sql +
-        "   AND old_week_end_at IS NULL AND new_week_end_at IS NULL "
-        "   AND observed_at_utc IS NULL "
-        "   AND unixepoch(effective_reset_at_utc) = unixepoch(?) "
-        " ORDER BY id",
-        (week_start_date,) + acct_params + (effective_iso,),
-    ).fetchall()
-
-
-def _manual_credits_in_week(conn, week_start_date, *, account_key):
-    """Every manual credit for this ACCOUNT'S week, oldest first.
-
-    ``account_key`` is MANDATORY (#703 + #707 §6.2a). This is the destructive
-    one: the half-applied scan built on it made a plain run COMPLETE another
-    account's crashed credit, reusing that account's `credit_key` so the row it
-    wrote carried the other account's identity."""
-    acct_sql, acct_params = _credit_account_clause(account_key)
-    return conn.execute(
-        _MANUAL_CREDIT_PROJECTION +
-        " WHERE week_start_date = ?" + acct_sql +
-        "   AND old_week_end_at IS NULL AND new_week_end_at IS NULL "
-        " ORDER BY unixepoch("
-        "     COALESCE(observed_at_utc, effective_reset_at_utc)), id",
-        (week_start_date,) + acct_params,
-    ).fetchall()
-
-
-def _credit_has_its_synthetic(conn, week_start_date, occurrence, *,
-                             account_key) -> bool:
-    """Whether ``occurrence`` already has the synthetic post-credit snapshot
-    `_apply_credit` writes for it.
-
-    Matched on the snapshot's OWN logical id, `sa:<the credit's op id>:syn:%`,
-    not on "any command-owned snapshot at or after this credit's effective
-    instant". With several credits in one week the looser predicate answers for
-    the wrong credit: a later occurrence's synthetic sits after an earlier one's
-    effective instant and would make a genuinely half-applied earlier credit
-    look finished. The looser predicate remains the fallback for a row with no
-    journal id, which is a hand-built or pre-fold state with no own-synthetic to
-    match.
-    """
-    acct_sql, acct_params = _credit_account_clause(account_key)
-    if occurrence["journal_id"]:
-        row = conn.execute(
-            "SELECT 1 FROM weekly_usage_snapshots "
-            " WHERE week_start_date = ?" + acct_sql +
-            "   AND source = 'record-credit' "
-            "   AND journal_id LIKE 'sa:' || ? || ':syn:%' LIMIT 1",
-            (week_start_date,) + acct_params + (occurrence["journal_id"],),
-        ).fetchone()
-        return row is not None
-    row = conn.execute(
-        "SELECT 1 FROM weekly_usage_snapshots "
-        " WHERE week_start_date = ?" + acct_sql +
-        "   AND source='record-credit' "
-        "   AND unixepoch(captured_at_utc) >= unixepoch(?) LIMIT 1",
-        (week_start_date,) + acct_params + (occurrence["effective_at_utc"],),
-    ).fetchone()
-    return row is not None
-
-
-def _resolve_credit_occurrence(conn, *, week_start_date, at_dt, is_force,
-                               account_key):
-    """Classify the credit occurrence this invocation acts on.
-
-    Returns ``(occurrence, is_completion, refusal)``; ``refusal`` is a message
-    or None. ONE function, shared by `cmd_record_credit` and
-    `_revalidate_credit_plan`, because the two must reach the same verdict — the
-    revalidation exists to refuse a plan that drifted, and two copies of this
-    rule would eventually make it refuse a plan that did not.
-
-    #703 + #707 replaced "is there a credit for this WEEK" with two narrower
-    questions, because the first could only be answered one way once several
-    credits per week became representable, and it is the question that made
-    `--force` replace the week.
-
-      - ``--force`` acts on the one occurrence at the instant ``--at`` names.
-        That instant is the UNFLOORED one: `effective_reset_at_utc` is
-        hour-floored and display-only, so naming an occurrence by it made every
-        credit inside one hour the same occurrence. None there is a refusal,
-        because replacing the week instead is what this change exists to stop.
-        Several is an ambiguity refusal: a keyless row predates credit identity
-        and cannot be told apart from another keyless row beside it, and picking
-        one silently would remove a credit nobody named.
-      - A plain run first looks for a HALF-APPLIED credit anywhere in the week —
-        a crash between the credit record and its synthetic snapshot — and
-        COMPLETES it, reusing its effective instant and its identity. This
-        lookup is deliberately not keyed on ``--at``: the completion rerun
-        happens at a later wall clock than the credit it finishes, which is the
-        whole reason section 4a reuses the recorded effective instead of
-        flooring a fresh one.
-      - Otherwise a plain run with a fully-applied occurrence at this instant is
-        refused, as before: a second credit at the identical instant is
-        indistinguishable from a double-run.
-      - Otherwise it ADDS an occurrence and leaves every other credit untouched.
-    """
-    effective_iso = _floor_to_hour(at_dt).isoformat(timespec="seconds")
-    at_iso = at_dt.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
-    at_instant = _manual_credits_at(
-        conn, week_start_date, at_iso, effective_iso,
-        account_key=account_key)
-    if is_force:
-        if not at_instant:
-            return None, False, (
-                f"no credit recorded at {at_iso}; --force replaces one "
-                "occurrence, named by --at")
-        if len(at_instant) > 1:
-            return None, False, (
-                f"several credits are recorded at {at_iso}; --force "
-                "cannot tell which one to replace")
-        target = at_instant[0]
-        if not target["credit_key"]:
-            return None, False, (
-                f"the credit at {at_iso} predates credit identity and "
-                "cannot be named for replacement")
-        return target, False, None
-
-    half_applied = [
-        row for row in _manual_credits_in_week(
-            conn, week_start_date, account_key=account_key)
-        if not _credit_has_its_synthetic(
-            conn, week_start_date, row, account_key=account_key)
-    ]
-    if len(half_applied) > 1:
-        return None, False, (
-            "several half-applied credits are recorded for this week; pass "
-            "--force with --at to replace one")
-    if half_applied:
-        return half_applied[0], True, None
-    if len(at_instant) > 1:
-        return None, False, (
-            f"several credits are recorded at {at_iso}; pass --at to "
-            "name one")
-    if at_instant:
-        return at_instant[0], False, None
-    return None, False, None
-
-
-# #703 + #707: `record-credit`'s existing-credit lookup. A manual credit is a
-# `week_reset_events` row now, so the classification that decides between
-# completion, refusal and `--force` reads that table. The projection is kept as
-# `(id, effective_at_utc, observed_pre_credit_pct)` because both call sites and
-# every downstream branch index it positionally, and the middle element is the
-# effective instant either way.
-#
-# A MANUAL credit is recognised by its row SHAPE: both boundary columns NULL.
-# Only the `weekly_credit_floor` op fold writes that shape, because a manual
-# credit moves no boundary and has none to record; every automatic path writes
-# both columns. `journal_id` is NOT the discriminator — an automatic credit's row
-# is stamped by harvest too, so that column separates "already journaled" from
-# "inserted this cycle", not manual from automatic. Scoping to manual rows keeps
-# this classification about what `record-credit` itself wrote, which is what the
-# completion and refusal branches are about.
-#
-# The ordering is §5.3's, not `unixepoch(effective_reset_at_utc) DESC, id DESC`.
-# Two credits inside one hour are legal now and share the floored instant, so
-# that form's real tiebreak was `id DESC` — a projection-local number a rebuild
-# reassigns, and §5.3 states plainly that it is unusable rather than merely
-# imprecise. The accounting instant orders by occurrence; `credit_order` records
-# a fact of the source record; `credit_key` is the deterministic final fallback.
-_EXISTING_MANUAL_CREDIT_SQL = (
-    "SELECT id, effective_reset_at_utc AS effective_at_utc, "
-    "       observed_pre_credit_pct, credit_key "
-    "  FROM week_reset_events "
-    " WHERE week_start_date = ?{acct} "
-    "   AND old_week_end_at IS NULL AND new_week_end_at IS NULL "
-    " ORDER BY unixepoch("
-    "     COALESCE(observed_at_utc, effective_reset_at_utc)) DESC, "
-    "          credit_order DESC, credit_key DESC LIMIT 1"
-)
-
-
-def _latest_manual_credit(conn, week_start_date, *, account_key):
-    """The manual credit whose accounting instant is latest for this account.
-
-    ``account_key`` is MANDATORY (#703 + #707 §6.2a); ``None`` is the explicit
-    merged read, which only a caller that genuinely has no account context uses.
-    """
-    acct_sql, acct_params = _credit_account_clause(account_key)
-    return conn.execute(
-        _EXISTING_MANUAL_CREDIT_SQL.format(acct=acct_sql),
-        (week_start_date,) + acct_params).fetchone()
-
-
-def _credit_command_account_scope():
-    """The account `record-credit` classifies its occurrences under.
-
-    `record-credit` is active-account-only (#341 P2-1), and the op it appends is
-    stamped with the active identity. The classification that decides between
-    completion, refusal and `--force` has to read the SAME account, or account B
-    resolves an occurrence belonging to account A (#703 + #707 §6.2a).
-
-    A TORN read yields ``None`` — the explicit merged read — rather than an
-    exit. The command already refuses a torn read before it writes anything, and
-    failing here instead would move that refusal onto the preview, which writes
-    nothing and is expected to work. So the transient degrades to exactly the
-    unscoped behavior that preceded this function, for the one tick it lasts.
-    """
-    identity = _cctally_core._resolve_active_claude_identity()
-    if identity.get("status") == "torn":
-        return None
-    return identity["account_key"]
-
-
 def _revalidate_credit_plan(conn, args, *, now, at_dt, expected_plan):
     """Recompute the confirmed credit plan from locked, current DB truth.
 
@@ -4975,24 +4052,31 @@ def _revalidate_credit_plan(conn, args, *, now, at_dt, expected_plan):
             ws_at = ws_at if isinstance(ws_at, str) else ws_at.isoformat(timespec="seconds")
             we_at = we_at if isinstance(we_at, str) else we_at.isoformat(timespec="seconds")
             week_start_date = parse_iso_datetime(ws_at, "ws_at").date().isoformat()
-        account_scope = _credit_command_account_scope()
-        latest = _latest_manual_credit(
-            conn, week_start_date, account_key=account_scope)
+        existing = conn.execute(
+            "SELECT id, effective_at_utc, observed_pre_credit_pct "
+            "FROM weekly_credit_floors WHERE week_start_date=? "
+            "ORDER BY unixepoch(effective_at_utc) DESC, id DESC LIMIT 1",
+            (week_start_date,),
+        ).fetchone()
         is_force = bool(getattr(args, "force", False))
         if getattr(args, "from_pct", None) is not None:
             from_pct, from_source = float(args.from_pct), "explicit"
-        elif latest is not None and latest[2] is not None:
-            from_pct, from_source = float(latest[2]), "prior_credit"
+        elif existing is not None and existing[2] is not None:
+            from_pct, from_source = float(existing[2]), "prior_credit"
         else:
             from_pct = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at, account_key=None)
             if from_pct is None:
                 return None
             from_source = "hwm"
-        existing, is_completion, refusal = _resolve_credit_occurrence(
-            conn, week_start_date=week_start_date, at_dt=at_dt,
-            is_force=is_force, account_key=account_scope)
-        if refusal is not None:
-            return None
+        is_completion = False
+        if existing is not None and not is_force:
+            owned = conn.execute(
+                "SELECT 1 FROM weekly_usage_snapshots "
+                " WHERE week_start_date=? AND source='record-credit' "
+                "   AND unixepoch(captured_at_utc) >= unixepoch(?) LIMIT 1",
+                (week_start_date, existing[1]),
+            ).fetchone()
+            is_completion = owned is None
         if existing is not None and not is_force and not is_completion:
             return None
         plan = _build_credit_plan(
@@ -5004,11 +4088,7 @@ def _revalidate_credit_plan(conn, args, *, now, at_dt, expected_plan):
             to_pct=args.to,
             at_dt=at_dt,
             now=now,
-            effective_override=(
-                existing["effective_at_utc"] if is_completion else None),
-            replaces_credit_key=(
-                existing["credit_key"] if (is_force and existing is not None)
-                else None),
+            effective_override=existing[1] if is_completion else None,
         )
     except (sqlite3.DatabaseError, ValueError, TypeError):
         return None
@@ -5048,20 +4128,20 @@ def cmd_record_credit(args) -> int:
         # both for the --from default fallback (a half-applied credit empties
         # the post-credit segment, so the reset-aware HWM reads NULL) and the
         # apply-time completion/refuse/force branch (M2 keys on
-        # the unified `week_reset_events` row the op fold writes, restricted to
-        # the manual rows — #703 + #707 retired `weekly_credit_floors` as a
-        # second materialization of one credit). Latest credit wins (a --force
-        # re-apply at a new effective leaves the old row only until the
-        # ingest-path wce evt's suppression deletes it; pick the newest
-        # defensively).
-        account_scope = _credit_command_account_scope()
-        latest = _latest_manual_credit(
-            conn, week_start_date, account_key=account_scope)
+        # weekly_credit_floors, NOT week_reset_events — a partial credit never
+        # writes a reset-event row). Latest floor wins (a --force re-apply at a
+        # new effective leaves the old row only until the ingest-path wce evt's
+        # floor_suppression deletes it; pick the newest defensively).
+        existing = conn.execute(
+            "SELECT id, effective_at_utc, observed_pre_credit_pct "
+            "FROM weekly_credit_floors WHERE week_start_date=? "
+            "ORDER BY unixepoch(effective_at_utc) DESC, id DESC LIMIT 1",
+            (week_start_date,)).fetchone()
 
         # 2. Resolve --from default.
         if getattr(args, "from_pct", None) is not None:
             from_pct, from_source = float(args.from_pct), "explicit"
-        elif latest is not None and latest[2] is not None:
+        elif existing is not None and existing[2] is not None:
             # A credit floor already exists for this week (completion or
             # --force re-record). Its recorded observed_pre_credit_pct is the
             # AUTHENTIC pre-credit baseline; prefer it over the reset-aware
@@ -5070,7 +4150,7 @@ def cmd_record_credit(args) -> int:
             # status-line reading, mis-deriving the baseline and causing the
             # stale-replay DELETE to (wrongly) match real history. fromSource
             # is 'prior_credit' (spec §5).
-            from_pct, from_source = float(latest[2]), "prior_credit"
+            from_pct, from_source = float(existing[2]), "prior_credit"
         else:
             hwm = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at, account_key=None)
             if hwm is None:
@@ -5081,7 +4161,7 @@ def cmd_record_credit(args) -> int:
         is_force = getattr(args, "force", False)
 
         # 2a. Classify the existing-floor state (M2, spec §4/§5). A
-        #     credit record may be:
+        #     `weekly_credit_floors` row may be:
         #       - half-applied (floor row present, NO command-owned snapshot
         #         at/after its effective): a crash between 4a and 4d. A plain
         #         rerun FINISHES it, reusing the existing effective_at_utc (NOT
@@ -5089,17 +4169,19 @@ def cmd_record_credit(args) -> int:
         #         into the floored MAX (spec §4a completion-effective reuse).
         #       - fully applied (floor row + command-owned snapshot): refuse by
         #         default; --force clears + re-records at a fresh effective.
-        existing, is_completion, refusal = _resolve_credit_occurrence(
-            conn, week_start_date=week_start_date, at_dt=at_dt,
-            is_force=is_force, account_key=account_scope)
-        if refusal is not None:
-            eprint(f"record-credit: {refusal}")
-            return 2
+        is_completion = False
+        if existing is not None and not is_force:
+            owned = conn.execute(
+                "SELECT 1 FROM weekly_usage_snapshots "
+                " WHERE week_start_date=? AND source='record-credit' "
+                "   AND unixepoch(captured_at_utc) >= unixepoch(?) LIMIT 1",
+                (week_start_date, existing[1])).fetchone()
+            is_completion = owned is None
 
         # The effective the plan should carry: a half-applied completion reuses
-        # the EXISTING record's effective; a first credit / --force replacement
+        # the EXISTING floor row's effective; a first credit / --force re-apply
         # uses floor_to_hour(at) (computed inside _build_credit_plan).
-        reuse_effective = existing["effective_at_utc"] if is_completion else None
+        reuse_effective = existing[1] if is_completion else None
 
         # 3. Validate + build plan.
         try:
@@ -5108,9 +4190,6 @@ def cmd_record_credit(args) -> int:
                 week_end_at=we_at, from_pct=from_pct, from_source=from_source,
                 to_pct=args.to, at_dt=at_dt, now=now,
                 effective_override=reuse_effective,
-                replaces_credit_key=(
-                    existing["credit_key"]
-                    if (is_force and existing is not None) else None),
             )
         except ValueError as e:
             eprint(f"record-credit: {e}")
@@ -5153,15 +4232,9 @@ def cmd_record_credit(args) -> int:
         # regardless of --yes/TTY so the precondition failure is uniform; the
         # earlier --dry-run path still previews (writes nothing) and returns 0.
         if existing is not None and not is_force and not is_completion:
-            # Name the EXACT instant, not the hour-floored one. The refusal's
-            # own "--at another instant" escape is only usable if the instant it
-            # reports is the one an occurrence is named by, and a second credit
-            # inside the same hour is now a legal second occurrence.
-            eprint(f"record-credit: a credit is already recorded at "
-                   f"{existing['observed_at_utc'] or existing['effective_at_utc']} "
-                   f"(pre_credit={existing['observed_pre_credit_pct']}); "
-                   f"pass --force to replace it, or --at another instant to "
-                   f"record a second credit in this week")
+            eprint(f"record-credit: a credit is already recorded for this "
+                   f"week (effective={existing[1]}, pre_credit={existing[2]}); "
+                   f"pass --force to re-record")
             return 2
 
         # No --yes: prompt (TTY) or refuse (non-TTY).
@@ -5220,9 +4293,8 @@ def cmd_record_credit(args) -> int:
             # directly. Build the `record-credit` `op` line (floor columns + the
             # full 9-field plan + the command-time prior-5h read + the `forced`
             # flag) and run an AUTHORITATIVE ingest so the command observes its
-            # own write synchronously. The op fold writes the unified
-            # `week_reset_events` row (journal_id = the op line id);
-            # `_pipeline_record_credit`
+            # own write synchronously. The op fold writes the `weekly_credit_floors`
+            # row (Option (i), journal_id = the op line id); `_pipeline_record_credit`
             # -> `_apply_credit(ctx=..., forced=...)` journals the `weekly_credit_effects`
             # evt (stale-replica suppression + the `--force` clear of OLD synthetics
             # + OLD floors) and the synthetic `snapshot_accept` evt. Preview/refusal
@@ -5267,14 +4339,6 @@ def cmd_record_credit(args) -> int:
                     "plan": dict(vars(plan)),
                     "five_hour": list(five_hour),
                     "forced": forced,
-                    # #703 + #707: a COMPLETION finishes the credit a crash left
-                    # half-applied, so it must take that credit's identity
-                    # rather than mint a new one from its own content digest.
-                    # Absent on every other path, where a distinct op is a
-                    # distinct credit.
-                    **({"completes_credit_key": existing["credit_key"]}
-                       if (is_completion and existing is not None
-                           and existing["credit_key"]) else {}),
                     # Two-shaped stamp (#341): evt/op carry account_key in the
                     # payload; the op fold + `_apply_credit` both read it.
                     "account_key": credit_account_key,
@@ -6980,15 +6044,6 @@ def _pipeline_claude_usage(ctx, rec):
         commit=False,
         ctx=ctx,
         account_key=account_key,
-        # #703 + #707: a credit this observation causes is identified by that
-        # observation. `sa:<obs id>` is the logical identity its snapshot_accept
-        # evt carries, and it is derived from the obs record's content digest,
-        # so it exists whether or not this particular tick goes on to emit one —
-        # a credit tick is frequently a clamp skip. `capture_at` is the payload
-        # capture instant, which is the domain the credit's observation columns
-        # must share with `weekly_usage_snapshots.captured_at_utc`.
-        source_identity=f"sa:{rec['id']}",
-        capture_at=capture_at,
     )
 
     # 2. Accept/skip DECISION (clamp + dedup), made ONCE and journaled via the

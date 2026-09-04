@@ -73,7 +73,6 @@ _COLD_RESETS = (
     "reset_weekref_cost_state",
     "reset_projects_env_state",
     "reset_projects_env_current_state",
-    "reset_bugk_segment_state",
     "reset_cache_report_state",
 )
 

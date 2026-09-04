@@ -198,7 +198,7 @@
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1012,
+                            "epoch": 1011,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -963,6 +963,13 @@
                     "severity": "ok",
                     "summary": "all observed models priced",
                     "title": "Coverage"
+                },
+                {
+                    "details": {},
+                    "id": "pricing.conversation_rollup_writer",
+                    "severity": "ok",
+                    "summary": "no refused pricing write recorded",
+                    "title": "Rollup writer"
                 }
             ],
             "id": "pricing",
@@ -1086,7 +1093,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 59,
+            "ok": 60,
             "warn": 5
         },
         "severity": "warn"

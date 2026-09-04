@@ -16,7 +16,6 @@ import { cardRegionClick } from '../lib/cardRegion';
 import { presentationPeriodRows, presentationProviders } from '../lib/dashboardPresentation';
 import type { PeriodRow } from '../types/envelope';
 import { modelChipStyle } from '../lib/model';
-import { CREDIT_MARKER_LABEL, CREDIT_MARKER_TITLE } from '../lib/creditMarker';
 import { PeriodAccountChips } from '../components/PeriodAccountChips';
 import { providerLegs, weeklySpan } from '../lib/periodFooter';
 import { formatSpan } from '../lib/projectWindow';
@@ -44,13 +43,6 @@ function Row({ r, isFirstMount, reduced }: { r: PeriodRow; isFirstMount: boolean
           <PeriodAccountChips labels={r.account_labels} />
           {r.label}
           {r.is_current && <span className="pill-current">Now</span>}
-          {/* #703 + #707 §6.4 — the week no longer splits, so without this
-              nothing on screen explains a low Used % late in a heavy week. */}
-          {r.credited && (
-            <span className="pill-credited" title={CREDIT_MARKER_TITLE}>
-              {CREDIT_MARKER_LABEL}
-            </span>
-          )}
         </span>
         <span className="right">
           <span className="cost">{fmt.usd2(r.cost_usd)}</span>
@@ -91,8 +83,13 @@ export function WeeklyPanel() {
   const hiddenCount = providerGroups?.reduce((sum, group) => sum + group.hiddenCount, 0)
     ?? singleSummary.hiddenCount;
   const total = allRows.reduce((sum, row) => sum + row.cost_usd, 0);
-  const rowNoun = activeSource === 'claude' ? 'weeks' : activeSource === 'codex' ? 'cycles' : 'provider periods';
-  const totalLabel = activeSource === 'claude' ? `${allRows.length}w` : `${allRows.length} ${rowNoun}`;
+  // A row is a BILLING CYCLE, not a calendar week. An Anthropic quota credit
+  // ends one cycle and begins another inside the same week, so a credited
+  // week supplies two rows and "12w total" would name twelve weeks over a
+  // span of nine. Claude therefore counts in the same noun Codex already
+  // used, and the footer spells the count out rather than abbreviating it.
+  const rowNoun = activeSource === 'all' ? 'provider periods' : 'cycles';
+  const totalLabel = `${allRows.length} ${rowNoun}`;
   const hydrating = presentationProviders(env, activeSource).hydrating;
   const reduced = useReducedMotion();
   const display = useDisplayTz();
@@ -196,7 +193,7 @@ export function WeeklyPanel() {
                     {group.source === 'claude' ? 'Claude' : 'Codex'}
                   </span>
                   <span className="provider-summary-label">
-                    {group.rows.length} {group.source === 'claude' ? 'weeks' : 'cycles'}
+                    {group.rows.length} cycles
                   </span>
                 </div>
                 {group.visible.length === 0 ? (

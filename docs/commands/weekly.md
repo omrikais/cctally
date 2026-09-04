@@ -56,6 +56,25 @@ cctally weekly --order desc
 3. If no snapshots exist at all, falls back to `config.json`
    `collector.week_start` (default `monday`).
 
+## A credited week is TWO rows
+
+An Anthropic quota reset never moves a week's boundaries, but it does end one billing cycle and begin another inside that week. A week that was credited in place therefore renders as **two rows** — the segment before the credit and the segment after it — each with its own interval, its own cost and its own `Used %`. This is the same pair [`report`](report.md) has rendered since v1.7.2, and the two commands now agree on it.
+
+The two rows share one `week` value, because `week` is the billing-cycle join key into `weekly_usage_snapshots.week_start_date`, which the credit does not move. What distinguishes them is `weekStartAt`, so **a row's identity in `--json` is the pair `(week, weekStartAt)`, not `week` alone**:
+
+```json
+{ "week": "2026-06-05", "displayWeek": "2026-06-05",
+  "weekStartAt": "2026-06-05T15:00:00Z", "weekEndAt": "2026-06-10T09:00:00+00:00",
+  "usedPct": 71.0, "totalCost": 6.0 },
+{ "week": "2026-06-05", "displayWeek": "2026-06-10",
+  "weekStartAt": "2026-06-10T09:00:00+00:00", "weekEndAt": "2026-06-12T15:00:00Z",
+  "usedPct": 12.0, "totalCost": 3.0 }
+```
+
+`displayWeek` differs between the two rows: it is each segment's own user-facing start date, and it is what the terminal table's `Week` column renders.
+
+**Scripting warning.** `{r["week"]: r for r in payload["weekly"]}` silently drops the pre-credit row and under-reports that week's spend by the whole pre-credit segment. Key on `(r["week"], r["weekStartAt"])`, or on `weekStartAt` alone.
+
 ## Gotchas
 
 - **`weekly` ignores `weekly_cost_snapshots` for cost.** Cost is always

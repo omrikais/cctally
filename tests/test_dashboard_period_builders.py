@@ -282,17 +282,14 @@ def test_monthly_caps_to_n_drops_boundary_spillover(tmp_path, monkeypatch):
     assert all(r.label != "2025-04" for r in rows)
 
 
-def test_dashboard_weekly_period_labels_a_moved_week_by_its_own_start(
+def test_dashboard_weekly_period_uses_display_date_after_reset(
     tmp_path, monkeypatch
 ):
-    """End-to-end: two adjacent API weeks plus a boundary-change event.
-
-    This asserted the label was the EFFECTIVE reset date (04-13) until
-    #703 + #707: a credit is not a display boundary, so no row is labelled by
-    one. Each week now renders under its own start, and the API-derived
-    backdated 04-11 IS one of them — it is the window that week's snapshots
-    recorded, and nothing rewrites it.
-    """
+    """End-to-end: seed a DB with two adjacent weeks + a reset event whose
+    effective moment falls inside the post-reset SubWeek's API-derived
+    backdated start. The dashboard's row label must reflect the effective
+    reset date (04-13), not the API-derived backdated week_start_date
+    (04-11)."""
     import datetime as dt
     import pathlib, sys
     ns = load_script()
@@ -374,12 +371,11 @@ def test_dashboard_weekly_period_labels_a_moved_week_by_its_own_start(
         rows = builder(conn, now_utc, n=4, skip_sync=True)
 
     labels = [r.label for r in rows]
-    assert labels == ["04-11"], labels
-    assert rows[0].week_start_at == "2026-04-11T15:00:00+00:00", rows[0]
-    assert rows[0].week_end_at == "2026-04-18T15:00:00+00:00", rows[0]
+    assert "04-13" in labels, f"expected 04-13 in {labels}"
+    assert "04-11" not in labels, f"unexpected 04-11 in {labels}"
 
 
-def test_dashboard_weekly_renders_a_credited_week_as_one_row(tmp_path, monkeypatch):
+def test_dashboard_weekly_synthesizes_pre_credit_row(tmp_path, monkeypatch):
     """Bug K regression guard (v1.7.2 round-5).
 
     In-place credit event (where ``old_week_end_at == effective_reset_at_utc``)
@@ -471,25 +467,114 @@ def test_dashboard_weekly_renders_a_credited_week_as_one_row(tmp_path, monkeypat
         now_utc = dt.datetime(2026, 5, 15, 20, 0, 0, tzinfo=dt.timezone.utc)
         rows = builder(conn, now_utc, n=6, skip_sync=True)
 
-    assert not [r for r in rows if r.week_end_at == effective], (
-        "a synthesized pre-credit row is still on the panel: "
-        f"{[(r.label, r.week_end_at) for r in rows]}")
-    credited = [r for r in rows if r.week_end_at == week_end]
-    assert len(credited) == 1, (
-        f"the credited week rendered {len(credited)} rows: "
-        f"{[r.label for r in rows]}")
+    # Find the two credited-week rows by their week_end_at: pre-credit
+    # ends at `effective`, post-credit ends at the original `week_end`.
+    pre_rows = [r for r in rows if r.week_end_at == effective]
+    post_rows = [r for r in rows if r.week_end_at == week_end]
+    assert len(pre_rows) == 1, f"expected 1 pre-credit row, rows={[r.label for r in rows]}"
+    assert len(post_rows) == 1, f"expected 1 post-credit row, rows={[r.label for r in rows]}"
 
-    row = credited[0]
-    # The live counter, on the week's own boundaries.
-    assert row.used_pct == 4.0, row.used_pct
-    assert row.is_current is True
-    assert row.label == "05-09", row.label
-    # The whole week's spend, not the post-credit slice: the pre-credit entry at
-    # 2026-05-13 is a hundredfold larger than the post-credit one, so a row
-    # covering only the post-credit interval could not reach this.
-    assert row.cost_usd > 1.0, row.cost_usd
-    # §6.4: the row says a credit happened, because nothing else on screen
-    # would explain a 4% counter beside a week's worth of spend.
-    assert row.credited is True, row
-    assert all(not r.credited for r in rows if r is not row), (
-        [(r.label, r.credited) for r in rows])
+    pre = pre_rows[0]
+    post = post_rows[0]
+
+    # Pre-credit segment: 67% peak, cost reflects entry at 2026-05-13.
+    assert pre.used_pct == 67.0, pre.used_pct
+    assert pre.cost_usd > post.cost_usd, (pre.cost_usd, post.cost_usd)
+    # Post-credit segment: 4% peak.
+    assert post.used_pct == 4.0, post.used_pct
+    # is_current is on the post-credit segment only (it's the live one).
+    assert post.is_current is True
+    assert pre.is_current is False
+    # Pre-credit label uses the ORIGINAL week start date.
+    assert pre.label == "05-09", pre.label
+    # Post-credit label uses the effective reset date.
+    assert post.label == "05-15", post.label
+
+
+def test_dashboard_weekly_marks_no_row_current_when_the_snapshot_names_no_week(
+    tmp_path, monkeypatch,
+):
+    """No row carries the "Now" pill when the fallback finds no matching week.
+
+    `_dashboard_build_weekly_periods` first looks for the SubWeek containing
+    `now_utc`; when an early-reset snapshot ends the last computed week before
+    `now_utc`, no SubWeek contains it. The fallback then reads the newest
+    snapshot's `week_start_date`. If that date names no computed week — the
+    newest snapshot predates the computed window — the correct answer is that
+    NO row is current. Marking the newest computed row current instead puts a
+    "Now" pill on a week that is not current.
+
+    Seeded shape: an in-range early-reset anchor (its week ends 05-13T15:00Z,
+    a day before `now_utc`) plus a later-captured snapshot stamped with a
+    January week that falls outside the computed window and is therefore
+    never emitted as a SubWeek.
+    """
+    import pathlib, sys
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
+    from _fixture_builders import (
+        create_cache_db, seed_session_file, seed_session_entry,
+        seed_weekly_usage_snapshot,
+    )
+    share = tmp_path / ".local" / "share" / "cctally"
+    open_db = ns["open_db"]
+
+    with open_db() as conn:
+        # The in-range anchor. Its week ended EARLY (two days in), so the
+        # computed walk emits no SubWeek covering `now_utc`.
+        seed_weekly_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-12T10:00:00Z",
+            week_start_date="2026-05-11",
+            week_end_date="2026-05-13",
+            week_start_at="2026-05-11T15:00:00+00:00",
+            week_end_at="2026-05-13T15:00:00+00:00",
+            weekly_percent=55.0,
+        )
+        # Captured LAST, but stamped with a week months before the computed
+        # window — so `_compute_subscription_weeks` never emits it.
+        seed_weekly_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T11:00:00Z",
+            week_start_date="2026-01-05",
+            week_end_date="2026-01-11",
+            week_start_at="2026-01-05T15:00:00+00:00",
+            week_end_at="2026-01-12T15:00:00+00:00",
+            weekly_percent=30.0,
+        )
+        conn.commit()
+
+    cache_path = share / "cache.db"
+    create_cache_db(cache_path)
+    with sqlite3.connect(cache_path) as cconn:
+        seed_session_file(
+            cconn, path="/fake/sess.jsonl",
+            session_id="s1", project_path="/p",
+        )
+        seed_session_entry(
+            cconn, source_path="/fake/sess.jsonl",
+            line_offset=0,
+            timestamp_utc="2026-05-05T12:00:00Z",
+            model="claude-opus-4-5-20251101",
+            input_tokens=100, output_tokens=50,
+            cache_create=1_000, cache_read=5_000,
+        )
+        seed_session_entry(
+            cconn, source_path="/fake/sess.jsonl",
+            line_offset=1,
+            timestamp_utc="2026-05-12T12:00:00Z",
+            model="claude-opus-4-5-20251101",
+            input_tokens=100, output_tokens=50,
+            cache_create=1_000, cache_read=5_000,
+        )
+
+    with open_db() as conn:
+        builder = ns["_dashboard_build_weekly_periods"]
+        now_utc = dt.datetime(2026, 5, 14, 12, 0, 0, tzinfo=dt.timezone.utc)
+        rows = builder(conn, now_utc, n=4, skip_sync=True)
+
+    assert rows, "expected at least one weekly row"
+    assert not any(r.is_current for r in rows), [
+        (r.label, r.is_current) for r in rows
+    ]

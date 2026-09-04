@@ -1041,10 +1041,6 @@ _hook_tick_make_mock_refresh = _cctally_refresh._hook_tick_make_mock_refresh
 _cctally_db = _load_sibling("_cctally_db")
 _MIGRATION_IDENT_RE = _cctally_db._MIGRATION_IDENT_RE
 add_column_if_missing = _cctally_db.add_column_if_missing
-# #703 + #707: the two halves of the `week_reset_events` reshape a pre-cutover
-# store needs, reached from `_cctally_core.open_db` through this namespace.
-begin_week_reset_events_reshape = _cctally_db.begin_week_reset_events_reshape
-finish_week_reset_events_reshape = _cctally_db.finish_week_reset_events_reshape
 _MIGRATION_NAME_RE = _cctally_db._MIGRATION_NAME_RE
 Migration = _cctally_db.Migration
 DowngradeDetected = _cctally_db.DowngradeDetected
@@ -2735,7 +2731,6 @@ compute_week_cost                   = _cctally_milestones.compute_week_cost     
 get_latest_cost_for_week            = _cctally_milestones.get_latest_cost_for_week            # _lib_view_models c.; record/tui shim
 insert_cost_snapshot                = _cctally_milestones.insert_cost_snapshot                # _cctally_sync_week c.
 get_max_milestone_for_week          = _cctally_milestones.get_max_milestone_for_week          # record shim
-get_max_journaled_milestone_for_segment = _cctally_milestones.get_max_journaled_milestone_for_segment  # record shim
 get_milestone_cost_for_week         = _cctally_milestones.get_milestone_cost_for_week         # record shim
 get_milestones_for_week             = _cctally_milestones.get_milestones_for_week             # forecast c.; tui shim; percent-breakdown c.
 insert_percent_milestone            = _cctally_milestones.insert_percent_milestone            # record shim; idempotency-test mod.
@@ -3242,8 +3237,6 @@ get_recent_weeks                    = _cctally_weekrefs.get_recent_weeks
 _apply_reset_events_to_weekrefs     = _cctally_weekrefs._apply_reset_events_to_weekrefs
 _backfill_week_reset_events         = _cctally_weekrefs._backfill_week_reset_events
 _week_ref_has_reset_event           = _cctally_weekrefs._week_ref_has_reset_event
-_week_ref_credit_epoch              = _cctally_weekrefs._week_ref_credit_epoch
-_credited_week_keys                 = _cctally_weekrefs._credited_week_keys
 _compute_cost_for_weekref           = _cctally_weekrefs._compute_cost_for_weekref
 _apply_overlap_clamp_to_weekrefs    = _cctally_weekrefs._apply_overlap_clamp_to_weekrefs
 _RESET_PCT_DROP_THRESHOLD           = _cctally_weekrefs._RESET_PCT_DROP_THRESHOLD

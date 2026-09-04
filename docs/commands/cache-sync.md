@@ -73,6 +73,7 @@ cctally cache-sync --source claude
   store is unavailable, a routine sync reports that degradation but retains a
   successful core result; an explicit `--rebuild` exits non-zero because the
   requested full rebuild was incomplete.
+- `--rebuild` also exits non-zero when cctally cannot prove its embedded pricing table is at least the one recorded in the conversation store. cctally refuses to rewrite materialized conversation cost from a pricing table it cannot order against the store's, and a rebuild is exactly that write, so it declines the whole operation rather than emptying the rollup and then being refused the re-derive. Two recorded values produce this. The ordinary one is a fingerprint **newer** than this cctally's; run the newer cctally, or restart the process that recorded the newer table. The other is a recorded value that is **not an ISO date**, which no version can order — an upgrade or a restart reaches nothing there, and neither does another `--rebuild`. Both name `phase=pricing`, and `cctally doctor` separates them under `pricing.conversation_rollup_writer`, whose remediation for the unorderable value names the only step that clears it. A routine (non-`--rebuild`) sync still reports success in either situation, because message ingestion did succeed there and only the rollup re-derive was declined.
 - Large histories can spend much longer rebuilding transcript/search rows than
   compact accounting rows. Explicit rebuilds report the active transcript
   provider and phase (`open`, `sync-start`, `lock`, `prepare`, `ingest`,

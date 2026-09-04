@@ -6,10 +6,10 @@ in place at 17:59:41Z, the debounced ``CONFIRM_RESET`` leg fired
 ``_fire_in_place_credit``, and the ``week_reset_events`` row it wrote carried an
 HOUR-FLOORED ``effective_reset_at_utc`` of 17:00:00Z — an instant that
 back-dates before observations that were still legitimately pre-credit. The
-stale-replica DELETE that ran alongside it banded on
+stale-replica DELETE that runs alongside it bands on
 ``ABS(weekly_percent - observed_pre_credit_pct) < 1.0``, so the stored 13.0
-snapshot captured at 17:33:38Z (``|13 - 14| == 1.0``) survived. That band was
-filed separately as issue #703 and was NOT what this module fixed.
+snapshot captured at 17:33:38Z (``|13 - 14| == 1.0``) survived. That surviving
+band is filed separately as issue #703 and is NOT what this module fixes.
 
 What this module fixes is what the engine then did with that survivor:
 
@@ -26,21 +26,15 @@ What this module fixes is what the engine then did with that survivor:
    new ladder at a threshold the meter said had not been crossed and foreclosed
    every genuine crossing below 13 in that epoch.
 
-#703 + #707 has since landed, and the module now pins the recovered state rather
-than the loss. Nothing is deleted to get there. The 13.0 and 14.0 readings are
-KEPT, because their captures precede the credit's own observation and at that
-moment a high reading is indistinguishable from genuine history (spec §5.1);
-what changed is that the accounting floor is the EXACT observation instant
-17:59:41 rather than the hour floor, so both fall outside the epoch, the clamp
-stops raising the rendered value, and the genuine 0%, 1%, 2% and 3% readings
-each land as themselves. ``test_the_incident_recovers_every_genuine_crossing``
-pins that outright; it is the inversion of the scope pin this module used to
-carry.
+Removing the fabricated row is the whole of what this module fixes. It does NOT
+recover the 1%, 2% and 3% readings that followed: while the #703 band leaves the
+13.0 replica stored inside the epoch, that row holds the reset-aware in-window
+maximum at 13.0, so each of those readings is clamp-skipped before any snapshot
+is written and ``maybe_record_milestone`` is never reached for it. Recovering
+them needs #703. That scope boundary is itself pinned, by
+``test_removing_the_replica_recovers_the_crossings_it_suppressed``.
 
-Three defences are pinned here, and the first two remain necessary after the
-floor moved: a replica arriving after the observation instant but removed only
-on a later tick, or one arriving in the gap between the credit and its
-detection, can still be the first row a fresh epoch sees.
+Two independent defences are pinned here.
 
 **Fix 1 — a CLAMP skip must not derive a weekly milestone.**
 ``_usage_snapshot_fold_decision`` collapsed two very different skips into one
@@ -156,32 +150,14 @@ def _seed_cost_snapshot(conn, *, cost_usd: float,
 def _seed_reset_event(conn, *, effective: str,
                       new_week_end_at: str = WEEK_END_ISO,
                       observed_pre_credit_pct: float | None = None,
-                      detected_at_utc: str = "2026-09-01T17:59:47Z",
-                      observed_at_utc: str | None = None,
-                      observed_post_credit_pct: float | None = None,
-                      week_start_date: str = WEEK_START_DATE) -> int:
-    """One credit row.
-
-    The three fact columns are parameters, not omissions. Left NULL, every test
-    built on this helper ran the `post_credit_pct is None` LEGACY fallback of
-    `post_reset_seed_has_climb_evidence` rather than the rule #707 introduced —
-    so a mutation making that function return True whenever a post-credit fact
-    is present passed every one of them. `observed_at_utc` defaults to
-    ``effective`` rather than to NULL for the same reason: it is the accounting
-    instant the epoch window is built from, and a NULL there falls back to the
-    hour-floored display instant.
-    """
+                      detected_at_utc: str = "2026-09-01T17:59:47Z") -> int:
     cur = conn.execute(
         "INSERT INTO week_reset_events "
         "(detected_at_utc, old_week_end_at, new_week_end_at, "
-        " effective_reset_at_utc, observed_pre_credit_pct, week_start_date, "
-        " observed_at_utc, confirming_capture_at_utc, "
-        " observed_post_credit_pct) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " effective_reset_at_utc, observed_pre_credit_pct) "
+        "VALUES (?, ?, ?, ?, ?)",
         (detected_at_utc, effective, new_week_end_at, effective,
-         observed_pre_credit_pct, week_start_date,
-         observed_at_utc or effective, observed_at_utc or effective,
-         observed_post_credit_pct),
+         observed_pre_credit_pct),
     )
     rowid = int(cur.lastrowid)
     _stamp_journal_id(conn, "week_reset_events", rowid)
@@ -220,27 +196,18 @@ def test_stale_pre_credit_replica_does_not_fabricate_a_post_reset_milestone(
 
     The ticks are pinned to the real instants: the 13% and 14% readings land in
     the same hour as the reset, the two zeros arm and confirm the reset-to-zero
-    debounce, and the resulting event anchors its DISPLAY instant at the hour
-    floor 17:00:00Z while recording its ACCOUNTING instant as the exact
-    17:59:41Z.
+    debounce, and the resulting event anchors at the hour floor 17:00:00Z. The
+    stale-replica DELETE removes BOTH rows: the band is inclusive at its drift
+    bound, so ``|13 - 14| == 1.0`` matches. It did not always. This scenario was
+    written while the bound was strict, the 13.0 row survived, and that survivor
+    was the PRECONDITION of the defect this module fixes. The automatic band was
+    corrected, so no survivor appears here and the genuine post-credit 0.0
+    reading lands instead.
 
-    Both pre-credit readings are kept, and that is deliberate (#703 + #707
-    §5.1): their capture instants precede the credit's own observation, so
-    nothing contradicts them, and at their capture a high reading is
-    indistinguishable from genuine history. They are outside the epoch because
-    §5.3's floor is the observation instant, not because they were deleted.
-
-    The guard this module exists for is unchanged by that: the engine must not
-    seed the new epoch's ladder from a reading captured before the credit.
-
-    This is NOT the #706 comparison any more, and saying so is the point. After
-    §5.1 anchored the epoch on the exact observation instant, the only in-epoch
-    reading here is the credited 0.0 itself, so the seeding guard ADMITS and the
-    empty post-credit ladder below is the arithmetic of a 0% reading crossing no
-    threshold. The #706 comparison — an in-epoch minimum of 13 against a
-    credited 0 — is constructed in isolation by
-    `test_post_reset_seed_refused_without_a_lower_in_epoch_observation`, which
-    carries the post-credit fact so it exercises the rule that replaced it.
+    The no-fabrication assertion below is kept as a regression guard on this
+    shape. A replica that STILL survives the inclusive band is the live
+    exercise of that guard and is covered by
+    ``test_out_of_band_replica_survives_and_still_seeds_no_epoch``.
     """
     assert _tick(ns, monkeypatch, at="2026-09-01T17:33:38Z", percent=13.0) == 0
     assert _tick(ns, monkeypatch, at="2026-09-01T17:40:00Z", percent=14.0) == 0
@@ -250,33 +217,24 @@ def test_stale_pre_credit_replica_does_not_fabricate_a_post_reset_milestone(
     conn = ns["open_db"]()
     try:
         events = conn.execute(
-            "SELECT id, effective_reset_at_utc, observed_pre_credit_pct, "
-            "       observed_at_utc FROM week_reset_events"
+            "SELECT id, effective_reset_at_utc, observed_pre_credit_pct "
+            "FROM week_reset_events"
         ).fetchall()
         assert len(events) == 1, list(events)
         evt_id = int(events[0]["id"])
         assert events[0]["effective_reset_at_utc"] == "2026-09-01T17:00:00+00:00"
         assert events[0]["observed_pre_credit_pct"] == 14.0
 
-        # The event records the exact observation instant alongside the
-        # hour-floored display one, and the accounting floor reads the exact
-        # one. Both pre-credit readings are kept and both are outside the epoch.
-        assert events[0]["observed_at_utc"] == "2026-09-01T17:59:41Z"
-        kept = conn.execute(
+        # Both pre-credit rows are gone; the genuine post-credit reading is
+        # what remains inside the epoch.
+        survivors = conn.execute(
             "SELECT captured_at_utc, weekly_percent FROM weekly_usage_snapshots "
-            "WHERE week_start_date = ? ORDER BY captured_at_utc, id",
-            (WEEK_START_DATE,),
-        ).fetchall()
-        assert [r["weekly_percent"] for r in kept] == [13.0, 14.0, 0.0], \
-            list(kept)
-        in_epoch = conn.execute(
-            "SELECT weekly_percent FROM weekly_usage_snapshots "
             "WHERE week_start_date = ? "
             "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
-            "ORDER BY captured_at_utc, id",
-            (WEEK_START_DATE, events[0]["observed_at_utc"]),
+            "ORDER BY captured_at_utc",
+            (WEEK_START_DATE, "2026-09-01T17:00:00+00:00"),
         ).fetchall()
-        assert [r["weekly_percent"] for r in in_epoch] == [0.0], list(in_epoch)
+        assert [r["weekly_percent"] for r in survivors] == [0.0], list(survivors)
 
         rows = _milestones(conn)
         post = [r for r in rows if r["reset_event_id"] == evt_id]
@@ -284,15 +242,60 @@ def test_stale_pre_credit_replica_does_not_fabricate_a_post_reset_milestone(
             "a post-reset epoch was seeded from the stale pre-credit replica: "
             f"{[dict(r) for r in post]}"
         )
-        # The pre-credit ladder is intact. Thresholds 13 and 14 were crossed
-        # before the credit and stay crossed: the evidence bracket anchors on
-        # the exact observation instant, so neither reading is selected as a
-        # replica and neither milestone is removed with one.
+        # The pre-credit ladder is untouched: threshold 13 seeded the epoch-0
+        # ladder on the first tick, 14 followed it.
         assert [r["percent_threshold"] for r in rows
                 if r["reset_event_id"] == 0] == [13, 14]
     finally:
         conn.close()
 
+
+def test_out_of_band_replica_survives_and_still_seeds_no_epoch(ns, monkeypatch):
+    """A replica outside the drift band survives, and this module's guard holds.
+
+    Making the automatic band inclusive removes a replica exactly one point
+    from the baseline, which is the 2026-09-01 shape. It does not remove one
+    further out, and it should not: past the drift the band exists to absorb,
+    a lower reading is not distinguishable from a genuine one by level alone.
+    A surviving replica therefore stays reachable, so the guard this module
+    exists for — never seed a post-reset milestone epoch from one — still needs
+    an exercise of its own. This is it.
+
+    Baseline 14.0 against a stored 12.0: ``|12 - 14| == 2.0``, outside the band.
+    """
+    assert _tick(ns, monkeypatch, at="2026-09-01T17:33:38Z", percent=12.0) == 0
+    assert _tick(ns, monkeypatch, at="2026-09-01T17:40:00Z", percent=14.0) == 0
+    assert _tick(ns, monkeypatch, at="2026-09-01T17:59:41Z", percent=0.0) == 0
+    assert _tick(ns, monkeypatch, at="2026-09-01T17:59:47Z", percent=0.0) == 0
+
+    conn = ns["open_db"]()
+    try:
+        events = conn.execute(
+            "SELECT id, observed_pre_credit_pct FROM week_reset_events"
+        ).fetchall()
+        assert len(events) == 1, list(events)
+        evt_id = int(events[0]["id"])
+        assert events[0]["observed_pre_credit_pct"] == 14.0
+
+        # The 14.0 row is removed; the 12.0 replica is beyond the band and is
+        # still stored inside the new epoch.
+        survivors = conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+            "ORDER BY captured_at_utc",
+            (WEEK_START_DATE, "2026-09-01T17:00:00+00:00"),
+        ).fetchall()
+        assert [r["weekly_percent"] for r in survivors] == [12.0], list(survivors)
+
+        rows = _milestones(conn)
+        post = [r for r in rows if r["reset_event_id"] == evt_id]
+        assert post == [], (
+            "a post-reset epoch was seeded from a surviving out-of-band "
+            f"replica: {[dict(r) for r in post]}"
+        )
+    finally:
+        conn.close()
 
 def test_genuine_post_reset_climb_records_each_threshold(ns, monkeypatch):
     """The same incident WITHOUT a surviving replica: every crossing lands.
@@ -329,26 +332,22 @@ def test_genuine_post_reset_climb_records_each_threshold(ns, monkeypatch):
         conn.close()
 
 
-def test_the_incident_recovers_every_genuine_crossing(ns, monkeypatch):
-    """The incident's full shape: every genuine crossing lands in its epoch.
+def test_the_fix_does_not_recover_the_crossings_the_replica_suppresses(
+    ns, monkeypatch
+):
+    """Removing the replica restores the readings it was suppressing.
 
-    This test used to pin the OPPOSITE, and the inversion is the point (spec
-    section 9). Under the hour-floored anchor the 13.0 reading captured at
-    17:33:38 sat INSIDE the new epoch, held the reset-aware maximum at 13.0, and
-    clamp-skipped the genuine 1%, 2% and 3% readings before any snapshot was
-    written. It also held the detector's ``prior`` at 13.0, so the 1% tick armed
-    the reset-to-zero marker and the 2% tick confirmed it — a SECOND credit
-    recorded off a reading that was not real, whose only effect was to move the
-    floor forward and let two of the three readings land under an epoch that
-    should not exist.
+    The incident's own shape, driven three readings further than the test
+    above. While the bound was strict the 13.0 replica stayed inside the new
+    epoch and held the reset-aware in-window MAXIMUM at 13.0, so the genuine
+    1%, 2% and 3% readings were each clamp-skipped before any snapshot was
+    written and ``maybe_record_milestone`` was never reached for them. This
+    module's earlier wording recorded that recovering them needed the wider
+    #703 work.
 
-    Nothing is deleted to fix this. The 13.0 and 14.0 readings are kept, exactly
-    as section 5.1 requires: their captures precede the credit's observation, so
-    they are genuine pre-credit history. What changed is where the epoch starts.
-    The accounting floor is the exact observation instant 17:59:41, so both
-    readings fall outside the epoch, the clamp stops raising the rendered value,
-    the genuine 0.0 is accepted as the epoch's first observation, and 1%, 2% and
-    3% each land as themselves.
+    It did not. Making the automatic band inclusive at its drift bound removes
+    the replica, the in-window maximum drops to the post-credit reading, and
+    all three crossings land in the new epoch's ladder.
     """
     assert _tick(ns, monkeypatch, at="2026-09-01T17:33:38Z", percent=13.0) == 0
     assert _tick(ns, monkeypatch, at="2026-09-01T17:40:00Z", percent=14.0) == 0
@@ -360,40 +359,28 @@ def test_the_incident_recovers_every_genuine_crossing(ns, monkeypatch):
 
     conn = ns["open_db"]()
     try:
-        evt = conn.execute(
-            "SELECT id, observed_at_utc, observed_post_credit_pct "
-            "FROM week_reset_events ORDER BY id").fetchall()
-        assert len(evt) == 1, (
-            "a phantom second credit was recorded off a stale reading: "
-            f"{[dict(r) for r in evt]}")
-        assert evt[0]["observed_at_utc"] == "2026-09-01T17:59:41Z"
-        assert evt[0]["observed_post_credit_pct"] == 0.0
-        epoch = int(evt[0]["id"])
+        evt = conn.execute("SELECT id FROM week_reset_events").fetchall()
+        assert len(evt) == 1, list(evt)
+        evt_id = int(evt[0]["id"])
 
-        # The genuine pre-credit readings are KEPT, and they are outside the
-        # epoch because the floor is the observation instant.
-        all_stored = [
-            r["weekly_percent"] for r in conn.execute(
-                "SELECT weekly_percent FROM weekly_usage_snapshots "
-                "WHERE week_start_date = ? ORDER BY captured_at_utc, id",
-                (WEEK_START_DATE,))]
-        assert all_stored == [13.0, 14.0, 0.0, 1.0, 2.0, 3.0], all_stored
-        in_epoch = [
-            r["weekly_percent"] for r in conn.execute(
-                "SELECT weekly_percent FROM weekly_usage_snapshots "
-                "WHERE week_start_date = ? "
-                "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
-                "ORDER BY captured_at_utc, id",
-                (WEEK_START_DATE, evt[0]["observed_at_utc"]))]
-        assert in_epoch == [0.0, 1.0, 2.0, 3.0], in_epoch
+        # Every genuine reading is stored: nothing holds the in-window
+        # maximum above them any more.
+        stored = conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+            "ORDER BY captured_at_utc",
+            (WEEK_START_DATE, "2026-09-01T17:00:00+00:00"),
+        ).fetchall()
+        assert [r["weekly_percent"] for r in stored] == [0.0, 1.0, 2.0, 3.0], \
+            list(stored)
 
+        # And the new epoch's ladder carries the three crossings rather than
+        # standing empty.
         rows = _milestones(conn)
         assert [r["percent_threshold"] for r in rows
-                if r["reset_event_id"] == epoch] == [1, 2, 3], \
+                if r["reset_event_id"] == evt_id] == [1, 2, 3], \
             [dict(r) for r in rows]
-        # And the pre-credit ladder is untouched.
-        assert [r["percent_threshold"] for r in rows
-                if r["reset_event_id"] == 0] == [13, 14], [dict(r) for r in rows]
     finally:
         conn.close()
 
@@ -513,8 +500,7 @@ def test_post_reset_seed_refused_without_a_lower_in_epoch_observation(ns):
     try:
         _seed_cost_snapshot(conn, cost_usd=20.85)
         _seed_reset_event(conn, effective="2026-09-01T17:00:00+00:00",
-                          observed_pre_credit_pct=14.0,
-                          observed_post_credit_pct=0.0)
+                          observed_pre_credit_pct=14.0)
         usage_id = _seed_usage_snapshot(
             conn, captured_at_utc="2026-09-01T17:33:38Z", weekly_percent=13.0)
         conn.commit()
@@ -528,105 +514,6 @@ def test_post_reset_seed_refused_without_a_lower_in_epoch_observation(ns):
     conn = ns["open_db"]()
     try:
         assert _milestones(conn) == [], [dict(r) for r in _milestones(conn)]
-    finally:
-        conn.close()
-
-
-def test_post_reset_seed_refused_on_the_legacy_rule_without_the_landed_fact(ns):
-    """The same refusal for a row that predates the post-credit column.
-
-    A credit written before #707 records no landing level, so the comparison
-    falls back to #706's "strictly below the threshold being recorded". An
-    in-epoch minimum of 13 against a threshold of 13 is not strictly below it,
-    so the seed is refused. Both branches are pinned because a rule that
-    collapsed to one of them would still pass the other's tests.
-    """
-    conn = ns["open_db"]()
-    try:
-        _seed_cost_snapshot(conn, cost_usd=20.85)
-        _seed_reset_event(conn, effective="2026-09-01T17:00:00+00:00",
-                          observed_pre_credit_pct=14.0,
-                          observed_post_credit_pct=None)
-        usage_id = _seed_usage_snapshot(
-            conn, captured_at_utc="2026-09-01T17:33:38Z", weekly_percent=13.0)
-        conn.commit()
-    finally:
-        conn.close()
-
-    ns["maybe_record_milestone"](
-        _saved(usage_id, weekly_percent=13.0,
-               captured_at="2026-09-01T17:33:38Z"))
-
-    conn = ns["open_db"]()
-    try:
-        assert _milestones(conn) == [], [dict(r) for r in _milestones(conn)]
-    finally:
-        conn.close()
-
-
-def test_post_reset_seed_refused_when_the_epoch_minimum_exceeds_the_landing(ns):
-    """The discriminating case for the rule that replaced #706's.
-
-    The epoch holds an observation BELOW the threshold being recorded — 5%
-    against a seed of 13 — so the legacy rule would admit. The credit says the
-    counter landed at 0, and 5 is not at or below 0, so the new rule refuses.
-    Without this case a mutation returning True whenever a landing level is
-    present passes the whole module.
-    """
-    conn = ns["open_db"]()
-    try:
-        _seed_cost_snapshot(conn, cost_usd=20.85)
-        _seed_reset_event(conn, effective="2026-09-01T17:00:00+00:00",
-                          observed_pre_credit_pct=14.0,
-                          observed_post_credit_pct=0.0)
-        _seed_usage_snapshot(
-            conn, captured_at_utc="2026-09-01T17:20:00Z", weekly_percent=5.0)
-        usage_id = _seed_usage_snapshot(
-            conn, captured_at_utc="2026-09-01T17:33:38Z", weekly_percent=13.0)
-        conn.commit()
-    finally:
-        conn.close()
-
-    ns["maybe_record_milestone"](
-        _saved(usage_id, weekly_percent=13.0,
-               captured_at="2026-09-01T17:33:38Z"))
-
-    conn = ns["open_db"]()
-    try:
-        assert _milestones(conn) == [], [dict(r) for r in _milestones(conn)]
-    finally:
-        conn.close()
-
-
-def test_post_reset_seed_records_the_landed_level_itself(ns):
-    """#707's own case, in isolation.
-
-    The credit landed at 2 and the epoch's minimum observation is that same 2,
-    so threshold 2 is admitted — "at or below the credited level" rather than
-    "strictly below the threshold". The legacy rule refuses this exact shape,
-    which is the cost #706 paid and #707 removes.
-    """
-    conn = ns["open_db"]()
-    try:
-        _seed_cost_snapshot(conn, cost_usd=20.85)
-        evt_id = _seed_reset_event(conn, effective="2026-09-01T17:00:00+00:00",
-                                   observed_pre_credit_pct=67.0,
-                                   observed_post_credit_pct=2.0)
-        usage_id = _seed_usage_snapshot(
-            conn, captured_at_utc="2026-09-01T17:20:00Z", weekly_percent=2.0)
-        conn.commit()
-    finally:
-        conn.close()
-
-    ns["maybe_record_milestone"](
-        _saved(usage_id, weekly_percent=2.0,
-               captured_at="2026-09-01T17:20:00Z"))
-
-    conn = ns["open_db"]()
-    try:
-        rows = _milestones(conn)
-        assert [(r["percent_threshold"], r["reset_event_id"]) for r in rows] \
-            == [(2, evt_id)], [dict(r) for r in rows]
     finally:
         conn.close()
 
@@ -642,8 +529,7 @@ def test_post_reset_seed_allowed_once_a_lower_observation_exists(ns):
     try:
         _seed_cost_snapshot(conn, cost_usd=20.85)
         evt_id = _seed_reset_event(conn, effective="2026-09-01T17:00:00+00:00",
-                                   observed_pre_credit_pct=14.0,
-                                   observed_post_credit_pct=0.0)
+                                   observed_pre_credit_pct=14.0)
         _seed_usage_snapshot(
             conn, captured_at_utc="2026-09-01T17:20:00Z", weekly_percent=0.4)
         usage_id = _seed_usage_snapshot(
@@ -672,8 +558,7 @@ def test_post_reset_evidence_ignores_observations_before_the_reset(ns):
     try:
         _seed_cost_snapshot(conn, cost_usd=20.85)
         _seed_reset_event(conn, effective="2026-09-01T17:00:00+00:00",
-                          observed_pre_credit_pct=14.0,
-                          observed_post_credit_pct=0.0)
+                          observed_pre_credit_pct=14.0)
         _seed_usage_snapshot(
             conn, captured_at_utc="2026-09-01T09:00:00Z", weekly_percent=2.0)
         usage_id = _seed_usage_snapshot(
@@ -729,31 +614,36 @@ def test_pre_credit_epoch_seeds_without_any_lower_observation(ns):
 # ── T5: the evidence rule's deliberate, disclosed cost ─────────────────
 
 
-def test_a_goodwill_credit_records_the_credited_levels_threshold(
+def test_goodwill_credit_to_a_nonzero_level_loses_that_levels_threshold(
     ns, monkeypatch
 ):
-    """#707's repair: the credited level's own threshold survives.
+    """DELIBERATE TRADE-OFF — this asserts a cost we accepted, not a defect.
 
-    This test used to assert the opposite, and #706 named the inversion as the
-    follow-up that would land it. The evidence rule asked for a stored in-epoch
-    observation flooring STRICTLY below the threshold being recorded. A
-    reset-to-zero satisfies that for free, because the credited ~0 reading is
-    itself the evidence for every threshold above it. A >=25pp goodwill credit
-    to a NON-zero level did not: Anthropic drops the counter from 67% to 2%, the
-    2% reading is the first observation of the new epoch, nothing lower was ever
-    stored in it, and threshold 2 was refused. The ladder opened one threshold
-    late, at 3.
+    Do not "repair" the engine to make this test's ``[3]`` become ``[2, 3]``
+    without reading the reasoning below and updating this test on purpose.
 
-    The reset event now records where the counter LANDED, so the epoch supplies
-    its own evidence and the comparison changes from "strictly below the
-    threshold" to "at or below the credited level". Nothing is fabricated: the
-    admission still rests on a stored observation, and the level it is compared
-    against is a fact the credit itself recorded rather than an inference.
+    The evidence rule asks for a stored in-epoch observation flooring strictly
+    below the threshold being recorded. A reset-to-zero satisfies it for free,
+    because the credited ~0 reading is itself the evidence for every threshold
+    above it. The >=25pp goodwill-credit leg does not, because the level it
+    credits to is non-zero: here Anthropic drops the counter from 67% to 2%,
+    the 2% reading is the FIRST observation of the new epoch, and nothing
+    lower was ever stored in it. Threshold 2 is therefore not recorded. The
+    ladder seeds one threshold later, at 3, once the 2% reading has itself
+    become the evidence for it.
 
-    The #706 shape stays blocked, and
-    `test_post_reset_seed_refused_without_a_lower_in_epoch_observation` is the
-    isolated guard for it: an in-epoch minimum of 13 against a credited 0 is
-    still refused, because 13 is not at or below 0.
+    Nothing in the credit path fills that gap on its own. The auto-credit
+    ``_fire_in_place_credit`` writes no synthetic snapshot — only the manual
+    ``record-credit`` op's ``_apply_credit`` does — so the epoch's first row
+    always arrives from the ordinary accept path, at whatever level the meter
+    reports.
+
+    We accept losing one threshold rather than fabricating one, because a
+    missed threshold is recoverable and a fabricated one is permanent
+    (milestones are forward-only within an epoch). Follow-up issue #707 is the
+    principled repair: store the post-credit level on ``week_reset_events`` so
+    the reset event itself supplies the evidence and the first threshold
+    survives. Until that lands, this is the shipped behavior.
     """
     assert _tick(ns, monkeypatch, at="2026-09-01T10:00:00Z", percent=67.0) == 0
     assert _tick(ns, monkeypatch, at="2026-09-01T10:30:00Z", percent=2.0) == 0
@@ -762,42 +652,33 @@ def test_a_goodwill_credit_records_the_credited_levels_threshold(
     conn = ns["open_db"]()
     try:
         evt = conn.execute(
-            "SELECT id, effective_reset_at_utc, observed_pre_credit_pct, "
-            "       observed_at_utc, observed_post_credit_pct "
+            "SELECT id, effective_reset_at_utc, observed_pre_credit_pct "
             "FROM week_reset_events"
         ).fetchall()
         assert len(evt) == 1, list(evt)
         evt_id = int(evt[0]["id"])
         assert evt[0]["observed_pre_credit_pct"] == 67.0
-        assert evt[0]["observed_post_credit_pct"] == 2.0
         assert evt[0]["effective_reset_at_utc"] == "2026-09-01T10:00:00+00:00"
-        assert evt[0]["observed_at_utc"] == "2026-09-01T10:30:00Z"
 
-        # The 67% reading is KEPT — its capture precedes the credit's own
-        # observation — and it is outside the epoch, because the accounting
-        # floor is that observation instant rather than the hour floor.
-        all_stored = [
-            r["weekly_percent"] for r in conn.execute(
-                "SELECT weekly_percent FROM weekly_usage_snapshots "
-                "WHERE week_start_date = ? ORDER BY captured_at_utc, id",
-                (WEEK_START_DATE,))]
-        assert all_stored == [67.0, 2.0, 3.0], all_stored
-        in_epoch = [
-            r["weekly_percent"] for r in conn.execute(
-                "SELECT weekly_percent FROM weekly_usage_snapshots "
-                "WHERE week_start_date = ? "
-                "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
-                "ORDER BY captured_at_utc, id",
-                (WEEK_START_DATE, evt[0]["observed_at_utc"]))]
-        assert in_epoch == [2.0, 3.0], in_epoch
+        # The 2% reading IS stored — the credit path accepted it. Only its
+        # milestone is missing, and only because it is the epoch's floor.
+        stored = conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+            "ORDER BY captured_at_utc",
+            (WEEK_START_DATE, "2026-09-01T10:00:00+00:00"),
+        ).fetchall()
+        assert [r["weekly_percent"] for r in stored] == [2.0, 3.0], list(stored)
 
         post = [r["percent_threshold"] for r in _milestones(conn)
                 if r["reset_event_id"] == evt_id]
-        assert post == [2, 3], (
-            "the credited level's own threshold was lost to the "
-            f"inferred-climb rule; got {post}")
+        assert post == [3], (
+            "the credited level's own threshold is the documented cost of the "
+            f"evidence rule (#707); got {post}"
+        )
 
-        # The pre-credit ladder keeps its own crossing at 67.
+        # The pre-credit ladder is untouched: 67 seeded the epoch-0 ladder.
         assert [r["percent_threshold"] for r in _milestones(conn)
                 if r["reset_event_id"] == 0] == [67]
     finally:

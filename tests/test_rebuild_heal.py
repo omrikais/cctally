@@ -398,13 +398,7 @@ def test_suppression_replay_rebuild_matches(ns, tmp_path):
             "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
             " week_end_at, weekly_percent, source, payload_json, journal_id) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            # Captured AFTER the op's asserted instant (09:00:05Z). #703 + #707
-            # §5.1 anchors the manual rule on the asserted instant rather than
-            # on the hour-floored effective one, so a row captured BEFORE the
-            # assertion is history it never claimed to supersede and is kept —
-            # and this row carries a `journal_id` with no journal line behind
-            # it, so a kept row would diverge from the rebuild by construction.
-            ("2026-01-04T09:00:06Z", "2026-01-01", "2026-01-08",
+            ("2026-01-04T09:00:03Z", "2026-01-01", "2026-01-08",
              "2026-01-01T00:00:00+00:00", "2026-01-07T23:59:59+00:00", 60.0,
              "test", "{}", "sa:pre"),
         )

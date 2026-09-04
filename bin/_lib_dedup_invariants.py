@@ -835,14 +835,6 @@ def _r_dedup5(ctx: _Context) -> None:
                 if int(reset_event_id or 0) == 0:
                     materialized_ref = "0"
                 else:
-                    # #703 + #707 widened this table's identity to
-                    # `(account_key, credit_key)` and added manual credits to
-                    # it. This lookup is unaffected and deliberately unchanged:
-                    # it resolves a milestone's `reset_event_id` to the row's
-                    # `journal_id`, which is exactly what harvest stored in the
-                    # payload's `reset_event_ref` — and a manual credit's row
-                    # carries its op id there, so the comparison holds for a
-                    # `record-credit` epoch as it does for an automatic one.
                     reset = stats.execute(
                         "SELECT journal_id FROM week_reset_events WHERE id=?",
                         (int(reset_event_id),),

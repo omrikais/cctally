@@ -1,7 +1,7 @@
 ---
 title: Per-project usage — 2026-05-04 → 2026-05-09
 generated_at: 2026-05-09T12:00:00Z
-period: 2026-05-04T15:00:00Z..2026-05-09T12:00:00Z
+period: 2026-05-04T12:00:00Z..2026-05-09T12:00:00Z
 panel: project
 anonymized: false
 cctally_version: 9.9.9
@@ -12,9 +12,9 @@ _2026-05-09T12:00:00Z_
 
 | Project | $ Cost | % Used | Sessions |
 |:---|---:|---:|---:|
-| alpha-internal | $0.03 | 19.8% | 1 |
-| beta-public | $0.02 | 17.9% | 1 |
-| (unknown) | $0.01 | 7.9% | 1 |
+| alpha-internal | $0.03 | — | 1 |
+| beta-public | $0.02 | — | 1 |
+| (unknown) | $0.01 | — | 1 |
 
 - **Sum:** $0.06
 - **Projects:** 3

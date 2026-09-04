@@ -1070,6 +1070,56 @@ def _gather_quota_rate_change(c, rejection=None) -> "dict | None":
     return dict(active, assessed=True)
 
 
+def _read_rollup_pricing_state(conn) -> "tuple[dict | None, str | None]":
+    """Read the ordered-write guard's two ``cache_meta`` keys from ``conn``
+    (#705), returning ``(refusal_record, stored_fingerprint)``.
+
+    ONE reader for BOTH stores. The guard runs on the cache.db connection in
+    ``sync_cache`` and on the conversations.db connection in
+    ``sync_claude_conversations``, so both files carry both keys and doctor
+    must classify them identically — the failure this replaces was reading
+    only one store, which reported OK for every refusal latched by a process
+    that never opens the conversation store.
+
+    A malformed record becomes ``{"__malformed__": True}`` rather than None,
+    which is the ONE deliberate difference from the sibling Codex
+    prune-refusal read beside it: a record that exists but cannot be read is
+    still evidence the guard fired and must not read as "no refusal". The
+    fingerprint is returned verbatim, because the check needs it to tell an
+    ordinary refusal (an older process against a newer store) apart from a
+    value no version can parse, which no restart or rebuild clears.
+
+    Degrades to ``(None, None)`` on a store whose ``cache_meta`` cannot be
+    read, like every other probe in this gather.
+    """
+    import _cctally_cache as _cc_sib
+    record = None
+    stored_fp = None
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key=?",
+            (_cc_sib.CONVERSATION_ROLLUP_PRICING_REFUSED_KEY,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if row and row[0]:
+        try:
+            parsed = json.loads(row[0])
+        except (ValueError, TypeError):
+            parsed = None
+        record = parsed if isinstance(parsed, dict) else {"__malformed__": True}
+    try:
+        fp_row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key=?",
+            (_cc_sib.CONVERSATION_ROLLUP_PRICING_FP_KEY,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        fp_row = None
+    if fp_row and fp_row[0]:
+        stored_fp = str(fp_row[0])
+    return record, stored_fp
+
+
 def doctor_gather_state(
     *,
     now_utc: "dt.datetime | None" = None,
@@ -1399,56 +1449,31 @@ def _doctor_gather_state_impl(
                     # post_credit_milestone_count == 0.
                     # unixepoch() normalizes the cross-offset comparison.
                     try:
-                        # #703 + #707 §6.2: select by the canonical WEEK and the
-                        # ACCOUNT, not by `new_week_end_at`. A manual credit
-                        # leaves both boundary columns NULL, so the boundary
-                        # join found no snapshot and every `record-credit` week
-                        # was silently skipped by this check. The instant is the
-                        # accounting one, matching every other accounting read.
                         credit_rows = conn.execute(
                             """
                             SELECT wre.id AS event_id,
-                                   wre.week_start_date AS week_start_date,
-                                   wre.account_key AS account_key,
-                                   wre.new_week_end_at AS end_at
+                                   wre.new_week_end_at AS end_at,
+                                   wre.effective_reset_at_utc AS effective
                               FROM week_reset_events wre
-                             WHERE unixepoch(COALESCE(wre.observed_at_utc,
-                                                      wre.effective_reset_at_utc))
+                             WHERE unixepoch(wre.effective_reset_at_utc)
                                    <= unixepoch(?)
                             """,
                             (now_utc_iso(),),
                         ).fetchall()
                         credited_weeks = []
                         for cr in credit_rows:
-                            evt_id = cr["event_id"]
-                            # A row that predates `week_start_date` carries only
-                            # the boundary, so that join is the fallback for
-                            # exactly those rows and nothing else.
-                            if cr["week_start_date"]:
-                                latest = conn.execute(
-                                    """
-                                    SELECT week_start_date, weekly_percent
-                                      FROM weekly_usage_snapshots
-                                     WHERE week_start_date = ?
-                                       AND account_key = ?
-                                     ORDER BY captured_at_utc DESC, id DESC
-                                     LIMIT 1
-                                    """,
-                                    (cr["week_start_date"], cr["account_key"]),
-                                ).fetchone()
-                            elif cr["end_at"]:
-                                latest = conn.execute(
-                                    """
-                                    SELECT week_start_date, weekly_percent
-                                      FROM weekly_usage_snapshots
-                                     WHERE week_end_at = ?
-                                     ORDER BY captured_at_utc DESC, id DESC
-                                     LIMIT 1
-                                    """,
-                                    (cr["end_at"],),
-                                ).fetchone()
-                            else:
-                                latest = None
+                            end_at = cr[1]
+                            evt_id = cr[0]
+                            latest = conn.execute(
+                                """
+                                SELECT week_start_date, weekly_percent
+                                  FROM weekly_usage_snapshots
+                                 WHERE week_end_at = ?
+                                 ORDER BY captured_at_utc DESC, id DESC
+                                 LIMIT 1
+                                """,
+                                (end_at,),
+                            ).fetchone()
                             if latest is None or latest[0] is None:
                                 continue
                             ws = latest[0]
@@ -1482,6 +1507,14 @@ def _doctor_gather_state_impl(
         cache_last_entry_at = None
         cache_db_page_count = None
         cache_db_freelist_count = None
+        # #705: the ordered-write guard's two cache_meta keys, read from
+        # cache.db as well as conversations.db. `sync_cache` runs the guard on
+        # THIS connection, so a refusal latched by a process that never opens
+        # the conversation store lives only here. Read inside the existing
+        # cache.db probe so the gather opens the file once, and behind the same
+        # `_cache_probe_allowed` gate as its neighbours.
+        cache_rollup_pricing_refusal: "dict | None" = None
+        cache_rollup_pricing_fp: "str | None" = None
         try:
             if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
                 conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
@@ -1495,6 +1528,10 @@ def _doctor_gather_state_impl(
                             cache_db_freelist_count = int(row[0])
                     except sqlite3.Error:
                         pass
+                    (
+                        cache_rollup_pricing_refusal,
+                        cache_rollup_pricing_fp,
+                    ) = _read_rollup_pricing_state(conn)
                     row = conn.execute(
                         "SELECT COUNT(*), MAX(timestamp_utc) FROM session_entries"
                     ).fetchone()
@@ -1535,6 +1572,8 @@ def _doctor_gather_state_impl(
         conversations_db_page_count = None
         conversations_db_freelist_count = None
         codex_prune_refusals: list[dict] = []
+        conversation_rollup_pricing_refusal: "dict | None" = None
+        conversation_rollup_pricing_fp: "str | None" = None
         try:
             if _cctally_core.CONVERSATIONS_DB_PATH.exists():
                 # This gather also runs inside dashboard snapshot precompute. A
@@ -1585,6 +1624,13 @@ def _doctor_gather_state_impl(
                                 codex_prune_refusals.append(record)
                     except (sqlite3.OperationalError, ValueError, TypeError):
                         pass
+                    # #705: the ordered-write guard's refusal latch and the
+                    # stored fingerprint, through the shared reader so both
+                    # stores are read identically.
+                    (
+                        conversation_rollup_pricing_refusal,
+                        conversation_rollup_pricing_fp,
+                    ) = _read_rollup_pricing_state(conn)
                     # Pending reingest/split/backfill flags ⇒ a full sync hasn't yet
                     # reconciled the rollup. Read the canonical flag set from
                     # _cctally_cache so it stays in lockstep with the sync consumers.
@@ -2529,6 +2575,11 @@ def _doctor_gather_state_impl(
         codex_replay_blocked=codex_replay_blocked,
         codex_replay_deferred=codex_replay_deferred,
         codex_prune_refusals=codex_prune_refusals or None,
+        conversation_rollup_pricing_refusal=(
+            conversation_rollup_pricing_refusal),
+        conversation_rollup_pricing_fp=conversation_rollup_pricing_fp,
+        cache_rollup_pricing_refusal=cache_rollup_pricing_refusal,
+        cache_rollup_pricing_fp=cache_rollup_pricing_fp,
         stats_db_quick_check=stats_db_quick_check,
         cache_db_quick_check=cache_db_quick_check,
         conversations_db_quick_check=conversations_db_quick_check,

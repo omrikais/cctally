@@ -220,6 +220,11 @@ PRICING_SNAPSHOT_DATE = _load_lib("_lib_pricing").PRICING_SNAPSHOT_DATE
 # from the same circular-safe stdlib leaf as PRICING_SNAPSHOT_DATE above.
 claude_usage_dict = _load_lib("_lib_pricing").claude_usage_dict
 
+# #705: the ONE parse of the recorded-fingerprint contract, shared with
+# `_lib_doctor`'s report of the same decision. Bound from the same circular-safe
+# stdlib leaf as the two names above.
+parse_pricing_fingerprint = _load_lib("_lib_pricing").parse_pricing_fingerprint
+
 # Shared by the fused per-file walk AND backfill_conversation_messages so the
 # column list, placeholders, and tuple order live in ONE place — a column
 # add/reorder can't silently desync the two ingest paths (which would land
@@ -4055,6 +4060,14 @@ def sync_cache(
             # post-walk recompute (after the per-file loop, still under the
             # flock) consumes the flag and rebuilds the rollup from the freshly
             # re-ingested messages, then drops it last (crash-safe).
+            #
+            # This clear carries NO #705 pricing authorization, unlike the
+            # authoritative rebuild path in sync_claude_conversations, and that
+            # is deliberate: _iter_sync_entries is called with
+            # include_conversations=False below, so cache.db's conversation
+            # tables are permanently empty (measured: 0 rows) and this DELETE
+            # destroys nothing. Enabling conversations on THIS connection would
+            # require the same pre-clear authorization the rebuild path uses.
             conn.execute("DELETE FROM conversation_sessions")
             _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
             conn.commit()
@@ -4437,6 +4450,11 @@ def sync_cache(
             # same destructive txn, alongside clear_conversation_messages) and
             # arm the durable backfill flag. The post-walk recompute rebuilds it
             # from the re-ingested messages and drops the flag last (crash-safe).
+            #
+            # Unauthorized for the same reason as the rebuild clear above:
+            # include_conversations=False keeps cache.db's conversation tables
+            # permanently empty, so this DELETE destroys nothing. Enabling
+            # conversations here would require the #705 pre-clear authorization.
             conn.execute("DELETE FROM conversation_sessions")
             _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
             conn.commit()
@@ -4761,17 +4779,50 @@ def sync_cache(
                 # embedded pricing snapshot changed since it was last derived.
                 # Runs BEFORE the pending check so a mismatch arms the same
                 # durable flag the full-recompute path already consumes below.
-                _arm_rollup_backfill_on_pricing_change(conn)
+                rollup_authorized = _arm_rollup_backfill_on_pricing_change(conn)
                 if _conversation_sessions_backfill_pending(conn):
-                    _recompute_conversation_sessions(conn)
-                    conn.execute(
-                        "DELETE FROM cache_meta "
-                        "WHERE key='conversation_sessions_backfill_pending'"
-                    )
-                    conn.commit()
+                    # #705: a refused process must NOT consume the flag. It leaves it
+                    # set for the next authorized process, so a newer process that armed
+                    # the backfill and died is not followed by a stale successor either
+                    # rewriting cost from its old table or declaring an unrecomputed
+                    # rollup authoritative.
+                    if _recompute_conversation_sessions(conn):
+                        conn.execute(
+                            "DELETE FROM cache_meta "
+                            "WHERE key='conversation_sessions_backfill_pending'"
+                        )
+                        _clear_pricing_write_refusal(conn)
+                        conn.commit()
+                    else:
+                        # #705: the refusal wrote a record and armed the flag,
+                        # and _recompute_conversation_sessions leaves the commit
+                        # to its caller. Nothing after this block reliably
+                        # commits: the walk-complete sentinel is skipped on an
+                        # unclean walk and _update_parse_health_meta returns
+                        # without writing in steady state, so on a walk with one
+                        # failed file the record died with the connection.
+                        conn.commit()
+                        rollup_authorized = False
                 elif touched_sessions:
-                    _recompute_conversation_sessions(conn, touched_sessions)
+                    if not _recompute_conversation_sessions(
+                            conn, touched_sessions):
+                        rollup_authorized = False
                     conn.commit()
+                if not rollup_authorized and stats.deferred_reason is None:
+                    # #705: say the refusal rather than leave it to be inferred.
+                    # A refused core sync was already non-certifiable, but only
+                    # because the same refusal armed
+                    # `conversation_sessions_backfill_pending` and
+                    # `_lib_ingest_frontier._pending_identity` reads that flag.
+                    # `provider_sync_certifiable` knows nothing about the flag
+                    # and refuses on any non-None `deferred_reason`, so the
+                    # guarantee lived entirely in a coupling nothing stated and
+                    # would disappear the day that arming changed. The `is
+                    # None` guard is DEFENSIVE, like its
+                    # `sync_claude_conversations` twin: every earlier
+                    # assignment in this function returns immediately, so no
+                    # earlier reason can reach this line today.
+                    stats.deferred_reason = "pricing_write_refused"
 
         # Walk-complete sentinel write (cctally-dev#93, D5a). Still inside the
         # held fcntl lock, before the finally-unlock. Only when the entire walk
@@ -5104,40 +5155,247 @@ def _conversation_sessions_backfill_pending(conn) -> bool:
         return False
 
 
-def _arm_rollup_backfill_on_pricing_change(conn) -> None:
+def _arm_rollup_backfill_pending(conn) -> bool:
+    """Arm the durable full-recompute flag, returning whether this call armed
+    it. Idempotent by design: a refused dashboard ticks continuously, and
+    rewriting a set flag every tick would take the writer lock to restate an
+    unchanged fact.
+
+    Every REFUSED pricing write arms this (#705). The flag is the store's
+    durable "this rollup is not fully derived" signal and a refusal is exactly
+    that condition, so arming it is not a white lie — it is what makes
+    ``_lib_conversation_query._rollup_authoritative()`` false and delivers the
+    degrade to live aggregation. Without it the refusal is a functional
+    REGRESSION rather than a guard: the refused process still ingests
+    conversation_messages but writes no rollup row for the sessions it touched,
+    the flag is clear (the newer process that advanced the fingerprint cleared
+    it), so the rail reads an un-recomputed rollup as authoritative and those
+    conversations vanish from it permanently — with no self-heal, because a
+    later authorized scoped recompute only covers sessions ITS walk touched and
+    the refused process already consumed those bytes.
+
+    NEVER commits — the caller owns the transaction, like
+    _record_pricing_write_refusal beside it. Degrades to False when cache_meta
+    is unavailable (path-less / schema-not-applied conn), like its neighbours.
+    """
+    try:
+        if conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='conversation_sessions_backfill_pending'"
+        ).fetchone() is not None:
+            return False
+        _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
+    except sqlite3.OperationalError:
+        return False
+    return True
+
+
+#: cache_meta keys for the conversation rollup's pricing provenance (#302, #705).
+CONVERSATION_ROLLUP_PRICING_FP_KEY = "conversation_sessions_pricing_fp"
+CONVERSATION_ROLLUP_PRICING_REFUSED_KEY = (
+    "conversation_sessions_pricing_write_refused"
+)
+
+
+def _pricing_write_authorized(stored, process=None) -> bool:
+    """Whether a process holding `process` pricing may write materialized
+    conversation cost over a store that recorded `stored` (#705).
+
+    ORDERED, not an equality. The bare `!=` this replaces let an OLD process
+    treat a NEWER stored fingerprint as a mismatch exactly as a new process
+    treats an older one, so it rewrote every session's cost from its stale
+    table and stamped the fingerprint backwards.
+
+    Absent or empty is older: a fresh store has nothing to protect. Anything
+    that does not parse as an ISO date — on EITHER side — is refused rather
+    than assumed old. This guard exists because a writer assumed its own table
+    beat the store's, and a value it cannot parse was written by a version
+    whose format it does not understand, which is precisely where that
+    assumption is least defensible.
+
+    Ordering is DAY-GRANULAR because PRICING_SNAPSHOT_DATE is a calendar date.
+    Two pricing revisions inside one UTC day compare equal and the older
+    process is authorized. `bin/_lib_pricing.py` records the contract that
+    makes this sound: a pricing revision must always ADVANCE the date.
+
+    The parse itself lives in `_lib_pricing.parse_pricing_fingerprint`, because
+    `doctor pricing.conversation_rollup_writer` reports which refusal state a
+    store is in and must classify a value exactly as this function acts on it.
+    Two parses of one contract had already drifted apart once."""
+    process = PRICING_SNAPSHOT_DATE if process is None else process
+    if not stored:
+        return True
+    stored_date = parse_pricing_fingerprint(stored)
+    process_date = parse_pricing_fingerprint(process)
+    if stored_date is None or process_date is None:
+        return False
+    return stored_date <= process_date
+
+
+def _record_pricing_write_refusal(conn, stored) -> None:
+    """Latch that a process holding older pricing was refused a write (#705).
+
+    Written only when the (process, store) pair DIFFERS from what is already
+    recorded. A dashboard ticks continuously, so rewriting per tick would take
+    the conversations writer lock purely to restate an unchanged fact — and it
+    would make the timestamp the latest refusal rather than the first, which
+    is the less useful of the two, because the first says how long the store
+    has been diverging.
+
+    NEVER commits — the caller owns the transaction. _prune_orphaned_cache_entries
+    reaches this from inside its own explicit ``BEGIN``, whose
+    ``except BaseException: rollback()`` must still be able to undo the three
+    message/touch/title DELETEs that precede it."""
+    pair = {
+        "process_snapshot_date": PRICING_SNAPSHOT_DATE,
+        "store_snapshot_date": stored,
+    }
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key=?",
+            (CONVERSATION_ROLLUP_PRICING_REFUSED_KEY,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return
+    if row and row[0]:
+        try:
+            existing = json.loads(row[0])
+        except (ValueError, TypeError):
+            existing = None  # unreadable -> replace it with a readable one
+        if isinstance(existing, dict) and all(
+            existing.get(field) == value for field, value in pair.items()
+        ):
+            return
+    record = dict(pair)
+    record["first_refused_at_utc"] = (
+        dt.datetime.now(dt.timezone.utc)
+        .replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
+    try:
+        _set_cache_meta(
+            conn, CONVERSATION_ROLLUP_PRICING_REFUSED_KEY,
+            json.dumps(record, sort_keys=True),
+        )
+    except sqlite3.OperationalError:
+        # Symmetric with the SELECT above: a locked or schema-less store must
+        # not raise out of a path that only latches a diagnostic.
+        return
+
+
+def _clear_pricing_write_refusal(conn) -> None:
+    """Drop the refusal latch, unconditionally. NEVER commits — the caller owns
+    the transaction, like the record and arm helpers beside it.
+
+    TWO callers, and the condition each satisfies before calling is the whole
+    contract. The two pending-flag branches call it directly, atomically with
+    consuming ``conversation_sessions_backfill_pending`` — the flag is deleted
+    in the same transaction one statement earlier, so the store is converged by
+    the time this runs. `_clear_converged_pricing_write_refusal` calls it for
+    every OTHER completed recompute, and checks the flag itself because those
+    paths do not consume it.
+
+    The earlier contract was "the pending-flag branch and nothing else", and it
+    made one record unreachable. The rebuild pre-clear refuses BEFORE anything
+    destructive and therefore arms no flag (correctly — the rollup it declines
+    to touch is intact), so no flag branch would ever run over the record it
+    latched, while `doctor pricing.conversation_rollup_writer` promised the
+    operator that the next tick would clear it."""
+    try:
+        conn.execute(
+            "DELETE FROM cache_meta WHERE key=?",
+            (CONVERSATION_ROLLUP_PRICING_REFUSED_KEY,),
+        )
+    except sqlite3.OperationalError:
+        pass
+
+
+def _clear_converged_pricing_write_refusal(conn, *, authorize: bool) -> None:
+    """Drop the refusal latch after an AUTHORIZED recompute completed over a
+    store with no backfill pending (#705).
+
+    Both conditions carry weight. ``authorize`` is False only for the
+    read-scope TEMP projection, and the gate is what stops a READ from deleting
+    a real diagnostic. That projection shadows ``conversation_sessions`` with a
+    TEMP table but defines no TEMP ``cache_meta``, so the unqualified ``DELETE``
+    in ``_clear_pricing_write_refusal`` resolves past ``temp`` to ``main`` —
+    which on that connection is conversations.db, the writable store whose own
+    refusal record this is. It does NOT reach the ``?mode=ro`` ``cache_db``
+    attachment, and reading it that way makes the gate look removable: a write
+    to a read-only attachment raises ``OperationalError``, which the handler one
+    frame down swallows, so the ungated clear would look harmless while actually
+    deleting the diagnostic from ``main``. And a set backfill flag means the
+    recompute that converges this store has not run yet, so clearing here would
+    declare convergence early; that case belongs to the two flag branches, which
+    clear atomically with consuming the flag.
+
+    NEVER commits. Every production caller of ``_recompute_conversation_sessions``
+    commits the transaction this runs in: ``_prune_orphaned_cache_entries``
+    inside its own ``BEGIN``, the legacy bridge at the end of its import (or
+    rolls the whole import back), and both sync functions on the scoped branch
+    immediately after the call."""
+    if not authorize or _conversation_sessions_backfill_pending(conn):
+        return
+    _clear_pricing_write_refusal(conn)
+
+
+def _arm_rollup_backfill_on_pricing_change(conn) -> bool:
     """Arm the conversation_sessions full backfill when the embedded pricing
     snapshot changed since the rollup's stored cost was last derived (#302). The
     rail now reads MATERIALIZED cost off the rollup, so a pricing sync / cctally
     upgrade would otherwise leave untouched sessions' cost (and the cost
     filter/sort axis) stale until a manual `cache-sync --rebuild`. This self-heals
     it: compares a stored cache_meta fingerprint against the current
-    PRICING_SNAPSHOT_DATE and, on mismatch, arms
-    conversation_sessions_backfill_pending + advances the stored fingerprint (one
-    committed txn). The existing full-recompute-then-drop-flag-last machinery then
-    re-derives every session's cost + enrichment.
+    PRICING_SNAPSHOT_DATE through the ORDERED _pricing_write_authorized and, when
+    the store is OLDER, arms conversation_sessions_backfill_pending + advances the
+    stored fingerprint (one committed txn). The existing
+    full-recompute-then-drop-flag-last machinery then re-derives every session's
+    cost + enrichment.
+
+    A stored fingerprint that is NEWER than this process's, or that does not
+    parse, is REFUSED rather than treated as a mismatch (#705). The bare equality
+    this replaced made an old process rewrite every session's cost from its stale
+    table and stamp the fingerprint backwards; the refusal latches a cache_meta
+    record instead, which `doctor pricing.conversation_rollup_writer` reports,
+    AND arms the backfill flag so the rail degrades to live aggregation instead
+    of reading an un-recomputed rollup as authoritative.
+
+    Returns whether this process is authorized to write materialized cost to
+    this store, so the caller can report a refusal (`deferred_reason`) rather
+    than finish as a silent success.
 
     Crash-safety is unchanged: the DURABLE backfill flag remains the recompute
     signal, so advancing the fingerprint here cannot strand stale cost (a crash
     after arming leaves the flag set -> next sync recomputes regardless of the
     fingerprint). No-op when cache_meta is unavailable (path-less / degraded
-    conn). Caller path holds the cache.db.lock flock."""
+    conn). Caller path holds the cache.db.lock flock. Unlike the recompute
+    chokepoint, this helper owns its OWN transaction and commits, so the flag
+    and the refusal record are durable for the next process."""
     try:
         row = conn.execute(
-            "SELECT value FROM cache_meta "
-            "WHERE key='conversation_sessions_pricing_fp'"
+            "SELECT value FROM cache_meta WHERE key=?",
+            (CONVERSATION_ROLLUP_PRICING_FP_KEY,),
         ).fetchone()
     except sqlite3.OperationalError:
-        return
-    if row is not None and row[0] == PRICING_SNAPSHOT_DATE:
-        return
+        return True
+    stored = row[0] if row is not None else None
+    if not _pricing_write_authorized(stored):
+        _record_pricing_write_refusal(conn, stored)
+        _arm_rollup_backfill_pending(conn)
+        conn.commit()
+        return False
+    if stored == PRICING_SNAPSHOT_DATE:
+        return True
     _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
-    _set_cache_meta(conn, "conversation_sessions_pricing_fp", PRICING_SNAPSHOT_DATE)
+    _set_cache_meta(
+        conn, CONVERSATION_ROLLUP_PRICING_FP_KEY, PRICING_SNAPSHOT_DATE)
     conn.commit()
+    return True
 
 
 def _recompute_conversation_sessions(
     conn, session_ids=None, *, advance_render_revision: bool = True,
-) -> None:
+    authorize: bool = True,
+) -> bool:
     """Recompute the ``conversation_sessions`` browse-rail rollup from
     ``conversation_messages``. The caller holds the cache.db.lock flock and owns
     the commit (this helper never commits).
@@ -5157,10 +5415,74 @@ def _recompute_conversation_sessions(
 
     The recomputed COUNT/MIN/MAX are byte-identical to the rail's prior live
     aggregate over the same rows — that is the load-bearing invariant
-    (assert_rollup_matches_live in the maintenance test pins it)."""
+    (assert_rollup_matches_live in the maintenance test pins it).
+
+    This is the ORDERED-WRITE CHOKEPOINT (#705). Both branches materialize
+    ``cost_usd`` from this process's pricing table, so authorization is consulted
+    HERE, before either branch deletes a row, and the function returns whether it
+    actually recomputed. Guarding only _arm_rollup_backfill_on_pricing_change is
+    insufficient, because the steady-state SCOPED path and
+    _prune_orphaned_cache_entries reach the write without passing through it;
+    guarding _fill_conversation_sessions_filter_columns instead is too late,
+    because rows are by then deleted and reinserted at the schema's default-zero
+    cost, which is the 0.0 the issue reports. A refused process writes no rollup
+    row at all and ARMS the durable backfill flag for the next authorized one,
+    which is what makes the rail degrade to live aggregation rather than read a
+    wrong value — or, for a session this refused process just ingested, read no
+    value at all. Arming is required rather than optional: in the scenario #705
+    describes the newer process COMPLETED, so it cleared the flag, and a refusal
+    that merely declined to write would leave _rollup_authoritative() true over
+    a rollup missing every newly ingested session.
+
+    A COMPLETED authorized recompute over a store with no backfill pending
+    clears the refusal record, through
+    `_clear_converged_pricing_write_refusal` on both successful returns. That
+    is what makes a record latched by the rebuild pre-clear — the one refusal
+    that arms no flag — reachable at all; without it no flag branch would ever
+    run over that record and doctor warned indefinitely.
+
+    ``authorize=False`` is for a connection whose ``conversation_sessions`` is a
+    connection-local TEMP projection: it mutates no persistent row, so the
+    persistent-store guard does not apply to it. The clear is gated for the
+    OPPOSITE reason — its unqualified ``cache_meta`` is not shadowed and would
+    reach ``main``, so on that connection it is the one statement here that
+    does touch a persistent row."""
     ids = None if session_ids is None else [s for s in session_ids if s is not None]
     if ids == []:
-        return
+        return True
+    if authorize:
+        try:
+            row = conn.execute(
+                "SELECT value FROM cache_meta WHERE key=?",
+                (CONVERSATION_ROLLUP_PRICING_FP_KEY,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        stored = row[0] if row else None
+        if not _pricing_write_authorized(stored):
+            _record_pricing_write_refusal(conn, stored)
+            _arm_rollup_backfill_pending(conn)
+            # No commit: this helper documents that the CALLER owns it, and
+            # every caller that can reach a refusal commits — the pruner inside
+            # its own BEGIN, the legacy bridge, and both sync paths on both the
+            # flag branch and the scoped branch.
+            #
+            # Do NOT weaken any of those to "the arm helper already committed
+            # the same two rows on this tick". That was the argument for the
+            # two flag branches, and it holds only while the arm helper's read
+            # of the fingerprint and the read below AGREE. They diverge two
+            # ways. _arm_rollup_backfill_on_pricing_change returns True and
+            # writes nothing when its own SELECT raises OperationalError, and
+            # `database is locked` is transient, so the read below can succeed
+            # against a newer stored value and refuse. And another process can
+            # advance the fingerprint between the two reads — which
+            # _import_legacy_conversation_rows made more reachable, because it
+            # stamps CONVERSATION_ROLLUP_PRICING_FP_KEY at DB open holding only
+            # the shared maintenance lock, never the conversations writer flock.
+            # In either case this writes a genuinely new record,
+            # _arm_rollup_backfill_pending short-circuits on the already-set
+            # flag, and nothing else commits.
+            return False
     render_revision = (
         _next_conversation_render_revision(conn)
         if advance_render_revision else 0
@@ -5177,7 +5499,8 @@ def _recompute_conversation_sessions(
             "UPDATE conversation_sessions SET render_revision=?",
             (render_revision,),
         )
-        return
+        _clear_converged_pricing_write_refusal(conn, authorize=authorize)
+        return True
     for i in range(0, len(ids), 400):
         chunk = ids[i:i + 400]
         placeholders = ",".join("?" for _ in chunk)
@@ -5198,6 +5521,8 @@ def _recompute_conversation_sessions(
             (render_revision, *chunk),
         )
     _fill_conversation_sessions_filter_columns(conn, ids)
+    _clear_converged_pricing_write_refusal(conn, authorize=authorize)
+    return True
 
 
 def _fill_conversation_sessions_filter_columns(conn, session_ids):
@@ -10013,7 +10338,13 @@ def scope_conversations_db_to_account(
     )
     # These are read-scope TEMP projections. They must neither consume nor
     # advance the durable render frontier used by writer recomputes.
-    _recompute_conversation_sessions(conn, advance_render_revision=False)
+    # authorize=False (#705): this connection shadows the leaves AND
+    # conversation_sessions with connection-local TEMP objects, so the recompute
+    # writes no persistent row. The ordered-write guard protects the persistent
+    # store's materialized cost, so it does not apply here — and applying it
+    # would make a read-scope projection refuse and record a spurious refusal.
+    _recompute_conversation_sessions(
+        conn, advance_render_revision=False, authorize=False)
     codex_keys = {
         row[0]
         for row in conn.execute(
@@ -10530,6 +10861,28 @@ def read_session_titles_bounded(
             maintenance_fh.close()
 
 
+#: Tables the pre-028 compatibility bridge copies out of the attached legacy
+#: store. ``conversation_sessions`` is deliberately ABSENT (#705): it is the
+#: browse-rail rollup, it carries materialized ``cost_usd``, and the bridge
+#: copies rows verbatim without any pricing comparison and without copying the
+#: fingerprint that would describe the cost it installs. The rollup is fully
+#: derivable from ``conversation_messages``, which the bridge does import, so
+#: the bridge DERIVES the rollup instead, through the ordered-write chokepoint,
+#: and stamps the fingerprint for the pricing table that derive used. (It armed
+#: the backfill and derived nothing in an earlier revision; that left a
+#: ``dashboard --no-sync`` reader with an empty rollup for its whole life. See
+#: _import_legacy_conversation_rows.)
+_LEGACY_BRIDGE_TABLES = (
+    "conversation_messages",
+    "conversation_ai_titles",
+    "conversation_file_touches",
+    "codex_conversation_events",
+    "codex_conversation_messages",
+    "codex_conversation_file_touches",
+    "codex_conversation_rollups",
+)
+
+
 def _import_legacy_conversation_rows(conn: sqlite3.Connection) -> None:
     """Bridge pre-028/compatibility rows into an empty conversation store.
 
@@ -10537,19 +10890,29 @@ def _import_legacy_conversation_rows(conn: sqlite3.Connection) -> None:
     defensive bridge covers an interrupted upgrade and keeps historical test
     fixtures readable without making core sync depend on the transcript DB.
     It writes only the main conversation store; ``cache_db`` is attached RO.
+
+    It does NOT copy ``conversation_sessions`` (#705). That table is the
+    browse-rail rollup and it carries materialized ``cost_usd``; copying it
+    bypassed _recompute_conversation_sessions entirely, carried no pricing
+    comparison, and copied no fingerprint describing the cost it installed. It
+    DERIVES the rollup instead, through the ordered-write chokepoint, from the
+    conversation_messages it just imported, so the installed cost comes from
+    this process's pricing table rather than an unknown one — and it records
+    which table that was in ``CONVERSATION_ROLLUP_PRICING_FP_KEY``, so the
+    provenance is written down rather than merely implied.
+
+    Deriving is required, not merely tidier: this runs at DB OPEN, and
+    ``dashboard --no-sync`` never runs a sync, so merely arming
+    ``conversation_sessions_backfill_pending`` left the rollup EMPTY and
+    non-authoritative for the life of that process. The rail itself survives
+    that (the flag routes it to live aggregation) but
+    ``list_conversation_facets`` reads the rollup's ``project_label`` directly
+    with no authoritative gate, so the browse filter's project list went empty;
+    and every rail read fell to the live branch, which is not the branch the
+    materialized-cost contract is about.
     """
-    tables = (
-        "conversation_messages",
-        "conversation_ai_titles",
-        "conversation_sessions",
-        "conversation_file_touches",
-        "codex_conversation_events",
-        "codex_conversation_messages",
-        "codex_conversation_file_touches",
-        "codex_conversation_rollups",
-    )
     changed = False
-    for table in tables:
+    for table in _LEGACY_BRIDGE_TABLES:
         try:
             if conn.execute(f"SELECT 1 FROM main.{table} LIMIT 1").fetchone():
                 continue
@@ -10574,6 +10937,48 @@ def _import_legacy_conversation_rows(conn: sqlite3.Connection) -> None:
         except sqlite3.Error:
             continue
     if changed:
+        # The rollup is DERIVED, never inherited. A full recompute here is
+        # bounded by the rows just imported (the bridge runs only into an empty
+        # store), and it goes through the ordered-write chokepoint, so the cost
+        # it installs comes from THIS process's pricing table — the provenance
+        # the copied cost lacked. Deliberately broad: a Codex-only import also
+        # re-derives the Claude rollup, which costs one recompute over an empty
+        # or tiny table and cannot under-derive.
+        #
+        # No unconditional arm. A completed full recompute IS what the flag
+        # asks for, so arming after one would only book a redundant repeat —
+        # and, because the bridge runs at DB OPEN, a `dashboard --no-sync`
+        # reader would carry that flag for its whole life and read the rail's
+        # LIVE fallback forever. A refused process is the case the flag is for,
+        # and _recompute_conversation_sessions arms it itself on refusal.
+        if _recompute_conversation_sessions(conn):
+            # Stamp the fingerprint for the table this derive actually used.
+            # Deriving cost and leaving an OLDER fingerprint recorded re-opens
+            # #705 one step down the line: a store recording 2026-08-01 bridged
+            # by a 2026-09-02 process would hold 2026-09-02 cost under a
+            # 2026-08-01 fingerprint, and a later 2026-08-15 process would read
+            # 2026-08-01 <= 2026-08-15, consider itself authorized, and rewrite
+            # the rollup from its older table. Only on the AUTHORIZED branch: a
+            # refused derive wrote no row, so claiming provenance for it would
+            # be false and would backdate the store as well.
+            try:
+                _set_cache_meta(
+                    conn, CONVERSATION_ROLLUP_PRICING_FP_KEY,
+                    PRICING_SNAPSHOT_DATE)
+            except sqlite3.OperationalError:
+                # Fail-soft like every other statement in this bridge — this
+                # runs at DB OPEN, so a degraded store must still open — but
+                # fail-soft by DISCARDING, never by committing the pair apart.
+                # The recompute above materialized cost from THIS process's
+                # pricing table; committing it while the store keeps whatever
+                # older fingerprint it already records is the exact sequence the
+                # stamp exists to prevent (#705), and a later intermediate
+                # process reads that older value as authorization to overwrite
+                # the rollup from its own staler table. The bridge is idempotent
+                # and runs at every open, so rolling the whole import back
+                # leaves the store as it was and the next open retries it.
+                conn.rollback()
+                return
         conn.commit()
 
 
@@ -10825,6 +11230,51 @@ def sync_claude_conversations(
                 return stats
         rebuild = rebuild or pending_rebuild
         if rebuild:
+            # #705: authorize BEFORE anything destructive. This branch deletes
+            # conversation_sessions long before the rollup path's pricing check
+            # is reached, so guarding only _recompute_conversation_sessions
+            # would let a process holding an older pricing table destroy
+            # correct materialized cost and only THEN be refused the re-derive,
+            # leaving an EMPTY rollup — strictly worse than the overwrite this
+            # issue is about. A rebuild is an explicit maintenance operation;
+            # performing half of it from a stale binary is worse than not
+            # performing it at all, and deferred_reason is how the caller
+            # learns it did nothing.
+            try:
+                fp_row = conn.execute(
+                    "SELECT value FROM cache_meta WHERE key=?",
+                    (CONVERSATION_ROLLUP_PRICING_FP_KEY,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                fp_row = None
+            stored_fp = fp_row[0] if fp_row else None
+            if not _pricing_write_authorized(stored_fp):
+                _record_pricing_write_refusal(conn, stored_fp)
+                # COMMIT. _record_pricing_write_refusal leaves the transaction
+                # to its caller, and this caller returns immediately, so
+                # without this the record dies with the connection. The
+                # function's other refusal sites are already covered — the
+                # rollup block's are behind _arm_rollup_backfill_on_pricing_change,
+                # which owns and commits its own transaction — and this one was
+                # missed when the commit moved out of the helper.
+                # `_run_transcript_rebuild_worker` runs the rebuild in a forked
+                # child that closes the connection and calls os._exit(0) the
+                # moment this returns, and sqlite3's implicit-transaction mode
+                # discards an uncommitted write on close, so
+                # `doctor pricing.conversation_rollup_writer` reported OK after
+                # every refused `cache-sync --rebuild`.
+                #
+                # Do NOT arm conversation_sessions_backfill_pending here. This
+                # is the one refusal path that runs BEFORE anything destructive,
+                # so the rollup it declines to touch is intact and was derived
+                # by a newer, authorized process — it is genuinely
+                # authoritative. Arming would force every rail read onto live
+                # aggregation to protect a rollup that needs no protection. The
+                # other refusal sites arm precisely because they refuse a write
+                # the store still needs.
+                conn.commit()
+                stats.deferred_reason = "pricing_write_refused"
+                return stats
             # Commit the retry marker before the destructive clear. A killed
             # #395 worker therefore leaves a partial transcript store visibly
             # pending instead of advancing it to a false-complete state.
@@ -11005,17 +11455,44 @@ def sync_claude_conversations(
                 _report_conversation_progress(progress, "ingest", stats)
 
         _report_conversation_progress(progress, "rollup", stats)
-        _arm_rollup_backfill_on_pricing_change(conn)
+        rollup_authorized = _arm_rollup_backfill_on_pricing_change(conn)
         if _conversation_sessions_backfill_pending(conn):
-            _recompute_conversation_sessions(conn)
-            conn.execute(
-                "DELETE FROM cache_meta "
-                "WHERE key='conversation_sessions_backfill_pending'"
-            )
-            conn.commit()
+            # #705: a refused process must NOT consume the flag. It leaves it
+            # set for the next authorized process, so a newer process that armed
+            # the backfill and died is not followed by a stale successor either
+            # rewriting cost from its old table or declaring an unrecomputed
+            # rollup authoritative.
+            if _recompute_conversation_sessions(conn):
+                conn.execute(
+                    "DELETE FROM cache_meta "
+                    "WHERE key='conversation_sessions_backfill_pending'"
+                )
+                _clear_pricing_write_refusal(conn)
+                conn.commit()
+            else:
+                # #705: same as the sync_cache twin — commit the refusal record
+                # and the armed flag here rather than relying on the trailing
+                # `conversation_rebuild_claude_pending` clear, which is skipped
+                # whenever a single file failed to ingest.
+                conn.commit()
+                rollup_authorized = False
         elif touched_sessions:
-            _recompute_conversation_sessions(conn, touched_sessions)
+            if not _recompute_conversation_sessions(conn, touched_sessions):
+                rollup_authorized = False
             conn.commit()
+        if not rollup_authorized and stats.deferred_reason is None:
+            # #705: the rebuild pre-clear was not the only refusal this call can
+            # take, and a refusal on ANY of them leaves the rollup non-derived.
+            # `deferred_reason` is the one channel the CLI ladder and
+            # `_lib_ingest_frontier.conversation_sync_certifiable` both read, so
+            # setting it here is what stops a refused sync being reported as a
+            # success and being certified as caught up. The `is None` guard is
+            # DEFENSIVE, not load-bearing today: every earlier assignment in
+            # this function returns immediately, so no earlier reason can reach
+            # this line. It preserves the first reason if one of those sites
+            # ever stops returning — the earlier, more specific account of the
+            # same incomplete result should win.
+            stats.deferred_reason = "pricing_write_refused"
         if only_paths is None and stats.files_failed == 0:
             conn.execute(
                 "DELETE FROM cache_meta "
@@ -12179,6 +12656,27 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                     f"core accounting/quota sync is complete. {retry}"
                 )
                 contended = True
+            elif conv_stats.deferred_reason == "pricing_write_refused":
+                # #705: `--rebuild` is the operator's recovery path, so this is
+                # the worst place for a silent success. Without this branch a
+                # refused rebuild fell through to the `done: 0 processed` line
+                # below and exited 0.
+                eprint(
+                    "[cache-sync] transcript rebuild incomplete: "
+                    f"provider={provider} store=conversations.db phase=pricing "
+                    "(cctally may not rewrite materialized conversation cost "
+                    "from a pricing table it cannot prove is at least the "
+                    "store's: the fingerprint recorded there is either newer "
+                    "than this cctally's or not an ISO date any version can "
+                    "order); core accounting/quota sync is complete. Upgrade "
+                    "or restart cctally so it carries at least the store's "
+                    "pricing table. When the recorded value is not a date, no "
+                    "upgrade or restart clears it — run `cctally doctor`, "
+                    "which reports that state under "
+                    "`pricing.conversation_rollup_writer` and names the step "
+                    f"that does. {retry}"
+                )
+                contended = True
             else:
                 eprint(
                     f"[cache-sync] {provider} transcripts done: "
@@ -12221,6 +12719,17 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                         "another process holds the conversations lock"
                     )
                 else:
+                    # #705: a routine sync reports success even when
+                    # `deferred_reason` is "pricing_write_refused", and that
+                    # asymmetry with `--rebuild` above is DELIBERATE. Message
+                    # ingestion did succeed here — only the rollup re-derive was
+                    # declined, and the armed backfill flag routes the rail to
+                    # live aggregation meanwhile, so nothing the user asked for
+                    # failed. `--rebuild` is the opposite case: the operator
+                    # asked for exactly the re-derive that was refused, so it
+                    # exits non-zero. `doctor
+                    # pricing.conversation_rollup_writer` is where the refusal
+                    # surfaces for a routine sync.
                     eprint(
                         f"[cache-sync] claude transcripts done: "
                         f"{conv_stats.files_processed} processed, "

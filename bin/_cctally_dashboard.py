@@ -510,7 +510,6 @@ from _cctally_cache import (
 from _lib_snapshot_cache import (
     build_cached_group_a,
     bump_generation,
-    reset_bugk_segment_state,
     reset_cache_report_state,
     reset_group_a_state,
     reset_projects_env_state,
@@ -2250,11 +2249,6 @@ def _dashboard_self_heal_orphans(*, skip_sync):
             # #269 M4.5 (spec §14 Win 2): the projects-envelope per-(project,
             # week) cache rides the same prune-site clear for the same reason.
             reset_projects_env_state()
-            # #271 M3 (spec §18): the Bug-K pre-credit segment cache rides the
-            # same prune-site clear — a non-max deletion inside a closed
-            # pre-credit window the reconcile's max-id regression check can't
-            # catch.
-            reset_bugk_segment_state()
             # #269 (final reviewer): the per-(project, week) cache clear above is
             # NOT sufficient on its own. `_build_projects_envelope` consults the
             # whole-envelope memo `_PROJECTS_ENV_MEMO` FIRST — and its memo_key is
@@ -3472,7 +3466,7 @@ def _group_a_weekly_buckets(stats_conn, now_utc, *, weeks):
     """Assemble the weekly panel's per-week ``BucketUsage`` list via the #268
     Group A cache, or ``None`` to fall back to the wide fetch (spec §5.1).
 
-    ``all_bucket_labels`` = each SubWeek's ``start_date.isoformat()`` in
+    ``all_bucket_labels`` = each SubWeek's ``segment_key`` in
     ascending order (matching ``_aggregate_weekly``'s sorted-key output);
     ``current_label`` = the SubWeek containing ``now_utc`` (always recomputed
     as the open week). Each recompute fetches ``[week.start_ts, min(week.end_ts,
@@ -3489,8 +3483,8 @@ def _group_a_weekly_buckets(stats_conn, now_utc, *, weeks):
     namespace (the scoped M2.4 fallback: recompute-all on a weekly-relevant
     change, cache-hit only when nothing weekly-relevant moved — still the idle
     win, and trivially byte-identical). Pure session-entry adds stay per-week
-    via the watermark. The overlay / Bug-K presentation reruns fresh each tick,
-    so a snapshot change is reflected even on a cache-served bucket.
+    via the watermark. The overlay presentation reruns fresh each tick, so a
+    snapshot change is reflected even on a cache-served bucket.
     """
     if not _GROUP_A_CACHE_ENABLED:
         return None
@@ -3499,8 +3493,11 @@ def _group_a_weekly_buckets(stats_conn, now_utc, *, weeks):
     except Exception:
         return None
     try:
-        sw_by_label = {w.start_date.isoformat(): w for w in weeks}
-        labels = [w.start_date.isoformat() for w in weeks]  # ascending
+        # Keyed on ``segment_key``, not ``start_date``: the two billing
+        # cycles of an in-place-credited week share the latter, and a
+        # date-keyed label map serves one of the pair under both labels.
+        sw_by_label = {w.segment_key: w for w in weeks}
+        labels = [w.segment_key for w in weeks]  # ascending
         # current_label = the SubWeek that contains now_utc (the open week);
         # fall back to the newest week if none contains it.
         current_label = None
@@ -3511,12 +3508,10 @@ def _group_a_weekly_buckets(stats_conn, now_utc, *, weeks):
             except ValueError:
                 continue
             if s <= now_utc < e:
-                current_label = w.start_date.isoformat()
+                current_label = w.segment_key
                 break
         if current_label is None:
-            current_label = max(
-                weeks, key=lambda w: w.start_date
-            ).start_date.isoformat()
+            current_label = max(weeks, key=lambda w: w.segment_key).segment_key
 
         # Weekly-relevant signature legs: any change full-invalidates.
         extra_signature = (
@@ -3561,7 +3556,7 @@ def _group_a_weekly_buckets(stats_conn, now_utc, *, weeks):
         _parsed_bounds = [
             (parse_iso_datetime(w.start_ts, "week.start_ts"),
              parse_iso_datetime(w.end_ts, "week.end_ts"),
-             w.start_date.isoformat())
+             w.segment_key)
             for w in weeks
         ]
         _bound_starts = [b[0] for b in _parsed_bounds]
@@ -3623,17 +3618,24 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
                                     use_group_a_cache: bool = False) -> "list[WeeklyPeriodRow]":
     """Latest n subscription weeks as WeeklyPeriodRow, newest-first.
 
-    Thin builder-using prelude on top of ``view.rows``. ``build_weekly_view``
-    (in ``bin/_lib_view_models.py``) owns the bucket+overlay walk — this
-    function calls it, swaps two presentation fields (``label`` ←
-    ``display_start_date`` for post-early-reset weeks; ``is_current`` ←
-    SubWeek-containing-now_utc with snapshot fallback so the "Now" pill tracks
-    wall time), then computes ``delta_cost_pct`` newest-first.
+    Thin builder-using prelude on top of ``view.rows``.
+    ``build_weekly_view`` (in ``bin/_lib_view_models.py``) owns the
+    bucket+overlay walk — this function calls it, swaps two presentation
+    fields (``label`` ← ``display_start_date`` for post-early-reset weeks;
+    ``is_current`` ← SubWeek-containing-now_utc with snapshot fallback so the
+    "Now" pill tracks wall time), then recomputes ``delta_cost_pct``
+    newest-first.
 
-    It used to layer a synthesized pre-credit row over the natural rows, because
-    the credited week's own row covered only the post-credit interval. #703 +
-    #707 §6.1 removed both halves of that: an Anthropic reset never changes the
-    week's boundaries, so the natural row already covers the whole week.
+    A week credited in place arrives here as TWO ``SubWeek`` segments from
+    ``_apply_reset_events_to_subweeks``, so it renders as two rows with no
+    work in this function. Until v1.x this function synthesized the
+    pre-credit row itself ("Bug K") from its own ``MIN(week_start_at)``
+    query and its own re-fold; that presentation-layer copy was removed when
+    the applier learned the split, because running both produced three rows
+    and double-counted the pre-credit cost.
+
+    ``n`` counts SEGMENTS, not calendar weeks — a credited week consumes two
+    of the slots, which is the same thing ``report`` already does.
 
     Note: weekly bucketing intentionally does NOT take ``display_tz`` —
     SubWeek bucket keys come from server-anchored stored anchors and the
@@ -3670,8 +3672,8 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
     # stats-only, so nothing invalidates the polluted week until a data change
     # lands). Every non-sync-thread caller falls through to the from-scratch
     # wide fetch, as does the cache-disabled / cache-unavailable case. The
-    # overlay + Bug-K + delta + is_current presentation always reruns fresh over
-    # the assembled list.
+    # overlay + delta + is_current presentation always reruns fresh over the
+    # assembled list.
     aggregated_override = (
         _group_a_weekly_buckets(conn, now_utc, weeks=weeks)
         if use_group_a_cache else None
@@ -3699,31 +3701,48 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
     # a SubWeek, and `now_utc` lands inside it. Fall back to the latest
     # snapshot's week_start_date for boundary edge cases, then to the newest
     # computed week as last resort.
-    cur_week_start: str | None = None
+    #
+    # Resolved to a `segment_key`, not a `start_date`: the two billing cycles
+    # of an in-place-credited week share `start_date`, so a date-valued answer
+    # marks BOTH of them current and the panel shows two "Now" pills.
+    cur_week_key: str | None = None
     for w in weeks:
         start_dt = parse_iso_datetime(w.start_ts, "week_start_at")
         end_dt = parse_iso_datetime(w.end_ts, "week_end_at")
         if start_dt <= now_utc < end_dt:
-            cur_week_start = w.start_date.isoformat()
+            cur_week_key = w.segment_key
             break
-    if cur_week_start is None:
+    if cur_week_key is None:
         latest_usage = conn.execute(
             "SELECT week_start_date FROM weekly_usage_snapshots "
             "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
         ).fetchone()
-        if latest_usage is not None and latest_usage["week_start_date"] is not None:
-            cur_week_start = latest_usage["week_start_date"]
+        wsd = (
+            latest_usage["week_start_date"] if latest_usage is not None else None
+        )
+        if wsd is not None:
+            # The snapshot names a week, not a segment. Take that week's LAST
+            # segment — the live one — so the pill lands on the open cycle.
+            # When the named week is NOT among the computed ones (the newest
+            # snapshot predates the window), leave `cur_week_key` None so NO
+            # row is marked current. Falling through to the newest computed
+            # week instead would put a "Now" pill on a week that is not
+            # current, which is what this branch did before the credit split.
+            matching = [w for w in weeks if w.start_date.isoformat() == wsd]
+            if matching:
+                cur_week_key = max(
+                    matching, key=lambda w: w.segment_key
+                ).segment_key
         else:
-            cur_week_start = max(weeks, key=lambda w: w.start_date).start_date.isoformat()
+            cur_week_key = max(weeks, key=lambda w: w.segment_key).segment_key
 
     # SubWeek lookup by (start_ts, end_ts) — the builder identifies each row
     # by these ISO strings on ``WeeklyPeriodRow``, which match SubWeek 1:1
     # post _aggregate_weekly invariant.
     sw_by_window = {(w.start_ts, w.end_ts): w for w in weeks}
 
-    # Convert builder rows (newest-first) → oldest-first so the existing
-    # Bug-K insertion logic (oldest-first indices) stays unchanged. Override
-    # the two presentation fields that diverge between CLI/share (which use
+    # Convert builder rows (newest-first) → oldest-first, then override the
+    # two presentation fields that diverge between CLI/share (which use
     # ``start_date`` + "now in window" semantics) and the dashboard panel
     # (which uses ``display_start_date`` + "current SubWeek" semantics).
     rows_oldest_first: list[WeeklyPeriodRow] = []
@@ -3736,25 +3755,15 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
             # so the user sees the date the week actually began (04-23 vs the
             # API-derived backdated 04-18).
             r.label = sw.display_start_date.strftime("%m-%d")
-            # is_current keys on start_date (the bucket / lookup key) on both
-            # sides of the comparison; display_start_date may diverge for
-            # reset-event weeks but that is intentional — display vs. lookup
-            # are kept separate.
-            r.is_current = (sw.start_date.isoformat() == cur_week_start)
+            # is_current keys on segment identity on both sides of the
+            # comparison; display_start_date may diverge for reset-event
+            # weeks but that is intentional — display vs. lookup are kept
+            # separate.
+            r.is_current = (sw.segment_key == cur_week_key)
         # delta_cost_pct: builder computed it in asc order; reset and
-        # recompute newest-first below AFTER Bug-K rows merge in, so the
-        # synthesized rows participate in the deltas.
+        # recompute newest-first below so every row participates.
         r.delta_cost_pct = None
         rows_oldest_first.append(r)
-
-    # #703 + #707 §6.1: the pre-credit segment row is gone. It existed because
-    # `_apply_reset_events_to_subweeks` shifted the credited week's `start_ts`
-    # to the credit moment, so the panel's bucket covered only the post-credit
-    # interval and the bulk of the week's spend was invisible. That shift is
-    # gone — an Anthropic reset never changes the week's boundaries — so the
-    # single row already covers the whole week and a second one would double it.
-    # The credit still shows: the row carries the marker §6.4 describes, and the
-    # accounting segments remain in the milestone and drill-down data.
 
     # Reverse so caller gets newest-first; compute delta_cost_pct vs the
     # immediately older row in that orientation.

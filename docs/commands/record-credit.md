@@ -19,13 +19,9 @@ cctally already auto-detects two shapes of an in-place weekly credit during `rec
 
 The 25pp threshold is deliberate: a slightly-behind API replica reports a marginally-lower number, and a 15pp drop is fundamentally ambiguous from percent-shape alone, so lowering the threshold would reintroduce exactly the false positives it guards against. `record-credit` is the deterministic, user-asserted escape hatch: you state the credit explicitly (zero false-positive risk), and the command repairs the local data so every current-week surface reads the credited value.
 
-**Same week — no re-anchor, on EVERY path.** An Anthropic reset never changes the week's boundaries. Whatever Anthropic does to the counter — a partial goodwill credit, a full zeroing, an early reset — the week keeps its original boundaries (e.g. `2026-06-13 → 2026-06-20`) and only the running 7d percent steps down (46 → 31, then climbs again as usage resumes). `record-credit` records this by writing a row to `week_reset_events`, the one table an Anthropic credit lives in. That row defines an **accounting epoch** — a milestone ladder segment, a cost range, a high-water-mark floor — and never a display boundary, so the window-resolution code never re-anchors the week to the credit moment. The four MAX-clamp sites that derive the current 7d percent (the statusline 7d high-water mark, the `record-usage` write-site monotonic clamp, the `--from` default helper, and `project`'s per-week usage) read that epoch's instant and floor the displayed value to the post-credit reading while the window stays put.
+**Same week — no re-anchor.** A partial credit is *not* a reset: the week keeps its original boundaries (e.g. `2026-06-13 → 2026-06-20`); only the running 7d percent steps down (46 → 31, then climbs again as usage resumes). `record-credit` records this by writing a row to `weekly_credit_floors` — a clamp *floor* for the current week — and **does not** write a `week_reset_events` row, so the window-resolution code never re-anchors the week to the credit moment (which would otherwise show a spurious "new week" and corrupt the forecast rate). The four MAX-clamp sites that derive the current 7d percent (the statusline 7d high-water mark, the `record-usage` write-site monotonic clamp, the `--from` default helper, and `project`'s per-week usage) consult the union of `week_reset_events` + `weekly_credit_floors` and floor the displayed value to the post-credit reading while the window stays put.
 
-Because the credit is a `week_reset_events` row, it also **restarts the milestone ladder** from the credited value. Before unification a manual credit restored the 7d number and could not restore the ladder, because it wrote no event and therefore opened no epoch.
-
-The **≥25pp / reset-to-zero auto-detected** credit takes the same model. It used to re-anchor the week; it no longer does. If Anthropic ever genuinely moves a boundary, cctally renders the original cadence and disagrees with the API — a consequence accepted deliberately.
-
-**Several credits in one week are representable.** A credit's identity is the journal record that caused it, not the week's boundaries, so two credits in one week — or two inside one hour — are two records. A repeat of the identical source record stays an idempotent retry.
+This is distinct from the **≥25pp / reset-to-zero auto-detected** credit, which still re-anchors the week (it writes a `week_reset_events` row). Unifying that path onto the same same-window model is a deliberate, separate decision and is out of scope here.
 
 This command is weekly/7d only. The 5-hour dimension has its own auto-detection and is out of scope.
 
@@ -44,7 +40,7 @@ This command is weekly/7d only. The 5-hour dimension has its own auto-detection 
 | `--week DATE` | no | the snapshot week whose window contains `--at`/now | `week_start_date` as `YYYY-MM-DD`. The default resolves the week window **containing `--at`** (correct at a reset edge, where the most-recent snapshot can belong to a just-ended week). If no snapshot week contains `--at`, the command refuses and points at `--week`. |
 | `--dry-run` | no | off | Print the plan, write nothing, exit 0. Works with or without `--json`, on a TTY or not. |
 | `--yes` | no | off | Apply without the confirm prompt. |
-| `--force` | no | off | Replace the **one** credit occurrence `--at` names — its record, its own synthetic snapshot and its dependent milestones — then re-record. Every other credit in the week is untouched. No credit at that instant is a refusal (exit 2), and several credits at one instant is an ambiguity refusal. Never touches real status-line snapshots. |
+| `--force` | no | off | Re-record when a credit is already **fully** recorded for the week. Deletes only that week's command-owned (`source='record-credit'`) snapshots and its `weekly_credit_floors` row(s), then re-records. Never touches real status-line snapshots, and never `week_reset_events` or `percent_milestones` (a partial credit writes neither). |
 | `--json` | no | off | Machine output, `schemaVersion: 1`. Must be paired with `--yes` (apply) or `--dry-run` (preview); otherwise refused. |
 
 ## Confirm matrix
@@ -69,15 +65,15 @@ record-credit — weekly in-place credit
   from -> to:    46% -> 31%   (from: current HWM)
   effective:     2026-06-19 14:00 UTC  (floored from 2026-06-19 14:37)
   writes:
-    + credit record         (effective=2026-06-19T14:00:00+00:00, pre_credit=46)
+    + weekly_credit_floors  (effective=2026-06-19T14:00:00+00:00, pre_credit=46)
     ~ hwm-7d                46 -> 31
     - stale replays         0 rows
     + snapshot              captured=2026-06-19T14:37:00Z, weekly_percent=31
-  note: same week — the window keeps its own boundaries
+  note: same week — no window re-anchor (no week_reset_events row)
   (dry-run — nothing written)
 ```
 
-After applying, `cctally report` (and the statusline / dashboard) read **31%** for the current week, the pre-credit 46% rows are preserved as history, a `week_reset_events` row records the credit and opens its milestone epoch, and the week keeps its original `2026-06-13 → 2026-06-20` boundaries (no re-anchor). As real usage resumes, the next `record-usage` tick at a value below the pre-credit peak (e.g. 37%) is stored normally rather than suppressed by the monotonic clamp.
+After applying, `cctally report` (and the statusline / dashboard) read **31%** for the current week, the pre-credit 46% rows are preserved as history, a `weekly_credit_floors` row records the credit, and the week keeps its original `2026-06-13 → 2026-06-20` boundaries (no re-anchor). As real usage resumes, the next `record-usage` tick at a value below the pre-credit peak (e.g. 37%) is stored normally rather than suppressed by the monotonic clamp.
 
 ## `--json` envelope
 
@@ -110,13 +106,13 @@ After applying, `cctally report` (and the statusline / dashboard) read **31%** f
 }
 ```
 
-`fromSource` is `hwm` (defaulted, first credit), `explicit` (user-supplied `--from`), or `prior_credit` (defaulted on a completion / `--force` re-apply, read from the existing credit record). Validation and refusal errors stay plain-text on stderr even under `--json`, so consumers should check the exit code, not stdout.
+`fromSource` is `hwm` (defaulted, first credit), `explicit` (user-supplied `--from`), or `prior_credit` (defaulted on a completion / `--force` re-apply, read from the existing `weekly_credit_floors` row). Validation and refusal errors stay plain-text on stderr even under `--json`, so consumers should check the exit code, not stdout.
 
 ## Re-running: completion, refuse, and `--force`
 
 Because the underlying repair commits the credit floor and cleanup *before* the post-credit snapshot, a crash in between can leave a **half-applied** credit (floor row present, no snapshot — every post-credit read then sees an empty segment). A plain rerun (no `--force`) detects this and **finishes it** — no special flag needed, and it **reuses the existing floor's effective moment** rather than re-flooring to the rerun's "now", so a rerun at a later wall-clock can't strand stale pre-credit readings inside the floored window.
 
-A **fully-applied** credit at the instant `--at` names (record plus a command-owned snapshot) is **refused by default** (exit 2). A plain run at a DIFFERENT instant adds another occurrence rather than refusing. Pass `--force` for a clean re-do of one occurrence: it removes that occurrence's record, the synthetic snapshot keyed on it and the milestones that depend on it — never your real status-line snapshots, and never another credit in the same week — and then re-records.
+A **fully-applied** credit (floor row plus a command-owned snapshot) is **refused by default** (exit 2), naming the recorded pre-credit value and effective time. Pass `--force` for a clean re-do: it deletes only that week's `source='record-credit'` synthetic rows and its `weekly_credit_floors` row(s) — never your real status-line snapshots, and never `week_reset_events` or `percent_milestones` — and then re-records.
 
 ## Exit codes
 
@@ -128,9 +124,9 @@ A **fully-applied** credit at the instant `--at` names (record plus a command-ow
 
 - "Now" routes through the same `CCTALLY_AS_OF` testing hook the other reporting commands use.
 - The effective credit moment is floored to the hour; the synthetic snapshot is captured at the un-floored `--at`, so the floored `MAX` always includes it.
-- Milestones **segment**: the credit writes a `week_reset_events` row, and the milestone ladder (keyed on `reset_event_id`) starts a new segment from the credited value. The percent milestones you already crossed stay recorded on the segment they were crossed in, so they neither re-fire nor disappear, and the credit does not undo the cost already spent. Inside the new segment the ladder starts at the credited level and rises with the climb. This is the change unification makes: before it, a manual credit restored the 7d number and left the ladder where the pre-credit peak had put it.
-- The credit opens an accounting epoch; it does **not** re-anchor the week. A credited week renders as ONE row on its original boundaries, marked `+`, and its `$/1%` is measured from the credit forward over the climb since it. When the counter has not yet climbed past the level it was credited to, that ratio is withheld with a typed cause rather than rendered.
-- No schema migration is involved. `week_reset_events` gains its columns through the normal schema init and the epoch bump, so a dev/worktree binary can still open and repair the production DB.
+- Milestones are **untouched**: a partial credit writes no `week_reset_events` row, so the milestone segmentation (keyed on `reset_event_id`) never fires — the percent milestones you already crossed (e.g. 32–46%) correctly don't re-fire, and the credit doesn't undo the cost already spent. Milestones above `--to` re-fire normally as you re-climb.
+- The credit lowers a clamp floor only; it does **not** re-anchor the week. Known limitation: the *historical* "final %" of a credited *past* week (as used by the forecast trailing-4-week $/% median and the `diff` multi-week average) still reads the pre-credit `MAX` — deciding the right $/%-denominator for a credited past week is a separate question scoped out of this command, which targets the current-week display.
+- No schema migration is involved. The `weekly_credit_floors` table is created via `CREATE TABLE IF NOT EXISTS` in the normal schema init (no `user_version` bump), so a dev/worktree binary can still open and repair the production DB.
 
 ## See also
 

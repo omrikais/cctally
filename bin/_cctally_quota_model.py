@@ -275,18 +275,10 @@ def _read_stats_component(conn, account_key, start):
             at=at, week_start=anchor, percent=float(percent),
             source=str(source), rowid=int(rowid)))
 
-    # #703 + #707 §6.2: ONE credit kind. The two tables were one distinction —
-    # a `week_reset_events` row re-anchored the logical week and a
-    # `weekly_credit_floors` row did not — and both halves are gone: the tables
-    # are unified, and an Anthropic credit never re-anchors a week whatever its
-    # size. The instant is the ACCOUNTING one, matching every other accounting
-    # read; the floors leg is retained only for a store between its in-place
-    # cutover and its first rebuild, where a legacy credit still lives there.
     credits = []
-    for table, column in (
-            ("week_reset_events",
-             "COALESCE(observed_at_utc, effective_reset_at_utc)"),
-            ("weekly_credit_floors", "effective_at_utc")):
+    for table, column, kind in (
+            ("week_reset_events", "effective_reset_at_utc", "reset"),
+            ("weekly_credit_floors", "effective_at_utc", "floor")):
         csql = f"SELECT {column} FROM {table} WHERE 1=1"
         cparams: list = []
         cclause, cextra = _account_clause("account_key", account_key)
@@ -295,7 +287,7 @@ def _read_stats_component(conn, account_key, start):
         for (raw,) in conn.execute(csql, cparams):
             at = parse_instant(raw, column)
             if at is not None and (start is None or at >= start):
-                credits.append(qm.CreditRecord(at=at, kind="credit"))
+                credits.append(qm.CreditRecord(at=at, kind=kind))
 
     diagnostics = {
         "unrecognisedSnapshotSources": unrecognised,

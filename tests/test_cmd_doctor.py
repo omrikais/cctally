@@ -536,3 +536,82 @@ def test_gather_statusline_pipeline_is_read_only_and_marks_invalid_authority(
     assert state.statusline_pipeline["tombstones"] == {
         "fiveHour": "absent", "sevenDay": "invalid",
     }
+
+
+def test_doctor_exit_zero_with_a_refused_pricing_write_recorded(tmp_path):
+    """#705: the refusal is a WARN, never a FAIL, so doctor's exit code is
+    unaffected — a refusal means the safety mechanism worked and ingestion
+    continues, so the store is degraded but usable. Provisioning mirrors
+    test_doctor_exit_code_zero_when_no_fail so the ONLY non-OK contribution
+    under test is the refusal itself.
+
+    Mutation: severity="fail" on the refusal branch.
+    """
+    import sqlite3
+    sys.path.insert(0, str(REPO / "bin"))
+    import _cctally_db as db  # noqa: PLC0415
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / ".credentials.json").write_text(json.dumps({
+        "claudeAiOauth": {"accessToken": "stub-token"}
+    }))
+    cdir = tmp_path / ".local" / "share" / "cctally"
+    cdir.mkdir(parents=True)
+    conn = sqlite3.connect(str(cdir / "stats.db"))
+    conn.execute("""
+        CREATE TABLE weekly_usage_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            captured_at_utc TEXT NOT NULL,
+            week_start_date TEXT NOT NULL,
+            week_end_date TEXT NOT NULL,
+            week_start_at TEXT,
+            week_end_at TEXT,
+            weekly_percent REAL NOT NULL,
+            page_url TEXT,
+            source TEXT NOT NULL DEFAULT 'userscript',
+            payload_json TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "INSERT INTO weekly_usage_snapshots "
+        "(captured_at_utc, week_start_date, week_end_date, "
+        " week_start_at, week_end_at, weekly_percent, "
+        " source, payload_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "2026-05-13T12:33:56+00:00",
+            "2026-05-12", "2026-05-19",
+            "2026-05-12T00:00:00+00:00",
+            "2026-05-19T00:00:00+00:00",
+            42.0, "test", "{}",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    conn = sqlite3.connect(str(cdir / "conversations.db"))
+    try:
+        db._apply_conversations_schema(conn)
+        db._set_cache_meta(
+            conn, "conversation_sessions_pricing_write_refused",
+            json.dumps({"process_snapshot_date": "2026-08-25",
+                        "store_snapshot_date": "2026-09-02",
+                        "first_refused_at_utc": "2026-09-03T08:00:00Z"}))
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = _run(
+        ["doctor", "--json"],
+        home=tmp_path,
+        env_extra={"CCTALLY_AS_OF": "2026-05-13T12:34:56Z"},
+    )
+    payload = json.loads(r.stdout)
+    check = next(
+        c for category in payload["categories"] for c in category["checks"]
+        if c["id"] == "pricing.conversation_rollup_writer"
+    )
+    assert check["severity"] == "warn"
+    assert check["details"]["store_snapshot_date"] == "2026-09-02"
+    assert payload["overall"]["counts"].get("fail", 0) == 0
+    assert r.returncode == 0

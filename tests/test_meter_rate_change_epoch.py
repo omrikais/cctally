@@ -79,11 +79,7 @@ def test_c1_the_epoch_is_bumped_and_the_legacy_registry_is_untouched():
     """The registry is FROZEN. A `@stats_migration` handler for this table
     would never run on an upgraded install, because an epoch-current open
     returns before any schema work."""
-    # Lower bound rather than equality: this module's subject is that #661 S2
-    # bumped the epoch past 1010 and did not add a migration. A later, unrelated
-    # bump (1012 for the #703/#707 unified credit record) must not turn that
-    # claim red, but a regression below 1011 must.
-    assert _cctally_core.STATS_INDEX_EPOCH >= 1011
+    assert _cctally_core.STATS_INDEX_EPOCH == 1011
     assert _cctally_core.LEGACY_STATS_HEAD == 13
     import _cctally_db
     assert len(_cctally_db._STATS_MIGRATIONS) == 13, "the registry is FROZEN"

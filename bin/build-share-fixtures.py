@@ -81,6 +81,15 @@ SCENARIOS: tuple[str, ...] = (
     "daily-md-desc",
     "monthly-md",
     "weekly-md",
+    # Reset-event coverage (#703/#707 review F3): the weekly artifact's Week
+    # Start cell renders each row's `display_start_date`, not the SubWeek's
+    # `start_date`, and the two diverge on ANY post-early-reset week — not
+    # only on a credited one. No other share fixture carries a reset event at
+    # all, so both that label and the artifact's content-derived stated
+    # period start (`displayed_period_dates` feeds `_share_resolve_period_start`)
+    # were ungoldened. Same data shape as `weekly-md`; only the seeded
+    # `week_reset_events` row differs.
+    "weekly-md-reset",
     "weekly-html",
     # Stacked-bar coverage: weekly --breakdown --format svg exercises the
     # `BarChart.stacks` rendering path. The non-breakdown weekly-md /
@@ -149,6 +158,25 @@ _EMPTY_STATS_SCENARIOS: frozenset[str] = frozenset({
     "report-empty-html",
 })
 
+# Scenarios that need one `week_reset_events` row describing an EARLY weekly
+# reset — not an in-place credit. The seeded event's `old_week_end_at` is the
+# 2026-04-20 week's end and its `new_week_end_at` is the 2026-04-27 week's
+# end, so `_apply_reset_events_to_subweeks` truncates the former and moves the
+# latter's `start_ts` (and therefore its `display_start_date`) forward to the
+# effective reset moment. The 2026-04-27 week's `start_date` stays 2026-04-27,
+# which is exactly the divergence the Week Start cell must render.
+_RESET_EVENT_SCENARIOS: frozenset[str] = frozenset({
+    "weekly-md-reset",
+})
+
+# The early-reset event those scenarios seed. `effective` sits AFTER the
+# API-derived start of the post-reset week, which is the production shape: the
+# API backdates the new week's start into the pre-reset week, and the reset
+# event carries the moment the week really began.
+_RESET_EVENT_OLD_END = "2026-04-27T15:00:00Z"
+_RESET_EVENT_NEW_END = "2026-05-04T15:00:00Z"
+_RESET_EVENT_EFFECTIVE = "2026-04-29T18:00:00Z"
+
 # Scenarios whose CURRENT week's meter reads at or beyond its cap, so the
 # forecast is right-censored: a displayed 100 denotes `[99, +inf)` and has no
 # point estimate (#661 S2 spec section 3.2).
@@ -211,6 +239,7 @@ SESSION_FILES: tuple[tuple[str, str | None, str | None], ...] = (
 def _seed_stats_db(
     path: pathlib.Path, *, empty: bool = False, seed_credit: bool = False,
     censored_week: bool = False, zero_week: bool = False,
+    reset_event: bool = False,
 ) -> None:
     """Stats.db: weekly_usage_snapshots + weekly_cost_snapshots + one
     five_hour_blocks row.
@@ -330,6 +359,19 @@ def _seed_stats_db(
                 """,
                 (credit_iso, window_key, 28.0, 8.0, credit_iso),
             )
+        if reset_event:
+            # One EARLY weekly reset (see `_RESET_EVENT_SCENARIOS`). The
+            # `weekly` post-processor truncates the 2026-04-20 week at
+            # `effective` and starts the 2026-04-27 week there, so the latter
+            # renders under 2026-04-29 while its snapshot join key stays
+            # 2026-04-27.
+            conn.execute(
+                "INSERT INTO week_reset_events "
+                "(detected_at_utc, old_week_end_at, new_week_end_at, "
+                " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+                ("2026-04-29T18:01:00Z", _RESET_EVENT_OLD_END,
+                 _RESET_EVENT_NEW_END, _RESET_EVENT_EFFECTIVE),
+            )
         conn.commit()
 
 
@@ -409,6 +451,7 @@ def main() -> int:
             seed_credit=seed_credit,
             censored_week=scenario in _CENSORED_WEEK_SCENARIOS,
             zero_week=scenario in _ZERO_WEEK_SCENARIOS,
+            reset_event=scenario in _RESET_EVENT_SCENARIOS,
         )
         _seed_cache_db(scen_dir / "cache.db")
         _write_changelog(scen_dir / "CHANGELOG.md")

@@ -1891,15 +1891,11 @@ def _build_record_credit_parser(subparsers, name, *, help_text, xref=None):
                     """\
                     Record an in-place weekly (7d) credit that the auto-detector
                     misses (a sub-25pp, non-zero drop — e.g. Anthropic lowered your
-                    7d % from 46 to 31 without a clean reset).
-
-                    The same week continues with its original boundaries, the 7d
-                    high-water mark drops to the credited value so reports and the
-                    statusline read it, and a new milestone segment starts from that
-                    value. Preview + confirm by default.
-
-                    Plain runs ADD an occurrence; --force replaces the ONE occurrence
-                    --at names, together with its snapshot and its milestones.
+                    7d % from 46 to 31 without a clean reset). Writes a
+                    weekly_credit_floors clamp row (no week re-anchor — the same week
+                    continues), lowers hwm-7d, and inserts a post-credit snapshot so
+                    reports and the statusline read the credited value.
+                    Preview + confirm by default.
                     """
                 ),
         epilog=textwrap.dedent(
@@ -1927,7 +1923,7 @@ def _build_record_credit_parser(subparsers, name, *, help_text, xref=None):
     rc.add_argument("--yes", action="store_true",
                     help="Apply without the confirm prompt.")
     rc.add_argument("--force", action="store_true",
-                    help="Replace the credit --at names; refuses if none is recorded there.")
+                    help="Re-record when a credit is already fully recorded for the week.")
     rc.add_argument("--json", action="store_true",
                     help="Machine output (schemaVersion 1).")
     rc.set_defaults(func=c.cmd_record_credit)

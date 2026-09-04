@@ -672,3 +672,90 @@ def test_prune_conversations_disabled_when_retention_zero(env, capsys):
         ).fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_a_refused_transcript_rebuild_is_not_reported_as_success(env, capsys):
+    """#705: `cache-sync --rebuild` is the operator's recovery path, so a
+    rebuild refused because this cctally's pricing table is older than the one
+    recorded in the store must say so rather than print `done: 0 processed`
+    and exit 0.
+
+    sync_claude_conversations already sets deferred_reason on that path; the
+    outcome ladder simply never read it, so the refusal fell through to the
+    final success branch.
+    """
+    ns, tmp_path, monkeypatch = env
+    cache_mod = ns["_cctally_cache"]
+    _write_claude_entry(tmp_path)
+    conn = ns["open_conversations_db"]()
+    try:
+        cache_mod.sync_claude_conversations(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+            (cache_mod.CONVERSATION_ROLLUP_PRICING_FP_KEY, "2026-09-30"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(cache_mod, "PRICING_SNAPSHOT_DATE", "2026-08-25")
+
+    args = argparse.Namespace(
+        source="claude", rebuild=True, prune_orphans=False,
+        prune_conversations=False,
+    )
+
+    assert ns["cmd_cache_sync"](args) == 1
+    stderr = capsys.readouterr().err
+    assert "provider=claude store=conversations.db phase=pricing" in stderr
+    assert "Upgrade or restart cctally" in stderr
+    assert (
+        "Re-run `cctally cache-sync --source claude --rebuild`." in stderr
+    )
+    assert "claude transcripts done" not in stderr, \
+        "a refused rebuild must not be reported as success"
+
+
+def test_a_refused_rebuild_names_the_unorderable_cause_too(env, capsys):
+    """#705: "older than the one recorded in the store" is not the only cause.
+
+    `_pricing_write_authorized` also refuses a recorded value that is not an
+    ISO date, which is not "older" — no version can order it, `--rebuild` is
+    refused too, and only clearing that one `cache_meta` row gets out of it.
+    `docs/commands/doctor.md` documents that state; the `cache-sync` stderr and
+    its own doc contradicted it, so an operator hitting the unorderable state
+    read a cause that does not apply and a remedy that does nothing.
+
+    Mutation: restoring the single-cause wording on either surface.
+    """
+    ns, tmp_path, monkeypatch = env
+    cache_mod = ns["_cctally_cache"]
+    _write_claude_entry(tmp_path)
+    conn = ns["open_conversations_db"]()
+    try:
+        cache_mod.sync_claude_conversations(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+            (cache_mod.CONVERSATION_ROLLUP_PRICING_FP_KEY, "v2/2026-09-02"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    args = argparse.Namespace(
+        source="claude", rebuild=True, prune_orphans=False,
+        prune_conversations=False,
+    )
+
+    assert ns["cmd_cache_sync"](args) == 1
+    stderr = capsys.readouterr().err
+    assert "provider=claude store=conversations.db phase=pricing" in stderr
+    assert "older than the one recorded in the store" not in stderr, \
+        "the store's fingerprint is not older here; it cannot be ordered at all"
+    assert "ISO date" in stderr
+    assert "cctally doctor" in stderr, \
+        "the unorderable state's only remedy is the one doctor names"
+
+    doc = (pathlib.Path(__file__).resolve().parent.parent
+           / "docs" / "commands" / "cache-sync.md").read_text()
+    assert "ISO date" in doc, \
+        "the documented cause list must carry the second cause too"

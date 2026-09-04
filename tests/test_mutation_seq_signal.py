@@ -593,40 +593,6 @@ def test_reconcile_projects_env_idstable_update_evicts():
     )
 
 
-def test_reconcile_bugk_idstable_update_evicts():
-    conn = _mk_mutation_conn()
-    _sc.reset_bugk_segment_state()
-    key = (dt.datetime(2026, 5, 9, tzinfo=dt.timezone.utc).isoformat(),
-           dt.datetime(2026, 5, 15, tzinfo=dt.timezone.utc).isoformat())
-    _sc._BUGK_SEGMENT_CACHE[key] = object()
-    _sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=5, max_seq=1, reset_sig=(0, 0))
-    # Changed row inside the half-open [05-09, 05-15) segment.
-    _seed_changed_only(conn, ts="2026-05-11T09:00:00Z", seq=2)
-    _sc.reconcile_bugk_cache(conn, max_entry_id=5, max_mutation_seq=2,
-                             reset_sig=(0, 0))
-    assert key not in _sc._BUGK_SEGMENT_CACHE, (
-        "the seq gate must evict the pre-credit segment (max_id flat, seq up)"
-    )
-
-
-def test_reconcile_bugk_idstable_at_effective_not_evicted():
-    """Bug-K keeps its STRICT `>` half-open bound (Codex-BK-5): a changed row
-    EXACTLY at `effective` is OUTSIDE [start, effective) → NOT evicted."""
-    conn = _mk_mutation_conn()
-    _sc.reset_bugk_segment_state()
-    eff = dt.datetime(2026, 5, 15, tzinfo=dt.timezone.utc)
-    key = (dt.datetime(2026, 5, 9, tzinfo=dt.timezone.utc).isoformat(),
-           eff.isoformat())
-    _sc._BUGK_SEGMENT_CACHE[key] = object()
-    _sc._BUGK_SEGMENT_LAST_SEEN.update(max_id=5, max_seq=1, reset_sig=(0, 0))
-    _seed_changed_only(conn, ts="2026-05-15T00:00:00Z", seq=2)  # exactly effective
-    _sc.reconcile_bugk_cache(conn, max_entry_id=5, max_mutation_seq=2,
-                             reset_sig=(0, 0))
-    assert key in _sc._BUGK_SEGMENT_CACHE, (
-        "a row AT effective is outside the half-open segment → not evicted"
-    )
-
-
 # ── Task 7 (M3): current-bucket accumulators — no double-count (§8) ─────────
 #
 # The #271 current-bucket accumulators fold the open bucket incrementally. An

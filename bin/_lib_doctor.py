@@ -232,6 +232,30 @@ class DoctorState:
     # evidence. None is the normal state; each record contains counts/reasons
     # but never configured paths or provider identifiers.
     codex_prune_refusals: Optional[list[dict]] = None
+    # #705: the conversations store's refused-pricing-write record, read
+    # verbatim from cache_meta. None means no refusal is recorded. A record
+    # that exists but cannot be parsed arrives as {"__malformed__": True}
+    # rather than None, because its existence is still evidence the guard
+    # fired and must not read as "no refusal".
+    conversation_rollup_pricing_refusal: Optional[dict] = None
+    # #705: the rollup's stored pricing fingerprint
+    # (``conversation_sessions_pricing_fp``), read verbatim. None/"" means a
+    # store that has never recorded one. It is gathered separately from the
+    # refusal record because it is what distinguishes an ordinary refusal (an
+    # older process against a newer store, which a restart fixes) from a value
+    # no version can parse (which nothing but clearing the row fixes).
+    conversation_rollup_pricing_fp: Optional[str] = None
+    # #705: the SAME two values read from cache.db. The ordered-write guard is
+    # not conversations-only: `sync_cache` runs
+    # `_arm_rollup_backfill_on_pricing_change` and
+    # `_recompute_conversation_sessions` on the cache.db connection, so cache.db
+    # carries its own `conversation_sessions_pricing_fp`, its own refusal record
+    # and its own backfill flag. A refusal latched by a process that never opens
+    # conversations.db — `hook-tick`, `statusline`, `daily`, `report` — exists
+    # only here, and reading the conversations store alone reported OK for every
+    # one of them.
+    cache_rollup_pricing_refusal: Optional[dict] = None
+    cache_rollup_pricing_fp: Optional[str] = None
     # #279 S2 (F5b): PRAGMA quick_check(1) results, gathered ONLY under
     # doctor_gather_state(deep=True) (CLI cmd_doctor) — the dashboard
     # rebuild loop calls the gather every rebuild and quick_check on a
@@ -969,7 +993,7 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
             # current index as a mismatch; keep this in lockstep with core
             # (#496 S5b §6.1). It stays a literal because this kernel is pure and
             # must not import `_cctally_core`.
-            epoch = 1012
+            epoch = 1011
         mismatch = uv > legacy_head and uv != epoch
         return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
                 "mismatch": mismatch}
@@ -1835,6 +1859,165 @@ def _check_data_conversation_sessions_rollup(s: DoctorState) -> CheckResult:
         details={"rollup_count": rollup,
                  "messages_distinct_sessions": distinct,
                  "sync_in_progress": False},
+    )
+
+
+#: Remediation for an ordinary refusal: this process's pricing table is older
+#: than the store's, and running a current process clears it. Kept as a module
+#: constant so `docs/commands/doctor.md` can be pinned against it verbatim.
+ROLLUP_WRITER_REFUSAL_REMEDIATION = (
+    "Restart or upgrade the process that is writing to this store — most "
+    "often a `cctally dashboard` left running across an upgrade. A process "
+    "whose pricing table is not older than the store's clears this record "
+    "the next time it recomputes the rollup: on its next tick when the "
+    "refusal also armed the rollup backfill, and "
+    "otherwise on the next sync that touches a session. While the backfill is "
+    "armed the conversation list falls back to live aggregation, so every "
+    "session stays visible, but cost sorting and project filtering are "
+    "degraded, the browse filter's project list omits sessions the rollup "
+    "has not indexed, and each row's cost is recomputed from the reading "
+    "process's own pricing table. A refusal `cctally cache-sync --rebuild` "
+    "takes before it clears anything arms no backfill, because the rollup it "
+    "declined to touch is intact — that store keeps reading it."
+)
+
+#: Remediation for a stored fingerprint that is not an ISO date. The ordinary
+#: remediation above is USELESS here: `_pricing_write_authorized` fails closed
+#: on an unparseable value, so every version refuses, `cache-sync --rebuild` is
+#: refused too, and no upgrade or restart reaches it. Only clearing the stored
+#: value does.
+ROLLUP_WRITER_UNPARSEABLE_FP_REMEDIATION = (
+    "The pricing fingerprint recorded in the rollup "
+    "(`conversation_sessions_pricing_fp` in the `cache_meta` table of the "
+    "store this check's `store` detail names — `conversations.db` or "
+    "`cache.db`) is not an ISO date, so cctally cannot tell whether "
+    "its own pricing table is older or newer and refuses the write. Every "
+    "version refuses it, including `cctally cache-sync --rebuild`, so "
+    "restarting or upgrading cctally does not clear this one. Delete that "
+    "single `cache_meta` row with `sqlite3`, then run `cctally cache-sync "
+    "--rebuild` to re-derive the rollup and record a fresh fingerprint. "
+    "Until then the conversation list falls back to live aggregation, so "
+    "every session stays visible, but cost sorting and project filtering "
+    "are degraded."
+)
+
+
+def _check_pricing_conversation_rollup_writer(s: DoctorState) -> CheckResult:
+    """WARN when a process holding older pricing was refused a write to the
+    conversation rollup (#705).
+
+    The record's presence proves that such a write was refused. It does NOT
+    prove that such a process is running now, so the wording is past and
+    conditional rather than present. The rollup is non-authoritative as a
+    CONSEQUENCE of a refusal arming ``conversation_sessions_backfill_pending``
+    — which every refusal does except the ``cache-sync --rebuild`` pre-clear,
+    which refuses before it destroys anything and so leaves an intact rollup —
+    not as an inference from this record. The record is a diagnostic, the flag
+    is the mechanism, and this check reports the record.
+
+    TWO STORES, not one. The ordered-write guard runs on the cache.db
+    connection in ``sync_cache`` and on the conversations.db connection in
+    ``sync_claude_conversations``, so each file carries its own fingerprint and
+    its own refusal record. Reading conversations.db alone reported OK for
+    every refusal latched by a process that runs ``sync_cache`` and never opens
+    the conversation store — ``hook-tick``, ``statusline``, ``daily``,
+    ``report``.
+
+    Reporting either store is correct rather than noisy. A refusal in either
+    file has the same diagnosis and the same remedy: a process holding older
+    pricing is running against this installation. That is true whether or not
+    that store's own rollup holds rows, so it is not a false alarm. And the
+    tempting alternative — deleting the cache.db rollup block as dead code — is
+    wrong: ``bin/build-conversation-fixtures.py`` deliberately seeds
+    ``conversation_messages`` into cache.db and recomputes the rollup there, so
+    those tables are not universally empty.
+
+    ``details`` names the store the report came from, because the
+    unparseable-fingerprint remediation tells the operator which file's
+    ``cache_meta`` row to delete. Both stores are classified before either
+    record is reported, so the state with no ordinary exit outranks an ordinary
+    refusal in the other store; within each pass conversations.db is reported
+    first, because it is the store the browse rail actually reads.
+
+    A stored fingerprint that no version can PARSE is reported separately, with
+    its own remediation. The ordinary remedy — run a current process — is
+    useless there: `_pricing_write_authorized` fails closed on an unparseable
+    value, so every version refuses, `cache-sync --rebuild` included, and the
+    rail stays on live aggregation until the stored row is cleared. It is
+    reported whether or not a refusal record exists yet, because the store is
+    already unwritable at that point and waiting for the record would only
+    delay the one diagnosis that leads anywhere. It still merges in the
+    refusal record's dates when one parses: those say WHICH process is refusing
+    and how long it has been, and a `--json` consumer has no other source.
+
+    The comparability decision is `_lib_pricing.pricing_fingerprint_is_comparable`
+    — the same parse `_pricing_write_authorized` acts on, not a second one that
+    mirrors it.
+
+    Never FAIL: a refusal means the safety mechanism worked and ingestion
+    continues, so the store is degraded but usable — the posture
+    `pricing.coverage` and `data.parse_health` already take, and the reason
+    doctor's exit code is unaffected."""
+    import _lib_pricing  # noqa: PLC0415 — lazy sibling, like _lib_artifact_retention
+
+    stores = (
+        ("conversations.db", s.conversation_rollup_pricing_fp,
+         s.conversation_rollup_pricing_refusal),
+        ("cache.db", s.cache_rollup_pricing_fp,
+         s.cache_rollup_pricing_refusal),
+    )
+    for store, stored_fp, record in stores:
+        if _lib_pricing.pricing_fingerprint_is_comparable(stored_fp):
+            continue
+        details = {"store": store, "stored_fingerprint": stored_fp}
+        if isinstance(record, dict) and not record.get("__malformed__"):
+            details.update({
+                "process_snapshot_date": record.get("process_snapshot_date"),
+                "store_snapshot_date": record.get("store_snapshot_date"),
+                "first_refused_at_utc": record.get("first_refused_at_utc"),
+            })
+        return CheckResult(
+            id="pricing.conversation_rollup_writer", title="Rollup writer",
+            severity="warn",
+            summary=(
+                "the rollup's stored pricing fingerprint is not a date any "
+                "version of cctally can compare"
+            ),
+            remediation=ROLLUP_WRITER_UNPARSEABLE_FP_REMEDIATION,
+            details=details,
+        )
+    for store, _stored_fp, record in stores:
+        if not record:
+            continue
+        if record.get("__malformed__"):
+            return CheckResult(
+                id="pricing.conversation_rollup_writer", title="Rollup writer",
+                severity="warn",
+                summary="a refused pricing write is recorded but cannot be read",
+                remediation=ROLLUP_WRITER_REFUSAL_REMEDIATION,
+                details={"store": store},
+            )
+        return CheckResult(
+            id="pricing.conversation_rollup_writer", title="Rollup writer",
+            severity="warn",
+            summary=(
+                f"a process holding {record.get('process_snapshot_date')} pricing "
+                f"was refused a write over stored "
+                f"{record.get('store_snapshot_date')}"
+            ),
+            remediation=ROLLUP_WRITER_REFUSAL_REMEDIATION,
+            details={
+                "store": store,
+                "process_snapshot_date": record.get("process_snapshot_date"),
+                "store_snapshot_date": record.get("store_snapshot_date"),
+                "first_refused_at_utc": record.get("first_refused_at_utc"),
+            },
+        )
+    return CheckResult(
+        id="pricing.conversation_rollup_writer", title="Rollup writer",
+        severity="ok",
+        summary="no refused pricing write recorded",
+        remediation=None, details={},
     )
 
 
@@ -3569,6 +3752,12 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
     )),
     ("pricing", "Pricing", (
         ("pricing.coverage", "_check_pricing_coverage"),
+        # #705. Cannot FAIL, so `doctor`'s exit code is unaffected — the same
+        # posture `pricing.coverage` and `data.parse_health` take. A refusal
+        # means the ordered-write guard WORKED and ingestion continues, so the
+        # store is degraded but usable.
+        ("pricing.conversation_rollup_writer",
+         "_check_pricing_conversation_rollup_writer"),
     )),
     # #661 S2 §7. NEITHER check can FAIL, so `doctor`'s exit code is
     # unaffected — the same posture `pricing.coverage` and
