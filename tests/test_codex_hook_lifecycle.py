@@ -975,3 +975,74 @@ def test_codex_throttle_marker_unattributed_keeps_legacy_name(tmp_path, monkeypa
         assert locks[0].marker_path.name == f"{root.source_root_key}.last-success"
     finally:
         release_lifecycle_locks(locks)
+
+
+# ── #719 §2.5: the account-suffix filter's REJECT path ────────────────────
+
+
+def test_liveness_markers_reject_a_suffix_that_is_not_an_account_key(
+    tmp_path, monkeypatch,
+):
+    """A bare `*` glob would admit backup-like siblings.
+
+    The regression this pins is silent in both directions: a widened pattern
+    inflates `marker_count` AND lets a stale root read `recent` off a file
+    that no lifecycle tick ever wrote.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_doctor
+
+    base = ns["_cctally_core"].APP_DIR / "codex-hook-tick"
+    base.mkdir(parents=True)
+    root_key = "root-a"
+    account = "0123456789abcdef" * 2
+    # 32 hex digits spelled in upper case. Its lower-case twin is deliberately
+    # NOT `account`, so the marker cannot collide with the valid one on a
+    # case-insensitive filesystem (APFS) and the glob-then-filter path is
+    # exercised on both that and the case-sensitive Linux matrix.
+    upper_account = "ABCDEF0123456789" * 2
+    assert upper_account.lower() != account
+    stale = 1_600_000_000.0
+    fresh = stale + 30 * 24 * 3600
+
+    for name, stamp in (
+        (f"{root_key}.last-success", stale),
+        (f"{root_key}.{account}.last-success", stale),
+        # Rejected: not 32 LOWER-case hex characters.
+        (f"{root_key}.bak.last-success", fresh),
+        (f"{root_key}.{account}0.last-success", fresh),
+        (f"{root_key}.{'g' * 32}.last-success", fresh),
+        (f"{root_key}.{upper_account}.last-success", fresh),
+        # Rejected: a different root's marker.
+        (f"root-b.{account}.last-success", fresh),
+    ):
+        path = base / name
+        path.write_text("", encoding="utf-8")
+        os.utime(path, (stamp, stamp))
+
+    records = _cctally_doctor._codex_hook_liveness_markers(root_keys={root_key})
+
+    assert records[root_key]["marker_count"] == 2
+    assert records[root_key]["last_success_at"] == dt.datetime.fromtimestamp(
+        stale, dt.timezone.utc)
+    assert records[root_key]["unavailable"] is False
+
+
+def test_liveness_markers_report_never_when_only_rejected_suffixes_exist(
+    tmp_path, monkeypatch,
+):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_doctor
+
+    base = ns["_cctally_core"].APP_DIR / "codex-hook-tick"
+    base.mkdir(parents=True)
+    marker = base / "root-a.bak.last-success"
+    marker.write_text("", encoding="utf-8")
+
+    records = _cctally_doctor._codex_hook_liveness_markers(root_keys={"root-a"})
+
+    assert records["root-a"] == {
+        "last_success_at": None, "marker_count": 0, "unavailable": False,
+    }

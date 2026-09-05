@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "mode": "install",
   "result": "warn",
   "symlinks": {
@@ -25,6 +25,8 @@
   "codex_hooks": {
     "roots": [],
     "installed_count": 0,
+    "enabled_count": 0,
+    "all_roots_enabled": null,
     "error_count": 0
   },
   "auth": {

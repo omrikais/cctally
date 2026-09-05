@@ -56,11 +56,11 @@ cctally weekly --order desc
 3. If no snapshots exist at all, falls back to `config.json`
    `collector.week_start` (default `monday`).
 
-## A credited week is TWO rows
+## A credited week is one row per billing cycle
 
-An Anthropic quota reset never moves a week's boundaries, but it does end one billing cycle and begin another inside that week. A week that was credited in place therefore renders as **two rows** — the segment before the credit and the segment after it — each with its own interval, its own cost and its own `Used %`. This is the same pair [`report`](report.md) has rendered since v1.7.2, and the two commands now agree on it.
+An Anthropic quota reset never moves a week's boundaries, but it does end one billing cycle and begin another inside that week. A week credited `n` times therefore renders as **`n + 1` rows** — the segment before the first credit, one segment between each pair of credits, and the segment after the last — each with its own interval, its own cost and its own `Used %`. The ordinary single credit gives two rows and a twice-credited week gives three. [`report`](report.md) renders the same segments for the same week, and the two commands agree on the count.
 
-The two rows share one `week` value, because `week` is the billing-cycle join key into `weekly_usage_snapshots.week_start_date`, which the credit does not move. What distinguishes them is `weekStartAt`, so **a row's identity in `--json` is the pair `(week, weekStartAt)`, not `week` alone**:
+Every row of the week shares one `week` value, because `week` is the billing-cycle join key into `weekly_usage_snapshots.week_start_date`, which a credit does not move. What distinguishes them is `weekStartAt`, so **a row's identity in `--json` is the pair `(week, weekStartAt)`, not `week` alone**. A singly-credited week looks like this:
 
 ```json
 { "week": "2026-06-05", "displayWeek": "2026-06-05",
@@ -71,9 +71,9 @@ The two rows share one `week` value, because `week` is the billing-cycle join ke
   "usedPct": 12.0, "totalCost": 3.0 }
 ```
 
-`displayWeek` differs between the two rows: it is each segment's own user-facing start date, and it is what the terminal table's `Week` column renders.
+`displayWeek` differs between the rows: it is each segment's own user-facing start date, and it is what the terminal table's `Week` column renders. Two credits on one calendar day give two segments with the same `displayWeek` and different `weekStartAt`.
 
-**Scripting warning.** `{r["week"]: r for r in payload["weekly"]}` silently drops the pre-credit row and under-reports that week's spend by the whole pre-credit segment. Key on `(r["week"], r["weekStartAt"])`, or on `weekStartAt` alone.
+**Scripting warning.** `{r["week"]: r for r in payload["weekly"]}` keeps only the last segment of a credited week and under-reports that week's spend by every earlier segment. Key on `(r["week"], r["weekStartAt"])`, or on `weekStartAt` alone.
 
 ## Gotchas
 

@@ -213,6 +213,7 @@ from _cctally_core import (
     open_db,
     get_latest_usage_for_week,
     _canonicalize_optional_iso,
+    _latest_reset_event_for_end,
     make_week_ref,
 )
 from _lib_display_tz import (
@@ -988,12 +989,21 @@ def _tui_build_percent_milestones(
         except (AttributeError, ValueError):
             canon_end = None
         if canon_end:
-            seg_row = conn.execute(
-                "SELECT id FROM week_reset_events "
-                "WHERE new_week_end_at = ? "
-                "ORDER BY id DESC LIMIT 1",
-                (canon_end,),
-            ).fetchone()
+            # #750 S3, Unit B review: through the one chokepoint, which
+            # orders on the reset INSTANT. This site kept its own `ORDER BY
+            # id DESC`, which answers "the segment written last" — a backfill
+            # row landing after a live-detected one makes that the older
+            # reset, and the modal then filters milestones on a segment
+            # nothing wrote to and renders empty.
+            #
+            # `account_key=None` is the EXPLICIT merged read, matching the two
+            # reads either side of it: `latest` above and
+            # `get_milestones_for_week` below are both account-blind, because
+            # this path resolves no account at all. Scoping only the event
+            # lookup would make the three disagree. Giving the TUI an account
+            # is a feature, not this bugfix.
+            seg_row = _latest_reset_event_for_end(
+                conn, canon_end, account_key=None)
             if seg_row is not None:
                 active_segment = int(seg_row["id"])
 
@@ -8207,8 +8217,13 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                     codex_hooks_mod = _cctally()._load_sibling("_lib_codex_hooks")
                     hook_roots = codex_hooks_mod.codex_hook_roots(
                         _cctally()._codex_home_roots())
-                    codex_guards = tuple(root.hooks_path for root in hook_roots)
+                    # config.toml joins the guard set (#719 §2.6a): a
+                    # certificate seeded while the handler was enabled must not
+                    # survive Codex flipping `enabled = false` under it.
+                    codex_guards = codex_hooks_mod.codex_frontier_guard_paths(
+                        hook_roots)
                 except Exception:
+                    codex_hooks_mod = None
                     hook_roots = ()
                     codex_guards = ()
 
@@ -8231,25 +8246,13 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                         return False
 
                 def _codex_hooks_trusted():
-                    try:
-                        trusted = bool(hook_roots)
-                        for hook_root in hook_roots:
-                            document = codex_hooks_mod._read_hooks_document(
-                                hook_root.hooks_path)
-                            hooks = document.get("hooks", {})
-                            for event in codex_hooks_mod.CODEX_HOOK_EVENTS:
-                                owned = sum(
-                                    1
-                                    for group in hooks.get(event, ())
-                                    if isinstance(group, dict)
-                                    for handler in group.get("hooks", ())
-                                    if codex_hooks_mod.is_dashboard_activity_codex_hook_handler(
-                                        handler)
-                                )
-                                trusted = trusted and owned >= 1
-                        return trusted
-                    except Exception:
+                    # Counting owned handlers proved nothing about whether
+                    # Codex would run them (#719). Route through the one
+                    # shared kernel, which is fail-closed on every state that
+                    # is not `installed_enabled`.
+                    if codex_hooks_mod is None:
                         return False
+                    return codex_hooks_mod.codex_hook_roots_all_enabled(hook_roots)
                 cache_conn = None
                 publish_prior = False
                 initial_cache_identity = None

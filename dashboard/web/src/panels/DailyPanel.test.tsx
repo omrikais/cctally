@@ -229,3 +229,22 @@ describe('#556 S2 QA — the Daily composition survives the mobile sub-span rule
     expect(container.querySelector('.panel-range-note')!.textContent).toBe('30 days');
   });
 });
+
+// #569 item 1 — the sub-line must agree with the body while hydrating.
+//
+// The body already tested `hydrating && rows.length === 0` first and rendered
+// a skeleton; the note was gated on `withheld` alone. A cold All-tab render
+// has a null snapshot, `presentationDailyRows` synthesizes `rows_absent` for
+// it, and the note therefore printed `withheld` over a skeleton — two
+// statements about the same moment that contradict each other. Projects
+// already demonstrates the panel-local `showLoadingSub` shape.
+describe('#569 — the Daily sub-line reads as loading, not withheld, during hydration', () => {
+  it('reports loading over the skeleton on a cold All-tab render', () => {
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<DailyPanel />);
+    const note = container.querySelector('.panel-range-note')!;
+    expect(container.querySelector('.panel-skeleton')).not.toBeNull();
+    expect(note.textContent).not.toContain('withheld');
+    expect(note.textContent).toMatch(/loading/i);
+  });
+});

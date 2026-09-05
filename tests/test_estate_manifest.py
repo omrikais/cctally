@@ -1646,3 +1646,181 @@ def test_a_kernel_that_fails_to_execute_restores_the_previous_binding(tmp_path):
             sys.modules.pop("_lib_estate_discovery", None)
         else:
             sys.modules["_lib_estate_discovery"] = previous
+
+
+# --------------------------------------------------------------------------
+# Per-entry expectation visibility (#678, #710, #750 S1)
+# --------------------------------------------------------------------------
+
+#: A stand-in for `.githooks/_match.py` written into a synthetic tree.
+#:
+#: It classifies a path as public exactly when the path appears as a
+#: whitespace-separated token in the allowlist TEXT it was handed. That is not
+#: the real matching grammar and is not meant to be: the point is that the
+#: helper has to read the tree's own `.mirror-allowlist` and hand it to the
+#: tree's own classifier, so a helper that reimplemented matching, or that read
+#: neither file, produces a different answer and fails these cases.
+#:
+#: The real `.githooks/_match.py` is mirror-private, so a public test module
+#: cannot copy it: on the public projection there is nothing to copy. A stub
+#: keeps every case below runnable in both profiles with no skip.
+_MATCH_STUB = '''\
+"""Synthetic allowlist classifier (test double)."""
+
+
+def classify(paths, allowlist_path=".mirror-allowlist", *, allowlist_text=None):
+    public = set((allowlist_text or "").split())
+    return {
+        "public": [p for p in paths if p in public],
+        "private": [p for p in paths if p not in public],
+        "unmatched": [],
+    }
+'''
+
+
+ALLOWLIST_NAME = ".mirror-allowlist"
+
+
+def _visibility_tree(tmp_path, *, allowlist=None, matcher=True):
+    """A synthetic repository root for the owner-path validation cases.
+
+    ``allowlist`` is the text of `.mirror-allowlist`, or ``None`` for a tree
+    that carries none — which is what a public projection looks like.
+    """
+    root = tmp_path / "repo"
+    (root / ".githooks").mkdir(parents=True)
+    if allowlist is not None:
+        (root / ALLOWLIST_NAME).write_text(allowlist, encoding="utf-8")
+    if matcher:
+        (root / ".githooks" / "_match.py").write_text(_MATCH_STUB, encoding="utf-8")
+    return root
+
+
+def test_visibility_an_unannotated_entry_is_expected_in_both_profiles():
+    """Every entry is public unless it says otherwise.
+
+    The default has to be the safe direction: a writer or a loader site added
+    later and left unannotated must still be expected on the public profile, so
+    the public comparison fails closed on it.
+    """
+    mod = _load()
+    entries = {"a": 1, "b": 2}
+    for profile in mod.PROFILES:
+        assert mod.applicable_expectations(entries, profile=profile) == {"a": 1, "b": 2}
+
+
+def test_visibility_a_private_entry_is_expected_only_on_the_private_profile():
+    mod = _load()
+    entries = {
+        "a": 1,
+        "b": mod.private_expectation(2, "bin/cctally-private-thing"),
+    }
+    assert mod.applicable_expectations(entries, profile=mod.PRIVATE) == {"a": 1, "b": 2}
+    assert mod.applicable_expectations(entries, profile="public") == {"a": 1}
+
+
+def test_visibility_filtering_refuses_a_profile_it_does_not_know():
+    mod = _load()
+    with pytest.raises(mod.EstateError):
+        mod.applicable_expectations({"a": 1}, profile="maintainer")
+
+
+def test_visibility_a_declared_owner_path_must_be_a_non_empty_string():
+    mod = _load()
+    for owner in ("", None, 3):
+        with pytest.raises(mod.EstateError):
+            mod.private_expectation(1, owner)
+
+
+def test_visibility_the_allowlist_presence_selects_the_active_profile(tmp_path):
+    """`.mirror-allowlist` is the tree's own profile marker.
+
+    `bin/_lib-test-contract.sh:440` already states that rule for admission, and
+    a second, differently-derived signal here would be a second answer to the
+    same question.
+    """
+    mod = _load()
+    public_tree = _visibility_tree(tmp_path / "a", allowlist=None)
+    assert mod.active_profile(public_tree) == "public"
+    private_tree = _visibility_tree(tmp_path / "b", allowlist="tests/**\n")
+    assert mod.active_profile(private_tree) == mod.PRIVATE
+
+
+def test_visibility_a_declaration_the_classifier_calls_public_raises(tmp_path):
+    """A row that claims to be private while the real boundary publishes it.
+
+    That is a declaration drifting away from `.mirror-allowlist`, and it would
+    silently narrow the public comparison to less than the public tree holds.
+    """
+    mod = _load()
+    root = _visibility_tree(tmp_path, allowlist="bin/public-thing\n")
+    entries = {"x": mod.private_expectation(1, "bin/public-thing")}
+    with pytest.raises(mod.EstateError) as caught:
+        mod.validate_owner_paths(entries, repo=root)
+    assert "bin/public-thing" in str(caught.value)
+
+
+def test_visibility_a_declaration_the_classifier_calls_private_is_accepted(tmp_path):
+    mod = _load()
+    root = _visibility_tree(tmp_path, allowlist="bin/something-else\n")
+    entries = {
+        "x": mod.private_expectation(1, "bin/private-thing"),
+        "y": 2,
+    }
+    assert mod.validate_owner_paths(entries, repo=root) is None
+
+
+def test_visibility_owner_validation_is_skipped_on_a_public_projection(tmp_path):
+    """The public clone carries neither the allowlist nor the classifier.
+
+    Validation is what is skipped there, never the comparison itself: the
+    declared visibility is consumed directly and the equality assertion still
+    runs.
+    """
+    mod = _load()
+    root = _visibility_tree(tmp_path, allowlist=None, matcher=False)
+    entries = {"x": mod.private_expectation(1, "bin/anything-at-all")}
+    assert mod.validate_owner_paths(entries, repo=root) is None
+
+
+def test_visibility_a_private_tree_without_the_classifier_refuses(tmp_path):
+    """A tree that claims to be private but cannot answer the question.
+
+    `contract_admit_visibility` refuses on exactly this shape rather than
+    reporting success it did not establish.
+    """
+    mod = _load()
+    root = _visibility_tree(tmp_path, allowlist="bin/x\n", matcher=False)
+    entries = {"x": mod.private_expectation(1, "bin/x")}
+    with pytest.raises(mod.EstateError) as caught:
+        mod.validate_owner_paths(entries, repo=root)
+    assert "_match.py" in str(caught.value)
+
+
+def test_visibility_validation_reads_the_trees_own_allowlist(tmp_path):
+    """The helper never reimplements allowlist matching.
+
+    The stub classifier answers only from the text it is handed, so a helper
+    that classified on its own, or that never read `.mirror-allowlist`, cannot
+    make this pair of trees disagree.
+    """
+    mod = _load()
+    entries = {"x": mod.private_expectation(1, "bin/thing")}
+    publishing = _visibility_tree(tmp_path / "a", allowlist="bin/thing\n")
+    withholding = _visibility_tree(tmp_path / "b", allowlist="bin/other\n")
+    with pytest.raises(mod.EstateError):
+        mod.validate_owner_paths(entries, repo=publishing)
+    assert mod.validate_owner_paths(entries, repo=withholding) is None
+
+
+def test_visibility_loading_the_classifier_leaves_sys_modules_alone(tmp_path):
+    """Two trees in one interpreter must not share a cached `_match`.
+
+    A registered module name would make the second tree's validation answer
+    with the first tree's classifier.
+    """
+    mod = _load()
+    before = sys.modules.get("_match")
+    root = _visibility_tree(tmp_path, allowlist="bin/other\n")
+    mod.validate_owner_paths({"x": mod.private_expectation(1, "bin/thing")}, repo=root)
+    assert sys.modules.get("_match") is before

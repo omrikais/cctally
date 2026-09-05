@@ -1,0 +1,5 @@
+setup: Codex hook trust slots would change at /FAKE/.codex/hooks.json:
+  Stop: the handler content at /FAKE/.codex/hooks.json:stop:0:0 would change under a recorded trust decision
+  SubagentStop: the handler content at /FAKE/.codex/hooks.json:subagent_stop:0:0 would change under a recorded trust decision
+  stale [hooks.state] keys (left as they are, cctally never writes config.toml): /FAKE/.codex/hooks.json:stop:3:0
+No configuration file was changed. Review the cctally handler in Codex /hooks, then re-run cctally setup.

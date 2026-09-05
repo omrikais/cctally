@@ -56,6 +56,10 @@ STATS_TABLES = frozenset({
     # incomplete-quota-projection gate.
     "journal_selector_state", "journal_selector_batches",
     "journal_selector_batch_records", "stats_quota_projection_state",
+    # #750 S3 epoch 1013: the transactional reset-to-zero debounce state that
+    # replaced the filesystem marker. Its writes are DML on a stats table and
+    # therefore belong under this guard.
+    "weekly_reset_debounce_state",
 })
 
 #: The SQL verb pattern. It matches the VERB alone and resolves the target from
@@ -129,7 +133,16 @@ FROZEN_WRITE_SITES = {
         "quota_projection_state": 3,
         "quota_threshold_events": 1,
         "quota_window_blocks": 1,
-        "week_reset_events": 1,
+        # #750 S3 epoch 1013: two. The `CREATE TABLE IF NOT EXISTS`, plus the
+        # `DROP TABLE` inside `_rebuild_retired_week_reset_uniqueness`, which
+        # rebuilds the one table without its retired table-level UNIQUE. It
+        # runs inside `_apply_schema`'s `stats_open_time_guard` block — the R2
+        # first-open / legacy / epoch regime, maintenance EXCLUSIVE plus
+        # `stats_write_scope("open-time")` — like every other statement there.
+        "week_reset_events": 2,
+        # #750 S3 epoch 1013: the `CREATE TABLE IF NOT EXISTS` for the
+        # debounce state, in the same guarded block.
+        "weekly_reset_debounce_state": 1,
         "weekly_cost_snapshots": 1,
         "weekly_credit_floors": 1,
         "weekly_usage_snapshots": 2,
@@ -235,6 +248,12 @@ FROZEN_WRITE_SITES = {
         "projected_milestones": 1,
         "week_reset_events": 2,
         "weekly_credit_floors": 1,
+        # #750 S3: the debounce ARM upsert and the CLEAR delete. Both run on
+        # `ctx.conn` inside `_run_cycle`'s `BEGIN IMMEDIATE` while
+        # `run_stats_ingest` holds maintenance-shared and `journal.ingest.lock`
+        # — the R1 steady-state regime — reached through
+        # `detect_reset_and_credit` and `_apply_credit`.
+        "weekly_reset_debounce_state": 2,
         "weekly_usage_snapshots": 6,
     },
     "_cctally_store.py": {
@@ -269,7 +288,17 @@ FROZEN_WRITE_SITES = {
         "week_reset_events": 2,
         "weekly_cost_snapshots": 3,
         "weekly_credit_floors": 1,
-        "weekly_usage_snapshots": 3,
+        # #750 S3: 3 -> 2. `seed_weekly_usage_snapshot` used to branch on
+        # `account_key` and carry one whole literal INSERT per branch; adding
+        # `journal_id` would have made that four branches, so the two literals
+        # collapsed into one statement whose COLUMN LIST is built in Python.
+        # The count moves and nothing else does: the statement still names
+        # `weekly_usage_snapshots` literally, so it stays a resolved site here
+        # rather than becoming a dynamic one (`FROZEN_DYNAMIC_SITES` is
+        # unchanged), and `_fixture_builders.py` is outside
+        # `test_accounts_writer_audit.AUDITED_MODULES`, which reads column
+        # lists and audits production writers only.
+        "weekly_usage_snapshots": 2,
     },
 }
 

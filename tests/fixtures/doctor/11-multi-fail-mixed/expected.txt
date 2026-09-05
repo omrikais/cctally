@@ -19,6 +19,7 @@ Hooks
       → No hook has fired yet. Restart Claude Code.
   ✓ Codex hooks installed    not applicable
   ✓ Codex recent activity    not applicable
+  ✓ Codex hook liveness (7d) not applicable
 Auth
   ✗ OAuth token              missing
       → Log into Claude Code to populate the OAuth token
@@ -88,4 +89,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 54 OK · 8 WARN · 3 FAIL
+Summary: 55 OK · 8 WARN · 3 FAIL

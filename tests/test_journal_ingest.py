@@ -884,7 +884,7 @@ def test_689_two_processes_recovering_one_rate_change_write_one_line(tmp_path):
     for p in procs:
         assert p.exitcode == 0, f"child exited {p.exitcode}"
 
-    event_id = f"mrc:claude:unattributed:{MRC_RACE_EFFECTIVE_FROM}"
+    event_id = f"mrc2:claude:unattributed:{MRC_RACE_EFFECTIVE_FROM}"
     lines = []
     for segment in sorted((data_dir / "journal").glob("*.jsonl")):
         for raw in segment.read_text(encoding="utf-8").splitlines():

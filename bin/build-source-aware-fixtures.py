@@ -294,7 +294,17 @@ def _legacy_fixture_dependencies(module, command: str, *, populated: bool):
         replace(module, "_get_canonical_boundary_for_date", lambda *_args: (
             "2026-06-29T00:00:00Z", "2026-07-06T00:00:00Z",
         ))
-        replace(module, "_apply_reset_events_to_weekrefs", lambda _conn, refs: refs)
+        # `**_kwargs` absorbs `account_key` (#750 S3 B1, which threaded the
+        # requesting account through both appliers), the same shape the
+        # `get_recent_weeks` stub below already uses. `cmd_report` calls
+        # `_apply_reset_events_to_weekrefs` unconditionally, so without it
+        # the builder raises `TypeError` and produces no artifacts at all.
+        # That break IS a golden-harness failure: `bin/cctally-source-aware-test`
+        # runs this builder over every scenario, including the six
+        # `source-report-*` ones that enter this branch, and a non-zero
+        # builder exit fails the harness outright.
+        replace(module, "_apply_reset_events_to_weekrefs",
+                lambda _conn, refs, **_kwargs: refs)
         replace(module, "get_recent_weeks",
                 lambda *_args, **_kw: [week_ref] if populated else [])  # **_kw: #341 account_key=
         replace(module, "build_trend_view", lambda *_args, **_kwargs: module.TrendView(rows=trend_rows))

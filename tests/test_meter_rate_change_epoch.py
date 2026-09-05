@@ -79,7 +79,7 @@ def test_c1_the_epoch_is_bumped_and_the_legacy_registry_is_untouched():
     """The registry is FROZEN. A `@stats_migration` handler for this table
     would never run on an upgraded install, because an epoch-current open
     returns before any schema work."""
-    assert _cctally_core.STATS_INDEX_EPOCH == 1011
+    assert _cctally_core.STATS_INDEX_EPOCH == 1013
     assert _cctally_core.LEGACY_STATS_HEAD == 13
     import _cctally_db
     assert len(_cctally_db._STATS_MIGRATIONS) == 13, "the registry is FROZEN"
@@ -191,3 +191,130 @@ def test_c1_the_identity_is_unique_per_provider_account_and_instant(ns):
             f"SELECT COUNT(*) FROM {NEW_TABLE}").fetchone()[0] == 2
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------
+# #690 / #692 — the four disclosure columns, added at epoch 1012
+# --------------------------------------------------------------------------
+PREVIOUS_EPOCH_1011 = 1011
+DISCLOSURE_COLUMNS = (
+    "withholding_status", "detector_input_causes",
+    "composition_provenance", "baseline_withheld_days",
+)
+
+#: The pre-1012 shape of the table, written out rather than derived from the
+#: shipped schema: a legacy fixture built from the CURRENT schema would gain
+#: every column this test exists to prove the rebuild adds, and would pass
+#: while proving nothing.
+_TABLE_AT_1011 = """
+    CREATE TABLE meter_rate_change_events (
+        id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider                 TEXT    NOT NULL,
+        account_key              TEXT    NOT NULL DEFAULT 'unattributed',
+        effective_from           TEXT    NOT NULL,
+        previous_units_per_point REAL    NOT NULL,
+        new_units_per_point      REAL    NOT NULL,
+        severity                 TEXT    NOT NULL,
+        detected_at_utc          TEXT    NOT NULL,
+        created_at_utc           TEXT    NOT NULL,
+        notified_at              TEXT,
+        UNIQUE(provider, account_key, effective_from)
+    )
+"""
+
+LEGACY_EFFECTIVE_FROM = "2026-08-25T00:00:00+00:00"
+
+
+def _seed_legacy_rate_change_event(ns):
+    """One v1 `mrc:` record on the JOURNAL, not in the index.
+
+    The rebuild materializes stats.db from the journal, so a row inserted
+    straight into the index would be discarded by the very rebuild under
+    test and its survival would prove nothing about the fold.
+    """
+    import _lib_journal
+    import _cctally_journal as jr
+    mrc = ns["_load_sibling"]("_lib_meter_rate_change")
+    transition = mrc.RateChangeTransition(
+        provider="claude", account_key="unattributed",
+        effective_from=LEGACY_EFFECTIVE_FROM,
+        previous_units_per_point=2_442_620.0,
+        new_units_per_point=1_665_096.0,
+        severity="alarm", detected_at=FIXED.isoformat())
+    created_at = FIXED.isoformat()
+    jr.append_record(
+        _lib_journal.make_evt(
+            kind=mrc.EVT_KIND,
+            id=_lib_journal.evt_id(mrc.EVT_ID_PREFIX, *transition.identity()),
+            at=created_at,
+            payload=mrc.event_payload(transition, created_at=created_at)),
+        now_utc=FIXED)
+
+
+def _downgrade_to_1011_shape(ns):
+    """The shape a pre-#750-S2 binary left behind: the table exists, the four
+    disclosure columns do not, and the stamp reads 1011."""
+    conn = ns["open_db"]()
+    try:
+        conn.execute(f"DROP TABLE {NEW_TABLE}")
+        conn.execute(_TABLE_AT_1011)
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_meter_rate_change_events_key"
+            f" ON {NEW_TABLE}(provider, account_key, effective_from)")
+        conn.execute(f"PRAGMA user_version = {PREVIOUS_EPOCH_1011}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_690_an_1011_shaped_store_gains_the_disclosure_columns_on_rebuild(ns):
+    """The epoch contract: a store at the previous epoch rebuilds forward.
+
+    Asserts the columns are present AND that the journaled row is
+    materialized with all four at NULL. A presence-only assertion would also
+    pass on a rebuild that simply produced an empty table, which would prove
+    nothing about the v1 fold under the new schema.
+    """
+    _seed_journal()
+    _seed_legacy_rate_change_event(ns)
+    _downgrade_to_1011_shape(ns)
+
+    # Non-vacuity: the downgraded shape must genuinely lack the columns and
+    # carry the previous stamp, or the rebuild below is not being forced.
+    conn = sqlite3.connect(_cctally_core.DB_PATH)
+    try:
+        assert conn.execute(
+            "PRAGMA user_version").fetchone()[0] == PREVIOUS_EPOCH_1011
+        assert not set(_columns(conn, NEW_TABLE)) & set(DISCLOSURE_COLUMNS)
+    finally:
+        conn.close()
+
+    conn = _resolve_epoch_transition()
+    try:
+        epoch = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        cols = set(_columns(conn, NEW_TABLE))
+        row = conn.execute(
+            "SELECT withholding_status, detector_input_causes,"
+            " composition_provenance, baseline_withheld_days"
+            f" FROM {NEW_TABLE} WHERE effective_from = ?",
+            (LEGACY_EFFECTIVE_FROM,)).fetchone()
+    finally:
+        conn.close()
+
+    assert epoch == _cctally_core.STATS_INDEX_EPOCH
+    assert epoch == 1013
+    assert epoch != PREVIOUS_EPOCH_1011, (
+        "the epoch was not bumped, so nothing forced the rebuild")
+    assert set(DISCLOSURE_COLUMNS) <= cols, (
+        f"the rebuild did not supply {sorted(set(DISCLOSURE_COLUMNS) - cols)}"
+        " — an epoch-current open returns before any schema work, so a"
+        " column added by any other mechanism would never appear here")
+    assert row is not None, (
+        "the journaled v1 record did not materialize, so the fold was never "
+        "exercised under the new schema")
+    # `tuple(...)` because the stats connection sets `row_factory =
+    # sqlite3.Row`, and a `Row` never compares equal to a plain tuple however
+    # right its values are.
+    assert tuple(row) == (None, None, None, None), (
+        "a v1 record materialized fabricated evidence; it must leave all "
+        f"four disclosure columns NULL, got {tuple(row)!r}")

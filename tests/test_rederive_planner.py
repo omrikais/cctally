@@ -271,6 +271,38 @@ def _isolated(tmp_path, monkeypatch):
     return load_isolated_cctally_module(tmp_path, monkeypatch)
 
 
+def _seed_live_debounce_state(mod, *, week_start_date, week_end_at,
+                              baseline_pct, first_zero_at_utc):
+    """Arm the LIVE index's #750 S3 debounce row.
+
+    The pre-#750 form of these tests wrote `APP_DIR/pending-reset-zero-7d` and
+    asserted the planner left the bytes alone. That file is retired; the state
+    is now a `weekly_reset_debounce_state` row, and the planner's isolation
+    property is that its scratch index carries the replayed state while the
+    live row is untouched. Returns a reader for the live row.
+    """
+    import _cctally_record as rec
+    conn = mod.open_db()
+    try:
+        rec._arm_reset_debounce_state(
+            conn, "unattributed", week_start_date=week_start_date,
+            week_end_at=week_end_at, baseline_pct=baseline_pct,
+            first_zero_at_utc=first_zero_at_utc,
+            first_zero_observation_id=None)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _live_debounce_state(mod):
+    import _cctally_record as rec
+    conn = mod.open_db()
+    try:
+        return rec._read_reset_debounce_state(conn, "unattributed")
+    finally:
+        conn.close()
+
+
 def _seed_cache(mod):
     path = "/tmp/claude/projects/repo/session.jsonl"
     conn = mod.open_cache_db()
@@ -917,14 +949,13 @@ def test_record_credit_effect_identity_change_is_dependency_closed(
         (action.payload or {}).get("kind") for action in desired.actions
     }
     assert {"weekly_credit_effects", "snapshot_accept"} <= family_kinds
-    marker = mod.APP_DIR / "pending-reset-zero-7d"
-    marker.write_text(
-        "2026-07-20 2026-07-27T00:00:00+00:00 50.0 "
-        "2026-07-25T12:30:00+00:00\n"
-    )
+    _seed_live_debounce_state(
+        mod, week_start_date="2026-07-20",
+        week_end_at="2026-07-27T00:00:00+00:00", baseline_pct=50.0,
+        first_zero_at_utc="2026-07-25T12:30:00+00:00")
     hwm5 = mod.APP_DIR / "hwm-5h"
     hwm5.write_text("sentinel-window 99\n")
-    before_marker = marker.read_bytes()
+    before_state = _live_debounce_state(mod)
     before_hwm5 = hwm5.read_bytes()
 
     repeated = mod.plan_claude_usage_rederive(
@@ -934,7 +965,7 @@ def test_record_credit_effect_identity_change_is_dependency_closed(
     )
 
     assert repeated.to_bytes() == desired.to_bytes()
-    assert marker.read_bytes() == before_marker
+    assert _live_debounce_state(mod) == before_state
     assert hwm5.read_bytes() == before_hwm5
     cache.close()
 
@@ -969,14 +1000,13 @@ def test_historical_reset_marker_and_five_hour_hwm_are_replayed_in_memory(
         obs("2026-07-25T12:01:00Z", 0.0, 5.0),
         obs("2026-07-25T12:02:00Z", 0.0, 5.0),
     ]
-    marker = mod.APP_DIR / "pending-reset-zero-7d"
-    marker.write_text(
-        "unrelated 2026-07-28T00:00:00+00:00 99.0 "
-        "2026-07-25T11:00:00+00:00\n"
-    )
+    _seed_live_debounce_state(
+        mod, week_start_date="unrelated",
+        week_end_at="2026-07-28T00:00:00+00:00", baseline_pct=99.0,
+        first_zero_at_utc="2026-07-25T11:00:00+00:00")
     hwm5 = mod.APP_DIR / "hwm-5h"
     hwm5.write_text("sentinel-window 99\n")
-    before_marker = marker.read_bytes()
+    before_state = _live_debounce_state(mod)
     before_hwm5 = hwm5.read_bytes()
 
     first = mod.plan_claude_usage_rederive(
@@ -984,11 +1014,11 @@ def test_historical_reset_marker_and_five_hour_hwm_are_replayed_in_memory(
         cache_conn=cache,
         journal_high_water=("observations-2026-07.jsonl", 1000),
     )
-    marker.write_text(
-        "different 2026-07-29T00:00:00+00:00 88.0 "
-        "2026-07-25T10:00:00+00:00\n"
-    )
-    changed_external_marker = marker.read_bytes()
+    _seed_live_debounce_state(
+        mod, week_start_date="different",
+        week_end_at="2026-07-29T00:00:00+00:00", baseline_pct=88.0,
+        first_zero_at_utc="2026-07-25T10:00:00+00:00")
+    changed_external_state = _live_debounce_state(mod)
     second = mod.plan_claude_usage_rederive(
         records,
         cache_conn=cache,
@@ -999,9 +1029,9 @@ def test_historical_reset_marker_and_five_hour_hwm_are_replayed_in_memory(
     assert {
         (action.payload or {}).get("kind") for action in first.actions
     } >= {"week_reset", "five_hour_credit"}
-    assert marker.read_bytes() == changed_external_marker
+    assert _live_debounce_state(mod) == changed_external_state
     assert hwm5.read_bytes() == before_hwm5
-    assert before_marker != changed_external_marker
+    assert before_state != changed_external_state
     cache.close()
 
 

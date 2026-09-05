@@ -116,15 +116,38 @@ def _seed_reset_event(
     effective: str,
     old_week_end_at: str | None = None,
     detected_at_utc: str = "2026-05-15T19:35:00Z",
+    observed_pre_credit_pct: float | None = None,
 ) -> int:
-    """Insert a week_reset_events row and return its id."""
+    """Insert a week_reset_events row and return its id.
+
+    `observed_pre_credit_pct` stores the level the credit was issued from, so a
+    seeded row carries the shape a real credit writes and round-trips through
+    the `week_reset` evt payload. It arms NOTHING. Nothing in `bin/` reads
+    `week_reset_events.observed_pre_credit_pct` as an input to any decision —
+    the only two SELECTs of a column by that name read `weekly_credit_floors`,
+    a different table, on the manual `record-credit` path (line numbers are
+    deliberately omitted: an earlier revision of this docstring cited two that
+    a same-commit insertion had already shifted) — and the
+    unconditional stale-replica DELETE bands around the
+    `observed_pre_credit_pct` ARGUMENT `_fire_in_place_credit` receives: the
+    detector's `prior_pct` on the immediate leg, the armed marker's baseline on
+    the debounced one. A case that needs that band must drive the fire; seeding
+    this column cannot supply it.
+
+    This corrects the second consecutive wrong justification on this helper.
+    The first tied it to the withdrawn #750 S3 echo guard, which read the
+    column; the guard is gone, and its replacement claim — that the DELETE
+    bands around this column — was never true.
+    """
     if old_week_end_at is None:
         old_week_end_at = effective
     cur = conn.execute(
         "INSERT INTO week_reset_events "
         "(detected_at_utc, old_week_end_at, new_week_end_at, "
-        " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
-        (detected_at_utc, old_week_end_at, new_week_end_at, effective),
+        " effective_reset_at_utc, observed_pre_credit_pct) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (detected_at_utc, old_week_end_at, new_week_end_at, effective,
+         observed_pre_credit_pct),
     )
     rowid = int(cur.lastrowid)
     _stamp_journal_id(conn, "week_reset_events", rowid)
@@ -290,6 +313,50 @@ def _week_start_for(end_iso: str) -> tuple[str, str]:
     return start.date().isoformat(), end.date().isoformat()
 
 
+def _arm_debounce(ns, *, week_start_date, week_end_at, baseline_pct,
+                  first_zero_at_utc, account_key="unattributed",
+                  first_zero_observation_id=None):
+    """Arm the #750 S3 `weekly_reset_debounce_state` row.
+
+    The pre-#750 filesystem marker is retired: the debounce state is now a
+    stats.db row so an ARM rolls back with the cursor and a CONFIRM rolls back
+    with the event it fired.
+    """
+    import _cctally_record as rec
+    conn = ns["open_db"]()
+    try:
+        rec._arm_reset_debounce_state(
+            conn, account_key, week_start_date=week_start_date,
+            week_end_at=week_end_at, baseline_pct=baseline_pct,
+            first_zero_at_utc=first_zero_at_utc,
+            first_zero_observation_id=first_zero_observation_id)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _pin_as_of(monkeypatch, offset_seconds):
+    """Give a tick a DISTINCT capture instant.
+
+    Two readings recorded inside the same wall-clock second produce one
+    observation id, and #750 S3's self-confirmation rule refuses to confirm a
+    reset from a byte-identical replay of the observation that armed it.
+    """
+    stamp = (dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+             + dt.timedelta(seconds=offset_seconds))
+    monkeypatch.setenv(
+        "CCTALLY_AS_OF", stamp.isoformat().replace("+00:00", "Z"))
+
+
+def _read_debounce(ns, account_key="unattributed"):
+    import _cctally_record as rec
+    conn = ns["open_db"]()
+    try:
+        return rec._read_reset_debounce_state(conn, account_key)
+    finally:
+        conn.close()
+
+
 def test_detection_fires_on_threshold(ns, tmp_path):
     """prior=67, cur=2 (drop 65pp ≥ 25pp threshold) with the SAME
     week_end_at as the new fetch: writes event row, seed snapshot
@@ -427,17 +494,26 @@ def test_reset_to_zero_lone_zero_arms_no_fire(ns, tmp_path):
     assert (ns["APP_DIR"] / "hwm-7d").read_text().strip().split() == [week_start_date, "14.0"]
 
     import _cctally_record as rec
-    marker = rec._read_reset_zero_marker()
-    assert marker is not None
-    assert marker[0] == week_start_date          # week
-    assert marker[2] == 14.0                      # baseline
+    state = _read_debounce(ns)
+    assert state is not None
+    assert state[0] == week_start_date            # week
+    assert state[2] == 14.0                       # baseline
 
 
-def test_detection_fires_on_reset_to_zero_below_threshold(ns, tmp_path):
+def test_detection_fires_on_reset_to_zero_below_threshold(ns, tmp_path,
+                                                         monkeypatch):
     """#128 (rewritten): two consecutive ~0 readings (14→0→0) CONFIRM and fire.
     Drop 14pp < 25pp, so this exercises the debounced reset-to-zero path, not
     the 25pp path. After the second zero: one event row (old==effective,
-    new==end, distinct), the post-reset 0 lands, hwm=0, marker cleared."""
+    new==end, distinct), the post-reset 0 lands, hwm=0, state cleared.
+
+    The two ticks are pinned to DISTINCT capture instants. An observation's
+    journal id is a digest over `{t, at, src, provider, payload}`, so two zero
+    readings recorded inside the same wall-clock second are one observation,
+    and #750 S3's self-confirmation rule then refuses to confirm from it —
+    correctly, because a byte-identical replay carries no new evidence. This
+    test means to exercise a genuine two-tick confirm, so it separates them.
+    """
     end_iso, end_epoch = _future_week_end_iso()
     week_start_date, _ = _week_start_for(end_iso)
 
@@ -454,6 +530,7 @@ def test_detection_fires_on_reset_to_zero_below_threshold(ns, tmp_path):
     (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 14.0\n")
 
     # Tick 1: arm.
+    _pin_as_of(monkeypatch, 0)
     assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0
     conn = ns["open_db"]()
     try:
@@ -462,6 +539,7 @@ def test_detection_fires_on_reset_to_zero_below_threshold(ns, tmp_path):
         conn.close()
 
     # Tick 2: confirm + fire.
+    _pin_as_of(monkeypatch, 60)
     assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0
     conn = ns["open_db"]()
     try:
@@ -480,8 +558,7 @@ def test_detection_fires_on_reset_to_zero_below_threshold(ns, tmp_path):
         conn.close()
     assert (ns["APP_DIR"] / "hwm-7d").read_text().strip().split() == [week_start_date, "0.0"]
 
-    import _cctally_record as rec
-    assert rec._read_reset_zero_marker() is None    # cleared after fire
+    assert _read_debounce(ns) is None               # cleared after fire
 
 
 def test_reset_to_zero_stayed_low_confirms(ns, tmp_path):
@@ -536,8 +613,7 @@ def test_reset_to_zero_recovery_clears(ns, tmp_path):
     finally:
         conn.close()
     assert (ns["APP_DIR"] / "hwm-7d").read_text().strip().split() == [week_start_date, "14.0"]
-    import _cctally_record as rec
-    assert rec._read_reset_zero_marker() is None    # cleared on recovery
+    assert _read_debounce(ns) is None               # cleared on recovery
 
 
 def test_reset_to_zero_near_recovery_clears(ns, tmp_path):
@@ -567,9 +643,15 @@ def test_reset_to_zero_near_recovery_clears(ns, tmp_path):
 
 
 def test_reset_to_zero_anchor_is_first_zero(ns, tmp_path, monkeypatch):
-    """#128: the effective_reset_at_utc is floored from the FIRST-zero instant
-    (stored in the marker), not the confirmation tick. Pin the two ticks an hour
-    apart via CCTALLY_AS_OF; assert the event anchors to the first hour."""
+    """#128: the effective_reset_at_utc is the FIRST-zero instant (recorded in
+    the debounce state), not the confirmation tick.
+
+    #750 S3 removed the hour floor, so the anchor is now that instant to the
+    exact second. `CCTALLY_TEST_PIN_CAPTURE` makes `cmd_record_usage` stamp the
+    observation's `captured_at` from the pinned `CCTALLY_AS_OF` instant, which
+    is what the anchor follows — the detection clock and the capture stamp are
+    deliberately different quantities.
+    """
     # Build an end well after both pinned instants so prior_end_dt > now_utc.
     first_zero = "2026-06-02T18:00:35+00:00"
     confirm    = "2026-06-02T19:00:05+00:00"
@@ -589,6 +671,7 @@ def test_reset_to_zero_anchor_is_first_zero(ns, tmp_path, monkeypatch):
         conn.close()
     (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 14.0\n")
 
+    monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
     monkeypatch.setenv("CCTALLY_AS_OF", first_zero)
     assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0  # arm
     monkeypatch.setenv("CCTALLY_AS_OF", confirm)
@@ -601,8 +684,9 @@ def test_reset_to_zero_anchor_is_first_zero(ns, tmp_path, monkeypatch):
         ).fetchone()[0]
     finally:
         conn.close()
-    # Floored to the FIRST-zero hour (18:00), not the confirmation hour (19:00).
-    assert eff.startswith("2026-06-02T18:00:00")
+    # The FIRST-zero instant to the second (18:00:35), not the confirmation
+    # instant (19:00:05) and not the hour it falls in.
+    assert eff == "2026-06-02T18:00:35+00:00"
 
 
 def test_reset_to_zero_big_drop_still_fires_immediately(ns, tmp_path):
@@ -631,17 +715,31 @@ def test_reset_to_zero_big_drop_still_fires_immediately(ns, tmp_path):
     assert (ns["APP_DIR"] / "hwm-7d").read_text().strip().split() == [week_start_date, "0.0"]
 
 
-def test_reset_to_zero_crash_recovery_reruns_pivots(ns, tmp_path):
-    """#128 P2a: simulate a tick that committed the event row then died before
-    clearing the marker. The next confirming zero re-runs the idempotent pivots
-    (hwm=0) and the INSERT OR IGNORE no-ops — exactly one event row, marker
-    cleared."""
+def test_reset_to_zero_confirm_reruns_pivots_and_clears_the_state(ns, tmp_path):
+    """#128 P2a: a confirming zero re-runs the idempotent pivots (hwm=0) and
+    clears the debounce state, with an unrelated event row already in the
+    table.
+
+    The half-committed shape this once modelled (event committed, debounce
+    marker not yet cleared) cannot arise through the write path any more:
+    #750 S3 A3 made the debounce state a row mutated inside the same
+    transaction as the event.
+
+    The seeded event no longer suppresses anything either. #750 S3 §1.5 made
+    deduplication exact-origin only, and a hand-seeded row names no origin, so
+    it is governed by the legacy tuple index while the confirm leg writes an
+    origin-bearing row governed by the origin index. The confirm is therefore
+    ADMITTED as its own event, which is the deliberate direction: a phantom
+    event is visible in the week's segmentation, whereas a suppressed genuine
+    reset does not self-heal. What this test still pins is the pivots and the
+    state clear, both of which run regardless.
+    """
     end_iso, end_epoch = _future_week_end_iso()
     week_start_date, _ = _week_start_for(end_iso)
     conn = ns["open_db"]()
     try:
         _seed_usage_snapshot(
-            conn, captured_at_utc="2026-05-14T10:00:00Z",
+            conn, captured_at_utc="2026-05-14T10:30:00Z",
             week_start_date=week_start_date, week_end_at=end_iso, weekly_percent=14.0,
         )
         conn.commit()
@@ -649,32 +747,40 @@ def test_reset_to_zero_crash_recovery_reruns_pivots(ns, tmp_path):
         conn.close()
     (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 14.0\n")
 
-    # Pre-seed the mid-fire crash state: an armed marker for this end PLUS a
-    # matching event row (the prior tick committed the event then died before
-    # clearing the marker).
-    import _cctally_record as rec
-    rec._arm_reset_zero_marker(
-        week_start_date, end_iso, baseline_pct=14.0,
-        first_zero_iso="2026-05-14T10:30:00+00:00",
+    _arm_debounce(
+        ns, week_start_date=week_start_date, week_end_at=end_iso,
+        baseline_pct=14.0, first_zero_at_utc="2026-05-14T10:40:00+00:00",
+        first_zero_observation_id="o:aaaaaaaaaaaaaaaa",
     )
     conn = ns["open_db"]()
     try:
         _seed_reset_event(
             conn, new_week_end_at=end_iso,
             effective="2026-05-14T10:00:00+00:00",
+            observed_pre_credit_pct=14.0,
         )
     finally:
         conn.close()
 
-    # Confirming zero: pivots re-run, no duplicate event, marker cleared.
+    # Confirming zero: pivots re-run and the state clears. The confirm writes
+    # its own origin-bearing event beside the seeded origin-null one.
     assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0
     conn = ns["open_db"]()
     try:
-        assert conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0] == 1
+        rows = [dict(r) for r in conn.execute(
+            "SELECT effective_reset_at_utc, origin_observation_id "
+            "FROM week_reset_events ORDER BY id")]
     finally:
         conn.close()
+    assert len(rows) == 2, rows
+    assert rows[0]["origin_observation_id"] is None
+    assert rows[0]["effective_reset_at_utc"] == "2026-05-14T10:00:00+00:00"
+    # The confirm anchors at the armed first-zero instant and carries that
+    # observation's id, which is the identity the origin index governs.
+    assert rows[1]["origin_observation_id"] == "o:aaaaaaaaaaaaaaaa"
+    assert rows[1]["effective_reset_at_utc"] == "2026-05-14T10:40:00+00:00"
     assert (ns["APP_DIR"] / "hwm-7d").read_text().strip().split() == [week_start_date, "0.0"]
-    assert rec._read_reset_zero_marker() is None
+    assert _read_debounce(ns) is None
 
 
 def test_reset_to_zero_stale_marker_boundary_mismatch(ns, tmp_path):
@@ -694,11 +800,11 @@ def test_reset_to_zero_stale_marker_boundary_mismatch(ns, tmp_path):
         conn.close()
     (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 14.0\n")
 
-    # Armed marker carries a DIFFERENT end boundary than the current tick's.
-    import _cctally_record as rec
-    rec._arm_reset_zero_marker(
-        week_start_date, "2025-01-01T00:00:00+00:00", baseline_pct=14.0,
-        first_zero_iso="2026-05-14T10:30:00+00:00",
+    # Armed state carries a DIFFERENT end boundary than the current tick's.
+    _arm_debounce(
+        ns, week_start_date=week_start_date,
+        week_end_at="2025-01-01T00:00:00+00:00", baseline_pct=14.0,
+        first_zero_at_utc="2026-05-14T10:30:00+00:00",
     )
     assert ns["cmd_record_usage"](_record_usage_args(percent=0.0, resets_at=end_epoch)) == 0
     conn = ns["open_db"]()
@@ -707,8 +813,8 @@ def test_reset_to_zero_stale_marker_boundary_mismatch(ns, tmp_path):
     finally:
         conn.close()
     # Re-armed against the real end (E2 = this tick's canonical end).
-    marker = rec._read_reset_zero_marker()
-    assert marker is not None and marker[1] == end_iso
+    state = _read_debounce(ns)
+    assert state is not None and state[1] == end_iso
 
 
 
@@ -767,9 +873,9 @@ def test_debounced_cleanup_removes_a_replay_exactly_one_point_below_baseline(
         conn.close()
     (ns["APP_DIR"] / "hwm-7d").write_text(f"{week_start_date} 14.0\n")
 
-    import _cctally_record as rec
-    rec._arm_reset_zero_marker(
-        week_start_date, end_iso, baseline_pct=14.0, first_zero_iso=floor_iso,
+    _arm_debounce(
+        ns, week_start_date=week_start_date, week_end_at=end_iso,
+        baseline_pct=14.0, first_zero_at_utc=floor_iso,
     )
 
     assert ns["cmd_record_usage"](
@@ -872,19 +978,43 @@ def test_detection_skipped_when_window_expired(ns, tmp_path):
         conn.close()
 
 
-def test_dedup_via_pre_check(ns, tmp_path):
-    """Pre-seed a week_reset_events row for the current new_week_end_at.
-    Drive a 67→2 record-usage call. The pre-check fires before the
-    INSERT, so no second event row is written.
+def test_a_replayed_pre_credit_high_is_admitted_as_its_own_event(ns, tmp_path):
+    """A re-detected credit against a stale pre-credit level opens its own
+    event, end to end through the live write path.
+
+    This test used to assert the opposite. It first pinned a pre-check keyed on
+    `new_week_end_at`, which refused ANY second event for a week and so made a
+    genuine second in-place credit unreachable (#732); it then pinned the
+    evidence-based echo guard that briefly replaced the pre-check. #750 S3 §1.5
+    withdrew that guard, because its epoch maximum was computed over a window
+    excluding the predecessor reading, so it also discarded the ordinary
+    sequence of a week climbing back to the level it was credited from and
+    being credited again.
+
+    Deduplication is now exact-origin only, and this detection carries a new
+    observation identity, so it is admitted. The residual is stated rather than
+    guarded against: this seed is indistinguishable from a genuine second climb
+    and credit. `tests/test_exact_origin_credit_dedup.py` owns the unit-level
+    statement of both halves.
     """
     end_iso, end_epoch = _future_week_end_iso()
     week_start_date, _ = _week_start_for(end_iso)
 
     conn = ns["open_db"]()
     try:
+        # The existing epoch's own post-credit reading.
         _seed_usage_snapshot(
             conn,
-            captured_at_utc="2026-05-14T10:00:00Z",
+            captured_at_utc="2026-05-15T17:10:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=2.0,
+        )
+        # The replayed pre-credit level, which is also the detector's
+        # `prior_pct`.
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T17:40:00Z",
             week_start_date=week_start_date,
             week_end_at=end_iso,
             weekly_percent=67.0,
@@ -893,7 +1023,7 @@ def test_dedup_via_pre_check(ns, tmp_path):
             conn,
             new_week_end_at=end_iso,
             effective="2026-05-15T17:00:00+00:00",
-            old_week_end_at=end_iso,
+            observed_pre_credit_pct=67.0,
         )
         conn.commit()
     finally:
@@ -905,12 +1035,78 @@ def test_dedup_via_pre_check(ns, tmp_path):
 
     conn = ns["open_db"]()
     try:
-        events = conn.execute(
-            "SELECT COUNT(*) FROM week_reset_events"
-        ).fetchone()[0]
-        assert events == 1, "pre-check should have prevented a duplicate event row"
+        origins = [r[0] for r in conn.execute(
+            "SELECT origin_observation_id FROM week_reset_events ORDER BY id")]
     finally:
         conn.close()
+    assert len(origins) == 2, origins
+    assert origins[0] is None and origins[1] is not None, origins
+
+
+def test_second_in_place_reset_in_one_week_is_a_distinct_event(ns, tmp_path):
+    """#755: Anthropic can reset an account twice inside one subscription
+    week. An in-place reset never moves ``week_end_at``, so both resets share
+    a ``new_week_end_at``. Keying the pre-check on that column alone let the
+    first reset of the week occupy the slot permanently, and the second reset
+    inserted nothing: no new cycle boundary existed, so the dashboard kept
+    attributing milestones to the superseded cycle.
+
+    What this test proves is exactly that: two events can share one
+    ``new_week_end_at``. It proves nothing about how they are told apart. The
+    seeded row names no origin and the tick's row does, so the two are governed
+    by different partial unique indexes and never compete — the seeded row by
+    ``(account_key, old_week_end_at, new_week_end_at)`` and the tick's by
+    ``(account_key, origin_observation_id)``. The table-level
+    ``UNIQUE(old_week_end_at, new_week_end_at)`` this docstring used to name is
+    retired by epoch 1013. Exact-origin deduplication itself is pinned by
+    ``tests/test_exact_origin_credit_dedup.py``.
+    """
+    end_iso, end_epoch = _future_week_end_iso()
+    week_start_date, _ = _week_start_for(end_iso)
+    earlier_reset = (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)
+    ).replace(minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
+
+    conn = ns["open_db"]()
+    try:
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            week_start_date=week_start_date,
+            week_end_at=end_iso,
+            weekly_percent=67.0,
+        )
+        # The week's FIRST reset, already recorded, two days ago.
+        _seed_reset_event(
+            conn,
+            new_week_end_at=end_iso,
+            effective=earlier_reset,
+            old_week_end_at=earlier_reset,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rc = ns["cmd_record_usage"](
+        _record_usage_args(percent=2.0, resets_at=end_epoch)
+    )
+    assert rc == 0
+
+    conn = ns["open_db"]()
+    try:
+        rows = conn.execute(
+            "SELECT old_week_end_at, new_week_end_at FROM week_reset_events "
+            "ORDER BY old_week_end_at"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 2, (
+        "the second in-place reset of the week must be its own event row, "
+        f"got {rows!r}"
+    )
+    assert {r[1] for r in rows} == {end_iso}
+    assert rows[0][0] == earlier_reset
+    assert rows[1][0] != earlier_reset
 
 
 def test_dedup_via_seed_snapshot(ns, tmp_path):
@@ -958,8 +1154,10 @@ def test_backfill_detects_historical_in_place_credit(ns):
     """Seed snapshots showing 67→2 with the SAME week_end on consecutive
     captures (captured BEFORE the end_at — i.e., we were "in the window"
     when the credit landed). Run ``_backfill_week_reset_events``.
-    Assert: one event row with old == new == cur_end (in-place credit
-    shape), effective == floor_to_hour(captured_at_of_2pct_row).
+    Assert: one event row with old == effective (in-place credit shape) and
+    effective == the EXACT capture second of the 2% row. #750 S3 removed the
+    hour floor: it read as a display convenience, and it back-dated the event
+    before observations that still legitimately belonged to the old segment.
     """
     # Use a future end_at so captured_dt < prior_end_dt is true.
     end_iso, _ = _future_week_end_iso()
@@ -997,14 +1195,13 @@ def test_backfill_detects_historical_in_place_credit(ns):
         assert events[0]["new_week_end_at"] == end_iso
         assert events[0]["old_week_end_at"] == events[0]["effective_reset_at_utc"]
         assert events[0]["old_week_end_at"] != events[0]["new_week_end_at"]
-        # Effective is floor-to-hour of the captured_at when the drop
-        # was first observed (Anthropic's reset times are always
-        # hour-aligned). Compare as UTC moment to absorb the host-tz
+        # Effective is the EXACT captured_at second of the row where the drop
+        # was first observed. Compare as a UTC moment to absorb the host-tz
         # rendering quirk in ``parse_iso_datetime`` — see project
         # gotcha ``unixepoch_for_cross_offset_compare``.
         eff_dt = dt.datetime.fromisoformat(events[0]["effective_reset_at_utc"])
         assert eff_dt.astimezone(dt.timezone.utc) == dt.datetime(
-            2026, 5, 14, 17, 0, 0, tzinfo=dt.timezone.utc
+            2026, 5, 14, 17, 30, 0, tzinfo=dt.timezone.utc
         )
     finally:
         conn.close()
@@ -1665,6 +1862,72 @@ def test_tui_percent_milestones_filters_to_active_segment(ns):
     assert out[0].cumulative_cost_usd == 5.0
 
 
+def test_tui_percent_milestones_take_the_latest_segment_not_the_last_written(
+    ns,
+):
+    """The TUI panel resolves the segment by INSTANT, not by insertion id.
+
+    This builder feeds both the TUI modal and the dashboard's
+    ``snap.percent_milestones`` envelope array, and it kept its own `ORDER BY
+    id DESC` after the read sites moved to `_latest_reset_event_for_end`. A
+    backfill row landing after a live-detected one makes "written last" the
+    OLDER reset, so the panel filters milestones on a segment nothing recent
+    wrote to and renders the wrong crossings — or none.
+
+    Three cuts, with the live one written neither first nor last, so neither
+    an unordered scan nor an `ORDER BY id DESC` reaches it.
+    """
+    end_iso = "2026-05-16T05:00:00+00:00"
+    week_start_date, week_end_date = _week_start_for(end_iso)
+    week_start_at = week_start_date + "T05:00:00+00:00"
+    cuts = {
+        "early": "2026-05-12T17:00:00+00:00",
+        "late": "2026-05-14T17:00:00+00:00",
+        "mid": "2026-05-13T17:00:00+00:00",
+    }
+    cumulative = {"early": 100.0, "late": 5.0, "mid": 77.0}
+
+    conn = ns["open_db"]()
+    try:
+        ids = {}
+        for name in ("early", "late", "mid"):
+            ids[name] = _seed_reset_event(
+                conn,
+                new_week_end_at=end_iso,
+                effective=cuts[name],
+                old_week_end_at=cuts[name],
+            )
+        assert min(ids.values()) < ids["late"] < max(ids.values()), ids
+        for index, name in enumerate(("early", "late", "mid")):
+            conn.execute(
+                "INSERT INTO percent_milestones "
+                "(captured_at_utc, week_start_date, week_end_date, "
+                " week_start_at, week_end_at, percent_threshold, "
+                " cumulative_cost_usd, marginal_cost_usd, "
+                " usage_snapshot_id, cost_snapshot_id, reset_event_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (cuts[name], week_start_date, week_end_date, week_start_at,
+                 end_iso, 1, cumulative[name], None, index + 1, index + 1,
+                 ids[name]),
+            )
+        _seed_usage_snapshot(
+            conn,
+            captured_at_utc="2026-05-15T10:30:00Z",
+            week_start_date=week_start_date,
+            week_end_date=week_end_date,
+            week_start_at=week_start_at,
+            week_end_at=end_iso,
+            weekly_percent=1.0,
+        )
+        conn.commit()
+
+        out = ns["_tui_build_percent_milestones"](conn)
+    finally:
+        conn.close()
+
+    assert [m.cumulative_cost_usd for m in out] == [cumulative["late"]], out
+
+
 # ── Task 8: alerts dedup (independent post-credit fire) ──────────────
 
 
@@ -2243,7 +2506,8 @@ def test_alerts_envelope_id_unique_across_segments(ns):
 # ── Round-3 user-test regressions (v1.7.2) ───────────────────────────
 
 
-def test_credit_branch_defensive_cleanup_removes_stale_replays(ns, tmp_path):
+def test_credit_branch_defensive_cleanup_removes_stale_replays(
+        ns, tmp_path, monkeypatch):
     """Bug A: race-defensive cleanup in the credit-detection branch.
 
     Failure mode the user hit: between the moment Anthropic credited the
@@ -2287,12 +2551,20 @@ def test_credit_branch_defensive_cleanup_removes_stale_replays(ns, tmp_path):
         # captured_at_utc DESC) — that's exactly what fires the
         # detection (prior=67 vs new=2 = 65pp drop) and what the
         # cleanup uses for its strict-equality predicate.
-        now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-        floor_hour = now_utc.replace(minute=0, second=0)
-        # Two stale-replay rows captured AT and just-after the floor.
+        # #750 S3: `effective_reset_at_utc` is the credit tick's exact
+        # capture second, not the hour it falls in, so the replays have to be
+        # placed against that instant rather than against an hour floor.
+        # `CCTALLY_TEST_PIN_CAPTURE` makes `cmd_record_usage` stamp the
+        # capture from the pinned `CCTALLY_AS_OF`, which is what makes the
+        # placement deterministic.
+        credit_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
+        monkeypatch.setenv(
+            "CCTALLY_AS_OF", credit_at.isoformat().replace("+00:00", "Z"))
+        # Two stale-replay rows captured AT and just-after the credit instant.
         _seed_usage_snapshot(
             conn,
-            captured_at_utc=floor_hour.isoformat().replace("+00:00", "Z"),
+            captured_at_utc=credit_at.isoformat().replace("+00:00", "Z"),
             week_start_date=week_start_date,
             week_end_date=week_end_date,
             week_end_at=end_iso,
@@ -2300,7 +2572,7 @@ def test_credit_branch_defensive_cleanup_removes_stale_replays(ns, tmp_path):
         )
         _seed_usage_snapshot(
             conn,
-            captured_at_utc=(floor_hour + dt.timedelta(minutes=5))
+            captured_at_utc=(credit_at + dt.timedelta(minutes=5))
             .isoformat().replace("+00:00", "Z"),
             week_start_date=week_start_date,
             week_end_date=week_end_date,
@@ -2378,7 +2650,8 @@ def test_credit_branch_defensive_cleanup_removes_stale_replays(ns, tmp_path):
         conn.close()
 
 
-def test_credit_branch_cleanup_tolerates_rounding_drift(ns, tmp_path):
+def test_credit_branch_cleanup_tolerates_rounding_drift(
+        ns, tmp_path, monkeypatch):
     """Issue #45 defensive hardening: replay rows whose ``weekly_percent``
     differs from the stored pre-credit baseline by ≤1pp must still be
     cleaned up.
@@ -2420,11 +2693,15 @@ def test_credit_branch_cleanup_tolerates_rounding_drift(ns, tmp_path):
             week_end_at=end_iso,
             weekly_percent=67.4,
         )
-        now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-        floor_hour = now_utc.replace(minute=0, second=0)
+        # #750 S3: place the replays against the credit tick's exact capture
+        # second, which `CCTALLY_TEST_PIN_CAPTURE` + `CCTALLY_AS_OF` pin.
+        credit_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
+        monkeypatch.setenv(
+            "CCTALLY_AS_OF", credit_at.isoformat().replace("+00:00", "Z"))
         _seed_usage_snapshot(
             conn,
-            captured_at_utc=(floor_hour + dt.timedelta(minutes=5))
+            captured_at_utc=(credit_at + dt.timedelta(minutes=5))
             .isoformat().replace("+00:00", "Z"),
             week_start_date=week_start_date,
             week_end_date=week_end_date,
@@ -2433,7 +2710,7 @@ def test_credit_branch_cleanup_tolerates_rounding_drift(ns, tmp_path):
         )
         _seed_usage_snapshot(
             conn,
-            captured_at_utc=(floor_hour + dt.timedelta(minutes=6))
+            captured_at_utc=(credit_at + dt.timedelta(minutes=6))
             .isoformat().replace("+00:00", "Z"),
             week_start_date=week_start_date,
             week_end_date=week_end_date,
@@ -3812,27 +4089,51 @@ def test_group_entries_into_blocks_no_phantom_between_two_credits(ns):
 # ── Round-3: pivots run even when event row already committed ────────
 
 
-def test_weekly_pivots_run_when_event_row_already_committed(ns, tmp_path):
+def test_weekly_pivots_run_beside_an_earlier_committed_event(
+        ns, tmp_path, monkeypatch):
     """Round-3 / memory ``project_dedup_must_not_gate_side_effects.md``:
-    weekly credit pivots (hwm-7d force-write + stale-replica DELETE)
-    MUST run even when the ``already`` pre-check sees the event row
-    is in the table because a prior crashed invocation committed the
-    INSERT before dying.
+    weekly credit pivots (hwm-7d force-write + stale-replica DELETE) MUST run
+    on a recovery tick, with a prior invocation's event row already in the
+    table.
 
     Failure mode: tick N detects the credit, INSERTs the week_reset_events
     row, ``conn.commit()`` lands — and then the process dies (CC
     self-update, OOM, kill -9) before the HWM force-write + DELETE
-    could run. On tick N+1 the same predicate fires; the
-    ``already`` pre-check finds the row and (pre-fix) the entire
-    ``if already is None:`` block skipped — leaving the system wedged
-    on the pre-credit HWM and the stale-replica rows.
+    could run. On tick N+1 the same predicate fires; the dedup decision
+    finds the credit already recorded and (pre-fix) the entire insert
+    block skipped — leaving the system wedged on the pre-credit HWM and
+    the stale-replica rows.
 
-    Fix: hoist pivots out of the ``if already is None:`` body. The
-    INSERT stays gated (no double-write), but the pivots are
-    individually idempotent so re-running them is safe.
+    Fix: hoist the pivots out of the insert branch. The INSERT stays gated (no
+    double-write), but the pivots are individually idempotent so re-running
+    them is safe.
+
+    Two things changed under this test in #750 S3, and both are asserted below
+    rather than assumed. Deduplication is now exact-origin only (§1.5), so the
+    pre-committed origin-null row does not refuse the recovery tick's
+    origin-bearing one and the tick opens its own event. And the effective
+    instant is the exact capture second rather than the hour it falls in
+    (§1.4), so the stale-replica DELETE is scoped to that instant and no longer
+    reaches back into the previous segment. The refused-insert half of the
+    original invariant — pivots running when the INSERT really is refused — is
+    pinned directly by
+    ``tests/test_exact_origin_credit_dedup.py::test_a5_the_pivots_run_on_the_credits_own_terms``.
     """
     end_iso, end_epoch = _future_week_end_iso()
     week_start_date, _ = _week_start_for(end_iso)
+
+    # The recovery tick's capture instant is PINNED, the way the sibling
+    # reset-origin module pins it. #750 S3 §1.4 scoped the stale-replica DELETE
+    # to that exact second, and the previous form of this case seeded the
+    # replica two seconds ahead of the wall clock and relied on the recording
+    # call reaching its own capture stamp inside that window — which a loaded
+    # runner under `pytest -n 10` does not guarantee. With the pin, the
+    # replica's capture and the tick's effective instant are one value by
+    # construction rather than by timing.
+    pinned_now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    pinned_iso = pinned_now.isoformat().replace("+00:00", "Z")
+    monkeypatch.setenv("CCTALLY_AS_OF", pinned_iso)
+    monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
 
     conn = ns["open_db"]()
     try:
@@ -3846,26 +4147,28 @@ def test_weekly_pivots_run_when_event_row_already_committed(ns, tmp_path):
             week_end_at=end_iso,
             weekly_percent=67.0,
         )
-        # 2. Pre-committed event row (simulates the crashed tick N).
-        # Use a floor_to_hour result for the same wall-clock window
-        # the recovery tick will compute so DELETE predicate's
-        # ``unixepoch(captured_at_utc) >= unixepoch(effective_iso)``
-        # still matches stale-replica rows we stage at "now".
-        now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-        precommitted_floor = now_utc.replace(minute=0, second=0)
+        # 2. Pre-committed event row (simulates the crashed tick N). Its
+        # instant is the hour the pinned capture falls in, which after §1.4 is
+        # a DIFFERENT instant from the recovery tick's own effective second —
+        # that difference is what assertion 1 reads.
+        precommitted_floor = pinned_now.replace(minute=0, second=0)
         precommitted_iso = precommitted_floor.isoformat(timespec="seconds")
         _seed_reset_event(
             conn,
             new_week_end_at=end_iso,
             effective=precommitted_iso,
             old_week_end_at=precommitted_iso,
+            observed_pre_credit_pct=67.0,
         )
-        # 3. Stale-replica row at the pre-credit value, captured
-        # at-or-after the pre-committed effective_iso (claude-statusline
-        # replay landed between the crash and the recovery tick).
-        _seed_usage_snapshot(
+        # 3. Stale-replica row at the pre-credit value (a claude-statusline
+        # replay), one second after the PINNED capture instant. That is
+        # unambiguously inside the DELETE's `>= effective` band whatever the
+        # runner's load, because the tick's effective instant is now a value
+        # this test chose rather than a clock it races.
+        stale_replica_id = _seed_usage_snapshot(
             conn,
-            captured_at_utc=ns["now_utc_iso"](),
+            captured_at_utc=(pinned_now + dt.timedelta(seconds=1))
+            .isoformat().replace("+00:00", "Z"),
             week_start_date=week_start_date,
             week_end_at=end_iso,
             weekly_percent=67.0,
@@ -3880,29 +4183,28 @@ def test_weekly_pivots_run_when_event_row_already_committed(ns, tmp_path):
         f"{week_start_date} 67.0\n"
     )
 
-    # 5. Recovery tick. Same percent (2%) as the original credit
-    # observation. Pre-check sees ``already`` non-None → before the
-    # fix, the entire body skipped; with the fix, INSERT is skipped
-    # but pivots still run.
+    # 5. Recovery tick. Same percent (2%) as the original credit observation.
     args = _record_usage_args(percent=2.0, resets_at=end_epoch)
     rc = ns["cmd_record_usage"](args)
     assert rc == 0
 
-    # Assertion 1: still exactly one event row (pre-check guarded
-    # the duplicate INSERT correctly).
+    # Assertion 1: the pre-committed row is untouched and the recovery tick
+    # opens its own event beside it, because the two carry different
+    # identities — one origin-null, one naming its observation.
     conn = ns["open_db"]()
     try:
-        events = conn.execute(
-            "SELECT effective_reset_at_utc FROM week_reset_events"
-        ).fetchall()
-        assert len(events) == 1, [dict(e) for e in events]
-        assert events[0]["effective_reset_at_utc"] == precommitted_iso
+        events = [dict(r) for r in conn.execute(
+            "SELECT effective_reset_at_utc, origin_observation_id "
+            "FROM week_reset_events ORDER BY id")]
     finally:
         conn.close()
+    assert len(events) == 2, events
+    assert events[0]["effective_reset_at_utc"] == precommitted_iso
+    assert events[0]["origin_observation_id"] is None
+    assert events[1]["origin_observation_id"] is not None
 
-    # Assertion 2: HWM force-written back down (pivot ran despite
-    # ``already`` being non-None). File used to be "67.0"; recovery
-    # tick must overwrite to "2.0".
+    # Assertion 2: HWM force-written back down (the pivot ran). File used to
+    # be "67.0"; the recovery tick must overwrite to "2.0".
     hwm_path = tmp_path / ".local" / "share" / "cctally" / "hwm-7d"
     hwm_parts = hwm_path.read_text().strip().split()
     assert len(hwm_parts) == 2, hwm_parts
@@ -3912,23 +4214,29 @@ def test_weekly_pivots_run_when_event_row_already_committed(ns, tmp_path):
         f"{hwm_parts[1]} (pre-fix bug: stays at 67.0)"
     )
 
-    # Assertion 3: stale-replica DELETE ran — no rows at the
-    # pre-credit value captured at-or-after the pre-committed
-    # effective_iso.
+    # Assertion 3: the stale-replica DELETE ran, scoped to the tick's OWN
+    # effective instant rather than to the hour that instant falls in. The
+    # replay seeded ahead of the clock is inside that range and is removed;
+    # the 2026-05-14 pre-credit seed is far outside it and survives, which is
+    # what #750 S3 §1.4 changed — under the hour floor a reading captured
+    # earlier in the same hour was pulled into the range too.
+    #
+    # The assertion names the seeded row's OWN id. Counting rows through the
+    # DELETE's own predicate cannot detect a miss: a replica that falls outside
+    # the DELETE's window is outside the counting window too, so the count is
+    # zero whether or not the DELETE worked. The pinned capture is what puts
+    # the replica inside the window; it does not make the assertion itself
+    # discriminating, which is why the assertion names the id.
     conn = ns["open_db"]()
     try:
         stale_count = conn.execute(
-            "SELECT COUNT(*) AS c FROM weekly_usage_snapshots "
-            "WHERE week_start_date = ? "
-            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
-            "  AND round(weekly_percent, 1) = 67.0",
-            (week_start_date, precommitted_iso),
+            "SELECT COUNT(*) AS c FROM weekly_usage_snapshots WHERE id = ?",
+            (stale_replica_id,),
         ).fetchone()["c"]
         assert stale_count == 0, (
             "stale-replica DELETE pivot must run on recovery tick"
         )
-        # Original pre-credit seed (well before effective_iso)
-        # survives.
+        # Original pre-credit seed (well before effective_iso) survives.
         original = conn.execute(
             "SELECT COUNT(*) AS c FROM weekly_usage_snapshots "
             "WHERE captured_at_utc = '2026-05-14T10:00:00Z'"
@@ -3938,42 +4246,48 @@ def test_weekly_pivots_run_when_event_row_already_committed(ns, tmp_path):
         conn.close()
 
 
-# ── Issue #128: reset-to-zero debounce marker helpers ────────────────────
+# ── Issue #128 / #750 S3: reset-to-zero debounce state helpers ────────────
 
 
-def test_reset_zero_marker_roundtrip_and_failsoft(ns):
-    """The marker helpers round-trip a 4-field line and fail soft (return
-    None) on every malformed shape, so a garbled marker re-arms cleanly
-    instead of wedging the confirm path. APP_DIR is redirected to tmp by
-    the `ns` fixture, so the marker lands in the scratch dir."""
+def test_reset_debounce_state_roundtrip_and_failsoft(ns):
+    """The state helpers round-trip a row and fail soft (return None) when the
+    table cannot be read, so a store that predates epoch 1013 re-arms cleanly
+    instead of crashing the recording tick over its own bookkeeping.
+
+    The pre-#750 form of this test round-tripped a four-field line in
+    `APP_DIR/pending-reset-zero-7d` and checked four malformed spellings. The
+    file is retired: there is no text to garble, so the surviving fail-soft
+    axis is the table's own absence.
+    """
     import _cctally_record as rec
 
-    marker_path = ns["APP_DIR"] / "pending-reset-zero-7d"
+    conn = ns["open_db"]()
+    try:
+        rec._arm_reset_debounce_state(
+            conn, "unattributed", week_start_date="2026-05-25",
+            week_end_at="2026-06-08T18:00:00+00:00", baseline_pct=14.0,
+            first_zero_at_utc="2026-06-01T18:00:35+00:00",
+            first_zero_observation_id="o:" + "c" * 16)
+        conn.commit()
+        assert rec._read_reset_debounce_state(conn, "unattributed") == (
+            "2026-05-25", "2026-06-08T18:00:00+00:00", 14.0,
+            "2026-06-01T18:00:35+00:00", "o:" + "c" * 16,
+        )
 
-    # Round-trip.
-    rec._arm_reset_zero_marker(
-        "2026-05-25", "2026-06-08T18:00:00+00:00",
-        baseline_pct=14.0, first_zero_iso="2026-06-01T18:00:35+00:00",
-    )
-    assert rec._read_reset_zero_marker() == (
-        "2026-05-25", "2026-06-08T18:00:00+00:00", 14.0,
-        "2026-06-01T18:00:35+00:00",
-    )
+        rec._clear_reset_debounce_state(conn, "unattributed")
+        conn.commit()
+        assert rec._read_reset_debounce_state(conn, "unattributed") is None
 
-    # Clear.
-    rec._clear_reset_zero_marker()
-    assert rec._read_reset_zero_marker() is None
-    assert not marker_path.exists()
+        # Fail-soft: an index with no such table reports "not armed".
+        conn.execute("DROP TABLE weekly_reset_debounce_state")
+        assert rec._read_reset_debounce_state(conn, "unattributed") is None
+    finally:
+        conn.rollback()
+        conn.close()
 
-    # Fail-soft: every malformed shape → None.
-    for bad in (
-        "",                                              # empty
-        "2026-05-25 2026-06-08T18:00:00+00:00 14.0",     # wrong arity (3)
-        "2026-05-25 end notafloat 2026-06-01T18:00:35+00:00",  # bad baseline
-        "2026-05-25 end 14.0 not-a-timestamp",           # bad first_zero_iso
-    ):
-        marker_path.write_text(bad + "\n")
-        assert rec._read_reset_zero_marker() is None, bad
+    # The retired marker file is never read, so one left by an older binary
+    # cannot arm anything.
+    assert not (ns["APP_DIR"] / "pending-reset-zero-7d").exists()
 
 
 # ── #269 M4.4: backfill-rescan process guard ───────────────────────────────

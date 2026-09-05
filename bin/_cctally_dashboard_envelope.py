@@ -40,6 +40,7 @@ from __future__ import annotations
 import bisect
 import datetime as dt
 import importlib.util as _ilu
+import json
 import os
 import sqlite3
 import sys
@@ -383,14 +384,23 @@ def _envelope_rows_weekly(
     # collide on the duplicate (week, threshold) pair. Older clients
     # tolerate longer ids — the id is opaque to them; only the React
     # key uniqueness invariant matters.
+    # The LEFT JOIN resolves the segment number into the instant its cycle
+    # began (#750 S3). ``reset_event_id`` is a ``week_reset_events.id``, whose
+    # AUTOINCREMENT never issues 0, so the pre-credit sentinel matches no row
+    # and the mapper falls back to the week's own start below. The join is on
+    # the id alone: the id IS the identity the milestone recorded, and adding
+    # an account predicate could only turn a legitimately-stamped row into a
+    # silent NULL.
     rows = conn.execute(
         f"""
-        SELECT week_start_date, week_start_at, percent_threshold,
-               captured_at_utc, alerted_at, cumulative_cost_usd,
-               reset_event_id, account_key
-        FROM {descriptor.milestone_table}
-        WHERE alerted_at IS NOT NULL
-        ORDER BY {_CANON_ALERTED_AT} DESC
+        SELECT m.week_start_date, m.week_start_at, m.percent_threshold,
+               m.captured_at_utc, m.alerted_at, m.cumulative_cost_usd,
+               m.reset_event_id, m.account_key,
+               e.effective_reset_at_utc
+        FROM {descriptor.milestone_table} m
+        LEFT JOIN week_reset_events e ON e.id = m.reset_event_id
+        WHERE m.alerted_at IS NOT NULL
+        ORDER BY {_CANON_ALERTED_AT_M} DESC
         LIMIT ?
         """,
         (limit,),
@@ -420,6 +430,20 @@ def _envelope_rows_weekly(
                 # key stays on the wire and the reader degrades to day
                 # granularity instead of inventing a clock reading.
                 "week_start_at":       r["week_start_at"] or "",
+                # The start instant of the BILLING CYCLE this crossing
+                # belongs to (#750 S3). A credit ends one cycle and begins
+                # another without moving either week boundary, so a week
+                # credited twice publishes three rows carrying one
+                # `week_start_date` and the week alone identifies none of
+                # them. Segment 0 has no reset event and its cycle begins
+                # with the week. Empty string when the row retains neither
+                # instant, mirroring `week_start_at` above. This is a
+                # SEPARATE field on purpose: `week_start_at` is what both
+                # scope kernels add seven days to, and the week's end does
+                # not move when a cycle inside it does.
+                "cycle_start_at":      (
+                    r["effective_reset_at_utc"] or r["week_start_at"] or ""
+                ),
                 "cumulative_cost_usd": cumulative,
                 "dollars_per_percent": dpp,
                 # Round-3: parallel to the 5h context block below — both
@@ -850,22 +874,53 @@ def _build_meter_rate_change_array(
     SCOPE (the account, decorated under R8 exactly as the alert rows are).
     """
     account_fields = _alert_account_resolver(conn)
+    # #747: the stored `severity` column is unconstrained, so an older writer,
+    # a hand-repaired row or a future kernel can put a token here that no
+    # `RateChangeSeverity` border rule matches; such a row renders on the base
+    # amber border with nothing reporting it. Clamp to `info` through the
+    # kernel's own tuple — the same rule `_cctally_alerts._dispatch_alert_
+    # notification` already applies on the notifier path, applied at the second
+    # site rather than written out a third time.
+    #
+    # Clamped, not asserted: an assertion in the envelope builder would let one
+    # malformed stored row break the entire payload, which is a worse outcome
+    # than rendering that row at `info`.
+    #
+    # An unresolvable kernel degrades to NO clamp, which is the behaviour that
+    # shipped before this change. Degrading to an empty vocabulary instead
+    # would send every row — including every correct one — to `info`.
+    try:
+        _severities = frozenset(
+            sys.modules["cctally"]._load_sibling(
+                "_lib_meter_rate_change").RATE_CHANGE_SEVERITIES)
+    except Exception:                                  # noqa: BLE001
+        _severities = None
     try:
         rows = conn.execute(
             "SELECT provider, account_key, effective_from,"
             "       previous_units_per_point, new_units_per_point, severity,"
-            "       detected_at_utc, created_at_utc"
+            "       detected_at_utc, created_at_utc,"
+            "       withholding_status, detector_input_causes,"
+            "       composition_provenance, baseline_withheld_days"
             "  FROM meter_rate_change_events"
             " ORDER BY unixepoch(effective_from) DESC, id DESC"
             " LIMIT ?", (int(limit),)).fetchall()
     except sqlite3.Error:
-        # A store predating epoch 1011 has no such table, and the rebuild
-        # that creates it is deferred to a background worker. An empty array
-        # renders as "no change recorded", which is the truth on that store.
+        # A store predating epoch 1012 does not have the shape this SELECT
+        # asks for: below 1011 there is no `meter_rate_change_events` table at
+        # all, and at 1011 the table exists but the four #690 disclosure
+        # columns do not. Both raise `sqlite3.Error` and both are answered the
+        # same way, because the rebuild that supplies either is deferred to a
+        # background worker. An empty array renders as "no change recorded",
+        # which is the truth on that store, rather than emptying the envelope.
         return []
     out: list[dict] = []
     for (provider, account_key, effective_from, previous, new, severity,
-         detected_at, created_at) in rows:
+         detected_at, created_at, status, causes, provenance,
+         baseline_days) in rows:
+        severity_token = str(severity or "info")
+        if _severities is not None and severity_token not in _severities:
+            severity_token = "info"
         entry = {
             # Opaque React key. It is never parsed — the same contract the
             # alert `id` carries.
@@ -873,17 +928,53 @@ def _build_meter_rate_change_array(
             "family": "meter_rate_change",
             "provider": str(provider),
             "owner": str(provider),
-            "severity": str(severity or "info"),
+            "severity": severity_token,
             "effective_from": str(effective_from),
             "detected_at": str(detected_at or created_at or ""),
             "recorded_at": str(created_at or ""),
             "previous_units_per_point": (
                 None if previous is None else float(previous)),
             "new_units_per_point": None if new is None else float(new),
+            # #690: the disclosure evidence, published ALWAYS and nulled
+            # rather than dropped. `null`, `[]` and `0` are three distinct
+            # states the client must be able to tell apart: null means legacy
+            # or unrecoverable evidence, `[]` means assessed with no such
+            # origin, and 0 means a clean baseline. The two array columns are
+            # decoded from their canonical JSON rather than forwarded as
+            # strings, so the client receives typed arrays; a column that
+            # will not decode degrades to null, which is the honest "cannot
+            # be read" answer and never an empty measurement.
+            "withholding_status": (
+                None if status is None else str(status)),
+            "detector_input_causes": _decode_evidence_array(causes),
+            "composition_provenance": _decode_evidence_array(provenance),
+            "baseline_withheld_days": (
+                None if baseline_days is None else int(baseline_days)),
         }
         entry.update(account_fields(str(provider), account_key))
         out.append(entry)
     return out
+
+
+def _decode_evidence_array(value) -> "list | None":
+    """One stored evidence column as a typed list, or None (#690).
+
+    The column holds a canonical JSON array of enum VALUES. Decoding here
+    rather than forwarding the string keeps the wire contract typed and keeps
+    the null-versus-empty distinction intact on the client: `null` and `[]`
+    are different answers and a string `"[]"` would be neither.
+
+    Anything that will not decode to a list degrades to None. That is the
+    honest "cannot be read" answer; returning `[]` would publish an empty
+    MEASUREMENT — assessed, no such origin — for a column nobody could read.
+    """
+    if value is None:
+        return None
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    return decoded if isinstance(decoded, list) else None
 
 
 def _build_alerts_envelope_array(

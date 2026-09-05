@@ -12,6 +12,50 @@ trap 'rm -rf "$SCRATCH"' EXIT
 export TZ=Etc/UTC
 export GOLDEN_DIFF_TMPDIR="$SCRATCH"
 
+# #711. The privacy leg used to run `if rg …`. The runners do not carry `rg`,
+# so the missing binary produced a non-zero status, the `if` read that as "no
+# leak found", and the leg reported success without ever scanning an artifact.
+#
+# Availability is settled by USE rather than by `command -v`, which answers the
+# wrong question: a binary that is present can still be broken, wrapped, or a
+# different program under the same name. The scanner is self-tested here,
+# BEFORE any fixture is built, against a scratch file it must match and must
+# not match.
+#
+# All six canaries translate exactly to fixed-string `grep`: none contains a
+# newline, a NUL, regex syntax needing interpretation, or a leading dash.
+# Quoted, because a bare word here reads as an attempt to capture the output
+# of `grep` rather than to name it (SC2209).
+SCANNER="grep"
+
+_scanner_self_test() {
+    local probe="$SCRATCH/scanner-self-test.txt" rc
+    printf 'cctally-scanner-probe\n' > "$probe" || return 1
+    LC_ALL=C "$SCANNER" -n -F -- "cctally-scanner-probe" "$probe" >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 0 ] || return 1
+    LC_ALL=C "$SCANNER" -n -F -- "a-token-this-probe-does-not-carry" "$probe" \
+        >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 1 ] || return 1
+    return 0
+}
+
+if ! _scanner_self_test; then
+    echo "FAIL source-aware: the privacy scanner ($SCANNER) is unavailable or does not behave as expected (a match must exit 0 and a clean non-match must exit 1); refusing to report a clean scan it cannot perform"
+    echo "----"
+    echo "passed: 0   failed: 1"
+    exit 1
+fi
+
+# 0 = a leak was found, 1 = clean, ANY OTHER STATUS = the scanner failed. That
+# third arm is the fix: it is the branch the old `if` collapsed into "clean".
+# Binary matches are deliberately not suppressed — a canary inside a binary
+# artifact is still a leak.
+_scan_for_canary() {   # $1 = canary
+    LC_ALL=C "$SCANNER" -R -n -F -- "$1" "$SCRATCH/artifacts"
+}
+
 if ! python3 "$REPO_ROOT/bin/build-source-aware-fixtures.py" --out "$SCRATCH/artifacts"; then
     echo "FAIL source-aware: fixture builder exited non-zero"
     echo "----"
@@ -53,16 +97,36 @@ if [[ "$actual_count" != "$expected_count" ]]; then
     fail_count=$((fail_count + 1))
 fi
 
+# A scanner can fail with a status and no message at all, and an unconditional
+# `printf '%s\n'` then follows the refusal with a bare blank line that reads as
+# a truncated report.
+_print_scan_output() {
+    [ -n "${1:-}" ] || return 0
+    printf '%s\n' "$1"
+}
+
 canaries=()
 while IFS= read -r canary; do
     canaries+=("$canary")
 done < <(python3 "$REPO_ROOT/bin/build-source-aware-fixtures.py" --canaries)
 for canary in "${canaries[@]}"; do
-    if rg -n -F -- "$canary" "$SCRATCH/artifacts" >/dev/null; then
-        echo "FAIL source-aware: privacy canary found in generated artifact: $canary"
-        rg -n -F -- "$canary" "$SCRATCH/artifacts"
-        fail_count=$((fail_count + 1))
-    fi
+    scan_output=$(_scan_for_canary "$canary" 2>&1)
+    scan_rc=$?
+    case "$scan_rc" in
+        0)
+            echo "FAIL source-aware: privacy canary found in generated artifact: $canary"
+            _print_scan_output "$scan_output"
+            fail_count=$((fail_count + 1))
+            ;;
+        1)
+            : # clean
+            ;;
+        *)
+            echo "FAIL source-aware: the privacy scanner exited $scan_rc while scanning for $canary; a scan that did not complete is not a clean result"
+            _print_scan_output "$scan_output"
+            fail_count=$((fail_count + 1))
+            ;;
+    esac
 done
 
 echo "----"

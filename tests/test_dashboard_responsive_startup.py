@@ -27,7 +27,8 @@ import types
 
 import pytest
 
-from conftest import load_script, redirect_paths  # type: ignore
+from conftest import (  # type: ignore
+    copy_shared_corpus, load_script, redirect_paths)
 
 from tests._support_http import (
     PRESENCE_BACKSTOP_SECONDS, shorten_sse_keepalive,
@@ -412,10 +413,11 @@ def _load_with_corpus(monkeypatch, tmp_path, small_corpus):
     keeps the shared session-scoped corpus clean — the dashboard writes WAL and
     ingest state into whatever data dir it is given.
     """
-    src_root = pathlib.Path(small_corpus).parent
+    #741: the copy goes through `conftest.copy_shared_corpus`, the ONE copier.
+    # It resolves the source root, excludes the SQLite sidecars, and holds the
+    # scale's build lock SHARED for the whole walk, so no copy races a rebuild.
     root = tmp_path / "corpus"
-    shutil.copytree(src_root, root,
-                    ignore=shutil.ignore_patterns("*.db-shm", "*.db-wal"))
+    copy_shared_corpus(small_corpus, root)
     for lock in (root / "data").glob("*.lock"):
         try:
             lock.unlink()

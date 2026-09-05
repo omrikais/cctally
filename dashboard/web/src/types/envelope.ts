@@ -292,6 +292,18 @@ export type AlertAxis =
 // `context` so the metric-aware renderer can read either.
 export type ProjectedMetric = 'weekly_pct' | 'budget_usd' | 'codex_budget_usd';
 
+// #693 D6 — two severity vocabularies, held as VALUES so the type cannot
+// gain a member the runtime cannot enumerate. The threshold family bands a
+// numeric percentage; the metering-rate family states its severity outright.
+// They are separate on purpose (see `MeterRateChangeEntry.severity`), and
+// every declaration site below derives from these tuples rather than
+// restating the literals, so a coverage test that walks the array is walking
+// the union itself.
+export const THRESHOLD_SEVERITIES = ['info', 'warn', 'critical'] as const;
+export type ThresholdSeverity = (typeof THRESHOLD_SEVERITIES)[number];
+export const RATE_CHANGE_SEVERITIES = ['info', 'warn', 'alarm'] as const;
+export type RateChangeSeverity = (typeof RATE_CHANGE_SEVERITIES)[number];
+
 export interface AlertEntry {
   id: string;                    // "axis:window_key:…:threshold" — budget/
                                  // codex_budget/projected carry a "period"
@@ -306,7 +318,7 @@ export interface AlertEntry {
   // `threshold` when absent, and normalizes the legacy `amber`/`red` tokens
   // a pre-Phase-B backend might still emit. See lib/alertAxis.ts
   // `alertSeverity`.
-  severity?: 'info' | 'warn' | 'critical';
+  severity?: ThresholdSeverity;
   // #345 / R8: present only when this provider has >1 real account.
   accountKey?: string;
   accountLabel?: string;
@@ -380,7 +392,7 @@ export interface MeterRateChangeEntry {
   owner: string;
   // EXPLICIT, never derived from a threshold: `info` when the rate became
   // more generous, `warn` on a drop, `alarm` on a drop of a quarter or more.
-  severity: 'info' | 'warn' | 'alarm';
+  severity: RateChangeSeverity;
   // The instant the new rate took effect, and when cctally observed it.
   effective_from: string;
   detected_at: string;
@@ -389,6 +401,61 @@ export interface MeterRateChangeEntry {
   // is a more generous rate — more work before the meter moves one point.
   previous_units_per_point: number | null;
   new_units_per_point: number | null;
+  // #690 — the disclosure evidence captured when the transition was
+  // DETECTED, so the surface can name the withheld calibration instead of
+  // implying a fitted budget that may not exist.
+  //
+  // `null`, `[]` and `0` are THREE distinct states and none of them may be
+  // collapsed into another. `[]` means the evidence WAS assessed and no such
+  // origin was found. `0` on the day count means a clean baseline, not an
+  // unknown one.
+  //
+  // What `null` means depends on which field carries it, and the two cases
+  // must not be conflated. On `detector_input_causes`,
+  // `composition_provenance` and `baseline_withheld_days` it means legacy or
+  // unrecoverable evidence — a row recorded before this shipped, or one
+  // reconstructed by the #689 regime-recovery route, which sees stored
+  // regimes and no analysis at all and so carries null on all four BY
+  // CONSTRUCTION.
+  //
+  // `withholding_status` is different. The server stamps it only when the
+  // transition was admitted by #688's detection-keyed path, and stamps the
+  // other three whenever the analysis publishes them, so an ORDINARY,
+  // non-withheld transition carries a null status beside three populated
+  // fields. Null there means "this transition was not withheld" at least as
+  // often as it means "no evidence was retained".
+  //
+  // Tell the two apart by the other three fields: all four null is the
+  // legacy or unrecoverable case, and a null status beside populated
+  // evidence is an ordinary transition. A surface that reads a null status
+  // alone as missing evidence renders "no evidence recorded" copy on every
+  // ordinary transition, which spec §4.1 requires to be unchanged.
+  //
+  // Do not default these to `[]` or `0`. A reader that cannot tell "never
+  // measured" from "measured as none" cannot write honest copy, and the
+  // fallback branch that renders generic copy for an unheard-of status code
+  // depends on the distinction.
+  //
+  // OPTIONAL for the same reason `meter_rate_changes` itself is: a dashboard
+  // tab outlives a server restart through `execvp`, so a new client really
+  // does meet an older server, and an older server does not emit these keys
+  // at all. `undefined` therefore means "this server predates the
+  // disclosure" and is a fourth state distinct from `null`. On
+  // `detector_input_causes`, `composition_provenance` and
+  // `baseline_withheld_days` a consumer may treat absent and null alike,
+  // because both mean "no evidence to show". On `withholding_status` it may
+  // NOT: null there also means "this transition was not withheld", so read
+  // it together with the other three exactly as described above. Neither
+  // state may be treated as `[]`. A current server always emits all four.
+  withholding_status?: string | null;
+  // Typed `WithholdingCause` values, as sent by the server.
+  detector_input_causes?: string[] | null;
+  // Typed `CompositionProvenance` values. There are five members, which is
+  // why a status NAME cannot stand in for this.
+  composition_provenance?: string[] | null;
+  // How many baseline days were withheld: a COUNT, so zero, one and many
+  // stay distinguishable.
+  baseline_withheld_days?: number | null;
   // R8: present only when this provider has more than one real account.
   accountKey?: string;
   accountLabel?: string;
@@ -637,7 +704,7 @@ export interface QuotaBasisPresentation {
 export interface QuotaRateChangeState {
   active: boolean;
   effective_from: string | null;
-  severity?: 'info' | 'warn' | 'alarm' | null;
+  severity?: RateChangeSeverity | null;
   previous_units_per_point?: number | null;
   new_units_per_point?: number | null;
   // #688. The successor regime's own calibration status. Declared rather

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "install": {
     "symlinks_present": 0,
     "symlinks_total": 16,
@@ -31,6 +31,8 @@
   "codex_hooks": {
     "roots": [],
     "installed_count": 0,
+    "enabled_count": 0,
+    "all_roots_enabled": null,
     "error_count": 0
   },
   "legacy": {

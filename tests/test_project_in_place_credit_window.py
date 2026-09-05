@@ -49,11 +49,20 @@ def _z(d: dt.datetime) -> str:
 
 
 def _canon(d: dt.datetime) -> str:
-    """The `+00:00` spelling `_backfill_week_reset_events` writes. Seeding the
-    event in this spelling is what lets `UNIQUE(old_week_end_at,
-    new_week_end_at)` recognize the backfill's own attempt as a duplicate —
-    its `already` pre-check compares `account_key = NULL`, which never matches
-    in SQL, so the UNIQUE constraint is the only thing that dedups."""
+    """The `+00:00` spelling `_canonicalize_optional_iso` produces.
+
+    Seeding the event in this spelling is what lets `_backfill_week_reset_events`
+    recognize it. #750 S3 A6 deleted the `already` pre-check this docstring used
+    to name, because it was keyed on `new_week_end_at` plus account and refused a
+    genuine second in-place credit in one week (#732). Its replacement inside the
+    legacy window, `_legacy_reset_row_exists`, still compares `new_week_end_at`
+    against the canonicalized week end as a string, so a `Z`-spelled seed does
+    not match and the backfill mints a second in-place row beside this one. Two
+    earlier claims here were also wrong and stay corrected: the comparison binds
+    the scanned row's own account (#341), not `account_key = NULL`, and the
+    table-level UNIQUE once named here was retired by epoch 1013 in favour of two
+    partial indexes.
+    """
     return d.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
 
 

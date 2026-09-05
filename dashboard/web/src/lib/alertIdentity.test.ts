@@ -1,6 +1,7 @@
 // #294 S5 Task 7 — source-aware alert identity + presentation adapters (§6.7).
 import { describe, expect, it } from 'vitest';
 import {
+  alertAccount,
   alertDisplay,
   collectToastAlertRows,
   filterAlertRowsForFocus,
@@ -18,7 +19,11 @@ import {
   makeSourceEnvelope,
   type SourceEnvelopeSlice,
 } from '../test-utils/sourceEnvelope';
-import type { Envelope, SourceAlertRow } from '../types/envelope';
+import type {
+  Envelope,
+  MeterRateChangeEntry,
+  SourceAlertRow,
+} from '../types/envelope';
 
 const claudeRow: SourceAlertRow = {
   source: 'claude',
@@ -354,5 +359,86 @@ describe('#556 S5 — filterAlertRowsForFocus', () => {
 
   it('an unfocused pair returns the input untouched', () => {
     expect(filterAlertRowsForFocus(union, { claude: null, codex: null })).toBe(union);
+  });
+});
+
+// #700 — `alertAccount` is the ONE account accessor the toast and the modal
+// share, so the toast cannot disagree with the modal about a label or about
+// the vendor-wide sentinel. Its fallbacks need direct cases: the Python
+// builder's `_alert_account_resolver` always attaches `accountKey` and
+// `accountLabel` TOGETHER, so no fixture derived from real envelope output
+// reaches the snake-case field, the label-less key or the `*` rendering.
+describe('alertAccount — the shared account accessor (#700)', () => {
+  const base = {
+    source: 'claude' as const,
+    key: 'alert:claude:0:weekly:90',
+    id: 'weekly:2026-08-31:90:0',
+    axis: 'weekly' as const,
+    threshold: 90,
+    crossed_at: '2026-09-02T12:00:00Z',
+    alerted_at: '2026-09-02T12:00:00Z',
+    context: {},
+  };
+
+  it('reads the camelCase key and label the envelope builder emits', () => {
+    expect(alertAccount({
+      ...base, accountKey: 'acct-work', accountLabel: 'work-account',
+    } as SourceAlertRow)).toEqual({ key: 'acct-work', label: 'work-account' });
+  });
+
+  it('accepts the snake-case account_key a Codex row may carry', () => {
+    expect(alertAccount({
+      ...base, source: 'codex', axis: 'quota', severity: 'warn',
+      created_at: '2026-09-02T12:00:00Z', account_key: 'acct-codex',
+      accountLabel: 'codex-account',
+    } as unknown as SourceAlertRow)).toEqual({
+      key: 'acct-codex', label: 'codex-account',
+    });
+  });
+
+  it('falls back to rendering the key when no label came with it', () => {
+    expect(alertAccount({
+      ...base, accountKey: 'acct-unlabelled',
+    } as SourceAlertRow)).toEqual({
+      key: 'acct-unlabelled', label: 'acct-unlabelled',
+    });
+  });
+
+  it('renders the vendor-wide sentinel as All accounts', () => {
+    // `*` means a crossing not attributable to one account. Printing the
+    // literal asterisk would read as a missing value rather than as the fact
+    // it states, and the modal already prints this phrasing.
+    expect(alertAccount({ ...base, accountKey: '*' } as SourceAlertRow)).toEqual({
+      key: '*', label: 'All accounts',
+    });
+  });
+
+  it('returns null when the row carries no account fields at all', () => {
+    // The ordinary undecorated install. The toast head must then render no
+    // chip and no account text, which is what this null drives.
+    expect(alertAccount(base as SourceAlertRow)).toBeNull();
+  });
+
+  it('reads a metering-rate entry too, from the same accessor', () => {
+    // #693/#700 D4: the accessor is WIDENED rather than duplicated, so the
+    // rate-change toast cannot grow its own gate and disagree with the
+    // threshold toasts about the sentinel or the label fallback.
+    const entry: MeterRateChangeEntry = {
+      id: 'meter_rate_change:claude:acct-work:2026-08-25T00:00:00+00:00',
+      family: 'meter_rate_change',
+      provider: 'claude',
+      owner: 'claude',
+      severity: 'alarm',
+      effective_from: '2026-08-25T00:00:00+00:00',
+      detected_at: '2026-08-29T12:00:00+00:00',
+      recorded_at: '2026-08-29T12:00:00+00:00',
+      previous_units_per_point: 2_442_620,
+      new_units_per_point: 1_685_000,
+      accountKey: 'acct-work',
+      accountLabel: 'work-account',
+    };
+    expect(alertAccount(entry)).toEqual({ key: 'acct-work', label: 'work-account' });
+    const { accountKey: _k, accountLabel: _l, ...undecorated } = entry;
+    expect(alertAccount(undecorated)).toBeNull();
   });
 });

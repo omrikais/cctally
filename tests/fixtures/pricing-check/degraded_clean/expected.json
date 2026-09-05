@@ -16,7 +16,7 @@
     "expiredSuppressions": [],
     "litellmSource": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
     "schemaVersion": 1,
-    "snapshotDate": "2026-09-02",
+    "snapshotDate": "2026-09-05",
     "staleSuppressions": [],
     "status": "degraded"
 }

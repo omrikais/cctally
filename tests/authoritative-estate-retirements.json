@@ -652,6 +652,344 @@
       "rows": [
         "vitest::src/panels/WeeklyPanel.test.tsx::<WeeklyPanel /> (#264 S2) > renders the whole-window footer total (all 4 weeks)"
       ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0058",
+      "predecessorDigest": "f219e9eaea8e091275e9b87a59bd4bdac9978ea736809bf006f1631bdfe0ce9c",
+      "profile": "public",
+      "reason": "The two predicates these tests pinned \u2014 is_dashboard_activity_codex_hook_command and is_dashboard_activity_codex_hook_handler in bin/_lib_codex_hooks.py \u2014 had no product-code reader left. #719 rewrote both ingest frontiers to route their Codex trust decision through codex_hook_roots_all_enabled, which is the shared observation kernel, so nothing outside these tests called either predicate. The review gate on #719/#720 found the pair dead; the predicates are deleted and the tests go with them, because a test whose only subject is deleted code pins nothing. The behaviour they described is covered where it now lives: tests/test_codex_hooks_setup.py::test_widened_ownership_predicate_covers_both_managed_forms for the two managed handler forms, and tests/test_codex_hook_state_frontier.py for the frontier trust verdict itself.",
+      "rows": [
+        "tests/test_codex_hooks_setup.py::test_dashboard_activity_trust_accepts_both_installed_entrypoint_names[/opt/lib/node_modules/cctally/bin/cctally-npm-shim.js hook-tick --foreground --source codex-True]",
+        "tests/test_codex_hooks_setup.py::test_dashboard_activity_trust_accepts_both_installed_entrypoint_names[/usr/local/bin/cctally hook-tick --foreground --source codex-True]",
+        "tests/test_codex_hooks_setup.py::test_dashboard_activity_trust_accepts_both_installed_entrypoint_names[/usr/local/bin/cctally hook-tick-False]",
+        "tests/test_codex_hooks_setup.py::test_dashboard_activity_trust_accepts_both_installed_entrypoint_names[/usr/local/bin/not-cctally hook-tick --foreground --source codex-False]",
+        "tests/test_codex_hooks_setup.py::test_dashboard_codex_trust_requires_an_executable_handler_shape[handler0-True]",
+        "tests/test_codex_hooks_setup.py::test_dashboard_codex_trust_requires_an_executable_handler_shape[handler1-False]",
+        "tests/test_codex_hooks_setup.py::test_dashboard_codex_trust_requires_an_executable_handler_shape[handler2-False]"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0060",
+      "predecessorDigest": "0bb0cb57bca78273e6320a0a55202214be430fb688f44c555bfb2c5c00f9b5f5",
+      "profile": "public",
+      "reason": "The two predicates these tests pinned \u2014 is_dashboard_activity_codex_hook_command and is_dashboard_activity_codex_hook_handler in bin/_lib_codex_hooks.py \u2014 had no product-code reader left. #719 rewrote both ingest frontiers to route their Codex trust decision through codex_hook_roots_all_enabled, which is the shared observation kernel, so nothing outside these tests called either predicate. The review gate on #719/#720 found the pair dead; the predicates are deleted and the tests go with them, because a test whose only subject is deleted code pins nothing. The behaviour they described is covered where it now lives: tests/test_codex_hooks_setup.py::test_widened_ownership_predicate_covers_both_managed_forms for the two managed handler forms, and tests/test_codex_hook_state_frontier.py for the frontier trust verdict itself. R-0058 and R-0059 already authorized these exact rows against the branch chain. This branch then merged main, whose own record still carries them because they were never removed there, and a declaration binds to the predecessor digest it names \u2014 so the merged tree needs the identical removal declared a second time against main's digest. Nothing is newly removed and no coverage is dropped.",
+      "rows": [
+        "tests/test_codex_hooks_setup.py::test_dashboard_activity_trust_accepts_both_installed_entrypoint_names[/opt/lib/node_modules/cctally/bin/cctally-npm-shim.js hook-tick --foreground --source codex-True]",
+        "tests/test_codex_hooks_setup.py::test_dashboard_activity_trust_accepts_both_installed_entrypoint_names[/usr/local/bin/cctally hook-tick --foreground --source codex-True]",
+        "tests/test_codex_hooks_setup.py::test_dashboard_activity_trust_accepts_both_installed_entrypoint_names[/usr/local/bin/cctally hook-tick-False]",
+        "tests/test_codex_hooks_setup.py::test_dashboard_activity_trust_accepts_both_installed_entrypoint_names[/usr/local/bin/not-cctally hook-tick --foreground --source codex-False]",
+        "tests/test_codex_hooks_setup.py::test_dashboard_codex_trust_requires_an_executable_handler_shape[handler0-True]",
+        "tests/test_codex_hooks_setup.py::test_dashboard_codex_trust_requires_an_executable_handler_shape[handler1-False]",
+        "tests/test_codex_hooks_setup.py::test_dashboard_codex_trust_requires_an_executable_handler_shape[handler2-False]"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0062",
+      "predecessorDigest": "7bb638f234477c1f1a546478f9a0532a23df2c083aa89752a1b1e60236c22046",
+      "profile": "public",
+      "reason": "#750 S1 replaced this case with test_every_declared_pristine_value_is_a_valid_spec in the same module. The successor is a strictly stronger check: this case asserted only that a declared pristine value is a scalar rather than a container, while the successor validates the whole PristineSpec, namely that the kind is one of the four the spec declares, that the spec's arguments are immutable, and that a literal value is still a scalar. Nothing this case covered is now unchecked.",
+      "renames": [
+        {
+          "from": "tests/test_isolation_plugin_globals.py::test_a_declared_pristine_value_is_a_scalar_and_never_a_container",
+          "to": "tests/test_isolation_plugin_globals.py::test_every_declared_pristine_value_is_a_valid_spec"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0063",
+      "predecessorDigest": "7bb638f234477c1f1a546478f9a0532a23df2c083aa89752a1b1e60236c22046",
+      "profile": "public",
+      "reason": "#750 S1 split this single non-vacuity case into two parametrized families in the same module, test_the_dynamic_scan_counts_every_sql_shape with 6 items and test_the_dynamic_scan_counts_no_english with 6 items. The one case had to establish two independent properties of the rewritten scanner: that every SQL shape the census must count is counted, and that the English prose the old scanner miscounted is not. Because no single successor corresponds to it, this is recorded as retired rather than renamed. The twelve successor items cover strictly more than the one row they replace.",
+      "rows": [
+        "tests/test_selector_state_496_s5b.py::test_the_dynamic_scan_is_non_vacuous"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0066",
+      "predecessorDigest": "fdb0605e86aeafb9f390012eb1fa51154ede235f52a36ae4bda78a79113f96fc",
+      "profile": "public",
+      "reason": "#750 S3 renamed three cases and re-parametrized two epoch items; every row has a successor in the same module. `test_dedup_via_pre_check` is now `test_dedup_via_the_echo_guard`: the pre-check it named was keyed on `new_week_end_at` and refused any second event for a week, which is what made a genuine second in-place credit unreachable (#732). Identity moved onto the originating observation and the dedup it pins is now the narrow unestablished-pre-credit echo guard, so the old name asserted a mechanism that no longer exists. `test_reset_zero_marker_roundtrip_and_failsoft` is now `test_reset_debounce_state_roundtrip_and_failsoft`: the filesystem marker it round-tripped is retired in favour of the transactional `weekly_reset_debounce_state` row, so there is no text to garble and the surviving fail-soft axis is the table's own absence. `test_apply_clears_reset_zero_marker` is now `test_apply_clears_reset_debounce_state`, for the same reason. The two `test_live_ingest_acquires_maintenance_before_ingest_lock` items carry the stats epoch in their parameter ids, so bumping `STATS_INDEX_EPOCH` from 1011 to 1012 renamed `[0-1011]` to `[0-1012]` and `[1011-1011]` to `[1012-1012]`. The test itself is unchanged. Coverage is preserved in every case: five rows leave and five equivalent rows arrive.",
+      "rows": [
+        "tests/test_in_place_credit_detection.py::test_dedup_via_pre_check",
+        "tests/test_in_place_credit_detection.py::test_reset_zero_marker_roundtrip_and_failsoft",
+        "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1011]",
+        "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1011-1011]",
+        "tests/test_record_credit.py::test_apply_clears_reset_zero_marker"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0068",
+      "predecessorDigest": "d19db3b1c6c4de561ce4e1f6702e0e0b2165263e6764757a742d8e22b855c0fb",
+      "profile": "public",
+      "reason": "#750 S3's Unit A review withdrew the unestablished pre-credit echo guard, so the module that pinned it is renamed and rewritten. The guard reused an existing event when the predecessor reading exceeded the epoch maximum, but that maximum was computed over a window excluding the predecessor, so the condition held for any monotonically climbing series whose top value was observed exactly once -- an ordinary shape. A week credited at 63, observed climbing back to 63 and genuinely credited again lost its second credit. Deduplication is now exact-origin only, enforced by the epoch-1012 partial unique index, so these nine rows in tests/test_pre_credit_echo_guard.py name a mechanism that no longer exists and the module is tests/test_exact_origin_credit_dedup.py. Their successors: the reuse case becomes test_a5_a_climb_back_to_the_credited_level_is_credited_again pinning the counterexample series; the suppressed residual and the production echo sequence collapse into test_a5_a_stale_pre_credit_high_is_admitted_and_names_the_residual, because under the amended spec both are admitted and the two old cases seeded byte-identical data; the four controls are replaced by test_a5_a_replayed_observation_writes_exactly_one_event, test_a5_two_origins_both_write_on_one_legacy_boundary_tuple, test_a5_one_origin_under_two_accounts_writes_two_events and test_a5_two_origin_null_credits_on_one_tuple_write_one_event, which assert the identity that now decides rather than a series shape -- control D in particular passed for the wrong reason, ending its second climb at 58 against a pre-credit level of 63 so the 1pp band alone admitted it, and it duplicated control B; the account-scoping case becomes the one-origin-two-accounts case; and the pivots case becomes test_a5_the_pivots_run_on_the_credits_own_terms, driving a refused insert through the origin index instead of an echo reuse. One successor claim in the original text was WRONG and is corrected here. test_a5_the_recovery_delete_survives_a_rebuild_from_the_journal was declared to be succeeded by test_a5_a_delete_no_new_event_carries_is_journalled_as_its_own_effect, test_a5_a_winning_insert_emits_no_separate_recovery_event and test_a5_two_credits_in_one_week_survive_a_rebuild_as_two_events, and none of the three discharges it: the first two assert the recovery event's presence and its absence, which an inline DELETE satisfies equally, and the third rebuilds but wins both of its inserts, so it never reaches the refused-insert path. Acceptance criterion 4 was therefore undischarged for one commit. The review of this pass found that, and the following commit restores a case of the same name in tests/test_exact_origin_credit_dedup.py which rebuilds AFTER a refused insert and fails when the DELETE is inline. That successor arrived in a later transition than this declaration covers, so these rows stay retired rather than becoming renames.",
+      "rows": [
+        "tests/test_pre_credit_echo_guard.py::test_a5_a_single_observation_climb_to_the_old_level_is_suppressed",
+        "tests/test_pre_credit_echo_guard.py::test_a5_control_a_previously_observed_high_admits",
+        "tests/test_pre_credit_echo_guard.py::test_a5_control_b_a_different_pre_reset_level_admits",
+        "tests/test_pre_credit_echo_guard.py::test_a5_control_c_no_active_event_admits",
+        "tests/test_pre_credit_echo_guard.py::test_a5_control_d_two_established_climbs_admit",
+        "tests/test_pre_credit_echo_guard.py::test_a5_reuse_still_runs_the_pivots_on_the_reused_events_terms",
+        "tests/test_pre_credit_echo_guard.py::test_a5_the_guard_is_scoped_to_one_account",
+        "tests/test_pre_credit_echo_guard.py::test_a5_the_production_echo_sequence_reuses_the_existing_event",
+        "tests/test_pre_credit_echo_guard.py::test_a5_the_recovery_delete_survives_a_rebuild_from_the_journal"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0070",
+      "predecessorDigest": "d19db3b1c6c4de561ce4e1f6702e0e0b2165263e6764757a742d8e22b855c0fb",
+      "profile": "public",
+      "reason": "The same transition as the retired echo-guard rows, reclassified. tests/test_in_place_credit_detection.py::test_dedup_via_the_echo_guard became test_a_replayed_pre_credit_high_is_admitted_as_its_own_event in the same file, on the same seed, with the opposite assertion: under exact-origin dedup the live path admits the replayed pre-credit high instead of folding it into the existing event. That is a rename with a successor arriving in this transition, which is what cause 'renamed' records, and the original declaration filed it as 'retired' beside nine genuinely retired rows from another module. The text there justified the choice against 'reclassified', which is the mirror-boundary cause, and never considered 'renamed'. Corrected here so the ledger states what happened; the predecessorDigest is unchanged, so this declaration describes the transition already applied and authorizes nothing further.",
+      "renames": [
+        {
+          "from": "tests/test_in_place_credit_detection.py::test_dedup_via_the_echo_guard",
+          "to": "tests/test_in_place_credit_detection.py::test_a_replayed_pre_credit_high_is_admitted_as_its_own_event"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0072",
+      "predecessorDigest": "6422eaec299964c014d04b7efebb77bdb468c0b9636b533b480d48475a4174f5",
+      "profile": "public",
+      "reason": "#750 S3's Unit A review found that two names promise a dedup collision their bodies no longer exercise, and both are renamed in place: same file, same seed, same assertions, new names. Under exact-origin dedup the pre-seeded event in each case names no origin and is governed by the legacy tuple index, while the tick under test writes an origin-bearing row governed by the origin index, so the two identities never meet and no dedup decision is reached. The docstrings already said so; only the names still promised otherwise. test_reset_to_zero_crash_recovery_reruns_pivots becomes test_reset_to_zero_confirm_reruns_pivots_and_clears_the_state, which is what it asserts: the confirming zero re-runs the idempotent pivots and clears the debounce state. test_weekly_pivots_run_when_event_row_already_committed becomes test_weekly_pivots_run_beside_an_earlier_committed_event, because the recovery tick now opens its own event beside the pre-committed one rather than being refused by it; the refused-insert half of that invariant is pinned by tests/test_exact_origin_credit_dedup.py::test_a5_the_pivots_run_on_the_credits_own_terms. Cause 'renamed' rather than 'retired': each successor arrives in this same transition, which is the claim that cause records, and no coverage leaves the estate.",
+      "renames": [
+        {
+          "from": "tests/test_in_place_credit_detection.py::test_reset_to_zero_crash_recovery_reruns_pivots",
+          "to": "tests/test_in_place_credit_detection.py::test_reset_to_zero_confirm_reruns_pivots_and_clears_the_state"
+        },
+        {
+          "from": "tests/test_in_place_credit_detection.py::test_weekly_pivots_run_when_event_row_already_committed",
+          "to": "tests/test_in_place_credit_detection.py::test_weekly_pivots_run_beside_an_earlier_committed_event"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0074",
+      "predecessorDigest": "cdf30b0e8c9a12e2033f48a6aa5b86dd8d40984c708348764c57d53c1bb9e84b",
+      "profile": "public",
+      "reason": "#750 S3's Unit B review found that tests/test_active_segment_selection.py::test_cmd_diff_resolves_the_account_before_it_builds_the_interval asserted a source-text ordering \u2014 body.index(\"resolve_account_filter\") < body.index(\"_diff_resolve_anchor\") \u2014 which passes for a cmd_diff that resolves the account early and then still calls _diff_resolve_anchor with no account_key. That is the whole defect the name promises to guard, so the node is renamed in place to test_cmd_diff_threads_the_resolved_account_into_the_anchor, in the same file, and rewritten to spy on the call and assert the resolved account reaches it. Coverage grows rather than shrinks: the new node fails when the account_key argument is removed from the call, which the retired one did not, and that was verified by re-introducing exactly that defect and observing RED (assert None == 'acct-b').",
+      "renames": [
+        {
+          "from": "tests/test_active_segment_selection.py::test_cmd_diff_resolves_the_account_before_it_builds_the_interval",
+          "to": "tests/test_active_segment_selection.py::test_cmd_diff_threads_the_resolved_account_into_the_anchor"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0076",
+      "predecessorDigest": "760a1cc93074e00da56b1a50b1085c5b25dcb8f01d65ecba5cedb8b5a162b62d",
+      "profile": "public",
+      "reason": "#750 S2 bumped STATS_INDEX_EPOCH from 1011 to 1012 to add the four metering-rate disclosure columns to the stats index. test_live_ingest_acquires_maintenance_before_ingest_lock derives its parametrized ids from that constant, so the same two cases now enumerate as [0-1012] and [1012-1012]. The test body, its assertions and its coverage are unchanged and nothing left the estate; only the ids the parametrization computes moved with the epoch.",
+      "renames": [
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1011]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1012]"
+        },
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1011-1011]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1012-1012]"
+        }
+      ]
+    },
+    {
+      "axis": "frontendTests",
+      "cause": "renamed",
+      "id": "R-0077",
+      "predecessorDigest": "760a1cc93074e00da56b1a50b1085c5b25dcb8f01d65ecba5cedb8b5a162b62d",
+      "profile": "public",
+      "reason": "#750 S2 moved the alert toast's dismiss hint rather than dropping it, so these six cases moved from the '#700 \u2014 the head drops the dismiss hint exactly when it names an account' describe into '#749 \u2014 the dismiss hint moves out of the head instead of vanishing', which changed every id. Coverage did not leave the estate: all six scenarios are still asserted in the same file, and each gained assertions rather than losing any. Three of them \u2014 the decorated Claude threshold, Codex threshold and metering-rate cases \u2014 also had their expectation inverted, from asserting the hint is absent to asserting it renders on its own line below the alert body, because #749 is precisely the defect that the hint vanished exactly when an account label appeared. The three undecorated cases keep their behaviour and gained a position assertion.",
+      "renames": [
+        {
+          "from": "vitest::src/components/toastAccountAttribution.test.tsx::#700 \u2014 the head drops the dismiss hint exactly when it names an account > drops it on a decorated Claude threshold toast",
+          "to": "vitest::src/components/toastAccountAttribution.test.tsx::#749 \u2014 the dismiss hint moves out of the head instead of vanishing > renders it on its own line on a decorated Claude threshold toast"
+        },
+        {
+          "from": "vitest::src/components/toastAccountAttribution.test.tsx::#700 \u2014 the head drops the dismiss hint exactly when it names an account > drops it on a decorated Codex threshold toast",
+          "to": "vitest::src/components/toastAccountAttribution.test.tsx::#749 \u2014 the dismiss hint moves out of the head instead of vanishing > renders it on its own line on a decorated Codex threshold toast"
+        },
+        {
+          "from": "vitest::src/components/toastAccountAttribution.test.tsx::#700 \u2014 the head drops the dismiss hint exactly when it names an account > drops it on a decorated metering-rate toast",
+          "to": "vitest::src/components/toastAccountAttribution.test.tsx::#749 \u2014 the dismiss hint moves out of the head instead of vanishing > renders it on its own line on a decorated metering-rate toast"
+        },
+        {
+          "from": "vitest::src/components/toastAccountAttribution.test.tsx::#700 \u2014 the head drops the dismiss hint exactly when it names an account > keeps it on an undecorated Claude threshold toast",
+          "to": "vitest::src/components/toastAccountAttribution.test.tsx::#749 \u2014 the dismiss hint moves out of the head instead of vanishing > keeps it on an undecorated Claude threshold toast"
+        },
+        {
+          "from": "vitest::src/components/toastAccountAttribution.test.tsx::#700 \u2014 the head drops the dismiss hint exactly when it names an account > keeps it on an undecorated Codex threshold toast",
+          "to": "vitest::src/components/toastAccountAttribution.test.tsx::#749 \u2014 the dismiss hint moves out of the head instead of vanishing > keeps it on an undecorated Codex threshold toast"
+        },
+        {
+          "from": "vitest::src/components/toastAccountAttribution.test.tsx::#700 \u2014 the head drops the dismiss hint exactly when it names an account > keeps it on an undecorated metering-rate toast",
+          "to": "vitest::src/components/toastAccountAttribution.test.tsx::#749 \u2014 the dismiss hint moves out of the head instead of vanishing > keeps it on an undecorated metering-rate toast"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0080",
+      "predecessorDigest": "9d63fd003d06a1fece66a9dd430ad9cdc67e09a8afacaed7c723f975ad1b0082",
+      "profile": "public",
+      "reason": "Merging origin/main into #750 S3 re-based every one of this branch's renames onto main's recorded estate, so the transitions S3 already declared against its own intermediate artifacts have to be declared once more against this predecessor. Every row here has a successor arriving in the same transition and in the same module, so nothing left the estate. `test_dedup_via_pre_check` is `test_a_replayed_pre_credit_high_is_admitted_as_its_own_event`: the pre-check it named refused any second event sharing a `new_week_end_at`, which made a genuine second in-place credit unreachable (#732); identity moved onto the originating observation and the replayed pre-credit high is now admitted as its own event. `test_reset_to_zero_crash_recovery_reruns_pivots` is `test_reset_to_zero_confirm_reruns_pivots_and_clears_the_state` and `test_weekly_pivots_run_when_event_row_already_committed` is `test_weekly_pivots_run_beside_an_earlier_committed_event`: same file, same seed, same assertions, names that no longer promise a dedup collision the bodies do not exercise. `test_reset_zero_marker_roundtrip_and_failsoft` is `test_reset_debounce_state_roundtrip_and_failsoft` and `test_apply_clears_reset_zero_marker` is `test_apply_clears_reset_debounce_state`, because the filesystem reset-to-zero marker is retired in favour of the transactional `weekly_reset_debounce_state` row. The two `test_live_ingest_acquires_maintenance_before_ingest_lock` items carry the stats epoch in their parameter ids. #750 S2 landed on main first and owns epoch 1012, so this branch renumbers to 1013 and the same two cases enumerate as [0-1013] and [1013-1013]. The test body and its assertions are untouched.",
+      "renames": [
+        {
+          "from": "tests/test_in_place_credit_detection.py::test_dedup_via_pre_check",
+          "to": "tests/test_in_place_credit_detection.py::test_a_replayed_pre_credit_high_is_admitted_as_its_own_event"
+        },
+        {
+          "from": "tests/test_in_place_credit_detection.py::test_reset_to_zero_crash_recovery_reruns_pivots",
+          "to": "tests/test_in_place_credit_detection.py::test_reset_to_zero_confirm_reruns_pivots_and_clears_the_state"
+        },
+        {
+          "from": "tests/test_in_place_credit_detection.py::test_reset_zero_marker_roundtrip_and_failsoft",
+          "to": "tests/test_in_place_credit_detection.py::test_reset_debounce_state_roundtrip_and_failsoft"
+        },
+        {
+          "from": "tests/test_in_place_credit_detection.py::test_weekly_pivots_run_when_event_row_already_committed",
+          "to": "tests/test_in_place_credit_detection.py::test_weekly_pivots_run_beside_an_earlier_committed_event"
+        },
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1012]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1013]"
+        },
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1012-1012]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1013-1013]"
+        },
+        {
+          "from": "tests/test_record_credit.py::test_apply_clears_reset_zero_marker",
+          "to": "tests/test_record_credit.py::test_apply_clears_reset_debounce_state"
+        }
+      ]
+    },
+    {
+      "axis": "frontendTests",
+      "cause": "renamed",
+      "id": "R-0084",
+      "predecessorDigest": "65f6b0519acacbb567f30198b7e4d7126e2e940cdaf306f9d3ba1b1daf588880",
+      "profile": "public",
+      "reason": "Against this branch's own recorded estate, the merge with origin/main moves eighteen identifiers and retires none. #750 S2 landed on main first and owns stats epoch 1012, so this branch renumbers to 1013, and every identifier that carries the epoch moves with it: `tests/test_epoch_1012_reset_origin.py` is `tests/test_epoch_1013_reset_origin.py` with all nine cases unchanged in name and body, `test_create_stats_db_week_reset_events_matches_epoch_1012` is `..._1013`, and `test_live_ingest_acquires_maintenance_before_ingest_lock` derives its parameter ids from `STATS_INDEX_EPOCH`, so its two cases enumerate as [0-1013] and [1013-1013]. The six `toastAccountAttribution` identifiers are main's, not this branch's: #750 S2 moved the alert toast's dismiss hint out of the head instead of dropping it, so those cases moved from the '#700 - the head drops the dismiss hint exactly when it names an account' describe into '#749 - the dismiss hint moves out of the head instead of vanishing'. They read as removals only because this branch's artifact predates that change; the same transition is already declared against main's own predecessor. Coverage leaves the estate in no case: every row here has a successor arriving in this transition, in the same file, with the same body.",
+      "renames": [
+        {
+          "from": "vitest::src/components/toastAccountAttribution.test.tsx::#700 \u2014 the head drops the dismiss hint exactly when it names an account > drops it on a decorated Claude threshold toast",
+          "to": "vitest::src/components/toastAccountAttribution.test.tsx::#749 \u2014 the dismiss hint moves out of the head instead of vanishing > renders it on its own line on a decorated Claude threshold toast"
+        },
+        {
+          "from": "vitest::src/components/toastAccountAttribution.test.tsx::#700 \u2014 the head drops the dismiss hint exactly when it names an account > drops it on a decorated Codex threshold toast",
+          "to": "vitest::src/components/toastAccountAttribution.test.tsx::#749 \u2014 the dismiss hint moves out of the head instead of vanishing > renders it on its own line on a decorated Codex threshold toast"
+        },
+        {
+          "from": "vitest::src/components/toastAccountAttribution.test.tsx::#700 \u2014 the head drops the dismiss hint exactly when it names an account > drops it on a decorated metering-rate toast",
+          "to": "vitest::src/components/toastAccountAttribution.test.tsx::#749 \u2014 the dismiss hint moves out of the head instead of vanishing > renders it on its own line on a decorated metering-rate toast"
+        },
+        {
+          "from": "vitest::src/components/toastAccountAttribution.test.tsx::#700 \u2014 the head drops the dismiss hint exactly when it names an account > keeps it on an undecorated Claude threshold toast",
+          "to": "vitest::src/components/toastAccountAttribution.test.tsx::#749 \u2014 the dismiss hint moves out of the head instead of vanishing > keeps it on an undecorated Claude threshold toast"
+        },
+        {
+          "from": "vitest::src/components/toastAccountAttribution.test.tsx::#700 \u2014 the head drops the dismiss hint exactly when it names an account > keeps it on an undecorated Codex threshold toast",
+          "to": "vitest::src/components/toastAccountAttribution.test.tsx::#749 \u2014 the dismiss hint moves out of the head instead of vanishing > keeps it on an undecorated Codex threshold toast"
+        },
+        {
+          "from": "vitest::src/components/toastAccountAttribution.test.tsx::#700 \u2014 the head drops the dismiss hint exactly when it names an account > keeps it on an undecorated metering-rate toast",
+          "to": "vitest::src/components/toastAccountAttribution.test.tsx::#749 \u2014 the dismiss hint moves out of the head instead of vanishing > keeps it on an undecorated metering-rate toast"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0082",
+      "predecessorDigest": "65f6b0519acacbb567f30198b7e4d7126e2e940cdaf306f9d3ba1b1daf588880",
+      "profile": "public",
+      "reason": "Against this branch's own recorded estate, the merge with origin/main moves eighteen identifiers and retires none. #750 S2 landed on main first and owns stats epoch 1012, so this branch renumbers to 1013, and every identifier that carries the epoch moves with it: `tests/test_epoch_1012_reset_origin.py` is `tests/test_epoch_1013_reset_origin.py` with all nine cases unchanged in name and body, `test_create_stats_db_week_reset_events_matches_epoch_1012` is `..._1013`, and `test_live_ingest_acquires_maintenance_before_ingest_lock` derives its parameter ids from `STATS_INDEX_EPOCH`, so its two cases enumerate as [0-1013] and [1013-1013]. The six `toastAccountAttribution` identifiers are main's, not this branch's: #750 S2 moved the alert toast's dismiss hint out of the head instead of dropping it, so those cases moved from the '#700 - the head drops the dismiss hint exactly when it names an account' describe into '#749 - the dismiss hint moves out of the head instead of vanishing'. They read as removals only because this branch's artifact predates that change; the same transition is already declared against main's own predecessor. Coverage leaves the estate in no case: every row here has a successor arriving in this transition, in the same file, with the same body.",
+      "renames": [
+        {
+          "from": "tests/test_epoch_1012_reset_origin.py::test_a1_a_fresh_index_carries_both_partial_unique_indexes",
+          "to": "tests/test_epoch_1013_reset_origin.py::test_a1_a_fresh_index_carries_both_partial_unique_indexes"
+        },
+        {
+          "from": "tests/test_epoch_1012_reset_origin.py::test_a1_a_fresh_index_carries_the_debounce_state_table",
+          "to": "tests/test_epoch_1013_reset_origin.py::test_a1_a_fresh_index_carries_the_debounce_state_table"
+        },
+        {
+          "from": "tests/test_epoch_1012_reset_origin.py::test_a1_a_fresh_index_carries_the_origin_column",
+          "to": "tests/test_epoch_1013_reset_origin.py::test_a1_a_fresh_index_carries_the_origin_column"
+        },
+        {
+          "from": "tests/test_epoch_1012_reset_origin.py::test_a1_the_epoch_is_bumped_and_the_legacy_registry_is_untouched",
+          "to": "tests/test_epoch_1013_reset_origin.py::test_a1_the_epoch_is_bumped_and_the_legacy_registry_is_untouched"
+        },
+        {
+          "from": "tests/test_epoch_1012_reset_origin.py::test_a1_the_new_objects_appear_on_an_upgraded_install_via_rebuild",
+          "to": "tests/test_epoch_1013_reset_origin.py::test_a1_the_new_objects_appear_on_an_upgraded_install_via_rebuild"
+        },
+        {
+          "from": "tests/test_epoch_1012_reset_origin.py::test_a1_the_new_objects_are_in_the_rebuild_shape_contract",
+          "to": "tests/test_epoch_1013_reset_origin.py::test_a1_the_new_objects_are_in_the_rebuild_shape_contract"
+        },
+        {
+          "from": "tests/test_epoch_1012_reset_origin.py::test_a1_the_schema_fingerprint_moved_with_the_epoch",
+          "to": "tests/test_epoch_1013_reset_origin.py::test_a1_the_schema_fingerprint_moved_with_the_epoch"
+        },
+        {
+          "from": "tests/test_epoch_1012_reset_origin.py::test_a1_two_distinct_origins_may_share_one_legacy_tuple",
+          "to": "tests/test_epoch_1013_reset_origin.py::test_a1_two_distinct_origins_may_share_one_legacy_tuple"
+        },
+        {
+          "from": "tests/test_epoch_1012_reset_origin.py::test_a1_two_null_origin_rows_still_collide_on_the_legacy_tuple",
+          "to": "tests/test_epoch_1013_reset_origin.py::test_a1_two_null_origin_rows_still_collide_on_the_legacy_tuple"
+        },
+        {
+          "from": "tests/test_fixture_reset_event_identity.py::test_create_stats_db_week_reset_events_matches_epoch_1012",
+          "to": "tests/test_fixture_reset_event_identity.py::test_create_stats_db_week_reset_events_matches_epoch_1013"
+        },
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1012]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1013]"
+        },
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1012-1012]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1013-1013]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0086",
+      "predecessorDigest": "52230f5a69d63205d0fe222f38598c08c9997d97f510de522ae8f501cc2d27e9",
+      "profile": "public",
+      "reason": "#750 S3 retired these seven node ids, and they need a declaration against main's estate because this branch merged main after its own declarations were written, which moved the predecessor digest. Four name mechanisms S3 removed: `test_dedup_via_pre_check` asserted the in-place-credit pre-check that S3 replaced with exact-origin deduplication, and `test_reset_zero_marker_roundtrip_and_failsoft`, `test_apply_clears_reset_zero_marker` and `test_reset_to_zero_crash_recovery_reruns_pivots` asserted the filesystem reset-to-zero marker that S3 replaced with the transactional `weekly_reset_debounce_state` row. `test_weekly_pivots_run_when_event_row_already_committed` was renamed once its pre-seeded event stopped colliding. The two `test_live_ingest_acquires_maintenance_before_ingest_lock` parametrizations are epoch-derived ids that moved from 1012 to 1013 when #750 S2 landed on main and claimed 1012 first. Every behaviour is still covered: by tests/test_exact_origin_credit_dedup.py, tests/test_reset_debounce_state.py, and the same parametrizations at 1013.",
+      "rows": [
+        "tests/test_in_place_credit_detection.py::test_dedup_via_pre_check",
+        "tests/test_in_place_credit_detection.py::test_reset_to_zero_crash_recovery_reruns_pivots",
+        "tests/test_in_place_credit_detection.py::test_reset_zero_marker_roundtrip_and_failsoft",
+        "tests/test_in_place_credit_detection.py::test_weekly_pivots_run_when_event_row_already_committed",
+        "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1012]",
+        "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1012-1012]",
+        "tests/test_record_credit.py::test_apply_clears_reset_zero_marker"
+      ]
     }
   ],
   "schemaVersion": 1

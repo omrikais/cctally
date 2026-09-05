@@ -358,6 +358,18 @@
     "cache_creation_input_token_cost_above_272k_tokens": 3.125e-05,
     "output_cost_per_token_above_272k_tokens": 1.125e-04
   },
+  "gpt-6-astra": {
+    "litellm_provider": "openai",
+    "max_input_tokens": 922000,
+    "input_cost_per_token": 1e-05,
+    "cache_read_input_token_cost": 1e-06,
+    "cache_creation_input_token_cost": 1.25e-05,
+    "output_cost_per_token": 5e-05,
+    "input_cost_per_token_above_272k_tokens": 2e-05,
+    "cache_read_input_token_cost_above_272k_tokens": 2e-06,
+    "cache_creation_input_token_cost_above_272k_tokens": 2.5e-05,
+    "output_cost_per_token_above_272k_tokens": 7.5e-05
+  },
   "gpt-4o": {
     "litellm_provider": "openai",
     "input_cost_per_token": 2.5e-06,

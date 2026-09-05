@@ -5,7 +5,14 @@ import { test, expect } from '@playwright/test';
 // board mode (data-board-mode), the tall-card data-span contract, and no
 // document-level horizontal overflow — the geometry JSDOM cannot evaluate.
 
+// #750 S2 review — 320 is the narrowest width this project designs for and the
+// sweep did not reach it. Note honestly what the case does and does not buy:
+// it guards the document-overflow contract at that width against the golden
+// fixture, and it would NOT have caught the #730 cluster overflow, because that
+// one reproduces only on a store whose Projects panel title is degraded and
+// long, and the e2e runtime serves the fixture.
 const MODE_AT: Array<{ w: number; mode: 'stack' | 'intermediate' | 'bento' }> = [
+  { w: 320, mode: 'stack' },
   { w: 390, mode: 'stack' },
   { w: 899, mode: 'stack' },
   { w: 900, mode: 'intermediate' },

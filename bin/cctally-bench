@@ -25,6 +25,7 @@ phase sub-tree, so the bench and /api/debug/backend speak one phase vocabulary.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.machinery
 import importlib.util
 import json
@@ -87,6 +88,33 @@ def _load_gen():
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod
+
+
+def _build_fixture_announced(gen, *, scale, seed, root, label="bench"):
+    """Build or reuse the corpus, ANNOUNCING a rebuild that replaced a corpus
+    another tree built.
+
+    REBUILD, not refuse (#718): a benchmark must measure stores the CURRENT
+    producer made, and its contract is already reuse-on-match. The announcement
+    is what that policy owes in exchange (#750 S1). This tool's default root is
+    machine-global — `<tmpdir>/cctally-bench/<scale>-seed<seed>` — so a
+    `--compare` or `--gate` run can replace a `large` corpus another checkout
+    built, at 1m49s and 1.2 GiB, and the operator has to be told rather than
+    left to infer it from the wall clock.
+
+    The reading is taken BEFORE the build, because the build rewrites the very
+    marker that says whose corpus was there.
+    """
+    root = pathlib.Path(root)
+    before = gen.read_marker_producer(gen._marker_path(root / "data"))
+    data_dir = gen.build_fixture(
+        scale=scale, seed=seed, root=root, on_mismatch="rebuild")
+    provenance = gen.marker_provenance(gen._marker_path(pathlib.Path(data_dir)))
+    announcement = gen.rebuild_announcement(
+        before, (provenance or {}).get("producer_sha256"))
+    if announcement is not None:
+        print(f"[{label}] corpus: {announcement}", file=sys.stderr)
+    return data_dir
 
 
 def _pin_and_import(data_dir, claude_dir):
@@ -155,6 +183,7 @@ def _capture_phases(name, body, perf, has_own_root):
 
 # ── benchmark registry ───────────────────────────────────────────────────
 
+@contextlib.contextmanager
 def _suspend_frontier_expiry(cctally):
     """Hold ingest certificates open for the length of a measurement run.
 
@@ -164,16 +193,33 @@ def _suspend_frontier_expiry(cctally):
     would silently measure a forced full walk instead.  Suspending it keeps the
     measured quantity the validation cost; the bound's own cost is one walk per
     interval, which the full-walk scenarios already measure separately.
+
+    The scope has to be a context manager, not an assignment.
+    ``_load_sibling`` registers the module in ``sys.modules``, so the object
+    this rebinds is the same object every other importer in the process holds,
+    and an in-process caller leaves ``float("inf")`` standing for the rest of
+    the interpreter unless every exit path — exceptions included — restores it.
     """
     frontier_mod = cctally._load_sibling("_lib_ingest_frontier")
+    previous = frontier_mod.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS
     frontier_mod.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS = float("inf")
-    return frontier_mod
+    try:
+        yield frontier_mod
+    finally:
+        frontier_mod.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS = previous
 
 
-def _make_benchmarks(cctally, perf, now_utc=None):
+def _make_benchmarks(cctally, perf, now_utc=None, *, scope):
     """Build the registry. Returns ``(benchmarks, cleanup)`` where each
     benchmark is ``(name, body, has_own_root, count_of)`` and ``cleanup`` closes
-    the shared read connection."""
+    the shared read connection.
+
+    ``scope`` is the caller's ``contextlib.ExitStack``.  The frontier-expiry
+    suspension must be entered on it rather than here: this function only
+    BUILDS the bodies, and the caller times them afterwards, so a suspension
+    unwound at this return would not cover the measurement it exists for.
+    Entering it on the caller's stack also restores it when this function
+    raises."""
     sc = cctally._load_sibling("_lib_snapshot_cache")
     cr = cctally._load_sibling("_lib_cache_report")
     cq = cctally._load_sibling("_lib_conversation_query")
@@ -236,7 +282,7 @@ def _make_benchmarks(cctally, perf, now_utc=None):
         return _snapshot()              # unchanged signature → reuse (near-zero)
 
     # ── family 2: ingest ──
-    frontier_mod = _suspend_frontier_expiry(cctally)
+    frontier_mod = scope.enter_context(_suspend_frontier_expiry(cctally))
     frontier = frontier_mod.DashboardIngestFrontier(
         cctally._cctally_core.APP_DIR)
     claude_roots = tuple(cctally._cctally_core._resolve_claude_projects_dirs())
@@ -245,9 +291,11 @@ def _make_benchmarks(cctally, perf, now_utc=None):
     )
     claude_guards = (cctally._cctally_core.CLAUDE_SETTINGS_PATH,)
     codex_hooks = cctally._load_sibling("_lib_codex_hooks")
-    codex_guards = tuple(
-        root.hooks_path
-        for root in codex_hooks.codex_hook_roots(cctally._codex_home_roots())
+    # Mirrors the TUI and dashboard guard sets exactly (#719 §2.6a); a
+    # benchmark seeded over a narrower set would measure a certificate the
+    # product never issues.
+    codex_guards = codex_hooks.codex_frontier_guard_paths(
+        codex_hooks.codex_hook_roots(cctally._codex_home_roots())
     )
     seed_conn = cctally.open_cache_db()
     try:
@@ -472,7 +520,8 @@ def run_all(*, scale, seed, iterations, trace, root=None,
     else:
         if root is None:
             raise ValueError("run_all requires root= unless data_dir+claude_dir given")
-        data_dir = gen.build_fixture(scale=scale, seed=seed, root=root)
+        data_dir = _build_fixture_announced(
+            gen, scale=scale, seed=seed, root=root)
         claude_dir = pathlib.Path(root) / "claude"
 
     # #583 S1: the corpus is anchored at a fixed reference epoch, so measuring
@@ -508,32 +557,38 @@ def run_all(*, scale, seed, iterations, trace, root=None,
         # which is the one thing `validate_corpus` structurally cannot check.
         gen.assert_tick_renders_the_codex_cycle(cctally, bench_now)
 
-    benchmarks, cleanup = _make_benchmarks(cctally, perf, bench_now)
     results = {}
-    try:
-        for name, body, has_own_root, count_of in benchmarks:
+    # The suspension of the certificate age bound lives exactly here: it must
+    # cover both the registry build (which seeds the frontier) and every timed
+    # body, and it must be gone before this function returns. #740.
+    with contextlib.ExitStack() as frontier_scope:
+        benchmarks, cleanup = _make_benchmarks(
+            cctally, perf, bench_now, scope=frontier_scope)
+        try:
+            for name, body, has_own_root, count_of in benchmarks:
+                _reset_perf(perf)
+                median, mn, mx, last = time_body(body, iterations)
+                count = None
+                if count_of is not None:
+                    try:
+                        count = count_of(last)
+                    except Exception:
+                        count = None
+                entry = {
+                    "median_ms": round(median, 4),
+                    "min_ms": round(mn, 4),
+                    "max_ms": round(mx, 4),
+                    "count": count,
+                    "bytes": None,
+                    "phases": None,
+                }
+                if trace:
+                    entry["phases"] = _capture_phases(
+                        name, body, perf, has_own_root)
+                results[name] = entry
+        finally:
             _reset_perf(perf)
-            median, mn, mx, last = time_body(body, iterations)
-            count = None
-            if count_of is not None:
-                try:
-                    count = count_of(last)
-                except Exception:
-                    count = None
-            entry = {
-                "median_ms": round(median, 4),
-                "min_ms": round(mn, 4),
-                "max_ms": round(mx, 4),
-                "count": count,
-                "bytes": None,
-                "phases": None,
-            }
-            if trace:
-                entry["phases"] = _capture_phases(name, body, perf, has_own_root)
-            results[name] = entry
-    finally:
-        _reset_perf(perf)
-        cleanup()
+            cleanup()
 
     # AFTER the benchmarks, deliberately. `semantic_hash` reads every row of
     # every table, which warms the OS page cache for exactly the tables
@@ -599,7 +654,9 @@ def run_assembly_scan(*, ladder_scale="small", iterations=DEFAULT_ITERATIONS,
         if root is None:
             raise ValueError("run_assembly_scan requires root= unless "
                              "data_dir+claude_dir given")
-        data_dir = gen.build_fixture(scale=scale, seed=DEFAULT_SEED, root=root)
+        data_dir = _build_fixture_announced(
+            gen, scale=scale, seed=DEFAULT_SEED, root=root,
+            label="assembly-scan")
         claude_dir = pathlib.Path(root) / "claude"
         ladder = (gen.ASSEMBLY_TURN_LADDER if scale == "assembly"
                   else gen.ASSEMBLY_TURN_LADDER_SMALL)
@@ -733,122 +790,126 @@ def run_assembly_scan(*, ladder_scale="small", iterations=DEFAULT_ITERATIONS,
     # Exercise the exact dashboard transcript pass after the ladder reads. The
     # first pass advances/certifies the independent transcript frontier; every
     # timed pass must then be a caught-up O(roots) validation with zero files.
-    _suspend_frontier_expiry(cctally)
-    dashboard = cctally._load_sibling("_cctally_dashboard")
-    first_sync = dashboard._conversation_sync_pass()
-    if first_sync != "ok":
-        raise RuntimeError(
-            f"conversation frontier bootstrap failed: {first_sync}")
-    conversation_sync_caught_up_ms = _time_median(
-        dashboard._conversation_sync_pass, iterations)
-    final_sync = dashboard._conversation_sync_pass()
-    sync_modes = dict(getattr(final_sync, "modes", {}))
-    sync_files = dict(getattr(final_sync, "files", {}))
-    if (final_sync != "ok"
-            or sync_modes != {"claude": "caught_up", "codex": "caught_up"}
-            or sync_files != {"claude": 0, "codex": 0}):
-        raise RuntimeError(
-            "conversation frontier did not stay caught up: "
-            f"status={final_sync} modes={sync_modes} files={sync_files}")
-
-    if append_target is None:
-        raise RuntimeError("assembly corpus has no appendable Claude source")
-    append_sid, append_path, parent_uuid, append_cwd, append_branch = append_target
-    append_path = pathlib.Path(append_path)
-    append_stat = append_path.stat()
-    append_size = append_stat.st_size
-    append_uuid = f"{append_sid}-bench-source-append"
-    append_marker = f"bench-source-append-{append_sid}"
-    append_record = {
-        "type": "user",
-        "uuid": append_uuid,
-        "parentUuid": parent_uuid,
-        "sessionId": append_sid,
-        "timestamp": gen._iso(50_000),
-        "cwd": append_cwd,
-        "gitBranch": append_branch,
-        "message": {"role": "user", "content": append_marker},
-    }
-    append_wall_start = time.perf_counter_ns()
-    append_cpu_start = time.process_time_ns()
-    frontier = cctally._load_sibling("_lib_ingest_frontier")
-    try:
-        with append_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(append_record) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        if not frontier.record_activity(
-            pathlib.Path(data_dir), "claude", str(append_path)
-        ):
-            raise RuntimeError("could not record benchmark Claude activity")
-        append_sync = dashboard._conversation_sync_pass()
-        append_modes = dict(getattr(append_sync, "modes", {}))
-        append_files = dict(getattr(append_sync, "files", {}))
-        if (append_sync != "ok"
-                or append_modes != {"claude": "targeted", "codex": "caught_up"}
-                or append_files != {"claude": 1, "codex": 0}):
+    # Scoped, and restored on every exit path (#740): this rebinds a module
+    # global on the shared `_lib_ingest_frontier` object, so an unrestored
+    # assignment would outlive the run and change what every later importer
+    # in the process reads as the certificate age bound.
+    with _suspend_frontier_expiry(cctally):
+        dashboard = cctally._load_sibling("_cctally_dashboard")
+        first_sync = dashboard._conversation_sync_pass()
+        if first_sync != "ok":
             raise RuntimeError(
-                "source append did not take the targeted transcript path: "
-                f"status={append_sync} modes={append_modes} files={append_files}")
-        visible_conn = cctally.open_conversations_db()
+                f"conversation frontier bootstrap failed: {first_sync}")
+        conversation_sync_caught_up_ms = _time_median(
+            dashboard._conversation_sync_pass, iterations)
+        final_sync = dashboard._conversation_sync_pass()
+        sync_modes = dict(getattr(final_sync, "modes", {}))
+        sync_files = dict(getattr(final_sync, "files", {}))
+        if (final_sync != "ok"
+                or sync_modes != {"claude": "caught_up", "codex": "caught_up"}
+                or sync_files != {"claude": 0, "codex": 0}):
+            raise RuntimeError(
+                "conversation frontier did not stay caught up: "
+                f"status={final_sync} modes={sync_modes} files={sync_files}")
+
+        if append_target is None:
+            raise RuntimeError("assembly corpus has no appendable Claude source")
+        append_sid, append_path, parent_uuid, append_cwd, append_branch = append_target
+        append_path = pathlib.Path(append_path)
+        append_stat = append_path.stat()
+        append_size = append_stat.st_size
+        append_uuid = f"{append_sid}-bench-source-append"
+        append_marker = f"bench-source-append-{append_sid}"
+        append_record = {
+            "type": "user",
+            "uuid": append_uuid,
+            "parentUuid": parent_uuid,
+            "sessionId": append_sid,
+            "timestamp": gen._iso(50_000),
+            "cwd": append_cwd,
+            "gitBranch": append_branch,
+            "message": {"role": "user", "content": append_marker},
+        }
+        append_wall_start = time.perf_counter_ns()
+        append_cpu_start = time.process_time_ns()
+        frontier = cctally._load_sibling("_lib_ingest_frontier")
         try:
-            visible = cq.find_in_conversation(
-                visible_conn, append_sid, append_marker)
-            if visible is None or int(visible.get("total", 0) or 0) != 1:
-                raise RuntimeError("source append was not query-visible")
+            with append_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(append_record) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            if not frontier.record_activity(
+                pathlib.Path(data_dir), "claude", str(append_path)
+            ):
+                raise RuntimeError("could not record benchmark Claude activity")
+            append_sync = dashboard._conversation_sync_pass()
+            append_modes = dict(getattr(append_sync, "modes", {}))
+            append_files = dict(getattr(append_sync, "files", {}))
+            if (append_sync != "ok"
+                    or append_modes != {"claude": "targeted", "codex": "caught_up"}
+                    or append_files != {"claude": 1, "codex": 0}):
+                raise RuntimeError(
+                    "source append did not take the targeted transcript path: "
+                    f"status={append_sync} modes={append_modes} files={append_files}")
+            visible_conn = cctally.open_conversations_db()
+            try:
+                visible = cq.find_in_conversation(
+                    visible_conn, append_sid, append_marker)
+                if visible is None or int(visible.get("total", 0) or 0) != 1:
+                    raise RuntimeError("source append was not query-visible")
+            finally:
+                visible_conn.close()
+            append_visible_ns = time.perf_counter_ns() - append_wall_start
+            append_cpu_ns = time.process_time_ns() - append_cpu_start
         finally:
-            visible_conn.close()
-        append_visible_ns = time.perf_counter_ns() - append_wall_start
-        append_cpu_ns = time.process_time_ns() - append_cpu_start
-    finally:
-        with append_path.open("r+b") as fh:
-            fh.truncate(append_size)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.utime(
-            append_path,
-            ns=(append_stat.st_atime_ns, append_stat.st_mtime_ns),
-        )
-        cleanup_conn = cctally.open_conversations_db()
-        try:
-            cleanup_conn.execute(
-                "DELETE FROM conversation_file_touches WHERE message_id IN "
-                "(SELECT id FROM conversation_messages "
-                "WHERE source_path=? AND uuid=?)",
-                (str(append_path), append_uuid),
+            with append_path.open("r+b") as fh:
+                fh.truncate(append_size)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.utime(
+                append_path,
+                ns=(append_stat.st_atime_ns, append_stat.st_mtime_ns),
             )
-            cleanup_conn.execute(
-                "DELETE FROM conversation_messages WHERE source_path=? AND uuid=?",
-                (str(append_path), append_uuid),
-            )
-            cleanup_conn.execute(
-                "UPDATE conversation_source_files SET size_bytes=?,mtime_ns=?,"
-                "last_byte_offset=? WHERE path=?",
-                (append_size, append_stat.st_mtime_ns, append_size, str(append_path)),
-            )
-            cache_mod = cctally._load_sibling("_cctally_cache")
-            cache_mod._recompute_conversation_sessions(
-                cleanup_conn, {append_sid})
-            cleanup_conn.commit()
-        finally:
-            cleanup_conn.close()
-        cleanup_sync = dashboard._conversation_sync_pass()
-        cleanup_caught_up = dashboard._conversation_sync_pass()
-        if cleanup_sync != "ok" or cleanup_caught_up != "ok":
-            raise RuntimeError("could not restore benchmark append probe")
-        if dict(getattr(cleanup_caught_up, "modes", {})) != {
-            "claude": "caught_up", "codex": "caught_up"
-        }:
-            raise RuntimeError("benchmark append cleanup did not recertify")
-        cq._assemble_memo_clear()
-        restored_conn = cctally.open_conversations_db()
-        try:
-            restored = cq.find_in_conversation(
-                restored_conn, append_sid, append_marker)
-            if restored is not None and int(restored.get("total", 0) or 0):
-                raise RuntimeError("benchmark append cleanup left visible rows")
-        finally:
-            restored_conn.close()
+            cleanup_conn = cctally.open_conversations_db()
+            try:
+                cleanup_conn.execute(
+                    "DELETE FROM conversation_file_touches WHERE message_id IN "
+                    "(SELECT id FROM conversation_messages "
+                    "WHERE source_path=? AND uuid=?)",
+                    (str(append_path), append_uuid),
+                )
+                cleanup_conn.execute(
+                    "DELETE FROM conversation_messages WHERE source_path=? AND uuid=?",
+                    (str(append_path), append_uuid),
+                )
+                cleanup_conn.execute(
+                    "UPDATE conversation_source_files SET size_bytes=?,mtime_ns=?,"
+                    "last_byte_offset=? WHERE path=?",
+                    (append_size, append_stat.st_mtime_ns, append_size, str(append_path)),
+                )
+                cache_mod = cctally._load_sibling("_cctally_cache")
+                cache_mod._recompute_conversation_sessions(
+                    cleanup_conn, {append_sid})
+                cleanup_conn.commit()
+            finally:
+                cleanup_conn.close()
+            cleanup_sync = dashboard._conversation_sync_pass()
+            cleanup_caught_up = dashboard._conversation_sync_pass()
+            if cleanup_sync != "ok" or cleanup_caught_up != "ok":
+                raise RuntimeError("could not restore benchmark append probe")
+            if dict(getattr(cleanup_caught_up, "modes", {})) != {
+                "claude": "caught_up", "codex": "caught_up"
+            }:
+                raise RuntimeError("benchmark append cleanup did not recertify")
+            cq._assemble_memo_clear()
+            restored_conn = cctally.open_conversations_db()
+            try:
+                restored = cq.find_in_conversation(
+                    restored_conn, append_sid, append_marker)
+                if restored is not None and int(restored.get("total", 0) or 0):
+                    raise RuntimeError("benchmark append cleanup left visible rows")
+            finally:
+                restored_conn.close()
     conversation_store = pathlib.Path(data_dir) / "conversations.db"
 
     return {

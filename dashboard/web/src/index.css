@@ -1591,6 +1591,17 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   font-size: var(--fs-meta); color: var(--text-dim);
   margin: 0 0 var(--space-2);
 }
+/* #690 — the disclosure evidence, on its own full-width line under the row it
+   belongs to. It spans every column so the four data columns keep the widths
+   they were sized for, and it wraps rather than truncating: these are typed
+   machine tokens, and half of one identifies nothing. */
+.alerts-rate-change-evidence-row > td { border-top: none; padding-top: 0; }
+.alerts-rate-change-evidence {
+  font-size: var(--fs-meta); color: var(--text-dim);
+  white-space: normal; overflow-wrap: anywhere;
+}
+.alerts-rate-change-evidence-item { display: inline-block; margin-right: var(--space-2); }
+.alerts-rate-change-evidence-label { color: var(--text-faint); }
 .fc-foot-line {
   display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
   font-size: var(--fs-meta);
@@ -1881,8 +1892,14 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
    `All accounts` is the vendor-wide sentinel; severity remains visually
    dominant, so this chip deliberately uses the neutral account vocabulary. */
 .alert-account-chip {
-  display: inline-flex;
-  align-items: center;
+  /* NOT inline-flex. `text-overflow: ellipsis` applies only to a block
+     container, so under inline-flex Chromium clipped the label flush at the
+     border and painted no ellipsis at all; an inline-block clone of the same
+     node at the same width painted one. Verified in a real browser on #700.
+     Inside the toast's flex head this blockifies anyway, and the vertical
+     centring there comes from the head's own `align-items: center`. */
+  display: inline-block;
+  vertical-align: middle;
   max-width: 20ch;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3546,7 +3563,17 @@ mark.current {
   display: flex;
   align-items: center;
   gap: var(--space-1);
+  /* This rule deliberately declares NO `min-width`, so the cluster keeps the
+     initial `auto` and cannot shrink below its own min-content. See the
+     `:has()` rule immediately below for the one case that overrides it. */
 }
+
+/* #730 / #750 S2 — the floor that lets this cluster shrink is NOT here. It is
+   `.panel-header-actions:has(.sessions-ctrls) { min-width: 0 }` inside
+   `@media (max-width: 640px)`, beside the `.sessions-ctrls` floor it needs to
+   do anything, because the two are only useful together. Above that breakpoint
+   the cluster keeps `auto`, which is what this file shipped before #730 and
+   what the measurement below says it must keep. */
 /* ⤢ expand button — the consistent "open this card's detail modal"
    affordance, distinct from Share. Matches the sibling header buttons
    (.share-icon / .panel-collapse-toggle): borderless, muted at rest, full
@@ -4030,7 +4057,22 @@ mark.current {
 
 .daily-foot {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  /* #750 S2 — the foot STACKS rather than clipping its own figures.
+     Diagnosed in a real browser at 320x844 on the dev store, where the peak
+     day read $1843.44: `.daily-foot-col` declares `min-width: 0`, which
+     replaces a grid item's automatic min-content minimum, so `1fr 1fr`
+     resolved to two 117px tracks inside a 258px `.panel-body` even though the
+     peak column's min-content is 158.7px and the total column's is 136.8px.
+     Both columns therefore overflowed — the peak by 42px and the total by
+     20px — and `.panel-body`'s `overflow-x: hidden` clipped them instead of
+     scrolling, so the figures were silently WRONG rather than visibly cut.
+     `span.a` measured x=246.4 to x=330.7, which is 10.7px past a 320px edge.
+     It was not a 320px-only defect: at 360px the peak still overflowed by
+     22px and at 390px by 7px, and only the viewport edge — not the clip —
+     moved. The first width that fits two columns of this data is about 404px.
+     `auto-fit` collapses the surplus track, so a wide panel keeps exactly the
+     two equal tracks it has today (measured 313px each at 1440). */
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 24px;
   margin-top: 18px;
   padding-top: 14px;
@@ -4064,6 +4106,14 @@ mark.current {
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.3px;
   display: flex; align-items: baseline; gap: 8px;
+  /* #750 S2 — the backstop behind the track floor above. The 160px floor is
+     measured against today's figures, and a longer one would clip again at
+     exactly the width where two tracks first fit. A dollar amount has no soft
+     break opportunity, and `.a` cannot shrink below its own min-content, so
+     the peak day's date and amount drop onto separate lines instead. Verified
+     at 420px, where the grid returns to two 167px tracks and this wrap is
+     what keeps the column's overflow at zero. */
+  flex-wrap: wrap;
 }
 .daily-foot-text .val .d {
   color: var(--text);
@@ -4445,19 +4495,63 @@ mark.current {
   cursor: pointer;
   background: linear-gradient(180deg, var(--panel-bg) 0%, var(--panel-bg-2) 100%);
 }
-/* 3-tier severity (Phase B): info <90 (calm indigo) / warn 90-99 (amber,
-   = the old amber styling) / critical >=100 (red, = the old red styling).
-   warn/critical keep today's exact accent so existing alerts read identically;
-   info is the new low tier with a calm forecast-blue accent. */
+/* TWO severity vocabularies reach this block, because two alert families
+   interpolate their own token into `toast--severity-${severity}`.
+
+   The THRESHOLD family bands a percentage into 3 tiers (Phase B): info <90
+   (calm indigo) / warn 90-99 (amber, = the old amber styling) / critical >=100
+   (red, = the old red styling). warn/critical keep today's exact accent so
+   existing alerts read identically; info is the low tier with a calm
+   forecast-blue accent.
+
+   The METERING-RATE family (#661 S2) states its severity outright rather than
+   deriving it, and its third tier is named `alarm` — info (a more generous
+   rate) / warn (a drop) / alarm (a drop of a quarter or more). This is a
+   separate vocabulary, NOT a second spelling of `critical`: the Python kernel
+   emits it, the wire carries it and the modal's chip classes consume it.
+   `alarm` shares `critical`'s red because red is already this family's alarm
+   colour on its other two surfaces (`.chip-rate-change.severity-alarm` and
+   `.fc-rate-chip.severity-alarm`). #693 — before that rule existed, an alarm
+   toast matched nothing here and kept the base `.toast` amber border, so it
+   was indistinguishable from a warn. */
 .toast--severity-info     { border: 1px solid var(--accent-indigo); box-shadow: inset 0 0 28px color-mix(in srgb, var(--accent-indigo) 6%, transparent), 0 8px 24px rgba(0,0,0,0.5); /* lint-allow: box-shadow bespoke toast glow+drop */ }
 .toast--severity-warn     { border: 1px solid var(--accent-amber);  box-shadow: inset 0 0 28px color-mix(in srgb, var(--accent-amber) 6%, transparent), 0 8px 24px rgba(0,0,0,0.5); /* lint-allow: box-shadow bespoke toast glow+drop */ }
 .toast--severity-critical { border: 1px solid var(--accent-red);    box-shadow: inset 0 0 28px color-mix(in srgb, var(--accent-red) 7%, transparent),  0 8px 24px rgba(0,0,0,0.5); /* lint-allow: box-shadow bespoke toast glow+drop */ }
+.toast--severity-alarm    { border: 1px solid var(--accent-red);    box-shadow: inset 0 0 28px color-mix(in srgb, var(--accent-red) 7%, transparent),  0 8px 24px rgba(0,0,0,0.5); /* lint-allow: box-shadow bespoke toast glow+drop */ }
 .toast--alert-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 .toast--alert-threshold { font-weight: 800; font-size: var(--fs-kpi); letter-spacing: -0.5px; font-family: var(--font-mono); }
 .toast--severity-info     .toast--alert-threshold { color: var(--accent-indigo); }
 .toast--severity-warn     .toast--alert-threshold { color: var(--accent-amber); }
 .toast--severity-critical .toast--alert-threshold { color: var(--accent-red); }
 .toast--alert-dismiss-hint { color: var(--text-faint); font-size: var(--fs-eyebrow); margin-left: auto; }
+/* #749 — the same hint on its own line, when the head names an account and
+   cannot also carry it.
+
+   #750 S2 review — the ordering against the rule above is DEFENSIVE, not
+   load-bearing, and the earlier claim that source order is what cancels
+   `margin-left: auto` was wrong. Measured in Chrome: the own-line hint is a
+   block-level `div` with `width: auto` in the toast root's ordinary block
+   flow, and CSS 2.1 §10.3.3 resolves an `auto` margin to 0 in that case, so
+   `margin-left: auto` has no used effect there at all. Forcing it back on with
+   `!important` left the element at the identical left -3.0, right 323.0, top
+   789.06 and a used `margin-left` of `0px`. The base rule still earns its
+   `margin-left: auto` inside the head, where the hint is a flex item and the
+   declaration right-aligns it (measured hint right 323.0 against head right
+   323.0). Keep the modifier after the base rule anyway: both selectors are a
+   single class, so specificity ties at (0,1,0) and source order is all that
+   decides, and the day this element is placed in a flex root the `margin-left:
+   0` below becomes the declaration that keeps it left-aligned.
+
+   #750 S2 review — the line moved BELOW the body (a `role="alert"` region
+   announces in DOM order, and above the title the instruction was read before
+   the alert), so the 8px separates it from the content above rather than from
+   the title below. Adjacent-sibling margins collapse against
+   `.toast--alert-follow`'s 6px, so the threshold toast keeps one gap. */
+.toast--alert-dismiss-hint--own-line {
+  display: block;
+  margin-left: 0;
+  margin-top: 8px;
+}
 .toast--alert-title { color: var(--text); font-weight: 700; font-size: var(--fs-data); margin-bottom: 4px; }
 .toast--alert-sub   { color: var(--text-dim); font-size: var(--fs-meta); margin-bottom: 6px; }
 .toast--alert-body  { color: var(--text); font-size: 13px; }
@@ -6020,6 +6114,65 @@ mark.current {
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   #panel-sessions > .panel-header > .panel-header-actions { margin-left: auto; }
+
+  /* #730 / #750 S2 — the second half of the header-overflow defense.
+     `min-width: 0` on `.panel-header-actions:has(.sessions-ctrls)` lets the
+     CLUSTER box shrink, but this strip kept the initial `min-width: auto`, so
+     its own 180px search input still held the cluster's children out past the
+     viewport however small the cluster's box became. Flooring the strip lets
+     it give, which pulls the 44px affordances back inside the line.
+
+     The floor is bare `.sessions-ctrls`, NOT `#panel-sessions > …`: the DOM
+     it has to reach is the one where this element is a child of the actions
+     cluster, which the id-prefixed selectors below do not match.
+
+     It is confined to this query on purpose. Above 640px the strip is a real
+     child of the cluster and its width is the search box a person uses; at or
+     below 640px the `SessionsControls` hoist makes it a block-level sibling
+     of `.panel-header`, where a min-width floor changes no rendered box. So
+     the defense costs nothing visible on either side of the breakpoint. */
+  .sessions-ctrls { min-width: 0; }
+
+  /* #730 / #750 S2 — the cluster half of the same defense, in the same query
+     as the rule above because the two only help together and each one alone
+     does harm.
+
+     Shrinking a cluster whose children are all incompressible cannot prevent
+     overflow; it only moves the overflow outside the cluster's own box. That
+     was measured twice. At 320px, with this floor unconditional, the Projects
+     header does not wrap, so its cluster is right-aligned against the header's
+     right edge, the flex algorithm shrank the box to 77.7px while its children
+     stayed at 44 + 44 + 16.7px, and `.panel-grip` rendered at x=324 against a
+     320px viewport. Above 640px the same thing happened on Sessions itself,
+     where `.sessions-ctrls` keeps `min-width: auto` because the rule above is
+     confined to this query: with the search input open, the cluster shrank to
+     320.2px at 1200px, 344.8px at 1280px, 369.4px at 1360px and 394.1px at
+     1440px while its children kept wanting 424.3px, so the strip and the three
+     icon affordances rendered 96.8, 72.1, 47.5 and 22.9px to the right of the
+     cluster's box — and past the Sessions panel's own right border at the
+     first three. Scoping the floor into this query returns every one of those
+     to zero: the header's `h2` gives instead, from 236.8px down to 85.4px at
+     1200px, and `.panel-grip` renders at its full 24px rather than squeezed to
+     16.7px.
+
+     What the pair buys at 390px is the criterion-13 counterfactual: re-parent
+     `.sessions-ctrls` as the first child of the cluster, reproducing the exact
+     `!isMobile` DOM the `SessionsControls` mobile hoist otherwise prevents, and
+     document `scrollWidth` is 390 against a `clientWidth` of 390 with both
+     rules, 563 with this one alone and 571 with neither.
+
+     No `flex-shrink: 0` is added to the children, deliberately, and this is
+     the one query where that is safe. `.share-icon`, `.panel-expand` and
+     `.panel-collapse-toggle` carry `min-width: var(--tap-target)` from the
+     tap-target block further down THIS query, so they are already
+     incompressible here whatever the pointer is. `.panel-grip` is not: its
+     44px floor lives in `@media (pointer: coarse)`, so on a fine-pointer
+     browser at 320px it computes `min-width: auto` and renders 24px. That is
+     tolerable because with the cluster floor confined here the flex algorithm
+     never asks it to give — measured 24px at 320px on every panel — and
+     pinning every child would instead stop `.sessions-ctrls`, the one child
+     that can safely give, from giving. */
+  .panel-header-actions:has(.sessions-ctrls) { min-width: 0; }
 
   /* Sessions panel — Q1=B layout. The SessionsControls component is
      hoisted out of .panel-header on mobile (TSX branch on useIsMobile)

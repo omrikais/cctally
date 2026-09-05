@@ -281,6 +281,8 @@ WeekRef = _cctally_core.WeekRef
 _canonicalize_optional_iso = _cctally_core._canonicalize_optional_iso
 make_week_ref = _cctally_core.make_week_ref
 _get_latest_row_for_week = _cctally_core._get_latest_row_for_week
+_latest_reset_event_for_end = _cctally_core._latest_reset_event_for_end
+_ordered_in_place_cuts = _cctally_core._ordered_in_place_cuts
 _reset_aware_floor = _cctally_core._reset_aware_floor
 _floored_week_max = _cctally_core._floored_week_max
 get_latest_usage_for_week = _cctally_core.get_latest_usage_for_week
@@ -1211,9 +1213,9 @@ _count_stale_replays = _cctally_record._count_stale_replays
 _credit_preview_text = _cctally_record._credit_preview_text
 _credit_json = _cctally_record._credit_json
 _revalidate_credit_plan = _cctally_record._revalidate_credit_plan
-_arm_reset_zero_marker = _cctally_record._arm_reset_zero_marker
-_read_reset_zero_marker = _cctally_record._read_reset_zero_marker
-_clear_reset_zero_marker = _cctally_record._clear_reset_zero_marker
+_arm_reset_debounce_state = _cctally_record._arm_reset_debounce_state
+_read_reset_debounce_state = _cctally_record._read_reset_debounce_state
+_clear_reset_debounce_state = _cctally_record._clear_reset_debounce_state
 cmd_record_credit = _cctally_record.cmd_record_credit
 _hook_tick_log_line = _cctally_record._hook_tick_log_line
 _hook_tick_log_rotate_if_needed = _cctally_record._hook_tick_log_rotate_if_needed
@@ -3263,6 +3265,15 @@ build_codex_cycle_detail = _cctally_milestone_history.build_codex_cycle_detail
 _cctally_percent_breakdown = _load_sibling("_cctally_percent_breakdown")
 cmd_percent_breakdown = _cctally_percent_breakdown.cmd_percent_breakdown
 _render_percent_breakdown_terminal = _cctally_percent_breakdown._render_percent_breakdown_terminal
+# #750 S3 Unit C. The observation-gap classifier and its rendering helpers are
+# re-exported because `report --detail` builds its OWN milestone table and
+# reaches them on this namespace, rather than repeating the predicate.
+OBSERVATION_GAP_CAUSE = _cctally_percent_breakdown.OBSERVATION_GAP_CAUSE
+ObservationGapRun = _cctally_percent_breakdown.ObservationGapRun
+ObservationGapDisclosure = _cctally_percent_breakdown.ObservationGapDisclosure
+classify_observation_gaps = _cctally_percent_breakdown.classify_observation_gaps
+observation_gap_notes = _cctally_percent_breakdown.observation_gap_notes
+observation_gap_marginal_cell = _cctally_percent_breakdown.observation_gap_marginal_cell
 
 
 # _is_cctally_hook_command, SetupError, _load_claude_settings,

@@ -182,9 +182,17 @@ export function TrendPanel() {
         <svg className="icon" aria-hidden="true">
           <use href="/static/icons.svg#bar-chart" />
         </svg>
-        <h2>
-          {presentation.title} <span className="sub">{hydratingEmpty ? '(loading)' : sub}</span>
-        </h2>
+        {/* #569 item 5 — the h2 carries the TITLE and nothing else.
+            Measured at 390px on the All source with the composition inside
+            it: `clientWidth` 178 against `scrollWidth` 258, so 80px — 31.0%
+            of the title — was clipped under the mobile `white-space: nowrap`
+            / `text-overflow: ellipsis` rule at `.panel-header h2`, rendering
+            `$/1% Trend (Claude 10w…` and dropping `· Codex 12c)` entirely.
+            The h2 is the only shrinkable item in a 328px header against an
+            unshrinkable actions cluster, so nothing else could give. The
+            composition moved to `.panel-range-note` below — a full-width
+            line that wraps, and the reason Projects does not truncate. */}
+        <h2>{presentation.title}</h2>
         <div className="panel-header-actions">
           <ShareIcon
             panel="trend"
@@ -198,6 +206,13 @@ export function TrendPanel() {
           />
           <PanelGrip />
         </div>
+      </div>
+      {/* The `.sub` class stays on the span so the parenthetical keeps the
+          register it has on every other card; only its PLACE changed. The
+          `.panel-header h2 .sub` rule no longer reaches it, and it does not
+          need to: `.panel-range-note` already sets the same dimmed 11px. */}
+      <div className="panel-range-note">
+        <span className="sub">{hydratingEmpty ? '(loading)' : sub}</span>
       </div>
       <div className="panel-body">
         {env?.hydrating && totalRows === 0 ? (

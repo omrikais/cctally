@@ -660,15 +660,30 @@ def test_s9_force_scope_keeps_real_history(ns, monkeypatch):
     assert kept == 1 and owned == 1                   # real row kept, single re-do'd synthetic
 
 
-def test_apply_clears_reset_zero_marker(ns, monkeypatch):
+def test_apply_clears_reset_debounce_state(ns, monkeypatch):
+    """#750 S3: the debounce state is a stats.db row, so the manual credit's
+    stale-state clear folds into the op's own transaction instead of unlinking
+    a file beside it."""
+    import _cctally_record as rec
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
-    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
-    ns["_arm_reset_zero_marker"](
-        "2026-06-13", "2026-06-20T05:00:00+00:00",
-        baseline_pct=46.0, first_zero_iso="2026-06-19T14:00:00+00:00")
-    assert ns["_read_reset_zero_marker"]() is not None
+    conn = ns["open_db"]()
+    _seed_week(ns, conn)
+    rec._arm_reset_debounce_state(
+        conn, "unattributed", week_start_date="2026-06-13",
+        week_end_at="2026-06-20T05:00:00+00:00", baseline_pct=46.0,
+        first_zero_at_utc="2026-06-19T14:00:00+00:00",
+        first_zero_observation_id=None)
+    conn.commit()
+    assert rec._read_reset_debounce_state(conn, "unattributed") is not None
+    conn.close()
+
     ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True))
-    assert ns["_read_reset_zero_marker"]() is None
+
+    conn = ns["open_db"]()
+    try:
+        assert rec._read_reset_debounce_state(conn, "unattributed") is None
+    finally:
+        conn.close()
 
 
 # ── output: preview / confirm matrix / --json / dry-run (S2,S3,S5,S6) ───

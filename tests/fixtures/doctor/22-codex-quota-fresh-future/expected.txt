@@ -14,8 +14,9 @@ Hooks
       → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
   ⚠ Last hook fire           never
       → No hook has fired yet. Restart Claude Code.
-  ✓ Codex hooks installed    2/2 root(s) installed
-  ✓ Codex recent activity    2 installed root(s); recent
+  ✓ Codex hooks installed    2/2 root(s) enabled
+  ✓ Codex recent activity    2 enabled root(s); recent
+  ✓ Codex hook liveness (7d) 2 enabled root(s); recent
 Auth
   ✓ OAuth token              present
 Database
@@ -83,4 +84,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 60 OK · 5 WARN · 0 FAIL
+Summary: 61 OK · 5 WARN · 0 FAIL

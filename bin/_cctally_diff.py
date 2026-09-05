@@ -118,11 +118,25 @@ def cmd_diff(args: argparse.Namespace) -> int:
     # windows for Claude instead of attempting to reinterpret the original
     # tokens against its subscription-week anchor.  Ordinary Claude invocations
     # keep the established anchor/parser path byte-for-byte.
+    # #341 --account: resolve the render filter (provider=claude; fail closed
+    # with exit 3 when the entry cache is unavailable). None = merged.
+    #
+    # #750 S3 B3: this resolves BEFORE the anchor, not a hundred lines after
+    # both windows are built. `docs/accounts-gotchas.md` states the rule — the
+    # account resolves before the interval is constructed — because an
+    # account-filtered read whose interval came from the merged boundary set
+    # buckets one account's dollars into a window that belongs to neither.
+    acct_key, acct_exit = c.resolve_account_filter(
+        args, "claude", needs_cache=True)
+    if acct_exit is not None:
+        return acct_exit
+
     supplied_windows = getattr(args, "_source_analytics_windows", None)
     if supplied_windows is None:
         # Resolve anchors (None when no snapshots exist; week tokens then
         # raise NoAnchorError in the parser).
-        anchor_week_start, anchor_resets_at = dk._diff_resolve_anchor(now_utc)
+        anchor_week_start, anchor_resets_at = dk._diff_resolve_anchor(
+            now_utc, account_key=acct_key)
     else:
         anchor_week_start, anchor_resets_at = None, None
 
@@ -221,13 +235,6 @@ def cmd_diff(args: argparse.Namespace) -> int:
         threshold = dataclasses.replace(threshold, min_delta_usd=args.min_delta_usd)
     if args.min_delta_pct is not None:
         threshold = dataclasses.replace(threshold, min_delta_pct=args.min_delta_pct)
-
-    # #341 --account: resolve the render filter (provider=claude; fail closed
-    # with exit 3 when the entry cache is unavailable). None = merged.
-    acct_key, acct_exit = c.resolve_account_filter(
-        args, "claude", needs_cache=True)
-    if acct_exit is not None:
-        return acct_exit
 
     try:
         result = dk._build_diff_result(

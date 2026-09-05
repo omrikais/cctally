@@ -575,7 +575,7 @@ def test_c2_a_row_with_no_effective_metadata_still_short_circuits(ns):
         jr.record_meter_rate_change(
             ctx, t, notify=False, created_at=NOW.isoformat())
         conn.execute(
-            "DELETE FROM journal_effective_events WHERE event_id LIKE 'mrc:%'")
+            "DELETE FROM journal_effective_events WHERE event_id LIKE 'mrc%'")
         lines = _journal_line_count(ns)
         assert jr.record_meter_rate_change(
             ctx, t, notify=True,
@@ -659,7 +659,7 @@ def test_c2_a_tombstoned_prior_materializes_nothing(ns):
         conn.execute("DELETE FROM meter_rate_change_events")
         conn.execute(
             "UPDATE journal_effective_events SET status = 'tombstone', "
-            "event_json = NULL WHERE event_id LIKE 'mrc:%'")
+            "event_json = NULL WHERE event_id LIKE 'mrc%'")
         assert jr.record_meter_rate_change(
             ctx, t, notify=True,
             created_at="2026-09-05T09:15:00+00:00").row_created is False
@@ -727,7 +727,7 @@ def test_c2_a_new_emission_writes_its_live_effective_metadata(ns, capsys):
             ctx, _transition(ns), notify=False, created_at=NOW.isoformat())
         row = conn.execute(
             "SELECT status FROM journal_effective_events "
-            "WHERE event_id LIKE 'mrc:%'").fetchone()
+            "WHERE event_id LIKE 'mrc%'").fetchone()
         assert row is not None, (
             "the emission wrote no effective metadata, so the next divergent "
             "re-emission would classify as NEW")
@@ -754,7 +754,7 @@ def test_c2_a_new_emission_writes_its_live_effective_metadata(ns, capsys):
             "step 4a must classify it as a duplicate")
         rev, status = conn.execute(
             "SELECT rev, status FROM journal_effective_events "
-            "WHERE event_id LIKE 'mrc:%'").fetchone()
+            "WHERE event_id LIKE 'mrc%'").fetchone()
         assert (int(rev), str(status)) == (0, "active"), (
             "the following cycle rewrote the metadata for its own emission")
     finally:
@@ -786,7 +786,7 @@ def test_c2_the_dropped_conflict_line_reports_an_insert_that_materialized_nothin
         conn.execute("DELETE FROM meter_rate_change_events")
         (event_id, event_json), = conn.execute(
             "SELECT event_id, event_json FROM journal_effective_events "
-            "WHERE event_id LIKE 'mrc:%'").fetchall()
+            "WHERE event_id LIKE 'mrc%'").fetchall()
         record = _lib_journal.decode_line(event_json.encode("utf-8"))
         record["payload"]["previous_units_per_point"] = "not-a-number"
         conn.execute(
@@ -832,7 +832,7 @@ def test_c2_the_dropped_conflict_line_survives_a_convergence_that_raises(
         # fails closed and raises rather than returning something to stamp.
         conn.execute(
             "UPDATE journal_effective_events SET event_json = NULL "
-            "WHERE event_id LIKE 'mrc:%'")
+            "WHERE event_id LIKE 'mrc%'")
         capsys.readouterr()
         with pytest.raises(_lib_journal.JournalProtocolError):
             jr.record_meter_rate_change(
@@ -898,7 +898,7 @@ def test_c2_the_dropped_conflict_line_does_not_claim_an_absent_convergence(
         conn.execute("DELETE FROM meter_rate_change_events")
         conn.execute(
             "UPDATE journal_effective_events SET status = 'tombstone', "
-            "event_json = NULL WHERE event_id LIKE 'mrc:%'")
+            "event_json = NULL WHERE event_id LIKE 'mrc%'")
         capsys.readouterr()
         jr.record_meter_rate_change(
             ctx, t, notify=False, created_at="2026-09-05T09:15:00+00:00")
@@ -931,7 +931,7 @@ def test_c2_a_dropped_conflict_is_recorded_even_when_convergence_raises(ns):
         # fails closed and raises rather than returning something to stamp.
         conn.execute(
             "UPDATE journal_effective_events SET event_json = NULL "
-            "WHERE event_id LIKE 'mrc:%'")
+            "WHERE event_id LIKE 'mrc%'")
         with pytest.raises(_lib_journal.JournalProtocolError):
             jr.record_meter_rate_change(
                 ctx, t, notify=False,
@@ -1057,12 +1057,12 @@ def test_c2_a_terminal_latch_suppresses_recovery(ns):
         # materializes it from the identical event.
         assert glue.unrecorded_rate_change_transitions((t,)) == (t,)
         conn.execute("UPDATE journal_effective_events SET status = 'tombstone'"
-                     " WHERE event_id LIKE 'mrc:%'")
+                     " WHERE event_id LIKE 'mrc%'")
         conn.commit()
         assert glue.unrecorded_rate_change_transitions((t,)) == ()
         conn.execute(
             "UPDATE journal_effective_events SET status = 'active', rev = 1"
-            " WHERE event_id LIKE 'mrc:%'")
+            " WHERE event_id LIKE 'mrc%'")
         conn.commit()
         assert glue.unrecorded_rate_change_transitions((t,)) == ()
     finally:
@@ -1409,3 +1409,525 @@ def test_c5_a_cycle_with_no_descriptor_carries_no_result(ns, monkeypatch):
     result = jr.run_stats_ingest(mode="authoritative")
     assert result.meter_rate_change_result is None
     assert result.deferred_alerts == []
+
+
+# --------------------------------------------------------------------------
+# #690 — cross-version authority and the asymmetric fold
+# --------------------------------------------------------------------------
+def _mrc_evt_v2(ns, transition, *, created_at):
+    """The version-2 evt, assembled the way the emitter assembles it."""
+    import _lib_journal
+    mrc = _mrc(ns)
+    return _lib_journal.make_evt(
+        kind=mrc.EVT_KIND,
+        id=_lib_journal.evt_id(mrc.EVT_ID_PREFIX_V2, *transition.identity()),
+        at=created_at,
+        payload=mrc.event_payload_v2(transition, created_at=created_at))
+
+
+def _seed_effective_event(conn, event_id, *, status, rev, event_json):
+    conn.execute(
+        "INSERT INTO journal_effective_events "
+        "(event_id, rev, status, content_hash, batch_id, event_json) "
+        "VALUES (?, ?, ?, 'sha256:seeded', NULL, ?)",
+        (event_id, rev, status, event_json))
+    conn.commit()
+
+
+@pytest.mark.parametrize("status,rev", [("tombstone", 0), ("active", 1)])
+def test_690_a_terminal_v1_latch_suppresses_recovery_under_the_v2_prefix(
+        ns, status, rev):
+    """A tombstone must be terminal for the IDENTITY, not for one prefix.
+
+    Journal selection and correction are keyed on `event_id` alone, so two
+    prefixes are two logical events unless the presence check asks about
+    both. Without that, a transition an operator terminally suppressed under
+    v1 is resurrected the first time a v2-capable binary runs — and the #689
+    terminal-latch contract would hold only until the version boundary.
+    """
+    import _lib_journal
+    glue = ns["_load_sibling"]("_cctally_quota_model")
+    mrc = _mrc(ns)
+    conn = ns["open_db"]()
+    try:
+        _seed_journal()
+        t = _transition(ns)
+        # Non-vacuity: with no metadata at all the candidate IS offered, so a
+        # suppression below is the latch and not an empty store.
+        assert glue.unrecorded_rate_change_transitions((t,)) == (t,)
+        _seed_effective_event(
+            conn, _lib_journal.evt_id(mrc.EVT_ID_PREFIX, *t.identity()),
+            status=status, rev=rev,
+            event_json=None if status == "tombstone" else "{}")
+        assert glue.unrecorded_rate_change_transitions((t,)) == (), (
+            f"a v1 identity terminally latched as status={status!r} rev={rev} "
+            "was offered for recording under the v2 prefix")
+    finally:
+        conn.close()
+
+
+def test_690_a_terminal_v2_latch_suppresses_recovery_under_the_v1_prefix(ns):
+    """The same authority in the other direction, so neither prefix is
+    privileged and a v2 correction supersedes an active v1 id at rebuild."""
+    import _lib_journal
+    glue = ns["_load_sibling"]("_cctally_quota_model")
+    mrc = _mrc(ns)
+    conn = ns["open_db"]()
+    try:
+        _seed_journal()
+        t = _transition(ns)
+        assert glue.unrecorded_rate_change_transitions((t,)) == (t,)
+        _seed_effective_event(
+            conn, _lib_journal.evt_id(mrc.EVT_ID_PREFIX_V2, *t.identity()),
+            status="tombstone", rev=0, event_json=None)
+        assert glue.unrecorded_rate_change_transitions((t,)) == ()
+    finally:
+        conn.close()
+
+
+def _live_v1_record(ns, conn, t):
+    """One ACTIVE revision-0 v1 record with its payload retained, no row.
+
+    This is exactly the state `unrecorded_rate_change_transitions` re-offers:
+    a store that recorded the identity under a pre-#690 binary and then lost
+    the physical row. Built through the real append and the real effective-
+    metadata writer so the retained `event_json` is the record convergence
+    materializes from, rather than a hand-written stand-in.
+    """
+    import _cctally_journal as jr
+    evt = _mrc_evt(ns, t, created_at=NOW.isoformat())
+    jr.append_record(evt, now_utc=NOW)
+    jr._record_new_effective_event(conn, evt)
+    conn.commit()
+    assert _events(conn) == [], "the fixture wrote a physical row"
+    return evt
+
+
+def test_750_a_live_v1_identity_is_re_emitted_under_the_v1_prefix(ns, capsys):
+    """#689's recovery route must survive the payload version boundary.
+
+    The v2 id is a different logical event, so emitting under it for an
+    identity the journal already holds at v1 appends a second line, leaves
+    two active revision-0 records describing one natural key, never reaches
+    `_converge_meter_rate_change_row` and prints no diagnostic. The prefix is
+    therefore chosen by whether the key holds ANY v1 record, and this is the
+    direction where that record is the live one the recovery converges from.
+    """
+    import _cctally_journal as jr
+    import _lib_journal
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        _live_v1_record(ns, conn, t)
+        lines = _journal_line_count(ns)
+        capsys.readouterr()
+        assert jr.record_meter_rate_change(
+            ctx, t, notify=True,
+            created_at="2026-09-05T09:15:00+00:00").row_created is False
+        assert _journal_line_count(ns) == lines, (
+            "a second logical event was appended for an identity the journal "
+            "already holds under the v1 prefix")
+        assert len(_events(conn)) == 1, (
+            "the missing row was not materialized from the retained event")
+        created = conn.execute(
+            "SELECT created_at_utc FROM meter_rate_change_events").fetchone()[0]
+        assert created == NOW.isoformat(), (
+            "the row was materialized from the recovery run's payload rather "
+            "than from the RETAINED event")
+        assert [d.event_id for d in ctx.conflicts_dropped] == [
+            _lib_journal.evt_id(
+                _mrc(ns).EVT_ID_PREFIX, *t.identity())], (
+            "the withheld emission was not recorded against the v1 id")
+        assert "converged the row" in capsys.readouterr().err, (
+            "the #689 diagnostic was not printed")
+        assert ctx.deferred_alerts == [], (
+            "a recovery re-fired a notification for history")
+    finally:
+        conn.close()
+
+
+def test_750_an_identity_with_no_record_is_emitted_under_the_v2_prefix(ns):
+    """The other direction: a version applies to identities never recorded."""
+    import _cctally_journal as jr
+    import _lib_journal
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        lines = _journal_line_count(ns)
+        assert jr.record_meter_rate_change(
+            ctx, t, notify=False,
+            created_at=NOW.isoformat()).row_created is True
+        assert _journal_line_count(ns) == lines + 1, (
+            "a new identity did not append exactly one event")
+        ids = [row[0] for row in conn.execute(
+            "SELECT event_id FROM journal_effective_events "
+            "WHERE event_id LIKE 'mrc%'")]
+        assert ids == [_lib_journal.evt_id(
+            _mrc(ns).EVT_ID_PREFIX_V2, *t.identity())], (
+            "a never-recorded identity was not emitted under the v2 prefix")
+    finally:
+        conn.close()
+
+
+def test_750_a_tombstoned_v1_identity_is_not_resurrected_under_v2(ns, capsys):
+    """The DETECTION-time emit site is not gated by the presence check.
+
+    `unrecorded_rate_change_transitions` files a tombstoned v1 record as
+    recorded and never re-offers it, so through the owed sweep the prefix
+    choice cannot resurrect anything. `cmd_quota` also calls the emitter
+    directly for a freshly detected transition, and that call has no such
+    gate. Choosing the prefix by whether the v1 record is LIVE would send
+    that emission to the v2 id, where the terminal latch is invisible,
+    classify it as new and append a row an operator had suppressed. The
+    prefix is therefore chosen by whether ANY v1 record exists, which puts
+    every non-live v1 state on the conflict path.
+
+    The tombstone is constructed directly because no supported `db rederive`
+    family can target this event kind today, so the state is unreachable
+    through a supported operation — which is what makes this defense in
+    depth rather than a live defect.
+    """
+    import _cctally_journal as jr
+    import _lib_journal
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        v1_eid = _lib_journal.evt_id(_mrc(ns).EVT_ID_PREFIX, *t.identity())
+        _seed_effective_event(
+            conn, v1_eid, status="tombstone", rev=0, event_json=None)
+        lines = _journal_line_count(ns)
+        capsys.readouterr()
+        result = jr.record_meter_rate_change(
+            ctx, t, notify=True, created_at=NOW.isoformat())
+        assert result.row_created is False
+        assert _events(conn) == [], (
+            "a terminally suppressed transition was resurrected as a row")
+        assert _journal_line_count(ns) == lines, (
+            "a terminally suppressed transition appended a journal line")
+        ids = sorted(row[0] for row in conn.execute(
+            "SELECT event_id FROM journal_effective_events "
+            "WHERE event_id LIKE 'mrc%'"))
+        assert ids == [v1_eid], (
+            "the emission minted a second logical event under the v2 prefix "
+            "for a natural key the journal already holds at v1")
+        assert [d.event_id for d in ctx.conflicts_dropped] == [v1_eid], (
+            "the withheld emission was not recorded against the v1 id")
+        assert ctx.deferred_alerts == [], (
+            "a terminally suppressed transition queued a notification")
+        assert "withheld a divergent emission" in capsys.readouterr().err, (
+            "the withheld-emission diagnostic was not printed")
+    finally:
+        conn.close()
+
+
+def _retained_v1_line(ns, t):
+    """The encoded v1 record an effective-metadata row retains."""
+    import _lib_journal
+    return _lib_journal.encode_line(
+        _mrc_evt(ns, t, created_at=NOW.isoformat())
+    ).decode("utf-8").rstrip("\n")
+
+
+def _emitter_raise(name):
+    """The exception class a parametrized case expects, resolved at call time.
+
+    This module reaches the binary's modules through in-function imports, so
+    the classes cannot be named in a `parametrize` list without importing at
+    collection time.
+    """
+    import _cctally_journal as jr
+    import _lib_journal
+    return {
+        "CorrectionRebuildRequired": jr.CorrectionRebuildRequired,
+        "JournalProtocolError": _lib_journal.JournalProtocolError,
+    }[name]
+
+
+@pytest.mark.parametrize(
+    "status,rev,retained,expected",
+    [
+        ("active", 1, True, "CorrectionRebuildRequired"),
+        ("tombstone", 1, False, "CorrectionRebuildRequired"),
+        ("active", 0, False, "JournalProtocolError"),
+    ],
+    ids=["active-rev1", "tombstone-rev1", "active-rev0-no-retained-record"],
+)
+def test_750_a_non_live_v1_state_raises_rather_than_minting_a_v2_identity(
+        ns, status, rev, retained, expected):
+    """The two emitter states the prose reasons about but nothing pinned.
+
+    `_v1_rate_change_identity_exists` tests EXISTENCE, so every v1 state that
+    is not "active at revision 0 with a retained payload" reaches the emitter
+    under the v1 id and raises there rather than being minted afresh under
+    the v2 id. Two of those states had no test:
+
+    - a revision ABOVE zero, under either status. `_classify_live_effective_
+      event` compares revisions before it compares content, so the candidate's
+      revision 0 against a stored revision 1 raises `CorrectionRebuildRequired`
+      whatever the stored status is. That signal defaults to
+      `recovery_eligible=False` and `run_stats_ingest` re-raises it.
+    - ACTIVE at revision 0 with `event_json IS NULL`. The revisions match and
+      the content hashes do not, because `_seed_effective_event` stores a
+      fixed sentinel hash the candidate cannot reproduce; the emission is
+      therefore withheld as a conflict and convergence is attempted, and
+      `_effective_event_for_convergence` fails closed on metadata that
+      retains no record, raising `JournalProtocolError`. Were the hashes to
+      match, the call would classify as a DUPLICATE and insert a row, so the
+      seeded hash is what makes this case the conflict it claims to be.
+
+    Both states are constructed directly. The second is not reachable through
+    any supported operation, which is precisely why only a test can build it.
+
+    What each case pins is the ABSENCE of the v2 mint: no physical row, no
+    appended journal line, no second logical event under the v2 prefix, and
+    no queued notification. `CorrectionRebuildRequired` is re-raised in every
+    mode and `JournalProtocolError` under `mode="authoritative"`, so both
+    discard the whole ingest cycle with the cursor unmoved and nothing this
+    emitter would have written survives.
+    """
+    import _cctally_journal as jr
+    import _lib_journal
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        t = _transition(ns)
+        v1_eid = _lib_journal.evt_id(_mrc(ns).EVT_ID_PREFIX, *t.identity())
+        _seed_effective_event(
+            conn, v1_eid, status=status, rev=rev,
+            event_json=_retained_v1_line(ns, t) if retained else None)
+        lines = _journal_line_count(ns)
+        with pytest.raises(_emitter_raise(expected)):
+            jr.record_meter_rate_change(
+                ctx, t, notify=True, created_at=NOW.isoformat())
+        assert _events(conn) == [], (
+            "a non-live v1 state materialized a physical row")
+        assert _journal_line_count(ns) == lines, (
+            "a non-live v1 state appended a journal line")
+        ids = sorted(row[0] for row in conn.execute(
+            "SELECT event_id FROM journal_effective_events "
+            "WHERE event_id LIKE 'mrc%'"))
+        assert ids == [v1_eid], (
+            "the emission minted a second logical event under the v2 prefix "
+            "for a natural key the journal already holds at v1")
+        assert ctx.deferred_alerts == [], (
+            "a non-live v1 state queued a notification")
+    finally:
+        conn.close()
+
+
+def test_750_the_row_tuple_names_the_columns_it_writes(ns):
+    """The INSERT's column list is DERIVED from these field names (#750 S2).
+
+    A field whose name is not a column would make the write fail rather than
+    shift every following value one column over, and the evidence backfill
+    reads the same names as attributes.
+
+    Membership is the whole assertion. The INSERT names its columns
+    explicitly from `_MeterRateChangeRow._fields` and binds the tuple against
+    that list, so the order the TABLE declares its columns in cannot affect
+    what the statement writes. An earlier revision of this test also asserted
+    that order, reasoning that the tuple was passed positionally against the
+    table's own declaration; it is not, and the assertion would have failed a
+    harmless column reordering.
+    """
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        columns = [row[1] for row in conn.execute(
+            "PRAGMA table_info(meter_rate_change_events)")]
+    finally:
+        conn.close()
+    assert columns, "the fixture store has no such table"
+    fields = list(jr._MeterRateChangeRow._fields)
+    assert set(fields) <= set(columns), (
+        f"the row tuple names something that is not a column: "
+        f"{sorted(set(fields) - set(columns))}")
+
+
+def _evidence_row(conn, t):
+    return tuple(conn.execute(
+        "SELECT withholding_status, detector_input_causes,"
+        " composition_provenance, baseline_withheld_days"
+        " FROM meter_rate_change_events"
+        " WHERE provider=? AND account_key=? AND effective_from=?",
+        t.identity()).fetchone())
+
+
+def _v2_transition(ns):
+    return _transition(
+        ns, withholding_status="unsupported-model-mix",
+        detector_input_causes="[]",
+        composition_provenance='["forecast-aggregate"]',
+        baseline_withheld_days=3)
+
+
+EVIDENCE = ("unsupported-model-mix", "[]", '["forecast-aggregate"]', 3)
+
+
+def test_690_a_v2_record_materializes_its_evidence(ns):
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        t = _v2_transition(ns)
+        jr._insert_meter_rate_change(
+            conn, _mrc_evt_v2(ns, t, created_at=NOW.isoformat()))
+        assert _evidence_row(conn, t) == EVIDENCE
+    finally:
+        conn.close()
+
+
+def test_690_a_v1_record_materializes_null_evidence(ns):
+    """NULL, not a fabricated empty set: a v1 payload never assessed this."""
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        t = _transition(ns)
+        jr._insert_meter_rate_change(
+            conn, _mrc_evt(ns, t, created_at=NOW.isoformat()))
+        assert _evidence_row(conn, t) == (None, None, None, None)
+    finally:
+        conn.close()
+
+
+def test_690_a_later_v1_fold_does_not_erase_v2_evidence(ns):
+    """Replay order is not guaranteed, so the fold has to be asymmetric."""
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        t = _v2_transition(ns)
+        jr._insert_meter_rate_change(
+            conn, _mrc_evt_v2(ns, t, created_at=NOW.isoformat()))
+        jr._insert_meter_rate_change(
+            conn, _mrc_evt(ns, _transition(ns), created_at=NOW.isoformat()))
+        assert _evidence_row(conn, t) == EVIDENCE, (
+            "a v1 fold arriving after a v2 record erased the evidence")
+    finally:
+        conn.close()
+
+
+def test_690_a_later_v2_fold_supplies_evidence_a_v1_row_lacks(ns):
+    """The other replay order, which an `INSERT OR IGNORE` alone would drop
+    on the floor: the row already exists, so the evidence must be backfilled
+    rather than ignored."""
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        t = _v2_transition(ns)
+        jr._insert_meter_rate_change(
+            conn, _mrc_evt(ns, _transition(ns), created_at=NOW.isoformat()))
+        assert _evidence_row(conn, t) == (None, None, None, None)
+        jr._insert_meter_rate_change(
+            conn, _mrc_evt_v2(ns, t, created_at=NOW.isoformat()))
+        assert _evidence_row(conn, t) == EVIDENCE
+    finally:
+        conn.close()
+
+
+def test_690_the_backfill_never_re_fires_a_notification(ns):
+    """The create predicate still means CREATED.
+
+    `_insert_meter_rate_change` returns `cur.rowcount == 1` and that is what
+    gates a notification. Written as an `ON CONFLICT DO UPDATE`, the backfill
+    would report `rowcount == 1` for an UPDATE too and every replayed
+    duplicate would re-fire.
+    """
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        t = _v2_transition(ns)
+        evt = _mrc_evt_v2(ns, t, created_at=NOW.isoformat())
+        assert jr._insert_meter_rate_change(conn, evt) is True
+        assert jr._insert_meter_rate_change(conn, evt) is False
+        v1 = _mrc_evt(ns, _transition(ns), created_at=NOW.isoformat())
+        assert jr._insert_meter_rate_change(conn, v1) is False
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# #690 — the post-commit recovery reader
+# --------------------------------------------------------------------------
+def test_690_a_retried_notification_carries_the_row_s_disclosure(ns):
+    """The row committed, delivery did not, and the retry must not lie.
+
+    The owed sweep knows only the IDENTITY, so the descriptor it offers
+    carries placeholder rates and severity and no evidence at all. Before
+    this, the reconstruction left `withholding_status` at its None default,
+    so the retry followed the `withholding_status`-absent branch of
+    `_alert_text_meter_rate_change` and told the reader to inspect a fitted
+    budget the withheld calibration may never have produced — on exactly the
+    path this disclosure exists to correct.
+    """
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        stored = _v2_transition(ns)
+        jr._insert_meter_rate_change(
+            conn, _mrc_evt_v2(ns, stored, created_at=NOW.isoformat()))
+        placeholder = _transition(
+            ns, previous_units_per_point=0.0, new_units_per_point=0.0,
+            severity="info")
+        assert placeholder.withholding_status is None, (
+            "the descriptor already carries the disclosure, so this would "
+            "pass without reading the row at all")
+        jr.record_meter_rate_change(
+            ctx, placeholder, notify=True, notification_owed=True,
+            created_at=NOW.isoformat())
+        assert len(ctx.deferred_alerts) == 1
+        payload = ctx.deferred_alerts[0]
+        assert payload["withholding_status"] == "unsupported-model-mix"
+        assert payload["detector_input_causes"] == "[]"
+        assert payload["composition_provenance"] == '["forecast-aggregate"]'
+        assert payload["baseline_withheld_days"] == 3
+        # The rates come from the ROW too, not from the placeholder.
+        assert payload["previous_units_per_point"] == 2_442_620.0
+    finally:
+        conn.close()
+
+
+def test_690_a_retried_notification_over_a_v1_row_reports_no_evidence(ns):
+    """A legacy row has none, and the retry must say so rather than invent
+    it. This is the null half of the three-state contract on the retry path.
+    """
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        jr._insert_meter_rate_change(
+            conn, _mrc_evt(ns, _transition(ns), created_at=NOW.isoformat()))
+        jr.record_meter_rate_change(
+            ctx, _transition(ns), notify=True, notification_owed=True,
+            created_at=NOW.isoformat())
+        payload = ctx.deferred_alerts[0]
+        assert payload["withholding_status"] is None
+        assert payload["detector_input_causes"] is None
+        assert payload["composition_provenance"] is None
+        assert payload["baseline_withheld_days"] is None
+    finally:
+        conn.close()
+
+
+def test_690_the_regime_recovery_route_carries_no_fabricated_evidence(ns):
+    """#689 recovery sees stored calibration regimes, never an analysis.
+
+    All four values are analysis-derived, so on this route all four are null
+    BY CONSTRUCTION. Null here is correct and deliberate, and acceptance
+    criteria 3 and 4 exclude this route explicitly. This test exists so that
+    a future change which starts supplying a plausible-looking value here
+    fails loudly instead of quietly asserting a cause nobody measured.
+    """
+    mrc = _mrc(ns)
+    out = mrc.enumerate_transitions(
+        [_regime(effectiveUntil=BOUNDARY, status="ok"),
+         _regime(effectiveFrom=BOUNDARY, unitsPerPoint=1_685_000.0)],
+        provider="claude", account_key="a1", detected_at=NOW.isoformat())
+    assert out, "the fixture produced no transitions, so nothing was checked"
+    for t in out:
+        assert t.withholding_status is None
+        assert t.detector_input_causes is None
+        assert t.composition_provenance is None
+        assert t.baseline_withheld_days is None

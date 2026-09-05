@@ -94,6 +94,8 @@ The event is keyed on `(provider, account, effective instant)` and each key gets
 
 The retry covers the accounts the run analysed plus the unattributed bucket, which is always retried whatever `--account` you gave, because that bucket records the absence of an account rather than a second one.
 
+You can rehearse this notification without waiting for a real transition: `cctally alerts test --axis meter-rate-change` builds a synthetic change and sends it through the same payload builder and dispatch path a real one uses. It takes no `--threshold` — this family has no percentage threshold — and supplying one exits 2. `cctally alerts test --axis quota --threshold 90` does the same for the Codex quota notification below.
+
 On an install with more than one real account the notification's **title names the account** whose rate changed, using the same `[label]` prefix every other cctally alert carries. A transition recorded against the merged view — the bucket an install below the decoration threshold is analysed under — is named `Unattributed`, because that bucket records the absence of an account rather than a second one. On an install with one account, or none, the notification is exactly what it was before: no prefix, and every word unchanged.
 
 Two things never fire it: the first regime a new install fits, which has no predecessor to have changed from, and a recalculation under new pricing constants, which closes the old regime as stale rather than recording a rate transition.

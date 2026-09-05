@@ -410,7 +410,33 @@ _init_paths_from_env()
 # install and the table would simply never appear. `quota_alert_arming` is the
 # precedent the family follows — a journaled STATE record whose boundary
 # survives a rebuild, so history cannot re-fire.
-STATS_INDEX_EPOCH = 1011
+# 1011 -> 1012 (#750 S2 §3.6): the rate-change disclosure evidence. Adds four
+# NULLABLE columns to `meter_rate_change_events` — `withholding_status`,
+# `detector_input_causes`, `composition_provenance` and
+# `baseline_withheld_days` — so a transition admitted by #688's
+# detection-keyed path carries the analysis's own stamp on the ROW rather than
+# only on the notification that may never have been delivered. It is an epoch
+# bump for the same two reasons every bump since 1005 carries: the 13-entry
+# registry is frozen, AND an epoch-current open returns before any schema
+# work, so neither a `@stats_migration` handler nor an
+# `add_column_if_missing` would ever run on an upgraded install and the
+# columns would simply never appear.
+# 1012 -> 1013 (#750 S3 §1.6): reset-event origin identity plus transactional
+# debounce state. Adds `week_reset_events.origin_observation_id` (the raw
+# journal id of the observation that caused the reset) and the two PARTIAL
+# unique indexes that carry the dual-shaped identity — a row with an origin is
+# unique on `(account_key, origin_observation_id)`, a legacy origin-null row
+# keeps the old `(account_key, old_week_end_at, new_week_end_at)` tuple, and
+# the table-level UNIQUE is retired because a single index cannot express
+# both. Also adds `weekly_reset_debounce_state`, which replaces the filesystem
+# reset-to-zero marker so an ARM or a CONFIRM commits in the same stats
+# transaction as the journal cursor and the reset event. The identity change
+# is what lets two genuinely distinct resets share one boundary tuple while
+# one physical reset detected twice stays one event. The mechanical reason it
+# is a bump and not a migration is unchanged: the registry is frozen at 13,
+# and an epoch-current open returns before any schema work, so a handler or an
+# `add_column_if_missing` would never run on an upgraded install.
+STATS_INDEX_EPOCH = 1013
 LEGACY_STATS_HEAD = 13
 
 #: #496 S1 F1. A NEW branch, for a state that cannot occur before the
@@ -1682,6 +1708,34 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
         -- would call the same one. The FINGERPRINT stays out of the key
         -- deliberately: including it would re-alert on our own algorithm
         -- revisions.
+        -- #690 / #692 (epoch 1012) adds the last four columns: the disclosure
+        -- evidence captured at DETECTION time, stored as four independent
+        -- facts rather than one merged status taxonomy. Folding the baseline
+        -- count into `withholding_status` would make an otherwise healthy
+        -- successor read as currently withheld.
+        --
+        -- NULL, an empty array and 0 are THREE distinct states and every
+        -- consumer must preserve the distinction: NULL means legacy or
+        -- unrecoverable evidence, an empty typed set means assessed with no
+        -- such origin, 0 means a clean baseline, and a positive count means
+        -- thin baseline evidence. The #689 regime-recovery route sees stored
+        -- calibration regimes and no `QuotaAnalysis` at all, and all four
+        -- values are analysis-derived, so on that route all four are NULL by
+        -- construction — which is why every one of them is nullable.
+        --
+        -- `detector_input_causes` and `composition_provenance` hold canonical
+        -- JSON arrays of enum VALUES, never their `repr`, so a sixth
+        -- `CompositionProvenance` origin added later cannot silently alias
+        -- onto an existing one. `baseline_withheld_days` carries
+        -- `baseline_fit.population["withheld"]` — the count of fenced
+        -- observations carrying a cause that fall strictly BEFORE
+        -- `window_start` — as a count rather than a boolean, so zero, one and
+        -- many stay distinguishable and honest copy stays possible.
+        --
+        -- These comments sit OUTSIDE the statement deliberately: SQLite
+        -- stores the CREATE TABLE text verbatim, so a comment written inside
+        -- it lands in `sqlite_schema.sql`, in every `iterdump()` golden and
+        -- in `_REBUILD_SCHEMA_FINGERPRINT`.
         CREATE TABLE IF NOT EXISTS meter_rate_change_events (
             id                       INTEGER PRIMARY KEY AUTOINCREMENT,
             provider                 TEXT    NOT NULL,
@@ -1693,6 +1747,10 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
             detected_at_utc          TEXT    NOT NULL,
             created_at_utc           TEXT    NOT NULL,
             notified_at              TEXT,
+            withholding_status       TEXT,
+            detector_input_causes    TEXT,
+            composition_provenance   TEXT,
+            baseline_withheld_days   INTEGER,
             UNIQUE(provider, account_key, effective_from)
         );
         CREATE INDEX IF NOT EXISTS idx_meter_rate_change_events_key
@@ -2217,6 +2275,14 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         # start — preventing the API's -7d-derived new week from overlapping
         # the old week. Inserted by cmd_record_usage on detection; read by
         # _apply_reset_events_to_weekrefs and the cost live-recompute path.
+        # #750 S3 §1.1: identity is DUAL-SHAPED, carried by the two partial
+        # unique indexes below rather than by a table-level UNIQUE. A row that
+        # names its originating observation is unique on
+        # `(account_key, origin_observation_id)`; a legacy row with no origin
+        # keeps the old `(account_key, old_week_end_at, new_week_end_at)`
+        # tuple. One index cannot express both, and a single index over the
+        # tuple would refuse a second genuine reset that happens to share a
+        # boundary pair with the first.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS week_reset_events (
@@ -2227,13 +2293,55 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
                 effective_reset_at_utc TEXT NOT NULL,
                 observed_pre_credit_pct REAL,
                 account_key TEXT NOT NULL DEFAULT 'unattributed',
-                UNIQUE(account_key, old_week_end_at, new_week_end_at)
+                origin_observation_id TEXT
             )
             """
         )
         add_column_if_missing(
             conn, "week_reset_events", "account_key",
             "TEXT NOT NULL DEFAULT 'unattributed'")
+        add_column_if_missing(
+            conn, "week_reset_events", "origin_observation_id", "TEXT")
+        # #750 S3 §1.7. A pre-journal store's `week_reset_events` was created
+        # with a table-level UNIQUE that epoch 1013 retires, and
+        # `CREATE TABLE IF NOT EXISTS` cannot change an existing table. Left in
+        # place it survives the cutover and keeps refusing a legitimate second
+        # in-place credit — the very refusal this session removes. Rebuild the
+        # one table into the current shape, preserving row ids, BEFORE the two
+        # partial indexes are created (a DROP TABLE takes its indexes with it)
+        # and before the backfill runs.
+        _rebuild_retired_week_reset_uniqueness(conn)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_week_reset_events_origin "
+            "ON week_reset_events(account_key, origin_observation_id) "
+            "WHERE origin_observation_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_week_reset_events_legacy_tuple "
+            "ON week_reset_events(account_key, old_week_end_at, "
+            "new_week_end_at) WHERE origin_observation_id IS NULL"
+        )
+        # #750 S3 §1.3: the transactional replacement for the filesystem
+        # reset-to-zero marker. ARM upserts the row, CONFIRM / CLEAR /
+        # FIRE_IMMEDIATE delete it, and every mutation commits in the same
+        # stats transaction as the journal cursor and the reset event, which is
+        # what closes both crash windows the filesystem marker left open. It is
+        # disposable operational state rather than journal truth, so an epoch
+        # rebuild legitimately loses it: a real reset simply re-arms and
+        # confirms one tick later.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weekly_reset_debounce_state (
+                account_key               TEXT PRIMARY KEY,
+                week_start_date           TEXT NOT NULL,
+                week_end_at               TEXT NOT NULL,
+                baseline_pct              REAL NOT NULL,
+                first_zero_at_utc         TEXT NOT NULL,
+                first_zero_observation_id TEXT
+            )
+            """
+        )
         _backfill_week_reset_events(conn)
 
         # ── five_hour_reset_events (Anthropic-issued in-place 5h credits) ──
@@ -2974,6 +3082,77 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
 # === WeekRef cluster ================================================
 
 
+#: The epoch-1013 column set of `week_reset_events`, in declaration order.
+#: `_rebuild_retired_week_reset_uniqueness` copies the intersection of this and
+#: whatever the existing table has, so a column added later in the schema apply
+#: (`journal_id`) is simply re-added afterwards by its own guarded ALTER.
+_WEEK_RESET_EVENT_COLUMNS = (
+    "id", "detected_at_utc", "old_week_end_at", "new_week_end_at",
+    "effective_reset_at_utc", "observed_pre_credit_pct", "account_key",
+    "origin_observation_id",
+)
+
+
+def _rebuild_retired_week_reset_uniqueness(conn) -> bool:
+    """Rebuild `week_reset_events` without its retired table-level UNIQUE.
+
+    #750 S3 §1.7. Epoch 1013 moved identity onto the originating observation
+    and expresses it as two PARTIAL unique indexes, which one table-level
+    constraint cannot represent. A table created by an older binary still
+    carries `UNIQUE(account_key, old_week_end_at, new_week_end_at)`, and
+    `CREATE TABLE IF NOT EXISTS` is a no-op against it, so the constraint would
+    survive the cutover and keep refusing a second genuine in-place credit.
+
+    Idempotent by construction: the trigger is the presence of a UNIQUE
+    CONSTRAINT index (`PRAGMA index_list` origin `'u'`), which only a
+    table-level UNIQUE creates and which the rebuilt shape does not have, so a
+    second call is a no-op. Row ids are preserved, because the cutover stamps
+    `journal_id = b:week_reset_events:<rowid>` from them and a renumbering
+    would give the same physical facts new logical identities.
+
+    Returns True when it rebuilt.
+    """
+    try:
+        columns = [str(row[1]) for row in
+                   conn.execute("PRAGMA table_info(week_reset_events)")]
+        if not columns:
+            return False
+        constrained = any(
+            str(row[3]) == "u"
+            for row in conn.execute("PRAGMA index_list(week_reset_events)")
+        )
+    except sqlite3.DatabaseError:
+        return False
+    if not constrained:
+        return False
+    carried = [name for name in _WEEK_RESET_EVENT_COLUMNS if name in columns]
+    column_list = ", ".join(carried)
+    conn.execute(
+        """
+        CREATE TABLE week_reset_events__rebuild_1013 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            detected_at_utc        TEXT NOT NULL,
+            old_week_end_at        TEXT NOT NULL,
+            new_week_end_at        TEXT NOT NULL,
+            effective_reset_at_utc TEXT NOT NULL,
+            observed_pre_credit_pct REAL,
+            account_key TEXT NOT NULL DEFAULT 'unattributed',
+            origin_observation_id TEXT
+        )
+        """
+    )
+    conn.execute(
+        f"INSERT INTO week_reset_events__rebuild_1013 ({column_list}) "
+        f"SELECT {column_list} FROM week_reset_events"
+    )
+    conn.execute("DROP TABLE week_reset_events")
+    conn.execute(
+        "ALTER TABLE week_reset_events__rebuild_1013 "
+        "RENAME TO week_reset_events"
+    )
+    return True
+
+
 def _canonicalize_optional_iso(value: str | None, label: str) -> str | None:
     if value is None:
         return None
@@ -3054,6 +3233,123 @@ def _get_latest_row_for_week(
         """,
         (week_ref.week_start.isoformat(), as_of_utc) + acct_params,
     ).fetchone()
+
+
+def _latest_reset_event_for_end(
+    conn: sqlite3.Connection,
+    new_week_end_at: str,
+    *,
+    account_key: str | None,
+    as_of_utc: "str | None" = None,
+) -> "sqlite3.Row | None":
+    """The ACTIVE segment's `week_reset_events` row for a week end, or None.
+
+    #750 S3 B3. One chokepoint for the read sites that ask "which segment
+    of this week is the live one", because they disagreed with each other and
+    all were wrong in the same direction.
+
+    The order is `unixepoch(effective_reset_at_utc) DESC, id DESC`. The
+    instant is the semantic cycle boundary, so it is what decides; `id` is
+    only a deterministic tie-breaker for two rows recording the same instant,
+    and ordering on it ALONE answers "whichever row was written last", which
+    a backfill can make the older reset. `unixepoch(...)`, never a lexical
+    compare: the column carries mixed offset spellings and a textual ORDER BY
+    mis-orders them on a non-UTC host, the same defence
+    `_reset_aware_floor` documents.
+
+    ``account_key`` scopes the read; ``None`` is the explicit merged read and
+    is byte-stable on a single-account install. It matters because the match
+    is on the end instant alone, and two accounts hold weeks that share one.
+
+    ``as_of_utc`` restricts the answer to segments already in effect at that
+    capture instant, which is what the milestone WRITER asks (#750 S3, Unit B
+    review): a crossing belongs to the segment that was live when it was
+    observed, not to one credited afterwards. It narrows the question rather
+    than changing it, so the ordering is the same ordering — the writer kept
+    its own `ORDER BY id DESC` copy of this query and therefore stamped
+    `percent_milestones.reset_event_id` with a segment
+    `cmd_percent_breakdown` does not filter on, and the milestone rendered
+    nowhere.
+    """
+    acct_pred = "" if account_key is None else " AND account_key = ?"
+    acct_params: tuple = () if account_key is None else (account_key,)
+    as_of_pred = ""
+    as_of_params: tuple = ()
+    if as_of_utc is not None:
+        as_of_pred = " AND unixepoch(effective_reset_at_utc) <= unixepoch(?)"
+        as_of_params = (as_of_utc,)
+    # The columns are NAMED rather than taken with `SELECT *`. `week_reset_
+    # events` is an epoch-versioned table that has already gained and lost
+    # columns (epoch 1013 added `origin_observation_id` and retired a
+    # constraint), and under `*` a column that goes away fails at whichever
+    # consumer happens to read it, one call frame away from the query. Named,
+    # it fails here. This is the read set: `id` is the segment identity
+    # `percent-breakdown` filters milestones on, `effective_reset_at_utc` is
+    # the boundary `_diff_resolve_anchor` moves the window start to, and the
+    # remaining three are the row's own identity for a caller that needs it.
+    return conn.execute(
+        f"""
+        SELECT id, account_key, old_week_end_at, new_week_end_at,
+               effective_reset_at_utc
+        FROM week_reset_events
+        WHERE new_week_end_at = ?{acct_pred}{as_of_pred}
+        ORDER BY unixepoch(effective_reset_at_utc) DESC, id DESC
+        LIMIT 1
+        """,
+        (new_week_end_at,) + acct_params + as_of_params,
+    ).fetchone()
+
+
+def _ordered_in_place_cuts(
+    cuts: "list[tuple[dt.datetime, str]] | None",
+    week_start_at: str | None,
+    week_end_dt: dt.datetime,
+) -> "list[tuple[dt.datetime, str]]":
+    """The week's in-place cuts, strictly inside it, deduplicated and ascending.
+
+    #750 S3 B2. Deduplication is on the parsed INSTANT rather than on the
+    stored text, because two rows can spell one instant in different offsets.
+    A cut on either boundary would emit a zero-width segment, which is not a
+    billing cycle, so both bounds are strict.
+
+    The two bounds degrade INDEPENDENTLY (#750 S3, Unit B review). When the
+    week's own start is absent or unparseable the lower bound cannot be
+    tested, and the cut is admitted, as it was before this filter existed.
+    The upper bound is a different quantity and the caller always has it, so
+    it still applies: skipping it alongside the lower one admitted a cut at or
+    after the week's end, and the tail `[cn, end)` it produced was inverted or
+    zero-width. That asymmetry was inherited from the two per-applier copies
+    rather than chosen.
+
+    ``week_start_at`` is the week's EFFECTIVE start — the caller passes the
+    boundary shift when the week carries one, so a cut that predates the shift
+    falls outside this week and is rejected rather than producing a head
+    segment that runs backwards. It is a raw ISO string rather than a `WeekRef`
+    or a `SubWeek`, because BOTH appliers apply this same bound and they had
+    two identical copies of it, neither with a test, until the Unit B review.
+    It lives here, beside `_latest_reset_event_for_end`, because the two
+    together are the whole of "which reset bounds this segment".
+    """
+    if not cuts:
+        return []
+    start_dt = None
+    if week_start_at:
+        try:
+            start_dt = parse_iso_datetime(week_start_at, "week_start_at")
+        except ValueError:
+            start_dt = None
+    ordered: list[tuple[dt.datetime, str]] = []
+    seen: set = set()
+    for cut_dt, cut_raw in sorted(cuts, key=lambda c: c[0]):
+        if cut_dt in seen:
+            continue
+        if cut_dt >= week_end_dt:
+            continue
+        if start_dt is not None and cut_dt <= start_dt:
+            continue
+        seen.add(cut_dt)
+        ordered.append((cut_dt, cut_raw))
+    return ordered
 
 
 def _reset_aware_floor(

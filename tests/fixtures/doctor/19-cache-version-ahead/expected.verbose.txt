@@ -41,9 +41,12 @@ Hooks
       details:
         root_count: 0
         installed_root_count: 0
+        enabled_root_count: 0
         states: []
         requires_review: False
         trust_state: not-applicable
+        worst_state: None
+        responsible_root_key: None
   ✓ Codex recent activity    not applicable
       details:
         activity_state: not-applicable
@@ -51,6 +54,15 @@ Hooks
         age_seconds: None
         success_count_24h: 0
         error_count_24h: 0
+        responsible_root_key: None
+        roots: []
+  ✓ Codex hook liveness (7d) not applicable
+      details:
+        liveness_state: not-applicable
+        window_seconds: 604800
+        last_success_at: None
+        age_seconds: None
+        marker_count: 0
         responsible_root_key: None
         roots: []
 Auth
@@ -74,7 +86,7 @@ Database
   ⚠ Version ahead            cache.db ahead (v99 > known v45) — auto-heals
       → Auto-heals on next command, or run `cctally db recover --db cache`
       details:
-        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1011, 'mismatch': False}
+        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1013, 'mismatch': False}
         cache.db: {'user_version': 99, 'registry_size': 45, 'ahead': True}
   ✓ Migrations               0/58 applied
       details:
@@ -305,4 +317,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 60 OK · 5 WARN · 0 FAIL
+Summary: 61 OK · 5 WARN · 0 FAIL

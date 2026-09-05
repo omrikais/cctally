@@ -938,6 +938,19 @@ def _reset_outline_derivation_cache():
 
 
 # ── #583 S1: the shared bench corpus ──────────────────────────────────────
+#
+# The mechanisms themselves live in `tests/_shared_corpus.py`, which imports
+# neither pytest nor anything from `bin/`, so a separate process can drive the
+# copier and prove that it really waits on the build lock. They are re-exported
+# here because `from conftest import ...` is how this estate's test modules
+# already reach shared test infrastructure.
+from _shared_corpus import (  # noqa: E402,F401
+    copy_shared_corpus,
+    corpus_lock_path,
+    describe_fingerprint_change,
+    logical_corpus_fingerprint,
+    suspend_corpus_protection,
+)
 
 
 def _load_bench_generator():
@@ -953,12 +966,6 @@ def _load_bench_generator():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
-
-
-def corpus_lock_path(corpus_root, scale):
-    """The flock file serialising one scale's build. Public so a test that
-    rebuilds the shared corpus takes the SAME lock the fixture takes."""
-    return pathlib.Path(corpus_root) / f".build-{scale}.lock"
 
 
 @pytest.fixture(scope="session")
@@ -1006,11 +1013,20 @@ def shared_corpus(corpus_root):
 
     `build_fixture_isolated` restores the pinned environment on return;
     `build_fixture` itself deliberately leaves the process pinned.
+
+    Each scale root is registered with the write detector once its build
+    completes, so a write into it fails in the process that attempted it and is
+    named by that process's own node id. The fingerprint captured alongside is
+    only the session-level backstop for the detector's three blind spots — a
+    writable `ATTACH`, a native child, and a descriptor opened before the
+    protection was installed — and it cannot name a writer, because under xdist
+    it would attribute one worker's write to a reader on another.
     """
     import fcntl
 
     generator = _load_bench_generator()
     built = {}
+    fingerprints = {}
 
     def _build(scale):
         if scale in built:
@@ -1020,19 +1036,81 @@ def shared_corpus(corpus_root):
         with open(corpus_lock_path(corpus_root, scale), "w") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
-                built[scale] = generator.build_fixture_isolated(
-                    scale=scale, seed=42, root=root)
+                # REBUILD, not refuse (#718). This root is scoped to the
+                # pytest numbered directory and only the cheap profiles are
+                # built here, so a corpus another tree left behind is simply
+                # replaced. A capture refuses instead, because it publishes.
+                data_dir = generator.build_fixture_isolated(
+                    scale=scale, seed=42, root=root, on_mismatch="rebuild")
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-        return built[scale]
+        built[scale] = data_dir
+        # Baseline BEFORE the root is protected, and the protection last: the
+        # build itself writes throughout the root, so registering earlier would
+        # fail the very item that built it.
+        fingerprints[scale] = (root, logical_corpus_fingerprint(root))
+        _iso.add_protected_root(root)
+        return data_dir
 
-    return _build
+    yield _build
+
+    problems = []
+    for scale, (root, before) in sorted(fingerprints.items()):
+        changed = describe_fingerprint_change(
+            before, logical_corpus_fingerprint(root))
+        # Paired with the `add_protected_root` above, and ordered AFTER the
+        # comparison so the fingerprint is still taken with the root guarded.
+        _iso.remove_protected_root(root)
+        if changed:
+            problems.append(
+                f"the shared `{scale}` corpus at {root} changed during this "
+                "session:\n    " + "\n    ".join(changed[:20]))
+    if problems:
+        pytest.fail(
+            "the write detector's backstop found the shared bench corpus "
+            "modified (#741). The detector names the writing test when it can "
+            "see the write; this fingerprint fires for the writes it cannot — "
+            "a writable ATTACH, a native child process, or a descriptor opened "
+            "before the protection was installed.\n" + "\n".join(problems),
+            pytrace=False,
+        )
 
 
 @pytest.fixture(scope="session")
 def small_corpus(shared_corpus):
-    """The built `small` corpus data dir — the larger half of the >=10x pair."""
+    """The built `small` corpus data dir — the larger half of the >=10x pair.
+
+    SHARED, and write-protected. A test that only reads may use it directly; a
+    test that writes — a real ingest, a tick, an in-place mutation — must take
+    `private_corpus` instead, or the detector fails it by name. Naming does not
+    make isolation the default here and no longer claims to: `small_corpus`
+    keeps its shared meaning, and D5's protection is what enforces the rule.
+    """
     return shared_corpus("small")
+
+
+@pytest.fixture
+def private_corpus(shared_corpus, tmp_path):
+    """A function-scoped PRIVATE copy of a built scale, by name.
+
+    `private_corpus("small")` returns the copy's data dir, in the same shape
+    `small_corpus` returns for the shared one, so a caller swaps one for the
+    other and changes nothing else. Repeated calls for one scale inside a
+    single test return the same copy; two different scales get two copies,
+    which is what the >=10x row-count pair needs.
+
+    The copy goes through `copy_shared_corpus`, so it is taken under the
+    scale's build lock held shared and never races a rebuild.
+    """
+    copies = {}
+
+    def _copy(scale="small"):
+        if scale not in copies:
+            copies[scale] = copy_shared_corpus(
+                shared_corpus(scale), tmp_path / f"private-corpus-{scale}")
+        return copies[scale]
+
+    return _copy
 
 
 @pytest.fixture(scope="session")

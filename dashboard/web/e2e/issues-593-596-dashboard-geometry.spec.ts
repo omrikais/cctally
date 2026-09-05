@@ -235,8 +235,17 @@ test('#573 — every All range note stays readable while Alerts recovers body he
   await page.goto('/');
   await selectSource(page, 'all');
 
+  // An EXACT count, deliberately: it is the guard that catches a panel
+  // silently losing its sub-line. Under `all` on the undecorated
+  // `all-combined` fixture the eight are Sessions, Weekly, Monthly, Daily,
+  // Blocks, Projects (its range note), Alerts and — added by #750 S2 — Trend,
+  // whose week/cycle composition moved out of the `h2` so the title stops
+  // being clipped mid-word on a phone. Projects' SECOND note, the merged-
+  // accounts sentence, needs a decorated Claude provider and this fixture has
+  // none. Raise or lower this number when you add or remove a note; do not
+  // soften it to a range.
   const notes = page.locator('.panel-range-note');
-  await expect(notes).toHaveCount(7);
+  await expect(notes).toHaveCount(8);
   for (const note of await notes.all()) {
     await expect(note).toBeVisible();
     await expect(note).not.toHaveText('');
@@ -270,7 +279,9 @@ test('#573 — every All range note stays readable while Alerts recovers body he
     }),
   }));
   expect(mobile.documentScrollWidth).toBeLessThanOrEqual(mobile.documentClientWidth);
-  expect(mobile.notes).toHaveLength(7);
+  // The same eight, re-counted at 390px: no note is dropped by the mobile
+  // rules, and the Trend note this branch added has to survive them too.
+  expect(mobile.notes).toHaveLength(8);
   for (const note of mobile.notes) {
     expect(note.text?.trim()).not.toBe('');
     expect(note.scrollWidth).toBeLessThanOrEqual(note.clientWidth + 1);

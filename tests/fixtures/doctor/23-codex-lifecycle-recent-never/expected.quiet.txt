@@ -6,7 +6,7 @@ Hooks
       → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
   ⚠ Last hook fire           never
       → No hook has fired yet. Restart Claude Code.
-  ⚠ Codex recent activity    2 installed root(s); never
+  ⚠ Codex recent activity    2 enabled root(s); never
       → Trigger Codex activity, then verify `cctally setup` hooks.
 Auth
 Database
@@ -23,4 +23,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 59 OK · 6 WARN · 0 FAIL
+Summary: 60 OK · 6 WARN · 0 FAIL

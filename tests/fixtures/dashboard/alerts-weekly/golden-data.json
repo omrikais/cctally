@@ -5,6 +5,7 @@
       "axis": "weekly",
       "context": {
         "cumulative_cost_usd": 38.25,
+        "cycle_start_at": "2026-04-13T14:00:00Z",
         "dollars_per_percent": 0.425,
         "reset_event_id": 0,
         "week_start_at": "2026-04-13T14:00:00Z",
@@ -20,6 +21,7 @@
       "axis": "weekly",
       "context": {
         "cumulative_cost_usd": 41.8,
+        "cycle_start_at": "2026-04-06T14:00:00Z",
         "dollars_per_percent": 0.43999999999999995,
         "reset_event_id": 0,
         "week_start_at": "2026-04-06T14:00:00Z",
@@ -35,6 +37,7 @@
       "axis": "weekly",
       "context": {
         "cumulative_cost_usd": 44.0,
+        "cycle_start_at": "",
         "dollars_per_percent": 0.44,
         "reset_event_id": 0,
         "week_start_at": "",
@@ -935,6 +938,7 @@
               "axis": "weekly",
               "context": {
                 "cumulative_cost_usd": 38.25,
+                "cycle_start_at": "2026-04-13T14:00:00Z",
                 "dollars_per_percent": 0.425,
                 "reset_event_id": 0,
                 "week_start_at": "2026-04-13T14:00:00Z",
@@ -952,6 +956,7 @@
               "axis": "weekly",
               "context": {
                 "cumulative_cost_usd": 41.8,
+                "cycle_start_at": "2026-04-06T14:00:00Z",
                 "dollars_per_percent": 0.43999999999999995,
                 "reset_event_id": 0,
                 "week_start_at": "2026-04-06T14:00:00Z",
@@ -969,6 +974,7 @@
               "axis": "weekly",
               "context": {
                 "cumulative_cost_usd": 44.0,
+                "cycle_start_at": "",
                 "dollars_per_percent": 0.44,
                 "reset_event_id": 0,
                 "week_start_at": "",
@@ -1081,6 +1087,7 @@
               "axis": "weekly",
               "context": {
                 "cumulative_cost_usd": 38.25,
+                "cycle_start_at": "2026-04-13T14:00:00Z",
                 "dollars_per_percent": 0.425,
                 "reset_event_id": 0,
                 "week_start_at": "2026-04-13T14:00:00Z",
@@ -1098,6 +1105,7 @@
               "axis": "weekly",
               "context": {
                 "cumulative_cost_usd": 41.8,
+                "cycle_start_at": "2026-04-06T14:00:00Z",
                 "dollars_per_percent": 0.43999999999999995,
                 "reset_event_id": 0,
                 "week_start_at": "2026-04-06T14:00:00Z",
@@ -1115,6 +1123,7 @@
               "axis": "weekly",
               "context": {
                 "cumulative_cost_usd": 44.0,
+                "cycle_start_at": "",
                 "dollars_per_percent": 0.44,
                 "reset_event_id": 0,
                 "week_start_at": "",

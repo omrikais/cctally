@@ -200,3 +200,80 @@ def test_reset_week_attribution_failure_does_not_abort_the_ingest_cycle(
         conn.close()
 
     assert row is None
+
+
+def test_milestone_reset_lookup_is_scoped_to_the_milestone_account(
+    ns, monkeypatch,
+):
+    """Both reset-event reads on the milestone path carry the account (#750 S3).
+
+    The cost written into the milestone is computed for `account_key` over
+    `effective_ref`'s range. The applier that produces that range and the
+    predicate that decides whether to live-compute at all were both merged, so
+    on a multi-account install ANOTHER account's cut shifted this account's
+    range and the result was stamped as this account's `cumulative_cost`.
+
+    Asserted on the two calls rather than on the resulting dollars, because the
+    misattribution is silent: the wrong range still yields a plausible number,
+    and only the account argument distinguishes right from wrong.
+    """
+    seen: dict = {}
+    real_applier = ns["_apply_reset_events_to_weekrefs"]
+
+    def _spy_applier(conn, refs, **kwargs):
+        seen["applier"] = kwargs.get("account_key", "MISSING")
+        return real_applier(conn, refs, **kwargs)
+
+    def _spy_predicate(conn, ref, **kwargs):
+        seen["predicate"] = kwargs.get("account_key", "MISSING")
+        return False
+
+    monkeypatch.setitem(ns, "cmd_sync_week", lambda *a, **k: 0)
+    monkeypatch.setitem(ns, "_apply_reset_events_to_weekrefs", _spy_applier)
+    monkeypatch.setitem(ns, "_week_ref_has_reset_event", _spy_predicate)
+
+    conn = ns["open_db"]()
+    try:
+        snap_id = _seed(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        ns["maybe_record_milestone"](
+            _saved(snap_id), conn=conn, as_of=_AS_OF, account_key="acct-a")
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert seen == {"applier": "acct-a", "predicate": "acct-a"}, seen
+
+
+def test_week_ref_has_reset_event_answers_for_one_account(ns):
+    """The predicate must not report another account's event as this one's.
+
+    It matches on the effective instant alone, and two accounts hold weeks
+    whose boundaries coincide, so the merged read answers True for a week its
+    own account never reset in — which sends the cost read down the
+    live-compute branch over a range that account never had.
+    """
+    has_event = ns["_week_ref_has_reset_event"]
+    make_ref = ns["make_week_ref"]
+    effective = "2026-01-04T12:00:00+00:00"
+
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO week_reset_events "
+            "(detected_at_utc, old_week_end_at, new_week_end_at, "
+            " effective_reset_at_utc, account_key) VALUES (?, ?, ?, ?, ?)",
+            (effective, effective, _WEEK_END_AT, effective, "acct-b"),
+        )
+        conn.commit()
+        ref = make_ref(
+            week_start_date=_WEEK_START, week_end_date=_WEEK_END,
+            week_start_at=effective, week_end_at=_WEEK_END_AT,
+        )
+        assert has_event(conn, ref, account_key="acct-b") is True
+        assert has_event(conn, ref, account_key="acct-a") is False
+        # The merged read stays the account-blind answer every caller that
+        # asks no account question relies on.
+        assert has_event(conn, ref) is True
+    finally:
+        conn.close()

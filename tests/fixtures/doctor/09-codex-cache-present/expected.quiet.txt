@@ -10,8 +10,8 @@ Hooks
       → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
   ⚠ Last hook fire           never
       → No hook has fired yet. Restart Claude Code.
-  ⚠ Codex hooks installed    0/1 root(s) installed
-      → Run `cctally setup`, then review the handler in Codex /hooks.
+  ⚠ Codex hooks installed    0/1 root(s) enabled
+      → Run `cctally setup` to install the native Codex handler.
 Auth
 Database
   ⚠ Pending migrations       58 pending
@@ -28,4 +28,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 57 OK · 8 WARN · 0 FAIL
+Summary: 58 OK · 8 WARN · 0 FAIL

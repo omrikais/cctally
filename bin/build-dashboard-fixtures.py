@@ -172,14 +172,21 @@ def _insert_usage_snapshot(
     week_end: dt.datetime,
     pct: float,
     account_key: str = "unattributed",
+    journal_id: str | None = None,
 ) -> None:
     """Write one weekly_usage_snapshots row carrying both ISO-timestamp
     and date-only boundary columns so the production selector picks it
-    up via either match path."""
+    up via either match path.
+
+    `journal_id` names the journal record the snapshot was materialized from.
+    `_backfill_week_reset_events` reads it to name the origin of any reset
+    event it synthesizes from this row, so a scenario that seeds an event with
+    an explicit `origin_observation_id` must stamp the matching
+    `"sa:" + <origin>` here (#750 S3 §4.3)."""
     stats_conn.execute(
         "INSERT INTO weekly_usage_snapshots(captured_at_utc, week_start_date, "
         "week_end_date, week_start_at, week_end_at, weekly_percent, source, "
-        "payload_json, account_key) VALUES (?,?,?,?,?,?,?,?,?)",
+        "payload_json, account_key, journal_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (
             _iso(captured_at),
             week_start.date().isoformat(),
@@ -190,6 +197,7 @@ def _insert_usage_snapshot(
             "fixture",
             json.dumps({"fixture": True}),
             account_key,
+            journal_id,
         ),
     )
 
@@ -654,6 +662,13 @@ FIXED_SESSION_IDS: dict[str, str] = {
     "over":       "fixture-over-session-0000000000000000",
     "reset-week": "fixture-reset-session-0000000000000000",
 }
+
+# The raw observation the ``reset-week`` scenario's reset event originates
+# from (#750 S3 §4.3). `_lib_journal` mints a raw id as ``"o:"`` plus the
+# first 16 hex characters of a content digest, and
+# `_origin_from_snapshot_journal_id` requires exactly that shape, so this
+# literal must stay 18 characters of that form.
+RESET_WEEK_ORIGIN_OBSERVATION_ID = "o:0f1e2d3c4b5a6978"
 
 
 # --- Scenario helpers --------------------------------------------------
@@ -1242,11 +1257,17 @@ def build_reset_week(as_of: dt.datetime) -> None:
         # pre_reset_end (2026-04-17T13Z == reset_at) so backfill's
         # captured_dt < prior_end_dt check passes and a reset row is
         # inserted automatically on the harness's first open_db().
+        # The FIRST post-reset capture is the observation the reset event
+        # originates from, so it is the one that carries a `journal_id`. Its
+        # `"sa:"`-prefixed form is what `_origin_from_snapshot_journal_id`
+        # strips to derive `RESET_WEEK_ORIGIN_OBSERVATION_ID` below.
         for hrs_after_reset, pct in [(0, 0.0), (8, 2.0), (16, 3.0), (24, 4.0), (25, 5.0)]:
             _insert_usage_snapshot(
                 stats_conn,
                 captured_at=reset_at + dt.timedelta(hours=hrs_after_reset),
                 week_start=week_start, week_end=post_reset_end, pct=pct,
+                journal_id=(f"sa:{RESET_WEEK_ORIGIN_OBSERVATION_ID}"
+                            if hrs_after_reset == 0 else None),
             )
 
         # Pre-seed the week_reset_events row that `_backfill_week_reset_events`
@@ -1254,13 +1275,19 @@ def build_reset_week(as_of: dt.datetime) -> None:
         # stamp the post-credit milestones with the matching `reset_event_id`
         # (Task 5) so the dashboard milestone-panel segment filter (Task 7)
         # surfaces them. AUTOINCREMENT on a fresh table assigns id=1; backfill
-        # is `INSERT OR IGNORE` keyed on UNIQUE(old, new) so it no-ops at open.
+        # is `INSERT OR IGNORE`, so it no-ops at open provided the seeded row
+        # and the backfill's candidate share an identity.
         # Production stores boundary timestamps via `_canonicalize_optional_iso`
         # which renders the UTC offset as `+00:00`, NOT `Z` — use the matching
-        # form here so the UNIQUE constraint recognizes the backfill's attempt
-        # as a duplicate. With `Z` form, backfill would insert a SECOND row
-        # with `+00:00`, the segment lookup would pick id=2, and milestones
-        # stamped with id=1 would be filtered out as a stale segment.
+        # form here. With `Z` form, backfill would insert a SECOND row with
+        # `+00:00`, the segment lookup would pick id=2, and milestones stamped
+        # with id=1 would be filtered out as a stale segment.
+        # #750 S3 §4.3: the row also NAMES its origin observation, which is the
+        # identity epoch 1013 deduplicates on. The two partial unique indexes
+        # are disjoint, so an origin-bearing row is NOT deduplicated by the
+        # legacy boundary tuple — which is exactly why the originating snapshot
+        # above carries the matching `journal_id`. Both halves are required:
+        # drop either one and the backfill mints a second row.
         def _iso_canon(d: dt.datetime) -> str:
             return d.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
 
@@ -1270,6 +1297,7 @@ def build_reset_week(as_of: dt.datetime) -> None:
             old_week_end_at=_iso_canon(pre_reset_end),
             new_week_end_at=_iso_canon(post_reset_end),
             effective_reset_at_utc=_iso_canon(reset_at),
+            origin_observation_id=RESET_WEEK_ORIGIN_OBSERVATION_ID,
         )
         reset_event_id_row = stats_conn.execute(
             "SELECT id FROM week_reset_events WHERE new_week_end_at = ?",

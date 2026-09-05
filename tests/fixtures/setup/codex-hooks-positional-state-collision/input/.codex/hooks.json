@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/lib/node_modules/cctally/bin/cctally-npm-shim.js hook-tick --foreground --source codex",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/lib/node_modules/cctally/bin/cctally-npm-shim.js hook-tick --foreground --source codex",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

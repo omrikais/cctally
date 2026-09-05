@@ -1,0 +1,4 @@
+# Codex's own trust record, hand-edited into a shape `tomllib` rejects.
+# Rule 6 of the ordered classification: the handler is installed and cctally
+# cannot observe whether Codex will run it.
+= = not toml

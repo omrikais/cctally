@@ -1367,9 +1367,6 @@ class IngestContext:
     # writes while still exercising the same SQLite derivation/fold code.
     event_sink: "list | None" = None
     projection_writes: bool = True
-    # Scratch replay reconstructs ephemeral marker state in memory. A planner
-    # shares this dict across its per-record contexts.
-    projection_state: dict = field(default_factory=dict)
     # #374 write boundary: emissions WITHHELD this cycle because they would have
     # violated the same-revision rule. Each entry is a `DroppedConflict`; the row
     # was converged from the already-journaled effective event instead.
@@ -1461,8 +1458,16 @@ class _HarvestSpec:
     # Design B (event+effects): when True this family's harvest evt carries a
     # `suppression` list (logical ids of `weekly_usage_snapshots` rows the reset
     # deleted) that the fold applier replays. `_build_harvest_evt` sources the
-    # list from `ctx.suppression_map` keyed on this spec's `id_parts` values.
+    # list from `ctx.suppression_map` keyed on this spec's id parts.
     suppression: bool = False
+    # #750 S3 §1.1: a family whose identity is not a fixed column list. When
+    # set, this callable takes the row and returns the ordered id parts, and
+    # `id_parts` is left empty. `week_reset_events` needs it because its
+    # identity is DUAL-SHAPED — the originating observation when there is one,
+    # the legacy boundary tuple when there is not — and one column list cannot
+    # express two shapes. The same callable also produces the
+    # `ctx.suppression_map` key, so the id and the effect lookup cannot drift.
+    id_parts_fn: "object | None" = None
 
 
 # --------------------------------------------------------------------------
@@ -3968,7 +3973,26 @@ def _apply_quota_alert_arming(conn, evt):
     return None
 
 
-def _meter_rate_change_row(evt) -> "tuple | None":
+#: One `meter_rate_change_events` row, addressed by NAME (#750 S2).
+#:
+#: Every field name IS the column name it writes, which is what lets the
+#: INSERT below derive its column list from this declaration rather than
+#: restating it, and lets `_backfill_meter_rate_change_evidence` read the
+#: evidence by attribute. The four evidence values were read positionally as
+#: `row[8]` through `row[11]`, so reordering these fields would have left the
+#: INSERT and that UPDATE writing different columns, silently, with nothing
+#: reporting the disagreement and no import-time failure.
+_MeterRateChangeRow = collections.namedtuple("_MeterRateChangeRow", (
+    "provider", "account_key", "effective_from", "previous_units_per_point",
+    "new_units_per_point", "severity", "detected_at_utc", "created_at_utc",
+    "withholding_status", "detector_input_causes", "composition_provenance",
+    "baseline_withheld_days"))
+
+_MRC_ROW_COLUMNS = ", ".join(_MeterRateChangeRow._fields)
+_MRC_ROW_PLACEHOLDERS = ",".join("?" for _ in _MeterRateChangeRow._fields)
+
+
+def _meter_rate_change_row(evt) -> "_MeterRateChangeRow | None":
     """The row `meter_rate_change_events` takes, or None for a bad payload.
 
     Normalising rather than trusting the payload keeps a malformed record from
@@ -3986,9 +4010,40 @@ def _meter_rate_change_row(evt) -> "tuple | None":
         return None
     account_key = p.get("account_key") or _lib_accounts.UNATTRIBUTED
     created = p.get("created_at_utc") or evt.get("at")
-    return (str(provider), str(account_key), str(effective_from), previous,
-            new, str(p.get("severity") or "info"),
-            str(p.get("detected_at_utc") or created or ""), str(created or ""))
+    # #690: version-aware. A v1 payload carries none of the four evidence
+    # keys, so `.get` yields None and the row materializes them as NULL — the
+    # legacy state, which is honest rather than fabricated. A v2 payload
+    # carries them and they materialize directly. Read by KEY PRESENCE rather
+    # than by branching on `payload_version`, so a v2 record that lost a key
+    # degrades to null on that one field instead of failing the whole fold.
+    days = p.get("baseline_withheld_days")
+    try:
+        days = None if days is None else int(days)
+    except (TypeError, ValueError):
+        days = None
+    return _MeterRateChangeRow(
+        provider=str(provider),
+        account_key=str(account_key),
+        effective_from=str(effective_from),
+        previous_units_per_point=previous,
+        new_units_per_point=new,
+        severity=str(p.get("severity") or "info"),
+        detected_at_utc=str(p.get("detected_at_utc") or created or ""),
+        created_at_utc=str(created or ""),
+        withholding_status=_text_or_none(p.get("withholding_status")),
+        detector_input_causes=_text_or_none(p.get("detector_input_causes")),
+        composition_provenance=_text_or_none(p.get("composition_provenance")),
+        baseline_withheld_days=days)
+
+
+def _text_or_none(value) -> "str | None":
+    """`str(value)` unless it is None, which stays None (#690).
+
+    NULL and `'[]'` are distinct states on the evidence columns, so a blanket
+    `str(...)` would turn the legacy state into the string `'None'` and a
+    reader could no longer tell them apart.
+    """
+    return None if value is None else str(value)
 
 
 def _insert_meter_rate_change(conn, evt) -> bool:
@@ -4004,12 +4059,62 @@ def _insert_meter_rate_change(conn, evt) -> bool:
     row = _meter_rate_change_row(evt)
     if row is None:
         return False
+    # The column list is DERIVED from `_MeterRateChangeRow._fields`, not
+    # restated: the tuple's field names are the column names, so a field
+    # reordered or renamed there moves this statement with it rather than
+    # shifting every value one column over (#750 S2).
     cur = conn.execute(
-        "INSERT OR IGNORE INTO meter_rate_change_events "
-        "(provider, account_key, effective_from, previous_units_per_point,"
-        " new_units_per_point, severity, detected_at_utc, created_at_utc) "
-        "VALUES (?,?,?,?,?,?,?,?)", row)
-    return cur.rowcount == 1
+        f"INSERT OR IGNORE INTO meter_rate_change_events "
+        f"({_MRC_ROW_COLUMNS}) VALUES ({_MRC_ROW_PLACEHOLDERS})", row)
+    created = cur.rowcount == 1
+    if not created:
+        _backfill_meter_rate_change_evidence(conn, row)
+    return created
+
+
+def _backfill_meter_rate_change_evidence(conn, row) -> None:
+    """Fill NULL evidence columns on an existing row from a v2 payload (#690).
+
+    Replay order is not guaranteed, so the fold has to be ASYMMETRIC. A v2
+    record arriving after a v1 record for the same natural key must be able to
+    supply the evidence the v1 record could not, and a v1 record arriving
+    after a v2 record must not erase it.
+
+    Both directions fall out of one rule: write a column only where the stored
+    value IS NULL and the incoming value is not. A v1 payload carries all four
+    as None, so its backfill is a no-op and cannot erase; a v2 payload fills
+    exactly the columns still unknown. It is not a general upsert — an
+    incoming non-null value never overwrites a stored non-null one, because
+    the first evidence recorded for an identity came from the analysis that
+    actually admitted it.
+
+    Deliberately SEPARATE from the insert rather than an `ON CONFLICT DO
+    UPDATE`. `_insert_meter_rate_change` returns `cur.rowcount == 1` as the
+    §6.5 step-5 predicate that gates a notification, and a conflicting upsert
+    reports `rowcount == 1` for an UPDATE too — which would re-fire a
+    notification for every replayed duplicate. Keeping the backfill in its own
+    statement leaves that predicate meaning exactly "this call created the
+    row".
+    """
+    # Read by NAME (#750 S2). These four were `row[8]` through `row[11]`, and
+    # the natural key was `row[0]` through `row[2]`; a reordering of
+    # `_MeterRateChangeRow` would have moved the INSERT's column list and left
+    # this UPDATE reading the old positions, writing wrong values into the
+    # right columns with nothing raising.
+    if (row.withholding_status is None and row.detector_input_causes is None
+            and row.composition_provenance is None
+            and row.baseline_withheld_days is None):
+        return
+    conn.execute(
+        "UPDATE meter_rate_change_events SET "
+        " withholding_status = COALESCE(withholding_status, ?),"
+        " detector_input_causes = COALESCE(detector_input_causes, ?),"
+        " composition_provenance = COALESCE(composition_provenance, ?),"
+        " baseline_withheld_days = COALESCE(baseline_withheld_days, ?) "
+        "WHERE provider = ? AND account_key = ? AND effective_from = ?",
+        (row.withholding_status, row.detector_input_causes,
+         row.composition_provenance, row.baseline_withheld_days,
+         row.provider, row.account_key, row.effective_from))
 
 
 def _apply_meter_rate_change(conn, evt):
@@ -4206,6 +4311,30 @@ def _apply_evt(conn, evt, *, projection_writes=True):
 # harvest registry (natural-keyed families, spec §5.3)
 # --------------------------------------------------------------------------
 
+#: #750 S3 §1.1. Re-exported here so `_cctally_journal` callers and the tests
+#: reach the ONE producer of `week_reset_events` id parts; the function itself
+#: is a pure kernel in `_lib_journal`.
+week_reset_identity_parts = _lib_journal.week_reset_identity_parts
+
+
+def _week_reset_row_identity_parts(row):
+    """`week_reset_identity_parts` over a `week_reset_events` row.
+
+    Reads `origin_observation_id` defensively: a scratch projection built by an
+    older shape can lack the column, and a harvest that raised there would
+    abort the whole ingest cycle rather than fall back to the legacy spelling
+    the row actually has.
+    """
+    try:
+        origin = row["origin_observation_id"]
+    except (IndexError, KeyError):
+        origin = None
+    return week_reset_identity_parts(
+        row["account_key"], row["old_week_end_at"], row["new_week_end_at"],
+        origin,
+    )
+
+
 # Every harvest family's natural key now leads with `account_key` (#341): the
 # account is part of each table's extended UNIQUE, so the opaque evt id must
 # include it to stay a bijection with the row (two accounts sharing a physical
@@ -4213,8 +4342,11 @@ def _apply_evt(conn, evt, *, projection_writes=True):
 # plain payload column, so the generic fold round-trips it back onto the row.
 _HARVEST_SPECS = [
     _HarvestSpec(
+        # #750 S3 §1.1: dual-shaped identity, so the parts come from the shared
+        # helper rather than from a fixed column list. `id_parts` stays empty.
         "week_reset_events", "week_reset", "wr",
-        id_parts=("account_key", "old_week_end_at", "new_week_end_at"),
+        id_parts=(),
+        id_parts_fn=_week_reset_row_identity_parts,
         at_column="detected_at_utc", order=30, suppression=True,
     ),
     _HarvestSpec(
@@ -4389,13 +4521,15 @@ def _build_harvest_evt(ctx, spec, row):
     """Build the evt for one harvested natural-keyed row (spec §5.3): map the
     plain columns, replace FK rowids with their referenced row's logical id
     (reverse lookup), embed rollup children, and assemble the opaque natural-key
-    id from `spec.id_prefix` + `spec.id_parts` (FK parts contribute their
-    logical id).
+    id from `spec.id_prefix` + the family's id parts (FK parts contribute
+    their logical id; a family carrying `spec.id_parts_fn` — today only
+    `week_reset_events`, whose identity is dual-shaped — gets its parts from
+    that callable instead of from a fixed column list).
 
     For a suppression family (`week_reset`/`five_hour_credit`, Design B) the
     reset's destructive effects also ride the evt: the list of logical
     `journal_id`s the live pipeline hook captured (in `ctx.suppression_map`,
-    keyed on this row's `id_parts` values) is attached as `payload["suppression"]`
+    keyed on this row's id parts) is attached as `payload["suppression"]`
     so the effects replay deterministically. The id stays the pure natural key —
     `suppression` is an effect, never an id component."""
     conn = ctx.conn
@@ -4426,10 +4560,21 @@ def _build_harvest_evt(ctx, spec, row):
             {k: cr[k] for k in cr.keys() if k not in ("id", "block_id")}
             for cr in child_rows
         ]
-    parts = [refs[name] if name in fk_cols else row[name]
-             for name in spec.id_parts]
+    # #750 S3 §1.1: ONE producer for the id parts and for the suppression-map
+    # key. A family with an `id_parts_fn` (today only `week_reset_events`,
+    # whose identity is dual-shaped) supplies both from that callable; every
+    # other family keeps the fixed column list, with an FK part contributing
+    # its logical id. Deriving the two separately is how a destructive effect
+    # stops riding its own event.
+    if spec.id_parts_fn is not None:
+        parts = tuple(spec.id_parts_fn(row))
+        supp_key = parts
+    else:
+        parts = tuple(refs[name] if name in fk_cols else row[name]
+                      for name in spec.id_parts)
+        supp_key = tuple(row[name] for name in spec.id_parts)
     if spec.suppression:
-        supp = ctx.suppression_map.get(tuple(row[name] for name in spec.id_parts))
+        supp = ctx.suppression_map.get(supp_key)
         if supp:
             payload["suppression"] = list(supp)
     eid = _lib_journal.evt_id(spec.id_prefix, *parts)
@@ -4598,7 +4743,9 @@ def record_meter_rate_change(ctx, transition, *, notify: bool,
     mrc = _load_meter_rate_change()
     existing = ctx.conn.execute(
         "SELECT provider, account_key, effective_from,"
-        " previous_units_per_point, new_units_per_point, severity "
+        " previous_units_per_point, new_units_per_point, severity,"
+        " withholding_status, detector_input_causes,"
+        " composition_provenance, baseline_withheld_days "
         "FROM meter_rate_change_events "
         "WHERE provider = ? AND account_key = ? AND effective_from = ? "
         "LIMIT 1", transition.identity()).fetchone()
@@ -4616,9 +4763,23 @@ def record_meter_rate_change(ctx, transition, *, notify: bool,
             return RateChangeRecordResult(notification_decided=True)
         # Rebuilt from the ROW rather than from the caller's descriptor: the
         # sweep knows only the identity, so its descriptor carries placeholder
-        # rates and severity. `withholding_status` stays at its `None`
-        # default, because it describes the analysis that originally admitted
-        # the transition and a later run's analysis is not that one.
+        # rates and severity.
+        #
+        # #695 reasoned that `withholding_status` had to stay at its `None`
+        # default here, because the disclosure describes the analysis that
+        # originally admitted the transition and a later run's analysis is not
+        # that one. That premise no longer holds. Since #690 the ROW carries
+        # the original analysis's own stamp, so reading the four columns back
+        # IS reading the original decision rather than substituting a later
+        # run's — the objection was to re-deriving the disclosure, not to
+        # retrieving it.
+        #
+        # Left defaulted, the retry would follow the
+        # `withholding_status`-absent branch of `_alert_text_meter_rate_change`
+        # and tell the reader to inspect a fitted budget the withheld
+        # calibration may never have produced, on exactly the path this
+        # disclosure exists to correct. A legacy v1 row carries four NULLs and
+        # honestly reports no evidence.
         ctx.deferred_alerts.append(mrc.alert_payload(
             mrc.RateChangeTransition(
                 provider=str(existing[0]),
@@ -4627,7 +4788,12 @@ def record_meter_rate_change(ctx, transition, *, notify: bool,
                 previous_units_per_point=float(existing[3]),
                 new_units_per_point=float(existing[4]),
                 severity=str(existing[5]),
-                detected_at=str(transition.detected_at))))
+                detected_at=str(transition.detected_at),
+                withholding_status=_text_or_none(existing[6]),
+                detector_input_causes=_text_or_none(existing[7]),
+                composition_provenance=_text_or_none(existing[8]),
+                baseline_withheld_days=(
+                    None if existing[9] is None else int(existing[9])))))
         return RateChangeRecordResult(notification_queued=True,
                                       notification_decided=True)
     if notification_owed:
@@ -4639,10 +4805,73 @@ def record_meter_rate_change(ctx, transition, *, notify: bool,
         # is what ENFORCES the claim `_owed_rate_change_transitions` makes;
         # without it the prose asserts an invariant the code does not hold.
         return RateChangeRecordResult()
-    payload = mrc.event_payload(transition, created_at=created_at)
-    eid = _lib_journal.evt_id(
+    # #690: new transitions are emitted under the VERSION-2 identity, whose
+    # payload carries the disclosure evidence alongside the complete row. The
+    # v1 payload and its `event_payload()` output stay byte-frozen.
+    #
+    # #750 S2: the prefix is chosen by whether this natural key ALREADY HAS a
+    # v1 journal record, not by the binary's payload version. A payload
+    # version applies to identities that have never been recorded; it must not
+    # retire #689's duplicate-with-missing-row recovery for identities that
+    # have. `unrecorded_rate_change_transitions` deliberately re-offers a v1
+    # record that is active at revision 0 with a retained payload and no
+    # physical row, precisely so this function can materialize that row from
+    # the RETAINED event. Emitting v2 there makes two logical events out of
+    # one natural key: the journal grows a line, two active revision-0 records
+    # describe one row, `_converge_meter_rate_change_row` is never reached,
+    # the `conflicts_dropped` diagnostic never prints, and — because the v2
+    # insert reports `rowcount == 1` — the recovery re-fires a notification
+    # for history.
+    #
+    # The test is EXISTENCE rather than liveness, because this function has a
+    # second caller the presence check does not gate. The owed and unrecorded
+    # sweeps ask about both prefixes and never re-offer a terminally latched
+    # identity, but `cmd_quota` also emits a FRESHLY detected transition here
+    # directly. A tombstoned or higher-revision v1 record is invisible to a v2
+    # lookup, so selecting v2 for one would classify a terminally suppressed
+    # identity as new and append the row the latch exists to hold down. Under
+    # existence every non-live v1 state reaches the conflict or
+    # revision-mismatch path instead, which is where a recorded-and-suppressed
+    # transition belongs, and the emitter's rule matches the presence check's
+    # own: a latch under either prefix suppresses the other.
+    #
+    # What that costs depends on the state. A revision mismatch raises
+    # `CorrectionRebuildRequired` with the default `recovery_eligible=False`,
+    # which `_run_stats_ingest_once` re-raises in EVERY mode, and an ACTIVE
+    # selection retaining no record raises `JournalProtocolError`, which it
+    # re-raises under `mode="authoritative"` alone. Either one discards the
+    # whole ingest cycle with the cursor unmoved, deferring every other leg
+    # to the next invocation. A TOMBSTONE at revision 0 is the exception and
+    # costs one line: `_prior_meter_rate_change_event` returns None for any
+    # non-active status before convergence is reached, so the emission is
+    # withheld and the cycle commits. No journal record is lost in any of
+    # them, because the journal is append-only and a discarded cycle never
+    # advanced the cursor — but the two raising states are terminal and
+    # repeat on every run until an operator intervenes.
+    #
+    # The v1 branch also DISCARDS evidence, at the DETECTION-TIME emit site
+    # only, as a consequence of the prefix rule rather than of the payload
+    # version. `mrc.event_payload` is the version-1 payload, so the four
+    # withheld-calibration values `persist_and_detect` stamps on a FRESHLY
+    # detected transition are dropped rather than journaled. The #689
+    # recovery route loses nothing here: `enumerate_transitions` builds its
+    # transitions from stored regimes and never stamps the four, so their
+    # nulls are the by-construction nulls spec §3.3 already describes. Only a
+    # fresh detection meeting an existing v1 record loses evidence THIS
+    # analysis captured. Spec §3.2 sanctions that outcome — the columns are
+    # nullable for exactly this, and the client renders honest generic copy
+    # for a null-evidence row.
+    v1_eid = _lib_journal.evt_id(
         mrc.EVT_ID_PREFIX, transition.provider, transition.account_key,
         transition.effective_from)
+    if _v1_rate_change_identity_exists(ctx.conn, v1_eid):
+        payload = mrc.event_payload(transition, created_at=created_at)
+        eid = v1_eid
+    else:
+        payload = mrc.event_payload_v2(transition, created_at=created_at)
+        eid = _lib_journal.evt_id(
+            mrc.EVT_ID_PREFIX_V2, transition.provider,
+            transition.account_key, transition.effective_from)
     evt = _lib_journal.make_evt(
         kind=mrc.EVT_KIND, id=eid, at=created_at, payload=payload)
     decision = _classify_live_effective_event(ctx.conn, evt)
@@ -4664,6 +4893,26 @@ def record_meter_rate_change(ctx, transition, *, notify: bool,
         return RateChangeRecordResult()
     _insert_meter_rate_change(ctx.conn, evt)
     return RateChangeRecordResult()
+
+
+def _v1_rate_change_identity_exists(conn, event_id) -> bool:
+    """Whether this natural key already holds a v1 journal record (#750 S2).
+
+    EXISTENCE, not liveness. One state — active, revision 0, with a retained
+    payload — is the state `unrecorded_rate_change_transitions` treats as NOT
+    recorded, and emitting under v1 there is what lets the convergence
+    machinery materialize the missing row from the retained event. Every
+    other state is terminal, and emitting under v1 there is what KEEPS it
+    terminal: the classifier reaches a same-revision conflict or a revision
+    mismatch rather than minting a second logical event under the v2 id,
+    where the latch would be invisible.
+
+    Only the total absence of a v1 record selects v2, which is the case a
+    payload version is actually about.
+    """
+    return conn.execute(
+        "SELECT 1 FROM journal_effective_events WHERE event_id = ?",
+        (event_id,)).fetchone() is not None
 
 
 def _converge_meter_rate_change_row(conn, event_id) -> str:
@@ -7436,6 +7685,7 @@ _REBUILD_REQUIRED_TABLES = frozenset(
         "week_reset_events",
         "weekly_cost_snapshots",
         "weekly_credit_floors",
+        "weekly_reset_debounce_state",
         "weekly_usage_snapshots",
     }
 )
@@ -7472,6 +7722,8 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
         "idx_usage_week_time",
         "idx_week_reset_events_journal_id",
         "idx_week_reset_events_journal_id_null",
+        "idx_week_reset_events_legacy_tuple",
+        "idx_week_reset_events_origin",
         "idx_weekly_cost_snapshots_journal_id",
         "idx_weekly_credit_floors_journal_id",
         "idx_weekly_usage_snapshots_5h_window_key",
@@ -7483,7 +7735,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
 # omitted column, constraint, partial predicate, or index definition.  An epoch
 # schema change must update this contract alongside STATS_INDEX_EPOCH.
 _REBUILD_SCHEMA_FINGERPRINT = (
-    "472e77f23b289eb9141c2b318b94f24e98d509a73a9063568fbd66b04013ead3"
+    "41038fa21e2c9e3c586768d98bc3a0984d223af943ef25d7bdae1c0c8906e217"
 )
 
 

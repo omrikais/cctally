@@ -211,6 +211,18 @@ def percent_breakdown_home(tmp_path, monkeypatch):
 def test_codex_percent_breakdown_matches_claude_visual_design_byte_for_byte(
     percent_breakdown_home,
 ):
+    """The two providers render the same milestones with the same bytes.
+
+    The Claude rows below are seeded with one `usage_snapshot_id` PER
+    CROSSING, which is what the Codex rows they mirror are: each Codex
+    crossing is its own observation. They previously all carried
+    `usage_snapshot_id = 1`, and four of them share a `capturedAt`, so under
+    #750 S3's observation-gap classifier the Claude side correctly reported a
+    back-filled run that the Codex data cannot have. That divergence is real
+    and intended — a Claude week with a genuine gap states it and Codex has
+    no snapshot identity to state one from — so the parity this test asserts
+    is over milestones that are not back-filled on either side.
+    """
     flags = (
         "--root-key", "root-weekly", "--limit-key", "limit-weekly",
         "--speed", "standard", "--tz", "utc",
@@ -246,15 +258,16 @@ def test_codex_percent_breakdown_matches_claude_visual_design_byte_for_byte(
                 cumulative_cost_usd, marginal_cost_usd,
                 usage_snapshot_id, cost_snapshot_id,
                 five_hour_percent_at_crossing, reset_event_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 0)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0)""",
             [
                 (
                     row["capturedAt"], payload["weekStartDate"], payload["weekEndDate"],
                     payload["weekStartAt"], payload["weekEndAt"],
                     row["percentThreshold"], row["cumulativeCostUSD"],
-                    row["marginalCostUSD"], row["fiveHourPercentAtCrossing"],
+                    row["marginalCostUSD"], snapshot_id,
+                    row["fiveHourPercentAtCrossing"],
                 )
-                for row in payload["milestones"]
+                for snapshot_id, row in enumerate(payload["milestones"], start=1)
             ],
         )
         stats.commit()

@@ -517,7 +517,16 @@ def test_empty_spool_reconciles_expired_pending_drop(app):
 
 def test_reset_zero_keeps_armed_consensus_until_the_next_revalidated_tick(
         app, monkeypatch):
-    """The first zero only arms cmd_record_usage's existing debounce marker."""
+    """The first zero only arms cmd_record_usage's existing debounce state.
+
+    The publications are pinned to DISTINCT capture instants, tracking the
+    same clock the kernel stage uses. An observation's journal id is a digest
+    over `{t, at, src, provider, payload}`, so two zero publications inside
+    one wall-clock second are literally one observation, and #750 S3's
+    self-confirmation rule then refuses to confirm a reset from a
+    byte-identical replay of the observation that armed it. Real ticks are
+    seconds apart; the test has to be too.
+    """
     now = int(time.time())
     assert app.cmd_record_usage(_record_ns(percent=20, resets_in_days=3)) == 0
     parsed = _status_input(
@@ -531,8 +540,16 @@ def test_reset_zero_keeps_armed_consensus_until_the_next_revalidated_tick(
     _iso_time.time = lambda: clock["value"]
     monkeypatch.setattr(app._cctally_statusline, "time", _iso_time)
 
+    def _pin_capture():
+        stamp = dt.datetime.fromtimestamp(clock["value"], tz=dt.timezone.utc)
+        monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
+        monkeypatch.setenv(
+            "CCTALLY_AS_OF", stamp.isoformat().replace("+00:00", "Z"))
+
+    _pin_capture()
     app._statusline_persist(parsed, sync_for_test=True)  # settle baseline
     clock["value"] += 1
+    _pin_capture()
     app._statusline_persist(parsed, sync_for_test=True)  # first kernel attempt arms zero
     assert _newest_row(app)["weekly_percent"] == 20
     control = app._read_control_state(now_epoch=clock["value"])
@@ -541,6 +558,7 @@ def test_reset_zero_keeps_armed_consensus_until_the_next_revalidated_tick(
     assert pending is not None and pending.kernel_stage == "zero_armed"
 
     clock["value"] += 1
+    _pin_capture()
     app._statusline_persist(parsed, sync_for_test=True)  # revalidated second attempt commits
     assert _newest_row(app)["weekly_percent"] == 0
     control = app._read_control_state(now_epoch=clock["value"])
@@ -1089,3 +1107,76 @@ def test_statusline_oauth_tick_never_waits_for_another_session(app, monkeypatch)
         os.close(lock_fd)
 
     assert elapsed < 0.1
+
+
+# --- #755: content-derived staleness of a whole rate_limits payload --------
+#
+# `received_at` records when cctally received a candidate, not when Claude
+# Code obtained the numbers in it, so the 90-second activity window bounds
+# nothing about how old the DATA is. An idle session re-renders its status
+# line from a cached `rate_limits` block indefinitely. Because
+# `_reduced_candidate` takes the MAXIMUM percent across active candidates, one
+# such session pins the 7d consensus at its stale pre-reset value and the
+# post-reset drop can never publish (issue #755).
+#
+# A 5-hour window that has already expired is a content-derived proof that the
+# whole block predates that expiry. The parser already computes it and today
+# drops only the 5h axis, keeping the 7d percent it has just proven stale.
+
+def _statusline_mod(app):
+    """The statusline glue module (``_candidate_from_input`` is not on the
+    ``cctally`` re-export surface)."""
+    mod = getattr(app, "_cctally_statusline", None)
+    if mod is None:
+        mod = sys.modules["_cctally_statusline"]
+    return mod
+
+
+def test_expired_five_hour_window_discards_the_whole_candidate(app):
+    now = int(time.time())
+    parsed = _status_input(
+        app,
+        seven_pct=28.0,
+        seven_resets_epoch=now + 6 * 3600,
+        five_pct=4.0,
+        five_resets_epoch=now - 3600,
+        with_five_key=True,
+        session_id="idle-session",
+    )
+    assert _statusline_mod(app)._candidate_from_input(parsed, received_at=now) is None
+
+
+def test_live_five_hour_window_still_yields_a_candidate(app):
+    now = int(time.time())
+    parsed = _status_input(
+        app,
+        seven_pct=1.0,
+        seven_resets_epoch=now + 6 * 3600,
+        five_pct=4.0,
+        five_resets_epoch=now + 1800,
+        with_five_key=True,
+        session_id="live-session",
+    )
+    got = _statusline_mod(app)._candidate_from_input(parsed, received_at=now)
+    assert got is not None
+    assert got.seven_day is not None
+    assert got.seven_day.percent == 1.0
+    assert got.five_hour is not None
+
+
+def test_absent_five_hour_block_still_yields_a_seven_day_candidate(app):
+    """No 5h data at all proves nothing about staleness, so it must not be
+    treated as stale — only a 5h window that is present and already expired
+    is evidence."""
+    now = int(time.time())
+    parsed = _status_input(
+        app,
+        seven_pct=42.0,
+        seven_resets_epoch=now + 6 * 3600,
+        session_id="seven-only-session",
+    )
+    got = _statusline_mod(app)._candidate_from_input(parsed, received_at=now)
+    assert got is not None
+    assert got.seven_day is not None
+    assert got.seven_day.percent == 42.0
+    assert got.five_hour is None

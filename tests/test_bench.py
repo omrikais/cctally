@@ -17,6 +17,7 @@ import os
 import pathlib
 import sqlite3
 import sys
+import types
 
 import pytest
 
@@ -586,6 +587,59 @@ _EXPECTED_BENCHMARKS = {
     "payload.assemble", "outline.build", "payload.assemble_memo_hit",
     "reconcile.cache_report", "reconcile.projects_env",
 }
+
+
+def test_the_frontier_suspension_restores_on_every_exit_path():
+    """#740. The suspension rebinds a module global on a SHARED object.
+
+    `_load_sibling` registers `_lib_ingest_frontier` in `sys.modules`, so the
+    object `bin/cctally-bench` rebinds is the object every importer in the
+    process holds. Before the scoped restore, `run_all` returned with
+    `float("inf")` still standing and the next certificate test on the same
+    xdist worker computed its age bound from `inf`.
+
+    The exception path is asserted rather than only the ordinary one, because a
+    seed failure inside `_make_benchmarks` raises exactly there and was the one
+    path a `try`/`return` restore would still have leaked.
+    """
+    import _lib_ingest_frontier as frontier
+
+    bench = _load_bin("cctally-bench")
+    stub = types.SimpleNamespace(_load_sibling=lambda name: frontier)
+    before = frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS
+    assert before == 120.0, (
+        "precondition: something before this test already leaked the bound")
+
+    with bench._suspend_frontier_expiry(stub):
+        assert frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS == float("inf"), (
+            "non-vacuity: the suspension did not suspend anything, so its "
+            "restore proves nothing")
+    assert frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS == before
+
+    with pytest.raises(RuntimeError, match="seed failure"):
+        with bench._suspend_frontier_expiry(stub):
+            raise RuntimeError("seed failure")
+    assert frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS == before
+
+
+def test_run_all_leaves_the_certificate_age_bound_at_its_default(tmp_path):
+    """Acceptance 1: the whole runner, not only the context manager.
+
+    `run_all` enters the suspension through an `ExitStack` that spans both the
+    registry build and every timed body, so the restore covers a benchmark that
+    raises mid-run as well as an ordinary return.
+    """
+    import _lib_ingest_frontier as frontier
+
+    bench = _load_bin("cctally-bench")
+    assert frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS == 120.0
+    bench.run_all(scale="tiny", seed=42, iterations=1, trace=False,
+                  root=tmp_path)
+    assert sys.modules["_lib_ingest_frontier"] is frontier, (
+        "the runner and this test hold different module objects, so this "
+        "assertion could not observe the leak it exists for")
+    assert frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS == 120.0, (
+        "run_all returned with the certificate age bound still suspended")
 
 
 def test_run_json_schema(tmp_path):

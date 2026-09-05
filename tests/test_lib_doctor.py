@@ -8,6 +8,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
 import dataclasses as dc
 import datetime as dt
 import pathlib
+
+import pytest
+
 import _lib_doctor as L
 
 
@@ -80,6 +83,8 @@ def test_doctor_state_has_required_fields():
         # #294 S2: root-qualified Codex quota/lifecycle doctor inputs.
         "codex_quota_windows", "codex_hook_roots",
         "codex_lifecycle_activity_24h",
+        # #719 §2.5: normalized Codex hook success-marker evidence.
+        "codex_hook_liveness",
         # public #5: 24h outcomes for the detached `_codex-quota-verify`
         # worker, which every hook-side whole-history pass now depends on. The
         # lifecycle counts cannot cover it — worker lines carry no
@@ -185,6 +190,7 @@ def test_codex_quota_doctor_registers_stable_contract_checks():
         "data.codex_quota",
         "hooks.codex_installed",
         "hooks.codex_recent_activity",
+        "hooks.codex_liveness_7d",
     } <= check_ids
 
 
@@ -461,8 +467,11 @@ def test_codex_hook_state_and_activity_are_root_qualified_and_never_masked():
     state = _state(
         now_utc=now,
         codex_hook_roots=[
-            {"source_root_key": "root-b", "state": "installed_trust_unobservable"},
-            {"source_root_key": "root-a", "state": "absent"},
+            {"source_root_key": "root-b", "state": "installed_enabled",
+             "requires_review": False, "remediation": None},
+            {"source_root_key": "root-a", "state": "absent",
+             "requires_review": False,
+             "remediation": "Run `cctally setup` to install the native Codex handler."},
         ],
         codex_lifecycle_activity_24h={
             "root-a": {"last_tick_at": None, "success_count_24h": 0,
@@ -477,12 +486,15 @@ def test_codex_hook_state_and_activity_are_root_qualified_and_never_masked():
     assert hooks.details == {
         "root_count": 2,
         "installed_root_count": 1,
+        "enabled_root_count": 1,
         "states": [
             {"source_root_key": "root-a", "state": "absent"},
-            {"source_root_key": "root-b", "state": "installed_trust_unobservable"},
+            {"source_root_key": "root-b", "state": "installed_enabled"},
         ],
-        "requires_review": None,
-        "trust_state": "unobservable",
+        "requires_review": False,
+        "trust_state": "partial",
+        "worst_state": "absent",
+        "responsible_root_key": "root-a",
     }
 
     activity = L._check_hooks_codex_recent_activity(state)
@@ -513,14 +525,23 @@ def test_codex_activity_error_only_and_stale_success_warn_without_failing_doctor
     state = _state(
         now_utc=now,
         codex_hook_roots=[
-            {"source_root_key": "root-a", "state": "installed_trust_unobservable"},
-            {"source_root_key": "root-b", "state": "installed_trust_unobservable"},
+            {"source_root_key": "root-a", "state": "installed_enabled",
+             "requires_review": False, "remediation": None},
+            {"source_root_key": "root-b", "state": "installed_enabled",
+             "requires_review": False, "remediation": None},
         ],
         codex_lifecycle_activity_24h={
             "root-a": {"last_tick_at": None, "success_count_24h": 0,
                        "error_count_24h": 1},
             "root-b": {"last_tick_at": stale_success, "success_count_24h": 0,
                        "error_count_24h": 1},
+        },
+        # The 7-day liveness leg reads different evidence and FAILs on its
+        # own; keep it healthy so this test still isolates the 24-hour check.
+        codex_hook_liveness={
+            key: {"last_success_at": now - dt.timedelta(hours=2),
+                  "marker_count": 1, "unavailable": False}
+            for key in ("root-a", "root-b")
         },
     )
 
@@ -2031,3 +2052,174 @@ def test_the_check_classifies_fingerprints_the_way_the_shared_predicate_does():
             r.remediation == L.ROLLUP_WRITER_UNPARSEABLE_FP_REMEDIATION)
         assert reported_unparseable is not \
             _lib_pricing.pricing_fingerprint_is_comparable(value), value
+
+
+# ── #719: Codex hook state severity, multi-root worst-case, 7d liveness ──
+
+
+def _codex_row(key, state, *, requires_review=False, remediation=None):
+    return {
+        "source_root_key": key, "state": state,
+        "requires_review": requires_review, "remediation": remediation,
+    }
+
+
+@pytest.mark.parametrize("state,severity", [
+    ("installed_enabled", "ok"),
+    ("installed_unverified", "warn"),
+    ("installed_disabled", "fail"),
+    ("installed_untrusted", "fail"),
+    ("installed_trust_unobservable", "warn"),
+    ("absent", "warn"),
+    ("malformed", "warn"),
+    ("feature_disabled", "warn"),
+])
+def test_codex_hook_state_severity_table_is_total(state, severity):
+    result = L._check_hooks_codex_installed(_state(
+        codex_hook_roots=[_codex_row("root-a", state, remediation="fix it")],
+    ))
+    assert result.severity == severity
+    assert L.CODEX_HOOK_STATE_SEVERITY[state] == severity
+
+
+def test_a_healthy_sibling_never_masks_a_disabled_codex_root():
+    result = L._check_hooks_codex_installed(_state(codex_hook_roots=[
+        _codex_row("root-a", "installed_enabled"),
+        _codex_row("root-b", "installed_disabled",
+                   remediation="Re-enable the cctally handler in Codex /hooks."),
+    ]))
+    assert result.severity == "fail"
+    assert result.details["worst_state"] == "installed_disabled"
+    assert result.details["responsible_root_key"] == "root-b"
+    assert result.details["enabled_root_count"] == 1
+    assert result.remediation == "Re-enable the cctally handler in Codex /hooks."
+
+
+def test_the_installed_summary_distinguishes_installed_from_enabled():
+    """`0/2 root(s) enabled` alone reads as "nothing is installed".
+
+    An `installed_untrusted` or `installed_unverified` handler IS installed
+    and may still be firing, and the modal row is all a reader who does not
+    expand the details block ever sees.
+    """
+    result = L._check_hooks_codex_installed(_state(codex_hook_roots=[
+        _codex_row("root-a", "installed_untrusted", remediation="review"),
+        _codex_row("root-b", "installed_unverified", remediation="review"),
+    ]))
+    assert result.summary == "0/2 root(s) enabled, 2 installed"
+    assert result.details["installed_root_count"] == 2
+    assert result.details["enabled_root_count"] == 0
+
+
+def test_the_installed_summary_stays_byte_stable_when_nothing_extra_is_installed():
+    """Every root that is installed is also enabled, so the ratio says it all."""
+    for rows, expected in [
+        ([_codex_row("root-a", "installed_enabled")], "1/1 root(s) enabled"),
+        ([_codex_row("root-a", "absent"),
+          _codex_row("root-b", "installed_enabled")], "1/2 root(s) enabled"),
+        ([_codex_row("root-a", "absent")], "0/1 root(s) enabled"),
+        ([], "not applicable"),
+    ]:
+        assert L._check_hooks_codex_installed(
+            _state(codex_hook_roots=rows)).summary == expected
+
+
+def test_each_untrusted_state_carries_its_own_remediation():
+    for state, remediation in [
+        ("installed_untrusted", "Review and trust the cctally handler in Codex /hooks."),
+        ("installed_unverified", "review after the change"),
+        ("installed_disabled", "Re-enable the cctally handler in Codex /hooks."),
+    ]:
+        result = L._check_hooks_codex_installed(_state(
+            codex_hook_roots=[_codex_row("root-a", state, remediation=remediation)],
+        ))
+        assert result.remediation == remediation, state
+
+
+def test_codex_liveness_fails_when_an_enabled_hook_is_silent_for_seven_days():
+    now = dt.datetime(2026, 9, 4, 12, 0, 0, tzinfo=dt.timezone.utc)
+    result = L._check_hooks_codex_liveness_7d(_state(
+        now_utc=now,
+        codex_hook_roots=[_codex_row("root-a", "installed_enabled")],
+        codex_hook_liveness={"root-a": {
+            "last_success_at": now - dt.timedelta(days=7, seconds=1),
+            "marker_count": 2, "unavailable": False,
+        }},
+    ))
+    assert result.severity == "fail"
+    assert result.details["liveness_state"] == "stale"
+    assert result.details["window_seconds"] == 604800
+    assert result.details["age_seconds"] == 604801
+    assert result.details["marker_count"] == 2
+    assert result.details["responsible_root_key"] == "root-a"
+
+
+def test_codex_liveness_reduces_to_the_newest_account_marker_per_root():
+    """A dormant historical account must not fail a root firing under a
+    current one; the gather already reduced to the newest readable mtime."""
+    now = dt.datetime(2026, 9, 4, 12, 0, 0, tzinfo=dt.timezone.utc)
+    result = L._check_hooks_codex_liveness_7d(_state(
+        now_utc=now,
+        codex_hook_roots=[_codex_row("root-a", "installed_enabled")],
+        codex_hook_liveness={"root-a": {
+            "last_success_at": now - dt.timedelta(hours=3),
+            "marker_count": 3, "unavailable": False,
+        }},
+    ))
+    assert result.severity == "ok"
+    assert result.details["liveness_state"] == "recent"
+    assert result.details["marker_count"] == 3
+
+
+def test_codex_liveness_states_never_unavailable_and_not_applicable():
+    now = dt.datetime(2026, 9, 4, 12, 0, 0, tzinfo=dt.timezone.utc)
+    never = L._check_hooks_codex_liveness_7d(_state(
+        now_utc=now,
+        codex_hook_roots=[_codex_row("root-a", "installed_enabled")],
+        codex_hook_liveness={},
+    ))
+    assert never.severity == "fail"
+    assert never.details["liveness_state"] == "never"
+
+    unavailable = L._check_hooks_codex_liveness_7d(_state(
+        now_utc=now,
+        codex_hook_roots=[_codex_row("root-a", "installed_enabled")],
+        codex_hook_liveness={"root-a": {
+            "last_success_at": None, "marker_count": 0, "unavailable": True}},
+    ))
+    assert unavailable.severity == "warn"
+    assert unavailable.details["liveness_state"] == "unavailable"
+
+    # A disabled root is not evaluated for liveness; the installed check owns it.
+    disabled = L._check_hooks_codex_liveness_7d(_state(
+        now_utc=now,
+        codex_hook_roots=[_codex_row("root-a", "installed_disabled")],
+        codex_hook_liveness={},
+    ))
+    assert disabled.severity == "ok"
+    assert disabled.details["liveness_state"] == "not-applicable"
+    assert disabled.details["roots"] == []
+
+
+def test_codex_liveness_and_activity_evaluate_only_enabled_roots():
+    now = dt.datetime(2026, 9, 4, 12, 0, 0, tzinfo=dt.timezone.utc)
+    state = _state(
+        now_utc=now,
+        codex_hook_roots=[
+            _codex_row("root-a", "installed_untrusted"),
+            _codex_row("root-b", "installed_enabled"),
+        ],
+        codex_lifecycle_activity_24h={
+            "root-a": {"last_tick_at": None, "success_count_24h": 0,
+                       "error_count_24h": 0},
+            "root-b": {"last_tick_at": now - dt.timedelta(seconds=30),
+                       "success_count_24h": 1, "error_count_24h": 0},
+        },
+        codex_hook_liveness={"root-b": {
+            "last_success_at": now - dt.timedelta(hours=1),
+            "marker_count": 1, "unavailable": False}},
+    )
+    activity = L._check_hooks_codex_recent_activity(state)
+    assert [row["source_root_key"] for row in activity.details["roots"]] == ["root-b"]
+    liveness = L._check_hooks_codex_liveness_7d(state)
+    assert [row["source_root_key"] for row in liveness.details["roots"]] == ["root-b"]

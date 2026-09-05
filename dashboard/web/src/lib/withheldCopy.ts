@@ -81,6 +81,57 @@ export function dollarsPerPercentQualification(
   }
 }
 
+// #690 — why the calibration behind a metering-rate transition was withheld.
+//
+// #688 records a transition whenever the detector qualifies, INCLUDING when
+// `cctally quota` withheld its own verdict, so the surface could no longer
+// promise a fitted budget that may not exist. The server stamps the status it
+// was withheld under onto the row; this turns that machine code into the one
+// sentence a person can act on, mirroring the server's own `_LONG_FORM`
+// wording for the same code (`bin/_lib_quota_copy.py`) so the dashboard and
+// `cctally quota` describe one withholding the same way.
+//
+// The desktop notification is NOT that surface and must not be assumed to be.
+// `_cctally_alerts.py`'s rate-change body reads the raw status code into one
+// fixed sentence for every code and never consults `_LONG_FORM`, so it stays
+// generic where this file is specific. Making the two agree would mean
+// changing the notifier, which is a server change and is not what this file
+// does.
+//
+// Returns null when there is NOTHING to disclose, and reading that null
+// correctly is the whole contract. A null `withholding_status` does not mean
+// "no evidence": the server stamps the status only on #688's detection-keyed
+// withheld path and stamps the other three evidence fields whenever the
+// analysis publishes them, so an ORDINARY confirmed transition arrives with a
+// null status beside three populated fields. Both cases render the unchanged
+// ordinary copy, which is what spec §4.1 requires; the caller must never read
+// a null status alone as missing evidence.
+//
+// The switch carries a REQUIRED fallback branch for the same reason
+// `withheldMessage` does: the in-place update path lets an old client meet a
+// newer server without reloading the JavaScript, and today exactly one
+// `CalibrationStatus` member is admissible here
+// (`TRANSITION_PERSISTENCE_PERMITTED_BLOCKING_STATUSES`), so a second one
+// really will arrive before this file is next edited. An unheard-of code
+// renders generic copy CARRYING the code, never nothing.
+export function rateChangeWithheldCopy(
+  status: string | null | undefined,
+): string | null {
+  switch (status) {
+    case null:
+    case undefined:
+    case '':
+      return null;
+    case 'unsupported-model-mix':
+      return 'The calibration was withheld because the models in use sit '
+        + 'outside the mix it was fitted over, so there is no fitted budget '
+        + 'behind this change.';
+    default:
+      return `The calibration was withheld (${status}), so there is no `
+        + 'fitted budget behind this change.';
+  }
+}
+
 export function dollarsPerPercentReason(code: string | null | undefined): string {
   switch (code) {
     case 'no_usage_observed':

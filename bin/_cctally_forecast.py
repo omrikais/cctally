@@ -2134,13 +2134,22 @@ def cmd_report(args: argparse.Namespace) -> int:
         # effective reset moment). Route `current_ref` through the same
         # override so its `week_start_at` reflects the post-credit start;
         # this lets the per-row match below disambiguate the synthesized
-        # pre-credit ref from the live post-credit ref via both
-        # `key` AND `week_start_at`. Order contract from
-        # `_apply_reset_events_to_weekrefs`: post-credit ref lands at
-        # index 0, pre-credit at index 1. Non-credit weeks return the
+        # earlier refs from the live one via both `key` AND `week_start_at`.
+        # Order contract from `_apply_reset_events_to_weekrefs`: the output is
+        # NEWEST-FIRST, so the live segment is at index 0 and every earlier
+        # segment follows it in descending order. #750 S3 made the applier
+        # N-ary, so index 1 is the segment before the live one rather than
+        # "the pre-credit ref" — a week credited twice puts a middle segment
+        # there. Only index 0 is read here. Non-credit weeks return the
         # single input ref unchanged, so this is a no-op on the common
         # path.
-        _adjusted_current = c._apply_reset_events_to_weekrefs(conn, [current_ref])
+        # SCOPED to the requesting account (#750 S3, Unit B review). The match
+        # below disambiguates the live segment by `week_start_at`, so a merged
+        # read lets ANOTHER account's cut shift that value and the current-week
+        # row is then misidentified. `acct_key` is None without `--account`,
+        # which is the explicit merged read this call always made.
+        _adjusted_current = c._apply_reset_events_to_weekrefs(
+            conn, [current_ref], account_key=acct_key)
         if _adjusted_current:
             current_ref = _adjusted_current[0]
 
@@ -2396,12 +2405,28 @@ def cmd_report(args: argparse.Namespace) -> int:
             if milestone_rows:
                 print()
                 print("Percent breakdown (current week):\n")
+                # #750 S3 Unit C (issue #738). This table is a SECOND surface
+                # over the same rows, with its own column set and its own bare
+                # `n/a`, so it had the same defect and shipping the disclosure
+                # on only one of the two would leave the issue half fixed. The
+                # classifier is C1's, reached on the namespace — the predicate
+                # has one home. It groups by `(account_key, reset_event_id)`
+                # itself, which matters here because this table is NOT
+                # segment-filtered and renders every epoch of the week.
+                gap_disclosure = c.classify_observation_gaps(milestone_rows)
+                for note in c.observation_gap_notes(gap_disclosure, tz=tz):
+                    print(note)
+                if gap_disclosure.runs:
+                    print()
                 m_headers = ["#", "Threshold", "Cumulative Cost", "Marginal Cost"]
                 m_rows: list[list[str]] = []
                 for idx, m in enumerate(milestone_rows, start=1):
                     pct = f"{int(m['percent_threshold'])}%"
                     cum = f"${float(m['cumulative_cost_usd']):.6f}"
-                    marg = f"${float(m['marginal_cost_usd']):.6f}" if m["marginal_cost_usd"] is not None else "n/a"
+                    marg = c.observation_gap_marginal_cell(
+                        m["marginal_cost_usd"],
+                        withheld=(idx - 1) in gap_disclosure.withheld_indexes,
+                    )
                     m_rows.append([str(idx), pct, cum, marg])
                 print(c._boxed_table(m_headers, m_rows, ["right", "right", "right", "right"]))
 

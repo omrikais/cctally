@@ -11,6 +11,14 @@ stale-replica DELETE that runs alongside it bands on
 snapshot captured at 17:33:38Z (``|13 - 14| == 1.0``) survived. That surviving
 band is filed separately as issue #703 and is NOT what this module fixes.
 
+**#750 S3 removed the hour floor.** ``effective_reset_at_utc`` now records the
+first-zero observation's exact capture second, so the anchor is 17:59:41Z and
+the 13.0 and 14.0 readings captured before it are outside the new epoch
+entirely rather than back-dated into it. The scenarios below are updated to
+that anchor. What the fixes below defend against is unchanged, and the direct
+``maybe_record_milestone`` exercises further down are what keep Fix 2 pinned
+against a replica that genuinely does sit inside an epoch.
+
 What this module fixes is what the engine then did with that survivor:
 
 1. The genuine ``weekly_percent = 0.0`` tick at 17:59:47Z was suppressed by the
@@ -20,8 +28,9 @@ What this module fixes is what the engine then did with that survivor:
    stored snapshot, which was the stale pre-credit 13.0 row.
 3. ``maybe_record_milestone`` resolved that row into the NEW epoch (its
    17:33:38Z capture is at-or-after the back-dated 17:00:00Z effective
-   instant), found no milestone in that epoch, and took the seeding branch —
-   inserting a fabricated milestone at threshold 13.
+   instant — which is exactly what the hour floor bought, and exactly what
+   #750 S3 removed), found no milestone in that epoch, and took the seeding
+   branch — inserting a fabricated milestone at threshold 13.
 4. Milestones are forward-only within an epoch, so the fabricated 13 opened the
    new ladder at a threshold the meter said had not been crossed and foreclosed
    every genuine crossing below 13 in that epoch.
@@ -195,19 +204,22 @@ def test_stale_pre_credit_replica_does_not_fabricate_a_post_reset_milestone(
     """The incident, replayed through ``cmd_record_usage``.
 
     The ticks are pinned to the real instants: the 13% and 14% readings land in
-    the same hour as the reset, the two zeros arm and confirm the reset-to-zero
-    debounce, and the resulting event anchors at the hour floor 17:00:00Z. The
-    stale-replica DELETE removes BOTH rows: the band is inclusive at its drift
-    bound, so ``|13 - 14| == 1.0`` matches. It did not always. This scenario was
-    written while the bound was strict, the 13.0 row survived, and that survivor
-    was the PRECONDITION of the defect this module fixes. The automatic band was
-    corrected, so no survivor appears here and the genuine post-credit 0.0
-    reading lands instead.
+    the same hour as the reset, and the two zeros arm and confirm the
+    reset-to-zero debounce. The event now anchors at the first zero's exact
+    capture second, 17:59:41Z, rather than at the hour floor 17:00:00Z that
+    #750 S3 removed.
+
+    Both pre-credit readings are therefore outside the new epoch. The
+    stale-replica DELETE does not touch them, and it should not: they were
+    captured before the counter was zeroed, so they belong to the old segment.
+    Under the hour floor they were pulled into the new epoch, and the 13.0 one
+    surviving the drift band was the PRECONDITION of the defect this module
+    fixes.
 
     The no-fabrication assertion below is kept as a regression guard on this
-    shape. A replica that STILL survives the inclusive band is the live
-    exercise of that guard and is covered by
-    ``test_out_of_band_replica_survives_and_still_seeds_no_epoch``.
+    shape. The live exercise of that guard is the three direct
+    ``maybe_record_milestone`` cases further down, which seed a replica inside
+    an epoch rather than trying to reach that state through the write path.
     """
     assert _tick(ns, monkeypatch, at="2026-09-01T17:33:38Z", percent=13.0) == 0
     assert _tick(ns, monkeypatch, at="2026-09-01T17:40:00Z", percent=14.0) == 0
@@ -222,17 +234,18 @@ def test_stale_pre_credit_replica_does_not_fabricate_a_post_reset_milestone(
         ).fetchall()
         assert len(events) == 1, list(events)
         evt_id = int(events[0]["id"])
-        assert events[0]["effective_reset_at_utc"] == "2026-09-01T17:00:00+00:00"
+        assert events[0]["effective_reset_at_utc"] == "2026-09-01T17:59:41+00:00"
         assert events[0]["observed_pre_credit_pct"] == 14.0
 
-        # Both pre-credit rows are gone; the genuine post-credit reading is
-        # what remains inside the epoch.
+        # Both pre-credit rows are OUTSIDE the epoch, not deleted — the
+        # docstring above says why. This query is scoped to the epoch, so what
+        # it must return is the genuine post-credit reading and nothing else.
         survivors = conn.execute(
             "SELECT captured_at_utc, weekly_percent FROM weekly_usage_snapshots "
             "WHERE week_start_date = ? "
             "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
             "ORDER BY captured_at_utc",
-            (WEEK_START_DATE, "2026-09-01T17:00:00+00:00"),
+            (WEEK_START_DATE, "2026-09-01T17:59:41+00:00"),
         ).fetchall()
         assert [r["weekly_percent"] for r in survivors] == [0.0], list(survivors)
 
@@ -251,15 +264,28 @@ def test_stale_pre_credit_replica_does_not_fabricate_a_post_reset_milestone(
 
 
 def test_out_of_band_replica_survives_and_still_seeds_no_epoch(ns, monkeypatch):
-    """A replica outside the drift band survives, and this module's guard holds.
+    """A replica outside the drift band survives, and lands OUTSIDE the epoch.
 
     Making the automatic band inclusive removes a replica exactly one point
     from the baseline, which is the 2026-09-01 shape. It does not remove one
     further out, and it should not: past the drift the band exists to absorb,
     a lower reading is not distinguishable from a genuine one by level alone.
-    A surviving replica therefore stays reachable, so the guard this module
-    exists for — never seed a post-reset milestone epoch from one — still needs
-    an exercise of its own. This is it.
+
+    Until #750 S3 that surviving replica was ALSO inside the new epoch,
+    because the hour floor back-dated the anchor to 17:00:00Z. It is not any
+    more: the anchor is the first zero's exact capture second, 17:59:41Z, and
+    a reading captured at 17:33:38Z is simply pre-credit. So this scenario now
+    pins the stronger property — an out-of-band pre-credit reading survives
+    the DELETE, which is correct because it belongs to the old segment, and it
+    cannot seed the new epoch because it is not in it.
+
+    A replica that genuinely does sit inside an epoch is no longer reachable
+    through `cmd_record_usage`, because before the event row exists the
+    reset-aware clamp suppresses any reading below the pre-credit baseline,
+    and once it exists the genuine post-credit reading is already stored below
+    the replica. Fix 2's guard therefore keeps its live exercise in the three
+    direct ``maybe_record_milestone`` cases below, which seed the event and the
+    replica themselves.
 
     Baseline 14.0 against a stored 12.0: ``|12 - 14| == 2.0``, outside the band.
     """
@@ -271,22 +297,30 @@ def test_out_of_band_replica_survives_and_still_seeds_no_epoch(ns, monkeypatch):
     conn = ns["open_db"]()
     try:
         events = conn.execute(
-            "SELECT id, observed_pre_credit_pct FROM week_reset_events"
+            "SELECT id, effective_reset_at_utc, observed_pre_credit_pct "
+            "FROM week_reset_events"
         ).fetchall()
         assert len(events) == 1, list(events)
         evt_id = int(events[0]["id"])
         assert events[0]["observed_pre_credit_pct"] == 14.0
+        assert events[0]["effective_reset_at_utc"] == "2026-09-01T17:59:41+00:00"
 
-        # The 14.0 row is removed; the 12.0 replica is beyond the band and is
-        # still stored inside the new epoch.
+        # The out-of-band replica survives the DELETE.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? AND weekly_percent = 12.0",
+            (WEEK_START_DATE,)).fetchone()[0] == 1
+
+        # ...and it is outside the new epoch, which holds only the genuine
+        # post-credit reading.
         survivors = conn.execute(
             "SELECT weekly_percent FROM weekly_usage_snapshots "
             "WHERE week_start_date = ? "
             "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
             "ORDER BY captured_at_utc",
-            (WEEK_START_DATE, "2026-09-01T17:00:00+00:00"),
+            (WEEK_START_DATE, "2026-09-01T17:59:41+00:00"),
         ).fetchall()
-        assert [r["weekly_percent"] for r in survivors] == [12.0], list(survivors)
+        assert [r["weekly_percent"] for r in survivors] == [0.0], list(survivors)
 
         rows = _milestones(conn)
         post = [r for r in rows if r["reset_event_id"] == evt_id]
@@ -300,12 +334,13 @@ def test_out_of_band_replica_survives_and_still_seeds_no_epoch(ns, monkeypatch):
 def test_genuine_post_reset_climb_records_each_threshold(ns, monkeypatch):
     """The same incident WITHOUT a surviving replica: every crossing lands.
 
-    The pre-credit climb happens two hours before the reset, so the hour-floored
-    17:00:00Z anchor leaves no pre-credit row inside the new epoch. The
-    confirming zero is therefore accepted as a snapshot, and the 1%, 2% and 3%
-    readings that follow are each recorded in the new epoch. This is the
-    counterpart to the test above: it pins that Fix 2's evidence requirement
-    does not block a real climb, and that Fix 1 leaves the accept path alone.
+    The pre-credit climb happens two hours before the reset, so no pre-credit
+    row lands inside the new epoch — under the exact 17:59:41Z anchor, and
+    under the hour floor it replaced. The confirming zero is therefore accepted
+    as a snapshot, and the 1%, 2% and 3% readings that follow are each recorded
+    in the new epoch. This is the counterpart to the test above: it pins that
+    Fix 2's evidence requirement does not block a real climb, and that Fix 1
+    leaves the accept path alone.
     """
     assert _tick(ns, monkeypatch, at="2026-09-01T15:33:38Z", percent=13.0) == 0
     assert _tick(ns, monkeypatch, at="2026-09-01T15:40:00Z", percent=14.0) == 0
@@ -322,7 +357,7 @@ def test_genuine_post_reset_climb_records_each_threshold(ns, monkeypatch):
         ).fetchall()
         assert len(evt) == 1, list(evt)
         evt_id = int(evt[0]["id"])
-        assert evt[0]["effective_reset_at_utc"] == "2026-09-01T17:00:00+00:00"
+        assert evt[0]["effective_reset_at_utc"] == "2026-09-01T17:59:41+00:00"
 
         rows = _milestones(conn)
         assert [r["percent_threshold"] for r in rows
@@ -338,16 +373,18 @@ def test_the_fix_does_not_recover_the_crossings_the_replica_suppresses(
     """Removing the replica restores the readings it was suppressing.
 
     The incident's own shape, driven three readings further than the test
-    above. While the bound was strict the 13.0 replica stayed inside the new
-    epoch and held the reset-aware in-window MAXIMUM at 13.0, so the genuine
-    1%, 2% and 3% readings were each clamp-skipped before any snapshot was
-    written and ``maybe_record_milestone`` was never reached for them. This
+    above. While the anchor was hour-floored the 13.0 replica sat inside the
+    new epoch and held the reset-aware in-window MAXIMUM at 13.0, so the
+    genuine 1%, 2% and 3% readings were each clamp-skipped before any snapshot
+    was written and ``maybe_record_milestone`` was never reached for them. This
     module's earlier wording recorded that recovering them needed the wider
     #703 work.
 
-    It did not. Making the automatic band inclusive at its drift bound removes
-    the replica, the in-window maximum drops to the post-credit reading, and
-    all three crossings land in the new epoch's ladder.
+    It did not. Two independent corrections now put the in-window maximum at
+    the post-credit reading: the automatic band became inclusive at its drift
+    bound, and #750 S3 anchored the event at the first zero's exact capture
+    second so a reading taken before it is outside the epoch to begin with.
+    All three crossings land in the new epoch's ladder.
     """
     assert _tick(ns, monkeypatch, at="2026-09-01T17:33:38Z", percent=13.0) == 0
     assert _tick(ns, monkeypatch, at="2026-09-01T17:40:00Z", percent=14.0) == 0
@@ -370,7 +407,7 @@ def test_the_fix_does_not_recover_the_crossings_the_replica_suppresses(
             "WHERE week_start_date = ? "
             "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
             "ORDER BY captured_at_utc",
-            (WEEK_START_DATE, "2026-09-01T17:00:00+00:00"),
+            (WEEK_START_DATE, "2026-09-01T17:59:41+00:00"),
         ).fetchall()
         assert [r["weekly_percent"] for r in stored] == [0.0, 1.0, 2.0, 3.0], \
             list(stored)
@@ -658,7 +695,7 @@ def test_goodwill_credit_to_a_nonzero_level_loses_that_levels_threshold(
         assert len(evt) == 1, list(evt)
         evt_id = int(evt[0]["id"])
         assert evt[0]["observed_pre_credit_pct"] == 67.0
-        assert evt[0]["effective_reset_at_utc"] == "2026-09-01T10:00:00+00:00"
+        assert evt[0]["effective_reset_at_utc"] == "2026-09-01T10:30:00+00:00"
 
         # The 2% reading IS stored — the credit path accepted it. Only its
         # milestone is missing, and only because it is the epoch's floor.
@@ -667,7 +704,7 @@ def test_goodwill_credit_to_a_nonzero_level_loses_that_levels_threshold(
             "WHERE week_start_date = ? "
             "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
             "ORDER BY captured_at_utc",
-            (WEEK_START_DATE, "2026-09-01T10:00:00+00:00"),
+            (WEEK_START_DATE, "2026-09-01T10:30:00+00:00"),
         ).fetchall()
         assert [r["weekly_percent"] for r in stored] == [2.0, 3.0], list(stored)
 

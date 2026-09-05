@@ -53,20 +53,51 @@ severity != `OK`.
 - `hooks.statusline_refresh_interval` — WARN only when a recognized cctally `statusLine` command is present but has no `refreshInterval` (state `missing`); the remediation is `Run cctally setup to add statusLine.refreshInterval, or set it manually`. Without it, statusline-fed usage persistence goes quiet while a coordinator waits on a long subagent (see [setup.md](setup.md#statuslinerefreshinterval) and [statusline.md](statusline.md#keeping-usage-fresh-during-subagent-waits-statuslinerefreshinterval)). Every other state is OK with its own summary — `present` (set), `absent` (no statusLine configured), `foreign` (a custom, non-cctally statusLine), and `unavailable` (settings.json unreadable — the `hooks.installed` / settings warnings already surface that, so this check does not double-WARN).
 - `hooks.recent_activity_24h` — WARN when no hook has fired in 24h, or error/fire ratio ≥ 0.5.
 - `hooks.last_fire_age` — WARN when the last fire was >1h ago or never.
-- `hooks.codex_installed` — root-qualified Codex hook state. With no detected
-  Codex root it is OK/not applicable. It is WARN when any detected root is
-  missing, malformed, or feature-disabled; exact owned handlers are OK only
-  when every root is installed. Its additive details include sorted
-  `states: [{source_root_key, state}]`, root/install counts,
-  `requires_review`, and `trust_state`. A status of
-  `installed_trust_unobservable` means cctally can recognize the handler but
-  cannot determine whether Codex has trusted it; verify it in Codex `/hooks`.
+- `hooks.codex_installed` — root-qualified Codex hook state, read from
+  Codex's own `[hooks.state]` table in `config.toml`. With no detected Codex
+  root it is OK/not applicable. Otherwise it takes the **worst** severity
+  across every root, so a healthy sibling never masks a bad one: **FAIL** on
+  `installed_disabled` (the operator turned the handler off in Codex
+  `/hooks`) and on `installed_untrusted` (no usable trust record exists);
+  WARN on `installed_unverified` (the handler changed after the last
+  recorded trust decision), `installed_trust_unobservable` (cctally cannot
+  read the recorded state), `absent`, `malformed` and `feature_disabled`;
+  OK only when every root is `installed_enabled`. Each state carries its own
+  remediation. The summary line reads `<enabled>/<roots> root(s) enabled`,
+  and appends `, <installed> installed` whenever more roots are installed
+  than are enabled — an `installed_untrusted` or `installed_unverified`
+  handler is installed and may still be firing, which the ratio alone would
+  hide from a reader who does not open the details block. Details include
+  sorted `states: [{source_root_key, state}]`,
+  root / installed / enabled counts, `requires_review`, `trust_state`,
+  `worst_state` and `responsible_root_key`. `trust_state` is one of
+  `not-applicable`, `review-required`, `unobservable`, `enabled`, `partial`
+  or `not-installed`. The full state vocabulary and its ordered
+  classification live in [setup.md](setup.md#hook-state-vocabulary).
 - `hooks.codex_recent_activity` — root-qualified success/error activity from
-  the last 24 hours for installed Codex handlers. It is WARN when any installed
-  root has never succeeded or was last successful more than 24 hours ago; it
-  is OK/not applicable when no owned Codex handler is installed. Details carry
-  a sorted `roots` array plus the worst-state representative, never a session
-  path or conversation payload.
+  the last 24 hours, for **enabled** Codex handlers only, read from the
+  lifecycle log. States are `recent` (OK) and `stale` / `never` (**WARN**);
+  the check reports the worst state across the enabled roots, so one silent
+  root is never masked by a firing sibling. Details carry `activity_state`,
+  `last_tick_at`, `age_seconds`, `success_count_24h`, `error_count_24h`,
+  `responsible_root_key` and a sorted `roots` array — never a session path or
+  conversation payload. With no enabled Codex root the check is OK and
+  `activity_state` takes a fourth value, `not-applicable`, which the per-root
+  `roots` array never carries.
+- `hooks.codex_liveness_7d` — the same question over a seven-day window and
+  **different evidence**: the per-root success markers, which survive the
+  rotation of the lifecycle log the 24-hour check reads. For each enabled
+  root it reduces over `<root-key>.last-success` and
+  `<root-key>.<account-key>.last-success` and takes the newest readable
+  timestamp, so a dormant historical account never fails a root that is
+  firing under a current one — which also means it is not proof of
+  per-account coverage. Account suffixes are never exposed. States are
+  `recent` (OK), `unavailable` (WARN, the markers could not be read), and
+  `stale` / `never` (**FAIL**). Details carry `liveness_state`,
+  `window_seconds: 604800`, `last_success_at`, `age_seconds`,
+  `marker_count`, `responsible_root_key` and a sorted `roots` array. With no
+  enabled Codex root the check is OK and `liveness_state` takes a fifth value,
+  `not-applicable`, which the per-root `roots` array never carries.
 
 ### Auth
 - `oauth.token_present` — FAIL when the OAuth token file is missing.

@@ -594,3 +594,63 @@ def test_688_a_foreign_analysis_object_refuses_rather_than_raising(glue):
     """`persist_and_detect` is public glue and its `analysis` argument is not
     type-checked, so the permit predicate has to be total over any input."""
     assert glue.qm.transition_persistence_permitted(object()) is False
+
+
+# --------------------------------------------------------------------------
+# #691 — the admission condition has exactly one spelling
+# --------------------------------------------------------------------------
+def test_691_the_admission_condition_has_exactly_one_spelling(glue):
+    """Both call sites must consult the same helper.
+
+    This is a STRUCTURAL assertion, not a behavioural one, and deliberately
+    so. The two conditions cannot disagree today:
+    `transition_persistence_permitted` requires a WITHHELD verdict under a
+    blocking status, which is mutually exclusive with the `fitted_ok` limb
+    that is the only other way `reduce_state` reaches a save — so the stamp
+    site is unreachable with the permit true and the successor fit
+    unavailable. The test fails when a future edit widens one site and not
+    the other, the direction of that divergence being `permitting`, which is
+    the harmful one on this axis.
+
+    The assertion is that no site OUTSIDE the helper calls the bare permit
+    predicate. It is deliberately not "`watch_fit.state` appears nowhere":
+    `reduce_state` also spells that limb in `successor_ok`, which is the
+    ORDINARY confirmed-change path and has nothing to do with #688 admission.
+    Asserting its absence would demand deleting a correct, unrelated
+    condition.
+    """
+    import inspect
+
+    src_reduce = inspect.getsource(glue.reduce_state)
+    src_persist = inspect.getsource(glue.persist_and_detect)
+    for name, src in (("reduce_state", src_reduce),
+                      ("persist_and_detect", src_persist)):
+        assert "_transition_persistence_admitted" in src, (
+            f"{name} does not consult the shared admission helper")
+        assert "qm.transition_persistence_permitted(" not in src, (
+            f"{name} still calls the bare permit predicate, which is the "
+            "admission condition with its successor-fit limb missing")
+    helper = inspect.getsource(glue._transition_persistence_admitted)
+    assert "qm.transition_persistence_permitted(" in helper, (
+        "the helper does not consult the permit predicate")
+    assert 'watch_fit.state == "available"' in helper, (
+        "the helper does not carry the complete conjunction")
+
+
+def test_691_the_helper_is_the_conjunction_it_claims_to_be(glue):
+    """The structural test above cannot see a helper whose text is right and
+    whose value is wrong, so the truth table is pinned beside it."""
+    permitted = _permitted_analysis(glue)
+    assert glue.qm.transition_persistence_permitted(permitted) is True
+    assert permitted.watch_fit.state == "available"
+    assert glue._transition_persistence_admitted(permitted) is True
+
+    withheld_successor = _permitted_analysis(glue, watch=_withheld(glue))
+    assert glue.qm.transition_persistence_permitted(
+        withheld_successor) is True, (
+        "the fixture no longer isolates the successor-fit limb")
+    assert glue._transition_persistence_admitted(withheld_successor) is False
+
+    assert glue._transition_persistence_admitted(object()) is False, (
+        "the helper must stay total over any input, as the predicate it "
+        "wraps is")

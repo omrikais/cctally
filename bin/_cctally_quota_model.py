@@ -1060,6 +1060,99 @@ def recorded_regime(state: dict, account_key) -> "dict | None":
     return _open_regime(stored_regimes(state, account_key))
 
 
+def _canonical_enum_values(members) -> "str | None":
+    """A frozenset of typed enum members as a canonical JSON array (#690).
+
+    Enum VALUES, never `repr` or `str` of the member, so a sixth
+    `CompositionProvenance` origin added later cannot silently alias onto an
+    existing one. Sorted and separator-pinned, so one set has exactly one
+    serialization and two rows recording the same evidence compare equal.
+
+    None in, None out — and that is the whole three-state contract: None means
+    the evidence was never assessed or is unrecoverable, while `"[]"` means it
+    WAS assessed and found no such origin. A path that cannot judge must not
+    publish the empty set, because a reader would take it as a measurement.
+    """
+    if members is None:
+        return None
+    try:
+        values = sorted(getattr(m, "value", m) for m in members)
+    except TypeError:
+        return None
+    return json.dumps(values, ensure_ascii=True, separators=(",", ":"))
+
+
+def _baseline_withheld_days(analysis) -> "int | None":
+    """`analysis.baseline_fit.population["withheld"]`, or None (#692).
+
+    The count of observations in `fenced` that carry a cause and fall strictly
+    BEFORE `window_start` — exactly the pre-split evidence loss the permit
+    predicate cannot see, because `analyse` sets
+    `window_start = detector.split_date` on a confirmed change, so the
+    published `detector_input_causes` covers only the successor window.
+
+    Read from the fit and NEVER inferred from `detector_input_causes`, from
+    diagnostics text, or from the successor status. A missing or unreadable
+    population yields None rather than 0: zero is a measurement meaning a
+    clean baseline, and reporting it for an unknown would be a fabricated
+    reassurance.
+    """
+    fit = getattr(analysis, "baseline_fit", None)
+    population = getattr(fit, "population", None)
+    if not isinstance(population, dict):
+        return None
+    try:
+        return int(population["withheld"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _analysis_evidence(analysis) -> tuple:
+    """`(detector_input_causes, composition_provenance, baseline_days)` (#690).
+
+    TOTAL over any input, for the reason `transition_persistence_permitted`
+    states about itself: `persist_and_detect` is public glue whose `analysis`
+    argument is not type-checked, and a test that stubs the reducer away
+    reaches this line with a bare object. Every field is read through
+    `getattr` with a None default, so an analysis that does not publish one
+    yields the honest "not assessed" state instead of raising and taking the
+    whole persistence step down.
+    """
+    return (
+        _canonical_enum_values(getattr(analysis, "detector_input_causes", None)),
+        _canonical_enum_values(getattr(analysis, "composition_provenance", None)),
+        _baseline_withheld_days(analysis),
+    )
+
+
+def _transition_persistence_admitted(analysis) -> bool:
+    """The COMPLETE #688 admission condition, in one place (#691).
+
+    Two functions asked this question and each wrote its own answer.
+    `reduce_state` spelled the permit predicate AND the successor-fit limb;
+    `persist_and_detect` spelled the permit predicate alone when stamping the
+    descriptor's `withholding_status`. Two spellings of one condition, in two
+    functions, with no shared definition, is the arrangement that silently
+    diverges — and the reducer's extra limb is invisible from the stamp site,
+    so nothing at the stamp would have reported the disagreement.
+
+    The two cannot disagree today, which is why extracting this is a
+    refactor and not a fix. `qm.transition_persistence_permitted` requires a
+    WITHHELD verdict under a blocking status, and that is mutually exclusive
+    with the `fitted_ok` limb that is the only other route to a save, so the
+    stamp site is unreachable with the permit true and the successor fit
+    unavailable. The value of one definition is that a future edit widening
+    either limb reaches both call sites, in the direction — permitting —
+    that is the harmful one on this axis.
+
+    Total over any input, because the predicate it wraps is: `watch_fit` is
+    only dereferenced once the permit has already accepted the object as a
+    `QuotaAnalysis`.
+    """
+    return (qm.transition_persistence_permitted(analysis)
+            and analysis.watch_fit.state == "available")
+
+
 def reduce_state(stored: dict, analysis, mode: PersistMode) -> dict:
     """The durable history as a pure function of `(stored, analysis, mode)`.
 
@@ -1098,8 +1191,7 @@ def reduce_state(stored: dict, analysis, mode: PersistMode) -> dict:
     # replacement: a bare detector-only predicate would newly admit
     # `fragmented-history` and `unstable-fit`, which `resolve_outcome`
     # deliberately refuses.
-    permitted = (qm.transition_persistence_permitted(analysis)
-                 and analysis.watch_fit.state == "available")
+    permitted = _transition_persistence_admitted(analysis)
     confirmed = confirmed or permitted
     successor_ok = successor_ok or permitted
     if not fitted_ok and not successor_ok:
@@ -1259,10 +1351,24 @@ def persist_and_detect(analysis, mode: PersistMode) -> tuple:
             # stamped onto what it returns rather than passed into it. The
             # value is computed once, from the analysis, before the call.
             withheld = (analysis.status.value
-                        if qm.transition_persistence_permitted(analysis)
+                        if _transition_persistence_admitted(analysis)
                         else None)
+            # #690 / #692: the rest of the disclosure, captured from the SAME
+            # analysis and at the same moment. `withholding_status` stays
+            # gated on admission, because it names the status a run was
+            # withheld under and an ordinary confirmed change was not
+            # withheld at all. The other three are stamped whenever the
+            # analysis publishes them, on both paths: they are measurements
+            # of the evidence this detection stood on, and
+            # `baseline_fit.population` is carried on EVERY branch, withheld
+            # and available alike.
+            causes, provenance, baseline_days = _analysis_evidence(analysis)
             transitions = tuple(
-                dataclasses.replace(t, withholding_status=withheld)
+                dataclasses.replace(
+                    t, withholding_status=withheld,
+                    detector_input_causes=causes,
+                    composition_provenance=provenance,
+                    baseline_withheld_days=baseline_days)
                 for t in mrc.detect_transitions(
                     before, stored_regimes(reduced, mode.account_key),
                     provider="claude", account_key=account_key,
@@ -1289,26 +1395,50 @@ def unrecorded_rate_change_transitions(transitions) -> tuple:
 
     TWO axes, because the physical row alone is not sufficient. A completed
     tombstone or a higher revision legitimately leaves effective metadata with
-    no row; a row-only lookup would re-select that key on every run, reach a
-    revision mismatch in `_classify_live_effective_event`, and raise
+    no row, and a row-only lookup would re-select that key on every run. The
+    two then cost different amounts. A higher revision reaches a revision
+    mismatch in `_classify_live_effective_event` and raises
     `CorrectionRebuildRequired` — which defaults to `recovery_eligible=False`
-    and is not overridden at the raise site, so the command would print its
-    failure line on every invocation forever. No supported `db rederive`
+    and is not overridden at the raise site — so the invocation discards its
+    whole ingest cycle. A completed tombstone instead withholds the emission
+    and prints one line, because `_prior_meter_rate_change_event` returns None
+    for any non-active status before convergence is reached. Both repeat on
+    every run, which is what makes them unbounded. No supported `db rederive`
     family can target an `mrc:` event today, so this guard is defensive; it is
     taken because it costs one column and the failure it prevents is
     unbounded.
 
     A metadata row that is ACTIVE at revision 0 with no physical row is NOT
     terminal: that is the duplicate-with-missing-row case, and the emitter
-    materializes the row from the identical event. There is ONE exception,
+    materializes the row from the RETAINED event under that same prefix.
+    It does so directly when the re-offered payload happens to be
+    byte-identical, and through the withheld-conflict convergence path when a
+    later command clock makes it divergent, which is the ordinary case.
+
+    #750 S2 states "under that same prefix" explicitly, because #690's
+    payload version could otherwise silently change it. A v2 emission for an
+    identity the journal already holds at v1 is a second logical event: it
+    appends a line, leaves two active revision-0 records describing one row,
+    reaches neither the convergence nor its diagnostic, and re-fires a
+    notification for history. `record_meter_rate_change` therefore chooses
+    the prefix by whether the natural key holds ANY v1 record, and re-emits a
+    v1 record as v1. It tests existence rather than liveness because its
+    other caller — `cmd_quota`'s fresh detection — is not gated by this
+    function, so a v1 state this function files as recorded can still reach
+    the emitter and must stay latched there. There is ONE exception,
     and it is terminal for the same reason a tombstone is. Metadata carrying
     no retained record (`event_json IS NULL`) cannot be materialized from:
     the recovery run's payload carries a later clock, so it hashes
     differently and classifies as a conflict, and
     `_effective_event_for_convergence` then fails closed and raises
-    `JournalProtocolError`, which `record_rate_change_transition` absorbs
-    into its failure line. Re-offering the key would print that line on every
-    run forever, which is the unbounded failure this axis exists to prevent.
+    `JournalProtocolError`. `_run_stats_ingest_once` re-raises it under
+    `mode="authoritative"`, so the WHOLE ingest cycle is discarded with the
+    cursor unmoved and every other leg it would have run is deferred; the
+    raise reaches `record_rate_change_transition`, which absorbs it into its
+    failure line. Nothing is lost permanently, because the journal is
+    append-only and the cursor did not advance, but the cost of re-offering
+    the key is one discarded cycle plus that line on every run forever, which
+    is the unbounded failure this axis exists to prevent.
 
     Unknown is treated as PRESENT, never absent. Returning no candidates on a
     failure is what stops a store that cannot answer from driving an ingest
@@ -1337,9 +1467,20 @@ def unrecorded_rate_change_transitions(transitions) -> tuple:
                     f"(provider, account_key, effective_from) IN (VALUES {rows})",
                     params):
                 recorded.add((str(provider), str(account), str(effective)))
-            by_id = {
-                _lib_journal.evt_id(mrc.EVT_ID_PREFIX, *t.identity()):
-                    t.identity() for t in chunk}
+            # #690: BOTH payload versions, for one natural key. Journal
+            # selection and correction are keyed on `event_id` alone, so two
+            # prefixes are two independent logical events; asking about only
+            # one would let a tombstoned or higher-revision v1 record become
+            # invisible to the v2 lookup and be resurrected under the v2 id
+            # the first time a v2-capable binary runs. A terminal latch under
+            # EITHER prefix therefore suppresses recovery under the other,
+            # which is what keeps the #689 terminal-latch contract intact
+            # across the version boundary.
+            by_id = {}
+            for t in chunk:
+                identity = t.identity()
+                for prefix in (mrc.EVT_ID_PREFIX, mrc.EVT_ID_PREFIX_V2):
+                    by_id[_lib_journal.evt_id(prefix, *identity)] = identity
             marks = ",".join("?" for _ in by_id)
             for event_id, rev, status, event_json in conn.execute(
                     "SELECT event_id, rev, status, event_json "

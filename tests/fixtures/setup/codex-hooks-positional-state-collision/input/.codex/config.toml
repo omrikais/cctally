@@ -1,0 +1,8 @@
+[hooks.state."/FAKE/.codex/hooks.json:stop:0:0"]
+trusted_hash = "fixture-recorded-for-a-different-handler"
+
+[hooks.state."/FAKE/.codex/hooks.json:subagent_stop:0:0"]
+trusted_hash = "fixture-recorded-for-a-different-handler"
+
+[hooks.state."/FAKE/.codex/hooks.json:stop:3:0"]
+trusted_hash = "fixture-orphan-pointing-at-a-removed-group"

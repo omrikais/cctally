@@ -9,7 +9,9 @@ signal, because it covers only a subset of material events — a new 5-hour
 window changes the dashboard without necessarily firing an alert.
 """
 import argparse
+import datetime as dt
 import sys
+import time
 import types
 import importlib
 import urllib.request
@@ -17,6 +19,17 @@ import urllib.request
 import pytest
 
 from conftest import load_script, redirect_paths
+
+# `cmd_record_usage` rejects a reset outside the plausibility band
+# [now-30d, now+8d] and writes no row, so a literal epoch here is a fixture
+# with an expiry date. One expired: `1786000000` sat inside the band when this
+# module was written and crossed the 30-day floor on 2026-09-05, failing eight
+# cases in this file for a reason none of them is about, on a branch that had
+# not touched this subsystem. Two ISO literals of `2026-08-20T00:00:00Z` were
+# 16 days from the same fate. Derive the instant from the clock the band is
+# measured against instead; three days ahead is inside the +8d ceiling with
+# room to spare, and no assertion in this module reads the value.
+_RESETS_AT_EPOCH = int(time.time()) + 3 * 86400
 
 
 class _Resp:
@@ -45,9 +58,30 @@ def _result(journal, *, ran, error, events_emitted):
     )
 
 
+def _plausible_resets_at() -> str:
+    """A `--resets-at` inside `cmd_record_usage`'s plausibility band.
+
+    Reads `_RESETS_AT_EPOCH`, which is resolved once at import, so every call
+    in one run names the same instant.
+    """
+    return str(_RESETS_AT_EPOCH)
+
+
+def _plausible_resets_at_iso() -> str:
+    """The same instant, in the ISO form an OAuth `resets_at` field carries.
+
+    `_hook_tick_parse_oauth_payload` converts this string to the epoch it
+    hands `cmd_record_usage`, so the payload stubs below are subject to the
+    same expiring-literal failure and need the same wall-clock derivation.
+    """
+    return dt.datetime.fromtimestamp(
+        _RESETS_AT_EPOCH, tz=dt.timezone.utc,
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _args(**over):
     base = dict(
-        percent=42.0, resets_at="1786000000",
+        percent=42.0, resets_at=_plausible_resets_at(),
         five_hour_percent=None, five_hour_resets_at=None, source="statusline",
     )
     base.update(over)
@@ -191,7 +225,8 @@ def test_the_hook_tick_nudge_fires_after_its_own_lock_is_released(
     monkeypatch.setitem(ns, "_nudge_dashboard_repaint",
                         lambda *a, **kw: events.append("nudge"))
     monkeypatch.setitem(ns, "_fetch_oauth_usage", lambda **kw: {
-        "seven_day": {"utilization": 0.42, "resets_at": "2026-08-20T00:00:00Z"},
+        "seven_day": {"utilization": 0.42,
+                      "resets_at": _plausible_resets_at_iso()},
     })
     monkeypatch.setattr(
         journal, "run_stats_ingest",
@@ -230,7 +265,7 @@ def test_hook_tick_oauth_fetch_does_not_hold_the_selected_state_lock(
         return {
             "seven_day": {
                 "utilization": 42.0,
-                "resets_at": "2026-08-20T00:00:00Z",
+                "resets_at": _plausible_resets_at_iso(),
             },
         }
 

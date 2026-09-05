@@ -133,6 +133,7 @@ from _cctally_core import (
     _command_as_of,
     _canonicalize_optional_iso,
     _floored_week_max,
+    _latest_reset_event_for_end,
     parse_iso_datetime,
 )
 
@@ -1571,6 +1572,8 @@ def _diff_render_json(
 
 def _diff_resolve_anchor(
     now_utc: dt.datetime,
+    *,
+    account_key: "str | None" = None,
 ) -> "tuple[dt.datetime | None, dt.datetime | None]":
     """Read the latest weekly_usage_snapshots row to obtain the
     (anchor_week_start, anchor_resets_at) pair, then apply two
@@ -1598,6 +1601,14 @@ def _diff_resolve_anchor(
        reset moment (mirrors `_apply_midweek_reset_override` /
        `_apply_reset_events_to_weekrefs` POST-reset rule).
 
+    ``account_key`` (#750 S3 B3) scopes both reads. ``None`` keeps the merged
+    latest-snapshot selection, and the reset-event lookup then binds to THAT
+    snapshot's own ``account_key``: reading another account's cut would move
+    the window start to an instant the anchor's own account never reset at.
+    `docs/accounts-gotchas.md` states the rule this satisfies — the account
+    resolves before the interval is constructed — so `cmd_diff` resolves
+    `--account` before it calls this.
+
     Returns (None, None) when the DB is unreachable or has no rows.
     """
     try:
@@ -1605,13 +1616,23 @@ def _diff_resolve_anchor(
     except Exception:
         return None, None
     try:
+        acct_pred = "" if account_key is None else " WHERE account_key = ?"
+        acct_params: tuple = () if account_key is None else (account_key,)
         row = conn.execute(
-            "SELECT week_start_at, week_end_at "
-            "FROM weekly_usage_snapshots "
-            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+            "SELECT week_start_at, week_end_at, account_key "
+            "FROM weekly_usage_snapshots" + acct_pred +
+            " ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+            acct_params,
         ).fetchone()
         if row is None:
             return None, None
+        # The anchor snapshot's own account, so the merged selection above
+        # still asks the event table a single-account question. The SELECT
+        # names `account_key` and `open_db` sets `row_factory = sqlite3.Row`,
+        # so the key is always present and always resolves by name.
+        anchor_account = account_key
+        if anchor_account is None:
+            anchor_account = row["account_key"]
         anchor_week_start = None
         anchor_resets_at = None
         if row[0]:
@@ -1645,14 +1666,16 @@ def _diff_resolve_anchor(
                 "diff.anchor.end",
             )
             if end_iso is not None:
-                event_row = conn.execute(
-                    "SELECT effective_reset_at_utc FROM week_reset_events "
-                    "WHERE new_week_end_at = ?",
-                    (end_iso,),
-                ).fetchone()
-                if event_row and event_row[0]:
+                # #750 S3 B3: through the one chokepoint. This site had NO
+                # `ORDER BY` at all before a bare `.fetchone()`, so with
+                # several rows sharing a week end it took whichever row SQLite
+                # returned first — the FIRST credit rather than the live one.
+                event_row = _latest_reset_event_for_end(
+                    conn, end_iso, account_key=anchor_account)
+                if event_row and event_row["effective_reset_at_utc"]:
                     reset_dt = parse_iso_datetime(
-                        event_row[0], "reset_event.effective"
+                        event_row["effective_reset_at_utc"],
+                        "reset_event.effective",
                     )
                     if reset_dt > anchor_week_start:
                         anchor_week_start = reset_dt

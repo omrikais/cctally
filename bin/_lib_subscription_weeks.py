@@ -81,6 +81,7 @@ _local_tz_name = _lib_display_tz._local_tz_name
 from _cctally_core import (
     parse_iso_datetime,
     get_week_start_name,
+    _ordered_in_place_cuts,
     WEEKDAY_MAP,
 )
 
@@ -235,9 +236,18 @@ def _apply_overlap_clamp_to_subweeks(weeks: list[SubWeek]) -> list[SubWeek]:
 
 
 def _apply_reset_events_to_subweeks(
-    conn: sqlite3.Connection, weeks: list[SubWeek]
+    conn: sqlite3.Connection, weeks: list[SubWeek], *,
+    account_key: "str | None" = None,
 ) -> list[SubWeek]:
     """Override SubWeek boundaries with reset-event effective moments.
+
+    ``account_key`` (#750 S3 B1) scopes the event read to one account.
+    ``None`` is the explicit merged read and is byte-identical to the
+    account-blind behaviour this applier had before, which is what keeps a
+    single-account install unchanged. A real key matters as soon as two
+    accounts hold credits in weeks that share an end instant: the events are
+    matched on that instant alone, so an unscoped read splits one account's
+    week at another account's cut.
 
     Same semantics as `_apply_reset_events_to_weekrefs` but for SubWeek:
       - SubWeek whose end_ts equals event.old_week_end_at (instant)
@@ -251,22 +261,26 @@ def _apply_reset_events_to_subweeks(
         ``old_week_end_at == effective_reset_at_utc`` (the shape both the
         live and the backfill detection paths write). An Anthropic reset
         never moves a week's boundaries, but it does end one billing cycle
-        and begin another inside that week, so the credited week IS two
-        billing cycles and must come back as two SubWeeks. The post-credit
-        override above rewrites ``start_ts`` to ``effective``; without a
-        synthesized pre-credit sibling, every entry in
-        ``[original_start, effective)`` falls into a gap that
-        ``_aggregate_weekly`` drops — the week's spend disappears from the
-        table AND from the totals. The pre-credit segment keeps the
-        SubWeek's original ``start_ts`` / ``display_start_date`` and ends at
-        ``effective``.
+        and begin another inside that week, so a week credited N times IS
+        N+1 billing cycles and must come back as N+1 SubWeeks. Without the
+        synthesized siblings, every entry before the last cut falls into a
+        gap that ``_aggregate_weekly`` drops — the week's spend disappears
+        from the table AND from the totals.
 
-    Both segments keep the same ``start_date`` (the snapshot join key the
+    The N-ary form (#750 S3 B2): gather every in-place cut strictly inside
+    the week's original interval, deduplicate on the parsed instant, sort
+    ascending as ``c1 < … < cn``, and emit ``[start, c1)``, each
+    ``[ci, ci+1)`` and ``[cn, end)``. A single slot for one cut used to hold
+    the pre-credit segment, so a second credit in one week silently
+    overwrote the first and the interval between them was lost.
+
+    Every segment keeps the same ``start_date`` (the snapshot join key the
     credit does not move), so they are told apart by ``SubWeek.segment_key``
-    — see the note on that property. `_apply_overlap_clamp_to_subweeks`,
-    `_aggregate_weekly`'s bisect and `cmd_weekly`'s ``weeks[0]`` all require
-    ascending order, so the synthesized segment is inserted in its sorted
-    position rather than appended.
+    — the UTC-canonicalized ``start_ts``, which yields n+1 distinct keys for
+    n+1 segments with no ordinal and no new field. `_apply_overlap_clamp_to_
+    subweeks`, `_aggregate_weekly`'s bisect and `cmd_weekly`'s ``weeks[0]``
+    all require ascending order, so the synthesized segments are emitted in
+    their sorted positions rather than appended.
 
     Mirrors `_apply_reset_events_to_weekrefs`, which grew the in-place-credit
     case in v1.7.2 while this twin did not. The two must stay in step;
@@ -277,21 +291,40 @@ def _apply_reset_events_to_subweeks(
     raw snapshot strings that may be written in non-UTC offsets while
     `week_reset_events.{old,new}_week_end_at` are canonicalized UTC.
     """
+    acct_pred = "" if account_key is None else " WHERE account_key = ?"
+    acct_p: tuple = () if account_key is None else (account_key,)
+    # ORDERED THE WAY `_latest_reset_event_for_end` ORDERS (#750 S3, Unit B
+    # review), and the weekrefs twin carries the identical clause. Two rows can
+    # share one `(old_week_end_at, new_week_end_at)` pair and carry different
+    # effective instants — epoch 1013 admits that whenever the rows carry
+    # distinct origins — and the two single-valued roles below take the FIRST
+    # matching row. Unordered, "first" meant "whichever row was written last",
+    # which is not what the chokepoint answers, so two consumers disagreed
+    # about where a week starts. `unixepoch(...)`, never a lexical compare:
+    # the column carries mixed offset spellings.
     rows = conn.execute(
         "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
-        "FROM week_reset_events"
+        "FROM week_reset_events" + acct_pred
+        + " ORDER BY unixepoch(effective_reset_at_utc) DESC, id DESC",
+        acct_p,
     ).fetchall()
     if not rows:
         return weeks
-    parsed_events: list[tuple[dt.datetime, dt.datetime, str, bool]] = []
+    parsed_events: list[
+        tuple[dt.datetime, dt.datetime, dt.datetime, str, bool]] = []
     for r in rows:
+        # The effective instant is parsed ONCE, here, rather than at each of
+        # the three use sites. A row whose effective instant is unparseable is
+        # dropped, which is what the per-site `continue` already amounted to.
         try:
             old_dt = parse_iso_datetime(r["old_week_end_at"], "evt.old_end")
             new_dt = parse_iso_datetime(r["new_week_end_at"], "evt.new_end")
+            eff_dt = parse_iso_datetime(
+                r["effective_reset_at_utc"], "evt.eff")
         except ValueError:
             continue
         parsed_events.append((
-            old_dt, new_dt, r["effective_reset_at_utc"],
+            old_dt, new_dt, eff_dt, r["effective_reset_at_utc"],
             r["old_week_end_at"] == r["effective_reset_at_utc"],
         ))
     if not parsed_events:
@@ -300,58 +333,101 @@ def _apply_reset_events_to_subweeks(
     out: list[SubWeek] = []
     synthesized = False
     for w in weeks:
-        new_w = w
-        pre_credit: SubWeek | None = None
         try:
             end_dt = parse_iso_datetime(w.end_ts, "subweek.end_ts")
         except ValueError:
             out.append(w)
             continue
-        for old_dt, new_dt, reset_at, is_in_place_credit in parsed_events:
-            if end_dt == old_dt:
-                try:
-                    reset_dt = parse_iso_datetime(reset_at, "evt.eff")
-                except ValueError:
-                    continue
-                # internal fallback: host-local intentional
-                new_end_date = (reset_dt - dt.timedelta(seconds=1)).astimezone().date()
-                new_w = replace(new_w, end_ts=reset_at, end_date=new_end_date)
+        # The three roles this week's events can play, resolved in ONE pass so
+        # the two single-valued ones can take the FIRST matching row (the rows
+        # arrive latest-effective-first, so that is the row the chokepoint
+        # would return) while the in-place cuts still collect every row.
+        end_shift: tuple[dt.datetime, str] | None = None
+        start_shift: tuple[dt.datetime, str] | None = None
+        # Every in-place cut this week carries, as (instant, raw text). The
+        # raw text is what lands in `start_ts` / `end_ts`, so the pair keeps
+        # the stored spelling while the instant does the ordering.
+        cuts: list[tuple[dt.datetime, str]] = []
+        for old_dt, new_dt, eff_dt, reset_at, is_in_place_credit in (
+                parsed_events):
+            if end_dt == old_dt and end_shift is None:
+                end_shift = (eff_dt, reset_at)
             if end_dt == new_dt:
-                try:
-                    reset_dt = parse_iso_datetime(reset_at, "evt.eff")
-                except ValueError:
-                    continue
                 if is_in_place_credit:
-                    # Close the pre-credit billing cycle. Built from the
-                    # ORIGINAL `w`, not from `new_w`, for the same reason the
-                    # weekrefs twin does: two in-place credits inside one week
-                    # both carry that week's unchanged `new_week_end_at`, and
-                    # deriving the second segment from the already-shifted
-                    # `new_w` would drop everything before the first credit.
-                    # internal fallback: host-local intentional
-                    pre_end_date = (
-                        reset_dt - dt.timedelta(seconds=1)
-                    ).astimezone().date()
-                    pre_credit = replace(
-                        w, end_ts=reset_at, end_date=pre_end_date,
-                    )
+                    cuts.append((eff_dt, reset_at))
+                elif start_shift is None:
+                    start_shift = (eff_dt, reset_at)
+        # The week's EFFECTIVE start. A boundary shift moves it, and a cut is
+        # only inside this week when it falls after that shift, so the shift is
+        # both the lower bound on the cuts and the head segment's start.
+        # Deriving the head from the API-derived start instead discards the
+        # shift, overlaps the previous week, and lets
+        # `_apply_overlap_clamp_to_subweeks` move that week's spend into this
+        # one (#750 S3, Unit B review).
+        eff_start_raw = w.start_ts if start_shift is None else start_shift[1]
+        # N cuts make N+1 billing cycles: `[start, c1)`, each `[ci, ci+1)` and
+        # `[cn, end)`. The shared helper deduplicates on the INSTANT rather
+        # than on the stored text, because two rows can spell one instant in
+        # different offsets, and sorts ascending so the emitted list stays
+        # ordered whatever order the rows arrived in.
+        ordered = _ordered_in_place_cuts(cuts, eff_start_raw, end_dt)
+
+        new_w = w
+        if end_shift is not None:
+            shift_dt, shift_raw = end_shift
+            # internal fallback: host-local intentional
+            new_end_date = (
+                shift_dt - dt.timedelta(seconds=1)).astimezone().date()
+            new_w = replace(new_w, end_ts=shift_raw, end_date=new_end_date)
+        if start_shift is not None:
+            new_w = replace(
+                new_w,
+                start_ts=start_shift[1],
                 # internal fallback: host-local intentional
-                new_display_start = reset_dt.astimezone().date()
-                new_w = replace(
-                    new_w,
-                    start_ts=reset_at,
-                    display_start_date=new_display_start,
-                )
-                # start_date intentionally NOT touched — it is the lookup
-                # key into weekly_usage_snapshots.week_start_date, shared by
-                # both segments. `segment_key` tells them apart.
-        if pre_credit is not None:
-            # Sorted position: `pre_credit.start_ts` is the SubWeek's original
-            # start and `pre_credit.end_ts == new_w.start_ts`, so emitting it
-            # immediately before the post-credit segment keeps `out`
-            # ascending. The defensive re-sort below covers the residual case
+                display_start_date=start_shift[0].astimezone().date(),
+            )
+            # start_date intentionally NOT touched — it is the lookup
+            # key into weekly_usage_snapshots.week_start_date, shared by
+            # both segments. `segment_key` tells them apart.
+        if ordered:
+            # Every segment but the last is derived from `new_w` BEFORE its
+            # start moves to the last cut: two in-place credits in one week
+            # both carry that week's unchanged `new_week_end_at`, so deriving a
+            # later segment from an already-split week would drop everything
+            # before the first credit. `new_w`, not `w`, so the head keeps the
+            # boundary shift; its own end shift is overwritten below by the
+            # cut, which is what closes every segment but the last.
+            base = new_w
+            for index, (cut_dt, cut_raw) in enumerate(ordered):
+                # internal fallback: host-local intentional
+                seg_end_date = (
+                    cut_dt - dt.timedelta(seconds=1)
+                ).astimezone().date()
+                if index == 0:
+                    out.append(replace(
+                        base, end_ts=cut_raw, end_date=seg_end_date))
+                else:
+                    prev_dt, prev_raw = ordered[index - 1]
+                    out.append(replace(
+                        base,
+                        start_ts=prev_raw,
+                        # internal fallback: host-local intentional
+                        display_start_date=prev_dt.astimezone().date(),
+                        end_ts=cut_raw,
+                        end_date=seg_end_date,
+                    ))
+            last_dt, last_raw = ordered[-1]
+            new_w = replace(
+                new_w,
+                start_ts=last_raw,
+                # internal fallback: host-local intentional
+                display_start_date=last_dt.astimezone().date(),
+            )
+            # Emitting the head and the middles immediately before the tail
+            # keeps `out` ascending, which `_apply_overlap_clamp_to_subweeks`,
+            # `_aggregate_weekly`'s bisect and `cmd_weekly`'s `weeks[0]` all
+            # require. The defensive re-sort below covers the residual case
             # where the input itself was not ascending.
-            out.append(pre_credit)
             synthesized = True
         out.append(new_w)
     if synthesized:
@@ -599,7 +675,8 @@ def _compute_subscription_weeks(
                 current = natural_next
 
         return _apply_overlap_clamp_to_subweeks(
-            _apply_reset_events_to_subweeks(conn, weeks)
+            _apply_reset_events_to_subweeks(
+                conn, weeks, account_key=account_key)
         )
 
     # Case A2 (spec A1.6 Step 1 fallback): no usage snapshots, but a

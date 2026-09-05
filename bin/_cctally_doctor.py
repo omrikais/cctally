@@ -31,6 +31,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -585,6 +586,61 @@ def _codex_lifecycle_activity_24h(
                     row["success_count_24h"] += 1
                 else:
                     row["error_count_24h"] += 1
+    return records
+
+
+_CODEX_ACCOUNT_KEY_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _codex_hook_liveness_markers(*, root_keys: set[str]) -> dict[str, dict]:
+    """Enumerate `<root>.last-success` / `<root>.<account>.last-success` mtimes.
+
+    Marker enumeration lives here, never in `bin/_lib_doctor.py`: the pure
+    kernel decides every check without touching the filesystem, the network
+    or the clock, and this check is not the exception.
+
+    A bare `*` glob would also admit backup-like siblings, so the account
+    suffix is filtered against the 32-hex `account_key` shape rather than
+    globbed. Account suffixes are never exposed to the report.
+    """
+    if not root_keys:
+        return {}
+    base = _cctally_core.APP_DIR / "codex-hook-tick"
+    records: dict[str, dict] = {
+        key: {"last_success_at": None, "marker_count": 0, "unavailable": False}
+        for key in root_keys
+    }
+    try:
+        names = sorted(entry.name for entry in os.scandir(base))
+    except FileNotFoundError:
+        # No marker directory yet is `never`, not `unavailable`: the hook has
+        # simply not run here.
+        return records
+    except OSError:
+        for record in records.values():
+            record["unavailable"] = True
+        return records
+    for name in names:
+        if not name.endswith(".last-success"):
+            continue
+        stem = name[: -len(".last-success")]
+        root_key = stem
+        if stem not in records:
+            head, _sep, suffix = stem.rpartition(".")
+            if not head or not _CODEX_ACCOUNT_KEY_PATTERN.match(suffix):
+                continue
+            root_key = head
+            if root_key not in records:
+                continue
+        try:
+            stamp = (base / name).stat().st_mtime
+        except OSError:
+            continue
+        record = records[root_key]
+        record["marker_count"] += 1
+        observed = dt.datetime.fromtimestamp(stamp, dt.timezone.utc)
+        if record["last_success_at"] is None or observed > record["last_success_at"]:
+            record["last_success_at"] = observed
     return records
 
 
@@ -1801,18 +1857,29 @@ def _doctor_gather_state_impl(
 
     with _lib_perf.phase("doctor.codex_hooks"):
         codex_hook_roots: list[dict] = []
+        codex_hook_liveness: dict = {}
         try:
-            codex_binary = str(c._setup_resolve_hook_target(repo_root))
             hook_rows = [
-                c._cctally_setup._codex_hook_row(root, codex_binary)
+                c._cctally_setup._codex_hook_row(root)
                 for root in c._setup_codex_hook_roots()
             ]
             codex_hook_roots = [
-                {"source_root_key": row["source_root_key"], "state": row["state"]}
+                {
+                    "source_root_key": row["source_root_key"],
+                    "state": row["state"],
+                    "requires_review": row["requires_review"],
+                    "remediation": row["remediation"],
+                }
                 for row in sorted(hook_rows, key=lambda row: row["source_root_key"])
             ]
         except Exception:
             codex_hook_roots = []
+        try:
+            codex_hook_liveness = _codex_hook_liveness_markers(
+                root_keys={row["source_root_key"] for row in codex_hook_roots},
+            )
+        except Exception:
+            codex_hook_liveness = {}
 
     with _lib_perf.phase("doctor.codex_lifecycle"):
         try:
@@ -2601,6 +2668,7 @@ def _doctor_gather_state_impl(
         conversations_db_freelist_count=conversations_db_freelist_count,
         codex_quota_windows=codex_quota_windows,
         codex_hook_roots=codex_hook_roots,
+        codex_hook_liveness=codex_hook_liveness,
         codex_lifecycle_activity_24h=codex_lifecycle_activity_24h,
         codex_quota_verify_activity=codex_quota_verify_activity,
         # #311: precomputed statusLine.refreshInterval classification.

@@ -298,6 +298,9 @@ class DoctorState:
     # hook state, and lifecycle activity are gathered by _cctally_doctor.
     codex_quota_windows: Optional[list[dict]] = None
     codex_hook_roots: Optional[list[dict]] = None
+    # #719 §2.5: normalized Codex hook success-marker evidence, enumerated in
+    # `doctor_gather_state`. The kernel must stay filesystem-free.
+    codex_hook_liveness: Optional[dict] = None
     codex_lifecycle_activity_24h: Optional[dict] = None
     # public #5: 24h outcome counts for the detached `_codex-quota-verify`
     # worker, parsed from the same bounded log. The lifecycle parser above
@@ -993,7 +996,7 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
             # current index as a mismatch; keep this in lockstep with core
             # (#496 S5b §6.1). It stays a literal because this kernel is pure and
             # must not import `_cctally_core`.
-            epoch = 1011
+            epoch = 1013
         mismatch = uv > legacy_head and uv != epoch
         return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
                 "mismatch": mismatch}
@@ -1564,6 +1567,28 @@ def _check_data_codex_quota(s: DoctorState) -> CheckResult:
     )
 
 
+# #719 §2.1: the severity each classified Codex hook state carries. A hook
+# proven dead (`installed_disabled`) or never approved (`installed_untrusted`)
+# FAILs, because the month-long silence on the reported incident was a
+# severity choice rather than a missing check.
+CODEX_HOOK_STATE_SEVERITY = {
+    "installed_enabled": "ok",
+    "installed_unverified": "warn",
+    "installed_disabled": "fail",
+    "installed_untrusted": "fail",
+    "installed_trust_unobservable": "warn",
+    "absent": "warn",
+    "malformed": "warn",
+    "feature_disabled": "warn",
+}
+_CODEX_INSTALLED_STATES = frozenset({
+    "installed_enabled", "installed_unverified", "installed_disabled",
+    "installed_untrusted", "installed_trust_unobservable",
+})
+_SEVERITY_RANK = {"fail": 0, "warn": 1, "ok": 2}
+CODEX_HOOK_LIVENESS_WINDOW_SECONDS = 7 * 24 * 3600
+
+
 def _check_hooks_codex_installed(s: DoctorState) -> CheckResult:
     """Summarize every configured Codex root without masking a bad sibling."""
     rows = sorted(
@@ -1574,51 +1599,173 @@ def _check_hooks_codex_installed(s: DoctorState) -> CheckResult:
         {"source_root_key": row.get("source_root_key"), "state": row.get("state")}
         for row in rows
     ]
-    installed_states = {
-        "installed_review_required", "installed_trust_unobservable",
-    }
-    installed = [row for row in rows if row.get("state") in installed_states]
+    installed = [row for row in rows if row.get("state") in _CODEX_INSTALLED_STATES]
+    enabled = [row for row in rows if row.get("state") == "installed_enabled"]
+    reviews = [row.get("requires_review") for row in rows]
     requires_review = (
-        True if any(row.get("state") == "installed_review_required" for row in rows)
-        else None if installed
+        True if any(value is True for value in reviews)
+        else None if any(value is None for value in reviews)
         else False
     )
     trust_state = (
         "not-applicable" if not rows
         else "review-required" if requires_review is True
-        else "unobservable" if installed
-        else "not-installed"
+        else "unobservable" if requires_review is None
+        else "enabled" if enabled and len(enabled) == len(rows)
+        else "not-installed" if not installed
+        else "partial"
     )
-    unhealthy = any(row.get("state") not in installed_states for row in rows)
+    severity = "ok"
+    responsible = None
+    for row in rows:
+        row_severity = CODEX_HOOK_STATE_SEVERITY.get(row.get("state"), "warn")
+        if _SEVERITY_RANK[row_severity] < _SEVERITY_RANK[severity]:
+            severity = row_severity
+            responsible = row.get("source_root_key")
+        elif responsible is None and row_severity == severity != "ok":
+            responsible = row.get("source_root_key")
+    worst_state = next(
+        (row.get("state") for row in rows
+         if CODEX_HOOK_STATE_SEVERITY.get(row.get("state"), "warn") == severity
+         and severity != "ok"),
+        None,
+    )
+    remediation = None
+    if severity != "ok":
+        remediation = next(
+            (row.get("remediation") for row in rows
+             if row.get("state") == worst_state and row.get("remediation")),
+            "Run `cctally setup`, then review the handler in Codex /hooks.",
+        )
+    summary = "not applicable"
+    if rows:
+        summary = f"{len(enabled)}/{len(rows)} root(s) enabled"
+        if len(installed) > len(enabled):
+            # An `installed_untrusted` or `installed_unverified` handler IS
+            # installed and may still be firing. The ratio alone reads as
+            # "nothing is installed" to anyone who does not expand the details
+            # block, which is the whole modal row for most readers.
+            summary += f", {len(installed)} installed"
     return CheckResult(
         id="hooks.codex_installed", title="Codex hooks installed",
-        severity="warn" if unhealthy else "ok",
-        summary=("not applicable" if not rows
-                 else f"{len(installed)}/{len(rows)} root(s) installed"),
-        remediation=("Run `cctally setup`, then review the handler in Codex /hooks."
-                     if unhealthy else None),
+        severity=severity,
+        summary=summary,
+        remediation=remediation,
         details={
             "root_count": len(rows),
             "installed_root_count": len(installed),
+            "enabled_root_count": len(enabled),
             "states": states,
             "requires_review": requires_review,
             "trust_state": trust_state,
+            "worst_state": worst_state,
+            "responsible_root_key": responsible,
+        },
+    )
+
+
+def _check_hooks_codex_liveness_7d(s: DoctorState) -> CheckResult:
+    """FAIL when an enabled Codex hook has not succeeded inside seven days.
+
+    Sibling to the 24-hour `hooks.codex_recent_activity`, over different
+    evidence: that check reads the lifecycle log, this one reads the success
+    markers, which survive log rotation. Against the reported incident a
+    marker last written on 2026-07-31 would have failed on 2026-08-07.
+    """
+    enabled_keys = sorted(
+        str(row.get("source_root_key"))
+        for row in (s.codex_hook_roots or [])
+        if isinstance(row, dict) and row.get("state") == "installed_enabled"
+        and row.get("source_root_key")
+    )
+    window = CODEX_HOOK_LIVENESS_WINDOW_SECONDS
+    if not enabled_keys:
+        return CheckResult(
+            id="hooks.codex_liveness_7d", title="Codex hook liveness (7d)",
+            severity="ok", summary="not applicable", remediation=None,
+            details={
+                "liveness_state": "not-applicable",
+                "window_seconds": window,
+                "last_success_at": None,
+                "age_seconds": None,
+                "marker_count": 0,
+                "responsible_root_key": None,
+                "roots": [],
+            },
+        )
+    evidence = s.codex_hook_liveness or {}
+    roots: list[dict] = []
+    for key in enabled_keys:
+        row = evidence.get(key) if isinstance(evidence, dict) else None
+        row = row if isinstance(row, dict) else {}
+        # The reduction is the NEWEST readable mtime across this root's
+        # accounts. That is the right question at root level: a dormant
+        # historical account must not fail a root that is firing under a
+        # current one. It is deliberately not proof of per-account coverage.
+        last_success = row.get("last_success_at")
+        marker_count = int(row.get("marker_count") or 0)
+        if row.get("unavailable"):
+            state = "unavailable"
+            age_seconds = None
+            wire = None
+        elif isinstance(last_success, dt.datetime):
+            age_seconds = max(0, int((s.now_utc - last_success).total_seconds()))
+            wire = _iso_z(last_success)
+            state = "recent" if age_seconds <= window else "stale"
+        else:
+            state = "never"
+            age_seconds = None
+            wire = None
+        roots.append({
+            "source_root_key": key,
+            "liveness_state": state,
+            "last_success_at": wire,
+            "age_seconds": age_seconds,
+            "marker_count": marker_count,
+        })
+    order = {"never": 0, "stale": 1, "unavailable": 2, "recent": 3}
+    worst_rank = min(order[row["liveness_state"]] for row in roots)
+    responsible = next(
+        row for row in roots if order[row["liveness_state"]] == worst_rank
+    )
+    severity = {
+        "never": "fail", "stale": "fail", "unavailable": "warn", "recent": "ok",
+    }[responsible["liveness_state"]]
+    remediation = None
+    if responsible["liveness_state"] in ("never", "stale"):
+        remediation = (
+            "The Codex hook has not succeeded in 7 days. Check the handler in "
+            "Codex /hooks, then run `cctally cache-sync --source codex`."
+        )
+    elif responsible["liveness_state"] == "unavailable":
+        remediation = "cctally could not read the Codex hook success markers."
+    return CheckResult(
+        id="hooks.codex_liveness_7d", title="Codex hook liveness (7d)",
+        severity=severity,
+        summary=f"{len(roots)} enabled root(s); {responsible['liveness_state']}",
+        remediation=remediation,
+        details={
+            "liveness_state": responsible["liveness_state"],
+            "window_seconds": window,
+            "last_success_at": responsible["last_success_at"],
+            "age_seconds": responsible["age_seconds"],
+            "marker_count": responsible["marker_count"],
+            "responsible_root_key": responsible["source_root_key"],
+            "roots": roots,
         },
     )
 
 
 def _check_hooks_codex_recent_activity(s: DoctorState) -> CheckResult:
-    """Aggregate 24-hour lifecycle records only for installed root handlers."""
-    installed_states = {
-        "installed_review_required", "installed_trust_unobservable",
-    }
-    installed_keys = sorted(
+    """Aggregate 24-hour lifecycle records only for enabled root handlers."""
+    enabled_states = {"installed_enabled"}
+    enabled_keys = sorted(
         str(row.get("source_root_key"))
         for row in (s.codex_hook_roots or [])
-        if isinstance(row, dict) and row.get("state") in installed_states
+        if isinstance(row, dict) and row.get("state") in enabled_states
         and row.get("source_root_key")
     )
-    if not installed_keys:
+    if not enabled_keys:
         return CheckResult(
             id="hooks.codex_recent_activity", title="Codex recent activity",
             severity="ok", summary="not applicable",
@@ -1636,7 +1783,7 @@ def _check_hooks_codex_recent_activity(s: DoctorState) -> CheckResult:
 
     activity = s.codex_lifecycle_activity_24h or {}
     roots: list[dict] = []
-    for key in installed_keys:
+    for key in enabled_keys:
         row = activity.get(key) if isinstance(activity, dict) else None
         row = row if isinstance(row, dict) else {}
         last_tick_at = row.get("last_tick_at")
@@ -1668,7 +1815,7 @@ def _check_hooks_codex_recent_activity(s: DoctorState) -> CheckResult:
     return CheckResult(
         id="hooks.codex_recent_activity", title="Codex recent activity",
         severity="ok" if responsible["activity_state"] == "recent" else "warn",
-        summary=f"{len(roots)} installed root(s); {responsible['activity_state']}",
+        summary=f"{len(roots)} enabled root(s); {responsible['activity_state']}",
         remediation=(None if responsible["activity_state"] == "recent"
                      else "Trigger Codex activity, then verify `cctally setup` hooks."),
         details={
@@ -3690,6 +3837,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("hooks.last_fire_age", "_check_hooks_last_fire_age"),
         ("hooks.codex_installed", "_check_hooks_codex_installed"),
         ("hooks.codex_recent_activity", "_check_hooks_codex_recent_activity"),
+        ("hooks.codex_liveness_7d", "_check_hooks_codex_liveness_7d"),
     )),
     ("auth", "Auth", (
         ("oauth.token_present", "_check_oauth_token_present"),

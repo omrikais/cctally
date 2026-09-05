@@ -48,7 +48,9 @@ cctally percent-breakdown --json
 - Only milestones recorded by `record-usage` show up — if your status
   line wasn't running for part of the week, you'll see gaps, and they
   cannot be retroactively reconstructed.
-- `report --detail` calls into the same renderer for the *current* week.
+- `report --detail` renders the same milestones for the *current* week in its
+  own table, with a narrower column set and no 5-hour column. Both tables
+  disclose an observation gap the same way.
 - **After an in-place weekly credit, this view has a gap it cannot fill
   (issue #213).** A partial credit lowers the reported weekly percentage
   without re-anchoring the week, and `percent_milestones` is forward-only: no
@@ -60,6 +62,39 @@ cctally percent-breakdown --json
   `percent-breakdown`, `report --detail`, and the dashboard's per-percent
   view — inherits the same gap. `cctally record-credit` documents the credit
   model itself.
+
+## A back-filled run says so
+
+When observation stops for long enough that the next reading crosses several
+integer percents at once, one snapshot records all of them. The whole
+accumulated cost lands on the first threshold of the run and every threshold
+after it has no separable marginal cost of its own — those crossings were
+never observed apart from each other.
+
+The run is named once above the table, giving its threshold range, the instant
+of the single observation that recorded it, and how long it had been since the
+previous crossing:
+
+```
+Observation gap: 19%-35% were all recorded from one observation at 2026-09-04 04:03 UTC, 17.4 hours after the previous crossing. Their marginal costs are not separable (observation_gap).
+```
+
+Inside the table those rows print `observation_gap` in the `Marginal Cost`
+column instead of a bare `n/a`, which read as "this crossing cost nothing
+measurable". The run's first row keeps its real marginal cost, and a week with
+several runs gets one line per run.
+
+A bare `n/a` still appears, and still means what it always did: a threshold
+whose marginal cost is unknown because no earlier milestone exists to subtract
+from. That is the ordinary shape of the first crossing of a week or of a
+post-credit cycle.
+
+In `--json`, `marginalCostUSD` stays a number or `null` exactly as before, and
+a classified row gains a sibling `marginalCostWithheldCause` whose value is
+`observation_gap`. The key is present only on a classified row, `schemaVersion`
+is unchanged, and a consumer that ignores unknown keys needs no change. The
+JSON does not expose the snapshot identity, so a consumer reconstructs a run
+from consecutive rows that share `capturedAt` and carry the cause.
 
 ## See also
 

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
 import stat
 import subprocess
 import sys
@@ -636,6 +637,85 @@ def test_source_aware_harness_diffs_committed_artifacts_and_scans_canaries():
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "passed: 190   failed: 0" in result.stdout
+
+
+def test_the_privacy_canary_fails_when_its_scanner_is_unavailable(tmp_path):
+    """A canary that cannot scan must not report a clean scan (#711).
+
+    The harness gated the canary leg on `if rg …` with no availability check,
+    and the runners do not carry `rg`, so the leg reported success without ever
+    looking at an artifact. `command -v` answers the wrong question — a present
+    binary can still be broken — so the harness self-tests the scanner and
+    treats every status other than "match" and "clean" as a refusal.
+
+    The fake `grep` is PREPENDED to the child's existing PATH rather than
+    replacing it, and this is the whole design of the reproduction: with a
+    replaced PATH the harness would fail for want of `python3`, `find` or `wc`
+    and the assertion would pass while proving nothing about the scanner. That
+    vacuity is the same defect class the test exists to close.
+    """
+    root = Path(__file__).resolve().parents[1]
+    shadow = tmp_path / "shadow-bin"
+    shadow.mkdir()
+    fake = shadow / "grep"
+    fake.write_text("#!/bin/sh\nexit 127\n", encoding="utf-8")
+    fake.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{shadow}{os.pathsep}{env['PATH']}"
+    result = subprocess.run(
+        [str(root / "bin" / "cctally-source-aware-test")],
+        text=True, capture_output=True, check=False, env=env,
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, (
+        "the harness passed with an unusable scanner, so its privacy leg "
+        f"reported a clean scan it never performed:\n{combined}")
+    assert "scanner" in combined.lower(), combined
+
+
+def test_a_silent_scanner_failure_prints_no_bare_blank_line(tmp_path):
+    """A scanner can fail with a status and no message.
+
+    `grep` exits 2 for an unreadable path without necessarily writing to
+    stderr, and the harness printed its captured output unconditionally, so the
+    refusal was followed by an empty line that reads as a truncated report. The
+    fake scanner here answers the self-test correctly and fails ONLY the
+    recursive canary scan, which is what isolates the reporting path from the
+    availability path the case above covers.
+    """
+    real_grep = shutil.which("grep")
+    assert real_grep, "no grep on PATH, so this case cannot build its fake"
+    root = Path(__file__).resolve().parents[1]
+    shadow = tmp_path / "shadow-bin"
+    shadow.mkdir()
+    fake = shadow / "grep"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-R" ]; then exit 2; fi\n'
+        f'exec {real_grep} "$@"\n',
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{shadow}{os.pathsep}{env['PATH']}"
+    result = subprocess.run(
+        [str(root / "bin" / "cctally-source-aware-test")],
+        text=True, capture_output=True, check=False, env=env,
+    )
+
+    assert result.returncode != 0, (
+        "the harness passed while its scanner refused every canary scan:\n"
+        + result.stdout + result.stderr)
+    lines = result.stdout.splitlines()
+    refusals = [i for i, line in enumerate(lines) if "exited 2" in line]
+    assert refusals, result.stdout
+    for index in refusals:
+        assert not lines[index + 1:] or lines[index + 1] != "", (
+            "the refusal is followed by a bare blank line, so the report "
+            "looks truncated:\n" + result.stdout)
 
 
 def test_source_aware_fixture_builder_and_harness_are_executable_regular_scripts():

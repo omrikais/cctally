@@ -167,31 +167,147 @@ exactly one current handler per event; status reports installed only for that
 exact canonical shape. `--uninstall` removes every token-recognized
 cctally-owned Codex handler and retains unrelated configuration.
 
-Codex requires a user or administrator to review/trust non-managed hook
-definitions. cctally cannot inspect Codex's undocumented trust store, so it
-never claims a handler is trusted. Immediately after installation a root is
-`installed_review_required` (`requires_review: true`); later status with the
-exact owned handler is `installed_trust_unobservable`
-(`requires_review: null`). Review the exact handler in Codex `/hooks` before
-expecting end-to-end alert delivery.
+### Hook state vocabulary
 
-The existing snake-case `schema_version: 1` setup JSON gains an additive
-`codex_hooks` object:
+Codex records its hook trust decisions in `~/.codex/config.toml`, under
+`[hooks.state."<hooks-file>:<event>:<group>:<handler>"]`. cctally reads that
+table (read-only — it never writes `config.toml`) and classifies each root by
+an **ordered** algorithm whose first matching rule wins:
+
+1. `CCTALLY_DISABLE_CODEX_HOOKS` is set → `feature_disabled`.
+2. `hooks.json` cannot be read or validated → `malformed`.
+3. Either event carries no supported handler → `absent`.
+4. Either event carries more than one supported handler → `absent`. A
+   duplicate registration is the condition setup exists to reconcile, so it
+   is never reported as installed.
+5. A handler matches only the legacy two-token form → `absent`. That handler
+   runs the Claude leg on a Codex event, so it is manageable but not
+   functioning.
+6. `config.toml` exists but cannot be read or parsed, or a relevant
+   `enabled` value is present and not a boolean →
+   `installed_trust_unobservable`.
+7. A relevant entry sets `enabled = false` → `installed_disabled`.
+8. A relevant entry is missing, carries no string `trusted_hash`, or
+   `config.toml` does not exist → `installed_untrusted`.
+9. `hooks.json` is newer than `config.toml` → `installed_unverified`. Trust
+   was recorded, but the handler changed after the last recorded decision.
+10. Otherwise → `installed_enabled`.
+
+An absent `enabled` key reads as enabled: the handlers that fire in practice
+carry no `enabled` key at all, so only a boolean `false` disables one.
+cctally cannot reproduce Codex's `trusted_hash`, so it never compares a
+recorded hash against current content — rule 9's modification-time test is
+what covers the residual risk instead. `installed_review_required` has been
+retired; it encoded "setup just changed the file", a fact about the running
+process rather than about Codex's recorded state.
+
+`cctally doctor` FAILs on `installed_disabled` and `installed_untrusted`,
+WARNs on `installed_unverified`, `installed_trust_unobservable`, `absent`,
+`malformed` and `feature_disabled`, and passes only on `installed_enabled`.
+See [doctor.md](doctor.md).
+
+### Slot preservation and the reconcile refusal
+
+Codex keys its trust record by position, so removing a handler renumbers
+every later group and can land a freshly installed handler on a key whose
+`enabled = false` was decided about a different handler. Before mutating any
+root, setup plans every configured root read-only and refuses the **whole
+run** at exit 1 when any of three conditions holds:
+
+- a surviving handler would acquire a different `(event, group, handler)`
+  key than the one it holds now;
+- a newly occupied key already appears in the state table for no current
+  handler;
+- the planned content at an existing key differs from the current content
+  there and that key's entry does not set `enabled = false`.
+
+The third condition's carve-out is deliberate and asymmetric. Inheriting a
+*disable* is fail-safe — the hook stays off and doctor FAILs on it loudly.
+Inheriting *trust* would run a command the operator never approved under an
+approval given to a different one, so only that direction refuses.
+
+An unreadable or unparseable `config.toml` also refuses a mutating
+reconcile, because cctally then lacks the evidence that it is not landing on
+a stale key. A missing `config.toml` never blocks: with no recorded decision
+there is nothing to strand or inherit. Neither does a plan that changes
+nothing — setup computes the plan first and refuses only when it would
+actually rewrite `hooks.json`, so an already-correct handler under a
+hand-broken `config.toml` still gets its symlinks and its Claude hooks.
+
+Two refusals name a different remedy. When every finding is a recorded key
+that no handler occupies, Codex `/hooks` has nothing to review, so the
+message names the manual edit instead: remove that `[hooks.state]` entry
+from `config.toml` by hand. And when the collision is detected after the
+preflight passed — another process rewrote `config.toml` inside the window
+between the read-only plan and the locked write — the message says that the
+earlier steps of the run already completed, because on that path the
+symlinks and `settings.json` are already written. With more than one Codex
+root the write loop can also have replaced an earlier root's `hooks.json`
+before it reached the racing one, so that message names every file it
+rewrote and scopes the unchanged claim to the root it refused on.
+
+The refusal names the hooks path, the event, the old and new slots or the
+reused key, and lists any recorded keys pointing at handlers that no longer
+exist. Before any mutation it also states that no configuration file was
+changed; after one it states instead what the run had already written,
+naming each `hooks.json` whose contents it rewrote and the dated backup
+holding what that file held before. When the collision lands on the first
+root the write loop reaches, there is no such file to name and the refusal
+says only that cctally rewrote the contents of no Codex hooks file. The
+claim is about rewritten contents specifically: a root whose document
+already matched the plan is not listed even though the run still enforced
+its file mode.
+Those stale keys are reported, never cleaned up — `config.toml` stays
+read-only. Under `--json` the refusal emits a `schema_version: 2` envelope
+with `result: "err"` and `reason: "codex_hook_slot_collision"` before
+exiting 1. That envelope carries `hooks_path`, `config_path`, `findings`,
+`stale_state_keys`, the boolean `after_mutation`,
+`changed_hooks_paths` — the Codex hooks files this run had already
+rewritten, empty on the pre-mutation path — and `changed_hooks_backups`,
+mapping each of those paths to its backup. A path is absent from that map
+when the run created the document rather than replacing one. A
+machine-readable caller reads that distinction off those fields rather than
+by substring-matching the English in `error`. `--dry-run` reports the same refusal without creating
+the hooks directory or a lock file.
+
+### Wire contract
+
+The snake-case setup JSON is at **`schema_version: 2`**. Version 2 retired
+the `installed_review_required` state and changed
+`codex_hooks.roots[].changes` from an integer to a nested per-event object;
+both are breaking value-shape changes rather than additive key additions.
 
 ```text
 codex_hooks = {
   roots: [{source_root_key, codex_home, hooks_path, state,
            stop_count, subagent_stop_count, feature_enabled,
-           requires_review, remediation, error}],
+           requires_review, remediation, error,
+           changes?: {Stop: {added, removed, unchanged},
+                      SubagentStop: {added, removed, unchanged}}}],
   installed_count,
+  enabled_count,
+  all_roots_enabled,
   error_count
 }
 ```
 
+A row carries `changes` only when setup planned that root: the install,
+uninstall and `--dry-run` envelopes. `--status` plans nothing, so its rows
+omit the key entirely, as do the rows of a root setup skipped because its
+document is malformed or the feature switch is set.
+
+`changes` counts managed handlers only. An exact canonical survivor is one
+`unchanged`; a normalization is one `removed` plus one `added`; each
+discarded duplicate is one further `removed`; a fresh append is one `added`.
+`--dry-run` and the applied run report all three axes and agree with each
+other for the same input. `installed_count` counts every `installed_*`
+state, `enabled_count` counts `installed_enabled` alone, `all_roots_enabled`
+is `null` with no roots and otherwise true only when every root is
+`installed_enabled`, and `error_count` counts `malformed` rows.
+
 `codex_home` and `hooks_path` are intentionally local setup diagnostics; they
-are not share/export data. Per-root states can also be `absent`, `malformed`,
-`feature_disabled`, or `unavailable`. A malformed document fails before any
-mutation; use the stated remediation, correct the JSON, and rerun setup.
+are not share/export data. A malformed document fails before any mutation;
+use the stated remediation, correct the JSON, and rerun setup.
 
 ## Exit codes
 

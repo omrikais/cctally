@@ -11,7 +11,6 @@ blocking until the full request size is satisfied) until we have the
 first complete event frame (terminated by `\n\n`).
 """
 import datetime as dt
-import shutil
 import pathlib
 import http.client
 import json
@@ -21,7 +20,7 @@ import time
 
 import pytest
 
-from conftest import load_script, redirect_paths
+from conftest import copy_shared_corpus, load_script, redirect_paths
 
 from tests._support_http import (
     PRESENCE_BACKSTOP_SECONDS,
@@ -1033,14 +1032,13 @@ def _private_corpus(data_dir, tmp_path):
     readers can create and remove the WAL sidecars between copytree's directory
     scan and its copy2 call, and the built corpus is checkpointed, so those
     sidecars are neither fixture inputs nor safe copy candidates.
+
+    #741: the copy itself goes through `conftest.copy_shared_corpus`, the ONE
+    copier, which owns the source-root resolution and the sidecar exclusions
+    above and additionally holds the scale's build lock SHARED for the whole
+    walk — so a copy can no longer race `_clear_previous_corpus`.
     """
-    source_root = pathlib.Path(data_dir).parent
-    private_root = tmp_path / "corpus"
-    shutil.copytree(
-        source_root, private_root,
-        ignore=shutil.ignore_patterns("*.db-shm", "*.db-wal"),
-    )
-    return private_root / pathlib.Path(data_dir).name
+    return copy_shared_corpus(data_dir, tmp_path / "corpus")
 
 
 def test_compressed_update_is_at_most_a_quarter_of_the_legacy_frame(

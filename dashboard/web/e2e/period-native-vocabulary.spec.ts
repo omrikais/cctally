@@ -108,9 +108,15 @@ for (const viewport of MATRIX) {
     await selectSource(page, 'claude');
     const claudeWeekly = await openPeriod(page, 'Weekly');
     await claudeWeekly.screenshot({ path: screenshotPath(viewport, 'claude-weekly') });
-    await expect(claudeWeekly.getByRole('heading')).toHaveText(/Weekly · last \d+ weeks/);
-    await expect(claudeWeekly.locator('[data-col="label"]')).toContainText('Week');
+    // Claude counts in CYCLES, exactly as Codex does: a quota credit ends one
+    // billing cycle and begins another inside the same week, so a row count is
+    // not a week count and the row's own start is not the week's. The vocabulary
+    // that stays provider-native is the WINDOW, asserted in both directions
+    // below — Claude names the subscription window and never the reset cycle.
+    await expect(claudeWeekly.getByRole('heading')).toHaveText(/Weekly · last \d+ cycles/);
+    await expect(claudeWeekly.locator('[data-col="label"]')).toContainText('Cycle');
     await expect(claudeWeekly.getByText(/Subscription window:/)).toBeVisible();
+    await expect(claudeWeekly.getByText(/Reset cycle:/)).toHaveCount(0);
     for (const tokenLabel of ['Input', 'Output', 'Cache+', 'Cache-read', 'Total']) {
       await expect(claudeWeekly.getByText(tokenLabel, { exact: true })).toBeVisible();
     }

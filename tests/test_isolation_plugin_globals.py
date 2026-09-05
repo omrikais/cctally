@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import json
+import os
+import pathlib
 import subprocess
 import sys
 import textwrap
 import threading
 import types
+
+import pytest
 
 from tests._pytest_isolation_plugin import (
     PROJECT_MANIFEST, STDLIB_MANIFEST, UNREACHABLE, _comparison_key,
@@ -32,12 +36,89 @@ def test_the_project_manifest_names_the_reset_fixtures_targets():
     """
     import importlib
 
-    for module_name, attr in PROJECT_MANIFEST:
+    for entry in PROJECT_MANIFEST:
+        module_name, attr = entry[0], entry[1]
         module = importlib.import_module(module_name)
         assert hasattr(module, attr), (
             f"{module_name}.{attr} does not exist, so the detector silently "
             f"covers nothing for it"
         )
+        # The DECLARED pristine value is checked in a fresh process instead —
+        # see test_every_declared_pristine_spec_holds_in_a_fresh_process. This
+        # process is not an untouched one, so asserting a spec here would
+        # assert against the autouse fixture stack.
+
+
+#: Resolve every declared pristine spec in a FRESH process.
+#:
+#: The specs describe an UNTOUCHED process, and the pytest process running this
+#: module is not one: `tests/conftest.py:361` repoints
+#: `_cctally_core.MIGRATION_ERROR_LOG_PATH` to `tmp_path/"migration-errors.log"`
+#: while line 380 repoints `LOG_DIR` to `tmp_path/"logs"`, so the derived
+#: relation the module itself states at `bin/_cctally_core.py:158` does not
+#: hold while those autouse patches are installed. Checking the specs in the
+#: running process would therefore assert against the fixture stack rather than
+#: against the pristine state, which is the opposite of what the rows mean.
+PRISTINE_SPEC_PROBE = textwrap.dedent('''
+    import importlib
+    import json
+    import sys
+
+    sys.path.insert(0, {bin_dir!r})
+    sys.path.insert(0, {repo_dir!r})
+
+    from tests._pytest_isolation_plugin import PROJECT_MANIFEST, _spec_matches
+
+    findings = []
+    for entry in PROJECT_MANIFEST:
+        if len(entry) <= 2:
+            continue
+        module = importlib.import_module(entry[0])
+        value = getattr(module, entry[1])
+        if not _spec_matches(entry[2], module, value):
+            findings.append(
+                entry[0] + "." + entry[1] + " = " + repr(value)
+                + " against " + repr(entry[2]))
+    print(json.dumps(findings))
+''')
+
+
+def test_every_declared_pristine_spec_holds_in_a_fresh_process(tmp_path):
+    """A declared spec must describe what an untouched process actually holds.
+
+    Otherwise the appeared-key comparison reports every first import of that
+    module, which is noise rather than signal.
+
+    CCTALLY_PERF_TRACE is cleared for the child on purpose. `_lib_perf._ENABLED`
+    is environment-derived at import but is declared `literal(False)`, because
+    the per-item pristine contract is set by `tests/conftest.py:529`'s autouse
+    `_reset_perf_state`, which calls `set_enabled(False)` around every item. The
+    child models the post-fixture state the row describes, not the import-time
+    state the row deliberately does not describe.
+    """
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    script = tmp_path / "probe.py"
+    script.write_text(
+        PRISTINE_SPEC_PROBE.format(
+            bin_dir=str(repo / "bin"), repo_dir=str(repo)),
+        encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(home),
+        "CCTALLY_DATA_DIR": str(tmp_path / "data"),
+        "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+        "CODEX_HOME": str(home / ".codex"),
+        "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    result = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True,
+        timeout=120, env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    findings = json.loads(result.stdout.strip().splitlines()[-1])
+    assert findings == [], findings
 
 
 def test_the_unreachable_list_is_stated_rather_than_empty():
@@ -107,8 +188,11 @@ def test_the_project_halfs_live_phase_blind_spot_is_recorded():
     """
     from tests._pytest_isolation_plugin import _LIVE_PHASE_KEYS
 
+    # First two elements only: a row may also declare a pristine value, and
+    # `_LIVE_PHASE_KEYS` is keyed by `(module, attr)`.
     mismatch = _blind_spot_mismatch(
-        PROJECT_MANIFEST, _LIVE_PHASE_KEYS, UNREACHABLE)
+        [(entry[0], entry[1]) for entry in PROJECT_MANIFEST],
+        _LIVE_PHASE_KEYS, UNREACHABLE)
     assert mismatch == "", mismatch
 
 
@@ -262,6 +346,82 @@ FIXTURE_INSTALLED_GLOBAL = textwrap.dedent('''
 ''')
 
 
+LEAKY_FRONTIER_AGE_BOUND = textwrap.dedent('''
+    import sys
+
+    sys.path.insert(0, {bin_dir!r})
+    import _lib_ingest_frontier as frontier
+
+
+    def test_this_one_leaks_the_frontier_certificate_age_bound():
+        frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS = float("inf")
+''')
+
+
+#: The same leak, from a module that is NOT loaded when the item's baseline is
+#: taken. Every `import _lib_ingest_frontier` in tests/ is inside a function
+#: body, so this — not the module-scope form above — is the arrangement the
+#: estate actually produces.
+LEAKY_FRONTIER_AGE_BOUND_FIRST_IMPORT = textwrap.dedent('''
+    import sys
+
+
+    def test_this_one_first_imports_the_frontier_then_leaks_its_age_bound():
+        sys.path.insert(0, {bin_dir!r})
+        import _lib_ingest_frontier as frontier
+
+        assert frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS == 120.0
+        frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS = float("inf")
+''')
+
+
+#: The same first import, leaving the constant alone. The appeared-key check
+#: must stay silent here, or it would fire on every item in the estate that is
+#: the first on its worker to import a manifest module.
+CLEAN_FRONTIER_FIRST_IMPORT = textwrap.dedent('''
+    import sys
+
+
+    def test_this_one_only_imports_the_frontier():
+        sys.path.insert(0, {bin_dir!r})
+        import _lib_ingest_frontier as frontier
+
+        assert frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS == 120.0
+''')
+
+
+#: A manifest module NO autouse fixture imports, first-imported by the item
+#: itself and then left dirty. `_lib_perf` cannot be used for this:
+#: `tests/conftest.py`'s `_reset_perf_state` imports it, so it is in
+#: `sys.modules` from the first item onward and can never be first-imported by
+#: a test.
+LEAKY_OUTLINE_CACHE_FIRST_IMPORT = textwrap.dedent('''
+    import sys
+
+
+    def test_this_one_first_imports_the_outline_cache_then_fills_it():
+        sys.path.insert(0, {bin_dir!r})
+        import _lib_codex_conversation_query as query
+
+        assert len(query._outline_derivation_cache) == 0
+        query._outline_derivation_cache["leaked"] = {{"rows": []}}
+''')
+
+
+#: The same first import, leaving the cache empty. The appeared-key check must
+#: stay silent here.
+CLEAN_OUTLINE_CACHE_FIRST_IMPORT = textwrap.dedent('''
+    import sys
+
+
+    def test_this_one_only_imports_the_outline_cache():
+        sys.path.insert(0, {bin_dir!r})
+        import _lib_codex_conversation_query as query
+
+        assert len(query._outline_derivation_cache) == 0
+''')
+
+
 def _run_child(tmp_path, source, name):
     test_file = tmp_path / name
     test_file.write_text(source, encoding="utf-8")
@@ -278,6 +438,76 @@ def test_a_residual_stdlib_rebind_fails_its_own_test(tmp_path):
     assert result.returncode == 1, combined
     assert "test_this_one_rebinds_a_shared_stdlib_callable" in combined
     assert "sqlite3.connect" in combined
+
+
+def test_a_leaked_frontier_age_bound_fails_its_own_test(tmp_path):
+    """#740's class, reported against the test that caused it.
+
+    `bin/cctally-bench` rebinds `FRONTIER_CERTIFICATE_MAX_AGE_SECONDS` to
+    `float("inf")` for the length of a measurement run, on the module object
+    `_load_sibling` shares through `sys.modules`. Before the scoped restore,
+    the leak was invisible here and surfaced instead as `assert 'full' ==
+    'caught_up'` in whichever certificate test the scheduler placed after the
+    bench run on the same xdist worker. This asserts the detector now names the
+    leaking item itself.
+    """
+    bin_dir = str(pathlib.Path(__file__).resolve().parents[1] / "bin")
+    result = _run_child(
+        tmp_path,
+        LEAKY_FRONTIER_AGE_BOUND.format(bin_dir=bin_dir),
+        "test_child_frontier_age_bound.py",
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1, combined
+    assert "test_this_one_leaks_the_frontier_certificate_age_bound" in combined
+    assert "FRONTIER_CERTIFICATE_MAX_AGE_SECONDS" in combined
+
+
+def test_a_first_import_that_leaks_the_age_bound_fails_its_own_test(tmp_path):
+    """The arrangement the before-keyed residue check structurally cannot see.
+
+    `_snapshot_state` skips a manifest target whose module is not in
+    `sys.modules`, and the residue comparison iterates the BEFORE snapshot, so
+    a key absent at setup and present at teardown was never compared at all.
+    Every `import _lib_ingest_frontier` in `tests/` sits inside a function
+    body, so on a worker where `tests/test_bench.py::test_run_json_schema` ran
+    first the manifest row for this constant would have stayed silent through
+    the whole of #740. The declared pristine value is what closes that: an
+    appeared key is compared against it.
+    """
+    bin_dir = str(pathlib.Path(__file__).resolve().parents[1] / "bin")
+    result = _run_child(
+        tmp_path,
+        LEAKY_FRONTIER_AGE_BOUND_FIRST_IMPORT.format(bin_dir=bin_dir),
+        "test_child_frontier_first_import.py",
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1, combined
+    assert ("test_this_one_first_imports_the_frontier_then_leaks_its_age_bound"
+            in combined)
+    assert "FRONTIER_CERTIFICATE_MAX_AGE_SECONDS" in combined
+    assert "not loaded at setup" in combined, (
+        "the appeared case and the residue case call for different reading, "
+        "so the report must say the module had no baseline")
+
+
+def test_a_first_import_that_changes_nothing_is_not_reported(tmp_path):
+    """The no-false-positive half: importing a manifest module is not a leak.
+
+    Reporting every appeared key would fail every item that happens to be the
+    first on its worker to import a manifest module, which is noise rather than
+    signal. Only a value that differs from the declared pristine one is
+    reported.
+    """
+    bin_dir = str(pathlib.Path(__file__).resolve().parents[1] / "bin")
+    result = _run_child(
+        tmp_path,
+        CLEAN_FRONTIER_FIRST_IMPORT.format(bin_dir=bin_dir),
+        "test_child_frontier_clean_import.py",
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "1 passed" in combined
 
 
 def test_the_safe_importer_local_rebind_is_not_reported(tmp_path):
@@ -351,3 +581,123 @@ def test_the_snapshot_never_imports_a_module_that_was_absent(monkeypatch, tmp_pa
         "changed the process it is supposed to be observing")
     assert ("_iso_probe_module", "MARKER") not in seen, (
         "an unloaded target must be recorded as uncovered, not covered")
+
+
+def test_a_first_import_that_leaks_a_declared_container_fails_its_own_test(
+        tmp_path):
+    """The appeared case over a row whose pristine value is not a literal.
+
+    `_lib_codex_conversation_query._outline_derivation_cache` is an empty
+    `collections.OrderedDict` in an untouched process, and no literal can
+    encode that: `_comparison_key` files a container under its identity, which
+    a manifest cannot predict. The `empty_container` spec states the type and
+    the zero length instead, which is what an appeared key can be checked
+    against.
+    """
+    bin_dir = str(pathlib.Path(__file__).resolve().parents[1] / "bin")
+    result = _run_child(
+        tmp_path,
+        LEAKY_OUTLINE_CACHE_FIRST_IMPORT.format(bin_dir=bin_dir),
+        "test_child_outline_first_import.py",
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1, combined
+    assert "test_this_one_first_imports_the_outline_cache_then_fills_it" in combined
+    assert "_outline_derivation_cache" in combined
+    assert "not loaded at setup" in combined, (
+        "the appeared case and the residue case call for different reading, "
+        "so the report must say the module had no baseline")
+
+
+def test_a_first_import_of_the_outline_cache_that_changes_nothing_is_clean(
+        tmp_path):
+    bin_dir = str(pathlib.Path(__file__).resolve().parents[1] / "bin")
+    result = _run_child(
+        tmp_path,
+        CLEAN_OUTLINE_CACHE_FIRST_IMPORT.format(bin_dir=bin_dir),
+        "test_child_outline_clean_import.py",
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "1 passed" in combined
+
+
+def test_every_declared_pristine_value_is_a_valid_spec():
+    """The vocabulary is CLOSED, and its arguments are immutable scalars.
+
+    An arbitrary callable is refused because a callable could import or perform
+    work, and this plugin runs at every setup, call and teardown. A "whatever
+    appears first" sentinel is refused because it would bless the very leak the
+    row exists to detect. `literal` stays scalar, because `_comparison_key`
+    files a container under its identity and a container literal could never
+    equal the module's own object.
+    """
+    from tests._pytest_isolation_plugin import (
+        PRISTINE_KINDS, _DECLARED_SPECS, PristineSpec,
+    )
+
+    assert _DECLARED_SPECS, (
+        "no row declares a pristine value, so this guard is vacuous and the "
+        "appeared-key comparison is unreachable")
+    for (module_name, attr), spec in _DECLARED_SPECS.items():
+        where = f"{module_name}.{attr}"
+        assert isinstance(spec, PristineSpec), where
+        assert spec.kind in PRISTINE_KINDS, f"{where}: unknown kind {spec.kind!r}"
+        assert isinstance(spec.args, tuple), (
+            f"{where}: a spec's arguments must be an immutable tuple of pairs")
+        for name, value in spec.args:
+            assert isinstance(name, str) and name, where
+            assert not isinstance(value, (dict, list, set)), (
+                f"{where}: {name} holds a mutable container; a spec's "
+                "arguments must be immutable")
+            assert isinstance(value, (str, bool, int, float, type(None))), (
+                f"{where}: {name} is not a scalar")
+        if spec.kind == "literal":
+            value = dict(spec.args)["value"]
+            assert not isinstance(value, (dict, list, set, tuple)), (
+                f"{where} declares a container literal; `_comparison_key` "
+                "encodes a container by identity, so it could never equal the "
+                "module's own object and this row would report a leak on every "
+                "first import of that module")
+
+
+def test_a_spec_rejects_an_unknown_kind_and_a_mutable_argument():
+    """The vocabulary refuses at construction rather than at comparison."""
+    from tests._pytest_isolation_plugin import PristineSpec, _spec_matches
+
+    with pytest.raises(ValueError):
+        PristineSpec("whatever_appears_first", ())
+    with pytest.raises(TypeError):
+        PristineSpec("literal", (("value", {}),))
+    with pytest.raises(ValueError):
+        _spec_matches(PristineSpec.__new__(PristineSpec, "unknown", ()),
+                      types.ModuleType("m"), 1)
+
+
+def test_each_pristine_kind_resolves_against_a_live_module(monkeypatch):
+    """Every kind in the closed vocabulary has an exercised resolution."""
+    import collections
+
+    from tests._pytest_isolation_plugin import (
+        _spec_matches, derived_path, empty_container, env_flag, literal,
+    )
+
+    module = types.ModuleType("m")
+    assert _spec_matches(literal(False), module, False)
+    assert not _spec_matches(literal(False), module, True)
+
+    monkeypatch.setenv("CCTALLY_SPEC_PROBE", "1")
+    assert _spec_matches(env_flag("CCTALLY_SPEC_PROBE"), module, True)
+    assert not _spec_matches(env_flag("CCTALLY_SPEC_PROBE"), module, False)
+    monkeypatch.delenv("CCTALLY_SPEC_PROBE")
+    assert _spec_matches(env_flag("CCTALLY_SPEC_PROBE"), module, False)
+
+    module.LOG_DIR = pathlib.Path("/tmp/spec-probe")
+    spec = derived_path(module_attr="LOG_DIR", suffix="migration-errors.log")
+    assert _spec_matches(spec, module, pathlib.Path("/tmp/spec-probe/migration-errors.log"))
+    assert not _spec_matches(spec, module, pathlib.Path("/tmp/elsewhere.log"))
+
+    container = empty_container(type="collections.OrderedDict")
+    assert _spec_matches(container, module, collections.OrderedDict())
+    assert not _spec_matches(container, module, collections.OrderedDict(a=1))
+    assert not _spec_matches(container, module, {})

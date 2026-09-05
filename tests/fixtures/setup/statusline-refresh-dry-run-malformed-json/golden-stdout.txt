@@ -1,6 +1,6 @@
 setup: warning: settings.json at /FAKE/.claude/settings.json is not valid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1). Fix it and re-run.
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "mode": "dry-run",
   "symlinks": {
     "would_create": 16,
@@ -37,6 +37,8 @@ setup: warning: settings.json at /FAKE/.claude/settings.json is not valid JSON: 
   "codex_hooks": {
     "roots": [],
     "installed_count": 0,
+    "enabled_count": 0,
+    "all_roots_enabled": null,
     "error_count": 0
   },
   "legacy": {

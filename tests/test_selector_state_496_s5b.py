@@ -13,6 +13,7 @@ pinned traversal.
 """
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 import pathlib
@@ -46,7 +47,7 @@ def _open_stats(core, tmp_path, name="scratch-stats.db"):
 def test_current_epoch_creates_the_four_selector_tables(core, tmp_path):
     conn = _open_stats(core, tmp_path)
     try:
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1011
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1013
         names = {
             row[0]
             for row in conn.execute(
@@ -1656,28 +1657,123 @@ _DYNAMIC_TARGET = re.compile(
 )
 
 
-def _scan_text_for_dynamic_reads(text) -> int:
-    """How many `FROM`/`JOIN` targets in ``text`` are INTERPOLATED.
+#: The statement verbs that make a `FROM`/`JOIN` a SQL clause rather than an
+#: English preposition. `INSERT … INTO` and `REPLACE … INTO` are members because
+#: `INSERT INTO x SELECT … FROM {t}` reads dynamically even though its verb is a
+#: write.
+_SQL_STATEMENT_VERB = re.compile(
+    r"\b(?:SELECT"
+    r"|DELETE"
+    r"|UPDATE(?:\s+OR\s+\w+)?"
+    r"|CREATE"
+    r"|PRAGMA"
+    r"|INSERT(?:\s+OR\s+\w+)?\s+INTO"
+    r"|REPLACE\s+INTO)\b",
+    re.IGNORECASE,
+)
 
-    Each f-string is reduced to its template — literal parts verbatim and `{}`
-    for every interpolation — so `f"SELECT COUNT(*) FROM {table} WHERE {where}"`
-    counts while `f"SELECT {columns} FROM quota_window_blocks"` does not, since
-    the second names its table and the literal scanner already sees it.
+
+def _sql_expression_text(node, constants):
+    """One expression reduced to a SQL template, or ``None`` if it is not one.
+
+    Literal parts are kept verbatim and every interpolation becomes `{}`, so a
+    dynamic target stays visible. A module constant resolves through
+    ``constants`` and an `a + b` concatenation is followed, which is what keeps
+    a statement's verb and its `FROM` inside ONE reconstructed string.
+    `_sql_text` at `tests/test_cache_coverage_496_s5b.py:805` is the model, and
+    adopting it is what stops `"SELECT 1 " + f"FROM {table}"` from reading as
+    prose.
     """
-    import ast
-
-    total = 0
-    for node in ast.walk(ast.parse(text)):
-        if not isinstance(node, ast.JoinedStr):
-            continue
-        template = "".join(
-            value.value
-            if isinstance(value, ast.Constant) and isinstance(value.value, str)
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            part.value
+            if isinstance(part, ast.Constant) and isinstance(part.value, str)
             else "{}"
-            for value in node.values
+            for part in node.values
         )
-        total += len(_DYNAMIC_TARGET.findall(template))
-    return total
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _sql_expression_text(node.left, constants)
+        right = _sql_expression_text(node.right, constants)
+        if left is None or right is None:
+            return None
+        return left + right
+    return None
+
+
+def _module_sql_constants(tree):
+    """Module-level names bound to a string expression, as templates."""
+    constants: dict = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            text = _sql_expression_text(node.value, constants)
+            if text:
+                constants[node.targets[0].id] = text
+    return constants
+
+
+def _sql_expressions(node, constants):
+    """Every OUTERMOST reconstructable expression that carries an f-string.
+
+    Descent stops at a node that reconstructs, so an operand of a counted
+    concatenation is not also counted on its own. A node that does not
+    reconstruct — a call in the middle of a `+` chain, say — is descended into,
+    so its own f-strings still get their chance.
+
+    WHAT THIS STILL CANNOT SEE. Reconstruction follows `ast.BinOp(Add)` and
+    module-level constants and nothing else, so a dynamic target assembled by
+    `+=`, `"".join(...)` or `.format()` counts zero where the pre-#746 scanner
+    counted one. That is a fail-open in a census whose purpose is to force
+    review of a new dynamic read. Symmetrically, one string concatenating SQL
+    and then English would carry the prose along with it. Neither shape exists
+    in `bin/` today — measured per file while re-censusing — so the limit is
+    recorded here rather than guarded, and a new dynamic read written in one
+    of those shapes will not raise the count.
+    """
+    for child in ast.iter_child_nodes(node):
+        text = None
+        if isinstance(child, (ast.JoinedStr, ast.BinOp)):
+            text = _sql_expression_text(child, constants)
+        if text is not None and any(
+                isinstance(inner, ast.JoinedStr) for inner in ast.walk(child)):
+            yield text
+        else:
+            yield from _sql_expressions(child, constants)
+
+
+def _dynamic_targets_in(text) -> int:
+    """`FROM`/`JOIN` interpolations preceded by a statement verb, in one text."""
+    verb = _SQL_STATEMENT_VERB.search(text)
+    if verb is None:
+        return 0
+    return sum(1 for found in _DYNAMIC_TARGET.finditer(text)
+               if found.start() > verb.start())
+
+
+def _scan_text_for_dynamic_reads(text) -> int:
+    """How many `FROM`/`JOIN` targets in ``text`` are INTERPOLATED SQL.
+
+    Each SQL-shaped expression is reduced to its template — literal parts
+    verbatim and `{}` for every interpolation — so
+    `f"SELECT COUNT(*) FROM {table} WHERE {where}"` counts while
+    `f"SELECT {columns} FROM quota_window_blocks"` does not, since the second
+    names its table and the literal scanner already sees it.
+
+    A recognized statement verb must appear EARLIER in the reconstructed text
+    than the match. Without that requirement the scan counted ordinary English
+    — `f"moved from {was!r} to {now!r}"` — and fourteen registry rows recorded
+    nothing but prose. Reconstructing the whole expression rather than reading
+    one f-string in isolation is what keeps the requirement from being
+    fail-open on a concatenated statement.
+    """
+    tree = ast.parse(text)
+    constants = _module_sql_constants(tree)
+    return sum(_dynamic_targets_in(expression)
+               for expression in _sql_expressions(tree, constants))
 
 
 def test_dynamic_target_read_sites_are_frozen():
@@ -1714,19 +1810,123 @@ def test_dynamic_target_read_sites_are_frozen():
     )
 
 
-def test_the_dynamic_scan_is_non_vacuous():
-    assert _scan_text_for_dynamic_reads(
+#: Statements whose interpolated read target must still be counted. Each is a
+#: shape the census would otherwise miss, so the widened suite is what makes a
+#: fourteen-row census cut safe to take.
+_DYNAMIC_TARGET_CASES = [
+    (
+        "a bare dynamic target",
         'def reader(conn, table):\n'
-        '    return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchall()\n'
-    ) == 1
-    assert _scan_text_for_dynamic_reads(
+        '    return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchall()\n',
+        1,
+    ),
+    (
+        "a schema-qualified dynamic target",
+        'def reader(conn, table):\n'
+        '    return conn.execute(f"SELECT 1 FROM main.{table}").fetchall()\n',
+        1,
+    ),
+    (
+        "a dynamic DELETE target",
+        'def reader(conn, table):\n'
+        '    return conn.execute(f"DELETE FROM {table}")\n',
+        1,
+    ),
+    (
+        "two dynamic joins in one statement",
+        'def reader(conn, left, right):\n'
+        '    return conn.execute(f"SELECT 1 FROM {left} JOIN {right} ON 1")\n',
+        2,
+    ),
+    (
+        "a statement assembled by concatenation",
+        'def reader(conn, table):\n'
+        '    return conn.execute("SELECT 1 " + f"FROM {table}").fetchall()\n',
+        1,
+    ),
+    (
+        "a statement whose verb comes from a module constant",
+        '_HEAD = "SELECT 1 "\n'
+        'def reader(conn, table):\n'
+        '    return conn.execute(_HEAD + f"FROM {table}").fetchall()\n',
+        1,
+    ),
+]
+
+#: Strings that must count ZERO. The first names its own table, so the literal
+#: scanner already sees it. The rest are user-facing English that the
+#: case-insensitive `FROM {` pattern cannot tell from a dynamic target on its
+#: own, and each is a real string this repository renders to a person.
+_NOT_A_DYNAMIC_TARGET_CASES = [
+    (
+        "a named table with dynamic columns",
         'def reader(conn, columns):\n'
-        '    return conn.execute(f"SELECT {columns} FROM quota_window_blocks")\n'
-    ) == 0
-    assert _scan_text_for_dynamic_reads(
-        'def reader(conn, table):\n'
-        '    return conn.execute(f"SELECT 1 FROM main.{table}").fetchall()\n'
-    ) == 1, "a qualified dynamic target must not be invisible to both guards"
+        '    return conn.execute(f"SELECT {columns} FROM quota_window_blocks")\n',
+    ),
+    (
+        "the release branch refusal",
+        'def message(head, allowed):\n'
+        '    return f"release: refusing to cut from {head}; allow-branch was '
+        '{allowed}"\n',
+    ),
+    (
+        "the uninstall symlink line",
+        'def message(count, directory):\n'
+        '    return f"Removed {count} symlinks from {directory}/"\n',
+    ),
+    (
+        "the worker-loader failure",
+        'def message(path):\n'
+        '    return f"cannot load cctally worker from {path}"\n',
+    ),
+    (
+        "the estate skip-transition line",
+        'def message(was, now):\n'
+        '    return f"moved from {was!r} to {now!r}"\n',
+    ),
+    (
+        "the revision-conflict line",
+        'def message(event, rev, effective, source):\n'
+        '    return f"event {event} rev {rev} conflicts with effective rev '
+        '{effective} from {source}"\n',
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label,source,expected",
+    [(label, source, expected)
+     for label, source, expected in _DYNAMIC_TARGET_CASES],
+    ids=[label for label, _s, _e in _DYNAMIC_TARGET_CASES],
+)
+def test_the_dynamic_scan_counts_every_sql_shape(label, source, expected):
+    assert _scan_text_for_dynamic_reads(source) == expected, label
+
+
+@pytest.mark.parametrize(
+    "label,source",
+    _NOT_A_DYNAMIC_TARGET_CASES,
+    ids=[label for label, _s in _NOT_A_DYNAMIC_TARGET_CASES],
+)
+def test_the_dynamic_scan_counts_no_english(label, source):
+    assert _scan_text_for_dynamic_reads(source) == 0, label
+
+
+def test_the_write_side_mirror_anchors_on_a_dml_verb():
+    """`FROZEN_DYNAMIC_SITES` does not share this false-positive defect.
+
+    Asserted rather than stated in a comment: the write-side scan starts from
+    `_VERB`, so prose can never reach its dynamic branch, and a change that
+    loosened that anchor would show up here.
+    """
+    import test_stats_writer_surface_386 as writer
+
+    _counts, dynamic = writer._scan_text(
+        'conn.execute(f"INSERT INTO {table} VALUES (1)")')
+    assert dynamic == 1, "the write-side scan must still count a dynamic write"
+    for label, source in _NOT_A_DYNAMIC_TARGET_CASES:
+        _counts, dynamic = writer._scan_text(source)
+        assert dynamic == 0, label
 
 
 def test_the_debug_counter_is_classified():

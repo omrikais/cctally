@@ -28,9 +28,54 @@ FAMILY = "meter_rate_change"
 EVT_KIND = FAMILY
 EVT_ID_PREFIX = "mrc"
 
+#: #690: the version-2 identity prefix. New transitions are emitted under it
+#: with a self-sufficient payload that also carries the disclosure evidence.
+#:
+#: A second PREFIX rather than a key on the v1 payload or an ordinary higher
+#: revision. A key is not available: event selection compares revision, status
+#: and the whole-record hash, and preflight quarantines same-revision
+#: divergence, so a re-emission of an already-recorded identity under a
+#: changed payload would be quarantined. A higher revision is not available
+#: either, because revisions above zero belong to correction batches.
+#:
+#: The cost of a second prefix is that journal selection and correction key on
+#: `event_id` ALONE, so two prefixes are two independent logical events unless
+#: every path that reaches one of them accounts for both. Two paths do.
+#:
+#: The PRESENCE check was taught both: `unrecorded_rate_change_transitions`
+#: builds both ids per identity, and a terminal latch under either suppresses
+#: recovery under the other. Without that, a tombstoned or higher-revision v1
+#: record would be invisible to the v2 lookup and the transition would be
+#: resurrected the first time a v2-capable binary ran.
+#:
+#: The EMITTER was taught it too (#750 S2): `record_meter_rate_change` emits
+#: under v1 whenever the natural key holds ANY v1 record, and reaches v2 only
+#: for a key with none. So a v1 record the presence check re-offered is
+#: re-emitted as v1 and converges its missing row rather than becoming a
+#: second logical event, and a v1 record in any other state stays latched.
+#: Existence rather than liveness, because the emitter's other caller is
+#: `cmd_quota`'s FRESH detection, which the presence check does not gate: a
+#: tombstoned v1 record would otherwise be invisible to the v2 lookup and the
+#: transition resurrected the first time it was detected again.
+#:
+#: The CORRECTION path needs nothing, and that is by construction rather than
+#: by omission. `_preview_from_snapshot` in `bin/_cctally_rederive.py` raises
+#: `RederiveConflict` for any family other than `_lib_rederive.FAMILY`, which
+#: is `claude-usage`, so no supported `db rederive` family can target an event
+#: under either prefix. A correction that could reach one would have to add a
+#: family first, and adding one is where this question would have to be
+#: answered.
+EVT_ID_PREFIX_V2 = "mrc2"
+
 #: The payload shape's own version, so a later field addition is legible at
 #: replay without guessing from key presence.
 JOURNAL_IDENTITY_VERSION = 1
+
+#: The v2 payload's discriminator. Distinct from `JOURNAL_IDENTITY_VERSION`,
+#: which describes the IDENTITY tuple `identity()` returns and is unchanged:
+#: `(provider, account_key, effective_from)` still keys the row. This names
+#: the KEY SET of the payload, which is what the fold branches on.
+PAYLOAD_VERSION_V2 = 2
 
 SEVERITY_INFO = "info"
 SEVERITY_WARN = "warn"
@@ -81,7 +126,36 @@ class RateChangeTransition:
     #: the journal payload would quarantine any re-emission of an
     #: already-recorded identity. `alert_payload` is never journaled, so the
     #: disclosure rides there instead.
+    #:
+    #: #690 UPDATES that last sentence for the three fields below and for this
+    #: one: the disclosure now ALSO rides a version-2 journal payload under
+    #: `EVT_ID_PREFIX_V2`, which is a distinct identity and therefore cannot
+    #: make a re-emitted v1 identity hash differently from its retained line.
+    #: The v1 payload stays byte-frozen.
     withholding_status: "str | None" = None
+    #: The typed `WithholdingCause` values the detector's own inputs carried,
+    #: as a canonical JSON array of enum VALUES, or None.
+    #:
+    #: None, `"[]"` and a populated array are THREE distinct states: None
+    #: means legacy or unrecoverable evidence, `"[]"` means assessed with no
+    #: such origin. Serialized as values rather than `repr` so a member added
+    #: later cannot silently alias onto an existing one.
+    detector_input_causes: "str | None" = None
+    #: The typed `CompositionProvenance` values, same serialization and the
+    #: same three-state rule. A status NAME cannot identify its origin —
+    #: there are five members — which is why this is carried separately
+    #: rather than folded into `withholding_status`.
+    composition_provenance: "str | None" = None
+    #: `baseline_fit.population["withheld"]` (#692): how many fenced
+    #: observations carrying a cause fall strictly BEFORE `window_start`.
+    #:
+    #: A COUNT, not a boolean, so zero, one and many stay distinguishable and
+    #: honest copy stays possible; None is reserved for the legacy case where
+    #: it was never retained. It is never inferred from
+    #: `detector_input_causes`, from diagnostics text, or from the successor
+    #: status. Folding it into `withholding_status` is rejected: it would make
+    #: an otherwise healthy successor read as currently withheld.
+    baseline_withheld_days: "int | None" = None
 
     def identity(self) -> tuple:
         """The §6.3 key: `(provider, account identity, effectiveFrom)`.
@@ -122,6 +196,21 @@ def _instant(value) -> "dt.datetime | None":
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(UTC)
+
+
+#: #747 — the codomain of `transition_severity`, as a value rather than a
+#: convention. `dashboard/web/src/types/envelope.ts` derives its
+#: `RateChangeSeverity` type from a tuple of the same three tokens and
+#: `toastSeverityCoverage.test.ts` walks that tuple to prove each member has a
+#: reachable border rule. Nothing connected the two halves, so a fourth token
+#: added here would render on the base amber border with no test on either
+#: side observing it.
+#:
+#: Order is part of the contract: the parity assertion is ordered equality.
+#: The members are the module's own constants rather than fresh literals, so
+#: this really is the codomain — a re-spelled literal could drift from what
+#: `transition_severity` actually returns and still look correct here.
+RATE_CHANGE_SEVERITIES = (SEVERITY_INFO, SEVERITY_WARN, SEVERITY_ALARM)
 
 
 def transition_severity(previous: float, new: float) -> str:
@@ -190,9 +279,17 @@ def enumerate_transitions(regimes, *, provider, account_key,
     what is already persisted, and a pair it admitted but detection refused —
     or the reverse — would record a transition the detector never confirmed.
 
-    `withholding_status` is deliberately left at its `None` default. It is
-    #688 disclosure captured at detection time from the analysis, and this
-    function sees only stored regimes.
+    ALL FOUR evidence fields are deliberately left at their `None` defaults:
+    `withholding_status`, `detector_input_causes`, `composition_provenance`
+    and `baseline_withheld_days`. Each is captured at detection time from the
+    `QuotaAnalysis` — #688 for the first, #690 and #692 for the other three —
+    and this function sees only stored regimes and no analysis at all.
+
+    That is accepted rather than repaired, which is why the four columns are
+    nullable: a transition reconstructed on the #689 recovery route carries
+    null evidence BY CONSTRUCTION, and the client's fallback branch renders
+    honest generic copy rather than asserting a cause it does not have.
+    Spec §3.3 records this docstring as the decision.
     """
     pairs = _adjacent_pairs(regimes or ())
     out: list = []
@@ -285,6 +382,30 @@ def event_payload(transition: RateChangeTransition, *, created_at: str) -> dict:
     }
 
 
+def event_payload_v2(transition: RateChangeTransition, *,
+                     created_at: str) -> dict:
+    """The version-2 journal payload: the complete row PLUS the evidence.
+
+    Self-sufficient in the same way `event_payload` is — the row is
+    reconstructible from this alone — and emitted under `EVT_ID_PREFIX_V2`,
+    which is a different logical event, so the v1 payload's byte-freeze is
+    untouched and no already-recorded v1 identity can be made to hash
+    differently.
+
+    The four evidence values are published ALWAYS, as their value or as JSON
+    `null`, following this repository's wire rule that a published key is
+    nulled rather than dropped. A reader must be able to tell null from `[]`
+    from `0`.
+    """
+    payload = event_payload(transition, created_at=created_at)
+    payload["payload_version"] = PAYLOAD_VERSION_V2
+    payload["withholding_status"] = transition.withholding_status
+    payload["detector_input_causes"] = transition.detector_input_causes
+    payload["composition_provenance"] = transition.composition_provenance
+    payload["baseline_withheld_days"] = transition.baseline_withheld_days
+    return payload
+
+
 def alert_payload(transition: RateChangeTransition) -> dict:
     """The notifier payload. `axis` carries the family, NOT a registry id.
 
@@ -308,6 +429,14 @@ def alert_payload(transition: RateChangeTransition) -> dict:
         "previous_units_per_point": transition.previous_units_per_point,
         "new_units_per_point": transition.new_units_per_point,
         "withholding_status": transition.withholding_status,
+        # #690: the rest of the disclosure, on the same never-journaled
+        # payload and under the same nulled-not-dropped rule. The notifier
+        # copy needs the cause to avoid promising a fitted budget the
+        # withheld calibration may not have produced, and the count to say
+        # how thin the baseline was without inferring it from the status.
+        "detector_input_causes": transition.detector_input_causes,
+        "composition_provenance": transition.composition_provenance,
+        "baseline_withheld_days": transition.baseline_withheld_days,
     }
 
 

@@ -317,3 +317,40 @@ describe('TrendPanel layout — chart above scrollable table (#265 B)', () => {
     ).toBeTruthy();
   });
 });
+
+// #569 item 5 — the composition moves off the h2 onto a wrapping sub-line.
+//
+// Measured at 390px on the All source: the h2 had `clientWidth` 178 against
+// `scrollWidth` 258, so 80px — 31.0% of the title — was clipped, rendering
+// `$/1% Trend (Claude 10w…` and dropping `· Codex 12c)` entirely. The winning
+// rule is `.panel-header h2` inside `@media (max-width: 640px)`, which sets
+// `white-space: nowrap` and `text-overflow: ellipsis`, and the constraining
+// container is a 328px header in which the h2 is the only shrinkable item
+// against an unshrinkable actions cluster. Projects does not truncate because
+// its composition already lives on `.panel-range-note`, a full-width line
+// that wraps; this is that same arrangement.
+describe('#569 — the Trend composition renders outside the truncating h2', () => {
+  it('leaves the h2 carrying the title alone on the All source', () => {
+    updateSnapshot(envWithTrend(6));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<TrendPanel />);
+    const h2 = container.querySelector('#panel-trend .panel-header h2')!;
+    expect(h2.textContent).not.toContain('Codex');
+    expect(h2.querySelector('.sub')).toBeNull();
+  });
+
+  it('states the composition on the wrapping sub-line', () => {
+    updateSnapshot(envWithTrend(6));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<TrendPanel />);
+    const note = container.querySelector('#panel-trend .panel-range-note')!;
+    expect(note.textContent).toContain('Codex');
+  });
+
+  it('states the count on the sub-line on a single source too', () => {
+    updateSnapshot(envWithTrend(6));
+    const { container } = render(<TrendPanel />);
+    expect(container.querySelector('#panel-trend .panel-range-note')!.textContent)
+      .toBe('(6 weeks)');
+  });
+});

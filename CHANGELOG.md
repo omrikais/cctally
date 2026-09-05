@@ -5,6 +5,54 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.108.0] - 2026-09-05
+
+### Added
+- Codex reporting prices `gpt-6-astra` from OpenAI's published standard, cached-input, long-context and Fast-mode rates instead of the legacy `gpt-5` fallback.
+- `cctally alerts test` gains `--axis quota` and `--axis meter-rate-change`, so you can rehearse those two notifications instead of waiting for a real crossing or rate change. `--threshold` does not apply to `meter-rate-change`.
+- `cctally percent-breakdown` and `cctally report --detail` name a run of percent thresholds that one observation recorded, and print `observation_gap` where the marginal cost showed a bare `n/a`. `--json` adds `marginalCostWithheldCause`.
+- On an install with more than one account for a provider, every alert toast names the account it belongs to, as the dashboard's Recent Alerts list already did.
+- `cctally doctor` gains `hooks.codex_liveness_7d`, which FAILs when an enabled Codex hook has not succeeded in seven days. It reads the per-root success markers, so log rotation cannot hide a hook that stopped firing.
+
+### Changed
+- `cctally weekly`, `cctally report` and `cctally project` render a week credited twice as three rows, one per billing cycle. A dictionary keyed on the week alone now keeps only the last cycle; key on the week and its start instant together.
+- `cctally weekly`, `cctally report` and `cctally project` start the first cycle of a week whose boundary moved and was then credited at the moved boundary. The previous week keeps its own spend, which was counted into the credited week.
+- Upgrading from 1.107.0 or earlier rebuilds the disposable stats index once, because a weekly reset now records the observation it came from and a rate change records its evidence. Commands report the rebuild until it finishes.
+- A metering-rate change recorded before this upgrade reports no evidence rather than inventing any.
+- A weekly credit is recorded at the exact second Anthropic issued it rather than the top of that hour, so a reading captured earlier in the same hour stays in the cycle it belongs to.
+- A pre-credit reading captured before a second weekly credit now survives and is shown inside the earlier cycle, because each credit's cleanup is scoped to its own instant instead of reaching back past the previous credit.
+- `cctally doctor` now reads Codex's own hook trust record and FAILs when the cctally handler is disabled or was never trusted in Codex `/hooks`, instead of reporting it as installed.
+- `cctally doctor` warns when the Codex handler changed after Codex last recorded a trust decision about it, and when that record cannot be read at all.
+- `cctally setup` refuses at exit 1 when reconciling the Codex handler would land it on a trust decision Codex recorded about a different handler. The message names the file, the slots and the fix.
+- When Codex's trust record changes mid-run, the `cctally setup` refusal names each Codex hooks file it had already rewritten and the dated backup of its previous contents. `--json` adds `changed_hooks_backups`.
+- `cctally doctor` states how many Codex roots are installed beside how many are enabled, so two installed-but-untrusted handlers no longer read as `0/2 root(s) enabled` alone.
+- `cctally setup` recognizes a Codex handler written by a different install channel and collapses it into one canonical handler, instead of adding a second one beside it.
+- `cctally setup --json` moves to `schema_version: 2`: the `installed_review_required` state is retired, and per-root `changes` becomes a per-event object with separate added, removed and unchanged counts.
+- `cctally setup --dry-run` and the applied run now report the same added, removed and unchanged Codex handler counts for the same input.
+- The dashboard and the TUI stop treating a Codex handler as trusted merely because it is present, and re-check that trust when `config.toml` changes, so a hook disabled while either was running no longer certifies stale conversation cost.
+- A freshly installed Codex handler reports as untrusted, and `cctally doctor` FAILs, until you approve it in Codex `/hooks`. Until then the dashboard and the TUI walk every Codex session on each refresh.
+- Two `cctally setup` messages read as ordinary English again: the orphaned `[hooks.state]` remedy says to remove the entry from the file by hand, and a moved trust slot says the handler would move from one key to the other.
+
+### Fixed
+- A percent milestone crossed on a week that holds two recorded resets is listed again. It was filed against one cycle while `cctally percent-breakdown` listed another, so the crossing appeared under neither.
+- Every view of a credited week picks the cycle the week is currently in, not the reset written last. `cctally diff`, the TUI's per-percent modal and the dashboard's milestone list could each name an earlier cycle.
+- A weekly threshold notification names the billing cycle that crossed. On a week credited more than once it read `Week starting Jun 05` for every cycle, naming all of them at once; an uncredited week reads exactly as before.
+- A second Anthropic usage reset inside one subscription week now registers. Every reset in a week shared one slot, so the first held it and later ones were discarded, leaving the reported percentage at the pre-reset high-water mark.
+- A weekly reset observed while cctally is interrupted is no longer lost, and one zero reading can no longer confirm itself into a credit. The pending-reset state moved into the database and commits or rolls back with the reset it fired.
+- A stale pre-credit reading that a credit removed stays removed after `cctally db rebuild --db stats`. The removal is recorded, so a rebuild no longer restores the reading and holds the reported percentage at the pre-credit high.
+- An idle session no longer holds the reported weekly percentage at a stale value. It re-renders its status line from a cached rate-limit block, and that block is now ignored in full once its five-hour window has closed.
+- A severe metering-rate drop now raises a red alert toast instead of the amber that made it look like a smaller drop, and the toast's rate chip matches the colour Recent Alerts already showed for the same event.
+- A metering-rate change detected while the quota calibration was withheld now records which calibration was withheld and how many baseline days were missing, instead of pointing you at a fitted budget that may never have been produced.
+- A metering-rate change whose notification failed and is retried later now carries that same disclosure, because it is read back from the recorded change rather than re-derived from a later run.
+- A metering-rate toast now names the calibration that was withheld and why, instead of pointing you at a fitted budget that may not exist. An ordinary rate change reads exactly as it did before.
+- Recent Alerts shows the evidence behind a metering-rate change: the withheld calibration, the detector's inputs, the composition provenance, and how many baseline days were withheld.
+- An alert toast on a multi-account install states how to dismiss it again, on its own line below the alert's own text rather than above it, so a screen reader reads the alert before it reads how to close it.
+- Alert toasts are usable from the keyboard: press Enter or Space to dismiss one, or to activate its own button and open the window it names. A focused toast states the alert before how to close it, and dismissing one restores focus.
+- The dashboard's Daily panel reads `loading` while it hydrates, instead of reporting the 30-day window as `withheld` over a loading skeleton.
+- The dashboard's Trend panel states its title in full on a phone. The week and cycle counts moved to the wrapping sub-line the other cards use, so the title is no longer cut off mid-word.
+- The dashboard's Daily panel prints its total and peak-day amounts in full on a narrow window. Below about 400px the two summary columns stack instead of cutting the dollar figures off.
+- An install upgrading from a version that predates the append-only journal no longer records a second copy of a reset it already had, so a credited week keeps its own cycles instead of gaining an extra one.
+
 ## [1.107.0] - 2026-09-04
 
 ### Changed

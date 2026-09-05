@@ -367,6 +367,83 @@ fi
 
 rm -rf "$TMP_CLI"
 
+# ------------------------------------------- the two NON-REGISTRY axes (#699)
+# `quota` and `meter_rate_change` sit outside `AXIS_REGISTRY`, so neither could
+# be rehearsed before #699. Both must reach the SAME dispatch pipeline and the
+# same `alerts.log` writer, with the `mode=test` discriminator, and the log's
+# axis field must carry the family rather than the generic fallback.
+# A FUNCTION taking "$@" rather than a packed spec string: the quota axis needs
+# `--threshold 90` and the rate-change axis needs no extra argument at all, and
+# an unquoted variable expansion would be the only other way to vary the count.
+check_nonregistry_axis () {
+    # $1 = --axis value  $2 = expected `alerts.log` axis field  $@ = extra args
+    axis_flag=$1
+    want_axis=$2
+    shift 2
+    TMP_NR=$(mktemp -d -t cctally-alerts-nonreg-XXXXXX)
+    HOME="$TMP_NR" bin/cctally alerts test --axis "$axis_flag" "$@" >/dev/null 2>&1
+    nr_ec=$?
+    if [ $nr_ec -eq 0 ] || [ $nr_ec -eq 1 ] || [ $nr_ec -eq 3 ]; then
+        echo "PASS: alerts test --axis $axis_flag exited with documented status ($nr_ec)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: alerts test --axis $axis_flag exited with unexpected status $nr_ec"
+        fail_count=$((fail_count + 1))
+    fi
+    nr_log="$TMP_NR/.local/share/cctally/logs/alerts.log"
+    if [ -f "$nr_log" ] && grep -q $'\t'"$want_axis"$'\t' "$nr_log"; then
+        echo "PASS: alerts test --axis $axis_flag logged axis=$want_axis"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: alerts test --axis $axis_flag did not log axis=$want_axis"
+        [ -f "$nr_log" ] && echo "  contents:" && cat "$nr_log"
+        fail_count=$((fail_count + 1))
+    fi
+    if [ -f "$nr_log" ] && grep -q $'\ttest\t' "$nr_log"; then
+        echo "PASS: alerts test --axis $axis_flag logged mode=test"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL: alerts test --axis $axis_flag did not log mode=test"
+        fail_count=$((fail_count + 1))
+    fi
+    rm -rf "$TMP_NR"
+}
+
+check_nonregistry_axis quota quota --threshold 90
+check_nonregistry_axis meter-rate-change meter_rate_change
+
+# `--threshold` is a usage error on the rate-change axis: exit 2, and the
+# message must name BOTH the axis and the flag.
+TMP_REF=$(mktemp -d -t cctally-alerts-refuse-XXXXXX)
+refuse_err=$(HOME="$TMP_REF" bin/cctally alerts test \
+    --axis meter-rate-change --threshold 95 2>&1 >/dev/null)
+refuse_ec=$?
+if [ $refuse_ec -eq 2 ]; then
+    echo "PASS: --threshold on meter-rate-change exits 2"
+    pass_count=$((pass_count + 1))
+else
+    echo "FAIL: --threshold on meter-rate-change exited $refuse_ec, expected 2"
+    fail_count=$((fail_count + 1))
+fi
+case "$refuse_err" in
+    *meter-rate-change*--threshold*|*--threshold*meter-rate-change*)
+        echo "PASS: the refusal names both the axis and the flag"
+        pass_count=$((pass_count + 1))
+        ;;
+    *)
+        echo "FAIL: the refusal does not name both the axis and the flag: $refuse_err"
+        fail_count=$((fail_count + 1))
+        ;;
+esac
+if [ -f "$TMP_REF/.local/share/cctally/logs/alerts.log" ]; then
+    echo "FAIL: a refused invocation still wrote alerts.log"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS: a refused invocation dispatched nothing"
+    pass_count=$((pass_count + 1))
+fi
+rm -rf "$TMP_REF"
+
 echo
 echo "passed: $pass_count   failed: $fail_count"
 [ $fail_count -eq 0 ]

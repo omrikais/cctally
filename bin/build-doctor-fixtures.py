@@ -106,6 +106,15 @@ SCENARIOS = {
     # `db.conversations_wal_size` WARN branch. Every other scenario leaves the
     # sidecar absent, which the check reports as OK.
     "35-conversations-wal-oversized":    "conversations_wal_oversized",
+    # #719: the four scenarios that reach the new Codex hook-state severities
+    # and the seven-day liveness leg. No existing fixture reaches any of them,
+    # and each failure mode gets its own scenario rather than one standing in
+    # for the others.
+    "36-codex-hooks-disabled-mixed-roots":     "codex_hooks_disabled_mixed_roots",
+    "37-codex-hooks-untrusted":                "codex_hooks_untrusted",
+    "38-codex-hooks-config-unparseable":       "codex_hooks_config_unparseable",
+    "39-codex-hooks-liveness-stale-multi-account":
+        "codex_hooks_liveness_stale_multi_account",
 }
 
 # user_version sentinel bumped well past either registry head so the
@@ -119,6 +128,10 @@ CODEX_HOMES = {
     "22-codex-quota-fresh-future": ("codex-a", "codex-b"),
     "23-codex-lifecycle-recent-never": ("codex-a", "codex-b"),
     "24-codex-lifecycle-recent-stale": ("codex-a", "codex-b"),
+    "36-codex-hooks-disabled-mixed-roots": ("codex-a", "codex-b"),
+    "37-codex-hooks-untrusted": ("codex-a", "codex-b"),
+    "38-codex-hooks-config-unparseable": ("codex-a", "codex-b"),
+    "39-codex-hooks-liveness-stale-multi-account": ("codex-a", "codex-b"),
 }
 
 
@@ -299,6 +312,9 @@ def _scenario_body(slug: str) -> str:
     if slug in {
         "codex_quota_fresh_stale", "codex_quota_fresh_future",
         "codex_lifecycle_recent_never", "codex_lifecycle_recent_stale",
+        "codex_hooks_disabled_mixed_roots", "codex_hooks_untrusted",
+        "codex_hooks_config_unparseable",
+        "codex_hooks_liveness_stale_multi_account",
     }:
         case = slug.removeprefix("codex_").replace("_", "-")
         return _scenario_body("all_ok") + textwrap.dedent(f"""\
@@ -660,6 +676,8 @@ def main():
     p.add_argument("--emit-codex-doctor-case", choices=[
         "quota-fresh-stale", "quota-fresh-future",
         "lifecycle-recent-never", "lifecycle-recent-stale",
+        "hooks-disabled-mixed-roots", "hooks-untrusted",
+        "hooks-config-unparseable", "hooks-liveness-stale-multi-account",
     ])
     p.add_argument(
         "--out", type=pathlib.Path, default=None,
@@ -1037,6 +1055,40 @@ def _emit_codex_doctor_case(
             f"alert_eligible_roots=1 dur_ms=12 result={result}\n"
         )
 
+    def write_trust(root: pathlib.Path, *, enabled=None, unparseable=False):
+        """Record a Codex `[hooks.state]` trust decision for this root.
+
+        The key's file component is the RESOLVED hooks.json path, because
+        `codex_hook_roots` resolves every configured home before building it.
+        `config.toml` is then made newer than `hooks.json` so the freshness
+        test in the classification reports `installed_enabled` rather than
+        `installed_unverified`.
+        """
+        hooks_path = (root / "hooks.json").resolve()
+        config = root / "config.toml"
+        if unparseable:
+            config.write_text("= = this is not toml\n", encoding="utf-8")
+        else:
+            lines = []
+            for token in ("stop", "subagent_stop"):
+                lines.append(f'[hooks.state."{hooks_path}:{token}:0:0"]')
+                lines.append(f'trusted_hash = "fixture-hash-{token}"')
+                if enabled is not None:
+                    lines.append(f"enabled = {str(enabled).lower()}")
+            config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        stamp = as_of.timestamp()
+        os.utime(config, (stamp, stamp))
+        os.utime(hooks_path, (stamp - 3600, stamp - 3600))
+
+    def write_marker(root_key: str, age_seconds: float, account=None):
+        base = app_dir / "codex-hook-tick"
+        base.mkdir(parents=True, exist_ok=True)
+        suffix = f".{account}" if account else ""
+        marker = base / f"{root_key}{suffix}.last-success"
+        marker.write_text("", encoding="utf-8")
+        stamp = as_of.timestamp() - age_seconds
+        os.utime(marker, (stamp, stamp))
+
     if case in {"quota-fresh-stale", "quota-fresh-future"}:
         db_path = app_dir / "cache.db"
         conn = sqlite3.connect(str(db_path))
@@ -1076,6 +1128,13 @@ def _emit_codex_doctor_case(
             conn.commit()
         finally:
             conn.close()
+        # 21/22 exercise quota freshness, so they carry a valid enabled trust
+        # record and fresh success markers for the same reason 23/24 do: an
+        # unrelated Codex hook FAIL would otherwise own their exit code.
+        for _key, root in roots:
+            write_trust(root)
+        for key, _root in roots:
+            write_marker(key, 120)
         log_path.write_text(
             log_line(as_of - dt.timedelta(seconds=30), roots[0][0])
             + log_line(as_of - dt.timedelta(seconds=20), roots[1][0])
@@ -1083,13 +1142,55 @@ def _emit_codex_doctor_case(
         return
 
     if case == "lifecycle-recent-never":
+        # 23/24 carry a valid enabled trust record and fresh success markers,
+        # so they stay dedicated to the 24-hour LOG check that names them.
+        for _key, root in roots:
+            write_trust(root)
+        for key, _root in roots:
+            write_marker(key, 120)
         log_path.write_text(log_line(as_of - dt.timedelta(seconds=30), roots[0][0]))
         return
     if case == "lifecycle-recent-stale":
+        for _key, root in roots:
+            write_trust(root)
+        for key, _root in roots:
+            write_marker(key, 120)
         log_path.write_text(
             log_line(as_of - dt.timedelta(seconds=30), roots[0][0])
             + log_line(as_of - dt.timedelta(seconds=10), roots[0][0], result="error")
             + log_line(as_of - dt.timedelta(seconds=24 * 3600 + 1), roots[1][0])
+        )
+        return
+    if case == "hooks-disabled-mixed-roots":
+        # #719 acceptance 5: a healthy sibling must never mask a disabled root.
+        write_trust(roots[0][1])
+        write_trust(roots[1][1], enabled=False)
+        write_marker(roots[0][0], 120)
+        log_path.write_text(log_line(as_of - dt.timedelta(seconds=30), roots[0][0]))
+        return
+    if case == "hooks-untrusted":
+        # hooks.json is installed and no trust decision exists at all.
+        log_path.write_text("")
+        return
+    if case == "hooks-config-unparseable":
+        for _key, root in roots:
+            write_trust(root, unparseable=True)
+        log_path.write_text("")
+        return
+    if case == "hooks-liveness-stale-multi-account":
+        # Both roots are enabled and the 24-hour LOG is fresh; only the
+        # success MARKERS are old, which is the evidence split the new leg
+        # exists for. Account-suffixed markers reduce to the newest.
+        for _key, root in roots:
+            write_trust(root)
+        write_marker(roots[0][0], 7 * 24 * 3600 + 1,
+                     account="0123456789abcdef0123456789abcdef")
+        write_marker(roots[0][0], 30 * 24 * 3600,
+                     account="fedcba9876543210fedcba9876543210")
+        write_marker(roots[1][0], 3600)
+        log_path.write_text(
+            log_line(as_of - dt.timedelta(seconds=30), roots[0][0])
+            + log_line(as_of - dt.timedelta(seconds=20), roots[1][0])
         )
         return
     raise ValueError(f"unsupported Codex doctor fixture case: {case}")

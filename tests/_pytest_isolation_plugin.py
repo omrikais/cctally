@@ -56,6 +56,7 @@ on `sys.path` and `tests` resolves as a namespace package.
 """
 from __future__ import annotations
 
+import collections
 import sys
 import threading
 import traceback
@@ -148,14 +149,178 @@ STDLIB_MANIFEST = (
     ("socket", "socket"),
 )
 
+#: The CLOSED vocabulary a manifest row may use to declare its pristine value.
+#:
+#: An arbitrary callable is refused because a callable could import a module or
+#: perform work, and this code runs at every setup, call and teardown of every
+#: item. A "whatever appears first" sentinel is refused because it would bless
+#: the very leak the row exists to detect.
+PRISTINE_KINDS = ("literal", "env_flag", "derived_path", "empty_container")
+
+
+class PristineSpec(collections.namedtuple("PristineSpec", ("kind", "args"))):
+    """What a manifest target holds in an untouched process.
+
+    ``args`` is a tuple of ``(name, scalar)`` pairs rather than a mapping, so
+    the whole value is immutable and no row can smuggle a mutable container
+    into the manifest.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, kind, args):
+        if kind not in PRISTINE_KINDS:
+            raise ValueError(
+                f"unknown pristine kind {kind!r}; expected one of "
+                f"{PRISTINE_KINDS}")
+        args = tuple(args)
+        for pair in args:
+            name, value = pair
+            if not isinstance(name, str) or not name:
+                raise TypeError(
+                    f"a pristine spec argument needs a name; got {name!r}")
+            if not isinstance(value, (str, bool, int, float, type(None))):
+                raise TypeError(
+                    f"a pristine spec argument must be an immutable scalar; "
+                    f"{name} holds {type(value).__name__}")
+        return super().__new__(cls, kind, args)
+
+
+def literal(value):
+    """A scalar the attribute holds outright.
+
+    Scalar only: `_comparison_key` files a container under its identity, so a
+    container literal could never equal the module's own object and the row
+    would report a leak on every first import of that module.
+    """
+    return PristineSpec("literal", (("value", value),))
+
+
+def env_flag(variable, true_value="1"):
+    """A boolean derived from the process environment at import time.
+
+    No manifest row uses this today, and the one candidate deliberately does
+    not: see `_lib_perf._ENABLED` below.
+    """
+    return PristineSpec(
+        "env_flag", (("variable", variable), ("true_value", true_value)))
+
+
+def derived_path(module_attr, suffix):
+    """A path the module derives from another of its own attributes."""
+    return PristineSpec(
+        "derived_path", (("module_attr", module_attr), ("suffix", suffix)))
+
+
+def empty_container(type):  # noqa: A002 - the argument names what it declares
+    """An empty container of a named type, e.g. `collections.OrderedDict`."""
+    return PristineSpec("empty_container", (("type", type),))
+
+
+def _resolve_dotted(name):
+    import importlib
+
+    module_name, _, attr = name.rpartition(".")
+    return getattr(importlib.import_module(module_name), attr)
+
+
+def _spec_matches(spec, module, value):
+    """Whether ``value`` is what ``spec`` says an untouched process holds.
+
+    ``module`` is the live module object, because two of the four kinds are
+    relative to it: a derived path is built from a sibling attribute, and a
+    row whose base attribute does not exist yet cannot be judged at all and is
+    accepted rather than reported.
+    """
+    import os
+
+    args = dict(spec.args)
+    if spec.kind == "literal":
+        return _comparison_key(value) == _comparison_key(args["value"])
+    if spec.kind == "env_flag":
+        return bool(value) is (
+            os.environ.get(args["variable"]) == args["true_value"])
+    if spec.kind == "derived_path":
+        base = getattr(module, args["module_attr"], None)
+        if base is None:
+            # The base attribute is what the derived one is measured against,
+            # and a module that does not carry it yet cannot be judged. This
+            # is the residual limitation recorded on the row itself: a first
+            # import that coherently leaks BOTH the base and the derived path
+            # is outside this row's reach.
+            return True
+        return (_comparison_key(value)
+                == ("path", os.path.join(os.fspath(base), args["suffix"])))
+    if spec.kind == "empty_container":
+        try:
+            expected_type = _resolve_dotted(args["type"])
+        except (ImportError, AttributeError):  # pragma: no cover - defensive
+            return True
+        if type(value) is not expected_type:
+            return False
+        try:
+            return len(value) == 0
+        except TypeError:  # pragma: no cover - defensive
+            return False
+    raise ValueError(f"unknown pristine kind {spec.kind!r}")
+
+
 # The targets the five autouse reset fixtures in tests/conftest.py restore.
 # Named individually, because a stdlib-only manifest cannot see any of them.
+#
+# A row is `(module, attr)` or `(module, attr, pristine)`. The optional third
+# element is what the attribute holds in an untouched process, and it exists
+# because a key that is ABSENT at setup and PRESENT at teardown is compared
+# against nothing by the before-keyed residue check: every `import
+# _lib_ingest_frontier` in tests/ is inside a function body, so on a worker
+# where the bench test runs first the row below would have stayed silent
+# through the very leak it names. Eager-importing the module here is ruled out
+# — see `_snapshot_state` — so a row that wants the appeared case covered
+# declares its pristine value instead.
 PROJECT_MANIFEST = (
-    ("_lib_perf", "_ENABLED"),
-    ("_lib_perf", "_LAST_BACKEND_PERF"),
-    ("_cctally_core", "QUOTA_PROJECTION_RECONCILE_ENABLED"),
-    ("_cctally_core", "MIGRATION_ERROR_LOG_PATH"),
-    ("_lib_codex_conversation_query", "_outline_derivation_cache"),
+    # `literal(False)`, NOT `env_flag`. The value IS environment-derived at
+    # import (`bin/_lib_perf.py:25` reads CCTALLY_PERF_TRACE), but the per-item
+    # pristine contract is defined by the FIXTURE, not by the environment:
+    # `tests/conftest.py:529`'s autouse `_reset_perf_state` calls
+    # `set_enabled(False)` before and after every item, and this plugin's
+    # baseline is captured before fixture setup. An `env_flag` spec would
+    # expect True on the first item of a run with CCTALLY_PERF_TRACE=1 while
+    # the correct post-fixture state is False, which is a false positive.
+    ("_lib_perf", "_ENABLED", literal(False)),
+    ("_lib_perf", "_LAST_BACKEND_PERF", literal(None)),
+    # `bin/_lib_perf.py:307`, beside its sibling and reset by the same fixture.
+    # The manifest simply omitted it.
+    ("_lib_perf", "_LAST_INGEST_PERF", literal(None)),
+    ("_cctally_core", "QUOTA_PROJECTION_RECONCILE_ENABLED", literal(False)),
+    # Derived from the module's own LOG_DIR at `bin/_cctally_core.py:158`, so
+    # no literal can encode it: the directory moves with the data dir.
+    # RESIDUAL LIMITATION: the spec is evaluated against LOG_DIR as the module
+    # currently holds it, so a first-import test that coherently leaks BOTH the
+    # base and the derived path is outside this row's reach. A row whose base
+    # attribute is absent is accepted rather than reported, because it cannot
+    # be judged at all.
+    ("_cctally_core", "MIGRATION_ERROR_LOG_PATH",
+     derived_path(module_attr="LOG_DIR", suffix="migration-errors.log")),
+    # An empty `collections.OrderedDict` in an untouched process. No literal
+    # can encode that, because `_comparison_key` files a container under its
+    # identity, which a manifest cannot predict. When the key APPEARS the spec
+    # compares type and zero length; when it was already present the ordinary
+    # residue comparison covers it by identity plus length.
+    ("_lib_codex_conversation_query", "_outline_derivation_cache",
+     empty_container(type="collections.OrderedDict")),
+    # #740: `bin/cctally-bench` rebinds this to `float("inf")` for the length of
+    # a measurement run, on the module object `_load_sibling` shares through
+    # `sys.modules`. An unrestored assignment made every later certificate test
+    # on the same xdist worker read `inf` as its age bound, and the failure was
+    # reported against that later test rather than against the bench run. The
+    # scoped restore in `_suspend_frontier_expiry` is the fix; this row is what
+    # names the culprit if the class recurs.
+    # 120.0 is `_lib_ingest_frontier`'s own documented default, restated here
+    # because reading it would require importing the module this plugin must
+    # not import. A change to that default must be mirrored into this row, or
+    # the appeared-key check reports every first import of the module.
+    ("_lib_ingest_frontier", "FRONTIER_CERTIFICATE_MAX_AGE_SECONDS",
+     literal(120.0)),
 )
 
 UNREACHABLE = (
@@ -227,6 +392,15 @@ def _comparison_key(value):
     return ("identity", id(value))
 
 
+#: Every manifest row that declares a pristine value, by target. Built once, at
+#: module level, because it is read on every teardown of every item.
+_DECLARED_SPECS = {
+    (entry[0], entry[1]): entry[2]
+    for entry in STDLIB_MANIFEST + PROJECT_MANIFEST
+    if len(entry) > 2
+}
+
+
 def _snapshot_state(manifest=None):
     """Capture one comparison key for every manifest target that is loaded.
 
@@ -248,7 +422,9 @@ def _snapshot_state(manifest=None):
     if manifest is None:
         manifest = STDLIB_MANIFEST + PROJECT_MANIFEST
     seen = {}
-    for module_name, attr in manifest:
+    for entry in manifest:
+        # Only the first two elements: a row may also declare a pristine value.
+        module_name, attr = entry[0], entry[1]
         module = sys.modules.get(module_name)
         if module is None or not hasattr(module, attr):
             continue
@@ -271,10 +447,23 @@ def _snapshot_state(manifest=None):
 # `os.environ["TZ"]` is compared at teardown only, for the same reason plus one
 # more: process environment has no importer-local form, so a call-phase finding
 # over it would name no repair.
-_LIVE_PHASE_KEYS = frozenset(STDLIB_MANIFEST)
+_LIVE_PHASE_KEYS = frozenset(
+    (entry[0], entry[1]) for entry in STDLIB_MANIFEST)
 
 
 def _compare_state(before, after, *, only=None):
+    """Every manifest key whose value moved between two snapshots.
+
+    Two passes, because a key can be missing from either side. The first
+    compares each key present in `before` against `after`, which is the residue
+    question. The second covers the case the first structurally cannot see: a
+    key ABSENT at setup because its module was not loaded yet, and PRESENT at
+    teardown because the item imported it. Such a key has no baseline, so it is
+    compared against the pristine value its manifest row DECLARES, and only a
+    row that declares one is examined. Reporting every appeared key would fire
+    on every item that first imports a manifest module, which is noise; a row
+    with a declared default reports only a value that differs from it.
+    """
     changed = []
     for key, was in before.items():
         if only is not None and key not in only:
@@ -284,6 +473,25 @@ def _compare_state(before, after, *, only=None):
             changed.append(f"{key[0]}.{key[1]}: {was} -> <absent>")
         elif now != was:
             changed.append(f"{key[0]}.{key[1]}: {was} -> {now}")
+    for key, spec in _DECLARED_SPECS.items():
+        if only is not None and key not in only:
+            continue
+        if key in before:
+            continue
+        now = after.get(key)
+        if now is None:
+            continue
+        module = sys.modules.get(key[0])
+        if module is None or not hasattr(module, key[1]):
+            continue
+        # Read ONCE. Judging a live read and then reporting the teardown
+        # snapshot would let the message name a value the verdict did not use.
+        live = getattr(module, key[1])
+        if _spec_matches(spec, module, live):
+            continue
+        changed.append(
+            f"{key[0]}.{key[1]}: <module not loaded at setup> -> {live}, "
+            f"against the declared pristine value {spec}")
     return changed
 
 

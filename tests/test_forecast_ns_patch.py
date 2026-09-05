@@ -108,8 +108,10 @@ def test_cmd_report_resolves_view_and_share_through_namespace(cctally_mod, monke
         )]
 
     monkeypatch.setattr(mod, "get_recent_weeks", spy_weeks)
+    # `**kwargs` absorbs #341 `account_key=`, which #750 S3 threaded through
+    # this call too — the same reason `spy_weeks` above takes it.
     monkeypatch.setattr(mod, "_apply_reset_events_to_weekrefs",
-                        lambda conn, refs: list(refs))
+                        lambda conn, refs, **kwargs: list(refs))
     monkeypatch.setattr(mod, "build_trend_view",
                         lambda *a, **k: (calls.__setitem__("view", calls["view"] + 1), mod.TrendView())[1])
     monkeypatch.setattr(mod, "_build_report_snapshot",

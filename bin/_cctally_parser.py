@@ -2859,24 +2859,28 @@ def _build_alerts_parser(subparsers, name, *, help_text, xref=None):
               cctally alerts test --axis codex-budget --threshold 100
               cctally alerts test --axis projected --metric budget_usd
               cctally alerts test --axis projected --metric codex_budget_usd
+              cctally alerts test --axis quota --threshold 90
+              cctally alerts test --axis meter-rate-change
         """),
     )
     p_alerts_test.add_argument(
         "--axis",
         choices=[
             "weekly", "five-hour", "budget", "project-budget", "codex-budget",
-            "projected",
+            "projected", "quota", "meter-rate-change",
         ],
         default="weekly",
         help="Alert axis to simulate: weekly subscription window, 5h block, "
-             "equiv-$ budget, per-project equiv-$ budget, Codex budget, or "
-             "projected-pace (default: weekly).",
+             "equiv-$ budget, per-project equiv-$ budget, Codex budget, "
+             "projected-pace, Codex quota, or a metering-rate change "
+             "(default: weekly).",
     )
     p_alerts_test.add_argument(
         "--threshold",
         type=int,
-        default=90,
-        help="Threshold percent (1-100, default: 90).",
+        default=None,
+        help="Threshold percent (1-100, default: 90). Not accepted with "
+             "--axis meter-rate-change, which has no percentage threshold.",
     )
     p_alerts_test.add_argument(
         "--metric",

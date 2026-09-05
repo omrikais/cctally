@@ -27,6 +27,7 @@ reads or writes the user's real ``~/.local/share/cctally`` or ``~/.claude``.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import contextlib
 import datetime as dt
@@ -545,6 +546,32 @@ def expected_counts(params: dict) -> dict:
     }
 
 
+def stamp_codex_hook_trust(codex_root) -> None:
+    """Record a Codex `[hooks.state]` trust decision for a corpus hook root.
+
+    #719: `codex_hook_roots_all_enabled` reads Codex's own trust table, so a
+    corpus that writes only `hooks.json` now certifies nothing. The key embeds
+    the RESOLVED `hooks.json` path, which means a corpus COPIED to a new
+    directory loses its record exactly as a relocated real Codex home would —
+    so every copy must re-stamp rather than inherit.
+    """
+    codex_root = pathlib.Path(codex_root)
+    hooks_path = codex_root / "hooks.json"
+    if not hooks_path.exists():
+        return
+    resolved = hooks_path.resolve()
+    config_path = codex_root / "config.toml"
+    config_path.write_text("".join(
+        f'[hooks.state."{resolved}:{token}:0:0"]\n'
+        f'trusted_hash = "bench-corpus-{token}"\n'
+        for token in ("stop", "subagent_stop")
+    ), encoding="utf-8")
+    # `config.toml` must be at least as new as `hooks.json`, or the freshness
+    # test reports `installed_unverified` instead of `installed_enabled`.
+    stamp = config_path.stat().st_mtime
+    os.utime(hooks_path, (stamp - 60, stamp - 60))
+
+
 def _emit_codex_corpus(codex_roots, params: dict, rng: random.Random) -> None:
     """Write auth.json plus seeded rollout JSONL under each provider root.
 
@@ -850,7 +877,7 @@ def pinned_env(data_dir, claude_dir, codex_dir=None, home_dir=None):
 
 
 def build_fixture_isolated(*, scale: str, seed: int, root,
-                           identity_root=None):
+                           identity_root=None, on_mismatch: str = "rebuild"):
     """``build_fixture`` for a caller that must not change the process.
 
     `build_fixture` pins four environment axes and LEAVES them pinned, which is
@@ -869,20 +896,455 @@ def build_fixture_isolated(*, scale: str, seed: int, root,
     codex_pin = ",".join(str(p) for p in codex_roots) if codex_roots else None
     with pinned_env(root / "data", root / "claude", codex_pin, root / "home"):
         return build_fixture(
-            scale=scale, seed=seed, root=root, identity_root=identity_root)
+            scale=scale, seed=seed, root=root, identity_root=identity_root,
+            on_mismatch=on_mismatch)
 
 
-def _marker_matches(marker: pathlib.Path, want: dict,
-                    data_dir: pathlib.Path) -> bool:
-    """Whether a complete, matching corpus is already on disk."""
+#: Bump when the manifest below changes shape or membership. It is folded into
+#: the digest so a manifest edit is itself a producer change.
+PRODUCER_SOURCE_MANIFEST_VERSION = 1
+
+#: Shape of the marker's `build_provenance` object. Separate from the
+#: manifest version above: the manifest can gain a source without the
+#: recorded object changing shape.
+PROVENANCE_SCHEMA_VERSION = 1
+
+#: Where the closure walk starts. The generator, the CLI entry point it builds
+#: through, and the cache module that performs every ingest.
+PRODUCER_SOURCE_ROOTS = (
+    "bin/build-bench-fixtures.py",
+    "bin/cctally",
+    "bin/_cctally_cache.py",
+)
+
+#: Closure members that are DELIBERATELY absent from the public mirror. Both
+#: are the maintainer-local `__preview` channel, `bin/cctally` loads them
+#: inside a `try` and sets `cmd_preview = None` when they are missing, and no
+#: ingest path reaches either one. Declaring them required would make
+#: `producer_source_records` raise on every public clone, which would break the
+#: public corpus builder outright.
+PRODUCER_SOURCE_EXCLUSIONS = (
+    "bin/_cctally_preview.py",  # mirror-private-ok: named only to be excluded
+    "bin/_lib_preview.py",  # mirror-private-ok: named only to be excluded
+)
+
+#: CLOSED manifest of the sources that determine what a built corpus CONTAINS.
+#: `_marker_payload` covers the PARAMETERS of a build; this covers the CODE
+#: that performs it. Two trees agreeing on every marker field but differing in
+#: ingest wrote different stores into one shared root, and no fingerprint could
+#: see it, because `semantic_hash` reads semantic columns only (#718).
+#:
+#: Resolved by `resolve_producer_closure()` at authoring time and frozen here
+#: so the set is reviewable in a diff. The re-derivation test compares the two
+#: and fails when they disagree, so the tuple cannot drift from the closure.
+#:
+#: DELIBERATELY OVER-INCLUSIVE. The walk follows static imports AND every
+#: string literal naming an existing `bin/<name>.py`, because several siblings
+#: are loaded through `spec_from_file_location(<name>, ...)` helpers whose name
+#: argument is a parameter -- `_lib_share` is reached that way from
+#: `bin/_lib_render.py` and by no static import at all. Over-inclusion costs
+#: rebuilds that were not strictly required; under-inclusion silently reuses a
+#: corpus another tree's ingest wrote, which is the defect being repaired.
+#:
+#: COST, stated rather than assumed: 139 files, 9.9 MB, measured at 47 ms to
+#: digest, independent of corpus scale. Roughly a quarter of recent commits
+#: touch one of these files, and each such change rebuilds any corpus root
+#: whose marker was written by the previous tree -- for `large` that is the
+#: 1m49s and 1.2 GiB recorded at the top of this file.
+PRODUCER_SOURCES = (
+    "bin/_cctally_account.py",
+    "bin/_cctally_alerts.py",
+    "bin/_cctally_cache.py",
+    "bin/_cctally_cache_report.py",
+    "bin/_cctally_codex.py",
+    "bin/_cctally_config.py",
+    "bin/_cctally_core.py",
+    "bin/_cctally_dashboard.py",
+    "bin/_cctally_dashboard_cache_report.py",
+    "bin/_cctally_dashboard_conversation.py",
+    "bin/_cctally_dashboard_envelope.py",
+    "bin/_cctally_dashboard_perf.py",
+    "bin/_cctally_dashboard_share.py",
+    "bin/_cctally_dashboard_sources.py",
+    "bin/_cctally_db.py",
+    "bin/_cctally_diagnosis.py",
+    "bin/_cctally_diagnosis_sources.py",
+    "bin/_cctally_diff.py",
+    "bin/_cctally_doctor.py",
+    "bin/_cctally_five_hour.py",
+    "bin/_cctally_forecast.py",
+    "bin/_cctally_journal.py",
+    "bin/_cctally_journal_repair.py",
+    "bin/_cctally_milestone_history.py",
+    "bin/_cctally_milestones.py",
+    "bin/_cctally_parser.py",
+    "bin/_cctally_percent_breakdown.py",
+    "bin/_cctally_pricing_check.py",
+    "bin/_cctally_project.py",
+    "bin/_cctally_quota.py",
+    "bin/_cctally_quota_calibration.py",
+    "bin/_cctally_quota_model.py",
+    "bin/_cctally_record.py",
+    "bin/_cctally_rederive.py",
+    "bin/_cctally_refresh.py",
+    "bin/_cctally_reporting.py",
+    "bin/_cctally_retention.py",
+    "bin/_cctally_setup.py",
+    "bin/_cctally_share.py",
+    "bin/_cctally_source_analytics.py",
+    "bin/_cctally_statusline.py",
+    "bin/_cctally_store.py",
+    "bin/_cctally_sync_week.py",
+    "bin/_cctally_telemetry.py",
+    "bin/_cctally_transcript.py",
+    "bin/_cctally_tui.py",
+    "bin/_cctally_update.py",
+    "bin/_cctally_weekrefs.py",
+    "bin/_lib_accounts.py",
+    "bin/_lib_aggregators.py",
+    "bin/_lib_alert_axes.py",
+    "bin/_lib_alert_dispatch.py",
+    "bin/_lib_alert_scope.py",
+    "bin/_lib_alerts_payload.py",
+    "bin/_lib_artifact_retention.py",
+    "bin/_lib_background_mcp.py",
+    "bin/_lib_blocks.py",
+    "bin/_lib_budget.py",
+    "bin/_lib_cache_coverage.py",
+    "bin/_lib_cache_report.py",
+    "bin/_lib_cache_report_wire.py",
+    "bin/_lib_cache_writer_lock.py",
+    "bin/_lib_changelog.py",
+    "bin/_lib_codex_account_adoption.py",
+    "bin/_lib_codex_conversation.py",
+    "bin/_lib_codex_conversation_export.py",
+    "bin/_lib_codex_conversation_query.py",
+    "bin/_lib_codex_conversation_watch.py",
+    "bin/_lib_codex_find_projection.py",
+    "bin/_lib_codex_harness_preamble.py",
+    "bin/_lib_codex_hooks.py",
+    "bin/_lib_codex_js_scan.py",
+    "bin/_lib_codex_landmarks.py",
+    "bin/_lib_codex_pools.py",
+    "bin/_lib_codex_reasoning_headings.py",
+    "bin/_lib_codex_segments.py",
+    "bin/_lib_codex_title_clean.py",
+    "bin/_lib_codex_window_attribution.py",
+    "bin/_lib_conversation.py",
+    "bin/_lib_conversation_anon.py",
+    "bin/_lib_conversation_dispatch.py",
+    "bin/_lib_conversation_export.py",
+    "bin/_lib_conversation_query.py",
+    "bin/_lib_conversation_retention.py",
+    "bin/_lib_conversation_watch.py",
+    "bin/_lib_credit.py",
+    "bin/_lib_dashboard_dates.py",
+    "bin/_lib_dashboard_json.py",
+    "bin/_lib_dashboard_settings_contract.py",
+    "bin/_lib_dashboard_sources.py",
+    "bin/_lib_diagnosis.py",
+    "bin/_lib_diff_kernel.py",
+    "bin/_lib_display_tz.py",
+    "bin/_lib_doctor.py",
+    "bin/_lib_five_hour.py",
+    "bin/_lib_fmt.py",
+    "bin/_lib_forecast.py",
+    "bin/_lib_ingest_frontier.py",
+    "bin/_lib_journal.py",
+    "bin/_lib_journal_router.py",
+    "bin/_lib_json_envelope.py",
+    "bin/_lib_jsonl.py",
+    "bin/_lib_log.py",
+    "bin/_lib_meter_rate_change.py",
+    "bin/_lib_milestone_history.py",
+    "bin/_lib_perf.py",
+    "bin/_lib_pricing.py",
+    "bin/_lib_pricing_check.py",
+    "bin/_lib_pricing_debug.py",
+    "bin/_lib_quota.py",
+    "bin/_lib_quota_alert_axes.py",
+    "bin/_lib_quota_calibration.py",
+    "bin/_lib_quota_copy.py",
+    "bin/_lib_quota_ledger.py",
+    "bin/_lib_quota_model.py",
+    "bin/_lib_rate_change_delivery.py",
+    "bin/_lib_record.py",
+    "bin/_lib_rederive.py",
+    "bin/_lib_render.py",
+    "bin/_lib_retained_size.py",
+    "bin/_lib_segment_summary.py",
+    "bin/_lib_selector_state.py",
+    "bin/_lib_semver.py",
+    "bin/_lib_share.py",
+    "bin/_lib_share_templates.py",
+    "bin/_lib_snapshot_cache.py",
+    "bin/_lib_source_analytics.py",
+    "bin/_lib_source_identity.py",
+    "bin/_lib_stats_damage.py",
+    "bin/_lib_stats_publish.py",
+    "bin/_lib_stats_wal.py",
+    "bin/_lib_statusline.py",
+    "bin/_lib_statusline_candidates.py",
+    "bin/_lib_subscription_weeks.py",
+    "bin/_lib_tick_stats.py",
+    "bin/_lib_transcript_access.py",
+    "bin/_lib_view_models.py",
+    "bin/build-bench-fixtures.py",
+    "bin/cctally",
+)
+
+
+def _repo_root() -> pathlib.Path:
+    return pathlib.Path(__file__).resolve().parent.parent
+
+
+def _local_dependency_names(path: pathlib.Path,
+                            bin_dir: pathlib.Path) -> set:
+    """Repository-relative `bin/*.py` this source can pull in.
+
+    Static `import`/`from` targets plus every string constant that names an
+    existing sibling. The second arm is what covers the dynamic loaders; see
+    the manifest comment for why it is deliberately broad.
+    """
+    names = set()
+    for node in ast.walk(ast.parse(path.read_bytes(), filename=str(path))):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:
+                names.add(node.module.split(".")[0])
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            names.add(node.value)
+    # `isidentifier()` before any filesystem call: a docstring is not a module
+    # name, and probing one raises ENAMETOOLONG on the runner rather than
+    # answering False.
+    return {"bin/" + name + ".py" for name in sorted(names)
+            if name.isidentifier() and (bin_dir / (name + ".py")).exists()}
+
+
+def resolve_producer_closure(repo_root=None) -> tuple:
+    """Re-derive the manifest from the three roots. Sorted, exclusions removed.
+
+    Used by the re-derivation test rather than at build time: a corpus build
+    digests the frozen tuple, so a manifest that had drifted would otherwise be
+    reported as a different digest instead of as a manifest defect.
+    """
+    repo_root = pathlib.Path(repo_root) if repo_root else _repo_root()
+    bin_dir = repo_root / "bin"
+    seen = set(PRODUCER_SOURCE_ROOTS)
+    pending = list(PRODUCER_SOURCE_ROOTS)
+    while pending:
+        current = repo_root / pending.pop()
+        for target in _local_dependency_names(current, bin_dir):
+            if target not in seen:
+                seen.add(target)
+                pending.append(target)
+    return tuple(sorted(seen - set(PRODUCER_SOURCE_EXCLUSIONS)))
+
+
+def digest_producer_records(records) -> str:
+    """sha256 over FRAMED `(path, digest)` records.
+
+    Each field carries an explicit length prefix, so no pair of paths and
+    digests can be concatenated into the same byte stream as another pair.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(
+        b"cctally-producer-v" + str(PRODUCER_SOURCE_MANIFEST_VERSION).encode()
+        + b"\n")
+    for record in records:
+        path = record["path"].encode("utf-8")
+        digest = record["sha256"].encode("ascii")
+        hasher.update(str(len(path)).encode() + b":" + path)
+        hasher.update(str(len(digest)).encode() + b":" + digest)
+    return hasher.hexdigest()
+
+
+def producer_source_records() -> list:
+    """One `{path, sha256}` per declared producer source, sorted by path.
+
+    FAILS CLOSED on a missing source: a manifest naming a file that is not
+    there would otherwise certify a smaller set than it declares, and a digest
+    over a smaller set still looks like a digest.
+    """
+    repo_root = _repo_root()
+    records = []
+    for relative in sorted(PRODUCER_SOURCES):
+        source = repo_root / relative
+        records.append({
+            "path": relative,
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        })
+    return records
+
+
+def producer_sha256() -> str:
+    """The identity of the tree that builds a corpus."""
+    return digest_producer_records(producer_source_records())
+
+#: `classify_marker`'s three answers. The boolean this replaced collapsed
+#: "nothing is here" and "something else built this" into one value, and every
+#: caller therefore rebuilt. Those two states want DIFFERENT policies: a
+#: capture must refuse a corpus another producer wrote rather than quietly
+#: replacing it, while the pytest fixture and the benchmark must rebuild.
+MARKER_MATCH = "match"
+MARKER_ABSENT = "absent"
+MARKER_MISMATCH = "mismatch"
+
+#: Accepted `on_mismatch` policies. Validated rather than defaulted, so a typo
+#: cannot silently select the permissive branch.
+MISMATCH_POLICIES = ("rebuild", "refuse")
+
+
+class CorpusProducerMismatch(RuntimeError):
+    """A complete corpus exists and a different tree built it.
+
+    Carries both digests because the whole point is to name the two trees; a
+    refusal that only says "mismatch" sends the reader back to guessing, which
+    is how #718 spent a day on host divergence that did not exist.
+    """
+
+    def __init__(self, *, root, built, current):
+        self.root = str(root)
+        self.built = built
+        self.current = current
+        built_text = built or "(absent: the marker predates build provenance)"
+        super().__init__(
+            f"the corpus at {self.root} was built by a different producer: "
+            f"built_producer_sha256={built_text} "
+            f"current_producer_sha256={current}")
+
+
+def marker_provenance(marker: pathlib.Path):
+    """The `build_provenance` an existing marker records, or None."""
+    try:
+        recorded = json.loads(marker.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(recorded, dict):
+        provenance = recorded.get("build_provenance")
+        if isinstance(provenance, dict):
+            return provenance
+    return None
+
+
+#: `read_marker_producer`'s four answers. `marker_provenance` returns None for
+#: three states that must be ANNOUNCED differently — no marker at all, a marker
+#: nobody can parse, and a marker that parses and predates build provenance —
+#: so a caller reading its None cannot say which of them it is looking at.
+MARKER_PRODUCER_ABSENT = "absent"
+MARKER_PRODUCER_UNREADABLE = "unreadable"
+MARKER_PRODUCER_LEGACY = "legacy"
+# A marker that records a producer digest which is not 64 hex characters. It is
+# NOT legacy: a legacy marker predates the field, and saying so about a marker
+# that carries the field would state a false reason for the rebuild.
+MARKER_PRODUCER_MALFORMED = "malformed"
+MARKER_PRODUCER_IDENTIFIED = "identified"
+
+
+def read_marker_producer(marker) -> tuple:
+    """``(kind, producer_sha256_or_None)`` for the marker as it is on disk.
+
+    Called BEFORE a build, so a rebuild can state what it replaced. The kind
+    selects the wording, so a marker that carries an unusable digest is
+    MALFORMED and not LEGACY: only a marker with no `build_provenance` at all
+    predates the field, and that is the only marker the legacy wording is true
+    of.
+    """
+    marker = pathlib.Path(marker)
+    if not marker.exists():
+        return (MARKER_PRODUCER_ABSENT, None)
+    try:
+        recorded = json.loads(marker.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return (MARKER_PRODUCER_UNREADABLE, None)
+    if not isinstance(recorded, dict):
+        return (MARKER_PRODUCER_UNREADABLE, None)
+    provenance = recorded.get("build_provenance")
+    if not isinstance(provenance, dict) or "producer_sha256" not in provenance:
+        return (MARKER_PRODUCER_LEGACY, None)
+    built = provenance.get("producer_sha256")
+    if not isinstance(built, str) or len(built) != 64:
+        return (MARKER_PRODUCER_MALFORMED, None)
+    return (MARKER_PRODUCER_IDENTIFIED, built)
+
+
+def rebuild_announcement(before: tuple, current):
+    """The sentence announcing a rebuild that replaced another tree's corpus.
+
+    ``before`` is a `read_marker_producer` reading taken before the build and
+    ``current`` is the producer digest the build recorded. Returns None when
+    there is nothing to announce: no corpus was there, or the marker already
+    named this tree.
+
+    Every rebuild policy owes this sentence, because rebuilding rather than
+    refusing rests on the announcement supplying the visibility the refusal
+    would have supplied.
+
+    An unreadable marker gets a weaker headline than the other kinds, because
+    it is the one case where this function cannot establish that another tree
+    built the corpus.
+    """
+    kind, built = before
+    if kind == MARKER_PRODUCER_ABSENT:
+        return None
+    if kind == MARKER_PRODUCER_IDENTIFIED and built == current:
+        return None
+    mine = current or "(the rebuild recorded none)"
+    if kind == MARKER_PRODUCER_UNREADABLE:
+        return ("REBUILT over a corpus whose builder cannot be established: "
+                "its marker could not be read, so which tree built it is "
+                f"unknown. This tree's producer is {mine}.")
+    if kind == MARKER_PRODUCER_LEGACY:
+        detail = ("its marker records no producer digest, because it predates "
+                  "build provenance")
+    elif kind == MARKER_PRODUCER_MALFORMED:
+        detail = "its marker records a producer digest that is not usable"
+    else:
+        detail = f"its marker records producer {built}"
+    return ("REBUILT over a corpus this tree did not build: "
+            f"{detail}. This tree's producer is {mine}.")
+
+
+def classify_marker(marker: pathlib.Path, want: dict,
+                    data_dir: pathlib.Path) -> str:
+    """Which of the three states the corpus under `data_dir` is in.
+
+    A corrupt or unreadable marker classifies ABSENT rather than MISMATCH,
+    keeping today's rebuild behaviour: a marker nobody can read is not evidence
+    that another producer built the corpus. A LEGACY marker that parses but
+    carries no `build_provenance` is a genuine mismatch, because it identifies
+    no producer at all and `want` now always names one.
+    """
     if not ((data_dir / "cache.db").exists()
             and (data_dir / "conversations.db").exists()
             and marker.exists()):
-        return False
+        return MARKER_ABSENT
     try:
-        return json.loads(marker.read_text()) == want
+        on_disk = json.loads(marker.read_text())
     except (OSError, json.JSONDecodeError):
-        return False  # corrupt marker -> rebuild
+        return MARKER_ABSENT  # corrupt marker -> rebuild
+    return MARKER_MATCH if on_disk == want else MARKER_MISMATCH
+
+
+def _refuse_on_mismatch(state: str, on_mismatch: str, root: pathlib.Path,
+                        marker: pathlib.Path, want: dict) -> None:
+    """Raise when a complete corpus another producer built must not be taken.
+
+    Raises BEFORE anything is cleared or rewritten, so a refusal leaves the
+    corpus and its marker exactly as they were. That matters: the refusing
+    caller is a capture, and the tree that legitimately owns the corpus may be
+    reading it concurrently.
+    """
+    if state != MARKER_MISMATCH or on_mismatch != "refuse":
+        return
+    recorded = marker_provenance(marker) or {}
+    raise CorpusProducerMismatch(
+        root=root,
+        built=recorded.get("producer_sha256"),
+        current=(want.get("build_provenance") or {}).get("producer_sha256"),
+    )
 
 
 def _marker_path(data_dir: pathlib.Path) -> pathlib.Path:
@@ -921,6 +1383,15 @@ def _marker_payload(cctally, *, seed, scale, identity_root=None) -> dict:
         "identity_root": None if identity_root is None else str(identity_root),
     }, sort_keys=True)
     payload["params_hash"] = hashlib.sha256(shape.encode()).hexdigest()[:16]
+    # #718: WHICH TREE built the corpus, alongside the parameters of the build.
+    # Every field above describes what was asked for; none of them describes
+    # the code that answered, and the stores in the root are written by the
+    # building tree's own ingest.
+    payload["build_provenance"] = {
+        "schema_version": PROVENANCE_SCHEMA_VERSION,
+        "producer_sha256": producer_sha256(),
+        "sources": producer_source_records(),
+    }
     return payload
 
 
@@ -930,6 +1401,9 @@ _ROOT_SENTINEL = ".bench-fixture-root"
 
 
 def _write_root_sentinel(root: pathlib.Path) -> None:
+    # The content must stay CONSTANT. A reuse rewrites this file inside a root
+    # other workers have already fingerprinted, so any varying byte would make
+    # the corpus fingerprint report a change on every worker but the last.
     (root / _ROOT_SENTINEL).write_text(
         "Built by bin/build-bench-fixtures.py. This file marks the directory "
         "as generator-owned; the builder refuses to build into, or clear, a "
@@ -1049,7 +1523,8 @@ def _clear_previous_corpus(root: pathlib.Path, data_dir: pathlib.Path) -> None:
 
 
 def build_fixture(*, scale: str, seed: int, root,
-                  identity_root=None) -> pathlib.Path:
+                  identity_root=None,
+                  on_mismatch: str = "rebuild") -> pathlib.Path:
     """Build under an optional location-independent identity namespace.
 
     The physical root still owns every read, write and containment decision;
@@ -1068,11 +1543,13 @@ def build_fixture(*, scale: str, seed: int, root,
         )
     with identity_context:
         return _build_fixture(
-            scale=scale, seed=seed, root=root, identity_root=identity_root)
+            scale=scale, seed=seed, root=root, identity_root=identity_root,
+            on_mismatch=on_mismatch)
 
 
 def _build_fixture(*, scale: str, seed: int, root,
-                   identity_root=None) -> pathlib.Path:
+                   identity_root=None,
+                   on_mismatch: str = "rebuild") -> pathlib.Path:
     """Build (or reuse) the deterministic synthetic fixture under ``root``.
 
     Writes JSONL under ``root/claude/projects/**``, pins ``CCTALLY_DATA_DIR`` =
@@ -1083,9 +1560,22 @@ def _build_fixture(*, scale: str, seed: int, root,
     ``(seed, scale, pricing_date, stats_epoch)`` and ``cache.db`` exists, the
     JSONL-emit + ``sync_cache`` are skipped (a ``large`` rebuild is slow), but
     env is still pinned + paths re-resolved so callers can open the cache
-    immediately."""
+    immediately.
+
+    ``on_mismatch`` decides what happens when a COMPLETE corpus is present
+    and its marker names a different build. ``"rebuild"`` keeps the
+    historical behaviour and is right for the pytest fixture and the
+    benchmark, which own their roots and must measure stores the current
+    producer made. ``"refuse"`` raises `CorpusProducerMismatch` without
+    touching anything, and is what a capture needs: publishing an envelope
+    over another tree's ingest is how a value nobody could reproduce became
+    a recorded baseline (#718)."""
     if scale not in SCALES:
         raise ValueError(f"unknown scale {scale!r}; choose from {sorted(SCALES)}")
+    if on_mismatch not in MISMATCH_POLICIES:
+        raise ValueError(
+            f"unknown on_mismatch {on_mismatch!r}; choose from "
+            f"{list(MISMATCH_POLICIES)}")
     root = pathlib.Path(root)
     # FIRST, before a single mkdir: once this function has created `data/` and
     # the provider roots, every ownership predicate is satisfied by its own
@@ -1118,8 +1608,10 @@ def _build_fixture(*, scale: str, seed: int, root,
     want = _marker_payload(
         cctally, seed=seed, scale=scale, identity_root=identity_root)
     marker = _marker_path(data_dir)
-    if _marker_matches(marker, want, data_dir):
+    state = classify_marker(marker, want, data_dir)
+    if state == MARKER_MATCH:
         return data_dir               # cached hit — nothing to rebuild
+    _refuse_on_mismatch(state, on_mismatch, root, marker, want)
 
     # One writer per root, for EVERY caller. `--out` and both tools' defaults
     # are fixed machine-global paths, and a clear that races a concurrent read
@@ -1130,9 +1622,12 @@ def _build_fixture(*, scale: str, seed: int, root,
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             # Re-check under the lock: another process may have finished the
-            # very build this one was about to start.
-            if _marker_matches(marker, want, data_dir):
+            # very build this one was about to start — or written a marker
+            # naming a different producer, which must refuse here too.
+            state = classify_marker(marker, want, data_dir)
+            if state == MARKER_MATCH:
                 return data_dir
+            _refuse_on_mismatch(state, on_mismatch, root, marker, want)
             _clear_previous_corpus(root, data_dir)
             _write_root_sentinel(root)
             projects.mkdir(parents=True, exist_ok=True)
@@ -1167,7 +1662,8 @@ def _build_fixture(*, scale: str, seed: int, root,
                 },
             }, sort_keys=True))
             for codex_root in codex_roots:
-                (codex_root / "hooks.json").write_text(json.dumps({
+                hooks_path = codex_root / "hooks.json"
+                hooks_path.write_text(json.dumps({
                     "hooks": {
                         event: [{"hooks": [{
                             "type": "command",
@@ -1180,6 +1676,11 @@ def _build_fixture(*, scale: str, seed: int, root,
                         for event in ("Stop", "SubagentStop")
                     },
                 }, sort_keys=True))
+                # #719: a present handler is no longer evidence that Codex
+                # would run it, so the corpus records the trust decision the
+                # frontier now requires. Without it the benchmark would time a
+                # certificate the product never issues.
+                stamp_codex_hook_trust(codex_root)
             if codex_roots:
                 conn = cctally.open_cache_db()
                 try:

@@ -158,6 +158,24 @@ def _with_next_step(body: str, payload: dict, tz: "ZoneInfo | None") -> str:
     return f"{body}\n{alert_next_step_line(payload, tz)}"
 
 
+def _parse_context_instant(value: object) -> "dt.datetime | None":
+    """The instant a context field names, or ``None`` when it names none.
+
+    Every absent instant on this axis is published as the empty string rather
+    than omitted, and the two spellings of UTC (``Z`` and ``+00:00``) both
+    occur on the wire, so callers compare parsed instants and never text.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
 def _alert_text_weekly(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, str]:
     """Build (title, subtitle, body) for a weekly threshold alert.
 
@@ -169,6 +187,13 @@ def _alert_text_weekly(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, 
     in ``America/Los_Angeles``). Render the date directly via
     ``dt.date.fromisoformat`` so the rendered weekday/day matches the
     calendar date the user thinks of as "this week".
+
+    ``cycle_start_at`` IS an instant, so it takes the chokepoint. It is
+    rendered only when it names a different instant from the week's own
+    start, because that is exactly when the week no longer identifies the
+    crossing: since #750 S3 a week credited twice holds three cycles, and
+    all three publish the same ``week_start_date``. An uncredited week has
+    one cycle and renders the sentence it always did.
     """
     threshold = int(payload["threshold"])
     title = f"cctally - Weekly usage {threshold}% reached"
@@ -184,6 +209,13 @@ def _alert_text_weekly(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, 
         ).strftime("%a, %b %d")
     else:
         subtitle = "Current week"
+    cycle_start = _parse_context_instant(ctx.get("cycle_start_at"))
+    if cycle_start is not None and cycle_start != _parse_context_instant(
+        ctx.get("week_start_at")
+    ):
+        subtitle += " · cycle from " + format_display_dt(
+            cycle_start, tz, fmt="%a, %b %d %H:%M"
+        )
     cumulative = float(ctx.get("cumulative_cost_usd") or 0.0)
     dpp = ctx.get("dollars_per_percent")
     if dpp is not None:
@@ -242,6 +274,7 @@ def _build_alert_payload_weekly(
     dollars_per_percent: "float | None",
     account_key: str = _UNATTRIBUTED,
     week_start_at: "str | None" = None,
+    cycle_start_at: "str | None" = None,
 ) -> dict:
     """Build the alert payload for a weekly threshold crossing.
 
@@ -259,7 +292,20 @@ def _build_alert_payload_weekly(
     for every account whose week does not reset at midnight. Empty string when
     the row predates the column, matching the five-hour axis's
     ``block_start_at``: the key stays on the wire and the reader degrades to
-    day granularity rather than inventing a clock reading."""
+    day granularity rather than inventing a clock reading.
+
+    ``cycle_start_at`` is the start instant of the BILLING CYCLE the crossing
+    belongs to, which since #750 S3 is no longer the same thing as the week.
+    An Anthropic in-place credit ends one cycle and begins another without
+    moving either week boundary, so a week credited twice holds three cycles
+    under one ``week_start_date`` and naming the week identifies none of them.
+    The governing reset event's ``effective_reset_at_utc`` is that instant;
+    segment 0 has no reset event, so its cycle begins with the week and the
+    parameter defaults to ``week_start_at``. Callers must NOT put this value
+    in ``week_start_at``: both scope kernels derive the alert's window end by
+    adding seven days to that field, and a credit does not move the week's
+    end, so overloading it would state a window the alert never fired
+    against."""
     return {
         "id": f"weekly:{week_start_date}:{threshold}",
         "axis": "weekly",
@@ -270,6 +316,7 @@ def _build_alert_payload_weekly(
         "context": {
             "week_start_date": week_start_date,
             "week_start_at": week_start_at or "",
+            "cycle_start_at": cycle_start_at or week_start_at or "",
             "cumulative_cost_usd": float(cumulative_cost_usd),
             "dollars_per_percent": (
                 float(dollars_per_percent) if dollars_per_percent is not None else None

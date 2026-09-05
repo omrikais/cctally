@@ -365,7 +365,10 @@ def test_stats_registry_is_frozen_at_13(ns):
 
 def test_epoch_constants(ns):
     core = _core()
-    assert core.STATS_INDEX_EPOCH == 1011  # #661 S2 meter-rate-change events
+    # #661 S2 added `meter_rate_change_events` at 1011, #750 S2 added that
+    # table's four rate-change disclosure columns at 1012, and #750 S3 added
+    # reset-event origin identity plus the transactional debounce state at 1013.
+    assert core.STATS_INDEX_EPOCH == 1013
     assert core.LEGACY_STATS_HEAD == 13
 
 

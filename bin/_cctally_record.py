@@ -99,7 +99,7 @@ What stays in bin/cctally:
   ``now_utc_iso``, ``load_config``, ``get_week_start_name``,
   ``compute_week_bounds``, ``parse_date_str``,
   ``_canonicalize_optional_iso``, ``_canonical_5h_window_key``,
-  ``_floor_to_hour``, ``_get_canonical_boundary_for_date``,
+  ``_get_canonical_boundary_for_date``,
   ``_apply_reset_events_to_weekrefs``, ``_week_ref_has_reset_event``,
   ``_compute_cost_for_weekref``, ``get_latest_cost_for_week``,
   ``get_max_milestone_for_week``, ``get_milestone_cost_for_week``,
@@ -115,8 +115,8 @@ What stays in bin/cctally:
   EXCEPT the names honest-imported by the #279 S4 F5 collapse below.
 
   #279 S4 F5 (the #50 treatment): the forwarding shims for
-  ``open_cache_db`` (→ ``_cctally_cache``), ``_floor_to_hour`` (→
-  ``_lib_blocks``), ``_resolve_display_tz_obj`` (→ ``_lib_display_tz``),
+  ``open_cache_db`` (→ ``_cctally_cache``), ``_resolve_display_tz_obj``
+  (→ ``_lib_display_tz``),
   ``_build_alert_payload_{weekly,five_hour,budget,project_budget,
   codex_budget,projected}`` (→ ``_lib_alerts_payload``), and
   ``_get_oauth_usage_config`` (→ ``_cctally_refresh``) were replaced by
@@ -194,6 +194,7 @@ from _cctally_core import (
     compute_week_bounds,
     parse_date_str,
     _canonicalize_optional_iso,
+    _latest_reset_event_for_end,
     _reset_aware_floor,
     make_week_ref,
     _get_alerts_config,
@@ -268,6 +269,7 @@ from _lib_record import (
     CONFIRM_RESET,
     CLEAR_MARKER,
     ARM_MARKER,
+    NO_ACTION,
     SNAPSHOT_SKIP_CLAMP,
 )
 
@@ -281,7 +283,6 @@ from _lib_record import (
 # bin/cctally-test-all. Patched / bin/cctally-homed / post-889-homed names
 # keep their shims below.
 from _cctally_cache import open_cache_db
-from _lib_blocks import _floor_to_hour
 from _lib_display_tz import _resolve_display_tz_obj
 from _lib_alerts_payload import (
     _build_alert_payload_weekly,
@@ -673,27 +674,24 @@ def maybe_record_milestone(
     if own_conn:
         conn = open_db()
     try:
-        # Resolve the active segment for THIS captured moment. The segment
-        # is the latest week_reset_events row keyed on week_end_at whose
-        # effective_reset_at_utc <= captured_at; 0 = pre-credit / no-event
-        # sentinel. ``unixepoch()`` normalizes the comparison across mixed
-        # +00:00 / Z offsets (see precedent at bin/cctally:_compute_block_totals
-        # cross-reset detection; also project gotcha
-        # ``unixepoch_for_cross_offset_compare``).
+        # Resolve the active segment for THIS captured moment, through the
+        # one chokepoint (#750 S3, Unit B review). The segment is the
+        # week_reset_events row keyed on week_end_at whose effective instant
+        # is the LATEST at or before `captured_at`; 0 = pre-credit / no-event
+        # sentinel. This site carried its own copy of the query ordered on
+        # insertion `id`, which answers "the segment written last" — a
+        # backfill row landing after a live-detected one makes that the older
+        # reset. `cmd_percent_breakdown` filters milestones on the segment
+        # `_latest_reset_event_for_end` returns, so the stamp and the filter
+        # named different segments and the milestone rendered on neither.
         captured_at_iso = saved.get("capturedAt") or as_of or now_utc_iso()
         reset_event_id = 0
         reset_effective_iso = None
         if week_end_at:
-            seg_row = conn.execute(
-                """
-                SELECT id, effective_reset_at_utc FROM week_reset_events
-                 WHERE new_week_end_at = ?
-                   AND account_key = ?
-                   AND unixepoch(effective_reset_at_utc) <= unixepoch(?)
-                 ORDER BY id DESC LIMIT 1
-                """,
-                (week_end_at, account_key, captured_at_iso),
-            ).fetchone()
+            seg_row = _latest_reset_event_for_end(
+                conn, week_end_at, account_key=account_key,
+                as_of_utc=captured_at_iso,
+            )
             if seg_row is not None:
                 reset_event_id = int(seg_row["id"])
                 reset_effective_iso = seg_row["effective_reset_at_utc"]
@@ -813,12 +811,20 @@ def maybe_record_milestone(
         # backdates into the old window). Live-compute over the effective
         # range so the milestone captures cost from the reset moment
         # forward, not from the phantom backdated start.
+        #
+        # SCOPED to the account this milestone belongs to (#750 S3, Unit B
+        # review). The cost seven lines below is computed for `account_key`
+        # over `effective_ref`'s range, so a merged read here lets ANOTHER
+        # account's cut shift that range and writes the result as this
+        # account's `cumulative_cost`.
         effective_ref = week_ref
-        adjusted = _apply_reset_events_to_weekrefs(conn, [week_ref])
+        adjusted = _apply_reset_events_to_weekrefs(
+            conn, [week_ref], account_key=account_key)
         if adjusted:
             effective_ref = adjusted[0]
 
-        if _week_ref_has_reset_event(conn, effective_ref):
+        if _week_ref_has_reset_event(
+                conn, effective_ref, account_key=account_key):
             import _cctally_cache  # fail-closed attribution guard (#341)
             try:
                 live_cost = _compute_cost_for_weekref(
@@ -971,6 +977,14 @@ def maybe_record_milestone(
                             crossed_at_utc=crossed_at,
                             week_start_date=week_start_date,
                             week_start_at=row["week_start_at"],
+                            # The instant the crossing's own cycle began
+                            # (#750 S3). `reset_effective_iso` is the
+                            # governing event resolved for THIS captured
+                            # moment above, so the cycle the alert names and
+                            # the segment the milestone was stamped under
+                            # cannot disagree. None on segment 0, where the
+                            # builder falls back to the week's own start.
+                            cycle_start_at=reset_effective_iso,
                             cumulative_cost_usd=cum,
                             dollars_per_percent=dpp,
                             account_key=account_key,
@@ -2929,96 +2943,87 @@ def maybe_update_five_hour_block(
 # ── Reset-to-zero debounce marker (issue #128) ─────────────────────────────
 # A transient Anthropic OAuth zero (cold replica / outage) against non-trivial
 # usage would otherwise mis-fire the live in-place reset-to-zero detector. We
-# debounce: the first ~0 ARMS this marker (it does not fire); the next reading
+# debounce: the first ~0 ARMS this state (it does not fire); the next reading
 # CONFIRMS (fires) only if usage stayed low, or CLEARS on recovery toward the
-# baseline. The marker is needed because the write-site clamp suppresses the
-# deferred first zero, so it leaves no DB trace. Losing the marker is always
-# safe (a real reset re-arms and fires one tick later). Best-effort file I/O —
-# the detector must never crash on a marker hiccup. See
-# docs/superpowers/specs/2026-06-02-reset-zero-debounce-design.md.
-_RESET_ZERO_MARKER_NAME = "pending-reset-zero-7d"
+# baseline. The state is needed because the write-site clamp suppresses the
+# deferred first zero, so it leaves no other DB trace. The original design is
+# docs/superpowers/specs/2026-06-02-reset-zero-debounce-design.md, and it
+# describes the FILESYSTEM marker this table replaced — read it for the
+# arm/confirm/clear rules only; §1.3 below supersedes its storage and its
+# crash-window discussion.
+#
+# #750 S3 §1.3: it is a stats.db ROW, not a file. The filesystem marker was
+# written and unlinked outside the stats transaction, which left two crash
+# windows. An arm-side crash rolled the cursor back but left the marker on
+# disk, so the retry read the very observation that armed it as a
+# confirmation. A confirm-side crash rolled the event back but had already
+# unlinked the marker, so the retry saw an unarmed window, classified the low
+# reading as NO_ACTION, and lost the reset with no visible symptom. A row
+# mutated inside the cycle's own transaction rolls back with the cursor and
+# with the event, which closes both. Moving the transition after the commit
+# would only move the gap, because the ingest contract commits derived rows
+# and cursor together.
+#
+# It is disposable operational state rather than journal truth, so an epoch
+# rebuild legitimately loses it: a genuine reset re-arms and confirms one tick
+# later. Losing it is always safe; acting on a stale copy of it is not.
 
 
-def _reset_zero_marker_path():
-    return _cctally_core.APP_DIR / _RESET_ZERO_MARKER_NAME
+def _read_reset_debounce_state(conn, account_key):
+    """Return the armed debounce state for ``account_key``, or None.
 
-
-def _arm_reset_zero_marker(week_start_date, cur_end_canon, *,
-                           baseline_pct, first_zero_iso):
-    """Persist the pending reset-to-zero candidate. ``first_zero_iso`` MUST be
-    the ``_command_as_of()`` clock value (it becomes the effective anchor on
-    confirm), NOT wall-clock."""
+    The tuple is ``(week_start_date, week_end_at, baseline_pct,
+    first_zero_at_utc, first_zero_observation_id)``. A missing table is
+    reported as "not armed" rather than raised: the detector must never crash
+    a recording tick over its own debounce bookkeeping, and an index that
+    predates epoch 1013 is about to be rebuilt anyway.
+    """
     try:
-        _reset_zero_marker_path().write_text(
-            f"{week_start_date} {cur_end_canon} "
-            f"{float(baseline_pct)} {first_zero_iso}\n"
-        )
-    except OSError:
-        pass
-
-
-def _clear_reset_zero_marker():
-    try:
-        _reset_zero_marker_path().unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
-def _read_reset_zero_marker():
-    """Return ``(week_start_date, cur_end_canon, baseline_pct, first_zero_iso)``
-    or ``None`` when missing / empty / garbled. Validates ALL fields (arity,
-    float baseline, parseable timestamp) so a malformed marker re-arms cleanly
-    rather than wedging the confirm path."""
-    try:
-        raw = _reset_zero_marker_path().read_text().strip()
-    except OSError:
+        row = conn.execute(
+            "SELECT week_start_date, week_end_at, baseline_pct, "
+            "       first_zero_at_utc, first_zero_observation_id "
+            "FROM weekly_reset_debounce_state WHERE account_key = ?",
+            (account_key,),
+        ).fetchone()
+    except sqlite3.DatabaseError:
         return None
-    if not raw:
+    if row is None:
         return None
-    parts = raw.split()
-    if len(parts) != 4:
-        return None
-    week_start_date, cur_end_canon, baseline_raw, first_zero_iso = parts
-    try:
-        baseline_pct = float(baseline_raw)
-    except ValueError:
-        return None
-    try:
-        parse_iso_datetime(first_zero_iso, "reset_zero_marker.first_zero")
-    except ValueError:
-        return None
-    return (week_start_date, cur_end_canon, baseline_pct, first_zero_iso)
+    return (row[0], row[1], float(row[2]), row[3], row[4])
 
 
-def _projection_read_reset_zero_marker(ctx):
-    if ctx is not None and not ctx.projection_writes:
-        return ctx.projection_state.get("reset_zero_marker")
-    return _read_reset_zero_marker()
+def _arm_reset_debounce_state(conn, account_key, *, week_start_date,
+                              week_end_at, baseline_pct, first_zero_at_utc,
+                              first_zero_observation_id):
+    """Upsert the pending reset-to-zero candidate for one account.
+
+    ``first_zero_at_utc`` MUST be the capture clock of the observation that
+    armed it, because it becomes the reset's effective instant on confirm.
+    ``first_zero_observation_id`` is that observation's raw journal id; the
+    confirm leg stores it on the event, and the self-confirmation rule
+    compares against it.
+    """
+    conn.execute(
+        "INSERT INTO weekly_reset_debounce_state "
+        "(account_key, week_start_date, week_end_at, baseline_pct, "
+        " first_zero_at_utc, first_zero_observation_id) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(account_key) DO UPDATE SET "
+        " week_start_date = excluded.week_start_date, "
+        " week_end_at = excluded.week_end_at, "
+        " baseline_pct = excluded.baseline_pct, "
+        " first_zero_at_utc = excluded.first_zero_at_utc, "
+        " first_zero_observation_id = excluded.first_zero_observation_id",
+        (account_key, week_start_date, week_end_at, float(baseline_pct),
+         first_zero_at_utc, first_zero_observation_id),
+    )
 
 
-def _projection_clear_reset_zero_marker(ctx):
-    if ctx is not None and not ctx.projection_writes:
-        ctx.projection_state.pop("reset_zero_marker", None)
-        return
-    _clear_reset_zero_marker()
-
-
-def _projection_arm_reset_zero_marker(
-    ctx, week_start_date, cur_end_canon, *, baseline_pct, first_zero_iso,
-):
-    if ctx is not None and not ctx.projection_writes:
-        ctx.projection_state["reset_zero_marker"] = (
-            week_start_date,
-            cur_end_canon,
-            float(baseline_pct),
-            first_zero_iso,
-        )
-        return
-    _arm_reset_zero_marker(
-        week_start_date,
-        cur_end_canon,
-        baseline_pct=baseline_pct,
-        first_zero_iso=first_zero_iso,
+def _clear_reset_debounce_state(conn, account_key):
+    """Drop the pending candidate for one account."""
+    conn.execute(
+        "DELETE FROM weekly_reset_debounce_state WHERE account_key = ?",
+        (account_key,),
     )
 
 
@@ -3028,10 +3033,37 @@ def _projection_arm_reset_zero_marker(
 # (``cmd_record_credit``) resolve them unchanged.
 
 
+#: The stale-replica band, as one text. Three sites in `_fire_in_place_credit`
+#: describe the same rows — the winner's doomed capture, the refused insert's
+#: recovery capture, and the DELETE both of them describe — and they drifted
+#: apart once already. The parameters are, in order, `week_start_date`,
+#: `account_key`, the credit's effective instant, and the pre-credit baseline.
+_STALE_REPLICA_BAND_SQL = (
+    "WHERE week_start_date = ? AND account_key = ? "
+    "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+    "  AND ABS(weekly_percent - ?) <= 1.0"
+)
+
+#: The two doomed-snapshot captures add two clauses the DELETE must NOT carry.
+#: `journal_id IS NOT NULL` because a NULL id names no row for the applier to
+#: delete, and the total order because an unordered list makes the payload
+#: depend on SQLite's row order, so a replay of one observation could produce a
+#: different payload under one id. The DELETE removes every row in the band,
+#: journalled or not: an un-journalled poisoned row is invisible to a rebuild
+#: but still holds the live 7d surfaces at the pre-credit percentage, so
+#: filtering the DELETE by `journal_id` would leave it standing.
+_DOOMED_SNAPSHOT_CAPTURE_SQL = (
+    "SELECT journal_id FROM weekly_usage_snapshots "
+    + _STALE_REPLICA_BAND_SQL
+    + "  AND journal_id IS NOT NULL ORDER BY journal_id"
+)
+
+
 def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
                           *, observed_pre_credit_pct, effective_dt,
                           as_of=None, commit=True, ctx=None,
-                          account_key=_lib_accounts.UNATTRIBUTED):
+                          account_key=_lib_accounts.UNATTRIBUTED,
+                          origin_observation_id=None):
     """Emit/refresh the in-place weekly-credit artifacts (issue #19 + #128).
     Shared by the immediate >=25pp path and the debounced reset-to-zero
     confirmation path.
@@ -3047,69 +3079,94 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
     Both defaults keep the legacy inline-commit, wall-clock behavior.
 
     Design B event+effects seam (§5.3): when an ``IngestContext`` ``ctx`` is
-    passed AND this call is the genuine-new-reset winner (the ``already is None``
-    pre-check AND the ``week_reset_events`` INSERT rowcount == 1), the doomed
-    stale-replica snapshots' ``journal_id``s are captured (SAME predicate as the
-    pivot-2 DELETE) into ``ctx.suppression_map`` keyed on the ``wr`` harvest
-    natural key ``(old_week_end_at, new_week_end_at) = (effective_iso,
-    cur_end_canon)`` BEFORE the DELETE runs, so ``_build_harvest_evt`` attaches
-    the list to the ``wr`` evt and the destructive effect replays. ``ctx=None``
-    (legacy) captures nothing.
+    passed AND this call is the genuine-new-reset winner (the
+    ``week_reset_events`` INSERT rowcount == 1), the doomed stale-replica
+    snapshots' ``journal_id``s are captured (SAME predicate as the pivot-2
+    DELETE) into ``ctx.suppression_map`` keyed on the ``wr`` harvest natural
+    key that ``week_reset_identity_parts`` builds, BEFORE the DELETE runs, so
+    ``_build_harvest_evt`` attaches the list to the ``wr`` evt and the
+    destructive effect replays. ``ctx=None`` (legacy) captures nothing.
 
     Side-effect ordering is load-bearing: the event-row INSERT is dedup-gated
-    on a pre-check, but the hwm force-write and stale-replica DELETE run
-    UNCONDITIONALLY — a prior run may have committed the event then died before
-    the pivots (memory: project_dedup_must_not_gate_side_effects). The pivots
-    are individually idempotent (file overwrite + DELETE on a stable predicate).
+    (by the epoch-1013 partial unique indexes), but the hwm force-write and
+    stale-replica DELETE run UNCONDITIONALLY — a prior run may have committed
+    the event then died before the pivots (memory:
+    project_dedup_must_not_gate_side_effects). The pivots are individually
+    idempotent (file overwrite + DELETE on a stable predicate).
 
-    ``effective_dt`` is the (already-resolved) reset moment; the immediate path
-    passes ``_floor_to_hour(now_utc)``, the debounced path passes the floored
-    first-zero instant from the marker."""
+    #750 S3 §1.5: when the INSERT is refused, no ``wr`` evt exists to carry
+    the DELETE, so on the ingest path the removal is journalled as its own
+    ``weekly_credit_effects`` event instead. Without it a rebuild re-folds the
+    poisoned `snapshot_accept` and resurrects the row this pass removed.
+
+    ``effective_dt`` is the (already-resolved) reset moment, recorded to the
+    EXACT UTC second (#750 S3 §1.4). The immediate path passes the triggering
+    observation's payload capture; the debounced path passes the first-zero
+    capture instant the debounce state recorded. Hour flooring is gone: it
+    back-dated the event before observations that were still legitimately
+    pre-credit, which is how the 2026-09-01 stale replica survived the DELETE
+    below and then seeded a fresh milestone epoch.
+
+    ``origin_observation_id`` (#750 S3 §1.2) is the raw journal id of the
+    observation this reset is derived from — the triggering observation on the
+    immediate leg, the FIRST-ZERO observation on the confirm leg. It is the
+    row's identity under the epoch-1013 partial unique index and, through
+    ``week_reset_identity_parts``, the journal's identity for the event too.
+    ``None`` keeps the legacy tuple identity, which is what a caller with no
+    journal line gets."""
     effective_iso = effective_dt.isoformat(timespec="seconds")
-    # Pre-check keyed on new_week_end_at: suppress a duplicate event row across
-    # ticks. UNIQUE(old, new) also dedups, but the pre-check avoids a useless
-    # write attempt and keeps logs clean.
-    already = conn.execute(
-        "SELECT 1 FROM week_reset_events "
-        "WHERE new_week_end_at = ? AND account_key = ? LIMIT 1",
-        (cur_end_canon, account_key),
-    ).fetchone()
-    if already is None:
-        # Row shape: old=effective_iso, new=cur_end_canon (DISTINCT) so only
-        # post_map fires on the credited week in _apply_reset_events_to_weekrefs
-        # (old==new collapses it to a zero-width window). observed_pre_credit_pct
-        # stamps the pre-credit baseline (issue #45).
-        ins_wr = conn.execute(
-            "INSERT OR IGNORE INTO week_reset_events "
-            "(detected_at_utc, old_week_end_at, new_week_end_at, "
-            " effective_reset_at_utc, observed_pre_credit_pct, account_key) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (as_of or now_utc_iso(), effective_iso, cur_end_canon,
-             effective_iso, float(observed_pre_credit_pct), account_key),
-        )
-        # Design B (§5.3 event+effects): on the ingest path, capture the doomed
-        # stale-replica snapshots' journal_ids BEFORE the pivot-2 DELETE (SAME
-        # predicate), keyed on the wr harvest natural key (old, new) =
-        # (effective_iso, cur_end_canon). Gated on the genuine-new-reset winner
-        # (rowcount == 1) so a crash-replayed reset never re-suppresses; ctx=None
-        # (legacy) captures nothing.
-        if ctx is not None and ins_wr.rowcount == 1:
-            doomed = conn.execute(
-                "SELECT journal_id FROM weekly_usage_snapshots "
-                "WHERE week_start_date = ? AND account_key = ? "
-                "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
-                "  AND ABS(weekly_percent - ?) <= 1.0",
-                (week_start_date, account_key, effective_iso,
-                 float(observed_pre_credit_pct)),
-            ).fetchall()
-            # #341: the wr harvest id_parts now lead with account_key, so the
-            # suppression_map key (which _build_harvest_evt derives from id_parts)
-            # must match: (account_key, old_week_end_at, new_week_end_at).
-            ctx.suppression_map[(account_key, effective_iso, cur_end_canon)] = [
-                r[0] for r in doomed
-            ]
-        if commit:
-            conn.commit()
+    # #750 S3 §1.5/§1.8. Deduplication is EXACT-ORIGIN ONLY, and it is the
+    # epoch-1013 partial unique indexes that perform it: a row naming an origin
+    # is unique on `(account_key, origin_observation_id)`, an origin-null row
+    # keeps the legacy `(account_key, old_week_end_at, new_week_end_at)` tuple.
+    # `INSERT OR IGNORE` is therefore the whole mechanism, and there is no
+    # pre-check. The old one refused ANY second event sharing a
+    # `new_week_end_at`, which made a genuine second in-place credit in one
+    # week unreachable (#732); the evidence-based echo guard that briefly
+    # replaced it was withdrawn because its epoch maximum was computed over a
+    # window excluding the predecessor reading, so it suppressed the ordinary
+    # climb-back-and-credit-again sequence rather than only the stale echo.
+    # A distinct observation reporting stale data is admitted, deliberately:
+    # a phantom event is visible in the week's segmentation, whereas a
+    # suppressed genuine reset does not self-heal.
+    #
+    # Row shape: old=effective_iso, new=cur_end_canon (DISTINCT) so only
+    # post_map fires on the credited week in _apply_reset_events_to_weekrefs
+    # (old==new collapses it to a zero-width window). observed_pre_credit_pct
+    # stamps the pre-credit baseline (issue #45).
+    ins_wr = conn.execute(
+        "INSERT OR IGNORE INTO week_reset_events "
+        "(detected_at_utc, old_week_end_at, new_week_end_at, "
+        " effective_reset_at_utc, observed_pre_credit_pct, account_key, "
+        " origin_observation_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (as_of or now_utc_iso(), effective_iso, cur_end_canon,
+         effective_iso, float(observed_pre_credit_pct), account_key,
+         origin_observation_id),
+    )
+    # Design B (§5.3 event+effects): on the ingest path, capture the doomed
+    # stale-replica snapshots' journal_ids BEFORE the pivot-2 DELETE (SAME
+    # predicate), keyed on the wr harvest natural key. Gated on the
+    # genuine-new-reset winner (rowcount == 1); a refused insert has no evt of
+    # its own to attach them to and journals them through the recovery event
+    # below instead. ctx=None (legacy) captures nothing.
+    if ctx is not None and ins_wr.rowcount == 1:
+        doomed = conn.execute(
+            _DOOMED_SNAPSHOT_CAPTURE_SQL,
+            (week_start_date, account_key, effective_iso,
+             float(observed_pre_credit_pct)),
+        ).fetchall()
+        # #750 S3 §1.1: the map key comes from the SAME helper that builds
+        # the harvest id, because the wr identity is dual-shaped and a key
+        # computed here by hand would stop matching the moment a row
+        # carries an origin. #341 put account_key first; the helper keeps
+        # it there for both shapes.
+        import _lib_journal as _lj
+        ctx.suppression_map[_lj.week_reset_identity_parts(
+            account_key, effective_iso, cur_end_canon,
+            origin_observation_id,
+        )] = [r[0] for r in doomed]
+    if commit:
+        conn.commit()
     # Unconditional pivot 1: force-write hwm-7d so the next status-line render
     # reflects the post-credit value (the monotonic guard at the normal write
     # site would refuse to decrease the file).
@@ -3134,25 +3191,101 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
     # of 13.0 matched nothing, the stale rows survived, and they provoked a
     # second phantom credit. The manual path keeps `<`: it compares against the
     # level the operator asserted, so the two quantities are one.
+    # #750 S3 §1.5: a DELETE that no `wr` evt carries has to be journalled on
+    # its own, because the poisoned snapshot is itself a retained
+    # `snapshot_accept` event and a rebuild or a `db rederive` would re-fold it
+    # and resurrect exactly the row this pass removed. That case is the refused
+    # insert: the winner's doomed ids ride its own harvested evt through
+    # `ctx.suppression_map` above, and a refused insert has no evt to ride. The
+    # recovery rides the existing effects-only `weekly_credit_effects` family —
+    # the same applier, deleting by logical id and force-writing the same floor
+    # — under an id keyed on the originating observation, which is the identity
+    # the refused insert collided on and is therefore stable across replays of
+    # that same observation.
+    recovery_ctx = (
+        ctx if (ctx is not None and ins_wr.rowcount != 1
+                and origin_observation_id) else None
+    )
+    doomed_ids = []
     try:
+        if recovery_ctx is not None:
+            doomed_ids = [
+                r[0] for r in conn.execute(
+                    _DOOMED_SNAPSHOT_CAPTURE_SQL,
+                    (week_start_date, account_key, effective_iso,
+                     float(observed_pre_credit_pct)),
+                ).fetchall()
+            ]
+        # The band alone, WITHOUT the capture's two extra clauses. See
+        # `_DOOMED_SNAPSHOT_CAPTURE_SQL`: an un-journalled poisoned row has no
+        # logical id to journal but must still be removed here.
         conn.execute(
-            "DELETE FROM weekly_usage_snapshots "
-            "WHERE week_start_date = ? AND account_key = ? "
-            "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
-            "  AND ABS(weekly_percent - ?) <= 1.0",
+            "DELETE FROM weekly_usage_snapshots " + _STALE_REPLICA_BAND_SQL,
             (week_start_date, account_key, effective_iso,
              float(observed_pre_credit_pct)),
         )
-        if commit:
-            conn.commit()
     except sqlite3.DatabaseError as exc:
         eprint(f"[record-usage] post-credit cleanup failed: {exc}")
+        return
+    # Deliberately OUTSIDE the handler above. Swallowing a failure here would
+    # leave the DELETE standing as an inline-only effect, which is the exact
+    # degradation this event exists to prevent, and the caller would be told
+    # nothing. On the ingest path the raise aborts the cycle, so the DELETE
+    # rolls back with it and the next pass retries both together.
+    if recovery_ctx is not None:
+        import _cctally_journal as _jr
+        import _lib_journal as _lj
+        recovery_payload = {
+            "suppression": doomed_ids,
+            "suppression_table": "weekly_usage_snapshots",
+            "hwm_floor": {
+                "week_start_date": week_start_date,
+                "weekly_percent": weekly_percent,
+            },
+        }
+        # The id names the originating observation AND digests the payload.
+        # The origin alone is not enough: `doomed_ids` is a live query, so one
+        # observation refused twice against different poisoned rows would emit
+        # two different payloads under one id, and
+        # `_classify_live_effective_event` withholds the second as a conflict —
+        # leaving its DELETE as the inline-only effect this event exists to
+        # replace, because `_converge_row_from_effective` drops an effects-only
+        # family and `emit_model_a` then returns normally. With the digest each
+        # distinct removal is its own event, while a genuine replay of one
+        # observation against one poisoned set reproduces the line byte for
+        # byte and collapses to the duplicate the journal already tolerates.
+        #
+        # `at` is the credit's effective instant, NOT the calling tick's clock,
+        # and that is what makes "byte for byte" true rather than approximately
+        # true: `at` is outside the id but inside the line's content hash, so a
+        # wall clock there would make two replays of one observation a
+        # same-revision CONFLICT even with identical payloads. On the debounce
+        # confirm leg the two genuinely differ — the id names the first-zero
+        # observation while `as_of` is the confirming tick — so the wall clock
+        # was not merely imprecise there. `effective_iso` is a function of the
+        # same observation the id names, on both legs.
+        _jr.emit_model_a(
+            recovery_ctx,
+            kind="weekly_credit_effects",
+            evt_id=_lj.evt_id(
+                "wce", "replay", origin_observation_id,
+                _lj.effects_payload_digest(recovery_payload)),
+            table=None,
+            columns=recovery_payload,
+            at=effective_iso.replace("+00:00", "Z"),
+        )
+    if commit:
+        try:
+            conn.commit()
+        except sqlite3.DatabaseError as exc:
+            eprint(f"[record-usage] post-credit cleanup failed: {exc}")
 
 
 def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                             weekly_percent, five_hour_window_key,
                             five_hour_percent, as_of=None, commit=True,
-                            ctx=None, account_key=_lib_accounts.UNATTRIBUTED):
+                            ctx=None, account_key=_lib_accounts.UNATTRIBUTED,
+                            origin_observation_id=None, capture_at=None):
     """Detect + record weekly and 5h reset/credit artifacts for one usage
     observation (extracted from ``cmd_record_usage``; DB journal redesign
     §5.2.3).
@@ -3188,9 +3321,30 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
       DELETE's doomed ``journal_id``s into ``ctx.suppression_map`` BEFORE
       deleting (Design B event+effects, §5.3), keyed on the reset row's
       harvest natural key. Legacy (``ctx=None``) captures nothing.
+    - ``origin_observation_id`` (#750 S3, default ``None``): the raw journal
+      id of the observation this detection is derived from. The debounce ARM
+      records it, and the self-confirmation rule compares an incoming
+      observation against the recorded one so a byte-identical replay of the
+      first zero cannot confirm itself. ``None`` (a caller with no journal
+      line, such as a direct legacy invocation) disables that comparison and
+      arms with no recorded origin, which is the pre-#750 behaviour.
+    - ``capture_at`` (#750 S3 §1.2, default ``None``): the observation's
+      payload CAPTURE stamp, which is what every ``effective_reset_at_utc``
+      written below records. It is deliberately separate from ``as_of``: the
+      journal distinguishes the detection clock from the capture stamp, they
+      are equal in production and differ under ``CCTALLY_AS_OF``, and mixing
+      them would make live detection and the backfill disagree about the same
+      physical reset. ``None`` falls back to the detection clock.
     """
     c = _cctally()
     now_utc = _as_of_or_command(as_of)
+    # The CAPTURE clock, used only for the reset instant. `now_utc` stays the
+    # causal detection clock (window comparisons, `detected_at_utc`).
+    capture_dt = (
+        parse_iso_datetime(capture_at, "record.capture_at")
+        .astimezone(dt.timezone.utc)
+        if capture_at else now_utc
+    )
     # Mid-week reset detection. When `resets_at` advances before the
     # previously-declared reset actually fires (Anthropic-initiated
     # goodwill reset, or any API-side shift), record one week_reset_events
@@ -3235,18 +3389,20 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                     and prior_pct is not None
                     and c._is_reset_drop(prior_pct, weekly_percent)
                 ):
-                    # See _backfill_week_reset_events for why we floor
-                    # the reset moment to the hour (natural display
-                    # boundary, aligned with Anthropic's hour-only
-                    # resets_at values).
-                    effective_iso = _floor_to_hour(now_utc).isoformat(timespec="seconds")
+                    # #750 S3 §1.4: the EXACT capture second. Flooring to the
+                    # hour was a display convenience that back-dated the
+                    # event before observations still legitimately belonging
+                    # to the old window. Provider-reported boundaries
+                    # (`old_week_end_at`, `new_week_end_at`) keep their own
+                    # hour normalization; only our own instant is unfloored.
+                    effective_iso = capture_dt.isoformat(timespec="seconds")
                     conn.execute(
                         "INSERT OR IGNORE INTO week_reset_events "
                         "(detected_at_utc, old_week_end_at, new_week_end_at, "
-                        " effective_reset_at_utc, account_key) "
-                        "VALUES (?, ?, ?, ?, ?)",
+                        " effective_reset_at_utc, account_key, "
+                        " origin_observation_id) VALUES (?, ?, ?, ?, ?, ?)",
                         ((as_of or now_utc_iso()), prior_end_canon, cur_end_canon,
-                         effective_iso, account_key),
+                         effective_iso, account_key, origin_observation_id),
                     )
                     # (inline commit removed — the function commits once at the
                     # end on the legacy path; the ingest cycle owns the commit.)
@@ -3262,76 +3418,108 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                 # reachable. See the spec for the midpoint rationale.
                 prior_end_dt = parse_iso_datetime(prior_end_canon, "prior.week_end_at")
                 if prior_end_dt > now_utc and prior_pct is not None:
-                    # Read the pending reset-to-zero marker up front (pure
-                    # file read) and compute whether it is armed for THIS
-                    # window; the debounce CLASSIFIER (pure) decides the
-                    # action from those values + the c._RESET_* constants,
-                    # then the glue below executes the decided I/O. The 5
-                    # branch outcomes (fire-immediate / confirm / clear /
-                    # arm / none) map 1:1 to the pre-extraction structure.
-                    marker = _projection_read_reset_zero_marker(ctx)
+                    # Read the pending reset-to-zero state up front and
+                    # compute whether it is armed for THIS window; the
+                    # debounce CLASSIFIER (pure) decides the action from
+                    # those values + the c._RESET_* constants, then the glue
+                    # below executes the decided I/O. The 5 branch outcomes
+                    # (fire-immediate / confirm / clear / arm / none) map 1:1
+                    # to the pre-extraction structure. #750 S3 §1.3: the
+                    # state is a stats.db row, so every mutation below folds
+                    # into the same transaction as the reset event and the
+                    # journal cursor.
+                    state = _read_reset_debounce_state(conn, account_key)
                     armed = (
-                        marker is not None
-                        and marker[0] == week_start_date
-                        and marker[1] == cur_end_canon
+                        state is not None
+                        and state[0] == week_start_date
+                        and state[1] == cur_end_canon
                     )
-                    decision = plan_weekly_credit_debounce(
-                        prior_pct, weekly_percent,
-                        drop_threshold=c._RESET_PCT_DROP_THRESHOLD,
-                        zero_floor_pct=c._RESET_ZERO_FLOOR_PCT,
-                        zero_min_drop_pct=c._RESET_ZERO_MIN_DROP_PCT,
-                        marker_armed=armed,
-                        marker_baseline=(marker[2] if armed else None),
-                    ).action
+                    # #750 S3 §1.3: an observation can never confirm ITSELF.
+                    # The armed state names the observation that armed it, so
+                    # a byte-identical replay of that line — which crash
+                    # replay produces by construction — must leave the state
+                    # armed rather than reach the confirm branch and mint a
+                    # reset nobody observed twice. Checked BEFORE the
+                    # classifier is consulted, because the classifier sees
+                    # only percentages and cannot tell the two readings
+                    # apart.
+                    self_replay = (
+                        armed
+                        and origin_observation_id is not None
+                        and state[4] == origin_observation_id
+                    )
+                    if self_replay:
+                        decision = NO_ACTION
+                    else:
+                        decision = plan_weekly_credit_debounce(
+                            prior_pct, weekly_percent,
+                            drop_threshold=c._RESET_PCT_DROP_THRESHOLD,
+                            zero_floor_pct=c._RESET_ZERO_FLOOR_PCT,
+                            zero_min_drop_pct=c._RESET_ZERO_MIN_DROP_PCT,
+                            marker_armed=armed,
+                            marker_baseline=(state[2] if armed else None),
+                        ).action
                     if decision == FIRE_IMMEDIATE:
                         # >=25pp goodwill credit — fire immediately, never
                         # debounced. Clear any pending arm (now moot).
-                        _projection_clear_reset_zero_marker(ctx)
+                        _clear_reset_debounce_state(conn, account_key)
                         _fire_in_place_credit(
                             conn, week_start_date, cur_end_canon, weekly_percent,
                             observed_pre_credit_pct=float(prior_pct),
-                            effective_dt=_floor_to_hour(now_utc),
+                            effective_dt=capture_dt,
                             as_of=as_of, commit=commit, ctx=ctx,
                             account_key=account_key,
+                            origin_observation_id=origin_observation_id,
                         )
                     elif decision == CONFIRM_RESET:
                         # Second reading stayed low → confirm. Anchor the
-                        # reset at the FIRST-zero instant from the marker
+                        # reset at the FIRST-zero instant from the state
                         # (UTC-normalized like the backfill in-place path).
                         first_zero_dt = parse_iso_datetime(
-                            marker[3], "reset_zero_marker.first_zero"
+                            state[3], "reset_debounce_state.first_zero"
                         ).astimezone(dt.timezone.utc)
                         _fire_in_place_credit(
                             conn, week_start_date, cur_end_canon,
                             weekly_percent,
-                            observed_pre_credit_pct=marker[2],
-                            effective_dt=_floor_to_hour(first_zero_dt),
+                            observed_pre_credit_pct=state[2],
+                            effective_dt=first_zero_dt,
                             as_of=as_of, commit=commit, ctx=ctx,
                             account_key=account_key,
+                            # The FIRST-ZERO observation, not the confirming
+                            # one: a replayed confirming observation must
+                            # reproduce the same event id, and only the first
+                            # zero is an instant the crashed cycle and its
+                            # retry both agree on (#750 S3 §1.2).
+                            origin_observation_id=state[4],
                         )
                         # Clear ONLY after the fire completes (P2a): a
-                        # mid-fire crash leaves the marker armed so the next
+                        # mid-fire raise leaves the state armed so the next
                         # zero re-confirms + re-runs the idempotent pivots.
-                        _projection_clear_reset_zero_marker(ctx)
+                        _clear_reset_debounce_state(conn, account_key)
                     elif decision == CLEAR_MARKER:
                         # Recovered toward baseline → transient zero, not a
                         # reset. Clear, do not fire.
-                        _projection_clear_reset_zero_marker(ctx)
+                        _clear_reset_debounce_state(conn, account_key)
                     elif decision == ARM_MARKER:
                         # First ~0 → arm; do NOT fire. The write clamp
                         # suppresses this 0 (no event row yet), so the prior
                         # snapshot stays at the baseline and this shape
-                        # re-evaluates next tick. first_zero_iso is the
-                        # _command_as_of() value (now_utc), NOT wall-clock —
-                        # it becomes the effective anchor.
-                        _projection_arm_reset_zero_marker(
-                            ctx,
-                            week_start_date, cur_end_canon,
+                        # re-evaluates next tick. first_zero_at_utc is the
+                        # observation's payload CAPTURE stamp (#750 S3 §1.2),
+                        # not the detection clock and not wall-clock — it
+                        # becomes the effective anchor on confirm, to the
+                        # exact second.
+                        _arm_reset_debounce_state(
+                            conn, account_key,
+                            week_start_date=week_start_date,
+                            week_end_at=cur_end_canon,
                             baseline_pct=float(prior_pct),
-                            first_zero_iso=now_utc.isoformat(timespec="seconds"),
+                            first_zero_at_utc=capture_dt.isoformat(
+                                timespec="seconds"),
+                            first_zero_observation_id=origin_observation_id,
                         )
                     # else NO_ACTION: not a reset shape and not armed →
-                    #     nothing. A non-matching stale marker is inert
+                    #     nothing. A non-matching stale state is inert
                     #     (ignored on key mismatch, overwritten by next arm).
 
         # ── 5h in-place credit detection (parallel to weekly above) ──
@@ -3947,9 +4135,11 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
             conn, plan, five_hour=five_hour, commit=False,
             journal=(ctx, f"sa:{id_base}:syn:0"), account_key=account_key)
 
-    # 4e. Clear a stale same-week reset-zero marker so the next record-usage
-    # tick can't confirm a phantom reset-to-zero off it.
-    _projection_clear_reset_zero_marker(ctx)
+    # 4e. Clear a stale same-week reset-zero debounce state so the next
+    # record-usage tick can't confirm a phantom reset-to-zero off it. The
+    # DELETE folds into whatever transaction this op is running in, so it is
+    # undone with the credit if the cycle rolls back.
+    _clear_reset_debounce_state(conn, account_key)
 
 
 def _count_stale_replays(conn, plan):
@@ -6044,6 +6234,15 @@ def _pipeline_claude_usage(ctx, rec):
         commit=False,
         ctx=ctx,
         account_key=account_key,
+        # #750 S3: the raw journal id of the line this derivation came from.
+        # The debounce ARM records it so a byte-identical replay of the first
+        # zero cannot confirm itself.
+        origin_observation_id=rec.get("id"),
+        # The CAPTURE stamp, not `as_of`. It is what every
+        # `effective_reset_at_utc` records, so live detection and the backfill
+        # (which reads `weekly_usage_snapshots.captured_at_utc`) agree about
+        # the same physical reset.
+        capture_at=capture_at,
     )
 
     # 2. Accept/skip DECISION (clamp + dedup), made ONCE and journaled via the

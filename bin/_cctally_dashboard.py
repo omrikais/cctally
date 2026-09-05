@@ -1892,7 +1892,10 @@ def _conversation_frontier_context():
     try:
         codex_hooks_mod = _cctally()._load_sibling("_lib_codex_hooks")
         hook_roots = codex_hooks_mod.codex_hook_roots(codex_homes)
-        codex_guards = tuple(root.hooks_path for root in hook_roots)
+        # config.toml joins the guard set (#719 §2.6a): a certificate seeded
+        # while the handler was enabled must not survive Codex flipping
+        # `enabled = false` under it.
+        codex_guards = codex_hooks_mod.codex_frontier_guard_paths(hook_roots)
     except Exception:
         codex_hooks_mod = None
         hook_roots = ()
@@ -1916,27 +1919,12 @@ def _conversation_frontier_context():
             return False
 
     def codex_trusted():
+        # Counting owned handlers proved nothing about whether Codex would
+        # run them (#719). Route through the one shared kernel, which is
+        # fail-closed on every state that is not `installed_enabled`.
         if codex_hooks_mod is None:
             return False
-        try:
-            trusted = bool(hook_roots)
-            for hook_root in hook_roots:
-                document = codex_hooks_mod._read_hooks_document(
-                    hook_root.hooks_path)
-                hooks = document.get("hooks", {})
-                for event in codex_hooks_mod.CODEX_HOOK_EVENTS:
-                    owned = sum(
-                        1
-                        for group in hooks.get(event, ())
-                        if isinstance(group, dict)
-                        for handler in group.get("hooks", ())
-                        if codex_hooks_mod.is_dashboard_activity_codex_hook_handler(
-                            handler)
-                    )
-                    trusted = trusted and owned >= 1
-            return trusted
-        except Exception:
-            return False
+        return codex_hooks_mod.codex_hook_roots_all_enabled(hook_roots)
 
     return frontier_mod, {
         "claude": (claude_roots, claude_guards, claude_trusted()),

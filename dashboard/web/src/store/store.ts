@@ -1,6 +1,7 @@
 import type { AlertEntry, AlertsSettingsEnvelope, DashboardSelection, Envelope, MeterRateChangeEntry, SessionRow, SourceAlertRow, SourceName } from '../types/envelope';
 import type { SourceResource } from '../hooks/useSourceDetail';
 import { seedFormsForRow, toastAlertId } from '../lib/alertIdentity';
+import { clearFocusOrigin } from '../lib/toastFocus';
 import {
   conversationRefKey,
   isConversationRef,
@@ -2472,5 +2473,10 @@ export function _resetForTests(): void {
   state = loadInitial();
   lastGeneratedAt = '';
   subscribers.clear();
+  // #750 S2 review — the toast's remembered focus origin is module state too,
+  // and a module global no reset reaches is cross-test state that leaks
+  // silently. It lives in `lib/toastFocus.ts` rather than in `Toast.tsx` so
+  // this reset can clear it without importing a component.
+  clearFocusOrigin();
 }
 export function loadInitialForTests(): UIState { return loadInitial(); }

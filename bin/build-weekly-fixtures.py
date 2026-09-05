@@ -17,6 +17,7 @@ from pathlib import Path
 # Make _fixture_builders importable when run directly (bin/ is not on sys.path).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from _cctally_core import _canonicalize_optional_iso  # noqa: E402
 from _fixture_builders import (  # noqa: E402
     FIXED_LAST_INGESTED_AT,
     create_cache_db,
@@ -581,14 +582,21 @@ def build_reset_event_rebucketing():
 
 
 def build_in_place_credit_split():
-    """Scenario: an in-place weekly credit ends one billing cycle and begins
-    another INSIDE the week, so the week renders as TWO rows.
+    """Scenario: a week credited TWICE, so it renders as THREE rows.
 
-    The credit does NOT move the week's boundaries, which is what makes this
-    shape distinct from `reset-event-rebucketing`: `old_week_end_at` equals
+    An in-place weekly credit ends one billing cycle and begins another INSIDE
+    the week without moving its boundaries, which is what makes this shape
+    distinct from `reset-event-rebucketing`: `old_week_end_at` equals
     `effective_reset_at_utc` (the detector's in-place-credit row shape) and
-    `new_week_end_at` is the week's own unchanged end, so both segments share
+    `new_week_end_at` is the week's own unchanged end, so every segment shares
     ONE `week_start_date` — the join key into `weekly_usage_snapshots`.
+
+    Two credits rather than one (#750 S3 B4). One credit cannot tell a
+    single-slot applier apart from an N-ary one: both emit the same two rows.
+    The boundary this fixture exists to prove is the SECOND one, and before
+    #750 S3 B2 the second event simply overwrote the first, so the interval
+    between the two credits belonged to no segment and its spend was dropped
+    from the table AND from the totals.
 
     Shape:
         AS_OF                = 2026-06-12T12:00Z
@@ -596,41 +604,74 @@ def build_in_place_credit_split():
                              end_at   = 2026-06-05T15:00Z, pct 40.0
         week-2 (credited):   start_at = 2026-06-05T15:00Z
                              end_at   = 2026-06-12T15:00Z
-                             pct 71.0 captured 06-10T08:00Z (pre-credit peak)
-                             pct 12.0 captured 06-10T09:30Z (post-credit)
-        credit event:        old_week_end_at        = 2026-06-10T09:00+00:00
-                             new_week_end_at        = 2026-06-12T15:00+00:00
-                             effective_reset_at_utc = 2026-06-10T09:00+00:00
+                             pct 60.0 captured 06-07T08:00Z (pre-credit-1 peak)
+                             pct 15.0 captured 06-08T09:30Z (post-credit-1)
+                             pct 55.0 captured 06-09T20:00Z (climbed back)
+                             pct 12.0 captured 06-10T09:30Z (post-credit-2)
+        credit 1:            old = effective = 2026-06-08T09:00+00:00
+        credit 2:            old = effective = 2026-06-10T09:00+00:00
+                             new_week_end_at = 2026-06-12T15:00+00:00 on both
 
-    Expected: week-2 emits two rows sharing `week` = 2026-06-05 —
-    [06-05T15:00Z, 06-10T09:00Z) at 71.0% and [06-10T09:00Z, 06-12T15:00Z) at
-    12.0%. Before the applier learned the split, the pre-credit interval had
-    no SubWeek at all and its two entries were dropped from the table AND from
-    `totals`.
+    Expected: week-2 emits three rows sharing `week` = 2026-06-05 —
+    [06-05T15:00Z, 06-08T09:00Z) at 60.0%, [06-08T09:00Z, 06-10T09:00Z) at
+    55.0%, and [06-10T09:00Z, 06-12T15:00Z) at 12.0%. Each segment carries a
+    DIFFERENT number of entries, so a lost boundary changes the table's cost
+    column and not only its row count.
 
-    Two shaping constraints, both learned the hard way from this fixture:
+    Three shaping constraints, all measured on this fixture's own shape rather
+    than carried forward.
 
-    1. The seeded event uses the CANONICAL `+00:00` spelling, not `Z`.
-       `_backfill_week_reset_events` runs on every `open_db()` and would
-       otherwise synthesize its OWN in-place-credit row for these snapshots:
-       its `already` pre-check compares `account_key = NULL`, which is never
-       true in SQL, so `UNIQUE(old_week_end_at, new_week_end_at)` is the only
-       thing that dedups — and it only recognizes the duplicate when the
-       spellings match. Same reasoning as `build-dashboard-fixtures.py`'s
-       `reset-week`.
-    2. `effective` is `_floor_to_hour(post-credit capture)`, and that capture
-       sits STRICTLY AFTER it (09:30 vs 09:00). Both halves matter: the floor
-       is what the detector would compute, and the strict inequality is what
-       lets the pre-credit segment's `captured_at_utc <= effective` lookup
-       resolve to the 71.0 peak instead of the post-credit 12.0.
+    1. The seeded event's `new_week_end_at` uses the CANONICAL `+00:00`
+       spelling, and it is derived by calling the production canonicalizer
+       rather than by re-implementing it.
+
+       `_backfill_week_reset_events` does NOT run on every `open_db()`. An
+       epoch-current open returns before the schema apply that calls it. It
+       runs for THIS fixture because `create_stats_db` leaves `user_version`
+       at 0 and this scenario never calls `stamp_all_stats_migrations_applied`,
+       so the open takes the legacy path and reaches the schema apply.
+
+       What dedups a seeded row is `_legacy_reset_row_exists`, which runs only
+       while `user_version <= LEGACY_STATS_HEAD`, matches the candidate's
+       HOUR-NORMALIZED instant against `effective_reset_at_utc`, and qualifies
+       it with `new_week_end_at = ?` against
+       `_canonicalize_optional_iso(week_end_at)`. That second comparison is a
+       string comparison, so the spelling is load-bearing: a `Z`-spelled seed
+       does not match it and the backfill synthesizes a SECOND in-place row
+       beside the seeded one.
+
+    2. Each `effective` sits STRICTLY BETWEEN the captures that bracket it, and
+       each is the HOUR the drop was observed in. The two are separate
+       requirements. The strict ordering is what lets a segment's
+       `captured_at_utc <= effective` lookup resolve to that segment's own
+       peak. The hour is what makes `_legacy_reset_row_exists` recognize the
+       backfill's candidate — which records the exact capture second since
+       #750 S3 §1.4 removed the floor — as the same event.
+
+    3. Both drops clear the 25pp `_is_reset_drop` gate (60 -> 15 and 55 -> 12),
+       so both credits are ones the detector would genuinely find. The
+       intervening 15 -> 55 climb is a rise, not a drop, so it mints nothing.
     """
     scenario_dir = FIXTURES_DIR / "in-place-credit-split"
     db_dir = scenario_dir / ".local/share/cctally"
     db_dir.mkdir(parents=True, exist_ok=True)
 
-    def _canon(d: dt.datetime) -> str:
-        """The `+00:00` spelling `_canonicalize_optional_iso` / the backfill's
-        `_floor_to_hour(...).isoformat(timespec="seconds")` produce."""
+    def _canon_boundary(d: dt.datetime) -> str:
+        """The spelling production stores a week BOUNDARY in.
+
+        Delegated rather than re-implemented: `bin/build-diff-fixtures.py`
+        carried its own copy of this rule, the copy floored where production
+        rounds, and the disagreement minted a duplicate reset event (#750 S3
+        B4).
+        """
+        canonical = _canonicalize_optional_iso(
+            d.astimezone(dt.timezone.utc).isoformat(), "fixture.boundary")
+        assert canonical is not None
+        return canonical
+
+    def _exact_instant(d: dt.datetime) -> str:
+        """The spelling production stores an INSTANT in — the exact second,
+        never hour-normalized (#750 S3 §1.4)."""
         return d.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
 
     as_of = dt.datetime(2026, 6, 12, 12, 0, 0, tzinfo=dt.timezone.utc)
@@ -639,9 +680,17 @@ def build_in_place_credit_split():
     wk1_end   = dt.datetime(2026, 6,  5, 15, 0, 0, tzinfo=dt.timezone.utc)
     wk2_start = wk1_end
     wk2_end   = dt.datetime(2026, 6, 12, 15, 0, 0, tzinfo=dt.timezone.utc)
-    effective = dt.datetime(2026, 6, 10,  9, 0, 0, tzinfo=dt.timezone.utc)
-    pre_capture  = dt.datetime(2026, 6, 10, 8,  0, 0, tzinfo=dt.timezone.utc)
-    post_capture = dt.datetime(2026, 6, 10, 9, 30, 0, tzinfo=dt.timezone.utc)
+    credit_1  = dt.datetime(2026, 6,  8,  9, 0, 0, tzinfo=dt.timezone.utc)
+    credit_2  = dt.datetime(2026, 6, 10,  9, 0, 0, tzinfo=dt.timezone.utc)
+
+    # (captured_at, weekly_percent). The first is the peak of segment 1, the
+    # third the peak of segment 2, and the fourth the reading segment 3 keeps.
+    wk2_captures = [
+        (dt.datetime(2026, 6, 7,  8,  0, 0, tzinfo=dt.timezone.utc), 60.0),
+        (dt.datetime(2026, 6, 8,  9, 30, 0, tzinfo=dt.timezone.utc), 15.0),
+        (dt.datetime(2026, 6, 9, 20,  0, 0, tzinfo=dt.timezone.utc), 55.0),
+        (dt.datetime(2026, 6, 10, 9, 30, 0, tzinfo=dt.timezone.utc), 12.0),
+    ]
 
     create_stats_db(db_dir / "stats.db")
     with sqlite3.connect(db_dir / "stats.db") as conn:
@@ -654,34 +703,31 @@ def build_in_place_credit_split():
             week_end_at=_iso(wk1_end),
             weekly_percent=40.0,
         )
-        # Both credited-week snapshots carry the SAME week_start_at /
-        # week_end_at — the credit leaves the boundaries alone. The 71 → 12
-        # drop across them is the in-place-credit signal.
-        seed_weekly_usage_snapshot(
-            conn,
-            captured_at_utc=_iso(pre_capture),
-            week_start_date=wk2_start.date().isoformat(),
-            week_end_date=wk2_end.date().isoformat(),
-            week_start_at=_iso(wk2_start),
-            week_end_at=_iso(wk2_end),
-            weekly_percent=71.0,
-        )
-        seed_weekly_usage_snapshot(
-            conn,
-            captured_at_utc=_iso(post_capture),
-            week_start_date=wk2_start.date().isoformat(),
-            week_end_date=wk2_end.date().isoformat(),
-            week_start_at=_iso(wk2_start),
-            week_end_at=_iso(wk2_end),
-            weekly_percent=12.0,
-        )
-        seed_week_reset_event(
-            conn,
-            detected_at_utc=_canon(post_capture),
-            old_week_end_at=_canon(effective),   # == effective: in-place credit
-            new_week_end_at=_canon(wk2_end),
-            effective_reset_at_utc=_canon(effective),
-        )
+        # Every credited-week snapshot carries the SAME week_start_at /
+        # week_end_at — a credit leaves the boundaries alone. The two ≥25pp
+        # drops across them are the in-place-credit signal.
+        for captured_at, pct in wk2_captures:
+            seed_weekly_usage_snapshot(
+                conn,
+                captured_at_utc=_iso(captured_at),
+                week_start_date=wk2_start.date().isoformat(),
+                week_end_date=wk2_end.date().isoformat(),
+                week_start_at=_iso(wk2_start),
+                week_end_at=_iso(wk2_end),
+                weekly_percent=pct,
+            )
+        for effective, detected_at in (
+            (credit_1, wk2_captures[1][0]),
+            (credit_2, wk2_captures[3][0]),
+        ):
+            seed_week_reset_event(
+                conn,
+                detected_at_utc=_exact_instant(detected_at),
+                # old == effective is the in-place-credit row shape.
+                old_week_end_at=_exact_instant(effective),
+                new_week_end_at=_canon_boundary(wk2_end),
+                effective_reset_at_utc=_exact_instant(effective),
+            )
 
     create_cache_db(db_dir / "cache.db")
     with sqlite3.connect(db_dir / "cache.db") as conn:
@@ -691,13 +737,21 @@ def build_in_place_credit_split():
             session_id="ipc-session",
             project_path="/fake/repos/ipc",
         )
-        # One entry in week-1, two in the pre-credit segment, one in the
-        # post-credit segment. The pre-credit pair is the demonstrative
-        # population: it is what fell into the gap before the split existed.
+        # One entry in week-1, then a DIFFERENT count in each of the credited
+        # week's three segments: two, three, one. Distinct counts are what
+        # make a lost boundary visible in the cost column rather than only in
+        # the row count.
         for i, ts in enumerate([
             dt.datetime(2026, 6,  1, 12, 0, 0, tzinfo=dt.timezone.utc),
+            # segment 1: [06-05T15:00, 06-08T09:00)
+            dt.datetime(2026, 6,  6, 12, 0, 0, tzinfo=dt.timezone.utc),
             dt.datetime(2026, 6,  7, 12, 0, 0, tzinfo=dt.timezone.utc),
-            dt.datetime(2026, 6,  9, 12, 0, 0, tzinfo=dt.timezone.utc),
+            # segment 2: [06-08T09:00, 06-10T09:00) — the population that had
+            # no segment at all before the appliers became N-ary.
+            dt.datetime(2026, 6,  8, 14, 0, 0, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 6,  9, 10, 0, 0, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 6,  9, 18, 0, 0, tzinfo=dt.timezone.utc),
+            # segment 3: [06-10T09:00, 06-12T15:00)
             dt.datetime(2026, 6, 11, 10, 0, 0, tzinfo=dt.timezone.utc),
         ]):
             seed_session_entry(

@@ -303,6 +303,16 @@ PROJECTION_GATE_CALLERS: "dict[str, tuple[str, ...]]" = {
 #: family. It mirrors `FROZEN_DYNAMIC_SITES` in
 #: `tests/test_stats_writer_surface_386.py`, which solved the same problem for
 #: the write surface.
+#:
+#: THE CENSUS DROPPED FROM 64 TO 50 IN #746. The scanner matched `FROM {` with
+#: no SQL context at all, so it counted ordinary English — `f"moved from {was}
+#: to {now}"` — and fourteen of the sixty-four entries recorded nothing but
+#: prose. Seven whole rows were prose only and are gone; `_cctally_db.py` lost
+#: one and `_cctally_journal.py` lost two. The scanner now reconstructs the
+#: enclosing SQL expression, following `+` concatenation and module constants,
+#: and requires a statement verb earlier in that text than the match. Nothing
+#: about which reads are covered changed; what changed is that the count now
+#: means what its name says.
 PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     "_cctally_account.py": 1,
     # Three, all in `_import_legacy_conversation_rows`: `FROM main.{table}`,
@@ -316,15 +326,14 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     "_cctally_core.py": 2,
     "_cctally_dashboard.py": 3,
     "_cctally_dashboard_envelope.py": 5,
-    "_cctally_db.py": 7,
-    # NOT a read. The worker-loader failure says `cannot load cctally worker
-    # from {path}`, which the case-insensitive `FROM\s+{` pattern cannot tell
-    # from a dynamic SQL target. The module's SQL table names remain literal,
-    # so no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
-    "_cctally_diagnosis_sources.py": 1,
+    # Six, not seven: `cctally: rebuilt stats.db from {} journal segment(s)` is
+    # an operator line, not a statement, and no longer counts.
+    "_cctally_db.py": 6,
     "_cctally_doctor.py": 1,
     "_cctally_five_hour.py": 1,
-    "_cctally_journal.py": 18,
+    # Sixteen, not eighteen: the two `event {} rev {} conflicts with effective
+    # rev {} from {}` refusals are prose and no longer count.
+    "_cctally_journal.py": 16,
     "_cctally_pricing_check.py": 1,
     # One, in `_read_stats_component`: a single `SELECT {column} FROM
     # {table}` shared by `week_reset_events` and `weekly_credit_floors`,
@@ -332,17 +341,12 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # so no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
     "_cctally_quota_model.py": 1,
     "_cctally_quota.py": 1,
-    "_cctally_record.py": 1,
-    "_cctally_release.py": 4,
-    "_cctally_setup.py": 3,
-    "_cctally_tui.py": 1,
     # One, in `_codex_rollup_revision`: the table is selected from a hardcoded
     # pair of Codex conversation rollups. Neither is a quota projection table,
     # so no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
     "_lib_codex_conversation_query.py": 1,
     "_lib_conversation_query.py": 1,
     "_lib_conversation_retention.py": 2,
-    "_lib_doctor.py": 1,
     # Three: `_target_has_cursor_gap` selects one of the two accounting source
     # tables, while `_conversation_source_paths` and `_conversation_target_risk`
     # select one of the two transcript source tables. Every choice is hardcoded;
@@ -351,14 +355,6 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     "_lib_ingest_frontier.py": 3,
     "_lib_snapshot_cache.py": 1,
     "_lib_subscription_weeks.py": 1,
-    # NOT a read. `bin/_lib_test_estate.py` opens no database and issues no SQL;
-    # it is the #648 estate checker, and its one match is the English message
-    # `f"moved from {was!r} to {SKIPPED!r}"`, which the case-insensitive
-    # `FROM\s+{` pattern cannot tell from a dynamic target. Recorded rather than
-    # reworded, because the count is what makes a new match visible: if a real
-    # dynamic read ever arrives in that module the count moves to 2 and this
-    # guard reports it.
-    "_lib_test_estate.py": 1,
 }
 
 #: The dynamic-target reads that provably reach a projection family, named by

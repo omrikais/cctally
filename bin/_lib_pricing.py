@@ -62,7 +62,7 @@ def _chip_for_model(name: str) -> str:
 # fingerprint a store recorded and refuses a write from an older process. That
 # comparison is day-granular by construction, so two revisions sharing a date
 # compare equal and the older process is authorized to write.
-PRICING_SNAPSHOT_DATE = "2026-09-02"
+PRICING_SNAPSHOT_DATE = "2026-09-05"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 
@@ -512,17 +512,18 @@ def _claude_fast_multiplier(model: str) -> float:
 _unknown_model_warnings: set[str] = set()
 
 # ---------------------------------------------------------------------------
-# Codex / GPT-5 pricing table
+# Codex / OpenAI pricing table
 # ---------------------------------------------------------------------------
 #
 # Codex (OpenAI) API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
 # - Captured: 2026-07-19 — the last FULL Codex sync. PRICING_SNAPSHOT_DATE has
-#   since moved for four targeted syncs (2026-07-24, the Claude-side opus-5
+#   since moved for five targeted syncs (2026-07-24, the Claude-side opus-5
 #   sync; 2026-07-31, the gpt-5.6-terra/-luna correction logged below;
 #   2026-08-13, the Claude-side Sonnet/Mythos sync above; and 2026-08-25, the
-#   gpt-5.6-cyber addition logged below). Codex values outside those two Codex
-#   corrections were NOT re-verified on those days.
+#   gpt-5.6-cyber addition logged below; and 2026-09-05, the gpt-6-astra
+#   addition logged below). Codex values outside those three Codex corrections
+#   were NOT re-verified on those days.
 # - As of the 2026-07-19 sync this carries every openai-provider
 #   gpt-5* model the LiteLLM snapshot lists, so `pricing-check`'s scope finds
 #   nothing missing. Models absent from this table still fall back to `gpt-5`
@@ -561,6 +562,11 @@ _unknown_model_warnings: set[str] = set()
 #   into this date-blind table, because roughly half the retained Sol rows
 #   predate it. The accepted cost is that while the promotion runs, Sol
 #   reporting is high by 25% on input and 50% on output.
+#   2026-09-05 (#767): added gpt-6-astra at OpenAI's published $10.00 input /
+#   $1.00 cached input / $50.00 output per MTok. Prompts above 272,000 input
+#   tokens use the published $20.00 / $2.00 / $75.00 long-context card, and
+#   Fast mode is 2x the applicable rates. Verified against OpenAI's model page
+#   and the live LiteLLM snapshot; max_input_tokens is 922,000.
 #
 # Billing rules:
 # - reasoning_output_tokens is billed at the *output* rate (matches
@@ -696,6 +702,17 @@ CODEX_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "input_cost_per_token_above_272k_tokens": 2.5e-05,
         "cache_read_input_token_cost_above_272k_tokens": 2.5e-06,
         "output_cost_per_token_above_272k_tokens": 1.125e-04,
+    },
+    "gpt-6-astra": {
+        # Source: https://developers.openai.com/api/docs/models/gpt-6-astra
+        # Standard $10.00/M input, $1.00/M cached input, $50.00/M output;
+        # above 272K input, rates are 2x input/cache and 1.5x output.
+        "input_cost_per_token": 1e-05,
+        "cache_read_input_token_cost": 1e-06,
+        "output_cost_per_token": 5e-05,
+        "input_cost_per_token_above_272k_tokens": 2e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 2e-06,
+        "output_cost_per_token_above_272k_tokens": 7.5e-05,
     },
     # ── Issue #123: full gpt-5.x LiteLLM sync (2026-05-30 snapshot) ──
     # Exact model_prices_and_context_window.json values for every

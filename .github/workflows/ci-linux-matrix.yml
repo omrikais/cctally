@@ -56,6 +56,17 @@ jobs:
       TZ: "Etc/UTC"                                     # repo gotcha: Etc/UTC, not UTC
     steps:
       - uses: actions/checkout@v5
+        with:
+          # tests/test_schema_delivery_parity.py reconstructs the previous
+          # installable shape from the newest release tag that is a strict
+          # ancestor of HEAD, so this lane needs the tags AND the history that
+          # decides ancestry. A shallow checkout makes that node fail loudly
+          # rather than skip, which is deliberate: a lane that skipped there
+          # would report success over a comparison it never made. The public
+          # mirror runs this same file without carrying that module, and pays a
+          # full-history checkout of the much smaller public repository for it.
+          fetch-depth: 0
+          fetch-tags: true
       - uses: actions/setup-python@v6
         with:
           python-version: '${{ matrix.python-version }}'

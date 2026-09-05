@@ -1,0 +1,83 @@
+{
+  "schema_version": 2,
+  "mode": "install",
+  "result": "warn",
+  "symlinks": {
+    "created": 16,
+    "already": 0,
+    "replaced": 0,
+    "total": 16,
+    "destination": "/FAKE/.local/bin"
+  },
+  "hooks": {
+    "events_added": [
+      "PostToolBatch",
+      "Stop",
+      "SubagentStop"
+    ],
+    "settings_path": "/FAKE/.claude/settings.json"
+  },
+  "statusline_refresh": {
+    "state": "absent",
+    "value": null,
+    "action": "none"
+  },
+  "codex_hooks": {
+    "roots": [
+      {
+        "source_root_key": "ROOT_KEY",
+        "codex_home": "/FAKE/.codex",
+        "hooks_path": "/FAKE/.codex/hooks.json",
+        "stop_count": 1,
+        "subagent_stop_count": 1,
+        "feature_enabled": true,
+        "requires_review": true,
+        "remediation": "Review and trust the cctally handler in Codex /hooks.",
+        "error": null,
+        "state": "installed_untrusted",
+        "changes": {
+          "Stop": {
+            "added": 1,
+            "removed": 2,
+            "unchanged": 0
+          },
+          "SubagentStop": {
+            "added": 1,
+            "removed": 1,
+            "unchanged": 0
+          }
+        }
+      }
+    ],
+    "installed_count": 1,
+    "enabled_count": 0,
+    "all_roots_enabled": false,
+    "error_count": 0
+  },
+  "auth": {
+    "oauth_token_present": false
+  },
+  "path_includes_local_bin": false,
+  "legacy": {
+    "statusline_snippet_path": null,
+    "bespoke_hooks": {
+      "detected": false,
+      "settings_entries": [],
+      "files": []
+    }
+  },
+  "migration": {
+    "performed": false,
+    "reason": "not_detected"
+  },
+  "bootstrap": {
+    "session_cache_rows": 0,
+    "oauth_status": null
+  },
+  "telemetry": {
+    "enabled": true,
+    "reason": "enabled"
+  },
+  "warnings_count": 3,
+  "exit_code": 0
+}

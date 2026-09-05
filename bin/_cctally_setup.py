@@ -89,15 +89,27 @@ from _cctally_core import (
 )
 from _lib_codex_hooks import (
     CODEX_HOOK_EVENTS,
+    CODEX_HOOK_INSTALLED_STATES,
+    CodexHookSlotCollision,
     CodexHooksError,
     _plan_install as _codex_hooks_plan_install,
     _plan_uninstall as _codex_hooks_plan_uninstall,
     _read_hooks_document as _read_codex_hooks_document,
     _write_hooks_document_atomic as _write_codex_hooks_atomic,
+    acquire_codex_hooks_write_locks,
+    codex_config_path,
+    codex_hook_remediation,
     codex_hook_roots,
-    is_canonical_owned_codex_hook_handler,
-    is_owned_codex_hook_command,
+    observe_codex_hook_root,
+    read_codex_hook_state,
+    release_codex_hooks_write_locks,
 )
+
+# `setup --json` envelope version. Bumped to 2 by #719/#720: the `state` enum
+# lost `installed_review_required` and `codex_hooks.roots[].changes` changed
+# from an integer to a nested per-event object, and `docs/cli-contract.md`'s
+# additive-evolution rule does not cover either.
+SETUP_JSON_SCHEMA_VERSION = 2
 
 
 # Dev-instance isolation (§3): refusal message when `cctally setup` is run
@@ -1595,84 +1607,103 @@ def _setup_claude_available() -> bool:
     return (pathlib.Path.home() / ".claude").is_dir()
 
 
-def _codex_hooks_count(document: dict, binary: str) -> dict[str, dict[str, int]]:
-    hooks = document.get("hooks", {})
-    counts = {
-        event: {"owned": 0, "canonical": 0}
-        for event in CODEX_HOOK_EVENTS
-    }
-    for event in CODEX_HOOK_EVENTS:
-        for group in hooks.get(event, []):
-            for handler in group["hooks"]:
-                if is_owned_codex_hook_command(handler.get("command"), binary):
-                    counts[event]["owned"] += 1
-                if is_canonical_owned_codex_hook_handler(handler, binary):
-                    counts[event]["canonical"] += 1
-    return counts
-
-
 def _codex_hook_remediation(state: str) -> str | None:
-    messages = {
-        "absent": "Run `cctally setup` to install the native Codex handler.",
-        "malformed": "Fix the malformed hooks.json before cctally can manage it.",
-        "feature_disabled": "Unset CCTALLY_DISABLE_CODEX_HOOKS to enable native Codex hooks.",
-        "installed_review_required": "Review and trust the exact cctally handler in Codex /hooks.",
-        "installed_trust_unobservable": "Verify the exact cctally handler in Codex /hooks.",
-        "unavailable": "Ensure this configured Codex home is available, then re-run setup.",
-    }
-    return messages.get(state)
+    return codex_hook_remediation(state)
 
 
-def _codex_hook_row(root, binary: str, *, changed: bool = False) -> dict:
-    base = {
+def _codex_hook_row(root, binary: str | None = None) -> dict:
+    """One root's setup row, classified by the one shared kernel (§2.6)."""
+    observation = observe_codex_hook_root(root)
+    return {
         "source_root_key": root.source_root_key,
         "codex_home": str(root.codex_home),
         "hooks_path": str(root.hooks_path),
-        "stop_count": 0,
-        "subagent_stop_count": 0,
+        "stop_count": observation.counts.get("Stop", 0),
+        "subagent_stop_count": observation.counts.get("SubagentStop", 0),
         "feature_enabled": _codex_hooks_feature_enabled(),
-        "requires_review": False,
-        "remediation": None,
-        "error": None,
+        "requires_review": observation.requires_review,
+        "remediation": observation.remediation,
+        "error": observation.error,
+        "state": observation.state,
     }
-    if not base["feature_enabled"]:
-        state = "feature_disabled"
+
+
+def _codex_hooks_planner(mode: str, binary: str, root):
+    """A planner bound to one root's positional trust evidence."""
+    if mode == "install":
+        plan = _codex_hooks_plan_install
+    elif mode == "uninstall":
+        plan = _codex_hooks_plan_uninstall
     else:
-        try:
-            document = _read_codex_hooks_document(root.hooks_path)
-        except CodexHooksError as exc:
-            state = "malformed"
-            base["error"] = str(exc)
-        else:
-            counts = _codex_hooks_count(document, binary)
-            base["stop_count"] = counts["Stop"]["owned"]
-            base["subagent_stop_count"] = counts["SubagentStop"]["owned"]
-            if all(
-                counts[event] == {"owned": 1, "canonical": 1}
-                for event in CODEX_HOOK_EVENTS
-            ):
-                state = "installed_review_required" if changed else "installed_trust_unobservable"
-                base["requires_review"] = True if changed else None
-            else:
-                state = "absent"
-    base["state"] = state
-    base["remediation"] = _codex_hook_remediation(state)
-    return base
+        raise ValueError(f"unsupported Codex hooks mode: {mode}")
+
+    def _plan(document):
+        config_path = codex_config_path(root)
+        status, table = read_codex_hook_state(config_path)
+        if status == "unreadable":
+            # D1 requires proof that no handler lands on a stale positional
+            # key, and an unreadable table is exactly the absence of that
+            # proof — but only a plan that WRITES needs the proof. Compute
+            # the plan first with collision detection off, and refuse only
+            # when it would change something: spec §2.3 states that a
+            # no-change plan always proceeds, and refusing one stranded the
+            # entire install over a write that never happens.
+            planned, changes = plan(
+                document, binary, state_table=None, hooks_path=None,
+            )
+            if planned == document:
+                return planned, changes
+            raise CodexHookSlotCollision(root.hooks_path, [{
+                "kind": "state_unreadable", "event": "-",
+                "old_key": None, "new_key": None,
+                "config_path": str(config_path),
+            }], config_path=config_path)
+        return plan(
+            document, binary, state_table=table, hooks_path=root.hooks_path,
+        )
+
+    return _plan
+
+
+def _codex_changes_totals(changes: object) -> dict[str, int]:
+    totals = {"added": 0, "removed": 0, "unchanged": 0}
+    if isinstance(changes, dict):
+        for delta in changes.values():
+            if isinstance(delta, dict):
+                for axis in totals:
+                    totals[axis] += int(delta.get(axis) or 0)
+    return totals
+
+
+def _codex_changes_line(prefix: str, row: dict) -> str:
+    totals = _codex_changes_totals(row.get("changes"))
+    return (
+        f"{prefix} Codex hooks at {row['hooks_path']}: "
+        f"{totals['added']} added, {totals['removed']} removed, "
+        f"{totals['unchanged']} unchanged"
+    )
 
 
 def _setup_codex_hooks_preflight(
     binary: str, *, validate_feature_disabled: bool = False,
+    plan_mode: str | None = None,
 ) -> list[dict]:
-    """Read/validate every managed file before any setup mutation.
+    """Read/validate/plan every managed file before any setup mutation.
 
     Feature-disabled status and preview normally avoid reading Codex
     configuration because installation is inactive. Mutating install and
     uninstall pass ``validate_feature_disabled=True`` so both fail closed on
     every malformed managed file before changing any provider-owned surface.
+
+    ``plan_mode`` additionally runs the planner read-only over every root, so
+    a positional-slot refusal (spec §2.3) is raised before install has
+    created a symlink or uninstall has rewritten ``settings.json``. This path
+    never creates the hooks directory or the ``.cctally.lock`` file, which is
+    what makes the refusal's "no configuration file was changed" literal.
     """
     rows: list[dict] = []
     for root in _setup_codex_hook_roots():
-        row = _codex_hook_row(root, binary)
+        row = _codex_hook_row(root)
         if validate_feature_disabled and row["state"] == "feature_disabled":
             try:
                 _read_codex_hooks_document(root.hooks_path)
@@ -1680,50 +1711,157 @@ def _setup_codex_hooks_preflight(
                 row["state"] = "malformed"
                 row["error"] = str(exc)
                 row["remediation"] = _codex_hook_remediation("malformed")
+        planning = plan_mode
+        if planning == "install" and row["state"] == "feature_disabled":
+            planning = None
+        if planning is not None and row["state"] != "malformed":
+            try:
+                document = _read_codex_hooks_document(root.hooks_path)
+                _planned, changes = _codex_hooks_planner(
+                    planning, binary, root)(document)
+            except CodexHooksError as exc:
+                row["state"] = "malformed"
+                row["error"] = str(exc)
+                row["remediation"] = _codex_hook_remediation("malformed")
+            else:
+                row["changes"] = changes
         rows.append(row)
     return rows
 
 
 def _setup_manage_codex_hooks(mode: str, binary: str) -> dict:
-    """Apply owned-only install/uninstall surgery to every detected home."""
+    """Apply owned-only install/uninstall surgery to every detected home.
+
+    Every applicable root's writer lock is held for the whole operation, and
+    the plan is decided for all of them before the first write, so a refusal
+    on the second root cannot leave the first one already rewritten.
+    """
     rows: list[dict] = []
+    applicable = []
     for root in _setup_codex_hook_roots():
         # The feature switch prevents new native-hook installation, but must
         # never strand handlers that an operator explicitly asks setup to
         # uninstall.  Malformed documents still remain fail-closed.
         if mode == "install" and not _codex_hooks_feature_enabled():
-            rows.append(_codex_hook_row(root, binary))
+            rows.append(_codex_hook_row(root))
             continue
-        try:
-            if mode == "install":
-                planner = lambda document: _codex_hooks_plan_install(document, binary)
-            elif mode == "uninstall":
-                planner = lambda document: _codex_hooks_plan_uninstall(document, binary)
-            else:
-                raise ValueError(f"unsupported Codex hooks mode: {mode}")
-            _planned, changes, changed, _backup = _write_codex_hooks_atomic(
-                root.hooks_path, transform=planner,
+        applicable.append(root)
+    if not applicable:
+        return _codex_hooks_summary(rows)
+
+    held = acquire_codex_hooks_write_locks(applicable)
+    changed_paths: list[pathlib.Path] = []
+    backup_paths: dict[str, pathlib.Path] = {}
+    try:
+        failures: dict[str, str] = {}
+        for root, _fd in held:
+            planner = _codex_hooks_planner(mode, binary, root)
+            try:
+                planner(_read_codex_hooks_document(root.hooks_path))
+            except CodexHooksError as exc:
+                failures[root.source_root_key] = str(exc)
+        for root, fd in held:
+            error = failures.get(root.source_root_key)
+            if error is not None:
+                row = _codex_hook_row(root)
+                row["state"] = "malformed"
+                row["requires_review"] = False
+                row["remediation"] = _codex_hook_remediation("malformed")
+                row["error"] = error
+                rows.append(row)
+                continue
+            planner = _codex_hooks_planner(mode, binary, root)
+            _planned, changes, changed, backup = _write_codex_hooks_atomic(
+                root.hooks_path, transform=planner, lock_fd=fd,
                 harden_unchanged=(mode == "install"),
             )
-            row = _codex_hook_row(root, binary, changed=(mode == "install" and changed))
+            if changed:
+                changed_paths.append(root.hooks_path)
+                # `backup` is None when the writer CREATED the document, so
+                # there was no previous content to save. Recorded rather than
+                # re-derived at render time: the writer reuses a same-day
+                # backup instead of overwriting it, so the file that holds the
+                # pre-run content is the one the writer names, not whatever
+                # today's date happens to spell.
+                if backup is not None:
+                    backup_paths[str(root.hooks_path)] = backup
+            row = _codex_hook_row(root)
             row["changes"] = changes
             rows.append(row)
-        except CodexHooksError as exc:
-            initial = _codex_hook_row(root, binary)
-            initial["state"] = "malformed"
-            initial["requires_review"] = False
-            initial["remediation"] = _codex_hook_remediation("malformed")
-            initial["error"] = str(exc)
-            rows.append(initial)
+    except CodexHookSlotCollision as exc:
+        # A TOCTOU window separates the read-only preflight from these locked
+        # writes: the preflight plans without the write locks, so another
+        # process — or Codex itself — can rewrite `config.toml` in between.
+        # The refusal is still correct here, but its "no configuration file
+        # was changed" promise is not, because the caller has already written
+        # the symlinks and `settings.json` — and, once the write loop has
+        # passed one root, that root's `hooks.json` too. `changed_paths`
+        # carries exactly the files this function replaced, so the diagnostic
+        # can name them instead of denying them.
+        raise CodexHookSlotCollision(
+            exc.hooks_path, exc.findings, exc.stale_keys,
+            config_path=exc.config_path, after_mutation=True,
+            changed_paths=changed_paths, backup_paths=backup_paths,
+        ) from exc
+    finally:
+        release_codex_hooks_write_locks(held)
+    rows.sort(key=lambda row: row["source_root_key"])
     return _codex_hooks_summary(rows)
 
 
+def _setup_codex_collision_refusal(
+    exc: CodexHookSlotCollision, *, mode: str, is_json: bool,
+) -> int:
+    """Refuse the whole run at exit 1 (spec §2.3).
+
+    Handles both refusal cases. On the pre-mutation path nothing has changed
+    at all; on the after-mutation path the symlinks and ``settings.json`` are
+    already written, and a sibling root's ``hooks.json`` may be too, so
+    `exc.after_mutation` and `exc.changed_paths` carry which case this is.
+
+    `--json` gets the same reason a human does: a machine-readable caller
+    needs to know why the reconcile stopped as much as an operator does, and
+    must be able to read that distinction off a field rather than the prose.
+    """
+    eprint(f"setup: {exc}")
+    if is_json:
+        print(json.dumps({
+            "schema_version": SETUP_JSON_SCHEMA_VERSION,
+            "mode": mode,
+            "result": "err",
+            "reason": "codex_hook_slot_collision",
+            "error": str(exc),
+            "hooks_path": str(exc.hooks_path),
+            "config_path": str(exc.config_path),
+            # Additive under `docs/cli-contract.md`'s optional-key rule, so
+            # `schema_version` stays 2. Without them a caller can only learn
+            # that the earlier steps landed by substring-matching `error`.
+            "after_mutation": exc.after_mutation,
+            "changed_hooks_paths": [str(path) for path in exc.changed_paths],
+            "changed_hooks_backups": {
+                path: str(backup)
+                for path, backup in sorted(exc.backup_paths.items())
+            },
+            "findings": exc.findings,
+            "stale_state_keys": exc.stale_keys,
+            "codex_hooks": _codex_hooks_summary(_setup_codex_hooks_preflight("")),
+            "exit_code": 1,
+        }, indent=2))
+    return 1
+
+
 def _codex_hooks_summary(rows: list[dict]) -> dict:
-    installed_states = {"installed_review_required", "installed_trust_unobservable"}
+    installed = [row for row in rows if row["state"] in CODEX_HOOK_INSTALLED_STATES]
+    enabled = [row for row in rows if row["state"] == "installed_enabled"]
     return {
         "roots": rows,
-        "installed_count": sum(1 for row in rows if row["state"] in installed_states),
-        "error_count": sum(1 for row in rows if row["state"] in {"malformed", "unavailable"}),
+        "installed_count": len(installed),
+        "enabled_count": len(enabled),
+        "all_roots_enabled": (None if not rows else len(enabled) == len(rows)),
+        # `unavailable` is retained in the remediation map for compatibility
+        # but is never emitted: `codex_hook_roots` drops a configured home
+        # that is not a directory, so it yields no row at all.
+        "error_count": sum(1 for row in rows if row["state"] == "malformed"),
     }
 
 
@@ -1764,7 +1902,7 @@ def _setup_status(args: argparse.Namespace) -> int:
 
     if getattr(args, "json", False):
         envelope = {
-            "schema_version": 1,
+            "schema_version": SETUP_JSON_SCHEMA_VERSION,
             "install": {
                 "symlinks_present": sym_ok,
                 "symlinks_total": len(c.SETUP_SYMLINK_NAMES),
@@ -1879,9 +2017,16 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
     out: list[str] = []
     repo_root = _setup_resolve_repo_root()
     codex_binary = str(_setup_resolve_hook_target(repo_root))
-    codex_preflight = _setup_codex_hooks_preflight(
-        codex_binary, validate_feature_disabled=True,
-    )
+    # Uninstall writes settings.json first, so its Codex planning must run
+    # here. Moving a foreign handler can misapply another handler's recorded
+    # trust even after cctally has left (spec §2.3).
+    try:
+        codex_preflight = _setup_codex_hooks_preflight(
+            codex_binary, validate_feature_disabled=True, plan_mode="uninstall",
+        )
+    except CodexHookSlotCollision as exc:
+        return _setup_codex_collision_refusal(
+            exc, mode="uninstall", is_json=is_json)
     bad_codex = next((row for row in codex_preflight if row["state"] == "malformed"), None)
     if bad_codex is not None:
         eprint(f"setup: {bad_codex['error']}")
@@ -1903,12 +2048,14 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
                 return 2
         out.append(f"Removed {removed} hook entries from {_cctally_core.CLAUDE_SETTINGS_PATH}")
 
-    codex_hooks = _setup_manage_codex_hooks("uninstall", codex_binary)
+    try:
+        codex_hooks = _setup_manage_codex_hooks("uninstall", codex_binary)
+    except CodexHookSlotCollision as exc:
+        return _setup_codex_collision_refusal(
+            exc, mode="uninstall", is_json=is_json)
     for row in codex_hooks["roots"]:
-        changes = row.get("changes", {})
-        count = sum(changes.values()) if isinstance(changes, dict) else 0
-        if count:
-            out.append(f"Removed {count} Codex hook entries from {row['hooks_path']}")
+        if "changes" in row:
+            out.append(_codex_changes_line("Reconciled", row))
 
     dst_dir = _setup_local_bin_dir()
     sym_removed = 0
@@ -1984,7 +2131,7 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
             if is_json:
                 # Spec: under --json without --yes, auto-decline. Script with --yes instead.
                 print(json.dumps({
-                    "schema_version": 1,
+                    "schema_version": SETUP_JSON_SCHEMA_VERSION,
                     "mode": "uninstall",
                     "result": "purge_declined",
                     "reason": "json_without_yes",
@@ -2019,7 +2166,7 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
             except OSError as exc:
                 if is_json:
                     print(json.dumps({
-                        "schema_version": 1,
+                        "schema_version": SETUP_JSON_SCHEMA_VERSION,
                         "mode": "uninstall",
                         "result": "err",
                         "reason": "rmtree_failed",
@@ -2041,7 +2188,7 @@ def _setup_uninstall(args: argparse.Namespace) -> int:
         )
     if is_json:
         envelope = {
-            "schema_version": 1,
+            "schema_version": SETUP_JSON_SCHEMA_VERSION,
             "mode": "uninstall",
             "result": "ok",
             "hooks_removed": removed,
@@ -2113,7 +2260,15 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
             out.append("  Remove them manually then re-run.")
 
     abs_path = str(_setup_resolve_hook_target(repo_root))
-    codex_hooks = _codex_hooks_summary(_setup_codex_hooks_preflight(abs_path))
+    # `--dry-run` reuses the planner without the writer, so it reports the
+    # same three delta axes the applied run reports and still creates neither
+    # the hooks directory nor the `.cctally.lock` file (spec §2.3).
+    try:
+        codex_hooks = _codex_hooks_summary(_setup_codex_hooks_preflight(
+            abs_path, plan_mode="install"))
+    except CodexHookSlotCollision as exc:
+        return _setup_codex_collision_refusal(
+            exc, mode="dry-run", is_json=bool(getattr(args, "json", False)))
     import shlex
     quoted = shlex.quote(abs_path)
     if claude_available:
@@ -2139,9 +2294,7 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
         elif row["state"] == "feature_disabled":
             out.append(f"Codex hooks disabled for {row['codex_home']}")
         else:
-            out.append(
-                f"Would add native Codex Stop/SubagentStop handlers to {row['hooks_path']}"
-            )
+            out.append(_codex_changes_line("Would reconcile", row))
     # Spec §2 mode×flag matrix — three distinct dry-run rendering paths
     # when legacy is detected:
     #   --dry-run --no-migrate-legacy-hooks → migration block omitted entirely
@@ -2200,7 +2353,7 @@ def _setup_dry_run(args: argparse.Namespace) -> int:
             decision = "prompt"
         legacy_path = _setup_detect_legacy_snippet()
         envelope = {
-            "schema_version": 1,
+            "schema_version": SETUP_JSON_SCHEMA_VERSION,
             "mode": "dry-run",
             "symlinks": (
                 {"skipped": True, "reason": "brew", "would_create": 0,
@@ -2425,9 +2578,16 @@ def _setup_install(args: argparse.Namespace) -> int:
             eprint(f"setup: {exc}")
             return 1
 
-    codex_preflight = _setup_codex_hooks_preflight(
-        abs_path, validate_feature_disabled=True,
-    )
+    # Read-only, all-root preflight: plan every Codex root before the first
+    # symlink or settings.json write, so a positional-slot refusal leaves the
+    # whole install untouched (spec §2.3).
+    try:
+        codex_preflight = _setup_codex_hooks_preflight(
+            abs_path, validate_feature_disabled=True, plan_mode="install",
+        )
+    except CodexHookSlotCollision as exc:
+        return _setup_codex_collision_refusal(
+            exc, mode="install", is_json=bool(getattr(args, "json", False)))
     bad_codex = next((row for row in codex_preflight if row["state"] == "malformed"), None)
     if bad_codex is not None:
         eprint(f"setup: {bad_codex['error']}")
@@ -2596,17 +2756,19 @@ def _setup_install(args: argparse.Namespace) -> int:
             eprint(f"setup: failed to write {_cctally_core.CLAUDE_SETTINGS_PATH}: {exc}")
             return 2
 
-    codex_hooks = _setup_manage_codex_hooks("install", abs_path)
+    try:
+        codex_hooks = _setup_manage_codex_hooks("install", abs_path)
+    except CodexHookSlotCollision as exc:
+        return _setup_codex_collision_refusal(
+            exc, mode="install", is_json=bool(getattr(args, "json", False)))
     for row in codex_hooks["roots"]:
-        changes = row.get("changes", {})
-        count = sum(changes.values()) if isinstance(changes, dict) else 0
-        if count:
-            out.append(f"✓ Wrote {count} Codex hook entries to {row['hooks_path']}")
-        if row["state"] == "installed_review_required":
-            out.append("⚠ Codex hook trust needs review in Codex /hooks.")
-            warnings += 1
-        elif row["state"] == "malformed":
+        if "changes" in row:
+            out.append(_codex_changes_line("✓ Reconciled", row))
+        if row["state"] == "malformed":
             out.append(f"⚠ Codex hooks unavailable: {row['error']}")
+            warnings += 1
+        elif row["state"] not in ("installed_enabled", "feature_disabled"):
+            out.append(f"⚠ {row['remediation']}")
             warnings += 1
 
     # ── Post-write migration apply (spec §2 steps 6a, 6b) ──
@@ -2822,7 +2984,7 @@ def _setup_install(args: argparse.Namespace) -> int:
         # envelope reports the opt-out state without arming telemetry.
         tele_enabled, tele_reason = c.resolve_telemetry_state(c.load_config())
         envelope = {
-            "schema_version": 1,
+            "schema_version": SETUP_JSON_SCHEMA_VERSION,
             "mode": "install",
             "result": "warn" if warnings else "ok",
             "symlinks": {

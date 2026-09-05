@@ -13,21 +13,31 @@
 
 import type {
   Envelope,
+  MeterRateChangeEntry,
   SourceAlertRow,
   SourceName,
+  ThresholdSeverity,
 } from '../types/envelope';
 import type { SourceView } from '../store/sourceView';
 import { AXIS_CHIP_LABEL, alertSeverity } from './alertAxis';
 
-export type AlertSeverity = 'info' | 'warn' | 'critical';
+export type AlertSeverity = ThresholdSeverity;
 
 export interface AlertAccount {
   key: string;
   label: string;
 }
 
-export function alertAccount(row: SourceAlertRow): AlertAccount | null {
-  const fields = row as SourceAlertRow & {
+// #700 — ONE account accessor for every alert family, so no surface can grow
+// its own gate and disagree with the others about a label, about the label
+// fallback, or about the `*` vendor-wide sentinel. It reads only the account
+// fields, which both the threshold rows and the metering-rate entries carry
+// under the same R8 decoration rule, so accepting the second family is a
+// signature change with no behaviour change.
+export function alertAccount(
+  row: SourceAlertRow | MeterRateChangeEntry,
+): AlertAccount | null {
+  const fields = row as {
     accountKey?: string;
     accountLabel?: string;
     account_key?: string;

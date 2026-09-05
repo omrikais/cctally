@@ -613,6 +613,76 @@ assert_contains "project-budget-text bar-90 subtitle" \
 assert_contains "project-budget-text bar-90 body" \
     "BODY	Project bar - \$18.00 of \$20.00 (90% of budget)" "$out"
 
+# --- Non-registry alert text goldens (`quota`, `meter_rate_change`, #699) ---
+# The two families `alerts test` can now rehearse. Unlike the six threshold
+# axes, their text builders live in the GLUE module `bin/_cctally_alerts.py`
+# rather than in the `_lib_alerts_payload` kernel, so they are loaded from
+# there. Rendering the REAL builders is the point: a rehearsal that showed
+# different words from a real crossing would certify nothing.
+render_nonregistry () {
+    # $1 = family (`meter_rate_change` | `quota`)
+    python3 - "$REPO_ROOT" "$1" <<'PYEOF'
+import importlib.util, pathlib, sys
+from importlib.machinery import SourceFileLoader
+repo, family = sys.argv[1:3]
+root = pathlib.Path(repo)
+sys.path.insert(0, str(root / "bin"))
+
+
+def _load(name):
+    loader = SourceFileLoader(name, str(root / "bin" / (name + ".py")))
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    loader.exec_module(mod)
+    return mod
+
+
+alerts = _load("_cctally_alerts")
+if family == "meter_rate_change":
+    mrc = _load("_lib_meter_rate_change")
+    previous, new = 2442620.0, 1665096.0
+    payload = mrc.alert_payload(mrc.RateChangeTransition(
+        provider="claude", account_key="*",
+        effective_from="2026-08-25T00:00:00Z",
+        previous_units_per_point=previous, new_units_per_point=new,
+        severity=mrc.transition_severity(previous, new),
+        detected_at="2026-08-29T00:00:00Z",
+        withholding_status="unsupported-model-mix",
+        detector_input_causes='["unsupported-composition"]',
+        composition_provenance='["forecast-aggregate"]',
+        baseline_withheld_days=3))
+    title, subtitle, body = alerts._alert_text_meter_rate_change(payload, None)
+    print("SEVERITY\t" + str(payload["severity"]))
+else:
+    payload = alerts._build_alert_payload_quota(
+        source="codex", source_root_key="default",
+        logical_limit_key="weekly", observed_slot="2026-08-27T00:00:00Z",
+        window_minutes=10080, resets_at_utc="2026-09-03T00:00:00Z",
+        threshold=90, kind="weekly", crossed_at_utc="2026-08-29T00:00:00Z",
+        qualifying_percent=90.0, projected_percent=95.0)
+    title, subtitle, body = alerts._alert_text_quota(payload, None)
+print("TITLE\t" + str(title))
+print("SUB\t" + str(subtitle))
+print("BODY\t" + str(body))
+PYEOF
+}
+
+# The rate-change family carries an EXPLICIT severity, never derived from a
+# threshold, and these rates are a 31.8% drop, which is `alarm`.
+out="$(render_nonregistry meter_rate_change)"
+assert_contains "non-registry rate-change severity is explicit" \
+    "SEVERITY	alarm" "$out"
+assert_contains "non-registry rate-change title" \
+    "TITLE	cctally - Claude metering rate changed" "$out"
+# The body must name the WITHHELD calibration rather than send the reader to a
+# fitted budget that the withheld calibration may never have produced (#690).
+assert_contains "non-registry rate-change body names the withholding" \
+    "The calibration was withheld (unsupported-model-mix)" "$out"
+
+out="$(render_nonregistry quota)"
+assert_contains "non-registry quota title" "TITLE	cctally" "$out"
+
 echo
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]

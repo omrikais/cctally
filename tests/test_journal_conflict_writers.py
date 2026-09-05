@@ -946,6 +946,171 @@ def test_red_credit_effects_diverges_when_the_queried_state_moves(ns):
 
 
 # --------------------------------------------------------------------------
+# Family 4b — `wce:replay:` (#750 S3 §1.5). The SAME family under a different
+# id shape: the refused-insert recovery digests its own payload into its id,
+# because that payload is a live query over `weekly_usage_snapshots` and no
+# exclusion can make it a pure function of the triggering observation. These
+# two cases drive the PRODUCTION emitter (`_fire_in_place_credit`) rather than
+# a hand-rolled `emit_model_a`, because the property under test is a property
+# of that call site's id construction.
+# --------------------------------------------------------------------------
+
+_REPLAY_ORIGIN = "o:aaaaaaaaaaaaaaaa"
+_REPLAY_WEEK_START = "2026-07-20"
+_REPLAY_WEEK_END = "2026-07-27T00:00:00+00:00"
+_REPLAY_EFFECTIVE = dt.datetime(2026, 7, 25, 12, 0, 0, tzinfo=dt.timezone.utc)
+_REPLAY_BASELINE = 63.0
+
+
+def _seed_credited_origin(conn):
+    """The committed in-place credit whose origin a retry collides on.
+
+    `_fire_in_place_credit` reaches the recovery leg only when its
+    `INSERT OR IGNORE` is refused, and after epoch 1013 the partial unique
+    index over `(account_key, origin_observation_id)` is what refuses it."""
+    effective = _REPLAY_EFFECTIVE.isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT INTO week_reset_events "
+        "(detected_at_utc, old_week_end_at, new_week_end_at, "
+        " effective_reset_at_utc, observed_pre_credit_pct, account_key, "
+        " origin_observation_id) VALUES (?,?,?,?,?,?,?)",
+        (AT, effective, _REPLAY_WEEK_END, effective, _REPLAY_BASELINE,
+         ACCOUNT, _REPLAY_ORIGIN),
+    )
+    conn.commit()
+
+
+def _seed_poisoned_replica(conn, journal_id, *, minute):
+    """One stale pre-credit replica inside the credit's own DELETE band."""
+    _seed_snapshot(
+        conn,
+        journal_id=journal_id,
+        percent=_REPLAY_BASELINE,
+        source="record-usage",
+        captured=_REPLAY_EFFECTIVE.replace(minute=minute)
+        .isoformat(timespec="seconds").replace("+00:00", "Z"),
+    )
+
+
+def _replay_emitter(ns, conn, clock):
+    def _emit(ctx):
+        return ns["_fire_in_place_credit"](
+            conn, _REPLAY_WEEK_START, _REPLAY_WEEK_END, 2.0,
+            observed_pre_credit_pct=_REPLAY_BASELINE,
+            effective_dt=_REPLAY_EFFECTIVE,
+            as_of=clock["now"], commit=False, ctx=ctx,
+            account_key=ACCOUNT, origin_observation_id=_REPLAY_ORIGIN,
+        )
+    return _emit
+
+
+def _assert_id_is_the_payload_digest(events):
+    """Every `wce:replay:` id must BE `origin + digest(payload)`.
+
+    Constructed with `evt_id` + `effects_payload_digest` rather than matched by
+    prefix, per the opaque-token rule in `docs/journal-gotchas.md`. It is also
+    the strictly stronger assertion: a prefix match passes for any suffix,
+    including a random one.
+
+    `kind` is dropped first. The digest's input is the payload the emitter
+    passes as `columns`; `make_evt` adds the fold discriminator to the payload
+    afterwards, so the decoded line carries one key the digest never saw."""
+    for event in events:
+        digested = {k: v for k, v in event["payload"].items() if k != "kind"}
+        assert event["id"] == J.evt_id(
+            "wce", "replay", _REPLAY_ORIGIN,
+            J.effects_payload_digest(digested)), event["id"]
+
+
+def test_wce_replay_unchanged_retry_reproduces_the_whole_line(ns):
+    """The property §1.5, the emit-site comment and `docs/journal-gotchas.md`
+    all rest on, asserted for the first time: a crash retry of one refused
+    insert against ONE poisoned set reproduces the whole line, so it collapses
+    to the duplicate the journal already tolerates.
+
+    The two sibling `wce:replay:` cases in `tests/test_exact_origin_credit_
+    dedup.py` prove only that two DIFFERENT payloads take two DIFFERENT ids. A
+    random suffix satisfies both of them while making every crash retry append
+    a NEW event — unbounded journal growth in the retry count, with each
+    aborted attempt's stale suppression list journalled permanently beside the
+    retry's.
+
+    The wall clock is deliberately moved between the two attempts, exactly as
+    the `wcs:` sibling above does it. `at` sits outside the id and inside the
+    line's content hash, so a wall-clock `at` reproduces the id and not the
+    line, and the second attempt classifies as a same-revision conflict rather
+    than as the tolerated duplicate."""
+    jr = _jr()
+    conn = jr._cctally_core.open_db()
+    clock = {"now": AT}
+    try:
+        _seed_credited_origin(conn)
+        _seed_poisoned_replica(conn, "sa:poisoned:0", minute=10)
+        emit = _replay_emitter(ns, conn, clock)
+
+        with pytest.raises(RuntimeError, match="forced abort"):
+            _run_in_cycle(conn, emit, abort=True)
+        clock["now"] = "2026-07-25T15:00:45Z"
+        _run_in_cycle(conn, emit)
+    finally:
+        conn.close()
+
+    records = _journal_lines()
+    replayed = _evts(records, "wce:replay:")
+    assert len(replayed) == 2, (
+        "both attempts append, because `emit_model_a` fsyncs the line before "
+        "the commit the abort rolls back", [e["id"] for e in replayed])
+    assert len({e["id"] for e in replayed}) == 1, (
+        "an unchanged retry must reproduce the id; a suffix that is not a "
+        "function of the payload makes every retry a new event",
+        [e["id"] for e in replayed])
+    assert _same_rev_conflicts(records) == set(), (
+        "the retry reproduced the id but not the line, so the journal sees a "
+        "same-revision conflict instead of the duplicate it tolerates")
+    _assert_id_is_the_payload_digest(replayed)
+    assert [e["payload"]["suppression"] for e in replayed] == [
+        ["sa:poisoned:0"], ["sa:poisoned:0"]]
+
+
+def test_wce_replay_moved_poisoned_set_takes_a_second_id_not_a_conflict(ns):
+    """The other half of the same property: when the queried state DOES move
+    between the aborted attempt and the retry, the two payloads are
+    legitimately different and the digest gives them two ids.
+
+    Under `wce:replay:<origin>` alone this is the `CLASSIFY_CONFLICT` §1.5
+    names — the second line withheld, `_converge_row_from_effective` dropping
+    it because the family is effects-only, `emit_model_a` returning normally,
+    and the second DELETE left standing as exactly the inline-only effect the
+    event exists to replace."""
+    jr = _jr()
+    conn = jr._cctally_core.open_db()
+    clock = {"now": AT}
+    try:
+        _seed_credited_origin(conn)
+        _seed_poisoned_replica(conn, "sa:poisoned:0", minute=10)
+        emit = _replay_emitter(ns, conn, clock)
+
+        with pytest.raises(RuntimeError, match="forced abort"):
+            _run_in_cycle(conn, emit, abort=True)
+
+        _seed_poisoned_replica(conn, "sa:poisoned:1", minute=20)
+        _run_in_cycle(conn, emit)
+    finally:
+        conn.close()
+
+    records = _journal_lines()
+    replayed = _evts(records, "wce:replay:")
+    assert [e["payload"]["suppression"] for e in replayed] == [
+        ["sa:poisoned:0"], ["sa:poisoned:0", "sa:poisoned:1"]], (
+        "the retry must see the widened poisoned set the abort rolled back to")
+    assert len({e["id"] for e in replayed}) == 2, (
+        "two legitimate payloads under one id is the withheld-line defect",
+        [e["id"] for e in replayed])
+    assert _same_rev_conflicts(records) == set()
+    _assert_id_is_the_payload_digest(replayed)
+
+
+# --------------------------------------------------------------------------
 # Family 5 — snapshot_accept (Model-A). Spec §7.5.
 # EXPECTED NEGATIVE: the payload carries no wall clock.
 # --------------------------------------------------------------------------

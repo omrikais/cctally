@@ -110,24 +110,27 @@
                 },
                 {
                     "details": {
+                        "enabled_root_count": 2,
                         "installed_root_count": 2,
-                        "requires_review": null,
+                        "requires_review": false,
+                        "responsible_root_key": null,
                         "root_count": 2,
                         "states": [
                             {
                                 "source_root_key": "$CODEX_ROOT_1",
-                                "state": "installed_trust_unobservable"
+                                "state": "installed_enabled"
                             },
                             {
                                 "source_root_key": "$CODEX_ROOT_2",
-                                "state": "installed_trust_unobservable"
+                                "state": "installed_enabled"
                             }
                         ],
-                        "trust_state": "unobservable"
+                        "trust_state": "enabled",
+                        "worst_state": null
                     },
                     "id": "hooks.codex_installed",
                     "severity": "ok",
-                    "summary": "2/2 root(s) installed",
+                    "summary": "2/2 root(s) enabled",
                     "title": "Codex hooks installed"
                 },
                 {
@@ -160,8 +163,38 @@
                     "id": "hooks.codex_recent_activity",
                     "remediation": "Trigger Codex activity, then verify `cctally setup` hooks.",
                     "severity": "warn",
-                    "summary": "2 installed root(s); stale",
+                    "summary": "2 enabled root(s); stale",
                     "title": "Codex recent activity"
+                },
+                {
+                    "details": {
+                        "age_seconds": 120,
+                        "last_success_at": "2026-05-13T14:20:31Z",
+                        "liveness_state": "recent",
+                        "marker_count": 1,
+                        "responsible_root_key": "$CODEX_ROOT_1",
+                        "roots": [
+                            {
+                                "age_seconds": 120,
+                                "last_success_at": "2026-05-13T14:20:31Z",
+                                "liveness_state": "recent",
+                                "marker_count": 1,
+                                "source_root_key": "$CODEX_ROOT_1"
+                            },
+                            {
+                                "age_seconds": 120,
+                                "last_success_at": "2026-05-13T14:20:31Z",
+                                "liveness_state": "recent",
+                                "marker_count": 1,
+                                "source_root_key": "$CODEX_ROOT_2"
+                            }
+                        ],
+                        "window_seconds": 604800
+                    },
+                    "id": "hooks.codex_liveness_7d",
+                    "severity": "ok",
+                    "summary": "2 enabled root(s); recent",
+                    "title": "Codex hook liveness (7d)"
                 }
             ],
             "id": "hooks",
@@ -223,7 +256,7 @@
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1011,
+                            "epoch": 1013,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -1117,7 +1150,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 59,
+            "ok": 60,
             "warn": 6
         },
         "severity": "warn"

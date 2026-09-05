@@ -294,6 +294,70 @@ def evt_id(kind: str, *parts: object) -> str:
     return f"{kind}:" + ":".join(str(p) for p in parts)
 
 
+#: The literal that separates the two `week_reset_events` identity shapes. It
+#: cannot collide with a legacy tuple part, because both legacy parts are ISO
+#: timestamps.
+WEEK_RESET_ORIGIN_MARKER = "origin"
+
+
+def week_reset_identity_parts(account_key, old_week_end_at, new_week_end_at,
+                              origin_observation_id):
+    """The ordered natural-key id parts for one `week_reset_events` row.
+
+    #750 S3 §1.1. Identity on that table is DUAL-SHAPED, because epoch 1013
+    gives new rows an `origin_observation_id` while every retained row has
+    none:
+
+    * a non-null origin returns ``(account_key, "origin", origin)``, which
+      `evt_id` spells ``wr:<account>:origin:o:<hex>`` and which matches the
+      partial unique index over `(account_key, origin_observation_id)`;
+    * a null origin returns the legacy tuple
+      ``(account_key, old_week_end_at, new_week_end_at)``, keeping the exact
+      ``wr:<account>:<old>:<new>`` spelling that already-journaled milestone
+      references name, and matching the partial unique index that governs
+      origin-null rows.
+
+    This is the ONE producer of those parts. `_build_harvest_evt` derives both
+    the evt id and the `ctx.suppression_map` lookup key from it, and
+    `_fire_in_place_credit` writes the map under the same key, so the SQL
+    identity and the journal identity cannot drift apart. Two call sites
+    computing the parts separately is precisely how a destructive effect would
+    stop riding its own event.
+
+    An empty string is treated as no origin: a NULL column that has round-
+    tripped through a payload can arrive that way, and an id built on it would
+    be neither shape.
+    """
+    if origin_observation_id:
+        return (account_key, WEEK_RESET_ORIGIN_MARKER, origin_observation_id)
+    return (account_key, old_week_end_at, new_week_end_at)
+
+
+def effects_payload_digest(payload: dict) -> str:
+    """A 16-hex digest over an effects-only evt payload, for its id.
+
+    An evt id must discriminate every payload a family can emit under it,
+    because two different payloads sharing one id classify as
+    `CLASSIFY_CONFLICT` and the second is never appended. For most families
+    the natural key already does that. `weekly_credit_effects` emitted by the
+    refused-insert recovery cannot: its `suppression` list is whatever
+    poisoned snapshots exist when the DELETE runs, so one originating
+    observation can legitimately produce two different removals, and the
+    second would be withheld and left as an inline-only effect a rebuild
+    undoes. Folding this digest into the id makes each distinct removal its
+    own event while a genuine byte-identical replay still collapses to the
+    duplicate the journal already tolerates.
+
+    The digest is over the canonical JSON, so it is stable under key order.
+    Reproducing it from a decoded line takes one step: the input is the payload
+    the emitter passes as `columns`, and `make_evt` adds the `kind` fold
+    discriminator to the payload AFTERWARDS, so a reader must drop `kind`
+    before re-digesting.
+    """
+    return hashlib.sha256(
+        _canonical_json(payload).encode("utf-8")).hexdigest()[:16]
+
+
 # --------------------------------------------------------------------------
 # fully-formed line records
 # --------------------------------------------------------------------------

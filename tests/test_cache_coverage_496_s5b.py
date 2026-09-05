@@ -18,6 +18,7 @@ same raw size.
 from __future__ import annotations
 
 import ast
+import errno
 import importlib
 import json
 import pathlib
@@ -28,6 +29,8 @@ import sys
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
+
+import _lib_test_estate as _estate  # noqa: E402  -- bin/ joins sys.path above
 
 from conftest import load_script, redirect_paths  # noqa: E402
 
@@ -825,6 +828,13 @@ def _python_sources(root):
     Globbing `*.py` never parsed `bin/cctally` — the extensionless entry point,
     and a recorded failure shape in this repository. The shebang is what decides
     membership, exactly as the interpreter does.
+
+    A failed probe RAISES. It used to `continue`, which removed the whole file
+    from the scan and left `test_the_inventory_is_complete` comparing an
+    observed set that was short by every writer that file held — reported as an
+    ordinary inventory mismatch, with nothing saying a source had been dropped.
+    Only sixty-four bytes are read, rather than the whole file sliced down to
+    sixty-four.
     """
     for path in sorted(root.iterdir()):
         if not path.is_file():
@@ -833,9 +843,14 @@ def _python_sources(root):
             yield path
             continue
         try:
-            head = path.read_bytes()[:64]
-        except OSError:  # pragma: no cover — unreadable entry
-            continue
+            with path.open("rb") as handle:
+                head = handle.read(64)
+        except OSError as exc:
+            raise OSError(
+                exc.errno,
+                f"cannot probe {path} for a shebang, so the cache-writer scan "
+                f"would silently omit every writer it holds: {exc}",
+            ) from exc
         if head.startswith(b"#!") and b"python" in head.split(b"\n", 1)[0]:
             yield path
 
@@ -902,6 +917,32 @@ def _scan_cache_materialization_sites(families):
     return sites
 
 
+#: The one inventory entry whose writer lives in a mirror-private file, and the
+#: repository path that owns it.
+_PRIVATE_WRITERS = {
+    # The owner path is handed to the allowlist classifier and is never
+    # opened, read or executed from here — mirror-private-ok.
+    "cctally-snapshot-measure.mutate_quota_only": "bin/cctally-snapshot-measure",
+}
+_PRIVATE_WRITER = "cctally-snapshot-measure.mutate_quota_only"
+
+
+def _declared_cache_writers(cache):
+    """The scannable half of the inventory, with its visibility declared.
+
+    Every entry is public unless it says otherwise, which is the fail-closed
+    direction: a writer added later inside a private file carries no
+    declaration, stays expected on the public profile, and is reported there.
+    """
+    scannable = set(cache.COVERAGE_WRITER_ACTIONS) - cache.COVERAGE_NON_LEAF_ACTIONS
+    return {
+        site: (_estate.private_expectation(site, owner)
+               if (owner := _PRIVATE_WRITERS.get(site)) is not None
+               else None)
+        for site in scannable
+    }
+
+
 def test_the_inventory_is_complete(core):
     """Spec §4.3's inventory is enforceable only if nothing outside it writes.
 
@@ -914,8 +955,80 @@ def test_the_inventory_is_complete(core):
     cache = _cache()
     observed = _scan_cache_materialization_sites(cache.COVERAGE_CACHE_FAMILIES)
     assert observed, "the scan must find writers, or this test proves nothing"
-    scannable = set(cache.COVERAGE_WRITER_ACTIONS) - cache.COVERAGE_NON_LEAF_ACTIONS
-    assert observed == scannable
+    declared = _declared_cache_writers(cache)
+    _estate.validate_owner_paths(declared)
+    expected = set(_estate.applicable_expectations(
+        declared, profile=_estate.active_profile()))
+    assert observed == expected
+
+
+@pytest.mark.parametrize("profile", _estate.PROFILES)
+def test_the_private_writer_is_expected_only_where_its_source_exists(
+        core, profile):
+    """`bin/cctally-snapshot-measure` is mirror-private.
+
+    The public clone collects this module and does not carry that script, so an
+    unfiltered inventory expects a writer the scan cannot observe. Filtering is
+    by the entry's own DECLARATION rather than by probing the tree, so the
+    comparison never becomes a subset test.
+    """
+    declared = _declared_cache_writers(_cache())
+    expected = _estate.applicable_expectations(declared, profile=profile)
+    assert (_PRIVATE_WRITER in expected) is (profile == _estate.PRIVATE)
+    assert len(expected) > 1
+
+
+def test_the_writer_declaration_agrees_with_the_real_boundary(core):
+    """A declaration that drifts away from `.mirror-allowlist` is a failure.
+
+    On the public projection there is neither an allowlist nor a classifier, so
+    this validates nothing and returns; the filtering above still runs.
+    """
+    assert _estate.validate_owner_paths(_declared_cache_writers(_cache())) is None
+
+
+@pytest.mark.parametrize("profile", _estate.PROFILES)
+@pytest.mark.parametrize("case", [
+    "an observed writer with no assigned action",
+    "an action whose public writer is absent",
+    "a new private writer defaulting to public",
+])
+def test_the_inventory_comparison_fails_closed_in_both_profiles(
+        core, profile, case):
+    """Filtering removes one declared entry and nothing else.
+
+    The third case is the fail-closed default: a writer added later inside a
+    mirror-private file carries no declaration, so it stays expected on the
+    public profile and the equality assertion reports it there.
+    """
+    declared = _declared_cache_writers(_cache())
+    expected = set(_estate.applicable_expectations(declared, profile=profile))
+    assert expected, "the inventory must be non-empty, or this proves nothing"
+    # `applicable_expectations` must have PARTICIPATED in building the set the
+    # cases below perturb. Without this the remaining assertions hold for any
+    # two sets differing by one member, and the filter under test contributes
+    # nothing to them.
+    assert (_PRIVATE_WRITER in expected) is (profile == _estate.PRIVATE), case
+    if case == "an observed writer with no assigned action":
+        extra = "_cctally_cache.brand_new_writer"
+        observed = expected | {extra}
+        assert observed - expected == {extra}, case
+    elif case == "an action whose public writer is absent":
+        absent = sorted(expected)[0]
+        observed = expected - {absent}
+        assert expected - observed == {absent}, case
+    else:
+        later = "cctally-snapshot-measure.a_later_writer"
+        undeclared = dict(declared)
+        undeclared[later] = None
+        expected = set(
+            _estate.applicable_expectations(undeclared, profile=profile))
+        # The fail-closed default, and the load-bearing claim of this case: an
+        # undeclared writer inside a mirror-private file stays EXPECTED on the
+        # public profile, so the comparison reports it instead of filtering it.
+        assert later in expected, case
+        observed = expected - {later}
+    assert observed != expected, case
 
 
 def test_the_scan_parses_the_extensionless_entry_point(core):
@@ -924,6 +1037,61 @@ def test_the_scan_parses_the_extensionless_entry_point(core):
     shebang, exactly as the interpreter decides it."""
     root = pathlib.Path(__file__).resolve().parent.parent / "bin"
     assert root / "cctally" in set(_python_sources(root))
+
+
+def test_a_probe_that_cannot_read_a_candidate_fails_rather_than_dropping_it(
+        tmp_path, monkeypatch):
+    """A swallowed OSError removes a whole file from the scan silently.
+
+    The branch applies precisely to extensionless files, and
+    `bin/cctally-snapshot-measure` is extensionless and holds the writer that
+    went missing under load.
+
+    THE HISTORICAL CAUSE IS UNPROVEN. This proves the branch CAN omit a file
+    whose probe fails. It does not prove that the loaded runner met `EMFILE`,
+    descriptor pressure, or any particular `OSError`; it fixes the fail-open
+    path that is provable and records the attribution as unconfirmed.
+
+    A synthetic root is used rather than the real `bin/`, because the private
+    script this class was observed on is absent from the public projection and
+    a case that named it would not run there.
+    """
+    root = tmp_path / "bin"
+    root.mkdir()
+    (root / "keep.py").write_text("x = 1\n", encoding="utf-8")
+    hidden = root / "extensionless-writer"
+    hidden.write_text("#!/usr/bin/env python3\nx = 1\n", encoding="utf-8")
+    real_open = pathlib.Path.open
+
+    def failing(self, *args, **kwargs):
+        if self.name == hidden.name:
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "open", failing)
+    with pytest.raises(OSError) as caught:
+        list(_python_sources(root))
+    assert hidden.name in str(caught.value)
+
+
+def test_the_whole_scan_propagates_an_unreadable_candidate(core, monkeypatch):
+    """The inventory comparison must not be handed a short source list.
+
+    `bin/cctally` is the extensionless candidate that exists in BOTH profiles,
+    so the propagation is asserted on a file every clone carries.
+    """
+    families = _cache().COVERAGE_CACHE_FAMILIES
+    real_open = pathlib.Path.open
+
+    def failing(self, *args, **kwargs):
+        if self.name == "cctally":
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "open", failing)
+    with pytest.raises(OSError) as caught:
+        _scan_cache_materialization_sites(families)
+    assert "cctally" in str(caught.value)
 
 
 #: Every `bin/` function whose DML names its table through an interpolation the

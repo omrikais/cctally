@@ -206,3 +206,134 @@ describe('the toast branches on the variant tag', () => {
     ).toBeNull();
   });
 });
+
+// #748 — the rate-change account gate has ONE spelling.
+//
+// Three of the four account-rendering surfaces already read `alertAccount`.
+// The modal's rate-change cell and its column-visibility derivation read
+// `row.accountLabel` directly instead, which is a SECOND definition of the R8
+// gate: the accessor takes the key as the gate and derives a label from it,
+// including the `All accounts` rendering of the vendor-wide `*`, while a
+// label test hides a row that carries a key and no label.
+describe('#748 — the rate-change account gate reads the shared accessor', () => {
+  it('renders the vendor-wide sentinel from the key alone', () => {
+    seed([rateChange({ accountKey: '*' })]);
+    const { container } = render(<RecentAlertsModal />);
+    const section = container.querySelector('[data-testid="alerts-rate-change"]')!;
+    expect(section.textContent).toContain('All accounts');
+  });
+
+  it('shows the Account column when a row carries a key and no label', () => {
+    seed([rateChange({ accountKey: '*' })]);
+    const { container } = render(<RecentAlertsModal />);
+    const section = container.querySelector('[data-testid="alerts-rate-change"]')!;
+    const headers = [...section.querySelectorAll('th')].map((h) => h.textContent);
+    expect(headers).toEqual(['Provider', 'Account', 'Change', 'Units / point', 'Effective']);
+  });
+});
+
+// #690 — the toast names the withheld calibration instead of implying a
+// fitted budget that may not exist.
+//
+// The status is a CLOSED server-side code set with a REQUIRED client
+// fallback, the pattern `lib/withheldCopy.ts` already establishes: the
+// in-place update path lets an old client meet a newer server without
+// reloading its JavaScript, so an unheard-of code renders generic copy
+// carrying the code rather than nothing.
+describe('#690 — the rate-change toast discloses a withheld calibration', () => {
+  function surface(entry: MeterRateChangeEntry): HTMLElement {
+    seed([], { firstTick: true });
+    seed([entry], { firstTick: false });
+    const { container } = render(<Toast />);
+    return container.querySelector(
+      '[data-testid="toast-meter-rate-change"]',
+    ) as HTMLElement;
+  }
+
+  it('names the withheld cause rather than promising a fitted budget', () => {
+    const toast = surface(rateChange({
+      withholding_status: 'unsupported-model-mix',
+      detector_input_causes: [],
+      composition_provenance: ['forecast-aggregate'],
+      baseline_withheld_days: 0,
+    }));
+    expect(toast.textContent).toContain('withheld');
+    expect(toast.textContent).toContain('outside the mix');
+    expect(toast.textContent).not.toContain('for the evidence behind this change');
+  });
+
+  it('renders generic copy carrying an unknown code from a newer server', () => {
+    const toast = surface(rateChange({ withholding_status: 'from-the-future' }));
+    expect(toast.textContent).toContain('withheld');
+    expect(toast.textContent).toContain('from-the-future');
+  });
+
+  it('is unchanged on an ORDINARY transition, whose status is null beside populated evidence', () => {
+    // The contract's trap: a null status does NOT mean missing evidence. The
+    // server stamps the status only on the withheld path and stamps the other
+    // three whenever the analysis publishes them, so this is what an ordinary
+    // confirmed change looks like on the wire.
+    const toast = surface(rateChange({
+      withholding_status: null,
+      detector_input_causes: ['transition-day'],
+      composition_provenance: ['decisive-day'],
+      baseline_withheld_days: 0,
+    }));
+    expect(toast.textContent).toContain('Run cctally quota for the evidence behind this change.');
+    expect(toast.textContent).not.toContain('withheld');
+  });
+
+  it('is unchanged against a server that predates the disclosure', () => {
+    const toast = surface(rateChange());
+    expect(toast.textContent).toContain('Run cctally quota for the evidence behind this change.');
+    expect(toast.textContent).not.toContain('withheld');
+  });
+});
+
+// #690 — Recent Alerts carries the evidence the toast omits.
+describe('#690 — the modal renders the baseline count and the typed provenance', () => {
+  function section(entry: MeterRateChangeEntry): HTMLElement {
+    seed([entry]);
+    const { container } = render(<RecentAlertsModal />);
+    return container.querySelector(
+      '[data-testid="alerts-rate-change"]',
+    ) as HTMLElement;
+  }
+
+  it('states a positive withheld-day count and the typed provenance tokens', () => {
+    const el = section(rateChange({
+      withholding_status: 'unsupported-model-mix',
+      detector_input_causes: ['sparse-local-history'],
+      composition_provenance: ['forecast-aggregate'],
+      baseline_withheld_days: 3,
+    }));
+    expect(el.textContent).toContain('3');
+    expect(el.textContent).toContain('forecast-aggregate');
+    expect(el.textContent).toContain('sparse-local-history');
+  });
+
+  it('distinguishes a clean baseline from an unknown one', () => {
+    const clean = section(rateChange({ baseline_withheld_days: 0 }));
+    expect(clean.textContent).toContain('clean baseline');
+  });
+
+  it('says nothing about the baseline when the count was never retained', () => {
+    const unknown = section(rateChange({ baseline_withheld_days: null }));
+    expect(unknown.textContent).not.toContain('clean baseline');
+    expect(unknown.textContent).not.toContain('baseline day');
+  });
+
+  it('renders no evidence line at all for a legacy row carrying all four nulls', () => {
+    // The #689 regime-recovery route reaches `enumerate_transitions`, which
+    // sees stored regimes and no analysis, so all four are null BY
+    // CONSTRUCTION. There is nothing to disclose and the row renders as it
+    // did before this shipped.
+    const el = section(rateChange({
+      withholding_status: null,
+      detector_input_causes: null,
+      composition_provenance: null,
+      baseline_withheld_days: null,
+    }));
+    expect(el.querySelector('.alerts-rate-change-evidence')).toBeNull();
+  });
+});

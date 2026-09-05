@@ -212,6 +212,17 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+        with:
+          # tests/test_schema_delivery_parity.py reconstructs the previous
+          # installable shape from the newest release tag that is a strict
+          # ancestor of HEAD, so this lane needs the tags AND the history that
+          # decides ancestry. A shallow checkout makes that node fail loudly
+          # rather than skip, which is deliberate: a lane that skipped there
+          # would report success over a comparison it never made. The public
+          # mirror runs this same file without carrying that module, and pays a
+          # full-history checkout of the much smaller public repository for it.
+          fetch-depth: 0
+          fetch-tags: true
 
       # `bin/cctally-share-v2-test` runs a Vitest-based GUI smoke
       # (`dashboard/web/src/share/ShareManualSmoke.test.tsx`) via
@@ -527,6 +538,10 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false                    # PR lane never needs a persisted token
+          # See the test-macos lane: tests/test_schema_delivery_parity.py needs
+          # release tags and the history that decides ancestry.
+          fetch-depth: 0
+          fetch-tags: true
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "install": {
     "symlinks_present": 0,
     "symlinks_total": 16,
@@ -38,12 +38,14 @@
         "subagent_stop_count": 1,
         "feature_enabled": true,
         "requires_review": null,
-        "remediation": "Verify the exact cctally handler in Codex /hooks.",
+        "remediation": "Verify the cctally handler in Codex /hooks; cctally cannot read the recorded state.",
         "error": null,
         "state": "installed_trust_unobservable"
       }
     ],
     "installed_count": 1,
+    "enabled_count": 0,
+    "all_roots_enabled": false,
     "error_count": 0
   },
   "legacy": {

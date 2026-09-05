@@ -15,6 +15,7 @@ import textwrap
 
 import pytest
 
+import _lib_test_estate as _estate
 import _script_loader
 from _script_loader import SCRIPT_PATH, load_script_module
 from conftest import load_script
@@ -2540,8 +2541,88 @@ def test_the_standalone_fixture_carve_out_still_describes_the_tree():
         )
 
 
+#: Every module that embeds a `bin/cctally` loader in the source of a child
+#: program, and how many such sites it holds. Module level so the profile
+#: filtering and the fail-closed cases can be exercised against synthetic
+#: inputs beside the real comparison.
+#: Owner paths for the mirror-private members of the map below, kept in their
+#: OWN statement: the waiver covers a whole statement, so a marker inside the
+#: map would exempt every path a later entry adds to it.
+_PRIVATE_CHILD_SITE_OWNERS = {
+    # Each path is handed to the allowlist classifier and is never opened,
+    # read or executed from here — mirror-private-ok.
+    "test_rewrite_release_notes.py": "tests/test_rewrite_release_notes.py",
+    "test_schema_delivery_parity.py": "tests/test_schema_delivery_parity.py",
+}
+
+_GENERATED_CHILD_SITES = {
+    "test_cache_write_ttl_pricing.py": 1,
+    "test_claude_fast_pricing.py": 1,
+    "test_codex_fused_ingest.py": 1,
+    "test_correction_rebuild_orchestration_394.py": 1,
+    "test_debug_sample_emission.py": 1,
+    "test_doctor_gather.py": 4,
+    # Loads tests/isolation_bootstrap/sitecustomize.py through an f-string
+    # placeholder, so the child's path is UNKNOWN rather than provably not
+    # the script.
+    "test_isolation_contract.py": 1,
+    # Runs bin/cctally-rewrite-release-notes through `runpy.run_path` with
+    # an f-string placeholder path. Invisible until `run_path` joined the
+    # vocabulary AND the placeholder kept the child parseable.
+    #
+    # Mirror-private, so the public clone collects this module without the
+    # file and cannot produce the site.
+    "test_rewrite_release_notes.py": _estate.private_expectation(
+        1, _PRIVATE_CHILD_SITE_OWNERS["test_rewrite_release_notes.py"]),
+    # Two `.format` child templates — `_HOLDER` at :324 and `_DETECTOR` at
+    # :369 — each spawning a child that loads bin/cctally through its
+    # `{cli!r}` slot.
+    "test_stats_corruption_epic_e2e_496.py": 2,
+    "test_stats_rebuild_cutover_388.py": 1,
+    "test_stats_rebuild_recovery_388.py": 3,
+    "test_stats_writer_storm_386.py": 1,
+    # The `_CREATE_STORES` child loads `<tree>/bin/cctally` under module
+    # identity `cctally` and registers it before the exec, because the openers
+    # resolve `sys.modules["cctally"]` at call time. The child runs an
+    # EXTRACTED release tag as often as it runs this tree, so it cannot import
+    # the primitive: `tests/` is not on its path and the primitive it would
+    # import is this tree's, not the tag's.
+    #
+    # Mirror-private, so the public clone collects this module without the
+    # file and cannot produce the site.
+    "test_schema_delivery_parity.py": _estate.private_expectation(
+        1, _PRIVATE_CHILD_SITE_OWNERS["test_schema_delivery_parity.py"]),
+    # The embedded validator shim loads whatever `EV_SHIM_REAL_KERNEL`
+    # names, so the path is a subscript the detector cannot evaluate.
+    "test_test_all_observability.py": 1,
+}
+
+
+_NO_DIFF = {"added": {}, "removed": {}, "changed": {}}
+
+
+def _generated_child_diff(found, known, *, profile):
+    """What `found` and the profile-applicable half of `known` disagree about.
+
+    Exact equality after filtering only the declared private entries. It is a
+    diff rather than a bare `==` so the three regression classes can each be
+    exercised on both profiles, and so the failure names which one fired.
+    """
+    expected = _estate.applicable_expectations(known, profile=profile)
+    return {
+        "added": {k: v for k, v in found.items() if k not in expected},
+        "removed": {k: v for k, v in expected.items() if k not in found},
+        "changed": {
+            k: (expected[k], found[k])
+            for k in expected.keys() & found.keys()
+            if expected[k] != found[k]
+        },
+    }
+
+
 def test_generated_child_sites_are_named_rather_than_silently_left():
-    """Thirteen modules embed a loader in source for a separate interpreter.
+    """Fourteen modules on the private profile, and twelve on the public
+    one, embed a loader in source for a separate interpreter.
 
     A child program started by `subprocess` has no `tests/` on its path and no
     parent pytest helper to import, so it cannot call the primitive. They are
@@ -2560,32 +2641,6 @@ def test_generated_child_sites_are_named_rather_than_silently_left():
     boolean could not: `test_doctor_gather.py` holds four embedded loaders and
     `test_stats_rebuild_recovery_388.py` holds three.
     """
-    known = {
-        "test_cache_write_ttl_pricing.py": 1,
-        "test_claude_fast_pricing.py": 1,
-        "test_codex_fused_ingest.py": 1,
-        "test_correction_rebuild_orchestration_394.py": 1,
-        "test_debug_sample_emission.py": 1,
-        "test_doctor_gather.py": 4,
-        # Loads tests/isolation_bootstrap/sitecustomize.py through an f-string
-        # placeholder, so the child's path is UNKNOWN rather than provably not
-        # the script.
-        "test_isolation_contract.py": 1,
-        # Runs bin/cctally-rewrite-release-notes through `runpy.run_path` with
-        # an f-string placeholder path. Invisible until `run_path` joined the
-        # vocabulary AND the placeholder kept the child parseable.
-        "test_rewrite_release_notes.py": 1,
-        # Two `.format` child templates — `_HOLDER` at :324 and `_DETECTOR` at
-        # :369 — each spawning a child that loads bin/cctally through its
-        # `{cli!r}` slot.
-        "test_stats_corruption_epic_e2e_496.py": 2,
-        "test_stats_rebuild_cutover_388.py": 1,
-        "test_stats_rebuild_recovery_388.py": 3,
-        "test_stats_writer_storm_386.py": 1,
-        # The embedded validator shim loads whatever `EV_SHIM_REAL_KERNEL`
-        # names, so the path is a subscript the detector cannot evaluate.
-        "test_test_all_observability.py": 1,
-    }
     tests_dir = _tests_dir()
     # This module is excluded from its own universe. It holds the synthetic
     # loader sources the matcher is tested against, so scanning it makes the
@@ -2600,14 +2655,67 @@ def test_generated_child_sites_are_named_rather_than_silently_left():
         if path.name != scanning_itself
         and (count := _embedded_loader_sites(path))
     }
-    assert found == known, (
+    _estate.validate_owner_paths(_GENERATED_CHILD_SITES)
+    diff = _generated_child_diff(
+        found, _GENERATED_CHILD_SITES, profile=_estate.active_profile())
+    assert diff == _NO_DIFF, (
         "the generated-child carve-out changed; a NEW module embedding the "
         "loader in child source must be justified, and a changed COUNT means "
-        "an existing module gained or lost a site: "
-        f"added={ {k: v for k, v in found.items() if k not in known} }, "
-        f"removed={ {k: v for k, v in known.items() if k not in found} }, "
-        f"changed={ {k: (known[k], found[k]) for k in known.keys() & found.keys() if known[k] != found[k]} }"
+        f"an existing module gained or lost a site: {diff}"
     )
+
+
+@pytest.mark.parametrize("profile", _estate.PROFILES)
+def test_the_private_generated_child_entry_is_expected_only_where_it_exists(profile):
+    """`tests/test_rewrite_release_notes.py` is mirror-private.
+
+    The public clone collects this module and does not carry that file, so an
+    unfiltered map expects a site the tree cannot produce. Filtering is by the
+    entry's own DECLARATION, so the whole comparison never turns into a subset
+    test.
+    """
+    expected = _estate.applicable_expectations(
+        _GENERATED_CHILD_SITES, profile=profile)
+    private_entry = "test_rewrite_release_notes.py"
+    assert (private_entry in expected) is (profile == _estate.PRIVATE)
+    assert "test_doctor_gather.py" in expected
+
+
+def test_the_generated_child_declaration_agrees_with_the_real_boundary():
+    """A declaration that drifts away from `.mirror-allowlist` is a failure.
+
+    On the public projection there is no allowlist and no classifier, so this
+    validates nothing and says so by returning; the filtering above still runs.
+    """
+    assert _estate.validate_owner_paths(_GENERATED_CHILD_SITES) is None
+
+
+@pytest.mark.parametrize("profile", _estate.PROFILES)
+@pytest.mark.parametrize("mutation,label", [
+    ({"test_doctor_gather.py": 5}, "a second loader site in a known file"),
+    ({"test_doctor_gather.py": None}, "a removed site"),
+    ({"test_brand_new_child.py": 1}, "an active file absent from the map"),
+])
+def test_the_generated_child_comparison_fails_closed_in_both_profiles(
+        profile, mutation, label):
+    """Filtering removes one declared entry and nothing else.
+
+    Each of the three regressions the map exists to catch must still be caught
+    on BOTH profiles: a known file that gained a site, a known file that lost
+    one, and a file the map has never heard of.
+    """
+    baseline = _estate.applicable_expectations(
+        _GENERATED_CHILD_SITES, profile=profile)
+    assert _generated_child_diff(baseline, _GENERATED_CHILD_SITES,
+                                 profile=profile) == _NO_DIFF, label
+    found = dict(baseline)
+    for name, count in mutation.items():
+        if count is None:
+            found.pop(name, None)
+        else:
+            found[name] = count
+    assert _generated_child_diff(found, _GENERATED_CHILD_SITES,
+                                 profile=profile) != _NO_DIFF, label
 
 
 @pytest.mark.parametrize("name", ["cctally", "_cctally_for_tests", "cctally_cli"])

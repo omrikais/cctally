@@ -118,12 +118,22 @@ def test_gather_codex_quota_doctor_state_is_root_qualified_and_privacy_safe(tmp_
     assert state["codex_quota_windows"] == [
         expected_windows[key] for key in sorted(expected_windows)
     ]
+    # #719: with no `config.toml` in the fixture home there is no recorded
+    # trust decision at all, which is `installed_untrusted`, not "cctally
+    # cannot observe the record".
     expected_hooks = {
-        stale_key: "installed_trust_unobservable",
-        fresh_key: "absent",
+        stale_key: ("installed_untrusted", True,
+                    "Review and trust the cctally handler in Codex /hooks."),
+        fresh_key: ("absent", False,
+                    "Run `cctally setup` to install the native Codex handler."),
     }
     assert state["codex_hook_roots"] == [
-        {"source_root_key": key, "state": expected_hooks[key]}
+        {
+            "source_root_key": key,
+            "state": expected_hooks[key][0],
+            "requires_review": expected_hooks[key][1],
+            "remediation": expected_hooks[key][2],
+        }
         for key in sorted(expected_hooks)
     ]
     assert state["codex_lifecycle_activity_24h"] == {
@@ -162,6 +172,8 @@ def test_doctor_rejects_canonical_plus_noncanonical_owned_handler(tmp_path):
     assert state["codex_hook_roots"] == [{
         "source_root_key": root_key,
         "state": "absent",
+        "requires_review": False,
+        "remediation": "Run `cctally setup` to install the native Codex handler.",
     }]
 
 

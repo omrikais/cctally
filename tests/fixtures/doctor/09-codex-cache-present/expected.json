@@ -129,8 +129,10 @@
                 },
                 {
                     "details": {
+                        "enabled_root_count": 0,
                         "installed_root_count": 0,
                         "requires_review": false,
+                        "responsible_root_key": "$CODEX_ROOT_1",
                         "root_count": 1,
                         "states": [
                             {
@@ -138,12 +140,13 @@
                                 "state": "absent"
                             }
                         ],
-                        "trust_state": "not-installed"
+                        "trust_state": "not-installed",
+                        "worst_state": "absent"
                     },
                     "id": "hooks.codex_installed",
-                    "remediation": "Run `cctally setup`, then review the handler in Codex /hooks.",
+                    "remediation": "Run `cctally setup` to install the native Codex handler.",
                     "severity": "warn",
-                    "summary": "0/1 root(s) installed",
+                    "summary": "0/1 root(s) enabled",
                     "title": "Codex hooks installed"
                 },
                 {
@@ -160,6 +163,21 @@
                     "severity": "ok",
                     "summary": "not applicable",
                     "title": "Codex recent activity"
+                },
+                {
+                    "details": {
+                        "age_seconds": null,
+                        "last_success_at": null,
+                        "liveness_state": "not-applicable",
+                        "marker_count": 0,
+                        "responsible_root_key": null,
+                        "roots": [],
+                        "window_seconds": 604800
+                    },
+                    "id": "hooks.codex_liveness_7d",
+                    "severity": "ok",
+                    "summary": "not applicable",
+                    "title": "Codex hook liveness (7d)"
                 }
             ],
             "id": "hooks",
@@ -223,7 +241,7 @@
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1011,
+                            "epoch": 1013,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -1118,7 +1136,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 57,
+            "ok": 58,
             "warn": 8
         },
         "severity": "warn"

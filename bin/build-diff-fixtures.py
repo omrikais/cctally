@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from _cctally_core import _canonicalize_optional_iso  # noqa: E402
 from _fixture_builders import (  # noqa: E402
     FIXED_LAST_INGESTED_AT,
     create_cache_db,
@@ -29,6 +30,7 @@ from _fixture_builders import (  # noqa: E402
     fixture_source_timestamp_z,
     seed_session_entry,
     seed_session_file,
+    seed_week_reset_event,
     seed_weekly_usage_snapshot,
 )
 
@@ -120,34 +122,21 @@ def _ensure_dir(scenario: str) -> tuple[Path, Path, Path]:
     return scenario_dir, db_dir / "stats.db", db_dir / "cache.db"
 
 
-def _ensure_week_reset_events_table(conn: sqlite3.Connection) -> None:
-    """Materialize the production `week_reset_events` table inside a
-    fixture stats.db. The shared `_fixture_builders.create_stats_db`
-    intentionally omits this table because most scenarios don't seed
-    reset events; the diff fixtures need it for scenarios that
-    exercise the mid-week reset override path."""
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS week_reset_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            detected_at_utc        TEXT NOT NULL,
-            old_week_end_at        TEXT NOT NULL,
-            new_week_end_at        TEXT NOT NULL,
-            effective_reset_at_utc TEXT NOT NULL,
-            UNIQUE(old_week_end_at, new_week_end_at)
-        )
-        """
-    )
-
-
 def _canonical_iso(ts: dt.datetime) -> str:
-    """Canonicalize a UTC datetime to the same form
-    `_canonicalize_optional_iso` produces in production: hour-floored
-    boundary, ISO 8601 with `+00:00` suffix (NOT `Z`). Required for
-    `week_reset_events` text comparisons to match what
-    `_diff_resolve_anchor` looks up."""
-    utc = ts.astimezone(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
-    return utc.isoformat(timespec="seconds")
+    """Canonicalize a week boundary exactly the way production does.
+
+    This used to FLOOR the datetime to the hour while production
+    `_normalize_week_boundary_dt` ROUNDS to the nearest hour, and the
+    `mid-week-reset-with-event` scenario's `19:30` boundary is on the wrong
+    side of that difference: the floor wrote `19:00` and the backfill derived
+    `20:00` from the very same snapshot, so `INSERT OR IGNORE` did not ignore
+    and one physical reset became two rows (#750 S3 B4). Delegating removes
+    the possibility of a second copy of the rule drifting again.
+    """
+    canonical = _canonicalize_optional_iso(
+        ts.astimezone(dt.timezone.utc).isoformat(), "fixture.boundary")
+    assert canonical is not None  # a real datetime never canonicalizes to None
+    return canonical
 
 
 def _seed_reset_event(
@@ -157,20 +146,33 @@ def _seed_reset_event(
     old_week_end: dt.datetime,
     new_week_end: dt.datetime,
     effective_reset_at: dt.datetime,
+    account_key: str = "unattributed",
+    origin_observation_id: str | None = None,
 ) -> None:
-    """Seed one week_reset_events row. Endpoints are stored in the
-    `+00:00` canonical form (mirrors production `cmd_record_usage`
-    output via `_canonicalize_optional_iso`)."""
-    conn.execute(
-        "INSERT OR IGNORE INTO week_reset_events "
-        "(detected_at_utc, old_week_end_at, new_week_end_at, "
-        " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
-        (
-            detected_at.astimezone(dt.timezone.utc).isoformat(timespec="seconds"),
-            _canonical_iso(old_week_end),
-            _canonical_iso(new_week_end),
-            _canonical_iso(effective_reset_at),
-        ),
+    """Seed one week_reset_events row.
+
+    The two BOUNDARY columns are canonicalized the way production
+    canonicalizes a week boundary, because that is what the backfill compares
+    them against. `detected_at_utc` and `effective_reset_at_utc` are stored as
+    the exact UTC instant instead: #750 S3 §1.4 removed the hour floor from
+    the detector, so an event now records the second its observation arrived,
+    not the hour that second falls in.
+
+    `account_key` and `origin_observation_id` are named rather than defaulted,
+    for the reason `_fixture_builders.seed_week_reset_event` gives: they carry
+    the epoch-1013 identity, and which partial unique index deduplicates a
+    repeat depends on them.
+    """
+    seed_week_reset_event(
+        conn,
+        detected_at_utc=detected_at.astimezone(
+            dt.timezone.utc).isoformat(timespec="seconds"),
+        old_week_end_at=_canonical_iso(old_week_end),
+        new_week_end_at=_canonical_iso(new_week_end),
+        effective_reset_at_utc=effective_reset_at.astimezone(
+            dt.timezone.utc).isoformat(timespec="seconds"),
+        account_key=account_key,
+        origin_observation_id=origin_observation_id,
     )
 
 
@@ -860,11 +862,11 @@ def build_mid_week_reset_with_event():
 
     create_stats_db(stats_path)
     with sqlite3.connect(stats_path) as conn:
-        _ensure_week_reset_events_table(conn)
         # Pre-reset snapshot — captured before the reset, original boundaries.
         # Required so cumulative pct on prior week is 50% (drop to 5% in
         # post-reset snapshot triggers backfill detection consistently with
-        # production but UNIQUE(old, new) ensures our explicit seed wins).
+        # production, and the origin-null legacy-tuple index recognizes the
+        # backfill's candidate as this seed so the explicit row wins).
         _seed_anchor(conn,
                      captured_at=dt.datetime(2026, 4, 17, 10, 0, 0, tzinfo=dt.timezone.utc),
                      week_start=orig_week_start, week_end=orig_week_end,

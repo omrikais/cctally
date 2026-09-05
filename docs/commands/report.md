@@ -119,6 +119,10 @@ shortcut — it's exactly `report --sync-current "$@"`.
 - For Claude, `--detail` adds the `percent-breakdown` view for the *current*
   week only; for an older week, call `percent-breakdown --week-start <date>`
   directly. Codex `--detail` emits native quota-window attribution detail.
+- `--detail` states an observation gap the same way `percent-breakdown` does:
+  a run of thresholds recorded from one observation is named above the table,
+  and those rows print `observation_gap` in the `Marginal Cost` column. See
+  [`percent-breakdown`](percent-breakdown.md#a-back-filled-run-says-so).
 - **`--source all` renders the same Claude report as `report` on its own.**
   It previously reduced the Claude section to the literal `Data available.` —
   no current-week table, no trend table, no `$ / 1%` column — because the

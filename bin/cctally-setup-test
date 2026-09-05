@@ -145,14 +145,22 @@ STUB
         path_pre="${path_pre}$fake/opt/homebrew/bin:"
     fi
 
-    # Template-expand /REPO -> actual REPO_ROOT in copied provider JSON.
-    # Both Claude settings and Codex hooks pin the exact current binary path,
-    # which cannot be hardcoded at fixture-creation time.
-    find "$fake" -type f -name '*.json' 2>/dev/null \
+    # Template-expand provider config copied from the fixture's `input/`:
+    #   /REPO -> REPO_ROOT   (Claude settings + Codex hooks pin the exact
+    #                         current binary path, unknowable at fixture time)
+    #   /FAKE -> realpath($fake)
+    # #719 extends this to `*.toml`, because a Codex `[hooks.state]` key
+    # embeds the scratch home's own resolved `hooks.json` path, and
+    # `codex_hook_roots` resolves every configured home before building that
+    # key — so the token must expand to the REALPATH form, which on macOS is
+    # the `/private/var` spelling rather than the bare `$fake`.
+    local template_fake; template_fake=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$fake")
+    find "$fake" -type f \( -name '*.json' -o -name '*.toml' \) 2>/dev/null \
         | while read -r f; do
-            python3 -c "import sys; p=sys.argv[1]; r=sys.argv[2]; \
+            python3 -c "import sys; p=sys.argv[1]; r=sys.argv[2]; h=sys.argv[3]; \
 import pathlib; t=pathlib.Path(p).read_text(); \
-pathlib.Path(p).write_text(t.replace('/REPO', r))" "$f" "$REPO_ROOT"
+pathlib.Path(p).write_text(t.replace('/REPO', r).replace('/FAKE', h))" \
+                "$f" "$REPO_ROOT" "$template_fake"
         done
 
     # The cctally shebang is `/usr/bin/env python3`; we want the harness's

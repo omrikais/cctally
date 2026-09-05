@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from 'react';
+import { Fragment, useSyncExternalStore } from 'react';
 import { Modal } from '../modals/Modal';
 import { getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
@@ -24,6 +24,7 @@ import { resolveViewAccountFocus } from '../store/accountFocus';
 import { AlertsEmptyGauge } from './AlertsEmptyGauge';
 import { ZoneTag } from './ZoneTag';
 import { rateChangeSummary } from '../lib/quotaCopy';
+import { rateChangeWithheldCopy } from '../lib/withheldCopy';
 import type {
   AlertEntry,
   CodexAlertRow,
@@ -192,6 +193,53 @@ function CodexCostCell(): JSX.Element {
 // columns would print an em-dash in three of them and mislabel the fourth.
 // The columns here are the ones a rate transition actually has: which
 // provider's rate moved, how far, and when it took effect.
+// #690 — the disclosure evidence Recent Alerts renders and the toast does not.
+//
+// Four independent facts, kept independent. `null`, `[]` and `0` are three
+// distinct states and none may be collapsed into another: `null` is legacy or
+// unrecoverable evidence, `[]` means the evidence WAS assessed and no such
+// origin was found, and `0` withheld baseline days means a CLEAN baseline
+// rather than an unknown one. That is why the count is carried as a count and
+// not as a boolean, and why an absent count renders nothing at all instead of
+// a zero it cannot vouch for.
+//
+// `withholding_status` is the field whose null means something else. The
+// server stamps it only on #688's detection-keyed withheld path and stamps the
+// other three whenever the analysis publishes them, so an ordinary confirmed
+// transition arrives with a null status beside populated evidence — and it
+// still has evidence worth showing here. Reading the status alone would
+// therefore hide the provenance on every ordinary change.
+//
+// The typed tokens are rendered RAW rather than prose-ified. This is the
+// detail surface: `forecast-aggregate` is the value the store holds, the value
+// `cctally quota` prints and the value a bug report should quote.
+function rateChangeEvidence(
+  row: MeterRateChangeEntry,
+): Array<{ key: string; label: string; value: string }> {
+  const out: Array<{ key: string; label: string; value: string }> = [];
+  const withheld = rateChangeWithheldCopy(row.withholding_status);
+  if (withheld != null) out.push({ key: 'withheld', label: 'Calibration:', value: withheld });
+  const causes = row.detector_input_causes;
+  if (causes != null && causes.length > 0) {
+    out.push({ key: 'causes', label: 'Detector input:', value: causes.join(', ') });
+  }
+  const provenance = row.composition_provenance;
+  if (provenance != null && provenance.length > 0) {
+    out.push({ key: 'provenance', label: 'Composition:', value: provenance.join(', ') });
+  }
+  const days = row.baseline_withheld_days;
+  if (days != null) {
+    out.push({
+      key: 'baseline',
+      label: 'Baseline:',
+      value: days === 0
+        ? 'clean baseline'
+        : `${days} withheld baseline ${days === 1 ? 'day' : 'days'}`,
+    });
+  }
+  return out;
+}
+
 function RateChangeSection({
   rows,
   ctx,
@@ -223,10 +271,18 @@ function RateChangeSection({
             const summary = rateChangeSummary(
               row.previous_units_per_point, row.new_units_per_point,
             );
+            // #748 — the SHARED accessor, as the other three account-rendering
+            // surfaces already use. The key is the R8 gate and the label is
+            // derived from it, which is how the vendor-wide `*` renders as
+            // `All accounts`; a direct `accountLabel` test was a second
+            // definition of the same gate and hid a row carrying a key alone.
+            const account = alertAccount(row);
             const effectiveTitle = fmt.startedShortOrNull(row.effective_from, ctx);
             const effectiveText = fmt.relativeOrAbsolute(row.effective_from ?? '', ctx);
+            const evidence = rateChangeEvidence(row);
             return (
-              <tr key={row.id} className="alert-modal-row">
+              <Fragment key={row.id}>
+              <tr className="alert-modal-row">
                 <td className="alert-cell-source">
                   <span className={`source-chip source-chip--${row.provider}`}>
                     {row.provider}
@@ -234,9 +290,9 @@ function RateChangeSection({
                 </td>
                 {showAccountColumn && (
                   <td className="alert-cell-account">
-                    {row.accountLabel != null && (
-                      <span className="alert-account-chip" title={row.accountLabel}>
-                        {row.accountLabel}
+                    {account != null && (
+                      <span className="alert-account-chip" title={account.label}>
+                        {account.label}
                       </span>
                     )}
                   </td>
@@ -259,6 +315,31 @@ function RateChangeSection({
                   {effectiveText === '—' ? null : <> <ZoneTag tz={ctx.tz} /></>}
                 </td>
               </tr>
+              {/* #690 — the evidence the toast omits, on its own full-width
+                  line so the four data columns keep their shape. A row with
+                  nothing to disclose — a legacy row, or one reconstructed by
+                  the #689 regime-recovery route, which sees stored regimes
+                  and no analysis at all and so carries null on all four BY
+                  CONSTRUCTION — renders no line rather than an empty one. */}
+              {evidence.length > 0 && (
+                <tr className="alert-modal-row alerts-rate-change-evidence-row">
+                  <td
+                    className="alerts-rate-change-evidence"
+                    colSpan={showAccountColumn ? 5 : 4}
+                  >
+                    {evidence.map((item) => (
+                      <span key={item.key} className="alerts-rate-change-evidence-item">
+                        <span className="alerts-rate-change-evidence-label">
+                          {item.label}
+                        </span>
+                        {' '}
+                        {item.value}
+                      </span>
+                    ))}
+                  </td>
+                </tr>
+              )}
+              </Fragment>
             );
           })}
         </tbody>
@@ -327,7 +408,10 @@ export function RecentAlertsModal(): JSX.Element {
   const rateChanges = (env?.meter_rate_changes ?? []).filter(
     (row) => activeSource === 'all' || row.owner === activeSource,
   );
-  const showRateAccountColumn = rateChanges.some((r) => r.accountLabel != null);
+  // #748 — the same accessor the cell reads and the same one
+  // `showAccountColumn` above reads for the THRESHOLD table. The two names are
+  // confusingly similar and both are live; this is the rate-change one.
+  const showRateAccountColumn = rateChanges.some((r) => alertAccount(r) != null);
 
   if (rows.length === 0 && rateChanges.length === 0) {
     return (

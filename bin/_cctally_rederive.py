@@ -310,7 +310,6 @@ def _derive_desired_events(records: list[dict], cache_conn: sqlite3.Connection,
 def _derive_desired_events_into(records, cache_conn, scratch_path) -> list[dict]:
     conn = _cctally_core.open_db(_target_path=str(scratch_path))
     events: list[dict] = []
-    projection_state: dict = {}
     hooks = (
         _journal._pipeline_op_fold,
         _record._pipeline_claude_usage,
@@ -326,7 +325,6 @@ def _derive_desired_events_into(records, cache_conn, scratch_path) -> list[dict]
                     config={},
                     event_sink=events,
                     projection_writes=False,
-                    projection_state=projection_state,
                 )
                 conn.execute("BEGIN IMMEDIATE")
                 try:

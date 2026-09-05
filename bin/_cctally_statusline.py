@@ -438,12 +438,38 @@ def _candidate_identity_token(parsed) -> str:
     return hashlib.sha256(f"{kind}\0{value}".encode("utf-8")).hexdigest()
 
 
+# A 5h reset this far in the past is no longer attributable to capture jitter.
+# Shared by the plausibility window and the #755 staleness proof below.
+_FIVE_HOUR_EXPIRY_GRACE_SECONDS = 600
+
+
 def _statusline_reset_is_plausible(axis: str, epoch: int, now_epoch: int) -> bool:
     if not isinstance(epoch, int) or isinstance(epoch, bool):
         return False
     if axis == "fiveHour":
-        return now_epoch - 600 <= epoch <= now_epoch + 6 * 3600
+        return (now_epoch - _FIVE_HOUR_EXPIRY_GRACE_SECONDS
+                <= epoch <= now_epoch + 6 * 3600)
     return now_epoch - 30 * 86400 <= epoch <= now_epoch + 8 * 86400
+
+
+def _five_hour_payload_is_expired(parsed, *, received_at: int) -> bool:
+    """True when the payload carries a 5h window that has already closed.
+
+    ``received_at`` is when cctally received the payload, not when Claude Code
+    obtained the numbers in it, so it bounds nothing about how old the DATA is:
+    an idle session re-renders its status line from a cached ``rate_limits``
+    block indefinitely. Because ``_reduced_candidate`` takes the MAXIMUM
+    percent across active candidates, one such session pins the 7d consensus
+    at its stale pre-reset value and a post-reset drop can never publish.
+
+    A 5h window that has already closed is the one content-derived proof of
+    staleness available here, so it condemns the whole block rather than only
+    its own axis (issue #755).
+    """
+    resets_at = parsed.rate_limits_5h_resets_at
+    if isinstance(resets_at, bool) or not isinstance(resets_at, int):
+        return False
+    return resets_at < received_at - _FIVE_HOUR_EXPIRY_GRACE_SECONDS
 
 
 def _candidate_from_input(parsed, *, received_at: int) -> "_candidates.Candidate | None":
@@ -455,6 +481,9 @@ def _candidate_from_input(parsed, *, received_at: int) -> "_candidates.Candidate
         if not _statusline_reset_is_plausible(name, resets_at, received_at):
             return None
         return _candidates.AxisValue(float(percent), int(resets_at))
+
+    if _five_hour_payload_is_expired(parsed, received_at=received_at):
+        return None
 
     five = axis(parsed.rate_limits_5h_pct, parsed.rate_limits_5h_resets_at, "fiveHour")
     seven = axis(parsed.rate_limits_7d_pct, parsed.rate_limits_7d_resets_at, "sevenDay")

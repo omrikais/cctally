@@ -1230,7 +1230,14 @@ def _recovery_clock(monkeypatch, failed_at):
 
 
 def _mrc_journal_lines(store):
-    """Every `mrc:` evt line across the journal segments."""
+    """Every rate-change evt line across the journal segments, both versions.
+
+    Counts `mrc:` and `mrc2:`, because #690 emits new transitions under the
+    second prefix and a store can hold both for different identities. Matched
+    as the two exact prefixes INCLUDING their separator rather than as the
+    bare stem `mrc`, which would also count an unrelated future id such as
+    `mrcx:`.
+    """
     import _lib_journal
     total = 0
     for path in sorted((_cctally_core.APP_DIR / "journal").glob("*.jsonl")):
@@ -1239,7 +1246,8 @@ def _mrc_journal_lines(store):
                 continue
             record = _lib_journal.decode_line(line.encode("utf-8")) or {}
             if (record.get("t") == "evt"
-                    and str(record.get("id") or "").startswith("mrc:")):
+                    and str(record.get("id") or "").startswith(
+                        ("mrc:", "mrc2:"))):
                 total += 1
     return total
 

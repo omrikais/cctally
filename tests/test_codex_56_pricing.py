@@ -28,6 +28,7 @@ BIN = ROOT / "bin"
 ALIAS = "gpt-5.6"
 CANONICAL = "gpt-5.6-sol"
 CYBER = "gpt-5.6-cyber"
+ASTRA = "gpt-6-astra"
 
 # Every runtime identifier OpenAI documents as pointing at Sol's card.
 # `docs/pricing-gotchas.md` requires the same three properties of each of them
@@ -225,6 +226,7 @@ def test_session_metrics_rate_card_matches_the_authoritative_table():
 
     assert metrics.PRICING, "the estimator prices no model at all"
     assert CYBER in metrics.PRICING
+    assert metrics.PRICING[ASTRA] == (10.0, 50.0)
     for model, (input_per_mtok, output_per_mtok) in metrics.PRICING.items():
         card = pricing.CODEX_MODEL_PRICING[pricing._canonical_codex_model(model)]
         assert input_per_mtok == pytest.approx(

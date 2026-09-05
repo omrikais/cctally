@@ -266,6 +266,24 @@ def create_stats_db(path: Path) -> None:
 
     week_reset_events carries observed_pre_credit_pct (record-credit M2) to
     match production head.
+
+    `week_reset_events` is built at the epoch-1013 shape (#750 S3): identity
+    lives on `origin_observation_id` and is expressed as TWO partial unique
+    indexes, which the single table-level UNIQUE this builder used to declare
+    cannot represent. A fixture that still carries that constraint is rebuilt
+    by `_rebuild_retired_week_reset_uniqueness` on every open, and until then
+    it refuses a second genuine in-place credit in one week. The origin index
+    covers rows that name an observation; the legacy-tuple index does the
+    de-duplication the retired constraint did, for the origin-null rows a
+    directly seeded or pre-cutover fixture writes.
+
+    `weekly_usage_snapshots.journal_id` is here for the same identity: it is
+    the column `_backfill_week_reset_events` reads to name a synthesized
+    event's origin, so a fixture that seeds an event WITH an origin must seed
+    the originating snapshot's `journal_id` too, or the backfill re-derives
+    the same reset as a second, origin-null row. Production adds `journal_id`
+    to ten further stats tables through the open-time ALTER; those stay as
+    they are, because no fixture seeds a value into them.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -290,8 +308,11 @@ def create_stats_db(path: Path) -> None:
                 five_hour_percent REAL,
                 five_hour_resets_at TEXT,
                 five_hour_window_key INTEGER,
-                account_key TEXT NOT NULL DEFAULT 'unattributed'
+                account_key TEXT NOT NULL DEFAULT 'unattributed',
+                journal_id TEXT
             );
+            CREATE UNIQUE INDEX idx_weekly_usage_snapshots_journal_id
+                ON weekly_usage_snapshots(journal_id) WHERE journal_id IS NOT NULL;
             CREATE INDEX idx_usage_week_time
                 ON weekly_usage_snapshots(week_start_date, captured_at_utc DESC, id DESC);
             CREATE INDEX idx_usage_week_start_at_time
@@ -346,8 +367,14 @@ def create_stats_db(path: Path) -> None:
                 effective_reset_at_utc TEXT NOT NULL,
                 observed_pre_credit_pct REAL,
                 account_key            TEXT NOT NULL DEFAULT 'unattributed',
-                UNIQUE(account_key, old_week_end_at, new_week_end_at)
+                origin_observation_id  TEXT
             );
+            CREATE UNIQUE INDEX idx_week_reset_events_origin
+                ON week_reset_events(account_key, origin_observation_id)
+                WHERE origin_observation_id IS NOT NULL;
+            CREATE UNIQUE INDEX idx_week_reset_events_legacy_tuple
+                ON week_reset_events(account_key, old_week_end_at, new_week_end_at)
+                WHERE origin_observation_id IS NULL;
 
             CREATE TABLE five_hour_blocks (
                 id                            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -615,6 +642,24 @@ def _self_test_create_stats_db() -> None:
             "PRAGMA table_info(week_reset_events)")}
         assert "observed_pre_credit_pct" in wre_cols, \
             "week_reset_events.observed_pre_credit_pct missing (drift vs _cctally_core)"
+        # #750 S3: epoch-1013 identity. The origin column and the two partial
+        # unique indexes replace the retired table-level UNIQUE, so a
+        # constraint-backed index here means the builder fell back to the
+        # pre-1013 shape.
+        assert "origin_observation_id" in wre_cols, \
+            "week_reset_events.origin_observation_id missing (drift vs epoch 1013)"
+        wre_indexes = list(conn.execute("PRAGMA index_list(week_reset_events)"))
+        constrained = [r[1] for r in wre_indexes if str(r[3]) == "u"]
+        assert not constrained, \
+            f"week_reset_events still carries a table-level UNIQUE: {constrained}"
+        assert {"idx_week_reset_events_origin",
+                "idx_week_reset_events_legacy_tuple"} <= {
+                    r[1] for r in wre_indexes}, \
+            "week_reset_events partial unique indexes missing"
+        wus_cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(weekly_usage_snapshots)")}
+        assert "journal_id" in wus_cols, \
+            "weekly_usage_snapshots.journal_id missing (drift vs _cctally_core)"
     print("OK: create_stats_db")
 
 
@@ -956,6 +1001,7 @@ def seed_weekly_usage_snapshot(
     source: str = "userscript",
     payload_json: str = "{}",
     account_key: Optional[str] = None,
+    journal_id: Optional[str] = None,
 ) -> None:
     """Insert a weekly_usage_snapshots row.
 
@@ -975,37 +1021,40 @@ def seed_weekly_usage_snapshot(
 
     `account_key` (#341) stamps the row's account; None keeps the schema
     default (`unattributed`), byte-identical for existing single-account
-    fixtures."""
-    if account_key is None:
-        conn.execute(
-            """INSERT INTO weekly_usage_snapshots
-               (captured_at_utc, week_start_date, week_end_date,
-                week_start_at, week_end_at, weekly_percent,
-                page_url, source, payload_json,
-                five_hour_percent, five_hour_resets_at,
-                five_hour_window_key)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (captured_at_utc, week_start_date, week_end_date,
-             week_start_at, week_end_at, weekly_percent,
-             page_url, source, payload_json,
-             five_hour_percent, five_hour_resets_at,
-             five_hour_window_key),
-        )
-    else:
-        conn.execute(
-            """INSERT INTO weekly_usage_snapshots
-               (captured_at_utc, week_start_date, week_end_date,
-                week_start_at, week_end_at, weekly_percent,
-                page_url, source, payload_json,
-                five_hour_percent, five_hour_resets_at,
-                five_hour_window_key, account_key)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (captured_at_utc, week_start_date, week_end_date,
-             week_start_at, week_end_at, weekly_percent,
-             page_url, source, payload_json,
-             five_hour_percent, five_hour_resets_at,
-             five_hour_window_key, account_key),
-        )
+    fixtures.
+
+    `journal_id` (#750 S3) names the journal record this snapshot was
+    materialized from. Production writes `"sa:" + <raw observation id>` for a
+    snapshot the `snapshot_accept` family produced, and
+    `_backfill_week_reset_events` strips that prefix to name the origin of any
+    reset event it synthesizes from this row. Seed it only in a fixture that
+    also seeds the event with the matching `origin_observation_id`; None (the
+    default) keeps every existing fixture's origin-null identity."""
+    columns = [
+        "captured_at_utc", "week_start_date", "week_end_date",
+        "week_start_at", "week_end_at", "weekly_percent",
+        "page_url", "source", "payload_json",
+        "five_hour_percent", "five_hour_resets_at", "five_hour_window_key",
+    ]
+    values = [
+        captured_at_utc, week_start_date, week_end_date,
+        week_start_at, week_end_at, weekly_percent,
+        page_url, source, payload_json,
+        five_hour_percent, five_hour_resets_at, five_hour_window_key,
+    ]
+    # `account_key` is NOT NULL with a schema default, so an explicit None
+    # cannot be bound — it is appended only when the caller stamps one.
+    if account_key is not None:
+        columns.append("account_key")
+        values.append(account_key)
+    if journal_id is not None:
+        columns.append("journal_id")
+        values.append(journal_id)
+    conn.execute(
+        f"INSERT INTO weekly_usage_snapshots ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' * len(columns))})",
+        tuple(values),
+    )
 
 
 def seed_weekly_cost_snapshot(
@@ -1069,6 +1118,8 @@ def seed_week_reset_event(
     old_week_end_at: str,
     new_week_end_at: str,
     effective_reset_at_utc: str,
+    account_key: str = "unattributed",
+    origin_observation_id: Optional[str] = None,
 ) -> None:
     """Insert a week_reset_events row.
 
@@ -1076,14 +1127,29 @@ def seed_week_reset_event(
     (_backfill_week_reset_events) inserts. Use this in fixtures that need
     to exercise mid-week-reset boundary overrides applied by
     `_apply_reset_events_to_subweeks` / `_apply_reset_events_to_weekrefs`.
-    `INSERT OR IGNORE` matches production: UNIQUE(old_week_end_at,
-    new_week_end_at) protects against double-inserts."""
+
+    `account_key` and `origin_observation_id` are named rather than left to
+    the schema default, because both participate in the epoch-1013 identity
+    (#750 S3) and a fixture that leaves them implicit cannot say which of the
+    two partial unique indexes deduplicates it. `INSERT OR IGNORE` matches
+    production, and which index catches a repeat depends on the origin: an
+    origin-null row is deduplicated on
+    `(account_key, old_week_end_at, new_week_end_at)`, and a row that names an
+    observation on `(account_key, origin_observation_id)`.
+
+    Naming an origin has a consequence a caller must plan for. The two indexes
+    are disjoint, so an origin-bearing seed does NOT deduplicate against the
+    origin-null row `_backfill_week_reset_events` derives from the same
+    snapshots. Seed the matching `weekly_usage_snapshots.journal_id`
+    (`"sa:" + origin_observation_id`) whenever a fixture whose backfill runs
+    names an origin."""
     conn.execute(
         "INSERT OR IGNORE INTO week_reset_events "
         "(detected_at_utc, old_week_end_at, new_week_end_at, "
-        " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+        " effective_reset_at_utc, account_key, origin_observation_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
         (detected_at_utc, old_week_end_at, new_week_end_at,
-         effective_reset_at_utc),
+         effective_reset_at_utc, account_key, origin_observation_id),
     )
 
 

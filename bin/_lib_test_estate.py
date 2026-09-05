@@ -72,20 +72,25 @@ __all__ = [
     "COMPLEMENT_SELECTOR",
     "EXECUTION_LEGS",
     "EstateError",
+    "Expectation",
     "Finding",
     "HARMFUL",
+    "PRIVATE",
     "PRIVATE_LEDGER",
     "PRIVATE_OVERLAY",
     "PUBLIC_ARTIFACT",
     "PUBLIC_LEDGER",
     "PROFILES",
+    "PUBLIC",
     "SCHEMA_VERSION",
     "SKIPPED",
     "Report",
     "Uncovered",
     "UncoveredRecord",
+    "active_profile",
     "active_set_digest",
     "allowlist_digest",
+    "applicable_expectations",
     "axis_diff",
     "classify_selector",
     "collapse_suppressions",
@@ -103,9 +108,11 @@ __all__ = [
     "merge_ledgers",
     "plan_execution",
     "predecessor_revisions",
+    "private_expectation",
     "render_report",
     "run_check",
     "uncovered_transitions",
+    "validate_owner_paths",
     "validate_transition",
 ]
 
@@ -1123,6 +1130,145 @@ PRIVATE_OVERLAY = "tests/authoritative-estate.private.json"
 PUBLIC_LEDGER = "tests/authoritative-estate-retirements.json"
 PRIVATE_LEDGER = "tests/authoritative-estate-retirements.private.json"
 ALLOWLIST = ".mirror-allowlist"
+
+
+# ---------------------------------------------------------------------------
+# Per-entry expectation visibility (#678, #710)
+# ---------------------------------------------------------------------------
+#
+# Two estate-wide comparisons name a file the mirror does not publish. The
+# generated-child loader map in `tests/test_script_loader.py` names
+# `tests/test_rewrite_release_notes.py`, and the cache-writer inventory in
+# `tests/test_cache_coverage_496_s5b.py` names `bin/cctally-snapshot-measure`.
+# Both are exact equality and both are collected by the public clone, where the
+# named file is absent, so on that profile each expects one entry the tree
+# cannot produce.
+#
+# Visibility is DECLARED per entry rather than inferred from the tree. An
+# unannotated entry is public, which is the fail-closed direction: a loader
+# site or a cache writer added later is expected on both profiles until
+# somebody classifies it. Only which declarations apply is profile-dependent.
+# The comparison itself never is, and is never relaxed to a subset test because
+# `.mirror-allowlist` is absent.
+
+PUBLIC = "public"
+PRIVATE = "private"
+
+Expectation = collections.namedtuple(
+    "Expectation", ("value", "visibility", "owner"))
+"""One expectation entry, its declared visibility, and the path that owns it.
+
+``owner`` is a repository-relative path. ``validate_owner_paths`` hands it to
+the tree's own allowlist classifier, so a declaration that has drifted away
+from `.mirror-allowlist` fails rather than silently narrowing a comparison.
+"""
+
+
+def private_expectation(value, owner):
+    """``value``, declared to exist only on the private profile."""
+    if not isinstance(owner, str) or not owner.strip():
+        raise EstateError(
+            "a private expectation must name the repository-relative path that "
+            f"owns it; got {owner!r}")
+    return Expectation(value, PRIVATE, owner)
+
+
+def active_profile(repo=None):
+    """Which profile this tree is, decided by `.mirror-allowlist`'s presence.
+
+    `bin/_lib-test-contract.sh:440` already states that rule for admission. A
+    second, differently-derived signal here would be a second answer to the
+    same question, so this reads the same marker.
+    """
+    root = Path(repo) if repo is not None else _repo_default()
+    return PRIVATE if (root / ALLOWLIST).exists() else PUBLIC
+
+
+def applicable_expectations(entries, *, profile):
+    """``entries`` without the declarations ``profile`` does not carry.
+
+    Returns a plain mapping of key to raw value, so the caller compares the
+    same shape it always did. An entry that is not an ``Expectation`` is
+    public and is passed through unchanged.
+    """
+    if profile not in PROFILES:
+        raise EstateError(
+            f"unknown profile {profile!r}; expected one of {PROFILES}")
+    applicable = {}
+    for key, entry in dict(entries).items():
+        if isinstance(entry, Expectation):
+            if entry.visibility == PRIVATE and profile != PRIVATE:
+                continue
+            applicable[key] = entry.value
+        else:
+            applicable[key] = entry
+    return applicable
+
+
+def _load_allowlist_matcher(path):
+    """Load `.githooks/_match.py` WITHOUT registering it in ``sys.modules``.
+
+    Two synthetic trees are classified in one interpreter by this module's own
+    tests, and a registered name would answer the second tree's question with
+    the first tree's classifier.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_lib_test_estate_allowlist_matcher", path)
+    if spec is None or spec.loader is None:
+        raise EstateError(f"the allowlist classifier at {path} is not loadable")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise EstateError(
+            f"the allowlist classifier at {path} did not load: {exc}") from exc
+    if not callable(getattr(module, "classify", None)):
+        raise EstateError(
+            f"the allowlist classifier at {path} exposes no classify()")
+    return module
+
+
+def validate_owner_paths(entries, repo=None):
+    """Refuse a private declaration the real allowlist actually publishes.
+
+    Private profile only. The public projection carries neither
+    `.mirror-allowlist` nor `.githooks/_match.py` by design, so it consumes the
+    declared visibility directly; what is skipped there is this validation, not
+    the comparison the declaration feeds.
+
+    On a tree that claims to be private, an absent classifier is a refusal
+    rather than a silent success, matching `contract_admit_visibility`.
+
+    This never reimplements allowlist matching. It reads the tree's own
+    `.mirror-allowlist` and hands the text to the tree's own classifier.
+    """
+    root = Path(repo) if repo is not None else _repo_default()
+    if active_profile(root) != PRIVATE:
+        return None
+    declared = sorted({
+        entry.owner for entry in dict(entries).values()
+        if isinstance(entry, Expectation) and entry.visibility == PRIVATE
+    })
+    if not declared:
+        return None
+    matcher = root / ".githooks" / "_match.py"
+    if not matcher.exists():
+        raise EstateError(
+            f"this tree is the private profile ({ALLOWLIST} is present) but the "
+            f"allowlist classifier {matcher} is absent, so a declared owner "
+            "path cannot be checked against the real mirror boundary")
+    classify = _load_allowlist_matcher(matcher).classify
+    text = (root / ALLOWLIST).read_text(encoding="utf-8")
+    published = set(classify(list(declared), allowlist_text=text)["public"])
+    drifted = [path for path in declared if path in published]
+    if drifted:
+        raise EstateError(
+            "an expectation entry declares private visibility but "
+            f"{ALLOWLIST} publishes the path that owns it: "
+            f"{', '.join(drifted)}. Either drop the declaration or negate the "
+            "path in the allowlist; the two must agree.")
+    return None
+
 
 # One line of the rendered report may not carry either of these, because the
 # shell reads it with `IFS=$'\t' read -r`. Rows come from node identifiers,

@@ -132,6 +132,14 @@ export function DailyPanel() {
           ? best
           : best == null || row.cost_usd > best.cost_usd ? row : best, null);
   const hydrating = presentationProviders(env, activeSource).hydrating;
+  // #569 item 1 — ONE predicate for the sub-line and the body, so the two
+  // cannot disagree about the same moment. The body already tested this first
+  // and rendered a skeleton; the note was gated on `withheld` alone, so a cold
+  // All-tab render — null snapshot, `presentationDailyRows` synthesizing
+  // `rows_absent` for it — printed `withheld` over that skeleton. Panel-local
+  // on purpose: `ProjectsPanel` demonstrates the same shape and no shared
+  // helper is warranted for a two-line ordering rule.
+  const showSkeleton = hydrating && rows.length === 0;
   const providerState = presentationProviders(env, activeSource);
   const warning = warningForDomain(providerState.warnings, 'daily');
 
@@ -212,9 +220,11 @@ export function DailyPanel() {
           body saying the shared range could not be resolved asserts the very
           range the body withholds. */}
       <div className="panel-range-note">
-        {withheld
-          ? 'withheld'
-          : `30 days${activeSource === 'all' ? ' · both providers' : ''}`}
+        {showSkeleton
+          ? 'loading'
+          : withheld
+            ? 'withheld'
+            : `30 days${activeSource === 'all' ? ' · both providers' : ''}`}
       </div>
       <div className="panel-body" id="panel-daily-body">
         {/* HYDRATING IS TESTED FIRST, ahead of `withheld`. The store's initial
@@ -223,7 +233,7 @@ export function DailyPanel() {
             `presentationDailyRows(null, 'all')` synthesizes `rows_absent` for
             it. Reaching the withheld branch there told the user their page was
             talking to the wrong server. */}
-        {hydrating && rows.length === 0 ? (
+        {showSkeleton ? (
           <PanelSkeleton />
         ) : withheld ? (
           <div className="panel-empty panel-withheld" data-withheld-code={withheld.code}>

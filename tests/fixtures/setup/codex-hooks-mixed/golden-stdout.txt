@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "install": {
     "symlinks_present": 0,
     "symlinks_total": 16,
@@ -37,10 +37,10 @@
         "stop_count": 1,
         "subagent_stop_count": 1,
         "feature_enabled": true,
-        "requires_review": null,
-        "remediation": "Verify the exact cctally handler in Codex /hooks.",
+        "requires_review": true,
+        "remediation": "Review and trust the cctally handler in Codex /hooks.",
         "error": null,
-        "state": "installed_trust_unobservable"
+        "state": "installed_untrusted"
       },
       {
         "source_root_key": "ROOT_KEY",
@@ -56,6 +56,8 @@
       }
     ],
     "installed_count": 1,
+    "enabled_count": 0,
+    "all_roots_enabled": false,
     "error_count": 1
   },
   "legacy": {

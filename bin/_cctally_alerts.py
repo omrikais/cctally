@@ -252,9 +252,16 @@ def _alert_label_prefix(axis: str, account_key: "str | None",
     install's alert text stays byte-identical to today.
 
     Delegates the R8 gate + label precedence to the single-definition helpers
-    ``_cctally_account.real_account_count`` / ``account_label`` (P2-CQ1) so the
-    ">1 real account" trigger and the key->label map have exactly one home; this
-    wrapper only opens the RO connection and stays best-effort/never-raise.
+    ``_cctally_account.provider_is_decorated`` / ``account_label`` (P2-CQ1) so
+    the ">1 real account" trigger and the key->label map have exactly one home;
+    this wrapper only opens the RO connection and stays best-effort/never-raise.
+
+    #702: the gate is the canonical predicate itself, negated at the call site.
+    This site previously inverted the underlying counter by hand
+    (``real_account_count(conn, vendor) <= 1``), which is a second written form
+    of the R8 threshold — the arrangement that lets the two spellings disagree
+    if the threshold ever moves. ``provider_is_decorated`` is ``> 1``, so the
+    suppressed branch is ``not provider_is_decorated(...)``.
 
     #697: the VENDOR comes from the payload's own ``provider`` when it carries
     one, and from ``_AXIS_VENDOR`` otherwise. The metering-rate-change family
@@ -288,7 +295,7 @@ def _alert_label_prefix(axis: str, account_key: "str | None",
             connect=lambda p: _sq.connect(f"file:{p}?mode=ro", uri=True),
         )
         try:
-            if _cctally_account.real_account_count(conn, vendor) <= 1:
+            if not _cctally_account.provider_is_decorated(conn, vendor):
                 return ""
             # #416 §6: population-aware, so two accounts that auto-label to
             # one email do not print the same alert prefix.
@@ -400,8 +407,27 @@ def _dispatch_alert_notification(
         # rate transition has no percentage threshold for `severity_for` to
         # map. Reading it verbatim is what keeps the three tiers meaningful
         # here; falling through would floor every transition at `info`.
+        #
+        # #750 S2: the vocabulary is RESOLVED from the kernel's own tuple
+        # rather than restated as a literal. A restated literal makes this the
+        # second written form of the same rule, which is exactly the
+        # arrangement #747 closed on the envelope: a fourth member added to
+        # `RATE_CHANGE_SEVERITIES`, to the TypeScript tuple and to the CSS
+        # passes every parity test and is still clamped to `info` here, so the
+        # OS notification's urgency and the trailing `alerts.log` column are
+        # wrong while the suite is green.
+        #
+        # Guarded the same way `_cctally_dashboard_envelope` guards its copy,
+        # and an unresolvable kernel degrades to NO clamp. This function's
+        # contract is that it never raises, and clamping against an empty
+        # vocabulary would send every correct severity to `info`.
         severity = str(payload.get("severity") or "info")
-        if severity not in ("info", "warn", "alarm"):
+        try:
+            _severities = frozenset(
+                _load_lib("_lib_meter_rate_change").RATE_CHANGE_SEVERITIES)
+        except Exception:                              # noqa: BLE001
+            _severities = None
+        if _severities is not None and severity not in _severities:
             severity = "info"
     else:
         try:
@@ -484,6 +510,54 @@ def _dispatch_alert_notification(
     return status
 
 
+def _synthetic_instant_days_ago(days: int) -> str:
+    """A timezone-aware ISO instant `days` before now (#699).
+
+    Negative goes forward, which is what a quota reset needs. Both non-registry
+    synthetics require real instants rather than placeholders: the rate-change
+    body renders an effective date, and the quota body renders a reset.
+    """
+    moment = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    return moment.isoformat().replace("+00:00", "Z")
+
+
+def _test_alert_account_key(vendor: str) -> str:
+    """A REAL account key for `vendor`, else the vendor-wide sentinel (#699).
+
+    This is what makes the R8 `[<label>]` prefix observable from
+    `alerts test`: on a decorated install the synthetic carries a key the
+    registry can label, and on a single-account install it falls back to `*`,
+    which `_alert_label_prefix` suppresses — so that install's output stays
+    byte-identical, exactly as R8 requires.
+
+    Best-effort and never-raise, following `_alert_label_prefix`: a missing
+    database, an unreadable registry or an empty one all degrade to the
+    sentinel rather than turning a rehearsal into an error path.
+    """
+    try:
+        import sqlite3 as _sq
+        import _cctally_account
+        import _cctally_store
+        db_path = _cctally_core.DB_PATH
+        if not db_path.exists():
+            return _lib_accounts.VENDOR_WIDE
+        conn = _cctally_store.stats_open_guarded(
+            db_path,
+            connect=lambda p: _sq.connect(f"file:{p}?mode=ro", uri=True),
+        )
+        try:
+            for row in _cctally_account.load_accounts(conn, vendor):
+                key = str(row.get("account_key") or "")
+                if key and key not in (_lib_accounts.UNATTRIBUTED,
+                                       _lib_accounts.VENDOR_WIDE):
+                    return key
+        finally:
+            conn.close()
+    except Exception:                                  # noqa: BLE001
+        return _lib_accounts.VENDOR_WIDE
+    return _lib_accounts.VENDOR_WIDE
+
+
 def cmd_alerts_test(args: argparse.Namespace) -> int:
     """Send a synthetic test alert through the dispatch pipeline.
 
@@ -510,9 +584,28 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
         axis = "codex_budget"
     elif args.axis == "projected":
         axis = "projected"
+    elif args.axis == "quota":
+        axis = "quota"
+    elif args.axis == "meter-rate-change":
+        axis = "meter_rate_change"
     else:
         axis = "five_hour"
-    threshold = int(args.threshold)
+    # #699: `--threshold` now defaults to None so that "supplied" is
+    # distinguishable from "defaulted". Every axis that takes one still gets 90
+    # when it is omitted, which keeps the existing surface byte-identical.
+    raw_threshold = getattr(args, "threshold", None)
+    if axis == "meter_rate_change" and raw_threshold is not None:
+        # Exit 2 is native-usage per docs/cli-contract.md. The message names
+        # BOTH the axis and the flag: a refusal that does not say what failed
+        # costs the reader more than one that gives no reason at all.
+        print(
+            "cctally: --axis meter-rate-change does not accept --threshold; "
+            "a metering-rate change has no percentage threshold and carries "
+            "an explicit severity instead",
+            file=sys.stderr,
+        )
+        return 2
+    threshold = 90 if raw_threshold is None else int(raw_threshold)
     # --threshold range stays [1, 100] (F5): the cap is axis-uniform with the
     # existing weekly/5h thresholds. Over-budget tiers (>100%) are a v2
     # deferral, not an oversight — see spec §2 (F5).
@@ -602,6 +695,54 @@ def cmd_alerts_test(args: argparse.Namespace) -> int:
             projected_value=projected_value,
             denominator=denominator,
             week_start_at=dt.date.today().isoformat(),
+        )
+    elif axis == "meter_rate_change":
+        # #699: the family is deliberately NOT in `AXIS_REGISTRY`, so there is
+        # no `_build_alert_payload_*` helper for it. The synthetic descriptor
+        # is built HERE and passed through the real
+        # `_lib_meter_rate_change.alert_payload`, which is what keeps that
+        # kernel clock-, database- and policy-free while still rehearsing the
+        # exact payload production dispatches.
+        import _lib_meter_rate_change as _mrc
+        previous, new = 2_442_620.0, 1_665_096.0
+        effective = _synthetic_instant_days_ago(7)
+        payload = _mrc.alert_payload(_mrc.RateChangeTransition(
+            provider="claude",
+            account_key=_test_alert_account_key("claude"),
+            effective_from=effective,
+            previous_units_per_point=previous,
+            new_units_per_point=new,
+            # Computed by the real kernel rather than hardcoded, so a change
+            # to the severity boundaries is rehearsed here too. These rates
+            # are a 31.8% drop — the maintainer's own observed transition —
+            # which lands on `alarm`.
+            severity=_mrc.transition_severity(previous, new),
+            detected_at=now_utc_iso(),
+            # The #690 disclosure, so the rehearsal exercises the withheld
+            # copy rather than only the ordinary path.
+            withholding_status="unsupported-model-mix",
+            detector_input_causes='["unsupported-composition"]',
+            composition_provenance='["forecast-aggregate"]',
+            baseline_withheld_days=3,
+        ))
+    elif axis == "quota":
+        # #699: also outside `AXIS_REGISTRY`, but this one HAS a payload
+        # builder, so the synthetic goes through it unchanged. `source` is
+        # `codex` because that is the only vendor this family observes, and
+        # `_AXIS_VENDOR` maps the axis to the same vendor for the R8 lookup.
+        payload = _build_alert_payload_quota(
+            source="codex",
+            source_root_key="default",
+            logical_limit_key="weekly",
+            observed_slot=_synthetic_instant_days_ago(2),
+            window_minutes=10080,
+            resets_at_utc=_synthetic_instant_days_ago(-5),
+            threshold=threshold,
+            kind="weekly",
+            crossed_at_utc=now_utc_iso(),
+            qualifying_percent=float(threshold),
+            projected_percent=min(100.0, float(threshold) + 5.0),
+            account_key=_test_alert_account_key("codex"),
         )
     else:
         payload = _build_alert_payload_five_hour(

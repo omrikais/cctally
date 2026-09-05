@@ -16,8 +16,10 @@ measurement rather than by reading:
   Codex leg.** The whole cost of the resolved cycle sits in the cold build, so
   no gate here may expect Codex work on a warm or idle tick.
 """
+import ast
 import contextlib
 import dataclasses
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
@@ -25,11 +27,15 @@ import os
 import pathlib
 import shutil
 import sqlite3
+import subprocess
 import sys
+import textwrap
+import time
 import types
 
 import pytest
-from conftest import load_script
+from conftest import copy_shared_corpus, corpus_lock_path, load_script
+from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 BIN = pathlib.Path(__file__).resolve().parent.parent / "bin"
 if str(BIN) not in sys.path:
@@ -92,66 +98,179 @@ def _run_refresh(data_dir, bbf, *, skip_sync=False, force_a2=False,
     return ref, hub
 
 
-def _private_corpus(data_dir, tmp_path):
-    """Copy every corpus axis so this test owns cache.db and its flock."""
-    source_root = pathlib.Path(data_dir).parent
-    private_root = tmp_path / "corpus"
-    # SQLite readers can create and remove these sidecars between copytree's
-    # directory scan and its copy2 call.  The built corpus is checkpointed;
-    # transient sidecars are neither fixture inputs nor safe copy candidates.
-    shutil.copytree(
-        source_root,
-        private_root,
-        ignore=shutil.ignore_patterns("*.db-shm", "*.db-wal"),
-    )
-    return private_root / pathlib.Path(data_dir).name
+def _private_corpus(data_dir, tmp_path, name="corpus"):
+    """Copy every corpus axis so this test owns cache.db and its flock.
+
+    Delegates to ``conftest.copy_shared_corpus``, the ONE copier in the estate.
+    It resolves the source root, excludes the SQLite sidecars a concurrent
+    reader can create and remove between ``copytree``'s directory scan and its
+    ``copy2`` call, and holds the scale's build lock SHARED for the whole walk
+    so a copy can never observe ``_clear_previous_corpus`` mid-rebuild.
+
+    ``name`` distinguishes two copies inside one test, which the writer-hazard
+    regression needs: one tree standing in for the shared corpus, and one
+    private copy taken from it.
+    """
+    return copy_shared_corpus(data_dir, tmp_path / name)
 
 
-def _private_frontier_corpus(data_dir, tmp_path, bbf):
+def _plan_detail(plan, note=""):
+    """A frontier plan's mode AND its reason, for an assertion message.
+
+    ``plan_provider`` distinguishes eleven refusals — ``certificate_expired``,
+    ``database_replaced``, ``schema_changed``, ``incomplete_store``,
+    ``maintenance_changed``, ``hook_config_changed``, ``filesystem_changed``,
+    ``marker_replaced``, ``ambiguous_activity``, ``target_outside_scope`` and
+    ``cursor_gap`` — and every one of them presents to a bare
+    ``assert plan.mode == "caught_up"`` as the single word ``full``. That is
+    why no retained log from any past failure of this module could be
+    diagnosed after the fact, and why every assertion over a plan here reports
+    the reason whether or not it asserts one.
+    """
+    detail = f"plan mode={plan.mode!r} reason={plan.reason!r}"
+    return f"{note}\n{detail}" if note else detail
+
+
+def _assert_plan(plan, *, mode=None, reason=None, note=""):
+    """Assert a plan's mode and/or reason, reporting both on failure."""
+    if mode is not None:
+        assert plan.mode == mode, _plan_detail(plan, note)
+    if reason is not None:
+        assert plan.reason == reason, _plan_detail(plan, note)
+    return plan
+
+
+def _seed_detail(state, note=""):
+    """A frontier's seed refusals, for an assertion message.
+
+    ``seed_provider`` returns a bare boolean and records WHY it refused in
+    ``last_seed_failure``. An assertion that reports only the boolean says a
+    seed failed and nothing about which of the refusals fired.
+    """
+    detail = f"last_seed_failure={dict(getattr(state, 'last_seed_failure', {}) or {})}"
+    return f"{note}\n{detail}" if note else detail
+
+
+#: The four tables a frontier reads its ``roots`` from, by the database that
+#: holds them. Stated as a closed list rather than as "any store": both stores
+#: carry many other path-bearing columns, and claiming to cover all of them
+#: while checking four would be a false claim, not a conservative one.
+_FRONTIER_ROOT_TABLES = {
+    "cache": ("session_files", "codex_session_files"),
+    "conversations": (
+        "conversation_source_files", "codex_conversation_source_files",
+    ),
+}
+
+
+def _assert_clean_rebuild(label, stats):
+    """A rederive that failed files, or never took its lock, proves nothing."""
+    assert not stats.lock_contended, (
+        f"{label} never took its writer lock, so it rederived nothing")
+    assert stats.files_failed == 0, (
+        f"{label} failed {stats.files_failed} of {stats.files_total} files")
+    assert stats.files_processed > 0, (
+        f"{label} processed no files at all, so every containment check below "
+        f"would pass over an empty table")
+
+
+def _assert_roots_are_private(conn, tables, private_root):
+    """Every frontier root in ``tables`` resolves INSIDE ``private_root``.
+
+    Resolved-path containment, not a string prefix. ``startswith`` admitted
+    ``/tmp/corpus-evil/x.jsonl`` against ``/tmp/corpus``, and on macOS it also
+    disagreed with itself whenever one side had been through ``/private/var``
+    and the other had not.
+
+    Each table must also be NON-EMPTY. "No stray rows" is satisfied vacuously
+    by a table a failed rebuild left with no rows at all, which is the state
+    this check most needs to catch.
+
+    EVERY row is selected, not only the ones matching ``path LIKE '/%'``. A
+    filter on absolute paths exempted a relative path from both halves of this
+    check — it counted toward neither the non-empty assertion nor the
+    containment one — while the docstring claimed every frontier root resolves
+    inside the private root. A stored ``../shared/x.jsonl`` would have passed.
+    A non-absolute path is therefore reported on its own, and it is reported
+    BEFORE the containment test because ``Path.resolve`` grounds a relative
+    path against the current working directory, which could place it inside
+    ``private_root`` by accident.
+    """
+    for table in tables:
+        rows = [str(row[0]) for row in conn.execute(f"SELECT path FROM {table}")]
+        assert rows, (
+            f"{table} holds no source path at all, so a containment check "
+            f"over it would pass without examining anything")
+        relative = [raw for raw in rows if not raw.startswith("/")]
+        assert not relative, (
+            f"{table} holds a non-absolute source path, which resolves "
+            f"against the process working directory rather than against "
+            f"{private_root}: {relative[:3]}"
+        )
+        stray = [
+            raw for raw in rows
+            if not pathlib.Path(raw).resolve().is_relative_to(private_root)
+        ]
+        assert not stray, (
+            f"{table} still points outside the private corpus "
+            f"{private_root}: {stray[:3]}"
+        )
+
+
+def _private_frontier_corpus(data_dir, tmp_path, bbf, name="corpus"):
     """Copy then rederive cache paths so an exhaustive walk can certify it.
 
-    ``cache.db`` stores absolute source paths.  A plain private copy therefore
-    quite correctly sees the shared fixture paths as orphaned and withholds its
-    walk-complete sentinel.  Frontier integration tests need a genuinely
-    self-contained cache, not a copied database whose source estate lives
-    elsewhere.
+    WHAT IS REDERIVED AND WHAT IS COPIED. The JSONL sources, the Codex
+    rollouts, ``home/`` and every other file under the corpus root are COPIED
+    verbatim. ``cache.db`` and ``conversations.db`` are copied and then
+    REDERIVED in place, by a full-rebuild ``sync_cache``, ``sync_codex_cache``,
+    ``sync_claude_conversations`` and ``sync_codex_conversations`` over the
+    private tree. ``stats.db`` and the append-only journal are neither: they
+    are copied and left as they are, because no frontier reads a root from
+    them.
 
-    ``conversations.db`` is rederived for the same reason and one more: the
+    Both databases store ABSOLUTE source paths. A plain private copy therefore
+    quite correctly sees the shared fixture paths as orphaned and withholds its
+    walk-complete sentinel, so a frontier test needs a genuinely self-contained
+    cache rather than a copied database whose source estate lives elsewhere.
+
+    ``conversations.db`` is rederived for that reason and one more: the
     frontier tests take their ``roots`` from ``conversation_source_files.path``,
     so a copied conversations database aims them at the SESSION-SCOPED corpus
-    that every xdist worker shares.  ``plan_provider`` stats those roots, and a
+    that every xdist worker shares. ``plan_provider`` stats those roots, and a
     write by any other worker then trips its ``filesystem_changed`` guard and
     degrades the plan to ``full`` — a cross-worker race whose victim is
     whichever test happens to be between its seed and its plan.
     """
-    corpus = _private_corpus(data_dir, tmp_path)
-    private_root = pathlib.Path(corpus).parent
+    corpus = _private_corpus(data_dir, tmp_path, name)
+    private_root = pathlib.Path(corpus).parent.resolve()
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
-            assert cctally.sync_cache(conn, rebuild=True).full_walk_complete
-            assert cctally.sync_codex_cache(conn, rebuild=True).full_walk_complete
-        finally:
-            conn.close()
-        conv = cctally.open_conversations_db()
-        try:
-            cctally.sync_claude_conversations(conv, rebuild=True)
-            cctally.sync_codex_conversations(conv, rebuild=True)
+            claude = cctally.sync_cache(conn, rebuild=True)
+            assert claude.full_walk_complete
+            _assert_clean_rebuild("sync_cache(rebuild=True)", claude)
+            codex = cctally.sync_codex_cache(conn, rebuild=True)
+            assert codex.full_walk_complete
+            _assert_clean_rebuild("sync_codex_cache(rebuild=True)", codex)
             # Fail here, deterministically, rather than inside whichever test
             # later draws a root from this table: a path outside the private
             # tree IS the cross-worker race, and it is invisible at the point
             # it actually causes a failure.
-            stray = [
-                row[0]
-                for row in conv.execute(
-                    "SELECT path FROM conversation_source_files WHERE path LIKE '/%'"
-                )
-                if not str(row[0]).startswith(str(private_root))
-            ]
-            assert not stray, (
-                "conversation_source_files still points outside the private "
-                f"corpus {private_root}: {stray[:3]}"
-            )
+            _assert_roots_are_private(
+                conn, _FRONTIER_ROOT_TABLES["cache"], private_root)
+        finally:
+            conn.close()
+        conv = cctally.open_conversations_db()
+        try:
+            _assert_clean_rebuild(
+                "sync_claude_conversations(rebuild=True)",
+                cctally.sync_claude_conversations(conv, rebuild=True))
+            _assert_clean_rebuild(
+                "sync_codex_conversations(rebuild=True)",
+                cctally.sync_codex_conversations(conv, rebuild=True))
+            _assert_roots_are_private(
+                conv, _FRONTIER_ROOT_TABLES["conversations"], private_root)
         finally:
             conv.close()
     return corpus
@@ -260,12 +379,13 @@ def test_refresh_retains_bounded_ingest_and_final_build_phase_trees(
         perf.reset_thread()
 
 
-def test_no_sync_reports_ingest_ran_false_and_zero(small_corpus):
+def test_no_sync_reports_ingest_ran_false_and_zero(private_corpus):
     """Preserve 17: `--no-sync` is a full non-hydrating seed with no ingest."""
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
     ts.reset_for_tests()
-    _ref, hub = _run_refresh(small_corpus, bbf, skip_sync=True)
+    corpus = private_corpus("small")
+    _ref, hub = _run_refresh(corpus, bbf, skip_sync=True)
     rec = ts.snapshot().records[-1]
     assert rec.ingest_ran is False
     assert rec.ingest_ns == 0
@@ -273,12 +393,13 @@ def test_no_sync_reports_ingest_ran_false_and_zero(small_corpus):
     assert hub.published and hub.published[-1].hydrating is False
 
 
-def test_a_standalone_build_is_recorded_without_a_dashboard_tick(small_corpus):
+def test_a_standalone_build_is_recorded_without_a_dashboard_tick(private_corpus):
     """`tui --render-once` and `cctally-snapshot-measure` reach this path."""
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
     ts.reset_for_tests()
-    with _corpus_env(small_corpus, bbf) as cctally:
+    corpus = private_corpus("small")
+    with _corpus_env(corpus, bbf) as cctally:
         cctally._cctally_tui._tui_build_snapshot(
             now_utc=bbf.CORPUS_CLOCK_UTC, skip_sync=True,
             precompute_envelope=True, runtime_bind="127.0.0.1",
@@ -312,8 +433,7 @@ def test_a_cold_refresh_realises_a_codex_rebuild(small_corpus, monkeypatch,
     assert rec.cold is True
 
 
-def test_a_refresh_whose_early_build_rebuilt_codex_is_active(small_corpus,
-                                                             monkeypatch):
+def test_a_refresh_whose_early_build_rebuilt_codex_is_active():
     """Last-write would call this idle. It is not (spec §1.5, review P1-2).
 
     Drives the classifier directly with the two realised decisions a single
@@ -321,6 +441,9 @@ def test_a_refresh_whose_early_build_rebuilt_codex_is_active(small_corpus,
     build rebuilds, a later one reuses. Simulating the DECISIONS rather than
     contriving a corpus that produces them is deliberate — the corpus carries
     exactly one weekly cycle, so the disagreement cannot be provoked from data.
+
+    It takes NO corpus fixture. It requested `small_corpus` and never read it,
+    which forced the shared build for a test that touches no data at all.
     """
     import _lib_tick_stats as ts
     ts.reset_for_tests()
@@ -335,19 +458,20 @@ def test_a_refresh_whose_early_build_rebuilt_codex_is_active(small_corpus,
     assert rec.dispatch == "full"
 
 
-def test_dispatch_counts_sum_to_completed_ticks(small_corpus):
+def test_dispatch_counts_sum_to_completed_ticks(private_corpus):
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
     ts.reset_for_tests()
+    corpus = private_corpus("small")
     for _ in range(3):
-        _run_refresh(small_corpus, bbf, skip_sync=True)
+        _run_refresh(corpus, bbf, skip_sync=True)
     snap = ts.snapshot()
     counts = snap.dispatch_counts
     assert snap.tick_seq == 3
     assert counts["idle"] + counts["full"] + counts["degraded"] == snap.tick_seq
 
 
-def test_a_warm_refresh_idles_and_does_not_touch_the_codex_leg(small_corpus):
+def test_a_warm_refresh_idles_and_does_not_touch_the_codex_leg(private_corpus):
     """Measured, not assumed: a warm tick reuses the whole source bundle.
 
     KNOWN GAP, recorded rather than fixed: `codex_regime == "idle"` has no
@@ -360,8 +484,9 @@ def test_a_warm_refresh_idles_and_does_not_touch_the_codex_leg(small_corpus):
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
     ts.reset_for_tests()
+    corpus = private_corpus("small")
     for _ in range(2):
-        _run_refresh(small_corpus, bbf, skip_sync=True)
+        _run_refresh(corpus, bbf, skip_sync=True)
     records = ts.snapshot().records
     assert records[0].dispatch == "full", "the first tick must be the cold one"
     assert records[1].dispatch == "idle", (
@@ -386,7 +511,7 @@ def _dashboard():
     ("monthly", "_group_a_monthly_buckets"),
 ])
 def test_each_group_a_open_failure_increments_its_own_counter(
-    kind, caller, monkeypatch, small_corpus
+    kind, caller, monkeypatch, private_corpus
 ):
     """Exactly one fixed counter, no SQL, and the original error unchanged."""
     import _lib_tick_stats as ts
@@ -403,7 +528,7 @@ def test_each_group_a_open_failure_increments_its_own_counter(
     monkeypatch.setattr(dash, "_raw_open_cache_db", failing_open)
     monkeypatch.setattr(dash, "_GROUP_A_CACHE_ENABLED", True)
 
-    with _corpus_env(small_corpus, bbf):
+    with _corpus_env(private_corpus("small"), bbf):
         fn = getattr(dash, caller)
         if caller == "_group_a_weekly_buckets":
             got = fn(None, bbf.CORPUS_CLOCK_UTC, weeks=[])
@@ -464,13 +589,13 @@ def test_an_unmatched_caller_does_not_guess_by_name(monkeypatch):
 
 
 def test_a_successful_open_costs_no_counter_and_returns_the_connection(
-    small_corpus
+    private_corpus
 ):
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
     ts.reset_for_tests()
     dash = _dashboard()
-    with _corpus_env(small_corpus, bbf):
+    with _corpus_env(private_corpus("small"), bbf):
         conn = dash.open_cache_db()
         try:
             assert conn.execute("SELECT 1").fetchone() == (1,)
@@ -551,14 +676,18 @@ def _provider_row_counts(data_dir):
 
 
 def test_the_instrument_does_the_same_work_over_a_ten_times_larger_corpus(
-    tiny_corpus, small_corpus, monkeypatch,
+    private_corpus, monkeypatch,
 ):
     """Constant overhead, asserted as a fixed call sequence (spec §7.1.1)."""
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
 
-    small_rows = _provider_row_counts(small_corpus)
-    tiny_rows = _provider_row_counts(tiny_corpus)
+    # BOTH halves of the >=10x pair are private: each arm drives a real
+    # refresh, so a shared corpus would be written by the very comparison.
+    small = private_corpus("small")
+    tiny = private_corpus("tiny")
+    small_rows = _provider_row_counts(small)
+    tiny_rows = _provider_row_counts(tiny)
     assert small_rows["claude"] >= 10 * tiny_rows["claude"], (
         f"non-vacuity: the pair must differ by >=10x on Claude rows, got "
         f"{small_rows['claude']} vs {tiny_rows['claude']}")
@@ -567,7 +696,7 @@ def test_the_instrument_does_the_same_work_over_a_ten_times_larger_corpus(
         f"{small_rows['codex']} vs {tiny_rows['codex']}")
 
     sequences = {}
-    for label, corpus in (("tiny", tiny_corpus), ("small", small_corpus)):
+    for label, corpus in (("tiny", tiny), ("small", small)):
         with monkeypatch.context() as mp:
             ts.reset_for_tests()
             log: list[str] = []
@@ -602,12 +731,13 @@ def _trace_every_connection(cctally, tui, statements):
 
 
 def test_an_idle_tick_issues_identical_sql_with_and_without_the_recorder(
-    small_corpus, monkeypatch,
+    private_corpus, monkeypatch,
 ):
     """Spec §7.1.2. The instrument must add no query and change no plan."""
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
     ts.reset_for_tests()
+    corpus = private_corpus("small")
 
     def run(null_recorder):
         statements: list[str] = []
@@ -622,10 +752,10 @@ def test_an_idle_tick_issues_identical_sql_with_and_without_the_recorder(
                                lambda **kw: null)
                     mp.setattr(ts, "current", lambda: null)
                     mp.setattr(ts, "note_cache_open_failure", lambda kind: None)
-            _run_refresh(small_corpus, bbf, skip_sync=True, before=before)
+            _run_refresh(corpus, bbf, skip_sync=True, before=before)
         return statements
 
-    _run_refresh(small_corpus, bbf, skip_sync=True)        # warm the memo
+    _run_refresh(corpus, bbf, skip_sync=True)        # warm the memo
     real = run(False)
     assert ts.snapshot().records[-1].dispatch == "idle", (
         "precondition: both arms must take the SAME (idle) branch")
@@ -699,11 +829,19 @@ def test_the_period_is_the_gap_between_two_injected_final_publishes(
 def test_ingest_frontier_caught_up_targeted_and_structural_fallback(
     small_corpus, tmp_path, monkeypatch,
 ):
-    """A trusted frontier skips, targets an append, and fails safe on structure."""
+    """A trusted frontier skips, targets an append, and fails safe on structure.
+
+    A REDERIVED private corpus, not a plain copy (#741). This test touches the
+    directory holding a tracked source file to provoke `filesystem_changed`,
+    and a plain copy keeps the absolute paths of the tree it was copied FROM —
+    so the mutation landed in the session-shared corpus, changing a directory
+    identity for every other worker. That is #721's mechanism, performed
+    deliberately. The write detector now refuses it.
+    """
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_corpus(small_corpus, tmp_path)
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -719,32 +857,35 @@ def test_ingest_frontier_caught_up_targeted_and_structural_fallback(
             state = frontier.DashboardIngestFrontier(app_dir)
             claude_roots = (pathlib.Path(claude_path).parent,)
             codex_roots = (pathlib.Path(codex_path).parent,)
-            state.seed_provider("claude", conn, roots=claude_roots)
-            state.seed_provider("codex", conn, roots=codex_roots)
+            assert state.seed_provider(
+                "claude", conn, roots=claude_roots), _seed_detail(state)
+            assert state.seed_provider(
+                "codex", conn, roots=codex_roots), _seed_detail(state)
 
-            assert state.plan_provider(
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=claude_roots,
-            ).mode == "caught_up"
+            ), mode="caught_up")
             frontier.record_activity(app_dir, "claude", claude_path)
             targeted = state.plan_provider(
                 "claude", conn, roots=claude_roots,
             )
-            assert targeted.mode == "targeted"
+            assert targeted.mode == "targeted", _plan_detail(targeted)
             assert targeted.paths == frozenset({claude_path})
 
             pathlib.Path(claude_path).parent.touch()
-            assert state.plan_provider(
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=claude_roots,
-            ).mode == "full"
+            ), mode="full", reason="filesystem_changed")
 
             bounded = dict(state.memory_stats())
             assert bounded["entryCount"] == 2
             assert bounded["estimatedBytes"] <= bounded["maxBytes"]
             monkeypatch.setattr(frontier, "FRONTIER_MAX_BYTES", 1)
-            assert not state.seed_provider("claude", conn, roots=claude_roots)
+            assert not state.seed_provider(
+                "claude", conn, roots=claude_roots), _seed_detail(state)
             assert state.last_seed_failure["claude"] == "memory_budget"
-            assert state.plan_provider(
-                "claude", conn, roots=claude_roots).mode == "full"
+            _assert_plan(state.plan_provider(
+                "claude", conn, roots=claude_roots), mode="full", reason="unseeded")
             assert dict(state.memory_stats())["fallbackCount"] == 1
         finally:
             conn.close()
@@ -803,10 +944,10 @@ def test_failed_pre_walk_cutoff_cannot_recapture_a_post_walk_boundary(
             assert frontier.record_activity(app_dir, "claude", source_path)
             assert not state.seed_provider(
                 "claude", conn, roots=roots, cutoff=cutoff,
-            )
-            assert state.plan_provider(
+            ), _seed_detail(state)
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=roots,
-            ).mode == "full"
+            ), mode="full", reason="unseeded")
         finally:
             conn.close()
 
@@ -836,10 +977,10 @@ def test_marker_replacement_read_binds_identity_and_bytes_to_one_descriptor(
             marker = frontier.activity_marker_path(app_dir)
             assert frontier.record_activity(app_dir, "claude", source_path)
             state = frontier.DashboardIngestFrontier(app_dir)
-            assert state.seed_provider("claude", conn, roots=roots)
-            assert state.plan_provider(
+            assert state.seed_provider("claude", conn, roots=roots), _seed_detail(state)
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=roots,
-            ).mode == "caught_up"
+            ), mode="caught_up")
 
             replacement = marker.with_name(marker.name + ".replacement")
             replacement.write_bytes(marker.read_bytes())
@@ -855,8 +996,8 @@ def test_marker_replacement_read_binds_identity_and_bytes_to_one_descriptor(
             monkeypatch.setattr(pathlib.Path, "open", replace_before_open)
             plan = state.plan_provider("claude", conn, roots=roots)
             assert raced["value"], "the marker replacement interleaving never fired"
-            assert plan.mode == "full"
-            assert plan.reason == "marker_replaced"
+            assert plan.mode == "full", _plan_detail(plan)
+            assert plan.reason == "marker_replaced", _plan_detail(plan)
         finally:
             conn.close()
 
@@ -868,7 +1009,7 @@ def test_caught_up_frontier_never_requeries_the_session_file_estate(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_corpus(small_corpus, tmp_path)
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -879,7 +1020,7 @@ def test_caught_up_frontier_never_requeries_the_session_file_estate(
             roots = (pathlib.Path(source_path).parent,)
             frontier.record_activity(app_dir, "claude", source_path)
             state = frontier.DashboardIngestFrontier(app_dir)
-            assert state.seed_provider("claude", conn, roots=roots)
+            assert state.seed_provider("claude", conn, roots=roots), _seed_detail(state)
 
             def forbidden(*_args, **_kwargs):
                 raise AssertionError("caught-up path requeried every source path")
@@ -888,7 +1029,7 @@ def test_caught_up_frontier_never_requeries_the_session_file_estate(
             statements = []
             conn.set_trace_callback(statements.append)
             plan = state.plan_provider("claude", conn, roots=roots)
-            assert plan.mode == "caught_up"
+            assert plan.mode == "caught_up", _plan_detail(plan)
             state.commit_provider(plan, conn, roots=roots)
             assert not any(
                 "session_files" in statement for statement in statements
@@ -916,14 +1057,14 @@ def test_conversation_frontier_caught_up_and_targeted_use_transcript_cursors(
             app_dir = pathlib.Path(corpus)
             frontier.record_activity(app_dir, "claude", source_path)
             state = frontier.ConversationSyncFrontier(app_dir)
-            assert state.seed_provider("claude", conn, roots=roots)
-            assert state.plan_provider(
+            assert state.seed_provider("claude", conn, roots=roots), _seed_detail(state)
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=roots,
-            ).mode == "caught_up"
+            ), mode="caught_up")
 
             frontier.record_activity(app_dir, "claude", source_path)
             plan = state.plan_provider("claude", conn, roots=roots)
-            assert plan.mode == "targeted"
+            assert plan.mode == "targeted", _plan_detail(plan)
             assert plan.paths == frozenset({source_path})
         finally:
             conn.close()
@@ -947,7 +1088,7 @@ def test_conversation_frontier_caught_up_never_queries_all_source_paths(
             app_dir = pathlib.Path(corpus)
             frontier.record_activity(app_dir, "claude", source_path)
             state = frontier.ConversationSyncFrontier(app_dir)
-            assert state.seed_provider("claude", conn, roots=roots)
+            assert state.seed_provider("claude", conn, roots=roots), _seed_detail(state)
 
             def forbidden(*_args, **_kwargs):
                 raise AssertionError("caught-up path queried transcript estate")
@@ -956,7 +1097,7 @@ def test_conversation_frontier_caught_up_never_queries_all_source_paths(
             statements = []
             conn.set_trace_callback(statements.append)
             plan = state.plan_provider("claude", conn, roots=roots)
-            assert plan.mode == "caught_up"
+            assert plan.mode == "caught_up", _plan_detail(plan)
             state.commit_provider(plan, conn, roots=roots)
             assert not any(
                 "conversation_source_files" in statement
@@ -1000,16 +1141,16 @@ def test_conversation_frontier_replacement_pending_and_cursor_gap_fail_full(
             app_dir = pathlib.Path(corpus)
             frontier.record_activity(app_dir, "claude", source_path)
             state = frontier.ConversationSyncFrontier(app_dir)
-            assert state.seed_provider("claude", conn, roots=roots)
+            assert state.seed_provider("claude", conn, roots=roots), _seed_detail(state)
 
             conn.execute(
                 "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
                 ("conversation_rebuild_claude_pending", "1"),
             )
             conn.commit()
-            assert state.plan_provider(
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=roots,
-            ).mode == "full"
+            ), mode="full", reason="maintenance_changed")
             conn.execute(
                 "DELETE FROM cache_meta WHERE key=?",
                 ("conversation_rebuild_claude_pending",),
@@ -1025,9 +1166,9 @@ def test_conversation_frontier_replacement_pending_and_cursor_gap_fail_full(
                 (actual_size + 1, source_path),
             )
             conn.commit()
-            assert state.plan_provider(
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=roots,
-            ).mode == "full"
+            ), mode="full", reason="cursor_gap")
         finally:
             conn.close()
 
@@ -1058,7 +1199,7 @@ def test_conversation_frontier_same_size_source_replacement_requires_rebuild(
             app_dir = pathlib.Path(corpus)
             frontier.record_activity(app_dir, provider, source_path)
             state = frontier.ConversationSyncFrontier(app_dir)
-            assert state.seed_provider(provider, conn, roots=roots)
+            assert state.seed_provider(provider, conn, roots=roots), _seed_detail(state)
 
             original = path.read_bytes()
             replacement = bytes([original[0] ^ 1]) + original[1:]
@@ -1075,8 +1216,8 @@ def test_conversation_frontier_same_size_source_replacement_requires_rebuild(
             frontier.record_activity(app_dir, provider, source_path)
 
             plan = state.plan_provider(provider, conn, roots=roots)
-            assert plan.mode == "full"
-            assert plan.reason == "source_replaced"
+            assert plan.mode == "full", _plan_detail(plan)
+            assert plan.reason == "source_replaced", _plan_detail(plan)
         finally:
             conn.close()
 
@@ -1088,7 +1229,7 @@ def test_frontier_can_certificate_a_stably_missing_tracked_directory(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_corpus(small_corpus, tmp_path)
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1101,10 +1242,10 @@ def test_frontier_can_certificate_a_stably_missing_tracked_directory(
             state = frontier.DashboardIngestFrontier(app_dir)
             assert state.seed_provider(
                 "claude", conn, roots=(missing_root,)
-            ), state.last_seed_failure
-            assert state.plan_provider(
+            ), _seed_detail(state)
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=(missing_root,)
-            ).mode == "caught_up"
+            ), mode="caught_up")
         finally:
             conn.close()
 
@@ -1116,7 +1257,7 @@ def test_ingest_frontier_database_replacement_and_bad_marker_fail_full(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_corpus(small_corpus, tmp_path)
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1128,13 +1269,13 @@ def test_ingest_frontier_database_replacement_and_bad_marker_fail_full(
             frontier.record_activity(app_dir, "claude", source_path)
             state = frontier.DashboardIngestFrontier(app_dir)
             roots = (pathlib.Path(source_path).parent,)
-            state.seed_provider("claude", conn, roots=roots)
+            assert state.seed_provider("claude", conn, roots=roots), _seed_detail(state)
             marker = frontier.activity_marker_path(app_dir)
             with marker.open("ab") as fh:
                 fh.write(b"not-json\n")
-            assert state.plan_provider(
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=roots,
-            ).mode == "full"
+            ), mode="full", reason="malformed")
         finally:
             conn.close()
 
@@ -1147,9 +1288,9 @@ def test_ingest_frontier_database_replacement_and_bad_marker_fail_full(
         replacement.replace(pathlib.Path(corpus) / "cache.db")
         conn = cctally.open_cache_db()
         try:
-            assert state.plan_provider(
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=roots,
-            ).mode == "full"
+            ), mode="full", reason="database_replaced")
         finally:
             conn.close()
 
@@ -1161,7 +1302,7 @@ def test_ambiguous_activity_forces_one_full_pass_then_can_reseed(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_corpus(small_corpus, tmp_path)
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1172,17 +1313,17 @@ def test_ambiguous_activity_forces_one_full_pass_then_can_reseed(
             roots = (pathlib.Path(source_path).parent,)
             frontier.record_activity(app_dir, "claude", source_path)
             state = frontier.DashboardIngestFrontier(app_dir)
-            assert state.seed_provider("claude", conn, roots=roots)
+            assert state.seed_provider("claude", conn, roots=roots), _seed_detail(state)
 
             assert frontier.record_activity(app_dir, "claude", "")
             plan = state.plan_provider("claude", conn, roots=roots)
-            assert plan.mode == "full"
-            assert plan.reason == "ambiguous_activity"
+            assert plan.mode == "full", _plan_detail(plan)
+            assert plan.reason == "ambiguous_activity", _plan_detail(plan)
 
             state.commit_provider(plan, conn, roots=roots)
-            assert state.plan_provider(
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=roots,
-            ).mode == "caught_up"
+            ), mode="caught_up")
         finally:
             conn.close()
 
@@ -1194,7 +1335,7 @@ def test_full_seed_preserves_activity_that_arrives_after_its_cutoff(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_corpus(small_corpus, tmp_path)
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1212,9 +1353,9 @@ def test_full_seed_preserves_activity_that_arrives_after_its_cutoff(
             frontier.record_activity(app_dir, "claude", source_path)
             assert state.seed_provider(
                 "claude", conn, roots=roots, cutoff=cutoff,
-            )
+            ), _seed_detail(state)
             plan = state.plan_provider("claude", conn, roots=roots)
-            assert plan.mode == "targeted"
+            assert plan.mode == "targeted", _plan_detail(plan)
             assert plan.paths == frozenset({source_path})
         finally:
             conn.close()
@@ -1227,7 +1368,7 @@ def test_full_seed_preserves_first_activity_when_marker_was_absent(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_corpus(small_corpus, tmp_path)
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1247,9 +1388,9 @@ def test_full_seed_preserves_first_activity_when_marker_was_absent(
             frontier.record_activity(app_dir, "claude", source_path)
             assert state.seed_provider(
                 "claude", conn, roots=roots, cutoff=cutoff,
-            )
+            ), _seed_detail(state)
             plan = state.plan_provider("claude", conn, roots=roots)
-            assert plan.mode == "targeted"
+            assert plan.mode == "targeted", _plan_detail(plan)
             assert plan.paths == frozenset({source_path})
         finally:
             conn.close()
@@ -1260,7 +1401,7 @@ def test_full_seed_rejects_a_malformed_marker_prefix(small_corpus, tmp_path):
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_corpus(small_corpus, tmp_path)
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1277,7 +1418,7 @@ def test_full_seed_rejects_a_malformed_marker_prefix(small_corpus, tmp_path):
 
             assert not state.seed_provider(
                 "claude", conn, roots=roots, cutoff=cutoff,
-            )
+            ), _seed_detail(state)
             assert "malformed" in state.last_seed_failure["claude"]
         finally:
             conn.close()
@@ -1305,15 +1446,15 @@ def test_missing_full_walk_sentinel_invalidates_a_same_inode_store(
             roots = (pathlib.Path(source_path).parent,)
             frontier.record_activity(app_dir, provider, source_path)
             state = frontier.DashboardIngestFrontier(app_dir)
-            assert state.seed_provider(provider, conn, roots=roots)
+            assert state.seed_provider(provider, conn, roots=roots), _seed_detail(state)
 
             conn.execute(
                 "DELETE FROM cache_meta WHERE key=?", (complete_key,)
             )
             conn.commit()
             plan = state.plan_provider(provider, conn, roots=roots)
-            assert plan.mode == "full"
-            assert plan.reason == "incomplete_store"
+            assert plan.mode == "full", _plan_detail(plan)
+            assert plan.reason == "incomplete_store", _plan_detail(plan)
         finally:
             conn.close()
 
@@ -1389,11 +1530,11 @@ def test_frontier_rejects_invalid_provider_targets_before_ingest(
                 assert cctally.sync_cache(conn).full_walk_complete
             frontier.record_activity(app_dir, "claude", source_path)
             state = frontier.DashboardIngestFrontier(app_dir)
-            assert state.seed_provider("claude", conn, roots=roots)
+            assert state.seed_provider("claude", conn, roots=roots), _seed_detail(state)
             frontier.record_activity(app_dir, "claude", invalid)
             plan = state.plan_provider("claude", conn, roots=roots)
-            assert plan.mode == "full"
-            assert plan.reason == "target_outside_scope"
+            assert plan.mode == "full", _plan_detail(plan)
+            assert plan.reason == "target_outside_scope", _plan_detail(plan)
         finally:
             conn.close()
 
@@ -1405,7 +1546,7 @@ def test_ingest_frontier_hook_maintenance_and_cursor_changes_fail_full(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_corpus(small_corpus, tmp_path)
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1421,23 +1562,23 @@ def test_ingest_frontier_hook_maintenance_and_cursor_changes_fail_full(
 
             assert state.seed_provider(
                 "claude", conn, roots=roots, guard_paths=(guard,),
-            )
+            ), _seed_detail(state)
             guard.write_text('{"changed":true}')
-            assert state.plan_provider(
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=roots, guard_paths=(guard,),
-            ).reason == "hook_config_changed"
+            ), reason="hook_config_changed")
 
             assert state.seed_provider(
                 "claude", conn, roots=roots, guard_paths=(guard,),
-            )
+            ), _seed_detail(state)
             conn.execute(
                 "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
                 ("conversation_backfill_pending", "1"),
             )
             conn.commit()
-            assert state.plan_provider(
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=roots, guard_paths=(guard,),
-            ).mode == "full"
+            ), mode="full", reason="maintenance_changed")
 
             conn.execute(
                 "DELETE FROM cache_meta WHERE key='conversation_backfill_pending'"
@@ -1445,7 +1586,7 @@ def test_ingest_frontier_hook_maintenance_and_cursor_changes_fail_full(
             conn.commit()
             assert state.seed_provider(
                 "claude", conn, roots=roots, guard_paths=(guard,),
-            )
+            ), _seed_detail(state)
             conn.execute(
                 "UPDATE session_files SET last_byte_offset=size_bytes+1 "
                 "WHERE path=?",
@@ -1453,9 +1594,9 @@ def test_ingest_frontier_hook_maintenance_and_cursor_changes_fail_full(
             )
             conn.commit()
             frontier.record_activity(app_dir, "claude", source_path)
-            assert state.plan_provider(
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=roots, guard_paths=(guard,),
-            ).reason == "cursor_gap"
+            ), reason="cursor_gap")
         finally:
             conn.close()
 
@@ -1467,7 +1608,7 @@ def test_frontier_refuses_to_seed_while_maintenance_is_pending(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_corpus(small_corpus, tmp_path)
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1483,39 +1624,17 @@ def test_frontier_refuses_to_seed_while_maintenance_is_pending(
             )
             conn.commit()
             state = frontier.DashboardIngestFrontier(app_dir)
-            assert not state.seed_provider("claude", conn, roots=roots)
+            assert not state.seed_provider(
+                "claude", conn, roots=roots), _seed_detail(state)
             assert state.last_seed_failure["claude"] == "maintenance_pending"
 
             conn.execute(
                 "DELETE FROM cache_meta WHERE key='conversation_backfill_pending'"
             )
             conn.commit()
-            assert state.seed_provider("claude", conn, roots=roots)
+            assert state.seed_provider("claude", conn, roots=roots), _seed_detail(state)
         finally:
             conn.close()
-
-
-def _align_source_cursor(conn, table, source_path):
-    """Make the store's recorded cursor agree with the file now on disk.
-
-    The frontier corpus copies the transcript store rather than rebuilding it,
-    so a recorded ``mtime_ns`` can disagree with the copy and classify an
-    ordinary append target as a replacement.  Replacement and cursor-gap
-    detection are pinned by their own tests; the age-bound tests below must not
-    inherit that variable from whatever ran before them.
-    """
-    stat = pathlib.Path(source_path).stat()
-    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-    assignments = ["size_bytes=?", "last_byte_offset=?"]
-    values = [stat.st_size, stat.st_size]
-    if "mtime_ns" in columns:
-        assignments.append("mtime_ns=?")
-        values.append(stat.st_mtime_ns)
-    conn.execute(
-        f"UPDATE {table} SET {', '.join(assignments)} WHERE path=?",
-        (*values, source_path),
-    )
-    conn.commit()
 
 
 class _FrozenClock:
@@ -1570,21 +1689,20 @@ def test_an_unchanged_certificate_expires_once_it_reaches_its_maximum_age(
             roots = (pathlib.Path(source_path).parent,)
             app_dir = pathlib.Path(corpus)
             state = getattr(frontier, frontier_class)(app_dir)
-            assert state.seed_provider("claude", conn, roots=roots)
+            assert state.seed_provider("claude", conn, roots=roots), _seed_detail(state)
 
             bound = frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS
             clock.advance(bound * 0.5)
-            assert state.plan_provider(
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=roots,
-            ).mode == "caught_up", (
+            ), mode="caught_up", note=(
                 "a certificate inside its age bound must still skip the walk, "
-                "or the bound has destroyed the fast negative outright"
-            )
+                "or the bound has destroyed the fast negative outright"))
 
             clock.advance(bound * 0.5)
             expired = state.plan_provider("claude", conn, roots=roots)
-            assert expired.mode == "full"
-            assert expired.reason == "certificate_expired"
+            assert expired.mode == "full", _plan_detail(expired)
+            assert expired.reason == "certificate_expired", _plan_detail(expired)
         finally:
             conn.close()
 
@@ -1619,25 +1737,23 @@ def test_committing_a_non_full_plan_never_postpones_the_age_bound(
             ).fetchone()[0]
             roots = (pathlib.Path(source_path).parent,)
             app_dir = pathlib.Path(corpus)
-            if commit_mode == "targeted":
-                _align_source_cursor(conn, source_table, source_path)
             state = getattr(frontier, frontier_class)(app_dir)
-            assert state.seed_provider("claude", conn, roots=roots)
+            assert state.seed_provider("claude", conn, roots=roots), _seed_detail(state)
 
             half = frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS / 2.0
             clock.advance(half)
             if commit_mode == "targeted":
                 assert frontier.record_activity(app_dir, "claude", source_path)
             plan = state.plan_provider("claude", conn, roots=roots)
-            assert plan.mode == commit_mode, plan.reason
+            assert plan.mode == commit_mode, _plan_detail(plan)
             state.commit_provider(plan, conn, roots=roots)
 
             clock.advance(half)
             expired = state.plan_provider("claude", conn, roots=roots)
-            assert expired.mode == "full", (
-                f"a committed {commit_mode} plan restarted the age bound"
-            )
-            assert expired.reason == "certificate_expired"
+            assert expired.mode == "full", _plan_detail(
+                expired,
+                f"a committed {commit_mode} plan restarted the age bound")
+            assert expired.reason == "certificate_expired", _plan_detail(expired)
         finally:
             conn.close()
 
@@ -1668,16 +1784,16 @@ def test_the_full_pass_an_expired_certificate_forces_restarts_the_age_bound(
             roots = (pathlib.Path(source_path).parent,)
             app_dir = pathlib.Path(corpus)
             state = getattr(frontier, frontier_class)(app_dir)
-            assert state.seed_provider("claude", conn, roots=roots)
+            assert state.seed_provider("claude", conn, roots=roots), _seed_detail(state)
 
             clock.advance(frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS)
             forced = state.plan_provider("claude", conn, roots=roots)
-            assert forced.mode == "full"
+            assert forced.mode == "full", _plan_detail(forced)
             state.commit_provider(forced, conn, roots=roots)
 
-            assert state.plan_provider(
+            _assert_plan(state.plan_provider(
                 "claude", conn, roots=roots,
-            ).mode == "caught_up"
+            ), mode="caught_up")
         finally:
             conn.close()
 
@@ -1739,9 +1855,9 @@ def test_dashboard_tick_skips_caught_up_estates_and_ingests_append_immediately(
             )
         finally:
             conn.close()
-        assert probe.mode == "caught_up", (
+        assert probe.mode == "caught_up", _plan_detail(probe, (
             probe.reason, locked._ingest_frontier.last_seed_failure,
-        )
+        ))
         locked(False)  # genuinely caught up: neither provider sync is called
         assert {name: len(values) for name, values in calls.items()} == first_counts
 
@@ -2204,7 +2320,7 @@ def test_frontier_database_failure_is_inside_the_shared_recovery_plan(
 # ── §7.5 non-regression ─────────────────────────────────────────────────────
 
 
-def test_the_environment_is_unchanged_after_a_gate_that_pins_it(small_corpus):
+def test_the_environment_is_unchanged_after_a_gate_that_pins_it(private_corpus):
     """Spec §7.5. `_pin_env` deliberately leaves the process pinned, which is
     right for the builder and wrong for a gate: a leaked override wins over a
     later test's HOME-based resolution and points APP_DIR at a deleted scratch
@@ -2212,21 +2328,22 @@ def test_the_environment_is_unchanged_after_a_gate_that_pins_it(small_corpus):
     restores all four axes — absence restored AS absence."""
     import os
     bbf = _load_build_bench()
+    corpus = private_corpus("small")
     before = {key: os.environ.get(key) for key in bbf.PINNED_ENV_KEYS}
-    _run_refresh(small_corpus, bbf, skip_sync=True)
+    _run_refresh(corpus, bbf, skip_sync=True)
     after = {key: os.environ.get(key) for key in bbf.PINNED_ENV_KEYS}
     assert after == before, (
         f"the refresh left the environment changed: "
         f"{ {k: (before[k], after[k]) for k in before if before[k] != after[k]} }")
 
 
-def test_the_owner_thread_tripwire_stays_armed_across_a_tick(small_corpus):
+def test_the_owner_thread_tripwire_stays_armed_across_a_tick(private_corpus):
     """Preserve 11: the tick boundary opens AFTER `mark_owner_thread`, so the
     thread holding `sync_lock` for this rebuild still owns the accelerator
     caches and a lock-bypassing foreign-thread mutation is still caught."""
     import threading
     bbf = _load_build_bench()
-    with _corpus_env(small_corpus, bbf) as cctally:
+    with _corpus_env(private_corpus("small"), bbf) as cctally:
         sc = cctally._load_sibling("_lib_snapshot_cache")
         dash = cctally._load_sibling("_cctally_dashboard")
         tui = cctally._cctally_tui
@@ -2257,7 +2374,7 @@ def test_the_owner_thread_tripwire_stays_armed_across_a_tick(small_corpus):
             raise error["exc"]
 
 
-def test_the_published_envelope_is_unchanged_by_the_recorder(small_corpus,
+def test_the_published_envelope_is_unchanged_by_the_recorder(private_corpus,
                                                              monkeypatch):
     """Spec §7.5. S1 may add instrumentation; it may not move a byte.
 
@@ -2271,10 +2388,11 @@ def test_the_published_envelope_is_unchanged_by_the_recorder(small_corpus,
     """
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
+    corpus = private_corpus("small")
 
     def build(null_recorder):
         with monkeypatch.context() as mp:
-            with _corpus_env(small_corpus, bbf) as cctally:
+            with _corpus_env(corpus, bbf) as cctally:
                 if null_recorder:
                     null = _NullTick()
                     mp.setattr(ts, "begin_tick", lambda **kw: null)
@@ -2297,7 +2415,7 @@ def test_the_published_envelope_is_unchanged_by_the_recorder(small_corpus,
         "the recorder changed the published envelope")
 
 
-def test_a_refresh_applies_a_pending_trace_request(small_corpus):
+def test_a_refresh_applies_a_pending_trace_request(private_corpus):
     """Acceptance item 3, end to end: the POST records, the TICK applies.
 
     The mailbox and the endpoint are covered elsewhere. This is the missing
@@ -2307,20 +2425,21 @@ def test_a_refresh_applies_a_pending_trace_request(small_corpus):
     """
     import _lib_perf as perf
     bbf = _load_build_bench()
+    corpus = private_corpus("small")
     saved = perf.enabled()
     try:
         perf.set_enabled(False)
         perf.request_enabled(True)
         assert perf.enabled() is False, (
             "precondition: the request must not have flipped anything yet")
-        _run_refresh(small_corpus, bbf, skip_sync=True)
+        _run_refresh(corpus, bbf, skip_sync=True)
         assert perf.enabled() is True, (
             "the refresh did not consume the pending trace request")
         assert perf.pending_state() == (True, True)
 
         perf.request_enabled(False)
         assert perf.enabled() is True, "still armed until the next build"
-        _run_refresh(small_corpus, bbf, skip_sync=True)
+        _run_refresh(corpus, bbf, skip_sync=True)
         assert perf.enabled() is False, "the disarm did not reach the tick"
     finally:
         perf.request_enabled(saved)
@@ -2385,3 +2504,681 @@ def test_the_cache_pin_hold_is_measured_at_its_own_boundaries(
         f"build.source_bundle's {bundle_ns}ns, so it is the function's "
         "duration rather than the transaction's hold")
     assert record.cache_pin_ns <= record.duration_ns
+
+
+# ── #740/#741/#721: the isolation the tests above depend on ────────────────
+
+
+def _load_bench_runner():
+    """Path-load `bin/cctally-bench`; a plain import cannot find a hyphen."""
+    path = BIN / "cctally-bench"
+    loader = importlib.machinery.SourceFileLoader("cctally_bench", str(path))
+    spec = importlib.util.spec_from_loader("cctally_bench", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+@contextlib.contextmanager
+def _restored_process_pins(bbf):
+    """Undo the environment `bin/cctally-bench` deliberately leaves pinned.
+
+    `run_all` pins `CCTALLY_DATA_DIR`, `CLAUDE_CONFIG_DIR` and friends and does
+    not restore them, which is correct for the tool and wrong inside a test:
+    the next item on this worker would resolve user state through a scratch
+    directory that no longer exists.
+    """
+    keys = (*bbf.PINNED_ENV_KEYS, "CCTALLY_AS_OF")
+    saved = {key: os.environ.get(key) for key in keys}
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        import _cctally_core
+
+        _cctally_core._init_paths_from_env()
+
+
+def test_a_benchmark_run_leaves_the_certificate_age_bound_intact(
+    tiny_corpus, tmp_path, monkeypatch,
+):
+    """#740's RED/GREEN pair, deterministic and in ONE process.
+
+    `bin/cctally-bench` suspends `FRONTIER_CERTIFICATE_MAX_AGE_SECONDS` for the
+    length of a measurement run by assigning `float("inf")` onto the shared
+    `_lib_ingest_frontier` module object — the same object `_load_sibling`
+    registers in `sys.modules` and this test imports. Before the suspension was
+    scoped, `run_all` returned with `inf` still standing, and the next
+    certificate test on the same xdist worker computed
+    `clock.advance(inf * 0.5)`, reached `inf - seeded_at >= inf`, and failed
+    with `assert 'full' == 'caught_up'` at half the nominal age.
+
+    The emergent form of that failure depends on xdist placement, which is why
+    two full-suite reproductions of it passed. This one does not depend on
+    placement: it runs the benchmark path and then the age-bound logic in one
+    process, in order, and it fails on the pre-fix tree.
+    """
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    bench = _load_bench_runner()
+    assert frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS == 120.0, (
+        "precondition: something before this test already leaked the bound")
+
+    with _restored_process_pins(bbf):
+        bench.run_all(scale="tiny", seed=42, iterations=1, trace=False,
+                      root=tmp_path / "bench")
+
+    # The module the bench mutated IS this module: `_load_sibling` shares it
+    # through `sys.modules`, which is the whole mechanism of the leak.
+    assert sys.modules["_lib_ingest_frontier"] is frontier
+    assert frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS == 120.0, (
+        "run_all returned with the certificate age bound still suspended; "
+        "every later certificate test on this worker now reads "
+        f"{frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS!r} as its bound")
+
+    # And now the logic that the leak silently broke, over a real corpus.
+    corpus = _private_frontier_corpus(tiny_corpus, tmp_path, bbf)
+    clock = _FrozenClock()
+    monkeypatch.setattr(frontier, "_now", clock)
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM session_files WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            roots = (pathlib.Path(source_path).parent,)
+            state = frontier.DashboardIngestFrontier(pathlib.Path(corpus))
+            assert state.seed_provider(
+                "claude", conn, roots=roots), _seed_detail(state)
+
+            bound = frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS
+            clock.advance(bound * 0.5)
+            _assert_plan(
+                state.plan_provider("claude", conn, roots=roots),
+                mode="caught_up",
+                note="half the age bound expired the certificate, which is "
+                     "what a leaked `inf` bound does: inf * 0.5 is inf, and "
+                     "inf - seeded_at >= inf holds")
+            clock.advance(bound * 0.5)
+            _assert_plan(
+                state.plan_provider("claude", conn, roots=roots),
+                mode="full", reason="certificate_expired")
+        finally:
+            conn.close()
+
+
+# ── criterion 5: the private-copy rule, checked over the module itself ─────
+
+#: The session-scoped fixtures. A test may name one, but may only hand it to a
+#: copier — never open it, tick over it, or pass it to a helper that does.
+#: `shared_corpus` is the builder itself and is listed for the same reason: it
+#: is a live fixture that another module takes directly, and a test here that
+#: took it would reach every built scale without copying any of them.
+_SHARED_CORPUS_FIXTURES = ("small_corpus", "tiny_corpus", "shared_corpus")
+
+#: The helpers that take a private copy before anything else touches it.
+#: `_copy_in_child` belongs here for the same reason as the other two: it
+#: hands the shared path to a process whose only job is to copy it.
+_CORPUS_COPIERS = (
+    "_private_corpus", "_private_frontier_corpus", "_copy_in_child",
+)
+
+
+def _shared_corpus_misuses(source):
+    """Every read of a shared-corpus fixture this module does not copy first.
+
+    An AST rule rather than a list of test names, because a list of names is
+    correct only until the next test is written and then silently stops being
+    the rule it claims to be.
+    """
+    problems = []
+    for node in ast.walk(ast.parse(source)):
+        # `AsyncFunctionDef` is a sibling of `FunctionDef`, not a subclass, so
+        # a matcher naming only the latter lets `async def test_x(small_corpus)`
+        # through without examining it at all.
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test_"):
+            continue
+        # All three parameter lists: pytest injects a fixture into a
+        # positional-only or a keyword-only parameter exactly as it does into an
+        # ordinary one, so reading `args.args` alone exempts both spellings.
+        declared = {
+            arg.arg
+            for arg in (node.args.posonlyargs + node.args.args
+                        + node.args.kwonlyargs)
+        } & set(_SHARED_CORPUS_FIXTURES)
+        if not declared:
+            continue
+        copied = set()
+        for call in ast.walk(node):
+            if (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id in _CORPUS_COPIERS):
+                # Keywords as well as positionals: `_private_corpus(
+                # data_dir=small_corpus, tmp_path=tmp_path)` is a legitimate
+                # copy, and reading `call.args` alone reported it as a direct
+                # use — a false positive that blocks a correctly written test.
+                for argument in list(call.args) + [
+                        keyword.value for keyword in call.keywords]:
+                    if isinstance(argument, ast.Name):
+                        copied.add(id(argument))
+        reads = [
+            name for name in ast.walk(node)
+            if isinstance(name, ast.Name)
+            and isinstance(name.ctx, ast.Load)
+            and name.id in declared
+        ]
+        if not reads:
+            problems.append(
+                f"{node.name} declares {sorted(declared)} and never reads it, "
+                f"so it pays for the shared build and uses nothing")
+        for name in reads:
+            if id(name) not in copied:
+                problems.append(
+                    f"{node.name} (line {name.lineno}) uses {name.id} "
+                    f"directly; hand it to one of {list(_CORPUS_COPIERS)} or "
+                    f"take the `private_corpus` fixture instead")
+    return problems
+
+
+def test_no_test_here_uses_the_shared_corpus_without_copying_it():
+    """#741: a writer into the session-scoped corpus is a cross-test hazard.
+
+    Twelve tests here drove real refreshes and builds straight against the
+    shared corpus. That is the same hazard class as #721's copied cursors, and
+    it is what made #721 fire: whichever frontier certificate happened to be
+    seeded over a directory another worker wrote to degraded to `full`.
+    """
+    problems = _shared_corpus_misuses(
+        pathlib.Path(__file__).read_text(encoding="utf-8"))
+    assert problems == [], "\n".join(problems)
+
+
+def test_the_private_copy_rule_reports_a_direct_user():
+    """Non-vacuity: the rule above must be able to fail."""
+    offender = textwrap.dedent('''
+        def test_writes_in_place(small_corpus):
+            _run_refresh(small_corpus, bbf)
+    ''')
+    assert _shared_corpus_misuses(offender), (
+        "the checker accepted a test that drives a refresh straight against "
+        "the shared corpus, so its silence over this module proves nothing")
+
+    unused = textwrap.dedent('''
+        def test_declares_and_ignores(small_corpus):
+            assert True
+    ''')
+    assert _shared_corpus_misuses(unused)
+
+    accepted = textwrap.dedent('''
+        def test_copies_first(small_corpus, tmp_path):
+            corpus = _private_corpus(small_corpus, tmp_path)
+            _run_refresh(corpus, bbf)
+    ''')
+    assert _shared_corpus_misuses(accepted) == []
+
+    # A keyword-only declaration. pytest injects into it exactly as it does
+    # into an ordinary parameter, and `node.args.args` does not contain it.
+    keyword_only = textwrap.dedent('''
+        def test_keyword_only(*, small_corpus):
+            _run_refresh(small_corpus, bbf)
+    ''')
+    assert _shared_corpus_misuses(keyword_only), (
+        "a keyword-only fixture declaration escaped the rule entirely")
+
+    # `AsyncFunctionDef` is a sibling of `FunctionDef`, not a subclass.
+    asynchronous = textwrap.dedent('''
+        async def test_async(small_corpus):
+            _run_refresh(small_corpus, bbf)
+    ''')
+    assert _shared_corpus_misuses(asynchronous), (
+        "an async test was never examined at all")
+
+    # `shared_corpus` is the builder itself: a test taking it reaches every
+    # built scale, and no test in this module may.
+    builder = textwrap.dedent('''
+        def test_takes_the_builder(shared_corpus):
+            _run_refresh(shared_corpus("small"), bbf)
+    ''')
+    assert _shared_corpus_misuses(builder), (
+        "the builder fixture was not in the guarded set, so a test could take "
+        "every scale uncopied")
+
+    # The false positive: a copy whose source is passed by KEYWORD.
+    keyword_copy = textwrap.dedent('''
+        def test_copies_by_keyword(small_corpus, tmp_path):
+            corpus = _private_corpus(data_dir=small_corpus, tmp_path=tmp_path)
+            _run_refresh(corpus, bbf)
+    ''')
+    assert _shared_corpus_misuses(keyword_copy) == [], (
+        "a legitimate copy taken through keyword arguments was reported as a "
+        "direct use, which would block a correctly written test")
+
+
+#: Receivers a `.mode` or `.reason` assertion may be read off. `Name` is
+#: `plan.mode`, `Call` is `state.plan_provider(...).mode`, `Attribute` is
+#: `result.plan.mode` and `Subscript` is `plans["claude"].mode`. All four are
+#: the same assertion and all four report `full` and nothing else.
+_PLAN_RECEIVERS = (ast.Name, ast.Call, ast.Attribute, ast.Subscript)
+
+
+def _is_seed_provider_call(node):
+    """A ``<anything>.seed_provider(...)`` call, whatever the receiver is."""
+    return (isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "seed_provider")
+
+
+def _message_helper_calls(msg):
+    """The helper names an assertion message actually CALLS.
+
+    Substring-matching ``ast.dump(node.msg)`` accepted the string literal
+    ``"see _plan_detail for why"`` as a report, which is the one shape a
+    message check has to reject: prose naming the helper is not the helper.
+    """
+    if msg is None:
+        return frozenset()
+    names = set()
+    for node in ast.walk(msg):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            names.add(node.func.id)
+        elif isinstance(node.func, ast.Attribute):
+            names.add(node.func.attr)
+    return frozenset(names)
+
+
+def _seed_bound_names(func):
+    """Names ``func`` assigns from a ``seed_provider`` call.
+
+    ``ok = state.seed_provider(...)`` followed by ``assert ok`` is the same
+    undiagnosable assertion written in two statements, so the rule carries the
+    binding across them. Deliberately simple and intra-function: a plain
+    assignment to a bare name, and nothing else.
+    """
+    bound = set()
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assign) and _is_seed_provider_call(node.value):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    bound.add(target.id)
+        elif (isinstance(node, ast.AnnAssign)
+                and node.value is not None
+                and _is_seed_provider_call(node.value)
+                and isinstance(node.target, ast.Name)):
+            bound.add(node.target.id)
+    return bound
+
+
+def _iter_asserts_with_bindings(node, bound=frozenset()):
+    """Every ``assert`` under ``node``, with its enclosing function's bindings.
+
+    A ``seed_provider`` call that is not inside an ``Assert`` is SETUP, not an
+    assertion, and this yields nothing for it — the rule is about what an
+    assertion reports when it fails.
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield from _iter_asserts_with_bindings(
+                child, frozenset(bound) | _seed_bound_names(child))
+            continue
+        if isinstance(child, ast.Assert):
+            yield child, bound
+        yield from _iter_asserts_with_bindings(child, bound)
+
+
+def _asserted_operands(test):
+    """One assertion's test, split into the expressions it actually asserts.
+
+    ``assert plan.mode == "caught_up" and plan.reason is None`` asserts two
+    things, and a rule that reads only the ``BoolOp`` examines neither.
+    """
+    if isinstance(test, ast.BoolOp):
+        for value in test.values:
+            yield from _asserted_operands(value)
+        return
+    if isinstance(test, ast.UnaryOp):
+        yield test.operand
+        return
+    yield test
+
+
+def _undiagnosable_frontier_assertions(source):
+    """Every plan or seed assertion here that would report `full` and nothing else.
+
+    `plan_provider` refuses for eleven distinct reasons and every one of them
+    reads as the single word `full`; `seed_provider` returns a bare boolean and
+    records its reason out of band. An assertion that reports neither cannot be
+    diagnosed from a retained log, which is why no past failure of this module
+    could be attributed after the fact.
+    """
+    problems = []
+    for node, seed_bound in _iter_asserts_with_bindings(ast.parse(source)):
+        reported = _message_helper_calls(node.msg)
+        for operand in _asserted_operands(node.test):
+            if (_is_seed_provider_call(operand)
+                    or (isinstance(operand, ast.Compare)
+                        and _is_seed_provider_call(operand.left))
+                    or (isinstance(operand, ast.Name)
+                        and operand.id in seed_bound)):
+                if "_seed_detail" not in reported:
+                    problems.append(
+                        f"line {node.lineno}: a seed_provider assertion that "
+                        f"does not report last_seed_failure")
+                continue
+            if (isinstance(operand, ast.Compare)
+                    and isinstance(operand.left, ast.Attribute)
+                    and operand.left.attr in ("mode", "reason")
+                    and isinstance(operand.left.value, _PLAN_RECEIVERS)):
+                if "_plan_detail" not in reported:
+                    problems.append(
+                        f"line {node.lineno}: a plan.{operand.left.attr} "
+                        f"assertion that does not report the plan's reason")
+    return problems
+
+
+def test_every_frontier_assertion_reports_why_the_plan_refused():
+    """#740 D2. Diagnosability is asserted, not left to each author's habit."""
+    problems = _undiagnosable_frontier_assertions(
+        pathlib.Path(__file__).read_text(encoding="utf-8"))
+    assert problems == [], "\n".join(problems)
+
+
+def test_the_diagnosability_check_reports_a_bare_assertion():
+    """Non-vacuity: the rule above must be able to fail."""
+    bare = textwrap.dedent('''
+        def test_bare():
+            assert plan.mode == "caught_up"
+            assert state.seed_provider("claude", conn, roots=roots)
+    ''')
+    assert len(_undiagnosable_frontier_assertions(bare)) == 2
+
+    reported = textwrap.dedent('''
+        def test_reported():
+            assert plan.mode == "caught_up", _plan_detail(plan)
+            assert state.seed_provider(
+                "claude", conn, roots=roots), _seed_detail(state)
+    ''')
+    assert _undiagnosable_frontier_assertions(reported) == []
+
+
+#: The six shapes the first form of this rule returned NO finding for. Each is
+#: an assertion that reports `full`, or a bare `False`, and nothing else. Named
+#: rather than folded into one blob so a regression says which shape came back.
+_UNDIAGNOSABLE_SHAPES = {
+    "attribute_receiver": ('''
+        def test_attribute_receiver():
+            assert state.plan.mode == "caught_up"
+    ''', 1),
+    "subscript_receiver": ('''
+        def test_subscript_receiver():
+            assert plans["a"].mode == "caught_up"
+    ''', 1),
+    "prose_naming_the_helper": ('''
+        def test_prose_naming_the_helper():
+            assert plan.mode == "caught_up", "see _plan_detail for why"
+    ''', 1),
+    "seed_inside_a_comparison": ('''
+        def test_seed_inside_a_comparison():
+            assert state.seed_provider("c", conn) is True
+    ''', 1),
+    "boolean_conjunction": ('''
+        def test_boolean_conjunction():
+            assert plan.mode == "caught_up" and plan.reason is None
+    ''', 2),
+    "seed_bound_to_a_name": ('''
+        def test_seed_bound_to_a_name():
+            ok = state.seed_provider("c", conn)
+            assert ok
+    ''', 1),
+}
+
+#: The same six, written the way this module writes them.
+_DIAGNOSABLE_SHAPES = {
+    "attribute_receiver": '''
+        def test_attribute_receiver():
+            assert state.plan.mode == "caught_up", _plan_detail(state.plan)
+    ''',
+    "subscript_receiver": '''
+        def test_subscript_receiver():
+            assert plans["a"].mode == "caught_up", _plan_detail(plans["a"])
+    ''',
+    "prose_naming_the_helper": '''
+        def test_prose_naming_the_helper():
+            assert plan.mode == "caught_up", _plan_detail(plan, "why")
+    ''',
+    "seed_inside_a_comparison": '''
+        def test_seed_inside_a_comparison():
+            assert state.seed_provider("c", conn) is True, _seed_detail(state)
+    ''',
+    "boolean_conjunction": '''
+        def test_boolean_conjunction():
+            assert (plan.mode == "caught_up"
+                    and plan.reason is None), _plan_detail(plan)
+    ''',
+    "seed_bound_to_a_name": '''
+        def test_seed_bound_to_a_name():
+            ok = state.seed_provider("c", conn)
+            assert ok, _seed_detail(state)
+    ''',
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_UNDIAGNOSABLE_SHAPES))
+def test_the_diagnosability_check_reports_every_evaded_shape(shape):
+    """Each shape must be REPORTED, and its repaired twin ACCEPTED.
+
+    Every one of these returned no finding from the first form of the rule, so
+    a guard that reads clean over this module proved nothing about them. The
+    accepted half is asserted alongside, because a rule that reports both forms
+    would block the repair it exists to require.
+    """
+    source, expected = _UNDIAGNOSABLE_SHAPES[shape]
+    found = _undiagnosable_frontier_assertions(textwrap.dedent(source))
+    assert len(found) == expected, (
+        f"{shape} produced {found}, not {expected} finding(s)")
+
+    repaired = _undiagnosable_frontier_assertions(
+        textwrap.dedent(_DIAGNOSABLE_SHAPES[shape]))
+    assert repaired == [], (
+        f"{shape} written correctly was still reported: {repaired}")
+
+
+def test_a_seed_call_outside_an_assertion_is_setup_and_not_reported():
+    """The rule is about assertions, and this module seeds as setup too.
+
+    A `seed_provider` call in an expression statement, or bound to a name that
+    is never asserted, arranges the state a later assertion examines. Reporting
+    it would demand a diagnostic message on a statement that cannot fail.
+    """
+    setup = textwrap.dedent('''
+        def test_seeds_as_setup():
+            state.seed_provider("claude", conn, roots=roots)
+            ok = state.seed_provider("codex", conn, roots=roots)
+            assert plan.mode == "caught_up", _plan_detail(plan)
+    ''')
+    assert _undiagnosable_frontier_assertions(setup) == []
+
+
+# ── criterion 6: the copier waits on the corpus build lock ─────────────────
+
+_COPIER_CHILD = textwrap.dedent('''
+    """Copy the shared corpus through the ONE copier, from another process."""
+    import pathlib
+    import sys
+
+    sys.path.insert(0, {tests_dir!r})
+    from _shared_corpus import copy_shared_corpus
+
+    data_dir, destination, started, done = sys.argv[1:5]
+    # Written immediately before the call, so the parent can distinguish a
+    # child that is BLOCKED from one that has not started yet.
+    pathlib.Path(started).write_text("started\\n", encoding="utf-8")
+    copy_shared_corpus(data_dir, destination)
+    pathlib.Path(done).write_text("done\\n", encoding="utf-8")
+''')
+
+
+def _copy_in_child(data_dir, destination, *, scratch, started, done):
+    """Launch another process that copies `data_dir` through the ONE copier.
+
+    Another PROCESS, because an exclusive flock is held per open file
+    description: a same-process probe would simply be granted the lock this
+    test is holding, and would prove nothing.
+    """
+    script = pathlib.Path(scratch) / "copy_child.py"
+    script.write_text(
+        _COPIER_CHILD.format(tests_dir=str(pathlib.Path(__file__).parent)),
+        encoding="utf-8")
+    return subprocess.Popen(
+        [sys.executable, str(script), str(data_dir), str(destination),
+         str(started), str(done)])
+
+
+def test_a_copy_waits_while_the_corpus_build_lock_is_held(
+    small_corpus, corpus_root, tmp_path,
+):
+    """The copier takes the build lock SHARED, so a rebuild excludes it.
+
+    `build_fixture` clears the whole data directory before it re-emits, so a
+    `copytree` racing that clear copies a half-deleted tree. Six sites took
+    such a copy with no lock at all.
+
+    Both halves are asserted: the copy does not complete while the lock is
+    held, and it does complete once it is released.
+    """
+    destination = tmp_path / "child-copy"
+    started = tmp_path / "started"
+    done = tmp_path / "done"
+
+    with open(corpus_lock_path(corpus_root, "small"), "w") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        child = _copy_in_child(
+            small_corpus, destination,
+            scratch=tmp_path, started=started, done=done)
+        try:
+            deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+            while not started.exists() and time.monotonic() < deadline:
+                assert child.poll() is None, (
+                    f"the child exited ({child.returncode}) before it reached "
+                    f"the copier at all")
+                time.sleep(0.05)
+            assert started.exists(), "the child never reached the copier"
+
+            # The blocked half. This is a structural claim, not a timing one:
+            # the child has started, has not exited, and cannot have copied,
+            # because this process holds the same lock exclusively.
+            for _ in range(20):
+                time.sleep(0.05)
+                assert child.poll() is None, (
+                    f"the child exited ({child.returncode}) while the build "
+                    f"lock was held exclusively")
+                assert not done.exists(), (
+                    "the copy completed while the build lock was held "
+                    "exclusively, so the copier does not take that lock")
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    assert child.wait(timeout=PRESENCE_BACKSTOP_SECONDS) == 0, (
+        "the copier failed once the lock was released")
+    assert done.exists(), "the copy never completed after the lock was freed"
+    assert (destination / "data" / "cache.db").exists(), (
+        "the released copy is not a usable corpus")
+
+
+# ── criterion 10: a certificate is immune to writes into its SOURCE ────────
+
+
+def test_a_private_certificate_ignores_a_write_into_the_corpus_it_copied(
+    small_corpus, tmp_path,
+):
+    """#721's mechanism, proved on a directory the certificate actually covers.
+
+    `plan_provider` stats every directory that holds a tracked source file and
+    refuses with `filesystem_changed` when one of their identities moves. A
+    certificate whose roots still aimed at the shared corpus therefore degraded
+    to `full` the moment any other worker wrote there — and the victim was
+    never the writer.
+
+    The mutation lands on a directory that is IN the seeded certificate's own
+    directory set, which is asserted rather than assumed. A write under `data/`
+    would not be in that set at all, so the same test shape over `data/` would
+    pass without exercising the guard once.
+
+    `upstream` stands in for the session-shared corpus. The real one is not
+    mutated here because writing into it is precisely the hazard under test,
+    and the write detector now refuses it.
+    """
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    upstream = _private_corpus(small_corpus, tmp_path, name="upstream")
+    corpus = _private_frontier_corpus(upstream, tmp_path, bbf, name="private")
+    upstream_root = pathlib.Path(upstream).parent.resolve()
+    private_root = pathlib.Path(corpus).parent.resolve()
+
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_conversations_db()
+        try:
+            source_path = conn.execute(
+                "SELECT path FROM conversation_source_files "
+                "WHERE path LIKE '/%' LIMIT 1"
+            ).fetchone()[0]
+            private_dir = pathlib.Path(source_path).parent
+            roots = (private_dir,)
+            state = frontier.ConversationSyncFrontier(pathlib.Path(corpus))
+            assert state.seed_provider(
+                "claude", conn, roots=roots), _seed_detail(state)
+
+            covered = dict(state._states["claude"].directory_identity)
+            assert covered, "the certificate covers no directory at all"
+            # Leg 3: the seed's roots are private.
+            outside = [
+                raw for raw in covered
+                if not pathlib.Path(raw).resolve().is_relative_to(private_root)
+            ]
+            assert not outside, (
+                f"the certificate covers directories outside the private "
+                f"corpus {private_root}: {outside[:3]}")
+            assert str(private_dir) in covered, (
+                "the directory this test mutates is not in the certificate, "
+                "so the mutation would prove nothing about filesystem_changed")
+
+            upstream_dir = upstream_root / private_dir.resolve().relative_to(
+                private_root)
+            assert upstream_dir.is_dir(), upstream_dir
+
+            shared_before = frontier._stat_identity(upstream_dir)
+            private_before = frontier._stat_identity(private_dir)
+            (upstream_dir / "another-worker-wrote-this.jsonl").write_text(
+                "{}\n", encoding="utf-8")
+            # Leg 1 and leg 2.
+            assert frontier._stat_identity(upstream_dir) != shared_before, (
+                "the write did not move the source tree's directory identity, "
+                "so this test could not distinguish the two trees")
+            assert frontier._stat_identity(private_dir) == private_before, (
+                "the private copy's directory identity moved too")
+            # Leg 4.
+            _assert_plan(
+                state.plan_provider("claude", conn, roots=roots),
+                mode="caught_up",
+                note="a write into the corpus this copy was taken from "
+                     "degraded a certificate seeded over the copy")
+
+            # Non-vacuity: the identical mutation on the PRIVATE side does
+            # degrade the plan, so leg 4 is a real negative rather than a
+            # guard that never fires.
+            (private_dir / "this-worker-wrote-this.jsonl").write_text(
+                "{}\n", encoding="utf-8")
+            _assert_plan(
+                state.plan_provider("claude", conn, roots=roots),
+                mode="full", reason="filesystem_changed")
+        finally:
+            conn.close()

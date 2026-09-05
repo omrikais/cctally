@@ -405,3 +405,165 @@ describe('#661 S2 — every m-sec accent modifier has a rule', () => {
       expect(body).toMatch(/color:/);
     });
 });
+
+// #730 / #750 S2 — the header actions cluster shrinks only where a child of it
+// can actually give, which today means only where it holds `.sessions-ctrls`.
+//
+// Shrinking a cluster whose children are all incompressible cannot prevent
+// overflow; it only moves the overflow outside the cluster's own box. Every
+// panel except Sessions holds three or four icon buttons and nothing else, and
+// an unconditional floor on the bare selector was measured doing exactly that:
+// at 320px the Projects header does not wrap, the flex algorithm shrank the
+// cluster to 77.7px while its children stayed at 44 + 44 + 16.7px, and
+// `.panel-grip` rendered at x=324 against a 320px viewport — 4px of document
+// horizontal scroll that the initial `auto` floor does not produce.
+//
+// #750 S2 review — the `:has()` scoping was necessary and not sufficient, and
+// the floor now lives INSIDE `@media (max-width: 640px)` beside the
+// `.sessions-ctrls` floor it needs. Above that breakpoint the two never both
+// applied: the `SessionsControls` hoist means `.sessions-ctrls` is a child of
+// the cluster only above 640px, exactly where its own floor is switched off,
+// so the cluster could shrink while its one compressible child could not give.
+// Measured on the Sessions header with the search input open: the cluster
+// shrank to 320.2px at 1200px against children wanting 424.3px, and the strip
+// and the three icon affordances rendered 96.8px to the right of the cluster's
+// box and 73.8px past the panel's own right border. Scoping the floor into the
+// query returns that to zero at every width from 900 to 1440, because the
+// header's `h2` gives instead.
+//
+// The counterfactual the pair exists for still closes. Re-parenting
+// `.sessions-ctrls` as the first child of the cluster at 390px — the exact
+// `!isMobile` DOM — measured document `scrollWidth` 571 against `clientWidth`
+// 390 with no floor at all, 563 with the cluster floor alone, and 390 with
+// both.
+//
+// These are the guards on that defense. Deleting the scoped declaration must
+// fail here, so must putting a floor back on the bare selector, and so must
+// hoisting the scoped one back out of the query.
+
+// `ruleBody` matches its needle as a substring, so `.panel-header-actions {`
+// also finds `#panel-alerts > .panel-header > .panel-header-actions {`. These
+// assertions must speak about the BARE selector specifically, so anchor the
+// match at a rule boundary and collect every such body.
+function bareClusterRuleBodies(): string[] {
+  const bodies: string[] = [];
+  const re = /(?:^|[\n,{}])\s*\.panel-header-actions\s*\{/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(css)) !== null) {
+    const open = css.indexOf('{', m.index);
+    bodies.push(css.slice(open + 1, css.indexOf('}', open)));
+  }
+  return bodies;
+}
+
+describe('#730 / #750 S2 — .panel-header-actions shrinks only where a child gives', () => {
+  it('declares min-width: 0 on the :has()-scoped cluster', () => {
+    expect(ruleBody('.panel-header-actions:has(.sessions-ctrls)')).toMatch(/min-width:\s*0/);
+  });
+
+  it('keeps that floor inside the mobile query, beside the child floor it needs', () => {
+    expect(mobileSessionsBlock()).toMatch(
+      /\n\s*\.panel-header-actions:has\(\.sessions-ctrls\)\s*\{[^}]*min-width:\s*0/,
+    );
+  });
+
+  it('leaves the cluster at its automatic minimum above 640px', () => {
+    const block = mobileSessionsBlock();
+    const outside = css.slice(0, css.indexOf(block)) + css.slice(css.indexOf(block) + block.length);
+    expect(outside).not.toMatch(
+      /\.panel-header-actions:has\(\.sessions-ctrls\)\s*\{[^}]*min-width:\s*0/,
+    );
+  });
+
+  it('is not vacuous: a bare cluster rule really is the right-aligned flex group', () => {
+    const bodies = bareClusterRuleBodies();
+    expect(bodies.length, 'no bare .panel-header-actions rule in index.css').toBeGreaterThan(0);
+    const chrome = bodies.find((b) => /margin-left:\s*auto/.test(b) && /display:\s*flex/.test(b));
+    expect(chrome, 'no bare .panel-header-actions rule sets margin-left: auto + display: flex').toBeDefined();
+  });
+
+  it('leaves every bare cluster rule at its automatic minimum', () => {
+    for (const body of bareClusterRuleBodies()) expect(body).not.toMatch(/min-width:/);
+  });
+});
+
+// #750 S2 review — the second half of the #730 defense, scoped to mobile.
+//
+// `min-width: 0` on `.panel-header-actions:has(.sessions-ctrls)` lets the
+// CLUSTER box shrink, but `.sessions-ctrls` keeps `min-width: auto`, so in the
+// counterfactual DOM its 180px search input held the cluster's children out
+// past the viewport whatever the cluster's own box did. Flooring the controls
+// strip too lets it give, which pulls the incompressible 44px affordances back
+// inside the line.
+//
+// The rule is deliberately confined to the mobile query. Above 640px
+// `.sessions-ctrls` is a real child of the cluster and its width is the search
+// strip a person uses; at or below 640px the `SessionsControls` hoist makes it
+// a block-level sibling of `.panel-header`, where a min-width floor changes no
+// rendered box at all. So the defense costs nothing visible on either side.
+//
+// `ruleBody` above cannot express this: it takes the LONGEST body for a
+// selector across the whole file and knows nothing about at-rules, so a
+// declaration inside a media query would be answered by the top-level rule of
+// the same name. The block is sliced by brace matching instead.
+function mobileSessionsBlock(): string {
+  const anchorSelector = '#panel-sessions > .sessions-ctrls {';
+  const anchor = css.indexOf(anchorSelector);
+  expect(anchor, 'no #panel-sessions > .sessions-ctrls rule in index.css').toBeGreaterThan(-1);
+  const open = css.lastIndexOf('@media (max-width: 640px) {', anchor);
+  expect(open, 'the Sessions mobile hoist left @media (max-width: 640px)').toBeGreaterThan(-1);
+  let depth = 0;
+  for (let i = css.indexOf('{', open); i < css.length; i += 1) {
+    if (css[i] === '{') depth += 1;
+    else if (css[i] === '}') {
+      depth -= 1;
+      if (depth === 0) return css.slice(open, i + 1);
+    }
+  }
+  throw new Error('unterminated @media (max-width: 640px) block in index.css');
+}
+
+describe('#750 S2 — .sessions-ctrls can give inside the actions cluster', () => {
+  it('floors the controls strip inside the mobile query', () => {
+    expect(mobileSessionsBlock()).toMatch(/\n\s*\.sessions-ctrls\s*\{[^}]*min-width:\s*0/);
+  });
+
+  it('is not vacuous: the slice really is the block holding the mobile hoist', () => {
+    const block = mobileSessionsBlock();
+    expect(block).toContain('#panel-sessions > .sessions-ctrls {');
+    expect(block.startsWith('@media (max-width: 640px) {')).toBe(true);
+  });
+
+  it('leaves the desktop strip alone: no bare floor outside the query', () => {
+    const block = mobileSessionsBlock();
+    const outside = css.slice(0, css.indexOf(block)) + css.slice(css.indexOf(block) + block.length);
+    expect(outside).not.toMatch(/\n\s*\.sessions-ctrls\s*\{[^}]*min-width:\s*0/);
+  });
+});
+
+// #750 S2 — the Daily foot stacks rather than clipping its own figures.
+//
+// Diagnosed in a real browser at 320x844: `.daily-foot-col` declares
+// `min-width: 0`, which replaces a grid item's automatic min-content minimum,
+// so `1fr 1fr` resolved to two 117px tracks inside a 258px `.panel-body` even
+// though the peak column's min-content is 158.7px and the total column's is
+// 136.8px. Both overflowed — the peak by 42px, the total by 20px — and
+// `.panel-body`'s `overflow-x: hidden` clipped them instead of scrolling, so
+// the figures were silently wrong rather than visibly cut. It was never a
+// 320px-only defect: the peak still overflowed by 22px at 360px and by 7px at
+// 390px.
+describe('#750 S2 — the Daily foot does not clip its dollar figures', () => {
+  it('floors each foot track so the columns stack instead of squeezing', () => {
+    const body = ruleBody('.daily-foot');
+    expect(body).toMatch(/grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(160px,\s*1fr\)\)/);
+  });
+
+  it('lets the value line wrap, which is the backstop behind that floor', () => {
+    expect(ruleBody('.daily-foot-text .val')).toMatch(/flex-wrap:\s*wrap/);
+  });
+
+  it('is not vacuous: both rules are the ones that size the foot', () => {
+    expect(ruleBody('.daily-foot')).toMatch(/display:\s*grid/);
+    expect(ruleBody('.daily-foot-text .val')).toMatch(/display:\s*flex/);
+  });
+});

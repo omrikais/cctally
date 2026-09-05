@@ -64,13 +64,33 @@ second time.
 ## Test the pipeline
 
 ```
-cctally alerts test [--axis weekly|five-hour] [--threshold N]
+cctally alerts test [--axis AXIS] [--threshold N] [--metric METRIC]
 ```
+
+`--axis` takes `weekly`, `five-hour`, `budget`, `project-budget`,
+`codex-budget`, `projected`, `quota` or `meter-rate-change`.
 
 Sends a synthetic alert through the same dispatch pipeline and
 `alerts.log` writer as a real crossing, but with `mode=test` in the log
 line so it's distinguishable. No DB writes, no envelope mutation. Use it
 to verify your notifier is wired up before relying on real crossings.
+
+`quota` and `meter-rate-change` are the two families that are **not**
+percentage-threshold axes, and until #699 neither could be rehearsed at all:
+the only way to see either notification was to wait for a real Codex quota
+crossing or a real metering-rate transition. Both now build a synthetic that
+goes through the same payload builder production uses.
+
+`--threshold` does not apply to `--axis meter-rate-change` and supplying it
+exits 2, because a metering-rate change has no percentage threshold and
+carries an explicit severity instead. `--axis quota` takes `--threshold`
+normally.
+
+Both synthetics resolve a **real account key** from the registry when the
+vendor has one, and fall back to the vendor-wide sentinel when it does not.
+That is what makes the R8 `[label]` title prefix observable from this command
+on a decorated install, while an install with one account or none sees output
+that is byte-identical to what it saw before.
 
 The first stdout line reports the **resolved notifier** for this host +
 config, e.g.:
@@ -112,9 +132,7 @@ Exit codes for the CLI form:
 - **Dashboard "Recent alerts" panel.** Press `9` (or click the panel) to
   open the modal with the full alert history for the current envelope.
   Collapsible from the panel header chevron.
-- **Dashboard toast.** Transient pill near the top of the page when a
-  new alert lands; click to dismiss. Distinct visual variant from status
-  toasts; colored by the 3-tier severity (see [Severity](#severity)).
+- **Dashboard toast.** Transient pill near the top of the page when a new alert lands. Distinct visual variant from status toasts; colored by the 3-tier severity (see [Severity](#severity)). Click anywhere on it to dismiss it, or Tab to it and press Enter or Space — the toast is focusable and carries the alert's own sentence as its accessible name, and a keyboard dismissal returns focus to wherever it came from. An arriving toast never takes focus by itself. On an install with more than one real account per provider the head also names the account, and the dismiss instruction then reads `tap or click to dismiss` on its own line below the alert's body rather than `click to dismiss` inside the head; a single-account install renders the in-head form unchanged.
 - **`alerts.log` audit line.** One tab-delimited line per dispatch
   attempt at `~/.local/share/cctally/logs/alerts.log`. The eight columns
   are: `timestamp`, `axis`, `threshold`, `window_key`, `mode`
@@ -268,5 +286,7 @@ peak.
 cctally config set alerts.enabled true
 cctally alerts test
 cctally alerts test --axis five-hour --threshold 95
+cctally alerts test --axis quota --threshold 90
+cctally alerts test --axis meter-rate-change
 cctally config get alerts.enabled
 ```

@@ -128,11 +128,14 @@
                 },
                 {
                     "details": {
+                        "enabled_root_count": 0,
                         "installed_root_count": 0,
                         "requires_review": false,
+                        "responsible_root_key": null,
                         "root_count": 0,
                         "states": [],
-                        "trust_state": "not-applicable"
+                        "trust_state": "not-applicable",
+                        "worst_state": null
                     },
                     "id": "hooks.codex_installed",
                     "severity": "ok",
@@ -153,6 +156,21 @@
                     "severity": "ok",
                     "summary": "not applicable",
                     "title": "Codex recent activity"
+                },
+                {
+                    "details": {
+                        "age_seconds": null,
+                        "last_success_at": null,
+                        "liveness_state": "not-applicable",
+                        "marker_count": 0,
+                        "responsible_root_key": null,
+                        "roots": [],
+                        "window_seconds": 604800
+                    },
+                    "id": "hooks.codex_liveness_7d",
+                    "severity": "ok",
+                    "summary": "not applicable",
+                    "title": "Codex hook liveness (7d)"
                 }
             ],
             "id": "hooks",
@@ -214,7 +232,7 @@
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1011,
+                            "epoch": 1013,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -1108,7 +1126,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 59,
+            "ok": 60,
             "warn": 6
         },
         "severity": "warn"

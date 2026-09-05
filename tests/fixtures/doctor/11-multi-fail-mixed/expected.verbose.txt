@@ -45,9 +45,12 @@ Hooks
       details:
         root_count: 0
         installed_root_count: 0
+        enabled_root_count: 0
         states: []
         requires_review: False
         trust_state: not-applicable
+        worst_state: None
+        responsible_root_key: None
   ✓ Codex recent activity    not applicable
       details:
         activity_state: not-applicable
@@ -55,6 +58,15 @@ Hooks
         age_seconds: None
         success_count_24h: 0
         error_count_24h: 0
+        responsible_root_key: None
+        roots: []
+  ✓ Codex hook liveness (7d) not applicable
+      details:
+        liveness_state: not-applicable
+        window_seconds: 604800
+        last_success_at: None
+        age_seconds: None
+        marker_count: 0
         responsible_root_key: None
         roots: []
 Auth
@@ -76,7 +88,7 @@ Database
         conversations_quick_check: None
   ✓ Version ahead            none ahead
       details:
-        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1011, 'mismatch': False}
+        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1013, 'mismatch': False}
         cache.db: {'user_version': 0, 'registry_size': 45, 'ahead': False}
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
@@ -310,4 +322,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 54 OK · 8 WARN · 3 FAIL
+Summary: 55 OK · 8 WARN · 3 FAIL

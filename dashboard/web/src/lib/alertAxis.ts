@@ -1,4 +1,5 @@
-import type { AlertAxis, AlertEntry } from '../types/envelope';
+import { THRESHOLD_SEVERITIES } from '../types/envelope';
+import type { AlertAxis, AlertEntry, ThresholdSeverity } from '../types/envelope';
 
 // Shared alert-axis labels (issue #19 widened the binary weekly|five_hour
 // union with a third `budget` axis; issue #121 adds the fourth `projected`
@@ -62,9 +63,14 @@ export function budgetPeriodNoun(period: string | undefined): string {
 //      falls back to deriving the tier from `threshold` — byte-identical with
 //      the Python kernel bands.
 //   3. Any other unexpected string also lands on the threshold fallback.
-export function alertSeverity(alert: AlertEntry): 'info' | 'warn' | 'critical' {
+export function alertSeverity(alert: AlertEntry): ThresholdSeverity {
   const s = alert.severity as string | undefined;
-  if (s === 'info' || s === 'warn' || s === 'critical') return s;
+  // Narrowed FROM the tuple rather than by restating its members: a fourth
+  // threshold tier added to THRESHOLD_SEVERITIES would otherwise type-check
+  // here and still be silently re-banded by the fallback below.
+  if (s != null && (THRESHOLD_SEVERITIES as readonly string[]).includes(s)) {
+    return s as ThresholdSeverity;
+  }
   if (s === 'amber') return 'warn'; // legacy token from a stale backend
   if (s === 'red') return 'critical'; // legacy token from a stale backend
   // threshold fallback — byte-identical with the Python kernel bands
