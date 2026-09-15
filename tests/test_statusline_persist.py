@@ -164,14 +164,26 @@ def _insert_snapshot(app, *, weekly_percent, weekly_resets_epoch, captured_epoch
 
 
 def _pending_drop(app, *, percent=20):
+    """A pending drop with no retained evidence.
+
+    #755 gives the record a persisted deadline and a retained-evidence field.
+    This helper deliberately leaves the evidence empty, so the callers below
+    exercise the reconciliation path rather than the publication path: a record
+    with nothing to publish is cleared instead. It is a hand-built shape rather
+    than one any binary writes — a version-1 control document does not parse to
+    this, it parses to no pending drop at all.
+    """
+    first_seen = int(time.time())
     return candidate_lib.PendingDrop(
         canonical_key=1,
         reduced_percent=percent,
-        first_seen_at=int(time.time()),
+        first_seen_at=first_seen,
         kernel_stage="settling",
         attempts=0,
         contributors={},
         retry_signature=None,
+        deadline_at=first_seen + candidate_lib.PENDING_DROP_DEADLINE_SECONDS,
+        retained=None,
     )
 
 
@@ -503,7 +515,15 @@ def test_authoritative_equal_fifty_clears_an_actual_pending_twenty_generation(ap
     assert control is not None and control.pending_drops["sevenDay"] is None
 
 
-def test_empty_spool_reconciles_expired_pending_drop(app):
+def test_empty_spool_clears_an_evidence_free_pending_drop(app):
+    """The record has nothing to publish, so reconciliation clears it.
+
+    The name this test used to carry promised the retired contract, under which
+    an empty spool expired a pending drop whatever it held. An empty spool is
+    not a retraction now, and a drop that carries retained evidence survives it
+    and publishes at its own deadline. What is cleared here is the evidence-free
+    record `_pending_drop` builds.
+    """
     assert app.cmd_record_usage(_record_ns(percent=50, resets_in_days=3)) == 0
     projection = app._read_db_projection_stable()
     app._write_control_state(candidate_lib.ControlState(

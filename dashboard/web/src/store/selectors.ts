@@ -117,6 +117,11 @@ export function computeSearchMatches(
 // trend.history[] is 12 rows (modal). Do not merge them.
 export interface TrendChartDatum {
   label: string;
+  // #750 S4 §3.1. The segment instant. `label` is year-free and an in-place
+  // credit splits one week into cycles that can render it identically, so
+  // the label alone is not a React key. Optional: an older envelope carries
+  // no instant and the row falls back to today's label keying.
+  week_start_at?: string | null;
   used_pct: number | null;
   dollar_per_pct: number | null;
   delta: number | null;
@@ -142,6 +147,7 @@ export function buildTrendSparkData(env: Envelope | null): TrendChartDatum[] {
     dollar_per_pct: w.dollar_per_pct,
     delta: w.delta,
     is_current: w.is_current,
+    week_start_at: w.week_start_at ?? null,
     spark_height: trend.spark_heights?.[i],
     cost_usd: w.cost_usd ?? null,
     ...(w.account_labels ? { account_labels: w.account_labels } : {}),
@@ -157,6 +163,7 @@ export function buildTrendHistoryData(env: Envelope | null): TrendChartDatum[] {
     dollar_per_pct: w.dollar_per_pct,
     delta: w.delta,
     is_current: w.is_current,
+    week_start_at: w.week_start_at ?? null,
     cost_usd: w.cost_usd ?? null,
     ...(w.account_labels ? { account_labels: w.account_labels } : {}),
   }));

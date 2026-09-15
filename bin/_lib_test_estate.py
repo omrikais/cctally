@@ -1623,7 +1623,7 @@ def _other_profile_rows(document):
     return {axis: document.get(axis) or [] for axis in AXES}
 
 
-def run_check(repo, profile, discover=None):
+def run_check(repo, profile, discover=None, *, transitions_only=False):
     """Compare the record against the tree and against committed history.
 
     ``profile`` is the tree's own profile, supplied by the caller rather than
@@ -1701,12 +1701,13 @@ def run_check(repo, profile, discover=None):
                 _transitions_against(repo, revisions, public, active, profile,
                                      ledgers, _unable))
 
-    try:
-        live = discover(repo)
-    except Exception as exc:  # the kernel raises its own error type
-        _unable("discovery-failed", f"{type(exc).__name__}: {exc}")
-    else:
-        findings.extend(compare(active, live))
+    if not transitions_only:
+        try:
+            live = discover(repo)
+        except Exception as exc:  # the kernel raises its own error type
+            _unable("discovery-failed", f"{type(exc).__name__}: {exc}")
+        else:
+            findings.extend(compare(active, live))
 
     for finding in findings:
         notes.append(
@@ -1868,6 +1869,9 @@ def build_parser():
     parser.add_argument("--check", action="store_true",
                         help="run the complete structural check and print a "
                              "tagged report")
+    parser.add_argument("--check-transitions", action="store_true",
+                        help="check committed predecessor transitions only; "
+                             "perform no live test discovery")
     parser.add_argument("--plan-legs", metavar="DIR", default=None,
                         help="expand pytestExecution into DIR and print the "
                              "leg records; performs no live derivation")
@@ -1887,8 +1891,10 @@ def main(argv=None):
     """
     args = build_parser().parse_args(argv)
     repo = Path(args.repo) if args.repo else _repo_default()
-    if not args.check and args.plan_legs is None and not args.validate_legs:
-        print("_lib_test_estate.py: pass --check, --plan-legs or --validate-legs",
+    if (not args.check and not args.check_transitions
+            and args.plan_legs is None and not args.validate_legs):
+        print("_lib_test_estate.py: pass --check, --check-transitions, "
+              "--plan-legs or --validate-legs",
               file=sys.stderr)
         return 2
     try:
@@ -1896,6 +1902,9 @@ def main(argv=None):
             _emit_plan(repo, args.profile, args.plan_legs, sys.stdout)
         if args.check:
             sys.stdout.write(render_report(run_check(repo, args.profile)))
+        if args.check_transitions:
+            sys.stdout.write(render_report(run_check(
+                repo, args.profile, transitions_only=True)))
     except EstateError as exc:
         print(f"_lib_test_estate.py: {exc}", file=sys.stderr)
         return 3

@@ -27,7 +27,18 @@ function openBlockDetail(r: BlockPresentationRow): void {
   if (r.source === 'claude') {
     dispatch({ type: 'OPEN_MODAL', kind: 'block', blockStartAt: r.start_at });
   } else {
-    dispatch({ type: 'OPEN_SOURCE_DETAIL', source: r.source, resource: 'block', key: r.key });
+    // #769 S9 QA P2 — the row names its OWN account, whatever the focus
+    // control says. Two accounts that observed one physical quota window
+    // publish two rows under one opaque key, so without this qualifier the
+    // server answered both from the first published row. `accountKey` is
+    // `null` when the wire published none; it is never synthesised.
+    dispatch({
+      type: 'OPEN_SOURCE_DETAIL',
+      source: r.source,
+      resource: 'block',
+      key: r.key,
+      accountKey: r.accountKey ?? null,
+    });
   }
 }
 

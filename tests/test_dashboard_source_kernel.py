@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import pathlib
 import sqlite3
 
 import pytest
@@ -459,7 +460,20 @@ def test_all_composition_never_blends_current_and_stale_provider_data(
     assert set(combined.data["providers"]) == {"claude", "codex"}
 
 
-def test_fresh_partial_provider_is_reusable_and_contributes_all_totals():
+def test_fresh_partial_provider_contributes_all_totals_but_is_not_reusable():
+    """#834 S2 (#830) split what this test used to assert as one property.
+
+    A fresh partial provider's data is real, so it still composes: its cost
+    and tokens contribute to the All source's combined figure, and #556 S2
+    §3.7 settled that withholding a whole cross-provider ranking over an
+    incomplete Codex project attribution would discard real data.
+
+    The same object is NOT reusable. Reuse republishes it unexamined, and with
+    `partial` admitted a provider reporting `freshness="fresh"` handed the
+    same degraded generation back for the life of the process, because the
+    reuse version is an identity digest a transient read failure does not
+    move.
+    """
     codex = _provider_state(
         "codex", availability="partial", freshness="fresh", cost_usd=2.0, total_tokens=20,
     )
@@ -467,9 +481,10 @@ def test_fresh_partial_provider_is_reusable_and_contributes_all_totals():
         "claude", availability="ok", freshness="fresh", cost_usd=1.0, total_tokens=10,
     )
 
+    assert source_kernel._coherent_provider(codex) is True
     assert source_kernel.reuse_coherent_source_state(
         codex, data_version=codex.data_version,
-    ) is codex
+    ) is None
     combined = source_kernel.compose_all_state(claude, codex)
 
     assert (combined.availability, combined.freshness) == ("partial", "fresh")
@@ -1683,4 +1698,44 @@ def test_source_schema_version_is_eleven():
     key itself is retained with null members so a still-loaded v9 bundle does
     not throw across an in-place `execvp` update.
     """
-    assert SOURCE_SCHEMA_VERSION == 11
+    assert SOURCE_SCHEMA_VERSION == 12
+    impact = json.loads(
+        (pathlib.Path(__file__).parent / "source-schema-impact.json").read_text()
+    )
+    assert impact["schemaVersion"] == 1
+    assert impact["sourceSchemaVersion"] == SOURCE_SCHEMA_VERSION
+    required = {
+        "producers", "retainedAndDerivedFields", "serverReaders",
+        "cliAndTuiReaders", "browserConsumers", "fixtures", "compatibilityOracles",
+    }
+    assert set(impact["consumers"]) == required
+    for category in required:
+        paths = impact["consumers"][category]
+        assert paths == sorted(set(paths)) and paths, category
+        for path in paths:
+            assert (pathlib.Path(__file__).parents[1] / path).exists(), path
+    recorded = {
+        path
+        for paths in impact["consumers"].values()
+        for path in paths
+        if not (pathlib.Path(__file__).parents[1] / path).is_dir()
+    }
+    discovered = set()
+    root = pathlib.Path(__file__).parents[1]
+    for base in (root / "bin", root / "dashboard/web/src", root / "tests"):
+        for path in base.rglob("*"):
+            if not path.is_file() or "fixtures" in path.parts:
+                continue
+            if path.name.startswith("authoritative-estate"):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            if "SOURCE_SCHEMA_VERSION" in text or "source_schema_version" in text:
+                discovered.add(path.relative_to(root).as_posix())
+    discovered.add("bench/baselines/envelope-oracle.json")
+    assert discovered <= recorded, (
+        "source-schema consumers are missing from tests/source-schema-impact.json: "
+        f"{sorted(discovered - recorded)}"
+    )

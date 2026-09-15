@@ -168,12 +168,29 @@ def _without_cache_report(state: dict) -> dict:
 # so it cannot mask a second axis moving.
 _REPOINTED_HERO_AXIS = "stale"
 
+# #769 S6 / #753 (D5) added `data.hero.update_state`, additive and omitted on
+# the healthy path. This fixture's Codex hero cannot resolve a cycle and the
+# process has published no coherent cohort, so the hero now names that state
+# explicitly instead of publishing null operands with nothing to read them by.
+#
+# Repointed for the same reason the freshness axis above is, and under the same
+# constraint: the oracle's value is its provenance, and this is one named leaf
+# with an asserted expected value, so a second key appearing still reddens.
+_REPOINTED_HERO_UPDATE_STATE = "pending"
+
 
 def _with_repointed_hero_axis(state: dict) -> dict:
     return {
         **state,
         "domain_freshness": {
             **state["domain_freshness"], "hero": _REPOINTED_HERO_AXIS,
+        },
+        "data": {
+            **state["data"],
+            "hero": {
+                **state["data"]["hero"],
+                "update_state": _REPOINTED_HERO_UPDATE_STATE,
+            },
         },
     }
 
@@ -186,6 +203,7 @@ def test_a_store_with_no_backlog_matches_the_pre_change_oracle(codex_state):
     # The repointing carve-out is CHECKED, not assumed: the built state must
     # actually carry the new value, so a third axis moving still reddens.
     assert built["domain_freshness"]["hero"] == _REPOINTED_HERO_AXIS
+    assert built["data"]["hero"]["update_state"] == _REPOINTED_HERO_UPDATE_STATE
     assert _without_cache_report(built) == _without_cache_report(oracle)
     # The carve-out is scoped to one subtree, not to the field's own claim.
     assert "ingest_backlog" not in built["data"]

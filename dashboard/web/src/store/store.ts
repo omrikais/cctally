@@ -666,7 +666,21 @@ export interface UIState {
   // qualified route via useSourceDetail. Null when closed. Separate from the
   // legacy `openSessionId`/`openBlockStartAt` fields (which stay the Claude
   // legacy-route path).
-  openSourceDetail: { source: SourceName; resource: SourceResource; key: string } | null;
+  // #769 S9 QA P2 — `accountKey` is the OPENING ROW's own account, carried
+  // from the panel rather than re-derived from the focus control. Two Codex
+  // accounts that observed one physical quota window publish two separately
+  // labelled rows sharing ONE opaque key, because `dashboard_resource_key`
+  // is built from root, logical limit key, observed slot, window minutes and
+  // reset and never the account. Under "All accounts" both rows used to issue
+  // the identical unqualified URL and `source_detail_lookup` answered both
+  // from the first published row, so one row opened the other account's
+  // block. `null` means the wire published no `account_key` for that row — it
+  // is never the `unattributed` sentinel, which would be a claim the wire did
+  // not make.
+  openSourceDetail: {
+    source: SourceName; resource: SourceResource; key: string;
+    accountKey: string | null;
+  } | null;
   // Dashboard selection captured when the qualified detail opens. This can be
   // `all` even though the route itself is provider-qualified, and keeps a
   // modal-launched share action stable across a later board source switch.
@@ -1214,7 +1228,11 @@ export type Action =
   | { type: 'SET_ACCOUNT_FOCUS'; source: SourceName; slot: AccountFocusSlot; account: string }
   // #294 S5 §5.6 — open / close the qualified source-detail modal (Codex/All
   // source rows). The modal fetches `/api/source/<source>/<resource>/<key>`.
-  | { type: 'OPEN_SOURCE_DETAIL'; source: SourceName; resource: SourceResource; key: string }
+  // #769 S9 QA P2 — `accountKey` is optional so an opener that genuinely has
+  // no row account keeps today's focus-derived qualifier; the blocks panel
+  // always supplies the row's own value (`null` when undecorated).
+  | { type: 'OPEN_SOURCE_DETAIL'; source: SourceName; resource: SourceResource; key: string;
+      accountKey?: string | null }
   | { type: 'CLOSE_SOURCE_DETAIL' }
   // #294 S5 §6.3 — header-click sort override for the source Sessions grid
   // (Codex / All). Transient; null restores the native recency-desc default.
@@ -1522,7 +1540,12 @@ export function dispatch(action: Action): void {
     case 'OPEN_SOURCE_DETAIL':
       state = {
         ...state,
-        openSourceDetail: { source: action.source, resource: action.resource, key: action.key },
+        openSourceDetail: {
+          source: action.source,
+          resource: action.resource,
+          key: action.key,
+          accountKey: action.accountKey ?? null,
+        },
         openSourceDetailSelection: state.activeSource,
       };
       break;

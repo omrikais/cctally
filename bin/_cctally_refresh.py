@@ -978,7 +978,8 @@ def _hook_tick_oauth_refresh(
     BUT do NOT call _bust_statusline_cache().
 
     `throttle_seconds` controls the DB-snapshot freshness gate (skip the
-    fetch if the newest weekly_usage_snapshots row is younger than this).
+    fetch if the newest genuinely observed weekly_usage_snapshots row is
+    younger than this; a `weekly_observation_held` row is not one).
     `None` => read `oauth_usage.throttle_seconds` from config (falling back
     to HOOK_TICK_DEFAULT_THROTTLE_SECONDS on validation error). An explicit
     value bypasses config so `cmd_hook_tick`'s already-resolved

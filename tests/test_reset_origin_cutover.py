@@ -286,7 +286,8 @@ def test_a6_the_rebuild_is_idempotent(ns):
     """A second CALL of the rebuild must be a no-op that renumbers nothing.
 
     Re-opening the store proves nothing here: the first open stamps
-    `user_version = 1013`, so every later open returns at the epoch gate and
+    `user_version` at the current head, so every later open returns at the
+    epoch gate and
     the rebuild is never reached a second time. Comparing two reads of an
     unchanged database would pass against a rebuild that renumbers row ids on
     every call, which is the failure this test exists to catch, so the

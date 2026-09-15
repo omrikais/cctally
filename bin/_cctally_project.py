@@ -29,8 +29,8 @@ import sys
 
 from _cctally_core import (
     _command_as_of,
-    _floored_week_max,
     eprint,
+    latest_usage_by_segment,
     open_db,
     parse_iso_datetime,
 )
@@ -327,7 +327,7 @@ def render_attribution_footer(totals, *, basis, cause) -> "list[str]":
                 "Modelled quota: withheld \u2014 "
                 f"{_cause_copy(cause)}. Used % is a cost share.")
         else:
-            parts = [f"{modelled:,.2f} points across the modelled weeks"]
+            parts = [f"{modelled:,.2f} points across the modelled cycles"]
             if visible is not None:
                 parts.append(f"{visible:,.2f} in the rows listed")
             if unmodelled is not None:
@@ -378,84 +378,45 @@ def observed_minus_modelled(*, observed, modelled):
 
 
 def _load_week_snapshots(
-    since: dt.datetime, until: dt.datetime, *,
-    account_key: "str | None" = None,
+    subweeks, *, account_key: "str | None" = None,
 ) -> dict[dt.datetime, float]:
-    """Return {week_start_utc -> max(weekly_percent)} for weeks intersecting
-    the [since, until] range.
+    """Return ``{segment start (UTC) -> that cycle's weekly_percent}``.
 
-    Reads the `weekly_percent` column of `weekly_usage_snapshots` (authoritative
-    column name — NOT `used_7d_percent`). A week's "used %" is the maximum
-    snapshot captured within that week (the monotonic-within-window invariant:
-    weekly_percent only increases across the life of a week). Skips rows
-    whose `week_start_at` or `week_end_at` are NULL (pre-migration legacy
-    rows that only carried date granularity).
+    #750 S4 §2.1. This used to return ``{week_start_utc -> max(weekly_percent)}``
+    keyed on `weekly_usage_snapshots.week_start_at`, while `cmd_project` looked
+    each week up with a `SubWeek.start_ts` instant. On a credited week those are
+    different quantities: the post-credit segment matched nothing and landed in
+    `weeks_missing_snapshot`, and the pre-credit segment received the
+    POST-credit reading. That is #731.
 
-    MAX is computed in Python keyed on the parsed UTC datetime so that rows
-    holding different string spellings of the same instant (e.g. `+00:00` vs
-    `+03:00` from pre-UTC-cast canonicalizer history) coalesce into one
-    bucket instead of splitting and silently dropping the higher value.
+    It is now a thin wrapper over `latest_usage_by_segment`, the shared reducer
+    the dashboard projects panel also calls, so the CLI and the panel resolve a
+    cycle's percentage through one implementation instead of two. The keys are
+    parsed back to datetimes because that is `cmd_project`'s bucket identity,
+    and a segment with no observation inside its own interval is ABSENT rather
+    than carrying a neighbour's reading — which is what lets
+    `weeks_missing_snapshot` report one missing cycle per cut.
 
-    Reset-aware (record-credit M2, #209): each week's MAX is restricted to
-    snapshots captured at-or-after that week's latest in-place clamp floor
-    (`_reset_aware_floor`, the union of `week_reset_events` +
-    `weekly_credit_floors`). Without this, a credited week's per-project Used %
-    would read the stale pre-credit peak (e.g. 46) instead of the post-credit
-    value (e.g. 31) — the same floor the statusline / write-clamp / `--from`
-    helper apply (spec §4a, test S15). The floor compare uses `unixepoch()` on
-    both sides (mixed `Z` / `+00:00` offset spellings).
-
-    ``account_key`` (#620 S1): scopes the read to one account's snapshots.
-    ``None`` — the default and every unfiltered invocation — is the merged
-    all-accounts read, byte-identical to before. A real key is required under
-    ``--account``: two accounts hold independent weekly quotas, so summing
-    another account's percentage into an account-filtered total reports a
-    figure that describes neither account. Percentages across accounts are
-    never summed for the same reason the dashboard never sums them.
-
-    Returns an empty dict if the stats DB has no relevant rows.
+    This wrapper is the leg that opens its own connection; the reducer takes
+    the caller's, because the dashboard already holds a transaction.
     """
-    acct_pred = "" if account_key is None else " AND account_key = ?"
-    acct_params: tuple = () if account_key is None else (account_key,)
     conn = open_db()
     try:
-        try:
-            cur = conn.execute(
-                "SELECT week_start_date, week_start_at, week_end_at, "
-                "       captured_at_utc, weekly_percent "
-                "FROM weekly_usage_snapshots "
-                "WHERE week_start_at IS NOT NULL "
-                "AND week_end_at IS NOT NULL "
-                "AND datetime(week_start_at) < datetime(?) "
-                "AND datetime(week_end_at) > datetime(?)"
-                f"{acct_pred}",
-                (until.isoformat(), since.isoformat(), *acct_params),
-            )
-        except sqlite3.OperationalError:
-            # A stats.db predating the `account_key` column — an install
-            # whose migrations have not run, or a dev binary that refused
-            # the prod forward-migration (#142). `_projects_week_grid`
-            # carries the same guard for the same predicate.
-            #
-            # Withholding is the degradation, not dropping the predicate:
-            # retrying unscoped would sum another account's weekly
-            # percentage into an account-filtered total, which is the
-            # figure describing neither account that #620 S1 removed.
-            return {}
-        rows_in = []
-        for wsd, ws_iso, we_iso, cap_iso, pct in cur.fetchall():
-            if ws_iso is None or pct is None:
-                continue
-            ws = dt.datetime.fromisoformat(str(ws_iso).replace("Z", "+00:00"))
-            key = ws.astimezone(dt.timezone.utc)
-            rows_in.append((key, wsd, ws_iso, we_iso, cap_iso, pct))
-        # Reset-aware per-week max (#290): the shared reducer resolves each
-        # week's clamp floor once (keyed on week_start_date) and drops stale
-        # pre-credit captures before taking the per-week maximum. The query
-        # above already filters NULL bounds, so canonical bounds are present.
-        return _floored_week_max(conn, rows_in)
+        by_segment = latest_usage_by_segment(
+            conn, subweeks, account_key=account_key)
     finally:
         conn.close()
+    out: dict[dt.datetime, float] = {}
+    for segment_key, pct in by_segment.items():
+        if pct is None:
+            continue
+        try:
+            out[parse_iso_datetime(
+                segment_key, "subweek.segment_key",
+            ).astimezone(dt.timezone.utc)] = float(pct)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _sum_cost_by_project(
@@ -1143,8 +1104,13 @@ def cmd_project(args: argparse.Namespace) -> int:
     # intersects [since_dt, until_dt]. Missing snapshots are tracked so we
     # can surface `weeksMissingSnapshot` in the output — those weeks can't
     # contribute to attributed %.
+    # One value per SEGMENT, resolved inside that cycle's own half-open
+    # interval (#750 S4 §2.1 / #731). The emitted `SubWeek`s are handed over
+    # rather than a date range, because the segment IS the identity
+    # `cmd_project` buckets by and a date is what the two cycles of a
+    # credited week share.
     week_snapshots: dict[dt.datetime, float] = _load_week_snapshots(
-        since_dt, until_dt, account_key=acct_key,
+        subweeks, account_key=acct_key,
     )
 
     # Set of every week the user asked about (from the computed SubWeek
@@ -1158,11 +1124,17 @@ def cmd_project(args: argparse.Namespace) -> int:
     # #661 S2 §5.1: one decision per subscription week, over that week's WHOLE
     # account population. A week with an unsupported or out-of-regime segment
     # falls back for the whole week; partial-week mixtures are not produced.
+    # The segment's REAL emitted end, never `ws + 7d` (#750 S4 §2.5). Once
+    # `ws` is a credit cut that synthetic end is not the cycle's end, and a
+    # bounded regime can then classify a short segment as crossing a boundary
+    # it never reaches.
+    _end_by_start = {s_dt: e_dt for s_dt, e_dt in parsed_bounds}
     week_attribution: dict = {}
     for ws in sorted(set(week_starts) | set(week_records)):
         week_attribution[ws] = resolve_week_attribution(
             attribution_regime, week_records.get(ws, ()),
-            week_start=ws, week_end=ws + dt.timedelta(days=7))
+            week_start=ws,
+            week_end=_end_by_start.get(ws, ws + dt.timedelta(days=7)))
     modelled_weeks = sorted(
         ws for ws, attr in week_attribution.items()
         if attr.basis == "modelled")

@@ -17,10 +17,16 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 """
 from __future__ import annotations
 
+import contextlib as _contextlib
+import contextvars as _contextvars
+import dataclasses
 import datetime as dt
 import re
 import sys
+import threading as _threading
 from typing import Any
+
+_sys = sys
 
 
 def _eprint(*args: Any) -> None:
@@ -99,6 +105,162 @@ def pricing_fingerprint_is_comparable(value) -> bool:
     if not value:
         return True
     return parse_pricing_fingerprint(value) is not None
+
+
+class PricingFingerprintObservation:
+    """ONE read of a store's recorded pricing fingerprint, in four states
+    (#728).
+
+    ``absent``    — the read succeeded and no value is recorded.
+    ``present``   — read and parsed; ``parsed_date`` is orderable.
+    ``malformed`` — read successfully, but the value is not an ISO date.
+    ``degraded``  — the read ITSELF failed; nothing is known about the store.
+
+    Four rather than three, because ``present(parsed_date, raw)`` cannot also
+    carry an unparseable value: a ``present`` observation whose ``parsed_date``
+    is None would either raise on the comparison or be silently read as
+    absent. And ``degraded`` is separate from ``absent`` because the whole
+    defect this replaces was a failed ``SELECT`` degrading to None and then
+    reading as "a fresh store with nothing to protect", which authorized every
+    writer over a store it had not managed to read.
+
+    Frozen, so a consumer cannot downgrade a degraded read to an absent one by
+    assignment.
+
+    Written by hand rather than with ``@dataclasses.dataclass(frozen=True)``,
+    and that is load-bearing for this module rather than a style choice. This
+    file declares ``from __future__ import annotations``, so every field
+    annotation is a string, and `dataclasses` resolves a string annotation via
+    ``sys.modules.get(cls.__module__).__dict__`` while building the class. This
+    module is deliberately a pure stdlib leaf that several callers load by
+    executing the file under a private name that is never registered in
+    ``sys.modules`` — `tests/test_claude_fast_pricing.py` is one — and for
+    those the lookup returns None and the class body raises ``AttributeError``
+    at import. A hand-rolled frozen class has no such dependency.
+    """
+
+    __slots__ = ("state", "parsed_date", "raw", "error_kind")
+
+    def __init__(self, state, parsed_date=None, raw=None, error_kind=None):
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "parsed_date", parsed_date)
+        object.__setattr__(self, "raw", raw)
+        object.__setattr__(self, "error_kind", error_kind)
+
+    def __setattr__(self, name, value):
+        raise dataclasses.FrozenInstanceError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name):
+        raise dataclasses.FrozenInstanceError(f"cannot delete field {name!r}")
+
+    def __copy__(self):
+        # An immutable value shares rather than duplicates. Required as well as
+        # correct: `__slots__` plus a refusing `__setattr__` means the generic
+        # `copy._reconstruct` path re-assigns each slot and raises, which
+        # `dataclasses.asdict` hits the moment one of these becomes a field of
+        # a dataclass — `DoctorState` carries two.
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __reduce__(self):
+        return (self.__class__, self._key())
+
+    def _key(self):
+        return (self.state, self.parsed_date, self.raw, self.error_kind)
+
+    def __eq__(self, other):
+        if not isinstance(other, PricingFingerprintObservation):
+            return NotImplemented
+        return self._key() == other._key()
+
+    def __hash__(self):
+        return hash(self._key())
+
+    def __repr__(self):
+        return (
+            "PricingFingerprintObservation("
+            f"state={self.state!r}, parsed_date={self.parsed_date!r}, "
+            f"raw={self.raw!r}, error_kind={self.error_kind!r})"
+        )
+
+
+def classify_pricing_fingerprint(
+    *, found: bool, raw: Any, error_kind: "str | None",
+) -> PricingFingerprintObservation:
+    """Interpret ONE fingerprint read. Pure: the caller performs the SELECT and
+    reports what happened; this decides what it means.
+
+    ``error_kind`` set means the read itself failed, which is NOT the same as a
+    store with nothing recorded — it wins over any value the partial read
+    returned, because a torn observation is not evidence about the store.
+
+    ``parse_pricing_fingerprint`` stays the sole date parser: the guard, doctor
+    and this classifier must never disagree about which values are orderable,
+    and two parses of that one contract have already drifted apart once.
+    """
+    if error_kind is not None:
+        return PricingFingerprintObservation("degraded", None, raw, error_kind)
+    if not found or not raw:
+        return PricingFingerprintObservation("absent")
+    parsed = parse_pricing_fingerprint(raw)
+    if parsed is None:
+        return PricingFingerprintObservation("malformed", None, raw)
+    return PricingFingerprintObservation("present", parsed, raw)
+
+
+def _coerce_process_date(process_date: Any) -> "dt.date | None":
+    """The writing process's own snapshot date as an orderable ``date``.
+
+    Accepts the date directly or the recorded string form, and returns None for
+    anything that cannot be ordered — which every predicate below refuses, so
+    the guard fails closed on BOTH sides rather than only on the stored one.
+    """
+    if isinstance(process_date, dt.datetime):
+        return process_date.date()
+    if isinstance(process_date, dt.date):
+        return process_date
+    return parse_pricing_fingerprint(process_date)
+
+
+def _ordered_ok(
+    obs: PricingFingerprintObservation, process_date: Any,
+) -> bool:
+    """Day-granular ordering: absent is older than anything, present compares,
+    and neither malformed nor degraded is orderable at all."""
+    if obs.state == "absent":
+        return True
+    if obs.state != "present":
+        return False
+    resolved = _coerce_process_date(process_date)
+    if resolved is None or obs.parsed_date is None:
+        return False
+    return obs.parsed_date <= resolved
+
+
+def may_write_materialized_cost(
+    obs: PricingFingerprintObservation, process_date: Any,
+) -> bool:
+    """Whether this process may materialize cost over the observed store.
+
+    A refused write costs a stale rollup, so ``absent`` still fails open: a
+    store that genuinely recorded nothing has nothing to protect.
+    """
+    return _ordered_ok(obs, process_date)
+
+
+def may_reset_rebuild_target(
+    obs: PricingFingerprintObservation, process_date: Any,
+) -> bool:
+    """Whether this process may CLEAR a rebuild target before replacing it.
+
+    Same ordering, and this is the path that must fail closed: a refused clear
+    costs nothing, while a clear performed on the strength of a read that never
+    happened destroys a rollup this process may then be refused permission to
+    re-derive.
+    """
+    return _ordered_ok(obs, process_date)
 
 # Canonical machine-readable pricing source (Claude values + Codex values).
 LITELLM_PRICES_URL = (
@@ -505,7 +667,7 @@ def _strip_anthropic_model_prefix(model: str) -> str:
 
 def _claude_fast_multiplier(model: str) -> float:
     """Fast-tier multiplier for a retained Claude model (standard = 1.0)."""
-    return CLAUDE_FAST_MULTIPLIER_OVERRIDES.get(
+    return current_pricing_snapshot().fast_multipliers["claude"].get(
         _strip_anthropic_model_prefix(model), 1.0
     )
 
@@ -928,14 +1090,16 @@ CODEX_FAST_MULTIPLIER_FALLBACK = 2.0
 
 def _codex_fast_multiplier(model: str) -> float:
     """Fast-tier price multiplier for a Codex model (standard tier = 1.0)."""
-    return CODEX_FAST_MULTIPLIER_OVERRIDES.get(
-        _canonical_codex_model(model), CODEX_FAST_MULTIPLIER_FALLBACK,
+    snapshot = current_pricing_snapshot()
+    return snapshot.fast_multipliers["codex"].get(
+        _canonical_codex_model(model),
+        snapshot.fast_multipliers["codex_fallback"],
     )
 
 
 def _canonical_codex_model(model: str) -> str:
     """Return the priced model name for a known Codex runtime alias."""
-    return CODEX_MODEL_ALIASES.get(model, model)
+    return current_pricing_snapshot().aliases.get(model, model)
 
 
 def _codex_config_requests_fast_service_tier(content: str) -> bool:
@@ -967,16 +1131,18 @@ def _resolve_codex_pricing(model: str) -> tuple[dict[str, Any] | None, bool]:
     only if the fallback model itself is missing from the pricing dict
     (programming error; warn once).
     """
-    direct = CODEX_MODEL_PRICING.get(_canonical_codex_model(model))
+    snapshot = current_pricing_snapshot()
+    direct = snapshot.codex_pricing.get(_canonical_codex_model(model))
     if direct is not None:
         return direct, False
-    fallback = CODEX_MODEL_PRICING.get(CODEX_LEGACY_FALLBACK_MODEL)
+    fallback = snapshot.codex_pricing.get(snapshot.fallback_model)
     return fallback, True
 
 
 def _is_codex_fallback(model: str) -> bool:
     """True iff `model` would resolve via the LEGACY_FALLBACK_MODEL path."""
-    return _canonical_codex_model(model) not in CODEX_MODEL_PRICING
+    return (_canonical_codex_model(model)
+            not in current_pricing_snapshot().codex_pricing)
 
 
 def _resolve_model_pricing(model: str, warn: bool = True) -> dict[str, Any] | None:
@@ -989,12 +1155,13 @@ def _resolve_model_pricing(model: str, warn: bool = True) -> dict[str, Any] | No
     effect, and don't poison `_unknown_model_warnings` (which would suppress a
     later genuine cost-path warning for the same model).
     """
-    pricing = CLAUDE_MODEL_PRICING.get(model)
+    table = current_pricing_snapshot().claude_pricing
+    pricing = table.get(model)
     if pricing is not None:
         return pricing
     stripped = _strip_anthropic_model_prefix(model)
     if stripped != model:
-        pricing = CLAUDE_MODEL_PRICING.get(stripped)
+        pricing = table.get(stripped)
         if pricing is not None:
             return pricing
     if warn and model not in _unknown_model_warnings:
@@ -1055,13 +1222,16 @@ def _cache_create_cost(pricing: dict, flat: int, h_raw, tiered) -> float:
         return tiered(flat, "cache_creation_input_token_cost",
                       "cache_creation_input_token_cost_above_200k_tokens")
 
-    below = min(flat, TIERED_THRESHOLD)
-    above = max(0, flat - TIERED_THRESHOLD)
+    snapshot = current_pricing_snapshot()
+    threshold = snapshot.tier_thresholds["claude"]
+    multiplier_1h = snapshot.cache_write_1h_multiplier
+    below = min(flat, threshold)
+    above = max(0, flat - threshold)
     frac = h / flat
     base = pricing.get("input_cost_per_token", 0.0)
-    r1h = base * CACHE_WRITE_1H_MULTIPLIER
+    r1h = base * multiplier_1h
     r1h_200k = pricing.get("input_cost_per_token_above_200k_tokens", base) \
-        * CACHE_WRITE_1H_MULTIPLIER
+        * multiplier_1h
     r5m = pricing.get("cache_creation_input_token_cost", 0.0)
     r5m_200k = pricing.get("cache_creation_input_token_cost_above_200k_tokens", r5m)
     return ((below * frac) * r1h + (above * frac) * r1h_200k
@@ -1089,9 +1259,10 @@ def _calculate_entry_cost(
         tiered_rate = pricing.get(tiered_key)
         if tokens <= 0:
             return 0.0
-        if tokens > TIERED_THRESHOLD and tiered_rate is not None:
-            below = min(tokens, TIERED_THRESHOLD)
-            above = tokens - TIERED_THRESHOLD
+        threshold = current_pricing_snapshot().tier_thresholds["claude"]
+        if tokens > threshold and tiered_rate is not None:
+            below = min(tokens, threshold)
+            above = tokens - threshold
             return below * base_rate + above * tiered_rate
         return tokens * base_rate
 
@@ -1181,8 +1352,9 @@ def _calculate_codex_entry_cost(
         if not base_rate:
             return 0.0
         tiered_rate = pricing.get(tiered_key)
-        if tokens > CODEX_TIERED_THRESHOLD and tiered_rate is not None:
-            return CODEX_TIERED_THRESHOLD * base_rate + (tokens - CODEX_TIERED_THRESHOLD) * tiered_rate
+        threshold = current_pricing_snapshot().tier_thresholds["codex"]
+        if tokens > threshold and tiered_rate is not None:
+            return threshold * base_rate + (tokens - threshold) * tiered_rate
         return tokens * base_rate
 
     non_cached_input = max(0, input_tokens - cached_input_tokens)
@@ -1218,3 +1390,335 @@ def _short_model_name(model: str) -> str:
     if re.match(r".*-\d{8}$", name):
         name = name[:-9]
     return name
+
+
+# ---------------------------------------------------------------------------
+# #714 — the published pricing snapshot, and the reader that replaces it
+#
+# Every CLI invocation re-imports this module, so only a long-lived process —
+# the dashboard — can hold pricing an installer has already replaced on disk.
+# Two rules shape everything below.
+#
+# A PARTIAL SWAP IS WORSE THAN NO SWAP. `PRICING_SNAPSHOT_DATE` is what gates
+# the materialized-cost write refusal in `_cctally_cache`, so replacing the
+# date alone clears the refusal and resumes writing cost computed from the old
+# tables. A candidate is therefore validated whole and adopted whole, or it is
+# rejected and the live snapshot is retained unchanged.
+#
+# NEVER `importlib.reload`. It executes arbitrary module code from a file an
+# installer has just written; it mutates a live module dict incrementally, so a
+# request in flight can see half a table; and it would not even fix the bug,
+# because reloading this module rebinds none of the import-time copies listed
+# in `PRICING_EXPORT_BINDINGS`. `ast.literal_eval` cannot execute code.
+
+
+class PricingCandidateRejected(Exception):
+    """A candidate pricing file was not adopted. Carries the reason."""
+
+
+class PricingSnapshot:
+    """One complete, immutable pricing revision.
+
+    Every pricing-affecting value lives here — not only the two tables. A
+    tier threshold, the Codex fallback model, an alias or a fast multiplier
+    left behind by a partial swap prices part of an entry from the previous
+    revision, which is the same defect as a stale table and harder to see.
+
+    Hand-written frozen rather than ``@dataclasses.dataclass(frozen=True)``,
+    for the reason `PricingFingerprintObservation` above states at length:
+    this file declares ``from __future__ import annotations``, `dataclasses`
+    resolves a string annotation through
+    ``sys.modules.get(cls.__module__).__dict__``, and several callers load
+    this module by executing the file under a private name that is never
+    registered in ``sys.modules``. For those the lookup returns None and the
+    class body raises ``AttributeError`` at import.
+    """
+
+    __slots__ = ("snapshot_date", "claude_pricing", "codex_pricing",
+                 "aliases", "tier_thresholds", "fallback_model",
+                 "cache_write_1h_multiplier", "fast_multipliers")
+
+    def __init__(self, *, snapshot_date, claude_pricing, codex_pricing,
+                 aliases, tier_thresholds, fallback_model,
+                 cache_write_1h_multiplier, fast_multipliers):
+        for name, value in (
+            ("snapshot_date", snapshot_date),
+            ("claude_pricing", claude_pricing),
+            ("codex_pricing", codex_pricing),
+            ("aliases", aliases),
+            ("tier_thresholds", tier_thresholds),
+            ("fallback_model", fallback_model),
+            ("cache_write_1h_multiplier", cache_write_1h_multiplier),
+            ("fast_multipliers", fast_multipliers),
+        ):
+            object.__setattr__(self, name, value)
+
+    def __setattr__(self, name, value):
+        raise dataclasses.FrozenInstanceError(
+            f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name):
+        raise dataclasses.FrozenInstanceError(
+            f"cannot delete field {name!r}")
+
+    def __repr__(self):
+        return (f"PricingSnapshot(snapshot_date={self.snapshot_date!r}, "
+                f"claude_models={len(self.claude_pricing)}, "
+                f"codex_models={len(self.codex_pricing)})")
+
+
+#: The complete inventory of import-time copies, made explicit so it can be
+#: tested rather than asserted. `(module name, attribute, field accessor)`.
+#: `bin/cctally` copies the tables at import and both dashboard source modules
+#: read those copies, so a swap that missed one would price from a stale table
+#: with the refusal latch already cleared.
+PRICING_EXPORT_BINDINGS = (
+    ("_lib_pricing", "PRICING_SNAPSHOT_DATE", lambda s: s.snapshot_date),
+    ("_lib_pricing", "CLAUDE_MODEL_PRICING", lambda s: s.claude_pricing),
+    ("_lib_pricing", "CODEX_MODEL_PRICING", lambda s: s.codex_pricing),
+    ("_lib_pricing", "CODEX_MODEL_ALIASES", lambda s: s.aliases),
+    ("_lib_pricing", "TIERED_THRESHOLD",
+     lambda s: s.tier_thresholds["claude"]),
+    ("_lib_pricing", "CODEX_TIERED_THRESHOLD",
+     lambda s: s.tier_thresholds["codex"]),
+    ("_lib_pricing", "CODEX_LEGACY_FALLBACK_MODEL", lambda s: s.fallback_model),
+    ("_lib_pricing", "CACHE_WRITE_1H_MULTIPLIER",
+     lambda s: s.cache_write_1h_multiplier),
+    ("_lib_pricing", "CLAUDE_FAST_MULTIPLIER_OVERRIDES",
+     lambda s: s.fast_multipliers["claude"]),
+    ("_lib_pricing", "CODEX_FAST_MULTIPLIER_OVERRIDES",
+     lambda s: s.fast_multipliers["codex"]),
+    ("_lib_pricing", "CODEX_FAST_MULTIPLIER_FALLBACK",
+     lambda s: s.fast_multipliers["codex_fallback"]),
+    ("cctally", "PRICING_SNAPSHOT_DATE", lambda s: s.snapshot_date),
+    ("cctally", "CLAUDE_MODEL_PRICING", lambda s: s.claude_pricing),
+    ("cctally", "CODEX_MODEL_PRICING", lambda s: s.codex_pricing),
+    ("cctally", "TIERED_THRESHOLD", lambda s: s.tier_thresholds["claude"]),
+    ("cctally", "CODEX_TIERED_THRESHOLD",
+     lambda s: s.tier_thresholds["codex"]),
+    ("cctally", "CODEX_LEGACY_FALLBACK_MODEL", lambda s: s.fallback_model),
+    ("cctally", "CACHE_WRITE_1H_MULTIPLIER",
+     lambda s: s.cache_write_1h_multiplier),
+    ("cctally", "CLAUDE_FAST_MULTIPLIER_OVERRIDES",
+     lambda s: s.fast_multipliers["claude"]),
+    ("cctally", "CODEX_FAST_MULTIPLIER_OVERRIDES",
+     lambda s: s.fast_multipliers["codex"]),
+    ("cctally", "CODEX_FAST_MULTIPLIER_FALLBACK",
+     lambda s: s.fast_multipliers["codex_fallback"]),
+    # `_cctally_cache` binds the date as a module global on purpose, so a test
+    # can monkeypatch it; that affordance is preserved and the binding is
+    # simply refreshed here too.
+    ("_cctally_cache", "PRICING_SNAPSHOT_DATE", lambda s: s.snapshot_date),
+    # `_lib_cache_report` unpacks the multiplier and the Claude tier threshold
+    # at import. The threshold used to be a literal `200_000` in that file with
+    # nothing keeping it equal to `TIERED_THRESHOLD` here, which made it a
+    # pricing value no reload could replace; it is read from this module now
+    # and refreshed through this entry.
+    ("_lib_cache_report", "CACHE_WRITE_1H_MULTIPLIER",
+     lambda s: s.cache_write_1h_multiplier),
+    ("_lib_cache_report", "DEFAULT_TIERED_THRESHOLD",
+     lambda s: s.tier_thresholds["claude"]),
+)
+
+#: The names `read_pricing_snapshot_from_source` requires, each mapped to the
+#: `PricingSnapshot` field it fills. A missing OR non-literal name rejects the
+#: whole candidate.
+_CANDIDATE_ASSIGNMENTS = (
+    "PRICING_SNAPSHOT_DATE",
+    "CLAUDE_MODEL_PRICING",
+    "CODEX_MODEL_PRICING",
+    "CODEX_MODEL_ALIASES",
+    "TIERED_THRESHOLD",
+    "CODEX_TIERED_THRESHOLD",
+    "CODEX_LEGACY_FALLBACK_MODEL",
+    "CACHE_WRITE_1H_MULTIPLIER",
+    "CLAUDE_FAST_MULTIPLIER_OVERRIDES",
+    "CODEX_FAST_MULTIPLIER_OVERRIDES",
+    "CODEX_FAST_MULTIPLIER_FALLBACK",
+)
+
+_PRICING_PUBLISH_LOCK = _threading.Lock()
+_PRICING_CONTEXT = _contextvars.ContextVar("cctally_pricing_snapshot",
+                                           default=None)
+
+
+def _snapshot_from_module_globals() -> PricingSnapshot:
+    return PricingSnapshot(
+        snapshot_date=PRICING_SNAPSHOT_DATE,
+        claude_pricing=CLAUDE_MODEL_PRICING,
+        codex_pricing=CODEX_MODEL_PRICING,
+        aliases=CODEX_MODEL_ALIASES,
+        tier_thresholds={"claude": TIERED_THRESHOLD,
+                         "codex": CODEX_TIERED_THRESHOLD},
+        fallback_model=CODEX_LEGACY_FALLBACK_MODEL,
+        cache_write_1h_multiplier=CACHE_WRITE_1H_MULTIPLIER,
+        fast_multipliers={
+            "claude": CLAUDE_FAST_MULTIPLIER_OVERRIDES,
+            "codex": CODEX_FAST_MULTIPLIER_OVERRIDES,
+            "codex_fallback": CODEX_FAST_MULTIPLIER_FALLBACK,
+        },
+    )
+
+
+_LIVE_PRICING_SNAPSHOT = _snapshot_from_module_globals()
+
+
+def current_pricing_snapshot() -> PricingSnapshot:
+    """The snapshot this caller must price from.
+
+    A caller inside `pricing_snapshot_context()` keeps the revision it entered
+    with, so a request, a dashboard snapshot build or a sync pass already
+    under way is never assembled from two revisions. Everyone else reads the
+    live pointer, which is one immutable object replaced by one assignment.
+    """
+    captured = _PRICING_CONTEXT.get()
+    return _LIVE_PRICING_SNAPSHOT if captured is None else captured
+
+
+@_contextlib.contextmanager
+def pricing_snapshot_context(snapshot: "PricingSnapshot | None" = None):
+    """Pin one revision for the duration of a request, build or sync pass."""
+    pinned = current_pricing_snapshot() if snapshot is None else snapshot
+    token = _PRICING_CONTEXT.set(pinned)
+    try:
+        yield pinned
+    finally:
+        _PRICING_CONTEXT.reset(token)
+
+
+def publish_pricing_snapshot(snapshot: PricingSnapshot) -> None:
+    """Swap the live pointer and refresh every import-time copy.
+
+    The pointer swap is one assignment of one frozen object, so a concurrent
+    reader observes the old revision whole or the new one whole. The binding
+    refresh that follows exists for call sites that still read a copied name;
+    every cost kernel in this module reads `current_pricing_snapshot()`
+    instead, so correctness does not depend on the refresh reaching a module
+    that has not been imported.
+    """
+    global _LIVE_PRICING_SNAPSHOT
+    with _PRICING_PUBLISH_LOCK:
+        _LIVE_PRICING_SNAPSHOT = snapshot
+        for module_name, attr, accessor in PRICING_EXPORT_BINDINGS:
+            module = _sys.modules.get(module_name)
+            if module is None:
+                continue
+            try:
+                setattr(module, attr, accessor(snapshot))
+            except Exception:  # noqa: BLE001
+                # A module that refuses an attribute set must not stop the
+                # rest of the inventory being refreshed.
+                _eprint(f"[pricing] could not refresh {module_name}.{attr}")
+
+
+def adopt_pricing_candidate(candidate: PricingSnapshot, *,
+                            force: bool = False) -> bool:
+    """Publish `candidate` iff it is strictly newer than the live snapshot.
+
+    `_lib_pricing` documents that a pricing revision always ADVANCES
+    `PRICING_SNAPSHOT_DATE`, so a candidate that does not is a rollback, a
+    corrupt read or the same revision read twice; each of those is a reason to
+    keep what is running. `force` exists for tests restoring a captured
+    snapshot and for nothing else.
+    """
+    if force:
+        publish_pricing_snapshot(candidate)
+        return True
+    live = _LIVE_PRICING_SNAPSHOT
+    new_date = parse_pricing_fingerprint(candidate.snapshot_date)
+    live_date = parse_pricing_fingerprint(live.snapshot_date)
+    if new_date is None:
+        return False
+    if live_date is not None and new_date <= live_date:
+        return False
+    publish_pricing_snapshot(candidate)
+    return True
+
+
+def _file_signature(path) -> tuple:
+    st = path.stat()
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def read_pricing_snapshot_from_source(path) -> PricingSnapshot:
+    """Build a candidate from the literal assignments in a pricing file.
+
+    `ast.parse` plus `ast.literal_eval`, never `importlib.reload` and never
+    `exec`: the file is one an installer has just written and this process
+    must not run it.
+
+    Raises `PricingCandidateRejected` — never returns a partial snapshot — on
+    a missing name, a name whose value is not a literal, a date that does not
+    parse, or a file whose inode/size/mtime signature changes while it is
+    being read, which is an installer replacing it mid-parse.
+    """
+    import ast
+    import pathlib as _pathlib
+
+    path = _pathlib.Path(path)
+    try:
+        before = _file_signature(path)
+        source = path.read_bytes()
+        after = _file_signature(path)
+    except OSError as exc:
+        raise PricingCandidateRejected(
+            f"pricing candidate could not be read: {exc}") from exc
+    if before != after:
+        raise PricingCandidateRejected(
+            "pricing candidate signature changed while it was being read")
+
+    try:
+        tree = ast.parse(source.decode("utf-8"), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError) as exc:
+        raise PricingCandidateRejected(
+            f"pricing candidate does not parse: {exc}") from exc
+
+    found: "dict[str, Any]" = {}
+    for node in tree.body:
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = [t for t in node.targets if isinstance(t, ast.Name)]
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target,
+                                                            ast.Name):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        for target in targets:
+            if target.id not in _CANDIDATE_ASSIGNMENTS or value is None:
+                continue
+            try:
+                found[target.id] = ast.literal_eval(value)
+            except (ValueError, SyntaxError, TypeError) as exc:
+                raise PricingCandidateRejected(
+                    f"{target.id} is no longer a literal, so the in-process "
+                    f"pricing reload cannot read it: {exc}") from exc
+
+    missing = [name for name in _CANDIDATE_ASSIGNMENTS if name not in found]
+    if missing:
+        raise PricingCandidateRejected(
+            "pricing candidate is incomplete; adopting a partial revision "
+            "would clear the write refusal and price from the old tables. "
+            f"Missing: {', '.join(missing)}")
+
+    if parse_pricing_fingerprint(found["PRICING_SNAPSHOT_DATE"]) is None:
+        raise PricingCandidateRejected(
+            "pricing candidate has no orderable PRICING_SNAPSHOT_DATE: "
+            f"{found['PRICING_SNAPSHOT_DATE']!r}")
+
+    return PricingSnapshot(
+        snapshot_date=found["PRICING_SNAPSHOT_DATE"],
+        claude_pricing=found["CLAUDE_MODEL_PRICING"],
+        codex_pricing=found["CODEX_MODEL_PRICING"],
+        aliases=found["CODEX_MODEL_ALIASES"],
+        tier_thresholds={"claude": found["TIERED_THRESHOLD"],
+                         "codex": found["CODEX_TIERED_THRESHOLD"]},
+        fallback_model=found["CODEX_LEGACY_FALLBACK_MODEL"],
+        cache_write_1h_multiplier=found["CACHE_WRITE_1H_MULTIPLIER"],
+        fast_multipliers={
+            "claude": found["CLAUDE_FAST_MULTIPLIER_OVERRIDES"],
+            "codex": found["CODEX_FAST_MULTIPLIER_OVERRIDES"],
+            "codex_fallback": found["CODEX_FAST_MULTIPLIER_FALLBACK"],
+        },
+    )

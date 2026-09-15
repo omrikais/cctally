@@ -83,7 +83,9 @@ function history10(): TrendRow[] {
 
 // TR-1 — every week count (title, section head) derives from rows.length; the
 // hardcoded "12-week" contradiction is gone.
-describe('<TrendModal /> derives the week count from N (TR-1)', () => {
+// #750 S4 §4.1: one vocabulary, both providers. A Claude trend row has
+// always been a billing CYCLE.
+describe('<TrendModal /> derives the cycle count from N (TR-1)', () => {
   beforeEach(() => {
     localStorage.clear();
     _resetForTests();
@@ -91,9 +93,9 @@ describe('<TrendModal /> derives the week count from N (TR-1)', () => {
 
   it('states the real N in the title + section head, never "12-week"', () => {
     const { container } = renderTrend(history10());
-    expect(container.textContent).not.toContain('12-week');
-    expect(container.textContent).toContain('10-week history');
-    expect(container.textContent).toContain('Trend — last 10 weeks');
+    expect(container.textContent).not.toContain('12-cycle');
+    expect(container.textContent).toContain('10-cycle history');
+    expect(container.textContent).toContain('Trend — last 10 cycles');
   });
 
   it('renders the empty-state title as bare "Trend" (no misleading count)', () => {
@@ -106,7 +108,7 @@ describe('<TrendModal /> derives the week count from N (TR-1)', () => {
   });
 });
 
-// TR-2 — the chart median reference line states its basis ("10-wk median $X"),
+// TR-2 — the chart median reference line states its basis ("10-cycle median $X"),
 // disambiguating it from the hero KV's "4-week median".
 describe('<TrendModal /> median label states its basis (TR-2)', () => {
   beforeEach(() => {
@@ -118,8 +120,8 @@ describe('<TrendModal /> median label states its basis (TR-2)', () => {
     const { container } = renderTrend(history10());
     const med = container.querySelector('.mtr-medlabel') as SVGTextElement;
     expect(med).not.toBeNull();
-    expect(med.textContent).toBe('10-wk median $1.45');
-    expect('10-wk median $1.45 stale').not.toBe('10-wk median $1.45');
+    expect(med.textContent).toBe('10-cycle median $1.45');
+    expect('10-cycle median $1.45 stale').not.toBe('10-cycle median $1.45');
     expect(med.textContent).not.toMatch(/^median \$/);
   });
 });
@@ -202,7 +204,7 @@ describe('<TrendModal /> median-KPI collapse (TREND-KPI · decision 8)', () => {
     _resetForTests();
   });
 
-  it('collapses to two tiles with an informational hint when <4 non-current weeks', () => {
+  it('collapses to two tiles with an informational hint when <4 non-current cycles', () => {
     const { container } = renderTrend(historyFew()); // 2 non-current → med == null
     expect(container.querySelector('.m-hero.cols-2')).not.toBeNull();
     expect(container.querySelector('.m-hero.cols-3')).toBeNull();
@@ -215,16 +217,16 @@ describe('<TrendModal /> median-KPI collapse (TREND-KPI · decision 8)', () => {
     );
     expect(values).not.toContain('—');
     // The hint reads as informational, not a bare median value.
-    expect(container.textContent).toContain('needs 4 weeks');
+    expect(container.textContent).toContain('needs 4 cycles');
     // The Current $/1% tile still shows a real number.
     expect(container.querySelector('#mtr-cur')?.textContent).toBe('$1.500');
   });
 
-  it('keeps the three-tile hero when >=4 non-current weeks (median present)', () => {
+  it('keeps the three-tile hero when >=4 non-current cycles (median present)', () => {
     const { container } = renderTrend(history10()); // 9 non-current → med != null
     expect(container.querySelectorAll('.m-hero.cols-3 .m-kv').length).toBe(3);
     expect(container.querySelector('.m-hero.cols-2')).toBeNull();
-    expect(container.textContent).not.toContain('needs 4 weeks');
+    expect(container.textContent).not.toContain('needs 4 cycles');
   });
 });
 

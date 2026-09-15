@@ -147,10 +147,12 @@ panel: clicking a project name in a Sessions row opens the Projects
 modal pre-expanded on that project's drill.
 
 Clicking the panel header or any row opens the **Projects modal**. The
-modal shows a `1w` / `4w` / `8w` / `12w` window-pill selector, a
-stacked-area trend chart over the selected window, a 7-column per-project
-table (cost desc by default), and an in-place per-project drill into
-model breakdown + recent sessions. Clicking a session in the drill
+modal shows a `1` / `4` / `8` / `12` window-pill selector under an
+explicit `cycles` unit label, a stacked-area trend chart over the selected
+window, a 7-column per-project table (cost desc by default), and an
+in-place per-project drill into model breakdown + recent sessions. The
+pills count billing CYCLES rather than calendar weeks, so a week that
+received a credit contributes one bucket per cycle. Clicking a session in the drill
 opens the Session modal (replaces, not stacks). The modal's share
 affordance routes through the same `_build_project_snapshot` kernel as
 the panel and carries the active `windowWeeks` into the share flow.
@@ -246,6 +248,16 @@ A manual refresh does not escape this bound. The earliest a queued request can s
 
 The dashboard binds its HTTP port immediately and serves the current cached snapshot; the first full sync (and any pending one-time conversation-enrichment reingest) runs in the background and is pushed to the page over SSE when it completes. On a large transcript history the background reingest is resumable — interrupting the dashboard mid-sync and relaunching resumes where it left off rather than restarting. To start without any sync, use `--no-sync`; to consume a pending reingest in one foreground pass, run `cctally cache-sync` (or `cache-sync --rebuild`).
 
+### What `--no-sync` freezes
+
+`--no-sync` freezes ingestion, the startup snapshot, and the two conversation derivations the transcript store used to run on every open: the legacy transcript-row import, and the Codex retained-event contract rebuild. The rebuild is the expensive one — on a large transcript history it has been measured at 135 seconds of startup against comparable launches of 15 and 30 seconds — and `--no-sync` exists precisely to avoid paying it. The suppression is process-wide, so an ordinary browse or a live-tail stream does not perform it either.
+
+`--no-sync` does **not** freeze the schema. The dashboard still applies the schema and runs the migration dispatcher once at startup, because under `--no-sync` no other process opens the transcript store for writing and the read-only reader refuses a store that is behind the current schema rather than migrating it from a request thread. Without that one open, a `--no-sync` dashboard would serve a degraded conversation surface indefinitely.
+
+There is a consequence worth stating plainly. When a store owes the Codex contract rebuild — normally just after an upgrade — a `--no-sync` dashboard serves `normalization_pending` for Codex conversation reads: the conversation viewer shows the pending state and the Codex project, cost and rebuild filter axes stay unavailable. That is the frozen-data trade the flag asks for. Run `cctally cache-sync --source codex`, or start the dashboard without `--no-sync`, and the rebuild happens once and the reads return to normal.
+
+The other frozen derivation has its own consequence, in a case that follows an interrupted upgrade. If your transcript rows have not finished moving into the transcript store, a `--no-sync` dashboard does not move them either. Rather than showing an empty conversation list and an empty project filter over rows that are present but not yet in place, every conversation read reports that the transcript import is still pending: browse, search, the conversation viewer and the live-tail stream all answer the same way. The conversation list says so where the rows would be — "Transcripts have not finished moving into the conversation store. Run cctally cache-sync to finish the import." — and it offers no Retry button, because re-reading cannot move rows this dashboard is not allowed to move. The server answers all four routes the same way, but the reader pane does not yet display that answer. Opening one conversation over a store in this state still prints the generic "Couldn't load the conversation." rather than the sentence above. Issue #817 tracks that difference. The same two remedies apply — run `cctally cache-sync`, or start the dashboard without `--no-sync`, and the import happens once at the next open and the reads return to normal.
+
 If a dashboard statistics query discovers a corrupt `stats.db` index, the
 dashboard closes its live database handle, attempts one safe rebuild from the
 append-only journal, and reconnects automatically. When a rebuild is not safe
@@ -281,6 +293,10 @@ GET /api/milestones/<source>/week/<key>[?account=<account_key>]
 ```
 
 `<source>` ∈ `claude | codex`. For both providers, `<key>` is an opaque server-issued `milestone_cycle:*` key obtained from the envelope index; never hand-construct it or expose provider identity fields. The response is snake_case JSON with `Cache-Control: no-cache`; the client reuses it client-side keyed by `(source, key, detail_stamp)`. A malformed key or source returns `400`; a key that no longer resolves returns `404` with a machine-readable `{ code: "unknown_key", reason }` body (`reason` ∈ `pruned | rebuild_pending | projection_incoherent | unknown`). While the published generation's quota projection is marked incomplete, the route returns `503` with `{ code: "quota_projection_incomplete", error: "quota view reconciling", action: "cctally cache-sync" }` — a retry signal over a valid index, not a server fault (#496 S5b §4.7).
+
+**The five-hour crossing rows carry two weekly percentages, and the modal renders the effective one.** Each entry of `current_week.five_hour_milestones` in the live envelope, of `sources.claude.quota.five_hour_milestones`, and of `blocks[].milestones` in the historical response carries both `seven_day_pct_at_crossing` — the raw reading the crossing tick reported, unchanged in type and meaning — and the additive, nullable `effective_seven_day_pct_at_crossing`, the weekly percentage a reader actually saw at that crossing. The two differ on a tick whose weekly axis was clamped and on a tick whose weekly value an in-place weekly credit has since retired. The modal's `5h milestones` column renders the effective value, and when it is `null` — the snapshot row the milestone refers to is gone, or the value that row carries is one a credit retired — the cell reads `—`. **It never falls back to the raw value**, because that number is one no reader ever saw. No `schemaVersion` moves for this: the raw field is unchanged and the new field is nullable and additive.
+
+The live block's own weekly axes follow the same rule on the wire. `current_week.five_hour_block.seven_day_pct_at_block_start`, and the `seven_day_pct_delta_pp` derived from it, are published only when no weekly credit has retired the value; otherwise both are `null`. Neither is rendered by any client today, so this is a machine-surface contract: a consumer must read a `null` there as "withheld because a credit retired it", never as zero.
 
 Under Codex account focus, pass the selected account as `?account=<account_key>` (a 32-hex key or the literal `unattributed`) — the same qualifier `/api/source/` already takes. It must be the account whose `cycle_index` produced `<key>`: the index is built per account, so a key from one account's index is not guaranteed to resolve against the merged enumeration, and the focused response carries that account's own crossings and its own spend rather than every account's on the same Codex home. Omitting the qualifier is the merged "All accounts" response and is unchanged. The vendor-wide `*` sentinel is rejected (it names no cycle), as is the qualifier on `claude` (Claude weeks are not account-partitioned on this route).
 

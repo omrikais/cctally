@@ -384,7 +384,12 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
         # uses) so the display header shows the effective window — e.g.
         # a post-reset short week shows "2026-04-23..2026-04-25" rather
         # than the backdated API-derived "2026-04-18..2026-04-25".
-        canon_start, canon_end = c._get_canonical_boundary_for_date(conn, week_start_date)
+        # SCOPED to the requesting account (#834 S2, #837): every other read
+        # in this command already carries `_acct_pred`, and a merged boundary
+        # read renders another account's window over this account's
+        # milestones.
+        canon_start, canon_end = c._get_canonical_boundary_for_date(
+            conn, week_start_date, account_key=acct_key)
         display_start_iso = canon_start
         display_end_iso = canon_end
         if canon_start and canon_end:

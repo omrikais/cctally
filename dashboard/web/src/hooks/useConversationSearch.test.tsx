@@ -36,6 +36,24 @@ describe('useConversationSearch', () => {
     expect(url).not.toContain('offset=');
   });
 
+  // #769 S6 / #802 browser QA P1 — search reads the same typed degraded
+  // envelope the browse rail does. Its body carries `results`, never `hits`, so
+  // both branches threw and the rail printed "Search failed." over a store that
+  // answered 200.
+  it('reports a degraded search as a named state, not a failure', async () => {
+    mockFetchOnce({
+      results: [], total: 0, status: 'degraded',
+      degraded_reason: 'legacy_bridge_pending',
+    });
+    const { result } = renderHook(() => useConversationSearch('needle'));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(result.current.error).toBeNull();
+    expect(result.current.degraded).not.toBeNull();
+    expect(result.current.degraded!.reason).toBe('legacy_bridge_pending');
+    expect(result.current.hits).toEqual([]);
+  });
+
   it('does not fetch for an empty query', () => {
     const { result } = renderHook(() => useConversationSearch(''));
     act(() => { vi.advanceTimersByTime(500); });

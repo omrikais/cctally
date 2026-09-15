@@ -436,7 +436,36 @@ _init_paths_from_env()
 # is a bump and not a migration is unchanged: the registry is frozen at 13,
 # and an epoch-current open returns before any schema work, so a handler or an
 # `add_column_if_missing` would never run on an upgraded install.
-STATS_INDEX_EPOCH = 1013
+# 1013 -> 1014 (#769 S2 §3): source-local five-hour credit confirmation state.
+# Adds `five_hour_credit_confirmation_state`, keyed
+# `(account_key, five_hour_window_key, source)`. Five-hour credit detection
+# used to compare an incoming reading against the latest accepted snapshot
+# whatever contributor produced it, so one stale `source=statusline` sample
+# below an `source=api` baseline fabricated a credit with no confirmation from
+# any source (the 2026-09-04 incident, #751). The state carries each
+# contributor's own pre-drop baseline and its pending descent, so a descent
+# observed by one source can only be confirmed by a later, distinct
+# observation from that same source. It is disposable operational state rather
+# than journal truth — the rebuild does not reproduce it and must not count it
+# — and the cold-start consequence of losing it is stated at the helpers in
+# `bin/_cctally_record.py`. The mechanical reason this is a bump and not a
+# migration is unchanged: the registry is frozen at 13, and an epoch-current
+# open returns before any schema work, so a handler or an
+# `add_column_if_missing` would never run on an upgraded install.
+# 1014 -> 1015 (#769 S11, issue #824): weekly_usage_snapshots gains
+# `weekly_observation_held`, which separates a weekly value that was genuinely
+# observed on this tick from one carried forward so a weekly-clamped tick can
+# still persist its five-hour evidence. Before it, a tick whose weekly percent
+# clamped against the stored high-water mark wrote no row at all, so the same
+# tick's genuine five-hour reading was discarded — unclamped and unpersisted.
+# A held row (`weekly_observation_held = 1`) carries the tick's own capture
+# time, source and five-hour fields, while its weekly value and boundary are
+# copied from the latest non-held basis. Weekly readers exclude held rows;
+# five-hour readers include them. The mechanical reason this is a bump and not
+# a migration is unchanged: the registry is frozen at 13, and an epoch-current
+# open returns before any schema work, so a handler or an
+# `add_column_if_missing` would never run on an upgraded install.
+STATS_INDEX_EPOCH = 1015
 LEGACY_STATS_HEAD = 13
 
 #: #496 S1 F1. A NEW branch, for a state that cannot occur before the
@@ -2102,7 +2131,9 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
                 page_url TEXT,
                 source TEXT NOT NULL DEFAULT 'userscript',
                 payload_json TEXT NOT NULL,
-                account_key TEXT NOT NULL DEFAULT 'unattributed'
+                account_key TEXT NOT NULL DEFAULT 'unattributed',
+                weekly_observation_held INTEGER NOT NULL DEFAULT 0
+                    CHECK (weekly_observation_held IN (0, 1))
             )
             """
         )
@@ -2148,6 +2179,19 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         add_column_if_missing(
             conn, "weekly_usage_snapshots", "account_key",
             "TEXT NOT NULL DEFAULT 'unattributed'")
+        # weekly_observation_held (#769 S11, issue #824): the provenance flag
+        # rides the STATS_INDEX_EPOCH 1015 bump, so a fresh rebuild carries it
+        # via the CREATE TABLE above. This backstop keeps an already-1015 index
+        # that predates the column consistent, and covers the interval between
+        # a new binary's first open of an epoch-1014 store and the background
+        # rebuild that resolves the mismatch. Every production writer passes the
+        # flag explicitly; the DEFAULT 0 is the rev-4.1 defensive backstop and
+        # is also the correct value for every row written before the column
+        # existed, because those rows are all genuine weekly observations.
+        add_column_if_missing(
+            conn, "weekly_usage_snapshots", "weekly_observation_held",
+            "INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (weekly_observation_held IN (0, 1))")
         add_column_if_missing(conn, "weekly_usage_snapshots", "five_hour_percent", "REAL")
         add_column_if_missing(conn, "weekly_usage_snapshots", "five_hour_resets_at", "TEXT")
         # five_hour_window_key — canonical (10-min-floored epoch) key for
@@ -2283,6 +2327,24 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         # tuple. One index cannot express both, and a single index over the
         # tuple would refuse a second genuine reset that happens to share a
         # boundary pair with the first.
+        # `observed_pre_credit_pct` is a RETAINED NON-INPUT (#761 residual 4,
+        # decision D2). The STORED COLUMN records what the pre-credit reading
+        # was and arms nothing: no read path branches on it, and the clamp floor
+        # that does arm behaviour lives in `weekly_credit_floors`. It is kept,
+        # with its journal payload field, because removing either would break
+        # journal compatibility for no gain, and because it is the only record
+        # of the baseline a historical reset was measured against.
+        #
+        # Do not confuse it with the LIVE FUNCTION ARGUMENT of the same name.
+        # `_fire_in_place_credit(..., observed_pre_credit_pct=...)` is a real
+        # input: it is the band the stale-replica DELETE and its two doomed
+        # captures select on (`_stale_replica_band_sql`). The argument decides
+        # which rows are removed; the column decides nothing.
+        #
+        # This note stays OUTSIDE the SQL. SQLite retains a `CREATE TABLE`
+        # statement verbatim in `sqlite_master.sql`, and `_REBUILD_SCHEMA_
+        # FINGERPRINT` digests that text, so an inline `--` comment here fails
+        # every rebuild with a schema definition mismatch.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS week_reset_events (
@@ -2339,6 +2401,39 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
                 baseline_pct              REAL NOT NULL,
                 first_zero_at_utc         TEXT NOT NULL,
                 first_zero_observation_id TEXT
+            )
+            """
+        )
+        # #769 S2 §3 epoch 1014: source-local five-hour credit confirmation
+        # state. One row per `(account_key, five_hour_window_key, source)`.
+        #
+        # `baseline_pct` is that contributor's own running maximum inside the
+        # window, held raw — never read back from `weekly_usage_snapshots`,
+        # whose five-hour percent is MAX-clamped at write time and therefore
+        # sits downstream of the defect this table exists to remove.
+        #
+        # The four `pending_*` columns are the armed descent, and they are
+        # nullable together: `pending_low_pct IS NOT NULL` is the armed
+        # predicate. `pending_observation_id` is the arming observation's raw
+        # journal id, so a byte-identical replay of that line cannot confirm
+        # itself; `pending_at_utc` is the arming tick's detection clock, which
+        # becomes the credit's effective instant on confirm.
+        #
+        # Disposable operational state, like `weekly_reset_debounce_state`
+        # above: a rebuild legitimately loses it, and the cold-start
+        # consequence is stated at `_read_five_hour_source_state` in
+        # `bin/_cctally_record.py`.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS five_hour_credit_confirmation_state (
+                account_key            TEXT NOT NULL,
+                five_hour_window_key   INTEGER NOT NULL,
+                source                 TEXT NOT NULL,
+                baseline_pct           REAL NOT NULL,
+                pending_low_pct        REAL,
+                pending_at_utc         TEXT,
+                pending_observation_id TEXT,
+                PRIMARY KEY (account_key, five_hour_window_key, source)
             )
             """
         )
@@ -3202,36 +3297,88 @@ def _get_latest_row_for_week(
     as_of_utc: str | None = None,
     *,
     account_key: str | None = None,
+    since_utc: str | None = None,
+    before_utc: str | None = None,
+    exclude_held: bool = False,
 ) -> sqlite3.Row | None:
     """Latest week row from a weekly snapshot table.
+
+    ``exclude_held`` (#769 S11, #824) drops `weekly_observation_held = 1` rows.
+    It is bound to the CALLER rather than applied unconditionally because this
+    primitive serves two tables: `weekly_usage_snapshots` has the column and
+    `weekly_cost_snapshots` does not, so an unconditional predicate would make
+    every cost lookup raise. `get_latest_usage_for_week` passes it; the cost
+    wrapper in `bin/_cctally_milestones.py` does not.
 
     ``account_key`` (#341): ``None`` = the account-blind merged read (today's
     behavior, byte-stable); a real key scopes to that account's rows — the
     ``--account`` render consumers and the write-path milestone-cost read (P2-1)
-    pass it explicitly."""
-    acct_pred = "" if account_key is None else " AND account_key = ?"
-    acct_params: tuple = () if account_key is None else (account_key,)
-    if as_of_utc is None:
-        return conn.execute(
-            f"""
-            SELECT *
-            FROM {table_name}
-            WHERE week_start_date = ?{acct_pred}
-            ORDER BY captured_at_utc DESC, id DESC
-            LIMIT 1
-            """,
-            (week_ref.week_start.isoformat(),) + acct_params,
-        ).fetchone()
+    pass it explicitly.
+
+    ``since_utc`` / ``before_utc`` (#750 S4 spec §1.2) bound the read to ONE
+    billing cycle of a credited week: ``since_utc`` is INCLUSIVE and
+    ``before_utc`` is EXCLUSIVE, which is `_aggregate_weekly`'s
+    ``[start_ts, end_ts)`` convention, so a snapshot captured exactly at a
+    credit instant lands in the same segment as an entry stamped there.
+
+    ``as_of_utc`` keeps its inclusive ``<=`` unchanged. It is a different
+    quantity — the caller's global freshness bound — and other callers reach
+    this primitive with it and no segment bounds
+    (`bin/_cctally_sync_week.py`, and `get_latest_cost_for_week` in
+    `bin/_cctally_milestones.py`, which reaches it for the cost table).
+    Redefining it would move them."""
+    preds = ["week_start_date = ?"]
+    params: list = [week_ref.week_start.isoformat()]
+    if as_of_utc is not None:
+        # `unixepoch(...)` here too, for the reason the `since_utc` comment
+        # below gives: a lexical compare disagrees with an instant compare on
+        # two spellings of one moment, and the two consumers of this table
+        # would then read different rows. `captured_at_utc` is stamped at
+        # seconds precision (`now_utc_iso`), so the conversion loses nothing.
+        preds.append("unixepoch(captured_at_utc) <= unixepoch(?)")
+        params.append(as_of_utc)
+        # One consequence, stated because a sibling reader of this table
+        # disagrees with it on purpose: `unixepoch()` is NULL on an
+        # unparseable `captured_at_utc`, so such a row fails this predicate
+        # and sorts LAST under the DESC below. It is excluded here, and
+        # `latest_usage_by_segment` excludes it too, because both answer which
+        # single row a cycle owns and a row whose instant is unknown cannot be
+        # placed in one. `_floored_week_max` RETAINS it, because it answers a
+        # week's maximum and dropping a row would understate that. Neither is
+        # a bug; the reasons are recorded at both sites.
+    if since_utc is not None:
+        # INCLUSIVE lower: the cut instant belongs to the segment that STARTS
+        # there (spec §1.2). Without it a credited tail with no post-cut
+        # capture returns the latest PRE-cut reading — a percent from the
+        # previous cycle — instead of being reported as missing.
+        #
+        # `unixepoch(...)`, never a lexical compare. `captured_at_utc` is
+        # written in more than one offset spelling across the tree, and
+        # `'…+00:00' < '…Z'` is TRUE for one instant written two ways: a
+        # capture stamped exactly at a credit would then fall in the
+        # PREDECESSOR, which is precisely the ownership rule §1.2 fixes. The
+        # same defence `_reset_aware_floor` and `_latest_reset_event_for_end`
+        # already document.
+        preds.append("unixepoch(captured_at_utc) >= unixepoch(?)")
+        params.append(since_utc)
+    if before_utc is not None:
+        # EXCLUSIVE upper: mirrors `_aggregate_weekly`'s [start, end).
+        preds.append("unixepoch(captured_at_utc) < unixepoch(?)")
+        params.append(before_utc)
+    if account_key is not None:
+        preds.append("account_key = ?")
+        params.append(account_key)
+    if exclude_held:
+        preds.append("weekly_observation_held = 0")
+    # Ordered by the PARSED instant, matching how `latest_usage_by_segment`
+    # ranks the same rows. A lexical `captured_at_utc DESC` and an instant
+    # ranking disagree on two spellings of one moment, so the two consumers of
+    # `weekly_usage_snapshots` could pick different rows for one segment. `id`
+    # stays the deterministic tie-breaker, which it already was.
     return conn.execute(
-        f"""
-        SELECT *
-        FROM {table_name}
-        WHERE week_start_date = ?
-          AND captured_at_utc <= ?{acct_pred}
-        ORDER BY captured_at_utc DESC, id DESC
-        LIMIT 1
-        """,
-        (week_ref.week_start.isoformat(), as_of_utc) + acct_params,
+        f"SELECT * FROM {table_name} WHERE " + " AND ".join(preds)
+        + " ORDER BY unixepoch(captured_at_utc) DESC, id DESC LIMIT 1",
+        tuple(params),
     ).fetchone()
 
 
@@ -3352,6 +3499,384 @@ def _ordered_in_place_cuts(
     return ordered
 
 
+def in_place_cut_instants(
+    conn: sqlite3.Connection, *, account_key: "str | None",
+) -> "frozenset[dt.datetime]":
+    """This account's admitted in-place cut instants, UTC-aware.
+
+    #750 S4 spec §1.1. The consumer-side twin of what both appliers decide
+    internally, so `build_weekly_view` and `build_trend_view` cannot drift
+    apart from each other or from the appliers (invariant 1). Five details
+    make it equivalent to them, and each one decides a real case:
+
+    * the in-place TEST is RAW string equality on the unparsed columns,
+      matching `_apply_reset_events_to_subweeks`
+      (bin/_lib_subscription_weeks.py) and `_apply_reset_events_to_weekrefs`
+      (bin/_cctally_weekrefs.py). NOT `unixepoch()`, and NOT
+      `_LEGACY_IN_PLACE_SHAPE` — that predicate is for legacy-row detection
+      and additionally admits the pre-v1.7.2 `(cur_end, cur_end)` shape,
+      which the appliers do not split. A canonicalizing test would bound
+      segments neither applier cut, on rows whose two columns spell one
+      instant in two offsets;
+    * the per-week grouping parses `new_week_end_at`, because that column
+      carries mixed offset spellings, and it is what bounds each cut against
+      its own week's end;
+    * the read is account-scoped, exactly as both appliers scope theirs;
+    * cut instants are deduplicated BY INSTANT and kept unrounded;
+    * a cut at or after its week's end, or at or before a boundary shift
+      that moved that week's start, is rejected through the same
+      `_ordered_in_place_cuts` both appliers call.
+
+    The rows are ordered the way `_latest_reset_event_for_end` orders, and
+    the boundary-shift lower bound is taken with `setdefault`, because that
+    is how both appliers pick the single row that moves a week's start.
+
+    The RESULT is flat rather than keyed by week, because no consumer can
+    reliably name a week's end: `_apply_overlap_clamp_to_subweeks` and a
+    boundary-shift event both move a tail's end away from
+    `new_week_end_at` after the appliers have run. `credited_segment_cuts`
+    is what binds these instants to one week's segments, and it also supplies
+    the remaining lower bound — the week's own start on an unshifted week,
+    which `week_reset_events` does not record.
+
+    An absent `week_reset_events` table yields an empty set: a render-path
+    consumer of an optional table degrades to "this install recorded no
+    credit" rather than raising.
+    """
+    have_table = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type IN ('table','view') AND name = 'week_reset_events'"
+    ).fetchone()
+    if have_table is None:
+        return frozenset()
+    acct_pred = "" if account_key is None else " WHERE account_key = ?"
+    acct_params: tuple = () if account_key is None else (account_key,)
+    try:
+        rows = conn.execute(
+            "SELECT old_week_end_at, new_week_end_at, effective_reset_at_utc "
+            "FROM week_reset_events" + acct_pred
+            + " ORDER BY unixepoch(effective_reset_at_utc) DESC, id DESC",
+            acct_params,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # A stats.db predating the `account_key` column (#620 S1): an install
+        # whose migrations have not run, or a dev binary that refused the prod
+        # forward-migration (#142). Withholding is the degradation, exactly as
+        # `_projects_week_grid` withholds on the same predicate — never a
+        # retry without the scope, which would let one account's credit bound
+        # another account's segment.
+        return frozenset()
+    # `post_map` is the boundary shift that moves a week's START; it is the
+    # lower bound every cut of that week must fall after. Only a NON-in-place
+    # row plays that role, which is the same split both appliers make.
+    post_map: dict[dt.datetime, str] = {}
+    cuts_raw: dict[dt.datetime, list[tuple[dt.datetime, str]]] = {}
+    for r in rows:
+        raw_eff = r["effective_reset_at_utc"]
+        try:
+            new_dt = parse_iso_datetime(r["new_week_end_at"], "evt.new_end")
+        except (TypeError, ValueError):
+            continue
+        if r["old_week_end_at"] == raw_eff:
+            try:
+                eff_dt = parse_iso_datetime(raw_eff, "evt.eff")
+            except (TypeError, ValueError):
+                continue
+            cuts_raw.setdefault(new_dt, []).append((eff_dt, raw_eff))
+        else:
+            post_map.setdefault(new_dt, raw_eff)
+    out: set[dt.datetime] = set()
+    for end_dt, cuts in cuts_raw.items():
+        for cut_dt, _raw in _ordered_in_place_cuts(
+                cuts, post_map.get(end_dt), end_dt):
+            out.add(cut_dt.astimezone(dt.timezone.utc))
+    return frozenset(out)
+
+
+def credited_segment_cuts(
+    segment_starts, cut_instants,
+) -> "frozenset[dt.datetime]":
+    """The cut instants that bound ONE week's emitted segments (#750 S4 §1.1).
+
+    ``segment_starts`` are the post-applier start instants of every segment
+    sharing one week identity — `SubWeek.start_date` for the subweeks
+    consumers, `WeekRef.key` for the trend one. ``cut_instants`` is
+    `in_place_cut_instants`. The result is empty for an uncredited week, so
+    ``bool(...)`` is the credited predicate and membership is the per-segment
+    bounded predicate.
+
+    A week's segments are matched to their cuts by their STARTS, never by the
+    week's end. Both appliers emit ``[start, c1)``, each ``[ci, ci+1)`` and
+    ``[cn, end)``, so every cut is verbatim the start of the segment that
+    follows it, while the LAST segment's end is the week end — and two
+    ordinary mechanisms move that end away from the `new_week_end_at` the
+    events table records. `_apply_overlap_clamp_to_subweeks` runs after the
+    reset applier and pulls a tail's end back to the successor's anchor when
+    that anchor drifted earlier, and a boundary-shift event whose
+    `old_week_end_at` is this week's end rewrites the end to the shift
+    instant. Keyed on the week end, the lookup then matched nothing, the week
+    read as uncredited, and BOTH cycles resolved to the week's latest
+    observation — the post-credit reading on the pre-credit cycle, which is
+    #731 / #736 back in full, and silently.
+
+    The EARLIEST start is excluded, which is not a formality: it is the
+    week's own effective start, and both appliers reject a cut at or before
+    it (`_ordered_in_place_cuts`, called with the boundary shift when the
+    week carries one and with the week's own start when it does not). The
+    helper cannot apply that lower bound itself, because `week_reset_events`
+    records no week start; here the segments supply it, so the rule holds on
+    a shifted and an unshifted week alike.
+    """
+    ordered = sorted({s for s in segment_starts if s is not None})
+    return frozenset(s for s in ordered[1:] if s in cut_instants)
+
+
+def canonical_capture_bound(value_dt: "dt.datetime") -> str:
+    """A segment bound spelled the way ``captured_at_utc`` is stored.
+
+    UTC, whole seconds, ``Z``. SQLite compares those lexicographically, so a
+    bound written in another offset would order wrongly against the stored
+    column. One definition, shared by every consumer that bounds a segment.
+    """
+    return (
+        value_dt.astimezone(dt.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _segment_instant(value: "str | None") -> "dt.datetime | None":
+    if not value:
+        return None
+    try:
+        return parse_iso_datetime(
+            value, "subweek.bound").astimezone(dt.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def segment_capture_bounds(
+    conn: sqlite3.Connection, subweeks, *, account_key: "str | None",
+) -> "dict[str, tuple[str | None, str | None]]":
+    """``{SubWeek.segment_key -> (since_utc, before_utc)}`` (#750 S4 §2.1).
+
+    ``since_utc`` is INCLUSIVE and ``before_utc`` EXCLUSIVE, which is
+    `_aggregate_weekly`'s ``[start, end)``, so an observation captured exactly
+    at a credit instant lands in the same cycle as an entry stamped there.
+
+    Only a segment whose END is an in-place cut carries an upper bound. The
+    lower bound is the LATER of two things, and is ``None`` when neither
+    applies:
+
+    * the segment's own start, when its week was credited. That is §1.2's
+      rule, and on the tail it is what makes a cycle with no post-cut
+      observation report as MISSING instead of resolving to the previous
+      cycle's reading;
+    * the latest `week_reset_events` / `weekly_credit_floors` instant lying
+      inside this segment's own interval. That is `_reset_aware_floor`, the
+      chokepoint every other clamp site consults, called per SEGMENT rather
+      than per week. Scoped to the week, its
+      automatic leg discarded pre-credit captures for BOTH segments and so
+      erased the very pre-credit reading it was meant to preserve; scoped to
+      the segment it lands on the tail alone, where it agrees with the first
+      clause. On a boundary-shifted week it still floors at the shift, and a
+      manual `record-credit` floor — written under the same-window model,
+      which re-anchors nothing and creates no segment — still raises the
+      bound of the segment it falls in.
+
+    A segment of a plain uncredited week therefore has NO lower bound, which
+    is what `weekly` does. Imposing one would discard an observation captured
+    a little BEFORE its week's anchor — the mirror of the post-boundary
+    capture jitter the weekly surfaces already tolerate, and a real shape in
+    the fixtures.
+    """
+    segments = list(subweeks)
+    if not segments:
+        return {}
+    cut_instants = in_place_cut_instants(conn, account_key=account_key)
+    by_date: dict = {}
+    for sw in segments:
+        by_date.setdefault(sw.start_date.isoformat(), []).append(sw)
+
+    out: dict = {}
+    for _date_key, group in by_date.items():
+        # Matched by the segments' own STARTS — a cut is verbatim the start
+        # of the segment that follows it, while a tail's END can be moved
+        # after the appliers run by the overlap clamp or a boundary shift.
+        week_cuts = credited_segment_cuts(
+            (_segment_instant(sw.start_ts) for sw in group), cut_instants)
+        credited = bool(week_cuts)
+        for sw in group:
+            start_dt = _segment_instant(sw.start_ts)
+            end_dt = _segment_instant(sw.end_ts)
+            lower = start_dt if (credited and start_dt is not None) else None
+            # The floor comes from the SAME chokepoint every other clamp site
+            # consults, called with this SEGMENT's bounds rather than the
+            # week's. Scoped to the week, its reset leg discarded pre-credit
+            # captures for both cycles; scoped to the segment it lands on the
+            # tail alone. The returned instant is re-checked against the
+            # segment interval because the manual `weekly_credit_floors` leg
+            # is keyed on the week's date and carries no interval bound of
+            # its own.
+            try:
+                floor_dt = _segment_instant(_reset_aware_floor(
+                    conn, sw.start_date.isoformat(), sw.start_ts, sw.end_ts,
+                    account_key=account_key,
+                ))
+            except sqlite3.OperationalError:
+                # A store with neither floor table: an install whose
+                # migrations have not run, or a unit fixture holding only the
+                # snapshot table. The leg is absent, not wrong.
+                floor_dt = None
+            if floor_dt is not None:
+                inside = (
+                    (start_dt is None or floor_dt >= start_dt)
+                    and (end_dt is None or floor_dt < end_dt)
+                )
+                if inside and (lower is None or floor_dt > lower):
+                    lower = floor_dt
+            before = (
+                canonical_capture_bound(end_dt)
+                if (end_dt is not None and end_dt in week_cuts) else None
+            )
+            out[sw.segment_key] = (
+                canonical_capture_bound(lower) if lower is not None else None,
+                before,
+            )
+    return out
+
+
+def weekly_held_exclusion(conn, *, prefix: str = " AND ") -> str:
+    """``AND weekly_observation_held = 0``, or empty on a store without it.
+
+    Omitting the predicate where the column is absent is not a compromise: the
+    column arrived with epoch 1015, and a store that does not carry it cannot
+    contain a held row, so the filtered and unfiltered populations are
+    identical. Production never takes that branch — `open_db` raises
+    `StatsEpochRebuildDeferred` on an epoch-mismatched store before any read,
+    and a legacy store gains the column at the schema apply — but several
+    hand-built fixture stores stop short of the current schema, and the readers
+    that use this already tolerate an older shape by design.
+    """
+    try:
+        cols = {str(row[1]) for row in
+                conn.execute("PRAGMA table_info(weekly_usage_snapshots)")}
+    except sqlite3.Error:
+        return ""
+    if "weekly_observation_held" not in cols:
+        return ""
+    return f"{prefix}weekly_observation_held = 0"
+
+
+def latest_usage_by_segment(
+    conn: sqlite3.Connection, subweeks, *,
+    account_key: "str | None" = None,
+    as_of_utc: "str | None" = None,
+    rows=None,
+) -> "dict[str, float | None]":
+    """``{SubWeek.segment_key -> the latest weekly_percent in that cycle}``.
+
+    #750 S4 §2.1. One value per SEGMENT identity, never per calendar date:
+    `_load_week_snapshots` returned ``{week_start_utc -> max(weekly_percent)}``
+    keyed on `weekly_usage_snapshots.week_start_at`, so on a credited week the
+    post-credit segment matched nothing and the pre-credit one received the
+    post-credit reading (#731). A segment with no observation inside its own
+    interval maps to ``None`` rather than borrowing a neighbour's.
+
+    LATEST, not MAX. "weekly_percent is monotonic within a week" is true of a
+    billing CYCLE and false of a credited week, which is why the dashboard
+    projects query already reads the latest row. Taking the maximum would lock
+    a credited week's attribution to the pre-credit high-water mark forever.
+    Inside one cycle the two agree.
+
+    It takes the CALLER's connection: `_load_week_snapshots` opened its own
+    while the dashboard already holds a transaction, and a reducer that opened
+    its own would give the dashboard a second, possibly inconsistent read.
+
+    ``rows`` lets a caller that has already fetched and resolved its own rows
+    hand them over as ``(segment_key, captured_at_utc, row_id,
+    weekly_percent)`` tuples; the bound and latest-wins decisions still happen
+    here, so the two consumers share them rather than each reimplementing.
+    """
+    segments = list(subweeks)
+    if not segments:
+        return {}
+    bounds = segment_capture_bounds(
+        conn, segments, account_key=account_key)
+    by_date: dict = {}
+    for sw in segments:
+        by_date.setdefault(sw.start_date.isoformat(), []).append(sw)
+
+    if rows is None:
+        placeholders = ",".join("?" for _ in by_date)
+        acct_pred = "" if account_key is None else " AND account_key = ?"
+        acct_params: tuple = () if account_key is None else (account_key,)
+        try:
+            fetched = conn.execute(
+                # Held rows are excluded because this is a weekly read.
+                # `_get_latest_row_for_week` and `_floored_week_max` exclude
+                # them for the same stated reason — the three answer which
+                # single row a cycle owns, so they must agree, and two of them
+                # excluding held rows while this one admitted them is what
+                # review finding F1 caught (#769 S11, #824). A store predating
+                # the column raises OperationalError and takes the fallback
+                # below, exactly as it does for `account_key`.
+                "SELECT week_start_date, captured_at_utc, id, weekly_percent "
+                "FROM weekly_usage_snapshots "
+                f"WHERE week_start_date IN ({placeholders}) "
+                f"AND weekly_percent IS NOT NULL"
+                f"{weekly_held_exclusion(conn)}{acct_pred}",
+                tuple(by_date) + acct_params,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # No table, or a stats.db predating `account_key` (#620 S1).
+            # Withholding is the degradation: retrying unscoped would sum
+            # another account's percentage into an account-filtered total.
+            return {sw.segment_key: None for sw in segments}
+        candidates = []
+        for wsd, captured, row_id, pct in fetched:
+            for sw in by_date.get(str(wsd), ()):
+                candidates.append((sw.segment_key, captured, row_id, pct))
+    else:
+        candidates = list(rows)
+
+    # Bounds are compared as INSTANTS, never as strings. `captured_at_utc` is
+    # written in more than one offset spelling across the tree, and
+    # `'…+00:00' < '…Z'` is TRUE for one instant written two ways — a capture
+    # stamped exactly at a credit would land in the PREDECESSOR, inverting
+    # §1.2's ownership rule. `tests/fixtures/project/credited-week` is written
+    # in the `+00:00` spelling and is where this surfaced.
+    bound_instants = {
+        key: (_segment_instant(since), _segment_instant(before))
+        for key, (since, before) in bounds.items()
+    }
+    as_of_dt = _segment_instant(as_of_utc)
+    best: dict = {}
+    for segment_key, captured, row_id, pct in candidates:
+        if pct is None or not captured:
+            continue
+        captured_dt = _segment_instant(captured)
+        if captured_dt is None:
+            continue
+        since, before = bound_instants.get(segment_key, (None, None))
+        if as_of_dt is not None and captured_dt > as_of_dt:
+            continue
+        if since is not None and captured_dt < since:
+            continue
+        if before is not None and captured_dt >= before:
+            continue
+        rank = (captured_dt, row_id if row_id is not None else -1)
+        current = best.get(segment_key)
+        if current is None or rank > current[0]:
+            best[segment_key] = (rank, float(pct))
+    return {
+        sw.segment_key: (best[sw.segment_key][1]
+                         if sw.segment_key in best else None)
+        for sw in segments
+    }
+
+
 def _reset_aware_floor(
     conn: sqlite3.Connection,
     week_start_date: str,
@@ -3370,13 +3895,20 @@ def _reset_aware_floor(
     week); ``None`` is the explicit "all accounts" (merged) read used by the
     analytics floor path, byte-identical to today on a single-account install.
 
-    This is the single chokepoint the four MAX-clamp sites consult to floor the
+    This is the single chokepoint the four clamp sites consult to floor the
     current 7d % to the most-recent in-place credit / reset effective moment
-    (record-credit M2, issue #209, spec §4a):
+    (record-credit M2, issue #209, spec §4a). The first three take a MAX:
       - statusline `_hwm_clamp` 7d (bin/_cctally_statusline.py)
       - the record-usage write-site monotonic clamp (bin/_cctally_record.py)
       - `_resolve_reset_aware_hwm` (the --from default helper)
-      - `project`'s `_load_week_snapshots` per-week MAX (bin/_cctally_project.py)
+
+    The fourth is `project`, and #750 S4 §2.1 changed how it consults this
+    function. It used to reach here through `_load_week_snapshots`'s per-week
+    MAX; that helper (bin/_cctally_project.py) is now a thin wrapper taking no
+    maximum at all, and the floor is resolved per SEGMENT from
+    `segment_capture_bounds` (bin/_cctally_core.py) with that segment's own
+    bounds rather than the week's. The floor still decides which captures a
+    cycle may read; it no longer decides a per-week maximum.
 
     A `week_reset_events` row counts iff its `effective_reset_at_utc` falls in
     `[week_start_at, week_end_at)`; a `weekly_credit_floors` row counts iff its
@@ -3430,9 +3962,20 @@ def _floored_week_max(conn, rows, *, account_key=None):
     suppress the reset-event leg for a later anchored row of the same week.
 
     A NULL ``weekly_percent`` row is skipped. An unparseable ``captured_at_utc``
-    under an active floor is RETAINED (epoch unknown), matching
-    ``_cctally_project._load_week_snapshots``. All-NULL bounds resolve
-    credit-floor-leg-only (the reset leg is inert: unixepoch(NULL) is NULL).
+    under an active floor is RETAINED here (epoch unknown), and that is a
+    DELIBERATE divergence from the two segment-scoped readers of the same
+    table: `_get_latest_row_for_week` compares and orders with `unixepoch()`,
+    which is NULL on an unparseable value, so such a row fails every bound
+    predicate and sorts last under DESC; `latest_usage_by_segment` parses in
+    Python and skips what will not parse. Those two answer "which single row
+    does this cycle own?", where admitting a row whose instant is unknown would
+    attribute it to an arbitrary cycle. This function answers "what is this
+    week's maximum?", where dropping a row would silently lower the answer, and
+    it is the pre-S4 behaviour of every MAX-clamp consumer. The claim that this
+    matches ``_cctally_project._load_week_snapshots`` is no longer true: that
+    helper now delegates to `latest_usage_by_segment` and therefore skips.
+    All-NULL bounds resolve credit-floor-leg-only (the reset leg is inert:
+    unixepoch(NULL) is NULL).
     A week whose every in-scope row is pre-floor is absent from the result.
     """
     # Pass 1: bucket + canonicalize bounds.
@@ -3575,8 +4118,22 @@ def get_latest_usage_for_week(
     as_of_utc: str | None = None,
     *,
     account_key: str | None = None,
+    since_utc: str | None = None,
+    before_utc: str | None = None,
 ) -> sqlite3.Row | None:
+    """The week's latest GENUINELY OBSERVED usage row.
+
+    `exclude_held` (#769 S11, #824): every caller of this helper reads the
+    weekly axis — `report`'s table, the TUI and dashboard trend rows, the
+    milestone cost read and `sync-week` — taking both the percentage and the
+    per-row freshness stamp from the returned row. A `weekly_observation_held`
+    row carries an older row's weekly value under the writing tick's capture
+    instant, so returning one would report a stale percentage as freshly
+    observed. Its five-hour fields are fresh, but nothing reached through here
+    reads them.
+    """
     return _get_latest_row_for_week(
         conn, "weekly_usage_snapshots", week_ref, as_of_utc=as_of_utc,
-        account_key=account_key,
+        account_key=account_key, since_utc=since_utc, before_utc=before_utc,
+        exclude_held=True,
     )

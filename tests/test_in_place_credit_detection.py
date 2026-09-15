@@ -3351,7 +3351,8 @@ def test_blocks_active_uses_five_hour_blocks_when_anchor_differs(
         ),
     ]
 
-    ns["_maybe_swap_active_block_to_canonical"](blocks, [], now=now_utc)
+    ns["_maybe_swap_active_block_to_canonical"](
+        blocks, [], now=now_utc, competing_windows=[])
 
     # The active block's times must be rewritten to the canonical
     # window and its anchor flipped to "recorded".
@@ -3405,7 +3406,8 @@ def test_blocks_active_falls_back_when_no_canonical_row(ns, monkeypatch):
         ),
     ]
 
-    ns["_maybe_swap_active_block_to_canonical"](blocks, [], now=now_utc)
+    ns["_maybe_swap_active_block_to_canonical"](
+        blocks, [], now=now_utc, competing_windows=[])
 
     # Active block unchanged.
     active = blocks[0]
@@ -3486,7 +3488,8 @@ def test_blocks_active_skips_when_canonical_window_already_closed(
         ),
     ]
 
-    ns["_maybe_swap_active_block_to_canonical"](blocks, [], now=now_utc)
+    ns["_maybe_swap_active_block_to_canonical"](
+        blocks, [], now=now_utc, competing_windows=[])
 
     active = blocks[0]
     # Heuristic times preserved; anchor unchanged.
@@ -3595,7 +3598,8 @@ def test_blocks_active_swap_recomputes_totals_over_canonical_interval(
     heuristic_cost = heuristic_block.cost_usd
     heuristic_input = heuristic_block.input_tokens
 
-    ns["_maybe_swap_active_block_to_canonical"](blocks, all_entries, now=now_utc)
+    ns["_maybe_swap_active_block_to_canonical"](
+        blocks, all_entries, now=now_utc, competing_windows=[])
 
     active = blocks[0]
     expected_start = dt.datetime.fromisoformat(
@@ -3678,7 +3682,8 @@ def test_blocks_active_swap_threads_mode(ns, monkeypatch):
         hb = _build([unrecorded], heuristic_start, heuristic_end, now_utc,
                     "auto", anchor="heuristic")
         blocks = [hb]
-        swap(blocks, all_entries, now=now_utc, mode=mode)
+        swap(blocks, all_entries, now=now_utc, mode=mode,
+             competing_windows=[])
         return blocks[0].cost_usd
 
     disp = swapped_cost("display")      # recorded 42.0 + 0 for the unrecorded

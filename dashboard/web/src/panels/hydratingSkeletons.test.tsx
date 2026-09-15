@@ -128,7 +128,7 @@ describe('per-panel hydrating headers (#278)', () => {
     expect(screen.queryByText(/0 weeks/i)).toBeNull();
   });
 
-  it('TrendPanel header shows the real week count when hydrated', () => {
+  it('TrendPanel header shows the real cycle count when hydrated', () => {
     updateSnapshot({
       ...baseEnvelope(),
       hydrating: false,
@@ -141,7 +141,7 @@ describe('per-panel hydrating headers (#278)', () => {
       },
     });
     render(<TrendPanel />);
-    expect(screen.getByText('(1 week)')).toBeInTheDocument();
+    expect(screen.getByText('(1 cycle)')).toBeInTheDocument();
     expect(screen.queryByText('(loading)')).toBeNull();
   });
 

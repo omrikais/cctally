@@ -502,3 +502,1099 @@ def test_codex_conversation_replay_uses_durable_file_account_map(
         ).fetchall() == [(ACCOUNT_A,), (ACCOUNT_B,)]
     finally:
         conn.close()
+
+
+# ===========================================================================
+# #769 S3 — durable account stamps and the source-incarnation key (#777)
+# ===========================================================================
+# `rebuild_account_stamps` was a process-local dict built from the very rows the
+# rebuild then deleted, so a rebuild killed after the clear resumed in a fresh
+# process with no attribution at all and restamped every replayed record with
+# whichever account happened to be active. The stamps are durable now, keyed by
+# an identity that a file rewritten in place cannot forge.
+#
+# Production carries exactly one distinct `account_key` and zero NULLs, so no
+# production state can serve as this section's corpus — every case below seeds
+# two accounts explicitly. The helpers carry an `_s3_` prefix because the
+# section above owns names of its own.
+
+import os  # noqa: E402 — section-local, kept beside the cases that use it
+from conftest import (  # noqa: E402
+    redirect_paths_without_conversation_retention,
+)
+
+
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
+    projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    projects.mkdir(parents=True, exist_ok=True)
+    conn = ns["open_conversations_db"]()
+    yield ns, conn, projects
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _s3_asst_line(uuid, msg_id, req_id, text, *, sid="s1",
+               ts="2026-06-01T00:00:00Z", model="claude-opus-4-8"):
+    return json.dumps({
+        "type": "assistant", "uuid": uuid, "sessionId": sid,
+        "requestId": req_id, "timestamp": ts,
+        "message": {"role": "assistant", "id": msg_id, "model": model,
+                    "content": [{"type": "text", "text": text}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_creation_input_tokens": 0,
+                              "cache_read_input_tokens": 0}},
+    }) + "\n"
+
+
+def _s3_pin_account(monkeypatch, ns, account_key):
+    """Pin the active Claude identity the ingest boundary resolves."""
+    monkeypatch.setattr(
+        ns["_cctally_core"], "_resolve_active_claude_identity",
+        lambda: {"status": "ok", "account_key": account_key},
+    )
+
+
+def _s3_accounts(conn):
+    return {
+        (row[0], row[1]): row[2] for row in conn.execute(
+            "SELECT source_path,byte_offset,account_key FROM conversation_messages")
+    }
+
+
+def _s3_stamps(conn):
+    return conn.execute(
+        "SELECT canonical_source_path,source_incarnation_id,byte_offset,"
+        "record_sha256,account_key FROM claude_conversation_account_stamps "
+        "ORDER BY canonical_source_path,byte_offset").fetchall()
+
+
+def _s3_incarnation(conn, path):
+    row = conn.execute(
+        "SELECT source_incarnation_id FROM conversation_source_files WHERE path=?",
+        (str(path),)).fetchone()
+    return row[0] if row else None
+
+
+# --- the stamping branch the per-migration golden cannot hold --------------
+
+
+def test_every_ingested_message_gets_a_stamp(store, monkeypatch):
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one")
+                 + _s3_asst_line("u2", "m2", "r2", "two"))
+    ns["sync_claude_conversations"](conn)
+    messages = _s3_accounts(conn)
+    assert len(messages) == 2
+    stamps = _s3_stamps(conn)
+    assert len(stamps) == 2
+    incarnation = _s3_incarnation(conn, a)
+    assert incarnation
+    for path, inc, offset, digest, account_key in stamps:
+        assert path == str(a)
+        assert inc == incarnation
+        assert account_key == "acct-a"
+        assert len(digest) == 64 and digest == digest.lower()
+        assert messages[(path, offset)] == "acct-a"
+
+
+def test_the_digest_is_over_the_raw_on_disk_bytes(store, monkeypatch):
+    """Not over the decoded text, and not over a re-serialized parse. The sync
+    walker decodes with `errors="replace"`, so a record carrying invalid UTF-8
+    decodes to a different string than it was written as."""
+    import hashlib
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    line = _s3_asst_line("u1", "m1", "r1", "one").encode()
+    a.write_bytes(line)
+    ns["sync_claude_conversations"](conn)
+    digest = _s3_stamps(conn)[0][3]
+    assert digest == hashlib.sha256(line[:-1]).hexdigest()
+
+
+def test_invalid_utf8_does_not_move_the_digest_between_runs(store, monkeypatch):
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    raw = _s3_asst_line("u1", "m1", "r1", "one").encode()
+    # A second record whose text carries a byte no UTF-8 decoder accepts.
+    bad = _s3_asst_line("u2", "m2", "r2", "two").encode().replace(b"two", b"t\xffo")
+    a.write_bytes(raw + bad)
+    ns["sync_claude_conversations"](conn)
+    first = _s3_stamps(conn)
+    assert len(first) == 2
+    conn.execute("DELETE FROM conversation_messages")
+    conn.execute("DELETE FROM claude_conversation_account_stamps")
+    conn.execute("DELETE FROM conversation_source_files")
+    conn.commit()
+    ns["sync_claude_conversations"](conn)
+    second = _s3_stamps(conn)
+    assert [row[3] for row in second] == [row[3] for row in first]
+
+
+def test_crlf_and_lf_digest_the_same_record_identically(store, monkeypatch):
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    body = _s3_asst_line("u1", "m1", "r1", "one")[:-1].encode()
+    a = projects / "a.jsonl"
+    a.write_bytes(body + b"\n")
+    ns["sync_claude_conversations"](conn)
+    lf_digest = _s3_stamps(conn)[0][3]
+    b = projects / "b.jsonl"
+    b.write_bytes(body + b"\r\n")
+    ns["sync_claude_conversations"](conn)
+    crlf = [row for row in _s3_stamps(conn) if row[0] == str(b)]
+    assert crlf and crlf[0][3] == lf_digest
+
+
+# --- source incarnation: one identity per append-continuous life -----------
+
+
+def test_an_ordinary_append_keeps_its_s3_incarnation(store, monkeypatch):
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    first = _s3_incarnation(conn, a)
+    with open(a, "a") as fh:
+        fh.write(_s3_asst_line("u2", "m2", "r2", "two"))
+    ns["sync_claude_conversations"](conn)
+    assert _s3_incarnation(conn, a) == first
+    assert len(_s3_stamps(conn)) == 2
+
+
+def test_an_inode_change_mints_a_new_s3_incarnation(store, monkeypatch):
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    first = _s3_incarnation(conn, a)
+    replacement = projects / "replacement.tmp"
+    replacement.write_text(_s3_asst_line("u1", "m1", "r1", "one")
+                           + _s3_asst_line("u2", "m2", "r2", "two"))
+    os.replace(replacement, a)
+    ns["sync_claude_conversations"](conn)
+    assert _s3_incarnation(conn, a) != first
+
+
+def test_a_size_preserving_rewrite_with_an_unchanged_mtime_is_a_new_s3_incarnation(
+        store, monkeypatch):
+    """The `touch`-defeating case. `_conversation_target_risk` decides this on
+    mtime and is defeated by restoring it; the committed-prefix digest is not."""
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    first = _s3_incarnation(conn, a)
+    st = a.stat()
+    rewritten = _s3_asst_line("u1", "m1", "r1", "ONE")
+    assert len(rewritten) == st.st_size, "the case needs an equal-size rewrite"
+    with open(a, "r+b") as fh:
+        fh.write(rewritten.encode())
+    os.utime(a, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert a.stat().st_size == st.st_size
+    assert a.stat().st_mtime_ns == st.st_mtime_ns
+    ns["sync_claude_conversations"](conn, rebuild=True)
+    assert _s3_incarnation(conn, a) != first
+
+
+def test_a_shrink_mints_a_new_s3_incarnation(store, monkeypatch):
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one")
+                 + _s3_asst_line("u2", "m2", "r2", "two"))
+    ns["sync_claude_conversations"](conn)
+    first = _s3_incarnation(conn, a)
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    assert _s3_incarnation(conn, a) != first
+
+
+def test_a_reused_offset_under_a_new_incarnation_inherits_nothing(
+        store, monkeypatch):
+    """A stamp is keyed by the incarnation, so an unrelated file that happens
+    to reuse a path and an offset cannot pick up the old attribution."""
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    old_incarnation = _s3_incarnation(conn, a)
+    old_stamps = _s3_stamps(conn)
+    replacement = projects / "replacement.tmp"
+    replacement.write_text(_s3_asst_line("u9", "m9", "r9", "different"))
+    os.replace(replacement, a)
+    _s3_pin_account(monkeypatch, ns, "acct-b")
+    ns["sync_claude_conversations"](conn, rebuild=True)
+    new_incarnation = _s3_incarnation(conn, a)
+    assert new_incarnation != old_incarnation
+    fresh = [row for row in _s3_stamps(conn) if row[1] == new_incarnation]
+    assert [row[4] for row in fresh] == ["acct-b"], (
+        "a record under a new incarnation is first observed now"
+    )
+    assert old_stamps[0][3] not in {row[3] for row in fresh}
+    # The superseded stamp is a durable record of an observation that really
+    # happened, so it stays. What matters is that the new incarnation cannot
+    # reach it: the incarnation is part of the key.
+    assert any(row[1] == old_incarnation for row in _s3_stamps(conn))
+    assert set(_s3_accounts(conn).values()) == {"acct-b"}
+
+
+def test_a_device_only_difference_preserves_continuity_and_attribution(
+        store, monkeypatch):
+    """#814. `st_dev` is assigned at mount time, so a remount renumbers every
+    stored `device_id` at once without changing a single file. Deciding
+    replacement on it mints a fresh incarnation whose high-water is zero, and
+    every already-attributed record is then restamped to whichever account is
+    active now — the corruption `_resolve_record_account` describes at
+    `bin/_cctally_cache.py:12376-12380`.
+    """
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one")
+                 + _s3_asst_line("u2", "m2", "r2", "two"))
+    ns["sync_claude_conversations"](conn)
+    first_incarnation = _s3_incarnation(conn, a)
+    before = _s3_accounts(conn)
+    assert set(before.values()) == {"acct-a"}
+    committed = conn.execute(
+        "SELECT last_byte_offset FROM conversation_source_files WHERE path=?",
+        (str(a),)).fetchone()[0]
+    assert committed > 0
+
+    # The remount: only the STORED device changes. The file is untouched, and
+    # the real `fstat` still reports the true device, so the same-descriptor
+    # guard stays exercised. This is the simulation the Codex device-only
+    # tests already use (`tests/test_codex_file_identity.py:280`).
+    stored_device = conn.execute(
+        "SELECT device_id FROM conversation_source_files WHERE path=?",
+        (str(a),)).fetchone()[0]
+    conn.execute(
+        "UPDATE conversation_source_files SET device_id=? WHERE path=?",
+        (int(stored_device) + 1, str(a)))
+    conn.commit()
+
+    # An append is required: an ordinary sync skips a same-size file before
+    # `_resolve_source_incarnation` is reached (`bin/_cctally_cache.py:12464`),
+    # so the stale device is harmless until the file's size changes.
+    resumed_from = []
+    cache_mod = ns["_cctally_cache"]
+    inner = cache_mod._iter_sync_entries
+
+    def _record_resume(fh, *args, **kwargs):
+        resumed_from.append(fh.tell())
+        return inner(fh, *args, **kwargs)
+
+    monkeypatch.setattr(cache_mod, "_iter_sync_entries", _record_resume)
+    _s3_pin_account(monkeypatch, ns, "acct-b")
+    a.write_text(a.read_text() + _s3_asst_line("u3", "m3", "r3", "three"))
+    ns["sync_claude_conversations"](conn)
+
+    assert _s3_incarnation(conn, a) == first_incarnation, (
+        "a device-only difference at an unchanged inode is a remount, not a "
+        "replacement, so the incarnation must survive it"
+    )
+    assert resumed_from and resumed_from[-1] == committed, (
+        "continuity means resuming at the committed offset, not replaying "
+        f"from byte zero; resumed at {resumed_from}"
+    )
+    after = _s3_accounts(conn)
+    preserved = {key: value for key, value in after.items() if key in before}
+    assert preserved == before, (
+        "the records ingested under acct-a must still be acct-a; a false "
+        "incarnation bump restamps every one of them to the active account"
+    )
+    appended = [value for key, value in after.items() if key not in before]
+    assert appended == ["acct-b"], (
+        "only the newly appended record is first observed now, so only it "
+        f"takes the active account; got {appended}"
+    )
+
+
+def test_a_non_integer_stored_inode_degrades_instead_of_aborting_the_walk(
+        store, monkeypatch):
+    """#814 / spec §2.4. `source_identity_replaced` degrades an unreadable
+    stored identity to "no evidence" rather than raising, because a raise here
+    escapes the per-file loop and takes every LATER file in the estate with it.
+
+    The helper's own unit tests cover the NULL combinations but not a
+    non-integer value, and the only full-walk regression for that case
+    exercises the two Codex stores rather than Claude's
+    `conversation_source_files` resolver (`tests/test_codex_file_identity.py:400`).
+    A stray `int(stored_inode)` left OUTSIDE the helper would abort the whole
+    estate while every helper unit test stayed green.
+    """
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    b = projects / "b.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one", sid="sa"))
+    b.write_text(_s3_asst_line("v1", "n1", "q1", "other", sid="sb"))
+    ns["sync_claude_conversations"](conn)
+    first_a = _s3_incarnation(conn, a)
+    first_b = _s3_incarnation(conn, b)
+    assert first_a and first_b
+
+    conn.execute(
+        "UPDATE conversation_source_files SET inode=? WHERE path=?",
+        ("not-an-inode", str(a)))
+    conn.commit()
+
+    # An append, so the same-size shortcut does not skip the resolver.
+    a.write_text(a.read_text() + _s3_asst_line("u2", "m2", "r2", "two", sid="sa"))
+    b.write_text(b.read_text() + _s3_asst_line("v2", "n2", "q2", "more", sid="sb"))
+    ns["sync_claude_conversations"](conn)
+
+    assert _s3_incarnation(conn, a) == first_a, (
+        "an unreadable stored inode is NO EVIDENCE, which returns the resolver "
+        "to size and digest — the pre-#769 behaviour. This is an append whose "
+        "committed prefix still hashes the same, so continuity holds. What "
+        "matters is that the walk decided it rather than raising."
+    )
+    assert _s3_incarnation(conn, b) == first_b, (
+        "the unreadable identity on one file must not disturb any other file "
+        "in the estate; a raise inside the loop would have skipped this one"
+    )
+    assert len(_s3_accounts(conn)) == 4, (
+        "every record of both files is ingested; the walk completed"
+    )
+
+
+# --- the rebuild attribution rules ----------------------------------------
+
+
+def test_a_rebuild_preserves_historical_attribution(store, monkeypatch):
+    """The #777 headline. Ingest as A, switch the active identity to B, rebuild
+    — and A's records stay A's."""
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    assert set(_s3_accounts(conn).values()) == {"acct-a"}
+    _s3_pin_account(monkeypatch, ns, "acct-b")
+    ns["sync_claude_conversations"](conn, rebuild=True)
+    assert set(_s3_accounts(conn).values()) == {"acct-a"}, (
+        "a rebuild replays the same bytes; it does not re-attribute them"
+    )
+
+
+def test_an_interrupted_rebuild_preserves_the_account_in_a_fresh_process(
+        store, monkeypatch):
+    """The durable half. The old in-process dict died with the process that
+    built it, so a resume attributed every replayed record to whoever was
+    active. Reopening the store stands in for that fresh process."""
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    # The state a killed rebuild actually leaves: the pending marker committed,
+    # the messages cleared, and `conversation_source_files` untouched — the
+    # cursor rows are what the resumed replay verifies continuity against.
+    conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+                 "VALUES('conversation_rebuild_claude_pending','1')")
+    conn.execute("DELETE FROM conversation_messages")
+    conn.commit()
+    conn.close()
+    _s3_pin_account(monkeypatch, ns, "acct-b")
+    resumed = ns["open_conversations_db"]()
+    try:
+        ns["sync_claude_conversations"](resumed)
+        assert set(_s3_accounts(resumed).values()) == {"acct-a"}
+    finally:
+        resumed.close()
+
+
+def test_an_offset_below_the_high_water_with_no_stamp_is_unattributed(
+        store, monkeypatch):
+    """Historical-and-unknown is NULL, never the active account. Writing the
+    active account there is exactly the silent re-attribution #777 reports."""
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one")
+                 + _s3_asst_line("u2", "m2", "r2", "two"))
+    ns["sync_claude_conversations"](conn)
+    conn.execute("DELETE FROM claude_conversation_account_stamps")
+    conn.execute("DELETE FROM claude_conversation_account_stamp_gaps")
+    conn.commit()
+    _s3_pin_account(monkeypatch, ns, "acct-b")
+    ns["sync_claude_conversations"](conn, rebuild=True)
+    assert set(_s3_accounts(conn).values()) == {None}
+
+
+def test_bytes_at_or_beyond_the_high_water_take_the_active_identity(
+        store, monkeypatch):
+    """First observed now, so it resolves the active identity freshly and
+    creates its stamp — the other half of the separation the high-water map
+    exists to make."""
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    with open(a, "a") as fh:
+        fh.write(_s3_asst_line("u2", "m2", "r2", "two"))
+    _s3_pin_account(monkeypatch, ns, "acct-b")
+    ns["sync_claude_conversations"](conn)
+    by_offset = sorted(_s3_accounts(conn).items())
+    assert [value for _key, value in by_offset] == ["acct-a", "acct-b"]
+
+
+def test_a_gap_row_keeps_the_attribution_a_stamp_could_not(store, monkeypatch):
+    """A source file deleted since ingestion has no bytes to digest. The
+    classified gap is what stops the backfill from discarding an orphan's real
+    attribution."""
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    conn.execute("DELETE FROM claude_conversation_account_stamps")
+    conn.execute("DELETE FROM cache_meta WHERE key=?",
+                 ("claude_account_stamp_coverage_complete",))
+    conn.commit()
+    import _cctally_db as db
+    db.backfill_claude_account_stamps(conn)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM claude_conversation_account_stamps"
+    ).fetchone()[0] == 1, "a readable file backfills to a stamp, not a gap"
+    a.unlink()
+    conn.execute("DELETE FROM claude_conversation_account_stamps")
+    conn.execute("DELETE FROM cache_meta WHERE key=?",
+                 ("claude_account_stamp_coverage_complete",))
+    conn.commit()
+    db.backfill_claude_account_stamps(conn)
+    assert conn.execute(
+        "SELECT source_path,cause,account_key "
+        "FROM claude_conversation_account_stamp_gaps").fetchall() == [
+        (str(a), "source_unreadable", "acct-a")]
+
+
+# --- the publication gate --------------------------------------------------
+
+
+def test_the_first_rebuild_after_the_migration_backfill_keeps_every_account(
+        store, monkeypatch):
+    """The case a copy-on-write rehearsal on the real store caught, and the
+    suite did not.
+
+    Every other rebuild case here starts from a store the LIVE ingester built,
+    and the ingester records `device_id`, `inode` and `committed_prefix_sha256`
+    alongside the incarnation. A store whose stamps came from migration 009
+    instead has none of those, so the continuity check rejects it, a fresh
+    incarnation is minted, every stamp misses on its incarnation column, and
+    the replay re-attributes all of it. On the real store that was 43,810 of
+    43,810 messages restamped to the active account, with the coverage marker
+    reporting complete throughout — which is exactly the loss the backfill
+    exists to prevent, performed by the code that is supposed to prevent it.
+    """
+    import _cctally_db as db
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one")
+                 + _s3_asst_line("u2", "m2", "r2", "two"))
+    ns["sync_claude_conversations"](conn)
+    before = _s3_accounts(conn)
+    assert set(before.values()) == {"acct-a"}
+
+    # Reduce the store to what a pre-009 store looks like: the messages and the
+    # cursor survive, the stamps and the whole identity do not.
+    conn.execute("DELETE FROM claude_conversation_account_stamps")
+    conn.execute("DELETE FROM claude_conversation_account_stamp_gaps")
+    conn.execute("UPDATE conversation_source_files SET source_incarnation_id=NULL,"
+                 " device_id=NULL, inode=NULL, committed_prefix_sha256=NULL")
+    conn.execute("DELETE FROM cache_meta WHERE key=?",
+                 ("claude_account_stamp_coverage_complete",))
+    conn.commit()
+
+    db.backfill_claude_account_stamps(conn)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM claude_conversation_account_stamps"
+    ).fetchone()[0] == 2
+    identity = conn.execute(
+        "SELECT source_incarnation_id,device_id,inode,committed_prefix_sha256 "
+        "FROM conversation_source_files WHERE path=?", (str(a),)).fetchone()
+    assert all(field is not None for field in identity), (
+        "the backfill must record the whole identity a stamp is keyed to, or "
+        "the very first rebuild cannot find the stamps it just wrote"
+    )
+
+    _s3_pin_account(monkeypatch, ns, "acct-b")
+    ns["sync_claude_conversations"](conn, rebuild=True)
+    assert _s3_accounts(conn) == before
+
+
+def test_a_rebuild_refuses_to_publish_while_stamp_coverage_is_incomplete(
+        store, monkeypatch):
+    """Shipping the lookup-miss rule over an unbackfilled store is the loss the
+    backfill exists to prevent, so the rebuild refuses rather than proceeding."""
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    before = _s3_accounts(conn)
+    conn.execute("DELETE FROM cache_meta WHERE key=?",
+                 ("claude_account_stamp_coverage_complete",))
+    conn.commit()
+    stats = ns["sync_claude_conversations"](conn, rebuild=True)
+    assert stats.deferred_reason == "stamp_backfill_pending"
+    assert _s3_accounts(conn) == before, "the refusal precedes every destructive step"
+
+
+def test_the_coverage_gate_lets_a_backfilled_store_through(store, monkeypatch):
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    assert conn.execute(
+        "SELECT value FROM cache_meta WHERE key=?",
+        ("claude_account_stamp_coverage_complete",)).fetchone() == ("1",)
+    stats = ns["sync_claude_conversations"](conn, rebuild=True)
+    assert stats.deferred_reason is None
+
+
+# --- a concurrent append is a continuation, not an identity break ----------
+#
+# Tranche 2 treated ANY change in size or mtime across the descriptor's fstat
+# pair as an identity break and aborted the file. The provider appends to an
+# active transcript continuously, so an ordinary append landed inside that
+# window, raised `files_failed`, withheld the sync certificate and forced the
+# whole rebuild to run again. Spec §2 now classifies the pair by what changed.
+
+
+def _appending_walker(real, path, line, fired):
+    """Wrap the walker so a real append lands AFTER the read and BEFORE the
+    trailing `fstat` — the exact window the descriptor pair covers."""
+    def walking(*args, **kwargs):
+        yield from real(*args, **kwargs)
+        if not fired["done"]:
+            fired["done"] = True
+            with open(path, "a") as fh:
+                fh.write(line)
+    return walking
+
+
+def _arm_raced_append(ns, monkeypatch, cache, path, fired):
+    """Make the file genuinely dirty, then arm the raced append.
+
+    The pass has to have work to do: a sync skips a file whose size and mtime
+    are unchanged, so without the first append the walker is never entered and
+    the descriptor pair is never taken.
+    """
+    with open(path, "a") as fh:
+        fh.write(_s3_asst_line("u2", "m2", "r2", "two"))
+    monkeypatch.setattr(
+        cache, "_iter_sync_entries",
+        _appending_walker(cache._iter_sync_entries, path,
+                          _s3_asst_line("u3", "m3", "r3", "three"), fired))
+
+
+def test_an_append_landing_mid_read_does_not_fail_the_file(store, monkeypatch):
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    first = _s3_incarnation(conn, a)
+    cache = ns["_cctally_cache"]
+    fired = {"done": False}
+    _arm_raced_append(ns, monkeypatch, cache, a, fired)
+    stats = ns["sync_claude_conversations"](conn)
+    assert fired["done"], "the append must really have landed inside the window"
+    assert stats.files_failed == 0, (
+        "an append is a continuation, not a file-identity break")
+    assert stats.files_processed == 1
+    assert _s3_incarnation(conn, a) == first
+
+
+def test_an_append_landing_mid_read_keeps_the_sync_certifiable(store,
+                                                               monkeypatch):
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    cache = ns["_cctally_cache"]
+    fired = {"done": False}
+    _arm_raced_append(ns, monkeypatch, cache, a, fired)
+    stats = ns["sync_claude_conversations"](conn)
+    assert fired["done"]
+    import _lib_ingest_frontier as frontier
+    # `common_clean` reads `files_failed`, so a raced append used to withhold
+    # the conversation frontier certificate outright.
+    assert frontier.provider_sync_certifiable("targeted", stats)
+    assert stats.targeted_clean
+
+
+def test_an_append_landing_mid_read_does_not_force_a_rebuild_rerun(
+        store, monkeypatch):
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    cache = ns["_cctally_cache"]
+    fired = {"done": False}
+    _arm_raced_append(ns, monkeypatch, cache, a, fired)
+    ns["sync_claude_conversations"](conn, rebuild=True)
+    assert fired["done"]
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta "
+        "WHERE key='conversation_rebuild_claude_pending'").fetchone() is None, (
+        "one raced append must not leave the whole rebuild pending")
+
+
+def test_an_append_landing_mid_read_commits_the_bytes_it_read(store,
+                                                              monkeypatch):
+    """The records read in that pass are kept, and the NEXT sync resumes from
+    the stored cursor rather than replaying the file from zero."""
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    cache = ns["_cctally_cache"]
+    real = cache._iter_sync_entries
+    fired = {"done": False}
+    _arm_raced_append(ns, monkeypatch, cache, a, fired)
+    ns["sync_claude_conversations"](conn)
+    assert fired["done"]
+    incarnation = _s3_incarnation(conn, a)
+    cursor = conn.execute(
+        "SELECT last_byte_offset FROM conversation_source_files WHERE path=?",
+        (str(a),)).fetchone()[0]
+    assert cursor == (len(_s3_asst_line("u1", "m1", "r1", "one"))
+                      + len(_s3_asst_line("u2", "m2", "r2", "two"))), (
+        "the bytes this pass read are committed; the raced append is not")
+    assert len(_s3_accounts(conn)) == 2
+    monkeypatch.setattr(cache, "_iter_sync_entries", real)
+    stats = ns["sync_claude_conversations"](conn)
+    assert stats.files_failed == 0
+    assert stats.files_reset_truncated == 0, (
+        "continuity held, so the next sync resumes rather than replaying")
+    assert _s3_incarnation(conn, a) == incarnation
+    assert len(_s3_accounts(conn)) == 3
+    assert len(_s3_stamps(conn)) == 3
+
+
+def test_a_truncation_landing_mid_read_is_still_an_identity_break(
+        store, monkeypatch):
+    """The window the descriptor pair exists to cover still closes: a shrink
+    inside it commits nothing for that file.
+
+    A `rename` is deliberately NOT this case and cannot be: the descriptor
+    keeps the old inode, so `fstat` reports the file the reader actually read.
+    The bytes stay self-consistent, and the next sync opens the new directory
+    entry, sees a different inode and mints a fresh incarnation.
+    """
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    before = _s3_accounts(conn)
+    cache = ns["_cctally_cache"]
+    real = cache._iter_sync_entries
+    fired = {"done": False}
+    # Dirty the file so the pass has work and the descriptor pair is taken.
+    with open(a, "a") as fh:
+        fh.write(_s3_asst_line("u2", "m2", "r2", "two"))
+
+    def truncating(*args, **kwargs):
+        yield from real(*args, **kwargs)
+        if not fired["done"]:
+            fired["done"] = True
+            with open(a, "r+b") as fh:
+                fh.truncate(10)
+
+    monkeypatch.setattr(cache, "_iter_sync_entries", truncating)
+    stats = ns["sync_claude_conversations"](conn)
+    assert fired["done"]
+    assert stats.files_failed == 1
+    assert _s3_accounts(conn) == before
+
+
+def test_a_rename_landing_mid_read_is_read_consistently_then_reincarnated(
+        store, monkeypatch):
+    """`os.replace` swaps the directory entry, not the open file, so the pair
+    reports no break and the pass commits the bytes it really read. The NEXT
+    sync opens the replacement, sees a different inode and replays from zero."""
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    first = _s3_incarnation(conn, a)
+    cache = ns["_cctally_cache"]
+    real = cache._iter_sync_entries
+    fired = {"done": False}
+    with open(a, "a") as fh:
+        fh.write(_s3_asst_line("u2", "m2", "r2", "two"))
+
+    def replacing(*args, **kwargs):
+        yield from real(*args, **kwargs)
+        if not fired["done"]:
+            fired["done"] = True
+            replacement = projects / "replacement.tmp"
+            replacement.write_text(_s3_asst_line("u9", "m9", "r9", "other"))
+            os.replace(replacement, a)
+
+    monkeypatch.setattr(cache, "_iter_sync_entries", replacing)
+    stats = ns["sync_claude_conversations"](conn)
+    assert fired["done"]
+    assert stats.files_failed == 0
+    assert _s3_incarnation(conn, a) == first
+    monkeypatch.setattr(cache, "_iter_sync_entries", real)
+    ns["sync_claude_conversations"](conn)
+    assert _s3_incarnation(conn, a) != first
+
+
+def test_a_size_preserving_rewrite_landing_mid_read_is_an_identity_break(
+        store, monkeypatch):
+    """Same size, changed mtime — the case `_conversation_target_risk` calls
+    `source_replaced`. It is a rewrite, not an append, so it breaks."""
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    before = _s3_accounts(conn)
+    cache = ns["_cctally_cache"]
+    real = cache._iter_sync_entries
+    fired = {"done": False}
+    rewritten = _s3_asst_line("u1", "m1", "r1", "ONE")
+    assert len(rewritten) == a.stat().st_size
+    # Dirty the file so the pass has work and the descriptor pair is taken.
+    with open(a, "a") as fh:
+        fh.write(_s3_asst_line("u2", "m2", "r2", "two"))
+
+    def rewriting(*args, **kwargs):
+        yield from real(*args, **kwargs)
+        if not fired["done"]:
+            fired["done"] = True
+            size_before = a.stat().st_size
+            with open(a, "r+b") as fh:
+                fh.write(rewritten.encode())
+            assert a.stat().st_size == size_before, (
+                "the case needs a size-PRESERVING rewrite")
+            st = a.stat()
+            os.utime(a, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+
+    monkeypatch.setattr(cache, "_iter_sync_entries", rewriting)
+    stats = ns["sync_claude_conversations"](conn)
+    assert fired["done"]
+    assert stats.files_failed == 1
+    assert _s3_accounts(conn) == before
+
+
+# --- the backfill's chunked resume and its four gap causes -----------------
+#
+# `_STAMP_BACKFILL_PATHS_PER_TXN` is 25, and the golden fixture carries two
+# source paths while the live case carries one, so nothing exercised the
+# cursor advance or the resume-from-cursor path. Of the four gap causes only
+# `source_unreadable` was asserted.
+
+
+def _s3_seed_many_paths(ns, conn, projects, count):
+    """One message per source path, so the path count is the chunk driver."""
+    for index in range(count):
+        (projects / f"f{index:03d}.jsonl").write_text(
+            _s3_asst_line(f"u{index}", f"m{index}", f"r{index}", "line",
+                          sid=f"s{index}"))
+    ns["sync_claude_conversations"](conn)
+
+
+def _s3_reset_backfill_state(conn):
+    conn.execute("DELETE FROM claude_conversation_account_stamps")
+    conn.execute("DELETE FROM claude_conversation_account_stamp_gaps")
+    conn.execute("DELETE FROM cache_meta WHERE key=?",
+                 ("claude_account_stamp_coverage_complete",))
+    conn.execute("DELETE FROM cache_meta WHERE key=?",
+                 ("claude_account_stamp_backfill_cursor",))
+    conn.commit()
+
+
+def _s3_backfill_cursor(conn):
+    row = conn.execute("SELECT value FROM cache_meta WHERE key=?",
+                       ("claude_account_stamp_backfill_cursor",)).fetchone()
+    return row[0] if row else None
+
+
+def test_the_backfill_advances_a_durable_cursor_across_chunks(store,
+                                                              monkeypatch):
+    import _cctally_db as db
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    _s3_seed_many_paths(ns, conn, projects, 30)
+    _s3_reset_backfill_state(conn)
+    assert _s3_backfill_cursor(conn) is None
+    observed = []
+    real_set = db._set_cache_meta
+
+    def watching(conn_, key, value):
+        if key == "claude_account_stamp_backfill_cursor":
+            observed.append(value)
+        return real_set(conn_, key, value)
+
+    monkeypatch.setattr(db, "_set_cache_meta", watching)
+    db.backfill_claude_account_stamps(conn)
+    assert observed, (
+        f"30 paths against a chunk of {db._STAMP_BACKFILL_PATHS_PER_TXN} must "
+        "commit at least one cursor advance"
+    )
+    assert observed == sorted(observed), "the cursor advances in sorted order"
+    assert _s3_backfill_cursor(conn) is None, "and is cleared on completion"
+
+
+def test_an_interrupted_backfill_resumes_from_its_cursor(store, monkeypatch):
+    """Interrupt mid-chunk, re-run, and the final stamp set must equal the
+    uninterrupted result while the cursor really carried the progress."""
+    import _cctally_db as db
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    _s3_seed_many_paths(ns, conn, projects, 30)
+
+    _s3_reset_backfill_state(conn)
+    db.backfill_claude_account_stamps(conn)
+    uninterrupted = _s3_stamps(conn)
+    assert len(uninterrupted) == 30
+
+    _s3_reset_backfill_state(conn)
+    real_read = db._stamp_backfill_read_records
+    seen = {"paths": 0}
+
+    def interrupting(path_str, offsets, committed_offset):
+        seen["paths"] += 1
+        if seen["paths"] > db._STAMP_BACKFILL_PATHS_PER_TXN + 2:
+            raise KeyboardInterrupt("killed mid-chunk")
+        return real_read(path_str, offsets, committed_offset)
+
+    monkeypatch.setattr(db, "_stamp_backfill_read_records", interrupting)
+    with pytest.raises(KeyboardInterrupt):
+        db.backfill_claude_account_stamps(conn)
+    conn.rollback()
+    partial_cursor = _s3_backfill_cursor(conn)
+    assert partial_cursor, "the interrupted run must leave durable progress"
+    partial = len(_s3_stamps(conn))
+    assert 0 < partial < 30
+
+    monkeypatch.setattr(db, "_stamp_backfill_read_records", real_read)
+    resumed = {"first": None}
+    real_read_2 = db._stamp_backfill_read_records
+
+    def recording(path_str, offsets, committed_offset):
+        if resumed["first"] is None:
+            resumed["first"] = path_str
+        return real_read_2(path_str, offsets, committed_offset)
+
+    monkeypatch.setattr(db, "_stamp_backfill_read_records", recording)
+    db.backfill_claude_account_stamps(conn)
+    assert resumed["first"] > partial_cursor, (
+        "the resume starts after the cursor rather than restarting the walk")
+    assert _s3_stamps(conn) == uninterrupted
+    assert _s3_backfill_cursor(conn) is None
+
+
+def _s3_backfill_gap_causes(conn):
+    return {
+        row[0]: row[1] for row in conn.execute(
+            "SELECT source_path,cause FROM claude_conversation_account_stamp_gaps")
+    }
+
+
+def test_a_source_changed_during_the_backfill_is_classified(store, monkeypatch):
+    import _cctally_db as db
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    _s3_reset_backfill_state(conn)
+    fired = {"done": False}
+    real_fstat = os.fstat
+
+    class _AppendingOs:
+        """Append BETWEEN the `fstat` pair, which is the window the guard
+        covers. Appending before the pair would leave both halves equal."""
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def fstat(self, fd):
+            st = real_fstat(fd)
+            if not fired["done"]:
+                fired["done"] = True
+                with open(a, "a") as writer:
+                    writer.write(_s3_asst_line("u2", "m2", "r2", "two"))
+            return st
+
+    monkeypatch.setattr(db, "os", _AppendingOs())
+    db.backfill_claude_account_stamps(conn)
+    assert fired["done"]
+    assert _s3_backfill_gap_causes(conn) == {
+        str(a): "source_changed_during_backfill"}
+    assert conn.execute(
+        "SELECT COUNT(*) FROM claude_conversation_account_stamps"
+    ).fetchone()[0] == 0
+
+
+def test_a_source_shorter_than_its_cursor_is_classified(store, monkeypatch):
+    import _cctally_db as db
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one")
+                 + _s3_asst_line("u2", "m2", "r2", "two"))
+    ns["sync_claude_conversations"](conn)
+    _s3_reset_backfill_state(conn)
+    # The cursor still describes both records; the file now holds one.
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    db.backfill_claude_account_stamps(conn)
+    assert _s3_backfill_gap_causes(conn) == {
+        str(a): "source_shorter_than_cursor"}
+
+
+def test_a_message_with_no_source_file_cursor_is_classified(store, monkeypatch):
+    """The bytes are readable, but no cursor row exists to carry an identity,
+    so a rebuild would have nothing to check continuity against."""
+    import _cctally_db as db
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    _s3_reset_backfill_state(conn)
+    conn.execute("DELETE FROM conversation_source_files WHERE path=?", (str(a),))
+    conn.commit()
+    db.backfill_claude_account_stamps(conn)
+    assert _s3_backfill_gap_causes(conn) == {str(a): "no_source_file_cursor"}
+    assert conn.execute(
+        "SELECT COUNT(*) FROM claude_conversation_account_stamps"
+    ).fetchone()[0] == 0
+
+
+def test_an_offset_that_does_not_begin_a_record_is_a_gap_not_a_partial_stamp(
+        store, monkeypatch):
+    """A mid-record offset used to yield a partial span, whose digest no record
+    reproduces — a stamp written and permanently unreachable."""
+    import _cctally_db as db
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    ns["sync_claude_conversations"](conn)
+    _s3_reset_backfill_state(conn)
+    conn.execute(
+        "UPDATE conversation_messages SET byte_offset=5 WHERE source_path=?",
+        (str(a),))
+    conn.commit()
+    db.backfill_claude_account_stamps(conn)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM claude_conversation_account_stamps"
+    ).fetchone()[0] == 0, "a mid-record offset must not produce a stamp"
+    assert _s3_backfill_gap_causes(conn) == {str(a): "offset_not_a_record_start"}
+
+
+# --- pruned source paths keep no unreachable stamps ------------------------
+
+
+def test_pruning_a_source_path_removes_its_unreachable_stamps(store,
+                                                              monkeypatch):
+    """`_resolve_record_account` keys on `(incarnation_id, offset, digest)`,
+    and with the `conversation_source_files` row gone `_resolve_source_incarnation`
+    sees `prev is None` and always mints a fresh incarnation. Every stamp for
+    that path is therefore unreachable, and keeping it grows the table without
+    bound."""
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    b = projects / "b.jsonl"
+    b.write_text(_s3_asst_line("u2", "m2", "r2", "two", sid="s2"))
+    ns["sync_claude_conversations"](conn)
+    assert {row[0] for row in _s3_stamps(conn)} == {str(a), str(b)}
+    b.unlink()
+    ns["sync_claude_conversations"](conn, rebuild=True)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_source_files WHERE path=?",
+        (str(b),)).fetchone()[0] == 0
+    assert {row[0] for row in _s3_stamps(conn)} == {str(a)}, (
+        "a stamp no read path can reach must not survive the prune")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM claude_conversation_account_stamp_gaps "
+        "WHERE source_path=?", (str(b),)).fetchone()[0] == 0
+
+
+def test_a_walk_that_discovers_nothing_deletes_no_stamp(store, monkeypatch):
+    """The prune computes its stale set by difference against the walked set,
+    so a walk that finds nothing used to call every tracked path stale and
+    delete every stamp in the store. An unmounted volume or a wrong
+    `CLAUDE_CONFIG_DIR` produces exactly that walk, and stamps are the one
+    thing in this store that is not re-derivable (spec §2)."""
+    ns, conn, projects = store
+    cache = ns["_cctally_cache"]
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    b = projects / "b.jsonl"
+    b.write_text(_s3_asst_line("u2", "m2", "r2", "two", sid="s2"))
+    ns["sync_claude_conversations"](conn)
+    before_stamps = {row[0] for row in _s3_stamps(conn)}
+    assert before_stamps == {str(a), str(b)}
+    before_files = {
+        row[0] for row in conn.execute(
+            "SELECT path FROM conversation_source_files")
+    }
+
+    monkeypatch.setattr(cache, "_iter_claude_jsonl_files", lambda: iter(()))
+    ns["sync_claude_conversations"](conn, rebuild=True)
+
+    assert {row[0] for row in _s3_stamps(conn)} == before_stamps, (
+        "an empty walk is not evidence that any file was removed")
+    assert {
+        row[0] for row in conn.execute(
+            "SELECT path FROM conversation_source_files")
+    } == before_files
+
+
+def test_a_path_still_on_disk_survives_a_walk_that_missed_it(store,
+                                                             monkeypatch):
+    """Absent from THIS walk is not the same fact as absent from disk. A
+    partial walk — a permission error under one project directory, a root that
+    momentarily failed to enumerate — must not delete the attribution for a
+    file that is still there."""
+    ns, conn, projects = store
+    cache = ns["_cctally_cache"]
+    _s3_pin_account(monkeypatch, ns, "acct-a")
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    b = projects / "b.jsonl"
+    b.write_text(_s3_asst_line("u2", "m2", "r2", "two", sid="s2"))
+    ns["sync_claude_conversations"](conn)
+    assert {row[0] for row in _s3_stamps(conn)} == {str(a), str(b)}
+
+    monkeypatch.setattr(cache, "_iter_claude_jsonl_files", lambda: iter([a]))
+    ns["sync_claude_conversations"](conn, rebuild=True)
+
+    assert str(b) in {row[0] for row in _s3_stamps(conn)}, (
+        "b.jsonl is still on disk; only a genuine absence may prune it")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_source_files WHERE path=?",
+        (str(b),)).fetchone()[0] == 1

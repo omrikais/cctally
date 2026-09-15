@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -223,7 +224,11 @@ def test_orchestrated_prune_retries_partial_incremental_vacuum(
         partial, now_utc=NOW, retention_days=180, force=True)
 
     assert stats is not None and stats.claude_messages == 2000
-    assert partial.script_calls == 2
+    # The partial step is retried rather than accepted. The exact call count is
+    # no longer fixed at two: #780 sizes each chunk from measured throughput
+    # instead of asking for 4096 pages every time, so what is pinned is that a
+    # step which reclaimed one page did not end the pass.
+    assert partial.script_calls >= 2
     assert conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
 
 
@@ -938,3 +943,375 @@ def test_migration_025_replay_after_prune_does_not_resurrect(tmp_path, monkeypat
             assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0, table
     finally:
         conn.close()
+
+
+# --- #780: the lock race, and bounded reclaim -------------------------------
+
+
+def _readonly_env(tmp_path, monkeypatch):
+    """A real conversations.db with a real WAL, plus its cache.db attachment."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    cache = ns["open_cache_db"]()
+    cache.close()
+    conn = ns["open_conversations_db"]()
+    return ns, conn
+
+
+def _fill_and_free_pages(conn, rows=2000):
+    """Write enough rows to grow the file, then delete them, so the freelist is
+    large enough for a chunked reclaim to be observable. Deliberately small: a
+    multi-GiB fixture proves nothing this does not."""
+    for index in range(rows):
+        conn.execute(
+            "INSERT OR IGNORE INTO conversation_messages "
+            "(session_id,uuid,source_path,byte_offset,timestamp_utc,entry_type,"
+            " text,blocks_json) VALUES(?,?,?,?,?,?,?,'[]')",
+            (f"s{index}", f"u{index}", "/f.jsonl", index,
+             "2020-01-01T00:00:00Z", "assistant", "x" * 500),
+        )
+    conn.commit()
+    conn.execute("DELETE FROM conversation_messages")
+    conn.commit()
+    return int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+
+
+def test_the_reader_that_loses_the_write_lock_is_named_by_instrumentation(
+        tmp_path, monkeypatch):
+    """The deterministic reproduction (#780, spec §4d).
+
+    A test replacement for the chunk seam takes the REAL SQLite write lock,
+    signals a barrier and holds it while a second thread runs the reader
+    opener. The failing statement is RECORDED, never predicted: the spec's
+    candidates are the first write-capable ones, but the instrumentation is
+    what says which loses.
+
+    The maintenance flock is explicitly NOT the cause and cannot be — it is
+    downgraded to SHARED before reclaim, and the reader takes it SHARED too.
+    """
+    import threading
+
+    ns, conn = _readonly_env(tmp_path, monkeypatch)
+    # The store module the OPENER uses, not a second import of the same name:
+    # `load_script` builds its own sibling namespace, and arming a trace hook on
+    # a different instance records nothing.
+    store_mod = ns["_cctally_cache"]._cctally_store
+    retention = importlib.import_module("_lib_conversation_retention")
+    freed = _fill_and_free_pages(conn)
+    assert freed > 0, "the fixture must really have a freelist to reclaim"
+    conn.close()
+
+    holding = threading.Event()
+    release = threading.Event()
+    observed = {"statements": [], "failed_on": None, "error": None}
+    real_chunk = retention._run_incremental_vacuum_chunk
+
+    def locking_chunk(chunk_conn, pages):
+        # BEGIN IMMEDIATE takes the real write lock, which is what a reclaim
+        # holds while it moves pages.
+        chunk_conn.execute("BEGIN IMMEDIATE")
+        holding.set()
+        release.wait(10)
+        chunk_conn.commit()
+        return real_chunk(chunk_conn, pages)
+
+    def read_under_the_lock():
+        holding.wait(10)
+        previous = store_mod._TRACE_HOOK
+        store_mod._TRACE_HOOK = observed["statements"].append
+        writer = None
+        try:
+            # The OLD reader route: the full mutation-capable opener.
+            writer = ns["open_conversations_db"]()
+        except sqlite3.OperationalError as exc:
+            observed["error"] = str(exc)
+            observed["failed_on"] = (
+                observed["statements"][-1] if observed["statements"] else None)
+        except Exception as exc:  # noqa: BLE001
+            observed["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            store_mod._TRACE_HOOK = previous
+            if writer is not None:
+                writer.close()
+            release.set()
+
+    monkeypatch.setattr(retention, "_run_incremental_vacuum_chunk",
+                        locking_chunk)
+    reader = threading.Thread(target=read_under_the_lock, daemon=True)
+    reader.start()
+    prune_conn = ns["open_conversations_db"]()
+    try:
+        retention.run_reclaim_pass(
+            prune_conn, now_utc=NOW, deadline_seconds=0.5)
+    finally:
+        release.set()
+        reader.join(20)
+        prune_conn.close()
+
+    assert holding.is_set(), "the chunk seam must really have held the lock"
+    # Record what was observed. This assertion is deliberately about the SHAPE
+    # of the evidence, because the spec forbids asserting a predicted loser.
+    assert observed["statements"], (
+        "the reader opener must have executed at least one statement under "
+        f"the held write lock; error was {observed['error']!r}"
+    )
+    if observed["failed_on"] is not None:
+        # Not the maintenance flock, and it cannot be: reclaim downgrades it to
+        # SHARED and the reader takes it SHARED too.
+        assert "flock" not in str(observed["failed_on"]).lower()
+    # What the instrumentation ACTUALLY reported, recorded rather than
+    # predicted: `PRAGMA auto_vacuum=INCREMENTAL`, with `database is locked`.
+    # That is the first statement `_cctally_store.apply_policy` emits, and it
+    # is write-capable, so a read route that routes through the full opener is
+    # a writer that loses the SQLite write lock to a reclaim pass. The spec
+    # listed it as a candidate; this is the measurement.
+    assert observed["failed_on"] == "PRAGMA auto_vacuum=INCREMENTAL", (
+        f"the instrumentation reported {observed['failed_on']!r} — record the "
+        "new loser here rather than keeping a stale one"
+    )
+    assert "locked" in (observed["error"] or "")
+
+
+def test_the_readonly_opener_does_not_execute_the_two_write_pragmas(
+        tmp_path, monkeypatch):
+    """The GREEN half: whatever the old opener loses on, the new one cannot,
+    because it never issues either write-capable pragma.
+
+    The store module has to come off the loaded namespace, exactly as the
+    sibling RED case above says. `load_script()` calls
+    `_script_loader._drop_stale_siblings()`, which evicts every `_cctally_*`
+    entry from `sys.modules`, so a bare `import _cctally_store` taken before
+    `_readonly_env` binds an instance the reloaded `cctally` no longer uses.
+    Arming the hook on that instance records nothing, and the two pragma
+    assertions then pass against an empty string — verified by running this
+    case with the stale import and the `assert seen` below, which failed with
+    `assert []`."""
+    ns, conn = _readonly_env(tmp_path, monkeypatch)
+    conn.close()
+    cache_mod = ns["_cctally_cache"]
+    store_mod = cache_mod._cctally_store
+    seen = []
+    previous = store_mod._TRACE_HOOK
+    store_mod._TRACE_HOOK = seen.append
+    try:
+        reader = cache_mod.open_conversations_db_readonly()
+    finally:
+        store_mod._TRACE_HOOK = previous
+    try:
+        assert seen, (
+            "the trace hook recorded nothing, so the two assertions below "
+            "would pass against an empty string and certify nothing")
+        lowered = " ".join(seen).lower()
+        assert "auto_vacuum=" not in lowered.replace(" ", "")
+        assert "journal_mode=" not in lowered.replace(" ", "")
+        # Both query paths still serve.
+        reader.execute(
+            "SELECT COUNT(*) FROM conversation_messages "
+            "WHERE text LIKE ?", ("%needle%",)).fetchone()
+        try:
+            reader.execute(
+                "SELECT COUNT(*) FROM conversation_fts "
+                "WHERE conversation_fts MATCH ?", ("needle",)).fetchone()
+        except sqlite3.OperationalError:
+            pass  # fts5 unavailable on this build; the LIKE path above covers it
+    finally:
+        reader.close()
+
+
+def test_a_reclaim_pass_respects_its_wall_clock_deadline(tmp_path, monkeypatch):
+    ns, conn = _readonly_env(tmp_path, monkeypatch)
+    retention = importlib.import_module("_lib_conversation_retention")
+    assert _fill_and_free_pages(conn) > 0
+    ticks = {"n": 0}
+
+    def fake_clock():
+        # Every reading advances by a second, so the second chunk is past a
+        # 2s budget however fast the disk is.
+        ticks["n"] += 1
+        return float(ticks["n"])
+
+    outcome = retention._reclaim_incremental_vacuum(
+        conn, deadline_seconds=2.0, clock=fake_clock)
+    assert outcome.deadline_hit
+    assert outcome.freelist_after > 0, "the pass stopped short, by design"
+    conn.close()
+
+
+def test_pending_reclaim_state_survives_to_the_next_pass(tmp_path, monkeypatch):
+    ns, conn = _readonly_env(tmp_path, monkeypatch)
+    retention = importlib.import_module("_lib_conversation_retention")
+    assert _fill_and_free_pages(conn) > 0
+    ticks = {"n": 0}
+
+    def fake_clock():
+        ticks["n"] += 1
+        return float(ticks["n"])
+
+    first = retention.run_reclaim_pass(
+        conn, now_utc=NOW, deadline_seconds=2.0, clock=fake_clock)
+    assert first["complete"] is False
+    state = retention.read_reclaim_pending(conn)
+    assert state is not None
+    assert state["freelist_count"] > 0
+    assert state["unreclaimed_bytes"] > 0
+    second = retention.run_reclaim_pass(conn, now_utc=NOW)
+    assert second["complete"] is True
+    assert retention.read_reclaim_pending(conn) is None
+    conn.close()
+
+
+def test_a_zero_freelist_with_a_busy_checkpoint_does_not_clear_pending(
+        tmp_path, monkeypatch):
+    """Completion is physical. `incremental_vacuum` drops `page_count` while
+    the bytes are still in the WAL, so a zero freelist alone is not success."""
+    ns, conn = _readonly_env(tmp_path, monkeypatch)
+    retention = importlib.import_module("_lib_conversation_retention")
+    _fill_and_free_pages(conn)
+    monkeypatch.setattr(retention, "_checkpoint_truncate",
+                        lambda c: (1, 42, 0))
+    result = retention.run_reclaim_pass(conn, now_utc=NOW)
+    assert result["complete"] is False
+    assert retention.read_reclaim_pending(conn) is not None
+    conn.close()
+
+
+def test_a_no_progress_pass_stays_pending(tmp_path, monkeypatch):
+    ns, conn = _readonly_env(tmp_path, monkeypatch)
+    retention = importlib.import_module("_lib_conversation_retention")
+    assert _fill_and_free_pages(conn) > 0
+    monkeypatch.setattr(
+        retention, "_run_incremental_vacuum_chunk",
+        lambda c, pages: int(c.execute("PRAGMA freelist_count").fetchone()[0]))
+    result = retention.run_reclaim_pass(conn, now_utc=NOW)
+    assert result["complete"] is False
+    assert result["reclaim"]["pages_reclaimed"] == 0
+    assert result["reclaim"]["made_progress"] is False
+    assert retention.read_reclaim_pending(conn) is not None
+    conn.close()
+
+
+def test_a_pass_with_no_new_deletion_still_continues_the_backlog(
+        tmp_path, monkeypatch):
+    """The old reclaim ran only when the prune had deleted something, so a
+    store that fell behind had no way to catch up."""
+    ns, conn, retention = _env(tmp_path, monkeypatch)
+    _seed_msg(conn, "fresh", FRESH)
+    conn.commit()
+    retention._write_reclaim_pending(conn, {
+        "freelist_count": 5, "unreclaimed_bytes": 5 * 4096,
+        "attempted_at": NOW.isoformat(), "made_progress": True,
+        "deadline_hit": True,
+    })
+    conn.commit()
+    ran = []
+    real = retention.run_reclaim_pass
+    monkeypatch.setattr(
+        retention, "run_reclaim_pass",
+        lambda c, **kw: (ran.append(1), real(c, **kw))[1])
+    stats = retention._maybe_prune_conversation_retention(
+        conn, now_utc=NOW, retention_days=180, force=True)
+    assert stats is not None and stats.total_rows == 0
+    assert ran == [1], "an outstanding backlog is continued with no new deletion"
+
+
+def test_an_escalated_backlog_does_not_wait_for_the_daily_throttle(
+        tmp_path, monkeypatch):
+    ns, conn, retention = _env(tmp_path, monkeypatch)
+    _seed_msg(conn, "fresh", FRESH)
+    retention._stamp_retention_prune(conn, NOW)
+    retention._write_reclaim_pending(conn, {
+        "freelist_count": 1_000_000,
+        "unreclaimed_bytes": retention.RECLAIM_ESCALATION_BYTES + 1,
+        "attempted_at": NOW.isoformat(), "made_progress": True,
+        "deadline_hit": True,
+    })
+    conn.commit()
+    ran = []
+    monkeypatch.setattr(
+        retention, "run_reclaim_pass",
+        lambda c, **kw: (ran.append(1), {
+            "reclaim": {}, "checkpoint": {}, "pending": None, "complete": True,
+        })[1])
+    stats = retention._maybe_prune_conversation_retention(
+        conn, now_utc=NOW, retention_days=180)
+    assert stats is None, "deletion stays throttled"
+    assert ran == [1], "reclaim continues anyway"
+
+
+def test_a_below_escalation_backlog_still_waits_for_the_throttle(
+        tmp_path, monkeypatch):
+    ns, conn, retention = _env(tmp_path, monkeypatch)
+    _seed_msg(conn, "fresh", FRESH)
+    retention._stamp_retention_prune(conn, NOW)
+    retention._write_reclaim_pending(conn, {
+        "freelist_count": 1, "unreclaimed_bytes": 4096,
+        "attempted_at": NOW.isoformat(), "made_progress": True,
+        "deadline_hit": False,
+    })
+    conn.commit()
+    ran = []
+    monkeypatch.setattr(
+        retention, "run_reclaim_pass",
+        lambda c, **kw: (ran.append(1), {})[1])
+    assert retention._maybe_prune_conversation_retention(
+        conn, now_utc=NOW, retention_days=180) is None
+    assert ran == []
+
+
+def test_the_backlog_ceiling_refuses_a_new_rebuild(tmp_path, monkeypatch):
+    ns, conn, retention = _env(tmp_path, monkeypatch)
+    conv = ns["open_conversations_db"]()
+    try:
+        retention._write_reclaim_pending(conv, {
+            "freelist_count": 9_999_999,
+            "unreclaimed_bytes": retention.RECLAIM_CEILING_BYTES,
+            "attempted_at": NOW.isoformat(), "made_progress": False,
+            "deadline_hit": True,
+        })
+        conv.commit()
+        stats = ns["sync_claude_conversations"](conv, rebuild=True)
+        assert stats.deferred_reason == "reclaim_backlog_over_ceiling"
+    finally:
+        conv.close()
+
+
+def _doctor_state(**kw):
+    """A DoctorState with only the fields under test set; every other field
+    falls back to its dataclass default or None."""
+    import dataclasses
+    import _lib_doctor as doctor
+
+    fields = {
+        f.name: (f.default if f.default is not dataclasses.MISSING else None)
+        for f in dataclasses.fields(doctor.DoctorState)
+    }
+    fields.update(kw)
+    return doctor.DoctorState(**fields)
+
+
+def test_the_backlog_ceiling_raises_a_doctor_fail(tmp_path, monkeypatch):
+    import _lib_doctor as doctor
+
+    retention = importlib.import_module("_lib_conversation_retention")
+    over = {"freelist_count": 1, "unreclaimed_bytes":
+            retention.RECLAIM_CEILING_BYTES, "attempted_at": NOW.isoformat()}
+    escalated = {"freelist_count": 1, "unreclaimed_bytes":
+                 retention.RECLAIM_ESCALATION_BYTES, "attempted_at":
+                 NOW.isoformat()}
+    fail = doctor._check_db_conversations_reclaimable(
+        _doctor_state(conversations_reclaim_pending=over))
+    assert fail.severity == "fail"
+    warn = doctor._check_db_conversations_reclaimable(
+        _doctor_state(conversations_reclaim_pending=escalated))
+    assert warn.severity == "warn"
+
+
+def test_no_pending_record_leaves_the_doctor_check_byte_identical(tmp_path):
+    """The backlog rides on an existing check id, and contributes nothing on a
+    store that has never fallen behind — which is every doctor fixture."""
+    import _lib_doctor as doctor
+
+    plain = doctor._check_db_conversations_reclaimable(_doctor_state())
+    assert plain.severity == "ok"
+    assert "reclaim_pending" not in plain.details
+    assert "reclaim_backlog_bytes" not in plain.details

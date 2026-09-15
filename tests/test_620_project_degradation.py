@@ -50,6 +50,16 @@ class _NoAccountColumnConn:
             self.saw_unscoped_retry = True
         return self._real.execute(sql, params)
 
+    def close(self):
+        """A no-op, because the TEST owns the wrapped connection's lifetime.
+
+        `_load_week_snapshots` opens and closes its own connection, and the
+        monkeypatched `open_db` hands back this one wrapper every time. Left
+        delegating, the first call would close the real connection and the
+        second would raise `ProgrammingError` before reaching the predicate
+        this test is about.
+        """
+
     def __getattr__(self, name):
         return getattr(self._real, name)
 
@@ -67,12 +77,21 @@ def test_account_scoped_snapshot_read_degrades_on_a_missing_column(
     wrapper = _NoAccountColumnConn(real)
     monkeypatch.setattr(_cctally_project, "open_db", lambda *a, **k: wrapper)
 
-    since = dt.datetime(2026, 4, 1, tzinfo=dt.timezone.utc)
-    until = dt.datetime(2026, 4, 30, tzinfo=dt.timezone.utc)
+    # #750 S4 §2.1: the reducer takes the emitted SEGMENTS rather than a date
+    # range, because the segment is the identity a percentage belongs to.
+    import _lib_subscription_weeks
+    segment = _lib_subscription_weeks.SubWeek(
+        start_ts="2026-04-06T00:00:00+00:00",
+        end_ts="2026-04-13T00:00:00+00:00",
+        start_date=dt.date(2026, 4, 6),
+        end_date=dt.date(2026, 4, 12),
+        source="snapshot",
+        display_start_date=dt.date(2026, 4, 6),
+    )
 
     # Guard the guard: the merged read must NOT hit the wrapper's raise, or
     # the assertion below could pass for the wrong reason.
-    merged = _cctally_project._load_week_snapshots(since, until)
+    merged = _cctally_project._load_week_snapshots([segment])
     assert merged == {}, merged
     assert wrapper.saw_unscoped_retry, (
         "the merged read must reach the unscoped query, or the wrapper is "
@@ -81,7 +100,7 @@ def test_account_scoped_snapshot_read_degrades_on_a_missing_column(
     wrapper.saw_unscoped_retry = False   # only the scoped call counts below
 
     got = _cctally_project._load_week_snapshots(
-        since, until, account_key="claude:abc123",
+        [segment], account_key="claude:abc123",
     )
     assert got == {}, got
     assert not wrapper.saw_unscoped_retry, (

@@ -122,3 +122,64 @@ it('stops after a single retry when the failure persists', async () => {
   expect(result.current.projects).toEqual([]);
   expect(result.current.models).toEqual([]);
 });
+
+// #717 — the hook normalizes two response shapes into one object and rebuilds
+// that object field by field in BOTH branches, so a field added server-side
+// reaches nothing until this hook carries it. Each branch is asserted on its
+// own; threading it through only the Claude branch would leave the Codex rail
+// with the same unexplained empty facet one source over.
+it('carries filter_degraded through the flat Claude branch', async () => {
+  (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+    ok: true, status: 200,
+    json: async () => ({ projects: [], models: [{ family: 'opus', count: 3 }], filter_degraded: true }),
+  } as Response);
+  const { result } = renderHook(() => useConversationFacets());
+  await waitFor(() => expect(result.current.models).toHaveLength(1));
+  expect(result.current.filter_degraded).toBe(true);
+  expect(result.current.projects).toEqual([]);
+});
+
+it('carries filter_degraded through the wrapped Codex branch', async () => {
+  (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+    ok: true, status: 200,
+    json: async () => ({
+      status: 'normalization_pending',
+      facets: { projects: [], models: [] },
+      filter_degraded: true,
+    }),
+  } as Response);
+  const { result } = renderHook(() => useConversationFacets('codex'));
+  await waitFor(() => expect(result.current.filter_degraded).toBe(true));
+  expect(result.current.projects).toEqual([]);
+});
+
+it('leaves filter_degraded absent on the authoritative response', async () => {
+  (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+    ok: true, status: 200,
+    json: async () => ({ projects: [{ project_label: 'projA', count: 4 }], models: [] }),
+  } as Response);
+  const { result } = renderHook(() => useConversationFacets());
+  await waitFor(() => expect(result.current.projects).toHaveLength(1));
+  expect(result.current.filter_degraded).toBeUndefined();
+});
+
+it('drops a stale degraded flag when the next response is authoritative', async () => {
+  const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+  fetchMock
+    .mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ projects: [], models: [], filter_degraded: true }),
+    } as Response)
+    .mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ projects: [{ project_label: 'projA', count: 1 }], models: [] }),
+    } as Response);
+  const { result, rerender } = renderHook(
+    ({ accountKey }) => useConversationFacets('claude', accountKey),
+    { initialProps: { accountKey: 'account-a' } },
+  );
+  await waitFor(() => expect(result.current.filter_degraded).toBe(true));
+  rerender({ accountKey: 'account-b' });
+  await waitFor(() => expect(result.current.projects).toHaveLength(1));
+  expect(result.current.filter_degraded).toBeUndefined();
+});

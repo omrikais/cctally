@@ -570,3 +570,151 @@ def test_a_tick_that_never_pinned_reports_zero_rather_than_none():
     t = ts.begin_tick()
     t.finish(published_ns=1, published_at="p")
     assert ts.snapshot().records[-1].cache_pin_ns == 0
+
+
+# --- #780: the maintenance phase ring ---------------------------------------
+
+
+def test_a_long_reclaim_cannot_hide_inside_a_conversation_sync_record():
+    """The defect this ring exists for: retention ran inside the measured sync
+    body, so a two-second reclaim and a fast one were both one
+    `conversation_sync` record reporting `ok`."""
+    import _lib_tick_stats as ts
+    ts.reset_for_tests()
+    ts.record_conversation_pass(
+        seq=1, started_ns=0, ended_ns=3_000_000_000,
+        duration_ns=3_000_000_000, cpu_ns=1, status="ok")
+    ts.record_maintenance_phase("reclaim", {
+        "duration_s": 2.0, "pages_reclaimed": 1234,
+        "deadline_hit": True, "made_progress": True,
+    })
+    ts.record_maintenance_phase("checkpoint", {
+        "result": (0, 0, 512), "bytes_returned": 4096,
+    })
+    snap = ts.snapshot()
+    assert [r.status for r in snap.conversation_records] == ["ok"]
+    phases = {r.phase: r for r in snap.maintenance_records}
+    assert set(phases) == {"reclaim", "checkpoint"}
+    assert phases["reclaim"].duration_ns == 2_000_000_000
+    assert phases["reclaim"].outcome == "deadline"
+    assert phases["reclaim"].pending is True
+    assert phases["reclaim"].pages_reclaimed == 1234
+    assert phases["checkpoint"].outcome == "ok"
+    assert phases["checkpoint"].pending is False
+    assert phases["checkpoint"].bytes_returned == 4096
+
+
+def test_the_maintenance_phase_vocabulary_is_a_closed_set():
+    """Same rule as `CONVERSATION_STATUSES`: a frozen field typed `str` would
+    accept `str(exc)` or a filesystem path and publish it through the debug
+    endpoint.
+
+    The coercion must not name another REAL phase. Relabelling an unrecognised
+    caller as `reclaim` publishes a reclaim record that no reclaim produced,
+    which reads as a maintenance history rather than as the coercion it is."""
+    import _lib_tick_stats as ts
+    ts.reset_for_tests()
+    ts.record_maintenance_phase("/Users/someone/secret.db", {"duration_s": 0})
+    snap = ts.snapshot()
+    assert [r.phase for r in snap.maintenance_records] == ["other"]
+    assert "secret.db" not in str(snap.maintenance_records[0])
+
+
+def test_a_coerced_phase_is_not_given_reclaim_arithmetic():
+    """A record filed under an unknown name carries no reclaim figures. The
+    old coercion sent it through the reclaim branch, so a caller passing a
+    stray name got `deadline`/`no_progress` outcomes derived from fields it
+    never set."""
+    import _lib_tick_stats as ts
+    ts.reset_for_tests()
+    ts.record_maintenance_phase("vacuum", {
+        "duration_s": 1.0, "deadline_hit": True, "made_progress": False,
+        "pages_reclaimed": 99, "bytes_returned": 4096,
+    })
+    record = ts.snapshot().maintenance_records[0]
+    assert record.phase == "other"
+    assert record.outcome == "ok", (
+        "a `deadline` outcome describes a reclaim budget this record has none "
+        "of")
+    assert record.pending is False
+
+
+def test_a_no_progress_reclaim_is_reported_as_pending():
+    import _lib_tick_stats as ts
+    ts.reset_for_tests()
+    ts.record_maintenance_phase("reclaim", {
+        "duration_s": 0.5, "pages_reclaimed": 0,
+        "deadline_hit": False, "made_progress": False,
+    })
+    record = ts.snapshot().maintenance_records[0]
+    assert record.outcome == "no_progress"
+    assert record.pending is True
+
+
+def test_a_busy_checkpoint_is_reported_as_pending():
+    import _lib_tick_stats as ts
+    ts.reset_for_tests()
+    ts.record_maintenance_phase("checkpoint", {"result": (1, 4096, 0)})
+    record = ts.snapshot().maintenance_records[0]
+    assert record.outcome == "busy"
+    assert record.pending is True
+
+
+def test_all_three_rings_stay_inside_the_frozen_budget():
+    """Non-vacuity: every ring is FULL. The maintenance ring is shorter than
+    the other two precisely because the 65,536-byte cap is frozen and a phase
+    that runs about once a day does not earn a full-length ring."""
+    import _lib_tick_stats as ts
+    ts.reset_for_tests()
+    longest = "z" * ts.PUBLISHED_AT_MAX_CHARS
+    for i in range(ts.RING_CAPACITY * 2):
+        t = ts.begin_tick()
+        t.set_dispatch("full")
+        t.set_codex_regime("active")
+        t.finish(published_ns=i, published_at=f"{i:04d}{longest}"[:len(longest)])
+        ts.record_conversation_pass(
+            seq=i, started_ns=i * 10, ended_ns=i * 10 + 5, duration_ns=5,
+            cpu_ns=1, status="ok")
+        ts.record_maintenance_phase("reclaim", {
+            "duration_s": 1.5, "pages_reclaimed": 4096,
+            "deadline_hit": True, "made_progress": True,
+        })
+    snap = ts.snapshot()
+    assert len(snap.records) == ts.RING_CAPACITY
+    assert len(snap.conversation_records) == ts.RING_CAPACITY
+    assert len(snap.maintenance_records) == ts.MAINTENANCE_RING_CAPACITY
+    assert ts.MEMORY_BUDGET_BYTES == 65536, (
+        "the budget is frozen; raising it is a separate reviewed decision")
+    assert ts._deep_size(snap) <= ts.MEMORY_BUDGET_BYTES
+
+
+def test_a_tick_finish_carries_every_other_ring_forward():
+    """`finish` is the one mutator that rebuilds the snapshot field by field
+    instead of using `dataclasses.replace`, so a ring added later is dropped on
+    every refresh tick unless someone remembers to carry it by hand. This
+    asserts the property rather than one field, so the NEXT ring is covered
+    before it is written."""
+    import dataclasses
+
+    import _lib_tick_stats as ts
+    ts.reset_for_tests()
+    ring_fields = [
+        f.name for f in dataclasses.fields(ts.StatsSnapshot)
+        if f.name.endswith("_records")
+    ]
+    assert "conversation_records" in ring_fields
+    assert "maintenance_records" in ring_fields
+    ts.record_conversation_pass(
+        seq=1, started_ns=0, ended_ns=1, duration_ns=1, cpu_ns=1, status="ok")
+    ts.record_maintenance_phase("reclaim", {"duration_s": 0.1})
+    before = {name: getattr(ts.snapshot(), name) for name in ring_fields}
+    assert all(before.values()), "the fixture must fill every ring"
+    tick = ts.begin_tick()
+    tick.set_dispatch("full")
+    tick.finish(published_ns=1, published_at="2026-09-08T00:00:00Z")
+    after = ts.snapshot()
+    for name in ring_fields:
+        assert getattr(after, name) == before[name], (
+            f"a refresh tick wiped {name}; `finish` rebuilds the snapshot "
+            "field by field and must carry every ring forward"
+        )

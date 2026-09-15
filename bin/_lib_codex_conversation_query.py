@@ -3253,8 +3253,18 @@ def _stored_browse_page(
 def list_codex_conversation_facets(conn: sqlite3.Connection) -> dict:
     """Facet-only browse projection; never builds or prices a discarded page."""
     if not codex_normalization_authoritative(conn):
+        # #717. The empty facets are not new; saying WHY they are empty is.
+        #
+        # Model counts are NOT derivable in this state, and that is a decision
+        # rather than an omission. Claude's model facet folds
+        # `conversation_messages`, which no rollup rebuild touches, so it stays
+        # live. Every Codex facet source — the stored rollups and the live
+        # recompute alike — reads the normalized corpus that the pending
+        # replay is about to rewrite, so deriving counts from it would publish
+        # numbers the replay is going to change.
         return {"status": "normalization_pending",
-                "facets": {"projects": [], "models": []}}
+                "facets": {"projects": [], "models": []},
+                "filter_degraded": True}
     facets = (_stored_browse_facets(conn) if _stored_rollups_present(conn)
               else _facets_from_fields(_live_browse_fields(conn)))
     return {"status": "ok", "facets": facets}

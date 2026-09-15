@@ -212,8 +212,15 @@ _DENIED = "not authorized"
 
 
 def _armed_conn(tmp_path, *, name="s.db", cross_thread=False):
+    # #778: mirror the opener's construction, not just its arming. Built with
+    # SQLite's default statement cache, every case in this module would run
+    # against a connection shape production no longer produces, and the guard's
+    # own module would be the one place blind to a regression back toward
+    # prepare-time enforcement.
     conn = sqlite3.connect(
-        str(tmp_path / name), check_same_thread=not cross_thread
+        str(tmp_path / name),
+        check_same_thread=not cross_thread,
+        **store._STATS_CONNECT_KWARGS,
     )
     conn.execute("CREATE TABLE weekly_usage_snapshots (x)")
     store.arm_stats_authorizer(conn)
@@ -398,12 +405,11 @@ def test_guard_log_rotates_and_stays_bounded_during_violation_storm(
     conn = _armed_conn(tmp_path)
     try:
         for i in range(100):
-            # Distinct comments force distinct prepares. Re-executing one
-            # cached statement does not call SQLite's authorizer again.
-            conn.execute(
-                f"INSERT INTO weekly_usage_snapshots VALUES (?) /* {i} */",
-                (i,),
-            )
+            # One statement, a hundred executions. Under #778's
+            # `cached_statements=0` each execution re-enters the authorizer, so
+            # the storm needs no distinct-prepare workaround — and this loop now
+            # also pins that per-execution logging, not just the rotation bound.
+            conn.execute("INSERT INTO weekly_usage_snapshots VALUES (?)", (i,))
     finally:
         conn.close()
 

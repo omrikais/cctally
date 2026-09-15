@@ -1095,9 +1095,11 @@ def test_the_stats_index_epoch_tripwire(stats_ns):
     advances to 1011 for the `meter_rate_change_events` table. #750 S2
     advances to 1012 for that table's four rate-change disclosure columns, and
     #750 S3 advances to 1013 for reset-event origin identity plus the
-    transactional debounce state."""
+    transactional debounce state. #769 S2 advances to 1014 for the
+    source-local five-hour credit confirmation state, and #769 S11 advances to
+    1015 for `weekly_usage_snapshots.weekly_observation_held`."""
     import _cctally_core
-    assert _cctally_core.STATS_INDEX_EPOCH == 1013
+    assert _cctally_core.STATS_INDEX_EPOCH == 1015
 
 
 # --------------------------------------------------------------------------
@@ -1181,9 +1183,11 @@ def test_r1_a_jittered_block_detail_keeps_every_member_observation(
     stats_conn = _stats_conn(stats_ns)
     try:
         _seed_block_row(stats_conn, resets_at_utc="2026-08-01T19:19:03+00:00")
+        # #769 S9 / #815: the builder loads its OWN physical group now, so the
+        # observations resolved above are the oracle rather than the input.
         detail = _dash()._build_codex_block_detail(
             _detail_context(stats_ns, cache_conn, stats_conn),
-            observations, key=_block_key(stats_conn),
+            key=_block_key(stats_conn),
         )
         assert len(detail["observations"]) == 3, (
             "block detail kept "
@@ -1194,13 +1198,34 @@ def test_r1_a_jittered_block_detail_keeps_every_member_observation(
 
 def test_r1_a_block_detail_survives_a_bounded_read_missing_the_anchor_member(
         stats_ns, cache_conn):
-    """`_codex_detail_inputs` bounds its read at 35 days / 1,000 rows while the
-    anchor was resolved UNBOUNDED at ingest. When the anchor-establishing
-    observation falls outside the bounds, a RAW-reset filter keeps NOTHING and
-    `build_blocks(()) == ()` raises `SourceResourceNotFound` — an HTTP 404 on a
-    window that plainly exists. The same happens when the anchor was established
-    by another ACCOUNT's observation, since the anchor group excludes the
-    account deliberately."""
+    """WHAT THIS CASE PINS: that the block detail's observation load carries
+    NO capture-time predicate and NO row cap.
+
+    The retired `_codex_detail_inputs` bounded its read at 35 days / 1,000 rows
+    while the anchor was resolved UNBOUNDED at ingest, so the
+    anchor-establishing observation could fall outside the bounds the builder
+    was handed. #769 S9 / #815 removed the bound itself: the builder asks for
+    its own snap-equivalent physical group. Re-introducing either
+    `captured_at_or_after` or `max_rows` on that load would leave only the
+    member captured 2026-07-28 and fail the assertions below, which is the
+    regression this case exists to catch. The bounded read above the block read
+    is the precondition, not the subject: it is what the retired code would
+    have handed the builder.
+
+    WHAT THIS CASE DOES NOT PIN, stated so it is not mistaken for coverage it
+    lacks: the raw-versus-anchor axis. The member filter inside the builder
+    compares `observation.canonical_resets_at` against the stored anchor, and
+    reverting it to the raw spelling would also keep the 2026-07-27 member
+    here, because that member is the one whose raw reset equals the anchor. The
+    defence for that axis is the sibling
+    `test_r1_a_jittered_block_detail_keeps_every_member_observation`, which
+    seeds three jittered resets and would render one observation of three under
+    a raw filter.
+
+    The two members are given DISTINCT used_percents so `build_history` cannot
+    deduplicate them to one interpreted point. With one shared percent the
+    rendered set was a single observation under the correct predicate and under
+    either reverted one, so neither assertion discriminated anything."""
     resolver = _resolver(cache_conn)
     # The anchor establisher, captured FIRST — and therefore the row the
     # dashboard's `max_rows` cap (newest capture wins) drops first.
@@ -1210,6 +1235,11 @@ def test_r1_a_block_detail_survives_a_bounded_read_missing_the_anchor_member(
         ("2026-07-27T00:00:00Z",))
     # A member inside the cap, carrying the stored anchor but a jittered raw.
     _seed_anchored(cache_conn, resolver, resets_at="2026-08-01T19:19:06Z")
+    # DISTINCT percents, so the two members stay two interpreted points. The
+    # 2026-07-28 capture is the one still inside a re-introduced cap.
+    cache_conn.execute(
+        "UPDATE quota_window_snapshots SET used_percent = 20.0 "
+        "WHERE captured_at_utc = ?", ("2026-07-28T00:00:00Z",))
     cache_conn.commit()
 
     bounded = _quota().load_codex_quota_observations(
@@ -1219,15 +1249,23 @@ def test_r1_a_block_detail_survives_a_bounded_read_missing_the_anchor_member(
     )
     assert len(bounded) == 1, "precondition: the anchor member is out of bounds"
     assert bounded[0].resets_at != bounded[0].canonical_resets_at
+    assert bounded[0].used_percent == 20.0, (
+        "precondition: the member a cap retains is the 2026-07-28 one, so a "
+        "re-introduced cap is observable in the rendered percents")
 
     stats_conn = _stats_conn(stats_ns)
     try:
         _seed_block_row(stats_conn, resets_at_utc="2026-08-01T19:19:03+00:00")
         detail = _dash()._build_codex_block_detail(
             _detail_context(stats_ns, cache_conn, stats_conn),
-            bounded, key=_block_key(stats_conn),
+            key=_block_key(stats_conn),
         )
-        assert len(detail["observations"]) == 1
+        assert [item["captured_at"] for item in detail["observations"]] == [
+            "2026-07-27T00:00:00+00:00", "2026-07-28T00:00:00+00:00"], (
+            "the group read must carry no capture-time predicate and no row "
+            f"cap; rendered {detail['observations']} instead")
+        assert [item["used_percent"] for item in detail["observations"]] == [
+            10.0, 20.0]
     finally:
         stats_conn.close()
 

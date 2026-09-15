@@ -1415,3 +1415,122 @@ def iter_media_items(content):
         if isinstance(item, dict) and item.get("type") in _MEDIA_BLOCK_TYPES:
             yield idx, item
             idx += 1
+
+
+# --- #777 source-incarnation identity and durable account stamps -----------
+# ONE definition of each, shared by the migration-009 backfill in
+# `_cctally_db` and the ingest boundary in `_cctally_cache`. Two definitions
+# would not raise, would not move a golden, and would not fail a suite: the
+# migration's stamps would simply never match the ingester's lookups, and every
+# rebuild after the first would silently re-attribute history to whichever
+# account happened to be active. That is the failure mode this module's
+# single-kernel rule exists to prevent.
+
+
+def record_sha256(raw_span: bytes) -> str:
+    """The digest of ONE record's raw on-disk bytes.
+
+    `raw_span` is the byte span of the record as it appears on disk, with the
+    terminator already removed. Digesting raw bytes rather than decoded text is
+    load-bearing: the sync walker reads with `errors="replace"`, so a record
+    carrying invalid UTF-8 decodes to a DIFFERENT string than it was written
+    as, and a digest over that string would change the moment the decoder's
+    replacement policy did. Re-serializing the parsed object would be worse
+    still — key order and separator choices are not stable across versions.
+    """
+    import hashlib  # noqa: PLC0415 — stdlib, kept off this module's import cost
+    return hashlib.sha256(raw_span).hexdigest()
+
+
+def strip_record_terminator(line: bytes) -> bytes:
+    """The record's bytes with its line terminator removed.
+
+    `\\r\\n` is removed WHOLE, so the same record content digests identically
+    whichever terminator wrote it. That is a deliberate reading of "excluding
+    the terminating newline": treating the `\\r` as record content would make
+    one logical record produce two identities across a file rewritten on
+    another platform, and every stamp for it would miss.
+    """
+    if line.endswith(b"\n"):
+        line = line[:-1]
+    if line.endswith(b"\r"):
+        line = line[:-1]
+    return line
+
+
+def new_source_incarnation_id() -> str:
+    """Mint an identifier for one append-continuous life of a source file.
+
+    Random rather than derived from the file's content or metadata. A derived
+    id would collide exactly when the file is rewritten to look like itself —
+    the size-preserving in-place rewrite this identity exists to detect — and a
+    colliding id lets a new incarnation inherit the old one's stamps.
+    """
+    import uuid  # noqa: PLC0415 — stdlib, kept off this module's import cost
+    return uuid.uuid4().hex
+
+
+def prefix_digest(fh, length: int):
+    """A live SHA-256 object over `[0, length)`, read through an ALREADY-OPEN
+    binary handle.
+
+    Returns the hash OBJECT rather than a hex string, because the ingester
+    continues it over the bytes it then appends. A hex digest cannot be
+    resumed, so returning one would force a full rehash of the whole file on
+    every sync instead of only the committed prefix.
+
+    A finite window ending at the cursor cannot keep the continuity promise,
+    because a rewrite entirely before that window leaves the window unchanged.
+    The guard is therefore the whole committed prefix. Verification on resume
+    rehashes it once, which is bounded by the file rather than by the corpus,
+    and only for files whose size actually changed — an unchanged file is
+    skipped before this is reached.
+
+    Reads through the caller's descriptor rather than re-opening by path, so
+    the digest and the caller's `fstat` pair describe the same open file.
+
+    POSITION CONTRACT. On return the handle is positioned at `length` — or at
+    end of file when the file is shorter. The ingester relies on that: it
+    continues this same object over the bytes it then reads, so a caller that
+    re-seeks between the two would digest the wrong span. State it here rather
+    than leaving the caller to depend on it silently.
+
+    A SHORT READ RAISES. Reading fewer than `length` bytes means the file no
+    longer holds the prefix the cursor describes, and returning a digest over
+    what was there would produce a hash of a different byte range wearing the
+    name of the committed prefix — which then compares unequal for a reason the
+    caller cannot see. `ValueError` says so directly; the caller's incarnation
+    resolver treats it as a broken continuity, which is the correct answer.
+    """
+    import hashlib  # noqa: PLC0415 — stdlib, kept off this module's import cost
+    digest = hashlib.sha256()
+    if length <= 0:
+        return digest
+    fh.seek(0)
+    remaining = length
+    while remaining > 0:
+        chunk = fh.read(min(remaining, 1 << 20))
+        if not chunk:
+            raise ValueError(
+                f"prefix_digest: read {length - remaining} of {length} bytes; "
+                "the file no longer holds the committed prefix"
+            )
+        digest.update(chunk)
+        remaining -= len(chunk)
+    return digest
+
+
+def prefix_sha256(fh, length: int) -> str:
+    """SHA-256 of `[0, length)` read through an ALREADY-OPEN binary handle.
+
+    A finite window ending at the cursor cannot keep the continuity promise,
+    because a rewrite entirely before that window leaves the window unchanged.
+    The guard is therefore the whole committed prefix. Verification on resume
+    rehashes it once, which is bounded by the file rather than by the corpus,
+    and only for files whose size actually changed — an unchanged file is
+    skipped before this is reached.
+
+    Reads through the caller's descriptor rather than re-opening by path, so
+    the digest and the caller's `fstat` pair describe the same open file.
+    """
+    return prefix_digest(fh, length).hexdigest()

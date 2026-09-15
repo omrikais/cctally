@@ -74,7 +74,7 @@ describe('<Modal /> — MODAL-1 fake handle removed (#293 S4)', () => {
 // their content with no scroller anywhere at >=1025px.
 //
 // F7 also deleted the `dataSource` prop here, on the grounds that nothing read
-// it. `e2e/period-native-vocabulary.spec.ts` read it, and Playwright runs in a
+// it. `e2e/period-vocabulary-convergence.spec.ts` read it, and Playwright runs in a
 // different CI job from vitest, so that lane went red on main while these unit
 // tests stayed green. The prop is restored, and asserted below in the direction
 // that would have caught its removal.

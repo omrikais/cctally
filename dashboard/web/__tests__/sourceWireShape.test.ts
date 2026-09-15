@@ -86,7 +86,7 @@ describe('S4 source envelope wire shape (guard)', () => {
     // #556 S2 §3.9 — tracks the server's current version, exactly as the JSON
     // fixture above does. Keeping the two in step is the invariant; the
     // number is not.
-    expect(slice.source_schema_version).toBe(11);
+    expect(slice.source_schema_version).toBe(12);
     expect(slice.default_source).toBe('claude');
     expect(slice.source_order).toEqual(['claude', 'codex', 'all']);
 

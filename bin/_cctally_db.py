@@ -138,6 +138,66 @@ def _compute_block_totals(*args, **kwargs):
     return sys.modules["cctally"]._compute_block_totals(*args, **kwargs)
 
 
+def _ownership_windows_by_account(rows):
+    """Group `five_hour_blocks` rows into per-account ownership contexts.
+
+    The two child backfills walk every block row, so the row set they
+    already hold IS the competing-window context each of those blocks
+    needs (issue #751a). Returns ``{account_key: [OwnedWindow, ...]}``.
+
+    A row this function cannot interpret is REPORTED rather than skipped.
+    It used to be skipped, on the reasoning that defaulting to an interval
+    would silently reassign entries between two windows — which is right,
+    but skipping it silently is not the alternative. The caller goes on to
+    price that same row and `_compute_block_totals` then raises `owner_key
+    ... is absent from the competing-window context`, a diagnostic that
+    names the wrong cause: the window is absent because this row could not
+    be read, not because the caller asked about a window nobody declared
+    (#769 S2 review P3-1). Both call sites already fail on an unparseable
+    `block_start_at` of their own, so this fails no run that previously
+    succeeded; it only says why.
+    """
+    import _lib_blocks
+
+    def _field(row, name):
+        try:
+            return row[name]
+        except (KeyError, IndexError):
+            return None
+
+    grouped: dict = {}
+    for row in rows:
+        row_id = _field(row, "id")
+        parsed = {}
+        for field in ("block_start_at", "five_hour_resets_at"):
+            raw = _field(row, field)
+            try:
+                parsed[field] = parse_iso_datetime(
+                    raw, f"five_hour_blocks.{field}",
+                ).astimezone(dt.timezone.utc)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"_ownership_windows_by_account: five_hour_blocks row "
+                    f"id={row_id!r} has an unusable {field}: {raw!r}"
+                ) from exc
+        try:
+            window_key = int(_field(row, "five_hour_window_key"))
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"_ownership_windows_by_account: five_hour_blocks row "
+                f"id={row_id!r} has an unusable five_hour_window_key: "
+                f"{_field(row, 'five_hour_window_key')!r}"
+            ) from exc
+        grouped.setdefault(_field(row, "account_key"), []).append(
+            _lib_blocks.OwnedWindow(
+                key=window_key,
+                start=parsed["block_start_at"],
+                reset=parsed["five_hour_resets_at"],
+            )
+        )
+    return grouped
+
+
 # === BEGIN MOVED REGIONS ===
 # Regions below are inserted verbatim from bin/cctally. Bare-name
 # references to `now_utc_iso(...)`, `parse_iso_datetime(...)`,
@@ -2335,9 +2395,13 @@ def _backfill_five_hour_block_models(conn: sqlite3.Connection) -> None:
 
         rows = conn.execute(
             "SELECT id, five_hour_window_key, block_start_at, "
-            "       last_observed_at_utc "
+            "       five_hour_resets_at, last_observed_at_utc, account_key "
             "  FROM five_hour_blocks"
         ).fetchall()
+        # #751a: the row set is the competing-window context. Without it
+        # each block re-sums its own raw interval and prices an adjacent
+        # window's overlap entries a second time.
+        ownership = _ownership_windows_by_account(rows)
         for row in rows:
             block_start_dt = parse_iso_datetime(
                 row["block_start_at"],
@@ -2357,6 +2421,8 @@ def _backfill_five_hour_block_models(conn: sqlite3.Connection) -> None:
             # so there is no recursion risk.
             totals = _compute_block_totals(
                 block_start_dt, last_obs_dt, skip_sync=False,
+                owner_key=int(row["five_hour_window_key"]),
+                windows=ownership.get(row["account_key"], []),
             )
             if totals.get("by_model"):
                 conn.executemany(
@@ -2418,9 +2484,13 @@ def _backfill_five_hour_block_projects(conn: sqlite3.Connection) -> None:
 
         rows = conn.execute(
             "SELECT id, five_hour_window_key, block_start_at, "
-            "       last_observed_at_utc "
+            "       five_hour_resets_at, last_observed_at_utc, account_key "
             "  FROM five_hour_blocks"
         ).fetchall()
+        # #751a: the row set is the competing-window context. Without it
+        # each block re-sums its own raw interval and prices an adjacent
+        # window's overlap entries a second time.
+        ownership = _ownership_windows_by_account(rows)
         for row in rows:
             block_start_dt = parse_iso_datetime(
                 row["block_start_at"],
@@ -2437,6 +2507,8 @@ def _backfill_five_hour_block_projects(conn: sqlite3.Connection) -> None:
             # so there is no open_db() recursion risk.
             totals = _compute_block_totals(
                 block_start_dt, last_obs_dt, skip_sync=False,
+                owner_key=int(row["five_hour_window_key"]),
+                windows=ownership.get(row["account_key"], []),
             )
             if totals.get("by_project"):
                 conn.executemany(
@@ -4387,6 +4459,14 @@ CACHE_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
         "index", "idx_codex_window_attributions_root", None,
         "043_codex_window_attributions"),
     SchemaDeliveryObject(
+        "column", "codex_session_files.device_id",
+        "_apply_codex_session_file_identity",
+        "046_codex_source_file_identity"),
+    SchemaDeliveryObject(
+        "column", "codex_session_files.inode",
+        "_apply_codex_session_file_identity",
+        "046_codex_source_file_identity"),
+    SchemaDeliveryObject(
         "index", "idx_codex_accounting_change_mutation",
         "_apply_codex_accounting_change_ledger",
         "044_codex_accounting_change_ledger"),
@@ -4453,6 +4533,33 @@ CACHE_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
         "_apply_codex_accounting_change_ledger",
         "044_codex_accounting_change_ledger"),
 )
+
+
+def _apply_codex_session_file_identity(conn: sqlite3.Connection) -> None:
+    """Deliver the Codex accounting cursor's file identity (#769 S6, #716 A).
+
+    ``codex_session_files`` records a size, an mtime and a byte offset but no
+    file identity, so a replacement that lands at the same size and the same
+    mtime leaves the retained cursor indistinguishable from a cursor into the
+    file that now occupies the pathname. ``conversation_source_files`` carries
+    exactly these two columns for the same reason (#777); this is the Codex
+    half of that identity.
+
+    NULLABLE with NO DEFAULT, and deliberately NOT backfilled. NULL is the
+    "identity unknown" state an existing row produces for free, and a reader
+    treats it as no evidence, which is the behavior that store already has.
+    Stamping a CURRENT stat onto a cursor written by an earlier pass would
+    assert that the pass read this inode, which the migration cannot know: the
+    file may have been replaced between that pass and the upgrade. The value
+    arrives on the next ingest of that path, which is the only moment the
+    identity and the offset are observed together.
+
+    ``add_column_if_missing`` ONLY, never in the CREATE TABLE body: ALTER TABLE
+    ADD COLUMN appends, so a column in both places sits at a different ordinal
+    on a fresh store than on a migrated one (the #195 hazard).
+    """
+    add_column_if_missing(conn, "codex_session_files", "device_id", "INTEGER")
+    add_column_if_missing(conn, "codex_session_files", "inode", "INTEGER")
 
 
 def _apply_cache_schema(conn: sqlite3.Connection) -> None:
@@ -4998,6 +5105,7 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, "codex_session_files", "ingest_complete",
         "INTEGER NOT NULL DEFAULT 1")
+    _apply_codex_session_file_identity(conn)
     add_column_if_missing(conn, "quota_window_snapshots", "account_key", "TEXT")
     # #195: the cache-write TTL split. NULLable with NO DEFAULT — NULL is the
     # "split unknown" sentinel a pre-#195 row produces for free, and a real
@@ -5279,6 +5387,8 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         current = None
     if current is not None and current[0] == "2":
         _apply_codex_find_projection_schema(conn)
+        _apply_conversation_generation_schema(conn)
+        _apply_codex_conversation_source_identity(conn)
         return
 
     _apply_cache_schema(conn)
@@ -5361,6 +5471,143 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
     )
     _apply_codex_find_projection_schema(conn)
+    _apply_conversation_generation_schema(conn)
+    _apply_codex_conversation_source_identity(conn)
+
+
+#: `cache_meta` keys the stamp backfill uses. The cursor is the durable resume
+#: point (the last source path whose rows are fully stamped); the completion
+#: marker is what a rebuild's publication gate reads. Both are values, not
+#: schema, so a store that has finished the backfill carries only the marker.
+CLAUDE_STAMP_BACKFILL_CURSOR_KEY = "claude_account_stamp_backfill_cursor"
+CLAUDE_STAMP_COVERAGE_COMPLETE_KEY = "claude_account_stamp_coverage_complete"
+
+#: Column shapes for the two staging tables, mirroring their live twins. Kept
+#: as literals rather than derived from `PRAGMA table_info` at runtime: a
+#: staging table whose shape is read off the live one at open time would follow
+#: the live table silently through a future column addition, and the publish
+#: `INSERT ... SELECT *` would then succeed against a shape nobody reviewed.
+#: A future column addition must edit BOTH, which is the point.
+_CONVERSATION_GENERATION_DDL = """
+    CREATE TABLE IF NOT EXISTS conversation_ai_titles_staging (
+        session_id  TEXT NOT NULL PRIMARY KEY,
+        ai_title    TEXT NOT NULL,
+        source_path TEXT,
+        byte_offset INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS conversation_sessions_staging (
+        session_id          TEXT NOT NULL PRIMARY KEY,
+        msg_count           INTEGER NOT NULL DEFAULT 0,
+        started_utc         TEXT,
+        last_activity_utc   TEXT,
+        project_label       TEXT,
+        cost_usd            REAL NOT NULL DEFAULT 0,
+        cache_rebuild_count INTEGER NOT NULL DEFAULT 0,
+        git_branch          TEXT,
+        models_json         TEXT,
+        title               TEXT,
+        render_revision     INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS claude_conversation_account_stamps (
+        canonical_source_path TEXT    NOT NULL,
+        source_incarnation_id TEXT    NOT NULL,
+        byte_offset           INTEGER NOT NULL,
+        record_sha256         TEXT    NOT NULL,
+        account_key           TEXT,
+        PRIMARY KEY(canonical_source_path, source_incarnation_id,
+                    byte_offset, record_sha256)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS claude_conversation_account_stamp_gaps (
+        source_path TEXT    NOT NULL,
+        byte_offset INTEGER NOT NULL,
+        cause       TEXT    NOT NULL,
+        account_key TEXT,
+        PRIMARY KEY(source_path, byte_offset)
+    ) WITHOUT ROWID;
+"""
+
+
+def _apply_conversation_generation_schema(conn: sqlite3.Connection) -> None:
+    """Create #752's staging tables and #777's durable account stamps.
+
+    Called from BOTH branches of `_apply_conversations_schema` — the
+    version-current early return and the full apply — exactly like
+    `_apply_codex_find_projection_schema`, so migration 009 can deliver the
+    objects to an existing store without replaying the much larger historical
+    transcript schema.
+
+    **The staging tables carry no FTS and no triggers.** `conversation_title_fts`
+    is an external-content FTS5 index bound BY NAME to `conversation_ai_titles`,
+    and it follows the live table through the existing `conv_title_fts_ai` /
+    `_ad` / `_au` triggers. A staging table with its own index would have to be
+    swapped too, which is the reader-routing problem the narrowed #752 design
+    exists to avoid.
+
+    **`claude_conversation_account_stamps` is the one table in this store that
+    a replay cannot reconstruct.** Everything else in `conversations.db` can be
+    rebuilt from provider JSONL; an observation-time account attribution cannot,
+    because the transcript does not record which account was active when the
+    bytes arrived.
+    That is why a rebuild reads attribution back from here instead of stamping
+    every replayed row with the currently active identity.
+
+    All four identity columns are NOT NULL and form the primary key;
+    `account_key` is nullable, and NULL is the stored spelling of
+    `unattributed`, matching the rest of the store. `WITHOUT ROWID` because the
+    table is all key and one small value, and every access is by the full key.
+
+    `claude_conversation_account_stamp_gaps` is what "explicitly classified"
+    means for a record whose bytes cannot be digested — a source file deleted
+    since ingestion, or one truncated below the offset. Such a row still holds
+    the attribution the pre-rebuild `conversation_messages` row carried, which
+    is the same evidence a stamp holds, minus the digest that would let it
+    survive the file being rewritten. Recording it is strictly better than
+    discarding it: without the gaps table, every orphaned path's attribution
+    would be lost at the first rebuild, which is the loss the backfill exists
+    to prevent.
+    """
+    conn.executescript(_CONVERSATION_GENERATION_DDL)
+    # #777: the source-incarnation identity. `size_bytes`/`mtime_ns` stay
+    # observations; these four are identity. `_conversation_target_risk`
+    # decides the size-preserving case on mtime and is defeated by a `touch`,
+    # so the committed-prefix digest is what makes the promise absolute.
+    add_column_if_missing(conn, "conversation_source_files", "device_id",
+                          "INTEGER")
+    add_column_if_missing(conn, "conversation_source_files", "inode",
+                          "INTEGER")
+    add_column_if_missing(conn, "conversation_source_files",
+                          "source_incarnation_id", "TEXT")
+    add_column_if_missing(conn, "conversation_source_files",
+                          "committed_prefix_sha256", "TEXT")
+    # A store with no retained messages has nothing to backfill, so its stamp
+    # coverage is complete by construction and the rebuild gate must let it
+    # through. Without this a FRESH install would be refused every rebuild,
+    # because the completion marker is written only by migration 009 — which a
+    # fresh install stamps without running. Same shape as the Codex find
+    # projection's fresh-store completion beside it.
+    if conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key=?",
+        (CLAUDE_STAMP_COVERAGE_COMPLETE_KEY,),
+    ).fetchone() is None and conn.execute(
+        "SELECT 1 FROM conversation_messages LIMIT 1"
+    ).fetchone() is None:
+        _set_cache_meta(conn, CLAUDE_STAMP_COVERAGE_COMPLETE_KEY, "1")
+
+
+def _apply_codex_conversation_source_identity(conn: sqlite3.Connection) -> None:
+    """Deliver the Codex transcript cursor's file identity (#769 S6, #716 A).
+
+    The twin of :func:`_apply_codex_session_file_identity` for
+    ``codex_conversation_source_files``. Same nullable shape, same reason for
+    not backfilling, same ``add_column_if_missing``-only delivery. The two
+    tables are one frontier root set, so an identity added to only one half
+    would let the accounting frontier and the conversation frontier disagree
+    about whether the pathname still names the file each of them read.
+    """
+    add_column_if_missing(
+        conn, "codex_conversation_source_files", "device_id", "INTEGER")
+    add_column_if_missing(
+        conn, "codex_conversation_source_files", "inode", "INTEGER")
 
 
 def _apply_codex_find_projection_schema(conn: sqlite3.Connection) -> None:
@@ -5502,6 +5749,46 @@ CONVERSATIONS_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
     SchemaDeliveryObject(
         "trigger", "codex_find_projection_message_ad",
         "_apply_codex_find_projection_schema", "004_codex_find_projection"),
+    SchemaDeliveryObject(
+        "column", "conversation_source_files.committed_prefix_sha256",
+        "_apply_conversation_generation_schema",
+        "009_conversation_title_staging_and_account_stamps"),
+    SchemaDeliveryObject(
+        "column", "conversation_source_files.device_id",
+        "_apply_conversation_generation_schema",
+        "009_conversation_title_staging_and_account_stamps"),
+    SchemaDeliveryObject(
+        "column", "conversation_source_files.inode",
+        "_apply_conversation_generation_schema",
+        "009_conversation_title_staging_and_account_stamps"),
+    SchemaDeliveryObject(
+        "column", "conversation_source_files.source_incarnation_id",
+        "_apply_conversation_generation_schema",
+        "009_conversation_title_staging_and_account_stamps"),
+    SchemaDeliveryObject(
+        "column", "codex_conversation_source_files.device_id",
+        "_apply_codex_conversation_source_identity",
+        "010_codex_conversation_source_file_identity"),
+    SchemaDeliveryObject(
+        "column", "codex_conversation_source_files.inode",
+        "_apply_codex_conversation_source_identity",
+        "010_codex_conversation_source_file_identity"),
+    SchemaDeliveryObject(
+        "table", "claude_conversation_account_stamp_gaps",
+        "_apply_conversation_generation_schema",
+        "009_conversation_title_staging_and_account_stamps"),
+    SchemaDeliveryObject(
+        "table", "claude_conversation_account_stamps",
+        "_apply_conversation_generation_schema",
+        "009_conversation_title_staging_and_account_stamps"),
+    SchemaDeliveryObject(
+        "table", "conversation_ai_titles_staging",
+        "_apply_conversation_generation_schema",
+        "009_conversation_title_staging_and_account_stamps"),
+    SchemaDeliveryObject(
+        "table", "conversation_sessions_staging",
+        "_apply_conversation_generation_schema",
+        "009_conversation_title_staging_and_account_stamps"),
 )
 
 
@@ -5825,6 +6112,300 @@ def _conv_008_conversation_render_revision(conn: sqlite3.Connection) -> None:
         conn, "codex_conversation_rollups", "render_revision",
         "INTEGER NOT NULL DEFAULT 0",
     )
+    conn.commit()
+
+
+#: How many source paths one backfill transaction covers. Small enough that an
+#: interrupted migration loses at most this much work, large enough that the
+#: per-transaction overhead does not dominate a 12,000-file store.
+_STAMP_BACKFILL_PATHS_PER_TXN = 25
+
+
+def _stamp_backfill_read_records(path_str, offsets, committed_offset):
+    """Read one source file's record spans AND the identity a stamp is keyed to.
+
+    Returns ``(spans, cause, identity, offset_causes)`` — a
+    ``{offset: raw_bytes}`` map, a classification string when the file could
+    not be used at all, the ``(device_id, inode, committed_prefix_sha256)``
+    triple for ``conversation_source_files``, and a per-offset cause for each
+    offset that produced no span.
+
+    THE IDENTITY IS NOT OPTIONAL, and leaving it out was a real defect this
+    function's first version shipped. A stamp is keyed by the incarnation, and
+    `_resolve_source_incarnation` only keeps an incarnation when the stored
+    inode and committed-prefix digest still match (the device is recorded as
+    corroborating evidence but does not decide — #814). A backfill that
+    wrote the incarnation but none of those left every one of its stamps
+    unreachable: the first rebuild rejected continuity, minted a fresh
+    incarnation, missed every stamp and re-attributed the whole store to
+    whichever account was active. Measured on a copy-on-write clone of the real
+    store: 43,810 of 43,810 sampled messages restamped, with the coverage
+    marker reporting complete throughout.
+
+    Opens the file ONCE and slices it, because one open per offset would
+    multiply a 334,239-row backfill by 334,239 syscalls. The `fstat` pair
+    around the read is the same time-of-check/time-of-use guard the ingest
+    boundary uses: a file replaced mid-read yields an identity that describes
+    neither version, so the whole path is classified rather than stamped
+    against bytes that are already gone.
+
+    An offset past the end of the file, and an offset that does not begin a
+    record, are both absent from the map and carry a per-offset cause the
+    caller records as a gap. The record-start check is what makes the second of
+    those true: without it a mid-record offset yields the tail of a record, and
+    a stamp written over that partial span has a digest no record will ever
+    reproduce, so it is written and then permanently unreachable. The backfill
+    never guesses a digest.
+    """
+    import hashlib  # noqa: PLC0415 — stdlib, matching the kernel beside it
+    try:
+        with open(path_str, "rb") as fh:
+            before = os.fstat(fh.fileno())
+            data = fh.read()
+            after = os.fstat(fh.fileno())
+    except OSError:
+        return {}, "source_unreadable", None, {}
+    if (before.st_dev != after.st_dev or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns):
+        return {}, "source_changed_during_backfill", None, {}
+    size = len(data)
+    if committed_offset > size:
+        # The cursor describes bytes the file no longer holds, so no identity
+        # this backfill could record would survive the continuity check anyway.
+        return {}, "source_shorter_than_cursor", None, {}
+    identity = (
+        after.st_dev,
+        after.st_ino,
+        hashlib.sha256(data[:max(0, committed_offset)]).hexdigest(),
+    )
+    strip = _lib_conversation_kernel().strip_record_terminator
+    spans = {}
+    offset_causes = {}
+    for offset in offsets:
+        if offset < 0 or offset >= size:
+            offset_causes[offset] = "offset_past_end_of_file"
+            continue
+        if offset and data[offset - 1:offset] != b"\n":
+            # Not a record start. The walker only ever records record-start
+            # offsets, so this means the file's records moved without the
+            # `fstat` pair or the identity check catching it. Slicing from here
+            # would digest a record's tail and write a stamp nothing can find.
+            offset_causes[offset] = "offset_not_a_record_start"
+            continue
+        end = data.find(b"\n", offset)
+        # Include the terminator in the slice and let the shared kernel remove
+        # it, so the `\r\n` rule lives in exactly one place. A last line with no
+        # terminator takes the same path with nothing to strip.
+        span = data[offset:] if end < 0 else data[offset:end + 1]
+        spans[offset] = strip(span)
+    return spans, None, identity, offset_causes
+
+
+def _lib_conversation_kernel():
+    """The pure conversation kernel, imported lazily.
+
+    `_cctally_db` is loaded by every command, and this kernel is reached only
+    by the transcript backfill, so a module-level import would add its cost to
+    `statusline`.
+    """
+    import _lib_conversation  # noqa: PLC0415 — lazy sibling, like _lib_pricing
+    return _lib_conversation
+
+
+def backfill_claude_account_stamps(conn: sqlite3.Connection) -> bool:
+    """Stamp every retained `conversation_messages` row with the account it was
+    ingested under (#777). Resumable, chunked, and idempotent.
+
+    THE ORDERING THIS PROTECTS. A rebuild replays every source file from byte
+    zero and must decide, per record, which account it belongs to. The rule
+    #777 introduces is that a record below the published high-water mark with
+    no stamp is historical-and-unknown and gets NULL, never the currently
+    active account. Production holds 334,239 attributed rows and zero NULLs
+    against an empty stamps table, so shipping that rule without this backfill
+    converts a latent defect into the immediate loss of every historical
+    attribution. This runs INSIDE migration 009, before any rebuild can reach
+    the new rule.
+
+    RESUMABILITY. Progress is a durable cursor — the last source path whose
+    rows are fully stamped — advanced and committed every
+    `_STAMP_BACKFILL_PATHS_PER_TXN` paths. A killed migration re-runs the
+    handler (the dispatcher stamps its marker in a separate transaction, so a
+    crash between the two re-invokes the handler), and it resumes from the
+    cursor rather than restarting. Paths are processed in sorted order, which
+    is what makes a single scalar cursor sufficient.
+
+    IDEMPOTENCE. Stamps and gaps are written with `INSERT OR IGNORE` against
+    their full primary keys, and an incarnation is minted only for a source
+    file that does not already carry one. A second run over the same store
+    therefore reproduces the same rows, which the per-migration golden pins.
+
+    GAPS ARE CLASSIFIED, NOT DISCARDED. A record whose source file has been
+    deleted, or truncated below its offset, has no bytes to digest and cannot
+    get a stamp. Its attribution is still real, and it is recorded in
+    `claude_conversation_account_stamp_gaps` with the cause. Writing NULL there
+    instead would lose exactly the attribution this function exists to keep,
+    for the files most likely to be gone: orphans from removed worktrees.
+
+    Returns True when coverage is complete.
+    """
+    kernel = _lib_conversation_kernel()
+    if conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key=?",
+        (CLAUDE_STAMP_COVERAGE_COMPLETE_KEY,),
+    ).fetchone() is not None:
+        return True
+    row = conn.execute(
+        "SELECT value FROM cache_meta WHERE key=?",
+        (CLAUDE_STAMP_BACKFILL_CURSOR_KEY,),
+    ).fetchone()
+    cursor = row[0] if row and row[0] is not None else ""
+    cursors = {
+        r[0]: (r[1], int(r[2] or 0)) for r in conn.execute(
+            "SELECT path,source_incarnation_id,last_byte_offset "
+            "FROM conversation_source_files")
+    }
+    # Driven by the MESSAGE rows, not by `conversation_source_files`: a message
+    # whose source-file row was pruned still carries an attribution worth
+    # keeping, and the source-file table is the derived half of the pair.
+    paths = [
+        r[0] for r in conn.execute(
+            "SELECT DISTINCT source_path FROM conversation_messages "
+            "WHERE source_path IS NOT NULL AND source_path > ? "
+            "ORDER BY source_path",
+            (cursor,),
+        )
+    ]
+    pending = 0
+    for path_str in paths:
+        rows = conn.execute(
+            "SELECT byte_offset,account_key FROM conversation_messages "
+            "WHERE source_path=? ORDER BY byte_offset",
+            (path_str,),
+        ).fetchall()
+        attribution = {int(offset): key for offset, key in rows}
+        incarnation, committed = cursors.get(path_str, (None, 0))
+        spans, cause, identity, offset_causes = _stamp_backfill_read_records(
+            path_str, sorted(attribution), committed)
+        if identity is None:
+            # Without a trustworthy identity a stamp cannot be found again, so
+            # this path takes the classified-gap branch for every offset — its
+            # attribution survives, keyed by path and offset alone.
+            spans = {}
+        elif path_str in cursors:
+            # Record the WHOLE identity, not just the incarnation. Continuity
+            # is checked on the inode and the committed-prefix digest together
+            # — the device is recorded but does not decide (#814) — so writing
+            # one of the four leaves the other three NULL and the first rebuild
+            # rejects the incarnation it just minted.
+            if incarnation is None:
+                incarnation = kernel.new_source_incarnation_id()
+            conn.execute(
+                "UPDATE conversation_source_files "
+                "SET source_incarnation_id=?, device_id=?, inode=?, "
+                "committed_prefix_sha256=? WHERE path=?",
+                (incarnation, identity[0], identity[1], identity[2], path_str),
+            )
+            cursors[path_str] = (incarnation, committed)
+        elif spans:
+            # A message whose source-file row was pruned. Its bytes are
+            # readable, but no cursor row exists to carry an identity, so a
+            # rebuild would have nothing to check continuity against. Keep the
+            # attribution as a classified gap rather than as a stamp nothing
+            # can reach.
+            spans = {}
+            cause = cause or "no_source_file_cursor"
+        for offset, account_key in attribution.items():
+            span = spans.get(offset)
+            if span is None or incarnation is None:
+                conn.execute(
+                    "INSERT OR IGNORE INTO "
+                    "claude_conversation_account_stamp_gaps"
+                    "(source_path,byte_offset,cause,account_key) "
+                    "VALUES(?,?,?,?)",
+                    (path_str, offset,
+                     cause or offset_causes.get(offset)
+                     or "offset_past_end_of_file", account_key),
+                )
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO claude_conversation_account_stamps"
+                "(canonical_source_path,source_incarnation_id,byte_offset,"
+                "record_sha256,account_key) VALUES(?,?,?,?,?)",
+                (path_str, incarnation, offset,
+                 kernel.record_sha256(span), account_key),
+            )
+        pending += 1
+        if pending >= _STAMP_BACKFILL_PATHS_PER_TXN:
+            _set_cache_meta(conn, CLAUDE_STAMP_BACKFILL_CURSOR_KEY, path_str)
+            conn.commit()
+            pending = 0
+    _set_cache_meta(conn, CLAUDE_STAMP_COVERAGE_COMPLETE_KEY, "1")
+    conn.execute(
+        "DELETE FROM cache_meta WHERE key=?",
+        (CLAUDE_STAMP_BACKFILL_CURSOR_KEY,),
+    )
+    conn.commit()
+    return True
+
+
+@conversations_migration("009_conversation_title_staging_and_account_stamps")
+def _conv_009_conversation_title_staging_and_account_stamps(
+    conn: sqlite3.Connection,
+) -> None:
+    """Deliver #752's staging tables and #777's durable stamps, then backfill.
+
+    Takes the Claude provider flock and defers cleanly on contention, matching
+    conversations migrations 003 and 005: the dispatcher holds only
+    maintenance-shared admission, and this handler mutates staging, stamp and
+    incarnation state that Claude ingestion writes concurrently.
+
+    The DDL is owned by `_apply_conversation_generation_schema`, the same
+    helper the fresh-install schema apply calls, so a fresh store and a
+    migrated 008 store converge on one shape and the object's delivery path is
+    declared rather than incidental (#580).
+
+    It must not assume `conversation_title_fts` exists. Staging carries no FTS,
+    so nothing here touches the index; the `fts5_unavailable` topology and the
+    migration-018 pending-backfill window are therefore both no-ops for this
+    handler rather than special cases.
+    """
+    held = _acquire_conversations_db_claude_provider_flock(
+        conn, migration="conversations 009 title staging and account stamps"
+    )
+    try:
+        _apply_conversation_generation_schema(conn)
+        conn.commit()
+        backfill_claude_account_stamps(conn)
+    finally:
+        _release_cache_db_writer_flocks(held)
+
+
+@conversations_migration("010_codex_conversation_source_file_identity")
+def _conv_010_codex_conversation_source_file_identity(
+    conn: sqlite3.Connection,
+) -> None:
+    """Deliver ``codex_conversation_source_files.device_id``/``.inode``.
+
+    #769 S6, #716 Task A. The conversations twin of cache migration
+    ``046_codex_source_file_identity``, and the same three facts apply: the
+    schema apply that declares the columns is version-gated, so only a
+    registered migration bumps the head and reaches an already-current store;
+    the DDL is owned by ``_apply_codex_conversation_source_identity``, the
+    helper the fresh-install apply also calls, so both shapes converge; and
+    there is deliberately NO backfill, because a stat taken now cannot prove it
+    describes the file the last transcript pass read.
+
+    Takes no provider flock. Unlike conversations 009 beside it, this handler
+    only adds two columns, and ``ALTER TABLE ADD COLUMN`` with no default is a
+    metadata-only change that rewrites no rows, so there is no window in which
+    a concurrent Codex transcript writer could observe a partial rewrite.
+
+    Re-running is a no-op. NO self-stamp — the dispatcher central-stamps on a
+    clean return (#140).
+    """
+    if _table_exists(conn, "codex_conversation_source_files"):
+        _apply_codex_conversation_source_identity(conn)
     conn.commit()
 
 
@@ -8620,6 +9201,38 @@ def _045_conversation_render_revision_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@cache_migration("046_codex_source_file_identity")
+def _046_codex_source_file_identity(conn: sqlite3.Connection) -> None:
+    """Deliver ``codex_session_files.device_id``/``.inode`` (#769 S6, #716 A).
+
+    ``_apply_cache_schema`` declares both columns through
+    ``_apply_codex_session_file_identity``, but that pass is VERSION-GATED:
+    ``open_cache_db`` runs it only when ``PRAGMA user_version`` differs from
+    ``len(_CACHE_MIGRATIONS)``. Registering here bumps the head, which is the
+    mechanism migrations 029, 031, 044 and 045 rely on and is stated there in
+    the same words. Without it an already-current store would never gain the
+    two columns and the Codex ingest commit would fail on every tick.
+
+    NO BACKFILL, and that is a decision rather than an omission. The identity
+    means "the pass that wrote this offset read this inode". A migration
+    running now can stat the pathname, but it cannot know that the file it
+    stats is the file the last ingest read, so writing that stat here would
+    assert something unverified. NULL is the honest value: it says the
+    identity is unknown, which is exactly the evidence every existing store
+    has today, and the real value arrives on the next ingest of that path,
+    where identity and offset are observed together.
+
+    ``codex_session_files`` is checked for existence first for the same reason
+    migration 045 checks its two tables: ``add_column_if_missing`` raises on a
+    missing table, and a table created later is created by the schema apply,
+    whose own body already carries the columns. Re-running is a no-op. NO
+    self-stamp — the dispatcher central-stamps on a clean return (#140).
+    """
+    if _table_exists(conn, "codex_session_files"):
+        _apply_codex_session_file_identity(conn)
+    conn.commit()
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")
@@ -9036,6 +9649,19 @@ def _009_recompute_five_hour_blocks_dedup_fix(
                 block_id, window_key, block_start_at,
                 last_observed_at_utc,
             ) in block_rows:
+                # #751a exemption, recorded deliberately. This walk is a
+                # raw interval and is NOT routed through
+                # `resolve_owning_window`, unlike the live writer and the
+                # two child backfills. It is a one-shot historical
+                # migration whose per-migration goldens are committed, and
+                # the spec's route for correcting history already written
+                # under the raw-interval rule is `claude-usage`
+                # rederivation, not a re-run of this handler. Its
+                # `[block_start, last_observed]` bounds are also the
+                # closed-interval contract
+                # `tests/test_migration_009_boundary_inclusive.py` pins,
+                # which the ownership change must leave alone.
+                #
                 # Walk session_entries over [block_start, last_observed]
                 # joined to session_files for project_path attribution.
                 # NULL session_files.project_path collapses to
@@ -9746,7 +10372,9 @@ def _db_status_for(
         import _cctally_store
         conn = _cctally_store.stats_open_guarded(
             db_path,
-            connect=lambda p: sqlite3.connect(f"file:{p}?mode=rw", uri=True),
+            # #778: forward the opener's `cached_statements=0`.
+            connect=lambda p, **kw: sqlite3.connect(
+                f"file:{p}?mode=rw", uri=True, **kw),
             recover_interruptions=recover_interrupted_stats,
         )
     else:
@@ -11196,10 +11824,11 @@ def cmd_db_backup(args: argparse.Namespace) -> int:
             # a long-lived reader, so it participates in the replacement
             # protocol. The `mode=ro` open is preserved verbatim through the
             # `connect` seam.
-            def _backup_source_connect(_p, _timeout_ms=timeout_ms):
+            # #778: `**kw` carries the opener's `cached_statements=0`.
+            def _backup_source_connect(_p, _timeout_ms=timeout_ms, **kw):
                 return sqlite3.connect(
                     f"file:{_p}?mode=ro", uri=True,
-                    timeout=max(_timeout_ms, 0) / 1000,
+                    timeout=max(_timeout_ms, 0) / 1000, **kw,
                 )
 
             if which == "stats":

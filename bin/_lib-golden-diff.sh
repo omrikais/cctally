@@ -89,13 +89,21 @@ _golden_require_str () {
     local label="$1" golden="$2" actual="$3" max="${4:-200}"
     local dir tmp rc
     dir="${GOLDEN_DIFF_TMPDIR:-${TMPDIR:-/tmp}}"
+    # WORDED FOR THE AGGREGATOR, not only for a terminal (#783). `scrub_line`
+    # replaces a FAIL line's whole detail unless every alphabetic token in it is
+    # reviewed vocabulary, and `could` and `materialize` are not. Both lines
+    # below read as `FAIL [REDACTED: unclassified detail]` in an aggregated
+    # export before this rewording, which is the one report anybody reads after
+    # a remote run. `tests/test_harness_scrub_vocabulary.py` derives these lines
+    # from this file and drives the real scrub over each, so the next line added
+    # here is checked rather than trusted.
     tmp=$(mktemp "$dir/golden-require.XXXXXX") || {
-        echo "FAIL ${name:-?}: could not materialize $label under $dir"
+        echo "FAIL ${name:-?}: $label diverged (mktemp failed under $dir)"
         return 1
     }
     if ! printf '%s\n' "$actual" > "$tmp"; then
         rm "$tmp"
-        echo "FAIL ${name:-?}: could not materialize $label under $dir"
+        echo "FAIL ${name:-?}: $label write failed under $dir"
         return 1
     fi
     _golden_require "$label" "$golden" "$tmp" "$max"
@@ -151,21 +159,35 @@ _golden_require () {
         if [ "${CCTALLY_REGEN_GOLDENS:-}" = "1" ]; then
             if ! mkdir -p "$(dirname "$golden")" \
                     || ! cp "$actual" "$golden"; then
-                echo "FAIL ${name:-?}: could not regenerate $label at $golden"
+                echo "FAIL ${name:-?}: $label regenerate failed at $golden"
                 return 1
             fi
             echo "[REGEN] ${name:-?}: created $golden"
             return 0
         fi
-        echo "FAIL ${name:-?}: $label has no golden at $golden"
-        echo "    (a missing golden is a failure, not an adoption — re-run with"
-        echo "     CCTALLY_REGEN_GOLDENS=1 to create it deliberately)"
+        # The advice rides on the MARKED line, because `scrub_line` replaces an
+        # unmarked continuation whatever its words — measured: `    (missing
+        # golden: re-run with REGEN enabled)` carries no unregistered token and
+        # still reached an aggregated export as `[REDACTED: unclassified
+        # line]`. It is one FAIL line and not two: `classify_failure_marker`
+        # counts markers when it selects failure windows, so a second one made
+        # a single failure look like two.
+        echo "FAIL ${name:-?}: $label has no golden at $golden — re-run with REGEN enabled to create a missing golden"
+        # The indented advisory is kept ALONGSIDE it rather than instead of it.
+        # It is class-replaced in an aggregated export and survives intact on a
+        # terminal, and the terminal reader is the primary audience of a FAIL
+        # line — so keeping it costs the export nothing and is the only place
+        # `CCTALLY_REGEN_GOLDENS` is spelled out. Nothing else in harness
+        # output names the variable, and the marked line above cannot: `GOLDENS`
+        # is not registered vocabulary, so naming it there would replace the
+        # whole detail.
+        echo "    (a missing golden is a failure, not an adoption — re-run with CCTALLY_REGEN_GOLDENS=1 to create it deliberately)"
         return 1
     fi
     if [ "${CCTALLY_REGEN_GOLDENS:-}" = "1" ]; then
         if ! cmp -s "$golden" "$actual"; then
             if ! cp "$actual" "$golden"; then
-                echo "FAIL ${name:-?}: could not regenerate $label at $golden"
+                echo "FAIL ${name:-?}: $label regenerate failed at $golden"
                 return 1
             fi
             echo "[REGEN] ${name:-?}: updated $golden"

@@ -400,7 +400,7 @@ def test_the_footer_states_all_four_quantities():
         "observedMinusModelledPoints": 0.75,
         "residualCause": None,
     })
-    assert "12.50 points across the modelled weeks" in text
+    assert "12.50 points across the modelled cycles" in text
     assert "11.00 in the rows listed" in text
     assert "1.50 filtered or unmodelled" in text
     assert "+0.75 points, as measured" in text

@@ -78,7 +78,9 @@ def _stats_ro_guarded():
 
     return _cctally_store.stats_open_guarded(
         _cctally_core.DB_PATH,
-        connect=lambda p: sqlite3.connect(f"file:{p}?mode=ro", uri=True),
+        # #778: forward the opener's `cached_statements=0`.
+        connect=lambda p, **kw: sqlite3.connect(
+            f"file:{p}?mode=ro", uri=True, **kw),
     )
 
 
@@ -1126,9 +1128,10 @@ def _gather_quota_rate_change(c, rejection=None) -> "dict | None":
     return dict(active, assessed=True)
 
 
-def _read_rollup_pricing_state(conn) -> "tuple[dict | None, str | None]":
+def _read_rollup_pricing_state(conn) -> "tuple[dict | None, str | None, object]":
     """Read the ordered-write guard's two ``cache_meta`` keys from ``conn``
-    (#705), returning ``(refusal_record, stored_fingerprint)``.
+    (#705), returning
+    ``(refusal_record, stored_fingerprint, fingerprint_observation)``.
 
     ONE reader for BOTH stores. The guard runs on the cache.db connection in
     ``sync_cache`` and on the conversations.db connection in
@@ -1145,8 +1148,19 @@ def _read_rollup_pricing_state(conn) -> "tuple[dict | None, str | None]":
     ordinary refusal (an older process against a newer store) apart from a
     value no version can parse, which no restart or rebuild clears.
 
-    Degrades to ``(None, None)`` on a store whose ``cache_meta`` cannot be
-    read, like every other probe in this gather.
+    The fingerprint read goes through ``_cctally_cache
+    ._read_pricing_fingerprint_observation`` — the SAME helper the three writer
+    sites use — so doctor classifies a store exactly as the guard acts on it.
+    Doctor adds a READ here, not a fourth authorization site, but the read it
+    performed was collapsing ``sqlite3.OperationalError`` to absence, so a
+    store it could not open reported "no refused pricing write recorded" and
+    doctor exited OK over a store it had no evidence about (#728). The third
+    element carries that distinction; the first two keep their shapes so every
+    existing consumer of the record and the value is unaffected.
+
+    The refusal record still degrades to None on a store whose ``cache_meta``
+    cannot be read, like every other probe in this gather — the observation is
+    what reports that the read failed.
     """
     import _cctally_cache as _cc_sib
     record = None
@@ -1164,16 +1178,22 @@ def _read_rollup_pricing_state(conn) -> "tuple[dict | None, str | None]":
         except (ValueError, TypeError):
             parsed = None
         record = parsed if isinstance(parsed, dict) else {"__malformed__": True}
-    try:
-        fp_row = conn.execute(
-            "SELECT value FROM cache_meta WHERE key=?",
-            (_cc_sib.CONVERSATION_ROLLUP_PRICING_FP_KEY,),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        fp_row = None
-    if fp_row and fp_row[0]:
-        stored_fp = str(fp_row[0])
-    return record, stored_fp
+    observation = _cc_sib._read_pricing_fingerprint_observation(conn)
+    # #769 S3: only a state whose read actually produced the store's value may
+    # publish one. The `and observation.raw` half is DEFENCE IN DEPTH and is
+    # currently unreachable, which the Tranche 2 review was right to say the
+    # previous comment obscured: `_read_pricing_fingerprint_observation` passes
+    # `raw=None` on every degraded return, so a DEGRADED observation carries no
+    # value to publish today. The guard is kept because the classifier's own
+    # signature permits `found=True, raw=..., error_kind=...`, so a future
+    # degraded path COULD carry one — and publishing it as `stored_fp` would
+    # route doctor's unparseable-value branch, whose remedy is "delete that
+    # cache_meta row", at a row this process never managed to read. MALFORMED
+    # stays included because that value WAS read, and it is the input the
+    # unparseable diagnosis is built from.
+    if observation.state in ("present", "malformed") and observation.raw:
+        stored_fp = str(observation.raw)
+    return record, stored_fp, observation
 
 
 def doctor_gather_state(
@@ -1466,6 +1486,29 @@ def _doctor_gather_state_impl(
                 import _cctally_store as _store_mod
                 conn = _store_mod.stats_open_guarded(_cctally_core.DB_PATH)
                 try:
+                    # HELD-INCLUSIVE, and that is the decision rather than an
+                    # omission (#769 S11, #824). Two different freshness
+                    # questions exist and this leg asks the first of them:
+                    #
+                    #   * PIPELINE freshness — did the write path run recently?
+                    #     `data.latest_snapshot_age` remediates with "check
+                    #     hooks are installed" and "hooks may be broken", so it
+                    #     is asking whether ticks are still arriving. A
+                    #     `weekly_observation_held` row is a real write by a
+                    #     real tick carrying genuine five-hour evidence, so it
+                    #     answers this question and must be counted. Excluding
+                    #     held rows would make doctor report broken hooks
+                    #     during a stretch when the hooks are working and only
+                    #     the weekly meter is clamped.
+                    #   * WEEKLY-AXIS freshness — how old is the newest genuine
+                    #     weekly reading? That is what the status line, the
+                    #     dashboard chip, `report`'s per-row stamp and the
+                    #     hook's OAuth throttle ask, and every one of those
+                    #     excludes held rows.
+                    #
+                    # Pinned by `test_doctor_latest_snapshot_age_counts_a_held_row`
+                    # so a later change that silently converts this leg to the
+                    # second question fails rather than passing quietly.
                     try:
                         row = conn.execute(
                             "SELECT MAX(captured_at_utc) FROM weekly_usage_snapshots"
@@ -1520,11 +1563,19 @@ def _doctor_gather_state_impl(
                         for cr in credit_rows:
                             end_at = cr[1]
                             evt_id = cr[0]
+                            # Held rows excluded: this reads a weekly VALUE
+                            # and compares it against a threshold, unlike the
+                            # freshness leg above, which asks whether the write
+                            # path is alive and therefore counts a held tick as
+                            # the real write it is (#769 S11, #824). The basis
+                            # of a held row carries the same `week_end_at`, so
+                            # the exclusion never empties this lookup.
                             latest = conn.execute(
                                 """
                                 SELECT week_start_date, weekly_percent
                                   FROM weekly_usage_snapshots
                                  WHERE week_end_at = ?
+                                   AND weekly_observation_held = 0
                                  ORDER BY captured_at_utc DESC, id DESC
                                  LIMIT 1
                                 """,
@@ -1571,6 +1622,7 @@ def _doctor_gather_state_impl(
         # `_cache_probe_allowed` gate as its neighbours.
         cache_rollup_pricing_refusal: "dict | None" = None
         cache_rollup_pricing_fp: "str | None" = None
+        cache_rollup_pricing_observation = None
         try:
             if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
                 conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
@@ -1587,6 +1639,7 @@ def _doctor_gather_state_impl(
                     (
                         cache_rollup_pricing_refusal,
                         cache_rollup_pricing_fp,
+                        cache_rollup_pricing_observation,
                     ) = _read_rollup_pricing_state(conn)
                     row = conn.execute(
                         "SELECT COUNT(*), MAX(timestamp_utc) FROM session_entries"
@@ -1627,9 +1680,11 @@ def _doctor_gather_state_impl(
         conv_rollup_sync_in_progress = False
         conversations_db_page_count = None
         conversations_db_freelist_count = None
+        conversations_reclaim_pending = None
         codex_prune_refusals: list[dict] = []
         conversation_rollup_pricing_refusal: "dict | None" = None
         conversation_rollup_pricing_fp: "str | None" = None
+        conversation_rollup_pricing_observation = None
         try:
             if _cctally_core.CONVERSATIONS_DB_PATH.exists():
                 # This gather also runs inside dashboard snapshot precompute. A
@@ -1650,6 +1705,15 @@ def _doctor_gather_state_impl(
                         if row and row[0] is not None:
                             conversations_db_freelist_count = int(row[0])
                     except sqlite3.Error:
+                        pass
+                    try:
+                        # #780: the durable reclaim backlog. Read here rather
+                        # than derived from the freelist, because the freelist
+                        # goes to zero while the bytes are still in the WAL.
+                        import _lib_conversation_retention as _conv_retention
+                        conversations_reclaim_pending = (
+                            _conv_retention.read_reclaim_pending(conn))
+                    except (ImportError, sqlite3.Error):
                         pass
                     try:
                         row = conn.execute(
@@ -1686,6 +1750,7 @@ def _doctor_gather_state_impl(
                     (
                         conversation_rollup_pricing_refusal,
                         conversation_rollup_pricing_fp,
+                        conversation_rollup_pricing_observation,
                     ) = _read_rollup_pricing_state(conn)
                     # Pending reingest/split/backfill flags ⇒ a full sync hasn't yet
                     # reconciled the rollup. Read the canonical flag set from
@@ -2647,6 +2712,9 @@ def _doctor_gather_state_impl(
         conversation_rollup_pricing_fp=conversation_rollup_pricing_fp,
         cache_rollup_pricing_refusal=cache_rollup_pricing_refusal,
         cache_rollup_pricing_fp=cache_rollup_pricing_fp,
+        conversation_rollup_pricing_observation=(
+            conversation_rollup_pricing_observation),
+        cache_rollup_pricing_observation=cache_rollup_pricing_observation,
         stats_db_quick_check=stats_db_quick_check,
         cache_db_quick_check=cache_db_quick_check,
         conversations_db_quick_check=conversations_db_quick_check,
@@ -2666,6 +2734,7 @@ def _doctor_gather_state_impl(
         cache_db_freelist_count=cache_db_freelist_count,
         conversations_db_page_count=conversations_db_page_count,
         conversations_db_freelist_count=conversations_db_freelist_count,
+        conversations_reclaim_pending=conversations_reclaim_pending,
         codex_quota_windows=codex_quota_windows,
         codex_hook_roots=codex_hook_roots,
         codex_hook_liveness=codex_hook_liveness,

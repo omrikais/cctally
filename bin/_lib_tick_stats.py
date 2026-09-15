@@ -130,6 +130,48 @@ class ConversationSyncRecord:
         return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
 
 
+#: The maintenance phases recorded independently of the sync body (#780).
+#: A long reclaim used to run INSIDE the measured conversation-sync body, so it
+#: was published as `conversation_sync status="ok"` with a large duration and
+#: nothing said which part of the pass had been slow.
+#: The three real phases, plus the coercion sink. `other` is deliberately NOT
+#: one of the three: an unrecognised caller name has to become something, and
+#: making it `reclaim` publishes a reclaim record that no reclaim produced —
+#: a fabricated maintenance history rather than a visible coercion.
+MAINTENANCE_PHASES = ("delete", "reclaim", "checkpoint", "other")
+
+#: The maintenance ring is deliberately SHORTER than the two tick rings. The
+#: whole published state is capped at a frozen 65,536 bytes, and a third
+#: full-length ring would spend that budget on a phase that runs about once a
+#: day rather than about once a second. Sixteen records is several weeks of
+#: maintenance history at the throttled cadence, and many continuation passes
+#: at the escalated one.
+MAINTENANCE_RING_CAPACITY = 16
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class MaintenancePhaseRecord:
+    """One timed maintenance phase.
+
+    `phase` is normalized against `MAINTENANCE_PHASES` in the recorder, for the
+    same reason `ConversationSyncRecord.status` is: a frozen field typed `str`
+    would accept `str(exc)` or a filesystem path and publish it through the
+    debug endpoint.
+    """
+
+    seq: int
+    phase: str
+    started_ns: int
+    duration_ns: int
+    outcome: str
+    pages_reclaimed: int = 0
+    bytes_returned: int = 0
+    pending: bool = False
+
+    def as_wire(self) -> dict:
+        return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class StatsSnapshot:
     """An immutable whole-state read. Rebound as one object, never mutated."""
@@ -140,6 +182,7 @@ class StatsSnapshot:
     records: "tuple[TickRecord, ...]"
     standalone: "TickRecord | None"
     conversation_records: "tuple[ConversationSyncRecord, ...]" = ()
+    maintenance_records: "tuple[MaintenancePhaseRecord, ...]" = ()
 
 
 def _frozen_counts(kinds, source=None) -> "types.MappingProxyType[str, int]":
@@ -154,6 +197,7 @@ _EMPTY = StatsSnapshot(
     records=(),
     standalone=None,
     conversation_records=(),
+    maintenance_records=(),
 )
 
 _LOCK = threading.Lock()
@@ -449,6 +493,10 @@ class TickContext:
                 # the whole suite stayed green. Regression:
                 # `tests/test_tick_stats.py`.
                 conversation_records=prior.conversation_records,
+                # #780's maintenance ring fell into exactly the hazard the
+                # comment above describes, on the run that added it: 128 ticks
+                # wiped it 128 times and the suite reported one record.
+                maintenance_records=prior.maintenance_records,
             )
 
 
@@ -513,6 +561,77 @@ def record_conversation_pass(
         _STATE = dataclasses.replace(
             prior,
             conversation_records=(retained + (record,))[-RING_CAPACITY:],
+        )
+
+
+def record_maintenance_phase(phase: str, payload: "dict | None" = None) -> None:
+    """Append one maintenance phase to its own bounded ring (#780).
+
+    Separate from the conversation-sync ring on purpose, so a two-second
+    reclaim and a slow checkpoint each appear as their own timed phase with
+    their own outcome instead of being visible only as one inflated
+    `conversation_sync` duration that reports `ok`.
+
+    Retention still runs INSIDE the measured sync body. §4c asked for it to be
+    moved out; the tranche deliberately did not move it, because the sync
+    thread is the only owner that holds the right locks in the right order,
+    and that deviation is recorded where the decision was taken. This ring is
+    what delivers §4c's actual requirement — that a long reclaim can no longer
+    hide inside `conversation_sync status="ok"` — and it does so by reporting
+    the phase separately, not by relocating it.
+
+    Every field is coerced here. The caller passes a phase record built from
+    SQLite pragma results, and this is the boundary that keeps an unexpected
+    value out of the published state.
+    """
+    global _STATE
+    data = payload or {}
+    safe_phase = phase if phase in MAINTENANCE_PHASES else "other"
+    duration_s = data.get("duration_s") or 0.0
+    try:
+        duration_ns = max(0, int(float(duration_s) * 1_000_000_000))
+    except (TypeError, ValueError):
+        duration_ns = 0
+    pending = bool(data.get("pending"))
+    if safe_phase == "reclaim":
+        pending = bool(data.get("deadline_hit")) or not bool(
+            data.get("made_progress", True))
+        outcome = "deadline" if data.get("deadline_hit") else (
+            "ok" if data.get("made_progress", True) else "no_progress")
+    elif safe_phase == "checkpoint":
+        result = data.get("result")
+        outcome = "ok" if (result and result[0] == 0) else "busy"
+        pending = not (result and result[0] == 0 and result[1] == 0)
+    else:
+        outcome = "ok"
+
+    def _as_int(value):
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    record = MaintenancePhaseRecord(
+        seq=0,
+        phase=safe_phase,
+        started_ns=time.monotonic_ns() - duration_ns,
+        duration_ns=duration_ns,
+        outcome=outcome,
+        pages_reclaimed=_as_int(data.get("pages_reclaimed")),
+        bytes_returned=_as_int(data.get("bytes_returned")),
+        pending=pending,
+    )
+    with _LOCK:
+        prior = _STATE
+        retained = prior.maintenance_records
+        record = dataclasses.replace(
+            record,
+            seq=(retained[-1].seq + 1) if retained else 1,
+        )
+        _STATE = dataclasses.replace(
+            prior,
+            maintenance_records=(
+                retained + (record,))[-MAINTENANCE_RING_CAPACITY:],
         )
 
 

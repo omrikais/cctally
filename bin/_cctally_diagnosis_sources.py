@@ -2793,6 +2793,23 @@ def _evaluate_codex_short_high_context(scope: DiagnosisScope,
     excludes it from the delegated one. The consequence is stated rather than
     hidden: this class is an identifiable subset of unknown completeness on
     Codex, not only the fan-out class.
+
+    #834 S2 (#800): RAW-EVIDENCE PRESENCE IS CLASSIFIED PER CONVERSATION KEY,
+    before origin, turn count or high-context qualification. The population and
+    the origin come from ACCOUNTING rows in `cache.db` while the prompt count
+    comes from the TRANSCRIPT store, so a conversation the accounting names and
+    the transcript store does not retain reached the turn count as zero and was
+    reported as a decided non-contributor. That overstated
+    `evaluabilityCoverage` — it published 1.0 over a window whose transcripts
+    were absent — and it dropped that conversation's cost silently. The Claude
+    twin returns `_unestablished()` in the same situation.
+
+    A GLOBAL test of whether the candidate query returned any row is not
+    sufficient, which is why the classification is per key: candidate rows are
+    stored per conversation, so a global guard still treats a conversation with
+    no retained transcript as evaluated with zero turns whenever some OTHER
+    conversation has rows. A key with rows none of which qualify stays a decided
+    non-contributor, because that is a measurement rather than an absence.
     """
     facts = bundle.facts
     by_conversation, _labels = facts.grouped_entries["session"]
@@ -2813,6 +2830,17 @@ def _evaluate_codex_short_high_context(scope: DiagnosisScope,
                 overflowed.add(key)
                 continue
             candidate_rows[key].append(row)
+    # Presence of RAW candidate evidence, per key. An overflowed key HAS
+    # evidence — its rows exist and ran past the normalize budget — so it is
+    # present here and reports `scan_budget_exhausted` below, which is the
+    # truthful cause for it.
+    has_evidence = {key for key in scoped
+                    if candidate_rows.get(key) or key in overflowed}
+    if not has_evidence:
+        # No key in the window retains a single candidate row, so nothing about
+        # this class was established at all. Matching the Claude twin, which
+        # returns the same when its session population is empty.
+        return _unestablished()
     prompt_counts: dict[str, int] = {}
 
     def _prompt_count(key: str) -> int:
@@ -2848,6 +2876,13 @@ def _evaluate_codex_short_high_context(scope: DiagnosisScope,
     # the published maximum came from a per-turn capacity.
     session_level: dict[str, bool] = {}
     for key in scoped:
+        if key not in has_evidence:
+            # NOT decided. The predicate needs a human turn count and the
+            # transcript store retains nothing to count, so this conversation
+            # leaves the evaluated population rather than being reported as a
+            # non-contributor with zero turns.
+            unevaluable[key] = kernel.GAP_NO_RETAINED_TRANSCRIPT
+            continue
         thread = threads.get(key)
         origin = _codex_origin(
             thread["root_thread_id"] if thread is not None else None)
@@ -3809,23 +3844,34 @@ def _assign_entries_to_blocks(entries: Sequence[AccountingEntry],
     most one window, so no entry is ever counted in two pools. An entry
     matching no compatible window is a coverage gap, reported through
     `unmatched`, and appears in no block.
+
+    Which of several compatible containing windows wins is
+    `_lib_blocks.resolve_owning_window`'s decision (issue #751a): the
+    earliest reset, ties broken by canonical key. This used to take the
+    first containing window in iteration order, and Claude blocks arrive
+    ordered by START, so a window truncated by a credit — one that begins
+    later and resets earlier — lost its own entries to the wider window
+    that began before it.
     """
+    import _lib_blocks
+
+    candidates: dict[tuple, list] = {}
+    for block in blocks:
+        candidates.setdefault((block.root_key, block.pool), []).append(
+            _lib_blocks.OwnedWindow(
+                key=block.key, start=block.start_at, reset=block.end_at,
+            )
+        )
     assigned: dict[str, list[AccountingEntry]] = {}
     unmatched: list[AccountingEntry] = []
     for entry in entries:
-        match = None
-        for block in blocks:
-            if block.root_key != entry.root_key:
-                continue
-            if block.pool != entry.pool:
-                continue
-            if block.start_at <= entry.timestamp < block.end_at:
-                match = block
-                break
-        if match is None:
+        owner = _lib_blocks.resolve_owning_window(
+            entry, candidates.get((entry.root_key, entry.pool), ()),
+        )
+        if owner is None:
             unmatched.append(entry)
             continue
-        assigned.setdefault(match.key, []).append(entry)
+        assigned.setdefault(owner.key, []).append(entry)
     return assigned, unmatched
 
 

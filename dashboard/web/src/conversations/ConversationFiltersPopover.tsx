@@ -206,7 +206,14 @@ export function ConversationFiltersPopover({ source = 'claude', accountKey }: { 
         <div className="conv-rail-filters-label">Project</div>
         <div className="conv-rail-filters-projects">
           {facets.projects.length === 0 && (
-            <div className="conv-rail-filters-empty">No projects.</div>
+            // #717: an empty list means two different things. "No projects."
+            // describes the corpus; while the index is being rebuilt it
+            // describes the index, and the user's next action differs.
+            <div className="conv-rail-filters-empty">
+              {facets.filter_degraded
+                ? 'Projects appear once indexing finishes.'
+                : 'No projects.'}
+            </div>
           )}
           {facets.projects.map((p) => {
             const value = p.filter_value ?? p.project_label;

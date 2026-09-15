@@ -134,12 +134,17 @@ function focusedHero(
   const cycle = (parent.cycles ?? []).find((c) => c.accountKey === accountKey) ?? null;
   const stale = child.quota.summary.freshness === 'stale';
   return {
-    cost_usd: card?.spendUsd ?? 0,
-    input_tokens: card?.inputTokens ?? 0,
-    cached_input_tokens: card?.cachedInputTokens ?? 0,
-    output_tokens: card?.outputTokens ?? 0,
-    reasoning_output_tokens: card?.reasoningOutputTokens ?? 0,
-    total_tokens: card?.totalTokens ?? 0,
+    // #769 S6 / #753. `?? 0` reconstructed a spend of zero whenever the card
+    // was absent, and beside a `SPENT THIS WEEK` label a zero is a claim: it
+    // says this account spent nothing. The server publishes the per-account
+    // hero operands and the card from ONE generation, so an absent card means
+    // there is no figure to show, and null is what renders that honestly.
+    cost_usd: card?.spendUsd ?? null,
+    input_tokens: card?.inputTokens ?? null,
+    cached_input_tokens: card?.cachedInputTokens ?? null,
+    output_tokens: card?.outputTokens ?? null,
+    reasoning_output_tokens: card?.reasoningOutputTokens ?? null,
+    total_tokens: card?.totalTokens ?? null,
     cycle: cycle == null ? null : {
       window_minutes: cycle.window_minutes,
       start_at: cycle.start_at,
@@ -151,6 +156,11 @@ function focusedHero(
     quota: child.quota.summary,
     budget: child.budget.status,
     alerts: { count: child.alerts.rows.length },
+    // #769 S6 / #753: the aggregate's publication state is the provider's, so
+    // a focused account inherits it. Reconciliation is in flight for the whole
+    // Codex source, not for one card, and a focused hero that dropped the
+    // marker would show a retained figure with nothing saying so.
+    ...(parent.update_state == null ? {} : { update_state: parent.update_state }),
     // Retained UNSCOPED so the "All accounts" per-account strip and the chip
     // row keep working while a chip is focused.
     ...(parent.cycles == null ? {} : { cycles: parent.cycles }),

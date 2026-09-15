@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 2,
+  "rangeStart": "2026-04-16",
+  "rangeEnd": "2026-04-17",
+  "weeksInRange": 2,
+  "groupMode": "git-root",
+  "totals": {
+    "costUsd": 1.35,
+    "usedPercent": 71.0,
+    "weeklyAttributionAvailable": true
+  },
+  "attribution": {
+    "basis": "cost-share",
+    "cause": "calibration-absent",
+    "totals": {
+      "modelledWeekPoints": null,
+      "visibleRowPoints": null,
+      "filteredOrUnmodelledPoints": null,
+      "observedMinusModelledPoints": null,
+      "residualCause": "population-misaligned"
+    }
+  },
+  "projects": [
+    {
+      "displayKey": "beta",
+      "projectPath": "/fake/repos/beta",
+      "gitRoot": null,
+      "sessions": 1,
+      "firstSeen": "2026-04-16T01:00:00Z",
+      "lastSeen": "2026-04-16T01:00:00Z",
+      "inputTokens": 170000,
+      "outputTokens": 20000,
+      "cacheWriteTokens": 0,
+      "cacheReadTokens": 0,
+      "costUsd": 1.35,
+      "attributedUsedPercent": 30.0,
+      "costPerPercent": 0.045,
+      "attributionBasis": "cost-share"
+    }
+  ],
+  "warnings": []
+}

@@ -126,7 +126,7 @@ function TrendSection({
             />
             <tbody id={composed ? `trend-rows-${section.source}` : 'trend-rows'}>
               {tableData.map((w) => (
-                <tr key={`${section.source}:${w.label}`} className={w.is_current ? 'current' : undefined}>
+                <tr key={`${section.source}:${w.week_start_at ?? w.label}`} className={w.is_current ? 'current' : undefined}>
                   <td>
                     <PeriodAccountChips labels={w.account_labels} />
                     {section.source === 'codex'
@@ -164,8 +164,11 @@ export function TrendPanel() {
   const hydratingEmpty = presentationProviders(env, activeSource).hydrating && totalRows === 0;
   const single = presentation.sections[0];
   const singleVocabulary = trendVocabulary(single?.source ?? 'claude');
+  // #750 S4 §4.1: the composed subtitle goes through the vocabulary too. It
+  // hardcoded `w` for Claude and `c` for Codex, which is the same
+  // week-versus-cycle distinction that module no longer draws.
   const sub = activeSource === 'all'
-    ? `(Claude ${presentation.sections[0]?.rows.length ?? 0}w · Codex ${presentation.sections[1]?.rows.length ?? 0}c)`
+    ? `(Claude ${presentation.sections[0]?.rows.length ?? 0}c · Codex ${presentation.sections[1]?.rows.length ?? 0}c)`
     : `(${trendUnitCount(single?.rows.length ?? 0, singleVocabulary)})`;
 
   return (
@@ -233,7 +236,9 @@ export function TrendPanel() {
                   </h3>
                   <span className={`source-chip source-chip--${section.source}`}>{section.label}</span>
                   <span className="provider-summary-label">
-                    {section.rows.length} {section.source === 'claude' ? 'weeks' : 'cycles'}
+                    {/* Routed through the vocabulary rather than branching on
+                        the provider (#750 S4 §4.1). */}
+                    {trendUnitCount(section.rows.length, trendVocabulary(section.source))}
                   </span>
                 </div>
                 <TrendSection section={section} trendOverride={trendOverride} composed />

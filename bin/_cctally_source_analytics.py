@@ -46,7 +46,22 @@ UTC = dt.timezone.utc
 
 
 class QualifiedMetadataUnavailable(RuntimeError):
-    """S1-qualified metadata is absent or cannot be truthfully read."""
+    """S1-qualified metadata is absent or cannot be truthfully read.
+
+    #834 S2 (#829): ``transient`` says which of those two it is. A failure of
+    the READ — a SQLite error, a contended ingest lock, a cache that would not
+    open — can succeed on the next refresh and must NOT tell the reader to
+    rebuild their Codex cache. A row that is deterministically unqualifiable
+    will still be unqualifiable next time, and rebuilding IS its remedy.
+
+    The default is ``True`` because an unclassified failure is safer treated
+    as transient: naming a rebuild that would not help is worse than saying a
+    build will retry.
+    """
+
+    def __init__(self, *args: object, transient: bool = True) -> None:
+        super().__init__(*args)
+        self.transient = bool(transient)
 
 
 class SourceUsageError(ValueError):
@@ -236,6 +251,182 @@ _CODEX_PROJECT_METADATA_HEALTH_LEGACY_SQL = """
 """
 
 
+# === #834 S2 (#828) — the bounded detail-horizon metadata probe ============
+#
+# `_CODEX_PROJECT_METADATA_HEALTH_SQL` above counts two qualification failures
+# and the qualified reader rejects more: it parses the timestamp at
+# `_parse_timestamp` and the integer token operands inside
+# `_calculate_codex_entry_cost`, raising `QualifiedMetadataUnavailable` on
+# either. A row with intact joins and a malformed timestamp was therefore
+# counted healthy by that SQL and refused by the reader.
+#
+# The horizon is the other half. The generation's accounting window is roughly
+# thirty calendar days while both detail routes read a YEAR, so a malformed row
+# aged thirty-one to three hundred and sixty-five days set no flag at all and
+# the page rendered in full with that row's cost silently absent.
+#
+# TWO LIMITS, stated rather than hidden. First, this probe and the qualified
+# reader share the same TEXT range bounds, so a timestamp malformed enough to
+# sort outside the window is invisible to BOTH — such a row also contributes to
+# no figure and reaches no route, so the two agree about it by construction.
+# Second, the text-integer test below strips the signed-digit character set
+# from the left, which admits a pathological interior form such as `1-2` that
+# `int()` would refuse. Neither writer in this repository produces either
+# shape, and both errors are in the direction of counting fewer rows, never of
+# degrading a page that would have rendered.
+
+#: The five integer operands the qualified reader parses. `total_tokens` is
+#: included even though its `int()` sits OUTSIDE the reader's `try`, so a
+#: malformed value there escapes as a bare `ValueError` rather than as
+#: `QualifiedMetadataUnavailable`. It is still a row the reader cannot turn
+#: into an entry, which is what this probe counts.
+_CODEX_TOKEN_OPERANDS = (
+    "input_tokens", "cached_input_tokens", "output_tokens",
+    "reasoning_output_tokens", "total_tokens",
+)
+
+
+def _unusable_integer_predicate(column: str) -> str:
+    """SQL for one token operand that ``int()`` would refuse."""
+    qualified = f"entries.{column}"
+    return (
+        f"(typeof({qualified}) IN ('null', 'blob')"
+        f" OR (typeof({qualified}) = 'text'"
+        f" AND ({qualified} = ''"
+        f" OR ltrim({qualified}, '+-0123456789') != '')))"
+    )
+
+
+#: A timestamp the qualified reader can turn into an aware UTC instant.
+#: `datetime()` returns NULL for anything SQLite cannot parse, and the offset
+#: test is what rejects a naive value — `dt.datetime.fromisoformat` yields a
+#: naive object for those and `_parse_timestamp` raises on it.
+_CODEX_AWARE_TIMESTAMP_SQL = """(
+        entries.timestamp_utc IS NOT NULL
+        AND datetime(entries.timestamp_utc) IS NOT NULL
+        AND (
+            entries.timestamp_utc LIKE '%Z'
+            OR entries.timestamp_utc GLOB '*[+-][0-9][0-9]:[0-9][0-9]'
+            OR entries.timestamp_utc GLOB '*[+-][0-9][0-9][0-9][0-9]'
+        )
+    )"""
+
+_CODEX_DETAIL_PROBE_JOIN_SQL = """
+        entries.conversation_key IS NOT NULL
+        AND entries.conversation_key != ''
+        AND threads.conversation_key IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM codex_session_files AS files
+          JOIN codex_conversation_threads AS inherited
+            ON inherited.source_root_key = entries.source_root_key
+           AND inherited.native_thread_id = files.last_native_thread_id
+         WHERE files.path = entries.source_path
+           AND files.source_root_key = entries.source_root_key
+        )"""
+
+_CODEX_DETAIL_PROBE_JOIN_LEGACY_SQL = """
+        entries.conversation_key IS NOT NULL
+        AND entries.conversation_key != ''
+        AND threads.conversation_key IS NULL"""
+
+
+def _codex_detail_metadata_probe_sql(cache_conn: sqlite3.Connection) -> str:
+    """Compose the probe over whichever thread-alias shape this cache carries."""
+    join_predicate = (
+        _CODEX_DETAIL_PROBE_JOIN_SQL if _supports_native_file_aliases(cache_conn)
+        else _CODEX_DETAIL_PROBE_JOIN_LEGACY_SQL
+    )
+    token_predicate = "\n           OR ".join(
+        _unusable_integer_predicate(column) for column in _CODEX_TOKEN_OPERANDS
+    )
+    # Direct non-null bounds, never the nullable `(? IS NULL OR ...)` form the
+    # unbounded doctor helper needs: that form is opaque to the query planner,
+    # so it cannot use the timestamp-leading index and reads every row.
+    return f"""
+    SELECT
+      COUNT(*) AS total_rows,
+      COALESCE(SUM(CASE WHEN
+           entries.conversation_key IS NULL OR entries.conversation_key = ''
+           OR ({join_predicate}
+        )
+           OR NOT {_CODEX_AWARE_TIMESTAMP_SQL}
+           OR {token_predicate}
+        THEN 1 ELSE 0 END), 0) AS unqualifiable_rows
+      FROM codex_session_entries AS entries
+           INDEXED BY idx_codex_entries_ts_root_conversation
+      LEFT JOIN codex_conversation_threads AS threads
+        ON threads.conversation_key = entries.conversation_key
+       AND threads.source_root_key = entries.source_root_key
+     WHERE entries.timestamp_utc >= ?
+       AND entries.timestamp_utc < ?
+"""
+
+
+def _probe_bounds(start: dt.datetime, end: dt.datetime) -> tuple[str, str]:
+    bound_start = _metadata_health_bound(start, name="start")
+    bound_end = _metadata_health_bound(end, name="end")
+    if bound_start is None or bound_end is None:
+        raise ValueError("the bounded probe requires both bounds")
+    if start > end:
+        raise ValueError("start must not be after end")
+    return bound_start, bound_end
+
+
+def probe_codex_detail_metadata_health(
+    *,
+    cache_conn: sqlite3.Connection,
+    start: dt.datetime,
+    end: dt.datetime,
+) -> CodexProjectMetadataHealth:
+    """Count rows in ``[start, end)`` the qualified reader would refuse.
+
+    Bounds are REQUIRED and both timezone-aware, unlike
+    ``load_codex_project_metadata_health``, which keeps its nullable predicate
+    for ``doctor``'s all-history read. The two are separate entry points on
+    purpose: they answer questions over different populations, and folding one
+    into the other would let a year-old malformed row redefine thirty-day
+    aggregate availability.
+
+    The returned partition reports the count under
+    ``missing_conversation_key_rows`` because this probe is a single verdict
+    rather than a per-cause breakdown; ``incomplete_rows`` is the figure every
+    caller reads.
+    """
+    bound_start, bound_end = _probe_bounds(start, end)
+    row = cache_conn.execute(
+        _codex_detail_metadata_probe_sql(cache_conn), (bound_start, bound_end),
+    ).fetchone()
+    if row is None or len(row) != 2:
+        raise RuntimeError("Codex detail metadata probe returned no partition")
+    try:
+        total_rows, unqualifiable_rows = (int(value) for value in row)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Codex detail metadata probe returned invalid counts") from exc
+    if total_rows < 0 or unqualifiable_rows < 0 or unqualifiable_rows > total_rows:
+        raise RuntimeError("Codex detail metadata probe partition is invalid")
+    return CodexProjectMetadataHealth(
+        total_rows=total_rows,
+        qualified_rows=total_rows - unqualifiable_rows,
+        missing_conversation_key_rows=unqualifiable_rows,
+        missing_thread_join_rows=0,
+    )
+
+
+def explain_codex_detail_metadata_probe(
+    *,
+    cache_conn: sqlite3.Connection,
+    start: dt.datetime,
+    end: dt.datetime,
+) -> tuple[str, ...]:
+    """Return the probe's query plan, so a test can prove it seeks."""
+    bound_start, bound_end = _probe_bounds(start, end)
+    rows = cache_conn.execute(
+        "EXPLAIN QUERY PLAN " + _codex_detail_metadata_probe_sql(cache_conn),
+        (bound_start, bound_end),
+    ).fetchall()
+    return tuple(str(row[-1]) for row in rows)
+
+
 def _supports_native_file_aliases(cache_conn: sqlite3.Connection) -> bool:
     """Return whether this cache generation can link child files to a root task."""
     try:
@@ -250,12 +441,17 @@ def _cctally():
 
 
 def _parse_timestamp(value: object) -> dt.datetime:
+    # #834 S2 (#829): deterministic. A stored timestamp that will not parse, or
+    # that carries no offset, is a property of the ROW; the next refresh reads
+    # the same bytes and refuses again.
     try:
         timestamp = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except (TypeError, ValueError) as exc:
-        raise QualifiedMetadataUnavailable("Codex accounting metadata is unavailable") from exc
+        raise QualifiedMetadataUnavailable(
+            "Codex accounting metadata is unavailable", transient=False) from exc
     if timestamp.tzinfo is None or timestamp.utcoffset() is None:
-        raise QualifiedMetadataUnavailable("Codex accounting metadata is unavailable")
+        raise QualifiedMetadataUnavailable(
+            "Codex accounting metadata is unavailable", transient=False)
     return timestamp.astimezone(UTC)
 
 
@@ -468,6 +664,63 @@ def _git_resolved_key(value: object) -> str | None:
     return "git:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+class _CodexProjectResolution:
+    """The per-entry project precedence, stated ONCE (#815).
+
+    Per entry the precedence is: thread ``cwd``, then inherited ``cwd``, then
+    thread ``git_json``, then inherited ``git_json``, then ``(unassigned)``.
+    The first two outrank BOTH git members because ``cwd = row["cwd"] or
+    inherited["cwd"]`` is evaluated before either ``git_json`` is consulted —
+    so a thread carrying no ``cwd`` and a direct ``git_json`` resolving to
+    project A, read through a path whose inherited ``cwd`` resolves to project
+    B, belongs to B.
+
+    Extracted so that the scoped project read resolves keys through exactly the
+    same code the unscoped qualifier uses. Two implementations of this
+    precedence is the shape in which one of them silently stops matching the
+    other, and here that would mean a project detail quietly losing rows.
+
+    The caches are the ones the qualifier already kept: there are 337 distinct
+    working directories on the production store against 216,165 accounting
+    rows, so the per-``cwd`` cache does almost all the work.
+    """
+
+    __slots__ = ("_group", "_resolver_cache", "_by_cwd", "_by_git_json")
+
+    def __init__(self, group: str = "git-root") -> None:
+        self._group = group
+        self._resolver_cache: dict[object, object] = {}
+        self._by_cwd: dict[str, object] = {}
+        self._by_git_json: dict[str, str | None] = {}
+
+    def resolve(self, cwd: object, git_json: object) -> tuple[str, str]:
+        """Return ``(resolved_key, project_label)`` for one already-merged pair."""
+        if isinstance(cwd, str) and cwd:
+            project = self._by_cwd.get(cwd)
+            if project is None:
+                project = _cctally()._resolve_project_key(
+                    cwd, self._group, self._resolver_cache)
+                self._by_cwd[cwd] = project
+            cwd_label = _project_label(cwd)
+            return project.bucket_path, (
+                cwd_label if cwd_label in {"(home)", "(root)"}
+                else _project_label(project.display_key)
+            )
+        if isinstance(git_json, str) and git_json not in self._by_git_json:
+            self._by_git_json[git_json] = _git_resolved_key(git_json)
+        git_key = (
+            self._by_git_json.get(git_json) if isinstance(git_json, str) else None
+        )
+        if git_key is None:
+            return "(unassigned)", "(unassigned)"
+        return git_key, "Git project"
+
+    def project_key(self, root_key: str, cwd: object, git_json: object) -> str:
+        """The opaque key one metadata pair resolves to, under one root."""
+        resolved, _label = self.resolve(cwd, git_json)
+        return opaque_project_key("codex", root_key, resolved)
+
+
 def _require_joined_metadata(row: sqlite3.Row) -> tuple[str, str]:
     root_key = row["source_root_key"]
     conversation_key = row["conversation_key"]
@@ -477,7 +730,11 @@ def _require_joined_metadata(row: sqlite3.Row) -> tuple[str, str]:
         or row["joined_conversation_key"] != conversation_key
         or row["joined_source_root_key"] != root_key
     ):
-        raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable")
+        # #834 S2 (#829): deterministic. A missing key or an absent same-root
+        # thread join is a property of the ROW, and rebuilding the Codex cache
+        # is its remedy.
+        raise QualifiedMetadataUnavailable(
+            "Codex qualified project metadata is unavailable", transient=False)
     return root_key, conversation_key
 
 
@@ -567,9 +824,23 @@ def load_qualified_codex_entries(
         else:
             conn.row_factory = previous_row_factory
 
-    resolver_cache: dict[object, object] = {}
-    resolved_by_cwd: dict[str, object] = {}
-    resolved_by_git_json: dict[str, str | None] = {}
+    return _qualify_codex_rows(
+        rows, inherited_metadata, speed=speed, group=group)
+
+
+def _qualify_codex_rows(
+    rows, inherited_metadata, *, speed: str, group: str = "git-root",
+    projects: "_CodexProjectResolution | None" = None,
+) -> tuple[QualifiedCodexEntry, ...]:
+    """Turn accounting rows plus their metadata into qualified entries.
+
+    The one implementation of the per-entry qualification, shared by the
+    unscoped year-long read and the project-scoped read (#815), so a scoped
+    request can never assign a row differently from the unscoped one.
+    """
+    c = _cctally()
+    if projects is None:
+        projects = _CodexProjectResolution(group)
     result: list[QualifiedCodexEntry] = []
     for row in rows:
         root_key = row["source_root_key"]
@@ -585,28 +856,9 @@ def load_qualified_codex_entries(
             ):
                 raise
         cwd = row["cwd"] or (inherited["cwd"] if inherited is not None else None)
-        if isinstance(cwd, str) and cwd:
-            project = resolved_by_cwd.get(cwd)
-            if project is None:
-                project = c._resolve_project_key(cwd, group, resolver_cache)
-                resolved_by_cwd[cwd] = project
-            resolved_key = project.bucket_path
-            cwd_label = _project_label(cwd)
-            project_label = (
-                cwd_label if cwd_label in {"(home)", "(root)"}
-                else _project_label(project.display_key)
-            )
-        else:
-            git_json = row["git_json"] or (inherited["git_json"] if inherited is not None else None)
-            if isinstance(git_json, str) and git_json not in resolved_by_git_json:
-                resolved_by_git_json[git_json] = _git_resolved_key(git_json)
-            git_key = resolved_by_git_json.get(git_json) if isinstance(git_json, str) else None
-            if git_key is None:
-                resolved_key = "(unassigned)"
-                project_label = "(unassigned)"
-            else:
-                resolved_key = git_key
-                project_label = "Git project"
+        git_json = row["git_json"] or (
+            inherited["git_json"] if inherited is not None else None)
+        resolved_key, project_label = projects.resolve(cwd, git_json)
         try:
             cost_usd = c._calculate_codex_entry_cost(
                 str(row["model"]), int(row["input_tokens"]),
@@ -614,7 +866,10 @@ def load_qualified_codex_entries(
                 int(row["reasoning_output_tokens"]), speed=speed,
             )
         except (TypeError, ValueError, OverflowError) as exc:
-            raise QualifiedMetadataUnavailable("Codex qualified accounting is unavailable") from exc
+            # #834 S2 (#829): deterministic. A stored token operand `int()`
+            # refuses is a property of the ROW.
+            raise QualifiedMetadataUnavailable(
+                "Codex qualified accounting is unavailable", transient=False) from exc
         result.append(QualifiedCodexEntry(
             timestamp=_parse_timestamp(row["timestamp_utc"]),
             session_id=str(row["session_id"] or ""),
@@ -636,6 +891,274 @@ def load_qualified_codex_entries(
             cache_entry_id=int(row["cache_entry_id"]),
         ))
     return tuple(result)
+
+
+_CODEX_PROJECT_THREAD_METADATA_SQL = """
+    SELECT conversation_key, source_root_key, cwd, git_json
+      FROM codex_conversation_threads
+"""
+
+
+def _require_sql_replace(sql: str, marker: str, replacement: str) -> str:
+    """Rewrite ``marker`` in ``sql``, refusing when it is not there.
+
+    A silent ``str.replace`` no-op is the failure mode this guards. Both scoped
+    constants below are derived from ``_QUALIFIED_CODEX_ENTRIES_SQL`` by
+    rewriting three markers in it. Reflow that constant — re-indent it, move its
+    ``ORDER BY``, rename its index hint — and every replacement quietly matches
+    nothing: the derived statement keeps the year-wide `WHERE`, loses its
+    identity predicate, and is then executed with FOUR bound parameters against
+    TWO placeholders. That is an unscoped read plus a binding error, arriving at
+    import time with no diagnostic naming the constant that moved.
+    """
+    if marker not in sql:
+        raise AssertionError(
+            "_QUALIFIED_CODEX_ENTRIES_SQL no longer contains the marker "
+            f"{marker!r}; the scoped Codex accounting statements are derived "
+            "from it by rewriting that text, so a reflow of that constant must "
+            "be mirrored here rather than left to no-op into an unscoped read"
+        )
+    return sql.replace(marker, replacement)
+
+
+#: The accounting read, re-shaped to seek ONE cache identity. Both forms keep
+#: the qualifier's own SELECT list and its `LEFT JOIN` verbatim, so a scoped
+#: row arrives in exactly the shape `_qualify_codex_rows` expects.
+#:
+#: ONE QUERY PER IDENTITY, never a disjunction over all of them. A
+#: multi-identity `OR` predicate makes SQLite abandon the index and scan the
+#: table — the reason `_cctally_quota.load_codex_quota_observations` issues one
+#: shard per physical group, and the reason
+#: `tests/test_codex_entries_root_path_index.py` exists at all. A scan hiding
+#: behind a correct row count is invisible to a materialisation counter, so
+#: both shapes below carry an `EXPLAIN QUERY PLAN` regression.
+#:
+#: THE `ORDER BY` COMES OFF. The unscoped statement orders its rows because it
+#: is the whole population; each shard here is one of many whose union
+#: `load_codex_project_scoped_entries` re-sorts in Python anyway, so a SQL sort
+#: is superseded the moment it returns. It is not free: the forced `INDEXED BY`
+#: cannot supply that order, so SQLite builds a temporary B-tree per shard to
+#: produce an ordering nothing reads.
+_CONVERSATION_SCOPED_CODEX_ENTRIES_SQL = _require_sql_replace(
+    _require_sql_replace(
+        _require_sql_replace(
+            _QUALIFIED_CODEX_ENTRIES_SQL,
+            "INDEXED BY idx_codex_entries_ts_root_conversation",
+            "INDEXED BY idx_codex_entries_conversation",
+        ),
+        "     WHERE entries.timestamp_utc >= ?",
+        "     WHERE entries.conversation_key = ?\n"
+        "       AND entries.source_root_key = ?\n"
+        "       AND entries.timestamp_utc >= ?",
+    ),
+    "     ORDER BY entries.timestamp_utc ASC, entries.source_root_key ASC,\n"
+    "              entries.conversation_key ASC, entries.id ASC\n",
+    "",
+)
+
+_ROOT_PATH_SCOPED_CODEX_ENTRIES_SQL = _require_sql_replace(
+    _require_sql_replace(
+        _require_sql_replace(
+            _QUALIFIED_CODEX_ENTRIES_SQL,
+            "INDEXED BY idx_codex_entries_ts_root_conversation",
+            "INDEXED BY idx_codex_entries_root_path",
+        ),
+        "     WHERE entries.timestamp_utc >= ?",
+        "     WHERE entries.source_root_key = ?\n"
+        "       AND entries.source_path = ?\n"
+        "       AND entries.timestamp_utc >= ?",
+    ),
+    "     ORDER BY entries.timestamp_utc ASC, entries.source_root_key ASC,\n"
+    "              entries.conversation_key ASC, entries.id ASC\n",
+    "",
+)
+
+
+def _load_inherited_codex_metadata(conn) -> "dict[tuple[str, str], sqlite3.Row]":
+    """The file-alias metadata map, keyed by ``(source_root_key, path)``.
+
+    ``setdefault`` and not assignment: the statement orders by
+    ``inherited.last_seen_utc DESC, inherited.conversation_key DESC`` and the
+    qualifier keeps the FIRST row per identity, so a second writer for the same
+    path must not win.
+    """
+    inherited_metadata: "dict[tuple[str, str], sqlite3.Row]" = {}
+    if not _supports_native_file_aliases(conn):
+        return inherited_metadata
+    for inherited in conn.execute(_INHERITED_CODEX_PROJECT_METADATA_SQL):
+        identity = (
+            str(inherited["source_root_key"] or ""), str(inherited["path"] or ""))
+        if all(identity):
+            inherited_metadata.setdefault(identity, inherited)
+    return inherited_metadata
+
+
+def resolve_codex_project_scope(
+    conn, matches_project_key, *, group: str = "git-root",
+) -> "tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...], dict]":
+    """Stage one: which cache identities can carry the requested project (#815)?
+
+    ``matches_project_key`` is a predicate over the OPAQUE project key rather
+    than a value, because the dashboard identifies a project by
+    ``dashboard_resource_key``, which is a non-reversible digest OVER that
+    opaque key. Neither identifier can be turned back into the other, so the
+    only way to decide membership is to derive a candidate's opaque key and let
+    the caller say whether it is the one requested.
+
+    ``opaque_project_key`` is not reversible, so the requested key cannot
+    become a SQL predicate. It has to be re-derived over the metadata tables
+    and compared — roughly 5,637 rows against 216,165 accounting rows on the
+    production store, with at most 337 git-root resolutions. Spec §4.6 accepts
+    that metadata read as disclosed resolution evidence.
+
+    Returns ``(conversations, paths, inherited_metadata)``: the
+    ``(source_root_key, conversation_key)`` identities to seek, the
+    ``(source_root_key, source_path)`` identities to seek, and the inherited
+    map stage two needs to qualify whatever it finds.
+
+    WHY TWO SHARDS AND WHY THEY ARE COMPLETE. An entry's key is
+    ``combined(thread, inherited)`` under the precedence in
+    ``_CodexProjectResolution``. That value differs from the thread's own key
+    only when the thread carries no ``cwd`` AND the inherited row supplies one,
+    or when neither carries a ``cwd`` and only the inherited row carries a
+    ``git_json`` — and in both of those cases the result is exactly the
+    inherited row's OWN key. So every eligible entry is reachable either from a
+    thread whose own metadata resolves to the request, or from an aliased path
+    whose own metadata does. That is what keeps the case the review
+    constructed: a thread with no ``cwd`` and a direct ``git_json`` resolving
+    to project A, read through a path whose inherited ``cwd`` resolves to
+    project B, belongs to B and is found through the path shard.
+
+    Both shards deliberately OVER-collect — an entry of a listed conversation
+    read through a path that reassigns it is selected here and dropped later.
+    Stage two re-qualifies every row and gates on the resolved key, so
+    over-collection costs rows read and never correctness. Under-collection
+    would silently lose a project's spend, which is why the shards are derived
+    from the precedence rather than from a guess about which is "the" axis.
+    """
+    projects = _CodexProjectResolution(group)
+    previous_row_factory = conn.row_factory
+    try:
+        # Set here rather than assumed, so this resolver is usable on a plain
+        # caller-owned connection as well as inside the scoped read.
+        conn.row_factory = sqlite3.Row
+        conversations: list[tuple[str, str]] = []
+        for row in conn.execute(_CODEX_PROJECT_THREAD_METADATA_SQL):
+            root_key = str(row["source_root_key"] or "")
+            conversation_key = str(row["conversation_key"] or "")
+            if not root_key or not conversation_key:
+                continue
+            if matches_project_key(
+                projects.project_key(root_key, row["cwd"], row["git_json"])
+            ):
+                conversations.append((root_key, conversation_key))
+        inherited_metadata = _load_inherited_codex_metadata(conn)
+    finally:
+        conn.row_factory = previous_row_factory
+    paths: list[tuple[str, str]] = []
+    for (root_key, path), inherited in inherited_metadata.items():
+        if matches_project_key(projects.project_key(
+            root_key, inherited["cwd"], inherited["git_json"],
+        )):
+            paths.append((root_key, path))
+    return tuple(sorted(set(conversations))), tuple(sorted(set(paths))), inherited_metadata
+
+
+def load_codex_project_scoped_entries(
+    start: dt.datetime,
+    end: dt.datetime,
+    *,
+    speed: str,
+    matches_project_key,
+    cache_conn,
+    group: str = "git-root",
+) -> tuple[QualifiedCodexEntry, ...]:
+    """One project's qualified accounting, without loading the year (#815).
+
+    BOTH STAGES RUN UNDER ONE EXPLICIT READ TRANSACTION. Python's ``sqlite3``
+    driver does not begin a transaction for a ``SELECT`` — this repository
+    records that at ``bin/_cctally_cache.py:7607`` — and the detail route's
+    context opener merely opens a connection. A cache writer can therefore
+    commit a new conversation belonging to this project between the two
+    stages: the single joined statement the unscoped read issues would see
+    both the thread and its entries, while a staged selector whose identity set
+    came from the earlier statement would miss the entries. Silently
+    under-reporting during ingest is worse than being slow.
+
+    THE TRANSACTION IS HELD ACROSS FILESYSTEM CALLS, which is a residual rather
+    than an oversight (spec §9). Stage one resolves each distinct ``cwd``
+    through ``_resolve_project_key``, which calls ``os.path.realpath`` and
+    walks parents with ``os.path.exists`` — up to 337 distinct working
+    directories on the production store. In WAL mode a held read transaction
+    blocks checkpointing, and this repository already carries a cache.db
+    WAL-bloat incident. The measured whole-route cost is 68.6 ms, so the window
+    is small, but on a slow or network-backed path a single ``realpath`` can
+    block for much longer. The per-``cwd`` resolver cache is what keeps the
+    call count near the number of distinct directories rather than the number
+    of threads.
+    """
+    if start.tzinfo is None or start.utcoffset() is None:
+        raise ValueError("start must be timezone-aware")
+    if end.tzinfo is None or end.utcoffset() is None:
+        raise ValueError("end must be timezone-aware")
+    if end <= start:
+        raise ValueError("end must be after start")
+
+    conn = cache_conn
+    previous_row_factory = conn.row_factory
+    started_transaction = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+            started_transaction = True
+        conn.row_factory = sqlite3.Row
+        conversations, paths, inherited_metadata = resolve_codex_project_scope(
+            conn, matches_project_key, group=group)
+        if not conversations and not paths:
+            return ()
+        start_iso = start.astimezone(UTC).isoformat()
+        end_iso = end.astimezone(UTC).isoformat()
+        selected: "dict[int, sqlite3.Row]" = {}
+        for root_key, conversation_key in conversations:
+            for row in conn.execute(
+                _CONVERSATION_SCOPED_CODEX_ENTRIES_SQL,
+                (conversation_key, root_key, start_iso, end_iso),
+            ):
+                selected[int(row["cache_entry_id"])] = row
+        for root_key, path in paths:
+            for row in conn.execute(
+                _ROOT_PATH_SCOPED_CODEX_ENTRIES_SQL,
+                (root_key, path, start_iso, end_iso),
+            ):
+                selected[int(row["cache_entry_id"])] = row
+        # The union is re-ordered the way the unscoped statement orders it, so
+        # every downstream "first row wins" or "last row wins" rule sees the
+        # same sequence it would have seen.
+        rows = [
+            selected[identity] for identity in sorted(
+                selected,
+                key=lambda identity: (
+                    str(selected[identity]["timestamp_utc"] or ""),
+                    str(selected[identity]["source_root_key"] or ""),
+                    str(selected[identity]["conversation_key"] or ""),
+                    identity,
+                ),
+            )
+        ]
+    except sqlite3.Error as exc:
+        raise QualifiedMetadataUnavailable(
+            "Codex qualified project metadata is unavailable") from exc
+    finally:
+        conn.row_factory = previous_row_factory
+        if started_transaction:
+            conn.rollback()
+    qualified = _qualify_codex_rows(
+        rows, inherited_metadata, speed=speed, group=group)
+    # THE FINAL GATE. Over-collection above is deliberate, so the scoped read
+    # can never admit a row the unscoped read would have assigned elsewhere.
+    return tuple(
+        entry for entry in qualified
+        if matches_project_key(entry.project_key))
 
 
 def load_codex_accounting_entries(

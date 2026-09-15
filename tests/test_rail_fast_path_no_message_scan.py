@@ -128,3 +128,77 @@ def test_live_branch_reaches_all_retained_maps(tmp_path, monkeypatch):
             f"live branch skipped a map: reached={reached}"
     finally:
         conn.close()
+
+
+# --- #769 S3 A11: the READ side of #728 -----------------------------------
+# `_rollup_authoritative` did `except sqlite3.OperationalError: return True`,
+# so a read it could not perform reported the rollup as AUTHORITATIVE. That is
+# the same failure class #728 fixed on the write side, in the more dangerous
+# direction: a refused write costs a stale rollup, while a wrongly-authoritative
+# read serves a rollup nobody verified. It fails closed now — a read that could
+# not happen reports "not authoritative", costing live aggregation.
+
+
+class _ExecProxy:
+    """A connection whose `execute` raises for statements matching `fail_on`.
+
+    `sqlite3.Connection.execute` is a read-only C attribute, so it cannot be
+    monkeypatched; a proxy is the only way to make one specific statement fail
+    while the rest of the connection stays real. `_rollup_authoritative` reads
+    through `execute` alone, so nothing else needs forwarding.
+    """
+
+    def __init__(self, conn, fail_on=None):
+        self._conn = conn
+        self._fail_on = fail_on
+
+    def execute(self, sql, *a, **k):
+        import sqlite3 as _sqlite3
+        if self._fail_on is None or self._fail_on in sql:
+            raise _sqlite3.OperationalError("database is locked")
+        return self._conn.execute(sql, *a, **k)
+
+
+def test_a_failed_flag_read_reports_the_rollup_as_not_authoritative(
+        tmp_path, monkeypatch):
+    cc, cq, conn = _load(tmp_path, monkeypatch)
+    try:
+        conn.execute("DELETE FROM cache_meta "
+                     "WHERE key='conversation_sessions_backfill_pending'")
+        conn.commit()
+        assert cq._rollup_authoritative(conn) is True
+        blocked = _ExecProxy(
+            conn, fail_on="conversation_sessions_backfill_pending")
+        assert cq._rollup_authoritative(blocked) is False, (
+            "a read that did not happen is not evidence the flag is clear"
+        )
+    finally:
+        conn.close()
+
+
+def test_a_store_with_no_cache_meta_table_is_still_authoritative(tmp_path,
+                                                                 monkeypatch):
+    """The structural carve-out, verbatim from the write side: a store whose
+    `sqlite_master` probe positively shows no `cache_meta` table determinately
+    holds no pending flag. Collapsing that into the failed-read case would put
+    every bare / in-memory connection on live aggregation forever."""
+    import sqlite3 as _sqlite3
+    _cc, cq, conn = _load(tmp_path, monkeypatch)
+    conn.close()
+    bare = _sqlite3.connect(":memory:")
+    try:
+        assert cq._rollup_authoritative(bare) is True
+    finally:
+        bare.close()
+
+
+def test_a_probe_that_also_fails_reports_not_authoritative(tmp_path,
+                                                           monkeypatch):
+    """Fail closed in every ambiguous case: a lock that defeats the flag SELECT
+    defeats the `sqlite_master` probe too, so an unanswerable probe must not be
+    read as "the table is absent"."""
+    cc, cq, conn = _load(tmp_path, monkeypatch)
+    try:
+        assert cq._rollup_authoritative(_ExecProxy(conn)) is False
+    finally:
+        conn.close()

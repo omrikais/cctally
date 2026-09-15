@@ -167,6 +167,19 @@ run_scenario () {
     mkdir -p "$scratch_home"
     cp -R "$dir/.local" "$scratch_home/"
 
+    # #769 S6 (#802): `--no-sync` no longer runs the legacy transcript bridge at
+    # DB open, so a store that still owes that import answers every conversation
+    # route with the typed `legacy_bridge_pending` envelope instead of serving.
+    # The builder produces exactly such a store: the transcript rows are in
+    # cache.db and no conversations.db exists yet. Prime it once with the command
+    # the product itself names as the remedy, then serve it frozen as before.
+    local prime_log="$scratch_home/cache-sync.log"
+    if ! HOME="$scratch_home" TZ=Etc/UTC "$BIN" cache-sync >"$prime_log" 2>&1; then
+        fail "$name: cache-sync priming failed (log: $prime_log)"
+        sed 's/^/    /' "$prime_log" 2>/dev/null || true
+        return 1
+    fi
+
     local log="$scratch_home/server.log"
     # Loopback bind + default expose (unset → false). The gate's 403 leg below
     # rejects a LAN-hostname Host even on this loopback bind.

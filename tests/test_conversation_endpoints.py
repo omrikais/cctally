@@ -15,6 +15,7 @@ import base64
 import json
 import pathlib
 import socketserver
+import sqlite3
 import sys
 import threading
 import time
@@ -1948,6 +1949,76 @@ def test_facets_lists_projects_with_counts(tmp_path, monkeypatch):
         stop(srv, srv._test_thread)
 
 
+# --- #717: filter_degraded reaches every shaping site ----------------------
+# `_arm_backfill_pending` is defined once, further down beside the live-branch
+# case that introduced it. A second copy here bound the LATER definition for
+# every caller in this module, so this one was dead code an edit could not
+# reach.
+
+
+def test_the_unqualified_claude_facets_route_carries_the_flag(tmp_path,
+                                                              monkeypatch):
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        st, before = _get_json(srv, "/api/conversations/facets")
+        assert st == 200 and "filter_degraded" not in before
+        assert before["projects"], "the fixture must have projects to lose"
+        _arm_backfill_pending(ns)
+        st, body = _get_json(srv, "/api/conversations/facets")
+        assert st == 200
+        assert body["filter_degraded"] is True
+        assert body["projects"] == []
+        assert body["models"], "model counts do not read the rollup"
+    finally:
+        stop(srv, srv._test_thread)
+
+
+def test_the_qualified_claude_facets_route_carries_the_flag(tmp_path,
+                                                            monkeypatch):
+    """Two reshaping sites sit between the producer and the client —
+    `neutral_facets` keeps only `status` and `facets`, and
+    `_handle_qualified_facets` rebuilds the response again — and each drops
+    unknown keys."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        st, before = _get_json(
+            srv, "/api/conversations/facets?source=claude")
+        assert st == 200 and "filter_degraded" not in before
+        _arm_backfill_pending(ns)
+        st, body = _get_json(srv, "/api/conversations/facets?source=claude")
+        assert st == 200
+        assert body["filter_degraded"] is True, (
+            "the flag was dropped by neutral_facets or by the route's own "
+            f"reconstruction: {body}")
+        # NOT emptied on this path, unlike the unqualified one: these facets
+        # are derived from browse rows that `list_conversations` still
+        # produces in full through its live GROUP-BY fallback. Emptying them
+        # would hide projects that are present.
+        assert body["facets"]["projects"], (
+            "the qualified path's facets come from live-capable rows and must "
+            "survive a pending rollup")
+    finally:
+        stop(srv, srv._test_thread)
+
+
+def test_the_qualified_claude_browse_route_carries_the_flag(tmp_path,
+                                                            monkeypatch):
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        st, before = _get_json(srv, "/api/conversations?source=claude")
+        assert st == 200 and "filter_degraded" not in before
+        _arm_backfill_pending(ns)
+        st, body = _get_json(srv, "/api/conversations?source=claude")
+        assert st == 200 and body["filter_degraded"] is True
+        assert body["facets"]["projects"]
+        assert body["rows"], "the live fallback still serves the rail"
+    finally:
+        stop(srv, srv._test_thread)
+
+
 def test_filter_by_project(tmp_path, monkeypatch):
     """?projects=proj returns ONLY the 'proj'-labelled session (s1)."""
     ns = load_script()
@@ -2511,3 +2582,993 @@ def test_every_live_tail_ingest_advances_accounting():
         assert called & {"_advance_live_tail_accounting", "sync_codex_cache"}, (
             f"the _ingest at line {fn.lineno} advances no accounting store"
         )
+
+
+# --- #780: the read-only reader opener -------------------------------------
+#
+# `apply_policy` emits `PRAGMA auto_vacuum=…` then `PRAGMA journal_mode=…`,
+# both write-capable, so a read route must not route through it. `mode=ro`
+# still permits the TEMP views account scoping needs; `PRAGMA query_only=ON`
+# does not, so it is deliberately never set.
+
+
+@pytest.fixture
+def readonly_ns(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    conn = ns["open_conversations_db"]()
+    conn.execute(
+        "INSERT OR IGNORE INTO conversation_messages "
+        "(session_id,uuid,source_path,byte_offset,timestamp_utc,entry_type,"
+        " text,blocks_json,account_key) "
+        "VALUES('ro-s1','ro-u1','/ro.jsonl',0,'2026-06-01T00:00:00Z',"
+        "'assistant','readable','[]',NULL)")
+    conn.commit()
+    conn.close()
+    return ns
+
+
+def _readonly_write_capable(sql: str) -> bool:
+    head = sql.strip().split(None, 2)
+    if not head:
+        return False
+    verb = head[0].upper()
+    if verb in {"INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER",
+                "REPLACE", "VACUUM", "REINDEX", "COMMIT", "BEGIN"}:
+        # A TEMP CREATE is the one permitted write: account scoping needs it,
+        # and it never reaches `main`.
+        return "TEMP" not in sql.upper() and "TEMPORARY" not in sql.upper()
+    if verb == "PRAGMA":
+        lowered = sql.lower()
+        return ("auto_vacuum" in lowered and "=" in lowered) or (
+            "journal_mode" in lowered and "=" in lowered)
+    return False
+
+
+def test_the_readonly_opener_executes_no_write_capable_statement(readonly_ns):
+    ns = readonly_ns
+    cache = ns["_cctally_cache"]
+    store_mod = cache._cctally_store
+    seen: list[str] = []
+    previous = store_mod._TRACE_HOOK
+    store_mod._TRACE_HOOK = seen.append
+    try:
+        conn = cache.open_conversations_db_readonly()
+    finally:
+        store_mod._TRACE_HOOK = previous
+    try:
+        offenders = [sql for sql in seen if _readonly_write_capable(sql)]
+        assert offenders == [], (
+            f"the read-only opener ran write-capable statements: {offenders}")
+        assert seen, "the trace hook must have been installed"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_messages").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_the_readonly_opener_runs_none_of_the_mutating_open_steps(
+        readonly_ns, monkeypatch):
+    ns = readonly_ns
+    cache = ns["_cctally_cache"]
+    called: list[str] = []
+
+    def _forbid(name):
+        def _boom(*a, **k):
+            called.append(name)
+            raise AssertionError(f"the read-only opener called {name}")
+        return _boom
+
+    for target, name in (
+        (cache, "open_cache_db"),
+        (cache, "_run_pending_migrations"),
+        (cache, "_import_legacy_conversation_rows"),
+        (cache, "_ensure_codex_conversation_contract"),
+        (cache, "_harden_conversation_sidecars"),
+        (cache, "_conversations_open_guarded"),
+        (cache._cctally_store, "apply_policy"),
+        (cache._cctally_store, "open_index"),
+        (cache._cctally_db_sib, "_apply_conversations_schema"),
+    ):
+        monkeypatch.setattr(target, name, _forbid(name))
+    import os as _os
+    monkeypatch.setattr(_os, "chmod", _forbid("os.chmod"))
+    conn = cache.open_conversations_db_readonly()
+    try:
+        assert called == []
+    finally:
+        conn.close()
+
+
+def test_the_readonly_connection_refuses_writes_to_main(readonly_ns):
+    cache = readonly_ns["_cctally_cache"]
+    conn = cache.open_conversations_db_readonly()
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("DELETE FROM conversation_messages")
+    finally:
+        conn.close()
+
+
+def test_account_scoping_still_works_on_the_readonly_connection(readonly_ns):
+    """The TEMP views survive `mode=ro`. This is why `PRAGMA query_only` is
+    never set: it breaks exactly these writes."""
+    cache = readonly_ns["_cctally_cache"]
+    conn = cache.open_conversations_db_readonly()
+    try:
+        cache.scope_conversations_db_to_account(conn, "a" * 32)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_messages").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_temp_master WHERE type='view'"
+        ).fetchone()[0] > 0
+    finally:
+        conn.close()
+
+
+def test_the_readonly_opener_refuses_a_schema_behind_store(readonly_ns,
+                                                           monkeypatch):
+    cache = readonly_ns["_cctally_cache"]
+    store_mod = cache._cctally_store
+    woken = []
+    monkeypatch.setattr(cache, "SCHEMA_WAKE_HOOK", lambda: woken.append(1))
+    monkeypatch.setattr(
+        store_mod, "schema_state",
+        lambda conn, store, *, schema="main": (
+            "behind" if store == "conversations" else "current"))
+    with pytest.raises(cache.SchemaBehind) as excinfo:
+        cache.open_conversations_db_readonly()
+    assert excinfo.value.reason == "schema_behind"
+    assert woken == [1], "behind wakes a writer; it never migrates here"
+
+
+def test_the_readonly_opener_fails_closed_on_a_schema_ahead_store(
+        readonly_ns, monkeypatch):
+    cache = readonly_ns["_cctally_cache"]
+    store_mod = cache._cctally_store
+    woken = []
+    monkeypatch.setattr(cache, "SCHEMA_WAKE_HOOK", lambda: woken.append(1))
+    monkeypatch.setattr(
+        store_mod, "schema_state",
+        lambda conn, store, *, schema="main": "ahead")
+    with pytest.raises(cache.SchemaAhead) as excinfo:
+        cache.open_conversations_db_readonly()
+    assert excinfo.value.reason == "schema_ahead"
+    assert woken == [], "ahead attempts no recovery"
+
+
+def test_the_readonly_opener_gates_the_attached_cache_store_too(readonly_ns,
+                                                                monkeypatch):
+    cache = readonly_ns["_cctally_cache"]
+    store_mod = cache._cctally_store
+    seen = []
+
+    def probing(conn, store, *, schema="main"):
+        seen.append((store, schema))
+        return "current" if store == "conversations" else "behind"
+
+    monkeypatch.setattr(store_mod, "schema_state", probing)
+    with pytest.raises(cache.SchemaBehind):
+        cache.open_conversations_db_readonly()
+    assert ("cache", "cache_db") in seen
+
+
+def test_the_readonly_opener_declines_rather_than_queueing_behind_maintenance(
+        readonly_ns):
+    import fcntl as _fcntl
+
+    cache = readonly_ns["_cctally_cache"]
+    core = readonly_ns["_cctally_core"]
+    holder = open(str(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH), "a+")
+    try:
+        _fcntl.flock(holder, _fcntl.LOCK_EX)
+        with pytest.raises(cache.MaintenanceInProgress) as excinfo:
+            cache.open_conversations_db_readonly()
+        assert excinfo.value.reason == "maintenance"
+    finally:
+        _fcntl.flock(holder, _fcntl.LOCK_UN)
+        holder.close()
+
+
+def test_every_reader_refusal_is_catchable_as_a_database_error(readonly_ns):
+    """The route boundary already catches `sqlite3.DatabaseError` and
+    `OSError`, so the new conditions must not escape it as a fresh 500."""
+    cache = readonly_ns["_cctally_cache"]
+    for cls in (cache.ConversationReaderUnavailable, cache.MaintenanceInProgress,
+                cache.SchemaBehind, cache.SchemaAhead):
+        assert issubclass(cls, sqlite3.DatabaseError)
+
+
+# --- #780: every read route degrades instead of returning a 5xx -------------
+
+_DEGRADING_ROUTES = (
+    "/api/conversations",
+    "/api/conversations/facets",
+    "/api/conversation/search?q=hello",
+    "/api/conversation/s1",
+    "/api/conversation/s1/outline",
+    "/api/conversation/s1/find?q=hello",
+    "/api/conversation/s1/export",
+)
+# Live-tail keeps the FULL opener for the stream it holds for minutes, and that
+# decision stands. What did NOT stand is the preflight in front of it: the full
+# opener waits on the maintenance flock with no timeout, so a stream opened
+# during a rebuild held a server thread for the rebuild's whole duration —
+# measured at 716.9 s. §4a names the live-tail preflight among the routes that
+# must fail soft, so it now probes the flock non-blocking first and answers with
+# the same typed degraded envelope every other route already serves. The cases
+# below drive that with a REAL held flock.
+
+
+@pytest.mark.parametrize("reason,factory", [
+    ("maintenance", "MaintenanceInProgress"),
+    ("schema_behind", "SchemaBehind"),
+    ("schema_ahead", "SchemaAhead"),
+])
+def test_no_read_route_returns_a_5xx_when_the_reader_cannot_be_admitted(
+        tmp_path, monkeypatch, reason, factory):
+    """A rebuild, a reclaim pass and a schema-behind store all reach the routes
+    through the same typed condition. Each used to arrive as a 500, which is
+    exactly the maintenance-induced 5xx #780 exists to remove."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    dash = sys.modules["_cctally_dashboard"]
+    cls = getattr(dash, factory)
+
+    def refusing(*a, **k):
+        raise cls("simulated")
+
+    monkeypatch.setattr(dash, "open_conversations_db_readonly", refusing)
+    try:
+        for route in _DEGRADING_ROUTES:
+            st, body = _get_json(srv, route)
+            assert st < 500, (route, st, body)
+            assert st == 200, (route, st, body)
+            assert body.get("status") == "degraded", (route, body)
+            assert body.get("degraded_reason") == reason, (route, body)
+            rendered = json.dumps(body)
+            assert "sqlite" not in rendered.lower(), route
+            assert "SELECT" not in rendered, route
+            assert str(tmp_path) not in rendered, route
+    finally:
+        stop(srv, srv._test_thread)
+
+
+def _get_raw(srv, path):
+    """GET ``path`` and return ``(status, raw_bytes)``.
+
+    `/export` answers Markdown, not JSON, so a status-and-bytes fetch is the
+    only shape that covers the whole route set.
+    """
+    from http.client import HTTPConnection
+    c = HTTPConnection("127.0.0.1", srv.server_address[1],
+                       timeout=PRESENCE_BACKSTOP_SECONDS)
+    c.request("GET", path, headers={"Host": "127.0.0.1"})
+    r = c.getresponse()
+    body = r.read()
+    c.close()
+    return r.status, body
+
+
+def _materialize_conversation_store(ns):
+    """Create `conversations.db` and its maintenance lock, and put one session
+    in it.
+
+    `_boot` seeds `cache.db` only, so the transcript store is absent and the
+    read-only opener answers `ConversationReaderUnavailable` — the deliberate
+    first-run fallback to the full opener, which is not the steady state these
+    cases are about.
+    """
+    conn = ns["open_conversations_db"]()
+    conn.execute(
+        "INSERT OR IGNORE INTO conversation_messages "
+        "(session_id,uuid,source_path,byte_offset,timestamp_utc,entry_type,"
+        " text,blocks_json,account_key) "
+        "VALUES('s1','s1-u1','/s1.jsonl',0,'2026-06-01T00:00:00Z',"
+        "'assistant','hello there','[]',NULL)")
+    conn.commit()
+    conn.close()
+
+
+def _spy_on_the_reader(monkeypatch, dash):
+    """Record the exception class each read admission actually raised.
+
+    Wraps the REAL opener rather than replacing it, so the condition under
+    test is the one the store is in and not a class the test chose.
+    """
+    real = dash.open_conversations_db_readonly
+    raised = []
+
+    def spying(*a, **k):
+        try:
+            return real(*a, **k)
+        except BaseException as exc:
+            raised.append(type(exc).__name__)
+            raise
+
+    monkeypatch.setattr(dash, "open_conversations_db_readonly", spying)
+    return raised
+
+
+def test_a_real_rebuild_holding_the_maintenance_lock_degrades_every_route(
+        tmp_path, monkeypatch):
+    """Driven, not simulated. A rebuild takes the maintenance flock
+    EXCLUSIVELY — `_prepare_claude_conversation_maintenance` is what does it —
+    and this holds that same lock on a second descriptor, which is the state a
+    reader meets during one. Nothing here names an exception class; the
+    assertion reads back which class the real opener raised."""
+    import fcntl as _fcntl
+
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    dash = sys.modules["_cctally_dashboard"]
+    core = ns["_cctally_core"]
+    _materialize_conversation_store(ns)
+    raised = _spy_on_the_reader(monkeypatch, dash)
+    holder = open(str(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH), "a+")
+    try:
+        _fcntl.flock(holder, _fcntl.LOCK_EX)
+        for route in _DEGRADING_ROUTES:
+            st, body = _get_json(srv, route)
+            assert st == 200, (route, st, body)
+            assert body.get("status") == "degraded", (route, body)
+            assert body.get("degraded_reason") == "maintenance", (route, body)
+        assert set(raised) == {"MaintenanceInProgress"}, (
+            "a real held maintenance lock must reach the routes as the typed "
+            f"maintenance condition, not as something else: {sorted(set(raised))}")
+    finally:
+        _fcntl.flock(holder, _fcntl.LOCK_UN)
+        holder.close()
+        stop(srv, srv._test_thread)
+
+
+def test_a_real_schema_behind_store_degrades_every_route(tmp_path, monkeypatch):
+    """Driven, not simulated: the store's own `user_version` is moved back, so
+    the tri-state probe reads `behind` off the file rather than off a patch."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    dash = sys.modules["_cctally_dashboard"]
+    cache = ns["_cctally_cache"]
+    core = ns["_cctally_core"]
+    # The wake-up would advance the store back to head on its background
+    # thread and un-do the condition mid-run. The condition under test is the
+    # route's answer while the store IS behind.
+    monkeypatch.setattr(cache, "SCHEMA_WAKE_HOOK", None)
+    _materialize_conversation_store(ns)
+    raised = _spy_on_the_reader(monkeypatch, dash)
+    writer = sqlite3.connect(str(core.CONVERSATIONS_DB_PATH))
+    head = writer.execute("PRAGMA user_version").fetchone()[0]
+    assert head > 0, "the fixture store must be at a real head to move back"
+    writer.execute(f"PRAGMA user_version={head - 1}")
+    writer.commit()
+    writer.close()
+    try:
+        for route in _DEGRADING_ROUTES:
+            st, body = _get_json(srv, route)
+            assert st == 200, (route, st, body)
+            assert body.get("status") == "degraded", (route, body)
+            assert body.get("degraded_reason") == "schema_behind", (route, body)
+        assert set(raised) == {"SchemaBehind"}, sorted(set(raised))
+    finally:
+        writer = sqlite3.connect(str(core.CONVERSATIONS_DB_PATH))
+        writer.execute(f"PRAGMA user_version={head}")
+        writer.commit()
+        writer.close()
+        stop(srv, srv._test_thread)
+
+
+def test_a_real_reclaim_pass_does_not_degrade_or_5xx_any_route(tmp_path,
+                                                               monkeypatch):
+    """The reclaim half of §4d's claim, and the one that is NOT a refusal.
+
+    Reclaim downgrades the maintenance flock to SHARED before it runs, so a
+    reader is admitted; what it holds is the SQLite WRITE lock, for one chunk
+    at a time. Every route must therefore keep serving normally — no 5xx and
+    no degraded envelope — while a real `incremental_vacuum` chunk is in
+    flight against the same file."""
+    import fcntl as _fcntl
+    import threading
+
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    dash = sys.modules["_cctally_dashboard"]
+    core = ns["_cctally_core"]
+    _materialize_conversation_store(ns)
+    raised = _spy_on_the_reader(monkeypatch, dash)
+
+    holding = threading.Event()
+    release = threading.Event()
+    failed = []
+
+    def reclaimer():
+        conn = sqlite3.connect(str(core.CONVERSATIONS_DB_PATH), timeout=30)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("PRAGMA incremental_vacuum(8)")
+            holding.set()
+            release.wait(30)
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            failed.append(repr(exc))
+            holding.set()
+        finally:
+            conn.close()
+
+    # Shared maintenance admission, exactly as reclaim leaves it.
+    shared = open(str(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH), "a+")
+    _fcntl.flock(shared, _fcntl.LOCK_SH)
+    worker = threading.Thread(target=reclaimer, daemon=True)
+    worker.start()
+    try:
+        assert holding.wait(30), "the reclaim thread never took the write lock"
+        assert not failed, failed
+        for route in _DEGRADING_ROUTES:
+            st, raw = _get_raw(srv, route)
+            assert st < 500, (route, st, raw[:200])
+            assert b'"degraded"' not in raw, (
+                "reclaim holds the WRITE lock and readers are `mode=ro`, so a "
+                f"read must not be refused: {route} {raw[:200]!r}")
+        assert raised == [], (
+            f"no read admission may fail during reclaim: {raised}")
+    finally:
+        release.set()
+        worker.join(30)
+        _fcntl.flock(shared, _fcntl.LOCK_UN)
+        shared.close()
+        stop(srv, srv._test_thread)
+
+
+_LIVE_TAIL_ROUTES = (
+    "/api/conversation/s1/events",
+    "/api/conversation/s1/events?account=acc-1",
+    "/api/conversation/v1.claude.s1/events",
+)
+
+
+def test_a_real_held_maintenance_lock_degrades_the_live_tail_preflight(
+        tmp_path, monkeypatch):
+    """The live-tail preflight is the route §4a names and the route that was
+    left blocking.
+
+    `_live_tail_read_connection` takes the FULL opener, whose maintenance
+    admission is a plain `LOCK_SH` with no timeout, so a stream opened during a
+    rebuild waited for the rebuild — 716.9 s in the measured run — holding a
+    server thread the whole time. The lock here is a real `LOCK_EX` on the real
+    maintenance file, which is the state `_prepare_claude_conversation_maintenance`
+    leaves a reader in.
+    """
+    import fcntl as _fcntl
+
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    core = ns["_cctally_core"]
+    _materialize_conversation_store(ns)
+    holder = open(str(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH), "a+")
+    try:
+        _fcntl.flock(holder, _fcntl.LOCK_EX)
+        for route in _LIVE_TAIL_ROUTES:
+            # The claim "it did not queue behind the flock" needs no wall-clock
+            # assertion: a request that queued cannot answer at all while the
+            # lock is held, so `_get_json`'s own client budget is what fails,
+            # and a degraded 200 is proof the preflight refused instead.
+            st, body = _get_json(srv, route)
+            assert st == 200, (route, st, body)
+            assert body.get("status") == "degraded", (route, body)
+            assert body.get("degraded_reason") == "maintenance", (route, body)
+            rendered = json.dumps(body)
+            assert "sqlite" not in rendered.lower(), route
+            assert str(tmp_path) not in rendered, route
+    finally:
+        _fcntl.flock(holder, _fcntl.LOCK_UN)
+        holder.close()
+        stop(srv, srv._test_thread)
+
+
+def _open_reader_off_thread(conv, *, seconds=PRESENCE_BACKSTOP_SECONDS):
+    """Call `_open_conversation_reader` on a daemon thread and wait `seconds`.
+
+    The failure under test is an UNBOUNDED wait, so the call cannot be made on
+    the test's own thread: the full opener's maintenance admission never times
+    out, so a blocked call would never return and the lock would never be
+    released. Returns ``(finished, outcome, worker)`` — `finished` False means
+    the call was still queued behind the flock when the wait expired, which IS
+    the defect. The caller MUST release the lock and then join `worker`: a
+    blocked opener that unwinds after the test's `monkeypatch` teardown has
+    restored the real path constants writes to the maintainer's production data
+    directory, which the isolation contract refuses.
+    """
+    import threading
+
+    outcome = {}
+    done = threading.Event()
+
+    def attempt():
+        try:
+            conn = conv._open_conversation_reader("/api/conversations")
+        except BaseException as exc:  # noqa: BLE001 — the outcome under test
+            outcome["error"] = exc
+        else:
+            outcome["conn"] = conn
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=attempt, daemon=True)
+    worker.start()
+    return done.wait(seconds), outcome, worker
+
+
+def test_the_reader_first_run_fallback_refuses_a_held_maintenance_lock(
+        tmp_path, monkeypatch):
+    """`_open_conversation_reader`'s absent-store fallback hands the open to
+    the FULL opener, which then waits on the maintenance flock with no timeout.
+
+    Both halves of the condition are real here: the transcript store is gone
+    while its maintenance lock is held exclusively, which is what a rebuild
+    that has replaced the file looks like to a reader arriving mid-pass.
+    """
+    import fcntl as _fcntl
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    conv = sys.modules["_cctally_dashboard_conversation"]
+    dash = sys.modules["_cctally_dashboard"]
+    core = ns["_cctally_core"]
+    conn = ns["open_conversations_db"]()
+    conn.close()
+    pathlib.Path(core.CONVERSATIONS_DB_PATH).unlink()
+    assert pathlib.Path(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH).is_file()
+    holder = open(str(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH), "a+")
+    worker = None
+    try:
+        _fcntl.flock(holder, _fcntl.LOCK_EX)
+        finished, outcome, worker = _open_reader_off_thread(conv)
+        assert finished, (
+            "the first-run fallback queued behind the maintenance flock "
+            "instead of refusing")
+        assert isinstance(outcome.get("error"), dash.MaintenanceInProgress), (
+            outcome)
+        assert outcome["error"].reason == "maintenance"
+    finally:
+        _fcntl.flock(holder, _fcntl.LOCK_UN)
+        holder.close()
+        if worker is not None:
+            worker.join(30)
+
+
+def test_the_reader_legacy_bridge_fallback_refuses_a_held_maintenance_lock(
+        tmp_path, monkeypatch):
+    """The second fallback, and the one that is not a first-run case.
+
+    `conversation_legacy_bridge_pending` is True after an INTERRUPTED migration
+    028, which is durable state rather than a transient. The bridge is a
+    writer, so the reader correctly hands the open back — but handing it to the
+    blocking full opener means every request in that state waits out any
+    concurrent maintenance pass. The lock is taken here at the moment the real
+    ordering makes it reachable: after the read-only open released its own
+    shared hold and before the fallback runs.
+    """
+    import fcntl as _fcntl
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    conv = sys.modules["_cctally_dashboard_conversation"]
+    dash = sys.modules["_cctally_dashboard"]
+    cache = ns["_cctally_cache"]
+    core = ns["_cctally_core"]
+    conn = ns["open_conversations_db"]()
+    conn.close()
+    holder = open(str(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH), "a+")
+
+    def bridge_pending_and_maintenance_starts(_conn):
+        _fcntl.flock(holder, _fcntl.LOCK_EX)
+        return True
+
+    monkeypatch.setattr(cache, "conversation_legacy_bridge_pending",
+                        bridge_pending_and_maintenance_starts)
+    worker = None
+    try:
+        finished, outcome, worker = _open_reader_off_thread(conv)
+        assert finished, (
+            "the legacy-bridge fallback queued behind the maintenance flock "
+            "instead of refusing")
+        assert isinstance(outcome.get("error"), dash.MaintenanceInProgress), (
+            outcome)
+        assert outcome["error"].reason == "maintenance"
+    finally:
+        try:
+            _fcntl.flock(holder, _fcntl.LOCK_UN)
+        except OSError:
+            pass
+        holder.close()
+        if worker is not None:
+            worker.join(30)
+
+
+def test_live_tail_holds_the_full_opener_and_writes_on_its_own_connection():
+    """The one route that is NOT on the read-only opener, and the reason.
+
+    Moving the live-tail READ connection to `open_conversations_db_readonly`
+    made `test_codex_child_discovery_emits_tail` stop emitting a tail: the
+    stream reached `ready` and `baselined`, the child rollout was ingested
+    through the separate writer, and the long-lived read connection never
+    observed the committed growth. A live-tail stream opens ONCE and holds the
+    connection for minutes, so it contributes one open rather than one per
+    request, which is not the pressure #780 removes. What #780 does require of
+    it — that every ingest branch take its OWN write connection — is what
+    `_live_tail_write` provides, and this asserts both halves.
+    """
+    import ast
+
+    conv = sys.modules["_cctally_dashboard_conversation"]
+    tree = ast.parse(pathlib.Path(conv.__file__).read_text())
+    functions = {
+        node.name: node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+    }
+    # Follow module-level helpers rather than reading one function body. The
+    # claim is which OPENER the live-tail read connection ends up on, and #802
+    # moved that open one hop away into `_full_open_or_refuse`, which refuses
+    # when the legacy bridge is still owed. A body-only read would have called
+    # that regression a rule violation, so the walk follows the indirection and
+    # the rule keeps meaning what it meant.
+    reached, pending = set(), ["_live_tail_read_connection"]
+    called = set()
+    while pending:
+        name = pending.pop()
+        if name in reached or name not in functions:
+            continue
+        reached.add(name)
+        for node in ast.walk(functions[name]):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Attribute):
+                called.add(node.func.attr)
+            elif isinstance(node.func, ast.Name):
+                pending.append(node.func.id)
+    assert "open_conversations_db" in called
+    assert "open_conversations_db_readonly" not in called
+
+    ingests = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_ingest"
+    ]
+    assert len(ingests) == 3, (
+        "the live-tail route set changed; give the new route its own write "
+        f"connection and update this count: {[n.lineno for n in ingests]}"
+    )
+    for fn in ingests:
+        names = {
+            node.func.id for node in ast.walk(fn)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert "_live_tail_write" in names, (
+            f"the _ingest at line {fn.lineno} writes on the stream's own "
+            "read connection instead of taking its own writer"
+        )
+
+
+def test_admission_is_retried_before_the_route_degrades(tmp_path, monkeypatch):
+    """Bounded by COUNT, never by wall clock: the opener's own busy timeout is
+    already route-bounded, and an unbounded retry against a rebuild that holds
+    the store for minutes would pin a request thread for the whole rebuild."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    dash = sys.modules["_cctally_dashboard"]
+    conv = sys.modules["_cctally_dashboard_conversation"]
+    attempts = {"n": 0}
+    real = dash.open_conversations_db_readonly
+
+    def flaky(*a, **k):
+        attempts["n"] += 1
+        if attempts["n"] < conv._CONVERSATION_READ_ATTEMPTS:
+            raise dash.MaintenanceInProgress("busy")
+        return real(*a, **k)
+
+    monkeypatch.setattr(dash, "open_conversations_db_readonly", flaky)
+    try:
+        st, body = _get_json(srv, "/api/conversations")
+        assert st == 200
+        assert body.get("status") != "degraded", body
+        assert attempts["n"] == conv._CONVERSATION_READ_ATTEMPTS
+    finally:
+        stop(srv, srv._test_thread)
+
+
+def test_the_retry_is_bounded_and_then_degrades(tmp_path, monkeypatch):
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    dash = sys.modules["_cctally_dashboard"]
+    conv = sys.modules["_cctally_dashboard_conversation"]
+    attempts = {"n": 0}
+
+    def always_busy(*a, **k):
+        attempts["n"] += 1
+        raise dash.MaintenanceInProgress("busy")
+
+    monkeypatch.setattr(dash, "open_conversations_db_readonly", always_busy)
+    try:
+        st, body = _get_json(srv, "/api/conversations")
+        assert st == 200
+        assert body["degraded_reason"] == "maintenance"
+        assert attempts["n"] == conv._CONVERSATION_READ_ATTEMPTS
+    finally:
+        stop(srv, srv._test_thread)
+
+
+def test_a_schema_behind_reader_asks_a_writer_to_advance_the_store(
+        tmp_path, monkeypatch):
+    """`--no-sync` disables the self-heal and the conversation sync thread, so
+    without an owner a reader would be degraded forever with no process willing
+    to advance the schema. `cmd_dashboard` arms this hook in EVERY mode."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    cache = ns["_cctally_cache"]
+    conn = ns["open_conversations_db"]()
+    conn.close()
+    woken = []
+    monkeypatch.setattr(cache, "SCHEMA_WAKE_HOOK", lambda: woken.append(1))
+    monkeypatch.setattr(
+        cache._cctally_store, "schema_state",
+        lambda conn, store, *, schema="main": "behind")
+    with pytest.raises(cache.SchemaBehind):
+        cache.open_conversations_db_readonly()
+    assert woken == [1]
+
+
+def test_the_wake_up_does_not_run_the_migration_on_the_calling_thread(
+        tmp_path, monkeypatch):
+    """`_gate_reader_schema` calls `SCHEMA_WAKE_HOOK` inline, so whatever the
+    hook does happens on the request thread that is about to return a degraded
+    envelope. Migration 009 plus its backfill was measured at 39.55 s on the
+    production-shaped store, and both the spec ("The opener never migrates from
+    a request thread") and this module's own retry comment forbid holding a
+    request for it. The wake-up must dispatch and return."""
+    import threading
+
+    load_script()
+    dash = sys.modules["_cctally_dashboard"]
+    started = threading.Event()
+    release = threading.Event()
+    ran_on = {}
+
+    def blocking_migration():
+        ran_on["thread"] = threading.current_thread().ident
+        started.set()
+        release.wait(20)
+
+    monkeypatch.setattr(
+        dash, "_dashboard_startup_schema_migration", blocking_migration)
+    dash._reset_schema_wake_state()
+    caller = threading.current_thread().ident
+    try:
+        dash._wake_schema_writer()
+        assert started.wait(10), "the wake-up never dispatched the migration"
+        assert ran_on["thread"] != caller, (
+            "the migration ran on the thread that asked for it")
+    finally:
+        release.set()
+        dash._join_schema_wake_thread(timeout=10)
+
+
+def test_concurrent_wake_ups_start_exactly_one_migration(tmp_path, monkeypatch):
+    """Every schema-behind request calls the hook, so an unguarded dispatch
+    would start one full open per request against a store that is already
+    behind."""
+    import threading
+
+    load_script()
+    dash = sys.modules["_cctally_dashboard"]
+    started = threading.Event()
+    release = threading.Event()
+    runs = []
+    lock = threading.Lock()
+
+    def blocking_migration():
+        with lock:
+            runs.append(1)
+        started.set()
+        release.wait(20)
+
+    monkeypatch.setattr(
+        dash, "_dashboard_startup_schema_migration", blocking_migration)
+    dash._reset_schema_wake_state()
+    try:
+        dash._wake_schema_writer()
+        assert started.wait(10)
+        for _ in range(8):
+            dash._wake_schema_writer()
+        assert runs == [1], (
+            "a migration was already in flight; a second one adds contention "
+            f"rather than progress: {runs}")
+    finally:
+        release.set()
+        dash._join_schema_wake_thread(timeout=10)
+
+
+def test_a_later_wake_up_still_dispatches_after_the_first_finishes(
+        tmp_path, monkeypatch):
+    """The guard suppresses a CONCURRENT start, not every future one — a store
+    that falls behind again must still be able to wake a writer."""
+    import threading
+
+    load_script()
+    dash = sys.modules["_cctally_dashboard"]
+    runs = []
+
+    def quick_migration():
+        runs.append(threading.current_thread().ident)
+
+    monkeypatch.setattr(
+        dash, "_dashboard_startup_schema_migration", quick_migration)
+    dash._reset_schema_wake_state()
+    try:
+        dash._wake_schema_writer()
+        dash._join_schema_wake_thread(timeout=10)
+        dash._wake_schema_writer()
+        dash._join_schema_wake_thread(timeout=10)
+        assert len(runs) == 2, runs
+    finally:
+        dash._join_schema_wake_thread(timeout=10)
+
+
+def test_a_second_wake_up_cannot_slip_between_the_assignment_and_the_start(
+        tmp_path, monkeypatch):
+    """The guard is `_SCHEMA_WAKE_THREAD is not None and is_alive()`, and
+    `is_alive()` is False for a thread that has been constructed and assigned
+    but not yet started.
+
+    The assignment happened under `_SCHEMA_WAKE_LOCK` and `start()` happened
+    outside it, so a second caller arriving in that window saw a non-None,
+    not-alive thread and passed the guard — dispatching the second 39.55-second
+    migration the guard exists to prevent. The window is opened here for real,
+    by holding the first `start()` until the second call has run.
+    """
+    import threading
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    dash = sys.modules["_cctally_dashboard"]
+    runs = []
+    runs_lock = threading.Lock()
+    finish_migration = threading.Event()
+
+    def blocking_migration():
+        with runs_lock:
+            runs.append(threading.current_thread().name)
+        # The migration is still IN FLIGHT while the second caller reaches the
+        # guard. Letting it finish first would make a second dispatch correct —
+        # the guard is per-flight, which
+        # `test_a_later_wake_up_still_dispatches_after_the_first_finishes`
+        # covers — and this case would then pass for the wrong reason.
+        finish_migration.wait(30)
+
+    monkeypatch.setattr(
+        dash, "_dashboard_startup_schema_migration", blocking_migration)
+    dash._reset_schema_wake_state()
+
+    plain_thread = threading.Thread
+    first_start_entered = threading.Event()
+    release_first_start = threading.Event()
+    gated = {"used": False}
+
+    class GatedStart(plain_thread):
+        def start(self):
+            if self.name == "cctally-schema-wake" and not gated["used"]:
+                gated["used"] = True
+                first_start_entered.set()
+                release_first_start.wait(20)
+            super().start()
+
+    monkeypatch.setattr(dash.threading, "Thread", GatedStart)
+    first = plain_thread(target=dash._wake_schema_writer, daemon=True)
+    second = plain_thread(target=dash._wake_schema_writer, daemon=True)
+    try:
+        first.start()
+        assert first_start_entered.wait(10), (
+            "the first wake-up never reached start()")
+        second.start()
+        # The window: the first thread is constructed and assigned but not
+        # started, so `is_alive()` is False. With the start outside the lock the
+        # second caller passes the guard here; with it inside, the second caller
+        # is blocked on the lock and gets no chance to. A second caller that
+        # passed the guard has already returned by now, and one blocked on the
+        # lock stays blocked however long this waits.
+        # timing-budget: the short budget IS the claim.
+        second.join(2.0)
+        release_first_start.set()
+        first.join(10)
+        second.join(10)
+        assert runs == ["cctally-schema-wake"], (
+            "a second migration was dispatched into the window between the "
+            f"assignment and the start: {runs}")
+    finally:
+        release_first_start.set()
+        finish_migration.set()
+        dash._join_schema_wake_thread(timeout=10)
+        dash._reset_schema_wake_state()
+
+
+def test_the_startup_schema_owner_runs_in_both_modes(tmp_path, monkeypatch):
+    """The schema-only startup open is what `--no-sync` otherwise has no owner
+    for. It opens and closes; it ingests nothing."""
+    import ast
+
+    load_script()
+    dash_path = pathlib.Path(
+        sys.modules["_cctally_dashboard"].__file__)
+    tree = ast.parse(dash_path.read_text())
+    cmd = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_dashboard"
+    )
+    calls = [
+        node for node in ast.walk(cmd)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "_dashboard_startup_schema_migration"
+    ]
+    assert len(calls) == 1, (
+        "cmd_dashboard must advance the schema exactly once at startup")
+    guarded = [
+        node for node in ast.walk(cmd)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+            and inner.func.id == "_dashboard_startup_schema_migration"
+            for inner in ast.walk(node)
+        )
+    ]
+    assert guarded == [], (
+        "the startup schema owner must not sit behind an `if` — a --no-sync "
+        "run is exactly the mode that has no other owner"
+    )
+    # ORDERING. Counting the call and refusing an `if` around it still admits a
+    # call placed AFTER the server starts serving, which would leave every
+    # request between startup and that line degraded. Pin it ahead of the
+    # thread that runs `serve_forever`.
+    serving = [
+        node.lineno for node in ast.walk(cmd)
+        if isinstance(node, ast.Attribute) and node.attr == "serve_forever"
+    ]
+    assert serving, "cmd_dashboard no longer starts the HTTP server here"
+    assert calls[0].lineno < min(serving), (
+        "the schema owner must run BEFORE the server begins serving: "
+        f"{calls[0].lineno} vs {min(serving)}")
+
+
+def test_the_startup_schema_owner_actually_advances_a_behind_store(
+        tmp_path, monkeypatch):
+    """The behavioural half. The AST case above pins where the call sits; this
+    one pins that the call does the job — a store genuinely behind head is
+    refused by the read-only opener, the owner runs, and the same opener is
+    then admitted. Nothing here patches `schema_state`."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    cache = ns["_cctally_cache"]
+    dash = sys.modules["_cctally_dashboard"]
+    core = ns["_cctally_core"]
+    conn = ns["open_conversations_db"]()
+    conn.close()
+
+    writer = sqlite3.connect(str(core.CONVERSATIONS_DB_PATH))
+    head = writer.execute("PRAGMA user_version").fetchone()[0]
+    assert head > 0
+    writer.execute(f"PRAGMA user_version={head - 1}")
+    writer.commit()
+    writer.close()
+
+    monkeypatch.setattr(cache, "SCHEMA_WAKE_HOOK", None)
+    with pytest.raises(cache.SchemaBehind):
+        cache.open_conversations_db_readonly()
+
+    dash._dashboard_startup_schema_migration()
+
+    reader = cache.open_conversations_db_readonly()
+    try:
+        assert reader.execute(
+            "SELECT COUNT(*) FROM conversation_messages").fetchone() is not None
+    finally:
+        reader.close()

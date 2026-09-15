@@ -38,6 +38,11 @@ export function useConversationFacets(
         // state: an older or mocked response carrying only `{ projects }` would
         // otherwise set `models: undefined` and crash the popover's `.map`.
         .then((raw) => {
+          // #717 — this normalization rebuilds the object field by field in
+          // BOTH branches, so an unknown top-level field is dropped in both.
+          // The flag is therefore threaded through each branch EXPLICITLY;
+          // doing it in the Claude branch alone would leave the Codex rail
+          // with the same unexplained empty facet one source over.
           if (source === 'codex') {
             const r = raw as QualifiedFacetsEnvelope;
             setFacets({
@@ -45,10 +50,14 @@ export function useConversationFacets(
                 project_label: p.project_label ?? 'Unnamed project', count: p.count, filter_value: p.project_key,
               })),
               models: r.facets.models.map((m) => ({ family: m.model, count: m.count, filter_value: m.model })),
+              ...(r.filter_degraded ? { filter_degraded: true as const } : {}),
             });
           } else {
             const r = raw as ConversationFacets;
-            setFacets({ projects: r.projects ?? [], models: r.models ?? [] });
+            setFacets({
+              projects: r.projects ?? [], models: r.models ?? [],
+              ...(r.filter_degraded ? { filter_degraded: true as const } : {}),
+            });
           }
         })
         .catch((e) => {

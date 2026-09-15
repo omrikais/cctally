@@ -1061,7 +1061,7 @@ def test_the_publication_stamp_table_is_part_of_the_epoch_contract(ns):
     import _cctally_core
     import _cctally_journal as jr
 
-    assert _cctally_core.STATS_INDEX_EPOCH == 1013
+    assert _cctally_core.STATS_INDEX_EPOCH == 1015
     assert "stats_publication_stamp" in jr._REBUILD_REQUIRED_TABLES
 
     _seed_live_index()
@@ -1081,7 +1081,7 @@ def test_the_publication_stamp_table_is_part_of_the_epoch_contract(ns):
             )
         ]
         assert columns == ["record_path", "started_at_utc", "stamped_at_utc"]
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1013
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1015
     finally:
         conn.close()
 

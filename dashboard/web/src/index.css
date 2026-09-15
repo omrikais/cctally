@@ -568,6 +568,26 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
    Without it the em-dash rendered in the bright accent-green of a real figure,
    which reads as a value rather than as an intentional blank. */
 .hs-big.is-blank { color: var(--text-dim); }
+/* #769 S6 / #753 (D5). The Pending state is a word, not a currency figure, so
+   it drops the metric's 800 weight and takes the dim colour `is-blank` already
+   supplies. No new colour token and no new size step. */
+.hs-big.hs-pending {
+  font-weight: 600;
+  font-size: var(--fs-kpi);
+  letter-spacing: 0.5px;
+}
+/* #769 S6 / #753 (D4). The quiet updating marker, on the shared `.chip`
+   primitive in its `chip-aging` (muted slate) variant — the design system's
+   existing disclosure vocabulary. Deliberately NOT `chip-stale`, which is the
+   amber alarm treatment: the figure beside this marker is correct, and the
+   only claim being made is that a newer one is on its way. */
+.chip.hs-updating {
+  display: block;
+  width: fit-content;
+  margin-top: 4px;
+  text-transform: lowercase;
+  letter-spacing: 0.5px;
+}
 /* The named reason a combined figure is withheld, and the notes that qualify a
    published one. Both wrap: they are sentences, not metrics. */
 .hs-sub.hero-combined-reason {
@@ -2447,6 +2467,22 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 
 .mcw-mshead { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .mcw-ms-sub { color: var(--text-dim); font-size: var(--fs-eyebrow); }
+/* #750 S4 §5.2 — the observation-gap notes above the milestone table. One
+   line per run, in the dim eyebrow voice `.mcw-ms-sub` already uses, so the
+   note reads as an annotation of the head above it rather than as content.
+   The list chrome is reset because the default disc and 40px indent are far
+   too loud inside a dense modal; `gap` spaces multiple runs instead. */
+.mcw-gap-notes {
+  list-style: none;
+  margin: -2px 0 8px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: var(--text-dim);
+  font-size: var(--fs-eyebrow);
+  line-height: 1.45;
+}
 
 /* Hero-modal history navigation: week chip + block navigator ‹/› buttons.
    Reuse the m-pill vocabulary; reset the native <button> chrome and add a
@@ -2955,6 +2991,14 @@ button.mcw-weeknav-btn:disabled, button.mcw-blocknav-btn:disabled {
   border-radius: var(--radius-sm);
   padding: 10px;
   margin: 12px 0;
+}
+/* #769 S2: names which body of evidence the block modal is showing when the
+   headline comes from retained facts and the chart from the current cache. */
+.mblock-timeline-note {
+  margin: 6px 2px 0;
+  color: var(--text-dim);
+  font-size: var(--fs-meta);
+  line-height: 1.45;
 }
 
 /* ----- Sessions panel controls (filter + sort, Phase 7) ----- */
@@ -7094,6 +7138,20 @@ mark.current {
   background: color-mix(in srgb, var(--accent-magenta) 18%, transparent);
   border-color: var(--accent-magenta); color: #f5d0fe;
 }
+/* #750 S4 D2/D6 — the window pills render bare numbers, so the unit they
+   count has to be stated once beside them. It is a label, not a control:
+   no border, no pointer, and dimmer than an unselected pill so it does not
+   read as a fifth option.
+   --text-faint, not a --text-dimmer fallback chain: no such token is defined
+   anywhere in this file, so the chain resolved to --text-dim — the very
+   colour the unselected pills use — and the rule achieved nothing it claimed.
+   --text-faint is the FOREGROUND-only token defined at the top of this file,
+   it is darker than --text-dim on this dark ground, and it clears WCAG AA on
+   both panel backgrounds. */
+.projects-controls .projects-window-unit {
+  font-size: 11.5px; color: var(--text-faint);
+  margin-left: 2px; letter-spacing: 0.01em;
+}
 /* #556 S4 — the window pills carry a real `disabled` attribute under Codex and
    All, but `.pill` had no disabled treatment at all, so they rendered
    pixel-identical to enabled pills with `cursor: pointer` still promising a
@@ -10084,13 +10142,19 @@ mark.current {
   padding: 10px;
 }
 /* Filtered-to-zero empty state (spec §4): the "no matches" copy plus a one-click
-   Clear-filters escape, distinct from the generic no-conversations message. */
-.conv-rail-empty--filtered {
+   Clear-filters escape, distinct from the generic no-conversations message.
+   #769 S6 / #802 — the degraded-store notice takes the same column layout: a
+   sentence plus, when the state is transient, one action beneath it. */
+.conv-rail-empty--filtered,
+.conv-rail-empty--degraded {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: 6px;
 }
+/* The notice is a full sentence rather than a label, so it wraps rather than
+   sitting on one clipped line. */
+.conv-rail-empty--degraded { line-height: 1.45; }
 .conv-rail-empty-clear {
   appearance: none;
   border: 1px solid var(--border-soft);

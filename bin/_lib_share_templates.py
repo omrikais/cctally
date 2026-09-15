@@ -750,12 +750,16 @@ def _build_trend_recap(*, panel_data, options):
     delta = panel_data.get("delta_3_weeks") or {}
     return _LS.ShareSnapshot(
         cmd="report",
-        title="$/% trend — last 8 weeks",
+        title="$/% trend — last 8 cycles",
         subtitle=None,
-        period=_civil_period(start, end, label="Last 8 weeks",
+        period=_civil_period(start, end, label="Last 8 cycles",
                               display_tz=_display_tz(options)),
         columns=(
-            _LS.ColumnSpec(key="week",  label="Week",   align="left"),
+            # The KEY stays `week` — it is a frozen wire name. Only the
+            # human label changes: a Claude trend row is a billing CYCLE,
+            # and `report` split a credited week into two long before this
+            # epic (#750 S4 D2 / §4.5).
+            _LS.ColumnSpec(key="week",  label="Cycle",  align="left"),
             _LS.ColumnSpec(key="cost",  label="$",      align="right", emphasis=True),
             _LS.ColumnSpec(key="pct",   label="% used", align="right"),
             _LS.ColumnSpec(key="dpp",   label="$/%",    align="right"),
@@ -776,8 +780,8 @@ def _build_trend_recap(*, panel_data, options):
             reference_lines=(),
         ) if weeks else None,
         totals=_kpi_strip(
-            ("Δ $/% (3wk)", _optional_signed_pct(delta.get('dpp_change_pct'))),
-            ("Δ $ (3wk)",   _optional_signed_money(delta.get('cost_change_usd'))),
+            ("Δ $/% (3cy)", _optional_signed_pct(delta.get('dpp_change_pct'))),
+            ("Δ $ (3cy)",   _optional_signed_money(delta.get('cost_change_usd'))),
         ),
         notes=(),
         generated_at=_utc_now(),
@@ -1261,9 +1265,9 @@ def _build_trend_visual(*, panel_data, options):
     delta = panel_data.get("delta_3_weeks") or {}
     return _LS.ShareSnapshot(
         cmd="report",
-        title="$/% trend visual — last 8 weeks",
+        title="$/% trend visual — last 8 cycles",
         subtitle=None,
-        period=_civil_period(start, end, label="Last 8 weeks",
+        period=_civil_period(start, end, label="Last 8 cycles",
                               display_tz=_display_tz(options)),
         columns=(),
         rows=(),
@@ -1274,8 +1278,8 @@ def _build_trend_visual(*, panel_data, options):
             reference_lines=(),
         ) if weeks else None,
         totals=_kpi_strip(
-            ("Δ $/% (3wk)", _optional_signed_pct(delta.get('dpp_change_pct'))),
-            ("Δ $ (3wk)",   _optional_signed_money(delta.get('cost_change_usd'))),
+            ("Δ $/% (3cy)", _optional_signed_pct(delta.get('dpp_change_pct'))),
+            ("Δ $ (3cy)",   _optional_signed_money(delta.get('cost_change_usd'))),
         ),
         notes=(),
         generated_at=_utc_now(),
@@ -1292,12 +1296,16 @@ def _build_trend_detail(*, panel_data, options):
     delta = panel_data.get("delta_3_weeks") or {}
     return _LS.ShareSnapshot(
         cmd="report",
-        title="$/% trend detail — last 8 weeks",
+        title="$/% trend detail — last 8 cycles",
         subtitle=None,
-        period=_civil_period(start, end, label="Last 8 weeks",
+        period=_civil_period(start, end, label="Last 8 cycles",
                               display_tz=_display_tz(options)),
         columns=(
-            _LS.ColumnSpec(key="week",  label="Week",   align="left"),
+            # The KEY stays `week` — it is a frozen wire name. Only the
+            # human label changes: a Claude trend row is a billing CYCLE,
+            # and `report` split a credited week into two long before this
+            # epic (#750 S4 D2 / §4.5).
+            _LS.ColumnSpec(key="week",  label="Cycle",  align="left"),
             _LS.ColumnSpec(key="cost",  label="$",      align="right", emphasis=True),
             _LS.ColumnSpec(key="pct",   label="% used", align="right"),
             _LS.ColumnSpec(key="dpp",   label="$/%",    align="right"),
@@ -1318,8 +1326,8 @@ def _build_trend_detail(*, panel_data, options):
             reference_lines=(),
         ) if weeks else None,
         totals=_kpi_strip(
-            ("Δ $/% (3wk)", _optional_signed_pct(delta.get('dpp_change_pct'))),
-            ("Δ $ (3wk)",   _optional_signed_money(delta.get('cost_change_usd'))),
+            ("Δ $/% (3cy)", _optional_signed_pct(delta.get('dpp_change_pct'))),
+            ("Δ $ (3cy)",   _optional_signed_money(delta.get('cost_change_usd'))),
         ),
         notes=(),
         generated_at=_utc_now(),
@@ -1929,8 +1937,10 @@ def _projects_chart_for_template(rows: list[dict], cap: int):
 def _projects_period(panel_data: dict, options: dict):
     start = panel_data["period_start"]
     end = panel_data["period_end"]
+    # `window_weeks` stays the frozen wire name; the rendered noun does not.
+    # The Projects window is a set of billing-cycle buckets (#750 S4 D2/D6).
     weeks = int(panel_data.get("window_weeks", 1) or 1)
-    label = "This week" if weeks == 1 else f"Last {weeks} weeks"
+    label = "This cycle" if weeks == 1 else f"Last {weeks} cycles"
     return _period(start, end, label=label,
                    display_tz=_display_tz(options))
 
@@ -2048,11 +2058,11 @@ _RECAP = (
                   default_options={"top_n": 5, "show_chart": True, "show_table": True},
                   builder=_build_weekly_recap),
     ShareTemplate(id="current-week-recap", panel="current-week", label="Recap",
-                  description="Week-to-date KPIs + line + top-3 projects",
+                  description="Cycle-to-date KPIs + line + top-3 projects",
                   default_options={"top_n": 3, "show_chart": True, "show_table": True},
                   builder=_build_current_week_recap),
     ShareTemplate(id="trend-recap", panel="trend", label="Recap",
-                  description="$/% trend over 8 weeks + 3-week delta",
+                  description="$/% trend over 8 cycles + 3-cycle delta",
                   default_options={"top_n": 3, "show_chart": True, "show_table": True},
                   builder=_build_trend_recap),
     ShareTemplate(id="daily-recap", panel="daily", label="Recap",
@@ -2093,7 +2103,7 @@ _VISUAL = (
                   default_options={"top_n": 8, "show_chart": True, "show_table": False},
                   builder=_build_weekly_visual),
     ShareTemplate(id="current-week-visual", panel="current-week", label="Visual",
-                  description="Week-to-date line with KPI overlay",
+                  description="Cycle-to-date line with KPI overlay",
                   default_options={"top_n": 8, "show_chart": True, "show_table": False},
                   builder=_build_current_week_visual),
     ShareTemplate(id="trend-visual", panel="trend", label="Visual",

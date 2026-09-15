@@ -101,7 +101,10 @@ def _install_spies(cctally, monkeypatch):
         calls["get_milestones_for_week"] += 1
         return [_fake_milestone_row()]
 
-    def spy_canon(conn, week_start_date):
+    # **kwargs: #834 S2 (#837) account_key=, the same shape `spy_milestones`
+    # already absorbs. The accessor forwards the requesting account now, and a
+    # positional-only spy raises `TypeError` rather than recording the call.
+    def spy_canon(conn, week_start_date, **kwargs):
         calls["_get_canonical_boundary_for_date"] += 1
         # non-None ISO bounds so md takes the display_start_iso branch -> _format_ts_compact fires
         return ("2026-05-01T00:00:00Z", "2026-05-07T23:59:59Z")

@@ -36,7 +36,7 @@ interface ModalProps {
   // The provider whose data the modal is showing, published on the card as
   // `data-source`. Bound when the modal opens and deliberately NOT re-read
   // afterwards, so a source switch on the board behind an open modal cannot
-  // change it. `e2e/period-native-vocabulary.spec.ts` asserts exactly that,
+  // change it. `e2e/period-vocabulary-convergence.spec.ts` asserts exactly that,
   // and it is the only direct observable of the binding — #556 S4 F7 removed
   // this prop as unread, which turned that assertion red on main.
   dataSource?: 'claude' | 'codex' | 'all';

@@ -87,6 +87,13 @@ const WARNING_DOMAIN_LABELS: Record<string, string> = {
   budget: 'Budget unavailable',
   forensics: 'Forensics unavailable',
   alerts: 'Alerts unavailable',
+  // #819. Without this entry the withheld account scope rendered the same
+  // 'Source degraded' as `source_build_failed`, whose domain is also unlisted —
+  // so the one surface a reader sees could not tell "the account registry could
+  // not be read, everything else is real" from "this source could not be built
+  // at all". The distinguishing sentence reached only `title` and the
+  // accessible name, and a `title` is not a touch disclosure.
+  accounts: 'Accounts unavailable',
 };
 
 function conciseWarningLabel(domain: string | undefined, code?: string): string {

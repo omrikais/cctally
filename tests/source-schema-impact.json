@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "sourceSchemaVersion": 12,
+  "consumers": {
+    "browserConsumers": [
+      "dashboard/web/src/components/RecentAlertsSource.test.tsx",
+      "dashboard/web/src/modals/CacheReportModal.test.tsx",
+      "dashboard/web/src/panels/CacheReportPanel.test.tsx",
+      "dashboard/web/src/panels/MonthlyPanel.test.tsx",
+      "dashboard/web/src/store/metadataHealth.test.ts",
+      "dashboard/web/src/store/sse.visibility.test.ts",
+      "dashboard/web/src/test-utils/sourceEnvelope.ts",
+      "dashboard/web/src/types/envelope.ts"
+    ],
+    "cliAndTuiReaders": [
+      "bin/_cctally_tui.py",
+      "bin/cctally-dashboard-test"
+    ],
+    "compatibilityOracles": [
+      "bench/baselines/envelope-oracle.json",
+      "tests/test_412_quota_history_acceptance.py",
+      "tests/test_556_s2_aggregate_ranges.py",
+      "tests/test_828_metadata_probe.py",
+      "tests/test_829_health_states.py",
+      "tests/test_830_partial_reuse_retry.py",
+      "tests/test_codex_detail_bounded_reads.py",
+      "tests/test_codex_session_detail_rows.py",
+      "tests/test_conversation_endpoints.py",
+      "tests/test_dashboard_api_data.py",
+      "tests/test_dashboard_codex_ingest_backlog_envelope.py",
+      "tests/test_dashboard_debug_backend.py",
+      "tests/test_dashboard_envelope_cache_report.py",
+      "tests/test_dashboard_source_kernel.py",
+      "tests/test_dashboard_source_read_model.py",
+      "tests/test_dashboard_source_routes.py",
+      "tests/test_dashboard_source_share.py",
+      "tests/test_forecast_quota_envelope.py",
+      "tests/test_snapshot_measure_oracle.py",
+      "tests/test_web_fixture_generator.py"
+    ],
+    "fixtures": [
+      "tests/fixtures/dashboard",
+      "tests/golden/429-pre-change-source-envelope.json",
+      "tests/golden/dashboard_envelope_with_blocks_daily.json"
+    ],
+    "producers": [
+      "bin/_cctally_dashboard_envelope.py",
+      "bin/_lib_dashboard_sources.py"
+    ],
+    "retainedAndDerivedFields": [
+      "bin/_cctally_dashboard_sources.py",
+      "bin/_lib_dashboard_sources.py"
+    ],
+    "serverReaders": [
+      "bin/_cctally_dashboard.py",
+      "bin/_cctally_dashboard_envelope.py"
+    ]
+  }
+}

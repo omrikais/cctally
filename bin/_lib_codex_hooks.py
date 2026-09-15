@@ -535,6 +535,84 @@ def observe_codex_hook_root(root: "CodexHookRoot") -> CodexHookObservation:
     )
 
 
+def codex_configuration_generation(roots) -> "str | None":
+    """One reproducible digest of every configured root's hook configuration.
+
+    #769 S6, #716 Task A. Returns a lowercase SHA-256 hex digest, or ``None``
+    when the configuration cannot be read or is ambiguous.
+
+    WHAT IT COVERS, per root, in canonical root order: the root's identity, the
+    exact bytes of ``hooks.json``, the exact bytes of ``config.toml``, and the
+    managed event and command identity — the event name, the slot position and
+    the command vector of the one managed handler on each event.
+
+    WHY A DIGEST RATHER THAN A RECORD. The value is stamped into a ticket that
+    the dashboard's diagnostic surfaces can reach, and a stored record would
+    put filesystem paths and configuration contents there. A digest answers
+    the only question the frontier asks — is the configuration the same one? —
+    and answers nothing else.
+
+    WHY BYTES RATHER THAN MTIMES. The classification in
+    ``_observe_classified_state`` compares ``hooks.json`` and ``config.toml``
+    mtimes precisely because Codex's recorded ``trusted_hash`` cannot be
+    reproduced (§1.5). A bare ``touch`` therefore retires trust that nothing
+    changed, and a rewrite that preserves the mtime does not retire trust that
+    did. Hashing the bytes has neither failure.
+
+    UNREADABLE AND AMBIGUOUS BOTH RETURN ``None``, and ``None`` never matches
+    any stamped generation, so both stay untrusted. An empty root set is one
+    of them: nothing was configured, so nothing can be shown to have run.
+    """
+    import hashlib  # noqa: PLC0415 — stdlib, matching the kernels beside it
+
+    roots = list(roots)
+    if not roots:
+        return None
+    digest = hashlib.sha256()
+    for root in sorted(roots, key=lambda item: str(item.hooks_path)):
+        try:
+            document = _read_hooks_document(root.hooks_path)
+            hooks_bytes = root.hooks_path.read_bytes()
+        except (CodexHooksError, OSError):
+            return None
+        try:
+            config_bytes = codex_config_path(root).read_bytes()
+        except FileNotFoundError:
+            # An absent config.toml is a real, ordinary state: Codex writes it
+            # when it first records trust. Distinguish it from empty rather
+            # than refusing, so a root that has never been trusted still has a
+            # stable generation.
+            config_bytes = b""
+        except OSError:
+            return None
+        digest.update(b"root\x00")
+        digest.update(str(root.source_root_key).encode("utf-8"))
+        digest.update(b"\x00hooks\x00")
+        digest.update(hooks_bytes)
+        digest.update(b"\x00config\x00")
+        digest.update(config_bytes)
+        for event in CODEX_HOOK_EVENTS:
+            managed = [
+                (group_index, handler_index, handler)
+                for group_index, handler_index, handler
+                in iter_codex_hook_slots(document, event)
+                if is_managed_codex_hook_handler(handler)
+            ]
+            if len(managed) != 1:
+                # Zero is "not installed" and more than one is the duplicate
+                # `setup` exists to reconcile. Neither is a configuration a
+                # ticket could have been written under unambiguously.
+                return None
+            group_index, handler_index, handler = managed[0]
+            tokens = _handler_command_tokens(handler) or []
+            digest.update(b"\x00event\x00")
+            digest.update(f"{event}:{group_index}:{handler_index}".encode("utf-8"))
+            for token in tokens:
+                digest.update(b"\x00arg\x00")
+                digest.update(token.encode("utf-8"))
+    return digest.hexdigest()
+
+
 def codex_hook_roots_all_enabled(roots) -> bool:
     """Fail-closed frontier predicate: at least one root, every one enabled."""
     roots = list(roots)
@@ -544,6 +622,30 @@ def codex_hook_roots_all_enabled(roots) -> bool:
         return all(observe_codex_hook_root(root).observed_enabled for root in roots)
     except Exception:
         return False
+
+
+def codex_configuration_generation_for_guard_paths(guard_paths) -> "str | None":
+    """:func:`codex_configuration_generation` for the roots a guard set names.
+
+    The inverse of :func:`codex_frontier_guard_paths`, and it lives here beside
+    it so the two stay one statement rather than an assumption held in the
+    frontier. Every guard set that function produces is, per root, the root's
+    ``hooks.json`` followed by its ``config.toml``, and a root's home is that
+    ``hooks.json``'s parent — so the guard set the frontier already holds names
+    exactly the roots whose configuration generation it needs, and it needs no
+    second channel to be told them.
+
+    Anything that is not a ``hooks.json`` is ignored rather than rejected: the
+    Claude frontier passes its settings path through the same parameter.
+    """
+    homes = [
+        pathlib.Path(path).parent
+        for path in guard_paths
+        if pathlib.Path(path).name == "hooks.json"
+    ]
+    if not homes:
+        return None
+    return codex_configuration_generation(codex_hook_roots(homes))
 
 
 def codex_frontier_guard_paths(roots) -> tuple[pathlib.Path, ...]:

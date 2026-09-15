@@ -5,7 +5,7 @@ record-credit — weekly in-place credit
   writes:
     + weekly_credit_floors  (effective=2026-06-19T14:00:00+00:00, pre_credit=46)
     ~ hwm-7d                46 -> 31
-    - stale replays         0 rows
+    - stale replays         1 rows
     + snapshot              captured=2026-06-19T14:37:00Z, weekly_percent=31
   note: same week — no window re-anchor (no week_reset_events row)
   (dry-run — nothing written)

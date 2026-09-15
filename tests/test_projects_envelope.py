@@ -222,16 +222,24 @@ def test_window_weeks_clamped_to_history():
     assert env["trend"]["window_weeks"] == len(env["trend"]["weeks"])
 
 
-def test_usage_snapshot_read_is_bounded_and_reduced_before_python():
+def test_usage_snapshot_read_is_bounded_before_python():
     """#627: old status-line ticks must not cross the SQLite/Python boundary.
 
     The live store has tens of thousands of snapshot rows but the Projects
-    envelope can render at most ``weeks_back`` week percentages.  Seed many
+    envelope can render at most ``weeks_back`` week percentages. Seed many
     rows far outside the rendered window and two credited captures in the
-    current week.  The query must return no more than one non-null latest row
-    per candidate boundary date while the later, lower credit remains
-    authoritative. The small calendar-window allowance preserves #620's rule
-    that an unresolvable legacy boundary cannot evict a valid week.
+    current week. The DATE WINDOW is what bounds the read, and the later,
+    lower credit remains authoritative.
+
+    #750 S4 §2.2 removed the per-date `ROW_NUMBER()` reduction this test used
+    to also assert. It kept exactly one row per calendar date, and both
+    cycles of a credited week share that date, so the panel could never give
+    the second cycle its own reading however the Python below resolved
+    intervals. The rows now cross with their `captured_at_utc` and `id`, and
+    the shared reducer applies the segment bounds and picks the latest. The
+    row bound therefore becomes a window bound rather than a per-date one,
+    which is what #627 was really about: the 500 seeded 2019 ticks are
+    excluded by the date range, not by the ranking.
     """
     source = _open(FIXTURE_DIR / "multi-week.db")
     raw = sqlite3.connect(":memory:")
@@ -310,8 +318,9 @@ def test_usage_snapshot_read_is_bounded_and_reduced_before_python():
 
     assert conn.snapshot_rows is not None
     assert conn.snapshot_rows <= 7 * 12, (
-        "the attribution query must return at most one latest row per date "
-        f"inside the bounded render window, got {conn.snapshot_rows}"
+        "the attribution query must stay bounded by the render window; the "
+        "500 seeded 2019 ticks must not cross into Python, got "
+        f"{conn.snapshot_rows}"
     )
     current = next(
         row for row in env["trend"]["weeks"]
@@ -806,3 +815,158 @@ def test_accumulator_f7_no_torn_value():
     warm, _ = _acc_tick(conn, _max_id(conn))
     assert warm[bp].cost_usd != captured_cost, "the live tick advanced the running cost"
     assert captured.cost_usd == captured_cost, "the previously-captured bucket is untouched (F7)"
+
+
+# --- #750 S4 §2.2 / §2.3: a credited week on the projects panel -------------
+
+CREDITED_WEEK_START = dt.datetime(2026, 5, 18, 0, tzinfo=dt.timezone.utc)
+# BEFORE `NOW_UTC`. `window_ending_at` renders intervals up to and including
+# the one containing "now", so a cut in the future would leave the tail cycle
+# legitimately unrendered and the test would prove nothing.
+CREDITED_CUT = dt.datetime(2026, 5, 19, 9, tzinfo=dt.timezone.utc)
+CREDITED_WEEK_END = dt.datetime(2026, 5, 25, 0, tzinfo=dt.timezone.utc)
+
+
+def _credited_store():
+    """`multi-week.db` with the current week credited in place.
+
+    One `week_reset_events` row in the shape both appliers require of an
+    in-place credit (`old_week_end_at == effective_reset_at_utc`), plus one
+    observation on each side of the cut.
+    """
+    source = _open(FIXTURE_DIR / "multi-week.db")
+    raw = sqlite3.connect(":memory:")
+    source.backup(raw)
+    source.close()
+    raw.row_factory = sqlite3.Row
+    raw.execute("DELETE FROM weekly_usage_snapshots")
+    for captured, pct in (
+        ("2026-05-19T08:00:00Z", 88.0),   # pre-credit peak
+        ("2026-05-19T10:00:00Z", 11.0),   # post-credit
+    ):
+        raw.execute(
+            "INSERT INTO weekly_usage_snapshots("
+            " captured_at_utc, week_start_date, week_end_date, week_start_at,"
+            " week_end_at, weekly_percent) VALUES (?,?,?,?,?,?)",
+            (captured, CREDITED_WEEK_START.date().isoformat(),
+             CREDITED_WEEK_END.date().isoformat(),
+             CREDITED_WEEK_START.isoformat(), CREDITED_WEEK_END.isoformat(),
+             pct),
+        )
+    cut = CREDITED_CUT.isoformat()
+    raw.execute(
+        "CREATE TABLE IF NOT EXISTS week_reset_events ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT, detected_at_utc TEXT NOT NULL,"
+        " old_week_end_at TEXT NOT NULL, new_week_end_at TEXT NOT NULL,"
+        " effective_reset_at_utc TEXT NOT NULL, observed_pre_credit_pct REAL,"
+        " account_key TEXT)"
+    )
+    raw.execute(
+        "INSERT INTO week_reset_events(detected_at_utc, old_week_end_at,"
+        " new_week_end_at, effective_reset_at_utc, observed_pre_credit_pct,"
+        " account_key) VALUES (?,?,?,?,?,?)",
+        (cut, cut, CREDITED_WEEK_END.isoformat(), cut, 88.0, "unattributed"),
+    )
+    raw.commit()
+    return raw
+
+
+def test_every_segment_of_a_credited_week_gets_its_own_percent_in_the_envelope():
+    """The `ROW_NUMBER() PARTITION BY week_start_date` kept ONE row per
+    calendar date, and both cycles of a credited week share that date, so the
+    panel could never give the second cycle its own reading. Asserted against
+    the panel's own envelope, not the CLI's."""
+    conn = _credited_store()
+    try:
+        _cctally_dashboard._projects_reset_memo()
+        env = _build_projects_envelope(
+            conn, now_utc=NOW_UTC, current_week=None, weeks_back=12,
+        )
+        by_instant = {
+            w["week_start_at"]: w["total_pct"] for w in env["trend"]["weeks"]
+        }
+        head = CREDITED_WEEK_START.isoformat().replace("+00:00", "Z")
+        tail = CREDITED_CUT.isoformat().replace("+00:00", "Z")
+        assert head in by_instant and tail in by_instant, (
+            "the credited week must contribute BOTH cycles as intervals; "
+            f"got {sorted(by_instant)}"
+        )
+        # One percentage per CYCLE. Under the ranked query only one row per
+        # calendar date survived, so the second cycle could carry nothing.
+        assert by_instant[head] == 88.0, by_instant
+        assert by_instant[tail] == 11.0, by_instant
+    finally:
+        conn.close()
+
+
+def test_projects_trend_weeks_carry_week_start_at():
+    """§3.5. `week_start_date` is the shared join key, so two cycles of a
+    credited week carry one value for it and it cannot be a React key."""
+    conn = _open(FIXTURE_DIR / "multi-week.db")
+    try:
+        _cctally_dashboard._projects_reset_memo()
+        env = _build_projects_envelope(
+            conn, now_utc=NOW_UTC, current_week=None, weeks_back=12,
+        )
+        weeks = env["trend"]["weeks"]
+        assert weeks, env["trend"]
+        for w in weeks:
+            assert "week_start_at" in w, w
+            assert w["week_start_at"].endswith("Z"), w["week_start_at"]
+        instants = [w["week_start_at"] for w in weeks]
+        assert len(set(instants)) == len(instants), instants
+    finally:
+        conn.close()
+
+
+def test_total_pct_agrees_with_the_weekly_surfaces_across_a_credited_boundary():
+    """#743 item 2: the earlier segment carried the LATER segment's percent
+    and the later carried null. The panel must read what the shared reducer
+    reads on the same store."""
+    conn = _credited_store()
+    try:
+        subweeks = _NS["_compute_subscription_weeks"](
+            conn, CREDITED_WEEK_START - dt.timedelta(days=1),
+            NOW_UTC, account_key=None,
+        )
+        by_segment = _NS["latest_usage_by_segment"](
+            conn, subweeks, account_key=None)
+        _cctally_dashboard._projects_reset_memo()
+        env = _build_projects_envelope(
+            conn, now_utc=NOW_UTC, current_week=None, weeks_back=12,
+        )
+        panel = {
+            w["week_start_at"]: w["total_pct"] for w in env["trend"]["weeks"]
+        }
+        for segment_key, pct in by_segment.items():
+            iso_z = segment_key.replace("+00:00", "Z")
+            if iso_z in panel and pct is not None:
+                assert panel[iso_z] == pct, (
+                    f"panel and reducer disagree at {iso_z}: "
+                    f"{panel[iso_z]} vs {pct}"
+                )
+    finally:
+        conn.close()
+
+
+def test_start_for_date_returns_none_when_a_date_resolves_to_two_segments():
+    """#737. The later interval used to win. A legacy row carrying only a
+    date is genuinely ambiguous on a credited week, and
+    `tests/test_620_projects_unresolvable_week.py` already requires an
+    unresolvable week to contribute nothing rather than be attributed to a
+    guess."""
+    same_day_cut = CREDITED_WEEK_START + dt.timedelta(hours=12)
+    grid = _cctally_dashboard._ProjectsWeekGrid([
+        (CREDITED_WEEK_START, same_day_cut),
+        (same_day_cut, CREDITED_WEEK_END),
+    ])
+    assert grid.start_for_date(CREDITED_WEEK_START.date()) is None, (
+        "both cycles start on 2026-05-18, so the date resolves to neither"
+    )
+    unambiguous = _cctally_dashboard._ProjectsWeekGrid([
+        (CREDITED_WEEK_START, CREDITED_WEEK_END),
+    ])
+    assert unambiguous.start_for_date(
+        CREDITED_WEEK_START.date()) == CREDITED_WEEK_START, (
+        "a date owned by exactly one interval still resolves"
+    )

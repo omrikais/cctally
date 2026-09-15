@@ -598,6 +598,14 @@ export interface WeekIndexEntry {
   milestone_count: number;
   block_count: number;
   segment_count?: number;          // Claude only
+  // #750 S4 §5.3. Claude only, additive and optional. A current
+  // single-segment cycle neither fetches its detail nor uses one that
+  // arrives, so a gap in the LIVE cycle would stay invisible — the
+  // disclosure travels on the week-detail payload. This is the reason to
+  // fetch, and the reason to use what comes back; it MUST reach both
+  // predicates, because a hint wired into the fetch alone produces a
+  // successful request whose rows and note never render.
+  has_observation_gap?: boolean | null;
   detail_stamp: string;
 }
 
@@ -624,8 +632,24 @@ export interface WeekDetailPayload {
   is_current: boolean;
   detail_stamp: string;
   segments: { key: string; milestones: Milestone[] | CodexQuotaMilestoneRow[] }[];
+  // #750 S4 §5.2. One entry per back-filled RUN, ascending by first
+  // threshold. Absent or empty means no gap. Additive and nullable so an
+  // older envelope served to a newer client renders without the note rather
+  // than crashing. The client composes the sentence from these fields through
+  // `lib/fmt.ts`; the server does NOT ship a rendered one, because that would
+  // put a presentation decision inside a data contract and take the display
+  // timezone from the server's idea of it.
+  observation_gap_runs?: ObservationGapRun[] | null;
   dividers: { effective_at_utc: string; prior_percent: number | null }[];
   blocks: WeekDetailBlock[];
+}
+
+export interface ObservationGapRun {
+  first_percent: number;
+  last_percent: number;
+  observed_at_utc: string | null;
+  // Null when the run opens the ladder and has no predecessor.
+  previous_crossed_at_utc: string | null;
 }
 
 export interface Milestone {
@@ -633,6 +657,10 @@ export interface Milestone {
   crossed_at_utc: string | null;
   cumulative_usd: number;
   marginal_usd: number | null;
+  // #750 S4 §5.1. Present ONLY on a row whose null marginal the classifier
+  // identified as an observation gap. Snake_case matches its neighbours on
+  // this frozen legacy wire shape; the CLI's own JSON keeps camelCase.
+  marginal_usd_withheld_cause?: string | null;
   five_hour_pct_at_cross: number | null;
 }
 
@@ -644,7 +672,16 @@ export interface FiveHourMilestone {
   captured_at_utc: string;
   block_cost_usd: number;
   marginal_cost_usd: number | null;
+  // The RAW value the milestone stored. Frozen: a weekly-clamped tick records a
+  // reading no reader ever saw, and #834 S1 (#836) does not change what is
+  // stored — only what is rendered. Do NOT render this.
   seven_day_pct_at_crossing: number | null;
+  // #834 S1 (#836): the EFFECTIVE weekly value, joined from the
+  // `weekly_usage_snapshots` row the milestone names. Additive and nullable, so
+  // no envelope version moves. `null` means the referenced snapshot row is gone
+  // — render the unavailable marker, NEVER `seven_day_pct_at_crossing`.
+  // Optional because a pre-#836 server can publish a row without it.
+  effective_seven_day_pct_at_crossing?: number | null;
   // Segment column (migration 006): ``0`` is the pre-credit / no-credit
   // sentinel; non-zero values reference a ``five_hour_reset_events.id``.
   // React's row key MUST include this to distinguish post-credit
@@ -781,6 +818,12 @@ export interface TrendRow {
   // Client-only provider attribution in All-mode trend compositions.
   source?: SourceName;
   label: string;
+  // #750 S4 §3.1. The segment instant, canonical UTC ISO. `label` is
+  // year-free and an in-place credit splits one week into cycles that can
+  // render the same label, so the label alone is not a React key. Optional
+  // and nullable: an older envelope served to a newer client degrades to
+  // today's label keying rather than crashing.
+  week_start_at?: string | null;
   used_pct: number | null;
   dollar_per_pct: number | null;
   delta: number | null;
@@ -851,6 +894,12 @@ export interface ProjectsCurrentWeekEnvelope {
 
 export interface ProjectsTrendWeek {
   week_start_date: string;
+  // #750 S4 §3.5. The segment instant, canonical UTC ISO. Optional and
+  // nullable so an older envelope served to a newer client degrades to the
+  // date rather than crashing. `week_start_date` is the SHARED billing-cycle
+  // join key, so two cycles of a credited week carry one value for it and it
+  // cannot be a React key.
+  week_start_at?: string | null;
   week_label: string;
   total_cost_usd: number;
   total_pct: number | null;
@@ -1065,6 +1114,12 @@ export interface BlockDetail {
   cache_read_tokens:      number;
   cache_hit_pct:          number | null;
 
+  // Which body of evidence the headline figures above came from. A frozen
+  // closed block reports the facts retained at its close; every other block is
+  // computed from the entries it owns right now. `samples` is always computed,
+  // so on a retained block the two can disagree (#769 S2).
+  facts_source: 'computed' | 'retained';
+
   models:     ModelCostRow[];
   burn_rate:  BlockDetailBurnRate | null;
   projection: BlockDetailProjection | null;
@@ -1152,6 +1207,86 @@ export interface SourceWarning {
 // One atomically-published provider read model. `TData` is the provider's own
 // `data` payload (ClaudeSourceData | CodexSourceData | AllSourceData); it is
 // null before the first coherent generation (unavailable / hydrating).
+// #834 S2 (#828, #829) — the typed Codex metadata-health result.
+//
+// `unknown` is CLIENT-ONLY and is what every absent, null or unrecognized
+// value normalizes to. The server publishes three states; a pre-v12 payload
+// publishes no field at all, and a v12 payload publishes null on a provider
+// that describes no Codex metadata. None of those is a statement that
+// attribution is complete, so none of them may read as `healthy`.
+export type MetadataHealthState =
+  | 'healthy'
+  | 'malformed_row_partial'
+  | 'transient_read_failure'
+  | 'unknown';
+
+export interface MetadataHealth {
+  state: MetadataHealthState;
+  incomplete_rows: number | null;
+  retryable: boolean;
+}
+
+export const METADATA_HEALTH_UNKNOWN: MetadataHealth = Object.freeze({
+  state: 'unknown',
+  incomplete_rows: null,
+  retryable: false,
+});
+
+const METADATA_HEALTH_SERVER_STATES: ReadonlySet<string> = new Set([
+  'healthy', 'malformed_row_partial', 'transient_read_failure',
+]);
+
+/**
+ * Turn whatever a payload carried into one typed result.
+ *
+ * ONE function, exported once, called by both transports. Two copies of this
+ * normalization is the shape in which one of them stops matching the other,
+ * and the two transports deliver to the same store.
+ *
+ * A state this bundle does not know becomes `unknown` rather than passing
+ * through: a future server could add a fourth state, this bundle cannot render
+ * it, and rendering it as healthy is the one unrecoverable mistake.
+ */
+export function normalizeMetadataHealth(value: unknown): MetadataHealth {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    return METADATA_HEALTH_UNKNOWN;
+  }
+  const record = value as Record<string, unknown>;
+  const state = record.state;
+  if (typeof state !== 'string' || !METADATA_HEALTH_SERVER_STATES.has(state)) {
+    return METADATA_HEALTH_UNKNOWN;
+  }
+  const rows = record.incomplete_rows;
+  return {
+    state: state as MetadataHealthState,
+    incomplete_rows: typeof rows === 'number' && Number.isFinite(rows)
+      ? rows
+      : null,
+    retryable: record.retryable === true,
+  };
+}
+
+/**
+ * Fill `metadata_health` on every source entry of one freshly-parsed envelope.
+ *
+ * Mutates in place and returns the same object. The caller has just parsed it
+ * from the wire and nothing else holds a reference yet, and cloning a whole
+ * dashboard envelope to set three fields would be a real cost on every frame.
+ */
+export function normalizeEnvelopeMetadataHealth<T extends Envelope>(
+  envelope: T,
+): T {
+  const sources = envelope.sources as
+    | Record<string, { metadata_health?: MetadataHealth | null }>
+    | undefined;
+  if (sources == null || typeof sources !== 'object') return envelope;
+  for (const entry of Object.values(sources)) {
+    if (entry == null || typeof entry !== 'object') continue;
+    entry.metadata_health = normalizeMetadataHealth(entry.metadata_health);
+  }
+  return envelope;
+}
+
 export interface SourceEntry<TData> {
   availability: SourceAvailability;
   freshness: SourceFreshness;
@@ -1164,6 +1299,11 @@ export interface SourceEntry<TData> {
   last_success_at: string | null;
   capabilities: Record<string, CapabilityRecord>;
   data: TData | null;
+  // #834 S2 (#828, #829). Declared optional because the WIRE may omit it — a
+  // pre-v12 server does — but every entry that reaches the store has been
+  // through `normalizeEnvelopeMetadataHealth`, so a consumer reading it there
+  // always finds a typed object. Never read it as healthy when absent.
+  metadata_health?: MetadataHealth | null;
 }
 
 // ---- Codex provider vocabulary (build_codex_source_state) -------------
@@ -1521,6 +1661,15 @@ export interface CodexHero {
   // has no background quota poll, so an idle weekly observation goes stale
   // after one hour while its spend, tokens and cycle bounds stay correct.
   cycle_freshness?: 'stale';
+  // #769 S6 / #753 — ADDITIVE and OMITTED on the healthy path, which keeps the
+  // coherent generation's payload byte-identical. `updating` means the figures
+  // beside it are the last COHERENT ones and the quota projection is
+  // reconciling; the server has republished a retained cohort and the values
+  // above are real, so the client must render them with a quiet marker rather
+  // than blank them (D4). `pending` means this server process has never
+  // published a coherent hero, and the client renders an explicit Pending
+  // state rather than an em dash that reads as no spend (D5).
+  update_state?: 'updating' | 'pending';
   quota: CodexQuotaSummary;
   budget: CodexBudgetStatus | null;
   alerts: { count: number };
@@ -2216,8 +2365,13 @@ export interface CodexSessionDetailBody extends CodexTokenTotals {
   last_activity: string;
   models: string[];
   model_breakdowns: CodexModelBreakdown[];
-  metadata_availability?: 'partial';
-  metadata_reason?: string;
+  // #834 S2 (#829): a healthy detail carries both keys explicitly NULL rather
+  // than omitting them, so a client cannot mistake an omitted key for one this
+  // build could not fill. Still optional, because a pre-v12 server omits them.
+  // Every render site tests `=== 'partial'`, which is false for null and for
+  // undefined alike.
+  metadata_availability?: 'partial' | null;
+  metadata_reason?: string | null;
 }
 export interface CodexProjectDetailBody extends CodexTokenTotals {
   detail_kind: 'codex_project';
@@ -2230,8 +2384,13 @@ export interface CodexProjectDetailBody extends CodexTokenTotals {
   session_count: number;
   models: Array<{ model: string } & CodexTokenTotals>;
   sessions: Array<{ label: string; last_activity: string } & CodexTokenTotals>;
-  metadata_availability?: 'partial';
-  metadata_reason?: string;
+  // #834 S2 (#829): a healthy detail carries both keys explicitly NULL rather
+  // than omitting them, so a client cannot mistake an omitted key for one this
+  // build could not fill. Still optional, because a pre-v12 server omits them.
+  // Every render site tests `=== 'partial'`, which is false for null and for
+  // undefined alike.
+  metadata_availability?: 'partial' | null;
+  metadata_reason?: string | null;
 }
 export interface CodexBlockDetailBody {
   detail_kind: 'codex_block';
@@ -2242,7 +2401,20 @@ export interface CodexBlockDetailBody {
   is_active?: boolean;
   cost_usd?: number;
   model_breakdowns?: CodexModelBreakdown[];
-  observed_slot: number;
+  // #769 S9 QA P1 — every field below `resets_at` is OPTIONAL because the
+  // partial payload omits it. `_codex_partial_source_detail` builds a block
+  // through `_source_safe_native_detail`, whose `block` allowlist intersects
+  // the published quota-block row; that row carries no `forecast`, no
+  // `observations`, no `milestones`, no `freshness` and no `observed_slot`, so
+  // the partial body is exactly these fourteen keys:
+  //
+  //   detail_kind, key, label, start_at, end_at, resets_at, current_percent,
+  //   orphaned, is_active, cost_usd, model_breakdowns, window_minutes,
+  //   metadata_availability, metadata_reason
+  //
+  // `forecast` was declared required, so the view read it unguarded and React
+  // threw before any element mounted.
+  observed_slot?: number;
   window_minutes: number | null;
   resets_at: string;
   current_percent: number | null;
@@ -2250,12 +2422,19 @@ export interface CodexBlockDetailBody {
   freshness?: string;
   observations?: Array<{ captured_at: string; used_percent: number; resets_at: string }>;
   milestones?: Array<{ percent: number; captured_at: string }>;
-  forecast: {
+  forecast?: {
     status: string;
     current_percent: number | null;
     projected_percent: number | null;
     resets_at: string | null;
   };
+  // #834 S2 (#829): a healthy detail carries both keys explicitly NULL rather
+  // than omitting them, so a client cannot mistake an omitted key for one this
+  // build could not fill. Still optional, because a pre-v12 server omits them.
+  // Every render site tests `=== 'partial'`, which is false for null and for
+  // undefined alike.
+  metadata_availability?: 'partial' | null;
+  metadata_reason?: string | null;
 }
 
 export type SourceDetailBody =

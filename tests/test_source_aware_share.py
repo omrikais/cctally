@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import shutil
 import stat
@@ -639,6 +640,27 @@ def test_source_aware_harness_diffs_committed_artifacts_and_scans_canaries():
     assert "passed: 190   failed: 0" in result.stdout
 
 
+def _canaries() -> list[str]:
+    """The canaries the builder declares, in the order the harness scans them.
+
+    Read from the builder rather than hard-coded, so adding a canary does not
+    silently narrow a case that counts one refusal per canary.
+    """
+    root = Path(__file__).resolve().parents[1]
+    listed = subprocess.run(
+        [sys.executable, str(root / "bin" / "build-source-aware-fixtures.py"),
+         "--canaries"],
+        text=True, capture_output=True, check=True,
+    ).stdout.splitlines()
+    canaries = [line for line in listed if line.strip()]
+    assert canaries, "the builder declared no canary"
+    return canaries
+
+
+def _canary_count() -> int:
+    return len(_canaries())
+
+
 def test_the_privacy_canary_fails_when_its_scanner_is_unavailable(tmp_path):
     """A canary that cannot scan must not report a clean scan (#711).
 
@@ -672,7 +694,14 @@ def test_the_privacy_canary_fails_when_its_scanner_is_unavailable(tmp_path):
     assert result.returncode != 0, (
         "the harness passed with an unusable scanner, so its privacy leg "
         f"reported a clean scan it never performed:\n{combined}")
-    assert "scanner" in combined.lower(), combined
+    # The PINNED line, not the word "scanner". Both the human-readable sentence
+    # and the evidence-retention line carry that word, so deleting the pinned
+    # line outright would have left this case green while removing the one
+    # sentence an aggregated export can carry.
+    assert (
+        "FAIL source-aware: privacy scanner failure status=127 phase=self-test "
+        "canary=0/0"
+    ) in result.stdout, result.stdout
 
 
 def test_a_silent_scanner_failure_prints_no_bare_blank_line(tmp_path):
@@ -710,12 +739,574 @@ def test_a_silent_scanner_failure_prints_no_bare_blank_line(tmp_path):
         "the harness passed while its scanner refused every canary scan:\n"
         + result.stdout + result.stderr)
     lines = result.stdout.splitlines()
-    refusals = [i for i, line in enumerate(lines) if "exited 2" in line]
-    assert refusals, result.stdout
+    # #754 pinned the refusal's wording so the aggregator's closed vocabulary
+    # can carry it intact. The line names a status, a phase and an ordinal; the
+    # scanner's own output moved to the private raw log, which is what removes
+    # the bare-blank-line class rather than merely guarding against it.
+    refusals = [
+        i
+        for i, line in enumerate(lines)
+        if line.startswith(
+            "FAIL source-aware: privacy scanner failure status=2 phase=artifact-scan canary="
+        )
+    ]
+    assert len(refusals) == _canary_count(), result.stdout
     for index in refusals:
         assert not lines[index + 1:] or lines[index + 1] != "", (
             "the refusal is followed by a bare blank line, so the report "
             "looks truncated:\n" + result.stdout)
+
+
+def _harness_statements(function_name: str) -> list[str]:
+    """The statements of one harness function, with continuations joined.
+
+    Returns the shell statements of `function_name` in source order, comments
+    and blank lines removed, so a case can make an assertion about the shape of
+    a single construct rather than about the whole file.
+    """
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "bin" / "cctally-source-aware-test").read_text(encoding="utf-8")
+    start = source.index(f"{function_name}()")
+    body = source[start:]
+    body = body[: body.index("\n}\n")]
+    statements: list[str] = []
+    pending = ""
+    for raw in body.splitlines():
+        stripped = raw.strip()
+        if stripped.endswith("\\"):
+            pending += stripped[:-1].rstrip() + " "
+            continue
+        statements.append((pending + stripped).strip())
+        pending = ""
+    if pending:
+        statements.append(pending.strip())
+    return [line for line in statements if line and not line.startswith("#")]
+
+
+def test_the_scan_observes_its_status_without_forking_a_subshell():
+    """#760. The scan must not be routed through a command substitution.
+
+    `out=$(… )` forks a bash subshell, and a subshell that dies on a signal
+    sets `$?` to 128+N. The harness then recorded that number as the scanner's
+    exit status, with the scanner's absolute path and version string attached,
+    for a program that may have completed normally. The proof that the number
+    was never the scanner's is #766's stand-in: a two-line `/bin/sh` script
+    that exits 2 on `-R` before opening any file was still recorded as
+    `status=139 signal=11`, and a program that does no work cannot crash from
+    the amount of work.
+
+    Reading the source is crude, but it pins the construct on every run. The
+    behavioural case below observes the consequence, and the two together are
+    what make a green run mean something: the interpreter fault that produced
+    the false status is intermittent, so a behavioural case alone would pass
+    against the broken construct most of the time.
+    """
+    statements = _harness_statements("_scan_for_canary")
+    invocations = [
+        line
+        for line in statements
+        if "LC_ALL=C" in line and '"$SCANNER_PATH"' in line
+    ]
+    assert len(invocations) == 1, statements
+    invocation = invocations[0]
+
+    assert "$(" not in invocation, (
+        "the scan is wrapped in a command substitution, so the status the "
+        f"harness reports is a forked subshell's:\n{invocation}")
+    assert "`" not in invocation, (
+        "the scan is wrapped in a backtick substitution, so the status the "
+        f"harness reports is a forked subshell's:\n{invocation}")
+    assert "|" not in invocation, (
+        "the scan is a pipeline, so the status the harness reports is not "
+        f"observed directly from the scanner:\n{invocation}")
+    assert invocation.startswith("LC_ALL=C "), (
+        "the scan is not the statement's own command, so its status is not "
+        f"the scanner's:\n{invocation}")
+    assert ">" in invocation, (
+        "the scan does not redirect its output to a file, so the harness "
+        f"cannot both observe the status directly and keep the output:\n{invocation}")
+
+    index = statements.index(invocation)
+    assert statements[index + 1] == "rc=$?", (
+        "another statement runs between the scan and the status it records, "
+        f"so `$?` is that statement's:\n{statements[index:index + 3]}")
+
+
+def test_the_reported_scan_status_is_the_status_the_scanner_exited_with(tmp_path):
+    """#760. The reported status must be the named program's own.
+
+    WHAT THE STAND-IN ACTUALLY DISCRIMINATES, measured rather than assumed: it
+    reports what kind of FILE its own standard output is, and nothing else. A
+    direct invocation redirected to a file leaves it writing to a regular file,
+    so it exits 3. Both `out=$(…)` and a pipeline leave it writing to a pipe, so
+    it exits 4 in either shape, and the harness runs `set -uo pipefail`, which
+    reports the status of the LAST command in the pipeline to exit non-zero
+    rather than the last element's 0. Measured under those options,
+    `( exit 4 ) | cat` reports 4 and `( exit 4 ) | head -1` reports 4, because
+    the right-hand stage exits 0 in both; `( exit 4 ) | ( exit 5 )` reports 5,
+    which is what "last non-zero" means. Only `set +o pipefail` reports 0.
+
+    So this case cannot tell a command substitution from a pipeline: both
+    report 4. It distinguishes each of them from a direct invocation's 3, which
+    is the discrimination it exists to make.
+
+    That is still narrower than "direct invocation versus forked subshell".
+    `( direct > file ); rc=$?` — a forked subshell that still redirects, and
+    still the #760 defect — leaves the stand-in writing to a regular file, so it
+    reports 3 and PASSES this case. That shape is covered by
+    `test_the_scan_observes_its_status_without_forking_a_subshell`, which reads
+    the construct out of the harness source rather than inferring it from a
+    status. Neither case covers the other, and both are kept.
+
+    The stand-in also writes a line to standard output before exiting, so the
+    case additionally proves the harness still records the scanner's output and
+    its byte counts once that output is read from a file rather than captured.
+    """
+    real_grep = shutil.which("grep")
+    assert real_grep, "no grep on PATH, so this case cannot build its stand-in"
+    root = Path(__file__).resolve().parents[1]
+    shadow = tmp_path / "shadow-bin"
+    shadow.mkdir()
+    fake = shadow / "grep"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-R" ]; then\n'
+        "    printf 'probe-stdout-line\\n'\n"
+        '    if [ -f /dev/stdout ]; then printf "stdout=regular-file\\n" >&2; exit 3; fi\n'
+        '    if [ -p /dev/stdout ]; then printf "stdout=pipe\\n" >&2; exit 4; fi\n'
+        '    printf "stdout=other\\n" >&2\n'
+        "    exit 5\n"
+        "fi\n"
+        f'exec {real_grep} "$@"\n',
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+
+    retained_dir = tmp_path / "retained"
+    env = dict(os.environ)
+    env["PATH"] = f"{shadow}{os.pathsep}{env['PATH']}"
+    env["CCTALLY_SOURCE_AWARE_RAW_LOG_DIR"] = str(retained_dir)
+    result = subprocess.run(
+        [str(root / "bin" / "cctally-source-aware-test")],
+        text=True, capture_output=True, check=False, env=env,
+    )
+
+    assert result.returncode != 0, (
+        "the harness passed while its scanner refused every canary scan:\n"
+        + result.stdout + result.stderr)
+    prefix = "FAIL source-aware: privacy scanner failure status="
+    statuses = [
+        line[len(prefix):].split(None, 1)[0]
+        for line in result.stdout.splitlines()
+        if line.startswith(prefix)
+    ]
+    assert statuses.count("3") == _canary_count(), (
+        "the harness did not report the stand-in's own exit status for every "
+        f"canary; it reported {statuses}. A `4` means the scanner's output "
+        "went to a pipe, so the scan was routed through a command substitution "
+        f"or a pipeline rather than invoked directly:\n{result.stdout}")
+    assert set(statuses) == {"3"}, result.stdout
+
+    retained = sorted(retained_dir.glob("scanner-raw.*.log"))
+    assert retained, sorted(p.name for p in retained_dir.iterdir())
+    raw = retained[-1].read_text(encoding="utf-8")
+    # Every diagnostic field the retained log carried before the fix is still
+    # written, and the output one now comes from the file.
+    assert "scan ordinal=1/" in raw, raw
+    # SCOPED TO THE SCAN RECORD. `_resolve_scanner` writes its own
+    # `resolve executable=…` and `  version=…` lines on every successful run,
+    # so an unscoped `in raw` is satisfied by resolution alone: both assertions
+    # would still pass if `_scan_for_canary` dropped both of its own lines, and
+    # the fields this case exists to pin would be gone with the case green.
+    scan_record = raw[raw.index("scan ordinal=1/"):]
+    assert f"executable={shadow}/grep" in scan_record, raw
+    assert "version=" in scan_record, raw
+    assert "argv=" in raw, raw
+    assert "started=" in raw and "ended=" in raw, raw
+    assert "scanner-stdout: probe-stdout-line" in raw, raw
+    assert "scanner-stderr: stdout=regular-file" in raw, raw
+    assert "stdout_bytes=0" not in raw, (
+        "the harness recorded no bytes for output the scanner did write, so "
+        f"the byte count is not read from the output file:\n{raw}")
+
+
+def test_the_scanner_is_resolved_without_forking_a_subshell():
+    """#769 S1 round 3. The same construct class, one function over.
+
+    `_resolve_scanner` read `command -v grep` through a command substitution and
+    consumed its status with `||`. A subshell dying from the #776 interpreter
+    fault would therefore have made the harness announce that no absolute path
+    for the scanner could be resolved, on a machine where `grep` is present —
+    a false diagnosis on a status-reporting path, which is exactly #760's class.
+    It is less severe only because the status it publishes is a hardcoded 127
+    rather than the subshell's own number.
+
+    The version capture is included in the rule rather than exempted from it. A
+    rule scoped to the one statement whose status is consumed is satisfied by
+    re-introducing a substitution on the line beside it, and the replacement is
+    strictly simpler anyway: a redirect plus a `read` builtin removes both the
+    forked subshell and the `head` process while preserving first-line
+    semantics exactly.
+    """
+    statements = _harness_statements("_resolve_scanner")
+    # The non-emptiness guard its sibling gets from `len(invocations) == 1`.
+    # `offenders == []` over an empty statement list is vacuously true, so an
+    # extractor that stopped finding this function's body — a renamed function,
+    # a changed brace style — would leave this case green while checking
+    # nothing at all.
+    assert statements, (
+        "the extractor returned no statements for _resolve_scanner, so the "
+        "assertion below would pass over an empty list")
+    assert any(line.startswith("command -v grep") for line in statements), (
+        "the extracted statements do not contain the resolution this case is "
+        f"about, so it is reading the wrong body:\n{statements}")
+    offenders = [
+        line for line in statements if "$(" in line or "`" in line
+    ]
+    assert offenders == [], (
+        "the scanner resolution reads a value through a command substitution, "
+        "so a subshell that dies takes the harness's diagnosis with it:\n"
+        + "\n".join(offenders))
+
+
+_GOLDEN_DIFF_HEADER_RE = re.compile(
+    r"^FAIL [^:]+: .+ diverged(?: \(diff error rc=.*\))?$"
+)
+# The five line shapes `diff -u` emits: the two file headers, a hunk header, a
+# context/removed/added line, and the no-final-newline note.
+_UNIFIED_DIFF_LINE_RE = re.compile(r"^(?:--- |\+\+\+ |@@ |[-+ ]|\\ )")
+
+
+def _golden_diff_body_indices(lines: list[str]) -> set[int]:
+    """Indices of the unified-diff lines `bin/_lib-golden-diff.sh` printed.
+
+    `_golden_diff_files` prints `FAIL <name>: <label> diverged` and then pipes
+    the whole unified diff through `head`, so its body is the run of
+    diff-shaped lines that follows such a header. Identifying the body by that
+    SHAPE is what lets a caller exclude it structurally instead of by guessing
+    which lines might contain a needle.
+
+    The header itself is deliberately NOT part of the body. It is built from a
+    scenario name and a relative artifact path, so it cannot carry a canary,
+    and leaving it in the checked set keeps the exclusion as narrow as the
+    reason for it.
+    """
+    body: set[int] = set()
+    inside = False
+    for index, line in enumerate(lines):
+        if _GOLDEN_DIFF_HEADER_RE.match(line):
+            inside = True
+            continue
+        if inside and _UNIFIED_DIFF_LINE_RE.match(line):
+            body.add(index)
+            continue
+        inside = False
+    return body
+
+
+# The six canaries the planted-artifact case drives, one parametrized case
+# each. `test_every_declared_canary_has_a_planted_case` asserts this list is
+# the builder's declared set, so a seventh canary fails the suite until its
+# case exists rather than going silently uncovered.
+_PLANTED_CANARIES = [
+    "/raw-path-canary", "source-root-canary", "conversation-canary",
+    "quota-canary", "repository-canary", "project-canary",
+]
+
+
+def test_every_declared_canary_has_a_planted_case():
+    """The parametrize list above must BE the builder's canary set.
+
+    A canary the builder stops declaring already fails loudly, through the
+    `canary in declared` assertion inside the planted case. A canary the
+    builder STARTS declaring failed nothing: the parametrize list is a literal,
+    so the new canary simply never got an end-to-end case, and the only leg
+    that proves the harness reads the corpus it certifies would have covered
+    six of seven.
+    """
+    declared = _canaries()
+    assert set(_PLANTED_CANARIES) == set(declared), (
+        "the planted-canary parametrize list and the builder's declared "
+        f"canaries differ; declared={declared}, parametrized={_PLANTED_CANARIES}")
+    assert len(_PLANTED_CANARIES) == len(set(_PLANTED_CANARIES)), _PLANTED_CANARIES
+
+
+@pytest.mark.parametrize("canary", _PLANTED_CANARIES)
+def test_the_real_harness_scan_path_finds_a_planted_canary(tmp_path, canary):
+    """Plant a canary in a generated artifact; the HARNESS must catch it.
+
+    Not the scanner's own self-test — the production traversal, over the real
+    generated corpus, reached the way the harness reaches it.
+
+    THE ONLY CASE THAT FAILS ON A SCAN THAT READS NOTHING. The fixture corpus
+    deliberately carries no canary, so every canary scan is expected to find
+    nothing, and a scanner that traverses the whole corpus and one that
+    traverses none of it produce the same six clean statuses. Every other case
+    in this file, and the whole campaign behind #760, is satisfied by either.
+
+    The canary goes at the END of the LAST artifact in sorted order, so a scan
+    that stops early — at a file count, a byte budget, or the first directory —
+    misses it and this case fails.
+    """
+    root = Path(__file__).resolve().parents[1]
+    declared = _canaries()
+    assert canary in declared, (
+        f"{canary!r} is not one of the builder's canaries: {declared}")
+    artifacts = tmp_path / "artifacts"
+    subprocess.run(
+        [sys.executable, str(root / "bin" / "build-source-aware-fixtures.py"),
+         "--out", str(artifacts)],
+        text=True, capture_output=True, check=True,
+    )
+    victim = sorted(artifacts.rglob("*.golden"))[-1]
+    victim.write_bytes(victim.read_bytes() + canary.encode("utf-8") + b"\n")
+
+    env = dict(os.environ)
+    env["CCTALLY_TESTING"] = "1"
+    env["CCTALLY_SOURCE_AWARE_PLANTED_ARTIFACTS"] = str(artifacts)
+    # Kept out of the shared default directory, which two sibling cases already
+    # write to and clean up by name.
+    env["CCTALLY_SOURCE_AWARE_RAW_LOG_DIR"] = str(tmp_path / "retained")
+    result = subprocess.run(
+        [str(root / "bin" / "cctally-source-aware-test")],
+        text=True, capture_output=True, check=False, env=env,
+    )
+
+    assert result.returncode != 0, (
+        f"the harness reported clean with {canary!r} planted at the end of "
+        f"{victim.name}, so its privacy leg does not read the corpus it "
+        "certifies:\n" + result.stdout + result.stderr)
+    ordinal = declared.index(canary) + 1
+    assert (
+        f"FAIL source-aware: privacy canary match canary={ordinal}/"
+        f"{len(declared)}"
+    ) in result.stdout, result.stdout
+    # The canary VALUE stays private even when it is the thing that was found.
+    #
+    # Planting a canary also makes that artifact diverge from its committed
+    # golden, so the golden-diff leg prints the differing line with the canary
+    # in it. That reprint is EXCLUDED STRUCTURALLY — by the shape of the lines
+    # `_golden_diff_files` emits — and every other line of stdout is required to
+    # be free of the canary, the privacy leg's own lines included.
+    #
+    # The previous form filtered stdout down to lines beginning
+    # `FAIL source-aware:` or `source-aware:`. Both of those shapes are built
+    # from an ordinal and a status and cannot contain a canary whatever the
+    # harness does, so the assertion could only fire if someone edited the
+    # `privacy canary match` echo to interpolate the canary. It was therefore
+    # blind to the regression the harness comment says was removed: an
+    # unconditional `printf '%s\n' "$out"` reprinting the scanner's matched
+    # line, which publishes both the canary and the artifact path. The
+    # measurement that showed this: the canary DOES reach stdout on exactly one
+    # line, `+/raw-path-canary`, and that line starts with `+`, so the filter
+    # skipped it.
+    #
+    # `test_the_private_log_retains_what_the_public_line_omits` does not cover
+    # the reprint either, because its stand-in exits 139 before matching
+    # anything, so there is no matched line to reprint.
+    lines = result.stdout.splitlines()
+    diff_body = _golden_diff_body_indices(lines)
+    leaked = [
+        line for index, line in enumerate(lines)
+        if index not in diff_body and canary in line
+    ]
+    assert leaked == [], (
+        "the canary value reached a line outside the golden diff's body, so a "
+        f"public line published the needle the leg exists to hide:\n{leaked}")
+
+
+def test_the_planted_artifact_hook_is_inert_without_cctally_testing(tmp_path):
+    """The hook redirects the scan away from the corpus the harness certifies.
+
+    An operator with a stray export would otherwise get a green authoritative
+    run over whatever tree that variable happened to name. The second condition
+    is what keeps the hook a test seam rather than an override.
+    """
+    root = Path(__file__).resolve().parents[1]
+    empty = tmp_path / "empty-tree"
+    empty.mkdir()
+
+    env = dict(os.environ)
+    env.pop("CCTALLY_TESTING", None)
+    env["CCTALLY_SOURCE_AWARE_PLANTED_ARTIFACTS"] = str(empty)
+    # As the two sibling planted-hook cases do. Setting the directory also sets
+    # the harness's RAW_LOG_ALWAYS, so this run retains its log unconditionally
+    # rather than only on failure — into this case's own temporary directory.
+    # Without it the retention would land in the shared default inside the
+    # repository, `$REPO_ROOT/.cctally-remote-state/source-aware-evidence/`.
+    env["CCTALLY_SOURCE_AWARE_RAW_LOG_DIR"] = str(tmp_path / "retained")
+    result = subprocess.run(
+        [str(root / "bin" / "cctally-source-aware-test")],
+        text=True, capture_output=True, check=False, env=env,
+    )
+
+    assert result.returncode == 0, (
+        "the harness honoured the planted-artifact hook without "
+        "CCTALLY_TESTING=1, so an exported variable can redirect an "
+        "authoritative run:\n" + result.stdout + result.stderr)
+    assert "passed: 190   failed: 0" in result.stdout, result.stdout
+
+
+def test_the_planted_artifact_hook_refuses_a_root_outside_the_temporary_tree(tmp_path):
+    """The bound `stage_fixtures_out_of_tree` has, on the one hook that lacked it.
+
+    The hook is read-only, so the worst case today is a recursive scan of
+    whatever tree it names — and the tree it is most likely to name by accident
+    is the committed fixture tree, which makes every comparison pass because the
+    generated side and the golden side are then the same file. The refusal is
+    the same three-arm `$TMPDIR` case the staging helper uses, `/private`
+    included, because macOS resolves the temporary root through it.
+    """
+    root = Path(__file__).resolve().parents[1]
+    inside_the_repo = root / "tests" / "fixtures" / "source-aware"
+
+    env = dict(os.environ)
+    env["CCTALLY_TESTING"] = "1"
+    env["CCTALLY_SOURCE_AWARE_PLANTED_ARTIFACTS"] = str(inside_the_repo)
+    env["CCTALLY_SOURCE_AWARE_RAW_LOG_DIR"] = str(tmp_path / "retained")
+    result = subprocess.run(
+        [str(root / "bin" / "cctally-source-aware-test")],
+        text=True, capture_output=True, check=False, env=env,
+    )
+
+    assert result.returncode != 0, (
+        "the harness accepted a planted-artifact root inside the repository, so "
+        "the hook can point the scan at any tree on the machine:\n"
+        + result.stdout + result.stderr)
+    assert (
+        "FAIL source-aware: artifact path not under tmpdir "
+    ) in result.stdout, result.stdout
+
+
+# --- #784: builder attribution and physical containment ---------------------
+#
+# The four refusals below must hold under BOTH interpreters this repository
+# runs bash from, so their bodies live in `tests/_source_aware_bash_refusals`
+# and each module calls them under one interpreter. This module is PUBLIC and
+# runs them under `/bin/bash`, the only interpreter a public clone is
+# guaranteed to have; the Homebrew 5.x leg is the mirror-private twin
+# `tests/test_source_aware_share_homebrew_bash.py`. Both keep static node ids
+# and neither introduces a suppression.
+
+from _source_aware_bash_refusals import (  # noqa: E402
+    BLANK_CANARY_BODIES,
+    FLOOR_BASH,
+    builder_shim_farm,
+    check_a_blank_canary_is_refused_and_one_nonblank_is_required,
+    check_a_crashed_manifest_builder_is_reported_as_a_builder_failure,
+    check_the_planted_hook_refuses_a_symlink_out_of_the_temporary_root,
+    check_the_planted_hook_refuses_a_traversal_out_of_the_temporary_root,
+)
+
+
+def _canary_shim_farm(tmp_path, root: Path, canaries_body: str) -> Path:
+    """The `--canaries` form of `builder_shim_farm`, kept for its three callers."""
+    return builder_shim_farm(tmp_path, root, canaries_body=canaries_body)
+
+
+def test_a_canary_list_that_scans_nothing_is_refused(tmp_path):
+    """A leg that reports success while having verified nothing.
+
+    When `--canaries` prints nothing the scan loop runs zero times, and the
+    harness prints `passed: 190   failed: 0` and exits 0 without having scanned
+    for a single canary. That is #711's defect family exactly, and the corpus
+    cannot expose it: every artifact is clean by construction, so a scan that
+    found nothing and a scan that never happened produce identical output.
+
+    The expected-paths leg already cross-checks its own count against `find`.
+    This is the counterpart the canary list never had.
+
+    The builder here SUCCEEDS and prints nothing, which is the declaration
+    refusal; the case below covers a builder that dies while printing nothing,
+    and each asserts the other's line is absent, because reporting one as the
+    other names a cause the harness never observed.
+    """
+    root = Path(__file__).resolve().parents[1]
+    farm = _canary_shim_farm(tmp_path, root, "    raise SystemExit(0)")
+
+    env = dict(os.environ)
+    env["CCTALLY_SOURCE_AWARE_RAW_LOG_DIR"] = str(tmp_path / "retained")
+    result = subprocess.run(
+        [str(farm / "bin" / "cctally-source-aware-test")],
+        text=True, capture_output=True, check=False, env=env,
+    )
+
+    assert result.returncode != 0, (
+        "the harness passed with an empty canary list, so it reported a clean "
+        "privacy scan it never performed:\n" + result.stdout + result.stderr)
+    assert (
+        "FAIL source-aware: privacy canary count expected at least 1, actual 0"
+    ) in result.stdout, result.stdout
+    assert "privacy canary builder exit status" not in result.stdout, (
+        "a builder that succeeded and declared nothing was reported as a "
+        "builder failure:\n" + result.stdout)
+    # The refusal takes the same path the other three do, so it says where the
+    # evidence went rather than leaving the reader to guess.
+    assert "source-aware: scanner evidence retained at " in result.stdout, result.stdout
+
+
+def test_a_crashed_canary_builder_is_not_reported_as_an_empty_declaration(tmp_path):
+    """A cause the harness did not observe — #760's class, one leg over.
+
+    The process substitution that fed `canaries` published no status, so a
+    `--canaries` invocation that DIED while printing nothing produced an empty
+    list and the harness announced that the fixture builder had declared no
+    privacy canary. Fail-closed, and a false statement about what happened: the
+    builder declared nothing because it never got that far.
+
+    The shim exits 3 on `--canaries` and writes nothing, and delegates every
+    other invocation to the real builder, so the crash is the only thing under
+    test.
+    """
+    root = Path(__file__).resolve().parents[1]
+    farm = _canary_shim_farm(tmp_path, root, "    raise SystemExit(3)")
+
+    env = dict(os.environ)
+    env["CCTALLY_SOURCE_AWARE_RAW_LOG_DIR"] = str(tmp_path / "retained")
+    result = subprocess.run(
+        [str(farm / "bin" / "cctally-source-aware-test")],
+        text=True, capture_output=True, check=False, env=env,
+    )
+
+    assert result.returncode != 0, (
+        "the harness passed with a canary builder that crashed:\n"
+        + result.stdout + result.stderr)
+    assert (
+        "FAIL source-aware: privacy canary builder exit status 3"
+    ) in result.stdout, result.stdout
+    assert "privacy canary count expected" not in result.stdout, (
+        "a crashed canary builder was reported as an empty declaration, which "
+        "names a cause the harness never observed:\n" + result.stdout)
+    assert "source-aware: scanner evidence retained at " in result.stdout, result.stdout
+
+
+# --- #784: builder attribution and physical containment ---------------------
+
+
+def test_a_crashed_manifest_builder_is_reported_as_a_builder_failure(tmp_path):
+    check_a_crashed_manifest_builder_is_reported_as_a_builder_failure(
+        tmp_path, FLOOR_BASH)
+
+
+def test_the_planted_hook_refuses_a_traversal_out_of_the_temporary_root(tmp_path):
+    check_the_planted_hook_refuses_a_traversal_out_of_the_temporary_root(
+        tmp_path, FLOOR_BASH)
+
+
+def test_the_planted_hook_refuses_a_symlink_out_of_the_temporary_root(tmp_path):
+    check_the_planted_hook_refuses_a_symlink_out_of_the_temporary_root(
+        tmp_path, FLOOR_BASH)
+
+
+@pytest.mark.parametrize(
+    "canaries_body",
+    [pytest.param(body, id=name) for name, body in BLANK_CANARY_BODIES],
+)
+def test_a_blank_canary_is_refused_and_one_nonblank_is_required(
+    tmp_path, canaries_body
+):
+    check_a_blank_canary_is_refused_and_one_nonblank_is_required(
+        tmp_path, FLOOR_BASH, canaries_body)
 
 
 def test_source_aware_fixture_builder_and_harness_are_executable_regular_scripts():
@@ -975,3 +1566,216 @@ def test_a_rendered_project_artifact_keeps_its_column_header(fmt, reveal):
             r'([^<]*)</text>', out).group(1)
     assert header == "Project", (fmt, reveal, header)
     assert not _re.fullmatch(r"project-\d+", header), (fmt, reveal, header)
+
+
+def test_the_private_log_retains_what_the_public_line_omits(tmp_path):
+    """The public line is deliberately thin; the evidence lives in the raw log.
+
+    The shim exits 139 on the recursive scan and delegates everything else to
+    the real grep, so the self-test passes and only the artifact scan crashes —
+    which is the shape the runners actually produce. `_resolve_scanner` calls
+    `command -v grep`, which still honours PATH, so the shim resolves and is
+    recorded exactly as a real binary would be.
+    """
+    real_grep = shutil.which("grep")
+    assert real_grep, "no grep on PATH, so this case cannot build its fake"
+    root = Path(__file__).resolve().parents[1]
+    shadow = tmp_path / "shadow-bin"
+    shadow.mkdir()
+    fake = shadow / "grep"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-R" ]; then exit 139; fi\n'
+        f'exec {real_grep} "$@"\n',
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+
+    retained_dir = tmp_path / "retained"
+    env = dict(os.environ)
+    env["PATH"] = f"{shadow}{os.pathsep}{env['PATH']}"
+    env["CCTALLY_SOURCE_AWARE_RAW_LOG_DIR"] = str(retained_dir)
+    result = subprocess.run(
+        [str(root / "bin" / "cctally-source-aware-test")],
+        text=True, capture_output=True, check=False, env=env,
+    )
+
+    assert result.returncode != 0
+    assert "privacy scanner failure status=139 phase=artifact-scan" in result.stdout
+    assert "/raw-path-canary" not in result.stdout, (
+        "a canary value reached public output:\n" + result.stdout)
+    assert str(shadow) not in result.stdout, (
+        "an absolute path reached public output:\n" + result.stdout)
+
+    # The retained copy is named per invocation rather than `scanner-raw.log`,
+    # so a campaign of sequential runs does not overwrite the one run whose
+    # evidence it was collected to keep.
+    retained = sorted(retained_dir.glob("scanner-raw.*.log"))
+    assert retained, sorted(p.name for p in retained_dir.iterdir())
+    raw = retained[-1].read_text(encoding="utf-8")
+    assert f"executable={shadow}/grep" in raw
+    assert "version=" in raw
+    assert "argv=" in raw
+    assert "signal=11" in raw
+    # The resolution attempt is recorded before the program is known, so a run
+    # that cannot name its scanner still says it tried.
+    assert raw.splitlines()[0].startswith("resolve attempted"), raw.splitlines()[:3]
+    # What the public line omits is present here and only here.
+    assert "/raw-path-canary" in raw
+
+
+def _crashing_grep_environment(tmp_path):
+    """A PATH whose `grep` crashes the recursive scan and delegates the rest.
+
+    PREPENDED rather than replacing PATH: a replaced PATH would fail the harness
+    for want of `python3`, `find` or `wc`, and the case would then pass while
+    proving nothing about the scanner.
+    """
+    real_grep = shutil.which("grep")
+    assert real_grep, "no grep on PATH, so this case cannot build its fake"
+    shadow = tmp_path / "shadow-bin"
+    shadow.mkdir()
+    fake = shadow / "grep"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-R" ]; then exit 139; fi\n'
+        f'exec {real_grep} "$@"\n',
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{shadow}{os.pathsep}{env['PATH']}"
+    env.pop("CCTALLY_SOURCE_AWARE_RAW_LOG_DIR", None)
+    return env
+
+
+def test_a_failing_run_retains_its_evidence_with_no_environment_variable_set(tmp_path):
+    """The authoritative run is the one that has no variable set.
+
+    Nothing sets `CCTALLY_SOURCE_AWARE_RAW_LOG_DIR` — not `bin/cctally-test-all`,
+    not `bin/cctally-test-remote`, not CI — so in the run where the crash under
+    investigation actually manifests, the raw log lived only in the scratch
+    directory the EXIT trap removes. The public line correctly named a status, a
+    phase and an ordinal, and every field that identifies the program was deleted
+    microseconds later. Retention is therefore unconditional on a failure, to a
+    durable default the wrapper never copies back.
+    """
+    root = Path(__file__).resolve().parents[1]
+    default_dir = root / ".cctally-remote-state" / "source-aware-evidence"
+
+    result = subprocess.run(
+        [str(root / "bin" / "cctally-source-aware-test")],
+        text=True, capture_output=True, check=False,
+        env=_crashing_grep_environment(tmp_path),
+    )
+
+    assert result.returncode != 0, result.stdout
+    assert "privacy scanner failure status=139 phase=artifact-scan" in result.stdout
+    # Identity comes from THIS invocation's own output, never from counting the
+    # directory. The retention directory is shared and real, and `pytest -n`
+    # runs other cases that invoke this same harness concurrently; their
+    # retained logs carry the same `scanner-raw.cctally-source-aware.` prefix,
+    # so no glob can separate them from this run's. An earlier form snapshotted
+    # the directory before and after and asserted exactly one new file, which
+    # failed as `assert 2 == 1` on every `-n 10` run once a sibling case began
+    # retaining evidence of its own. The harness prints the path it kept, so
+    # that line is the only race-free identity available.
+    retained = re.search(
+        r"^source-aware: scanner evidence retained at (.+)$",
+        result.stdout,
+        re.MULTILINE,
+    )
+    assert retained, result.stdout
+    kept = Path(retained.group(1))
+
+    try:
+        assert kept.parent == default_dir, kept
+        # Named per invocation, so a 300-run campaign cannot overwrite the one
+        # crashing run whose evidence it was collected to keep.
+        assert kept.name.startswith("scanner-raw.cctally-source-aware."), kept.name
+        assert kept.is_file(), kept
+        raw = kept.read_text(encoding="utf-8")
+        assert "signal=11" in raw
+        assert "argv=" in raw
+        assert "version=" in raw
+    finally:
+        # Unlink the one path this run created. The previous form popped the
+        # only element out of the set it then iterated in `finally`, so it
+        # deleted nothing and every run left a file behind.
+        kept.unlink(missing_ok=True)
+
+
+def test_the_retention_default_is_ignored_by_git(tmp_path):
+    """A kept log must never dirty the tree it was produced from.
+
+    `git status --porcelain` staying clean is what keeps a retained log out of a
+    staged tree, out of the UI-QA guard's source digest and out of the release
+    gate's dirt check.
+    """
+    root = Path(__file__).resolve().parents[1]
+    default_dir = root / ".cctally-remote-state" / "source-aware-evidence"
+    default_dir.mkdir(parents=True, exist_ok=True)
+    probe = default_dir / "scanner-raw.ignore-probe.log"
+    probe.write_text("probe\n", encoding="utf-8")
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", str(probe)],
+            cwd=root, capture_output=True, check=False,
+        )
+        assert result.returncode == 0, (
+            "the retention default is not gitignored, so a kept log dirties the "
+            "worktree it certifies"
+        )
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def test_a_failed_fixture_builder_retains_its_evidence_too(tmp_path):
+    """The third refusal path, which kept nothing.
+
+    `_resolve_scanner` and `_scanner_self_test` each set `fail_count` and call
+    `_report_raw_log`. The fixture-builder refusal did neither, so the EXIT
+    trap's retention rule read `fail_count` as 0 and removed the scratch
+    directory holding the only record of the run. That path is reached exactly
+    when the harness cannot build the corpus it was about to scan, and the
+    resolve and self-test records are then the whole of the evidence.
+
+    The harness runs through a symlink farm so its `REPO_ROOT` — and therefore
+    its default retention directory — resolve inside `tmp_path`, which keeps
+    this case out of the repository directory the two cases above share. The
+    farm also supplies the failure: `$REPO_ROOT/bin/build-source-aware-fixtures.py`
+    does not exist under it, so `python3` exits non-zero on the one call this
+    case is about and on no other. `CCTALLY_SOURCE_AWARE_RAW_LOG_DIR` stays
+    unset, so retention here still depends on the failure count.
+    """
+    root = Path(__file__).resolve().parents[1]
+    farm = tmp_path / "farm"
+    (farm / "bin").mkdir(parents=True)
+    for name in ("cctally-source-aware-test", "_lib-harness-env.sh",
+                 "_lib-golden-diff.sh"):
+        (farm / "bin" / name).symlink_to(root / "bin" / name)
+
+    env = dict(os.environ)
+    env.pop("CCTALLY_SOURCE_AWARE_RAW_LOG_DIR", None)
+    result = subprocess.run(
+        [str(farm / "bin" / "cctally-source-aware-test")],
+        text=True, capture_output=True, check=False, env=env,
+    )
+
+    assert result.returncode != 0, result.stdout
+    # `python3 <missing file>` exits 2, and the harness reports the builder's
+    # own number rather than the bare "exited non-zero" it used to print.
+    assert (
+        "FAIL source-aware: fixture builder exit status 2"
+    ) in result.stdout, result.stdout
+    assert "scanner evidence retained at " in result.stdout, result.stdout
+
+    kept = sorted(
+        (farm / ".cctally-remote-state" / "source-aware-evidence")
+        .glob("scanner-raw.cctally-source-aware.*.log")
+    )
+    assert len(kept) == 1, [path.name for path in kept]
+    assert kept[0].name in result.stdout, result.stdout
+    raw = kept[0].read_text(encoding="utf-8")
+    assert raw.splitlines()[0].startswith("resolve attempted"), raw.splitlines()[:3]
+    assert "self-test probe=match" in raw

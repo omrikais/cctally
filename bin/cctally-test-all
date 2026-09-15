@@ -187,6 +187,10 @@ SUBSET_MODE=0
 SUBSET_SET=" "               # " name name ", the caller's set
 SUBSET_SEEN=()               # the same names, one array element each, for the duplicate test
 COVERAGE_MODE=full
+MERGE_MODE=0
+MERGE_DEADLINE_WORKER=0
+MERGE_MAX_SECONDS=0
+MERGE_RECORD=""
 COVERAGE_SELECTED=""         # space-separated, MANIFEST order
 COVERAGE_OMITTED=""          # space-separated, MANIFEST order
 COVERAGE_PYTEST=full
@@ -259,7 +263,9 @@ while [ $# -gt 0 ]; do
             fi
             ESTATE_CHECK_OPT_IN=1
             shift ;;
-        --tier-fast)
+        --tier-fast|--merge-gate|--merge-gate-worker)
+            [ "$1" = --tier-fast ] || MERGE_MODE=1
+            [ "$1" != --merge-gate-worker ] || MERGE_DEADLINE_WORKER=1
             # Same three separate refusals `--harness` makes, for the same
             # reason: a caller can only fix the mistake they actually made.
             if [ $# -lt 2 ]; then
@@ -445,6 +451,25 @@ TIERPY
     COVERAGE_TIER_WORKTREE_PATHS=$(printf '%s\n' "$_tier_basis" | sed -n 4p)
     _tier_paths=$(printf '%s\n' "$_tier_basis" | tail -n +5)
 
+    if [ "$MERGE_MODE" = 1 ]; then
+        _merge_plan=$(python3 -B "$REPO_ROOT/bin/_lib_merge_gate.py" \
+            --repo "$REPO_ROOT" --base "$TIER_BASE_REV" --shell) \
+            || contract_usage_abort "merge-gate selection failed" --merge-gate
+        while IFS=$'\t' read -r _key _value; do
+            case "$_key" in
+                mode) COVERAGE_MODE=$_value ;;
+                harnesses) COVERAGE_SELECTED=$_value ;;
+                omitted) COVERAGE_OMITTED=$_value ;;
+                pytest) COVERAGE_PYTEST=$_value ;;
+                seconds) MERGE_MAX_SECONDS=$_value ;;
+                record) MERGE_RECORD=$_value ;;
+            esac
+        done <<EOF
+$_merge_plan
+EOF
+        [ -n "$MERGE_RECORD" ] || contract_usage_abort "merge selection missing" --merge-gate
+        printf 'cctally-test-all: merge gate selected %s coverage\n' "$COVERAGE_MODE" >&2
+    else
     # ---- 5: ownership verification, BEFORE any narrow result is accepted --
     # Ordering hazard 5. The admission gate proves the estate's NAMES; it says
     # nothing about whether the ownership declarations used to narrow are TRUE,
@@ -580,6 +605,7 @@ EOF
     # settles it — the aggregator has no Playwright EXECUTION axis to narrow,
     # because bin/cctally-frontend-test runs `npx vitest run` as its estate leg.
     COVERAGE_PYTEST=full
+    fi
     COVERAGE_RESOLVED=1
     unset _tier_basis _tier_paths _tier_safe _tier_want _tier_owners _tier_widen
 fi
@@ -928,6 +954,9 @@ if [ "${CCTALLY_TEST_ALL_PLAN:-}" = "1" ]; then
     printf 'scheduler=%s\n' "$SCHEDULER_MODE"
     printf 'mode=%s\n' "$COVERAGE_MODE"
     printf 'pytest_disposition=%s\n' "$COVERAGE_PYTEST"
+    if [ "$MERGE_MODE" = 1 ]; then
+        printf 'merge_selection=%s\n' "$MERGE_RECORD"
+    fi
     # The tier's own lines, printed only in tier mode and named in their own
     # namespace. `harnesses=` above stays the single carrier of a SUBSET's
     # selection for the reason recorded there, and these do not reopen that: a
@@ -1000,6 +1029,7 @@ def _load(path, name):
 # arguments.
 REQUIRED = (
     "DEFAULT_MAX_AGE_DAYS", "DEFAULT_MAX_BYTES", "RUN_STATES", "ScrubContext",
+    "TRANSFORMER_HEALTH_REFUSAL",
     "allocate_budget", "apply_validation_redactions",
     "bound_extract_lines", "build_scrubbed_extract",
     "_coverage_gaps",
@@ -1282,11 +1312,28 @@ if MODE == "scrub-log":
     # file — and both were the same mistake at different scales.
     body, redaction = EV.apply_validation_redactions(body, violations, _roots())
     if redaction["refused"]:
-        sys.stdout.write(
-            "[REDACTED: %s context refused by the validator, %d violations, "
-            "cause: %s]\n"
-            % (subject, len(violations), redaction.get("refusal") or "unknown")
-        )
+        # BRANCH ON THE CAUSE. The canary refusal is not a leg's verdict and
+        # carries no violation, so the generic wording below reported "0
+        # violations" and named the validator for a refusal the validator did
+        # not reach. Compared against the kernel's own constant, because a
+        # retyped literal would drift silently from the reason the sidecar
+        # records.
+        if redaction.get("refusal") == EV.TRANSFORMER_HEALTH_REFUSAL:
+            sys.stdout.write(
+                "[REDACTED: %s context withheld whole: the transformer failed "
+                "its health canary, so all %d lines were withheld; cause: "
+                "%s]\n"
+                % (subject, redaction["total"], EV.TRANSFORMER_HEALTH_REFUSAL)
+            )
+        else:
+            sys.stdout.write(
+                "[REDACTED: %s context refused by the validator, %d "
+                "violations, cause: %s]\n"
+                % (
+                    subject, len(violations),
+                    redaction.get("refusal") or "unknown",
+                )
+            )
     elif body:
         if redaction["notice"]:
             body = body + [redaction["notice"]]
@@ -1371,15 +1418,28 @@ if MODE == "export":
     out, redaction = EV.apply_validation_redactions(out, violations, _roots())
     _write_validator_sidecar(evidence_dir, redaction)
     if redaction["refused"]:
-        sys.stderr.write(
-            "cctally-test-all: the sanitized extract was refused by the "
-            "validator (%d of %d lines, cause: %s); no export file was "
-            "written\n"
-            % (
-                len(violations), redaction["total"],
-                redaction.get("refusal") or "unknown",
+        # Same branch as the console path above, and for the same reason: this
+        # line plus the non-deciding `contract_note` are the operator's entire
+        # signal in the one case where every byte of failure evidence is
+        # withheld, so it must not report zero violations or blame the
+        # validator for a refusal the validator did not reach.
+        if redaction.get("refusal") == EV.TRANSFORMER_HEALTH_REFUSAL:
+            sys.stderr.write(
+                "cctally-test-all: the transformer failed its health canary, "
+                "so all %d lines of the sanitized extract were withheld "
+                "(cause: %s); no export file was written\n"
+                % (redaction["total"], EV.TRANSFORMER_HEALTH_REFUSAL)
             )
-        )
+        else:
+            sys.stderr.write(
+                "cctally-test-all: the sanitized extract was refused by the "
+                "validator (%d of %d lines, cause: %s); no export file was "
+                "written\n"
+                % (
+                    len(violations), redaction["total"],
+                    redaction.get("refusal") or "unknown",
+                )
+            )
         raise SystemExit(1)
     if redaction["redacted"]:
         # Never silent, on the operator's surface and in the machine-readable
@@ -1912,6 +1972,22 @@ printf '[cctally-test-all] run %s — %s harnesses, outer=%s inner=%s pytest=%s\
     "$RUN_ID" "${#report_harnesses[@]}" "$OUTER" "$INNER" "$PYTEST" >&2
 
 # ---- admission (#529 S1) -----------------------------------------------
+if [ "$COVERAGE_MODE" = merge-focused ] && [ "$MERGE_DEADLINE_WORKER" = 0 ]; then
+    # The worker form is internal and is NOT a receipt-carrying command in
+    # cctally-test-remote. Only this outer selected gate starts it, under a
+    # deadline that covers admission as well as every execution phase.
+    python3 -B "$REPO_ROOT/bin/_lib_merge_gate.py" \
+        --deadline "$((MERGE_MAX_SECONDS - SECONDS))" \
+        "$REPO_ROOT/bin/cctally-test-all" --merge-gate-worker "$TIER_BASE_REV"
+    _merge_rc=$?
+    if [ "$_merge_rc" = 124 ]; then
+        contract_note "merge gate reached its ${MERGE_MAX_SECONDS}-second execution deadline"
+        contract_fail infrastructure merge-runtime-budget-exceeded "$SECONDS" completion
+        contract_finish
+    fi
+    exit "$_merge_rc"
+fi
+
 # AFTER plan mode by design: the block above exits "before ANY side effect" and
 # tests/test_test_all_scheduler.py depends on that, while these checks parse a
 # manifest, import the allowlist classifier and (from Task 3) launch capability
@@ -2709,6 +2785,27 @@ EOF
     python3 "$REPO_ROOT/bin/_lib_test_estate.py" --repo "$REPO_ROOT" \
         --profile "$CONTRACT_PROFILE" --plan-legs "$estate_leg_dir" \
         > "$estate_plan_log" 2>&1 || true
+    if [ "$COVERAGE_MODE" = merge-focused ]; then
+        python3 -B "$REPO_ROOT/bin/_lib_merge_gate.py" --repo "$REPO_ROOT" \
+            --base "$TIER_BASE_REV" --filter-legs "$estate_leg_dir" \
+            || { contract_fail infrastructure manifest-missing-pytest-node "merge selection" pytest; contract_abort; }
+        # The recorded per-leg lists are the execution targets as well as the
+        # observed-collection oracle. No --deselect/--ignore can narrow them.
+        pytest_args=(-q -rfE -p tests._estate_leg_plugin)
+        [ -z "$pytest_durations_main" ] || pytest_args+=(-p tests._pytest_durations_plugin)
+        while IFS= read -r _node; do
+            [ -z "$_node" ] || pytest_args+=("$_node")
+        done < "$estate_leg_dir/pytest.txt"
+        pytest_serial_targets=()
+        pytest_estate_selectors_seen=0
+        while IFS= read -r _node; do
+            if [ -n "$_node" ]; then
+                pytest_serial_targets+=("$_node")
+                pytest_estate_selectors_seen=1
+            fi
+        done < "$estate_leg_dir/benchmark.txt"
+        [ -s "$estate_leg_dir/pytest.txt" ] || { contract_fail infrastructure manifest-missing-pytest-node "empty merge smoke" pytest; contract_abort; }
+    fi
     if python3 -c 'import xdist' >/dev/null 2>&1; then
         pytest_args+=(-n "$PYTEST")
     fi
@@ -2921,6 +3018,10 @@ fi
 # in the scrollback above an exit 1 — the self-contradicting summary this file
 # already refuses elsewhere.
 contract_check_runtime_budget
+if [ "$COVERAGE_MODE" = merge-focused ] && [ "$SECONDS" -gt "$MERGE_MAX_SECONDS" ]; then
+    contract_note "merge gate exceeded its ${MERGE_MAX_SECONDS}-second execution budget ($SECONDS seconds)"
+    contract_fail infrastructure merge-runtime-budget-exceeded "$SECONDS" completion
+fi
 
 echo "----"
 for row in ${rows[@]+"${rows[@]}"}; do echo "$row"; done

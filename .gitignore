@@ -106,6 +106,9 @@ tests/fixtures/weekly/*/.local/share/cctally/*.db
 # it certifies; nothing else a QA run produces belongs in the tree at all.
 .agentmem/local/
 
+# Private locally generated reports; never commit account-specific telemetry.
+/.local/reports/
+
 # Screenshot-pipeline output manifest (README_SCREENSHOTS_OUT_DIR contract artifact,
 # consumed by cctally-release readme-refresh; regenerated every run, never published)
 docs/img/manifest.json

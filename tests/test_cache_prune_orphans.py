@@ -234,3 +234,169 @@ def test_030_does_not_invent_orphans_for_never_ingested_rows(env):
     _arm_030(ns, conn)
     res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
     assert res.pruned_files == 0 and res.residual_paths == []
+
+
+# --- #729: a refused rollup recompute must reach the prune's caller ---------
+# `_prune_orphaned_cache_entries` discarded `_recompute_conversation_sessions`'
+# return inside its own BEGIN, so a prune whose deletions committed without an
+# authorized rollup re-derive reported the same clean result as one that fully
+# succeeded.
+
+
+def _refuse_the_rollup(ns, monkeypatch):
+    """Make the store's recorded pricing NEWER than this process's, which is
+    exactly the production condition: an older binary against a store a newer
+    one already wrote."""
+    import _cctally_cache as cache
+    monkeypatch.setattr(cache, "PRICING_SNAPSHOT_DATE", "2020-01-01")
+    return cache
+
+
+def test_refused_recompute_is_reported_not_swallowed(env, monkeypatch):
+    ns, conn, conversations, projects = env
+    orphan = projects / "-proj-gone" / "s1.jsonl"
+    _write(orphan, "S1", [_assistant("m1", "r1", uuid="u1")])
+    _sync(ns, conn, conversations)
+    import shutil
+    shutil.rmtree(orphan.parent)
+    _refuse_the_rollup(ns, monkeypatch)
+    res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+    assert res.prune_refused is True
+    assert res.prune_refused_files > 0
+    # The deletions themselves still completed: the refusal is about the
+    # re-derive that should have followed them, and reporting it as "nothing
+    # was pruned" would be a second lie.
+    assert res.pruned_files == 1
+
+
+def test_an_authorized_prune_reports_no_refusal(env):
+    ns, conn, conversations, projects = env
+    orphan = projects / "-proj-gone" / "s1.jsonl"
+    _write(orphan, "S1", [_assistant("m1", "r1", uuid="u1")])
+    _sync(ns, conn, conversations)
+    import shutil
+    shutil.rmtree(orphan.parent)
+    res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+    assert res.prune_refused is False
+    assert res.prune_refused_files == 0
+
+
+def test_the_shared_predicate_would_read_the_field_if_a_result_reached_it(env):
+    """The field matches `CodexIngestStats`, and this pins WHY it is there —
+    which is not what the spec first claimed (#769 S3, corrected premise).
+
+    `provider_sync_certifiable` reads `prune_refused` through
+    `getattr(stats, "prune_refused", False)`, so adding the field to
+    `PruneResult` makes that read see it. But no production path routes a
+    `PruneResult` there: it is constructed in `_prune_orphaned_cache_entries`
+    and consumed only by `_dashboard_self_heal_orphans` and its startup caller,
+    while the sole production caller of `provider_sync_certifiable` passes
+    accounting sync stats that already carry the field. So this composition is
+    synthetic and flips no production verdict; the behavioural consequence of a
+    refused prune is `ConversationSyncFrontier.drop_provider`, pinned in
+    `tests/test_dashboard_self_heal.py`.
+    """
+    ns, conn, conversations, projects = env
+    import _lib_ingest_frontier as frontier
+    import _cctally_cache as cache
+    clean = cache.PruneResult(pruned_files=1, pruned_entries=1)
+    refused = cache.PruneResult(pruned_files=1, pruned_entries=1,
+                                prune_refused=True, prune_refused_files=1)
+    assert hasattr(clean, "prune_refused"), (
+        "the field must exist, or the shared predicate cannot read it"
+    )
+    assert frontier.provider_sync_certifiable("targeted", clean) is True
+    assert frontier.provider_sync_certifiable("targeted", refused) is False
+
+
+def test_no_production_path_routes_a_prune_result_to_the_certifier(env):
+    """The corrected premise, asserted rather than asserted-in-prose.
+
+    `_prune_orphaned_cache_entries` is the only constructor of `PruneResult`,
+    and neither of its two consumers hands the result to
+    `provider_sync_certifiable`. If a future change routes one there, this
+    fails and the test above stops being synthetic — which is the moment to
+    reword it.
+
+    SCOPE, stated so the docstring does not read as a general guarantee. The
+    walk covers `ast.FunctionDef` only, so an `async def` consumer would be
+    invisible, and it inspects exactly the three named consumers rather than
+    every function that could construct or receive a `PruneResult`. Widening
+    either is the right response to a fourth consumer; reading this as a
+    whole-tree proof is not.
+    """
+    import ast
+    import pathlib as _pathlib
+    for module, consumers in (
+        ("bin/_cctally_cache.py", ("_prune_orphaned_cache_entries", "cmd_cache_sync")),
+        ("bin/_cctally_dashboard.py", ("_dashboard_self_heal_orphans",)),
+    ):
+        tree = ast.parse((_pathlib.Path(__file__).resolve().parent.parent
+                          / module).read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or node.name not in consumers:
+                continue
+            called = {
+                c.func.attr if isinstance(c.func, ast.Attribute) else
+                getattr(c.func, "id", None)
+                for c in ast.walk(node) if isinstance(c, ast.Call)
+            }
+            assert "provider_sync_certifiable" not in called, (
+                f"{module}:{node.name} now routes a PruneResult to the "
+                f"certifier; the synthetic test above must be reworded"
+            )
+
+
+# --- #769 S3 A2: the refusal message must name the cause that occurred ------
+# A refused rollup re-derive had exactly one cause when the message was
+# written: this process's pricing table being older than the store's. #728 made
+# that non-exclusive — MALFORMED and DEGRADED refuse too — so the message
+# states a cause that may not have happened.
+
+
+def _degrade_the_fingerprint_read(monkeypatch):
+    import _cctally_cache as cache
+    import _lib_pricing
+    obs = _lib_pricing.classify_pricing_fingerprint(
+        found=False, raw=None, error_kind="operational_error")
+    monkeypatch.setattr(
+        cache, "_read_pricing_fingerprint_observation",
+        lambda conn, key=None: obs)
+    return cache
+
+
+@pytest.mark.parametrize("degrade,expected_state", [
+    (False, "present"),
+    (True, "degraded"),
+])
+def test_the_prune_result_carries_the_state_that_refused(
+        env, monkeypatch, degrade, expected_state):
+    ns, conn, conversations, projects = env
+    orphan = projects / "-proj-gone" / "s1.jsonl"
+    _write(orphan, "S1", [_assistant("m1", "r1", uuid="u1")])
+    _sync(ns, conn, conversations)
+    import shutil
+    shutil.rmtree(orphan.parent)
+    if degrade:
+        _degrade_the_fingerprint_read(monkeypatch)
+    else:
+        _refuse_the_rollup(ns, monkeypatch)
+    res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+    assert res.prune_refused is True
+    assert res.prune_refused_state == expected_state
+
+
+def test_each_refusal_state_gets_its_own_operator_phrase():
+    import _cctally_cache as cache
+    phrases = {
+        state: cache.pricing_refusal_cause_phrase(state)
+        for state in ("present", "malformed", "degraded", None)
+    }
+    assert len(set(phrases.values())) == len(phrases), (
+        "two states sharing a phrase re-creates the single-cause claim"
+    )
+    assert "older" in phrases["present"]
+    assert "older" not in phrases["degraded"], (
+        "a read that failed says nothing about which pricing table is older"
+    )
+    assert "older" not in phrases["malformed"]

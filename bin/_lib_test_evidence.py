@@ -353,8 +353,37 @@ _TYPED_PATTERNS = (
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "<email>"),
     (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                 r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<uuid>"),
-    (re.compile(r"(?i)\b(?:bearer|token|api[_-]?key|authorization)\b\s*[:=]?\s*\S+"),
+    # `token` is split out of the alternation below because it is ordinary
+    # English in this codebase — a search needle, a lexer token, a token count
+    # — while `bearer`, `api_key` and `authorization` are not. With the
+    # separator optional, `token for` matched with no separator at all and the
+    # whole line was replaced (#812). A literal `:` or `=` is now required.
+    # Newly admitted, and accepted: every former match lacking a separator,
+    # such as `token status` or a bare `token=`.
+    #
+    # THE ENTRY ENUMERATES FIVE SPELLINGS, and `_` being a word character is the
+    # whole reason it has to (#820). `\btoken\b` never matches between a prefix
+    # and `token`, and the alternation above fails at the boundary AFTER
+    # `bearer` for the same reason, so `access_token`, `refresh_token`,
+    # `id_token` and `bearer_token` matched NEITHER surface and published their
+    # values in full. The four are enumerated here rather than moved into the
+    # optional-separator alternation above, and rather than generalized to
+    # `\w+_token`: either widening recreates the over-redaction #812 exists to
+    # remove, and `api_token`, `csrf_token` and every other `\w+_token` form
+    # stay out for that reason.
+    #
+    # `id_token` is in the set because it is a real credential in this
+    # repository rather than incidental vocabulary: `bin/build-bench-fixtures.py`
+    # writes the official Codex `auth.json` shape as `{"id_token": token,
+    # "access_token": "a", "refresh_token": "r"}`, `bin/_lib_accounts.py`
+    # decodes it to obtain the account email, and `bin/_lib_codex_hooks.py`
+    # reads it from the live `auth.json`. Covering two names from one JSON
+    # object and not the third would be an arbitrary boundary on a privacy
+    # surface.
+    (re.compile(r"(?i)\b(?:bearer|api[_-]?key|authorization)\b\s*[:=]?\s*\S+"),
      "<credential>"),
+    (re.compile(r"(?i)\b(?:token|(?:access|refresh|id|bearer)_token)\b"
+                r"\s*[:=]\s*\S+"), "<credential>"),
     (re.compile(r"\b(?:sk|pk)-[A-Za-z0-9_-]{8,}"), "<credential>"),
     (re.compile(r"\b[a-z]+://[^\s/@]+:[^\s/@]+@\S+"), "<credential-url>"),
     (re.compile(r"\b[0-9a-fA-F]{32,}\b"), "<hex>"),
@@ -756,6 +785,82 @@ def _has_quoted_free_text(text: str) -> bool:
     return False
 
 
+# THE VALUE POSITION AFTER AN ENUMERATED TOKEN-CREDENTIAL PREFIX, and the
+# placeholder shape, for the provenance check below (#821). The prefix is the
+# transformer's own word set and separator, spelled here a third time rather
+# than composed out of `_TYPED_PATTERNS`, because that entry consumes the whole
+# value and so cannot report where the value begins.
+# `test_both_surfaces_spell_the_same_token_word_set` compares all four live
+# spellings and is what stops them drifting apart.
+_TOKEN_VALUE_PREFIX_RE = re.compile(
+    r"(?i)\b(?:token|(?:access|refresh|id|bearer)_token)\b\s*[:=]"
+)
+# EITHER CASE, deliberately. This kernel writes placeholder names in lowercase
+# only, so an uppercase-named span can never be one this module wrote and can
+# never be covered by a decided span — which means the rule below reads exactly
+# as "a placeholder-shaped span this module did not write" rather than as a
+# second rule about how a name is spelled. A lowercase-only class would be a
+# shape rule of the kind this file records as a repeated defect class, and it
+# would leave `token=<repo><A90210904812340981234>` publishing its twenty digits
+# on the strength of the validator's backstop alone.
+_PLACEHOLDER_SHAPE_RE = re.compile(r"<[A-Za-z][A-Za-z0-9-]*>")
+
+
+def _undecided_placeholder_in_a_token_value(text: str, decided_spans=()) -> bool:
+    """A placeholder-shaped span in a token value that this module did not write.
+
+    PROVENANCE, not shape, and it is the same rule `unknown_vocabulary` already
+    applies to words: the only text exempt is text this module itself wrote, at
+    the position it wrote it. `decided_spans` are the positions `_reduce`
+    MEASURED, never a shape re-derived from the output.
+
+    WHAT IT CLOSES. A secret whose own bytes are placeholder-shaped published in
+    full whenever a substitution consumed the value's head: the transformer
+    emitted `token=/repo<secret-90210904812340981234>` as
+    `token=<repo><secret-90210904812340981234>`, because the token entry then
+    found no value after `token=` and the tail's only alphabetic word is one the
+    repository vouches for. No shape rule can separate those bytes from a
+    placeholder this kernel wrote, because only provenance distinguishes them.
+
+    SCOPED TO THE VALUE POSITION, NEVER APPLIED TO THE WHOLE LINE, and the
+    scoping is load-bearing rather than cautious. `bin/cctally-migrations-test`
+    emits `echo "$db_label: <missing>"`, the golden at
+    `tests/fixtures/migrations/01-fresh-install/expected.txt` retains
+    `stats.db: <missing>`, and `_reduce` neither creates nor decides that span.
+    A global rule would newly redact a safe public diagnostic that a committed
+    golden pins.
+
+    LINEAR IN THE SCAN, AND THE CONTAINMENT TEST IS NOT PART OF THAT BOUND.
+    Each prefix's walk stops at the first byte that is neither whitespace nor a
+    complete placeholder span, and a prefix can never sit inside a span —
+    `<token>` offers no `[:=]` after the word — so the walks are disjoint and
+    every byte is visited at most once. Each span found is then compared against
+    every decided span, so the total is the line length plus the product of the
+    two span counts. `MAX_LINE_BYTES` bounds both factors, which is why that
+    product is affordable; it is not why it is absent.
+    """
+    spans = tuple((int(low), int(high)) for low, high in (decided_spans or ()))
+    for prefix in _TOKEN_VALUE_PREFIX_RE.finditer(text):
+        position = prefix.end()
+        while position < len(text):
+            if text[position].isspace():
+                position += 1
+                continue
+            span = _PLACEHOLDER_SHAPE_RE.match(text, position)
+            if span is None:
+                # A raw byte ends the value's placeholder run. What follows is
+                # the validator's `token-credential` leg's business, not this
+                # check's.
+                break
+            if not any(
+                low <= span.start() and span.end() <= high
+                for low, high in spans
+            ):
+                return True
+            position = span.end()
+    return False
+
+
 def _is_ordinary(text: str, ctx: "ScrubContext", decided_spans=()) -> bool:
     if not _SAFE_LINE_RE.match(text):
         return False
@@ -778,6 +883,12 @@ def _scrub_free_field(text: str, ctx: "ScrubContext"):
     generated shape — a marker's suffix, a progress line's tail, a section
     rule's body. The shape vouches for itself and for nothing inside it."""
     reduced, spans = _reduce(text, ctx)
+    # Provenance BEFORE ordinariness (#821): an undecided placeholder-shaped
+    # span carries no alphabetic word the vocabulary check can refuse once its
+    # own name is one the repository vouches for, so `_is_ordinary` publishes
+    # it. This runs first because it is the stricter question.
+    if _undecided_placeholder_in_a_token_value(reduced, spans):
+        return UNCLASSIFIED_DETAIL, False
     if _is_ordinary(reduced, ctx, spans):
         return reduced, True
     return UNCLASSIFIED_DETAIL, False
@@ -857,6 +968,15 @@ def scrub_line(line, ctx: "ScrubContext", *, _in_gutter: bool = False) -> str:
         # token. A token this kernel cannot vouch for is not a path it can
         # disclose, and a `---` line carrying one is a removed payload line
         # rather than a header, so it takes the payload rule's outcome.
+        #
+        # PROVENANCE IS NOT CONSULTED ON THIS PATH, deliberately.
+        # `_undecided_placeholder_in_a_token_value` guards the two paths that
+        # decide by ORDINARINESS — the tail fallback and `_scrub_free_field` —
+        # and reaches each one before `_is_ordinary`, which is where a
+        # placeholder-shaped secret would otherwise be published. This path
+        # never asks that question: it vouches for the header's path word by
+        # word and returns the placeholder otherwise, which is already the
+        # stricter outcome.
         shown, spans = _reduce(header.group("path"), ctx)
         if unknown_vocabulary(shown, ctx, spans):
             return UNCLASSIFIED_PLACEHOLDER
@@ -943,6 +1063,8 @@ def scrub_line(line, ctx: "ScrubContext", *, _in_gutter: bool = False) -> str:
         return UNCLASSIFIED_PLACEHOLDER
 
     candidate, spans = _reduce(raw, ctx)
+    if _undecided_placeholder_in_a_token_value(candidate, spans):
+        return UNCLASSIFIED_PLACEHOLDER
     if _is_ordinary(candidate, ctx, spans):
         return candidate
     return UNCLASSIFIED_PLACEHOLDER
@@ -1101,6 +1223,35 @@ def build_scrubbed_extract(subject_lines, ctx, alloc, log_names=None, clusters=N
 # independently formulated structural test, and it never calls scrub_line or
 # any helper the transformer uses. Do not refactor the two into one helper:
 # their disjointness is the property the mutation tests exist to prove.
+#
+# ONE SHARED GRAMMAR IS A STATED EXCEPTION TO "independently formulated", and
+# it is recorded here rather than only beside itself, because a reader who takes
+# the paragraph above as absolute will read the exception as a defect and "fix"
+# it. IT NOW HAS FOUR LIVE SPELLINGS, two per surface: the transformer's
+# `_TYPED_PATTERNS` entry and `_TOKEN_VALUE_PREFIX_RE`, and on this side the
+# `token-credential` entry below and `_TOKEN_VALUE_NAME_PREFIX_RE`.
+# `test_both_surfaces_spell_the_same_token_word_set` compares all four, so they
+# cannot drift apart one at a time.
+# `token-credential`'s prefix
+# `(?i:\b(?:token|(?:access|refresh|id|bearer)_token)\b)\s*[:=]` is
+# byte-identical to the transformer's
+# `(?i)\b(?:token|(?:access|refresh|id|bearer)_token)\b\s*[:=]`, apart from the
+# scope of the case-insensitivity flag, and the equality of the WORD SET and the
+# SEPARATOR is deliberate: a validator whose separator scope is narrower than the
+# transformer's misses regressions the transformer would publish, and one that
+# is broader refuses exports the transformer legitimately published. Both
+# failures were measured, and the comment beside the entry records them. What
+# stays disjoint is the part that decides safety — the VALUE class — and the
+# independence of the leg as a whole is carried by
+# `test_the_validator_catches_a_transformer_regression_independently`, which
+# deletes the transformer's token entry and requires this leg to refuse the
+# credential anyway. No other entry in this tuple shares any text with a
+# transformer classifier, and a new one should not.
+#
+# THE FOURTH SPELLING SITS BELOW THIS TUPLE. `_token_value_names_an_unknown_
+# placeholder` reaches the same `token-credential` verdict from outside
+# `_FORBIDDEN`, so a count taken from the tuple alone reads one short. It is
+# named here so that this paragraph can be read on its own.
 
 _FORBIDDEN = (
     ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
@@ -1121,7 +1272,358 @@ _FORBIDDEN = (
     ("json-payload",
      re.compile(r'"(?:content|text|prompt|message|cwd|project|account)"\s*:')),
     ("control-bytes", re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")),
+    # THIS ENTRY IS LAST IN THE TUPLE, AND ITS POSITION IS PART OF THE RULE.
+    # `validate_export` reports the FIRST leg that matches a line, and
+    # `token-credential` is the only reason in this tuple that
+    # `PER_LINE_VIOLATION_REASONS` contains; every other entry refuses the whole
+    # export. Matched earlier, this leg would report its own reason for a line
+    # that also violates a wholesale leg, `apply_validation_redactions` would
+    # then replace that single line, and the export would publish — so the
+    # wholesale leg's refusal would be downgraded to one replaced line without
+    # anybody deciding to downgrade it. Measured with this entry at its former
+    # position between `credential` and `credential-url`: a line reading
+    # `token: value`, byte 0x01, then more text reported `token-credential`
+    # rather than `control-bytes`, and `token=/etc/passwd` reported
+    # `token-credential` rather than `absolute-path`. Two reviews classified
+    # those two misreports as a diagnosis-quality defect with no effect on
+    # safety, and that classification was correct only while this leg refused
+    # wholesale, because both reasons withheld the export either way. A leg
+    # added to this tuple later belongs ABOVE this entry unless its reason is
+    # filed in `PER_LINE_VIOLATION_REASONS` as well. Pinned by
+    # `test_a_wholesale_leg_is_not_shadowed_by_the_token_leg` and
+    # `test_every_wholesale_denylist_leg_precedes_every_per_line_leg`.
+    #
+    # The WORD SET, the `[:=]` class and the `\s` whitespace class are the
+    # transformer's own, and the five spellings are enumerated in the same order
+    # here as there (#820): a prefixed spelling the transformer reduces and this
+    # leg cannot see is a regression nothing catches, and one this leg sees and
+    # the transformer does not reduce refuses the kernel's own output.
+    # The equality is deliberate: a validator whose separator scope is
+    # NARROWER than the transformer's misses regressions the transformer would
+    # publish, and one that is BROADER refuses exports the transformer
+    # legitimately published. An earlier form spelled the whitespace class
+    # `[ \t]` and claimed independence from that wording while reusing `[:=]`
+    # verbatim; the claim was wrong, and `token\xa0=\xa0SECRET` was matched by
+    # the transformer and by no leg here. Independence is carried by
+    # `test_the_validator_catches_a_transformer_regression_independently`, which
+    # deletes the transformer's token entry, confirms the value actually leaks,
+    # and requires this leg to refuse it anyway. The comment above `_FORBIDDEN`
+    # records this equality as the tuple's one stated exception to
+    # "independently formulated", so the two comments state the same fact.
+    #
+    # THE CASE-INSENSITIVITY FLAG IS SCOPED TO THE WORD SET,
+    # `(?i:\b(?:token|(?:access|refresh|id|bearer)_token)\b)` rather
+    # than a leading `(?i)`, and the scope is the only place this prefix diverges
+    # from the transformer's. A leading `(?i)` applies to the whole pattern,
+    # including the `<[a-z][a-z0-9-]*>` run and the lookahead, so the leg treated
+    # `<A>`, `<SECRET>` and `<Email>` as complete placeholders although this
+    # kernel writes placeholder names in lowercase only. That cost a disclosure
+    # of the same class the lookahead closed: measured under the production
+    # vocabulary, with nothing regressed in either surface, the transformer
+    # published `token=/repo<SECRET-90210904812340981234>` as
+    # `token=<repo><SECRET-90210904812340981234>` with the twenty digits intact
+    # and the unscoped leg admitted it, as it did `<A...>`, `<Secret-...>` and
+    # `<Email...>` tails. Scoping the flag makes the run and the lookahead
+    # case-SENSITIVE, which refuses all four, while the word still matches
+    # `TOKEN=` and `Token:`. Every placeholder this kernel writes is lowercase,
+    # so no legitimate output moved: verified over the inventory derived in
+    # `test_the_leg_admits_every_placeholder_name_the_kernel_can_write`.
+    #
+    # The separator scope survives the DELETION of the `\s*` that used to stand
+    # between `[:=]` and the leading run, because the run's own `\s` branch
+    # accepts exactly the same whitespace. Verified over every character Python's
+    # `\s` matches, and over all 66,430 values the residual case enumerates: the
+    # two spellings agree on every verdict, and `token\xa0=\xa0SECRET` is still
+    # refused. Deleting it is what returns the leg's cost to linear, for the
+    # reason `test_the_token_leg_quantifies_whitespace_after_the_separator_exactly_once`
+    # records, and that case is the only thing that stops it coming back.
+    #
+    # The value may OPEN with a run of complete placeholders, because `_reduce`
+    # substitutes roots and typed values before the token entry runs: an email,
+    # a UUID or a root-prefixed path is consumed and marked decided, the
+    # residual `token=` then matches no transformer pattern at all, and the
+    # published line is the already-safe `token=<email>`. A `[^\s]` value class
+    # refused that output, and because `token-credential` was a content leg the
+    # refusal was wholesale, so one benign line destroyed the entire evidence
+    # extract for a failing run (#812). The leg degrades per line now, so the
+    # same false positive would cost one line rather than the file; the value
+    # class is still the fix, because a line the validator refuses is a line the
+    # operator does not get either way.
+    #
+    # What the run may not do is END in raw bytes. Requiring one byte after it is
+    # what refuses `token=<repo>90210904812340981234`,
+    # `token=<email>90210904812340981234`, `token=<uuid>-90210904812340981234`
+    # and `token=<home>90210904812340981234`. Those four are what the
+    # transformer publishes, with nothing regressed anywhere, when a raw value's
+    # head is a root, an email or a UUID and its tail is a digit secret: the
+    # head is consumed, the token entry finds no value after `token=`, and a
+    # pure-digit tail carries no alphabetic word for the ordinary-word check to
+    # refuse. A bare `[^\s<]` value class, with no leading run at all, admitted
+    # all four.
+    #
+    # THE VALUE CLASS IS "A BYTE THAT IS NEITHER WHITESPACE NOR THE OPENING OF A
+    # COMPLETE PLACEHOLDER", spelled as a negative lookahead in front of
+    # `[^\s]`. The earlier spelling `[^\s<]` excluded every `<`, which cost a
+    # disclosure: `<` is itself an attach byte the transformer publishes a secret
+    # behind, and a `<` that opens no complete placeholder stopped the run
+    # without being reachable by the value class either. Measured under the
+    # production vocabulary, the transformer published
+    # `token=/repo<90210904812340981234` as
+    # `token=<repo><90210904812340981234` with the twenty digits intact and the
+    # leg admitted it, through the `<email>`, `<uuid>` and `<home>` heads as
+    # well. The lookahead refuses that `<` while still admitting a `<` that does
+    # open a complete placeholder, so the kernel's own output is untouched. Four
+    # rows of `test_a_secret_behind_a_placeholder_and_a_bracket_is_refused` pin
+    # it at both seams.
+    #
+    # THE RUN ABSORBS WHITESPACE AS WELL AS COMPLETE PLACEHOLDERS, and the `|\s`
+    # branch is what closes a disclosure the placeholder-only run admitted. A
+    # raw value whose head a substitution consumes and whose tail is separated
+    # from that head by a SPACE published its secret in full: measured under the
+    # production vocabulary, the transformer published
+    # `token=/repo 90210904812340981234` as
+    # `token=<repo> 90210904812340981234`, and a run that could not step over
+    # the space looked for its raw byte immediately after `<repo>`, found the
+    # space, backtracked to a zero-length run, failed against `<`, and admitted
+    # the line. The same shape leaked through `<email>`, `<uuid>` and `<home>`
+    # heads, and through a tab as well as a space. With whitespace in the run
+    # the value class is reached across it and all of them are refused.
+    #
+    # THE LEG'S COST IS LINEAR, and it was quadratic for one commit, so the
+    # reason is recorded here rather than left to be rediscovered. Adding the
+    # `|\s` branch left a `\s*` standing between `[:=]` and the run, and the two
+    # quantifiers accepted the same whitespace: a line carrying only whitespace
+    # after the separator gave the engine no terminator, so it retried every way
+    # of splitting that whitespace between them. Measured on `token=` followed by
+    # N spaces, the cost grew about fourfold per doubling of N, reaching 156,210
+    # us for one line at `MAX_LINE_BYTES` — about 375 seconds for a
+    # `GLOBAL_LINE_CAP`-sized extract, which would have denied the operator the
+    # failure extract for six minutes. Deleting the redundant `\s*` returns it to
+    # linear: 6.7 us at 200 spaces and 119 us at 4,090, about 0.29 seconds for
+    # the whole extract, with no verdict changed anywhere. The lookahead inside
+    # the quantified run introduces no new blowup of its own: neither of the two
+    # shapes where one would appear grows faster than linearly. A long run of `<`
+    # now matches at the first byte, so it is constant at 0.1 us where the earlier
+    # form grew to 25 us at 4,090 bytes; a long `<a><a><a>...` run is linear and
+    # costs about 1.3 times the earlier form at the same length, 69.9 us against
+    # 54.2 us at 3,060 bytes, because each backtrack step now checks the
+    # lookahead. NOTHING BUT THE PATTERN'S SHAPE PINS THIS. The quadratic form is
+    # verdict-identical, so no admitted or refused line can tell the two apart,
+    # and the only guard is
+    # `test_the_token_leg_quantifies_whitespace_after_the_separator_exactly_once`.
+    # That guard asserts the whole segment between `[:=]` and the trailing value
+    # class, so a redundant `\s*` reintroduced on EITHER side of the run reds it.
+    # An earlier form of the guard asserted only that `[:=]` is not followed by
+    # `\s`, and the quadratic cost came back for a spelling it did not cover:
+    # `(?:<[a-z][a-z0-9-]*>|\s)*\s*(?!<…>)` puts the redundant quantifier after
+    # the run instead of before it, passes that guard, is verdict-identical over
+    # all 66,430 values the residual case enumerates, and costs 93,329 us at
+    # 4,090 spaces against 131 us for this form.
+    #
+    # RECORDED PLAINLY, as the residual THIS ENTRY admits: ONE class, and the
+    # class is the whole bound of the entry. A value reaches no match here
+    # exactly when it consists only of complete LOWERCASE-NAMED
+    # placeholder-shaped spans and whitespace, the empty value included;
+    # `token=`, `token: `, `token=<email>`, `token: <uuid>`,
+    # `token=<repo><path>`, `token=<repo> <path>`, `token=<uuid> ` and
+    # `token=<secret-payload>` are members, not the whole membership.
+    #
+    # THE ENTRY IS NO LONGER THE WHOLE LEG (#821). `validate_export` consults
+    # `_token_value_names_an_unknown_placeholder` after every entry in this
+    # tuple, and it reports the same `token-credential` reason for a value whose
+    # spans are complete and lowercase-named but whose NAMES nobody vouches for.
+    # So `token=<secret-payload>` is a violation now although this entry does not
+    # match it, and `token=<repo><path>` is admitted only when the caller passes
+    # the `roots` mapping that names `repo`. What follows describes this entry's
+    # own bound, which is still exactly as stated; the enumeration below the
+    # tuple describes the rest. The word
+    # LOWERCASE carries weight: `token=<SECRET>` and `token=<Email>` are the same
+    # shape with an uppercase letter in the name and they are refused, which is
+    # what scoping the case flag to the word bought. Measured over 66,430 values
+    # built from `<`, `>`, `a`, `1`, `-`, space, tab, `x` and `.` at every length
+    # up to five, against a reachability model of the leading run written
+    # independently of this regex: zero disagreements, 169 admitted, and zero
+    # admitted values outside that class. Extending that alphabet with a single
+    # uppercase `A` gives 111,111 values, of which 95 are decided differently by
+    # the unscoped flag and this one, every one of them admitted there and refused
+    # here, and none decided the permissive way round. The class is admitted on
+    # purpose, because it is what the transformer legitimately writes when a
+    # substitution consumed the whole value, and refusing it destroyed the
+    # evidence extract for a failing run (#812).
+    #
+    # NO SHAPE RULE CAN CLOSE THE LOWERCASE SUBSET, and that subset alone was what
+    # remained irreducible TO A SHAPE RULE rather than merely unclosed. An earlier
+    # wording said "no shape rule can close it" of the whole class, and
+    # measurement refuted it: scoping the case-insensitivity flag to the word is a
+    # shape rule, and it closes every span whose name carries an uppercase letter
+    # — `<A>`, `<SECRET>`, `<Email>` and `<Secret-payload>` are refused now and
+    # were admitted before. What no shape rule can close is what remained: a span
+    # whose name is spelled exactly the way this kernel spells one, lowercase
+    # letters, digits and hyphens, because a leaker's bytes and the kernel's bytes
+    # are then identical.
+    #
+    # #821 CLOSED IT, AND NOT WITH A SHAPE RULE. Separating those spans needs the
+    # NAME, so the validator owns a frozen enumeration of the transformer's static
+    # placeholder names below this tuple and takes the dynamic root names from the
+    # `roots` mapping the caller already passes. That couples the two surfaces
+    # this file otherwise keeps disjoint, which is why it carries its own drift
+    # test: `tests/test_test_evidence_kernel.py` derives the transformer's
+    # inventory by walking `_TYPED_PATTERNS` and the kernel's string constants
+    # with `ast` and requires EXACT equality with the enumeration.
+    #
+    # THE CLASS REACHED THE PUBLISHED OUTPUT, which is why #821 was a disclosure
+    # and not only a gap in this backstop, and why the TRANSFORMER changed as well
+    # as this surface. Measured under the production vocabulary, with nothing
+    # regressed in either surface, the transformer published
+    # `token=/repo<a90210904812340981234>` as
+    # `token=<repo><a90210904812340981234>` and
+    # `token=/repo<secret-90210904812340981234>` as
+    # `token=<repo><secret-90210904812340981234>`, twenty digits intact, and this
+    # entry admitted both because each tail IS placeholder-shaped. The head is
+    # consumed, the token entry finds no value after `token=`, and the tail's only
+    # alphabetic word — `a`, `secret` — is one `build_known_tokens` vouches for,
+    # so the ordinary-word check published the line.
+    # `_undecided_placeholder_in_a_token_value` now fails those lines closed
+    # before `_is_ordinary` runs, because the tail is a placeholder-shaped span
+    # `_reduce` did not write. A pure-digit tail such as
+    # `<90210904812340981234>` is not placeholder-shaped, so this entry refuses it
+    # as it always did.
+    # NOT every form of this entry has admitted the shape, and the earlier claim
+    # that they all had was measured false. The original form, `b2385f688`'s
+    # `(?i)\btoken\b[ \t]*[:=][ \t]*[^\s]`, refuses all three of those rows —
+    # incidentally rather than by separating leak from legitimate output, because a
+    # value class of `[^\s]` with no leading run refuses the kernel's own
+    # `token=<email>` too, which is the #812 false positive. `f2a8e4309` widened
+    # that class to `[^\s<]` and opened all three, and `135384cd3`, `b8402d5d7`
+    # and `253190e98` admitted them until #821. So the three rows were the price of
+    # closing #812, not a constant of the leg; what the `|\s` branch, the lookahead
+    # and the scoped flag each did is recorded above, and none of the three
+    # touched the lowercase subset. Pinned by
+    # `PREVIOUSLY_DISCLOSED_PLACEHOLDER_SHAPED_SECRET` in the residual case, so it
+    # cannot be lost the way the `<` attach case nearly was.
+    #
+    # A DESCRIPTION THAT WAS WRONG TWICE IS NOW ACCURATE, which is worth stating
+    # because both corrections are recorded above this line. "A value made
+    # ENTIRELY of placeholder-shaped spans" was measured false when the leg
+    # admitted `token=<secretpayload`, `token=<SECRET`, `token=<Ab9!x`,
+    # `token=<>`, `token=<1abc>` and `token=<a><b`. The value class was then
+    # widened until the description became true: all six of those are refused
+    # now, and the class is exactly lowercase-named placeholder-shaped spans and
+    # whitespace. `token=<SECRET` in that list is the unterminated form; the
+    # terminated `token=<SECRET>` was admitted until the case flag was scoped to
+    # the word, and is refused now too. "Any value that begins with `<`" was wrong
+    # in the other direction and still is, because
+    # `token=<repo>90210904812340981234` begins with `<` and is refused.
+    #
+    # RECORDED PLAINLY AS WELL, because it is the price of admitting the residual
+    # above: a placeholder value followed by ordinary content is refused. The
+    # transformer publishes `token=<repo><path>:373: FAIL`, `token: <uuid>.`,
+    # `token: <uuid> FAIL` and `token=<repo> diverged`, and this leg refuses each
+    # of them — one replaced line each now that the reason degrades per line,
+    # rather than the whole export. The lookahead widens that class by the shapes
+    # whose value opens with a `<` that completes no placeholder, `token=<>` and
+    # `token=<1abc>` among them. It is one class throughout, and none of its
+    # members carries a secret.
+    #
+    # Shape cannot separate that class from the leak class, and the reason is NOT
+    # that one of the four leaks above opens its tail with `-`. That wording
+    # invited the reader to conclude that excluding `:` and `.` from the value
+    # class would admit the benign lines safely, and the conclusion is false:
+    # almost every candidate character is attackable the same way, so an
+    # exclusion opens a leak for whatever it excludes. Measured over
+    # `token=/repo` plus one candidate character plus `90210904812340981234`. The
+    # candidate set is the 32 characters of Python's `string.punctuation` —
+    # `!"#$%&'()*+,-./:;<=>?@[\]^_` plus a backtick, `{|}~` — plus a space and a
+    # tab, so the denominator is 34. The transformer publishes the twenty-digit
+    # secret for 31 of those 34, and only `/`, `\` and a backtick do not, because
+    # those three reach the path and unknown-vocabulary rules instead. `:` and
+    # `.` — the two characters an exclusion would have to cover to admit the
+    # benign lines — are both in the attackable set, so excluding them would
+    # admit `token=<repo>:90210904812340981234` and
+    # `token=<repo>.90210904812340981234` with the secret in full. Of the 31 this
+    # leg now admits NONE. Three of them were admitted at some point in this
+    # tranche: the space and the tab until the `|\s` branch was added, and `<`
+    # until the lookahead replaced `[^\s<]`.
+    ("token-credential",
+     re.compile(r"(?i:\b(?:token|(?:access|refresh|id|bearer)_token)\b)"
+                r"\s*[:=](?:<[a-z][a-z0-9-]*>|\s)*"
+                r"(?!<[a-z][a-z0-9-]*>)[^\s]")),
 )
+
+# ------------------------------------- the token value's placeholder NAMES
+#
+# #821. The `token-credential` leg above decides by SHAPE, and shape cannot
+# separate a lowercase-named placeholder-shaped span a leaker wrote from one the
+# transformer wrote: the bytes are identical. The leg therefore admitted
+# `token=<repo><secret-90210904812340981234>` with its twenty digits intact, and
+# the comment above it recorded the class as irreducible. It is not irreducible;
+# it is unclosable BY SHAPE. Separating the two needs the NAME, and that is what
+# this enumeration supplies.
+#
+# OWNED HERE, NOT IMPORTED FROM THE TRANSFORMER, and the duplication is the
+# point: the paragraph above `_FORBIDDEN` keeps the two surfaces disjoint so a
+# classifier that wrongly admits unsafe text cannot admit it in both places. The
+# static names are written out; `tests/test_test_evidence_kernel.py` derives the
+# transformer's own inventory by walking `_TYPED_PATTERNS` and the kernel's
+# string constants with `ast` and requires EXACT equality with this set, so a
+# transformer placeholder added later fails there and names both sides. That
+# drift test is what makes an owned copy safe; without it the copy would be a
+# transcription that cannot fail.
+#
+# `param` IS DELIBERATELY ABSENT. The node normalizer writes `[<param>]` inside
+# a pytest node identifier, which is not a token value position, so admitting it
+# here would widen the class for no reachable output.
+#
+# ROOT PLACEHOLDERS ARE NOT HARD-CODED. The caller supplies `roots`, the
+# transformer renders each name as `<name>`, and this leg compares the exact
+# rendered literal. The precedent for that coupling is already in this file: the
+# `unnormalized-parameter` leg accepts the literal placeholder the transformer
+# substitutes. A hard-coded root list would be a second transcription, and it
+# would be wrong for any caller whose roots differ.
+TOKEN_VALUE_PLACEHOLDER_NAMES = frozenset({
+    "b64", "credential", "credential-url", "email", "hex", "path", "uuid",
+})
+
+# The leg's own prefix and span grammar, spelled independently of the
+# transformer's for the reason the disjointness paragraph gives. The prefix is
+# the one stated exception and is byte-identical to the leg's above.
+_TOKEN_VALUE_NAME_PREFIX_RE = re.compile(
+    r"(?i:\b(?:token|(?:access|refresh|id|bearer)_token)\b)\s*[:=]"
+)
+_TOKEN_VALUE_NAME_SPAN_RE = re.compile(r"<[a-z][a-z0-9-]*>")
+
+
+def _token_value_names_an_unknown_placeholder(text: str, roots=None) -> bool:
+    """A complete placeholder span in a token value whose NAME nobody vouches for.
+
+    LAST-RUNNING AND LINEAR. `validate_export` consults this only after every
+    entry in `_FORBIDDEN`, so no wholesale leg can be shadowed by it, and its
+    reason is `token-credential`, which `PER_LINE_VIOLATION_REASONS` contains —
+    a firing costs its own line. Each prefix's walk stops at the first byte that
+    is neither whitespace nor a complete span, and a prefix cannot sit inside a
+    span, so the walks are disjoint and every byte is visited at most once.
+
+    A RAW BYTE IS NOT THIS PREDICATE'S BUSINESS. The `token-credential` entry in
+    `_FORBIDDEN` already refuses a value that reaches one, and it has run by the
+    time this is consulted. What is left for this to decide is exactly the class
+    that entry admits: a value of whitespace and complete lowercase-named spans.
+    """
+    known = set(TOKEN_VALUE_PLACEHOLDER_NAMES)
+    known.update(str(name) for name in (roots or {}))
+    for prefix in _TOKEN_VALUE_NAME_PREFIX_RE.finditer(text):
+        position = prefix.end()
+        while position < len(text):
+            if text[position].isspace():
+                position += 1
+                continue
+            span = _TOKEN_VALUE_NAME_SPAN_RE.match(text, position)
+            if span is None:
+                break
+            if span.group(0)[1:-1] not in known:
+                return True
+            position = span.end()
+    return False
+
 
 # The structural legs, stated as proportions rather than as token counts so
 # that they do not restate the transformer's rule in different words. A span
@@ -1199,14 +1701,13 @@ _EXCEPTION_PLACEHOLDER_TEXT = EXCEPTION_MESSAGE_PLACEHOLDER
 #
 # A CORRECTION, because the withdrawal used to rest on a row that is not a
 # measurement: `E   E   share diverged` does NOT survive the permissive
-# context. `build_known_tokens` over this repository yields 1,283 words and
-# `e` is not one of them, so the inner body `E   share diverged` carries an
-# unvouched token, `_is_ordinary` fails, and the transformer emits
-# `E   [REDACTED: unclassified line]`. Today's doubled-gutter emissions are
-# therefore a purely STRUCTURAL class, and the claim that separating a safe
-# doubled gutter from an unsafe one needs a word-by-word vocabulary is
-# withdrawn with it: a leg reading "is the inner body an `assert`/`raise`
-# form" would have been available.
+# context. `build_known_tokens` over this repository does not vouch for `e`, so
+# the inner body `E   share diverged` carries an unvouched token, `_is_ordinary`
+# fails, and the transformer emits `E   [REDACTED: unclassified line]`. Today's
+# doubled-gutter emissions are therefore a purely STRUCTURAL class, and the
+# claim that separating a safe doubled gutter from an unsafe one needs a
+# word-by-word vocabulary is withdrawn with it: a leg reading "is the inner
+# body an `assert`/`raise` form" would have been available.
 #
 # THE LEG STAYS WITHDRAWN ANYWAY, on the argument that does hold. This
 # validator has no gutter awareness in any other leg, so `E   E   X` and
@@ -1439,6 +1940,15 @@ def validate_export(lines, roots=None):
                 if pattern.search(text):
                     reason = name
                     break
+        # AFTER every entry in `_FORBIDDEN`, for the positional reason the
+        # comment above the `token-credential` entry states: a line that also
+        # violates a wholesale leg must report that leg, or its refusal would be
+        # downgraded to one replaced line without anybody deciding to downgrade
+        # it (#821).
+        if reason is None and _token_value_names_an_unknown_placeholder(
+            text, roots
+        ):
+            reason = "token-credential"
         if reason is None and (
             _looks_like_free_text(text) or _looks_like_quoted_prose(text)
         ):
@@ -1465,33 +1975,194 @@ VALIDATION_REDACTION_NOTICE = (
 # repository sweep added 320 retained free-form-text judgements. A check with
 # that record must cost one line when it is wrong, not the whole export.
 #
-# Every OTHER reason `validate_export` can report is a CONTENT leg: an
-# unsubstituted root or one of the denylist patterns in `_FORBIDDEN`. A content
-# violation means the transformer emitted a payload it was
-# supposed to have removed, which is the systemic-breakage signal the previous
-# whole-file refusal existed for, and it is not made safer by arriving alone.
+# Every OTHER reason `validate_export` can report is a CONTENT leg, with the one
+# exception filed below: an unsubstituted root or one of the denylist patterns
+# in `_FORBIDDEN`. A content violation means the transformer emitted a payload
+# it was supposed to have removed, which is the systemic-breakage signal the
+# previous whole-file refusal existed for, and it is not made safer by arriving
+# alone.
+#
+# `token-credential` is a denylist leg and is filed here anyway. It is the
+# exception, and it is decided on the same question of KIND as the rows above,
+# not by volume. The leg's primary designed firing class is a value whose head
+# a root or a typed substitution consumed, leaving a raw tail: the transformer
+# publishes `token=<repo>90210904812340981234` with nothing regressed in either
+# surface, and the four rows recorded above the leg itself are the measured
+# shapes. Its second documented firing class, a placeholder value followed by
+# ordinary punctuation, contains no secret by construction. Its THIRD, added by
+# #821, is a value whose spans are complete and lowercase-named but whose names
+# nobody vouches for — reported by
+# `_token_value_names_an_unknown_placeholder` rather than by the tuple entry.
+# That kind means either that the transformer regressed or that the caller did
+# not pass the `roots` mapping naming its own placeholders, and the first of
+# those is what the canary below separates out. So when this leg
+# fires, nothing has regressed, and its firing is therefore not evidence that
+# the UNFLAGGED lines cannot be trusted — which is the only protection a
+# wholesale refusal adds, because the flagged line's own bytes never reach the
+# file, the sidecar, the manifest or stderr either way.
+#
+# Volume could not have decided it, and the figure that supports that is
+# measured on PUBLISHED OUTPUT, which the earlier wording did not say. The
+# distinction is not cosmetic, because the two populations disagree. On RAW
+# tracked text this leg fires on 533 lines of this repository at the commit that
+# writes this sentence — `token: str` and `token = secrets.token_hex(24)` in
+# committed Python, and several lines of this comment — since the word followed
+# by a separator is ordinary Python and ordinary prose. Pushed through the
+# transformer, whose own token entry replaces such a value with `<credential>`
+# before this leg ever reads the line, it fires on ZERO of those same lines, all
+# 2.07 million of them; the earlier sweep recorded zero over the 12,625 published
+# lines of 118 retained failure extracts as well, and this sweep records zero
+# under the unscoped case flag as well as the scoped one, so scoping it newly
+# refused no published line anywhere. The figure over published output is the one
+# the argument needs, because the validator reads nothing but published output,
+# so the volume argument is silent in both directions and the kind argument
+# decides alone. The raw-text figure would have argued the other way about a leg
+# that never fires on anything this validator reads.
+#
+# Filing that reason here puts a POSITIONAL requirement on `_FORBIDDEN`,
+# because `validate_export` reports the first leg that matches: the
+# `token-credential` entry must be matched after every leg whose reason this
+# set does not contain, or a line violating both would report
+# `token-credential`, degrade to one replaced line, and publish — silently
+# downgrading the other leg's refusal. It is the LAST entry in `_FORBIDDEN` for
+# that reason, and the comment above the entry states the requirement where a
+# reader adding a leg will meet it.
 #
 # The set is stated this way round on purpose. A leg added later is a content
 # leg until somebody deliberately files it here, so an unfiled leg refuses
 # wholesale rather than degrading per line, which is the fail-closed
 # direction. Enumerating the content legs instead would make an unfiled leg
 # degrade per line, which is the permissive one.
+#
+# MEMBERSHIP IN THIS SET IS A STATEMENT ABOUT A LEG, AND THAT IS ONLY VALID
+# WHEN EVERY FIRING OF THE LEG MEANS THE SAME THING. The earlier formulation of
+# the rule stopped at the reason: file the reason here and every occurrence of
+# it degrades per line, leave it out and every occurrence refuses wholesale. A
+# review measured that `token-credential` does not satisfy the precondition that
+# formulation assumes. Its firings come in two kinds. One kind occurs with the
+# transformer working exactly as shipped, because a substitution consumed the
+# value's head and left a raw tail the ordinary-word check cannot refuse; that
+# kind is a leg over-firing on safe output and must cost one line. The other
+# kind occurs when the transformer has regressed, and that kind is evidence
+# about every line in the export, not only the flagged one. A static set cannot
+# tell them apart, because it is consulted per REASON and the two kinds share a
+# reason.
+#
+# So the rule now has two levels, and the second one is what this leg needed. A
+# reason filed here still says "one firing of this leg costs one line". What
+# decides whether the export publishes at all is an OCCURRENCE-level escalation
+# on evidence the legs do not carry: `_transformer_health_ok` below, consulted
+# once per publication. A healthy transformer with an over-broad validator hit
+# costs one line; a regressed transformer fails the canary and withholds every
+# line, including the residuals no leg here can see.
+#
+# `token-credential` IS THE FIRST MIXED-KIND MEMBER OF THIS SET, and the next
+# person filing a reason here has one question to ask because of it: does every
+# firing of this leg mean the same thing? If it does, set membership alone is
+# the whole rule and nothing else is needed. If it does not — if some firings
+# are the transformer working and others are the transformer broken — then set
+# membership is not sufficient by itself, and the filing owes an independent
+# health check that separates the two, because the reason string cannot.
 PER_LINE_VIOLATION_REASONS = frozenset({
     "free-form-text",
     "unnormalized-parameter",
     "text-after-exception-placeholder",
     "unknown-counter-word",
+    # The one denylist reason in this set. See the paragraphs above, and the
+    # positional requirement it puts on `_FORBIDDEN`.
+    "token-credential",
 })
+
+# ---------------------------------------------- the transformer-health canary
+#
+# ONE fixed line, pushed through the REAL reduction once per publication. It is
+# the occurrence-level evidence the rule above says a mixed-kind leg needs: the
+# validator's legs judge the CONTENT that was published, and this judges whether
+# the surface that produced it still works. Separating those two questions is
+# the whole point, because the validator cannot answer the second one — the
+# measured case is a transformer whose token entry is gone and a value whose
+# tail is already placeholder-shaped, which produces no violation at all, so
+# every leg here stays silent while the secret publishes.
+#
+# THIS IS THE ONE PLACE THE VALIDATOR SIDE CALLS A TRANSFORMER HELPER, and the
+# paragraph above `_FORBIDDEN` forbidding exactly that still holds as written.
+# What that paragraph protects is the independence of the legs that decide
+# SAFETY: a leg built from a transformer classifier admits whatever the
+# classifier admits, and the check then proves nothing. This function decides no
+# line's safety and formulates no leg. It asks the transformer one question about
+# itself, so consulting the transformer is not a shortcut around an independent
+# judgement — it is the only way to obtain the answer. The legs stay
+# independently formulated; only the escalation consults health.
+#
+# RUN UNCONDITIONALLY, not when `token-credential` fires. Keying it to that leg
+# would leave the worst case uncovered for exactly the reason the leg needed an
+# escalation in the first place: a regressed transformer together with a secret
+# of the placeholder-shaped residual class produces no violation, so a
+# violation-gated probe would never be consulted and that export would publish
+# the secret. The cost is the same either way, because it is a fixed line.
+#
+# THE CANARY VALUE'S VERDICT DEPENDS ON THE TOKEN ENTRY AND ON NOTHING ELSE.
+# `_reduce` substitutes roots, then the typed patterns in order, then paths, and
+# a probe any of the others can claim would still pass with the token entry
+# gone. This value reaches none of them: it carries no `@` for `<email>`, no
+# hyphen-grouped hex for `<uuid>`, none of the `bearer`/`api_key`/
+# `authorization` words, no `sk-`/`pk-` prefix, no `://`, no 32-character hex
+# run, no 40-character unbroken alphanumeric run, and no `/` for either path
+# rule. The context is EMPTY, so root substitution is the identity and no
+# caller's root prefix can consume the value either. Exactly one entry in
+# `_TYPED_PATTERNS` matches it, and deleting that entry leaves the line byte
+# for byte with no decided span — which is the failure this check reports.
+# Pinned by `test_the_canary_is_claimed_only_by_the_token_entry`.
+#
+# EMPTY CONTEXT ALSO MAKES THIS DATA-INDEPENDENT AND CONSTANT. It must not call
+# `build_known_tokens`, shell out, or read the repository: `build_known_tokens`
+# runs `git ls-files`, so borrowing the caller's real context would turn a
+# per-publication probe into a subprocess per publication. `ScrubContext()` with
+# no arguments compiles no root alternation and touches nothing outside memory.
+# Measured at 4.6 us per call, context construction included.
+TRANSFORMER_CANARY_LINE = "token=cctally-transformer-health-canary"
+TRANSFORMER_CANARY_EXPECTED = "<credential>"
+# Names WHAT HAPPENED rather than a leg, because no leg's verdict produced it
+# and an operator reading `token-credential` here would look for a credential in
+# the export instead of at the transformer. Deliberately NOT a member of
+# `PER_LINE_VIOLATION_REASONS`: there is no line to replace, and the whole
+# content of the verdict is that the unflagged lines cannot be trusted.
+TRANSFORMER_HEALTH_REFUSAL = "transformer-health-check-failed"
+
+
+def _transformer_health_ok() -> bool:
+    """Does the real reduction still replace a separated token's value?
+
+    FAIL CLOSED ON THE CHECK ITSELF. An unevaluable canary is an unhealthy
+    transformer, not an inconclusive probe: a reduction that raises, returns the
+    wrong shape, or has lost a name it needs cannot be trusted with the export
+    either, and treating "I could not tell" as "healthy" would publish on
+    exactly the faults this check exists to catch.
+
+    `SystemExit` and `KeyboardInterrupt` are deliberately outside the clause.
+    Neither is a failure mode of a pure in-memory reduction, and swallowing an
+    operator's interrupt in order to record a canary verdict would be a worse
+    outcome than refusing.
+    """
+    try:
+        reduced, spans = _reduce(TRANSFORMER_CANARY_LINE, ScrubContext())
+        return (
+            reduced == TRANSFORMER_CANARY_EXPECTED
+            and tuple(spans) == ((0, len(TRANSFORMER_CANARY_EXPECTED)),)
+        )
+    except Exception:                                   # noqa: BLE001
+        return False
+
 
 # NO RATE THRESHOLD. A proportional escape shipped here and is withdrawn,
 # because it decided the question by VOLUME when the question is one of KIND.
 #
 # The issue is KIND, not VOLUME. A fault confined to the vocabulary stage is
 # checked independently by the single/double-quoted-span rule and the free-text
-# heuristic; every detected line is removed. A denylist hit or unsubstituted
-# root is stronger evidence that a concrete secret class survived, so one still
-# refuses wholesale. A rate threshold adds no useful safety distinction to
-# either group.
+# heuristic; every detected line is removed. An unsubstituted root, or a
+# denylist hit whose reason `PER_LINE_VIOLATION_REASONS` does not contain, is
+# stronger evidence that a concrete secret class survived, so one still refuses
+# wholesale. A rate threshold adds no useful safety distinction to either group.
 def apply_validation_redactions(lines, violations, roots=None):
     """Replace each flagged line with a placeholder, or refuse wholesale.
 
@@ -1500,13 +2171,21 @@ def apply_validation_redactions(lines, violations, roots=None):
     publish nothing, because a denylist CONTENT violation means the transformer
     rather than one leg is broken and the UNFLAGGED lines cannot be trusted.
 
+    EVERY REFUSAL PATH RETURNS AN EMPTY LIST, so "publish nothing" is a property
+    of the value rather than only a rule the caller has to remember. `total`
+    still states how many lines were withheld, and both callers already read
+    `refused` before they read the lines, so the change is invisible to them.
+    Returning the caller's own list on a refusal was safe only by convention,
+    and a refusal is exactly the occasion on which a caller that skipped the
+    convention would write out unsanitized text.
+
     Degrading per line rather than per file is what keeps a single false
     positive from costing the operator every byte of a failure extract — the
     same failure class, at the file level, that the sanitizer's own
     over-redaction was raised as. Fail-closed still holds for the offending
-    line: its bytes never reach the caller's output. It applies to the
-    structural and heuristic free-text legs only, for the reason recorded
-    above the function.
+    line: its bytes never reach the caller's output. It applies to the reasons
+    `PER_LINE_VIOLATION_REASONS` names — the structural legs, the heuristic
+    free-text leg and `token-credential` — for the reasons recorded on that set.
 
     The placeholders and the notice are OUTPUT, so they are put back through
     the same validator. A reason string that did not clear it would publish
@@ -1524,11 +2203,22 @@ def apply_validation_redactions(lines, violations, roots=None):
         "refused": False,
         # WHY the export was refused, which is not always the first violation's
         # reason: a structural violation may be recorded ahead of the content
-        # one that caused the refusal, and two of the three refusal paths below
+        # one that caused the refusal, and three of the four refusal paths below
         # are not a leg's verdict at all. A caller that reported
         # `violations[0]["reason"]` therefore named the wrong cause.
         "refusal": None,
     }
+    # FIRST, AND WITHOUT REGARD TO WHAT THE VALIDATOR FOUND. A failed canary is
+    # the strongest verdict this function can reach, so it is also the most
+    # actionable cause to record: a content leg firing beside it is a symptom of
+    # the same regression, and naming the leg would send the reader after one
+    # line's payload instead of after the transformer. It sits ahead of the
+    # no-violation return because a clean validator pass is exactly what a
+    # regressed transformer produces on a secret of the residual class.
+    if not _transformer_health_ok():
+        record["refused"] = True
+        record["refusal"] = TRANSFORMER_HEALTH_REFUSAL
+        return [], record
     if not violations:
         return lines, record
     # A violation carrying no reason at all is not a recognized per-line leg:
@@ -1541,7 +2231,7 @@ def apply_validation_redactions(lines, violations, roots=None):
     if content:
         record["refused"] = True
         record["refusal"] = content[0] or "unclassified-violation"
-        return lines, record
+        return [], record
     for violation in violations:
         index = violation.get("index")
         if not isinstance(index, int) or not 0 <= index < total:
@@ -1549,7 +2239,7 @@ def apply_validation_redactions(lines, violations, roots=None):
             # there is nothing safe to publish around it.
             record["refused"] = True
             record["refusal"] = "unlocatable-violation"
-            return lines, record
+            return [], record
         lines[index] = VALIDATION_REDACTION_TEMPLATE % violation.get("reason")
     notice = VALIDATION_REDACTION_NOTICE % (
         len(violations), total, ", ".join(reasons) or "unknown",
@@ -1557,7 +2247,7 @@ def apply_validation_redactions(lines, violations, roots=None):
     if validate_export(lines + [notice], roots):
         record["refused"] = True
         record["refusal"] = "unvalidatable-replacement"
-        return lines, record
+        return [], record
     record["notice"] = notice
     return lines, record
 

@@ -113,7 +113,7 @@ ones you asked for and are used verbatim.
 
 **A credited week counts as one interval per billing cycle.** An Anthropic quota reset leaves a week's boundaries where they are but ends one billing cycle and begins another inside it, so a week credited `n` times is `n + 1` subscription intervals — two for the ordinary single credit. `--weeks N` counts intervals, which means a credited week consumes `n + 1` of the N slots and the range reaches less far back in calendar time than N times seven days. That is deliberate: a segment IS a billing cycle, so counting segments is counting cycles, and it is what [`report`](report.md) and [`weekly`](weekly.md) already render for the same week. `weeksInRange` and `rangeStart` both reflect the segment count.
 
-One consequence is visible in the attribution figures. Every segment after the first starts at a credit instant, which matches no snapshot's `week_start_at`, so it reports no snapshot and `totals.weeklyAttributionAvailable` goes false on a window containing a credited week. The head segment does match, and its contribution is the week's reset-aware-floored percentage rather than the pre-credit peak that `weekly` shows on the same segment. That difference is a known limitation of the per-`week_start_date` snapshot lookup, tracked separately; the figures here are correct against that lookup, not against `weekly`'s per-segment one.
+Every segment resolves its own percentage inside its own half-open interval, so `project` reports the same per-cycle figures as [`weekly`](weekly.md) on the same store. A cycle with no observation of its own is reported as missing rather than given a neighbour's reading, which means a week credited `n` times can report up to `n + 1` independently missing observations. `totals.usedPercent` sums every cycle, because a billing cycle is the unit that owns a 100% quota and this surface already sums one cycle per week across weeks; a credited week therefore contributes one percentage per cycle.
 
 ## Claude `Used %`
 
@@ -150,7 +150,7 @@ output under the model's weights. That is the reason the modelled basis
 exists.
 
 Over a multi-week range, per-week attributions sum: three weeks of 20% →
-`60.0% (3wk)`. The `(Nwk)` suffix makes this explicit. `—` in the `Used %`
+`60.0% (3cy)`. The `(Ncy)` suffix makes this explicit, and it counts billing cycles rather than calendar weeks, because a credited week contributes more than one. `—` in the `Used %`
 column means the week had no `weekly_usage_snapshots` row (usually: very fresh
 install), or that modelled quota was withheld. `$/1%` is
 `cost / attributed_pct`.

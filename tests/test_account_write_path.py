@@ -43,15 +43,22 @@ def _claude_key(uuid="acct-uuid-1"):
     return _lib_accounts.account_key("claude", uuid)
 
 
-def _seed_week(cc, pct=46.0):
+def _seed_week(cc, pct=46.0, account_key="unattributed"):
+    """Seed one week's usage snapshot.
+
+    #834 S2 (#837) made `record-credit` plan strictly inside the ACTIVE
+    account's population, so a test that activates a real identity must seed
+    that identity's rows. Leaving the row on the sentinel would exercise the
+    refusal below rather than the stamp this file is about.
+    """
     conn = cc.open_db()
     try:
         conn.execute(
             "INSERT INTO weekly_usage_snapshots (captured_at_utc, week_start_date, "
             "week_end_date, week_start_at, week_end_at, weekly_percent, page_url, "
-            "source, payload_json) VALUES (?,?,?,?,?,?,?,?,?)",
+            "source, payload_json, account_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
             ("2026-06-18T21:12:00Z", "2026-06-13", "2026-06-20", WS_AT, WE_AT, pct,
-             None, "userscript", "{}"),
+             None, "userscript", "{}", account_key),
         )
         conn.commit()
     finally:
@@ -102,9 +109,31 @@ def _floor_account(cc):
 def test_record_credit_stamps_active_account(cc, monkeypatch):
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
     _write_claude_json()
-    _seed_week(cc)
+    _seed_week(cc, account_key=_claude_key())
     assert cc.cmd_record_credit(_credit_args()) == 0
     assert _floor_account(cc) == _claude_key()      # real key, not 'unattributed'
+
+
+def test_record_credit_refuses_a_week_the_active_account_does_not_hold(
+        cc, monkeypatch):
+    """#834 S2 (#837): the plan is a statement about ONE account's population.
+
+    An active real identity whose week holds only `unattributed` rows is
+    refused rather than planned from the sentinel's history. `unattributed` is
+    a real scope key, not permission to aggregate, and a credit computed from
+    rows the active account does not own would stamp a floor the reset
+    detector's account-scoped predecessor query then measures later credits
+    against.
+
+    This is a deliberate behaviour change, and the state is reachable: a user
+    who had no `~/.claude.json` when the journal cutover ran, and logs in
+    afterwards, holds sentinel history under a real identity.
+    """
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    _write_claude_json()
+    _seed_week(cc)                                  # sentinel history only
+    assert cc.cmd_record_credit(_credit_args()) == 2
+    assert _floor_account(cc) is None
 
 
 def test_record_credit_exits_2_on_torn_identity(cc, monkeypatch):

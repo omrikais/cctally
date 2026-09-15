@@ -6,7 +6,7 @@
   "groupMode": "git-root",
   "totals": {
     "costUsd": 3.0,
-    "usedPercent": 70.0,
+    "usedPercent": 50.0,
     "weeklyAttributionAvailable": true
   },
   "attribution": {
@@ -33,8 +33,8 @@
       "cacheWriteTokens": 0,
       "cacheReadTokens": 0,
       "costUsd": 3.0,
-      "attributedUsedPercent": 70.0,
-      "costPerPercent": 0.0429,
+      "attributedUsedPercent": 50.0,
+      "costPerPercent": 0.06,
       "attributionBasis": "cost-share"
     }
   ],

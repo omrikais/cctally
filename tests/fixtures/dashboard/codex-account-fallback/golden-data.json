@@ -108,7 +108,7 @@
     "current_week": {
       "rows": [],
       "total_cost_usd": 0.0,
-      "week_label": "wk Apr 13",
+      "week_label": "Apr 13",
       "week_start_at": "2026-04-13T00:00:00Z",
       "week_start_date": "2026-04-13"
     },
@@ -118,7 +118,8 @@
         {
           "total_cost_usd": 0.0,
           "total_pct": null,
-          "week_label": "wk Apr 13",
+          "week_label": "Apr 13",
+          "week_start_at": "2026-04-13T00:00:00Z",
           "week_start_date": "2026-04-13"
         }
       ],
@@ -135,7 +136,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 11,
+  "source_schema_version": 12,
   "sources": {
     "all": {
       "availability": "ok",
@@ -242,6 +243,7 @@
       },
       "freshness": "fresh",
       "last_success_at": "2026-04-16T14:00:00Z",
+      "metadata_health": null,
       "warnings": []
     },
     "claude": {
@@ -784,7 +786,7 @@
           "current_week": {
             "rows": [],
             "total_cost_usd": 0.0,
-            "week_label": "wk Apr 13",
+            "week_label": "Apr 13",
             "week_start_at": "2026-04-13T00:00:00Z",
             "week_start_date": "2026-04-13"
           },
@@ -795,7 +797,8 @@
               {
                 "total_cost_usd": 0.0,
                 "total_pct": null,
-                "week_label": "wk Apr 13",
+                "week_label": "Apr 13",
+                "week_start_at": "2026-04-13T00:00:00Z",
                 "week_start_date": "2026-04-13"
               }
             ],
@@ -822,6 +825,7 @@
       },
       "freshness": "fresh",
       "last_success_at": "2026-04-16T14:00:00Z",
+      "metadata_health": null,
       "warnings": []
     },
     "codex": {
@@ -2423,6 +2427,11 @@
       },
       "freshness": "fresh",
       "last_success_at": "2026-04-16T14:00:00Z",
+      "metadata_health": {
+        "incomplete_rows": 0,
+        "retryable": false,
+        "state": "healthy"
+      },
       "warnings": []
     }
   },

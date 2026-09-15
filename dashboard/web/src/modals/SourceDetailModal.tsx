@@ -57,8 +57,24 @@ export function SourceDetailModal() {
     subscribeStore,
     () => getState().accountFocus,
   );
+  // #769 S9 QA P2 — the OPENING ROW's own account outranks the focus control.
+  // Two Codex accounts that observed one physical quota window publish two
+  // separately labelled rows under ONE opaque key, so with focus on "All
+  // accounts" both rows sent the identical unqualified URL and the server
+  // resolved both to the first published row: the row labelled with one
+  // account opened the other account's block. The row's `account_key` is the
+  // only qualifier that distinguishes them, and the wire publishes it exactly
+  // where two rows can collide (decoration is active only above one real
+  // account).
+  //
+  // The focus fallback stays for an opener that names no row account. It is
+  // unreachable from the blocks panel, which always supplies the row's value,
+  // and it cannot disagree with a decorated row: a `null` row account means
+  // the wire published none, which is the undecorated case, where the focus
+  // resolver also returns null. Neither branch ever synthesises the
+  // `unattributed` sentinel — that would be a claim the wire did not make.
   const detailAccount = open?.resource === 'block'
-    ? resolveViewAccountFocus(env, selection, detailSource, focusState)
+    ? open.accountKey ?? resolveViewAccountFocus(env, selection, detailSource, focusState)
     : null;
   const detail = useSourceDetail<SourceDetailBody>(
     open?.source ?? 'codex',
@@ -477,12 +493,25 @@ function CodexProjectDetailView({ d }: { d: CodexProjectDetailBody }) {
 function CodexBlockDetailView({ d }: { d: CodexBlockDetailBody }) {
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
+  // #769 S9 QA P1 — the partial block payload omits `forecast`,
+  // `observations`, `milestones` and `freshness`, and the view read the
+  // forecast unguarded: on a generation whose Codex project metadata is
+  // incomplete, `fmt.pct1(d.forecast.projected_percent)` threw
+  // `TypeError: Cannot read properties of undefined`, no `role="dialog"`
+  // mounted, and the error boundary told the user the build had changed under
+  // the tab — which is false, because nothing updated and the build is
+  // coherent. Guard all four, not only the one that crashed.
   const models = d.model_breakdowns ?? [];
   const observations = d.observations ?? [];
   const milestones = d.milestones ?? [];
   const freshness = d.freshness ?? 'unavailable';
+  const forecast = d.forecast ?? null;
   return (
     <div className="sd-codex-block modal-content" data-testid="codex-block-detail">
+      {/* The same disclosure the project sibling renders on the same
+          generation, so a partial block is a stated limitation above real
+          figures rather than a blank panel or an error card. */}
+      {d.metadata_availability === 'partial' ? <p className="sd-note">{d.metadata_reason}</p> : null}
       <div className="m-chipstrip">
         <span className="msess-badge sd-project-label" title={d.label}>{d.label}</span>
         <span className={`m-pill ${providerAccentClass('codex')}`}>Codex</span>
@@ -492,7 +521,7 @@ function CodexBlockDetailView({ d }: { d: CodexBlockDetailBody }) {
       <div className="m-hero cols-3">
         <div className="m-kv kv-dur"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#activity" /></svg><div><div className="v">{fmt.pct0(d.current_percent)}</div><div className="lbl">Current usage</div></div></div>
         <div className="m-kv kv-cost"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#dollar" /></svg><div><div className="v">{fmt.usd2(d.cost_usd ?? null)}</div><div className="lbl">Retained cost</div></div></div>
-        <div className="m-kv kv-proj"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#trending-up" /></svg><div><div className="v">{fmt.pct1(d.forecast.projected_percent)}</div><div className="lbl">Projected at reset</div><div className="sub">{d.forecast.status}</div></div></div>
+        <div className="m-kv kv-proj"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#trending-up" /></svg><div><div className="v">{fmt.pct1(forecast?.projected_percent ?? null)}</div><div className="lbl">Projected at reset</div><div className="sub">{forecast?.status ?? 'unavailable'}</div></div></div>
       </div>
       <div className="msess-ts sd-block-ts">
         <svg className="icon" aria-hidden="true"><use href="/static/icons.svg#calendar" /></svg>

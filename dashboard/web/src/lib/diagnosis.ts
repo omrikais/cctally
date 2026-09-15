@@ -444,6 +444,12 @@ export function gapCodeMessage(code: string | null | undefined): string {
       return 'some subagent spend could not be joined to exactly one parent';
     case 'ambiguous_origin_category':
       return 'some threads carried an origin category this build cannot read';
+    // #834 S2 (#800). The accounting rows name a conversation the transcript
+    // store retains no candidate row for, so there are no turns to count and
+    // the conversation is not DECIDED — it leaves the evaluated population
+    // rather than being reported as a non-contributor with zero turns.
+    case 'no_retained_transcript':
+      return 'some conversations retained no transcript to count turns in';
     case null:
     case undefined:
     case '':

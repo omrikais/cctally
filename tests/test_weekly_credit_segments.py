@@ -13,10 +13,23 @@ import sqlite3
 from conftest import load_script
 
 
-def _usage_snapshot_conn(rows):
-    """An in-memory `weekly_usage_snapshots` table holding `rows`.
+# The credited week `_segments` describes: it ends at 2026-05-16T15:00Z and
+# an in-place credit cut it at 2026-05-15T17:00Z.
+WEEK_END = "2026-05-16T15:00:00+00:00"
+CREDIT_CUT = "2026-05-15T17:00:00+00:00"
+
+
+def _usage_snapshot_conn(rows, *, cuts=(), week_end=WEEK_END):
+    """An in-memory stats connection holding `rows` and, optionally, the
+    `week_reset_events` rows that make a week credited.
 
     `rows` is a list of `(captured_at_utc, week_start_date, weekly_percent)`.
+
+    `cuts` is the list of in-place credit instants inside `week_end`. Each is
+    written in the shape both appliers require of an in-place credit:
+    `old_week_end_at == effective_reset_at_utc`, with `new_week_end_at`
+    holding the week's unchanged end. Without a row here a week is NOT
+    credited, however many segments a caller hands in — which is #736.
     """
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -28,7 +41,23 @@ def _usage_snapshot_conn(rows):
             week_end_date TEXT,
             week_start_at TEXT,
             week_end_at TEXT,
-            weekly_percent REAL
+            weekly_percent REAL,
+            -- #769 S11 (#824): `get_latest_usage_for_week` excludes held rows,
+            -- so this hand-built table has to carry the column the real
+            -- schema declares or every read here raises.
+            weekly_observation_held INTEGER NOT NULL DEFAULT 0
+                CHECK (weekly_observation_held IN (0, 1))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE week_reset_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            detected_at_utc TEXT NOT NULL,
+            old_week_end_at TEXT NOT NULL,
+            new_week_end_at TEXT NOT NULL,
+            effective_reset_at_utc TEXT NOT NULL,
+            observed_pre_credit_pct REAL,
+            account_key TEXT
         )
     """)
     for captured, wsd, pct in rows:
@@ -37,6 +66,14 @@ def _usage_snapshot_conn(rows):
             "(captured_at_utc, week_start_date, weekly_percent) "
             "VALUES (?, ?, ?)",
             (captured, wsd, pct),
+        )
+    for cut in cuts:
+        conn.execute(
+            "INSERT INTO week_reset_events "
+            "(detected_at_utc, old_week_end_at, new_week_end_at, "
+            " effective_reset_at_utc, observed_pre_credit_pct, account_key) "
+            "VALUES (?,?,?,?,?,?)",
+            (cut, cut, week_end, cut, 67.0, "unattributed"),
         )
     conn.commit()
     return conn
@@ -105,13 +142,46 @@ def test_aggregate_weekly_emits_two_buckets_for_two_segments_of_one_week():
     assert [round(b.cost_usd, 6) for b in buckets] == [40.0, 4.0]
 
 
-def test_build_weekly_view_resolves_each_segment_to_its_own_percent():
-    """Each segment must resolve to the usage snapshot current at ITS end.
+def test_two_segments_sharing_a_start_date_with_no_credit_are_not_bounded():
+    """#736. The old predicate armed on any duplicate `start_date`.
 
-    `build_weekly_view` passes one global `as_of_utc` to every row, so both
-    segments used to read the same (latest) snapshot and render the same
-    percent. The pre-credit segment must instead pick up the last snapshot
-    captured before the credit.
+    A duplication from reset-day drift, a backfill, or a future boundary
+    repair must NOT silently move a rendered `Used %`. With no in-place
+    `week_reset_events` row present, neither segment is bounded, so both
+    read the globally-latest snapshot at-or-before `as_of_utc`.
+    """
+    ns = load_script()
+    build = ns["build_weekly_view"]
+    pre, post = _segments(ns)
+    conn = _usage_snapshot_conn([
+        ("2026-05-15T16:00:00Z", "2026-05-09", 67.0),
+        ("2026-05-15T19:00:00Z", "2026-05-09", 4.0),
+    ])  # no `cuts` — this week received no credit
+    entries = [
+        _entry(ns, ts="2026-05-13T12:00:00+00:00", cost=40.0),
+        _entry(ns, ts="2026-05-15T18:30:00+00:00", cost=4.0),
+    ]
+    now = dt.datetime(2026, 5, 15, 20, 0, tzinfo=dt.timezone.utc)
+
+    view = build(
+        conn, entries, weeks=[pre, post], now_utc=now,
+        as_of_utc="2026-05-15T20:00:00Z", mode="display",
+    )
+
+    assert len(view.rows) == 2, [r.week_start_at for r in view.rows]
+    newest, oldest = view.rows
+    assert oldest.used_pct == 4.0, (
+        "an unbounded segment reads the globally-latest snapshot; bounding it "
+        "on a shared start_date alone is exactly the defect #736 reports"
+    )
+    assert newest.used_pct == 4.0
+
+
+def test_segments_of_a_real_credited_week_are_bounded_by_their_own_cut():
+    """Same shape, but with an in-place `week_reset_events` row present.
+
+    The pre-credit segment now reads the last snapshot captured strictly
+    before the credit instant and the post-credit segment the latest one.
     """
     ns = load_script()
     build = ns["build_weekly_view"]
@@ -119,7 +189,7 @@ def test_build_weekly_view_resolves_each_segment_to_its_own_percent():
     conn = _usage_snapshot_conn([
         ("2026-05-15T16:00:00Z", "2026-05-09", 67.0),   # pre-credit peak
         ("2026-05-15T19:00:00Z", "2026-05-09", 4.0),    # post-credit
-    ])
+    ], cuts=[CREDIT_CUT])
     entries = [
         _entry(ns, ts="2026-05-13T12:00:00+00:00", cost=40.0),
         _entry(ns, ts="2026-05-15T18:30:00+00:00", cost=4.0),
@@ -204,7 +274,7 @@ def test_build_weekly_view_keeps_the_global_as_of_for_the_last_segment():
         # Captured 7 seconds after the week's real end (post.end_ts) and
         # still stamped with this week — the capture-jitter case.
         ("2026-05-16T15:00:07Z", "2026-05-09", 13.0),
-    ])
+    ], cuts=[CREDIT_CUT])
     entries = [
         _entry(ns, ts="2026-05-13T12:00:00+00:00", cost=40.0),
         _entry(ns, ts="2026-05-15T18:30:00+00:00", cost=4.0),
@@ -268,3 +338,128 @@ def test_weekly_share_artifact_labels_the_two_segments_distinctly(monkeypatch):
 
     labels = [r.cells["week"].text for r in snap.rows]
     assert labels == ["2026-05-09", "2026-05-15"], labels
+
+
+CUT_LADDER = (
+    "2026-05-11T15:00:00+00:00",
+    "2026-05-13T15:00:00+00:00",
+    "2026-05-15T15:00:00+00:00",
+)
+
+
+def _base_week(ns):
+    """The uncut week `CUT_LADDER` sits inside."""
+    return ns["SubWeek"](
+        start_ts="2026-05-09T15:00:00+00:00",
+        end_ts=WEEK_END,
+        start_date=dt.date(2026, 5, 9),
+        end_date=dt.date(2026, 5, 15),
+        source="snapshot",
+        display_start_date=dt.date(2026, 5, 9),
+    )
+
+
+def test_a_week_with_n_cuts_yields_n_plus_one_bounded_segments():
+    """N cuts make N+1 billing cycles, and every one of them resolves its own
+    percent. Written as cuts-plus-one rather than as a literal, because
+    nothing in this contract may assume two segments (#750 S4 spec §1.3).
+    """
+    ns = load_script()
+    apply_events = ns["_apply_reset_events_to_subweeks"]
+    build = ns["build_weekly_view"]
+    for n_cuts in (1, 2, 3):
+        cuts = list(CUT_LADDER[:n_cuts])
+        # One snapshot inside each cycle, ascending, so a segment reading the
+        # wrong cycle's reading is visible in the value rather than only in
+        # the count.
+        captures = [("2026-05-10T12:00:00Z", "2026-05-09", 10.0)]
+        for i, cut in enumerate(cuts):
+            captures.append((
+                cut.replace("+00:00", "Z").replace("T15:00:00", "T16:00:00"),
+                "2026-05-09", 20.0 + 10.0 * i,
+            ))
+        conn = _usage_snapshot_conn(captures, cuts=cuts)
+        segments = apply_events(conn, [_base_week(ns)])
+        assert len(segments) == n_cuts + 1, [s.start_ts for s in segments]
+
+        entries = [
+            _entry(ns, ts="2026-05-10T09:00:00+00:00", cost=1.0),
+        ] + [
+            _entry(ns, ts=c.replace("T15:00:00", "T15:30:00"), cost=1.0)
+            for c in cuts
+        ]
+        view = build(
+            conn, entries, weeks=segments,
+            now_utc=dt.datetime(2026, 5, 20, tzinfo=dt.timezone.utc),
+            as_of_utc="2026-05-20T00:00:00Z", mode="display",
+        )
+        assert len(view.rows) == n_cuts + 1
+        # rows are newest-first; oldest-first reads 10, 20, 30, ...
+        oldest_first = list(reversed(view.rows))
+        assert [r.used_pct for r in oldest_first] == [
+            10.0 + 10.0 * i for i in range(n_cuts + 1)
+        ], [r.used_pct for r in oldest_first]
+        conn.close()
+
+
+def test_a_capture_exactly_at_the_credit_belongs_to_the_post_credit_segment():
+    """#735 / spec §1.2, asserted on BOTH sides of the split.
+
+    `_aggregate_weekly` buckets an entry into `[start_ts, end_ts)`, so a cost
+    entry stamped at the credit instant is the successor's. The percent
+    lookup now uses the same convention, so the observation captured there is
+    the successor's too.
+    """
+    ns = load_script()
+    build = ns["build_weekly_view"]
+    pre, post = _segments(ns)
+    conn = _usage_snapshot_conn([
+        ("2026-05-15T12:00:00Z", "2026-05-09", 71.0),   # inside the head
+        # Captured EXACTLY at the credit instant (CREDIT_CUT).
+        ("2026-05-15T17:00:00Z", "2026-05-09", 2.0),
+    ], cuts=[CREDIT_CUT])
+    entries = [
+        _entry(ns, ts="2026-05-13T12:00:00+00:00", cost=40.0),
+        # Stamped EXACTLY at the credit instant.
+        _entry(ns, ts=CREDIT_CUT, cost=4.0),
+    ]
+
+    view = build(
+        conn, entries, weeks=[pre, post],
+        now_utc=dt.datetime(2026, 5, 16, 12, 0, tzinfo=dt.timezone.utc),
+        as_of_utc="2026-05-16T12:00:00Z", mode="display",
+    )
+
+    newest, oldest = view.rows
+    assert oldest.used_pct == 71.0, "the cut instant is EXCLUSIVE for the head"
+    assert newest.used_pct == 2.0, "and INCLUSIVE for the tail"
+    assert round(oldest.cost_usd, 6) == 40.0
+    assert round(newest.cost_usd, 6) == 4.0
+    conn.close()
+
+
+def test_a_credited_tail_with_no_post_cut_observation_reports_missing():
+    """Spec §1.2. The tail's lower bound is not optional: without it the tail
+    resolves to the latest PRE-cut reading, a percent from the previous
+    cycle, instead of being reported as missing."""
+    ns = load_script()
+    build = ns["build_weekly_view"]
+    pre, post = _segments(ns)
+    conn = _usage_snapshot_conn([
+        ("2026-05-15T16:00:00Z", "2026-05-09", 67.0),
+    ], cuts=[CREDIT_CUT])
+    entries = [
+        _entry(ns, ts="2026-05-13T12:00:00+00:00", cost=40.0),
+        _entry(ns, ts="2026-05-15T18:30:00+00:00", cost=4.0),
+    ]
+
+    view = build(
+        conn, entries, weeks=[pre, post],
+        now_utc=dt.datetime(2026, 5, 16, 12, 0, tzinfo=dt.timezone.utc),
+        as_of_utc="2026-05-16T12:00:00Z", mode="display",
+    )
+
+    newest, oldest = view.rows
+    assert oldest.used_pct == 67.0
+    assert newest.used_pct is None
+    conn.close()

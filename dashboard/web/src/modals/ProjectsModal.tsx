@@ -2,9 +2,9 @@
 // Step 6). Layout (top → bottom):
 //   1. Header — title "Projects · last Nw" + ShareIcon (passes
 //      `{ windowWeeks }` to the share modal state per spec §7.3).
-//   2. Window pills (1w / 4w / 8w / 12w) + Y-axis radios (share % vs.
+//   2. Window pills (1 / 4 / 8 / 12 cycles) + Y-axis radios (share % vs.
 //      $ absolute).
-//   3. Optional "Showing N weeks" notice when the snapshot has less
+//   3. Optional "Showing N cycles" notice when the snapshot has less
 //      history than the requested window.
 //   4. Stacked-area trend chart (top-5 + (other) bucket).
 //   5. Full 7-column projects table (Project / Sessions / First seen /
@@ -25,6 +25,7 @@ import { Modal } from './Modal';
 import { ProjectsTrendChart } from './ProjectsTrendChart';
 import { ProjectsRankedBars } from './ProjectsRankedBars';
 import { ProjectsDrillPanel } from './ProjectsDrillPanel';
+import { useProjectDetail } from '../hooks/useProjectDetail';
 import { ShareIcon } from '../components/ShareIcon';
 import { SortableHeader } from '../components/SortableHeader';
 import { KeyHintFooter } from '../components/KeyHintFooter';
@@ -275,6 +276,22 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
   // Issue #73.
   const isMobile = useIsMobile();
 
+  // #834 S2 (#775) — the ONE owner of the project-detail request, hoisted
+  // ABOVE the mobile/desktop branch below. Both mount points render this same
+  // state, so crossing the breakpoint moves where the drill appears and
+  // nothing else: no unmount, no reset to `data == null`, no second request.
+  //
+  // The hook's contract is preserved exactly as it was inside the panel. Its
+  // dependency array stays `[projectKey, windowWeeks, token]`; none of those
+  // is viewport-derived, which is why the refetch came from REMOUNTING rather
+  // than from a changing dependency. Passing `null` when the drill is not
+  // shown is the hook's own documented idle state — it clears its data, its
+  // 404 arm and its in-flight guard — so hoisting does not start a request the
+  // two mounts would not have made.
+  const projectDetail = useProjectDetail(
+    isClaude ? selectedKey : null, windowWeeks,
+  );
+
   // Resolve the current cycle position from the persisted sort override
   // — when none is set we're on cost-desc (the table's default), which
   // is index 0 of the cycle. Unknown overrides (e.g. legacy values) fall
@@ -393,7 +410,9 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
 
   return (
     <Modal
-      title={`Projects · last ${windowWeeks}w`}
+      // #750 S4 D2/D6: the buckets are billing CYCLES. `windowWeeks` is a
+      // frozen wire name; only the rendered noun changes.
+      title={`Projects · last ${windowWeeks} ${windowWeeks === 1 ? 'cycle' : 'cycles'}`}
       accentClass="accent-magenta"
       headerExtras={
         <ShareIcon
@@ -415,14 +434,28 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
               type="button"
               role="radio"
               aria-checked={windowWeeks === w}
+              aria-label={`${w} ${w === 1 ? 'cycle' : 'cycles'}`}
               className={`pill ${windowWeeks === w ? 'on' : ''}`}
               disabled={!isClaude}
               title={!isClaude ? 'Provider-native project history is unavailable' : undefined}
               onClick={() => savePref('projectsWindowWeeks', w)}
             >
-              {w}w
+              {w}
             </button>
           ))}
+          {/* The pills render bare numbers under this explicit unit label
+              (#750 S4 D2/D6). The `0` key still selects 12, so the keymap is
+              unchanged.
+              The unit reaches assistive technology through each radio's own
+              `aria-label`, not through this span and not through the group's
+              label: a non-radio text child of a radiogroup is not tied to the
+              radios, so a screen-reader user heard four bare numbers and then a
+              loose "cycles". Naming the GROUP for the unit would be wrong in
+              the other direction, because this one radiogroup also holds the
+              `share %` and `$ absolute` radios, which count no cycles. The span
+              is hidden from the accessibility tree because it now duplicates
+              what every window radio already announces. */}
+          <span className="projects-window-unit" aria-hidden="true">cycles</span>
           <span className="sep" aria-hidden="true">|</span>
           <button
             type="button"
@@ -460,7 +493,7 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
 
         {actual > 0 && actual < requested && (
           <div className="projects-notice">
-            Showing {actual} week{actual === 1 ? '' : 's'} (need more history for the full window).
+            Showing {actual} cycle{actual === 1 ? '' : 's'} (need more history for the full window).
           </div>
         )}
 
@@ -557,7 +590,11 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
                 {isClaude && isMobile && selectedKey === r.key && (
                   <tr className="projects-drill-row" aria-hidden="false">
                     <td colSpan={7}>
-                      <ProjectsDrillPanel projectKey={r.key} windowWeeks={windowWeeks} />
+                      <ProjectsDrillPanel
+                        projectKey={r.key}
+                        windowWeeks={windowWeeks}
+                        detail={projectDetail}
+                      />
                     </td>
                   </tr>
                 )}
@@ -581,7 +618,11 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
         )}
 
         {isClaude && !isMobile && selectedKey && (
-          <ProjectsDrillPanel projectKey={selectedKey} windowWeeks={windowWeeks} />
+          <ProjectsDrillPanel
+            projectKey={selectedKey}
+            windowWeeks={windowWeeks}
+            detail={projectDetail}
+          />
         )}
 
         <KeyHintFooter

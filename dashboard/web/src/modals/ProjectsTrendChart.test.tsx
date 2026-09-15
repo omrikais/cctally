@@ -8,7 +8,7 @@
 // "bar") instead of a line.
 import { fireEvent, render } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ProjectsTrendChart } from './ProjectsTrendChart';
+import { ProjectsTrendChart, projectsAxisLabels } from './ProjectsTrendChart';
 import type { ProjectsTrendEnvelope } from '../types/envelope';
 import { stubMobileMedia } from '../test-utils/mobileMedia';
 
@@ -305,5 +305,124 @@ describe('<ProjectsTrendChart /> — PR-2 conditional swap (#250)', () => {
     );
     expect(container.querySelector('polygon')).not.toBeNull();
     expect(container.querySelector('[data-testid="projects-yaxis"]')).not.toBeNull();
+  });
+});
+
+// #750 S4 §3.5 / D5: a credited week's two cycles share `week_start_date`,
+// the billing-cycle join key. Keying the x-axis on it gave React duplicate
+// keys, which a production build compiles the warning out of — so the keys
+// are read directly rather than inferred from console output.
+function buildSameDayCreditedTrend(): ProjectsTrendEnvelope {
+  const week = (startAt: string, label: string, cost: number, pct: number) => ({
+    week_start_date: '2026-05-15',
+    week_start_at: startAt,
+    week_label: label,
+    total_cost_usd: cost,
+    total_pct: pct,
+  });
+  return {
+    window_weeks: 3,
+    weeks: [
+      week('2026-05-15T02:00:00Z', 'May 15', 30, 30),
+      week('2026-05-15T08:00:00Z', 'May 15', 20, 20),
+      week('2026-05-15T14:00:00Z', 'May 15', 10, 10),
+    ],
+    projects: [
+      { key: 'p-a', bucket_path: '/repos/p-a', weekly_cost: [16, 11, 5],
+        weekly_pct: [null, null, null], sessions_per_week: [1, 1, 1],
+        first_seen_per_week: [null, null, null], last_seen_per_week: [null, null, null] },
+      { key: 'p-b', bucket_path: '/repos/p-b', weekly_cost: [14, 9, 5],
+        weekly_pct: [null, null, null], sessions_per_week: [1, 1, 1],
+        first_seen_per_week: [null, null, null], last_seen_per_week: [null, null, null] },
+    ],
+  };
+}
+
+function xAxisFiberKeys(container: HTMLElement): (string | null)[] {
+  const axis = container.querySelector('.projects-trend-xaxis')
+    ?? container.querySelector('[data-testid="projects-xaxis"]');
+  const host = (axis ?? container) as HTMLElement & Record<string, unknown>;
+  const spans = Array.from(host.querySelectorAll('span'));
+  return spans.map((el) => {
+    const fiberKey = Object.keys(el).find((k) => k.startsWith('__reactFiber$'));
+    if (!fiberKey) return null;
+    return ((el as unknown as Record<string, { key: string | null }>)[fiberKey]).key;
+  });
+}
+
+describe('<ProjectsTrendChart /> — credited-week x-axis identity (#750 S4)', () => {
+  beforeEach(() => stubMobileMedia(false));
+  afterEach(() => vi.restoreAllMocks());
+
+  it('renders distinct React fiber keys for three same-day cycles', () => {
+    const { container } = render(
+      <ProjectsTrendChart trend={buildSameDayCreditedTrend()} yMode="absolute" windowWeeks={3} />,
+    );
+    const keys = xAxisFiberKeys(container).filter((k): k is string => k !== null);
+    expect(keys.length).toBeGreaterThanOrEqual(3);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  // §3.2a. The keys were already distinct; the LABELS were not, so a reader
+  // saw three identical `May 15` columns. `useDisplayTz` falls back to Etc/UTC
+  // with no snapshot, so the rendered times are the seeded UTC instants.
+  it('suffixes colliding x-axis labels with each cycle own time', () => {
+    const { container } = render(
+      <ProjectsTrendChart trend={buildSameDayCreditedTrend()} yMode="absolute" windowWeeks={3} />,
+    );
+    const text = Array.from(container.querySelectorAll('span')).map((el) => el.textContent);
+    expect(text).toContain('May 15 02:00');
+    expect(text).toContain('May 15 08:00');
+    expect(text).toContain('May 15 14:00');
+    expect(text).not.toContain('May 15');
+  });
+
+  it('leaves non-colliding labels byte-identical', () => {
+    const trend = buildSameDayCreditedTrend();
+    // Move the INSTANTS apart, not just the labels: the axis derives its date
+    // from `week_start_at`, so relabelling alone would still collide.
+    trend.weeks = trend.weeks.map((w, i) => ({
+      ...w,
+      week_label: `May 1${5 + i}`,
+      week_start_at: `2026-05-1${5 + i}T02:00:00Z`,
+    }));
+    const { container } = render(
+      <ProjectsTrendChart trend={trend} yMode="absolute" windowWeeks={3} />,
+    );
+    const text = Array.from(container.querySelectorAll('span')).map((el) => el.textContent);
+    expect(text).toContain('May 15');
+    expect(text).toContain('May 16');
+    expect(text).toContain('May 17');
+    expect(text.some((t) => (t ?? '').includes(':'))).toBe(false);
+  });
+
+  // The date and the time must come from ONE instant in ONE zone. Appending a
+  // display-zone time to the wire's UTC `week_label` rendered `Apr 17 20:00`
+  // for an instant whose Los Angeles date is Apr 16, so the axis ran backwards.
+  it('derives the date in the display zone, not from the wire label', () => {
+    const weeks = buildSameDayCreditedTrend().weeks;
+    // 02:00Z is May 14 in Los Angeles; 08:00Z and 14:00Z are both May 15, so
+    // only the genuine pair collides and the lone cycle keeps a bare date.
+    expect(projectsAxisLabels(weeks, 'America/Los_Angeles'))
+      .toEqual(['May 14', 'May 15 01:00', 'May 15 07:00']);
+    // The same three instants all fall on one UTC date, so all three collide.
+    expect(projectsAxisLabels(weeks, 'Etc/UTC'))
+      .toEqual(['May 15 02:00', 'May 15 08:00', 'May 15 14:00']);
+  });
+
+  it('falls back to the wire label when an instant is absent', () => {
+    expect(projectsAxisLabels([{ week_label: 'wk0' }], 'Etc/UTC')).toEqual(['wk0']);
+  });
+
+  it('still renders when an older envelope omits week_start_at', () => {
+    const trend = buildSameDayCreditedTrend();
+    trend.weeks = trend.weeks.map((w) => {
+      const { week_start_at: _drop, ...rest } = w;
+      return rest;
+    });
+    const { container } = render(
+      <ProjectsTrendChart trend={trend} yMode="absolute" windowWeeks={3} />,
+    );
+    expect(container.querySelector('.projects-trend')).not.toBeNull();
   });
 });

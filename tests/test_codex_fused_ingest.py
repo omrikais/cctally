@@ -197,7 +197,7 @@ def test_schema_codex_fused_tables_and_nullable_linkage_are_exact():
             # account_key (#341): trailing observe-and-stamp column.
             ("account_key", "TEXT", 0),
         ]
-        assert _columns(conn, "codex_session_files")[-8:] == [
+        assert _columns(conn, "codex_session_files")[-10:] == [
             ("source_root_key", "TEXT", 0),
             ("last_native_thread_id", "TEXT", 0),
             ("last_root_thread_id", "TEXT", 0),
@@ -213,6 +213,11 @@ def test_schema_codex_fused_tables_and_nullable_linkage_are_exact():
             # by ALTER after account_key, so a fresh one must build it in the
             # same position or the two disagree on ordinal.
             ("ingest_complete", "INTEGER", 1),
+            # #769 S6: the identity of the file the cursor describes. Trailing
+            # for the same ordinal reason as ingest_complete above, and
+            # nullable because an existing row has no identity to claim.
+            ("device_id", "INTEGER", 0),
+            ("inode", "INTEGER", 0),
         ]
 
         quota_sql = _schema_sql(conn, "quota_window_snapshots")

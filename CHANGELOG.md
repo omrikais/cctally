@@ -5,6 +5,107 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.109.0] - 2026-09-15
+
+### Added
+- The dashboard picks up a new pricing revision without a restart. It re-reads the deployed pricing file every 60 seconds, adopts a complete newer revision, and keeps serving; no connected client is dropped.
+- The conversation filter popover says `Projects appear once indexing finishes.` in place of `No projects.` while the transcript index is being rebuilt. Model counts stay live on the Claude tab.
+- The dashboard's Projects panel gives every billing cycle of a credited week its own percentage. Both cycles shared one calendar date, and only the later reading survived, so the second cycle could never carry one.
+- The milestone modal names an observation gap where it showed a bare em dash, and states each back-filled run once above the table, as `cctally percent-breakdown` already did. A gap in the current cycle is disclosed too.
+
+### Changed
+- The dashboard's conversation routes open the transcript store read-only. Every browse used to run two write-capable pragmas first, so a read competed with maintenance for the SQLite write lock and lost.
+- A conversation route answers with a typed degraded envelope instead of HTTP 500 while a rebuild, a reclaim pass or a schema upgrade holds the store. Sessions reappear on their own; no request returns a server error.
+- Transcript reclaim runs under a two-second budget and continues on the next pass, so it no longer holds the maintenance and both provider locks until the freelist drains. It is reported as its own timed phase.
+- `cctally project` reports the same per-cycle percentages as `cctally weekly` on the same store. A credited week now contributes one percentage per cycle to `totals.usedPercent`, so a week credited once reports both figures instead of one.
+- A cycle with no observation of its own is reported as missing rather than given the previous cycle's reading, so a week credited `n` times can report up to `n + 1` independently missing observations.
+- An observation captured at the exact instant of a weekly credit belongs to the cycle that starts there, matching where the spend recorded at that instant already goes.
+- The Trend panel, the Trend modal, the Projects modal and the period modal count in billing cycles for both providers, and share artifacts follow.
+- The Projects window pills render bare numbers under a `cycles` label, the Projects grid columns drop the `wk` prefix, and the period modal's `Subscription window` field is now `Reset cycle`.
+- Two cycles of a credited week that fall on one calendar day now render distinct labels, with a time suffix on each. An uncredited week and an ordinarily credited week are unchanged.
+- The dashboard's Projects share artifact states the period its data actually covers. It multiplied a cycle count by seven days, which overstates the span once a credited week is inside it.
+- An All-tab project drill widens to a window that reaches the ranking the row came from, instead of assuming every cycle spans seven days.
+- `cctally project`'s `Used %` cell counts billing cycles: `(3wk)` now reads `(3cy)`, and the trend share artifacts' `Δ` rows follow. A credited week contributes two cycles, so the week abbreviation named the wrong unit.
+- Screen readers announce the Weekly modal's cost chart and the Current Week navigator in billing cycles on the Claude tab. They announced "week" and "period" while every visible label beside them said cycle.
+- `--no-sync` no longer runs the two transcript derivations at startup, so a frozen dashboard starts promptly. While either is owed, conversation reads report that state rather than an empty list, until you run `cctally cache-sync`.
+- A Codex project or quota block reports itself partial when any accounting record inside the past year is unreadable, and states that project metadata is withheld for that item, so a cost is no longer missing with nothing saying so.
+- A momentary database error marks that refresh's Codex project and quota block views partial, and the next refresh recovers on its own once the store is healthy.
+- When the dashboard cannot read the account registry, the Codex source says so: it reports the refresh as partial and states that per-account detail is withheld, instead of presenting the install as if it held one account.
+- The source status chip names the withheld account detail instead of reading `Source degraded`, so a registry the dashboard could not read is distinguishable from a source that could not be built at all.
+- The first journal rebuild after upgrading re-reads every segment once, because the stored segment-summary format changed. Later rebuilds skip unchanged segments as before.
+
+### Fixed
+- `cctally record-credit` plans a credit from the confirmed account's own snapshots, floors and five-hour readings, and its preview names the account it will write to. An install with one account is unchanged.
+- `cctally record-usage`, `cctally report` and `cctally percent-breakdown` read each account's own week boundary, so one account's earliest capture no longer sets another account's week.
+- `cctally explain` decides Codex prompt evidence per conversation. A conversation whose transcript is no longer retained leaves the evaluated population and lowers reported coverage, instead of counting as a confident non-contributor.
+- A journal segment summary survives an ordinary volume remount, after proving the file's bytes are unchanged, so a rebuild no longer re-reads the whole journal once an external or network volume is remounted.
+- The dashboard rebuilds a Codex view whose project metadata was incomplete instead of serving it again for the life of the process, and retries on a bounded schedule rather than once.
+- The dashboard tells a temporary read failure apart from a record it cannot interpret, so only the second advises `cctally cache-sync --source codex --rebuild`.
+- The Projects drill issues one request at the width where two panels are mounted, so resizing the window no longer fetches the same project twice.
+- `cctally five-hour-breakdown` and the current-usage modal report the weekly percentage a reader saw at each five-hour crossing, not the raw reading a held tick recorded. Where that reading is no longer retained the column reads `—`.
+- A five-hour block shows only its own account's crossings. One window owns one block per account, and both the current-usage modal and the historical cycle view listed every account's crossings under each.
+- `cctally five-hour-blocks` and `cctally five-hour-breakdown` withhold a weekly percentage a weekly credit retired, at a block's start and end, closed and reset-crossing blocks included. A block observed only before the credit is unchanged.
+- A held status-line tick keeps its five-hour reading through an in-place weekly credit. The credit's cleanup of stale pre-credit replays removed that tick's row, the only record of the reading it carried.
+- A status-line tick whose weekly percentage is held at its high-water mark no longer discards that tick's five-hour usage, so `cctally five-hour-blocks` and the dashboard's five-hour panel stay current.
+- A status-line tick held at the weekly high-water mark does not advance the weekly percentage or its freshness stamp. `cctally forecast`, `cctally report`, the status line, the TUI and the dashboard keep the last observed reading.
+- The Codex source recovers on the next refresh once the account registry is readable again. A refresh that could not read it republished that result for the life of the process, so the per-account panels stayed missing until a restart.
+- A Codex quota block whose retained metadata is incomplete opens and states that, instead of replacing the whole panel with a message saying the dashboard had updated. Nothing had updated.
+- Above one Codex account, clicking a quota block row in the Blocks panel opens that row's own account while the account selector is on All accounts. One of two rows sharing a window opened the other account's block.
+- Opening a Codex project or quota block in the dashboard is immediate. Each click read a year of Codex accounting first, which on a large store is every row it has, and now reads only that project's or that window's own rows.
+- A Codex quota block opens while one unreadable Codex accounting record sits elsewhere in the store. The view converted a year of records it never used, so a single bad record failed the whole request.
+- A Codex quota block renders every observation of its own window. The detail read a thousand recent rows, so a busy window could lose members, or arrive empty and report the block as missing.
+- Above one Codex account, opening a quota block returns that account's block. Two accounts whose blocks share a root, a limit, a slot, a window length and a reset produced one link, and whichever sorted first was shown.
+- A Codex quota block older than the two hundred and fiftieth most recent now opens instead of reporting itself missing.
+- A Claude transcript keeps its account after its volume is remounted. A remount renumbers the device each transcript records, and the next time one grew, its whole history took the account signed in then. Existing damage is not repaired.
+- The conversation list names the transcript-import state and the command that clears it, instead of reporting a load failure beside a Retry that could never succeed. The server reported that state; the page discarded it.
+- The current-usage modal describes a reconciling Codex quota projection the way the hero does, rather than calling it unavailable directly above the figures it publishes. The Codex-only view carries that qualification too.
+- A Codex hero that is showing its last coherent figure says so in text and to assistive technology. The explanation was in a tooltip, which a touch user cannot reach.
+- Opening a Codex row in Recent Sessions is immediate. The detail rebuilt every Codex session of the past year on each click, and now uses the row the dashboard already published, so it reads no accounting data at all.
+- The dashboard's Codex hero keeps its last known spend, with a quiet updating marker, while the quota projection reconciles. It blanked the figure for that moment, and the account card beneath it went on showing a number.
+- A Codex hero says it is pending, rather than rendering an empty value that reads as no spend, both before its first coherent reading and whenever its weekly cycle stops resolving afterwards.
+- The dashboard publishes a recorded metering-rate change on the next refresh. Nothing the dashboard compared between refreshes changed when one was written, so an idle dashboard kept serving the alert list from before it.
+- The dashboard evicts its least recently used Codex caches at their retained-memory budget instead of discarding all of them. A store permanently above the budget rebuilt every cached view on every refresh. Published figures are unchanged.
+- The visible-population memo is still evicted whole, not in part, because it is one indivisible population. Two other cases take every Codex cache cold: a total eviction cannot reduce, and a refresh whose generation moved mid-build.
+- The dashboard no longer discards its most expensive Codex caches first. Two reported no age and no size to the eviction order, so the visible-population memo and the quota memo always went first, however recently they had been used.
+- `cctally dashboard-perf` reports what the Codex source caches retain. The figure came from a background measurement that never finished on a large store, so it read as zero.
+- Codex spend and transcripts reach the dashboard within one tick of a rollout being appended to. An append made mid-turn left no evidence any freshness check examined, so only the two-minute safety walk ever found it.
+- A Codex rollout cctally has read since this release is re-read from the start when it is replaced in place, even at an unchanged size and modification time. An older read position carries no file identity to compare.
+- Adding or removing a `$CODEX_HOME` entry is noticed immediately. A configured root could be added or removed with nothing on disk changing, and the dashboard would keep reporting itself up to date.
+- The conversation viewer keeps every session title and the browse list's cost, project and date columns while `cctally cache-sync --rebuild` replays. The rebuild cleared those tables first, so the list showed no titles throughout.
+- A transcript sync keeps reading a file that the running session appended to mid-read. Any size or modification-time change read as a replacement, so an ordinary append discarded that pass's records and left the whole rebuild to run again.
+- A transcript rebuild drops session titles whose sessions no longer exist. Every rebuild kept the previous titles in full, so titles for deleted sessions stayed forever and title search returned them.
+- A transcript rebuild keeps each message's recorded account instead of re-attributing it to whichever account is active. The attribution was held in memory, so a rebuild resumed in a fresh process lost it.
+- A transcript file replaced in place is recognised as a new file even when its size and modification time are unchanged, so records that no longer exist cannot lend their identity to whatever replaced them.
+- `cctally cache-sync --rebuild` refuses, before deleting anything, when the volume holding `conversations.db` is nearly full, instead of failing partway through and leaving the store half-rebuilt.
+- `cctally doctor` warns when it cannot read a store's rollup pricing fingerprint, instead of reporting no refused write. A locked store read as one that recorded nothing, and every writer of conversation cost authorized itself over it.
+- `cctally cache-sync --prune-orphans` exits 3 and names the affected files when the conversation rollup re-derive is refused. It reported success, and the dashboard's automatic prune said nothing at all.
+- The conversation browse rail falls back to live aggregation when the rollup's state cannot be read, instead of reporting it authoritative over a failed read. Sessions stay visible; cost sorting and project filtering degrade.
+- `cctally doctor` reports a transcript reclaim backlog that is not draining, and fails above 16 GiB. A rebuild is refused at that point, because it adds churn to a store already failing to return the space it freed.
+- `cctally cache-sync --rebuild` measures the free space it needs against the store instead of a fixed 64 MiB. A rebuild replays the whole corpus before the pages it frees come back, so the fixed figure admitted rebuilds that ran out of room.
+- A transcript rebuild that finds no files on disk no longer deletes every message's recorded account. An unmounted volume produced that walk, and the account is the one thing in the store that cannot be derived again.
+- A `cctally dashboard --no-sync` run advances the transcript schema once at startup. Nothing else does in that mode, so a store one migration behind stayed behind and every conversation route stayed degraded.
+- `cctally five-hour-blocks`, `five-hour-breakdown` and the dashboard's Blocks panel record a five-hour credit only when one reporting source both observes the drop and confirms it. A stale status-line sample below an API reading minted one.
+- `cctally statusline` records a weekly reset within 180 seconds even while another session still reports the pre-reset percentage. Agreement from every session was required, so one session that never agreed held the reset back forever.
+- `cctally record-credit` keeps its journalled cleanup when the operation is retried. The list of rows to remove followed database row order, so a retry could describe the same removal differently and have the second description withheld.
+- The stats-database writer guard `cctally doctor` reports now checks every write, not only the first of its kind on a connection. A repeated write that reused an earlier statement went unchecked, so it was neither refused nor recorded.
+- `cctally five-hour-blocks` totals, their breakdowns and the dashboard's Blocks panel count an entry once when a reset shift makes two windows overlap. The later window also priced the earlier one's overlapping entries.
+- The dashboard's Blocks panel and its block modal report a closed five-hour block's recorded totals and model split. They recomputed from the cache, so a session ingested after the block closed changed numbers that are meant to be final.
+- The Blocks share artifact counts a project's cost in one five-hour block only. It read the recorded rollup with a key that never matched, then swept each block's raw interval, so two overlapping windows both claimed the shared entries.
+- The dashboard's block modal says when a closed five-hour block's headline comes from the record kept at its close while the chart below is drawn from the local cache. The two can differ, and nothing said so.
+- After `cctally cache-sync --rebuild`, `cctally doctor` warns that `conversations.db` has space to reclaim until the passes drain it. The dashboard drains it; without one, run `cctally db vacuum --db conversations`.
+- `cctally cache-sync --rebuild` still runs when the free space on its volume cannot be measured. A failed measurement is now unknown and the check is skipped; it used to read as too little space and defer every rebuild.
+- The conversation viewer's live-tail stream answers immediately while a rebuild holds the transcript store, instead of holding the connection open for the whole rebuild. Two other conversation-route paths answer the same way.
+- A dashboard request, panel rebuild or transcript sync that is under way when a new pricing revision is adopted finishes on the revision it started with, so one response is never priced from two revisions.
+- `cctally cache-report`'s per-call tier threshold follows an adopted pricing revision. It was a fixed figure that a reload could not replace.
+- A transcript schema upgrade is started once when several conversation requests find the store behind head at the same moment, instead of once per request.
+- The dashboard's Codex cache report keeps each row on the day it belongs to when a row moves to another day. Its former day kept a copy, so the report either refused to build or published the row under a date it had left.
+
+### Maintenance
+- The test-evidence scrub no longer redacts a diagnostic line for containing the ordinary word "token". A token credential now needs a real separator, so a line such as `unexpected token ')' at line 4` is published rather than replaced.
+- A failing envelope-oracle verification keeps the envelope that disagreed with the baseline, and the sanitized failure extract names it, so a mismatch can be diagnosed from the retained evidence instead of by reproducing it.
+- The sanitized failure extract is withheld whole, and says which check withheld it, when the scrub's transformer fails a health probe before publication. A per-line refusal could otherwise publish beside a secret the backstop cannot see.
+- The envelope-oracle harness emits its results in the one form the failure-extract reader parses, bringing it under the harness scrub contract so its output survives sanitization.
+
 ## [1.108.0] - 2026-09-05
 
 ### Added

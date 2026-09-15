@@ -163,6 +163,22 @@ The committed prose does not freeze one transient receipt. Record the exact
 paired JSON used for an issue or release gate alongside its SHA; the corpus
 counts, seed, numeric ceilings and evaluator are the reproducible contract.
 
+### Statement-cache cost campaign (`measure-778-statement-cache.py`)
+
+`#778` disabled SQLite's per-connection statement cache on every guarded stats connection, so the authorizer runs on every execution rather than only at prepare. This driver measures what that costs. It compares a FIXED arm (the production `_cctally_store._STATS_CONNECT_KWARGS`) against a BASELINE arm that empties that constant, which is the only difference between the two.
+
+Four workloads. `ingest` drives 160 `cctally record-usage` ticks through the real single-flight ingest cycle, crossing 96 integer weekly milestones (forty-eight in each of two weeks), closing five-hour blocks and taking one weekly reset to zero, then ten caught-up repeats, for 170 calls in total. `rebuild` runs one `rebuild_stats_index` plus its in-place publication over the million-line production-shaped journal `bin/build-journal-benchmark-fixture.py` writes. `dashboard` runs `bin/cctally-bench --scale large` and reads its own `snapshot.cold` / `snapshot.warm` / `snapshot.idle` medians, so corpus construction stays outside the reported metric even when it happens inside the run. `aa` is the A/A control: both labels run the production constant, so its separation is the noise floor the other three are read against.
+
+Every measured run is a fresh subprocess over its own copied store, fixtures are built once outside every measured region, and rounds alternate ABBA so a monotone drift in machine load lands on both arms equally. The `dashboard` warm-up builds its corpus in the master store rather than in a scratch copy; an earlier form warmed through the per-run copy helper, which deleted the corpus it had just built and left every measured run rebuilding it inside its own timer. The campaign recorded for `#778` ran under that earlier form, so its `dashboard` wall and CPU summaries include corpus construction. Its verdict does not, because the verdict is read from `snapshot_total_s`. Results print to stdout as JSON, because the remote wrapper copies no files back. The verdict applies `max(15% of the baseline median, 15 ms)` — the same two tolerances `bin/cctally-bench` uses — to the paired 95% confidence interval: within budget when the whole interval sits inside it, `BREACH` when the whole interval sits beyond it, and `inconclusive` when the interval spans it, which forces a rerun rather than a pass.
+
+```sh
+CCTALLY_REMOTE_HOST=<runner-alias> bin/cctally-test-remote \
+    python3 bench/measure-778-statement-cache.py campaign \
+    --rounds 14 --workloads ingest aa --workdir /tmp/bench778
+```
+
+Pin one runner for a campaign, and clear the pin before any authoritative test run: a pinned host makes the receipt non-authoritative.
+
 ### Tunable constants
 
 The regression tolerance is `max(BENCH_TOLERANCE_PCT × baseline, BENCH_TOLERANCE_FLOOR_MS)` — the proportional part (`0.15`) catches regressions on the big benches, and the absolute floor (`15.0` ms) stops sub-millisecond benches from flapping on same-machine noise and cleanly handles a zero/near-zero baseline (idle). `DEFAULT_ITERATIONS` (`5`), `DEFAULT_SEED` (`42`), and `DEFAULT_SCALE` (`large`) round out the knobs. All five are named constants at the top of `bin/cctally-bench` and are meant to be tuned after the first real run on a new reference machine: if the same-machine repeat-run spread on the big benches exceeds the floor, raise `BENCH_TOLERANCE_FLOOR_MS` and note it here. For `--assembly-scan`, `ASSEMBLY_VISIBLE_MS` (`100.0` ms, in `bin/cctally-bench`) is the visibility budget the threshold analysis solves against, and `ASSEMBLY_TURN_LADDER` / `ASSEMBLY_TURN_LADDER_SMALL` (in `bin/build-bench-fixtures.py`) are the full and self-test rung sets — editing either busts only the `assembly` scratch cache via the marker's `params_hash`.

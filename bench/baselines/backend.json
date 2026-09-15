@@ -5,7 +5,11 @@
       "conversations.page1",
       "conversations.sorted",
       "find.in_conversation",
-      "frontier.caught_up",
+      "frontier.expired_full",
+      "frontier.racing_append_next_tick",
+      "frontier.recent_active_restat",
+      "frontier.targeted_append",
+      "frontier.trusted_caught_up",
       "outline.build",
       "payload.assemble",
       "payload.assemble_memo_hit",
@@ -42,133 +46,887 @@
       "conversations.filtered": {
         "bytes": null,
         "count": 50,
-        "max_ms": 0.2535,
-        "median_ms": 0.2481,
-        "min_ms": 0.2464,
-        "phases": null
+        "frontier": null,
+        "max_ms": 0.1767,
+        "median_ms": 0.1664,
+        "min_ms": 0.1542,
+        "phases": {
+          "elapsed_ms": 0.158,
+          "name": "conversations.filtered"
+        }
       },
       "conversations.page1": {
         "bytes": null,
         "count": 50,
-        "max_ms": 0.1788,
-        "median_ms": 0.1655,
-        "min_ms": 0.1621,
-        "phases": null
+        "frontier": null,
+        "max_ms": 0.1103,
+        "median_ms": 0.1081,
+        "min_ms": 0.1018,
+        "phases": {
+          "elapsed_ms": 0.104,
+          "name": "conversations.page1"
+        }
       },
       "conversations.sorted": {
         "bytes": null,
         "count": 50,
-        "max_ms": 0.6152,
-        "median_ms": 0.5959,
-        "min_ms": 0.5959,
-        "phases": null
+        "frontier": null,
+        "max_ms": 1.0561,
+        "median_ms": 0.3677,
+        "min_ms": 0.3671,
+        "phases": {
+          "elapsed_ms": 0.382,
+          "name": "conversations.sorted"
+        }
       },
       "find.in_conversation": {
         "bytes": null,
         "count": 14500,
-        "max_ms": 148.5172,
-        "median_ms": 148.1758,
-        "min_ms": 147.3793,
-        "phases": null
+        "frontier": null,
+        "max_ms": 106.303,
+        "median_ms": 105.0048,
+        "min_ms": 102.7373,
+        "phases": {
+          "elapsed_ms": 103.221,
+          "name": "find.in_conversation"
+        }
       },
-      "frontier.caught_up": {
+      "frontier.expired_full": {
+        "bytes": null,
+        "count": 1200,
+        "frontier": {
+          "full_walks.accounting.codex": 6,
+          "plans.accounting.codex.full": 6
+        },
+        "max_ms": 266.121,
+        "median_ms": 263.97,
+        "min_ms": 261.4414,
+        "phases": {
+          "children": [
+            {
+              "elapsed_ms": 0.048,
+              "meta": {
+                "contended": false
+              },
+              "name": "flock"
+            },
+            {
+              "children": [
+                {
+                  "count": 1200,
+                  "elapsed_ms": 38.936,
+                  "name": "discover"
+                }
+              ],
+              "elapsed_ms": 38.937,
+              "name": "frontier"
+            },
+            {
+              "count": 0,
+              "elapsed_ms": 3.798,
+              "meta": {
+                "rows": 0,
+                "skipped": 1200
+              },
+              "name": "walk"
+            },
+            {
+              "elapsed_ms": 0.081,
+              "name": "accounting"
+            },
+            {
+              "elapsed_ms": 0.001,
+              "name": "accounting"
+            },
+            {
+              "elapsed_ms": 0.035,
+              "name": "accounting"
+            },
+            {
+              "elapsed_ms": 0.013,
+              "name": "projector"
+            }
+          ],
+          "elapsed_ms": 264.466,
+          "name": "frontier.expired_full"
+        }
+      },
+      "frontier.racing_append_next_tick": {
+        "bytes": null,
+        "count": 1,
+        "frontier": {
+          "plans.accounting.codex.targeted": 6,
+          "retained_file_visits.codex_session_files": 6,
+          "targeted_paths.accounting.codex": 6
+        },
+        "max_ms": 2.2178,
+        "median_ms": 1.3075,
+        "min_ms": 1.2277,
+        "phases": {
+          "elapsed_ms": 2.177,
+          "name": "frontier.racing_append_next_tick"
+        }
+      },
+      "frontier.recent_active_restat": {
+        "bytes": null,
+        "count": 1,
+        "frontier": {
+          "plans.accounting.codex.caught_up": 6,
+          "retained_file_visits.codex_session_files": 6
+        },
+        "max_ms": 2.2337,
+        "median_ms": 1.3011,
+        "min_ms": 1.201,
+        "phases": {
+          "elapsed_ms": 2.311,
+          "name": "frontier.recent_active_restat"
+        }
+      },
+      "frontier.targeted_append": {
+        "bytes": null,
+        "count": 1,
+        "frontier": {
+          "plans.accounting.codex.targeted": 6,
+          "retained_file_visits.codex_session_files": 6,
+          "targeted_paths.accounting.codex": 6
+        },
+        "max_ms": 2.3177,
+        "median_ms": 2.2685,
+        "min_ms": 1.3255,
+        "phases": {
+          "elapsed_ms": 1.318,
+          "name": "frontier.targeted_append"
+        }
+      },
+      "frontier.trusted_caught_up": {
         "bytes": null,
         "count": 6200,
-        "max_ms": 1.4103,
-        "median_ms": 1.3987,
-        "min_ms": 1.3738,
-        "phases": null
+        "frontier": {
+          "plans.accounting.claude.caught_up": 6,
+          "plans.accounting.codex.caught_up": 6,
+          "plans.conversation.claude.caught_up": 6,
+          "plans.conversation.codex.caught_up": 6
+        },
+        "max_ms": 5.5303,
+        "median_ms": 4.4544,
+        "min_ms": 3.6972,
+        "phases": {
+          "elapsed_ms": 4.147,
+          "name": "frontier.trusted_caught_up"
+        }
       },
       "outline.build": {
         "bytes": null,
         "count": null,
-        "max_ms": 44.7707,
-        "median_ms": 43.0841,
-        "min_ms": 42.0142,
-        "phases": null
+        "frontier": null,
+        "max_ms": 427.6692,
+        "median_ms": 41.7709,
+        "min_ms": 38.5536,
+        "phases": {
+          "elapsed_ms": 134.899,
+          "name": "outline.build"
+        }
       },
       "payload.assemble": {
         "bytes": null,
         "count": null,
-        "max_ms": 695.792,
-        "median_ms": 180.1328,
-        "min_ms": 179.6767,
-        "phases": null
+        "frontier": null,
+        "max_ms": 546.4812,
+        "median_ms": 155.2539,
+        "min_ms": 152.7132,
+        "phases": {
+          "children": [
+            {
+              "children": [
+                {
+                  "count": 17000,
+                  "elapsed_ms": 29.006,
+                  "name": "assemble.read"
+                },
+                {
+                  "elapsed_ms": 43.076,
+                  "meta": {
+                    "cost_chunks": 15,
+                    "turn_keys": 6000,
+                    "usage_chunks": 15
+                  },
+                  "name": "assemble.cost_read"
+                },
+                {
+                  "count": 17000,
+                  "elapsed_ms": 1.186,
+                  "name": "assemble.dedup"
+                },
+                {
+                  "count": 17000,
+                  "elapsed_ms": 33.386,
+                  "name": "assemble.build"
+                },
+                {
+                  "elapsed_ms": 1.966,
+                  "meta": {
+                    "subagents": 0
+                  },
+                  "name": "assemble.correlate"
+                },
+                {
+                  "elapsed_ms": 2.503,
+                  "name": "assemble.fold"
+                },
+                {
+                  "elapsed_ms": 19.449,
+                  "name": "assemble.classify"
+                },
+                {
+                  "elapsed_ms": 9.053,
+                  "meta": {
+                    "cost_chunks": 15,
+                    "turn_keys": 6000,
+                    "usage_chunks": 15
+                  },
+                  "name": "assemble.cost"
+                },
+                {
+                  "count": 17000,
+                  "elapsed_ms": 4.536,
+                  "name": "assemble.finalize"
+                }
+              ],
+              "elapsed_ms": 146.913,
+              "name": "assemble"
+            }
+          ],
+          "elapsed_ms": 156.653,
+          "name": "payload.assemble"
+        }
       },
       "payload.assemble_memo_hit": {
         "bytes": null,
         "count": null,
-        "max_ms": 0.0264,
-        "median_ms": 0.0237,
-        "min_ms": 0.0229,
-        "phases": null
+        "frontier": null,
+        "max_ms": 0.0402,
+        "median_ms": 0.0277,
+        "min_ms": 0.0261,
+        "phases": {
+          "elapsed_ms": 2.053,
+          "name": "payload.assemble_memo_hit"
+        }
       },
       "reconcile.cache_report": {
         "bytes": null,
         "count": null,
-        "max_ms": 3.1866,
-        "median_ms": 3.1318,
-        "min_ms": 3.103,
-        "phases": null
+        "frontier": null,
+        "max_ms": 4.0105,
+        "median_ms": 1.9613,
+        "min_ms": 1.9188,
+        "phases": {
+          "elapsed_ms": 3.962,
+          "name": "reconcile.cache_report"
+        }
       },
       "reconcile.projects_env": {
         "bytes": null,
         "count": null,
-        "max_ms": 3.1392,
-        "median_ms": 3.1258,
-        "min_ms": 3.1007,
-        "phases": null
+        "frontier": null,
+        "max_ms": 3.8096,
+        "median_ms": 1.8603,
+        "min_ms": 1.8272,
+        "phases": {
+          "elapsed_ms": 3.866,
+          "name": "reconcile.projects_env"
+        }
       },
       "search.cross_session": {
         "bytes": null,
         "count": 594384,
-        "max_ms": 3404.0392,
-        "median_ms": 3370.433,
-        "min_ms": 3316.0322,
-        "phases": null
+        "frontier": null,
+        "max_ms": 2281.3047,
+        "median_ms": 2237.5249,
+        "min_ms": 2216.5746,
+        "phases": {
+          "elapsed_ms": 2236.407,
+          "name": "search.cross_session"
+        }
       },
       "snapshot.cold": {
         "bytes": null,
         "count": null,
-        "max_ms": 2645.2467,
-        "median_ms": 2203.5784,
-        "min_ms": 2149.2259,
-        "phases": null
+        "frontier": null,
+        "max_ms": 2295.4171,
+        "median_ms": 1797.6643,
+        "min_ms": 1785.3788,
+        "phases": {
+          "children": [
+            {
+              "elapsed_ms": 0.002,
+              "meta": {
+                "ingest": false
+              },
+              "name": "sync"
+            },
+            {
+              "elapsed_ms": 1.1,
+              "name": "signature"
+            },
+            {
+              "elapsed_ms": 0.441,
+              "name": "reconcile.cache_open"
+            },
+            {
+              "elapsed_ms": 0.003,
+              "meta": {
+                "hit": true
+              },
+              "name": "reconcile.weekref"
+            },
+            {
+              "elapsed_ms": 0.115,
+              "meta": {
+                "hit": true
+              },
+              "name": "reconcile.projects_env"
+            },
+            {
+              "elapsed_ms": 0.082,
+              "meta": {
+                "hit": true
+              },
+              "name": "reconcile.cache_report"
+            },
+            {
+              "elapsed_ms": 0.044,
+              "name": "build.current_week"
+            },
+            {
+              "elapsed_ms": 0.038,
+              "name": "build.forecast"
+            },
+            {
+              "elapsed_ms": 0.041,
+              "name": "build.trend"
+            },
+            {
+              "elapsed_ms": 54.157,
+              "name": "build.sessions"
+            },
+            {
+              "elapsed_ms": 0.0,
+              "name": "build.milestones"
+            },
+            {
+              "elapsed_ms": 0.053,
+              "name": "build.weekly_history"
+            },
+            {
+              "elapsed_ms": 49.912,
+              "name": "build.weekly_periods"
+            },
+            {
+              "elapsed_ms": 66.175,
+              "name": "build.monthly_periods"
+            },
+            {
+              "elapsed_ms": 0.0,
+              "name": "build.blocks"
+            },
+            {
+              "elapsed_ms": 141.49,
+              "name": "build.daily"
+            },
+            {
+              "elapsed_ms": 0.22,
+              "name": "build.alerts"
+            },
+            {
+              "elapsed_ms": 0.094,
+              "name": "build.meter_rate_changes"
+            },
+            {
+              "elapsed_ms": 0.001,
+              "name": "build.five_hour_milestones"
+            },
+            {
+              "elapsed_ms": 0.178,
+              "name": "build.week_index"
+            },
+            {
+              "elapsed_ms": 0.527,
+              "name": "build.projects_envelope"
+            },
+            {
+              "elapsed_ms": 99.488,
+              "name": "build.cache_report"
+            },
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "elapsed_ms": 0.075,
+                      "name": "doctor.gate"
+                    },
+                    {
+                      "elapsed_ms": 0.177,
+                      "name": "doctor.backup_sync"
+                    },
+                    {
+                      "elapsed_ms": 1.553,
+                      "name": "doctor.install"
+                    },
+                    {
+                      "elapsed_ms": 0.183,
+                      "name": "doctor.hooks"
+                    },
+                    {
+                      "elapsed_ms": 14.099,
+                      "name": "doctor.auth"
+                    },
+                    {
+                      "elapsed_ms": 1.209,
+                      "name": "doctor.db_status"
+                    },
+                    {
+                      "elapsed_ms": 0.385,
+                      "name": "doctor.stats_freshness"
+                    },
+                    {
+                      "elapsed_ms": 11.001,
+                      "name": "doctor.cache_probes"
+                    },
+                    {
+                      "elapsed_ms": 0.064,
+                      "name": "doctor.statusline"
+                    },
+                    {
+                      "elapsed_ms": 15.035,
+                      "name": "doctor.conversations"
+                    },
+                    {
+                      "elapsed_ms": 0.031,
+                      "name": "doctor.claude_files"
+                    },
+                    {
+                      "elapsed_ms": 58.828,
+                      "name": "doctor.codex_cache"
+                    },
+                    {
+                      "elapsed_ms": 0.284,
+                      "name": "doctor.codex_files"
+                    },
+                    {
+                      "elapsed_ms": 0.594,
+                      "name": "doctor.quota_summary"
+                    },
+                    {
+                      "elapsed_ms": 0.542,
+                      "name": "doctor.codex_hooks"
+                    },
+                    {
+                      "elapsed_ms": 0.032,
+                      "name": "doctor.codex_lifecycle"
+                    },
+                    {
+                      "elapsed_ms": 0.425,
+                      "name": "doctor.parse_health"
+                    },
+                    {
+                      "elapsed_ms": 0.0,
+                      "name": "doctor.integrity"
+                    },
+                    {
+                      "elapsed_ms": 0.085,
+                      "name": "doctor.locks"
+                    },
+                    {
+                      "elapsed_ms": 0.02,
+                      "name": "doctor.wal"
+                    },
+                    {
+                      "elapsed_ms": 0.081,
+                      "name": "doctor.config"
+                    },
+                    {
+                      "elapsed_ms": 0.016,
+                      "name": "doctor.update"
+                    },
+                    {
+                      "elapsed_ms": 155.19,
+                      "name": "doctor.pricing_coverage"
+                    },
+                    {
+                      "elapsed_ms": 0.072,
+                      "name": "doctor.quota_calibration"
+                    },
+                    {
+                      "elapsed_ms": 1.842,
+                      "name": "doctor.journal"
+                    },
+                    {
+                      "elapsed_ms": 0.325,
+                      "name": "doctor.stats_projection"
+                    },
+                    {
+                      "elapsed_ms": 0.149,
+                      "name": "doctor.heal"
+                    },
+                    {
+                      "elapsed_ms": 1.569,
+                      "name": "doctor.meta_accounts"
+                    }
+                  ],
+                  "elapsed_ms": 265.802,
+                  "name": "doctor.gather"
+                },
+                {
+                  "elapsed_ms": 0.28,
+                  "name": "doctor.checks"
+                }
+              ],
+              "elapsed_ms": 266.168,
+              "name": "doctor"
+            },
+            {
+              "elapsed_ms": 0.015,
+              "name": "envelope.precompute"
+            },
+            {
+              "elapsed_ms": 0.552,
+              "name": "envelope.legacy_projection"
+            },
+            {
+              "children": [
+                {
+                  "elapsed_ms": 1.498,
+                  "name": "source.store_open"
+                },
+                {
+                  "elapsed_ms": 0.088,
+                  "name": "source.signature"
+                },
+                {
+                  "elapsed_ms": 19.141,
+                  "name": "source.quota"
+                },
+                {
+                  "elapsed_ms": 0.107,
+                  "name": "source.projection"
+                },
+                {
+                  "elapsed_ms": 55.538,
+                  "name": "source.accounting"
+                },
+                {
+                  "elapsed_ms": 0.982,
+                  "name": "source.accounts"
+                },
+                {
+                  "elapsed_ms": 1.609,
+                  "name": "source.models"
+                },
+                {
+                  "elapsed_ms": 737.601,
+                  "name": "source.serialization"
+                },
+                {
+                  "elapsed_ms": 0.649,
+                  "name": "source.reconciliation"
+                }
+              ],
+              "elapsed_ms": 1095.839,
+              "name": "build.source_bundle"
+            }
+          ],
+          "elapsed_ms": 1778.749,
+          "name": "snapshot"
+        }
       },
       "snapshot.idle": {
         "bytes": null,
         "count": null,
-        "max_ms": 2.5571,
-        "median_ms": 2.525,
-        "min_ms": 2.4932,
-        "phases": null
+        "frontier": null,
+        "max_ms": 2.4113,
+        "median_ms": 2.3761,
+        "min_ms": 1.4702,
+        "phases": {
+          "children": [
+            {
+              "elapsed_ms": 0.001,
+              "meta": {
+                "ingest": false
+              },
+              "name": "sync"
+            },
+            {
+              "elapsed_ms": 0.936,
+              "name": "signature"
+            },
+            {
+              "elapsed_ms": 0.088,
+              "name": "idle-decision"
+            }
+          ],
+          "elapsed_ms": 1.441,
+          "name": "snapshot"
+        }
       },
       "snapshot.warm": {
         "bytes": null,
         "count": null,
-        "max_ms": 139.9814,
-        "median_ms": 139.4094,
-        "min_ms": 138.9858,
-        "phases": null
+        "frontier": null,
+        "max_ms": 130.31,
+        "median_ms": 129.2526,
+        "min_ms": 126.1423,
+        "phases": {
+          "children": [
+            {
+              "elapsed_ms": 0.001,
+              "meta": {
+                "ingest": false
+              },
+              "name": "sync"
+            },
+            {
+              "elapsed_ms": 0.995,
+              "name": "signature"
+            },
+            {
+              "elapsed_ms": 0.443,
+              "name": "reconcile.cache_open"
+            },
+            {
+              "elapsed_ms": 0.002,
+              "meta": {
+                "hit": true
+              },
+              "name": "reconcile.weekref"
+            },
+            {
+              "elapsed_ms": 0.111,
+              "meta": {
+                "hit": true
+              },
+              "name": "reconcile.projects_env"
+            },
+            {
+              "elapsed_ms": 0.088,
+              "meta": {
+                "hit": true
+              },
+              "name": "reconcile.cache_report"
+            },
+            {
+              "elapsed_ms": 0.034,
+              "name": "build.current_week"
+            },
+            {
+              "elapsed_ms": 0.031,
+              "name": "build.forecast"
+            },
+            {
+              "elapsed_ms": 0.034,
+              "name": "build.trend"
+            },
+            {
+              "elapsed_ms": 1.93,
+              "name": "build.sessions"
+            },
+            {
+              "elapsed_ms": 0.0,
+              "name": "build.milestones"
+            },
+            {
+              "elapsed_ms": 0.032,
+              "name": "build.weekly_history"
+            },
+            {
+              "elapsed_ms": 2.189,
+              "name": "build.weekly_periods"
+            },
+            {
+              "elapsed_ms": 20.153,
+              "name": "build.monthly_periods"
+            },
+            {
+              "elapsed_ms": 0.0,
+              "name": "build.blocks"
+            },
+            {
+              "elapsed_ms": 8.795,
+              "name": "build.daily"
+            },
+            {
+              "elapsed_ms": 0.182,
+              "name": "build.alerts"
+            },
+            {
+              "elapsed_ms": 0.071,
+              "name": "build.meter_rate_changes"
+            },
+            {
+              "elapsed_ms": 0.001,
+              "name": "build.five_hour_milestones"
+            },
+            {
+              "elapsed_ms": 0.111,
+              "name": "build.week_index"
+            },
+            {
+              "elapsed_ms": 0.451,
+              "name": "build.projects_envelope"
+            },
+            {
+              "elapsed_ms": 1.533,
+              "name": "build.cache_report"
+            },
+            {
+              "elapsed_ms": 0.003,
+              "name": "doctor"
+            },
+            {
+              "elapsed_ms": 0.011,
+              "name": "envelope.precompute"
+            },
+            {
+              "elapsed_ms": 0.222,
+              "name": "envelope.legacy_projection"
+            },
+            {
+              "children": [
+                {
+                  "elapsed_ms": 0.43,
+                  "name": "source.store_open"
+                },
+                {
+                  "elapsed_ms": 0.06,
+                  "name": "source.signature"
+                },
+                {
+                  "elapsed_ms": 0.521,
+                  "name": "source.reconciliation"
+                }
+              ],
+              "elapsed_ms": 90.755,
+              "name": "build.source_bundle"
+            }
+          ],
+          "elapsed_ms": 129.966,
+          "name": "snapshot"
+        }
       },
       "sync.delta": {
         "bytes": null,
         "count": 1,
-        "max_ms": 6.4647,
-        "median_ms": 6.365,
-        "min_ms": 6.2402,
-        "phases": null
+        "frontier": null,
+        "max_ms": 5.5471,
+        "median_ms": 4.5348,
+        "min_ms": 4.4599,
+        "phases": {
+          "children": [
+            {
+              "elapsed_ms": 0.002,
+              "meta": {
+                "contended": false
+              },
+              "name": "flock"
+            },
+            {
+              "elapsed_ms": 0.0,
+              "name": "backfills"
+            },
+            {
+              "children": [
+                {
+                  "count": 1,
+                  "elapsed_ms": 0.008,
+                  "name": "discover"
+                }
+              ],
+              "elapsed_ms": 0.009,
+              "name": "frontier"
+            },
+            {
+              "count": 1,
+              "elapsed_ms": 1.737,
+              "meta": {
+                "failed": 0,
+                "rows": 0,
+                "skipped": 0
+              },
+              "name": "walk"
+            },
+            {
+              "children": [
+                {
+                  "elapsed_ms": 0.012,
+                  "name": "recompute.conversation_sessions"
+                }
+              ],
+              "elapsed_ms": 0.013,
+              "name": "accounting"
+            }
+          ],
+          "elapsed_ms": 5.263,
+          "name": "sync.delta"
+        }
       },
       "sync.noop": {
         "bytes": null,
         "count": 5000,
-        "max_ms": 87.571,
-        "median_ms": 86.3822,
-        "min_ms": 83.5023,
-        "phases": null
+        "frontier": null,
+        "max_ms": 63.9251,
+        "median_ms": 62.8375,
+        "min_ms": 61.6912,
+        "phases": {
+          "children": [
+            {
+              "elapsed_ms": 0.002,
+              "meta": {
+                "contended": false
+              },
+              "name": "flock"
+            },
+            {
+              "elapsed_ms": 0.025,
+              "name": "backfills"
+            },
+            {
+              "children": [
+                {
+                  "count": 5000,
+                  "elapsed_ms": 20.142,
+                  "name": "discover"
+                }
+              ],
+              "elapsed_ms": 20.143,
+              "name": "frontier"
+            },
+            {
+              "count": 0,
+              "elapsed_ms": 26.472,
+              "meta": {
+                "failed": 0,
+                "rows": 0,
+                "skipped": 5000
+              },
+              "name": "walk"
+            },
+            {
+              "children": [
+                {
+                  "elapsed_ms": 0.021,
+                  "name": "recompute.conversation_sessions"
+                }
+              ],
+              "elapsed_ms": 0.022,
+              "name": "accounting"
+            }
+          ],
+          "elapsed_ms": 63.52,
+          "name": "sync.noop"
+        }
       }
     },
-    "cctally_version": "1.104.0",
+    "cctally_version": "1.108.0",
     "corpus_fingerprint": "184823a7f9a323fce2cc1048e610d9b991ab1a4470404286af38d6abf6e6c3ce",
     "dataset_counts": {
       "claude_meta_messages": 2500,

@@ -1,5 +1,5 @@
 // ProjectsModal — covers window pills + Y-axis toggle, table sort,
-// drill-on-click, "Showing N weeks" notice when actual < requested,
+// drill-on-click, "Showing N cycles" notice when actual < requested,
 // drill-session cross-nav to SessionModal (replace pattern), and
 // share-icon `windowWeeks` param plumbing (spec §3, §4.1, §7.3, plan
 // Task 5 Step 1).
@@ -61,7 +61,7 @@ interface BuildOpts {
   projectCount?: number;
   // When set, the trend's `window_weeks` is the SMALLER of these two;
   // the table's first/last columns scale by `windowWeeks`. Pass
-  // `actualWeeks < windowWeeks` to exercise the "Showing N weeks"
+  // `actualWeeks < windowWeeks` to exercise the "Showing N cycles"
   // notice. Defaults to `windowWeeks` when unset.
   actualWeeks?: number;
   // Append N additional projects with all-zero `weekly_cost` (still
@@ -250,7 +250,7 @@ describe('<ProjectsModal />', () => {
     // Flip to 4w — Sessions count must collapse to 4, and the
     // first-seen / last-seen cells should shift to the trailing 4 weeks
     // (i.e. NOT the same as the 12w extremes).
-    fireEvent.click(screen.getByRole('radio', { name: '4w' }));
+    fireEvent.click(screen.getByRole('radio', { name: '4 cycles' }));
     const row4 = screen.getByTestId('projects-table-row');
     expect(row4.getAttribute('data-sessions')).toBe('4');
     const cells4 = row4.querySelectorAll('td');
@@ -293,23 +293,37 @@ describe('<ProjectsModal />', () => {
     expect(await screen.findByText(/1 reset gap/)).toBeInTheDocument();
   });
 
-  it('renders window pills with the current selection (default 4w)', () => {
+  // #750 S4 D2/D6: the pills render BARE NUMBERS under an explicit `cycles`
+  // unit label, because the buckets are billing cycles and a credited week
+  // contributes one bucket per cycle. The `windowWeeks` pref and the `weeks=N`
+  // query parameter are frozen wire names and do not move.
+  it('renders window pills with the current selection (default 4)', () => {
     vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
     updateSnapshot(buildProjectsEnvelope({ windowWeeks: 12 }));
     render(<ProjectsModal />);
-    expect(screen.getByRole('radio', { name: '4w' })).toHaveAttribute('aria-checked', 'true');
-    // The pill for 8w is rendered but not checked.
-    expect(screen.getByRole('radio', { name: '8w' })).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByRole('radio', { name: '4 cycles' })).toHaveAttribute('aria-checked', 'true');
+    // The pill for 8 is rendered but not checked.
+    expect(screen.getByRole('radio', { name: '8 cycles' })).toHaveAttribute('aria-checked', 'false');
+    // The unit the bare numbers count, visibly...
+    expect(screen.getByText('cycles')).toBeInTheDocument();
+    // ...and in the accessibility tree, where the visible span cannot reach:
+    // it is a non-radio child of the radiogroup and is tied to nothing, so a
+    // screen-reader user would otherwise hear four bare numbers. Each radio's
+    // own name carries the unit. The GROUP is not named for it, because this
+    // radiogroup also holds `share %` and `$ absolute`, which count no cycles.
+    expect(screen.getByRole('radiogroup', { name: 'Window' })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: 'share %' })).toBeInTheDocument();
+    expect(screen.getByText('cycles')).toHaveAttribute('aria-hidden', 'true');
   });
 
-  it('clicking 8w pill updates prefs and re-renders the title', () => {
+  it('clicking the 8 pill updates prefs and re-renders the title', () => {
     vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
     updateSnapshot(buildProjectsEnvelope({ windowWeeks: 12 }));
     render(<ProjectsModal />);
-    fireEvent.click(screen.getByRole('radio', { name: '8w' }));
+    fireEvent.click(screen.getByRole('radio', { name: '8 cycles' }));
     expect(getState().prefs.projectsWindowWeeks).toBe(8);
     // Title reflects the new window
-    expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent(/last 8w/);
+    expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent(/last 8 cycles/);
   });
 
   it('table renders all projects sorted desc by window cost (default)', () => {
@@ -375,13 +389,13 @@ describe('<ProjectsModal />', () => {
     )).toBe(true);
   });
 
-  it('renders the "Showing N weeks" notice when actual < requested', () => {
+  it('renders the "Showing N cycles" notice when actual < requested', () => {
     vi.stubGlobal('fetch', stubFetchOk(buildProjectDetail('project-1')));
     // User has 8w pref but the snapshot only has 3 weeks of history.
     dispatch({ type: 'SAVE_PREFS', patch: { projectsWindowWeeks: 8 } });
     updateSnapshot(buildProjectsEnvelope({ windowWeeks: 8, actualWeeks: 3 }));
     render(<ProjectsModal />);
-    expect(screen.getByText(/Showing 3 weeks/)).toBeInTheDocument();
+    expect(screen.getByText(/Showing 3 cycles/)).toBeInTheDocument();
   });
 
   it('drill session row click opens SessionModal (replace pattern)', async () => {

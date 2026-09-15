@@ -47,6 +47,58 @@ unset CODEX_HOME
 unset DO_NOT_TRACK
 unset CCTALLY_DISABLE_TELEMETRY
 
+# PHYSICAL containment, replacing a textual one (#784).
+#
+# Two callers used to ask the same question with the same three string arms —
+# `"$tmp_root"/*`, `/private"$tmp_root"/*` and `"${tmp_root#/private}"/*` — and
+# a string comparison answers a question about spelling rather than about the
+# file a path reaches. Both of the following satisfy the first arm character
+# for character and name the committed fixture tree:
+#
+#   $TMPDIR/../../<repo>/tests/fixtures/source-aware      (a traversal)
+#   $TMPDIR/corpus -> <repo>/tests/fixtures/source-aware  (a symlink)
+#
+# Measured on the pre-fix tree, the planted-artifact hook accepted both and the
+# harness then reported `passed: 190   failed: 0` having compared the committed
+# corpus against itself.
+#
+# Both sides are resolved through `os.path.realpath`, so the `/private` arms are
+# no longer needed either: macOS resolves `/var/folders/...` to
+# `/private/var/folders/...` on both sides at once. A candidate that does not
+# exist yet still resolves — `realpath` follows the symlinks that do exist and
+# appends the rest — which is what the staging destination needs.
+#
+# Exit 0 = the candidate resolves under the resolved temp root. Every non-zero
+# status is a refusal, and BOTH callers read it as one: each writes `if !
+# _harness_realpath_under_tmpdir "$dest"`, so the status is boolean in
+# practice. The two non-zero values are kept because they distinguish two
+# genuinely different situations for anyone reading a trace — 1 = the
+# candidate resolves outside the root; 2 = the question could not be asked,
+# because the candidate is empty or the temp root is empty or `/`, either of
+# which would make every path "contained" — but no caller branches on them and
+# none needs to, since the refusal is the same either way (#769 S4).
+_harness_realpath_under_tmpdir () {   # $1 = candidate path
+    local candidate=${1:-} tmp_root
+    [ -n "$candidate" ] || return 2
+    tmp_root=${TMPDIR:-/tmp}
+    tmp_root=${tmp_root%/}
+    case "$tmp_root" in
+        ""|/) return 2 ;;
+    esac
+    # Through the environment rather than argv, so a candidate beginning with a
+    # dash or carrying a quote cannot be read as an option or reparsed.
+    _HARNESS_TMP_ROOT="$tmp_root" _HARNESS_CANDIDATE="$candidate" python3 -c '
+import os
+import sys
+
+root = os.path.realpath(os.environ["_HARNESS_TMP_ROOT"])
+if not root.startswith("/") or root == "/":
+    sys.exit(2)
+candidate = os.path.realpath(os.environ["_HARNESS_CANDIDATE"])
+sys.exit(0 if candidate.startswith(root + os.sep) else 1)
+'
+}
+
 # Stage a committed fixture tree into scratch, then rebuild its generated inputs
 # THERE, so a test run never writes into the tracked tree (#529 S3, Task 15).
 #
@@ -73,18 +125,15 @@ stage_fixtures_out_of_tree () {   # $1 = fixture name, $2 = destination root
     # place while satisfying every static check that the harness calls the
     # staging helper at all.
     if [ -z "$dest" ]; then
-        echo "stage_fixtures_out_of_tree: refusing an empty destination" >&2
+        echo "FAIL: fixture tree: empty path, refuses to run" >&2
         return 2
     fi
     tmp_root=${TMPDIR:-/tmp}
     tmp_root=${tmp_root%/}
-    case "$dest" in
-        "$tmp_root"/*|/private"$tmp_root"/*|"${tmp_root#/private}"/*) ;;
-        *)
-            echo "stage_fixtures_out_of_tree: refusing a destination outside $tmp_root: $dest" >&2
-            return 2
-            ;;
-    esac
+    if ! _harness_realpath_under_tmpdir "$dest"; then
+        echo "FAIL: fixture path $dest not under temp $tmp_root" >&2
+        return 2
+    fi
     repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
     committed="$repo/tests/fixtures/$name"
     builder="$repo/bin/build-$name-fixtures.py"

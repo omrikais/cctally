@@ -938,10 +938,27 @@ class Seed:
                     and row["text"].strip()):
                 prompts[row["conversation"]] = prompts.get(
                     row["conversation"], 0) + 1
+        # #834 S2 (#800), restated rather than imported: raw candidate evidence
+        # is a property of the TRANSCRIPT store and the population is a property
+        # of the ACCOUNTING rows, so a conversation the accounting names and the
+        # transcript store does not retain has NO turn count to read. It is not
+        # decided, it lowers coverage, and when no conversation in the window
+        # retains a candidate row nothing about the class was established.
+        # Presence is any retained candidate row for the key, not a prompt: a
+        # retained conversation of zero human prompts IS decided.
+        retained = {row["conversation"] for row in self.codex_conversation_rows}
         threads = {t["conversation"]: t for t in self.codex_threads.values()}
+        keys = sorted({entry["conversation"] for entry in candidates})
+        if not any(key in retained for key in keys):
+            return _s3_class_oracle("short_high_context",
+                                    not_applicable=False,
+                                    code=ORACLE_S3_UNEVALUATED_CODE)
         unevaluable: set[str] = set()
         qualifying_keys: list[str] = []
-        for key in sorted({entry["conversation"] for entry in candidates}):
+        for key in keys:
+            if key not in retained:
+                unevaluable.add(key)
+                continue
             thread = threads.get(key)
             origin = thread["root_thread_id"] if thread else None
             if origin not in ("user", "subagent"):
@@ -2155,6 +2172,85 @@ def _codex_short_context() -> Seed:
     return seed
 
 
+def _control_s3_codex_zero_match() -> Seed:
+    """The CODEX zero-match control: evaluated, decided, matching nothing.
+
+    #834 S2 (#800). `control-s3-zero-match` is registered as a CLAUDE scenario,
+    so it cannot constrain the Codex evaluator at all — an implementation that
+    withheld every Codex zero-match case would pass it unchanged. This is its
+    Codex sibling, and it is a guard against OVER-withholding rather than a
+    restatement of the fix: every conversation here retains prompt rows, so
+    every one is evaluated and decided, and the class must still answer
+    `no_contributor` rather than withdrawing behind an absence.
+
+    Two conversations of five prompts each are long by the published rule, and
+    every request sits at a twentieth of its turn's capacity, so nothing
+    qualifies on either predicate half.
+    """
+    seed = Seed()
+    for index, name in enumerate(("quiet-a", "quiet-b")):
+        conversation = f"v1.root-a.{name}"
+        path = f"/fixtures/codex/{name}.jsonl"
+        start = WINDOW_START + dt.timedelta(hours=6 * index)
+        seed.add_codex_session_start(conversation=conversation, path=path,
+                                     at=start)
+        for turn in range(5):
+            seed.add_codex_turn(
+                conversation=conversation, path=path,
+                turn_id=f"{name}-{turn}",
+                at=start + dt.timedelta(minutes=20 * (turn + 1)),
+                context_window=400_000, entries=[20_000, 20_000, 20_000],
+                model=CODEX_STANDARD, session_context_window=400_000,
+                native_thread_id=f"{name}-1")
+    seed.add_codex_window(start=WINDOW_START,
+                          end=WINDOW_START + dt.timedelta(hours=5))
+    return seed
+
+
+def _codex_mixed_transcript_coverage() -> Seed:
+    """One conversation the transcript store retains, one it does not.
+
+    #834 S2 (#800). A GLOBAL test of whether the candidate query returned any
+    row would pass this scenario while still reporting `evaluabilityCoverage`
+    of 1.0, because the retained conversation supplies the rows the global test
+    looks for. Only a PER-KEY classification lowers the coverage here, which is
+    what makes this the scenario that discriminates the two implementations.
+
+    The retained conversation runs eight prompts and is decided long. The
+    unretained one carries accounting entries and a readable `user` origin —
+    so its origin is NOT what could not be read — and no transcript row at all.
+
+    The retained conversation is sized so the class still clears
+    `min_priced_entries` after the unretained one leaves the evaluated
+    population. Without that the class would be withheld for want of support
+    and the fixture would pin `insufficient_population` — a different sentence
+    from the one it exists to pin, which is a MEASURED class publishing an
+    `evaluabilityCoverage` below 1.0 with a `no_retained_transcript` gap.
+    """
+    seed = Seed()
+    retained_path = "/fixtures/codex/retained.jsonl"
+    seed.add_codex_session_start(conversation="v1.root-a.retained",
+                                 path=retained_path, at=WINDOW_START)
+    for turn in range(8):
+        seed.add_codex_turn(
+            conversation="v1.root-a.retained", path=retained_path,
+            turn_id=f"retained-{turn}",
+            at=WINDOW_START + dt.timedelta(minutes=20 * (turn + 1)),
+            context_window=400_000, entries=[20_000, 20_000, 20_000],
+            model=CODEX_STANDARD, session_context_window=400_000,
+            native_thread_id="retained-1")
+    for index in range(12):
+        seed.add_codex(
+            model=CODEX_STANDARD,
+            at=WINDOW_START + dt.timedelta(hours=6, minutes=10 * index),
+            conversation="v1.root-a.unretained", cwd="/repo/codex",
+            native_thread_id="unretained-1", root_thread_id="user",
+            input_tokens=20_000, output_tokens=500)
+    seed.add_codex_window(start=WINDOW_START,
+                          end=WINDOW_START + dt.timedelta(hours=5))
+    return seed
+
+
 def _control_s3_zero_match() -> Seed:
     """Every conversation-derived predicate is EVALUATED and matches nothing.
 
@@ -2384,6 +2480,15 @@ SCENARIOS = {
     # whole terminal surface is covered under a non-UTC zone.
     "display-zone-non-utc": (_short_context_dominant, "claude"),
     "control-s3-zero-match": (_control_s3_zero_match, "claude"),
+    # #834 S2 (#800). The Claude control above is registered as a CLAUDE
+    # scenario and therefore constrains only the Claude evaluator; these two
+    # are its Codex counterparts. The first proves the Codex class still
+    # DECIDES and answers `no_contributor` where the evidence is present and
+    # matches nothing; the second proves a per-key evidence classification,
+    # because a global one would leave its coverage at 1.0.
+    "control-s3-codex-zero-match": (_control_s3_codex_zero_match, "codex"),
+    "codex-mixed-transcript-coverage": (
+        _codex_mixed_transcript_coverage, "codex"),
 }
 
 

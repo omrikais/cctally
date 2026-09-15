@@ -1006,18 +1006,25 @@ def test_the_tz_override_fixture_now_routes_its_ranked_row():
     assert len(published) == 1
     row = published[0]
     assert row["label"] == "fixture-tz-override"
-    assert row["cost_usd"] == pytest.approx(0.48, abs=1e-9)
+    assert row["cost_usd"] == pytest.approx(13.0, abs=1e-9)
     assert row["drillable"] is True
 
-    # The ranked dollar figure and the attributed week now describe the same
-    # entry, which is what makes the row routable.
+    # The ranked row is attributed in the same week the ranking came from,
+    # which is what makes it routable. #769 S4 #795 seeded this scenario with a
+    # retained-facts five-hour block, so it now carries several entries rather
+    # than the single one it was built with, and the twelve-week aggregate and
+    # the subscription week legitimately sum to different figures. Before that
+    # seeding both windows saw the one entry and both read 0.48; the matching
+    # figures were a consequence of the cardinality, never the property under
+    # test. What the test pins is that the row is published, drillable, and
+    # present in the current week, the trend and the flat route-lookup rows.
     cw = claude["projects"]["current_week"]
     assert cw["week_start_at"] == "2026-04-13T14:00:00Z"
     # The per-source Claude domain publishes anonymized `project:<hash>`
     # keys, so identity is asserted by cost and cardinality here; the
     # human-readable key is asserted on the top-level block below.
     assert len(cw["rows"]) == 1
-    assert cw["rows"][0]["cost_usd"] == pytest.approx(0.48, abs=1e-9)
+    assert cw["rows"][0]["cost_usd"] == pytest.approx(18.6, abs=1e-9)
     assert len(claude["projects"]["trend"]["projects"]) == 1
     assert claude["projects"]["rows"]
 
@@ -1978,10 +1985,11 @@ def test_the_committed_golden_states_the_boundary_by_value():
     # #556 S5 bumped this to 8 (the Claude budget capability detail changed
     # meaning), #564 to 9 (a decorated Codex fallback card's totals changed
     # value), #583 S3 to 10 (the All provider mirror publishes null), and #565
-    # to 11 (certified decorated account-cycle legs). The
+    # to 11 (certified decorated account-cycle legs), and #834 S2 to 12 (the
+    # typed three-state Codex metadata-health result). The
     # assertion is kept rather than deleted: it is what tells a reader which
     # wire version this golden was captured against.
-    assert golden["source_schema_version"] == 11
+    assert golden["source_schema_version"] == 12
     aggregates = golden["sources"]["all"]["data"]["aggregates"]
     assert aggregates["range"] == {
         "kind": "absolute_range",
@@ -2545,6 +2553,84 @@ def test_the_idle_rebuild_carries_the_prior_projects_envelope(
     assert idle.source_bundle is not bundle, "the rebuild branch must have run"
     _assert_legacy_labels_published(
         idle.source_bundle, site="_tui_build_idle_snapshot",
+    )
+
+
+def test_the_idle_tick_rebuilds_a_retryable_metadata_health_generation(
+    routable_install,
+):
+    """#834 S2 (#829, #830) — gate 2 of the same idle guard, through the tick.
+
+    The sibling above covers gate 1. This covers the leg added after the second
+    browser gate found that refusing reuse in ``_reusable_provider`` does not
+    reach this path: the idle tick never calls ``reuse_coherent_source_state``,
+    it consults ``_tui_source_bundle_can_idle`` and then republishes through the
+    two clock refreshes.
+
+    ``availability`` stays ``ok`` here deliberately. A detail-probe read failure
+    never sets ``partial``, so every other leg of the guard passes and the
+    carrier is the only thing that can refuse. That is what makes this test
+    discriminating: before the leg existed the guard returned True for exactly
+    this bundle, and the transient generation was republished for the life of
+    the process.
+    """
+    import dataclasses
+    from zoneinfo import ZoneInfo
+
+    ns = routable_install
+    tui = ns["_cctally_tui"]
+    prior = tui._tui_build_snapshot_once(
+        now_utc=NOW,
+        skip_sync=True,
+        display_tz_pref_override="utc",
+        precompute_envelope=True,
+        runtime_bind=None,
+        stats_heal_attempted=False,
+    )
+    bundle = prior.source_bundle
+    assert bundle is not None
+
+    codex = bundle.sources["codex"]
+    degraded = dataclasses.replace(
+        codex,
+        availability="ok",
+        freshness="fresh",
+        metadata_health=lds.build_metadata_health("transient_read_failure"),
+    )
+    prior = dataclasses.replace(
+        prior,
+        source_bundle=dataclasses.replace(
+            bundle, sources={**dict(bundle.sources), "codex": degraded},
+        ),
+    )
+    assert prior.source_bundle.sources["codex"].availability == "ok", (
+        "the fixture must leave availability ok, or the guard would refuse on "
+        "a different leg and this test would say nothing about the carrier"
+    )
+    assert not tui._tui_source_bundle_can_idle(prior.source_bundle), (
+        "the idle guard must refuse a retryable carrier, or the transient "
+        "state is republished without ever re-reading the store"
+    )
+
+    stats = ns["open_db"]()
+    try:
+        idle = tui._tui_build_idle_snapshot(
+            prior,
+            now_utc=NOW,
+            precompute_envelope=False,
+            runtime_bind=None,
+            raw_config=_ROUTE_RAW_CONFIG,
+            errors=[],
+            display_tz_pref_override="utc",
+            source_stats_conn=stats,
+            source_display_tz_name="UTC",
+            source_display_tz=ZoneInfo("UTC"),
+        )
+    finally:
+        stats.close()
+    assert idle.source_bundle is not prior.source_bundle, (
+        "the rebuild branch must have run: a clock refresh would have returned "
+        "the same degraded bundle, which is the defect"
     )
 
 

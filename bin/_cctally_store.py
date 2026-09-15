@@ -285,6 +285,44 @@ def schema_current(conn: sqlite3.Connection, store: str) -> bool:
     return user_version == head
 
 
+def schema_state(conn: sqlite3.Connection, store: str, *,
+                 schema: str = "main") -> str:
+    """``"current"`` / ``"behind"`` / ``"ahead"`` for ``store`` under ``schema``.
+
+    The read-only conversation opener (#780) needs two things ``schema_current``
+    structurally cannot give it. It must address an ATTACHED store, and
+    ``schema_current`` always runs an unqualified ``PRAGMA user_version``, which
+    reports ``main`` however the attachment is stamped. And it must tell BEHIND
+    from AHEAD, because the two have opposite remedies: behind wakes a writer
+    and fails soft, while ahead fails closed with no recovery attempt, matching
+    the existing version-ahead posture. A bare boolean collapses both into
+    "not current".
+
+    ``schema`` is a SQLite schema name, not user input — it is a literal at
+    every call site, and it is validated against the connection's own
+    ``database_list`` before being interpolated, because ``PRAGMA`` does not
+    take a bound parameter for its schema qualifier.
+
+    A store with no registry head to gate on reports ``"behind"``: the soft
+    direction, and the same conservative answer ``schema_current`` gives with
+    its bare ``False``. The opener never migrates from a request thread
+    whichever answer it gets.
+    """
+    if schema != "main":
+        attached = {
+            row[1] for row in conn.execute("PRAGMA database_list")
+        }
+        if schema not in attached:
+            raise ValueError(f"schema {schema!r} is not attached")
+    head = _expected_head(store)
+    if head <= 0:
+        return "behind"
+    user_version = conn.execute(f"PRAGMA {schema}.user_version").fetchone()[0]
+    if user_version == head:
+        return "current"
+    return "behind" if user_version < head else "ahead"
+
+
 # --------------------------------------------------------------------------
 # §7.1 stats.db epoch gate (Task 9)
 # --------------------------------------------------------------------------
@@ -1372,6 +1410,25 @@ def _recover_or_reclaim_interrupted_stats_rebuild(
         _cctally_journal._release_ingest_lock(ingest_fd)
 
 
+#: #778 — every guarded stats connection is built with the statement cache OFF.
+#:
+#: `set_authorizer` installs a callback SQLite invokes while it COMPILES a
+#: statement, never while it runs one, and Python's `sqlite3` caches 128
+#: compiled statements per connection. `arm_stats_authorizer` answers from the
+#: `stats_write_scope` `ContextVar`, so a statement first prepared inside a
+#: sanctioned scope is re-used verbatim afterwards and the guard is never
+#: consulted again — the same SQL executed after the scope exits, or from a
+#: thread whose `ContextVar` was never set, wrote unchallenged. With no cache
+#: every `execute()` re-prepares, so authorization is decided per execution.
+#:
+#: Passed to the caller-supplied `connect` callable as a MANDATORY keyword. A
+#: connector that cannot accept it raises `TypeError`, and that call is never
+#: retried without the keyword: the loud failure is what makes a future
+#: connection factory that forgets to forward `**kwargs` a test failure rather
+#: than a silently unguarded connection.
+_STATS_CONNECT_KWARGS = {"cached_statements": 0}
+
+
 def stats_open_guarded(
     db_path=None, *, connect=None, recover_interruptions: bool = True
 ) -> sqlite3.Connection:
@@ -1384,8 +1441,8 @@ def stats_open_guarded(
 
     ``connect`` lets a caller keep its own open mode (``mode=ro`` for
     ``db backup``, ``mode=rw`` for ``db status``) while still participating; it
-    receives the path and returns the connection. Defaults to
-    ``sqlite3.connect``.
+    receives the path and ``cached_statements=0`` (see ``_STATS_CONNECT_KWARGS``)
+    and returns the connection. Defaults to ``sqlite3.connect``.
     """
     db_path = pathlib.Path(
         db_path if db_path is not None else _cctally_core.DB_PATH
@@ -1399,7 +1456,7 @@ def stats_open_guarded(
         # Pre-#386 behaviour, unchanged.
         if marker.exists():
             raise _cctally_db.StatsDbMaintenanceError()
-        conn = _connect(db_path)
+        conn = _connect(db_path, **_STATS_CONNECT_KWARGS)
         arm_stats_authorizer(conn)
         return conn
 
@@ -1537,7 +1594,7 @@ def stats_open_guarded(
                     fcntl.flock(lock_fh, fcntl.LOCK_UN)
                     continue
             try:
-                conn = _connect(db_path)
+                conn = _connect(db_path, **_STATS_CONNECT_KWARGS)
                 # Re-check inside the same shared hold: cheap, and it closes the
                 # window between the checks above and a slow connect.
                 if marker.exists() or pending.exists():

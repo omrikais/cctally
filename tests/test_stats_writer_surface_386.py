@@ -60,6 +60,17 @@ STATS_TABLES = frozenset({
     # replaced the filesystem marker. Its writes are DML on a stats table and
     # therefore belong under this guard.
     "weekly_reset_debounce_state",
+    # #769 S2 epoch 1014: the source-local five-hour credit confirmation
+    # state. Same class as the debounce state above — disposable operational
+    # state, but its writes are DML on a stats table and therefore belong
+    # under this guard.
+    "five_hour_credit_confirmation_state",
+    # #661 S2 epoch 1011 created the table and #750 S2 taught the emitter its
+    # identity, but neither added it here, so its three write sites sat
+    # outside this freeze for two epochs (#768). It is an ordinary stats
+    # table — `open_db` creates it and the journal fold writes it — and it
+    # joins with NO exemption.
+    "meter_rate_change_events",
 })
 
 #: The SQL verb pattern. It matches the VERB alone and resolves the target from
@@ -120,6 +131,14 @@ FROZEN_WRITE_SITES = {
         "journal_selector_batches": 1,
         "journal_selector_state": 1,
         "stats_quota_projection_state": 1,
+        # #768: the `CREATE TABLE IF NOT EXISTS meter_rate_change_events`
+        # in `_apply_quota_projection_schema`. Epoch 1011 created the table
+        # and epoch 1012 widened it, but it never joined `STATS_TABLES`, so
+        # this statement sat outside the freeze. Both callers are R2:
+        # `open_db` runs it inside `stats_open_time_guard` (maintenance EX
+        # + `stats_write_scope("open-time")`), and stats migration 013
+        # reaches it through the dispatcher inside that same block.
+        "meter_rate_change_events": 1,
         "percent_milestones": 1,
         "project_budget_milestones": 1,
         "projected_milestones": 1,
@@ -143,6 +162,11 @@ FROZEN_WRITE_SITES = {
         # #750 S3 epoch 1013: the `CREATE TABLE IF NOT EXISTS` for the
         # debounce state, in the same guarded block.
         "weekly_reset_debounce_state": 1,
+        # #769 S2 epoch 1014: the `CREATE TABLE IF NOT EXISTS` for the
+        # source-local five-hour confirmation state, in that same guarded
+        # block — `_apply_schema` under `stats_open_time_guard` (maintenance
+        # EXCLUSIVE plus `stats_write_scope("open-time")`).
+        "five_hour_credit_confirmation_state": 1,
         "weekly_cost_snapshots": 1,
         "weekly_credit_floors": 1,
         "weekly_usage_snapshots": 2,
@@ -204,6 +228,20 @@ FROZEN_WRITE_SITES = {
         # installs the rows and writes `stats_publication_stamp`, so content
         # and identity commit together. The single-row table needs no removal.
         "journal_selector_state": 4,
+        # Two, both #768 and both R1. `_insert_meter_rate_change`
+        # contributes the `INSERT OR IGNORE` and
+        # `_backfill_meter_rate_change_evidence` the COALESCE `UPDATE`,
+        # which only that insert calls. Both are reached through the
+        # `_apply_meter_rate_change` fold applier and through
+        # `record_meter_rate_change` at the step-4b rate-change leg of
+        # `_run_cycle`, so both run on `ctx.conn` inside the ingest
+        # `BEGIN IMMEDIATE` under `stats_write_scope("ingest",
+        # ingest_lock=True)`. The backfill stays a SEPARATE statement
+        # rather than an `ON CONFLICT DO UPDATE` because the insert
+        # returning `rowcount == 1` is the notification predicate;
+        # folding them would re-fire a notification for every replayed
+        # duplicate.
+        "meter_rate_change_events": 2,
         "quota_alert_arming": 2,
         "quota_threshold_events": 1,
         # Two, both #496 S5b §4.7 and both sanctioned. `_write_quota_projection_
@@ -254,7 +292,29 @@ FROZEN_WRITE_SITES = {
         # — the R1 steady-state regime — reached through
         # `detect_reset_and_credit` and `_apply_credit`.
         "weekly_reset_debounce_state": 2,
-        "weekly_usage_snapshots": 6,
+        # #769 S2 epoch 1014: both inside `_write_five_hour_source_state` —
+        # the upsert that advances one contributor's baseline or arms its
+        # descent, and the DELETE that retires that contributor's rows for
+        # earlier windows so the table stays proportional to live state. Both
+        # run on `ctx.conn` inside `_run_cycle`'s `BEGIN IMMEDIATE` while
+        # `run_stats_ingest` holds maintenance-shared and
+        # `journal.ingest.lock` — the R1 steady-state regime — reached through
+        # `detect_reset_and_credit`.
+        "five_hour_credit_confirmation_state": 2,
+        # #834 S1 (#835): SIX became FIVE. The stale-replica removal ran a
+        # `DELETE ... WHERE id IN (...)` at two call sites —
+        # `_fire_in_place_credit`'s pivot 2 and `_apply_credit`'s inline step 4c —
+        # and both now call `_delete_doomed_snapshot_rows`, one statement over the
+        # shared band predicate. The scope is unchanged, because the helper
+        # executes on the CALLER's connection: pivot 2 still runs on `ctx.conn`
+        # inside `_run_cycle`'s `BEGIN IMMEDIATE` under
+        # `stats_write_scope("ingest", ingest_lock=True)`, and the inline path
+        # still runs inside its caller's transaction. The collapse was made for
+        # two reasons other than the count: a predicate deletion evaluates the
+        # band at DELETION time, so a row entering it between classification and
+        # deletion cannot escape, and it takes four parameters whatever the
+        # population. See docs/journal-gotchas.md, R1 section.
+        "weekly_usage_snapshots": 5,
     },
     "_cctally_store.py": {
         "stats_open_fixups": 2,
@@ -310,8 +370,18 @@ FROZEN_WRITE_SITES = {
 #: `_cctally_journal.py`'s `INSERT INTO main."{name}" SELECT * FROM src."{name}"`
 #: were both resolving to the literal `main` and counting as neither a frozen
 #: table nor a dynamic target.
+#: #769 S3 raised `_cctally_cache.py` from 1 to 10. Nine of the new sites name
+#: a TABLE this session parameterised on purpose: `_recompute_conversation_sessions`
+#: and `_fill_conversation_sessions_filter_columns` gained a `target` so a
+#: rebuild can derive its rollup into `conversation_sessions_staging` and leave
+#: the live table alone until the publish (#752), `_ai_title_upsert_sql` builds
+#: the same statement for the live table or its staging twin, and
+#: `sync_claude_conversations` names the title table it is writing plus the
+#: chunked stale-source-file cleanup. Every one of them substitutes a name from
+#: a fixed pair chosen in this module, never a caller-supplied string, and the
+#: staging names are declared in `CONVERSATIONS_REDERIVABLE_OBJECTS`.
 FROZEN_DYNAMIC_SITES = {
-    "_cctally_cache.py": 1,
+    "_cctally_cache.py": 10,
     "_cctally_db.py": 9,
     "_cctally_journal.py": 9,
     "_cctally_store.py": 1,

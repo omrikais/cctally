@@ -718,9 +718,12 @@ def test_source_bundle_threads_the_canonical_fast_tier_and_week_start(
     seen = []
     now = ns["dt"].datetime(2026, 7, 20, tzinfo=ns["dt"].timezone.utc)
 
-    def capture(context, *, data_version):
+    def capture(context, *, data_version, **kwargs):
+        # `**kwargs` rather than a fixed list: this double stands in for the
+        # real builder only to observe the context it is handed, so a keyword
+        # added to that builder must pass through rather than break the case.
         seen.append(context)
-        return original_builder(context, data_version=data_version)
+        return original_builder(context, data_version=data_version, **kwargs)
 
     try:
         (provider_root / "config.toml").write_text(
@@ -1696,8 +1699,18 @@ def test_codex_projection_and_source_build_failed_retain_prior_then_recover(
         assert incoherent.sources["codex"].availability == "partial"
         assert incoherent.sources["codex"].freshness == "fresh"
         assert incoherent.sources["codex"].capabilities["hero"].status == "unavailable"
+        # #769 S6 / #753 (D4): the operands are no longer erased. The prior
+        # generation was coherent, so its cohort is republished with a quiet
+        # `updating` marker while reconciliation is in flight; the capability
+        # and the warning are unchanged, and they are what disclose the state.
+        # The retained cycle is None because the prior generation resolved no
+        # cycle either — the cohort travels with the boundary that produced it.
+        assert incoherent.sources["codex"].data["hero"]["update_state"] == "updating"
         assert incoherent.sources["codex"].data["hero"]["cycle"] is None
-        assert incoherent.sources["codex"].data["hero"]["total_tokens"] is None
+        assert (incoherent.sources["codex"].data["hero"]["total_tokens"]
+                == prior.sources["codex"].data["hero"]["total_tokens"])
+        assert (incoherent.sources["codex"].data["hero"]["cost_usd"]
+                == prior.sources["codex"].data["hero"]["cost_usd"])
         assert incoherent.sources["codex"].warnings[0].code == "codex_projection_incoherent"
         assert incoherent.sources["codex"].warnings[0].domain == "hero"
         assert incoherent.sources["all"].data["combined"] is None

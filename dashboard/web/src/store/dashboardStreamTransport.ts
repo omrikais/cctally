@@ -1,4 +1,5 @@
 import type { Envelope } from '../types/envelope';
+import { normalizeEnvelopeMetadataHealth } from '../types/envelope';
 import type {
   DashboardStreamClientMessage,
   DashboardStreamWorkerMessage,
@@ -40,7 +41,10 @@ function directTransport(callbacks: DashboardStreamCallbacks): DashboardStreamTr
         try {
           const parsed = JSON.parse(event.data);
           if (!isEnvelope(parsed)) throw new Error('invalid dashboard envelope');
-          callbacks.onSnapshot(parsed);
+          // #834 S2 (#829): the ONE normalizer, shared with the hub. A pre-v12
+          // server omits `metadata_health`, and an absent value must reach the
+          // store as `unknown` rather than as a clean bill of health.
+          callbacks.onSnapshot(normalizeEnvelopeMetadataHealth(parsed));
         } catch {
           console.error('Dashboard stream frame was rejected.');
           callbacks.onError();

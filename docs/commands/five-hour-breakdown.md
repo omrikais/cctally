@@ -57,6 +57,7 @@ Block: 2026-04-30 19:30 UTC (active, 4h 06m elapsed) · 5h%: 66.7% · 7d% 62.5�
 
 - Closed blocks: `(closed, 5h 00m, ended HH:MM)`.
 - Crossed-reset blocks: append ` ⚡ crossed weekly reset` and Δ renders as `—`.
+- The header's `7d%` range renders `—`, with `(—)` for the delta, when an in-place weekly credit retired the value either end of the range was observed at. That applies to closed blocks as well as to the active one, and `--json` follows: the block object's `sevenDayPctAtBlockStart`, `sevenDayPctAtBlockEnd` and `sevenDayPctDeltaPp` are `null` in the same case. A block observed only before the credit is unchanged, because its stored figures are historical truth rather than a retired value. `cctally five-hour-blocks` applies the same rule to its `7d % range` and `Δ7d` columns; see [`five-hour-blocks.md`](five-hour-blocks.md) for the full statement, including the one condition that applies on a multi-account install.
 
 ## Default columns
 
@@ -66,7 +67,7 @@ Block: 2026-04-30 19:30 UTC (active, 4h 06m elapsed) · 5h%: 66.7% · 7d% 62.5�
 - **Threshold** — `percent_threshold` formatted `1%`, `2%`, ….
 - **Cumulative Cost** — `block_cost_usd`.
 - **Marginal Cost** — `marginal_cost_usd`; `n/a` for the first crossing.
-- **7d at crossing** — `seven_day_pct_at_crossing` formatted as integer percent; `—` if null.
+- **7d at crossing** — the **effective** weekly percentage at the crossing, `effectiveSevenDayPctAtCrossing`, formatted as an integer percent; `—` when it is null. It is not `sevenDayPctAtCrossing`. That field is the raw reading the crossing tick reported, and on a tick whose weekly axis was clamped or whose weekly value a credit has since retired, the raw reading is a number no reader ever saw. The column never falls back to it: when the effective value is unavailable the marker says so.
 
 ## Empty case
 
@@ -117,11 +118,24 @@ cctally five-hour-breakdown --json
       "capturedAt":             "2026-04-30T19:42:11Z",
       "blockCostUSD":           5.67,
       "marginalCostUSD":        null,
-      "sevenDayPctAtCrossing":  4.0
+      "sevenDayPctAtCrossing":  4.0,
+      "effectiveSevenDayPctAtCrossing": 4.0
     }
   ]
 }
 ```
+
+`sevenDayPctAtCrossing` is the raw stored reading and keeps its type and meaning.
+`effectiveSevenDayPctAtCrossing` is the weekly percentage a reader actually saw,
+and it is nullable: it is `null` when the snapshot row the milestone refers to is
+gone, and when the weekly value that row carries is one an in-place weekly credit
+retired. The two fields differ on exactly those ticks. The human table renders the
+effective one, so a consumer that wants to match what the table prints should read
+`effectiveSevenDayPctAtCrossing` and render `—` for a `null`.
+
+## One condition, on a multi-account install only
+
+Everything above about withholding a retired weekly percentage — the header's `7d%` range and the `7d at crossing` column alike — holds unconditionally when the machine has a single Claude account. With more than one it is conditional on open issue #837: `cctally record-credit` builds its whole credit plan from reads that name no account and resolves the account it stamps only afterwards, so a manual credit's floor can be recorded under an account other than the one whose value it retired. Both of this command's filters are correctly scoped to the account the value belongs to, because a credit under one account must not retire another account's observations, so when the floor lands under the wrong account the filter finds no credit for the right one and the retired value is still shown. `cctally account list` reports how many accounts a store holds.
 
 ## Credit divider rows
 

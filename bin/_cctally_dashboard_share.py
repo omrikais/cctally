@@ -49,7 +49,6 @@ from _cctally_core import open_db, parse_iso_datetime
 from _cctally_config import save_config, _load_config_unlocked
 from _lib_fmt import stable_sum
 from _lib_pricing import _calculate_entry_cost, claude_usage_dict
-from _lib_five_hour import _canonical_5h_window_key
 from _lib_display_tz import _resolve_tz, resolve_display_tz_name
 
 
@@ -525,48 +524,154 @@ def _share_per_day_per_project_for_range(
     return out
 
 
+def _share_block_ownership_context(range_start, range_end):
+    """The canonical five-hour windows competing over ``[range_start,
+    range_end]``, as ``(windows, owner_key_by_block_start_epoch)``.
+
+    #751a: a block cannot decide what it owns without knowing what its
+    neighbours own, so the caller widens this range past what it displays
+    purely in order to exclude a predecessor's entries.
+    """
+    import _lib_blocks
+
+    _selected, _overrides, canonical_intervals = (
+        sys.modules["cctally"]._load_recorded_five_hour_windows(
+            range_start, range_end,
+        )
+    )
+    windows = []
+    owner_key_by_start: dict[int, object] = {}
+    for anchor, (block_start, reset) in canonical_intervals.items():
+        windows.append(_lib_blocks.OwnedWindow(
+            key=anchor, start=block_start, reset=reset,
+        ))
+        owner_key_by_start[int(block_start.timestamp())] = anchor
+    return windows, owner_key_by_start
+
+
+def _share_entry_cost(entry) -> float:
+    usage = claude_usage_dict(   # #195 chokepoint
+        input_tokens=entry.input_tokens,
+        output_tokens=entry.output_tokens,
+        cache_creation_tokens=entry.cache_creation_tokens,
+        cache_read_tokens=entry.cache_read_tokens,
+        cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+        speed=getattr(entry, "speed", None),
+    )
+    return _calculate_entry_cost(
+        entry.model, usage, mode="auto", cost_usd=entry.cost_usd,
+    )
+
+
+def _share_per_block_per_project_by_ownership(starts, iso_by_start_epoch):
+    """Per-block per-project costs over the entries each block OWNS.
+
+    The rollup-table path above is the canonical source; this runs only
+    when that table is empty or unreadable. It used to sweep each block's
+    raw ``[start, start + 5h]`` interval through
+    ``_share_all_projects_for_range``, which is an independent
+    reselection: two windows overlapping after a reset shift each claimed
+    the overlap entries, and the artifact's per-block per-project
+    breakdown double-counted them (#751a review P2-1).
+
+    Ownership is resolved once, by the one rule in
+    ``_lib_blocks.partition_entries_by_owner``. A block with no canonical
+    row is heuristic, so it reads the leftovers — the entries no exact
+    window contains — inside its own interval, which is the grouping
+    pass's own treatment of them.
+    """
+    import _lib_blocks
+
+    five_hours = dt.timedelta(hours=5)
+    earliest, latest = min(starts), max(starts)
+    out: dict[str, dict[str, float]] = {
+        iso: {} for iso in iso_by_start_epoch.values()
+    }
+    try:
+        windows, owner_key_by_start = _share_block_ownership_context(
+            earliest - five_hours, latest + 2 * five_hours,
+        )
+        # late-binding: reach the dashboard module object so both the ns-patch
+        # (share tests) and a dashboard-object patch (rebuild-parity) are
+        # honored (#279 S5 F1 / spec §3).
+        entries = list(
+            sys.modules["_cctally_dashboard"].get_claude_session_entries(
+                earliest, latest + 2 * five_hours, skip_sync=True,
+            )
+        )
+    except Exception:
+        return out
+    owned, leftovers = _lib_blocks.partition_entries_by_owner(entries, windows)
+    for start in starts:
+        block_iso = iso_by_start_epoch[int(start.timestamp())]
+        owner_key = owner_key_by_start.get(int(start.timestamp()))
+        if owner_key is None:
+            mine = [
+                e for e in leftovers
+                if start <= e.timestamp < start + five_hours
+            ]
+        else:
+            mine = owned.get(owner_key, [])
+        bucket = out[block_iso]
+        for entry in mine:
+            key = entry.project_path or "(unknown)"
+            bucket[key] = bucket.get(key, 0.0) + _share_entry_cost(entry)
+    return out
+
+
 def _share_per_block_per_project(
     recent_blocks: list[dict],
 ) -> dict[str, dict[str, float]]:
     """Aggregate per-block per-project costs from `five_hour_block_projects`.
 
     Returns {block_start_at_iso: {project_path_or_'(unknown)': cost_usd}}.
-    Block.start_at → five_hour_window_key via `_canonical_5h_window_key`
-    (10-min floor; same chokepoint as `maybe_update_five_hour_block`,
-    per CLAUDE.md "5-hour windows" gotcha — never derive a third key shape).
 
-    Fallback (rollup empty/unreadable): per-block sweep over
-    `_share_all_projects_for_range` — uncapped, accuracy parity with the
-    canonical path. Fires only during the first tick after fresh install
-    or before stats-migration `002_five_hour_block_projects_backfill_v1`
-    completes. Issue #33.
+    The rollup rows are reached through their parent's `block_start_at`
+    rather than through a window key derived here. `five_hour_block_projects.
+    five_hour_window_key` is canonicalized from the window's RESET, so a key
+    derived from the block's START missed every row by the block duration and
+    the lookup never resolved — which made the fallback the effective path
+    (#751a review P2-1). Resolving the parent by its own recorded start is a
+    lookup rather than a second derivation, so no third key shape is created
+    (CLAUDE.md "5-hour windows").
+
+    Fallback (rollup empty/unreadable): `_share_per_block_per_project_by_
+    ownership`, which prices the entries each block owns. Fires only during
+    the first tick after fresh install or before stats-migration
+    `002_five_hour_block_projects_backfill_v1` completes. Issue #33.
     """
     if not recent_blocks:
         return {}
     out: dict[str, dict[str, float]] = {}
-    keys: list[int] = []
-    iso_by_key: dict[int, str] = {}
+    starts: list[dt.datetime] = []
+    iso_by_start_epoch: dict[int, str] = {}
     for b in recent_blocks:
         try:
             ts = parse_iso_datetime(b["start_at"], "share.block.start_at")
         except (ValueError, KeyError):
             continue
-        wk = _canonical_5h_window_key(int(ts.timestamp()))
-        keys.append(wk)
-        iso_by_key[wk] = b["start_at"]
-    if not keys:
+        ts = ts.astimezone(dt.timezone.utc)
+        starts.append(ts)
+        iso_by_start_epoch[int(ts.timestamp())] = b["start_at"]
+    if not starts:
         return out
+    epochs = list(iso_by_start_epoch)
     try:
         conn = open_db()
-        placeholders = ",".join("?" for _ in keys)
-        rows = conn.execute(
-            f"SELECT five_hour_window_key, project_path, cost_usd "
-            f"FROM five_hour_block_projects "
-            f"WHERE five_hour_window_key IN ({placeholders})",
-            keys,
-        ).fetchall()
-        for wk, project_path, cost in rows:
-            block_iso = iso_by_key.get(wk)
+        try:
+            placeholders = ",".join("?" for _ in epochs)
+            rows = conn.execute(
+                f"SELECT unixepoch(b.block_start_at) AS start_epoch, "
+                f"       p.project_path, p.cost_usd "
+                f"  FROM five_hour_block_projects p "
+                f"  JOIN five_hour_blocks b ON b.id = p.block_id "
+                f" WHERE unixepoch(b.block_start_at) IN ({placeholders})",
+                epochs,
+            ).fetchall()
+        finally:
+            conn.close()
+        for start_epoch, project_path, cost in rows:
+            block_iso = iso_by_start_epoch.get(int(start_epoch))
             if block_iso is None:
                 continue
             proj = project_path or "(unknown)"
@@ -576,15 +681,7 @@ def _share_per_block_per_project(
             return out
     except (sqlite3.DatabaseError, OSError):
         pass
-    # Fallback: per-block uncapped session_entries sweep.
-    for b in recent_blocks:
-        try:
-            ts = parse_iso_datetime(b["start_at"], "share.block.start_at")
-        except (ValueError, KeyError):
-            continue
-        end = ts + dt.timedelta(hours=5)
-        out[b["start_at"]] = sys.modules["cctally"]._share_all_projects_for_range(ts, end)
-    return out
+    return _share_per_block_per_project_by_ownership(starts, iso_by_start_epoch)
 
 
 def _build_share_panel_data(panel: str, options: dict,
@@ -1327,7 +1424,28 @@ def _build_projects_share_panel_data(options: dict,
     week_end = cw_start + dt.timedelta(days=7)
     now = _share_now_utc()
     period_end = week_end if week_end <= now else now
-    period_start = cw_start - dt.timedelta(days=7 * (effective_weeks - 1))
+    # #750 S4 §4.7: the period start comes from the SELECTED INTERVAL
+    # IDENTITIES, not from `cw_start - 7 * (effective_weeks - 1)`. A credited
+    # week adds a billing cycle without adding seven calendar days, so the
+    # seven-day arithmetic advertises a period WIDER than the data the
+    # artifact aggregated the moment one is inside the window. The instants
+    # come from `projects.trend.weeks[].week_start_at` (§2.2). The old
+    # arithmetic remains the fallback for an envelope that predates the
+    # field, where it is still the best available answer.
+    _selected_starts = [
+        w.get("week_start_at") for w in (trend.get("weeks") or [])
+        if isinstance(w, dict) and w.get("week_start_at")
+    ][-effective_weeks:]
+    period_start = None
+    if _selected_starts:
+        try:
+            period_start = parse_iso_datetime(
+                _selected_starts[0], "projects.trend.week_start_at",
+            )
+        except (TypeError, ValueError):
+            period_start = None
+    if period_start is None:
+        period_start = cw_start - dt.timedelta(days=7 * (effective_weeks - 1))
 
     return {
         "rows":           rows,
@@ -1533,7 +1651,7 @@ def _share_codex_state_for_period(data_snap, *, panel: str, options: dict):
             ),
             data_version=(
                 f"share:codex:{panel}:{range_start.isoformat()}:"
-                f"{now_override.isoformat()}:{semantics.identity}"
+                f"{now_override.isoformat()}:{semantics.codex_identity}"
             ),
         )
     finally:

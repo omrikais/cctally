@@ -199,6 +199,148 @@ def test_only_paths_with_rebuild_raises_value_error(isolated):
         sync_cache(conn, only_paths={str(a)}, rebuild=True)
 
 
+_FINGERPRINT_TABLES = (
+    "conversation_messages",
+    "conversation_ai_titles",
+    "conversation_sessions",
+    "conversation_source_files",
+    "conversation_file_touches",
+)
+
+
+def _store_fingerprint(conn):
+    """Every row of every table the rejected call could reach, plus cache_meta.
+
+    Asserting one surviving message row would pass while the rebuild branch
+    still committed its pending marker and emptied the titles, the rollup and
+    the source-file cursors, so the fingerprint covers all five derived tables
+    and the whole marker set. `key=repr` because a column mixing None with a
+    string is not orderable.
+    """
+    fingerprint = {
+        table: sorted(
+            (tuple(row) for row in conn.execute(f"SELECT * FROM {table}")),
+            key=repr,
+        )
+        for table in _FINGERPRINT_TABLES
+    }
+    fingerprint["cache_meta"] = sorted(
+        (tuple(row) for row in conn.execute("SELECT key, value FROM cache_meta")),
+        key=repr,
+    )
+    return fingerprint
+
+
+def _conversations_lock_mtime(core):
+    """The lock file's mtime, or None when the file does not exist."""
+    try:
+        return core.CONVERSATIONS_LOCK_PATH.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def test_rebuild_with_only_paths_mutates_nothing(isolated, monkeypatch):
+    """#779: the incompatible-argument rejection runs before every side effect.
+
+    The check used to sit after the pending-marker commit, the maintenance
+    preparation and the four destructive DELETEs, so the call that raised had
+    already emptied the store it was refusing to touch.
+    """
+    ns, conn, projects = isolated
+    import _cctally_core
+    import _cctally_cache as cache
+    a = projects / "a.jsonl"
+    a.write_text(_asst_line("a1", "m1", "r1", "A"))
+    ns["sync_claude_conversations"](conn)
+    before = _store_fingerprint(conn)
+    assert before["conversation_messages"], "the guard needs real rows to protect"
+    _cctally_core.CONVERSATIONS_LOCK_PATH.unlink(missing_ok=True)
+    lock_mtime = _conversations_lock_mtime(_cctally_core)
+    calls = []
+    monkeypatch.setattr(
+        cache, "_report_conversation_progress",
+        lambda *a, **k: calls.append(a),
+    )
+    with pytest.raises(
+        ValueError, match="only_paths is incompatible with rebuild"
+    ):
+        ns["sync_claude_conversations"](
+            conn, rebuild=True, only_paths={str(a)})
+    assert _store_fingerprint(conn) == before
+    assert _conversations_lock_mtime(_cctally_core) == lock_mtime
+    assert calls == []
+
+
+# --- #779: the ordering the rejection depends on ---------------------------
+# The incompatible-argument check is the function's first statement and is
+# NEVER re-checked. That is only correct because a targeted call meeting a
+# PENDING global rebuild returns `deferred_reason="rebuild_pending"` BEFORE
+# `rebuild = rebuild or pending_rebuild` runs. Reorder those two and the merge
+# turns a legitimate targeted call into `only_paths` + `rebuild` — inherited
+# global work mistaken for an explicitly incompatible pair — and the store is
+# rebuilt from a targeted request, or (with the check restored after the merge)
+# an ordinary live-tail tick raises. Spec §7 required this test and it did not
+# exist; `conversation_rebuild_claude_pending` is not in _TARGETED_DECLINE_FLAGS
+# and has its own branch, so the pending-global-flag test above does not cover
+# it.
+
+
+def test_targeted_under_a_pending_global_rebuild_defers(isolated):
+    ns, conn, projects = isolated
+    a = projects / "a.jsonl"
+    a.write_text(_asst_line("a1", "m1", "r1", "A"))
+    ns["sync_claude_conversations"](conn)
+    before = _store_fingerprint(conn)
+    conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+                 "VALUES('conversation_rebuild_claude_pending','1')")
+    conn.commit()
+    a.write_text(_asst_line("a1", "m1", "r1", "A")
+                 + _asst_line("a2", "m2", "r2", "AA"))
+    stats = ns["sync_claude_conversations"](conn, only_paths={str(a)})
+    assert stats.deferred_reason == "rebuild_pending"
+    assert stats.targeted_clean is False
+    # It deferred rather than ingesting: the appended line is NOT in the store.
+    assert _count(conn, a) == 1
+    # The marker survives for the backstop full sync that owns the rebuild.
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta "
+        "WHERE key='conversation_rebuild_claude_pending'"
+    ).fetchone() is not None
+    after = _store_fingerprint(conn)
+    del before["cache_meta"], after["cache_meta"]   # the marker we just added
+    assert after == before
+
+
+def test_the_pending_rebuild_deferral_precedes_the_rebuild_merge(isolated):
+    """Order-sensitive by construction: it fails if the deferral return is
+    moved below `rebuild = rebuild or pending_rebuild`.
+
+    After the merge a targeted call carries `rebuild=True`, so the function
+    either raises the #779 ValueError (if the check were re-applied there) or
+    performs a global rebuild from a targeted request. Both are visible here:
+    a raised ValueError is not the contract, and a rebuild would re-ingest the
+    file whose appended line the deferral leaves unread.
+    """
+    ns, conn, projects = isolated
+    a = projects / "a.jsonl"
+    b = projects / "b.jsonl"
+    a.write_text(_asst_line("a1", "m1", "r1", "A"))
+    b.write_text(_asst_line("b1", "m2", "r2", "B", sid="s2"))
+    ns["sync_claude_conversations"](conn)
+    assert _count(conn, b) == 1
+    conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+                 "VALUES('conversation_rebuild_claude_pending','1')")
+    conn.commit()
+    stats = ns["sync_claude_conversations"](conn, only_paths={str(a)})
+    assert stats.deferred_reason == "rebuild_pending"
+    assert _count(conn, b) == 1, (
+        "a merged rebuild clears the whole store and then re-ingests only the "
+        "targeted file, so B's rows are the evidence the deferral ran first"
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_messages").fetchone()[0] == 2
+
+
 def test_only_paths_parity_with_full_sync_for_that_file(isolated, tmp_path, monkeypatch):
     ns, conn, projects = isolated
     sync_cache = ns["sync_claude_conversations"]

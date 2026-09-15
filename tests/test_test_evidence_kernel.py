@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import gzip
 import importlib.util
 import json
 import pathlib
 import re
 import sys
+import threading
+import time
 
 import pytest
 
@@ -1920,13 +1923,34 @@ def test_a_denylist_content_violation_refuses_even_beside_per_line_ones():
     assert record["refusal"] == "email", record
 
 
+# The denylist reasons deliberately filed in `PER_LINE_VIOLATION_REASONS`,
+# declared here by name so that the case below stays fail-closed for every leg
+# nobody declared. `token-credential` is the only member: #769 S7 filed it after
+# measuring that its designed firing classes occur with the transformer working
+# exactly as shipped, so its firing is not evidence the unflagged lines cannot
+# be trusted. The argument, the corpus figures and the positional requirement
+# the filing puts on `_FORBIDDEN` are recorded on the set itself.
+DECLARED_PER_LINE_DENYLIST_REASONS = ("token-credential",)
+
+
 @pytest.mark.parametrize("reason", sorted(
     {name for name, _ in K._FORBIDDEN} | {"unsubstituted-root"}))
 def test_every_denylist_content_leg_is_outside_the_per_line_set(reason):
     """The classification, checked against the leg table rather than against a
     transcription of it. A leg added to `_FORBIDDEN` later is a denylist leg
     by default, which is the fail-closed direction; this pins that it stays
-    one."""
+    one unless somebody declares it above.
+
+    The declaration is a tuple in this file rather than a read of the kernel's
+    own set, because reading the set would make the case restate the thing it
+    checks and every future filing would pass silently.
+    """
+    if reason in DECLARED_PER_LINE_DENYLIST_REASONS:
+        assert reason in K.PER_LINE_VIOLATION_REASONS, (
+            "%s is declared as a per-line denylist reason here but the kernel "
+            "does not file it, so the declaration is stale" % reason
+        )
+        return
     assert reason not in K.PER_LINE_VIOLATION_REASONS, reason
 
 # A failing pytest log of the shape this estate really produces, used to
@@ -2833,3 +2857,2119 @@ def test_the_cap_stays_within_twice_the_uncompressed_worst_case():
     projected = _projected_working_set_bytes(
         MEASURED_DURATIONS_UNCOMPRESSED_BYTES)
     assert K.DEFAULT_MAX_BYTES <= projected * 2, (K.DEFAULT_MAX_BYTES, projected)
+
+
+# ------------------------------------------------- #812: the token credential
+
+ORDINARY_TOKEN_LINES = (
+    "log missing expected token for the-harness: the-needle",
+    "checking token count for the run",
+    "unexpected token ')' at line 4",
+)
+
+
+# The ordinary words each control line needs before the ordinary-word check
+# will let it reach the export boundary at all. Registered in THIS CASE'S
+# CONTEXT ONLY, never in the kernel's vocabulary: `KNOWN_TOKENS` above is a
+# deliberately small stand-in, and the production vocabulary
+# `build_known_tokens` assembles already vouches for `token`, `unexpected`,
+# `at`, `count` and `run`, which is why the production-vocabulary case for #812
+# lives in `tests/test_test_remote_observability.py` instead.
+_ORDINARY_TOKEN_VOCABULARY = frozenset({
+    "unexpected", "at", "token", "expected", "for", "the", "needle",
+    "checking", "count", "run",
+})
+
+
+@pytest.mark.parametrize("line", ORDINARY_TOKEN_LINES)
+def test_ordinary_token_wording_is_not_decided_as_a_credential(line):
+    """#812. The ordinary English word `token` is not a credential.
+
+    Asserted at BOTH seams, because each one alone is insufficient.
+
+    `K._reduce` is the typed-substitution seam, and it is where the three lines
+    differ decisively: the combined alternation replaced the word following
+    `token` with `<credential>`, and the split pattern leaves each line byte for
+    byte. Equality against the input is what makes this case fail against the
+    reverted kernel.
+
+    `K.scrub_line` is the export boundary — what the estate actually publishes —
+    and a whole-line assertion there needs the surrounding ordinary words
+    registered in the context. Without them the ordinary-word check refuses all
+    three lines for unrelated vocabulary reasons and every one of them produces
+    `[REDACTED: unclassified line]` under either credential pattern. An earlier
+    form of this case asserted only `"<credential>" not in scrub_line(...)`
+    against the bare stand-in vocabulary, which held against the unmodified
+    kernel and therefore certified nothing.
+    """
+    reduced, _spans = K._reduce(line, _ctx())
+    assert reduced == line, reduced
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | _ORDINARY_TOKEN_VOCABULARY)
+    assert K.scrub_line(line, ctx) == line
+
+
+def test_the_one_ordinary_control_whose_export_changes_now_publishes():
+    """#812. The only control whose exported bytes change, so the only one
+    that can carry a whole-line assertion.
+
+    The extra words come from `_ORDINARY_TOKEN_VOCABULARY` above and are
+    supplied to THIS CONTEXT ONLY, not to the kernel's vocabulary.
+    `KNOWN_TOKENS` above is a deliberately small stand-in for what the private
+    caller assembles, and it registers neither `unexpected` nor `at` nor
+    `token`, so without them the ordinary-word check refuses this line
+    whichever credential pattern is in force and the case would assert nothing
+    about the credential rule. Measured on the runner with the words
+    registered: the old combined alternation published
+    `unexpected <credential> at line 4` and the split pattern publishes the
+    line unchanged, which is the transition the spec's table records.
+    """
+    line = "unexpected token ')' at line 4"
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | _ORDINARY_TOKEN_VOCABULARY)
+    assert K.scrub_line(line, ctx) == line
+
+
+SEPARATED_TOKEN_CREDENTIALS = (
+    "token=sk-abc123XYZdeadbeef",
+    "token: ghp_9fA2kLmZq0w1e2r3t4y5u6i7o8p9",
+    "token = sk-abc123XYZdeadbeef",
+    "TOKEN=sk-abc123XYZdeadbeef",
+)
+
+
+@pytest.mark.parametrize("line", SEPARATED_TOKEN_CREDENTIALS)
+def test_a_token_with_a_real_separator_is_still_redacted(line):
+    """#812. Narrowing must not weaken real credential detection."""
+    assert "sk-abc123XYZdeadbeef" not in K.scrub_line(line, _ctx())
+    assert "ghp_9fA2kLmZq0w1e2r3t4y5u6i7o8p9" not in K.scrub_line(line, _ctx())
+
+
+UNCHANGED_CREDENTIAL_WORDS = (
+    "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc",
+    "api_key=abc123deadbeef",
+    "api-key abc123deadbeef",
+    "bearer abc123deadbeef",
+)
+
+
+@pytest.mark.parametrize("line", UNCHANGED_CREDENTIAL_WORDS)
+def test_the_other_three_credential_words_keep_the_optional_separator(line):
+    """#812. Only `token` is narrowed. `bearer`, `api_key` and
+    `authorization` are rarely ordinary English here, so they keep matching
+    with no separator at all.
+
+    Asserted at the typed-substitution seam, because whether the reduced line
+    then publishes depends on the ordinary-word check rather than on the
+    credential rule: `Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc` leaves
+    the JWT body as its remainder, nothing vouches for that word, and the line
+    is refused wholesale — which the spec's measurement table records as the
+    behaviour before this change too. What this case pins is that the three
+    words still decide a `<credential>` span with no separator present.
+    """
+    reduced, spans = K._reduce(line, _ctx())
+    assert "<credential>" in reduced
+    assert spans, "no span was decided, so nothing was classified"
+
+
+ACCEPTED_TOKEN_RESIDUALS = (
+    "token status",
+    "token count",
+    "token=",
+    "token:",
+)
+
+# Registered in the residual cases' CONTEXT ONLY, for the reason given on
+# `test_the_one_ordinary_control_whose_export_changes_now_publishes`: the
+# stand-in `KNOWN_TOKENS` vouches for none of these words, so the ordinary-word
+# check would refuse every residual line under either credential pattern and
+# the cases could not distinguish them.
+_RESIDUAL_VOCABULARY = frozenset({"token", "status", "count"})
+
+
+@pytest.mark.parametrize("line", ACCEPTED_TOKEN_RESIDUALS)
+def test_the_accepted_residual_forms_are_published_deliberately(line):
+    """#812 accepted residual. Requiring a real separator plus a value newly
+    admits every former `token` match lacking one. Each of these carries no
+    secret, and the maintainer accepted the class explicitly. This case exists
+    so that narrowing the pattern further is a deliberate decision rather than
+    an accident."""
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | _RESIDUAL_VOCABULARY)
+    assert K.scrub_line(line, ctx) == line
+
+
+def test_the_token_credential_pattern_is_anchored_on_a_real_separator():
+    """#812. The existing anchoring coverage addresses `_STRUCTURED_VERBATIM`,
+    not this alternation, so the alternation is pinned here."""
+    patterns = [p.pattern for p, _repl in K._TYPED_PATTERNS]
+    assert TRANSFORMER_TOKEN_ENTRY_PATTERN in patterns
+    assert (
+        r"(?i)\b(?:bearer|api[_-]?key|authorization)\b\s*[:=]?\s*\S+" in patterns
+    )
+    # The combined alternation that caused #812 must be gone. `bearer` appears
+    # in BOTH entries now — as a bare word in the optional-separator one and as
+    # the prefix of `bearer_token` in this one (#820) — so the check stays on
+    # the exact adjacency that caused the outage rather than on the word.
+    for pattern in patterns:
+        assert "bearer|token" not in pattern
+
+
+def test_the_validator_refuses_a_separated_token_credential():
+    """#812. The validator is the independent backstop, so it must refuse a
+    separated token credential on its own terms."""
+    violations = K.validate_export(["token: ghp_9fA2kLmZq0w1e2r3t4y5u6i7o8p9"])
+    assert violations, "the validator admitted a separated token credential"
+
+
+def test_the_validator_admits_the_accepted_token_residuals():
+    """#812. The validator must not be broader than the transformer, or it
+    would refuse exports the transformer legitimately published."""
+    for line in ACCEPTED_TOKEN_RESIDUALS:
+        assert not K.validate_export([line]), line
+
+
+# ------------------------------- #821: placeholder provenance in both surfaces
+#
+# A secret whose own bytes are placeholder-shaped fell inside the class the
+# `token-credential` leg admits, because the leg decided by SHAPE and a
+# lowercase-named span a leaker wrote and one this kernel wrote are the same
+# bytes. Only PROVENANCE separates them, and provenance is what `_reduce`
+# already measures and reports as decided spans.
+#
+# THIS IS A DISCLOSURE AND NOT ONLY A BACKSTOP GAP, which is why both surfaces
+# change. Measured under the production vocabulary with nothing regressed
+# anywhere, the transformer published `token=/repo<secret-90210904812340981234>`
+# as `token=<repo><secret-90210904812340981234>` with its twenty digits intact:
+# root substitution consumed the head, the token entry then found no value after
+# `token=`, and the tail's only alphabetic word is one the repository vouches
+# for, so the ordinary-word check published the line.
+
+# The three rows the module recorded as the residual this leg admits. Each is a
+# raw line, the bytes the shipped transformer published for it, and the bytes it
+# must publish now. `a` and `secret` are vouched for by the production
+# vocabulary and are registered in this file's context so the disclosure is
+# reachable here too; without them the ordinary-word check redacts the line for
+# an unrelated reason and the rows would assert nothing about provenance.
+CLOSED_PLACEHOLDER_SHAPED_SECRET = (
+    ("token=/repo<a90210904812340981234>",
+     "token=<repo><a90210904812340981234>"),
+    ("token=/repo<secret-90210904812340981234>",
+     "token=<repo><secret-90210904812340981234>"),
+    ("token=/repo <a90210904812340981234>",
+     "token=<repo> <a90210904812340981234>"),
+)
+
+#: The vocabulary those rows need before the ordinary-word check would have let
+#: them publish at all.
+_DISCLOSURE_VOCABULARY = frozenset({"token", "a", "secret"})
+
+
+@pytest.mark.parametrize(
+    "raw,previously", CLOSED_PLACEHOLDER_SHAPED_SECRET,
+    ids=[raw for raw, _ in CLOSED_PLACEHOLDER_SHAPED_SECRET],
+)
+def test_a_placeholder_shaped_secret_in_a_token_value_no_longer_publishes(
+    raw, previously
+):
+    """#821, the transformer half. The disclosure, closed at its source.
+
+    BOTH HALVES ARE ASSERTED. `previously` is the exact text the shipped
+    transformer published, so the case records what changed rather than only
+    that something did, and a run that redacted the line for some unrelated
+    reason would not satisfy it: the published form must be the whole-line
+    placeholder, which is what failing closed produces.
+    """
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | _DISCLOSURE_VOCABULARY)
+    published = K.scrub_line(raw, ctx)
+    assert "90210904812340981234" not in published, published
+    assert published != previously, published
+    assert published == K.UNCLASSIFIED_PLACEHOLDER, published
+
+
+@pytest.mark.parametrize(
+    "raw,previously", CLOSED_PLACEHOLDER_SHAPED_SECRET,
+    ids=[raw for raw, _ in CLOSED_PLACEHOLDER_SHAPED_SECRET],
+)
+def test_the_validator_refuses_the_placeholder_shaped_secret_it_admitted(
+    raw, previously
+):
+    """#821, the validator half. The backstop refuses what it used to admit.
+
+    Asserted over the bytes the shipped transformer PUBLISHED, because that is
+    what this validator reads. The transformer no longer emits them, and the
+    backstop must refuse them anyway: a regressed transformer is exactly the
+    condition under which the backstop is the only thing left.
+    """
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | _DISCLOSURE_VOCABULARY)
+    reasons = [
+        v["reason"] for v in K.validate_export([previously], roots=ctx.roots)
+    ]
+    assert reasons == ["token-credential"], (previously, reasons)
+
+
+# THE TWO CONTROLS THAT MUST STAY GREEN, and they are what forbid the global
+# form of this rule.
+#
+# The first is #812 itself: a value the transformer's own substitutions consumed
+# publishes with a placeholder where the value was, and refusing that destroyed
+# the evidence extract for a failing run.
+KERNEL_WRITTEN_TOKEN_VALUES = (
+    ("token=user@example.com", "token=<email>"),
+    ("token: 123e4567-e89b-12d3-a456-426614174000", "token: <uuid>"),
+)
+
+# The second is a benign public diagnostic that a committed golden pins.
+# `bin/cctally-migrations-test` emits `echo "$db_label: <missing>"` and
+# `tests/fixtures/migrations/01-fresh-install/expected.txt` retains
+# `stats.db: <missing>`. `_reduce` neither creates nor decides that span, so a
+# rule applied to the WHOLE LINE would newly redact it. Scoping the rule to the
+# value position after a token-credential prefix is what keeps it published.
+BENIGN_UNDECIDED_PLACEHOLDER_LINES = (
+    "stats.db: <missing>",
+    "cache.db: <missing>",
+)
+
+#: `stats` and `db` are vouched for by the production vocabulary, measured
+#: against `build_known_tokens` over this repository; this file's stand-in does
+#: not carry them, so they are registered in the control's context only.
+_BENIGN_PLACEHOLDER_VOCABULARY = frozenset({"stats", "db", "cache", "missing"})
+
+
+@pytest.mark.parametrize("raw,expected", KERNEL_WRITTEN_TOKEN_VALUES)
+def test_a_token_value_the_kernel_wrote_still_publishes(raw, expected):
+    """#812, which #821 must not undo. The span is DECIDED, so it stays."""
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | {"token"})
+    published = K.scrub_line(raw, ctx)
+    assert published == expected, published
+    assert not K.validate_export([published], roots=ctx.roots), published
+
+
+@pytest.mark.parametrize("line", BENIGN_UNDECIDED_PLACEHOLDER_LINES)
+def test_a_benign_undecided_placeholder_line_is_returned_byte_identically(line):
+    """#821. The measured reason the rule is scoped rather than global.
+
+    A globally scoped undecided-placeholder rule was proposed first and it is
+    wrong: it would newly redact a safe public diagnostic that a committed
+    golden pins, and the current production scrub returns this line byte for
+    byte.
+    """
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | _BENIGN_PLACEHOLDER_VOCABULARY)
+    assert K.scrub_line(line, ctx) == line, K.scrub_line(line, ctx)
+    assert not K.validate_export([line], roots=ctx.roots), line
+
+
+def test_a_token_value_of_an_undeclared_placeholder_name_is_a_violation():
+    """#821, the validator's enumeration, at the shape the leg used to admit.
+
+    `token=<secret-payload>` is placeholder-shaped, lowercase-named and
+    complete, so no shape rule separates it from the kernel's own output. The
+    only thing that does is the NAME, which is why the validator owns a frozen
+    enumeration of the transformer's static placeholder names beside itself.
+    """
+    reasons = [v["reason"] for v in K.validate_export(["token=<secret-payload>"])]
+    assert reasons == ["token-credential"], reasons
+
+
+def test_the_validator_enumerates_the_transformers_static_placeholders():
+    """#821. The frozen enumeration, owned beside the validator."""
+    assert K.TOKEN_VALUE_PLACEHOLDER_NAMES == frozenset({
+        "b64", "credential", "credential-url", "email", "hex", "path", "uuid",
+    }), sorted(K.TOKEN_VALUE_PLACEHOLDER_NAMES)
+
+
+def test_the_validator_placeholder_inventory_matches_the_transformer():
+    """#821. The drift test, derived from the kernel rather than transcribed.
+
+    THREE LEGS, none of them a hard-coded list. The replacement literals of the
+    live `_TYPED_PATTERNS`, which supplies six names; every `<name>`-shaped
+    string CONSTANT in the kernel's source, walked with `ast`, which is what
+    supplies `<path>` — written inline in `_substitute_paths` and in no table;
+    and nothing else.
+
+    THE SUBSET IS THE ONE REACHABLE IN A TOKEN VALUE POSITION, stated that way
+    because the AST leg's `fullmatch` deliberately cannot see the `[<param>]`
+    literal the node normalizer writes. `<param>` is reachable only inside a
+    pytest node identifier and never in a token value, so excluding it is a
+    scoping decision rather than an oversight, and this case asserts that the
+    exclusion is the only difference.
+
+    AN UNRESTRICTED SUBSTRING SCAN IS FORBIDDEN, and measured: the kernel's
+    source carries more than forty `<…>`-shaped substrings — `<indent>`,
+    `<rest>`, `<cls>`, `<msg>` and the rest of the regex named groups, plus the
+    literals quoted in its own commentary — none of which is a placeholder.
+
+    EXACT EQUALITY, not containment, and the justification is narrower than an
+    earlier draft claimed. `token-credential` is not the only per-line reason;
+    `PER_LINE_VIOLATION_REASONS` holds five, and a false positive here replaces
+    its own line rather than destroying the export. What exact equality buys is
+    that the two surfaces cannot drift: a transformer placeholder missing from
+    the validator's list makes the validator refuse the kernel's own output one
+    line at a time, and a validator name the transformer never writes admits a
+    span nobody vouches for.
+    """
+    typed = {replacement for _pattern, replacement in K._TYPED_PATTERNS}
+    literals = _kernel_placeholder_literals()
+    # Non-vacuity per leg, because a derivation that silently stopped finding
+    # names would leave this case green and empty.
+    assert len(typed) >= 6, typed
+    assert "<path>" in literals, literals
+    derived = {name[1:-1] for name in typed | literals}
+    declared = set(K.TOKEN_VALUE_PLACEHOLDER_NAMES)
+    added = sorted(derived - declared)
+    missing = sorted(declared - derived)
+    assert not added and not missing, (
+        "the transformer's placeholder inventory and the validator's "
+        "enumeration have drifted. The transformer now writes %r that the "
+        "validator does not admit, and the validator admits %r that the "
+        "transformer never writes." % (added, missing)
+    )
+    # `param` is the one placeholder the kernel writes that this subset
+    # excludes, and the exclusion is asserted so it cannot become an accident.
+    assert "param" not in declared
+    assert "[<param>]" in (REPO / "bin" / "_lib_test_evidence.py").read_text(
+        encoding="utf-8")
+
+
+def test_passing_the_production_roots_admits_their_generated_placeholders():
+    """#821. Root placeholders are not hard-coded; they come from the caller.
+
+    The kernel cannot report the root names itself, because the caller supplies
+    them. `bin/cctally-test-all` is that caller, and the names are read out of
+    its embedded evidence driver rather than transcribed. Each one must be
+    admitted in a token value when its own `roots` mapping is passed, and
+    refused when it is not, or the enumeration would be a second hard-coded
+    list wearing the caller's name.
+    """
+    names = _production_root_names()
+    assert len(names) >= 6, names
+    roots = {name: f"/opt/{name}" for name in names}
+    for name in names:
+        line = f"token=<{name}>"
+        assert not K.validate_export([line], roots=roots), line
+        reasons = [v["reason"] for v in K.validate_export([line])]
+        assert reasons == ["token-credential"], (line, reasons)
+
+
+# ------------------------------------ #820: the prefixed credential spellings
+#
+# `_` IS A WORD CHARACTER, which is the whole mechanism. `\btoken\b` never
+# matches between a prefix and `token`, and the
+# `\b(?:bearer|api[_-]?key|authorization)\b` alternation above fails at the
+# boundary AFTER `bearer` for the same reason. Four spellings therefore matched
+# neither surface: `access_token`, `refresh_token`, `id_token` and
+# `bearer_token`.
+#
+# THE ENUMERATION IS CLOSED AND DELIBERATELY SHORT. `api_token`, `csrf_token`
+# and any general `\w+_token` form stay out, and the five spellings stay in the
+# dedicated required-separator entry rather than moving into the
+# optional-separator three-word alternation. Either widening recreates the
+# over-redaction #812 exists to remove.
+#
+# `id_token` IS A REAL CREDENTIAL IN THIS REPOSITORY rather than incidental
+# vocabulary. `bin/build-bench-fixtures.py` writes the official Codex
+# `auth.json` shape as `{"id_token": token, "access_token": "a",
+# "refresh_token": "r"}`, `bin/_lib_accounts.py` decodes it to obtain the
+# account email, and `bin/_lib_codex_hooks.py` reads it from the live
+# `auth.json`. Covering two names from one JSON object and not the third would
+# be an arbitrary boundary on a privacy surface.
+PREFIXED_TOKEN_WORDS = (
+    "access_token", "refresh_token", "id_token", "bearer_token",
+)
+TOKEN_CREDENTIAL_WORDS = ("token",) + PREFIXED_TOKEN_WORDS
+
+#: The transformer's dedicated token entry, as the kernel spells it. Restated
+#: here rather than read from `K._TYPED_PATTERNS`, because a case that read the
+#: live tuple would agree with whatever pattern the kernel carried, including
+#: one that had lost a spelling. Three consumers share it: the anchoring
+#: assertion, the transformer-regression mutation, and the canary's
+#: single-claimant case. A fourth consumer lives outside this module —
+#: `tests/test_test_all_observability.py` mangles the kernel FILE by deleting
+#: this entry's source LINE, so that declaration has to move with this one.
+TRANSFORMER_TOKEN_ENTRY_PATTERN = (
+    r"(?i)\b(?:token|(?:access|refresh|id|bearer)_token)\b\s*[:=]\s*\S+"
+)
+
+# Twenty DIGITS, so the value carries no alphabetic word for the ordinary-word
+# check to refuse and no other denylist leg to claim: `long-hex` needs 32, and a
+# shorter hex value would be refused for its letters rather than by the token
+# leg. The same carrier the #812 mutation case uses, for the same reason.
+_TOKEN_SECRET = "90210904812340981234"
+
+# The words each prefixed spelling decomposes into under `_WORD_RUN_RE`, which
+# excludes `_`. Registered in the affected cases' CONTEXT ONLY: the stand-in
+# `KNOWN_TOKENS` vouches for none of them, so without these the ordinary-word
+# check refuses the line for an unrelated reason and the case would assert
+# nothing about the credential rule.
+_PREFIX_VOCABULARY = frozenset({
+    "token", "access", "refresh", "id", "bearer", "api", "csrf", "shape",
+    "my", "xid", "status",
+})
+
+
+def _token_credential_lines(word: str) -> tuple:
+    """One spelling, in every separator and casing the grammar must reach."""
+    return (
+        f"{word}={_TOKEN_SECRET}",
+        f"{word}: {_TOKEN_SECRET}",
+        f"{word} = {_TOKEN_SECRET}",
+        f"{word} :{_TOKEN_SECRET}",
+        f"{word.upper()}={_TOKEN_SECRET}",
+        f"{word.title()}: {_TOKEN_SECRET}",
+    )
+
+
+PREFIXED_TOKEN_CREDENTIALS = tuple(
+    line
+    for word in PREFIXED_TOKEN_WORDS
+    for line in _token_credential_lines(word)
+)
+
+# The uppercase placeholder-shaped tail, for every spelling. `<SECRET-…>` is a
+# name this kernel cannot write, so the leg's scoped case flag refuses it —
+# and it must refuse it behind a prefixed spelling exactly as it does behind
+# the bare word.
+UPPERCASE_HOSTILE_TAILS = tuple(
+    f"{word}=<SECRET-{_TOKEN_SECRET}>" for word in TOKEN_CREDENTIAL_WORDS
+)
+
+# THE NEGATIVE CONTROLS, which are what bound the enumeration. Each of these
+# carries `token` behind an underscore that the enumeration does not name, so
+# neither surface may claim it. `my_access_token` and `xid_token` are the two
+# that matter most: they show the grammar is anchored on a word boundary before
+# the PREFIX and is not a suffix search.
+NON_ENUMERATED_TOKEN_WORDS = (
+    "api_token", "csrf_token", "shape_token", "my_access_token", "xid_token",
+)
+
+
+#: The word set both surfaces spell, located inside either pattern. `\b` is two
+#: characters in the pattern STRING, which is what this reads.
+_WORD_SET_RE = re.compile(r"\\b\(\?:(?P<words>.*)\)\\b")
+
+
+def _token_word_set(pattern: str) -> str:
+    found = _WORD_SET_RE.search(pattern)
+    assert found, "no `\\b(?:…)\\b` word set in %r" % pattern
+    return found.group("words")
+
+
+def test_both_surfaces_spell_the_same_token_word_set():
+    """#820. The stated shared-grammar exception, enforced rather than
+    remembered.
+
+    `bin/_lib_test_evidence.py` keeps its transformer and its validator
+    deliberately disjoint, with ONE recorded exception: `token-credential`'s
+    word and separator are the transformer's own, because a validator whose
+    scope is narrower than the transformer's misses regressions the transformer
+    would publish and one that is broader refuses exports the transformer
+    legitimately published. Until #820 that exception was carried by two
+    comments and by nothing that could fail, and #821 raised the count of
+    spellings from two to four.
+
+    IT IS THE DEFECT CLASS #820 ITSELF IS. `_` is a word character, so the two
+    surfaces agreed on `\btoken\b` and both missed `access_token` — and either
+    one could have been widened alone, in which case the other would have gone
+    on missing it with no case anywhere able to see the difference. Comparing
+    the two word sets directly is what makes that impossible.
+
+    NON-VACUITY IS ASSERTED SEPARATELY, because two patterns that had both lost
+    the alternation would still be equal to each other.
+    """
+    spellings = {
+        "transformer entry": TRANSFORMER_TOKEN_ENTRY_PATTERN,
+        "transformer value prefix": K._TOKEN_VALUE_PREFIX_RE.pattern,
+        "validator leg": dict(K._FORBIDDEN)["token-credential"].pattern,
+        "validator name prefix": K._TOKEN_VALUE_NAME_PREFIX_RE.pattern,
+    }
+    # FOUR SPELLINGS, not two. #821 added a value-position scanner to each
+    # surface, and neither can be composed out of the pattern beside it: the
+    # transformer's entry consumes the whole value and so cannot report where
+    # the value begins, and the validator's leg ends in its own value class.
+    # Four copies of one word set is exactly the shape a drift test exists for.
+    sets = {name: _token_word_set(pattern)
+            for name, pattern in spellings.items()}
+    assert len(set(sets.values())) == 1, sets
+    transformer = sets["transformer entry"]
+    for word in PREFIXED_TOKEN_WORDS:
+        prefix = word[: -len("_token")]
+        assert prefix in transformer, (word, transformer)
+    assert "token|" in transformer, transformer
+    # And the live transformer really carries the pattern this constant states,
+    # so the comparison is against the shipped tuple and not only against a
+    # literal typed in this module.
+    assert TRANSFORMER_TOKEN_ENTRY_PATTERN in [
+        pattern.pattern for pattern, _replacement in K._TYPED_PATTERNS
+    ]
+
+
+@pytest.mark.parametrize("line", PREFIXED_TOKEN_CREDENTIALS)
+def test_a_prefixed_token_credential_is_reduced_to_the_placeholder(line):
+    """#820. The transformer half, at the typed-substitution seam.
+
+    The whole line is one credential assignment, so the reduction consumes it
+    and reports one decided span over the placeholder. Asserting the span as
+    well as the text is what distinguishes a substitution from a line the
+    reduction merely left alone and some later rule redacted.
+    """
+    reduced, spans = K._reduce(line, _ctx())
+    assert reduced == "<credential>", (line, reduced)
+    assert spans == ((0, len("<credential>")),), (line, spans)
+
+
+@pytest.mark.parametrize("line", PREFIXED_TOKEN_CREDENTIALS)
+def test_the_validator_refuses_a_prefixed_token_credential(line):
+    """#820. The validator half, on its own terms and with no other leg."""
+    reasons = [v["reason"] for v in K.validate_export([line])]
+    assert reasons == ["token-credential"], (line, reasons)
+
+
+@pytest.mark.parametrize("line", UPPERCASE_HOSTILE_TAILS)
+def test_an_uppercase_placeholder_tail_is_refused_behind_every_spelling(line):
+    """#820. The scoped case flag, exercised for all five spellings.
+
+    A leading `(?i)` applies to the whole pattern, including the run and the
+    lookahead, so it would read `<SECRET-…>` as a complete placeholder, consume
+    it and admit the line. The kernel writes placeholder names in lowercase
+    only, so refusing this costs nothing — and the refusal has to hold behind a
+    prefixed spelling as much as behind the bare word.
+    """
+    reasons = [v["reason"] for v in K.validate_export([line])]
+    assert reasons == ["token-credential"], (line, reasons)
+
+
+@pytest.mark.parametrize("word", NON_ENUMERATED_TOKEN_WORDS)
+def test_a_non_enumerated_token_prefix_is_not_a_credential(word):
+    """#820 negative control. The enumeration is closed in both surfaces."""
+    line = f"{word}={_TOKEN_SECRET}"
+    reduced, spans = K._reduce(line, _ctx())
+    assert reduced == line, (line, reduced)
+    assert spans == (), (line, spans)
+    assert not K.validate_export([line]), line
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | _PREFIX_VOCABULARY)
+    assert K.scrub_line(line, ctx) == line, line
+
+
+@pytest.mark.parametrize(
+    "line",
+    tuple(f"{word} status" for word in PREFIXED_TOKEN_WORDS)
+    + tuple(f"{word}=" for word in PREFIXED_TOKEN_WORDS),
+)
+def test_a_prefixed_spelling_without_a_value_is_still_published(line):
+    """#820 negative control. The separator and a non-empty value stay
+    required, so the residual class #812 accepted is unchanged for the four new
+    spellings as well as for the bare word."""
+    reduced, spans = K._reduce(line, _ctx())
+    assert reduced == line, (line, reduced)
+    assert spans == (), (line, spans)
+    assert not K.validate_export([line]), line
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | _PREFIX_VOCABULARY)
+    assert K.scrub_line(line, ctx) == line, line
+
+
+# The transformer's OWN placeholder language, reached through `_reduce` rather
+# than written by hand. `_reduce` substitutes roots first and then runs the
+# typed patterns in order, so an email, a UUID and a root-prefixed path are all
+# consumed and marked decided before the token entry runs; the residual `token=`
+# then matches no transformer pattern at all, and the published line carries a
+# placeholder where its value was.
+TOKEN_CARRIED_PLACEHOLDERS = (
+    "token=user@example.com",
+    "token: 123e4567-e89b-12d3-a456-426614174000",
+    "token=/repo/bin/cctally-test-all",
+)
+
+
+@pytest.mark.parametrize("line", TOKEN_CARRIED_PLACEHOLDERS)
+def test_the_validator_admits_the_placeholder_the_transformer_writes(line):
+    """#812. The validator must not refuse the kernel's own output.
+
+    The leg's value class shipped as `[^\\s]`, which matches `<`, so every one
+    of these lines was refused on the strength of the placeholder the kernel
+    itself had just written. `token-credential` is a CONTENT leg, so that
+    refusal was wholesale — see the sibling case below.
+    """
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | {"token"})
+    published = K.scrub_line(line, ctx)
+    assert published.startswith("token"), published
+    assert "<" in published, published
+    assert not K.validate_export([published], roots=ctx.roots), published
+
+
+# The leg spells the transformer's placeholder GRAMMAR twice — once in its
+# leading run, `(?:<[a-z][a-z0-9-]*>|\s)*`, and once in its lookahead — so every
+# name the transformer can write has to satisfy both. The three examples above
+# are examples; this is the inventory, and it is DERIVED so that a name added
+# later is covered without anybody remembering to add a row. The production
+# vocabulary vouches for `a`, `secret`, `repo` and `email`, measured against
+# `build_known_tokens` over this repository, which is what makes the leak rows
+# further down reachable on a real run rather than only under a fixture context.
+_PLACEHOLDER_LITERAL_RE = re.compile(r"<[a-z][a-z0-9-]*>")
+# `bin/cctally-test-all` is a Bash script that embeds its evidence driver as a
+# single-quoted `EVPY` heredoc, so the production root names are read out of that
+# heredoc's Python rather than out of the shell.
+_EVPY_HEREDOC_RE = re.compile(r"<<'EVPY'\n(?P<body>.*?)\nEVPY\n", re.S)
+
+
+def _production_root_names():
+    """The `roots` keys `bin/cctally-test-all` injects, read from its source."""
+    text = (REPO / "bin" / "cctally-test-all").read_text(encoding="utf-8")
+    heredoc = _EVPY_HEREDOC_RE.search(text)
+    assert heredoc, "bin/cctally-test-all no longer embeds an EVPY heredoc"
+    for node in ast.walk(ast.parse(heredoc.group("body"))):
+        if isinstance(node, ast.FunctionDef) and node.name == "_roots":
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Dict):
+                    return [
+                        key.value for key in sub.keys
+                        if isinstance(key, ast.Constant)
+                        and isinstance(key.value, str)
+                    ]
+    raise AssertionError("bin/cctally-test-all no longer defines _roots()")
+
+
+def _kernel_placeholder_literals():
+    """Every `<name>`-shaped string constant in the kernel's own source."""
+    source = (REPO / "bin" / "_lib_test_evidence.py").read_text(encoding="utf-8")
+    return {
+        node.value for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        and _PLACEHOLDER_LITERAL_RE.fullmatch(node.value)
+    }
+
+
+def test_the_leg_admits_every_placeholder_name_the_kernel_can_write():
+    """#821. The coupling between the leg's run and the transformer's placeholder
+    grammar, asserted over the INVENTORY rather than over three examples.
+
+    WHY THIS IS NOT COVERED BY THE THREE EXAMPLES ABOVE. The leg spells the
+    grammar twice, as `<[a-z][a-z0-9-]*>` in the leading run and again in the
+    lookahead: a lowercase letter, then lowercase letters, digits and hyphens.
+    Every name the kernel writes today satisfies both, so the coupling is LATENT
+    and no behavioural case can see it. A name carrying any other character — a
+    `<repo_root>` adopted later — satisfies neither, and the leg then finds a raw
+    `<` where the placeholder was and begins refusing legitimate published output
+    one line at a time. The negative control at the end measures exactly that, so
+    this case states the hazard rather than describing it.
+
+    THE TWO HALVES FAIL IN OPPOSITE DIRECTIONS, so both are asserted against the
+    same inventory. Measured on the shipped kernel: narrowing the LOOKAHEAD alone
+    to `[a-z][a-z0-9]*` refuses `token=<credential-url>`, which is a false
+    positive against the kernel's own output. Narrowing the RUN alone to the same
+    class admits `token=<credential-url>` and also admits
+    `token=<credential-url>90210904812340981234`, which is a DISCLOSURE — the run
+    can no longer step over the placeholder to reach the raw tail behind it. So
+    the first loop below asserts every inventory placeholder is admitted alone,
+    which bounds the lookahead, and the second asserts a raw secret attached to
+    each one is refused, which bounds the run.
+
+    HOW THE INVENTORY IS DERIVED, in three legs, none of them a hard-coded list:
+    the replacement literals of `K._TYPED_PATTERNS`, read from the live tuple;
+    every `<name>`-shaped string constant in the kernel's source, walked with
+    `ast`, which is what supplies `<path>` — written inline in
+    `_substitute_paths` and in no table; and the `roots` keys
+    `bin/cctally-test-all` injects into the production `ScrubContext`, walked out
+    of its `EVPY` heredoc, which is what supplies `<private-tmp>`,
+    `<runner-temp>` and `<tmpdir>`. The kernel cannot report the root names
+    itself, because the caller supplies them.
+
+    EACH LEG IS GUARDED AGAINST CONTRIBUTING NOTHING, because a derivation that
+    silently stops finding names would leave this case green and empty. The leg
+    is asserted directly as well as through `validate_export`, so a name admitted
+    only because some other leg happened not to fire is not counted as passing.
+    """
+    typed = {replacement for _pattern, replacement in K._TYPED_PATTERNS}
+    literals = _kernel_placeholder_literals()
+    roots = _production_root_names()
+    assert len(typed) >= 6, typed
+    assert "<path>" in literals, literals
+    assert len(roots) >= 6, roots
+    inventory = sorted(typed | literals | {"<%s>" % name for name in roots})
+    assert len(inventory) >= 13, inventory
+
+    leg = dict(K._FORBIDDEN)["token-credential"]
+    # #821 made the VALIDATOR'S verdict depend on the placeholder's NAME as well
+    # as its shape, and a root name is the caller's to state, so the caller's own
+    # mapping is supplied here exactly as `bin/cctally-test-all` supplies it.
+    # The leg-level assertion below is unchanged and still shape-only.
+    supplied_roots = {name: f"/opt/{name}" for name in roots}
+    for placeholder in inventory:
+        assert _PLACEHOLDER_LITERAL_RE.fullmatch(placeholder), (
+            "the kernel can write a placeholder the leg cannot spell, so the leg "
+            "will refuse the transformer's own output: %r" % placeholder
+        )
+        for template in ("token=%s", "token: %s", "token =%s"):
+            line = template % placeholder
+            assert not leg.search(line), (
+                "the token leg refuses a placeholder this kernel writes: %r"
+                % line
+            )
+            assert not K.validate_export([line], roots=supplied_roots), line
+        # The run must be able to step OVER the placeholder to reach a raw tail
+        # behind it, or a secret attached to the kernel's own substitution is
+        # admitted. The digits are twenty, which no other denylist leg matches.
+        leak = "token=%s90210904812340981234" % placeholder
+        reasons = [v["reason"] for v in K.validate_export([leak])]
+        assert reasons == ["token-credential"], (leak, reasons)
+
+    # The negative control, which is what makes the loop above mean something: a
+    # name outside the leg's character class IS refused when it stands alone, so
+    # the drift this case exists to catch is real and reachable.
+    assert leg.search("token=<repo_root>"), (
+        "the leg accepts a name with an underscore, so this case would not "
+        "notice the transformer adopting one"
+    )
+
+
+def test_one_admitted_placeholder_line_does_not_refuse_the_whole_export():
+    """#812. What the leg's false positive actually cost.
+
+    When the false positive shipped, `token-credential` was not in
+    `PER_LINE_VIOLATION_REASONS`, so a violation on one benign line did not
+    degrade to that line: it refused the entire export and the operator got no
+    failure extract at all for the run. That is why this case pins the
+    whole-export outcome rather than the single line's, and the whole-export
+    outcome is what the value class fixed.
+
+    #769 S7 filed the reason in that set, so the same false positive would now
+    cost one replaced line instead of the file. The value class is still the
+    fix, because a benign line this validator refuses is a benign line the
+    operator does not get either way, and the outcome asserted below — the leg
+    admitting the line outright, with nothing replaced — is the stronger of the
+    two.
+    """
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | {"token"})
+    corpus = [
+        "FAIL: <path> golden diverged",
+        K.scrub_line("token=user@example.com", ctx),
+        "1 failed, 100 passed in 45.67s",
+    ]
+    assert corpus[1] == "token=<email>", corpus[1]
+    violations = K.validate_export(corpus, roots=ctx.roots)
+    lines, record = K.apply_validation_redactions(
+        corpus, violations, roots=ctx.roots)
+    assert not violations, violations
+    assert record["refused"] is False, record
+    assert record["refusal"] is None, record
+    assert lines == corpus
+
+
+# The four shapes a bare `[^\s<]` value class admitted, with the transformer
+# behaving exactly as shipped. `_reduce` substitutes the roots and then runs the
+# typed patterns in order, so a value whose HEAD is a root, an email or a UUID is
+# consumed and marked decided; the token entry then finds no value after `token=`
+# and does not match; and the raw tail survives to the export. A pure-digit tail
+# carries no alphabetic word, so the ordinary-word check has nothing to refuse
+# and the line publishes. Nothing regressed in either surface to reach any of
+# them, which is why the refusal has to come from the validator's own leg.
+TOKEN_SECRET_BEHIND_A_PLACEHOLDER = (
+    ("token=/repo90210904812340981234", "token=<repo>90210904812340981234"),
+    ("token=user@example.com90210904812340981234",
+     "token=<email>90210904812340981234"),
+    ("token=123e4567-e89b-12d3-a456-426614174000-90210904812340981234",
+     "token=<uuid>-90210904812340981234"),
+    ("token=/Users/testuser90210904812340981234",
+     "token=<home>90210904812340981234"),
+)
+
+
+@pytest.mark.parametrize("raw,published", TOKEN_SECRET_BEHIND_A_PLACEHOLDER)
+def test_a_secret_behind_a_placeholder_head_is_refused(raw, published):
+    """#812. A raw secret sitting behind the transformer's own placeholder.
+
+    The value class may admit a run of COMPLETE placeholders, because that run
+    is what the transformer legitimately writes. It may not admit raw bytes
+    AFTER the run, and these four rows are why: each one publishes a
+    twenty-digit secret in full, and a value class that stopped at the first
+    `<` admitted every one of them.
+
+    Both halves are asserted, because the case is only about the validator if
+    the transformer really published the secret first.
+
+    #769 S7 filed `token-credential` in `PER_LINE_VIOLATION_REASONS`, so the
+    refusal now costs this line rather than the whole export. The redaction
+    outcome is asserted as a third half: a leg refusing a line is not the same
+    event as a file being withheld, and what the operator needs from these four
+    rows is that the twenty digits are replaced while the rest of the extract
+    still publishes.
+    """
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | {"token"})
+    assert K.scrub_line(raw, ctx) == published
+    assert "90210904812340981234" in published, published
+    violations = K.validate_export([published], roots=ctx.roots)
+    reasons = [v["reason"] for v in violations]
+    assert reasons == ["token-credential"], reasons
+    lines, record = K.apply_validation_redactions(
+        [published], violations, roots=ctx.roots)
+    assert record["refused"] is False, record
+    assert lines == [
+        "[REDACTED: line refused by the validator: token-credential]"
+    ], lines
+    assert "90210904812340981234" not in record["notice"], record["notice"]
+
+
+# The same leak class with WHITESPACE between the consumed head and the raw tail.
+# The mechanism is the one the four rows above use, and the byte that separates
+# the placeholder from the secret is the only difference: a space or a tab rather
+# than a digit or a punctuation mark. A run that could absorb only complete
+# placeholders stopped at that byte, the value class was never reached, and the
+# published line carried the twenty digits past this validator. The run absorbs
+# whitespace as well now, so the value class is reached across it.
+#
+# The tab row is built with an escape rather than a literal so the separator is
+# visible in the source.
+TOKEN_SECRET_BEHIND_WHITESPACE = (
+    ("token=/repo 90210904812340981234", "token=<repo> 90210904812340981234"),
+    ("token=/repo\t90210904812340981234", "token=<repo>\t90210904812340981234"),
+    ("token=user@example.com 90210904812340981234",
+     "token=<email> 90210904812340981234"),
+    ("token=123e4567-e89b-12d3-a456-426614174000 90210904812340981234",
+     "token=<uuid> 90210904812340981234"),
+    ("token=/Users/testuser 90210904812340981234",
+     "token=<home> 90210904812340981234"),
+)
+
+
+@pytest.mark.parametrize("raw,published", TOKEN_SECRET_BEHIND_WHITESPACE)
+def test_a_secret_behind_a_placeholder_and_whitespace_is_refused(raw, published):
+    """#821. A raw secret one whitespace byte behind the kernel's own placeholder.
+
+    #769 S7 recorded this shape as an admitted hole in the PUBLISHED OUTPUT
+    rather than only in this backstop, and left it open. It is closed here by
+    letting the value class's leading run absorb whitespace as well as complete
+    placeholders, so the raw byte after the whitespace is reached.
+
+    Both halves are asserted, because the case is only about the validator if the
+    transformer really published the secret first: the transformer's substitution
+    consumes `/repo`, `user@example.com`, the UUID or the home root, its token
+    entry then finds no value after `token=`, and a pure-digit tail carries no
+    alphabetic word for the ordinary-word check to refuse. Nothing is regressed
+    in either surface to reach any of these five.
+
+    The redaction outcome is asserted as a third half for the reason the sibling
+    case above gives: what the operator needs is that the twenty digits are
+    replaced while the rest of the extract still publishes.
+
+    MUTATION EVIDENCE. Removing the `|\\s` branch from the leg's leading run
+    reds all five rows: the validator admits every published line and the twenty
+    digits survive into the export.
+    """
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | {"token"})
+    assert K.scrub_line(raw, ctx) == published
+    assert "90210904812340981234" in published, published
+    violations = K.validate_export([published], roots=ctx.roots)
+    reasons = [v["reason"] for v in violations]
+    assert reasons == ["token-credential"], reasons
+    lines, record = K.apply_validation_redactions(
+        [published], violations, roots=ctx.roots)
+    assert record["refused"] is False, record
+    assert lines == [
+        "[REDACTED: line refused by the validator: token-credential]"
+    ], lines
+    assert "90210904812340981234" not in record["notice"], record["notice"]
+
+
+def test_the_validator_separator_scope_equals_the_transformers():
+    """#812. The two surfaces must accept the same separators.
+
+    A validator whose separator scope is narrower than the transformer's misses
+    a regression the transformer would publish, and a broader one refuses
+    exports the transformer legitimately published, so the scopes are equal on
+    purpose. The leg spelled its whitespace class `[ \\t]` while the transformer
+    used `\\s`, and a non-breaking space fell through the gap: the
+    transformer matched this line, no other leg here caught it, and the
+    validator admitted it. The separator is built with `chr` so this file
+    stays ASCII.
+    """
+    nbsp = chr(0xA0)
+    line = "token%s=%sSECRETVALUE" % (nbsp, nbsp)
+    reduced, _spans = K._reduce(line, _ctx())
+    assert reduced == "<credential>", reduced
+    reasons = [v["reason"] for v in K.validate_export([line])]
+    assert reasons == ["token-credential"], reasons
+
+
+# The `<`-attach form of the same leak class: the byte between the consumed head
+# and the raw tail is a `<` that opens no complete placeholder. b8402d5d7 recorded
+# this shape as an admitted hole in the PUBLISHED output and left it open, because
+# a run that could absorb only complete placeholders and whitespace stopped at
+# that `<` and the value class `[^\s<]` could not match a `<` either. The value
+# class is now "a byte that is not whitespace and does not open a complete
+# placeholder", so the run stops at the `<` and the value class matches it.
+TOKEN_SECRET_BEHIND_A_BRACKET = (
+    ("token=/repo<90210904812340981234", "token=<repo><90210904812340981234"),
+    ("token=user@example.com<90210904812340981234",
+     "token=<email><90210904812340981234"),
+    ("token=123e4567-e89b-12d3-a456-426614174000<90210904812340981234",
+     "token=<uuid><90210904812340981234"),
+    ("token=/Users/testuser<90210904812340981234",
+     "token=<home><90210904812340981234"),
+)
+
+
+@pytest.mark.parametrize("raw,published", TOKEN_SECRET_BEHIND_A_BRACKET)
+def test_a_secret_behind_a_placeholder_and_a_bracket_is_refused(raw, published):
+    """#821. A raw secret one `<` behind the kernel's own placeholder.
+
+    b8402d5d7 measured this shape, recorded it in source as an open disclosure
+    and closed only the whitespace-attach sibling. It is closed here by the value
+    class, which now refuses a `<` that opens no complete placeholder while still
+    admitting one that does.
+
+    Both halves are asserted, because the case is only about the validator if the
+    transformer really published the secret first: the transformer's substitution
+    consumes `/repo`, `user@example.com`, the UUID or the home root, its token
+    entry then finds no value after `token=`, and a pure-digit tail carries no
+    alphabetic word for the ordinary-word check to refuse. Nothing is regressed
+    in either surface to reach any of these four.
+
+    The redaction outcome is asserted as a third half for the reason the two
+    sibling cases above give: what the operator needs is that the twenty digits
+    are replaced while the rest of the extract still publishes.
+
+    MUTATION EVIDENCE. Reverting the value class from
+    `(?!<[a-z][a-z0-9-]*>)[^\\s]` to `[^\\s<]` reds all four rows: the validator
+    admits every published line and the twenty digits survive into the export.
+    """
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | {"token"})
+    assert K.scrub_line(raw, ctx) == published
+    assert "90210904812340981234" in published, published
+    violations = K.validate_export([published], roots=ctx.roots)
+    reasons = [v["reason"] for v in violations]
+    assert reasons == ["token-credential"], reasons
+    lines, record = K.apply_validation_redactions(
+        [published], violations, roots=ctx.roots)
+    assert record["refused"] is False, record
+    assert lines == [
+        "[REDACTED: line refused by the validator: token-credential]"
+    ], lines
+    assert "90210904812340981234" not in record["notice"], record["notice"]
+
+
+# THE SINGLE CLASS THIS LEG ADMITS: a value made only of complete
+# placeholder-shaped spans and whitespace, the empty value included. These are
+# what the transformer legitimately writes when a substitution consumed the whole
+# value, so refusing them would refuse the kernel's own output. Their reduced
+# forms differ from one another — `token=<repo> <path>` reduces to
+# `<credential> <path>` and `token=<a> <b>` to a whole-line redaction — so only
+# the validator's verdict is asserted for the group, which is the property under
+# test.
+ADMITTED_PLACEHOLDER_AND_WHITESPACE_VALUES = (
+    "token=",
+    "token:",
+    "token: ",
+    "token=  ",
+    "token=<email>",
+    "token: <uuid>",
+    "token=<repo><path>",
+    "token=<repo> <path>",
+    "token=<uuid> ",
+)
+
+#: The two members of the tuple above whose placeholder names are ROOT names
+#: rather than static ones. They are admitted only when the caller's own `roots`
+#: mapping is passed, because #821 compares the exact rendered literal and the
+#: kernel cannot report a name its caller supplies.
+_ROOT_NAMED_ADMITTED_VALUES = frozenset({
+    "token=<repo><path>",
+    "token=<repo> <path>",
+})
+
+# The nearest refused shapes, kept beside the admitted class because the class is
+# only bounded if its boundary is asserted too. The first four present a complete
+# run — placeholders and whitespace — and then a raw byte, which is the shape the
+# value class exists to refuse. The last seven were ADMITTED until the
+# value class stopped requiring a byte outside `[\s<]`: each one presents a `<`
+# that opens no complete placeholder, and `token=<90210904812340981234` is the
+# published half of `TOKEN_SECRET_BEHIND_A_BRACKET` with its head already
+# consumed.
+REFUSED_BRACKET_VALUES = (
+    "token=<repo>90210904812340981234",
+    "token=<a>x",
+    "token=<repo> 90210904812340981234",
+    "token=<uuid> .",
+    "token=<90210904812340981234",
+    "token=<secretpayload",
+    "token=<SECRET",
+    "token=<Ab9!x",
+    "token=<>",
+    "token=<1abc>",
+    "token=<a><b",
+)
+
+# THE AXIS THE CASE FLAG DECIDES, and the reason the whole suite used to pass
+# under both spellings of it. `REFUSED_BRACKET_VALUES` above carries
+# `token=<SECRET` without a closing bracket, which every form of the leg has
+# refused; the boundary that a leading `(?i)` moved is the TERMINATED form. With
+# the flag applied to the whole pattern, `<[a-z][a-z0-9-]*>` matched
+# case-insensitively, so the leg treated each of these as a complete placeholder,
+# consumed it in the leading run, found no byte after it and admitted the line.
+# This kernel writes placeholder names in lowercase only — see
+# `test_the_leg_admits_every_placeholder_name_the_kernel_can_write` — so none of
+# these is output the transformer can produce, and refusing them costs nothing.
+#
+# MUTATION EVIDENCE. Respelling the leg's `(?i:\btoken\b)` as a leading `(?i)`
+# admits all eight and reds
+# `test_the_admitted_residual_is_a_value_of_placeholders_and_whitespace_only`.
+REFUSED_UPPERCASE_PLACEHOLDER_VALUES = (
+    "token=<A>",
+    "token=<SECRET>",
+    "token=<Email>",
+    "token=<UUID>",
+    "token=<Tmp>",
+    "token=<Secret-payload>",
+    "token=<repo><SECRET>",
+    "token=<repo> <Email>",
+)
+
+# THE RESIDUAL THAT REACHES THE PUBLISHED OUTPUT, and the reason issue #821 is a
+# disclosure rather than only a gap in this backstop. A secret that is itself
+# shaped like a placeholder falls inside the admitted class, so the leg cannot
+# refuse it without enumerating the transformer's placeholder NAMES. It is
+# reachable with the production vocabulary and with nothing regressed in either
+# surface: the head is consumed, the token entry finds no value after `token=`,
+# and the tail's only alphabetic word is one the repository vouches for, so the
+# ordinary-word check publishes the line. Measured admitted by every form of this
+# leg — 135384cd3's, b8402d5d7's and this one — so this edit neither opens nor
+# closes it.
+PREVIOUSLY_DISCLOSED_PLACEHOLDER_SHAPED_SECRET = (
+    ("token=/repo<a90210904812340981234>",
+     "token=<repo><a90210904812340981234>"),
+    ("token=/repo<secret-90210904812340981234>",
+     "token=<repo><secret-90210904812340981234>"),
+    ("token=/repo <a90210904812340981234>",
+     "token=<repo> <a90210904812340981234>"),
+)
+
+# THE UPPERCASE HALF OF THAT DISCLOSURE, which a leading `(?i)` admitted and the
+# scoped `(?i:\btoken\b)` refuses. These are the same mechanism as the rows above
+# — a substitution consumes the value's head, the token entry then finds no value
+# after `token=`, and the tail's alphabetic word is one the repository vouches for
+# — with an uppercase letter in the tail's name. The four heads are the four
+# substitution sources `_reduce` runs before the token entry: a root prefix, an
+# email, a UUID and the home root. The name casings are all-caps, initial-caps and
+# a single capital, so no one spelling carries the case.
+#
+# BOTH HALVES ARE ASSERTED because neither proves the other: the published text
+# proves the secret actually reaches the output with nothing regressed in either
+# surface, and the validator's verdict proves this leg is what refuses it.
+#
+# MUTATION EVIDENCE. Respelling the leg's `(?i:\btoken\b)` as a leading `(?i)`
+# admits all four — measured `reasons == []` for each — and reds
+# `test_the_admitted_residual_is_a_value_of_placeholders_and_whitespace_only`.
+PREVIOUSLY_DISCLOSED_UPPERCASE_PLACEHOLDER_SECRET = (
+    ("token=/repo<A90210904812340981234>",
+     "token=<repo><A90210904812340981234>"),
+    ("token=user@example.com<SECRET-90210904812340981234>",
+     "token=<email><SECRET-90210904812340981234>"),
+    ("token=123e4567-e89b-12d3-a456-426614174000<Secret-90210904812340981234>",
+     "token=<uuid><Secret-90210904812340981234>"),
+    ("token=/Users/testuser<Repo90210904812340981234>",
+     "token=<home><Repo90210904812340981234>"),
+)
+
+
+def test_the_admitted_residual_is_a_value_of_placeholders_and_whitespace_only():
+    """#812 accepted residual, recorded plainly, narrowed to ONE class by #821.
+
+    Bounding the residual is this case's entire purpose, so the class the leg
+    admits is asserted here and the nearest refused shapes are asserted beside
+    it.
+
+    THIS CASE HAS BEEN NAMED WRONGLY TWICE, and both names were corrected against
+    measurement rather than against argument. It said "a token value that begins
+    with a bracket", which is not what it bounds, because
+    `token=<repo>90210904812340981234` begins with `<` and is refused. It then
+    said "a token value with no reachable raw byte", which described the
+    mechanism correctly but named no class, because at that point the leg admitted
+    two unrelated groups: values the transformer legitimately writes, and values
+    whose leading run stopped at a `<` that opened no complete placeholder. The
+    second group is refused now, so one class remains and the name states it.
+
+    WHAT THE TUPLE ENTRY ADMITS is a value made only of complete LOWERCASE-NAMED
+    placeholder-shaped spans and whitespace, the empty value included. Measured
+    over 66,430 values built from `<`, `>`, `a`, `1`, `-`, space, tab, `x` and `.`
+    at every length up to five, compared with a reachability model of the leading
+    run written independently of the regex: no disagreement, and no admitted value
+    outside that one class. 9,159 of those values were admitted before that change
+    and are refused now, and none moved the other way.
+
+    THE ENTRY IS NO LONGER THE WHOLE LEG (#821), so the class above is what the
+    regex admits rather than what `validate_export` publishes.
+    `_token_value_names_an_unknown_placeholder` runs after every entry in
+    `_FORBIDDEN` and reports the same reason for a value whose spans are complete
+    and lowercase-named but whose NAMES the validator's enumeration and the
+    caller's `roots` do not carry. `token=<secret-payload>` is therefore a
+    violation now, and `token=<repo><path>` is admitted only when the caller
+    passes the mapping that names `repo` — both asserted below.
+
+    THE CASE OF THE PLACEHOLDER NAME IS PART OF THE CLASS, and the suite did not
+    bound it until `REFUSED_UPPERCASE_PLACEHOLDER_VALUES` and
+    `PREVIOUSLY_DISCLOSED_UPPERCASE_PLACEHOLDER_SECRET` were asserted here. A
+    leading `(?i)` applies to the whole pattern, so the run and the lookahead
+    matched `<A>`, `<SECRET>` and `<Email>` as complete placeholders although this
+    kernel writes lowercase names only; the leg then consumed such a span and
+    admitted the line. Every case in this module passed under both spellings,
+    which is why the characterization above and the module comment beside the leg
+    both recorded a property nothing measured. Extending the alphabet above with a
+    single uppercase `A` gives 111,111 values, of which 95 are decided differently
+    by the two spellings, all 95 admitted under the leading `(?i)` and refused
+    under the scoped one.
+
+    NO SHAPE RULE COULD CLOSE THE LOWERCASE SUBSET, and only that subset, because
+    a lowercase-named placeholder-shaped span a leaker wrote and one this kernel
+    wrote are the same bytes. Scoping the case flag IS a shape rule and it closed
+    the rest of the class. #821 closed the subset with something that is not a
+    shape rule: the validator enumerates the transformer's placeholder NAMES and
+    takes the dynamic root names from the caller's own mapping, and the
+    transformer refuses a placeholder-shaped span `_reduce` did not write.
+
+    THE CLASS REACHED THE PUBLISHED OUTPUT, which is why #821 was a disclosure and
+    not only a gap in this backstop, and
+    `PREVIOUSLY_DISCLOSED_PLACEHOLDER_SHAPED_SECRET` is asserted here so the
+    statement stays measured rather than argued. A secret whose own bytes are
+    placeholder-shaped published in full when a substitution had consumed the
+    value's head and the tail's alphabetic component was a word the repository
+    vouches for. NOT every form of this leg admitted those three rows:
+    `b2385f688`'s `(?i)\\btoken\\b[ \\t]*[:=][ \\t]*[^\\s]` refuses all
+    three, incidentally rather than by separating leak from legitimate output,
+    because that value class also refuses the kernel's own `token=<email>` — the
+    #812 false positive. `f2a8e4309`'s `[^\\s<]` is what opened them, and
+    `135384cd3`, `b8402d5d7` and `253190e98` admitted them until #821. The scoped
+    case flag closed the uppercase-named counterparts and left these three; both
+    groups are now refused by the transformer at the source and by this surface as
+    a backstop, which is why they are asserted together below.
+
+    For a value the transformer reduces to `<credential>` in full, what this
+    backstop decides never reaches an export, and that is asserted for the two
+    members of the class that carry no consumed head.
+    """
+    roots = _ctx().roots
+    for line in ADMITTED_PLACEHOLDER_AND_WHITESPACE_VALUES:
+        # The root-named members need the caller's mapping, because #821
+        # compares the exact rendered literal and a root name is the caller's
+        # to state. Every other member is admitted with no roots at all.
+        supplied = roots if line in _ROOT_NAMED_ADMITTED_VALUES else None
+        assert not K.validate_export([line], roots=supplied), (
+            "the leg refuses a value the transformer legitimately writes, and "
+            "the residual recorded in bin/_lib_test_evidence.py no longer holds "
+            "for %r" % line
+        )
+        if supplied is not None:
+            # And the same line WITHOUT the roots is refused, so the admission
+            # above is the caller's mapping and not a name admitted anyway.
+            assert K.validate_export([line]), line
+    for line in REFUSED_BRACKET_VALUES + REFUSED_UPPERCASE_PLACEHOLDER_VALUES:
+        reasons = [v["reason"] for v in K.validate_export([line])]
+        assert reasons == ["token-credential"], (line, reasons)
+    # The two members with no consumed head: the transformer removes the whole
+    # value, so what this backstop decides about them never reaches an export.
+    for line in ("token=<secret-payload>", "token=<repo><path>"):
+        assert K.scrub_line(line, _ctx()) == "<credential>", line
+    # `a` and `secret` are registered here because this file's fixture
+    # vocabulary does not carry them and the production one does: measured
+    # against `build_known_tokens` over this repository, both are vouched for,
+    # which is why the disclosure was reachable on a real run and not only under
+    # a constructed context. Without them the transformer redacts the whole line
+    # for want of a known word, so the rows would assert nothing about the leg.
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | {"token", "a", "secret"})
+    for raw, previously in (
+        PREVIOUSLY_DISCLOSED_PLACEHOLDER_SHAPED_SECRET
+        + PREVIOUSLY_DISCLOSED_UPPERCASE_PLACEHOLDER_SECRET
+    ):
+        # BOTH HALVES, and they are different claims. The transformer no longer
+        # publishes the bytes at all, which is what #821 closed at the source;
+        # and this leg refuses those bytes anyway, which is what the backstop
+        # owes when the transformer has regressed.
+        published = K.scrub_line(raw, ctx)
+        assert published == K.UNCLASSIFIED_PLACEHOLDER, (raw, published)
+        assert "90210904812340981234" not in published, published
+        reasons = [
+            v["reason"] for v in K.validate_export([previously], roots=ctx.roots)
+        ]
+        assert reasons == ["token-credential"], (raw, previously, reasons)
+
+
+def test_the_token_leg_quantifies_whitespace_after_the_separator_exactly_once():
+    """#821. The leg's cost is linear, and this is the only case that pins it.
+
+    THE PROPERTY UNDER TEST IS A COST, NOT A VERDICT, and it therefore cannot be
+    stated as an input and an expected answer. b8402d5d7 gave the leading run a
+    `\\s` branch while a separate `\\s*` still stood between `[:=]` and the run,
+    so the two quantifiers overlapped: a line carrying only whitespace after the
+    separator gave the engine no terminator and it retried every way of splitting
+    that whitespace between them. Measured on `token=` followed by N spaces, the
+    cost then grew about fourfold per doubling of N — 375 us at 200 spaces and
+    156,210 us at the 4,090 that fill `MAX_LINE_BYTES`, which is about 375
+    seconds for a `GLOBAL_LINE_CAP`-sized extract of such lines, so the operator
+    would lose the failure extract to a six-minute scan. Deleting the redundant
+    `\\s*` returns the cost to linear: 6.7 us and 119 us for the same two lines,
+    and 0.29 seconds for the whole extract. The two forms are verdict-identical
+    over all 66,430 values the case above enumerates, so no assertion about an
+    admitted or refused line can tell them apart.
+
+    WHAT IS ASSERTED IS A STRUCTURAL PROXY FOR A TIMING PROPERTY, not a timing
+    measurement, and it is stated that way because a reader who mistakes it for
+    one will trust it further than it goes. A wall-clock assertion was considered
+    and not written, because a duration ceiling in a module that runs under
+    `xdist` on a shared runner fails on a loaded machine, and this estate's
+    timing-budget guard reports such a ceiling as a finding that must be declared
+    in a file this tranche may not touch. So this case cannot observe the cost at
+    all; it observes the one pattern shape that produces the cost.
+
+    THE PROXY IS THE WHOLE SEGMENT, not the junction before the run. An earlier
+    form asserted only that `[:=]` is not followed by `\\s`, and that guard is
+    evaded by one token: `(?:<[a-z][a-z0-9-]*>|\\s)*\\s*(?!<…>)` puts the
+    redundant quantifier AFTER the run rather than before it, and the overlap and
+    the cost are identical. Measured: that spelling passes the earlier guard, is
+    verdict-identical to this one over all 66,430 values the case above
+    enumerates — zero disagreements — and costs 93,329 us at 4,090 spaces against
+    131 us for the shipped form, which is the same quadratic curve the deleted
+    `\\s*` produced. Requiring the segment between `[:=]` and the trailing value
+    class to equal the run and the lookahead EXACTLY reds an insertion on either
+    side. It still would not catch an overlap spelled without a whitespace
+    quantifier at all, which is the proxy's remaining limit.
+
+    MUTATION EVIDENCE. Both insertions red this case and nothing else:
+    `[:=]\\s*(?:<…>|\\s)*(?!<…>)` and `[:=](?:<…>|\\s)*\\s*(?!<…>)`.
+    """
+    pattern = dict(K._FORBIDDEN)["token-credential"].pattern
+    value_class = r"[^\s]"
+    expected_segment = r"(?:<[a-z][a-z0-9-]*>|\s)*(?!<[a-z][a-z0-9-]*>)"
+    _head, separator, tail = pattern.partition("[:=]")
+    assert separator, (
+        "the leg no longer spells its separator `[:=]`, so this guard cannot "
+        "locate the segment it bounds: %r" % pattern
+    )
+    assert tail.endswith(value_class), (
+        "the leg no longer ends in the `[^\\s]` value class, so this guard "
+        "cannot locate the segment it bounds: %r" % pattern
+    )
+    assert tail[: -len(value_class)] == expected_segment, (
+        "the segment between the separator and the value class is no longer "
+        "exactly the placeholder-and-whitespace run followed by its lookahead. "
+        "A whitespace quantifier on EITHER side of that run overlaps the run's "
+        "own `\\s` branch, and the two overlapping quantifiers cost quadratic "
+        "time on a line carrying only whitespace after the separator — 93,329 us "
+        "at 4,090 spaces against 131 us — with no verdict changed anywhere, so "
+        "nothing but this assertion can catch it: %r" % pattern
+    )
+
+
+#: The two lengths the cost is measured at. 4,090 spaces is what fills
+#: `MAX_LINE_BYTES` after the `token=` head, so it is the worst line the
+#: transformer can hand this leg; 200 is the short reference the module's own
+#: comment records beside it.
+_COST_SHORT_SPACES = 200
+_COST_LONG_SPACES = 4090
+
+
+def _token_leg_search_cost(spaces: int, repeats: int) -> float:
+    """Seconds per `search` on the leg's FAILURE path, as a minimum of five.
+
+    The minimum rather than the mean: a scheduler steals time and never gives
+    it back, so the smallest observation is the one least contaminated by the
+    machine. The loop is repeated inside each sample so one sample is
+    milliseconds rather than microseconds, which keeps the clock's resolution
+    out of the ratio.
+    """
+    leg = dict(K._FORBIDDEN)["token-credential"]
+    line = "token=" + " " * spaces
+    assert leg.search(line) is None, "the probe must take the FAILURE path"
+    best = None
+    for _sample in range(5):
+        started = time.perf_counter()
+        for _attempt in range(repeats):
+            leg.search(line)
+        elapsed = (time.perf_counter() - started) / repeats
+        best = elapsed if best is None else min(best, elapsed)
+    return best
+
+
+def test_the_token_leg_failure_path_cost_does_not_grow_superlinearly():
+    r"""#820. The MEASURED half of the linear-cost property, beside the
+    structural proxy that pins the pattern's shape.
+
+    The structural guard above asserts the one shape that produces the cost; it
+    cannot observe the cost itself, and it admits by its own account an overlap
+    spelled without a whitespace quantifier at all. This case observes the cost
+    directly, over the same two lengths the module's comment records.
+
+    WHY THIS IS NOT THE WALL-CLOCK CEILING THAT CASE DECLINED TO WRITE. A
+    ceiling such as `elapsed < 6.237` fails on a loaded runner and passes on an
+    idle one, whichever way the mechanism behaves, which is the class
+    `tests/test_timing_budget_guard.py` exists to refuse. What is asserted here
+    is a RATIO between two measurements taken back to back on the same machine,
+    against a bound derived from the length ratio rather than from a duration.
+    Load that doubles the machine's cost doubles both terms and moves the ratio
+    not at all, and no literal ever bounds a measured duration from above.
+
+    THE NUMBERS THE BOUND SITS BETWEEN, both from the module's own record.
+    Linear: 6.7 us at 200 spaces and 119 us at 4,090, a ratio of about 18,
+    against a length ratio of 20.45. Quadratic, which is what the deleted
+    redundant `\s*` cost: 131 us and 93,329 us, a ratio of about 712. The bound
+    is 120 — about seven times the linear ratio and about six times below the
+    quadratic one — so it separates the two curves with room on both sides
+    rather than pinning a machine's speed.
+    """
+    short = _token_leg_search_cost(_COST_SHORT_SPACES, 400)
+    long_line = _token_leg_search_cost(_COST_LONG_SPACES, 20)
+    # Non-vacuity: a zero reading would make the ratio meaningless.
+    assert short > 0.0 and long_line > 0.0, (short, long_line)
+    length_ratio = _COST_LONG_SPACES / _COST_SHORT_SPACES
+    assert long_line < short * 120, (
+        "the leg's failure-path cost grew %.1f times over a %.1f times longer "
+        "line, which is the quadratic curve a whitespace quantifier standing "
+        "beside the run's own `\\s` branch produces. Measured %.1f us at %d "
+        "spaces and %.1f us at %d."
+        % (long_line / short, length_ratio,
+           short * 1e6, _COST_SHORT_SPACES,
+           long_line * 1e6, _COST_LONG_SPACES)
+    )
+
+
+@pytest.mark.parametrize("word", TOKEN_CREDENTIAL_WORDS)
+def test_the_validator_catches_a_transformer_regression_independently(word):
+    """#812, extended to all five spellings by #820. This is the property the
+    module's disjointness comment protects, and the only test that actually
+    demonstrates it: with the transformer's token pattern disabled, the
+    validator must still refuse the credential.
+
+    A regex that merely restates the transformer's would pass the static
+    reachability check while sharing its blind spots. Mutating the transformer
+    and requiring the validator to hold is what distinguishes the two.
+
+    PARAMETERIZED OVER EVERY SPELLING, because one entry now carries five of
+    them and the mutation removes the entry whole. A spelling the transformer
+    reduces and this leg cannot see would leak the moment the entry regressed,
+    and a single `token` row could not tell: the bare word passed here
+    throughout the two years the four prefixed spellings matched neither
+    surface.
+
+    The carrier's value is twenty DIGITS rather than a hex string, and the
+    spelling's own words are registered in this context only. Both choices
+    exist so that the leak is actually reachable and the refusal is actually
+    the new leg's: a hex value long enough to reach `_FORBIDDEN`'s `long-hex`
+    leg would be refused without the new leg and prove nothing, a shorter hex
+    value carries a word the ordinary-word check refuses so the whole-line
+    fallback would mask the leak instead of publishing it, and digits carry no
+    word at all.
+    """
+    original = K._TYPED_PATTERNS
+    mutated = tuple(
+        entry for entry in original
+        if entry[0].pattern != TRANSFORMER_TOKEN_ENTRY_PATTERN
+    )
+    assert len(mutated) == len(original) - 1, "the mutation removed nothing"
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | _PREFIX_VOCABULARY)
+    try:
+        K._TYPED_PATTERNS = mutated
+        leaked = K.scrub_line(f"{word}={_TOKEN_SECRET}", ctx)
+        assert _TOKEN_SECRET in leaked, (
+            "the mutation did not actually leak, so this proves nothing: %r"
+            % leaked
+        )
+        assert K.validate_export([leaked]), (
+            "the validator did not independently refuse a leaked credential: "
+            "%r" % leaked
+        )
+    finally:
+        K._TYPED_PATTERNS = original
+
+
+# ------------------------------------- #769 S7: the token leg degrades per line
+#
+# #812 gave `token-credential` a value class that no longer refuses the
+# transformer's own placeholders, and #769 S7 then moved the reason into
+# `PER_LINE_VIOLATION_REASONS` and moved the leg to the END of `_FORBIDDEN`. The
+# two cases below guard the two things that pair makes fragile: the degradation
+# itself, and the ordering the degradation depends on.
+
+
+def test_the_token_credential_leg_degrades_per_line():
+    """#769 S7. A token-credential violation costs its line, not the export.
+
+    The leg's primary designed firing class is a value whose head a root or a
+    typed substitution consumed, leaving a raw tail, and the transformer produces
+    that with nothing regressed in either surface. So its firing is not evidence
+    that the UNFLAGGED lines cannot be trusted, which is the only protection a
+    wholesale refusal adds. This case pins what the per-line filing buys the
+    operator: the flagged line's bytes still never reach the output, and every
+    other byte of the failure extract still does.
+
+    The replacement text and the notice are asserted literally because
+    `apply_validation_redactions` puts both back through the same validator, and
+    a reason string that did not clear it would escalate to
+    `unvalidatable-replacement` and withhold the export after all. The word
+    `token` in `token-credential` is followed by `-` rather than by `:` or `=`,
+    so this leg does not match its own replacement text.
+
+    MUTATION EVIDENCE. Removing `"token-credential"` from
+    `PER_LINE_VIOLATION_REASONS` reds this case: `record["refused"]` becomes
+    True, `record["refusal"]` becomes `token-credential`, the notice stays None
+    and the flagged line keeps its bytes.
+    """
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | {"token"})
+    leak = K.scrub_line("token=/repo90210904812340981234", ctx)
+    assert leak == "token=<repo>90210904812340981234", leak
+    corpus = [
+        "FAIL: <path> golden diverged",
+        leak,
+        "1 failed, 100 passed in 45.67s",
+    ]
+    violations = K.validate_export(corpus, roots=ctx.roots)
+    assert [v["reason"] for v in violations] == ["token-credential"], violations
+    lines, record = K.apply_validation_redactions(
+        corpus, violations, roots=ctx.roots)
+    assert record["refused"] is False, record
+    assert record["refusal"] is None, record
+    assert lines[1] == (
+        "[REDACTED: line refused by the validator: token-credential]"
+    ), lines[1]
+    assert record["notice"] == (
+        "[REDACTED: 1 of 3 lines were refused by the validator and replaced; "
+        "reasons: token-credential]"
+    ), record["notice"]
+    assert lines[0] == corpus[0], lines[0]
+    assert lines[2] == corpus[2], lines[2]
+    assert not any(
+        "90210904812340981234" in text for text in lines + [record["notice"]]
+    ), lines
+
+
+# A line violating `token-credential` AND a leg that may not degrade.
+# `validate_export` reports the FIRST leg that matches, and `token-credential`
+# is the only reason in `_FORBIDDEN` that `PER_LINE_VIOLATION_REASONS` contains,
+# so the token leg's position in the tuple decides whether the other leg's
+# refusal survives. The control byte is built with `chr` so this file stays
+# ASCII.
+SHADOWED_WHOLESALE_LINES = (
+    ("token: value" + chr(1) + "payload", "control-bytes"),
+    ("token=/etc/passwd", "absolute-path"),
+)
+
+
+@pytest.mark.parametrize(
+    "line,expected", SHADOWED_WHOLESALE_LINES,
+    ids=("control-bytes", "absolute-path"),
+)
+def test_a_wholesale_leg_is_not_shadowed_by_the_token_leg(line, expected):
+    """#769 S7. A wholesale leg still refuses when a token credential shares
+    its line.
+
+    With the token entry at its former position between `credential` and
+    `credential-url`, both of these lines reported `token-credential`. Two
+    reviews called that a diagnosis-quality defect with no effect on safety, and
+    that was correct only while the leg refused wholesale, because both reasons
+    withheld the export either way. Once `token-credential` degrades per line,
+    the misreport downgrades the other leg's refusal: a control-byte disclosure
+    or an unsubstituted absolute path sharing a line with `token:` would be
+    replaced per line and the export would publish.
+
+    Both halves are asserted, because the reported reason alone does not prove
+    the outcome and the outcome alone does not prove which leg produced it.
+
+    MUTATION EVIDENCE. Moving the `token-credential` entry back between
+    `credential` and `credential-url` reds both parameters: the reported reason
+    becomes `token-credential` and `record["refused"]` becomes False.
+    """
+    reasons = [v["reason"] for v in K.validate_export([line])]
+    assert reasons == [expected], (line, reasons)
+    violations = K.validate_export([line])
+    _lines, record = K.apply_validation_redactions([line], violations)
+    assert record["refused"] is True, record
+    assert record["refusal"] == expected, record
+    assert record["notice"] is None, record
+
+
+def test_every_wholesale_denylist_leg_precedes_every_per_line_leg():
+    """#769 S7. The positional requirement `PER_LINE_VIOLATION_REASONS` puts on
+    `_FORBIDDEN`, stated over the tuple itself rather than over two example
+    lines.
+
+    `validate_export` reports the first leg that matches, so a leg whose reason
+    degrades per line must be matched after every leg whose reason does not.
+    Otherwise a line violating both is replaced per line and the wholesale leg's
+    refusal is downgraded. The behavioural case above covers the two shapes
+    measured on the shipped kernel; this one covers a leg added later, which no
+    example line can reach.
+
+    The two vacuity guards are assertions rather than skips on purpose, so
+    unfiling `token-credential` from `PER_LINE_VIOLATION_REASONS` reds this case
+    instead of emptying it. Measured: that mutation reds this case on the
+    per-line guard and reds
+    `test_the_token_credential_leg_degrades_per_line` on the refusal outcome.
+    """
+    names = [name for name, _pattern in K._FORBIDDEN]
+    per_line = [
+        i for i, name in enumerate(names)
+        if name in K.PER_LINE_VIOLATION_REASONS
+    ]
+    wholesale = [
+        i for i, name in enumerate(names)
+        if name not in K.PER_LINE_VIOLATION_REASONS
+    ]
+    assert per_line, "no denylist leg degrades per line, so this case is vacuous"
+    assert wholesale, (
+        "no denylist leg refuses wholesale, so this case is vacuous"
+    )
+    assert min(per_line) > max(wholesale), (
+        "a per-line denylist leg is matched before a wholesale one and can "
+        "shadow its refusal: %r" % (names,)
+    )
+
+
+# ---------------------------- #769 S7: the transformer-health canary
+#
+# The escalation `token-credential`'s mixed firing classes needed. Filing the
+# reason in `PER_LINE_VIOLATION_REASONS` is right for the kind of firing that
+# happens with the transformer working as shipped, and it removes the incidental
+# protection a wholesale filing gave the kind that happens when the transformer
+# has regressed. A canary run once per publication separates the two: a healthy
+# transformer with an over-broad validator hit costs one line, and a regressed
+# one withholds every line including the residuals no leg can see.
+#
+# The canary literal is restated here rather than read from the kernel alone,
+# because a case that reads the kernel's constant would pass for any literal the
+# kernel happened to carry, and a literal another typed pattern claims would make
+# the whole check vacuous.
+DECLARED_TRANSFORMER_CANARY = "token=cctally-transformer-health-canary"
+
+
+def _without_the_token_entry(monkeypatch):
+    """`_TYPED_PATTERNS` with the transformer's token entry deleted.
+
+    The same mutation `test_the_validator_catches_a_transformer_regression_
+    independently` performs, which is the mutation the review built its
+    counter-example with.
+    """
+    original = K._TYPED_PATTERNS
+    mutated = tuple(
+        entry for entry in original
+        if entry[0].pattern != TRANSFORMER_TOKEN_ENTRY_PATTERN
+    )
+    assert len(mutated) == len(original) - 1, "the mutation removed nothing"
+    monkeypatch.setattr(K, "_TYPED_PATTERNS", mutated)
+
+
+def test_the_canary_is_claimed_only_by_the_token_entry():
+    """#769 S7. The canary's verdict depends on the token entry and nothing else.
+
+    A probe another typed pattern also claims would keep passing with the token
+    entry gone, and the check would then report health it had not measured. Three
+    things are asserted, because none of them implies the others: the literal is
+    the one this file declares, exactly one entry in `_TYPED_PATTERNS` matches it
+    and that entry is the token one, and deleting that entry leaves the line byte
+    for byte with no decided span.
+
+    MUTATION EVIDENCE, and the two mutations differ in how dangerous they are.
+    Respelling the kernel's literal as `bearer=cctally-transformer-health-canary`
+    makes the `bearer` entry claim the WHOLE line, so with the transformer's token
+    entry deleted the reduction is still `<credential>` over a decided span, the
+    canary reports health it has not measured, and the export publishes
+    `token=<repo><a90210904812340981234>` with the twenty digits intact. Measured:
+    that mutation reds this case on the declared-literal and single-claimant
+    assertions and reds the two regression cases below with it. Respelling it as
+    `token=sk-canaryvalue123` is the quieter half: the `sk-` entry can claim the
+    value too, so the claim this case makes is no longer true, and measurement
+    shows this case is the ONLY one that reds — every behavioural case stays green
+    because the token entry still matches first. A literal that no entry reduces
+    at all, `token=canary@example.invalid`, reds 33 cases including this one,
+    because the canary then fails on a healthy kernel.
+
+    EVERY COUNT IN THIS SECTION IS PYTEST NODES OVER THIS WHOLE MODULE, whose 488
+    nodes all pass unmutated, so each one reproduces as `bin/cctally-test-remote
+    python3 -m pytest tests/test_test_evidence_kernel.py -q` with that one edit
+    applied to `bin/_lib_test_evidence.py`. The first two figures are the same
+    under any narrower scope, because both mutations red only cases in this
+    section. The third is not: an earlier form of this paragraph counted it over
+    this section plus `test_the_token_credential_leg_degrades_per_line` and
+    `test_no_violations_leaves_the_extract_and_the_record_untouched` and gave it
+    as ten, which is what that subset measures and not what the command above
+    prints. The whole module is the scope stated here because it is the scope one
+    command reproduces.
+    """
+    assert K.TRANSFORMER_CANARY_LINE == DECLARED_TRANSFORMER_CANARY, (
+        "the kernel's canary literal is no longer the one this file declares, "
+        "so nothing here has checked that the new literal is unconfusable: %r"
+        % K.TRANSFORMER_CANARY_LINE
+    )
+    claimants = [
+        (pattern.pattern, token)
+        for pattern, token in K._TYPED_PATTERNS
+        if pattern.search(DECLARED_TRANSFORMER_CANARY)
+    ]
+    assert claimants == [
+        (TRANSFORMER_TOKEN_ENTRY_PATTERN, "<credential>")
+    ], claimants
+    # The canary is also reachable by neither path rule and by no root, so the
+    # empty context the check uses cannot consume it either.
+    assert K._PATH_SCAN_RE.search(DECLARED_TRANSFORMER_CANARY) is None
+
+
+def test_the_healthy_kernel_passes_the_transformer_canary():
+    """#769 S7. The reduction, measured rather than assumed.
+
+    The exact `<credential>` replacement AND the decided span, because the span
+    is what the check reads: a reduction that produced the right text without
+    marking it decided would mean the transformer had stopped reporting where it
+    acted, and `unknown_vocabulary` reads those same spans.
+    """
+    reduced, spans = K._reduce(K.TRANSFORMER_CANARY_LINE, K.ScrubContext())
+    assert reduced == K.TRANSFORMER_CANARY_EXPECTED, reduced
+    assert spans == ((0, len(K.TRANSFORMER_CANARY_EXPECTED)),), spans
+    assert K._transformer_health_ok() is True
+
+
+# The audit hook behind the no-I/O half of the case below, and every property
+# that keeps installing one inside a test suite safe.
+#
+# AN AUDIT HOOK CANNOT BE REMOVED ONCE INSTALLED. This one is therefore
+# installed at most once per process and is INERT outside a probe window:
+# `_AUDIT_WINDOW` is empty for the whole of the rest of the suite, which is the
+# only state the other cases in this module — and the other modules that share
+# an xdist worker with it — ever observe. The hook also never raises, because an
+# exception raised inside a hook surfaces in whatever unrelated code happened to
+# emit the event rather than here.
+#
+# THE THREAD FILTER IS PART OF THAT ISOLATION rather than a refinement of it. A
+# pytest-xdist worker keeps a receiver thread doing socket reads, so a hook that
+# recorded every thread's events would capture `socket.*` from that thread
+# inside the window and red the case intermittently.
+_AUDIT_WINDOW = []
+_AUDIT_HOOK_INSTALLED = []
+
+
+def _audit_probe(event, args):
+    """Record one audit event when a window is open on this thread."""
+    window = _AUDIT_WINDOW
+    if window and window[0][0] == threading.get_ident():
+        window[0][1].append(event)
+
+
+@contextlib.contextmanager
+def _recorded_audit_events():
+    """Every audit event THIS thread emits inside the block."""
+    if not _AUDIT_HOOK_INSTALLED:
+        sys.addaudithook(_audit_probe)
+        _AUDIT_HOOK_INSTALLED.append(True)
+    events = []
+    _AUDIT_WINDOW.append((threading.get_ident(), events))
+    try:
+        yield events
+    finally:
+        _AUDIT_WINDOW.clear()
+
+
+def test_the_canary_needs_no_repository_and_no_subprocess(monkeypatch):
+    """#769 S7. Data-independent, in-memory and constant.
+
+    It runs once per publication, so a probe that read the repository would add a
+    `git ls-files` per publication: that is what `build_known_tokens` does, and
+    borrowing the caller's real context is the obvious edit somebody will try.
+    The context the check builds carries no roots and no predicates, so no
+    caller's data can change its verdict either.
+
+    Two claims, because neither implies the other. NO I/O AT ALL: an audit hook
+    records every event the call emits on this thread, and no `open`, `os.*`,
+    `subprocess.*` or `socket.*` event is among them. AN EMPTY CONTEXT: every
+    `ScrubContext` the call builds, and the one the reduction actually receives,
+    carries no roots, no path predicate, no vocabulary and no case ids.
+
+    THE I/O CLAIM IS MEASURED RATHER THAN INFERRED FROM AN IMPORT. An earlier
+    form asserted `not hasattr(K, "subprocess")`, which established neither half
+    of what its message said: the kernel imports `os`, so `os.popen` and
+    `os.system` were reachable from it for as long as that assertion stood, and a
+    file read was not covered at all.
+    `test_the_public_kernel_imports_only_the_standard_library` already enumerates
+    every module the published kernel may import, which is the stronger form of
+    the claim that assertion was reaching for.
+
+    THE CONTEXT'S STATE IS ASSERTED, NOT THE SYNTAX THAT PRODUCED IT. An earlier
+    form parsed the kernel and required the function's single `ScrubContext(...)`
+    call to be argument-free, which pinned WHERE the context is built as well as
+    THAT it is empty. Hoisting an empty context to a module constant is an
+    ordinary optimization that weakens nothing, and it red that assertion with an
+    `ast.dump` of the call and red the behavioural assertion beside it.
+
+    MUTATION EVIDENCE, all counted as pytest nodes over this whole module.
+    Building the context as `ScrubContext(known_tokens=())` reds this case and
+    nothing else, which is exactly why the case is here: an argument threaded in
+    changes no verdict today, so no behavioural case can see it. Making the
+    canary read a file — `open(__file__, "rb").close()` ahead of the reduction —
+    reds this case and nothing else as well. Hoisting the construction to a
+    module-level `ScrubContext()` and passing that constant reds NOTHING, which
+    is the whole point of asserting state rather than syntax.
+    """
+    with _recorded_audit_events() as events:
+        assert K._transformer_health_ok() is True
+    reached = sorted({
+        event for event in events
+        if event == "open"
+        or event.startswith(("os.", "subprocess.", "socket."))
+    })
+    assert reached == [], reached
+    # NON-VACUITY FOR AN ABSENCE. The list above would also be empty if the hook
+    # recorded nothing at all, so one deliberate file read inside a second window
+    # establishes that the hook is live and that `open` is a name it records.
+    with _recorded_audit_events() as control:
+        with open(REPO / "bin" / "_lib_test_evidence.py", "rb") as handle:
+            handle.read(1)
+    assert "open" in control, control
+
+    observed = []
+    real_context = K.ScrubContext
+    real_reduce = K._reduce
+
+    def _record_context(*args, **kwargs):
+        context = real_context(*args, **kwargs)
+        observed.append(context)
+        return context
+
+    def _record_reduce(text, context):
+        observed.append(context)
+        return real_reduce(text, context)
+
+    monkeypatch.setattr(K, "ScrubContext", _record_context)
+    monkeypatch.setattr(K, "_reduce", _record_reduce)
+    assert K._transformer_health_ok() is True
+    # The reduction is reached on every path this check has, so this is a
+    # non-vacuity guard rather than a claim of its own.
+    assert observed, "no ScrubContext reached the reduction"
+    for context in observed:
+        assert context.roots == {}, context.roots
+        assert context.is_public_path is None, context.is_public_path
+        assert context.known_tokens is None, context.known_tokens
+        assert context.known_case_ids is None, context.known_case_ids
+
+
+def test_the_canary_reason_is_outside_the_per_line_set():
+    """#769 S7. The refusal reason names no line and replaces none.
+
+    It is not a leg's verdict, so it is not a member of the per-line set and it
+    is not a name in `_FORBIDDEN` either. Filing it per line would restore
+    exactly the publication this check exists to stop.
+    """
+    assert K.TRANSFORMER_HEALTH_REFUSAL not in K.PER_LINE_VIOLATION_REASONS
+    assert K.TRANSFORMER_HEALTH_REFUSAL not in {
+        name for name, _pattern in K._FORBIDDEN
+    }
+    # It states what happened rather than naming a leg, which is what lets an
+    # operator reading the sidecar look at the transformer instead of hunting
+    # for a credential in the export.
+    assert K.TRANSFORMER_HEALTH_REFUSAL == "transformer-health-check-failed"
+    # MUTATION EVIDENCE. Adding the reason to `PER_LINE_VIOLATION_REASONS` reds
+    # this case and nothing else, because the canary path does not consult the
+    # set: the filing would be wrong without changing a verdict.
+
+
+def test_the_healthy_canary_leaves_the_four_leak_rows_costing_one_line_each():
+    """#769 S7. Per-line behaviour is unchanged when the transformer is healthy.
+
+    The four rows of `TOKEN_SECRET_BEHIND_A_PLACEHOLDER` are the leg's designed
+    firing class: the transformer is working exactly as shipped, a substitution
+    consumed the value's head, and a raw tail survived. All four are put in ONE
+    corpus here, which the per-row cases above do not do, because what the
+    unconditional canary could have broken is precisely the publication: a check
+    that refused on healthy output would cost the operator the whole extract on
+    the commonest firing this leg has.
+
+    MUTATION EVIDENCE. Changing `TRANSFORMER_CANARY_EXPECTED` to `<credentials>`
+    makes the canary fail on a healthy kernel, and it then reds 32 of this
+    module's 488 pytest nodes, this one among them — every refusal path, the
+    pre-existing per-line degradation case and the clean-record case included.
+    That breadth is the hazard this case guards: an over-strict canary withholds
+    every export. The figure is counted over the whole module, on the scope and
+    with the command `test_the_canary_is_claimed_only_by_the_token_entry` states;
+    an earlier form gave it as nine, which is what this section plus those two
+    named cases measures rather than what the module does.
+    """
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | {"token"})
+    published = []
+    for raw, expected in TOKEN_SECRET_BEHIND_A_PLACEHOLDER:
+        line = K.scrub_line(raw, ctx)
+        assert line == expected, (raw, line)
+        assert "90210904812340981234" in line, line
+        published.append(line)
+    corpus = [GOOD_EXTRACT_LINE] + published + [GOOD_EXTRACT_LINE]
+    violations = K.validate_export(corpus, roots=ctx.roots)
+    assert [v["reason"] for v in violations] == ["token-credential"] * 4, (
+        violations
+    )
+    lines, record = K.apply_validation_redactions(
+        corpus, violations, roots=ctx.roots)
+    assert record["refused"] is False, record
+    assert record["refusal"] is None, record
+    assert lines.count(
+        "[REDACTED: line refused by the validator: token-credential]"
+    ) == 4, lines
+    assert lines.count(GOOD_EXTRACT_LINE) == 2, lines
+    assert record["notice"] and "4 of 6" in record["notice"], record
+    assert not any(
+        "90210904812340981234" in text for text in lines + [record["notice"]]
+    ), lines
+
+
+# The review's counter-example, stated as data. The first row is what the
+# validator's own leg catches; the second is the residual it admits, because the
+# secret's own bytes are placeholder-shaped. With `token-credential` filed per
+# line and no health check, the first row cost one replaced line and the second
+# PUBLISHED with the twenty digits intact.
+# `(raw, published, carries the secret)` under a transformer whose token entry
+# has been deleted. The FIRST row leaks and the validator flags it; the SECOND
+# carries no secret and the validator admits it, which is why a per-line remedy
+# alone would have written the export with the first row replaced and the second
+# published, and why the canary has to withhold both.
+#
+# THE SECOND ROW USED TO BE A LEAK AND IS NOT ANY MORE (#821). It was
+# `token=/repo<a90210904812340981234>`, which the regressed transformer
+# published as `token=<repo><a90210904812340981234>` with its twenty digits
+# intact and no leg refused. The provenance check closed that at the source: the
+# tail is a placeholder-shaped span `_reduce` did not write, so the line now
+# fails closed whether or not the token entry is present. What the row must
+# still supply is a line a REGRESSED transformer publishes and the validator
+# does not flag, and `token=user@example.com` is one: the email substitution
+# DECIDES the value's span, so the provenance check is satisfied and the
+# ordinary-word check publishes `token=<email>`, which the validator admits
+# because `email` is a name the transformer really writes. A healthy transformer
+# reduces the whole line to `<credential>` instead.
+#
+# THE RAW INPUT MATTERS, and `token=<email>` typed literally is NOT this row.
+# That span is bytes a caller supplied rather than bytes `_reduce` wrote, so the
+# provenance check fails closed on it — which is the whole content of #821 and
+# is asserted in its own case.
+REGRESSED_TRANSFORMER_CORPUS = (
+    ("token=90210904812340981234", "token=90210904812340981234", True),
+    ("token=user@example.com", "token=<email>", False),
+)
+REGRESSED_TRANSFORMER_SECRET = "90210904812340981234"
+
+
+def test_a_regressed_transformer_refuses_the_export_and_the_residual_secret(
+    monkeypatch,
+):
+    """#769 S7. The counter-example the review measured, now refused wholesale.
+
+    Both halves are asserted, because neither proves the other. The transformer
+    really publishes the first row with the twenty digits in it, and the
+    validator really finds only ONE violation over the two rows — so per-line
+    filing alone would have replaced the first row and written the second. The
+    canary is what withholds both.
+
+    THE SECOND ROW CHANGED IN #821, and the corpus records why: it used to be a
+    leak the validator admitted, and the transformer's provenance check now
+    fails closed on it whether or not the token entry is present. The property
+    this case pins is unchanged — a regressed transformer produces an export in
+    which some lines are unflagged, and the canary withholds those too.
+
+    The assertion is the ABSENCE OF THE SECRET from everything the function
+    returns, not merely `refused is True`. A caller that read the lines without
+    reading the record is the failure mode a refusal has to survive, and every
+    refusal path returns no lines for that reason.
+
+    MUTATION EVIDENCE. Deleting the `_transformer_health_ok` call from
+    `apply_validation_redactions` reds this case: `record["refused"]` becomes
+    False, one line is replaced, and the returned lines carry
+    `token=<repo><a90210904812340981234>`.
+    """
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | {"token", "a"})
+    _without_the_token_entry(monkeypatch)
+    corpus = []
+    for raw, expected, carries_secret in REGRESSED_TRANSFORMER_CORPUS:
+        line = K.scrub_line(raw, ctx)
+        assert line == expected, (raw, line)
+        assert (REGRESSED_TRANSFORMER_SECRET in line) is carries_secret, line
+        corpus.append(line)
+    violations = K.validate_export(corpus, roots=ctx.roots)
+    # Non-vacuity for the whole case: the validator sees the first row and
+    # admits the second, which is why a per-line remedy would have published it.
+    assert [v["reason"] for v in violations] == ["token-credential"], violations
+    assert [v["index"] for v in violations] == [0], violations
+    lines, record = K.apply_validation_redactions(
+        corpus, violations, roots=ctx.roots)
+    assert record["refused"] is True, record
+    assert record["refusal"] == K.TRANSFORMER_HEALTH_REFUSAL, record
+    assert lines == [], lines
+    assert record["notice"] is None, record
+    assert REGRESSED_TRANSFORMER_SECRET not in json.dumps(
+        [lines, record], default=repr
+    ), (lines, record)
+
+
+def test_the_canary_runs_even_when_the_validator_found_nothing(monkeypatch):
+    """#769 S7. The unconditional run, which is the whole of what it buys.
+
+    A probe gated on `token-credential` firing would never be consulted on this
+    corpus, because a regressed transformer produces lines no leg refuses. Such
+    an export publishes with the check never reached, so running the canary once
+    per publication regardless of what the validator found is the property, not
+    an incidental simplification.
+
+    THE CORPUS CHANGED IN #821, and the reason is recorded rather than left to
+    be rediscovered. This case used to reach the unflagged state through a
+    SECRET of the placeholder-shaped residual class —
+    `token=/repo<a90210904812340981234>` published with its twenty digits and
+    refused by nothing. The transformer's provenance check closed that class, so
+    the state is now reached through a line that carries no secret at all: a
+    healthy transformer reduces `token=user@example.com` to `<credential>`, and
+    a regressed one publishes `token=<email>` over the email substitution's own
+    decided span. The canary's property does not depend on a secret being
+    present, only on the validator having found nothing.
+
+    MUTATION EVIDENCE. Gating the call on
+    `any(v.get("reason") == "token-credential" for v in violations)` reds this
+    case and the six rows of `test_a_canary_that_cannot_be_evaluated_refuses`,
+    which pass no violation either, and leaves
+    `test_a_regressed_transformer_refuses_the_export_and_the_residual_secret`
+    green, because a `token-credential` violation IS present there. Moving the
+    call below the `if not violations` return reds exactly the same seven.
+    """
+    ctx = _ctx(known_tokens=KNOWN_TOKENS | {"token", "a"})
+    _without_the_token_entry(monkeypatch)
+    # A line only a HEALTHY transformer reduces to `<credential>`, published by
+    # the regressed one with the email substitution's DECIDED placeholder where
+    # the value was, and admitted by every leg — so nothing the validator
+    # reports could gate the canary on this corpus.
+    unreduced = K.scrub_line("token=user@example.com", ctx)
+    assert unreduced == "token=<email>", unreduced
+    corpus = [GOOD_EXTRACT_LINE, unreduced, GOOD_EXTRACT_LINE]
+    violations = K.validate_export(corpus, roots=ctx.roots)
+    # Non-vacuity: nothing was flagged, so no violation-gated check could fire.
+    assert violations == [], violations
+    lines, record = K.apply_validation_redactions(
+        corpus, violations, roots=ctx.roots)
+    assert record["refused"] is True, record
+    assert record["refusal"] == K.TRANSFORMER_HEALTH_REFUSAL, record
+    assert record["reasons"] == [], record
+    assert record["redacted"] == 0, record
+    assert record["total"] == 3, record
+    assert lines == [], lines
+    assert REGRESSED_TRANSFORMER_SECRET not in json.dumps(
+        [lines, record], default=repr
+    ), (lines, record)
+
+
+# Every way the canary can fail to produce an answer. An unevaluable canary is
+# an unhealthy transformer, not an inconclusive probe: treating "I could not
+# tell" as "healthy" would publish on exactly the faults the check exists to
+# catch.
+UNEVALUABLE_CANARY_REDUCERS = {
+    "raises": lambda text, ctx: (_ for _ in ()).throw(RuntimeError("boom")),
+    # The span is the EXPECTED one and only the text is wrong, so this row
+    # isolates the text conjunct. A row whose span is also wrong is caught by
+    # the span conjunct and proves nothing about the text one.
+    "wrong-text": lambda text, ctx: ("token=<cred>", ((0, 12),)),
+    "no-decided-span": lambda text, ctx: ("<credential>", ()),
+    "extra-decided-span": lambda text, ctx: ("<credential>", ((0, 6), (6, 12))),
+    "unpackable-into-nothing": lambda text, ctx: None,
+    "wrong-arity": lambda text, ctx: ("<credential>", ((0, 12),), "extra"),
+}
+
+
+@pytest.mark.parametrize("mode", sorted(UNEVALUABLE_CANARY_REDUCERS))
+def test_a_canary_that_cannot_be_evaluated_refuses(mode, monkeypatch):
+    """#769 S7. Fail closed on the check itself.
+
+    Six failure modes, because the reduction can fail to answer in more ways than
+    by raising: a wrong replacement, a replacement that reports no decided span,
+    one that reports the span in pieces, and a return value that cannot be
+    unpacked at all or unpacks to the wrong arity. Every one of them refuses.
+
+    MUTATION EVIDENCE, measured row by row. Narrowing the clause to
+    `except re.error` reds the three rows that raise — `raises`,
+    `unpackable-into-nothing` and `wrong-arity` — as FAILURES, because an
+    exception raised in a test body is a pytest failure and not an error; the
+    module reports `3 failed, 485 passed` and no error at all under that
+    mutation. Returning True from the `except` clause reds those same three and
+    NOT the other three, because a wrong answer is not an exception. Dropping the
+    `tuple(spans) == …` conjunct reds `no-decided-span` and
+    `extra-decided-span`; dropping the `reduced == TRANSFORMER_CANARY_EXPECTED`
+    conjunct reds `wrong-text`, whose span is deliberately the expected one so
+    that it isolates the text conjunct. Deleting the whole check reds all six.
+    """
+    monkeypatch.setattr(K, "_reduce", UNEVALUABLE_CANARY_REDUCERS[mode])
+    assert K._transformer_health_ok() is False
+    lines, record = K.apply_validation_redactions(
+        [GOOD_EXTRACT_LINE] * 3, [], ROOTS)
+    assert record["refused"] is True, record
+    assert record["refusal"] == K.TRANSFORMER_HEALTH_REFUSAL, record
+    assert lines == [], lines
+
+
+def test_the_canary_does_not_swallow_an_operator_interrupt(monkeypatch):
+    """#769 S7. `SystemExit` and `KeyboardInterrupt` stay outside the clause.
+
+    Neither is a failure mode of a pure in-memory reduction, and swallowing an
+    operator's interrupt in order to record a canary verdict would be a worse
+    outcome than refusing. The clause is `except Exception` for that reason, and
+    this case is what stops it being widened to `BaseException`.
+    """
+    def _interrupt(text, ctx):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(K, "_reduce", _interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        K._transformer_health_ok()
+
+
+# Every refusal path reachable without a mutation, with the input that reaches
+# it. The canary path is checked first and has its own cases above; these three
+# are reached only once it has passed. `unvalidatable-replacement` is the fourth
+# and is unreachable from real data, so it has its own case below.
+REFUSAL_PATHS = (
+    ("email", ["maintainer@example.invalid"], [
+        {"index": 0, "reason": "email"}]),
+    ("unlocatable-violation", [GOOD_EXTRACT_LINE], [
+        {"index": 99, "reason": "unknown-counter-word"}]),
+    ("unclassified-violation", [GOOD_EXTRACT_LINE], [{"index": 0}]),
+)
+
+
+@pytest.mark.parametrize(
+    "expected,lines,violations", REFUSAL_PATHS,
+    ids=[row[0] for row in REFUSAL_PATHS],
+)
+def test_every_refusal_path_returns_no_lines(expected, lines, violations):
+    """#769 S7. "Publish nothing" is a property of the value, not only a rule.
+
+    Each refusal path used to return the caller's own list, which was safe by
+    convention: both callers read `refused` before they read the lines. A
+    refusal is exactly the occasion on which a caller that skipped the
+    convention would write out unsanitized text, so every path now returns an
+    empty list and `total` carries the count that was withheld.
+
+    MUTATION EVIDENCE. Restoring `return lines, record` on the content branch
+    reds the `email` and `unclassified-violation` rows, which is both of the rows
+    that reach it; restoring it on the unlocatable branch reds the
+    `unlocatable-violation` row; restoring it on the re-validation branch reds
+    `test_the_unvalidatable_replacement_path_returns_no_lines_either`; and
+    restoring it on the canary path reds
+    `test_a_regressed_transformer_refuses_the_export_and_the_residual_secret`
+    together with the six unevaluable rows.
+    """
+    out, record = K.apply_validation_redactions(lines, violations, ROOTS)
+    assert record["refused"] is True, record
+    assert record["refusal"] == expected, record
+    assert out == [], out
+    assert record["total"] == len(lines), record
+
+
+def test_the_unvalidatable_replacement_path_returns_no_lines_either(monkeypatch):
+    """#769 S7. The fourth refusal path, which no real reason can reach.
+
+    Every reason the kernel writes into a placeholder clears the validator —
+    `test_every_redaction_placeholder_clears_the_validator` measures that over
+    the whole vocabulary — so this path is reachable only by making the re-check
+    refuse. The canary is untouched by the mutation, because it reads `_reduce`
+    rather than `validate_export`.
+    """
+    monkeypatch.setattr(
+        K, "validate_export",
+        lambda lines, roots=None: [
+            {"index": 0, "reason": "email", "excerpt": ""}],
+    )
+    out, record = K.apply_validation_redactions(
+        [BAD_EXTRACT_LINE],
+        [{"index": 0, "reason": "unknown-counter-word"}],
+        ROOTS,
+    )
+    assert record["refused"] is True, record
+    assert record["refusal"] == "unvalidatable-replacement", record
+    assert out == [], out

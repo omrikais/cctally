@@ -127,8 +127,33 @@ def _resolve_forecast_now(as_of: str | None) -> dt.datetime:
     return _command_as_of()
 
 
+def _shape_week_samples(rows, *, include_held: bool) -> list:
+    """Turn snapshot rows into the sample tuples `_fetch_current_week_snapshots`
+    returns. Both of that function's row-fetch legs go through here so the two
+    cannot drift on the tuple width.
+
+    `rows` are `(captured_at_utc, weekly_percent, five_hour_percent,
+    weekly_observation_held)`. The held flag is appended to the sample only
+    when the caller asked for held rows, because a caller that excluded them
+    has nothing to tell apart and the three-element shape is what every
+    existing consumer unpacks.
+    """
+    out = []
+    for row in rows:
+        sample = (
+            parse_iso_datetime(row[0], "captured_at_utc"),
+            float(row[1]),
+            float(row[2]) if row[2] is not None else None,
+        )
+        if include_held:
+            sample = sample + (int(row[3] or 0),)
+        out.append(sample)
+    return out
+
+
 def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime,
-                                  *, account_key: "str | None" = None):
+                                  *, account_key: "str | None" = None,
+                                  include_held: bool = False):
     """Return (week_start_at, week_end_at, list[(captured_at, percent, five_hr)])
     for the subscription week containing `now_utc`, or None if no snapshot
     exists for the current week.
@@ -157,16 +182,38 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
     Samples are filtered to `captured_at <= now_utc` so that `--as-of <past>`
     is deterministic (no leak of future snapshots into samples[-1] / p_now /
     snapshot_count / latest_snapshot_at).
+
+    ``include_held`` (#769 S11, #824) selects the AXIS. A
+    `weekly_observation_held` row carries the writing tick's capture time,
+    source and five-hour reading while its weekly value and boundary are
+    copied forward from the latest genuinely observed row, so:
+
+      * ``False`` (the default, and every weekly caller) excludes those rows.
+        This function IS the weekly sample series — the weekly projection, the
+        weekly freshness stamp and `snapshot_count` are all derived from it —
+        and a held row would contribute a repeat of an older reading under a
+        newer instant, inflating the sample count and stamping stale weekly
+        evidence as fresh.
+      * ``True`` retains them and appends a fourth element, the held flag, to
+        every sample. One query then serves both axes: a caller reading the
+        five-hour axis takes the newest sample, a caller reading the weekly
+        axis takes the newest sample whose flag is 0, and neither can mistake
+        a carried-forward weekly value for an observed one.
     """
     # #341: optional account scoping — same predicate on every leg so the whole
     # window resolution stays consistent (a real key or the `unattributed`
     # sentinel both match `account_key = ?`; `None` omits the predicate = merged).
     _acct_pred = "" if account_key is None else " AND account_key = ?"
     _acct_p: tuple = () if account_key is None else (account_key,)
+    # Applied to the WINDOW-RESOLUTION legs as well as the row fetches, so
+    # `include_held=True` is a pure superset of the default read rather than a
+    # read that can also resolve a different week.
+    _held_pred = "" if include_held else " AND weekly_observation_held = 0"
     candidates = conn.execute(
         "SELECT week_start_at, week_end_at, week_start_date, MAX(captured_at_utc) AS latest_cap "
         "FROM weekly_usage_snapshots "
-        "WHERE week_start_at IS NOT NULL AND week_end_at IS NOT NULL" + _acct_pred +
+        "WHERE week_start_at IS NOT NULL AND week_end_at IS NOT NULL"
+        + _acct_pred + _held_pred +
         " GROUP BY week_start_at, week_end_at, week_start_date",
         _acct_p,
     ).fetchall()
@@ -192,7 +239,8 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
         drow = conn.execute(
             "SELECT week_start_date, week_end_date "
             "FROM weekly_usage_snapshots "
-            "WHERE week_start_date <= ? AND week_end_date >= ?" + _acct_pred +
+            "WHERE week_start_date <= ? AND week_end_date >= ?"
+            + _acct_pred + _held_pred +
             " GROUP BY week_start_date, week_end_date "
             "ORDER BY MAX(captured_at_utc) DESC LIMIT 1",
             (today_local_str, today_local_str) + _acct_p,
@@ -206,17 +254,14 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
         week_start_at = dt.datetime.combine(ws_date, dt.time(0, 0), local_tz).astimezone(dt.timezone.utc)
         week_end_at = dt.datetime.combine(we_date + dt.timedelta(days=1), dt.time(0, 0), local_tz).astimezone(dt.timezone.utc)
         rows = conn.execute(
-            "SELECT captured_at_utc, weekly_percent, five_hour_percent "
+            "SELECT captured_at_utc, weekly_percent, five_hour_percent, "
+            "       weekly_observation_held "
             "FROM weekly_usage_snapshots "
-            "WHERE week_start_date = ?" + _acct_pred +
+            "WHERE week_start_date = ?" + _acct_pred + _held_pred +
             " ORDER BY captured_at_utc ASC",
             (drow[0],) + _acct_p,
         ).fetchall()
-        samples = [
-            (parse_iso_datetime(r[0], "captured_at_utc"), float(r[1]),
-             float(r[2]) if r[2] is not None else None)
-            for r in rows
-        ]
+        samples = _shape_week_samples(rows, include_held=include_held)
         samples = [s for s in samples if s[0] <= now_utc]
         return week_start_at, week_end_at, samples
     row = chosen
@@ -237,18 +282,16 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
     chosen_date = chosen[2]
     placeholders = ",".join("?" * len(matching_texts))
     rows = conn.execute(
-        f"SELECT captured_at_utc, weekly_percent, five_hour_percent "
+        f"SELECT captured_at_utc, weekly_percent, five_hour_percent, "
+        f"       weekly_observation_held "
         f"FROM weekly_usage_snapshots "
         f"WHERE (week_start_at IN ({placeholders}) "
-        f"       OR (week_start_at IS NULL AND week_start_date = ?)){_acct_pred} "
+        f"       OR (week_start_at IS NULL AND week_start_date = ?))"
+        f"{_acct_pred}{_held_pred} "
         f"ORDER BY captured_at_utc ASC",
         tuple(matching_texts) + (chosen_date,) + _acct_p,
     ).fetchall()
-    samples = [
-        (parse_iso_datetime(r[0], "captured_at_utc"), float(r[1]),
-         float(r[2]) if r[2] is not None else None)
-        for r in rows
-    ]
+    samples = _shape_week_samples(rows, include_held=include_held)
     samples = [s for s in samples if s[0] <= now_utc]
     return week_start_at, week_end_at, samples
 
@@ -854,12 +897,30 @@ def _select_dollars_per_percent(
         source_col = ("source" if "source" in present else "NULL")
         payload_col = ("payload_json" if "payload_json" in present
                        else "NULL")
+        # Held rows are excluded: `_realized_week_movement` sums POSITIVE
+        # DELTAS between consecutive readings, which is a weekly-axis question
+        # (#769 S11, #824).
+        #
+        # Inside one account a held row repeats the immediately preceding
+        # genuine reading and contributes a delta of exactly zero, so this
+        # predicate changes nothing there. It matters on the MERGED read, where
+        # `account_key` is None: `_realized_week_movement` orders the merged
+        # readings by capture instant alone, so account A's held row can follow
+        # account B's lower reading and contribute a large spurious positive
+        # delta. Review finding F2 — the earlier held-inclusive justification
+        # was stated unqualified but is true only per account.
+        #
+        # Guarded on `_snapshot_columns`, because this query already reads a
+        # store that may predate the column.
+        held_pred = (" AND weekly_observation_held = 0"
+                     if "weekly_observation_held" in present else "")
         snap = conn.execute(
             "SELECT week_start_date, week_start_at, week_end_at, "
             "       captured_at_utc, weekly_percent, "
             f"      {source_col}, {payload_col} "
             "FROM weekly_usage_snapshots "
-            "WHERE week_start_at IN (" + placeholders + ")" + _acct_pred,
+            "WHERE week_start_at IN (" + placeholders + ")"
+            + held_pred + _acct_pred,
             ws_iso_list + list(_acct_p),
         ).fetchall()
         for wsd, ws_iso, we_iso, cap_iso, pct, source, payload in snap:
@@ -1070,7 +1131,10 @@ def _assess_forecast_confidence(
 
 
 def _pick_p_24h_ago(
-    samples: list[tuple[dt.datetime, float, float | None]],
+    # Three members when `_fetch_current_week_snapshots` ran with
+    # `include_held=False`, four when the held flag is appended. Only the first
+    # two are read here, so both shapes are accepted deliberately.
+    samples: list[tuple],
     now_utc: dt.datetime,
 ) -> tuple[float | None, float | None]:
     """Return (p_24h_ago, t_24h_actual_hours). Closest to (now_utc - 24h)
@@ -1292,25 +1356,39 @@ def _load_forecast_inputs(
     account (``forecast --account``).
     """
     c = _cctally()
-    fetched = _fetch_current_week_snapshots(conn, now_utc, account_key=account_key)
+    # #769 S11 (#824): ONE read, held-inclusive, split per axis below.
+    fetched = _fetch_current_week_snapshots(
+        conn, now_utc, account_key=account_key, include_held=True)
     if fetched is None:
         return None
-    week_start_at, week_end_at, samples = fetched
-    if not samples:
+    week_start_at, week_end_at, observations = fetched
+    if not observations:
         return None
 
     # Mid-week reset override: shift week_start_at to the effective
     # reset moment and drop pre-reset samples so elapsed/remaining math
     # and spent_usd reflect the post-reset window only.
-    week_start_at, samples = _apply_midweek_reset_override(
-        conn, week_start_at, week_end_at, samples, now_utc=now_utc
+    week_start_at, observations = _apply_midweek_reset_override(
+        conn, week_start_at, week_end_at, observations, now_utc=now_utc
     )
 
+    if not observations:
+        return None
+    # The weekly axis. A `weekly_observation_held` row repeats an older weekly
+    # reading under a newer capture instant, so every weekly quantity derived
+    # below — `p_now`, the 24-hour anchor, `snapshot_count` and
+    # `latest_snapshot_at` — is taken from genuinely observed rows alone.
+    # Counting a held row would both stamp stale weekly evidence as fresh and
+    # raise the confidence assessment on a sample that observed nothing.
+    samples = [s for s in observations if not s[3]]
     if not samples:
         return None
     latest = samples[-1]
     p_now = latest[1]
-    five_hr = latest[2]
+    # The five-hour axis, which is why the read is held-inclusive: a held row
+    # exists precisely because its five-hour reading GREW, so the newest
+    # observation of either kind is the current five-hour percentage.
+    five_hr = observations[-1][2]
 
     elapsed_hours = (now_utc - week_start_at).total_seconds() / 3600.0
     total_hours = (week_end_at - week_start_at).total_seconds() / 3600.0
@@ -2111,7 +2189,12 @@ def cmd_report(args: argparse.Namespace) -> int:
         ).fetchone()
         if latest_usage is not None:
             date_str = latest_usage["week_start_date"]
-            canon_start, canon_end = c._get_canonical_boundary_for_date(conn, date_str)
+            # SCOPED to the requesting account (#834 S2, #837). The latest
+            # usage row above is already account-scoped, so resolving its
+            # boundary account-blind handed the current week the window the
+            # EARLIEST-capturing account established.
+            canon_start, canon_end = c._get_canonical_boundary_for_date(
+                conn, date_str, account_key=acct_key)
             current_ref = make_week_ref(
                 week_start_date=date_str,
                 week_end_date=latest_usage["week_end_date"],

@@ -316,6 +316,45 @@ def _no_usage_observed(stats_conn, cache_conn):
     ])
 
 
+# --- Scenario: credited-week-current ------------------------------------
+# #750 S4 §6.3 / #713. The CURRENT week received an in-place Anthropic credit,
+# so `_apply_reset_events_to_subweeks` splits it into two billing cycles that
+# share `week_start_date` and are told apart by `segment_key`. Both `forecast`
+# and `weekly`'s last row are anchored to the POST-credit cycle, and this
+# scenario is what makes the harness's reconciliation say so on evidence
+# rather than because nothing exercises it.
+#
+# The event row carries the shape both appliers require of an in-place credit:
+# `old_week_end_at == effective_reset_at_utc`, with `new_week_end_at` holding
+# the week's unchanged end. A boundary shift (`old != effective`) must NOT
+# split, and `build_reset_week` in the dashboard builder remains that control.
+def _credited_week_current(stats_conn, cache_conn):
+    week_start = dt.datetime(2026, 4, 13, 14, 0, 0, tzinfo=dt.timezone.utc)
+    week_end   = dt.datetime(2026, 4, 20, 14, 0, 0, tzinfo=dt.timezone.utc)
+    credit_at  = dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc)
+    # Pre-credit ramp to 62%, then the credit, then a post-credit ramp. The
+    # capture EXACTLY at the credit instant pins §1.2's ownership rule: it
+    # belongs to the cycle that STARTS there, so the pre-credit cycle reads
+    # 62.0 and the post-credit one starts from 8.0.
+    _insert_snapshots(stats_conn, week_start, week_end, [
+        (12, 18.0), (36, 41.0), (60, 62.0),
+        (72, 8.0), (84, 14.0), (96, 21.0),
+    ])
+    stats_conn.execute(
+        "INSERT INTO week_reset_events(detected_at_utc, old_week_end_at, "
+        "new_week_end_at, effective_reset_at_utc, observed_pre_credit_pct, "
+        "account_key) VALUES (?,?,?,?,?,?)",
+        (_iso(credit_at), _iso(credit_at), _iso(week_end), _iso(credit_at),
+         62.0, "unattributed"),
+    )
+    _insert_entries(cache_conn, [
+        (week_start + dt.timedelta(hours=30), "claude-sonnet-4-6",
+         1_000_000, 400_000, 0, 0),
+        (credit_at + dt.timedelta(hours=6), "claude-sonnet-4-6",
+         400_000, 200_000, 0, 0),
+    ])
+
+
 SCENARIOS = {
     "midweek-safe": (
         dt.datetime(2026, 4, 16, 20, 0, 0, tzinfo=dt.timezone.utc),  # day 4, 78h elapsed
@@ -356,6 +395,10 @@ SCENARIOS = {
     "mixed-boundary-current-week": (
         dt.datetime(2026, 4, 16, 20, 0, 0, tzinfo=dt.timezone.utc),
         _mixed_boundary_current_week,
+    ),
+    "credited-week-current": (
+        dt.datetime(2026, 4, 17, 18, 0, 0, tzinfo=dt.timezone.utc),
+        _credited_week_current,
     ),
 }
 

@@ -12,20 +12,93 @@
 
 ## Storage layers
 
-```
-status line ──► record-usage ──► stats.db (weekly_usage_snapshots, percent_milestones)
-                                       ▲
-                                       │ joined per WeekRef
-                                       ▼
-session JSONLs ──► sync_cache() ──► cache.db (session_entries) ──► sync-week ──► weekly_cost_snapshots
-                            ▲                                                          │
-                            │                                                          ▼
-                            └────── daily/monthly/weekly/blocks/range-cost/cache-report/session
-                                                                                       │
-report ◄─── joins weekly_usage_snapshots × weekly_cost_snapshots ◄─────────────────────┘
+```text
+Claude status line / OAuth / operator decisions ──► append-only journal
+Codex rollout quota observations ─────────────────► append-only journal
+                                                        │
+                                 single-flight ingest / derivation
+                                 journal derived events before commit
+                                                        │
+                                                        ▼
+                                                   stats.db index
+                                               (usage, cost snapshots,
+                                                milestones, credits)
+Provider JSONL ──► accounting cursor ──► cache.db ──► query-time priced reports
+             └──► transcript cursor ──► conversations.db ──► transcript readers
+
+report joins usage × cost snapshots in stats.db by the documented WeekRef.
+Dashboard resources compose these stores with explicit provenance and scope.
 ```
 
-See [runtime-data.md](runtime-data.md) for the full schema of both DBs.
+The journal preserves observations, operator decisions, derived events and
+completed corrections. `stats.db` is its disposable, epoch-versioned index;
+losing the journal loses durable history. Provider JSONL remains the source
+for reconstructible accounting and transcript records, rather than being
+duplicated wholesale into the journal. See [runtime-data.md](runtime-data.md)
+for table details and the authority/connection contract below.
+
+## Authority, connections and service boundaries
+
+| State | Authority and owner | Connection and publication rule |
+|---|---|---|
+| Provider JSONL | Provider writes; discovery identifies root, physical file and incarnation | Accounting and transcript consumers retain independent byte cursors; advancing one never advances the other |
+| Observation journal | Append-only observations, operations, committed derived facts and corrections | Append/fsync under the leaf journal lock; pin a high-water prefix before replay |
+| `stats.db` | Disposable journal projection; live derivation goes through `run_stats_ingest` | DELETE/FULL policy; journal events precede the transaction commit; rows and applied-prefix pairs commit atomically; alerts dispatch afterward |
+| `cache.db` | Reconstructible accounting, quota and identity projections | WAL/NORMAL; global writer flock before Codex provider flock; source/pricing revisions invalidate derived consumers |
+| `conversations.db` | Reconstructible normalized messages, rollups, titles, turns and search indexes | WAL/NORMAL; independent provider cursors/locks; readers attach accounting read-only and apply account-local TEMP views |
+| Process caches | Disposable accelerators, never durable truth | Generation and all semantic input revisions must agree; cold fallback preserves information |
+| Published dashboard | Complete snapshot plus separately owned activity state | `_SnapshotRef` owns activity counters; `SSEHub` coalesces each subscriber to its latest complete delivery |
+
+Product openers are not pure query APIs: `open_db`, `open_cache_db` and
+`open_conversations_db` can run policy, schema, recovery or maintenance work.
+Calling a handler GET therefore does not establish that its transitive path is
+free of persistent writes. Raw read-only inspection uses SQLite `mode=ro`
+without those openers. Account TEMP tables are connection-local scope, not
+persistent writes, and must remain possible in a future query interface.
+
+The target boundary is an initial **in-process Python query service**, followed
+by explicit ingestion, projection, publication and maintenance interfaces.
+This is a refactoring contract, not a claim those services already exist:
+
+| Interface | Input and output | Invariant |
+|---|---|---|
+| Query | Provider/root/account scope, window, bounded page, expected generation → rows, provenance, continuation or typed degradation | No persistent mutation/recovery; preserve TEMP account isolation and complete useful fields |
+| Discovery | Root identity and consumer position → scoped change batch and high-water | Separate acknowledgement per accounting/transcript consumer; gap/replacement forces explicit reconciliation |
+| Ingestion | Source incarnation, byte range and prior cursor → committed changed identities and next cursor | Cursor advances with its own rows; id-stable updates and truncations are changes |
+| Projection | Complete change sequence, pricing/account/window semantics → committed generation | Never mix generations; gaps rebuild from authority; old writer cannot publish over a newer generation |
+| Publication | Complete projection generation, source watermarks, time deadline → versioned resource | Fresh publication time is not proof of fresh source data; partial hydration is identified |
+| Maintenance | Store identity, policy, generation and bounded work budget → resumable progress/refusal | Respect writer/reader admission and preserve last-complete data; no live-family unlink shortcut |
+
+The first proposed module is `bin/_lib_query_context.py`: bounded query
+connection ownership, provider/account scope, generation checks and typed
+readiness results. It delegates existing domain kernels and initially serves
+one conversation reader. No module is added by this documentation change.
+Start with query ownership because its transitive mutation is observable and
+its interface can be adopted by one production reader before broad extraction.
+Retain current Python/SQLite/React/SSE foundations. A process or native helper
+requires measured benefit in CPU, memory, failure isolation and end-to-end
+latency, including its own startup, serialization and shutdown costs.
+
+Lock acquisition order is maintenance → journal ingest → global cache writer
+→ Codex cache writer → conversation writers (Claude then Codex) → artifact
+retention → SQLite transaction → journal append. Never acquire an earlier
+lock while holding a later one. The existing rebuild preservation exception
+holds artifact-retention **shared** under stats maintenance **exclusive** while
+acquiring cache writers; it is a specific documented protocol, not permission
+for a new inversion. A SQLite write transaction never spans a flock acquisition.
+
+Durable identity includes provider, root key, physical source/incarnation,
+logical session/message identity, account attribution/provenance, canonical
+physical quota window, billing-cycle segments, pricing fingerprint and semantic
+mutation/render revisions. Paths and directory basenames alone do not identify
+accounts or sessions. A same-id finalization must advance the revision even
+when row count and maximum id do not move.
+
+Current publication gives atomic replacement within each retained snapshot;
+it does not establish a common source frontier across independently ingested
+stores. The target requires explicit per-consumer watermarks and a consistent
+generation, with typed degradation when coherence cannot be proved. Never
+infer that guarantee from `generated_at`, a content hash or SSE connectivity.
 
 ## The session-entry cache (`cache.db`)
 
@@ -47,9 +120,11 @@ writers use the independent `conversations.db.lock`,
 `conversations.db.codex.lock`, and maintenance lock, so a large reingest never
 extends the core sync critical section.
 
-**Pricing freshness:** cost is **not** stored in the cache. It's computed
-at query time from `CLAUDE_MODEL_PRICING` / `CODEX_MODEL_PRICING`. Update
-the dict, and the next read sees the new prices — no invalidation.
+**Pricing freshness:** raw tokens remain available for query-time calculation;
+some derived costs and rollups are materialized and carry pricing provenance.
+Changing an embedded table is not sufficient to certify every retained or
+long-running reader. Preserve fingerprint ordering, invalidation and stale-writer
+refusal when changing a pricing or query boundary.
 
 **Resilience:** both derived stores are fully re-derivable; use
 `cache-sync --rebuild` rather than unlinking a live SQLite family. Classified
@@ -164,11 +239,21 @@ this back to upstream parity.**
 Two patterns, one rule each:
 
 - **Column additions** use `add_column_if_missing(...)` — an idempotent guard that adds the column when absent. No marker row, no version bump.
-- **Data-shape changes** (backfills, dedups, renames, table rewrites) go through the migration framework: handlers registered with `@stats_migration` / `@cache_migration` and dispatched by `_run_pending_migrations` on DB open, tracked in the `schema_migrations` table alongside `PRAGMA user_version`.
+- **Derived cache/conversation data-shape changes** (backfills, dedups, renames,
+  table rewrites) use their migration registry and schema version. Current
+  stats schema changes bump `STATS_INDEX_EPOCH` and rebuild from the journal;
+  the stats migration registry describes the legacy, pre-cutover path.
 
 Do **not** write inline `if "<col>" not in cols: ALTER TABLE …` blocks in `open_db()` — that is the anti-pattern the framework replaces.
 
-The operator surface is `cctally db status` (list applied/pending/failed/skipped across both DBs), `db skip` / `db unskip` (park a migration that cannot succeed on this machine), and `db recover` (revert a version-ahead DB to the known head). A dev-checkout binary refuses to forward-migrate the production data dir, so an in-progress migration on a git checkout can never brick the installed release's databases.
+The operator surface is `cctally db status`, `db skip` / `db unskip` for
+registry migrations, `db recover --db cache` for a version-ahead cache, and
+`db rebuild --db stats` for the journal index. `db recover --db stats` is
+retired. A dev-checkout binary refuses production forward migrations by
+default. A supported upgrade needs an explicit prior-package/schema fixture,
+recovery evidence and an installed-path check; an old binary is not
+automatically a safe rollback. Internal module or derived-schema changes must
+preserve the public CLI JSON/exit contracts through adapters and migrations.
 
 ## Diagnostics
 

@@ -98,8 +98,8 @@ describe('week nav chip', () => {
   it('renders ‹/› and disables the newer step on the current week', () => {
     updateSnapshot(makeEnv(INDEX));
     render(<CurrentWeekModal />);
-    const older = screen.getByLabelText('Older week') as HTMLButtonElement;
-    const newer = screen.getByLabelText('Newer week') as HTMLButtonElement;
+    const older = screen.getByLabelText('Older cycle') as HTMLButtonElement;
+    const newer = screen.getByLabelText('Newer cycle') as HTMLButtonElement;
     expect(older.disabled).toBe(false);
     expect(newer.disabled).toBe(true);
   });
@@ -110,7 +110,7 @@ describe('fetch policy + reset-defined cycle wire', () => {
     const spy = mockFetch(HISTORIC_CYCLE_PAYLOAD);
     updateSnapshot(makeEnv(INDEX));
     render(<CurrentWeekModal />);
-    fireEvent.click(screen.getByLabelText('Older week'));
+    fireEvent.click(screen.getByLabelText('Older cycle'));
     await screen.findByText('Jul 16–Jul 18');
     expect(spy).toHaveBeenCalledWith('/api/milestones/claude/week/milestone_cycle%3Apost-reset');
     expect(screen.queryByText(/CREDIT/)).toBeNull();
@@ -152,7 +152,7 @@ describe('Share visibility + vanish', () => {
     updateSnapshot(makeEnv(INDEX));
     render(<CurrentWeekModal />);
     expect(screen.queryByLabelText('Share Current week report')).toBeTruthy();
-    fireEvent.click(screen.getByLabelText('Older week'));
+    fireEvent.click(screen.getByLabelText('Older cycle'));
     await waitFor(() => expect(screen.queryByLabelText('Share Current week report')).toBeNull());
     expect(screen.queryByLabelText('Share Current week report')).toBeNull();
   });
@@ -161,7 +161,7 @@ describe('Share visibility + vanish', () => {
     mockFetch(HISTORIC_CYCLE_PAYLOAD);
     updateSnapshot(makeEnv(INDEX));
     render(<CurrentWeekModal />);
-    fireEvent.click(screen.getByLabelText('Older week'));
+    fireEvent.click(screen.getByLabelText('Older cycle'));
     await screen.findByText('Jul 16–Jul 18');
     // A later snapshot drops the selected cycle from the index.
     const shrunk = [idxEntry('milestone_cycle:current', { is_current: true })];
@@ -169,7 +169,7 @@ describe('Share visibility + vanish', () => {
     await screen.findByText(/no longer available/i);
     fireEvent.click(screen.getByText('Back to current'));
     await waitFor(() => expect(screen.queryByText(/no longer available/i)).toBeNull());
-    expect(screen.getByLabelText('Newer week')).toBeTruthy();
+    expect(screen.getByLabelText('Newer cycle')).toBeTruthy();
   });
 });
 
@@ -273,7 +273,7 @@ describe('empty-stream block keeps the navigator mounted (P1)', () => {
     mockFetch(HISTORIC_EMPTY_BLOCK);
     updateSnapshot(makeEnv(INDEX));
     render(<CurrentWeekModal />);
-    fireEvent.click(screen.getByLabelText('Older week'));
+    fireEvent.click(screen.getByLabelText('Older cycle'));
     // The navigator stays mounted even though the block's stream is empty …
     const label = await screen.findByText(/Block 1 of 1/);
     expect(label.textContent).toContain('⚡'); // cross-reset straddler marker
@@ -547,7 +547,7 @@ describe('Codex current-cycle block navigator (P2-A)', () => {
     const claude = container.querySelector<HTMLElement>('[data-provider-section="claude"]')!;
     const codex = container.querySelector<HTMLElement>('[data-provider-section="codex"]')!;
 
-    fireEvent.click(within(claude).getByLabelText('Older week'));
+    fireEvent.click(within(claude).getByLabelText('Older cycle'));
     await within(claude).findByText('Jul 16–Jul 18');
     expect(within(codex).queryByText('Cyc prev')).toBeNull();
 
@@ -632,11 +632,13 @@ describe('current-cycle range and reset semantics (#412 Task B)', () => {
   });
 });
 
-// #556 S4 F6 — `WeekNavChip` is shared by both providers and hard-coded
-// `Older week` / `Newer week`. On the Claude section that is correct. On the
-// Codex section it names a Claude concept: Codex navigates reset-defined quota
-// CYCLES, which the section's own pill, title and chip all call cycles, so a
-// screen reader heard "week" where every visible label said "cycle".
+// #556 S4 F6, revised by #750 S4 — `WeekNavChip` is shared by both providers.
+// It once hard-coded `Older week` / `Newer week`, which named a Claude concept
+// on the Codex section. #556 S4 gave Codex its own noun; #750 S4 removes the
+// remaining divergence, because Claude steps cycles too: its index comes from
+// `build_claude_week_index`, one entry per effective reset-defined cycle, so
+// on a credited week two adjacent steps stay inside one subscription week.
+// Both sections must now name the same unit their visible labels do.
 //
 // This state is unreachable on a store with more than one Codex account: the
 // Codex call site is gated behind `perAccountCycles === false`, and a decorated
@@ -647,7 +649,7 @@ describe('current-cycle range and reset semantics (#412 Task B)', () => {
 // and both enabled states exist. No realistic browser pass can reach this, so
 // it is verified here and is deliberately absent from the acceptance criteria.
 describe('provider-specific navigator vocabulary (#556 S4)', () => {
-  it('names the Codex navigator in cycle vocabulary, and leaves Claude on week', () => {
+  it('names both providers\' navigators in cycle vocabulary', () => {
     const env = codexEnvWithIndex(CODEX_IDX);
     env.current_week = makeEnv(INDEX).current_week;
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
@@ -666,9 +668,11 @@ describe('provider-specific navigator vocabulary (#556 S4)', () => {
     expect(within(codex).queryByLabelText('Newer week')).toBeNull();
 
     const claude = container.querySelector<HTMLElement>('[data-provider-section="claude"]')!;
-    expect(within(claude).getByLabelText('Older week')).toBeInTheDocument();
-    expect(within(claude).getByLabelText('Newer week')).toBeInTheDocument();
-    expect(within(claude).queryByLabelText('Older cycle')).toBeNull();
+    expect(claude.querySelector('.mcw-weeknav')).not.toBeNull();
+    expect(within(claude).getByLabelText('Older cycle')).toBeInTheDocument();
+    expect(within(claude).getByLabelText('Newer cycle')).toBeInTheDocument();
+    expect(within(claude).queryByLabelText('Older week')).toBeNull();
+    expect(within(claude).queryByLabelText('Newer week')).toBeNull();
   });
 });
 
@@ -735,7 +739,7 @@ describe('#620 S1 — a week with no recorded boundaries', () => {
     // bounds, so what follows is about this row and not about an index whose
     // every row is boundary-less.
     expect(BOUNDARYLESS_INDEX[0].start_at_utc).not.toBeNull();
-    fireEvent.click(screen.getByLabelText('Older week'));
+    fireEvent.click(screen.getByLabelText('Older cycle'));
     await screen.findByText('Mar 01');
   });
 
@@ -743,7 +747,7 @@ describe('#620 S1 — a week with no recorded boundaries', () => {
     mockFetch(BOUNDARYLESS_PAYLOAD);
     updateSnapshot(makeEnv(BOUNDARYLESS_INDEX));
     const { container } = render(<CurrentWeekModal />);
-    fireEvent.click(screen.getByLabelText('Older week'));
+    fireEvent.click(screen.getByLabelText('Older cycle'));
     await screen.findByText('Mar 01');
 
     // The pill falls back to the bare label — no `–` range, and certainly no
@@ -771,7 +775,7 @@ describe('#620 S1 — a week with no recorded boundaries', () => {
     mockFetch(BOUNDARYLESS_PAYLOAD);
     updateSnapshot(makeEnv(BOUNDARYLESS_INDEX));
     render(<CurrentWeekModal />);
-    fireEvent.click(screen.getByLabelText('Older week'));
+    fireEvent.click(screen.getByLabelText('Older cycle'));
     await screen.findByText('Mar 01');
     // The week has one 3% milestone; a missing boundary must not hide it.
     // `splitBigNum` renders the hero as two spans, so match the element rather
@@ -817,8 +821,236 @@ describe('#620 S1 — a week with no recorded boundaries', () => {
     mockFetch(HISTORIC_CYCLE_PAYLOAD);
     updateSnapshot(makeEnv(INDEX));
     const { container } = render(<CurrentWeekModal />);
-    fireEvent.click(screen.getByLabelText('Older week'));
+    fireEvent.click(screen.getByLabelText('Older cycle'));
     await screen.findByText('Jul 16–Jul 18');
     expect(container.querySelector('.mcw-bounds-missing')).toBeNull();
+  });
+});
+
+// #750 S4 §5. The milestone modal must name an observation gap rather than
+// render a bare em dash for a marginal the CLI names, and state each run once
+// above the table.
+const GAP_RUN = {
+  first_percent: 12,
+  last_percent: 15,
+  observed_at_utc: '2026-07-17T09:00:00Z',
+  previous_crossed_at_utc: '2026-07-16T10:00:00Z',
+};
+
+function gapMilestones() {
+  return [
+    { percent: 11, crossed_at_utc: '2026-07-16T10:00:00Z', cumulative_usd: 1, marginal_usd: 1, five_hour_pct_at_cross: null },
+    { percent: 12, crossed_at_utc: '2026-07-17T09:00:00Z', cumulative_usd: 4, marginal_usd: 3, five_hour_pct_at_cross: null },
+    { percent: 13, crossed_at_utc: '2026-07-17T09:00:00Z', cumulative_usd: 4, marginal_usd: null, five_hour_pct_at_cross: null, marginal_usd_withheld_cause: 'observation_gap' },
+    { percent: 14, crossed_at_utc: '2026-07-17T09:00:00Z', cumulative_usd: 4, marginal_usd: null, five_hour_pct_at_cross: null, marginal_usd_withheld_cause: 'observation_gap' },
+    { percent: 15, crossed_at_utc: '2026-07-17T09:00:00Z', cumulative_usd: 4, marginal_usd: null, five_hour_pct_at_cross: null, marginal_usd_withheld_cause: 'observation_gap' },
+  ];
+}
+
+const HISTORIC_GAP_PAYLOAD = {
+  ...HISTORIC_CYCLE_PAYLOAD,
+  segments: [{ key: 'milestone_segment:post-reset', milestones: gapMilestones() }],
+  observation_gap_runs: [GAP_RUN],
+};
+
+describe('#750 S4 §5 — the observation-gap disclosure', () => {
+  it('names the cause on the affected rows instead of a bare em dash', async () => {
+    mockFetch(HISTORIC_GAP_PAYLOAD);
+    updateSnapshot(makeEnv(INDEX));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await screen.findByText('Jul 16–Jul 18');
+    const cells = Array.from(document.querySelectorAll('#mcw-table .m-marginal'))
+      .map((el) => (el.textContent ?? '').trim());
+    // Rows 13/14/15 withhold; 11 and 12 carry a real figure.
+    expect(cells.filter((c) => c === 'observation gap')).toHaveLength(3);
+    expect(cells).not.toContain('—');
+  });
+
+  it('states each run once above the table', async () => {
+    mockFetch(HISTORIC_GAP_PAYLOAD);
+    updateSnapshot(makeEnv(INDEX));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await screen.findByText('Jul 16–Jul 18');
+    const notes = document.getElementById('mcw-gap-notes');
+    expect(notes).not.toBeNull();
+    expect(notes?.querySelectorAll('li')).toHaveLength(1);
+    expect(notes?.textContent).toMatch(/12%-15% were all recorded from one observation/);
+    expect(notes?.textContent).toMatch(/not separable/);
+    // The CLI's trailing `(observation_gap)` token is NOT repeated here: the
+    // cell reads the cause in words, so the note does not need the code.
+    expect(notes?.textContent).not.toContain('(observation_gap)');
+  });
+
+  it('names the span since the previous crossing, as the CLI does', async () => {
+    // §5.2 requires the rendered sentence to match the CLI's except for the
+    // trailing `(observation_gap)` token. `previous_crossed_at_utc` is what
+    // that clause is composed from, and the field shipped unread.
+    mockFetch(HISTORIC_GAP_PAYLOAD);
+    updateSnapshot(makeEnv(INDEX));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await screen.findByText('Jul 16–Jul 18');
+    const notes = document.getElementById('mcw-gap-notes');
+    expect(notes?.textContent).toContain('23.0 hours after the previous crossing');
+  });
+
+  it('drops the clause for a run that opens the ladder', async () => {
+    mockFetch({
+      ...HISTORIC_GAP_PAYLOAD,
+      observation_gap_runs: [{ ...GAP_RUN, previous_crossed_at_utc: null }],
+    });
+    updateSnapshot(makeEnv(INDEX));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await screen.findByText('Jul 16–Jul 18');
+    const notes = document.getElementById('mcw-gap-notes');
+    expect(notes?.textContent).toMatch(/12%-15% were all recorded from one observation/);
+    expect(notes?.textContent).not.toContain('after the previous crossing');
+  });
+
+  // The CLI renders this span with Python's `f"{x:.1f}"`, which breaks a tie to
+  // EVEN. `Number.toFixed(1)` breaks it upward, so before the fix this exact
+  // 4500-second gap read "1.3 hours" here and "1.2 hours" in the CLI. Whole
+  // seconds are what `captured_at_utc` carries, so the tie is reachable.
+  it('breaks a rounding tie the way Python does', async () => {
+    mockFetch({
+      ...HISTORIC_GAP_PAYLOAD,
+      observation_gap_runs: [{
+        ...GAP_RUN,
+        // 4500 seconds = 1.25 hours exactly.
+        previous_crossed_at_utc: '2026-07-17T07:45:00Z',
+        observed_at_utc: '2026-07-17T09:00:00Z',
+      }],
+    });
+    updateSnapshot(makeEnv(INDEX));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await screen.findByText('Jul 16–Jul 18');
+    const notes = document.getElementById('mcw-gap-notes');
+    expect(notes?.textContent).toContain('1.2 hours after the previous crossing');
+    expect(notes?.textContent).not.toContain('1.3 hours');
+  });
+
+  // The other side of the same tie: 6300 seconds is 1.75 hours, where rounding
+  // to even and rounding upward agree. Without it a helper that always rounded
+  // DOWN at a tie would pass the case above.
+  it('rounds a tie upward when the even neighbour is the higher one', async () => {
+    mockFetch({
+      ...HISTORIC_GAP_PAYLOAD,
+      observation_gap_runs: [{
+        ...GAP_RUN,
+        previous_crossed_at_utc: '2026-07-17T07:15:00Z',
+        observed_at_utc: '2026-07-17T09:00:00Z',
+      }],
+    });
+    updateSnapshot(makeEnv(INDEX));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await screen.findByText('Jul 16–Jul 18');
+    const notes = document.getElementById('mcw-gap-notes');
+    expect(notes?.textContent).toContain('1.8 hours after the previous crossing');
+  });
+
+  // A near-miss must NOT be treated as a tie: 3780 seconds is 1.05 hours, whose
+  // nearest double sits just above the midpoint, and Python renders it "1.1".
+  // A tie test written on the decimal literal rather than on the double would
+  // round it to "1.0" here.
+  it('leaves a near-midpoint span to ordinary rounding', async () => {
+    mockFetch({
+      ...HISTORIC_GAP_PAYLOAD,
+      observation_gap_runs: [{
+        ...GAP_RUN,
+        previous_crossed_at_utc: '2026-07-17T07:57:00Z',
+        observed_at_utc: '2026-07-17T09:00:00Z',
+      }],
+    });
+    updateSnapshot(makeEnv(INDEX));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await screen.findByText('Jul 16–Jul 18');
+    const notes = document.getElementById('mcw-gap-notes');
+    expect(notes?.textContent).toContain('1.1 hours after the previous crossing');
+  });
+
+  it('renders nothing when the payload carries no runs', async () => {
+    mockFetch(HISTORIC_CYCLE_PAYLOAD);
+    updateSnapshot(makeEnv(INDEX));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await screen.findByText('Jul 16–Jul 18');
+    expect(document.getElementById('mcw-gap-notes')).toBeNull();
+  });
+
+  // §5.3's probe, written BEFORE deciding whether the `has_observation_gap`
+  // hint is needed. A CURRENT single-segment cycle neither fetches its detail
+  // (`shouldFetch`) nor uses one that arrives (`useDetail`), so a gap in the
+  // live cycle would stay invisible. If this passes, the hint must not be
+  // written.
+  it('renders the disclosure for a CURRENT single-segment cycle', async () => {
+    mockFetch({
+      ...HISTORIC_GAP_PAYLOAD,
+      key: 'milestone_cycle:current',
+      is_current: true,
+      detail_stamp: 'st-milestone_cycle:current',
+    });
+    updateSnapshot(makeEnv([
+      idxEntry('milestone_cycle:current', {
+        is_current: true, label: 'Jul 18–Jul 25', segment_count: 1,
+        has_observation_gap: true,
+      }),
+      INDEX[1],
+    ]));
+    render(<CurrentWeekModal />);
+    await waitFor(() => {
+      expect(document.getElementById('mcw-gap-notes')).not.toBeNull();
+    });
+  });
+  // ── #834 S1 (#836): render the EFFECTIVE weekly value at a crossing ────
+
+  it('renders the effective weekly value at a crossing, and the unavailable marker when the joined snapshot row is gone', () => {
+    // `seven_day_pct_at_crossing` is the RAW reading a weekly-clamped tick
+    // stored, which no reader ever saw. The modal must render
+    // `effective_seven_day_pct_at_crossing` instead, and an em-dash when that is
+    // null — never a fallback to the raw value, which would put the wrong number
+    // on screen exactly in the case nobody checks.
+    const env = makeEnv([idxEntry('milestone_cycle:current', { is_current: true })]);
+    env.current_week!.five_hour_block = {
+      block_start_at: '2026-05-16T05:00:00Z',
+      five_hour_window_key: 901,
+      seven_day_pct_at_block_start: 40,
+      seven_day_pct_delta_pp: 2,
+      crossed_seven_day_reset: false,
+      credits: [],
+    };
+    env.current_week!.five_hour_milestones = [
+      {
+        percent_threshold: 20,
+        reset_event_id: 0,
+        captured_at_utc: '2026-05-16T06:00:00Z',
+        block_cost_usd: 1,
+        marginal_cost_usd: 1,
+        seven_day_pct_at_crossing: 50,
+        effective_seven_day_pct_at_crossing: 63,
+      },
+      {
+        percent_threshold: 30,
+        reset_event_id: 0,
+        captured_at_utc: '2026-05-16T07:00:00Z',
+        block_cost_usd: 2,
+        marginal_cost_usd: 1,
+        seven_day_pct_at_crossing: 50,
+        effective_seven_day_pct_at_crossing: null,
+      },
+    ];
+    updateSnapshot(env);
+    render(<CurrentWeekModal />);
+
+    const table = document.querySelector('#mcw-5h-table');
+    expect(table).toBeTruthy();
+    const cells = Array.from(table!.querySelectorAll('.m-fh')).map((n) => n.textContent);
+    expect(cells).toEqual(['63%', '\u2014']);
+    expect(table!.textContent).not.toContain('50%');
   });
 });

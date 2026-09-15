@@ -759,3 +759,121 @@ def test_a_refused_rebuild_names_the_unorderable_cause_too(env, capsys):
            / "docs" / "commands" / "cache-sync.md").read_text()
     assert "ISO date" in doc, \
         "the documented cause list must carry the second cause too"
+
+
+# --- #729: `--prune-orphans` exit contract when the rollup re-derive is refused
+
+
+def _orphan_then_remove(ns):
+    """One fully ingested transcript whose directory is then deleted."""
+    pdir = pathlib.Path(os.environ["HOME"]) / ".claude" / "projects" / "-gone"
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "s.jsonl").write_text(json.dumps({
+        "type": "assistant", "timestamp": "2026-07-01T00:00:00Z",
+        "requestId": "r1", "sessionId": "S1", "uuid": "u1",
+        "parentUuid": None,
+        "message": {"id": "m1", "model": "claude-opus-4-7", "usage": {
+            "input_tokens": 0, "output_tokens": 5,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        }},
+    }) + "\n")
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_cache"](conn)
+    finally:
+        conn.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        ns["sync_claude_conversations"](conn)
+    finally:
+        conn.close()
+    shutil.rmtree(pdir)
+
+
+def _prune_args():
+    return argparse.Namespace(
+        source="claude", rebuild=False, prune_orphans=True,
+        prune_conversations=False,
+    )
+
+
+def test_prune_orphans_exits_3_when_the_rollup_rederive_is_refused(env, capsys):
+    """Staged failure under docs/cli-contract.md, not a usage error: the
+    deletions committed and the re-derive that should have followed them did
+    not, so the store is left partially derived."""
+    ns, tmp_path, monkeypatch = env
+    _orphan_then_remove(ns)
+    monkeypatch.setattr(
+        ns["_cctally_cache"], "PRICING_SNAPSHOT_DATE", "2020-01-01")
+    assert ns["cmd_cache_sync"](_prune_args()) == 3
+    err = capsys.readouterr().err
+    assert "refused" in err
+    assert "1 file" in err
+
+
+def test_the_refusal_message_names_the_cause_that_actually_occurred(
+        env, capsys, monkeypatch):
+    """#769 S3 A2. The message stated one cause — "this process's pricing table
+    is older than the one the store recorded" — which #728 made non-exclusive:
+    a MALFORMED stored value and a read that FAILED refuse too, and neither is
+    about which table is older.
+    """
+    ns, tmp_path, monkeypatch2 = env
+    _orphan_then_remove(ns)
+    cache = ns["_cctally_cache"]
+    import _lib_pricing
+    obs = _lib_pricing.classify_pricing_fingerprint(
+        found=False, raw=None, error_kind="operational_error")
+    monkeypatch.setattr(
+        cache, "_read_pricing_fingerprint_observation",
+        lambda conn, key=None: obs)
+    assert ns["cmd_cache_sync"](_prune_args()) == 3
+    err = capsys.readouterr().err
+    assert "refused" in err
+    assert "older" not in err, (
+        "a read that failed says nothing about which pricing table is older"
+    )
+    assert cache.pricing_refusal_cause_phrase("degraded") in err
+
+
+def test_the_older_pricing_message_survives_for_the_state_it_describes(
+        env, capsys, monkeypatch):
+    ns, tmp_path, monkeypatch2 = env
+    _orphan_then_remove(ns)
+    monkeypatch.setattr(
+        ns["_cctally_cache"], "PRICING_SNAPSHOT_DATE", "2020-01-01")
+    assert ns["cmd_cache_sync"](_prune_args()) == 3
+    err = capsys.readouterr().err
+    assert ns["_cctally_cache"].pricing_refusal_cause_phrase("present") in err
+
+
+def test_prune_orphans_exits_0_when_the_rederive_is_authorized(env, capsys):
+    ns, tmp_path, monkeypatch = env
+    _orphan_then_remove(ns)
+    assert ns["cmd_cache_sync"](_prune_args()) == 0
+    assert "refused" not in capsys.readouterr().err
+
+
+def test_prune_orphans_reports_contention_before_a_refusal(env, capsys):
+    """Precedence: contention is reported first because NOTHING was attempted,
+    so there is no refusal to outrank — the pricing table is irrelevant on a
+    path that never reached the recompute."""
+    ns, tmp_path, monkeypatch = env
+    monkeypatch.setattr(
+        ns["_cctally_cache"], "_REBUILD_LOCK_TIMEOUT_SECONDS", 0.3,
+        raising=False)
+    monkeypatch.setattr(
+        ns["_cctally_cache"], "PRICING_SNAPSHOT_DATE", "2020-01-01")
+    _orphan_then_remove(ns)
+    lock_path = ns["_cctally_core"].CACHE_LOCK_PATH
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    holder = open(lock_path, "w")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        assert ns["cmd_cache_sync"](_prune_args()) == 1
+        err = capsys.readouterr().err
+        assert "another process holds the lock" in err
+        assert "refused" not in err
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        holder.close()

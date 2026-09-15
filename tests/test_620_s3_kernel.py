@@ -233,6 +233,12 @@ def test_the_s3_constants_and_codes_are_published_from_the_kernel():
     assert k.DIAGNOSIS_CODEX_EVENT_SCAN_PER_FILE_ROWS == 4_096
     assert k.GAP_UNKNOWN_CONTEXT_WINDOW == "unknown_context_window"
     assert k.GAP_SCAN_BUDGET_EXHAUSTED == "scan_budget_exhausted"
+    # #834 S2 (#800). Its own code, because none of the other four describes a
+    # conversation the accounting names and the transcript store does not
+    # retain: the context window is known, the budget was not exhausted, the
+    # origin is readable and nothing about a subagent is unresolved.
+    assert k.GAP_NO_RETAINED_TRANSCRIPT == "no_retained_transcript"
+    assert k.GAP_NO_RETAINED_TRANSCRIPT in k.GAP_CODES
     assert k.SUBJECT_KIND_QUALIFYING_SET == "qualifying_set"
     assert k.SUBJECT_CACHE_CHURN == "qualifying-set/cache-churn"
     assert k.SUBJECT_SHORT_HIGH_CONTEXT == "qualifying-set/short-high-context"

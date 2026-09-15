@@ -199,6 +199,22 @@ print(json.dumps(env, indent=2, sort_keys=True))
 '
 }
 
+# Normalize the /api/block/:start_at payload (#769 S4 #795). Asserting the
+# `label` alone could not see the defect this golden exists for: a reader
+# that regressed from the RETAINED facts of a closed, journal-stamped block
+# to recomputing them from the cache produces the same label, the same
+# start_at and the same anchor, and differs only in the headline totals, the
+# entry count and the model breakdown. Those are exactly what this compares.
+# CCTALLY_AS_OF pins the clock, so burn_rate/projection are deterministic and
+# nothing here is sentinelized.
+normalize_block_json () {
+    python3 -c '
+import json, sys
+env = json.load(sys.stdin)
+print(json.dumps(env, indent=2, sort_keys=True))
+'
+}
+
 # Phase 1 worker. Returns 0 on PASS, 1 on FAIL. Output goes to stdout/
 # stderr; `run_scenario` redirects those to a per-scenario log file
 # before invoking this. Counters live in the parent shell — the
@@ -430,8 +446,8 @@ def need(cond, msg):
     if not cond:
         errs.append(msg)
 
-need(d.get("source_schema_version") == 11,
-     "source_schema_version != 11: %r" % (d.get("source_schema_version"),))
+need(d.get("source_schema_version") == 12,
+     "source_schema_version != 12: %r" % (d.get("source_schema_version"),))
 
 sources = d.get("sources") or {}
 claude = sources.get("claude") or {}
@@ -1020,6 +1036,21 @@ print(label)
                 echo "FAIL $name: GET /api/block label='$block_label' suggests Tokyo zone leaked through (--tz utc override should win)"
                 ok=0
             fi
+            # #769 S4 #795: the whole payload, not just the label. The
+            # fixture's block is closed and journal-stamped with two
+            # children summing to $41.50, while its cache population
+            # recomputes to $18.60 over four samples — so a reader that
+            # stops serving retained facts moves this golden while leaving
+            # every field the label check reads untouched.
+            local block_golden block_actual
+            block_golden="$GOLDEN_ROOT/$name/golden-block.json"
+            block_actual=$(printf '%s' "$block_raw" | normalize_block_json)
+            if [ $? -ne 0 ] || [ -z "$block_actual" ]; then
+                echo "FAIL $name: /api/block JSON could not be normalized"
+                ok=0
+            else
+                _golden_require_str "/api/block" "$block_golden" "$block_actual" 5000 || ok=0
+            fi
         fi
     fi
 
@@ -1265,8 +1296,12 @@ run_scenario () {
 # output goes to its own _output.log; the loop after `xargs` flushes
 # them in fixed scenario order so the harness output reads identically
 # to the old sequential version.
-fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts command-secret codex-cache-active codex-cache-idle all-combined all-combined-decorated all-combined-account-unresolved all-budget-account-focus codex-account-fallback non-monday-anchor block-week-straddle alerts-weekly alerts-five-hour alerts-project-budget)
-export -f _run_scenario_inner run_scenario normalize_json normalize_session_json
+# `credited-week` / `credited-week-same-day` (#750 S4 §6.2 / #734): the
+# builder shipped no production-shaped in-place credit, so the assembled
+# wire and render contract of a credited week had no byte-compared
+# coverage. `reset-week` stays the BOUNDARY-SHIFT control beside them.
+fixture_scenarios=(ok warn over reset-week credited-week credited-week-same-day no-data utc-tz tz-override projected-alerts command-secret codex-cache-active codex-cache-idle all-combined all-combined-decorated all-combined-account-unresolved all-budget-account-focus codex-account-fallback non-monday-anchor block-week-straddle alerts-weekly alerts-five-hour alerts-project-budget)
+export -f _run_scenario_inner run_scenario normalize_json normalize_session_json normalize_block_json
 export -f kill_server_bounded
 # Golden-diff helpers must reach the xargs `bash -c` subshells too.
 export -f _golden_diff_files _golden_diff_str _golden_diff_two_str

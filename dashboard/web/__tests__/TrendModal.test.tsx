@@ -11,14 +11,16 @@ describe('<TrendModal />', () => {
     updateSnapshot(fixture as unknown as Envelope);
   });
 
-  it('renders the weeks pill and all three hero cards', () => {
+  it('renders the cycles pill and all three hero cards', () => {
     render(<TrendModal />);
     const pill = document.getElementById('mtr-weeks-pill');
     expect(pill).not.toBeNull();
     expect(pill?.classList.contains('m-pill')).toBe(true);
     expect(pill?.classList.contains('accent-amber')).toBe(true);
-    // Fixture has 12 history rows → "12 weeks · 3 months"
-    expect(pill?.textContent).toBe('12 weeks · 3 months');
+    // Fixture has 12 history rows. #750 S4 §4.1: cycles, both providers.
+    // The "· 3 months" half is gone from this fixture's render; the pill
+    // states the cycle count alone.
+    expect(pill?.textContent).toBe('12 cycles');
     expect(document.querySelectorAll('.m-hero.cols-3 .m-kv').length).toBe(3);
   });
 
@@ -57,14 +59,14 @@ describe('<TrendModal />', () => {
     expect(medline).not.toBeNull();
   });
 
-  it('renders x-axis labels W−11 / W−5 / Now', () => {
+  it('renders x-axis labels C−11 / C−5 / Now', () => {
     render(<TrendModal />);
     const axis = document.getElementById('mtr-sparkaxis');
     expect(axis).not.toBeNull();
     const spans = axis?.querySelectorAll('span');
     expect(spans?.length).toBe(3);
-    expect(spans?.[0].textContent).toBe('W−11');
-    expect(spans?.[1].textContent).toBe('W−5');
+    expect(spans?.[0].textContent).toBe('C−11');
+    expect(spans?.[1].textContent).toBe('C−5');
     expect(spans?.[2].textContent).toBe('Now');
   });
 
@@ -74,7 +76,7 @@ describe('<TrendModal />', () => {
     expect(sec).not.toBeNull();
     expect(sec?.querySelector('svg use')?.getAttribute('href')).toBe('/static/icons.svg#hash');
     const count = document.getElementById('mtr-tbl-count');
-    expect(count?.textContent).toBe('12 weeks');
+    expect(count?.textContent).toBe('12 cycles');
     const rows = document.querySelectorAll('#mtr-rows tr');
     expect(rows.length).toBe(12);
     const curRows = document.querySelectorAll('#mtr-rows tr.cur');

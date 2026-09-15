@@ -258,10 +258,19 @@ def test_unfiltered_project_output_stays_merged(two_account_store, capsys):
     assert row["outputTokens"] == 20_000, row["outputTokens"]
     assert payload["totals"]["costUsd"] == pytest.approx(
         row["costUsd"]), "one project, so the total is that project's cost"
-    # The merged TOTAL is a meter reading rather than an attribution, so it
-    # is unaffected: the withholding is about dividing it among projects.
-    # It sums the STORED weeks intersecting [05-21T09, 05-26T12] — alice's
-    # 50.0 plus bob's 90.0 and 20.0 — and not the merged interval starts,
-    # which is why it exceeds either account's own reading.
-    assert payload["totals"]["usedPercent"] == pytest.approx(160.0), (
+    # The merged TOTAL is a meter reading rather than an attribution, so the
+    # withholding above does not silence it. WHICH readings it sums changed
+    # under #750 S4 §2.1 / D7, and the change is the point of that work: the
+    # figure is now the sum over the EMITTED SEGMENTS, resolved through
+    # `weekly_usage_snapshots.week_start_date` — the documented join key
+    # `weekly` and `_get_latest_row_for_week` already use.
+    #
+    # `--weeks 2` emits [05-21T09, 05-25T00) and [05-25T00, …), whose
+    # `start_date`s are 05-21 and 05-25. Alice's 05-21 row (50.0) and bob's
+    # 05-25 row (20.0) join to them; bob's 05-18 week (90.0) is not one of
+    # the emitted intervals and no longer contributes. The former 160.0
+    # summed the stored weeks that merely INTERSECTED the span, including one
+    # the walk does not report, so it could exceed either account's reading
+    # while describing no interval the payload names.
+    assert payload["totals"]["usedPercent"] == pytest.approx(70.0), (
         payload["totals"]["usedPercent"])

@@ -14,7 +14,7 @@ Hooks
       → Run `cctally setup` to install the native Codex handler.
 Auth
 Database
-  ⚠ Pending migrations       58 pending
+  ⚠ Pending migrations       59 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Journal
 Data

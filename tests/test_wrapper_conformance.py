@@ -55,6 +55,10 @@ def test_map_is_complete():
             "cctally-test-all", "cctally-preview", "cctally-bench",
             "cctally-mirror-public", "cctally-release", "cctally-test-remote",
             "cctally-isolation-sweep",
+            # #769 S4 #776. A paired interpreter-exposure measurement, not a
+            # subcommand: it asserts nothing, dispatches to no `cctally`
+            # verb, and is mirror-private.
+            "cctally-bash-interpreter-probe",
         ):
             continue
         head = p.read_text(encoding="utf-8", errors="replace").splitlines()[0]

@@ -43,6 +43,13 @@ BEFORE_GAP = "2026-09-03T10:40:06Z"
 AFTER_GAP = "2026-09-04T04:03:18Z"
 
 
+@pytest.fixture(autouse=True)
+def _plain_terminal_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep byte-level table assertions independent of the CI color policy."""
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+
+
 def _row(
     threshold: int,
     *,

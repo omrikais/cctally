@@ -180,6 +180,7 @@
         "block_count": 0,
         "detail_stamp": "169c5df519d2b40f",
         "end_at_utc": "2026-04-20T14:00:00Z",
+        "has_observation_gap": false,
         "is_current": true,
         "key": "milestone_cycle:Zc1ylvwKaIGcW_AdgkGd6JXX7QUUhY-nufvRJeRy9Xk",
         "label": "Apr 13\u2013Apr 20",
@@ -798,7 +799,7 @@
         }
       ],
       "total_cost_usd": 0.63,
-      "week_label": "wk Apr 13",
+      "week_label": "Apr 13",
       "week_start_at": "2026-04-13T14:00:00Z",
       "week_start_date": "2026-04-13"
     },
@@ -834,7 +835,8 @@
         {
           "total_cost_usd": 0.63,
           "total_pct": 50.0,
-          "week_label": "wk Apr 13",
+          "week_label": "Apr 13",
+          "week_start_at": "2026-04-13T14:00:00Z",
           "week_start_date": "2026-04-13"
         }
       ],
@@ -862,7 +864,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 11,
+  "source_schema_version": 12,
   "sources": {
     "all": {
       "availability": "ok",
@@ -999,6 +1001,7 @@
       },
       "freshness": "fresh",
       "last_success_at": "2026-04-16T14:00:00Z",
+      "metadata_health": null,
       "warnings": []
     },
     "claude": {
@@ -1270,6 +1273,7 @@
                 "block_count": 0,
                 "detail_stamp": "169c5df519d2b40f",
                 "end_at_utc": "2026-04-20T14:00:00Z",
+                "has_observation_gap": false,
                 "is_current": true,
                 "key": "milestone_cycle:Zc1ylvwKaIGcW_AdgkGd6JXX7QUUhY-nufvRJeRy9Xk",
                 "label": "Apr 13\u2013Apr 20",
@@ -1395,7 +1399,8 @@
                 "dollar_per_pct": null,
                 "is_current": true,
                 "label": "Apr 13",
-                "used_pct": 50.0
+                "used_pct": 50.0,
+                "week_start_at": "2026-04-13T14:00:00Z"
               }
             ],
             "history_median_dpp": null,
@@ -1409,7 +1414,8 @@
                 "dollar_per_pct": null,
                 "is_current": true,
                 "label": "Apr 13",
-                "used_pct": 50.0
+                "used_pct": 50.0,
+                "week_start_at": "2026-04-13T14:00:00Z"
               }
             ]
           }
@@ -2373,7 +2379,7 @@
               }
             ],
             "total_cost_usd": 0.63,
-            "week_label": "wk Apr 13",
+            "week_label": "Apr 13",
             "week_start_at": "2026-04-13T14:00:00Z",
             "week_start_date": "2026-04-13"
           },
@@ -2418,7 +2424,8 @@
               {
                 "total_cost_usd": 0.63,
                 "total_pct": 50.0,
-                "week_label": "wk Apr 13",
+                "week_label": "Apr 13",
+                "week_start_at": "2026-04-13T14:00:00Z",
                 "week_start_date": "2026-04-13"
               }
             ],
@@ -2468,6 +2475,7 @@
                 "block_count": 0,
                 "detail_stamp": "169c5df519d2b40f",
                 "end_at_utc": "2026-04-20T14:00:00Z",
+                "has_observation_gap": false,
                 "is_current": true,
                 "key": "milestone_cycle:Zc1ylvwKaIGcW_AdgkGd6JXX7QUUhY-nufvRJeRy9Xk",
                 "label": "Apr 13\u2013Apr 20",
@@ -2506,6 +2514,7 @@
       },
       "freshness": "fresh",
       "last_success_at": "2026-04-16T14:00:00Z",
+      "metadata_health": null,
       "warnings": []
     },
     "codex": {
@@ -2675,6 +2684,11 @@
       },
       "freshness": "fresh",
       "last_success_at": "2026-04-16T14:00:00Z",
+      "metadata_health": {
+        "incomplete_rows": 0,
+        "retryable": false,
+        "state": "healthy"
+      },
       "warnings": []
     }
   },
@@ -2699,7 +2713,8 @@
         "dollar_per_pct": null,
         "is_current": true,
         "label": "Apr 13",
-        "used_pct": 50.0
+        "used_pct": 50.0,
+        "week_start_at": "2026-04-13T14:00:00Z"
       }
     ],
     "history_median_dpp": null,
@@ -2713,7 +2728,8 @@
         "dollar_per_pct": null,
         "is_current": true,
         "label": "Apr 13",
-        "used_pct": 50.0
+        "used_pct": 50.0,
+        "week_start_at": "2026-04-13T14:00:00Z"
       }
     ]
   },

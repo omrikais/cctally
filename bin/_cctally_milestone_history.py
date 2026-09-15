@@ -34,6 +34,10 @@ from _cctally_quota import assert_projection_readable, codex_quota_breakdown
 from _lib_accounts import UNATTRIBUTED
 from _lib_codex_pools import is_model_scoped_codex_quota
 from _lib_dashboard_sources import dashboard_resource_key
+from _cctally_percent_breakdown import (
+    OBSERVATION_GAP_CAUSE,
+    classify_observation_gaps,
+)
 from _lib_display_tz import _resolve_display_tz_obj, format_display_dt
 from _lib_json_envelope import _iso_z
 from _lib_quota import QuotaWindowIdentity
@@ -326,6 +330,21 @@ def _index_entry(conn, ref, current_cycle_key, tz) -> dict:
     block_count = _count_blocks(conn, start_z, end_z)
     key = _claude_cycle_key(ref)
 
+    # #750 S4 §5.3. A CURRENT single-segment cycle neither fetches its detail
+    # nor uses one that arrives, so a gap in the LIVE cycle would stay
+    # invisible: the disclosure travels on the week-detail payload. This hint
+    # is what gives the client a reason to fetch, and a reason to render what
+    # comes back. It was written only after the failing test §5.3 requires
+    # demonstrated the need — the probe is
+    # `renders the disclosure for a CURRENT single-segment cycle` in
+    # `dashboard/web/src/modals/currentWeekHistory.test.tsx`, and it failed.
+    #
+    # Additive and cheap: the rows are already loaded, and the classifier is
+    # the same pure kernel the detail route uses, so the index and the detail
+    # cannot disagree about whether a cycle has a gap.
+    has_gap = bool(
+        classify_observation_gaps(rows).runs) if rows else False
+
     return {
         "key": key,
         "start_at_utc": start_z,
@@ -335,6 +354,7 @@ def _index_entry(conn, ref, current_cycle_key, tz) -> dict:
         "milestone_count": milestone_count,
         "block_count": block_count,
         "segment_count": segment_count,
+        "has_observation_gap": has_gap,
         "detail_stamp": _mh.compute_detail_stamp(
             key, milestone_count, block_count, segment_count, max_captured
         ),
@@ -365,19 +385,62 @@ def build_claude_week_index(conn: sqlite3.Connection) -> list:
 # ── Claude week detail (spec §1b) ──────────────────────────────────────
 
 
-def _shape_weekly_milestone(row) -> dict:
+def _shape_weekly_milestone(row, *, withheld: bool = False) -> dict:
     """Reshape a ``percent_milestones`` row to the envelope
     ``current_week.milestones`` wire shape (byte-parallel with
-    ``_cctally_dashboard_envelope.snapshot_to_envelope``)."""
+    ``_cctally_dashboard_envelope.snapshot_to_envelope``).
+
+    ``withheld`` (#750 S4 §5.1) says the classifier identified this row's null
+    marginal as an observation gap rather than an absent one. The shaper
+    emitted five fields and dropped the cause, so the modal rendered a bare em
+    dash for a figure the CLI names. The key is snake_case to match its
+    neighbours on this wire shape, which is one of the frozen legacy snake
+    surfaces `docs/cli-contract.md` describes; the CLI's own JSON keeps its
+    camelCase `marginalCostWithheldCause`.
+
+    The field appears ONLY on a withheld row, so every existing payload byte
+    is unchanged.
+    """
     marginal = row["marginal_cost_usd"]
     fh = row["five_hour_percent_at_crossing"]
-    return {
+    shaped = {
         "percent": int(row["percent_threshold"]),
         "crossed_at_utc": _to_iso_z(row["captured_at_utc"]),
         "cumulative_usd": round(float(row["cumulative_cost_usd"]), 4),
         "marginal_usd": None if marginal is None else round(float(marginal), 4),
         "five_hour_pct_at_cross": None if fh is None else float(fh),
     }
+    if withheld and marginal is None:
+        shaped["marginal_usd_withheld_cause"] = OBSERVATION_GAP_CAUSE
+    return shaped
+
+
+def _shape_observation_gap_runs(disclosure, rows) -> list:
+    """The classified runs, as the additive week-detail wire member.
+
+    #750 S4 §5.2. The per-row cause alone cannot state a run's first threshold
+    or the instant of the previous crossing, which are what the note above the
+    table is about, so the runs travel as structured data and the CLIENT
+    composes the sentence through `lib/fmt.ts`. Shipping a pre-rendered
+    sentence would put a presentation decision inside a data contract and
+    bypass the browser's display-timezone chokepoint, so the viewer's zone
+    would come from the server's idea of it.
+
+    Ordered ascending by first threshold. Absent or empty means no gap.
+    """
+    out: list = []
+    for run in sorted(disclosure.runs, key=lambda r: r.first_threshold):
+        out.append({
+            "first_percent": int(run.first_threshold),
+            "last_percent": int(run.last_threshold),
+            "observed_at_utc": _to_iso_z(run.captured_at_utc),
+            # None when the run opens the ladder and has no predecessor.
+            "previous_crossed_at_utc": (
+                _to_iso_z(run.previous_captured_at_utc)
+                if run.previous_captured_at_utc else None
+            ),
+        })
+    return out
 
 
 def _load_block_credits(conn: sqlite3.Connection, window_key: int) -> list:
@@ -407,8 +470,14 @@ def _build_blocks(conn: sqlite3.Connection, start_iso, end_iso) -> list:
     if not start_iso or not end_iso:
         return []
     c = _cctally()
+    # #834 S1 (#836): `id` is selected so each block's milestones are loaded by
+    # the PRECISE selector. This route used to select blocks account-blind and
+    # then pass a bare `five_hour_window_key` to the milestone read, while block
+    # uniqueness is `(account_key, five_hour_window_key)` — so one physical
+    # window's per-account blocks each rendered EVERY account's milestones. `id`
+    # stays internal: it is not added to the published `blocks[]` shape.
     rows = conn.execute(
-        "SELECT five_hour_window_key, block_start_at, five_hour_resets_at, "
+        "SELECT id, five_hour_window_key, block_start_at, five_hour_resets_at, "
         "       final_five_hour_percent, total_cost_usd, "
         "       crossed_seven_day_reset, is_closed "
         "FROM five_hour_blocks "
@@ -431,7 +500,8 @@ def _build_blocks(conn: sqlite3.Connection, start_iso, end_iso) -> list:
                 "total_cost_usd": None if cost is None else float(cost),
                 "crossed_seven_day_reset": bool(b["crossed_seven_day_reset"]),
                 "is_closed": bool(b["is_closed"]),
-                "milestones": c._tui_build_five_hour_milestones(conn, wk),
+                "milestones": c._tui_build_five_hour_milestones(
+                    conn, wk, block_id=int(b["id"])),
                 "credits": _load_block_credits(conn, wk),
             }
         )
@@ -452,9 +522,17 @@ def build_claude_week_detail(conn: sqlite3.Connection, key: str) -> "dict | None
         "milestone_segment", "claude", ref.key,
         ref.week_start_at or None, ref.week_end_at or None,
     )
+    # #750 S4 §5.1: classify BEFORE shaping, through the existing pure kernel,
+    # so the shaper can name a null marginal's cause instead of dropping it.
+    disclosure = classify_observation_gaps(rows)
     segments = ([{"key": segment_key,
-                  "milestones": [_shape_weekly_milestone(r) for r in rows]}]
+                  "milestones": [
+                      _shape_weekly_milestone(
+                          r, withheld=i in disclosure.withheld_indexes)
+                      for i, r in enumerate(rows)
+                  ]}]
                 if rows else [])
+    gap_runs = _shape_observation_gap_runs(disclosure, rows) if rows else []
     blocks = _build_blocks(conn, entry["start_at_utc"], entry["end_at_utc"])
 
     return {
@@ -466,6 +544,8 @@ def build_claude_week_detail(conn: sqlite3.Connection, key: str) -> "dict | None
         "is_current": entry["is_current"],
         "detail_stamp": entry["detail_stamp"],
         "segments": segments,
+        # #750 S4 §5.2: additive and nullable. Absent or empty means no gap.
+        "observation_gap_runs": gap_runs,
         "dividers": [],
         "blocks": blocks,
     }

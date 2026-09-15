@@ -10,6 +10,7 @@
     "conversationNormalizeBudgetRows": 2000,
     "gapCodes": [
       "ambiguous_origin_category",
+      "no_retained_transcript",
       "scan_budget_exhausted",
       "unknown_context_window",
       "unresolved_subagent_attribution"
@@ -822,7 +823,8 @@
       "generation": {
         "cache": "9c14f3f024ce3547969feec698f951eeeecd76e0553f28e32f3f189e66dbef3f",
         "configuration": "da5f89c8c63549782b2c4680396250ec10ef5a8f6e017a19e0c93a14ee79accd",
-        "generationId": "a4fa86266197247e2dbbb2840967ed9821d72643f0fcfa6576139d52e738f359",
+        "conversations": "9319bb111d0e65cdc697a7b2bbfee3dcb01d92ea37dc47f88f4cea5e52275666",
+        "generationId": "ac334cfe50e5256d3f23faf219e67d55430a619129c10fac8e919326f12ea37e",
         "stats": "650fd68dabc966c6e9cae5f171645cba20fca0d8b46b672ad02beff3b0e35f99"
       },
       "source": "codex",

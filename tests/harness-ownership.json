@@ -336,7 +336,8 @@
     },
     "tui": {
       "fixturePaths": [
-        "tests/fixtures/tui"
+        "tests/fixtures/tui",
+        "bin/build-tui-fixtures.py"
       ],
       "sourcePaths": []
     },

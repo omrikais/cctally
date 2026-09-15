@@ -2,20 +2,21 @@
 
 This is the qualitative contract for cctally's backend read model — what owns which data, where request time goes, and which invariants must never break. It is deliberately a public architectural doc (a contract, not secrets), consolidating knowledge that previously lived only in scattered gotchas docs and session memory. It cross-links to [architecture.md](architecture.md) and the private `docs/*-gotchas.md` files rather than duplicating them.
 
-Quantitative budgets (how many milliseconds a warm rebuild "should" take) are **not** here — those are M3's committed benchmark baselines. This doc is the shape; the numbers live with the benchmarks. For live introspection, use the opt-in instrumentation described in [Introspection](#introspection-cctally_perf_trace--apidebugbackend).
+Quantitative budgets (how many milliseconds a warm rebuild "should" take) are **not** here — versioned acceptance contracts and benchmark receipts carry them. Historical M3 microbenchmarks remain historical evidence, with their original policy limits. This doc is the shape; the numbers live with the benchmarks. For live introspection, use the opt-in instrumentation described in [Introspection](#introspection-cctally_perf_trace--apidebugbackend).
 
 ## 1. Read-model ownership
 
-cctally has three tiers of state. Knowing which tier owns a fact tells you whether it is authoritative, re-derivable, or a per-process accelerator — and therefore what you may safely rebuild.
+cctally separates durable authority, disposable indexes and process accelerators. Knowing which tier owns a fact tells you whether it is authoritative, re-derivable, or a per-process accelerator — and therefore what you may safely rebuild.
 
 | Tier | Store | Owns | Re-derivable? |
 | --- | --- | --- | --- |
-| Authoritative | `stats.db` | User/runtime facts: weekly usage snapshots, percent milestones, week-reset events, weekly credit floors, budget milestones. | **No** — the source of truth. Losing it loses recorded history. |
+| Authoritative | Append-only observation journal | Observations, operator decisions, committed derived events and completed corrections. Provider JSONL separately owns reconstructible token/transcript records. | **No** — preserve the journal and its provenance. |
+| Journal-derived index | `stats.db` | Weekly usage, milestones, reset/credit/account state and applied journal prefix. | **Yes** — epoch-versioned replay/rebuild, preserving journal-first commit and alert rules. |
 | Core derived read model | `cache.db` | Compact Claude/Codex accounting entries and cursors, quota observations, Codex thread identity, and the `mutation_seq` change-signal counters. | **Yes** — re-derived from local JSONL by `cache-sync --rebuild`; direct readers may fall back to JSONL where documented. |
 | Transcript derived read model | `conversations.db` | Claude prose, Codex physical/normalized events, browse rollups, file-touch axes, AI titles, and FTS indexes. | **Yes** — independently re-derived from the same JSONL without blocking the core cache. |
 | Per-process accelerators | dashboard in-memory caches | Signature-keyed rebuild state in `bin/_lib_snapshot_cache.py`: the reconcile caches, bucket/session caches, the Codex dirty-path accounting population, and the idle-dispatch `(signature, snapshot)` memo. | **Yes** — dropped on process exit; re-warmed on the next rebuild. Never persisted. |
 
-Above those stores sit the **endpoint groups** the dashboard serves: the snapshot/SSE spine (`/api/data`, `/api/events`); the conversation viewer (browse/search/reader/find/live-tail under `/api/conversation*`); share/export; and doctor/update. Each group reads the tiers above but never writes authoritative state on a GET.
+Above those stores sit the **endpoint groups** the dashboard serves: the snapshot/SSE spine (`/api/data`, `/api/events`); the conversation viewer (browse/search/reader/find/live-tail under `/api/conversation*`); share/export; and doctor/update. Product openers can perform schema, recovery and maintenance work, so a GET is not itself proof of a persistent-write-free call graph. See [architecture.md](architecture.md#authority-connections-and-service-boundaries) for the current and target connection contracts.
 
 ## 2. Hot-path map
 
@@ -25,7 +26,7 @@ The map below is written in the **same phase vocabulary as the instrumentation**
 
 Every dashboard rebuild is a three-path dispatch keyed on a cheap composite `signature` (MAX-id descents over `cache.db` + `stats.db`, the reset-event change-signal, and a generation counter):
 
-- **Idle** — signature unchanged and no wall-clock day/week/month boundary rolled over ⇒ reuse the prior snapshot's heavy rows, re-patch only time-derived fields, and return. An idle dashboard sits near 0% CPU. Phase: `idle-decision`.
+- **Idle** — signature unchanged and no wall-clock day/week/month boundary rolled over ⇒ reuse the prior snapshot's heavy rows, re-patch only time-derived fields, and return. This cheap builder path does not establish whole-process idle CPU: discovery, transcript maintenance and other workers must be measured in the same phase. Phase: `idle-decision`.
 - **Warm/cold rebuild** — signature moved ⇒ run the builders. Under the `snapshot` root the phases are: `sync` (the once-per-rebuild ingest, which nests the `sync_cache` seams below), `signature`, the three `reconcile.{weekref, projects_env, cache_report}` phases (each carrying its `use_*_cache` hit boolean as meta — the only place those build-time locals are observable), the builders `build.{current_week, forecast, trend, sessions, milestones, weekly_periods, monthly_periods, projects_envelope}`, then `doctor` and `envelope.precompute`.
 
 The reconciles run **once per rebuild** (not once per SSE client): they refresh the signature-keyed accelerator caches so each builder can opt into an incremental read instead of a full-window walk. A failed or absent reconcile always falls back to direct compute — byte-identical output, just slower.
@@ -83,8 +84,10 @@ therefore also expires on elapsed time alone, after
 `FRONTIER_CERTIFICATE_MAX_AGE_SECONDS` (120 monotonic seconds) measured from the
 exhaustive walk it rests on. The expiry is checked before any database or
 filesystem work and reports the `certificate_expired` reason. This bounds
-worst-case staleness at one interval regardless of hook liveness, at a cost of
-one full walk per interval per provider. Only an exhaustive walk restarts that
+eventual reconciliation after expiry, at a cost of a full walk per expired
+consumer/provider certificate. It does not bound source-to-visible latency to
+120 seconds: in-flight walks, cooldown, independent consumer timing and later
+publication also contribute. Only an exhaustive walk restarts that
 clock: committing a caught-up or targeted plan advances the journal cursor
 without reading any source the tickets did not name, so neither a steady tick
 rate nor a steady ticket stream over one busy file can defer the walk.
@@ -118,7 +121,7 @@ These hold regardless of performance work; a change that violates one is a bug e
 - **`mutation_seq` change-stamp correctness.** An id-stable in-place finalization UPSERT still advances the per-file `mutation_seq` leg, so the dashboard leaves the idle path and recomputes exactly the affected bucket. A signature that fails to move on a real data change silently serves stale rows.
 - **Leading-and-trailing-edge cache eviction.** Signature-keyed accelerator caches must evict at both edges of their window — a leading-edge-only eviction leaves stale trailing buckets that a later read wrongly reuses.
 - **Codex dirty-path completeness.** Every accounting insert, semantic update, delete, and project-identity metadata change must advance migration 044's accounting sequence and retain both old and new path identities where they differ. A destructive clear emits one full marker. If a consumer cannot prove an unbroken sequence, it must rebuild cold.
-- **The sync loop's duty bound.** The background rebuild loop's publish period is never shorter than twice the rebuild it just performed, which caps its CPU use at 50% of one core no matter how large the store grows. No path — including a user's manual refresh — may start a rebuild sooner. See below.
+- **The sync loop's duty bound.** The background rebuild loop rests at least as long as its preceding wall-clock work. This bounds that loop's wall-clock duty, not aggregate process-tree CPU; independent workers and child processes must be charged separately. See below.
 - **The conversation loop's duty bound.** The transcript ingest thread carries the same 50% property, measured over its whole pass — open, both syncs, retention prune and close. Both loops are bounded; neither bound may be expressed through the other's helper. See below.
 
 ### The sync loop's duty bound (#313, extended by #583 S2)
@@ -129,7 +132,11 @@ The dashboard's background loop rebuilds the snapshot, then cools down before th
 next_start = (t0 + work) + max(interval, work)
 ```
 
-which makes the period `work + max(interval, work)`, and therefore never less than `2 * work`. That is the whole point: the loop always rests at least as long as it just worked, so its duty cycle stays at or below 50% of one core. The bound is scale-independent — it does not assume the rebuild is fast, and it degrades gracefully rather than saturating a core as a corpus grows. Consequently `--sync-interval` is a floor on the cooldown and not the period: raising it slows publication, and lowering it below `work` has no effect at all.
+which makes the period `work + max(interval, work)`, and therefore never less
+than `2 * work`. This is a wall-time scheduling rule, not proof of a 50% CPU
+ceiling across threads or a freshness guarantee. Consequently `--sync-interval`
+is a floor on cooldown, not the publication period: raising it slows
+publication, and lowering it below `work` has no effect.
 
 #583 S2 added a request-driven start, so a queued manual refresh no longer waits out a full interval. It is bounded by the same rule: the earliest a queued request can begin is `t0 + 2 * work`. That floor is never later than the automatic deadline — when `work >= interval` the two coincide, and when `work < interval` the deadline is strictly later — so a queued request is always served at or before the tick it would otherwise have waited for, and never earlier than the duty bound allows.
 
@@ -137,11 +144,11 @@ which makes the period `work + max(interval, work)`, and therefore never less th
 
 The dashboard runs a **second** work loop, on its own thread and its own SQLite file: transcript ingest into `conversations.db`. Until #583 S4 it had no scale-independent bound. It computed `interval = max(5.0, --sync-interval)` once and ended every pass with a fixed sleep of that length, which prevents literal 100% duty for finite work but caps nothing below it: a pass costing 30 seconds ran 30-on/5-off, about 86% duty, and that share grew with the store. Measured on a live instance against an 8.28 GB store, the thread was 15.5% of process CPU and system-time dominated (476 s system against 190 s user).
 
-It now uses `_conversation_next_deadline(t0, interval, work)`, which carries the same algebra as `_next_deadline` above, so once `work >= interval` the period is `2 * work` and the thread's CPU duty is capped at 50% of one core regardless of store size. The helper is deliberately a **separate function** rather than a call into `_next_deadline`: the two loops' bounds are independent regressions, and sharing one helper would let a later change to the main loop's scheduling silently remove this one. A test asserts the two currently agree, so a divergence has to be a deliberate act.
+It now uses `_conversation_next_deadline(t0, interval, work)`, which carries the same algebra as `_next_deadline` above, so once `work >= interval` the period is `2 * work` and the loop's wall-clock duty is at most 50%; aggregate process-tree CPU still requires measurement. The helper is deliberately a **separate function** rather than a call into `_next_deadline`: the two loops' bounds are independent regressions, and sharing one helper would let a later change to the main loop's scheduling silently remove this one. A test asserts the two currently agree, so a divergence has to be a deliberate act.
 
 `work` charges the **whole** pass — the store open, both provider syncs, the retention prune and the close. Anything measured outside it would be work outside the duty denominator, which is the defect this bound exists to fix. The prune is attempted on every pass whose store OPENED, including one whose sync then failed, and is skipped when the open itself failed: the prune opens its own connection to the same store and would otherwise retry an unopenable open every pass forever.
 
-The cost is published on `/api/debug/backend` under `tick.conversation_sync` and rendered by `cctally dashboard-perf`, which reports the measured one-core share as `sum(cpu_ns) / sum(period_ns)` over the passes carrying a forward period. `period_ns` is the interval from a pass's own start to the **next** pass's start, stamped onto that pass when its successor records, so the newest retained pass carries none and contributes to neither sum. Reading the interval backwards instead — the gap that preceded the pass — pairs each pass's CPU with someone else's interval, and that ratio has no upper bound: a long pass after short ones renders above 100%, past the 50% ceiling this bound guarantees.
+The cost is published on `/api/debug/backend` under `tick.conversation_sync` and rendered by `cctally dashboard-perf`, which reports the measured one-core share as `sum(cpu_ns) / sum(period_ns)` over the passes carrying a forward period. `period_ns` is the interval from a pass's own start to the **next** pass's start, stamped onto that pass when its successor records, so the newest retained pass carries none and contributes to neither sum. Reading the interval backwards instead — the gap that preceded the pass — pairs each pass's CPU with someone else's interval, and that ratio has no upper bound: a long pass after short ones renders above 100%, so it does not represent that pass's measured duty.
 
 The per-pass outcome (`ok`, `store_unavailable`, `error`) describes the store open and the two provider syncs. The retention prune runs after them and swallows its own failures, so a pass that ingested successfully and then failed only in the prune is still recorded as `ok`.
 
@@ -180,9 +187,14 @@ Arming no longer suppresses A2 progressive fill. The partial build runs inside `
 
 ### Where the numbers live
 
-This doc is the qualitative contract. Concrete budgets — target warm-rebuild time, ingest throughput, idle CPU — are M3's committed benchmark baselines, measured with the same phase vocabulary above. When you need live numbers for the machine in front of you, read them from `CCTALLY_PERF_TRACE` or `/api/debug/backend`; when you need the regression thresholds, read the M3 baselines.
+This doc is the qualitative contract. Versioned acceptance contracts bind numerical budgets to hardware, workload and policy. Historical M3 microbenchmarks retain their original limited scope. Live `CCTALLY_PERF_TRACE` and `/api/debug/backend` observations explain work on the current machine; they do not independently certify an end-to-end budget.
 
-## 5. Conversation assembly: measured cost & materialization decision
+## 5. Historical conversation assembly measurement and materialization decision
+
+The following v1.64.0 measurements preserve the original pre-materialization
+decision. They do not describe current reader behavior: current versions
+retain rendered turns/generations and invalidate them using semantic revisions.
+Use current source and fresh measurements for present-day cost claims.
 
 The conversation reader assembles a whole session from `conversations.db`'s `conversation_messages` on **every** call — `_assemble_session` runs the full dedup → turn-grouping → fold → sweep → meta-classify → cost/usage-stamp pipeline over the entire session, and `get_conversation` (each page), `get_conversation_outline`, `get_conversation_export`, `get_conversation_prompts`, and `find_in_conversation` (after a non-empty match probe) all funnel through it. Nothing is materialized or cached across calls. M5's mandate was measurement-first: instrument that path (deep `assemble.*` seams, §4), sweep its cost across a synthetic size ladder, find the threshold where whole-session assembly becomes human-perceptible, and only then decide whether to materialize rendered turns in `conversations.db`.
 
@@ -225,7 +237,12 @@ Before #278, `cmd_dashboard` was a strict sequential chain: `_dashboard_initial_
 
 **A2 — progressive first-run fill.** The dashboard's locked rebuild closure decouples the ingest from the build on the `skip_sync=False` path: it runs `sync_cache` **standalone** with a throttled progress callback (`T = 2 s`, completion-measured, suppressed under `CCTALLY_PERF_TRACE`), then builds the final snapshot with `skip_sync=True`. The partials republish over the latest-wins SSE hub as files land, so a first-run / long-gap dashboard fills progressively instead of empty-then-jump. Self-limiting: a warm returning user's sync finishes under `T`, so the throttle never fires (exactly one publish).
 
-### The measurement
+### Historical startup measurement
+
+The following #278 measurements and A3 decision describe that original
+fixture and product version. Their startup timings and statements about
+"today" are historical; current-size Architecture A measurements separately
+record bind, populated snapshot and browser readiness.
 
 Instrumentation first (§0): the six previously-unwrapped `_tui_build_snapshot` builders are now `_perf.phase`-instrumented, so a `--trace` cold build attributes them instead of dropping ~370 ms into "unattributed". A traced large-fixture cold build (`cctally-bench --scale large --trace`) confirms all six: `build.daily` ≈ 274 ms and `build.cache_report` ≈ 94 ms were the bulk of the previously-lost time; `build.weekly_history` / `build.blocks` / `build.alerts` / `build.five_hour_milestones` are sub-ms.
 

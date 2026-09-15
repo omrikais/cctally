@@ -6,6 +6,7 @@ import type { BlocksPanelRow, Envelope } from '../types/envelope';
 import fixture from '../../__tests__/fixtures/envelope.json';
 import {
   ACCOUNT_A,
+  ACCOUNT_B,
   makeDecoratedCodexSourceData,
 } from '../test-utils/sourceEnvelope';
 import { openActiveOrNewestBlockModal } from '../store/actions';
@@ -352,6 +353,9 @@ describe('#556 S2 — which block the expand affordance opens under All', () => 
 
     expect(getState().openSourceDetail).toEqual({
       source: 'codex', resource: 'block', key: 'block:codex-active',
+      // #769 S9: the undecorated fixture publishes no `account_key`, so the
+      // opener records null rather than synthesising `unattributed`.
+      accountKey: null,
     });
     expect(getState().openModal).not.toBe('block');
   });
@@ -434,5 +438,69 @@ describe('#556 S2 QA — the Blocks composition is off the h2', () => {
     expect(container.querySelector('.panel-header .panel-range-note')).toBeNull();
     const note = container.querySelector('.panel-range-note')!;
     expect(note.parentElement!.querySelector(':scope > .panel-header')).not.toBeNull();
+  });
+});
+
+// #769 S9 QA P2 — the row that opened a block detail names its own account.
+//
+// Two Codex accounts that observed one physical quota window publish two
+// separately labelled rows carrying ONE opaque resource key, because
+// `dashboard_resource_key("block", "codex", …)` is built from root, logical
+// limit key, observed slot, window minutes and reset — and never the account.
+// Under "All accounts" the modal resolved no qualifier, both rows issued the
+// identical unqualified URL, and `source_detail_lookup` answered both from the
+// first published row: one of the two rows opened the other account's block.
+//
+// The row already carries its own `accountKey` (`row.account_key ?? null`),
+// so the opener forwards it regardless of the focus control's setting.
+describe('#769 S9 — a block row opens its OWN account detail', () => {
+  const SHARED_KEY = 'block:one-physical-window';
+
+  function twoAccountBlocks(): Envelope {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    const codex = makeDecoratedCodexSourceData();
+    const base = codex.quota.blocks[0];
+    // One physical window observed by both accounts: identical opaque key,
+    // different owners. This is the shape that produced the mismatch.
+    codex.quota.blocks = [
+      { ...base, key: SHARED_KEY, account_key: ACCOUNT_A },
+      { ...base, key: SHARED_KEY, account_key: ACCOUNT_B },
+    ];
+    env.sources!.codex.data = codex;
+    return env;
+  }
+
+  it('forwards each row account while focus is on All accounts', () => {
+    updateSnapshot(twoAccountBlocks());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<BlocksPanel />);
+
+    const rows = screen.getAllByRole('button', { name: /^Open detail for / });
+    const blockRows = rows.filter((el) => el.classList.contains('blocks-row'));
+    expect(blockRows).toHaveLength(2);
+
+    fireEvent.click(blockRows[0]);
+    expect(getState().openSourceDetail).toEqual({
+      source: 'codex', resource: 'block', key: SHARED_KEY, accountKey: ACCOUNT_A,
+    });
+
+    dispatch({ type: 'CLOSE_SOURCE_DETAIL' });
+    fireEvent.click(blockRows[1]);
+    expect(getState().openSourceDetail).toEqual({
+      source: 'codex', resource: 'block', key: SHARED_KEY, accountKey: ACCOUNT_B,
+    });
+  });
+
+  it('forwards no account when the wire published none', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<BlocksPanel />);
+
+    const row = screen.getAllByRole('button', { name: /^Open detail for / })
+      .filter((el) => el.classList.contains('blocks-row'))[0];
+    fireEvent.click(row);
+    // `null`, never the `unattributed` sentinel: the wire published nothing.
+    expect(getState().openSourceDetail!.accountKey).toBeNull();
   });
 });

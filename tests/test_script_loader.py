@@ -961,6 +961,23 @@ def _code_path_expression(node, bindings):
                 return None
             source = _code_path_expression(node.args[0], bindings)
             if source is not None:
+                filename = node.args[1] if len(node.args) > 1 else None
+                if (
+                    isinstance(source, ast.Name)
+                    and source.id not in bindings
+                    and _is_synthetic_code_label(filename)
+                ):
+                    # The source expression is a name this scope cannot
+                    # resolve — a parameter whose callers supply generated
+                    # text — and the caller labelled the compiled code
+                    # `<...>`, which is the convention for code with no file
+                    # of origin. Two indeterminate halves do not make a load,
+                    # and reporting one sends the reader to a call site that
+                    # never names a file. The veto needs BOTH halves: when the
+                    # source resolves to a path, the label cannot override it,
+                    # so `compile(SCRIPT.read_text(), "<cctally>", "exec")`
+                    # is still reported.
+                    return None
                 return source
             if _is_literal_text(node.args[0], bindings) or len(node.args) < 2:
                 return None
@@ -976,6 +993,27 @@ def _code_path_expression(node, bindings):
         # and the outward recursion may resolve the second.
         return node
     return None
+
+
+def _is_synthetic_code_label(node):
+    """True when a ``compile()`` filename asserts the code has no file.
+
+    CPython's own convention: ``<string>``, ``<stdin>``, ``<generated>``. A
+    caller writing one is stating that the compiled text was assembled rather
+    than read, and an f-string label such as ``f"<connector {label}>"`` is the
+    same statement with a detail interpolated into it — so the first literal
+    segment is what decides, not the interpolated part.
+    """
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str) and node.value.startswith("<")
+    if isinstance(node, ast.JoinedStr) and node.values:
+        head = node.values[0]
+        return (
+            isinstance(head, ast.Constant)
+            and isinstance(head.value, str)
+            and head.value.startswith("<")
+        )
+    return False
 
 
 def _writes_into_namespace(node, name):
@@ -1530,6 +1568,12 @@ _STANDALONE_FIXTURE_LOADERS = {
     # siblings above: a separate `cctally tui --snapshot-module` process
     # executes it, so it cannot reach `tests/_script_loader`.
     "fixtures/tui/snapshot_censored.py": "cctally tui --snapshot-module argument",
+    # #769 S2's credited-week TUI fixture (#734). Same class again: the
+    # harness runs `cctally tui --render-once --snapshot-module` on it in a
+    # separate process, so `tests/_script_loader` is not importable from it.
+    # Its Trend-modal sibling `snapshot_modal_tr_credited_week.py` needs no
+    # entry, because it loads this fixture rather than `bin/cctally`.
+    "fixtures/tui/snapshot_credited_week.py": "cctally tui --snapshot-module argument",
 }
 
 
@@ -2437,7 +2481,7 @@ def test_the_estate_has_one_loader_implementation():
     Enumerated from the tree so a new hand-rolled copy is caught rather than a
     known one re-checked. Four classes are exempt and every one is named: the
     primitive itself, the three modules whose loader runs inside a child process
-    (``_CHILD_PROCESS_LOADERS``), the six fixture files a separate ``cctally``
+    (``_CHILD_PROCESS_LOADERS``), the seven fixture files a separate ``cctally``
     process executes (``_STANDALONE_FIXTURE_LOADERS``), and the thirteen that
     embed the loader inside source written out for another interpreter, which
     the test below covers.

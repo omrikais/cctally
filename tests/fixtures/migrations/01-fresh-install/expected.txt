@@ -15,7 +15,7 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 14 known
   · 013_codex_quota_projection_state               pending
   · 014_test_failure_injection                     pending
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 46 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 47 known
   · 001_dedup_highest_wins                         pending
   · 002_conversation_messages_backfill             pending
   · 003_conversation_reingest_tool_ids             pending
@@ -61,9 +61,10 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 46 known
   · 043_codex_window_attributions                  pending
   · 044_codex_accounting_change_ledger             pending
   · 045_conversation_render_revision_columns       pending
-  · 046_test_cache_migration                       pending
+  · 046_codex_source_file_identity                 pending
+  · 047_test_cache_migration                       pending
 
-conversations.db (<HOME>/.local/share/cctally/conversations.db)  version 0 / 8 known
+conversations.db (<HOME>/.local/share/cctally/conversations.db)  version 0 / 10 known
   · 001_adopt_schema_version_marker                pending
   · 002_codex_thread_source_inference_replay       pending
   · 003_background_mcp_result_replay               pending
@@ -72,6 +73,8 @@ conversations.db (<HOME>/.local/share/cctally/conversations.db)  version 0 / 8 k
   · 006_backfill_codex_file_touches                pending
   · 007_codex_find_projection_v2_meta              pending
   · 008_conversation_render_revision               pending
+  · 009_conversation_title_staging_and_account_stamps pending
+  · 010_codex_conversation_source_file_identity    pending
 ## stderr
 
 ## exit

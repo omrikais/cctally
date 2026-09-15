@@ -63,7 +63,12 @@ done
 # This block is at module scope (outside run_mode), so it uses plain
 # assignments instead of the plan's `local` declarations — `local` would
 # be a syntax error here.
-RECONCILE_FIXTURES="midweek-safe midweek-approaching projected-cap zero-prior-weeks stable-sparse-current date-only-current-week mixed-boundary-current-week"
+# `credited-week-current` (#750 S4 §6.3 / #713): the current week received
+# an in-place credit, so it is TWO billing cycles. `forecast` and
+# `weekly`'s last row must both be anchored to the post-credit one. Until
+# this scenario existed the reconciliation was green because nothing
+# exercised a credited week, not because it holds across one.
+RECONCILE_FIXTURES="midweek-safe midweek-approaching projected-cap zero-prior-weeks stable-sparse-current date-only-current-week mixed-boundary-current-week credited-week-current"
 for name in $RECONCILE_FIXTURES; do
     dir="$FIXTURES_DIR/$name"          # for reading input.env (still in-tree)
     FAKE_HOME="$SCRATCH_DIR/$name"     # for HOME during forecast/weekly invocations (scratch)
@@ -81,26 +86,43 @@ for name in $RECONCILE_FIXTURES; do
     week_start_date="${week_start%T*}"
     weekly_json=$(HOME="$FAKE_HOME" NO_COLOR=1 TZ=UTC \
         "$BIN" weekly --since "$week_start_date" --until "$as_of_date" --json 2>/dev/null)
-    w_pct=$(echo "$weekly_json" | python3 -c "
-import json,sys
+    # ONE matcher, parameterized by the field it prints. It was written out
+    # twice, the two copies differing only in `usedPct` versus `totalCost`.
+    _weekly_field=$(cat <<'PYEOF'
+import datetime as dt, json, sys
+field, target_iso, target_date = sys.argv[1], sys.argv[2], sys.argv[3]
+def canon(value):
+    try:
+        return dt.datetime.fromisoformat(
+            str(value).replace('Z', '+00:00')).astimezone(dt.timezone.utc)
+    except (TypeError, ValueError):
+        return None
 data = json.load(sys.stdin).get('weekly') or []
-target = '$week_start_date'
-for row in data:
-    if row.get('weekStartAt', '').startswith(target):
-        print(row.get('usedPct', ''))
-        break
-else:
-    print('')")
-    w_cost=$(echo "$weekly_json" | python3 -c "
-import json,sys
-data = json.load(sys.stdin).get('weekly') or []
-target = '$week_start_date'
-for row in data:
-    if row.get('weekStartAt', '').startswith(target):
-        print(row.get('totalCost', ''))
-        break
-else:
-    print('')")
+target = canon(target_iso)
+# EXACT match on the canonical instant first, see #750 S4 section 6.1. An
+# in-place credit puts two billing CYCLES on one date, and the old
+# date-prefix match took whichever came first, the PRE-credit cycle, while
+# forecast.week.start_at names the post-credit one — so the two sides of the
+# reconciliation described different windows.
+picked = [r for r in data
+          if target is not None and canon(r.get('weekStartAt')) == target]
+if not picked:
+    # A legacy week whose snapshots carry NULL week_start_at, the
+    # date-only-current-week scenario: weekly and forecast synthesize the
+    # boundary independently and agree on the DATE but not the time, so no
+    # instant matches. Fall back to the date, and only when exactly ONE row
+    # carries it — two rows sharing a date is the credited case this
+    # comparison must never resolve by guessing.
+    same_date = [r for r in data
+                 if str(r.get('weekStartAt') or '').startswith(target_date)]
+    picked = same_date if len(same_date) == 1 else []
+print(picked[0].get(field, '') if picked else '')
+PYEOF
+)
+    w_pct=$(echo "$weekly_json" | python3 -c "$_weekly_field" \
+        usedPct "$week_start" "$week_start_date")
+    w_cost=$(echo "$weekly_json" | python3 -c "$_weekly_field" \
+        totalCost "$week_start" "$week_start_date")
     if [ "$f_pct" != "$w_pct" ]; then
         echo "RECONCILE FAIL $name: forecast.current.weekly_percent=$f_pct  weekly=$w_pct"
         fail_count=$((fail_count + 1))

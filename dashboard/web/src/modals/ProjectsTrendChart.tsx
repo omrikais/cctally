@@ -20,6 +20,7 @@
 // established pattern).
 import { useMemo } from 'react';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { useDisplayTz } from '../hooks/useDisplayTz';
 import type { ProjectsTrendEnvelope } from '../types/envelope';
 import { ProjectsRankedBars } from './ProjectsRankedBars';
 import {
@@ -40,6 +41,45 @@ export interface ProjectsTrendChartProps {
   onProjectSelect?: (key: string) => void;
 }
 
+/** X-axis labels for the projects trend chart, disambiguated per display zone.
+ *
+ * Exported so the zone behaviour is unit-testable without mocking a hook.
+ *
+ * Both halves of a label come from ONE instant in ONE zone. `week_label`
+ * arrives baked in UTC, so appending a display-zone time to it produced a
+ * label whose date and time disagreed: under America/Los_Angeles the axis read
+ * `Apr 17 20:00` for an instant whose local date is Apr 16, and so appeared to
+ * run backwards. Deriving the date here also makes this axis agree with the
+ * Trend panel, which already labels in the display zone.
+ *
+ * A suffix is added only where two cycles genuinely render the same local date.
+ * That needs no canonical-week key the way the server kernel does: this window
+ * holds at most twelve consecutive cycles, so two ordinary cycles a year apart
+ * cannot both appear and any collision here IS one credited week's segments.
+ * `week_label` remains the fallback for an envelope predating `week_start_at`.
+ */
+export function projectsAxisLabels(
+  weeks: { week_label: string; week_start_at?: string | null }[],
+  zone: string,
+): string[] {
+  const dayFmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: zone, month: 'short', day: '2-digit',
+  });
+  const timeFmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: zone, hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+  const base = weeks.map((w) => (
+    w.week_start_at ? dayFmt.format(new Date(w.week_start_at)) : w.week_label
+  ));
+  const counts = new Map<string, number>();
+  for (const label of base) counts.set(label, (counts.get(label) ?? 0) + 1);
+  return weeks.map((w, i) => (
+    (counts.get(base[i]) ?? 0) > 1 && w.week_start_at
+      ? `${base[i]} ${timeFmt.format(new Date(w.week_start_at))}`
+      : base[i]
+  ));
+}
+
 export function ProjectsTrendChart({
   trend,
   yMode,
@@ -58,11 +98,14 @@ export function ProjectsTrendChart({
   );
 
   const isMobile = useIsMobile();
+  // Read ABOVE the early return below: a hook placed after it unmounts on
+  // the empty branch and blanks the dashboard.
+  const display = useDisplayTz();
 
   if (prepared.weeks.length === 0 || prepared.series.length === 0) {
     return (
       <div className="panel-empty">
-        No project activity in the last {windowWeeks} week{windowWeeks === 1 ? '' : 's'}.
+        No project activity in the last {windowWeeks} cycle{windowWeeks === 1 ? '' : 's'}.
       </div>
     );
   }
@@ -122,8 +165,32 @@ export function ProjectsTrendChart({
     return { color: colorFor(p.key, i), key: p.key, points: points.join(' ') };
   });
 
-  const xAxisLabels = prepared.weeks.map((w) => (
-    <span key={w.week_start_date}>{w.week_label}</span>
+  // #750 S4 §3.5: keyed on the segment INSTANT. `week_start_date` is the
+  // shared billing-cycle join key, so both cycles of a credited week carry
+  // one value for it and this axis rendered duplicate React keys. The
+  // fallback keeps an older envelope rendering rather than crashing.
+  //
+  // §3.2a: the keys were distinct but the LABELS were not — two cycles of a
+  // credited week that fall on one date both rendered `Apr 17`, so a reader
+  // could not tell the columns apart. The suffix is derived here rather than on
+  // the wire because `week_label` is UTC-anchored by contract to keep the JSON
+  // timezone-agnostic, while this axis can honour the viewer's own zone.
+  // Grouping needs no canonical-week key the way the server kernel does: this
+  // window holds at most twelve consecutive cycles, so two ordinary cycles a
+  // year apart cannot both appear, and any collision here IS two segments of
+  // one credited week. A window with no collision is byte-identical.
+  // The DATE is derived here too, not just the suffix. `week_label` is baked
+  // UTC on the wire, so appending a display-zone time to it produced a label
+  // whose two halves came from different zones: under America/Los_Angeles the
+  // axis read `Apr 17 20:00` for an instant whose local date is Apr 16, so it
+  // appeared to run backwards. Deriving both halves from one instant in one
+  // zone also makes this axis agree with the Trend panel, which already labels
+  // in the display zone — under that same setting the panel reads Apr 16 / Apr
+  // 17 and needs no suffix at all, and now so does this. `week_label` remains
+  // the fallback for an envelope that predates `week_start_at`.
+  const labelTexts = projectsAxisLabels(prepared.weeks, display.resolvedTz);
+  const xAxisLabels = prepared.weeks.map((w, i) => (
+    <span key={w.week_start_at ?? `${w.week_start_date}:${i}`}>{labelTexts[i]}</span>
   ));
 
   // PR-2 y-axis labels for the stacked-area mode: absolute labels $total
@@ -149,7 +216,7 @@ export function ProjectsTrendChart({
               viewBox={`0 0 ${VW} ${VH}`}
               preserveAspectRatio="none"
               role="img"
-              aria-label={`Stacked area: project ${yMode === 'share' ? 'share %' : 'cost'} over ${weekCount} weeks`}
+              aria-label={`Stacked area: project ${yMode === 'share' ? 'share %' : 'cost'} over ${weekCount} ${weekCount === 1 ? 'cycle' : 'cycles'}`}
             >
               {polygons.map((p) => {
                 const isOther = p.key === OTHER_KEY;

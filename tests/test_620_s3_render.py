@@ -162,7 +162,10 @@ def test_the_gap_code_vocabulary_is_published_on_the_wire():
     diagnosis = _diagnosis()
     constants = diagnosis.diagnosis_to_wire(_report([]))["constants"]
     assert constants["gapCodes"] == sorted(kernel.GAP_CODES)
-    assert len(constants["gapCodes"]) == 4
+    # A literal count, so a code added to the kernel without a decision about
+    # the wire fails here rather than shipping. #834 S2 (#800) added the fifth,
+    # `no_retained_transcript`.
+    assert len(constants["gapCodes"]) == 5
 
 
 def test_no_published_gap_code_collides_with_a_withheld_cause():

@@ -3922,6 +3922,55 @@ def test_codex_facets_do_not_build_or_price_a_browse_page(tmp_path, monkeypatch)
         conn.close()
 
 
+# --- #717: the Codex facets rail says when it is degraded ------------------
+
+
+@pytest.mark.parametrize("marker", [
+    "codex_conversation_contract_rebuild_pending",
+    "codex_conversation_replay_from_zero",
+])
+def test_a_pending_codex_replay_marks_the_facets_degraded(tmp_path,
+                                                          monkeypatch, marker):
+    """Both replay markers withhold normalization authority, and each is armed
+    by its own key on purpose — the contract replay must not consume the
+    thread_source one — so each is tested independently. In that state
+    `list_codex_conversation_facets` already returns empty facets; #717 makes
+    it say why, instead of leaving the rail with an unexplained empty list."""
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, _BROWSE_MIX)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        healthy = q.list_codex_conversation_facets(conn)
+        assert healthy["status"] == "ok"
+        assert "filter_degraded" not in healthy, (
+            "byte stability: the flag is omitted on the authoritative path")
+
+        key = (q.CODEX_CONTRACT_REBUILD_MARKER
+               if marker == "codex_conversation_contract_rebuild_pending"
+               else kern.CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY)
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,'1')",
+            (key,))
+        conn.commit()
+        assert q.codex_normalization_authoritative(conn) is False
+
+        env = q.list_codex_conversation_facets(conn)
+        assert env["status"] == "normalization_pending"
+        assert env["filter_degraded"] is True
+        assert env["facets"]["projects"] == []
+        # DECIDED, and stated rather than left to the reader: Codex model
+        # counts are NOT derivable in this state. Unlike Claude, whose model
+        # facet folds `conversation_messages` and never reads the rollup,
+        # every Codex facet source — the stored rollups and the live
+        # recompute alike — reads the normalized corpus that the pending
+        # replay is about to rewrite. Deriving counts from it would publish
+        # numbers the replay is going to change.
+        assert env["facets"]["models"] == []
+    finally:
+        conn.close()
+
+
 def test_browse_model_and_project_facets_and_filters(tmp_path, monkeypatch):
     ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, _BROWSE_MIX)
     conn = ns["open_cache_db"]()

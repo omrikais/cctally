@@ -56,7 +56,9 @@ def _stage(
 def test_an_empty_destination_is_refused():
     proc = _stage("")
     assert proc.returncode == 2, (proc.returncode, proc.stderr)
-    assert "refusing an empty destination" in proc.stderr
+    # Reworded under #769 S5 #808 so the diagnostic survives the evidence
+    # scrub; the fail-loud intent is unchanged.
+    assert "fixture tree: empty path, refuses to run" in proc.stderr
 
 
 def test_a_destination_in_the_repository_is_refused(tmp_path):
@@ -78,7 +80,7 @@ def test_a_destination_in_the_repository_is_refused(tmp_path):
 
     proc = _stage(str(sentinel), temp_root=allowed_root)
     assert proc.returncode == 2, (proc.returncode, proc.stderr)
-    assert "refusing a destination outside" in proc.stderr
+    assert "fixture path" in proc.stderr and "not under temp" in proc.stderr
     assert sorted(path.name for path in sentinel.iterdir()) == before
 
 

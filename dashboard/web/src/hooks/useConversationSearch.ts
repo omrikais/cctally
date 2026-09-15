@@ -4,7 +4,7 @@ import { getState, subscribeStore } from '../store/store';
 import { useDebouncedValue } from './useDebouncedValue';
 import { filterParams } from './conversationFilterParams';
 import { adaptQualifiedSearch } from '../lib/conversationAdapters';
-import { qualifiedSearchUrl, type QualifiedSearchEnvelope } from '../lib/conversationTransport';
+import { conversationDegradedNotice, conversationDegradedReason, qualifiedSearchUrl, type ConversationDegradedNotice, type QualifiedSearchEnvelope } from '../lib/conversationTransport';
 import type { ConversationSearchResult, ConversationSource, SearchHit, SearchKind } from '../types/conversation';
 
 // Debounced cross-session search. Empty/whitespace needle -> no fetch, empty
@@ -39,6 +39,11 @@ export interface UseConversationSearch {
   error: string | null;
   loadMore: () => void;
   pending: boolean;
+  // #769 S6 / #802 browser QA P1 — the transcript store answered 200 with a
+  // typed degraded envelope, which carries `results` and never `hits`. Reading
+  // hits out of it threw and the rail printed "Search failed." over a store
+  // that had answered successfully.
+  degraded: ConversationDegradedNotice | null;
 }
 
 const DEBOUNCE_MS = 200;
@@ -61,6 +66,7 @@ export function useConversationSearch(
   const [error, setError] = useState<string | null>(null);
   const [cursor, setCursor] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const [degraded, setDegraded] = useState<ConversationDegradedNotice | null>(null);
   const q = query.trim();
   // #217 S4 / I-2.5 — the shared browse filters (auto-applied to search). A
   // stable JSON key folds into the `url` callback's deps so a filter change
@@ -99,7 +105,7 @@ export function useConversationSearch(
   // needle OR kind OR filter set changes — so a prior response can never commit
   // late over the newer query's state.
   useEffect(() => {
-    if (!q) { setHits([]); setMode(null); setTotal(0); setSearchDepth(null); setFilterDegraded(false); setError(null); }
+    if (!q) { setHits([]); setMode(null); setTotal(0); setSearchDepth(null); setFilterDegraded(false); setError(null); setDegraded(null); }
     return () => { ctlRef.current?.abort(); };
   }, [q, kind, filterKey, source, qualified, accountKey]);
 
@@ -119,6 +125,17 @@ export function useConversationSearch(
     setLoadingMore(false);
     fetchJson<ConversationSearchResult | QualifiedSearchEnvelope>(url(0), ctl.signal)
       .then((raw) => {
+        // Before either branch reads `hits` off the body — the degraded
+        // envelope has none.
+        const degradedReason = conversationDegradedReason(raw);
+        if (degradedReason != null) {
+          setHits([]); setTotal(0); setCursor(null); setPending(false);
+          setFilterDegraded(false);
+          setDegraded(conversationDegradedNotice(degradedReason));
+          setError(null); setFetching(false);
+          return;
+        }
+        setDegraded(null);
         const body = qualified
           ? adaptQualifiedSearch(source, raw as QualifiedSearchEnvelope, accountKey)
           : {
@@ -196,5 +213,5 @@ export function useConversationSearch(
   // (debouncedQ never changes, so no fetch re-fires to clear an imperative flag).
   const loading = q !== '' && (q !== debouncedQ || fetching);
 
-  return { hits, mode, total, loading, loadingMore, searchDepth, filterDegraded, error, loadMore, pending };
+  return { hits, mode, total, loading, loadingMore, searchDepth, filterDegraded, error, loadMore, pending, degraded };
 }

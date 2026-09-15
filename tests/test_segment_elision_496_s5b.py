@@ -1498,3 +1498,196 @@ def test_the_prefix_digest_over_an_elided_pass_is_byte_identical(
     )
     assert acknowledged == sorted(
         item.fingerprint for item in oracle.acknowledged_protocol_violations)
+
+
+# --------------------------------------------------------------------------
+# #834 S2 (#827) — the inode decides elision; the device corroborates
+# --------------------------------------------------------------------------
+#
+# `summary_is_elidable` compared `(st_dev, st_ino)` as a PAIR, so a volume
+# remount refused a summary that was still valid for the same physical file.
+# `st_dev` is assigned when a volume is mounted rather than when a file is
+# created, so a journal on an external or network volume presented every
+# segment at a new device number with no file changed at all.
+#
+# The verdict is now `_lib_ingest_frontier.source_identity_replaced`, the single
+# point of truth the Codex walks already use. A device-only change additionally
+# requires a byte-identity proof of the current complete prefix, because
+# `SegmentSummary` carries device, inode, size and a complete-line offset but
+# nothing that distinguishes two files sharing all four. Inode numbers are
+# unique only WITHIN a device, so without that proof a same-inode file on
+# another volume at the same size and pinned extent would be accepted as
+# unchanged and its segment skipped — a silent omission of retained data rather
+# than a recomputation.
+
+PREFIX_DIGEST = "a" * 64
+OTHER_DIGEST = "b" * 64
+
+
+def _elidable(summary, **over):
+    kwargs = dict(pinned_raw_extent=100, is_last=False,
+                  certificate_covers=True, resolution_seen=False)
+    kwargs.update(over)
+    return ss.summary_is_elidable(summary, **kwargs)
+
+
+def test_827_device_only_change_with_matching_prefix_reuses():
+    """A remount must not discard a summary of the same physical file."""
+    summary = _complete_summary(complete_prefix_sha256=PREFIX_DIGEST)
+    ok, why = _elidable(
+        summary, stat_identity=(99, 2), prefix_proof=lambda: PREFIX_DIGEST)
+    assert ok and why == ss.REASON_OK
+
+
+def test_827_device_only_change_with_differing_prefix_refuses():
+    """The counterexample: identical inode, size and pinned extent, other bytes.
+
+    Nothing in `SegmentSummary` separates this case from the one above except
+    the digest, which is why the digest exists.
+    """
+    summary = _complete_summary(complete_prefix_sha256=PREFIX_DIGEST)
+    ok, why = _elidable(
+        summary, stat_identity=(99, 2), prefix_proof=lambda: OTHER_DIGEST)
+    assert not ok and why == ss.REASON_IDENTITY
+
+
+def test_827_device_only_change_without_a_proof_refuses():
+    """No proof is not a proof. A summary written before the digest field, or a
+    caller that cannot supply one, refuses rather than reusing optimistically."""
+    for summary, proof in (
+            (_complete_summary(complete_prefix_sha256=None),
+             lambda: PREFIX_DIGEST),
+            (_complete_summary(complete_prefix_sha256=PREFIX_DIGEST), None)):
+        ok, why = _elidable(summary, stat_identity=(99, 2),
+                            prefix_proof=proof)
+        assert not ok and why == ss.REASON_IDENTITY
+
+
+def test_827_inode_change_still_refuses():
+    """The inode is the decision, so a changed one refuses on the same device
+    and a matching prefix digest does not rescue it."""
+    summary = _complete_summary(complete_prefix_sha256=PREFIX_DIGEST)
+    ok, why = _elidable(
+        summary, stat_identity=(1, 999), prefix_proof=lambda: PREFIX_DIGEST)
+    assert not ok and why == ss.REASON_IDENTITY
+
+
+def test_827_an_unchanged_identity_needs_no_proof():
+    """The common path stays free: same device, same inode, no prefix read."""
+    calls = []
+
+    def _proof():
+        calls.append(1)
+        return PREFIX_DIGEST
+
+    summary = _complete_summary(complete_prefix_sha256=PREFIX_DIGEST)
+    ok, why = _elidable(summary, stat_identity=(1, 2), prefix_proof=_proof)
+    assert ok and why == ss.REASON_OK
+    assert calls == [], (
+        "the prefix proof was evaluated on an unchanged identity; it must be "
+        "reached only by a device-only change, or elision reads every segment "
+        "it was built to skip")
+
+
+def test_827_a_truncated_segment_still_refuses_on_extent():
+    """A device-only change does not let a torn segment through: the extent
+    check still runs, and its reason is still the one reported."""
+    summary = _complete_summary(
+        summarized_size=120, complete_line_covered_offset=100,
+        complete_prefix_sha256=PREFIX_DIGEST)
+    ok, why = _elidable(
+        summary, pinned_raw_extent=120, stat_identity=(99, 2),
+        prefix_proof=lambda: PREFIX_DIGEST)
+    assert not ok and why == ss.REASON_EXTENT
+
+
+def test_827_every_existing_refusal_reason_is_unchanged():
+    """The order of the remaining checks is preserved, and each still reports
+    its own reason. The module docstring records that reordering the coverage
+    and extent checks is a behaviour change rather than a cleanup."""
+    base = dict(stat_identity=(1, 2))
+    cases = [
+        (ss.REASON_RESOLUTION, _complete_summary(), dict(resolution_seen=True)),
+        (ss.REASON_LAST, _complete_summary(), dict(is_last=True)),
+        (ss.REASON_EXTENT, _complete_summary(summarized_size=120,
+                                             complete_line_covered_offset=100),
+         dict(pinned_raw_extent=120)),
+        (ss.REASON_RETAINED, _complete_summary(quota_only=False), {}),
+        (ss.REASON_UNCOVERED, _complete_summary(),
+         dict(certificate_covers=False)),
+        (ss.REASON_NO_DECODED_COUNT,
+         _complete_summary(decoded_entry_count=None), {}),
+    ]
+    for expected, summary, over in cases:
+        kwargs = dict(base)
+        kwargs.update(over)
+        ok, why = _elidable(summary, **kwargs)
+        assert not ok and why == expected, (
+            f"expected {expected}, got {why}")
+
+
+def test_827_the_recorded_prefix_digest_matches_the_segments_own_bytes(
+    elision_fixture,
+):
+    """The writer's accumulated digest equals a hash of the file's real bytes.
+
+    The kernel tests above drive the proof through a stub, so nothing in them
+    would catch a writer that hashed the lines without their newlines, hashed a
+    decoded form instead of the raw bytes, or stopped at the wrong offset. The
+    digest is only a proof if the two derivations agree on real segments, so
+    this compares the recorded value against an independent read of
+    `[0, complete_line_covered_offset)`.
+    """
+    import hashlib
+
+    jr = _journal()
+    _rebuild(jr)
+    summaries = jr.read_segment_summaries()
+    assert summaries, "the rebuild recorded no summaries to check"
+
+    core = importlib.import_module("_cctally_core")
+    checked = 0
+    for name, summary in summaries.items():
+        assert summary.complete_prefix_sha256, (
+            f"{name} carries no prefix digest, so a device-only identity "
+            "change could never be settled for it")
+        raw = (core.JOURNAL_DIR / name).read_bytes()
+        covered = int(summary.complete_line_covered_offset)
+        expected = hashlib.sha256(raw[:covered]).hexdigest()
+        assert summary.complete_prefix_sha256 == expected, (
+            f"{name}: the recorded digest does not describe the file's first "
+            f"{covered} bytes")
+        # Non-vacuity: a zero-length prefix would make every segment's digest
+        # the hash of the empty string and the comparison above meaningless.
+        assert covered > 0
+        checked += 1
+    assert checked >= 2, (
+        "the fixture must cover more than one segment, or a single accidental "
+        "agreement would pass")
+
+
+def test_827_the_planners_proof_reproduces_the_recorded_digest(elision_fixture):
+    """The production proof and the production writer agree on real segments.
+
+    The two derivations are different code — the writer accumulates from lines
+    the pass already holds, the proof re-reads the file in chunks — and only
+    their agreement makes a device-only reuse safe.
+    """
+    jr = _journal()
+    _rebuild(jr)
+    summaries = jr.read_segment_summaries()
+    for name, summary in summaries.items():
+        assert jr._complete_prefix_digest(
+            name, int(summary.complete_line_covered_offset)
+        ) == summary.complete_prefix_sha256
+
+
+def test_827_a_prefix_shorter_than_the_summary_is_not_a_proof(elision_fixture):
+    """A short read raises, which the predicate treats as no proof."""
+    jr = _journal()
+    _rebuild(jr)
+    summaries = jr.read_segment_summaries()
+    name, summary = next(iter(summaries.items()))
+    with pytest.raises(OSError):
+        jr._complete_prefix_digest(
+            name, int(summary.complete_line_covered_offset) + 4096)

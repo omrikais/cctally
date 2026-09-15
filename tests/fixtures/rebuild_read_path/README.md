@@ -16,3 +16,10 @@ Both are the `canonical_view` of a `tests/_rebuild_worker_496_s4.py` dump: every
 ## Regenerating
 
 Do **not** regenerate these to make a failing comparison pass — the whole point is that they predate the change. If the fixture builder itself legitimately changes, recapture them from a checkout of the pre-change implementation, not from the current tree, and say so in the commit body.
+
+## Amendments since capture
+
+These two files are no longer byte-identical to the capture, because `_REBUILD_COUNT_TABLES` membership and column sets have both grown since. Each amendment below is additive and surgical — a new key or a new empty section, with every previously captured value left exactly as it was — so the oracle still pins everything it pinned at capture. A change to a value that existed at capture is NOT an amendment and must not be made here.
+
+- **#661 S2, epoch 1011.** Both files gained a zero count and an empty rows list for `meter_rate_change_events`, which joined `_REBUILD_COUNT_TABLES`.
+- **#769 S11 (#824), epoch 1015.** Every `weekly_usage_snapshots` row in both files gained `"weekly_observation_held": 0` — 150 rows in the full prefix and 139 in the pinned one. Zero is the value the rebuild produces for all of them: each was written by a `snapshot_accept` evt that predates the column, and the generic fold applier builds its INSERT from the evt payload's own keys, so an omitted column takes the declared `DEFAULT 0`. That is also the truthful value, because every row captured here is a genuine weekly observation.

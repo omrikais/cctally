@@ -32,7 +32,7 @@ export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR"
 # check against reproducible state without dirtying the tree.
 . "$REPO_ROOT/bin/_lib-fixture-cache.sh"
 build_fixtures_cached "$REPO_ROOT/bin/build-weekly-fixtures.py" "$SCRATCH_DIR" || {
-    echo "FAIL: build-weekly-fixtures.py crashed (exit $?)" >&2
+    echo "FAIL: fixture builder bin/build-weekly-fixtures.py exit status $?" >&2
     exit 1
 }
 

@@ -47,7 +47,7 @@ fail_count=0
 
 run_quota_mode () {
     local name="$1" label="$2" flags="$3" suffix="$4"
-    local golden home actual status
+    local golden golden_name home actual status
     golden="$HARNESS_FIXTURES_DIR/$name/golden-$suffix.txt"
     # A per-mode COPY, because the command persists. See the header.
     home="$SCRATCH_DIR/run/$name.$suffix"
@@ -93,7 +93,11 @@ exit: $status"
         return 0
     fi
     if [ ! -s "$golden" ]; then
-        echo "FAIL $name/$label: $(basename "$golden") is missing or empty"
+        # The basename is resolved BEFORE the message rather than inside it:
+        # a command substitution in the body is a form the emission contract's
+        # reader cannot read, so the line would be unreadable and unchecked.
+        golden_name=$(basename "$golden")
+        echo "FAIL $name/$label: $golden_name is missing or empty"
         fail_count=$((fail_count + 1))
         return 0
     fi
@@ -164,10 +168,14 @@ print(json.load(open(sys.argv[1]))["accounts"]["*"]["regimes"][0]["unitsPerPoint
 ' "$state_file" 2>/dev/null)
 
 if [ "$cache_rebuild_status" -ne 0 ] || [ "$stats_rebuild_status" -ne 0 ]; then
-    echo "FAIL persistence/survives-cache-and-stats-rebuild:" \
-         "rebuild refused (cache-sync $cache_rebuild_status," \
-         "db rebuild $stats_rebuild_status); the survival check certifies" \
-         "nothing unless both rebuilds ran"
+    # One `echo` of one quoted body, not four continued arguments. The output
+    # bytes are identical either way, because the shell joins the arguments
+    # with single spaces; what changes is that the emission contract's reader
+    # can now read the line and check what the evidence scrub leaves of it.
+    # Folding is accurate here because this is one semantic diagnostic, and it
+    # is not a licence to fold raw diff or detail continuations, which really
+    # are separate output lines.
+    echo "FAIL persistence/survives-cache-and-stats-rebuild: rebuild refused (cache-sync $cache_rebuild_status, db rebuild $stats_rebuild_status); the survival check certifies nothing unless both rebuilds ran"
     fail_count=$((fail_count + 1))
 elif [ -n "$before" ] && [ "$before" = "$after" ]; then
     echo "PASS persistence/survives-cache-and-stats-rebuild"

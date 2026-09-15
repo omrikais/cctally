@@ -1,6 +1,9 @@
 name: CI
 
 on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
   push:
     branches: [main]
     # Skip docs-only pushes — every job here is code/test focused, and
@@ -31,8 +34,8 @@ on:
 # acceptable because the authoritative gate run BEFORE the push is the primary
 # evidence and CI is corroboration.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'background' || github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
   # #529 S7 (E1). A release stamp is a mechanical two-or-three-file version
@@ -108,21 +111,24 @@ jobs:
         github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Read-only. This job reads the repository, fetches a ref namespace and
-    # writes one output; it needs no token scope beyond that.
+    # Read-only repository receipts and completed full-verification jobs.
     permissions:
       contents: read
+      actions: read
     outputs:
+      admitted: ${{ steps.classify.outputs.admitted }}
       discharged: ${{ steps.classify.outputs.discharged }}
     steps:
       - uses: actions/checkout@v5
         with:
-          # The reconstruction reads git OBJECTS for one commit, so a shallow
-          # checkout carries everything it needs.
+          # Merge selection also needs the actual incoming base/history.
+          fetch-depth: 0
           persist-credentials: false
       - id: classify
         env:
           RECEIPT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGE_BASE: ${{ github.event.before || github.event.pull_request.base.sha }}
         run: |
           # No `set -x`: a trace would echo the authorization header.
           #
@@ -141,6 +147,7 @@ jobs:
           tree=$(git rev-parse 'HEAD^{tree}' 2>/dev/null || true)
           if ! printf '%s' "$tree" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "receipt-gate: HEAD names no tree object; the estate runs" >&2
+            echo "admitted=false" >> "$GITHUB_OUTPUT"
             echo "discharged=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -155,11 +162,16 @@ jobs:
           for ref in $(git for-each-ref --format='%(refname)' "refs/receipts/$tree/"); do
             git cat-file blob "$ref" > "$receipts/${ref##*/}.json" 2>/dev/null || true
           done
-          python3 .github/scripts/classify_receipt.py \
+          merge_args=()
+          if [ -n "$MERGE_BASE" ] && python3 -B bin/_lib_merge_gate.py --health; then
+            merge_args=(--merge-base "$MERGE_BASE")
+          fi
+          python3 .github/scripts/classify_receipt.py "${merge_args[@]}" \
             --sha "${{ github.sha }}" \
             --repo . \
             --receipts-dir "$receipts" \
             --ref-namespace "$tree" \
+            --topology-profile private \
             --summary-file "$GITHUB_STEP_SUMMARY" >> "$GITHUB_OUTPUT"
 
   # test-linux (hosted ubuntu) was disabled to save GH Actions minutes.
@@ -200,9 +212,11 @@ jobs:
       (needs.release-stamp-gate.result != 'success' ||
        needs.release-stamp-gate.outputs.skipHeavy != 'true') &&
       (needs.receipt-gate.result != 'success' ||
+       needs.receipt-gate.outputs.admitted != 'true' ||
        needs.receipt-gate.outputs.discharged != 'true') &&
       github.repository == 'omrikais/cctally-dev' &&
-      (github.event_name == 'push' ||
+      (github.event_name == 'push' || github.event_name == 'schedule' ||
+       github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'pull_request' &&
         github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: [self-hosted, macOS, cctally]

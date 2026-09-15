@@ -10,6 +10,7 @@
     "conversationNormalizeBudgetRows": 2000,
     "gapCodes": [
       "ambiguous_origin_category",
+      "no_retained_transcript",
       "scan_budget_exhausted",
       "unknown_context_window",
       "unresolved_subagent_attribution"
@@ -297,7 +298,8 @@
       "generation": {
         "cache": "a8671f7d50078654e54f87e5880bad9afa1498b7837dbb732282a98d7468c115",
         "configuration": "4ecd450e20d00526d12a5371c7fd171f515543a706aaf252e22842c0777e5386",
-        "generationId": "644201171b00350db504477c584a4a2f5093b2a74ff83967a94dc224f5ade714",
+        "conversations": "d261d88c798424f8566898fe476364963f0ace05361b454ee7ab079223485e4a",
+        "generationId": "2ae2cc9bf4910cf47ad119dfd09b55ddf154513537f8604b59e270f060cb0d27",
         "stats": "b88a6c0b34842c8f3341b153f00dcbb220baa673b4716b4f983369bb9a25463d"
       },
       "source": "claude",

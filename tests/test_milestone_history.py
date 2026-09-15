@@ -1683,3 +1683,87 @@ def test_api_milestones_codex_unknown_key_404(tmp_path, monkeypatch):
         assert body["reason"] in {"pruned", "rebuild_pending", "projection_incoherent", "unknown"}
     finally:
         stop(srv, srv._test_thread)
+
+
+# ── #834 S1 (#836): one window, two accounts, no shared milestones ──────
+
+
+def _seed_account_block(
+    conn, *, window_key, block_start_at, five_hour_resets_at, account_key,
+    final_five_hour_percent,
+) -> int:
+    """`_seed_block`'s account-stamped twin. Block uniqueness is
+    `(account_key, five_hour_window_key)`, so one physical window owns one block
+    per account."""
+    cur = conn.execute(
+        "INSERT INTO five_hour_blocks "
+        "(five_hour_window_key, five_hour_resets_at, block_start_at, "
+        " first_observed_at_utc, last_observed_at_utc, final_five_hour_percent, "
+        " crossed_seven_day_reset, total_cost_usd, is_closed, "
+        " created_at_utc, last_updated_at_utc, account_key) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, 1.0, 1, ?, ?, ?)",
+        (window_key, five_hour_resets_at, block_start_at, block_start_at,
+         five_hour_resets_at, final_five_hour_percent, block_start_at,
+         five_hour_resets_at, account_key),
+    )
+    return int(cur.lastrowid)
+
+
+def _seed_account_5h_milestone(
+    conn, *, block_id, window_key, percent_threshold, captured_at_utc,
+    account_key, usage_snapshot_id=1,
+):
+    conn.execute(
+        "INSERT INTO five_hour_milestones "
+        "(block_id, five_hour_window_key, percent_threshold, captured_at_utc, "
+        " usage_snapshot_id, block_cost_usd, reset_event_id, account_key) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+        (block_id, window_key, percent_threshold, captured_at_utc,
+         usage_snapshot_id, 0.5, account_key),
+    )
+
+
+def test_836_one_window_two_accounts_do_not_share_milestones(ns):
+    """#834 S1 (#836). The historical-detail route selected its blocks without an
+    account and then loaded each one's milestones by a bare
+    `five_hour_window_key`, while block uniqueness is
+    `(account_key, five_hour_window_key)`. One physical five-hour window
+    therefore owned one block per account and every block showed EVERY account's
+    milestones.
+
+    Blocks are identified here by `final_five_hour_percent` rather than by an
+    account field, because the route's published `blocks[]` shape does not carry
+    one and this test must not require it to."""
+    import _cctally_milestone_history as mh
+    conn = ns["open_db"]()
+    try:
+        resets = "2026-05-16T05:00:00+00:00"
+        start = "2026-05-16T00:00:00+00:00"
+        window_key = ns["_canonical_5h_window_key"](
+            int(dt.datetime.fromisoformat(resets).timestamp()))
+        alice = _seed_account_block(
+            conn, window_key=window_key, block_start_at=start,
+            five_hour_resets_at=resets, account_key="acct-alice",
+            final_five_hour_percent=5.0)
+        bob = _seed_account_block(
+            conn, window_key=window_key, block_start_at=start,
+            five_hour_resets_at=resets, account_key="acct-bob",
+            final_five_hour_percent=9.0)
+        _seed_account_5h_milestone(
+            conn, block_id=alice, window_key=window_key, percent_threshold=1,
+            captured_at_utc="2026-05-16T01:00:00+00:00",
+            account_key="acct-alice")
+        _seed_account_5h_milestone(
+            conn, block_id=bob, window_key=window_key, percent_threshold=2,
+            captured_at_utc="2026-05-16T02:00:00+00:00",
+            account_key="acct-bob")
+        conn.commit()
+
+        blocks = mh._build_blocks(conn, WK_A_START, WK_A_END)
+        by_final = {b["final_five_hour_percent"]: b for b in blocks}
+        assert set(by_final) == {5.0, 9.0}, (
+            f"expected one block per account, got {blocks!r}")
+        assert [m["percent_threshold"] for m in by_final[5.0]["milestones"]] == [1]
+        assert [m["percent_threshold"] for m in by_final[9.0]["milestones"]] == [2]
+    finally:
+        conn.close()

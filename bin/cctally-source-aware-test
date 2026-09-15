@@ -12,6 +12,100 @@ trap 'rm -rf "$SCRATCH"' EXIT
 export TZ=Etc/UTC
 export GOLDEN_DIFF_TMPDIR="$SCRATCH"
 
+# The PRIVATE evidence file. Everything that identifies the scanner — its
+# absolute path, its version string, the exact argv, the scanned root and the
+# scanner's own output — is written here and NEVER to stdout. The aggregator
+# rewrites any absolute path to `<path>` and admits only a reviewed vocabulary,
+# so a public line carrying the argv would either disclose the canary needle and
+# the scratch path or be redacted into uselessness. The public lines therefore
+# carry only a status, a phase and a canary ordinal, and this file carries the
+# rest.
+RAW_LOG="$SCRATCH/scanner-raw.log"
+# WHERE THE COPY GOES, and why a failing run keeps one without being asked.
+#
+# The scratch directory is removed by the EXIT trap, so a raw log kept only
+# there is deleted microseconds after the public line that points at it. Nothing
+# in the estate sets CCTALLY_SOURCE_AWARE_RAW_LOG_DIR — not bin/cctally-test-all,
+# not bin/cctally-test-remote, not CI — so in the authoritative run where a
+# scanner crash actually manifests, every field identifying the program was
+# destroyed and only the ordinal survived. Retention is therefore unconditional
+# on a non-zero fail_count, and its default home is durable:
+#
+#   * gitignored at the repository root through `/.cctally-remote-state/`, so a
+#     kept log never dirties `git status`, never enters a staged tree and never
+#     moves the UI-QA guard's source digest;
+#   * inside a root `bin/cctally-test-remote` declares RUNNER-OWNED, so the
+#     transport never transfers it and `--delete` never reaches it; and it is
+#     NOT under the evidence root the wrapper copies back, which matters because
+#     this file carries the exact argv, the canary needle and the scratch path;
+#   * named per invocation from the scratch directory's own `mktemp` suffix, so
+#     a campaign of 300 sequential runs cannot overwrite the one crashing run.
+#
+# The environment variable remains an override, and it additionally asks for
+# EVERY run's log rather than only a failing one, which is what a campaign
+# measuring a rate needs.
+RAW_LOG_DEFAULT_DIR="$REPO_ROOT/.cctally-remote-state/source-aware-evidence"
+RAW_LOG_DIR="${CCTALLY_SOURCE_AWARE_RAW_LOG_DIR:-$RAW_LOG_DEFAULT_DIR}"
+RAW_LOG_RETAINED="$RAW_LOG_DIR/scanner-raw.$(basename "$SCRATCH").log"
+RAW_LOG_ALWAYS=0
+if [ -n "${CCTALLY_SOURCE_AWARE_RAW_LOG_DIR:-}" ]; then
+    RAW_LOG_ALWAYS=1
+fi
+RAW_LOG_KEPT=0
+# Declared here rather than beside the counters below, because the retention
+# rule reads it and three refusal paths exit before those counters are reached.
+fail_count=0
+
+_raw_log_line() {   # $* = free text; PRIVATE log only, never stdout
+    printf '%s\n' "$*" >> "$RAW_LOG"
+}
+
+_retain_raw_log() {
+    [ "$RAW_LOG_KEPT" -eq 0 ] || return 0
+    if [ "$RAW_LOG_ALWAYS" -ne 1 ] && [ "$fail_count" -eq 0 ]; then
+        return 0
+    fi
+    [ -f "$RAW_LOG" ] || return 0
+    mkdir -p "$RAW_LOG_DIR" 2>/dev/null || return 0
+    cp "$RAW_LOG" "$RAW_LOG_RETAINED" 2>/dev/null || return 0
+    RAW_LOG_KEPT=1
+    return 0
+}
+
+# Retention happens in the trap rather than at each failure site, because the
+# harness has four exits — the three refusal paths below that exit early, and
+# the normal end — and an evidence file kept only on the path someone
+# remembered is not evidence. `_report_raw_log` calls it too, so the line it
+# prints reports what actually happened rather than what was configured; the
+# second call is a no-op.
+#
+# The trap is not sufficient on its own, because it reads `fail_count`. Each of
+# the three refusal paths therefore sets that count AND calls `_report_raw_log`:
+# the fixture-builder refusal did neither, so its run retained nothing and said
+# nothing, which is the case `tests/test_source_aware_share.py`'s
+# `test_a_failed_fixture_builder_retains_its_evidence_too` now pins.
+trap '_retain_raw_log; rm -rf "$SCRATCH"' EXIT
+
+_report_raw_log() {
+    _retain_raw_log
+    # Both wordings are built from vocabulary the aggregator's sanitizer already
+    # admits. A maintainer-local test enumerates EVERY `echo` in this file and
+    # drives the real scrub path over each one, so a line added here that would
+    # be redacted fails the suite rather than degrading in the one report
+    # anybody reads afterwards. Named that way rather than by path, because this
+    # file is published to the public mirror and that test is not, so a path
+    # here would send a public reader to a file their tree does not carry.
+    # The previous fallback advised setting an
+    # environment variable and became `[REDACTED: unclassified line]`, so the
+    # advice never reached the reader of an aggregated export — the only reader
+    # who needed it.
+    if [ "$RAW_LOG_KEPT" -eq 1 ]; then
+        echo "source-aware: scanner evidence retained at $RAW_LOG_RETAINED"
+    else
+        echo "source-aware: scanner evidence not retained"
+    fi
+}
+
 # #711. The privacy leg used to run `if rg …`. The runners do not carry `rg`,
 # so the missing binary produced a non-zero status, the `if` read that as "no
 # leak found", and the leg reported success without ever scanning an artifact.
@@ -24,25 +118,110 @@ export GOLDEN_DIFF_TMPDIR="$SCRATCH"
 #
 # All six canaries translate exactly to fixed-string `grep`: none contains a
 # newline, a NUL, regex syntax needing interpretation, or a leading dash.
-# Quoted, because a bare word here reads as an attempt to capture the output
-# of `grep` rather than to name it (SC2209).
-SCANNER="grep"
+#
+# #760. `SCANNER="grep"` resolved through `PATH` at every call site, so the
+# program that produced a result was whatever the machine happened to offer —
+# BSD grep on the LAN runners, a Homebrew `ugrep` on a workstation — and a crash
+# could not be attributed to a named program. The name is resolved ONCE to an
+# absolute path here, and the path and version are recorded, so the scanner's
+# identity is evidence rather than an assumption.
+SCANNER=""
+SCANNER_PATH=""
+SCANNER_VERSION=""
+SELF_TEST_STATUS=0
+
+_resolve_scanner() {
+    # #760's construct class, one function over. RESOLUTION MUST NOT READ A
+    # STATUS THROUGH A COMMAND SUBSTITUTION EITHER.
+    #
+    # This read `SCANNER_PATH=$(command -v grep) || { … return 1; }`, so the
+    # `||` consumed a forked subshell's status. A subshell dying from the #776
+    # interpreter fault would have made the harness announce that no absolute
+    # path for the scanner could be resolved on a machine where `grep` is
+    # present — a false diagnosis, milder than #760 only because the status it
+    # publishes is a hardcoded 127 rather than the subshell's own number.
+    #
+    # `command -v` and `read` are both builtins, and redirecting a builtin
+    # forks nothing, so the value crosses a file rather than a subshell. The
+    # version capture below takes the same treatment even though nothing reads
+    # its status: a rule scoped to the one consumed status is satisfied by
+    # re-introducing a substitution on the line beside it, and the replacement
+    # also removes the `head` process while keeping first-line semantics.
+    local resolved="$SCRATCH/scanner-path.txt"
+    local version_out="$SCRATCH/scanner-version.txt" rc
+    # The attempt is recorded BEFORE the program is known. A resolution that
+    # fails names nothing, so without this line the raw log for a phase=resolve
+    # refusal was completely empty and could not even say that resolution had
+    # been tried.
+    _raw_log_line "resolve attempted name=grep"
+    SCANNER_PATH=""
+    command -v grep >"$resolved" 2>/dev/null
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        IFS= read -r SCANNER_PATH < "$resolved"
+    fi
+    if [ "$rc" -ne 0 ] || [ -z "$SCANNER_PATH" ]; then
+        _raw_log_line "  resolve failed: no grep on PATH"
+        return 1
+    fi
+    case "$SCANNER_PATH" in
+        /*) ;;
+        # A shell builtin or a bare relative name is not a program this harness
+        # can name in its evidence, so it is refused rather than used.
+        *)
+            _raw_log_line "  resolve failed: '$SCANNER_PATH' is not an absolute path"
+            return 1
+            ;;
+    esac
+    SCANNER_VERSION=""
+    LC_ALL=C "$SCANNER_PATH" --version >"$version_out" 2>&1
+    # `read` returns non-zero on a final line with no terminating newline and
+    # still assigns it, so the status is deliberately not consumed here: doing
+    # so would discard a one-line version string that has no trailing newline.
+    IFS= read -r SCANNER_VERSION < "$version_out"
+    SCANNER="$SCANNER_PATH"
+    _raw_log_line "resolve executable=$SCANNER_PATH"
+    _raw_log_line "  version=$SCANNER_VERSION"
+    return 0
+}
+
+if ! _resolve_scanner; then
+    fail_count=1
+    echo "FAIL source-aware: privacy scanner failure status=127 phase=resolve canary=0/0"
+    echo "source-aware: privacy scanner resolve failed, no scan run"
+    _report_raw_log
+    echo "----"
+    echo "passed: 0   failed: 1"
+    exit 1
+fi
 
 _scanner_self_test() {
     local probe="$SCRATCH/scanner-self-test.txt" rc
-    printf 'cctally-scanner-probe\n' > "$probe" || return 1
+    SELF_TEST_STATUS=0
+    printf 'cctally-scanner-probe\n' > "$probe" || { SELF_TEST_STATUS=1; return 1; }
     LC_ALL=C "$SCANNER" -n -F -- "cctally-scanner-probe" "$probe" >/dev/null 2>&1
     rc=$?
-    [ "$rc" -eq 0 ] || return 1
+    _raw_log_line "self-test probe=match status=$rc expected=0"
+    if [ "$rc" -ne 0 ]; then
+        SELF_TEST_STATUS=$rc
+        return 1
+    fi
     LC_ALL=C "$SCANNER" -n -F -- "a-token-this-probe-does-not-carry" "$probe" \
         >/dev/null 2>&1
     rc=$?
-    [ "$rc" -eq 1 ] || return 1
+    _raw_log_line "self-test probe=clean status=$rc expected=1"
+    if [ "$rc" -ne 1 ]; then
+        SELF_TEST_STATUS=$rc
+        return 1
+    fi
     return 0
 }
 
 if ! _scanner_self_test; then
-    echo "FAIL source-aware: the privacy scanner ($SCANNER) is unavailable or does not behave as expected (a match must exit 0 and a clean non-match must exit 1); refusing to report a clean scan it cannot perform"
+    fail_count=1
+    echo "FAIL source-aware: privacy scanner failure status=$SELF_TEST_STATUS phase=self-test canary=0/0"
+    echo "source-aware: privacy scanner self test failed, no scan run"
+    _report_raw_log
     echo "----"
     echo "passed: 0   failed: 1"
     exit 1
@@ -52,27 +231,182 @@ fi
 # third arm is the fix: it is the branch the old `if` collapsed into "clean".
 # Binary matches are deliberately not suppressed — a canary inside a binary
 # artifact is still a leak.
-_scan_for_canary() {   # $1 = canary
-    LC_ALL=C "$SCANNER" -R -n -F -- "$1" "$SCRATCH/artifacts"
+#
+# The scan keeps its single recursive invocation. The crash that motivated
+# splitting it per file turned out not to be the scanner's at all — it was the
+# shell subprocess the old command substitution forked (#760, #776) — so
+# per-file scanning would multiply the invocation count without addressing
+# anything, and `_scan_for_canary` removes the substitution instead.
+ARTIFACT_FILE_COUNT=""
+ARTIFACT_BYTE_TOTAL=""
+
+# THE ONE WAY TO REACH THE REAL SCAN PATH OVER A CORPUS THIS HARNESS DID NOT
+# BUILD, and why one exists at all.
+#
+# The fixture corpus deliberately carries no canary, so every canary scan is
+# expected to find nothing. A scan that reads all 190 artifacts and a scan that
+# reads none of them therefore produce the same six clean statuses, and no leg
+# of this harness distinguishes them. `tests/test_source_aware_share.py`'s
+# `test_the_real_harness_scan_path_finds_a_planted_canary` is the only check
+# that does, and it needs a corpus with a canary in it — which the builder will
+# never produce, because producing one is the leak.
+#
+# Gated on CCTALLY_TESTING=1 as well as on its own value. A stray export in an
+# operator's shell would otherwise redirect an authoritative run away from the
+# corpus it certifies and report a clean scan of some other tree.
+ARTIFACTS="$SCRATCH/artifacts"
+ARTIFACTS_PLANTED=0
+if [ "${CCTALLY_TESTING:-}" = "1" ] \
+    && [ -n "${CCTALLY_SOURCE_AWARE_PLANTED_ARTIFACTS:-}" ]; then
+    # THE BOUND `stage_fixtures_out_of_tree` HAS, on the one hook that lacked
+    # it. The hook only reads, so the worst case is a recursive scan of whatever
+    # tree it names rather than a write into one. But the tree it is most likely
+    # to name by accident is the committed fixture tree, and pointing at that
+    # makes every comparison pass because the generated side and the golden side
+    # become the same file: the run reports `passed: 190   failed: 0` having
+    # certified nothing.
+    #
+    # #784. The bound is now the shared `_harness_realpath_under_tmpdir`, which
+    # resolves both sides rather than comparing spellings. The three textual
+    # arms this replaces accepted a `..` traversal and a symlink, and the run
+    # above is what each of them produced.
+    planted="$CCTALLY_SOURCE_AWARE_PLANTED_ARTIFACTS"
+    tmp_root="${TMPDIR:-/tmp}"
+    tmp_root="${tmp_root%/}"
+    if _harness_realpath_under_tmpdir "$planted"; then
+        ARTIFACTS="$planted"
+        ARTIFACTS_PLANTED=1
+    else
+        fail_count=1
+        _raw_log_line "planted artifacts refused: root=$planted tmp_root=$tmp_root"
+        echo "FAIL source-aware: artifact path not under tmpdir $tmp_root"
+        _report_raw_log
+        echo "----"
+        echo "passed: 0   failed: 1"
+        exit 1
+    fi
+fi
+
+_measure_artifacts() {
+    # ONCE per invocation, not once per canary. The corpus does not change
+    # between scans, and `find … -exec cat {} + | wc -c` re-read all 190
+    # artifacts on every one of the six scans for a single private log field.
+    ARTIFACT_FILE_COUNT=$(find "$ARTIFACTS" -type f | wc -l | tr -d ' ')
+    ARTIFACT_BYTE_TOTAL=$(find "$ARTIFACTS" -type f -exec cat {} + \
+        | wc -c | tr -d ' ')
 }
 
-if ! python3 "$REPO_ROOT/bin/build-source-aware-fixtures.py" --out "$SCRATCH/artifacts"; then
-    echo "FAIL source-aware: fixture builder exited non-zero"
-    echo "----"
-    echo "passed: 0   failed: 1"
-    exit 1
+_scan_for_canary() {   # $1 = canary, $2 = ordinal, $3 = total
+    local start end rc out_file err_file out_bytes err_bytes
+    out_file="$SCRATCH/scanner-stdout.$2"
+    err_file="$SCRATCH/scanner-stderr.$2"
+    start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    # #760. THE STATUS MUST COME FROM A DIRECT INVOCATION.
+    #
+    # This scan used to run through `out=$(…)`. A command substitution forks a
+    # bash subshell, so when that subshell died on a signal `$?` was 128+N and
+    # the harness recorded the number as the SCANNER's exit status, with the
+    # scanner's absolute path and version string attached to it. That is a
+    # false statement about a program that may have completed normally.
+    #
+    # The disproof is #766's stand-in: a two-line `/bin/sh` script that exits 2
+    # on `-R` before opening any file was recorded as `status=139 signal=11`. A
+    # program that does no work cannot crash from the amount of work. The
+    # faulting process is the shell, not the scanner (#776 carries the crash
+    # reports), which is also why `_scanner_self_test` has never once failed:
+    # it already invokes the scanner directly.
+    #
+    # Substitutions BELOW this line are for logging only. Their failure cannot
+    # corrupt `rc`, which is the one value the harness makes a claim about.
+    LC_ALL=C "$SCANNER_PATH" -R -n -F -- "$1" "$ARTIFACTS" \
+        >"$out_file" 2>"$err_file"
+    rc=$?
+    end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    out_bytes=$(wc -c < "$out_file" | tr -d ' ')
+    err_bytes=$(wc -c < "$err_file" | tr -d ' ')
+    _raw_log_line "scan ordinal=$2/$3 status=$rc"
+    _raw_log_line "  executable=$SCANNER_PATH"
+    _raw_log_line "  version=$SCANNER_VERSION"
+    _raw_log_line "  argv=$SCANNER_PATH -R -n -F -- $1 $ARTIFACTS"
+    _raw_log_line "  root=$ARTIFACTS files=$ARTIFACT_FILE_COUNT bytes=$ARTIFACT_BYTE_TOTAL"
+    _raw_log_line "  started=$start ended=$end"
+    _raw_log_line "  stdout_bytes=$out_bytes stderr_bytes=$err_bytes"
+    if [ "$rc" -gt 128 ]; then
+        _raw_log_line "  signal=$((rc - 128))"
+    fi
+    if [ "$out_bytes" -gt 0 ]; then
+        _raw_log_line "  scanner-stdout: $(cat "$out_file")"
+    fi
+    if [ "$err_bytes" -gt 0 ]; then
+        _raw_log_line "  scanner-stderr: $(cat "$err_file")"
+    fi
+    return $rc
+}
+
+if [ "$ARTIFACTS_PLANTED" -eq 1 ]; then
+    _raw_log_line "artifacts planted root=$ARTIFACTS (the builder did not run)"
+else
+    # The status is read from a direct invocation and recorded, rather than
+    # consumed by an `if !`. `exited non-zero` said only that something went
+    # wrong; the number says which failure it was, and it also puts the line in
+    # the aggregator's reviewed vocabulary, which `exited` and `non` are not.
+    python3 "$REPO_ROOT/bin/build-source-aware-fixtures.py" --out "$ARTIFACTS"
+    builder_rc=$?
+    if [ "$builder_rc" -ne 0 ]; then
+        fail_count=1
+        _raw_log_line "fixture builder exit status $builder_rc"
+        echo "FAIL source-aware: fixture builder exit status $builder_rc"
+        _report_raw_log
+        echo "----"
+        echo "passed: 0   failed: 1"
+        exit 1
+    fi
 fi
 
 pass_count=0
-fail_count=0
+# `fail_count` is initialised at the top of the file, beside the retention rule
+# that reads it, and must not be reset here: the refusal paths above exit before
+# this line and a reset would only ever undo a count they had already recorded.
 expected_paths=()
+# THE MANIFEST IS READ THROUGH A FILE, NOT A PROCESS SUBSTITUTION (#784), for
+# the reason the `--canaries` leg below already carries. A process substitution
+# publishes no status, so a `--manifest` invocation that died while printing
+# nothing produced an empty expected-path list and the harness then announced
+# `fixture count expected 0, actual 190` — a disagreement it never observed,
+# because the count did not disagree, the builder never answered.
+#
+# Measured on the pre-fix tree with a builder stubbed to exit 4 and print
+# nothing: under Bash 5 that is exactly the line it printed, and under Bash
+# 3.2.57 the run died first at the bare `"${expected_paths[@]}"` expansion with
+# `expected_paths[@]: unbound variable` and printed nothing at all.
+#
+# The destination is written out at the invocation rather than held in a
+# variable, for the same reason as the `--canaries` leg: `tests/
+# test_test_all_overlap_safety.py` reads the invocation to decide whether a
+# builder call writes into the committed fixture tree.
+python3 "$REPO_ROOT/bin/build-source-aware-fixtures.py" --manifest \
+    >"$SCRATCH/manifest.txt" 2>>"$RAW_LOG"
+manifest_rc=$?
+if [ "$manifest_rc" -ne 0 ]; then
+    fail_count=$((fail_count + 1))
+    _raw_log_line "fixture manifest unavailable: builder exit status $manifest_rc"
+    echo "FAIL source-aware: fixture manifest builder exit status $manifest_rc"
+    _report_raw_log
+    echo "----"
+    echo "passed: $pass_count   failed: $fail_count"
+    exit 1
+fi
 while IFS= read -r rel; do
     expected_paths+=("$rel")
-done < <(python3 "$REPO_ROOT/bin/build-source-aware-fixtures.py" --manifest)
+done < "$SCRATCH/manifest.txt"
 expected_count=${#expected_paths[@]}
-for rel in "${expected_paths[@]}"; do
+# The repository's one accepted empty-array expansion. Under Bash 3.2 with
+# `set -u` the bare `"${expected_paths[@]}"` form dies as
+# `expected_paths[@]: unbound variable`, which is how the crashed-builder case
+# above presented on the 3.2 floor.
+for rel in ${expected_paths[@]+"${expected_paths[@]}"}; do
     golden="$FIXTURES/$rel"
-    actual="$SCRATCH/artifacts/$rel"
+    actual="$ARTIFACTS/$rel"
     name="${rel%%/*}"
     if [[ ! -f "$actual" ]]; then
         echo "FAIL $name: missing $rel"
@@ -84,51 +418,156 @@ for rel in "${expected_paths[@]}"; do
     fi
 done
 
-expected_count=${#expected_paths[@]}
 fixture_count=$(find "$FIXTURES" -type f -name '*.golden' | wc -l | tr -d ' ')
 if [[ "$fixture_count" != "$expected_count" ]]; then
-    echo "FAIL source-aware: fixture count expected $expected_count, got $fixture_count"
+    echo "FAIL source-aware: fixture count expected $expected_count, actual $fixture_count"
     fail_count=$((fail_count + 1))
 fi
 
-actual_count=$(find "$SCRATCH/artifacts" -type f -name '*.golden' | wc -l | tr -d ' ')
+actual_count=$(find "$ARTIFACTS" -type f -name '*.golden' | wc -l | tr -d ' ')
 if [[ "$actual_count" != "$expected_count" ]]; then
-    echo "FAIL source-aware: artifact count expected $expected_count, got $actual_count"
+    echo "FAIL source-aware: artifact count expected $expected_count, actual $actual_count"
     fail_count=$((fail_count + 1))
 fi
 
-# A scanner can fail with a status and no message at all, and an unconditional
-# `printf '%s\n'` then follows the refusal with a bare blank line that reads as
-# a truncated report.
-_print_scan_output() {
-    [ -n "${1:-}" ] || return 0
-    printf '%s\n' "$1"
-}
-
+# The scanner's own output is no longer printed at all. A scanner can fail with
+# a status and no message, and an unconditional `printf '%s\n'` then followed
+# the refusal with a bare blank line that read as a truncated report; the whole
+# class is closed by keeping that output in the private log, where the canary
+# needle and the scratch path belong anyway.
+#
+# The ordinal is what makes a crash countable without naming the canary that
+# was being scanned for. No line THIS leg prints carries the canary value.
+#
+# The golden-diff leg is the exception, and it is not one this harness
+# controls. On a genuine leak the generated artifact carries the canary and the
+# committed golden does not, so the artifact diverges and the unified diff
+# reprints the canary — which means the reprint happens precisely on the run
+# where the privacy leg matters, unless the goldens were regenerated after the
+# leak and nothing diverges. Measured bound on that exposure: a diff-body line
+# carrying a canary is not built from reviewed vocabulary, so the aggregator
+# reduces it to `[REDACTED: unclassified line]` and it does not reach an
+# aggregated export.
+_measure_artifacts
+# THE COUNTERPART TO THE EXPECTED-PATHS CROSS-CHECK ABOVE, and why there are
+# two refusals here rather than one.
+#
+# When `--canaries` prints nothing the scan loop runs zero times, and the
+# harness then prints `passed: 190   failed: 0` and exits 0 having scanned for
+# no canary at all. That is #711's defect family — a leg reporting success
+# while having verified nothing — and this corpus cannot expose it: every
+# artifact is clean by construction, so a scan that found nothing and a scan
+# that never happened produce identical output. The expected-paths leg already
+# cross-checks its own count against `find`; the canary list had no such check.
+#
+# THE LIST IS READ THROUGH A FILE, NOT A PROCESS SUBSTITUTION. A process
+# substitution publishes no status, so a `--canaries` invocation that died while
+# printing nothing produced an empty list and the harness announced that the
+# fixture builder had declared no privacy canary — fail-closed, and a false
+# statement about what happened, which is #760's own class one leg over. A
+# non-zero builder is reported as a builder failure; an empty list from a
+# builder that SUCCEEDED is the declaration refusal.
+# The destination is written out at the invocation rather than held in a
+# variable, because `tests/test_test_all_overlap_safety.py` reads this line to
+# decide whether a builder call writes into the committed fixture tree. It looks
+# for the destination ON the invocation, so hiding it behind a name reads to that
+# guard as an unredirected build.
+python3 "$REPO_ROOT/bin/build-source-aware-fixtures.py" --canaries \
+    >"$SCRATCH/canaries.txt" 2>>"$RAW_LOG"
+canary_rc=$?
+if [ "$canary_rc" -ne 0 ]; then
+    fail_count=$((fail_count + 1))
+    _raw_log_line "canary list unavailable: builder exit status $canary_rc"
+    echo "FAIL source-aware: privacy canary builder exit status $canary_rc"
+    _report_raw_log
+    echo "----"
+    echo "passed: $pass_count   failed: $fail_count"
+    exit 1
+fi
 canaries=()
 while IFS= read -r canary; do
     canaries+=("$canary")
-done < <(python3 "$REPO_ROOT/bin/build-source-aware-fixtures.py" --canaries)
-for canary in "${canaries[@]}"; do
-    scan_output=$(_scan_for_canary "$canary" 2>&1)
+done < "$SCRATCH/canaries.txt"
+canary_total=${#canaries[@]}
+# `expected at least 1` rather than `expected 1`. Six canaries are declared, so
+# 1 is the MINIMUM this leg enforces and not a number the harness expects; the
+# two count lines above state a real expected number and this one cannot.
+#
+# `actual` rather than `got` on all three of those lines: `got` is not in the
+# aggregator's reviewed vocabulary, so a line carrying it reaches an aggregated
+# export as `FAIL [REDACTED: unclassified detail]` and tells its one reader
+# nothing.
+if [ "$canary_total" -eq 0 ]; then
+    fail_count=$((fail_count + 1))
+    _raw_log_line "canary list empty: the fixture builder declared no canary"
+    echo "FAIL source-aware: privacy canary count expected at least 1, actual 0"
+    echo "source-aware: fixture builder output has no privacy canary, no scan run"
+    _report_raw_log
+    echo "----"
+    echo "passed: $pass_count   failed: $fail_count"
+    exit 1
+fi
+# A BLANK CANARY MATCHES EVERY ARTIFACT (#784). `grep -F -- ""` succeeds against
+# any file, so one stray blank line in the declaration turns the privacy leg
+# into an unconditional report of a leak on a corpus that carries none —
+# measured on the pre-fix tree as `FAIL source-aware: privacy canary match
+# canary=2/3`, which names a leak nobody planted. A list that is nothing but a
+# blank line is the same defect with the count check satisfied: `canary_total`
+# is 1, the refusal above does not fire, and the harness scans for no real
+# canary at all.
+#
+# Refused before the scan loop begins, so "at least one non-blank canary" is a
+# property of the run rather than an assumption about the builder.
+blank_canary_at=0
+blank_scan_ordinal=0
+for canary in ${canaries[@]+"${canaries[@]}"}; do
+    blank_scan_ordinal=$((blank_scan_ordinal + 1))
+    # WHITESPACE-ONLY counts too (#769 S4). `[ -z "$canary" ]` alone accepts a
+    # canary of one space, and `grep -F -- " "` matches nearly every artifact,
+    # so the whole defect this refusal exists for survives one space. The
+    # `${canary//[[:space:]]/}` form is Bash 3.2 pattern substitution, which
+    # 3.2.57 has.
+    if [ -z "${canary//[[:space:]]/}" ]; then
+        blank_canary_at=$blank_scan_ordinal
+        break
+    fi
+done
+if [ "$blank_canary_at" -ne 0 ]; then
+    fail_count=$((fail_count + 1))
+    _raw_log_line "canary list blank at ordinal $blank_canary_at of $canary_total"
+    echo "FAIL source-aware: privacy canary empty canary=$blank_canary_at/$canary_total"
+    # `an` is not reviewed vocabulary, so the article is dropped: with it, this
+    # advisory reached an aggregated export as `[REDACTED: unclassified line]`
+    # and told its one reader nothing (#783).
+    echo "source-aware: fixture builder output has empty privacy canary, no scan run"
+    _report_raw_log
+    echo "----"
+    echo "passed: $pass_count   failed: $fail_count"
+    exit 1
+fi
+canary_ordinal=0
+for canary in ${canaries[@]+"${canaries[@]}"}; do
+    canary_ordinal=$((canary_ordinal + 1))
+    _scan_for_canary "$canary" "$canary_ordinal" "$canary_total"
     scan_rc=$?
     case "$scan_rc" in
         0)
-            echo "FAIL source-aware: privacy canary found in generated artifact: $canary"
-            _print_scan_output "$scan_output"
+            echo "FAIL source-aware: privacy canary match canary=$canary_ordinal/$canary_total"
             fail_count=$((fail_count + 1))
             ;;
         1)
             : # clean
             ;;
         *)
-            echo "FAIL source-aware: the privacy scanner exited $scan_rc while scanning for $canary; a scan that did not complete is not a clean result"
-            _print_scan_output "$scan_output"
+            echo "FAIL source-aware: privacy scanner failure status=$scan_rc phase=artifact-scan canary=$canary_ordinal/$canary_total"
             fail_count=$((fail_count + 1))
             ;;
     esac
 done
 
+if [ "$fail_count" -ne 0 ]; then
+    _report_raw_log
+fi
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]

@@ -508,9 +508,9 @@ def build_two_weeks_span():
             )
 
     (scenario_dir / "input.env").write_text(
-        # COLUMNS_OVERRIDE=200 so the `(2wk)` suffix on the Used % column is
+        # COLUMNS_OVERRIDE=200 so the `(2cy)` suffix on the Used % column is
         # not truncated by the default 120-col render scale-down. Without it
-        # the cell collapses to `80.0% (…` and the (Nwk) marker disappears.
+        # the cell collapses to `80.0% (…` and the (Ncy) marker disappears.
         f'AS_OF="{_iso(as_of)}"\nFLAGS="--weeks 2"\nCOLUMNS_OVERRIDE=200\n'
     )
 
@@ -857,24 +857,273 @@ def build_reset_boundary_default_range():
         f'AS_OF="{_iso(as_of)}"\n'
     )
 
+def _build_project_credited(name, *, cuts, ladder, flags, as_of=None,
+                            week_of=None, successor=None):
+    """One in-place-credited week for `cctally project` (#750 S4 §6.2 / #734).
+
+    `bin/build-project-fixtures.py` wrote no `old_week_end_at` at all, so no
+    project fixture exercised a credited week. Each event here carries the
+    shape both appliers require — `old_week_end_at == effective_reset_at_utc`,
+    with `new_week_end_at` holding the week's unchanged end — and N cuts
+    produce N+1 billing cycles, each of which must resolve its own percentage
+    inside its own half-open interval.
+
+    Every drop across a cut stays under the 25pp threshold
+    `_backfill_week_reset_events` uses. Above it the backfill mints a second,
+    capture-anchored event beside the seeded one and the fixture would hold
+    more cycles than it seeds. The split under test comes from the seeded
+    event, not from the size of the drop.
+
+    ``week_of`` anchors the credited week somewhere other than the one
+    containing ``as_of``, and ``successor`` seeds the following week. Together
+    they put the credited week somewhere other than LAST, which is what lets
+    `_apply_overlap_clamp_to_subweeks` reach its tail: that clamp runs after
+    the reset applier and pulls a tail's end back to the next week's start
+    when the next anchor drifted earlier, so the tail's end stops being the
+    `new_week_end_at` the event recorded.
+    """
+    as_of = as_of or dt.datetime(2026, 4, 17, 18, 0, 0, tzinfo=dt.timezone.utc)
+    scenario_dir = FIXTURES_DIR / name
+    db_dir = scenario_dir / ".local/share/cctally"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    week_start, week_end = _week_bounds_for(week_of or as_of)
+
+    stats_path = db_dir / "stats.db"
+    create_stats_db(stats_path)
+    with sqlite3.connect(stats_path) as conn:
+        for hours_in, pct in ladder:
+            conn.execute(
+                "INSERT INTO weekly_usage_snapshots "
+                "(captured_at_utc, week_start_date, week_end_date, "
+                " week_start_at, week_end_at, weekly_percent, payload_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (_iso(week_start + dt.timedelta(hours=hours_in)),
+                 week_start.date().isoformat(), week_end.date().isoformat(),
+                 _iso(week_start), _iso(week_end), pct, "{}"),
+            )
+        for hours_in in cuts:
+            cut = week_start + dt.timedelta(hours=hours_in)
+            cut_iso = cut.astimezone(dt.timezone.utc).isoformat(
+                timespec="seconds")
+            conn.execute(
+                "INSERT INTO week_reset_events "
+                "(detected_at_utc, old_week_end_at, new_week_end_at, "
+                " effective_reset_at_utc, observed_pre_credit_pct, "
+                " account_key) VALUES (?,?,?,?,?,?)",
+                (cut_iso, cut_iso,
+                 week_end.astimezone(dt.timezone.utc).isoformat(
+                     timespec="seconds"),
+                 cut_iso, 0.0, "unattributed"),
+            )
+        if successor is not None:
+            succ_start = week_end + dt.timedelta(
+                hours=successor["drift_hours"])
+            succ_end = succ_start + dt.timedelta(days=7)
+            # A successor is either a single uncredited reading
+            # (`captured_hours` + `pct`) or a credited week of its own
+            # (`ladder` + `cuts`). The second form is what puts TWO credited
+            # weeks inside one rendered window.
+            succ_ladder = successor.get("ladder")
+            if succ_ladder is None:
+                succ_ladder = [(successor["captured_hours"],
+                                successor["pct"])]
+            for hours_in, pct in succ_ladder:
+                conn.execute(
+                    "INSERT INTO weekly_usage_snapshots "
+                    "(captured_at_utc, week_start_date, week_end_date, "
+                    " week_start_at, week_end_at, weekly_percent, "
+                    " payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (_iso(succ_start + dt.timedelta(hours=hours_in)),
+                     succ_start.date().isoformat(),
+                     succ_end.date().isoformat(),
+                     _iso(succ_start), _iso(succ_end), pct, "{}"),
+                )
+            for hours_in in successor.get("cuts", ()):
+                cut = succ_start + dt.timedelta(hours=hours_in)
+                cut_iso = cut.astimezone(dt.timezone.utc).isoformat(
+                    timespec="seconds")
+                conn.execute(
+                    "INSERT INTO week_reset_events "
+                    "(detected_at_utc, old_week_end_at, new_week_end_at, "
+                    " effective_reset_at_utc, observed_pre_credit_pct, "
+                    " account_key) VALUES (?,?,?,?,?,?)",
+                    (cut_iso, cut_iso,
+                     succ_end.astimezone(dt.timezone.utc).isoformat(
+                         timespec="seconds"),
+                     cut_iso, 0.0, "unattributed"),
+                )
+
+    cache_path = db_dir / "cache.db"
+    create_cache_db(cache_path)
+    with sqlite3.connect(cache_path) as conn:
+        # One entry per cycle, in alternating projects, so a cycle reading
+        # another cycle's percentage shows up in a rendered Used %.
+        bounds = [0] + list(cuts) + [24 * 7]
+        for i in range(len(bounds) - 1):
+            ts = week_start + dt.timedelta(hours=bounds[i] + 1)
+            project = "/fake/repos/alpha" if i % 2 == 0 else "/fake/repos/beta"
+            _insert_entry(
+                conn,
+                source_path=f"/fake/jsonl/{name}-{i}.jsonl",
+                ts=ts,
+                model="claude-opus-4-7",
+                input_t=150_000 + 20_000 * i, output_t=20_000,
+                session_id=f"{name}-s{i}", project_path=project,
+            )
+        if successor is not None:
+            succ_start = week_end + dt.timedelta(
+                hours=successor["drift_hours"])
+            # One entry per successor cycle, for the same reason the credited
+            # week gets one per cycle: a cycle borrowing a neighbour's
+            # percentage has to show up in a rendered Used %.
+            succ_bounds = [0] + list(successor.get("cuts", ())) + [24 * 7]
+            for i in range(len(succ_bounds) - 1):
+                _insert_entry(
+                    conn,
+                    source_path=f"/fake/jsonl/{name}-succ-{i}.jsonl",
+                    ts=succ_start + dt.timedelta(hours=succ_bounds[i] + 12),
+                    model="claude-opus-4-7",
+                    input_t=90_000 + 15_000 * i, output_t=15_000,
+                    session_id=f"{name}-succ{i}",
+                    project_path=("/fake/repos/alpha" if i % 2 == 0
+                                  else "/fake/repos/beta"),
+                )
+
+    (scenario_dir / "input.env").write_text(
+        f'AS_OF="{_iso(as_of)}"\nFLAGS="{flags}"\nCOLUMNS_OVERRIDE=200\n'
+    )
+
+
+def build_credited_week():
+    """An ordinary single credit whose two cycles fall on DIFFERENT dates.
+
+    `project` must report the pre-credit cycle's own 41.0 and the post-credit
+    cycle's 30.0 — the two figures `weekly` reports for the same store — and
+    `totals.usedPercent` must SUM them, because a billing cycle is the unit
+    that owns a 100% quota (D7).
+    """
+    _build_project_credited(
+        "credited-week",
+        cuts=[72],
+        ladder=[(20, 24.0), (50, 41.0), (72, 19.0), (92, 30.0)],
+        flags="--weeks 1",
+    )
+
+
+def build_credited_week_same_day():
+    """TWO cuts on one calendar day: three cycles."""
+    _build_project_credited(
+        "credited-week-same-day",
+        cuts=[75, 87],
+        ladder=[(30, 26.0), (74, 44.0), (77, 22.0), (89, 5.0), (100, 13.0)],
+        flags="--weeks 1",
+    )
+
+
+def build_credited_week_not_last():
+    """A credited week followed by one whose anchor drifted EARLIER.
+
+    The overlap clamp then pulls the credited week's tail end back to that
+    drifted anchor, so the tail no longer ends at the `new_week_end_at` the
+    reset event recorded. A cut binding keyed on the week end finds nothing
+    here, reports the week as uncredited, and hands BOTH cycles the week's
+    latest reading — #731 in full, and silently. Every credited project
+    fixture before this one ran `--weeks 1`, which always makes the credited
+    week the last one and leaves its tail unclamped.
+
+    It carries TWO cuts rather than one, so the moved tail and the N-ary split
+    are exercised together. Before that they were covered only apart: every
+    three-segment case ran `--weeks 1`, where the tail is never clamped, and
+    this scenario was the only clamped tail and had a single cut. Both
+    behaviours are correct by construction, which is exactly why a regression
+    in their interaction would be silent.
+    """
+    _build_project_credited(
+        "credited-week-not-last",
+        cuts=[72, 120],
+        ladder=[(20, 24.0), (50, 41.0), (72, 19.0), (92, 30.0),
+                (120, 8.0), (140, 17.0)],
+        # `--weeks 4`, not 3: the second cut adds a third cycle, and at 3 the
+        # window starts inside the credited week, dropping the head cycle's 41.0 and
+        # leaving a cycle in range with no snapshot, so
+        # `weeklyAttributionAvailable` went false. At 4 all three cycles and
+        # the successor are in range with four distinct readings — 41.0, 30.0,
+        # 17.0, 15.0 — one per cycle.
+        flags="--weeks 4",
+        as_of=dt.datetime(2026, 4, 22, 12, 0, 0, tzinfo=dt.timezone.utc),
+        week_of=dt.datetime(2026, 4, 15, 12, 0, 0, tzinfo=dt.timezone.utc),
+        successor={"drift_hours": -6, "captured_hours": 42, "pct": 15.0},
+    )
+
+
+def build_two_credited_weeks():
+    """TWO credited weeks inside ONE rendered window.
+
+    Every other credited fixture holds exactly one, so nothing pinned what
+    happens when a window contains several: the cut binding, the segment
+    capture bounds and the per-segment percentage each key on one week at a
+    time, and a defect that mixed one week's cuts into another's segments
+    would leave every single-week fixture green. The successor's anchor does
+    NOT drift here, so this scenario isolates the multiplicity from the
+    overlap clamp `credited-week-not-last` covers.
+
+    Four cycles in total at four different percentages, so a cycle reading a
+    neighbour's figure — inside a week or across the two — changes a rendered
+    Used %.
+    """
+    _build_project_credited(
+        "two-credited-weeks",
+        cuts=[72],
+        ladder=[(20, 24.0), (50, 41.0), (72, 19.0), (92, 30.0)],
+        # `--weeks 4` is the width that admits all four cycles. At 3 the
+        # window opens on the first week's cut and the head cycle's 41.0 never
+        # renders, which halves what the goldens discriminate.
+        flags="--weeks 4",
+        as_of=dt.datetime(2026, 4, 24, 12, 0, 0, tzinfo=dt.timezone.utc),
+        week_of=dt.datetime(2026, 4, 15, 12, 0, 0, tzinfo=dt.timezone.utc),
+        successor={
+            "drift_hours": 0,
+            "cuts": [96],
+            # 33.0 -> 10.0 is 23pp, under the 25pp threshold
+            # `_backfill_week_reset_events` uses, for the reason
+            # `_build_project_credited`'s docstring gives: above it the
+            # backfill mints its own capture-anchored event beside the seeded
+            # one.
+            "ladder": [(24, 12.0), (90, 33.0), (96, 10.0), (120, 21.0)],
+        },
+    )
+
+
 def build_tz_variant_snapshots():
-    """Fixture H (covers P1 fix: coalesce week_start_at variant spellings).
+    """Two snapshots of ONE cycle whose offset spellings disagree with their
+    instant order.
 
-    Two weekly_usage_snapshots rows for the SAME logical week written with
-    different tz spellings (`+00:00` vs `+03:00`, same UTC instant). Before
-    the fix, the SQL `GROUP BY week_start_at` split them into two groups and
-    `_load_week_snapshots` silently overwrote the higher pct on dict-key
-    collision (last-fetchall-wins, nondeterministic). After the fix, both
-    spellings coalesce on the parsed UTC datetime and MAX is taken in
-    Python.
+    Fixture H originally covered a `GROUP BY week_start_at` defect: two rows
+    for one logical week written `+00:00` and `+03:00` split into two groups
+    and `_load_week_snapshots` overwrote one pct on the dict-key collision.
+    #750 S4 §2.1 replaced that reducer, and `latest_usage_by_segment` selects
+    `week_start_date, captured_at_utc, id, weekly_percent` — it never reads
+    `week_start_at`, so through THIS command that question is now unreachable.
+    It is still live on the dashboard projects query, which anchors each row
+    by `week_start_at` (bin/_cctally_dashboard.py), and it is asserted there.
 
-    Percentage assignment matters: the UNFIXED path does `GROUP BY
-    week_start_at` and SQLite returns groups in alphabetical order on that
-    string. `+00:00` sorts before `+03:00`, so the Python loop assigns the
-    `+00:00` pct first and then OVERWRITES it with the `+03:00` pct. To
-    make that overwrite LOSE the true max, we put the higher pct (70) on
-    the alphabetically-earlier `+00:00` spelling and the lower pct (50) on
-    `+03:00`. Without the fix: displays 50%. With the fix: 70% (max).
+    So the discriminating construction moved to the column this path does
+    read. The reducer ranks candidates by the PARSED capture instant, never
+    by the stored text, because one instant is written in more than one
+    offset across the tree and `'…+00:00' < '…Z'` holds for two spellings of
+    the same moment. The two rows below are built so a textual ranking and an
+    instant ranking disagree outright: the 70% row is captured EARLIER
+    (13:00Z) but spelled `+03:00`, so its text sorts AFTER the 50% row's
+    (14:00Z, `+00:00`). A lexical `ORDER BY captured_at_utc DESC` therefore
+    reports 70 and the golden's 50 fails.
+
+    The value also pins LATEST over MAX. MAX rested on "weekly_percent is
+    monotonic within a week", which is true of a billing CYCLE and false of a
+    credited week; segment bounds express the cycle directly now, and LATEST
+    is what `weekly` and the dashboard projects panel already read, so all
+    three surfaces answer #731's question the same way. The two rows sit in
+    one uncredited cycle, so the later capture (50) is the answer where the
+    maximum (70) used to be.
     """
     scenario_dir = FIXTURES_DIR / "tz-variant-snapshots"
     db_dir = scenario_dir / ".local/share/cctally"
@@ -892,14 +1141,17 @@ def build_tz_variant_snapshots():
     stats_path = db_dir / "stats.db"
     create_stats_db(stats_path)
     with sqlite3.connect(stats_path) as conn:
-        # 70% on the alphabetically-earlier +00:00 spelling, 50% on the
-        # later +03:00 spelling. Without the fix, +03:00 overwrites +00:00
-        # in the result dict → displays 50% (wrong). With the fix, max=70%.
+        # The 70% row is captured at 13:00Z — EARLIER than the 50% row — but
+        # written `+03:00`, so its text sorts after the other row's. A ranking
+        # by stored text picks it; a ranking by parsed instant does not. The
+        # literal is written out rather than passed through `_iso`, because
+        # `_iso` canonicalizes to `+00:00` and that is exactly the spelling
+        # this row must NOT carry.
         conn.execute(
             "INSERT INTO weekly_usage_snapshots "
             "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
             " week_end_at, weekly_percent, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (_iso(as_of - dt.timedelta(hours=2)),
+            ("2026-04-15T16:00:00+03:00",
              week_start.date().isoformat(), week_end.date().isoformat(),
              ws_utc, we_utc, 70.0, "{}"),
         )
@@ -962,5 +1214,9 @@ if __name__ == "__main__":
     build_equal_cost_tie_break_asc()
     build_missing_session_id_fallback()
     build_reset_boundary_default_range()
+    build_credited_week()
+    build_credited_week_same_day()
+    build_credited_week_not_last()
+    build_two_credited_weeks()
     build_tz_variant_snapshots()
     print(f"Built fixtures under {FIXTURES_DIR}")

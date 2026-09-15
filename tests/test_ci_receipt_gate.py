@@ -32,6 +32,7 @@ PRIVATE_REPO = "omrikais/cctally-dev"
 # succeed, which is never, on a healthy push.
 RECEIPT_CLAUSE = (
     "(needs.receipt-gate.result != 'success' || "
+    "needs.receipt-gate.outputs.admitted != 'true' || "
     "needs.receipt-gate.outputs.discharged != 'true')"
 )
 
@@ -40,9 +41,11 @@ TEST_MACOS_CONDITION = (
     "(needs.release-stamp-gate.result != 'success' || "
     "needs.release-stamp-gate.outputs.skipHeavy != 'true') && "
     "(needs.receipt-gate.result != 'success' || "
+    "needs.receipt-gate.outputs.admitted != 'true' || "
     "needs.receipt-gate.outputs.discharged != 'true') && "
     "github.repository == 'omrikais/cctally-dev' && "
-    "(github.event_name == 'push' || "
+    "(github.event_name == 'push' || github.event_name == 'schedule' || "
+    "github.event_name == 'workflow_dispatch' || "
     "(github.event_name == 'pull_request' && "
     "github.event.pull_request.head.repo.full_name == github.repository))"
 )
@@ -60,7 +63,7 @@ PUSH_ONLY_GUARD = (
 )
 
 CONCURRENCY_GROUP = (
-    "ci-${{ github.event_name }}-"
+    "ci-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'background' || github.event_name }}-"
     "${{ github.event.pull_request.number || github.ref }}"
 )
 
@@ -184,11 +187,13 @@ def _evaluate(condition, context):
 
 def _context(*, repository=PRIVATE_REPO, event="push", head_repo=None,
              cancelled=False, stamp_result="success", skip_heavy="false",
-             receipt_result="success", discharged="false",
+             receipt_result="success", admitted="true", discharged="false",
              receipt_outputs_present=True):
     receipt_outputs = {}
     if receipt_outputs_present and discharged is not None:
         receipt_outputs["discharged"] = discharged
+    if receipt_outputs_present and admitted is not None:
+        receipt_outputs["admitted"] = admitted
     return {
         "cancelled": cancelled,
         "github": {
@@ -302,7 +307,7 @@ def test_the_release_classifier_stays_deliberately_unguarded():
 
 def test_the_receipt_gate_is_read_only_and_does_not_persist_credentials():
     body = _ci()["jobs"][GATE_JOB]
-    assert body["permissions"] == {"contents": "read"}
+    assert body["permissions"] == {"contents": "read", "actions": "read"}
     checkout = [s for s in body["steps"] if str(s.get("uses", "")).startswith(
         "actions/checkout")]
     assert len(checkout) == 1, body["steps"]
@@ -310,12 +315,14 @@ def test_the_receipt_gate_is_read_only_and_does_not_persist_credentials():
 
 
 def test_the_receipt_gate_publishes_a_discharged_output():
-    assert "discharged" in (_ci()["jobs"][GATE_JOB].get("outputs") or {})
+    outputs = _ci()["jobs"][GATE_JOB].get("outputs") or {}
+    assert {"admitted", "discharged"} <= set(outputs)
 
 
 def test_the_receipt_gate_runs_the_public_classifier():
     body = yaml.safe_dump(_ci()["jobs"][GATE_JOB])
     assert ".github/scripts/classify_receipt.py" in body, body
+    assert "--topology-profile" in body, body
 
 
 def test_only_test_macos_carries_the_receipt_conjunct():
@@ -344,7 +351,12 @@ def test_the_test_macos_condition_is_exactly_the_specified_string():
 def test_the_three_fork_guards_are_byte_unchanged():
     """Preserve-item 1's regression test. Nothing in #630 S4 touches the
     repository or head-repository equalities, and this is what says so."""
-    assert _condition("test-macos").endswith(FORK_GUARD)
+    full_job_guard = FORK_GUARD.replace(
+        "(github.event_name == 'push' || ",
+        "(github.event_name == 'push' || github.event_name == 'schedule' || "
+        "github.event_name == 'workflow_dispatch' || ",
+    )
+    assert _condition("test-macos").endswith(full_job_guard)
     for job in ("dashboard-build-stability", "e2e-reader"):
         assert PUSH_ONLY_GUARD in _condition(job), _condition(job)
 
@@ -352,7 +364,9 @@ def test_the_three_fork_guards_are_byte_unchanged():
 def test_the_workflow_level_concurrency_group_is_exactly_as_specified():
     concurrency = _ci()["concurrency"]
     assert concurrency["group"] == CONCURRENCY_GROUP
-    assert concurrency["cancel-in-progress"] is True
+    assert concurrency["cancel-in-progress"] == (
+        "${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}"
+    )
 
 
 def test_the_pull_request_lane_keeps_a_distinct_concurrency_scope():
@@ -366,6 +380,8 @@ def test_the_pull_request_lane_keeps_a_distinct_concurrency_scope():
 def test_a_verified_discharge_skips_the_estate():
     assert _evaluate(_condition("test-macos"),
                      _context(discharged="true")) is False
+    assert _evaluate(_condition("test-macos"), _context(
+        admitted="false", discharged="true")) is True
 
 
 def test_no_discharge_runs_the_estate():

@@ -34,6 +34,12 @@ export function BlockTimeline({ detail }: { detail: BlockDetail }) {
   const generatedAt = useGeneratedAt();
   const display = useDisplayTz();
   const ctx: FmtCtx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
+  // A frozen block's headline is served from retained facts while `samples` is
+  // always computed from the current cache, so the chart can fall short of the
+  // headline without either being wrong (#769 S2). The empty-`samples` arm
+  // below is defensive: a block exists only where entries grouped into it, so
+  // the route answers 404 rather than serving one with no samples.
+  const retained = detail.facts_source === 'retained';
   const startMs = Date.parse(detail.start_at);
   const endMs   = Date.parse(detail.end_at);
   const span    = endMs - startMs || 1;
@@ -131,7 +137,9 @@ export function BlockTimeline({ detail }: { detail: BlockDetail }) {
           <text x={VB_W / 2} y={VB_H / 2}
                 fill="var(--text-faint)" fontSize={11}
                 textAnchor="middle">
-            No spend recorded yet in this block.
+            {retained
+              ? 'Cost trajectory unavailable for this block.'
+              : 'No spend recorded yet in this block.'}
           </text>
         )}
         {/* Projection ghost + now-marker (active only, projection present) */}
@@ -174,6 +182,17 @@ export function BlockTimeline({ detail }: { detail: BlockDetail }) {
           </>
         ) : null}
       </svg>
+      {retained ? (
+        <p className="mblock-timeline-note">
+          The figures above are the facts retained when this block closed.{' '}
+          {detail.samples.length === 0
+            ? 'Its entries are no longer in the local cache, so there is no '
+              + 'trajectory to draw.'
+            : `The trajectory is drawn from the entries currently in the local `
+              + `cache and totals ${fmt.usd2(lastCum)}, so it can differ from `
+              + `those figures.`}
+        </p>
+      ) : null}
     </div>
   );
 }

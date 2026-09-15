@@ -1505,7 +1505,7 @@ export function makeSourceEnvelope(
   return {
     // #556 S2 §3.9 — tracks the server's current `SOURCE_SCHEMA_VERSION`. No
     // production client branches on it; the number is a signal, not a gate.
-    source_schema_version: 11,
+    source_schema_version: 12,
     default_source: 'claude',
     source_order: ['claude', 'codex', 'all'],
     sources: makeSourcesMap(),

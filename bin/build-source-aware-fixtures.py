@@ -291,9 +291,15 @@ def _legacy_fixture_dependencies(module, command: str, *, populated: bool):
             range_start_iso="2026-06-29T00:00:00Z", range_end_iso="2026-07-06T00:00:00Z",
         ),)
         replace(module, "load_config", lambda: {"display": {"tz": "utc"}})
-        replace(module, "_get_canonical_boundary_for_date", lambda *_args: (
-            "2026-06-29T00:00:00Z", "2026-07-06T00:00:00Z",
-        ))
+        # `**_kwargs` absorbs `account_key` (#834 S2 #837, which gave the
+        # boundary helper a keyword-only account predicate) for the same reason
+        # the appliers' stubs below absorb theirs: `cmd_report` now forwards the
+        # resolved account, so a positional-only stub raises `TypeError` and the
+        # builder produces no artifacts at all.
+        replace(module, "_get_canonical_boundary_for_date",
+                lambda *_args, **_kwargs: (
+                    "2026-06-29T00:00:00Z", "2026-07-06T00:00:00Z",
+                ))
         # `**_kwargs` absorbs `account_key` (#750 S3 B1, which threaded the
         # requesting account through both appliers), the same shape the
         # `get_recent_weeks` stub below already uses. `cmd_report` calls

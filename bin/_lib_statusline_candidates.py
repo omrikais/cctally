@@ -6,17 +6,31 @@ This module deliberately has no filesystem, database, clock, process, or
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import math
 import re
 from typing import Callable, Mapping
 
 
+#: Candidate and tombstone documents.  Every session on this machine writes
+#: candidates, so this version may only move when peer sessions running the
+#: previous binary can still be read.
 SCHEMA_VERSION = 1
+#: The control document, versioned independently (#755).  It is written by
+#: whichever session holds the persist lock and read by the next tick, so a
+#: shape change here must not invalidate the spool documents peers are writing.
+CONTROL_SCHEMA_VERSION = 2
+#: Control documents this binary can read.  Version 1 predates the pending
+#: drop's deadline and retained evidence; see `_pending_drop`.
+CONTROL_SCHEMA_VERSIONS_READ = (1, 2)
+#: D5: a non-extendable wall clock measured from the first pending drop.
+PENDING_DROP_DEADLINE_SECONDS = 180
 CANDIDATE_DOCUMENT_MAX_BYTES = 4 * 1024
 CONTROL_DOCUMENT_MAX_BYTES = 1024 * 1024
 TOMBSTONE_DOCUMENT_MAX_BYTES = 1024
 CANDIDATE_TOKEN_RE = re.compile(r"[0-9a-f]{64}\Z")
+OBSERVATION_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 AXES = ("fiveHour", "sevenDay")
 _SIGNED_I64_MIN = -(2**63)
 _SIGNED_I64_MAX = 2**63 - 1
@@ -82,6 +96,42 @@ class RetrySignature:
 
 
 @dataclasses.dataclass(frozen=True)
+class SupportingObservation:
+    """One observation that reported the pending low.
+
+    ``observation_id`` identifies the observation itself rather than the moment
+    this machine read it.  It is a pure function of the reporting contributor
+    and the axis content that contributor reported, so re-reading one spool
+    record and receiving another render of the same upstream reading both
+    produce the identity already retained.  Neither is a second distinct
+    confirmation, which a receipt-time comparison alone cannot express.
+    """
+
+    observation_id: str
+    token: str
+    percent: float
+    raw_resets_at: int
+    received_at: int
+
+
+@dataclasses.dataclass(frozen=True)
+class RetainedLow:
+    """The low value a pending drop will publish, and the evidence for it.
+
+    A candidate is active only while ``-5 <= now - received_at < 90`` while the
+    deadline is 180 seconds, so every contributor supporting a pending low can
+    age out of the active set before that drop's own deadline expires.  The
+    record therefore carries the value and its supporting observations rather
+    than re-deriving them from a live candidate set that is empty by then.
+    """
+
+    percent: float
+    raw_resets_at: int
+    canonical_key: int
+    observations: tuple[SupportingObservation, ...]
+
+
+@dataclasses.dataclass(frozen=True)
 class PendingDrop:
     canonical_key: int
     reduced_percent: float
@@ -90,6 +140,12 @@ class PendingDrop:
     attempts: int
     contributors: Mapping[str, Contributor]
     retry_signature: RetrySignature | None
+    #: First-seen plus ``PENDING_DROP_DEADLINE_SECONDS``.  Persisted once and
+    #: never advanced: neither membership churn nor an upward report may move
+    #: it.  Deliberately carries no default, so that every construction site
+    #: states the deadline the record will be judged against.
+    deadline_at: int
+    retained: RetainedLow | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -322,14 +378,65 @@ def _retry_signature(value: object) -> RetrySignature | None:
     )
 
 
-def _pending_drop(value: object, *, now_epoch: int) -> PendingDrop | None:
+def _supporting_observation(value: object, *, now_epoch: int) -> SupportingObservation:
+    doc = _require_object(value, "supporting observation")
+    _require_exact_keys(
+        doc, {"observationId", "token", "percent", "rawResetsAt", "receivedAt"}
+    )
+    if not isinstance(doc["observationId"], str) or not OBSERVATION_ID_RE.fullmatch(
+        doc["observationId"]
+    ):
+        raise StateValidationError("invalid observationId")
+    if not isinstance(doc["token"], str) or not CANDIDATE_TOKEN_RE.fullmatch(doc["token"]):
+        raise StateValidationError("invalid supporting observation token")
+    if not _is_int(doc["rawResetsAt"]):
+        raise StateValidationError("rawResetsAt must be an integer")
+    received = doc["receivedAt"]
+    if not _is_int(received) or not 0 <= received <= now_epoch + 5:
+        raise StateValidationError("invalid supporting receivedAt")
+    return SupportingObservation(
+        observation_id=doc["observationId"],
+        token=doc["token"],
+        percent=_percent(doc["percent"]),
+        raw_resets_at=doc["rawResetsAt"],
+        received_at=received,
+    )
+
+
+def _retained_low(value: object, *, now_epoch: int) -> RetainedLow | None:
+    if value is None:
+        return None
+    doc = _require_object(value, "retained low")
+    _require_exact_keys(doc, {"percent", "rawResetsAt", "canonicalKey", "observations"})
+    for key in ("rawResetsAt", "canonicalKey"):
+        if not _is_int(doc[key]):
+            raise StateValidationError(f"{key} must be an integer")
+    observations = doc["observations"]
+    if not isinstance(observations, list) or len(observations) > 4096:
+        raise StateValidationError("observations must be a bounded array")
+    return RetainedLow(
+        percent=_percent(doc["percent"]),
+        raw_resets_at=doc["rawResetsAt"],
+        canonical_key=doc["canonicalKey"],
+        observations=tuple(
+            _supporting_observation(item, now_epoch=now_epoch) for item in observations
+        ),
+    )
+
+
+def _pending_drop(
+    value: object, *, now_epoch: int, control_version: int = CONTROL_SCHEMA_VERSION
+) -> PendingDrop | None:
     if value is None:
         return None
     doc = _require_object(value, "pending drop")
-    _require_exact_keys(
-        doc,
-        {"canonicalKey", "reducedPercent", "firstSeenAt", "kernelStage", "attempts", "contributors", "retrySignature"},
-    )
+    required = {
+        "canonicalKey", "reducedPercent", "firstSeenAt", "kernelStage",
+        "attempts", "contributors", "retrySignature",
+    }
+    if control_version >= 2:
+        required |= {"deadlineAt", "retained"}
+    _require_exact_keys(doc, required)
     if not _is_int(doc["canonicalKey"]):
         raise StateValidationError("canonicalKey must be an integer")
     if not _is_int(doc["firstSeenAt"]) or not 0 <= doc["firstSeenAt"] <= now_epoch + 5:
@@ -355,22 +462,46 @@ def _pending_drop(value: object, *, now_epoch: int) -> PendingDrop | None:
         contributors[token] = Contributor(
             baseline_received_at=baseline, satisfied=contributor_doc["satisfied"]
         )
+    reduced_percent = _percent(doc["reducedPercent"])
+    retry_signature = _retry_signature(doc["retrySignature"])
+    if control_version < 2:
+        # A pending drop written by the previous binary carries neither the
+        # deadline nor the retained evidence, and neither can be recovered.  The
+        # evidence is not invented, and the deadline is not reconstructed from
+        # `firstSeenAt` either: that instant was stamped under the pre-#755
+        # arming rule, where a pending drop was armed from the reduced maximum
+        # rather than from a retained low, so it does not mean "when this low
+        # was first seen" under this contract.  The record is therefore
+        # unreadable here and is discarded on read; the drop re-arms from live
+        # evidence at the next evaluation.  The rest of the document — the
+        # projection it was read for — is kept, and its shape is still validated
+        # above, so a malformed record is refused rather than dropped quietly.
+        # A binary running the previous version discards this one's control
+        # document in the same way, for the same reason.
+        return None
+    deadline_at = doc["deadlineAt"]
+    if not _is_int(deadline_at) or deadline_at < doc["firstSeenAt"]:
+        raise StateValidationError("invalid deadlineAt")
+    retained = _retained_low(doc["retained"], now_epoch=now_epoch)
     return PendingDrop(
         canonical_key=doc["canonicalKey"],
-        reduced_percent=_percent(doc["reducedPercent"]),
+        reduced_percent=reduced_percent,
         first_seen_at=doc["firstSeenAt"],
         kernel_stage=doc["kernelStage"],
         attempts=doc["attempts"],
         contributors=contributors,
-        retry_signature=_retry_signature(doc["retrySignature"]),
+        retry_signature=retry_signature,
+        deadline_at=deadline_at,
+        retained=retained,
     )
 
 
 def validate_control_document(document: object, *, now_epoch: int) -> ControlState:
     doc = _require_object(document, "control state")
     _require_exact_keys(doc, {"schemaVersion", "dbProjection", "dbFiles", "pendingDrops"})
-    if not _is_int(doc["schemaVersion"]) or doc["schemaVersion"] != SCHEMA_VERSION:
+    if not _is_int(doc["schemaVersion"]) or doc["schemaVersion"] not in CONTROL_SCHEMA_VERSIONS_READ:
         raise StateValidationError("unsupported schemaVersion")
+    control_version = doc["schemaVersion"]
     projection_doc = _require_object(doc["dbProjection"], "dbProjection")
     _require_exact_keys(projection_doc, {"fiveHour", "sevenDay"})
     files_doc = _require_object(doc["dbFiles"], "dbFiles")
@@ -387,8 +518,12 @@ def validate_control_document(document: object, *, now_epoch: int) -> ControlSta
             db_files={"main": main, "wal": _fingerprint(files_doc["wal"])},
         ),
         pending_drops={
-            "fiveHour": _pending_drop(pending_doc["fiveHour"], now_epoch=now_epoch),
-            "sevenDay": _pending_drop(pending_doc["sevenDay"], now_epoch=now_epoch),
+            "fiveHour": _pending_drop(
+                pending_doc["fiveHour"], now_epoch=now_epoch, control_version=control_version
+            ),
+            "sevenDay": _pending_drop(
+                pending_doc["sevenDay"], now_epoch=now_epoch, control_version=control_version
+            ),
         },
     )
 
@@ -537,8 +672,88 @@ def _reduced_candidate(
     return AxisValue(maximum, raw, canonical_key=newest_key), in_window
 
 
+def observation_identity(token: str, axis: str, value: AxisValue) -> str:
+    """Identify one upstream reading, independently of when it was read.
+
+    The digest covers the reporting contributor and the axis content it
+    reported.  It deliberately excludes the receipt time, because the receipt
+    time records when this machine rendered the reading rather than when the
+    provider produced it: several renders of one cached upstream block carry
+    distinct receipt times and are still one observation.
+    """
+    payload = f"{token}|{axis}|{float(value.percent)!r}|{int(value.raw_resets_at)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _supporting_observations(
+    in_window: tuple[tuple[Candidate, AxisValue], ...], axis: str, low: float
+) -> tuple[SupportingObservation, ...]:
+    """The observations reporting ``low``, deduplicated by observation identity."""
+    seen: dict[str, SupportingObservation] = {}
+    for candidate, value in in_window:
+        if value.percent != low:
+            continue
+        identity = observation_identity(candidate.token, axis, value)
+        existing = seen.get(identity)
+        if existing is None or candidate.received_at > existing.received_at:
+            seen[identity] = SupportingObservation(
+                observation_id=identity,
+                token=candidate.token,
+                percent=value.percent,
+                raw_resets_at=value.raw_resets_at,
+                received_at=candidate.received_at,
+            )
+    return tuple(sorted(seen.values(), key=lambda item: item.observation_id))
+
+
+def _merged_retained(
+    previous: RetainedLow | None,
+    *,
+    canonical_key: int,
+    low: float,
+    observations: tuple[SupportingObservation, ...],
+) -> RetainedLow:
+    """Refresh the retained evidence from the live observations.
+
+    Observations carrying an identity already retained are the same upstream
+    reading seen again, so they replace their own entry rather than adding a
+    second confirmation.  A different low replaces the record outright, which
+    is how an upward correction moves the target without restarting anything
+    else.
+    """
+    merged: dict[str, SupportingObservation] = {}
+    if previous is not None and previous.canonical_key == canonical_key and previous.percent == low:
+        merged.update({item.observation_id: item for item in previous.observations})
+    for item in observations:
+        # `setdefault`, not assignment: an identity already retained is the same
+        # upstream reading seen again, and rewriting its receipt time would make
+        # the control document differ on every tick while nothing was confirmed.
+        merged.setdefault(item.observation_id, item)
+    ordered = tuple(sorted(merged.values(), key=lambda item: item.observation_id))
+    return RetainedLow(
+        percent=low,
+        raw_resets_at=min(item.raw_resets_at for item in ordered),
+        canonical_key=canonical_key,
+        observations=ordered,
+    )
+
+
+def _retained_axis_value(retained: RetainedLow, db_axis: AxisProjection | None) -> AxisValue:
+    """The value a pending drop publishes, using the DB's own raw reset when it
+    describes the same physical window — the rule `_reduced_candidate` applies."""
+    if db_axis is not None and db_axis.canonical_key == retained.canonical_key:
+        raw = db_axis.raw_resets_at
+    else:
+        raw = retained.raw_resets_at
+    return AxisValue(retained.percent, raw, canonical_key=retained.canonical_key)
+
+
 def _new_pending(
-    reduced: AxisValue, contributors: tuple[tuple[Candidate, AxisValue], ...], now_epoch: int
+    reduced: AxisValue,
+    contributors: tuple[tuple[Candidate, AxisValue], ...],
+    now_epoch: int,
+    *,
+    retained: RetainedLow,
 ) -> PendingDrop:
     return PendingDrop(
         canonical_key=_axis_value_key(reduced),
@@ -551,6 +766,8 @@ def _new_pending(
             for candidate, _ in contributors
         },
         retry_signature=None,
+        deadline_at=now_epoch + PENDING_DROP_DEADLINE_SECONDS,
+        retained=retained,
     )
 
 
@@ -628,6 +845,82 @@ def _pending_kernel_attempt(
     return None
 
 
+def _has_evidence(retained: RetainedLow | None) -> bool:
+    """Does this record carry a low with at least one supporting observation?
+
+    A retained low with no observations supports nothing, so it can neither be
+    published at expiry nor be retracted by a live contributor.  Both readers of
+    a pending record consult this, because disagreeing about the evidence-free
+    case had `_reduce_axis` cancelling where `_hold_pending` would publish.
+    """
+    return retained is not None and bool(retained.observations)
+
+
+def _supporters_retracted(
+    pending: PendingDrop,
+    in_window: tuple[tuple[Candidate, AxisValue], ...],
+    db_axis: AxisProjection,
+) -> bool:
+    """Has every PRESENT retained supporter reported at or above the baseline?
+
+    Cancellation and expiry are distinct outcomes.  Cancellation means a
+    contributor actively reported a value at or above the database baseline,
+    retracting the evidence it once supplied.  A supporter that merely aged out
+    of the 90-second active window has reported nothing, and reading its absence
+    as retraction is the same mistake as clearing on an empty spool.
+
+    Both rules hold at once only if the decision is taken over the supporters
+    that are actually present, and only if that set is non-empty.  Requiring
+    EVERY supporter to be present instead let one absent peer veto a live
+    retraction: a session that came back and said the database value was right
+    was ignored because a peer had ended, and the drop then published a low no
+    live contributor still supported.
+    """
+    if not _has_evidence(pending.retained):
+        return False
+    supporters = {item.token for item in pending.retained.observations}
+    present = {candidate.token: value for candidate, value in in_window}
+    live = [present[token] for token in supporters if token in present]
+    if not live:
+        # Every supporter is absent, which is silence rather than retraction.
+        return False
+    return all(value.percent >= db_axis.percent for value in live)
+
+
+def _hold_pending(
+    pending: PendingDrop | None, db_axis: AxisProjection | None, now_epoch: int
+) -> _AxisDecision:
+    """Decide a pending drop with no eligible candidate on its axis.
+
+    An axis can lose every candidate while the spool is not empty at all,
+    because another axis still has candidates and evaluations keep running, and
+    an in-flight tombstone suppresses an axis the same way.  Empty membership is
+    never unanimous confirmation, so preservation is decided here per axis and
+    per physical window rather than per spool.
+    """
+    if pending is None:
+        return _AxisDecision("NOOP", None, None)
+    if not _has_evidence(pending.retained):
+        # Evidence-free pending state — a record built by hand, or one whose
+        # retained low carries no observation — has nothing to publish and no
+        # live contributor left to confirm it.
+        return _AxisDecision("WRITE_CONTROL", None, None)
+    if db_axis is None or db_axis.canonical_key != pending.canonical_key:
+        return _AxisDecision("NOOP", None, pending)
+    if db_axis.percent <= pending.retained.percent:
+        # The database already holds the drop, so the record has done its work.
+        return _AxisDecision("WRITE_CONTROL", None, None)
+    if now_epoch < pending.deadline_at:
+        return _AxisDecision("NOOP", None, pending)
+    publish = _retained_axis_value(pending.retained, db_axis)
+    attempted = _pending_kernel_attempt(pending, publish, db_axis)
+    if attempted is not None:
+        return _AxisDecision("PUBLISH_DB", publish, attempted)
+    # The bounded attempts are spent and no contributor remains that could
+    # change the signature, so retaining the record would never advance it.
+    return _AxisDecision("WRITE_CONTROL", None, None)
+
+
 def _reduce_axis(
     axis: str,
     candidates: tuple[Candidate, ...],
@@ -640,7 +933,7 @@ def _reduce_axis(
         candidates, axis=axis, tombstone=tombstone, db_axis=db_axis
     )
     if reduced_data is None:
-        return _AxisDecision("WRITE_CONTROL" if pending is not None else "NOOP", None, None)
+        return _hold_pending(pending, db_axis, now_epoch)
     reduced, in_window = reduced_data
     key = _axis_value_key(reduced)
 
@@ -649,39 +942,110 @@ def _reduce_axis(
     if key > db_axis.canonical_key:
         return _AxisDecision("PUBLISH_DB", reduced, None)
     if key < db_axis.canonical_key:
-        return _AxisDecision("NOOP", None, pending)
-    if reduced.percent > db_axis.percent:
-        return _AxisDecision("PUBLISH_DB", reduced, None)
-    if reduced.percent == db_axis.percent:
+        # A stale older window says nothing about the pending newer one.
+        return _hold_pending(pending, db_axis, now_epoch)
+    # `reduced` is the MAXIMUM across active contributors, so it can equal or
+    # exceed the database value while a lower contributor is reporting a real
+    # drop.  The maximum decides what is displayed; it may not erase the
+    # evidence that a drop is pending, which is why the low is read separately
+    # here and why a rise is a publication rather than a branch of its own.
+    rising = reduced.percent > db_axis.percent
+    low = min(value.percent for _, value in in_window)
+    armed = (
+        pending is not None
+        and pending.canonical_key == key
+        and _has_evidence(pending.retained)
+    )
+
+    if not armed:
+        if rising:
+            # The rise moves the baseline and no drop is pending against the old
+            # one, so there is nothing to preserve.
+            return _AxisDecision("PUBLISH_DB", reduced, None)
+        if low >= db_axis.percent:
+            return _AxisDecision(
+                "WRITE_CONTROL" if pending is not None else "NOOP", None, None
+            )
+        supporters = _supporting_observations(in_window, axis, low)
+        retained = _merged_retained(
+            None, canonical_key=key, low=low, observations=supporters
+        )
         return _AxisDecision(
-            "WRITE_CONTROL" if pending is not None else "NOOP",
-            None,
-            None,
+            "WRITE_CONTROL", None, _new_pending(reduced, in_window, now_epoch, retained=retained)
         )
 
-    # The current max is lower than the current DB value.  Because `reduced`
-    # is that max, every active contributor in this canonical window is lower.
-    if pending is None or pending.canonical_key != key:
-        return _AxisDecision("WRITE_CONTROL", None, _new_pending(reduced, in_window, now_epoch))
-    if reduced.percent > pending.reduced_percent:
-        # A lower-only upward correction starts a distinct consensus generation;
-        # old baselines must never be mutated into this new target.
-        return _AxisDecision("WRITE_CONTROL", None, _new_pending(reduced, in_window, now_epoch))
+    # A cancelled or already-recorded drop stops being pending, and a rise still
+    # publishes on the way out.
+    cancelled = _AxisDecision(
+        "PUBLISH_DB" if rising else "WRITE_CONTROL", reduced if rising else None, None
+    )
+    if _supporters_retracted(pending, in_window, db_axis):
+        return cancelled
+    if db_axis.percent <= pending.retained.percent:
+        return cancelled
 
     reconciled = _reconcile_pending(pending, in_window)
-    if reconciled.contributors and all(item.satisfied for item in reconciled.contributors.values()):
-        attempted = _pending_kernel_attempt(reconciled, reduced, db_axis)
+    if low < db_axis.percent:
+        supporters = _supporting_observations(in_window, axis, low)
+        retained = _merged_retained(
+            pending.retained, canonical_key=key, low=low, observations=supporters
+        )
+    else:
+        # Every present contributor is at or above the baseline while at least
+        # one supporter is merely absent.  Freeze the evidence rather than
+        # rewriting it from a set that no longer contains the low.
+        retained = pending.retained
+    # An upward correction updates the reduced maximum and the retained low.  It
+    # never restarts the generation: `first_seen_at`, `deadline_at` and every
+    # other contributor's progress are carried through unchanged.
+    updated = dataclasses.replace(
+        reconciled, reduced_percent=reduced.percent, retained=retained
+    )
+
+    if rising:
+        # The rise moves the database baseline, and that is all it does.
+        # Discarding the pending drop here and re-arming it against the new
+        # baseline was an upward report advancing the single deadline D5 fixes
+        # at the first pending drop, and it is the stall family: a peer
+        # reporting a higher number erased another session's real reset.  The
+        # retained low keeps its meaning, because the baseline only moved UP —
+        # a low armed below the old baseline is still a drop below the new one.
+        return _AxisDecision("PUBLISH_DB", reduced, updated)
+
+    unanimous = (
+        reduced.percent < db_axis.percent
+        and bool(updated.contributors)
+        and all(item.satisfied for item in updated.contributors.values())
+    )
+    if unanimous:
+        attempted = _pending_kernel_attempt(updated, reduced, db_axis)
         if attempted is not None:
             return _AxisDecision("PUBLISH_DB", reduced, attempted)
-        return _AxisDecision(
-            "WRITE_CONTROL" if _axis_control_changed(pending, reconciled) else "NOOP",
-            None,
-            reconciled,
-        )
+    elif now_epoch >= updated.deadline_at:
+        # D5: the first eligible evaluation after expiry publishes the retained
+        # supported low despite unsatisfied contributors.  Never the
+        # all-contributor maximum, never the old high, and never a fresh
+        # generation over the same drop.
+        publish = _retained_axis_value(updated.retained, db_axis)
+        attempted = _pending_kernel_attempt(updated, publish, db_axis)
+        if attempted is not None:
+            return _AxisDecision("PUBLISH_DB", publish, attempted)
+        # The bounded attempts are spent against an unchanged signature, so this
+        # record can no longer advance — the same state `_hold_pending`
+        # terminates on, reached with contributors still present.  Keeping it
+        # would rewrite the control document on every tick whose membership
+        # differs, and would let a later signature change re-publish evidence
+        # that expired long ago.  What a live contributor still reports arms a
+        # NEW drop from current evidence at the next evaluation, which is the
+        # difference from the unanimous path above: that one publishes the LIVE
+        # reduced value, so re-firing it on a signature change republishes
+        # something current.
+        return _AxisDecision("WRITE_CONTROL", None, None)
+
     return _AxisDecision(
-        "WRITE_CONTROL" if _axis_control_changed(pending, reconciled) else "NOOP",
+        "WRITE_CONTROL" if _axis_control_changed(pending, updated) else "NOOP",
         None,
-        reconciled,
+        updated,
     )
 
 

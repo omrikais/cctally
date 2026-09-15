@@ -37,6 +37,7 @@ describe('Codex source rows open the qualified detail modal (§5.6)', () => {
       source: 'codex',
       resource: 'session',
       key: 'session:codex-a',
+      accountKey: null,
     });
   });
 });
@@ -97,7 +98,7 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     expect(detail.querySelector('.msess-model-caption')).not.toBeNull();
     expect(screen.getByRole('heading', { name: 'Session detail' })).toBeInTheDocument();
     // The card publishes the provider it was opened for. #556 S4 F7 deleted
-    // this attribute as unread; `e2e/period-native-vocabulary.spec.ts` read it,
+    // this attribute as unread; `e2e/period-vocabulary-convergence.spec.ts` read it,
     // and that Playwright lane went red on main. Provider-local `data-source`
     // attributes set by inner components are a different attribute on a
     // different element and are untouched.
@@ -179,6 +180,7 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
       source: 'claude',
       resource: 'project',
       key: 'project:opaque',
+      accountKey: null,
     });
     expect(getState().openSourceDetailSelection).toBe('all');
   });
@@ -225,8 +227,10 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     );
     // #571 — the detail's own authoritative half-open bounds state its span;
     // no retained or top-level projects anchor is needed on the client.
+    // #750 S4 acceptance 11: the drill header names CYCLES on both branches.
+    // `window_weeks` is still the wire name; only the rendered noun changed.
     expect(detail).toHaveTextContent(
-      'project-red · 3 sessions · $8.50 · 4w · Jul 20 – Aug 16',
+      'project-red · 3 sessions · $8.50 · 4 cycles · Jul 20 – Aug 16',
     );
     expect(detail).toHaveTextContent('Models (this project)');
     expect(detail).toHaveTextContent('Recent sessions');
@@ -239,6 +243,7 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
       source: 'claude',
       resource: 'session',
       key: 'session:opaque-a',
+      accountKey: null,
     });
     expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Session detail' }));
 
@@ -304,10 +309,10 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     // end is Apr 24, because the fixture's `generated_at` is
     // 2026-04-24T13:07 and a stated span never names a day that has not
     // happened. This case previously asserted Apr 27 — a future Sunday.
-    expect(detail).toHaveTextContent('8w · Mar 03 – Apr 24');
+    expect(detail).toHaveTextContent('8 cycles · Mar 03 – Apr 24');
     // The response's window, never the request's — the whole point is that the
     // server widened it.
-    expect(detail).not.toHaveTextContent('4w');
+    expect(detail).not.toHaveTextContent('4 cycles');
   });
 
   it('uses the shared labelled modal lifecycle for focus, Escape, and return focus', async () => {
@@ -629,5 +634,162 @@ describe('the Codex project drill states its reported window', () => {
     // The shipped form: "Aug 14 00:55 UTC → Aug 14 00:55 UTC", a year rendered
     // as a zero-width span directly below a FIRST SEEN of Apr 28.
     expect(range.textContent).not.toMatch(/Aug 14 \d{2}:\d{2}.*→.*Aug 14 \d{2}:\d{2}/);
+  });
+});
+
+// #769 S9 QA P1 — the partial Codex BLOCK payload must render, not crash.
+//
+// `_codex_partial_source_detail` builds a block payload through
+// `_source_safe_native_detail`, whose `block` allowlist intersects the
+// published quota-block row. That row carries no `forecast`, no
+// `observations`, no `milestones` and no `freshness`, so the partial payload
+// is exactly these fourteen keys:
+//
+//   detail_kind, key, label, start_at, end_at, resets_at, current_percent,
+//   orphaned, is_active, cost_usd, model_breakdowns, window_minutes,
+//   metadata_availability, metadata_reason
+//
+// The client read `d.forecast.projected_percent` unguarded, so React threw
+// `TypeError: Cannot read properties of undefined (reading
+// 'projected_percent')`, no `role="dialog"` mounted, and the error boundary
+// claimed the build had changed under the tab — which is untrue here.
+//
+// The project sibling on the same generation renders its real figures under a
+// "Project metadata is unavailable for this item." banner. The block route
+// gets the same disclosure rather than a blank panel or an error card.
+describe('#769 S9 — a partial Codex block detail renders its partial fallback', () => {
+  // Exactly what the server emits: no forecast, observations, milestones or
+  // freshness key at all. Spelled as a literal object rather than built by
+  // deletion so a future server change cannot silently widen it here.
+  const PARTIAL_BLOCK_PAYLOAD = {
+    detail_kind: 'codex_block',
+    key: 'block:partial',
+    label: '08:00 Jul 21 UTC',
+    start_at: '2026-07-21T08:00:00Z',
+    end_at: '2026-07-21T13:00:00Z',
+    resets_at: '2026-07-21T13:00:00Z',
+    current_percent: 42,
+    orphaned: false,
+    is_active: true,
+    cost_usd: 1.25,
+    model_breakdowns: [],
+    window_minutes: 300,
+    metadata_availability: 'partial',
+    metadata_reason: 'Project metadata is unavailable for this item.',
+  };
+
+  function stubPartialBlock(): void {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({
+        source: 'codex', resource: 'block', data: PARTIAL_BLOCK_PAYLOAD,
+      }),
+    } as Response)));
+  }
+
+  it('mounts the dialog instead of throwing on the absent forecast', async () => {
+    stubPartialBlock();
+    dispatch({ type: 'OPEN_SOURCE_DETAIL', source: 'codex', resource: 'block', key: 'block:partial' });
+    render(<SourceDetailModal />);
+
+    const detail = await screen.findByTestId('codex-block-detail');
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(screen.queryByTestId('source-detail-error')).not.toBeInTheDocument();
+    // The figures the partial payload DOES carry are still reported.
+    expect(detail).toHaveTextContent('$1.25');
+    expect(detail).toHaveTextContent('42%');
+  });
+
+  it('discloses the partial metadata the way the project sibling does', async () => {
+    stubPartialBlock();
+    dispatch({ type: 'OPEN_SOURCE_DETAIL', source: 'codex', resource: 'block', key: 'block:partial' });
+    render(<SourceDetailModal />);
+
+    const detail = await screen.findByTestId('codex-block-detail');
+    expect(detail).toHaveTextContent('Project metadata is unavailable for this item.');
+  });
+
+  it('renders each omitted progression field as its own empty state', async () => {
+    stubPartialBlock();
+    dispatch({ type: 'OPEN_SOURCE_DETAIL', source: 'codex', resource: 'block', key: 'block:partial' });
+    render(<SourceDetailModal />);
+
+    const detail = await screen.findByTestId('codex-block-detail');
+    // forecast — the field that crashed.
+    expect(detail).toHaveTextContent('Projected at reset');
+    // freshness, observations, milestones — guarded already, pinned here so a
+    // fix that guards only the forecast cannot pass this describe block.
+    expect(detail).toHaveTextContent('unavailable');
+    expect(detail).toHaveTextContent('No model breakdown is available.');
+    expect(detail).toHaveTextContent('No retained quota observations are available.');
+    expect(detail).toHaveTextContent('No quota milestones were crossed in this window.');
+  });
+});
+
+// #769 S9 QA P2 — a block detail is fetched under the ROW's own account.
+//
+// Two Codex accounts that observed one physical quota window publish two
+// separately labelled rows sharing one opaque resource key. With the Account
+// focus control on "All accounts" the modal resolved no qualifier, both rows
+// issued the identical unqualified URL, and `source_detail_lookup` answered
+// both from the first published row — so the row labelled with one account
+// opened the other account's block.
+//
+// The qualifier is the row's own `account_key`, which the wire publishes only
+// under decoration. A row that carries none sends none; `unattributed` is
+// never synthesised where the wire published nothing.
+describe('#769 S9 — a block detail is qualified by the row that opened it', () => {
+  function stubEcho(): ReturnType<typeof vi.fn> {
+    const fetchFn = vi.fn((url: string) => Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({
+        source: 'codex', resource: 'block', data: {
+          detail_kind: 'codex_block', key: 'block:shared', label: url,
+          observed_slot: 0, window_minutes: 300,
+          start_at: '2026-07-21T08:00:00Z', end_at: '2026-07-21T13:00:00Z',
+          resets_at: '2026-07-21T13:00:00Z', current_percent: 42,
+          orphaned: false, is_active: true, cost_usd: 1.25, model_breakdowns: [],
+        },
+      }),
+    } as Response));
+    vi.stubGlobal('fetch', fetchFn);
+    return fetchFn;
+  }
+
+  it('sends the opening row account under All accounts', async () => {
+    updateSnapshot(fixture as unknown as Envelope);
+    const fetchFn = stubEcho();
+    const rowAccount = 'b'.repeat(32);
+    dispatch({
+      type: 'OPEN_SOURCE_DETAIL',
+      source: 'codex',
+      resource: 'block',
+      key: 'block:shared',
+      accountKey: rowAccount,
+    });
+    render(<SourceDetailModal />);
+
+    await waitFor(() => expect(fetchFn).toHaveBeenCalled());
+    expect(fetchFn).toHaveBeenCalledWith(
+      `/api/source/codex/block/block%3Ashared?account=${rowAccount}`,
+    );
+  });
+
+  it('sends no qualifier when the row carries no account_key', async () => {
+    updateSnapshot(fixture as unknown as Envelope);
+    const fetchFn = stubEcho();
+    dispatch({
+      type: 'OPEN_SOURCE_DETAIL',
+      source: 'codex',
+      resource: 'block',
+      key: 'block:shared',
+      accountKey: null,
+    });
+    render(<SourceDetailModal />);
+
+    await waitFor(() => expect(fetchFn).toHaveBeenCalled());
+    expect(fetchFn).toHaveBeenCalledWith('/api/source/codex/block/block%3Ashared');
   });
 });

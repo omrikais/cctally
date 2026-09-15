@@ -693,3 +693,268 @@ def test_block_detail_floor_band_trap_returns_exact_window(
         assert r.status == 404, r.status
     finally:
         stop(srv, srv._test_thread)
+
+
+# ---- #751a: a journal-stamped closed block reads its retained facts ----
+
+
+_FROZEN_START = "2026-04-22T14:00:00+00:00"
+_FROZEN_COST = 4.5
+_FROZEN_TOKENS = {
+    "total_input_tokens": 700,
+    "total_output_tokens": 210,
+    "total_cache_create_tokens": 3400,
+    "total_cache_read_tokens": 18000,
+}
+
+
+_FROZEN_CHILDREN = (
+    ("claude-opus-4-5-20251101", 500, 150, 2400, 13000, 3.0, 4),
+    ("claude-sonnet-4-6-20251015", 200, 60, 1000, 5000, 1.5, 2),
+)
+
+
+def _freeze_block_facts(ns, *, journal_id=4242, children=_FROZEN_CHILDREN):
+    """Stamp the 14:00 block closed and give it retained parent + children."""
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            """
+            INSERT INTO five_hour_blocks (
+              five_hour_window_key, five_hour_resets_at, block_start_at,
+              first_observed_at_utc, last_observed_at_utc,
+              final_five_hour_percent,
+              seven_day_pct_at_block_start, seven_day_pct_at_block_end,
+              crossed_seven_day_reset,
+              total_input_tokens, total_output_tokens,
+              total_cache_create_tokens, total_cache_read_tokens,
+              total_cost_usd, is_closed, journal_id,
+              created_at_utc, last_updated_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            """,
+            (
+                1777125600,
+                "2026-04-22T19:00:00+00:00",
+                _FROZEN_START,
+                _FROZEN_START,
+                "2026-04-22T18:55:00+00:00",
+                40.0, 20.0, 25.0,
+                _FROZEN_TOKENS["total_input_tokens"],
+                _FROZEN_TOKENS["total_output_tokens"],
+                _FROZEN_TOKENS["total_cache_create_tokens"],
+                _FROZEN_TOKENS["total_cache_read_tokens"],
+                _FROZEN_COST,
+                journal_id,
+                _FROZEN_START, _FROZEN_START,
+            ),
+        )
+        block_id = conn.execute(
+            "SELECT id FROM five_hour_blocks WHERE five_hour_window_key = ?",
+            (1777125600,),
+        ).fetchone()["id"]
+        conn.executemany(
+            """
+            INSERT INTO five_hour_block_models (
+              block_id, five_hour_window_key, model,
+              input_tokens, output_tokens, cache_create_tokens,
+              cache_read_tokens, cost_usd, entry_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [(block_id, 1777125600) + tuple(child) for child in children],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _append_a_later_cache_entry(ns):
+    """The cache moves on after the close: a newly ingested in-window row."""
+    cache = ns["open_cache_db"]()
+    try:
+        cache.execute(
+            """INSERT INTO session_entries
+            (source_path, line_offset, timestamp_utc, model,
+             input_tokens, output_tokens, cache_create_tokens,
+             cache_read_tokens)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("/late.jsonl", 0, "2026-04-22T17:30:00+00:00",
+             "claude-opus-4-5-20251101", 9999, 9999, 9999, 9999),
+        )
+        cache.commit()
+    finally:
+        cache.close()
+
+
+def test_api_block_reads_retained_facts_for_a_journal_stamped_closed_block(
+    tmp_path, monkeypatch,
+):
+    """A closed block with a journal id is frozen. Its detail must come from
+    the retained parent and child facts, not from newer cache contents."""
+    ns = load_script()
+    srv = _start_dashboard_server(ns, tmp_path, monkeypatch)
+    try:
+        _freeze_block_facts(ns)
+        _append_a_later_cache_entry(ns)
+        encoded = urllib.parse.quote(_FROZEN_START, safe="")
+        c = HTTPConnection("127.0.0.1", srv.server_address[1],
+                           timeout=PRESENCE_BACKSTOP_SECONDS)
+        c.request("GET", f"/api/block/{encoded}")
+        r = c.getresponse()
+        assert r.status == 200, r.status
+        body = json.loads(r.read())
+    finally:
+        stop(srv, srv._test_thread)
+
+    assert body["facts_source"] == "retained", body.get("facts_source")
+    assert abs(body["cost_usd"] - _FROZEN_COST) < 1e-9, body["cost_usd"]
+    assert body["input_tokens"] == _FROZEN_TOKENS["total_input_tokens"]
+    assert body["output_tokens"] == _FROZEN_TOKENS["total_output_tokens"]
+    assert body["cache_creation_tokens"] == (
+        _FROZEN_TOKENS["total_cache_create_tokens"])
+    assert body["cache_read_tokens"] == (
+        _FROZEN_TOKENS["total_cache_read_tokens"])
+    assert body["total_tokens"] == sum(_FROZEN_TOKENS.values())
+    assert body["entries_count"] == 6, body["entries_count"]
+    names = sorted(m["model"] for m in body["models"])
+    assert names == ["claude-opus-4-5-20251101", "claude-sonnet-4-6-20251015"]
+    assert abs(sum(m["cost_usd"] for m in body["models"])
+               - _FROZEN_COST) < 1e-9
+
+
+def test_api_block_still_computes_an_unstamped_block(tmp_path, monkeypatch):
+    """Only a journal-stamped CLOSED block is frozen. Without the stamp the
+    route keeps recomputing, which is what an open block needs."""
+    ns = load_script()
+    srv = _start_dashboard_server(ns, tmp_path, monkeypatch)
+    try:
+        _freeze_block_facts(ns, journal_id=None)
+        encoded = urllib.parse.quote(_FROZEN_START, safe="")
+        c = HTTPConnection("127.0.0.1", srv.server_address[1],
+                           timeout=PRESENCE_BACKSTOP_SECONDS)
+        c.request("GET", f"/api/block/{encoded}")
+        r = c.getresponse()
+        assert r.status == 200, r.status
+        body = json.loads(r.read())
+    finally:
+        stop(srv, srv._test_thread)
+
+    assert body["facts_source"] == "computed", body.get("facts_source")
+    assert body["entries_count"] == 5
+    assert abs(body["samples"][-1]["cum"] - body["cost_usd"]) < 1e-9
+
+
+# ---- #769 S2 review P1-1: inconsistent retained facts must not 500 ----
+#
+# `five_hour_blocks` and `five_hour_block_models` are two tables read at
+# request time with no transaction that makes them agree. A live read
+# route must not raise on stored data that disagrees with itself: it
+# withholds the retained facts and computes instead, which is the same
+# resolution `367761bf4` applied when this defect class first reached the
+# client as an HTTP 500.
+
+
+def test_api_block_computes_when_the_retained_children_disagree_with_parent(
+    tmp_path, monkeypatch,
+):
+    """Children summing to less than the retained parent cost is a
+    disagreement between two tables, not a reason to fail the request."""
+    ns = load_script()
+    srv = _start_dashboard_server(ns, tmp_path, monkeypatch)
+    try:
+        # 3.0 + 0.5 == 3.5, against a retained parent cost of 4.5.
+        _freeze_block_facts(ns, children=(
+            ("claude-opus-4-5-20251101", 500, 150, 2400, 13000, 3.0, 4),
+            ("claude-sonnet-4-6-20251015", 200, 60, 1000, 5000, 0.5, 2),
+        ))
+        encoded = urllib.parse.quote(_FROZEN_START, safe="")
+        c = HTTPConnection("127.0.0.1", srv.server_address[1],
+                           timeout=PRESENCE_BACKSTOP_SECONDS)
+        c.request("GET", f"/api/block/{encoded}")
+        r = c.getresponse()
+        status = r.status
+        payload = r.read()
+    finally:
+        stop(srv, srv._test_thread)
+
+    assert status == 200, (status, payload[:400])
+    body = json.loads(payload)
+    assert body["facts_source"] == "computed", body.get("facts_source")
+    assert abs(body["samples"][-1]["cum"] - body["cost_usd"]) < 1e-9
+
+
+def test_api_block_computes_when_a_frozen_parent_has_no_children(
+    tmp_path, monkeypatch,
+):
+    """A frozen parent with no child rows would otherwise serve
+    `entries_count: 0` beside a nonzero `cost_usd` — a partial record."""
+    ns = load_script()
+    srv = _start_dashboard_server(ns, tmp_path, monkeypatch)
+    try:
+        _freeze_block_facts(ns, children=())
+        encoded = urllib.parse.quote(_FROZEN_START, safe="")
+        c = HTTPConnection("127.0.0.1", srv.server_address[1],
+                           timeout=PRESENCE_BACKSTOP_SECONDS)
+        c.request("GET", f"/api/block/{encoded}")
+        r = c.getresponse()
+        status = r.status
+        payload = r.read()
+    finally:
+        stop(srv, srv._test_thread)
+
+    assert status == 200, (status, payload[:400])
+    body = json.loads(payload)
+    assert body["facts_source"] == "computed", body.get("facts_source")
+    assert body["entries_count"] == 5, body["entries_count"]
+
+
+# ---- #769 S2 review P2-2: the panel and the modal answer from one body
+# ---- of evidence for a journal-stamped closed block.
+
+
+def test_blocks_panel_serves_a_frozen_block_the_facts_the_modal_serves(
+    tmp_path, monkeypatch,
+):
+    """Clicking a Blocks row must not change the number. `/api/block`
+    reads a journal-stamped closed block's retained facts; the panel row
+    behind it recomputed from cache contents that have moved on since the
+    close, so the two disagreed on exactly that population."""
+    ns = load_script()
+    srv = _start_dashboard_server(ns, tmp_path, monkeypatch)
+    try:
+        _freeze_block_facts(ns)
+        _append_a_later_cache_entry(ns)
+        encoded = urllib.parse.quote(_FROZEN_START, safe="")
+        c = HTTPConnection("127.0.0.1", srv.server_address[1],
+                           timeout=PRESENCE_BACKSTOP_SECONDS)
+        c.request("GET", f"/api/block/{encoded}")
+        r = c.getresponse()
+        assert r.status == 200, r.status
+        body = json.loads(r.read())
+        conn = ns["open_db"]()
+        try:
+            view = ns["_dashboard_build_blocks_view"](
+                conn,
+                dt.datetime(2026, 4, 22, 20, 0, tzinfo=dt.timezone.utc),
+                week_start_at=dt.datetime(2026, 4, 20, tzinfo=dt.timezone.utc),
+                week_end_at=dt.datetime(2026, 4, 27, tzinfo=dt.timezone.utc),
+                skip_sync=True,
+            )
+        finally:
+            conn.close()
+    finally:
+        stop(srv, srv._test_thread)
+
+    assert body["facts_source"] == "retained", body.get("facts_source")
+    row = next(r for r in view.rows if r.start_at == _FROZEN_START)
+    assert abs(row.cost_usd - _FROZEN_COST) < 1e-9, row.cost_usd
+    assert abs(row.cost_usd - body["cost_usd"]) < 1e-9
+    assert sorted(m["model"] for m in row.models) == sorted(
+        m["model"] for m in body["models"]
+    )
+    for panel_model, modal_model in zip(
+        sorted(row.models, key=lambda m: m["model"]),
+        sorted(body["models"], key=lambda m: m["model"]),
+    ):
+        assert abs(panel_model["cost_usd"] - modal_model["cost_usd"]) < 1e-9
+    # The footer total the React panel reconciles against follows the rows.
+    assert abs(view.total_cost_usd - _FROZEN_COST) < 1e-9, view.total_cost_usd

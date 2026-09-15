@@ -207,7 +207,9 @@ PY
 ec=$?
 
 if [ $ec -ne 0 ]; then
-    echo "FAIL: python harness exited non-zero ($ec)"
+    # #783: `exit status N` rather than `exited non-zero`, which carried two
+    # words the aggregator cannot vouch for and reached an export redacted.
+    echo "FAIL: python harness exit status $ec"
     echo "$out"
     fail_count=$((fail_count + 1))
 fi

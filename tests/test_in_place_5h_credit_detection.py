@@ -139,6 +139,72 @@ def _seed_5h_snapshot(
     return rowid
 
 
+#: The arming instant every seeded five-hour descent uses by default. Read ONCE
+#: at import and pushed thirty seconds into the past, so that it is earlier than
+#: every instant a test seeds — including the rows two tests build at
+#: ``now - 2s`` — and its ten-minute floor therefore never lands after one of
+#: them. Reading the clock inside the helper instead made the credit's
+#: ``effective_reset_at_utc`` depend on which side of a ten-minute boundary the
+#: run happened to fall on.
+_ARMED_AT = (
+    dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=30)
+).replace(microsecond=0).isoformat(timespec="seconds")
+
+
+def _arm_5h_source_state(
+    conn,
+    *,
+    five_hour_window_key: int,
+    baseline_pct: float,
+    pending_low_pct: float,
+    pending_at_utc: str | None = None,
+    source: str = "statusline",
+    account_key: str = "unattributed",
+    pending_observation_id: str = "o:seeded-descent",
+) -> None:
+    """Seed one contributor's ARMED five-hour credit state (#769 S2 §3, #751).
+
+    A five-hour credit now needs a same-source observed descent followed by a
+    distinct same-source confirmation, so a test that drives ONE
+    ``cmd_record_usage`` tick has to supply the descent the same way it already
+    supplies the pre-credit snapshot: as seeded state. ``cmd_record_usage``
+    defaults ``source`` to ``statusline``, which is why that is the default
+    here.
+
+    ``pending_at_utc`` is the arming tick's instant, and the credit's
+    ``effective_reset_at_utc`` is its 10-minute floor. It defaults to the
+    module-level ``_ARMED_AT`` rather than to wall-clock now, because wall-clock
+    now is captured HERE, after the caller has already seeded its snapshot rows
+    at their own wall-clock instants. A run that crosses a ten-minute boundary
+    between those two reads floors the credit into the LATER slot, and the
+    stale-replica DELETE — which reaches only rows captured at or after
+    ``effective_reset_at_utc`` — then leaves the row the test expects it to
+    remove. ``_ARMED_AT`` is fixed at import and set thirty seconds early, so it
+    precedes every instant any test seeds and its floor can never land after
+    one.
+    """
+    conn.execute(
+        "INSERT INTO five_hour_credit_confirmation_state "
+        "(account_key, five_hour_window_key, source, baseline_pct, "
+        " pending_low_pct, pending_at_utc, pending_observation_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(account_key, five_hour_window_key, source) DO UPDATE SET "
+        " baseline_pct = excluded.baseline_pct, "
+        " pending_low_pct = excluded.pending_low_pct, "
+        " pending_at_utc = excluded.pending_at_utc, "
+        " pending_observation_id = excluded.pending_observation_id",
+        (
+            account_key,
+            int(five_hour_window_key),
+            source,
+            float(baseline_pct),
+            float(pending_low_pct),
+            pending_at_utc or _ARMED_AT,
+            pending_observation_id,
+        ),
+    )
+
+
 def _future_5h_block_window():
     """Return (resets_iso, resets_epoch_str, window_key) for a 5h block
     whose resets_at is a few hours in the future. The detection branch
@@ -201,6 +267,14 @@ def test_detection_fires_on_5pp_threshold(ns, tmp_path):
             five_hour_window_key=window_key,
             five_hour_resets_at_iso=resets_iso,
             week_end_at=end_iso,
+        )
+        # #769 S2 §3: the descent this tick CONFIRMS. Seeded because a
+        # credit now needs a same-source observed descent first.
+        _arm_5h_source_state(
+            conn,
+            five_hour_window_key=window_key,
+            baseline_pct=28.0,
+            pending_low_pct=8.0,
         )
         conn.commit()
     finally:
@@ -409,6 +483,14 @@ def test_post_percent_aware_dedup(ns, tmp_path):
             five_hour_resets_at_iso=resets_iso,
             week_end_at=end_iso,
         )
+        # #769 S2 §3: the descent this tick CONFIRMS. Seeded because a
+        # credit now needs a same-source observed descent first.
+        _arm_5h_source_state(
+            conn,
+            five_hour_window_key=window_key,
+            baseline_pct=28.0,
+            pending_low_pct=8.0,
+        )
         conn.commit()
     finally:
         conn.close()
@@ -469,6 +551,14 @@ def test_stacked_credits_across_distinct_10min_slots(ns, tmp_path, monkeypatch):
             five_hour_resets_at_iso=resets_iso,
             week_end_at=end_iso,
         )
+        # #769 S2 §3: the descent this tick CONFIRMS. Seeded because a
+        # credit now needs a same-source observed descent first.
+        _arm_5h_source_state(
+            conn,
+            five_hour_window_key=window_key,
+            baseline_pct=28.0,
+            pending_low_pct=8.0,
+        )
         conn.commit()
     finally:
         conn.close()
@@ -499,6 +589,14 @@ def test_stacked_credits_across_distinct_10min_slots(ns, tmp_path, monkeypatch):
             five_hour_window_key=window_key,
             five_hour_resets_at_iso=resets_iso,
             week_end_at=end_iso,
+        )
+        # #769 S2 §3: the descent this tick CONFIRMS. Seeded because a
+        # credit now needs a same-source observed descent first.
+        _arm_5h_source_state(
+            conn,
+            five_hour_window_key=window_key,
+            baseline_pct=22.0,
+            pending_low_pct=2.0,
         )
         conn.commit()
     finally:
@@ -579,6 +677,14 @@ def test_same_slot_collision_absorbed_by_unique(ns, tmp_path, monkeypatch):
             five_hour_resets_at_iso=resets_iso,
             week_end_at=end_iso,
         )
+        # #769 S2 §3: the descent this tick CONFIRMS. Seeded because a
+        # credit now needs a same-source observed descent first.
+        _arm_5h_source_state(
+            conn,
+            five_hour_window_key=window_key,
+            baseline_pct=28.0,
+            pending_low_pct=8.0,
+        )
         conn.commit()
     finally:
         conn.close()
@@ -604,6 +710,14 @@ def test_same_slot_collision_absorbed_by_unique(ns, tmp_path, monkeypatch):
             five_hour_window_key=window_key,
             five_hour_resets_at_iso=resets_iso,
             week_end_at=end_iso,
+        )
+        # #769 S2 §3: the descent this tick CONFIRMS. Seeded because a
+        # credit now needs a same-source observed descent first.
+        _arm_5h_source_state(
+            conn,
+            five_hour_window_key=window_key,
+            baseline_pct=14.0,
+            pending_low_pct=1.0,
         )
         conn.commit()
     finally:
@@ -659,6 +773,14 @@ def test_clamp_pivot_post_credit_value_not_re_clamped(ns, tmp_path):
             five_hour_window_key=window_key,
             five_hour_resets_at_iso=resets_iso,
             week_end_at=end_iso,
+        )
+        # #769 S2 §3: the descent this tick CONFIRMS. Seeded because a
+        # credit now needs a same-source observed descent first.
+        _arm_5h_source_state(
+            conn,
+            five_hour_window_key=window_key,
+            baseline_pct=28.0,
+            pending_low_pct=8.0,
         )
         conn.commit()
     finally:
@@ -742,6 +864,14 @@ def test_stale_replica_delete(ns, tmp_path):
             five_hour_window_key=window_key,
             five_hour_resets_at_iso=resets_iso,
             week_end_at=end_iso,
+        )
+        # #769 S2 §3: the descent this tick CONFIRMS. Seeded because a
+        # credit now needs a same-source observed descent first.
+        _arm_5h_source_state(
+            conn,
+            five_hour_window_key=window_key,
+            baseline_pct=28.0,
+            pending_low_pct=8.0,
         )
         conn.commit()
     finally:
@@ -865,6 +995,14 @@ def test_credit_branch_5h_cleanup_tolerates_rounding_drift(ns, tmp_path):
             five_hour_window_key=window_key,
             five_hour_resets_at_iso=resets_iso,
             week_end_at=end_iso,
+        )
+        # #769 S2 §3: the descent this tick CONFIRMS. Seeded because a
+        # credit now needs a same-source observed descent first.
+        _arm_5h_source_state(
+            conn,
+            five_hour_window_key=window_key,
+            baseline_pct=27.4,
+            pending_low_pct=4.0,
         )
         conn.commit()
     finally:
@@ -1197,6 +1335,14 @@ def test_pivots_run_when_event_row_already_committed(ns, tmp_path):
             five_hour_resets_at_iso=resets_iso,
             week_end_at=end_iso,
         )
+        # #769 S2 §3: the descent this tick CONFIRMS. Seeded because a
+        # credit now needs a same-source observed descent first.
+        _arm_5h_source_state(
+            conn,
+            five_hour_window_key=window_key,
+            baseline_pct=28.0,
+            pending_low_pct=8.0,
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1333,6 +1479,14 @@ def test_consecutive_credits_with_idle_between(ns, tmp_path):
             five_hour_resets_at_iso=resets_iso,
             week_end_at=end_iso,
         )
+        # #769 S2 §3: the descent this tick CONFIRMS. Seeded because a
+        # credit now needs a same-source observed descent first.
+        _arm_5h_source_state(
+            conn,
+            five_hour_window_key=window_key,
+            baseline_pct=5.0,
+            pending_low_pct=0.0,
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1446,6 +1600,14 @@ def test_replay_with_pair_match_still_runs_pivots(ns, tmp_path):
             five_hour_resets_at_iso=resets_iso,
             week_end_at=end_iso,
         )
+        # #769 S2 §3: the descent this tick CONFIRMS. Seeded because a
+        # credit now needs a same-source observed descent first.
+        _arm_5h_source_state(
+            conn,
+            five_hour_window_key=window_key,
+            baseline_pct=20.0,
+            pending_low_pct=5.0,
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1517,3 +1679,226 @@ def test_replay_with_pair_match_still_runs_pivots(ns, tmp_path):
         )
     finally:
         conn.close()
+
+
+def _claude_obs_ids(ns) -> list:
+    """Every Claude `obs` record id in the journal, in append order."""
+    import _cctally_core
+    import _cctally_journal
+    import _lib_journal as J
+    out = []
+    for seg in _cctally_journal.list_segments():
+        for raw in (_cctally_core.JOURNAL_DIR / seg).read_bytes().splitlines():
+            if not raw.strip():
+                continue
+            rec = J.decode_line(raw)
+            if rec is None:
+                continue
+            if rec.get("t") == "obs" and rec.get("provider") == "claude":
+                out.append(rec.get("id"))
+    return out
+
+
+def test_characterization_823_stale_high_re_raise_mints_a_second_credit(
+        ns, monkeypatch):
+    """CHARACTERIZATION of a KNOWN RESIDUAL (#823). This test asserts that the
+    defect currently OCCURS; it is not a statement that the behaviour is right.
+
+    One underlying descent is credited TWICE. A source descends from 20 to 5
+    and a distinct same-source observation confirms it, which is the credit the
+    #751b rule was built to require. A later tick then replays the pre-credit
+    high of 20, and because that reading is above the post-credit baseline the
+    kernel takes its raise branch and restores the baseline to 20. The source's
+    next ordinary reading is therefore a 14-point descent from a baseline that
+    was never re-earned, it arms, and the reading after it confirms — so a
+    second `five_hour_reset_events` row is written for a drop that happened
+    once.
+
+    Why no guard is built, and why this test exists instead. The five-hour path
+    retains no discriminator the weekly path lacks: the source-local state key
+    records account, canonical window and payload source only, and
+    `source=statusline` is not a contributor identity. Two ticks carrying the
+    same stale payload at different capture instants receive different
+    observation ids, so the arming self-replay guard — which catches only a
+    byte-identical duplicate of one journal line — cannot see this. Suppressing
+    it would need a value band, a time horizon or a source latch, and
+    `bin/_lib_record.py` already forecloses that whole family: there is "no
+    maximum gap, no maximum climb and no confirmation-value band, because
+    observations arrive at an unbounded interval and every finite threshold on
+    the change between two of them has a legitimate crossing". #823 therefore
+    reaches the same architecture gate as #797 — durable upstream-capture
+    identity, or a journalled contributor lifecycle — and is carried rather
+    than built. See `docs/five-hour-gotchas.md`.
+
+    When that architecture arrives this test FAILS LOUDLY, which is its whole
+    purpose: rewrite it to assert ONE event rather than deleting it.
+
+    Two controls the mechanism requires, both deliberate:
+
+      * Every observation id in the sequence is controlled rather than assumed
+        distinct. `content_id` digests `{t, at, src, provider, payload}`, and
+        two renders inside one second carrying identical core fields collide,
+        which would make the second tick a byte-identical replay instead of the
+        distinct observation this sequence needs. Each tick therefore gets its
+        own `CCTALLY_AS_OF`, and the ids the run actually produced are asserted
+        pairwise distinct.
+      * The two ARMING ticks' ten-minute floors are separated, not the
+        confirming ticks'. A credit's `effective_reset_at_utc` is the ARMING
+        tick's floor, so without this the two events collide on
+        UNIQUE(five_hour_window_key, effective_reset_at_utc) and the second is
+        absorbed — which would hide the defect rather than reproduce it.
+    """
+    end_iso, end_epoch = _future_week_end()
+    resets_iso, resets_epoch_str, resets_epoch = _future_5h_block_window()
+    window_key = ns["_canonical_5h_window_key"](resets_epoch)
+    base_as_of = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+    def _tick(five_hour_percent: float, *, offset_seconds: int) -> None:
+        """One `record-usage` tick at its own controlled capture instant."""
+        monkeypatch.setenv(
+            "CCTALLY_AS_OF",
+            (base_as_of + dt.timedelta(seconds=offset_seconds)).isoformat(
+                timespec="seconds"),
+        )
+        assert ns["cmd_record_usage"](_record_usage_args(
+            percent=42.0,
+            resets_at=end_epoch,
+            five_hour_percent=five_hour_percent,
+            five_hour_resets_at=resets_epoch_str,
+        )) == 0
+
+    conn = ns["open_db"]()
+    try:
+        _seed_5h_snapshot(
+            conn,
+            captured_at_utc="2026-05-14T10:00:00Z",
+            weekly_percent=42.0,
+            five_hour_percent=20.0,
+            five_hour_window_key=window_key,
+            five_hour_resets_at_iso=resets_iso,
+            week_end_at=end_iso,
+        )
+        # The first descent, 20 -> 5, armed by an observation whose id is
+        # stated here so the confirming tick below is provably a DISTINCT one.
+        _arm_5h_source_state(
+            conn,
+            five_hour_window_key=window_key,
+            baseline_pct=20.0,
+            pending_low_pct=5.0,
+            pending_observation_id="o:descent-one",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 1. Confirm the genuine credit. Event one is (20, 5) and the source's
+    #    baseline becomes this observation's own reading, 6.
+    _tick(6.0, offset_seconds=1)
+
+    # 2. The stale replay of the pre-credit high. It is above the post-credit
+    #    baseline, so the kernel's raise branch restores the baseline to 20 —
+    #    a level this source has not observed since the credit.
+    _tick(20.0, offset_seconds=2)
+
+    # 3. An ordinary reading, which is now a 14-point descent from that
+    #    restored baseline and arms a second candidate.
+    _tick(6.0, offset_seconds=3)
+
+    conn = ns["open_db"]()
+    try:
+        armed = conn.execute(
+            "SELECT baseline_pct, pending_low_pct, pending_at_utc, "
+            "       pending_observation_id "
+            "  FROM five_hour_credit_confirmation_state "
+            " WHERE five_hour_window_key = ? AND source = 'statusline'",
+            (window_key,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert armed is not None, "the stale re-raise must leave a second candidate armed"
+    assert round(armed["baseline_pct"], 1) == 20.0
+    assert round(armed["pending_low_pct"], 1) == 6.0
+    second_pending_at = armed["pending_at_utc"]
+    second_pending_observation = armed["pending_observation_id"]
+
+    # Separate the SECOND arming tick's ten-minute floor from the first's. The
+    # credit's effective instant is derived from `pending_at_utc` at the
+    # confirming tick, so the shift has to be live for tick 4 rather than for
+    # tick 3.
+    real_floor = ns["_floor_to_ten_minutes"]
+
+    def shifted_floor(d):
+        return real_floor(d) + dt.timedelta(minutes=40)
+
+    monkeypatch.setitem(ns, "_floor_to_ten_minutes", shifted_floor)
+
+    # 4. Confirm the second candidate. Event two is (20, 6): the same
+    #    underlying descent, credited a second time.
+    _tick(7.0, offset_seconds=4)
+
+    first_effective = real_floor(
+        dt.datetime.fromisoformat(_ARMED_AT)
+    ).isoformat(timespec="seconds")
+    second_effective = shifted_floor(
+        dt.datetime.fromisoformat(second_pending_at)
+    ).isoformat(timespec="seconds")
+
+    conn = ns["open_db"]()
+    try:
+        events = [dict(r) for r in conn.execute(
+            "SELECT id, prior_percent, post_percent, effective_reset_at_utc "
+            "  FROM five_hour_reset_events "
+            " WHERE five_hour_window_key = ? ORDER BY id",
+            (window_key,),
+        ).fetchall()]
+        block = conn.execute(
+            "SELECT final_five_hour_percent FROM five_hour_blocks "
+            " WHERE five_hour_window_key = ?",
+            (window_key,),
+        ).fetchone()
+        milestone_reset_ids = [r[0] for r in conn.execute(
+            "SELECT DISTINCT reset_event_id FROM five_hour_milestones "
+            " WHERE five_hour_window_key = ?",
+            (window_key,),
+        ).fetchall()]
+    finally:
+        conn.close()
+
+    # The defect: ONE descent, TWO credits.
+    assert len(events) == 2, (
+        f"#823 characterization: expected the residual to mint two credits for "
+        f"one descent; got {events}"
+    )
+    one, two = events
+    assert (round(one["prior_percent"], 1), round(one["post_percent"], 1)) == (20.0, 5.0)
+    assert (round(two["prior_percent"], 1), round(two["post_percent"], 1)) == (20.0, 6.0)
+    # Both effective instants are the ARMING tick's floor, and they are
+    # distinct — the UNIQUE index is what would otherwise absorb the second.
+    assert one["effective_reset_at_utc"] == first_effective
+    assert two["effective_reset_at_utc"] == second_effective
+    assert one["effective_reset_at_utc"] != two["effective_reset_at_utc"]
+    # Every observation id in the sequence is distinct, which is what makes the
+    # arming self-replay guard inapplicable rather than merely unlucky. The ids
+    # are read from the JOURNAL rather than from the event rows, because
+    # `five_hour_reset_events` carries no observation or contributor column at
+    # all — which is itself half of why this residual is architecture-gated.
+    observation_ids = ["o:descent-one"] + _claude_obs_ids(ns)
+    assert len(observation_ids) == 5, (
+        f"the seeded descent plus four ticks must produce five observations; "
+        f"got {observation_ids}")
+    assert all(observation_ids), (
+        f"every step must carry an observation id; got {observation_ids}")
+    assert len(set(observation_ids)) == len(observation_ids), (
+        f"the sequence must be five distinct observations; got {observation_ids}")
+    # The second candidate was armed by the THIRD tick, and the fourth tick
+    # confirmed it. A confirmation by the arming observation itself would have
+    # been held, so this is the fact that makes the second credit reachable.
+    assert second_pending_observation == observation_ids[3], (
+        "the second candidate must be armed by the third tick's own observation")
+    # The five-hour axis ends the sequence at the last reading, and the
+    # post-credit milestone ladder is stamped with the SECOND event.
+    assert block is not None
+    assert round(block["final_five_hour_percent"], 1) == 7.0
+    assert two["id"] in milestone_reset_ids, (
+        f"a post-credit five-hour milestone must carry event two's id; "
+        f"got reset_event_id values {milestone_reset_ids}")

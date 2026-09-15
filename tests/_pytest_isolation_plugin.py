@@ -321,6 +321,25 @@ PROJECT_MANIFEST = (
     # the appeared-key check reports every first import of the module.
     ("_lib_ingest_frontier", "FRONTIER_CERTIFICATE_MAX_AGE_SECONDS",
      literal(120.0)),
+    # #769 S6 added two process-global containers to the same module, and
+    # neither was reachable by this detector. `_FRONTIER_COUNTERS` accumulates
+    # the deterministic plan/visit counts a benchmark asserts the SHAPE of a
+    # tick from, so residue in it silently inflates a later reading.
+    # `_FRONTIER_GENERATIONS` is the worse of the two: it holds one coordinator
+    # per data directory, and a coordinator holds CONSUMER REGISTRATIONS, so a
+    # leaked entry is precisely the state in which a later test sees a
+    # registration made by an earlier one — a generation that never retires,
+    # or a peer acknowledgement reconciled against a store that is gone.
+    #
+    # Both are empty in an untouched process, and both are dicts, so the
+    # ordinary residue comparison covers them by identity plus length once the
+    # key exists; the declared pristine value is what covers the APPEARED case,
+    # because every `import _lib_ingest_frontier` in tests/ is inside a
+    # function body and the module may not be present at baseline capture.
+    ("_lib_ingest_frontier", "_FRONTIER_COUNTERS",
+     empty_container(type="builtins.dict")),
+    ("_lib_ingest_frontier", "_FRONTIER_GENERATIONS",
+     empty_container(type="builtins.dict")),
 )
 
 UNREACHABLE = (

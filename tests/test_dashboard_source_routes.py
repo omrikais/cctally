@@ -17,6 +17,7 @@ from _lib_dashboard_sources import (
     CapabilityRecord,
     SourceDashboardBundle,
     SourceDashboardState,
+    build_metadata_health,
     compose_all_state,
 )
 from conftest import load_script, redirect_paths
@@ -43,6 +44,15 @@ def _state(source, now, data):
             "quota": CapabilityRecord("supported"),
         },
         data=data,
+        # #834 S2 (#828, #829): a healthy Codex generation publishes the typed
+        # result its detail-horizon probe observed, and the detail routes now
+        # decide from it. Omitting it here would build a state production never
+        # publishes, and every Codex detail route would degrade to the partial
+        # branch — which is the correct reading of an absent carrier (absence
+        # is no evidence, never a clean bill of health) and the wrong fixture.
+        metadata_health=(
+            build_metadata_health("healthy") if source == "codex" else None
+        ),
     )
 
 
@@ -547,11 +557,18 @@ def test_source_routes_do_not_ingest_or_parse_rollouts_on_detail_reads(
     monkeypatch.setattr(dashboard.pathlib.Path, "rglob", _forbidden)
     try:
         status, payload = _get(server, "/api/source/codex/session/session%3Acodex")
-        assert status == 404
-        assert payload == {
-            "code": "source_resource_not_found",
-            "error": "source resource not found",
-        }
+        # #769 S6 / #781: the session detail is now served from the published
+        # row, so this key resolves rather than falling through the year-long
+        # relational read to a 404. The 404 was incidental to the synthetic
+        # fixture — a published row carrying no accounting fields — and never
+        # what this case is about. The three `_forbidden` patches above are,
+        # and they still hold: the request performed no ingest and parsed no
+        # rollout, only more decisively than before, because the route opened
+        # no store at all.
+        assert status == 200
+        assert payload["data"]["detail_kind"] == "codex_session"
+        assert payload["data"]["key"] == "session:codex"
+        assert payload["data"]["cost_usd"] is None
     finally:
         _close(server, thread)
 
@@ -644,7 +661,9 @@ def test_codex_source_routes_round_trip_published_rows_with_incomplete_project_m
                 assert detail["key"] == row["key"]
                 assert detail["detail_kind"] == f"codex_{resource}"
                 if resource == "session" and row.get("project"):
-                    assert "metadata_availability" not in detail
+                    # #834 S2 (#829): present and null, never absent.
+                    assert detail["metadata_availability"] is None
+                    assert detail["metadata_reason"] is None
                     assert detail["project"] == row["project"]
                 else:
                     assert detail["metadata_availability"] == "partial"
@@ -678,10 +697,12 @@ def test_codex_source_routes_bound_real_relational_reads_over_retained_history(
     cache_sql = []
     stats_sql = []
     qualified_calls = []
+    scoped_calls = []
     quota_calls = []
     original_open_cache = cache_module.open_cache_db
     original_open_stats = dashboard.open_db
     original_qualified = analytics.load_qualified_codex_entries
+    original_scoped = analytics.load_codex_project_scoped_entries
     original_quota = quota.load_codex_quota_observations
 
     def _traced_open_cache():
@@ -704,6 +725,18 @@ def test_codex_source_routes_bound_real_relational_reads_over_retained_history(
         })
         return result
 
+    def _traced_scoped(start, end, *, speed, matches_project_key,
+                       cache_conn=None, group="git-root"):
+        result = original_scoped(
+            start, end, speed=speed, matches_project_key=matches_project_key,
+            cache_conn=cache_conn, group=group,
+        )
+        scoped_calls.append({
+            "start": start, "end": end,
+            "shared_connection": cache_conn is not None, "rows": len(result),
+        })
+        return result
+
     def _traced_quota(**kwargs):
         result = original_quota(**kwargs)
         quota_calls.append({
@@ -720,6 +753,8 @@ def test_codex_source_routes_bound_real_relational_reads_over_retained_history(
     monkeypatch.setattr(cache_module, "open_cache_db", _traced_open_cache)
     monkeypatch.setattr(dashboard, "open_db", _traced_open_stats)
     monkeypatch.setattr(analytics, "load_qualified_codex_entries", _traced_qualified)
+    monkeypatch.setattr(
+        analytics, "load_codex_project_scoped_entries", _traced_scoped)
     monkeypatch.setattr(quota, "load_codex_quota_observations", _traced_quota)
     monkeypatch.setattr(dashboard, "sync_cache", _forbidden)
     monkeypatch.setattr(cache_module, "sync_codex_cache", _forbidden)
@@ -758,29 +793,39 @@ def test_codex_source_routes_bound_real_relational_reads_over_retained_history(
             item["captured_at"] for item in block["observations"]
         }
 
-        # Two collision-safe session requests plus project and block are each
-        # one bounded relational accounting load, regardless of 100k old rows.
-        assert len(qualified_calls) == 4
-        for call in qualified_calls:
-            assert call["sync"] is False
+        # #769 S6 / #781: the two collision-safe SESSION requests perform NO
+        # relational accounting load at all — they are served from the
+        # published row. #769 S9 / #815 then split the remaining two: the
+        # BLOCK route never read the qualified accounting it loaded, so only
+        # the PROJECT request performs one, and only the BLOCK request loads
+        # quota observations. This case is a route-level smoke test beside the
+        # focused materialisation assertions in
+        # `tests/test_codex_detail_bounded_reads.py`.
+        assert qualified_calls == [], (
+            "no detail route performs the unscoped year-long qualified read "
+            f"any more; got {qualified_calls}"
+        )
+        assert len(scoped_calls) == 1
+        for call in scoped_calls:
             assert call["shared_connection"] is True
             assert call["end"] - call["start"] == dt.timedelta(
                 days=365, microseconds=1,
             )
             assert call["rows"] < 100
 
-        # Stage 1's presentation interface must cap rows in SQLite while
-        # retaining an active window whose last capture predates the cutoff.
-        assert len(quota_calls) == 4
+        # The quota read is the requested block's own snap-equivalent physical
+        # group. The 35-day predicate and the thousand-row cap are gone,
+        # because the group is now the bound: that cap was on CARDINALITY
+        # rather than on the answer, so it could drop members of the very
+        # window the request named.
+        assert len(quota_calls) == 1
         for call in quota_calls:
             assert call["shared_connection"] is True
-            assert call["captured_at_or_after"] == dt.datetime(
-                2026, 6, 11, 18, tzinfo=UTC,
-            )
+            assert "captured_at_or_after" not in call
+            assert "max_rows" not in call
+            assert call["physical_groups"]
             assert call["active_at"] == dt.datetime(2026, 7, 16, 18, tzinfo=UTC)
-            assert call["max_rows"] == 1000
             assert call["source_root_keys"]
-            assert call["rows"] <= 1000
 
         normalized_cache_sql = [" ".join(statement.split()) for statement in cache_sql]
         accounting_queries = [
@@ -788,19 +833,58 @@ def test_codex_source_routes_bound_real_relational_reads_over_retained_history(
             if statement.startswith("SELECT entries.timestamp_utc")
             and "FROM codex_session_entries AS entries" in statement
         ]
-        assert len(accounting_queries) == 4
-        assert all("INDEXED BY idx_codex_entries_ts_root_conversation" in sql
-                   for sql in accounting_queries)
+        # #769 S9 / #815: the project route seeks ONE cache identity per
+        # statement instead of reading the year, so it issues one query per
+        # surviving identity rather than a single unscoped read. Every one of
+        # them names a seeking index and stays inside the window.
+        #
+        # AN EXACT COUNT, not merely "some". The number is deterministic for
+        # this fixture — the requested project resolves to one conversation
+        # identity and one aliased path identity, so two shards — and a bare
+        # truthiness check would pass a regression that issued one statement
+        # per row in the corpus, which is precisely the unbounded shape this
+        # case exists to refuse.
+        assert len(accounting_queries) == 2, accounting_queries
+        assert all(
+            "INDEXED BY idx_codex_entries_conversation" in sql
+            or "INDEXED BY idx_codex_entries_root_path" in sql
+            for sql in accounting_queries
+        ), accounting_queries
+        # The trace callback inlines bound parameters, so each predicate is
+        # matched without its placeholder.
+        assert all(
+            "entries.conversation_key = " in sql
+            or "entries.source_path = " in sql
+            for sql in accounting_queries
+        ), accounting_queries
         assert all("entries.timestamp_utc >=" in sql and "entries.timestamp_utc <" in sql
                    for sql in accounting_queries)
+        # EVERY non-PRAGMA statement over the relation, not only the ones
+        # already carrying the loader's `source_root_key IS NOT NULL` clause.
+        # Filtering on a clause that only the intended statements contain makes
+        # any OTHER unbounded read of this table invisible to the bound below —
+        # the loader's root-scoped operator-attribution overlay and the
+        # adoption pass both read it through different shapes. The route
+        # currently issues exactly one such statement; the filter is wide so
+        # that a second one has to satisfy the assertions rather than escape
+        # them.
         quota_queries = [
             statement for statement in normalized_cache_sql
-            if "FROM quota_window_snapshots" in statement
+            if "quota_window_snapshots" in statement
+            and not statement.upper().startswith("PRAGMA")
         ]
-        assert len(quota_queries) == 4
-        assert all("unixepoch(captured_at_utc) >=" in sql for sql in quota_queries)
-        assert all("OR unixepoch(resets_at_utc) >" in sql for sql in quota_queries)
-        assert all("LIMIT 1000" in sql for sql in quota_queries)
+        # ONE SHARD PER GROUP, never a disjunction over all of them: a
+        # multi-identity OR makes SQLite abandon the index and scan. The
+        # snap-equivalent closure is bounded at nine tuples per input group.
+        assert 1 <= len(quota_queries) <= 9, quota_queries
+        assert all(
+            "source_root_key IS NOT NULL" in sql for sql in quota_queries
+        ), quota_queries
+        assert all("unixepoch(captured_at_utc) >=" not in sql for sql in quota_queries)
+        assert all("LIMIT 1000" not in sql for sql in quota_queries)
+        # The trace callback inlines bound parameters, so the predicate is
+        # matched without its placeholder.
+        assert all("AND observed_slot=" in sql for sql in quota_queries), quota_queries
 
         normalized_stats_sql = [" ".join(statement.split()) for statement in stats_sql]
         block_queries = [

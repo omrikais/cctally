@@ -1106,7 +1106,15 @@ def test_the_whole_scan_propagates_an_unreadable_candidate(core, monkeypatch):
 #: ever assigned into a variable that reaches a table position anywhere in
 #: `bin/` — they are named only as literals — which is what makes this list
 #: safe today and worth re-reading whenever it grows.
+#: #769 S3 added the four `_cctally_cache` entries. Each names a table from a
+#: fixed pair this module chooses — the live title/rollup table or its staging
+#: twin — so a rebuild can build its replacement generation without touching
+#: what readers are reading (#752). None substitutes a caller-supplied string.
 _COMPUTED_TABLE_SITES = frozenset({
+    "_cctally_cache._ai_title_upsert_sql",
+    "_cctally_cache._fill_conversation_sessions_filter_columns",
+    "_cctally_cache._recompute_conversation_sessions",
+    "_cctally_cache.sync_claude_conversations",
     "_cctally_db._migration_budget_milestone_period_keys",
     "_cctally_db._migration_merge_5h_block_duplicates_v1",
     "_cctally_db._recover_version_ahead",

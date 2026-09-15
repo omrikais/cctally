@@ -14,6 +14,7 @@ import { Modal } from './Modal';
 import { ShareIcon } from '../components/ShareIcon';
 import {
   CODEX_STALE_CYCLE_NOTE,
+  CODEX_HERO_RECONCILING_NOTE,
   codexIngestBacklogNote,
 } from '../components/HeroStrip';
 import { fmt, spendWindowLabel, type FmtCtx } from '../lib/fmt';
@@ -37,6 +38,7 @@ import type {
   FiveHourCredit,
   SourceEntry,
   WeekDetailBlock,
+  ObservationGapRun,
   WeekDetailPayload,
   WeekIndexEntry,
 } from '../types/envelope';
@@ -238,6 +240,10 @@ function useMilestoneNav(
     selectedEntry != null && !vanished && (
       weekKey != null ||
       (selectedEntry.segment_count ?? 0) > 1 ||
+      // #750 S4 §5.3: a current single-segment cycle with an observation gap
+      // has a reason to fetch, because the disclosure lives on the detail
+      // payload and the envelope's active-segment rows carry no runs.
+      selectedEntry.has_observation_gap === true ||
       wantDetail
     );
   const fetchKey = shouldFetch && selectedEntry
@@ -308,13 +314,12 @@ function WeekNavChip({
   accentClass: string;
   singleId: (v: string) => string | undefined;
   // #556 S4 — the unit this navigator steps through, used verbatim in the two
-  // buttons' accessible names. Claude navigates subscription WEEKS and Codex
-  // navigates reset-defined quota CYCLES, which its own pill, title and chip
-  // all call cycles; the shared chip previously said "week" for both, so a
-  // screen reader heard a Claude concept on the Codex section. Required rather
-  // than defaulted, so a new call site has to state which unit it steps, and
-  // passed explicitly rather than derived from the accent class or the
-  // provider string.
+  // buttons' accessible names. #750 S4: both providers step CYCLES. Claude's
+  // index comes from `build_claude_week_index`, which emits one entry per
+  // effective reset-defined cycle, so on a credited week two adjacent steps
+  // stay inside one subscription week. Required rather than defaulted, so a
+  // new call site has to state which unit it steps, and passed explicitly
+  // rather than derived from the accent class or the provider string.
   unitNoun: string;
 }) {
   const { index, weekKey, setWeekKey } = nav;
@@ -513,6 +518,91 @@ function CurrentWeekShell({
 type WeeklyRow =
   | { kind: 'ms'; m: Milestone; key: string }
   | { kind: 'divider'; effectiveAt: string; priorPercent: number | null; key: string };
+
+// #750 S4 §5.2. The note the milestone table needs about its own gaps,
+// composed HERE from the route's structured runs rather than received as a
+// rendered sentence. Every instant goes through `fmt`, the browser's
+// display-timezone chokepoint; a server-rendered sentence would carry the
+// server's idea of the viewer's zone.
+//
+// It matches the CLI's sentence except for the trailing `(observation_gap)`
+// token, which that surface needs because its cell prints the bare token
+// while this one reads `observation gap` in words.
+// The elapsed span between the previous crossing and this run's observation,
+// in the CLI's own words. It mirrors `_observation_gap_span`
+// (bin/_cctally_percent_breakdown.py) branch for branch — seconds below a
+// minute, whole truncated minutes below an hour, one-decimal hours above it —
+// rather than reusing `fmt.gapDuration`, which abbreviates to "min" / "h" and
+// would make the two sentences differ in more than the trailing token.
+// A non-positive or unparseable span yields null and the clause is dropped,
+// which is also what a run that opens the ladder produces.
+function observationGapSpan(
+  startIso: string | null | undefined,
+  endIso: string | null | undefined,
+): string | null {
+  if (!startIso || !endIso) return null;
+  const start = Date.parse(startIso);
+  const end = Date.parse(endIso);
+  if (!isFinite(start) || !isFinite(end)) return null;
+  const seconds = (end - start) / 1000;
+  if (!(seconds > 0)) return null;
+  if (seconds < 60) {
+    const whole = Math.max(1, Math.trunc(seconds));
+    return `${whole} ${whole === 1 ? 'second' : 'seconds'}`;
+  }
+  if (seconds < 3600) {
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`;
+  }
+  return `${toFixed1HalfEven(seconds / 3600)} hours`;
+}
+
+// Python's `f"{x:.1f}"` breaks a tie to EVEN; `Number.toFixed(1)` breaks it
+// upward, so a 4500-second gap read "1.2 hours" in the CLI and "1.3 hours"
+// here. `captured_at_utc` is stamped at whole seconds, so exact ties are
+// reachable — the ties are the gaps of 4500, 6300, 8100, 9900 … seconds,
+// every 1800 rather than every 3600.
+//
+// A double lies exactly on a one-decimal midpoint only when it is an odd
+// multiple of a quarter, and multiplying by 4 is exact, so `quarters` admits no
+// near-miss. A one-decimal midpoint is an odd multiple of 1/20, and that is
+// exactly representable only when it is also an odd multiple of 1/4, so the
+// test is an exact characterisation rather than a heuristic: 1.05 is not
+// representable, `1.05 * 4` is not an integer, and it correctly falls through
+// to `toFixed`, which already rounds the exact binary value the way Python does
+// everywhere except at a tie.
+function toFixed1HalfEven(value: number): string {
+  const quarters = value * 4;
+  if (Number.isInteger(quarters) && quarters % 2 !== 0) {
+    const lower = Math.floor(value * 10);
+    const even = lower % 2 === 0 ? lower : lower + 1;
+    return (even / 10).toFixed(1);
+  }
+  return value.toFixed(1);
+}
+
+function observationGapNotes(
+  runs: ObservationGapRun[] | null | undefined,
+  ctx: Parameters<typeof fmt.startedShort>[1],
+): string[] {
+  if (!runs || runs.length === 0) return [];
+  return runs.map((run) => {
+    // `noSuffix`, deliberately, though the CLI's twin appends an offset
+    // (§5.2). The milestone table this note sits directly above carries the
+    // timezone in its `Crossed (<offsetLabel>)` header, and `observed_at_utc`
+    // is a value in that very column.
+    // Appending the offset here would print the timezone twice within one line
+    // of vertical space and would leave the note the only datetime in the
+    // dialog carrying one.
+    const observed = fmt.startedShort(run.observed_at_utc, ctx, { noSuffix: true });
+    let head = `Observation gap: ${run.first_percent}%-${run.last_percent}% `
+      + `were all recorded from one observation at ${observed}`;
+    const span = observationGapSpan(run.previous_crossed_at_utc, run.observed_at_utc);
+    if (span !== null) head += `, ${span} after the previous crossing`;
+    return `${head}. Their marginal costs are not separable.`;
+  });
+}
+
 
 function flattenClaudeWeekly(detail: WeekDetailPayload): { rows: WeeklyRow[]; count: number } {
   const rows: WeeklyRow[] = [];
@@ -927,6 +1017,17 @@ function CodexCurrentCycleModal({
             EMBEDDED All variant, which per spec §3.7 shows the All-local §3.5
             reason and nothing more; a visible All-tab stale marker is a
             deliberate §4 follow-up. */}
+        {/* #769 S6 / #753 QA P2 — the Codex-only view surfaced no qualification
+            at all during a projection gap, because `providerReason` is read
+            only on the combined All path: the drill-down silently dropped the
+            caveat the hero had just made. Suppressed when `embedded` for the
+            same reason the stale note is — the All section already prints the
+            reason above this component, and printing it twice is noise. */}
+        {!embedded && !isHistoric && hero?.update_state === 'updating' ? (
+          <p className="mcw-ms-sub" data-testid="codex-hero-reconciling-note">
+            {CODEX_HERO_RECONCILING_NOTE}
+          </p>
+        ) : null}
         {!embedded && !isHistoric && hero?.cycle_freshness === 'stale' ? (
           <p className="mcw-ms-sub" data-testid="codex-cycle-stale-note">
             {CODEX_STALE_CYCLE_NOTE}
@@ -1101,9 +1202,22 @@ function ClaudeCurrentWeekModal({
 
   // Render from the fetched payload for a historic week, a multi-segment
   // current week, or once a block-step asked for the current week's payload.
-  const useDetail = detail != null && (isHistoric || (selectedEntry?.segment_count ?? 0) > 1 || wantDetail);
+  // The hint reaches BOTH predicates. Wired into `shouldFetch` alone it would
+  // produce a successful request whose rows and note never render — a network
+  // assertion would pass and a visual one would fail (#750 S4 §5.3).
+  const useDetail = detail != null && (
+    isHistoric
+    || (selectedEntry?.segment_count ?? 0) > 1
+    || selectedEntry?.has_observation_gap === true
+    || wantDetail
+  );
 
   const flat = useDetail && detail ? flattenClaudeWeekly(detail) : null;
+  // #750 S4 §5.2: the note is driven by the payload's classified runs, so it
+  // renders exactly where the rows it describes come from.
+  const gapNotes = useDetail && detail
+    ? observationGapNotes(detail.observation_gap_runs, ctx)
+    : [];
   const weeklyRows: WeeklyRow[] = flat
     ? flat.rows
     : envMs.map((m) => ({ kind: 'ms', m, key: `ms-${m.percent}` }));
@@ -1257,7 +1371,7 @@ function ClaudeCurrentWeekModal({
     >
       <section className="modal-current-week" data-source="claude">
         {index.length > 0 ? (
-          <WeekNavChip nav={nav} pillText={weekPillText} accentClass="accent-green" singleId={singleId} unitNoun="week" />
+          <WeekNavChip nav={nav} pillText={weekPillText} accentClass="accent-green" singleId={singleId} unitNoun="cycle" />
         ) : (
           <div className="m-chipstrip" id={singleId('mcw-badges')}>
             <span className="m-pill accent-green" id={singleId('mcw-week-pill')}>{weekPillText}</span>
@@ -1327,6 +1441,13 @@ function ClaudeCurrentWeekModal({
             {subText ?? ''}
           </span>
         </div>
+        {gapNotes.length > 0 && (
+          <ul className="mcw-gap-notes" id={singleId('mcw-gap-notes')}>
+            {gapNotes.map((note, i) => (
+              <li key={`gap-${i}`}>{note}</li>
+            ))}
+          </ul>
+        )}
         {loading ? (
           <p className="empty-state">Loading…</p>
         ) : error ? (
@@ -1373,7 +1494,15 @@ function ClaudeCurrentWeekModal({
                   </td>
                   <td className="num">
                     <span className="m-marginal">
-                      {row.m.marginal_usd != null ? '$' + row.m.marginal_usd.toFixed(2) : '—'}
+                      {row.m.marginal_usd != null
+                        ? '$' + row.m.marginal_usd.toFixed(2)
+                        : (row.m.marginal_usd_withheld_cause
+                          // #750 S4 §5.1: name the cause instead of a bare em
+                          // dash. In words, not the CLI's bare token — that
+                          // surface prints the token because its cell has no
+                          // room for the wrapper.
+                          ? 'observation gap'
+                          : '—')}
                     </span>
                   </td>
                   <td className="num">
@@ -1483,9 +1612,16 @@ function ClaudeCurrentWeekModal({
                           </span>
                         </td>
                         <td className="num">
+                          {/* #834 S1 (#836): the EFFECTIVE weekly value only. A
+                              weekly-clamped tick stores a reading nobody saw, so
+                              `seven_day_pct_at_crossing` must not reach the
+                              screen — not even as a fallback, which would show
+                              the wrong number exactly in the case nobody checks.
+                              A null effective value means the joined snapshot row
+                              is gone, and the em-dash says so. */}
                           <span className="m-fh">
-                            {m.seven_day_pct_at_crossing != null
-                              ? Math.round(m.seven_day_pct_at_crossing) + '%'
+                            {m.effective_seven_day_pct_at_crossing != null
+                              ? Math.round(m.effective_seven_day_pct_at_crossing) + '%'
                               : '—'}
                           </span>
                         </td>
@@ -1504,6 +1640,13 @@ function ClaudeCurrentWeekModal({
 
 function providerReason(env: Envelope | null, source: 'claude' | 'codex'): string | null {
   const entry = env?.sources?.[source];
+  // #769 S6 / #753 QA P2 — the projection gap first. During it the server
+  // publishes the last coherent hero AND repeats the `projection_incoherent`
+  // warning, so returning the warning here printed "Codex quota projection is
+  // unavailable." immediately above the retained SPENT figure, the $/1% value,
+  // the percentage and the reset time. The figure is real and is being
+  // refreshed, which is what the hero says, so this says the same.
+  if (source === 'codex' && codexHeroUpdating(entry)) return CODEX_HERO_RECONCILING_NOTE;
   const warning = warningForDomain(entry?.warnings, 'hero');
   if (warning != null) return warning.message;
   if (entry?.availability === 'unavailable') {
@@ -1522,6 +1665,14 @@ function providerReason(env: Envelope | null, source: 'claude' | 'codex'): strin
     return 'Codex native reset cycle is unavailable.';
   }
   return null;
+}
+
+/** Whether the Codex hero is showing a retained figure while the projection
+ * reconciles. Read from the published `update_state`, which is the same field
+ * `HeroStrip` reads, so the two surfaces cannot disagree about the state. */
+function codexHeroUpdating(entry: SourceEntry<unknown> | undefined): boolean {
+  const codex = entry?.data as CodexSourceData | null | undefined;
+  return codex?.hero?.update_state === 'updating';
 }
 
 function accountCycleRanges(

@@ -1515,8 +1515,12 @@ def validate_export(lines, roots=None):
 '''
 
 
-def _scrub_log(tmp_path, log_lines, reason):
-    """Run the aggregator's embedded `scrub-log` mode over one subject log."""
+def _scrub_log(tmp_path, log_lines, reason, kernel=EVIDENCE_KERNEL):
+    """Run the aggregator's embedded `scrub-log` mode over one subject log.
+
+    `kernel` is the module the shim re-exports, so a case that needs a broken
+    transformer rather than an injected violation supplies a mangled copy.
+    """
     source = RUNNER.read_text(encoding="utf-8")
     marker = "python3 - \"$EVIDENCE_KERNEL\" \"$EVIDENCE_PRIVATE\" \"$@\" <<'EVPY'\n"
     bridge = source.split(marker, 1)[1].split("\nEVPY\n", 1)[0]
@@ -1532,7 +1536,7 @@ def _scrub_log(tmp_path, log_lines, reason):
         TZ="Etc/UTC",
         HOME=str(tmp_path / "home"),
         EV_REPO_ROOT=str(tmp_path / "repo"),
-        EV_SHIM_REAL_KERNEL=str(EVIDENCE_KERNEL),
+        EV_SHIM_REAL_KERNEL=str(kernel),
         EV_SHIM_REASON=reason,
     )
     return subprocess.run(
@@ -1877,7 +1881,8 @@ def test_an_undecodable_log_leaves_no_export_at_all(tmp_path):
     assert "the complete unsanitized logs are retained" in res.stderr, res.stderr
 
 
-def _embedded_export(tmp_path, log_lines, extra_env=None):
+def _embedded_export(tmp_path, log_lines, extra_env=None,
+                     kernel=EVIDENCE_KERNEL):
     """The aggregator's OWN export mode, over a log this test controls.
 
     `EV_COVERAGE_NOTE` reaches the extract HEADER unscrubbed — it is the
@@ -1905,7 +1910,7 @@ def _embedded_export(tmp_path, log_lines, extra_env=None):
     })
     env.update(extra_env or {})
     result = subprocess.run(
-        [sys.executable, "-", str(EVIDENCE_KERNEL), os.devnull,
+        [sys.executable, "-", str(kernel), os.devnull,
          "export", str(evidence)],
         input=bridge, env=env, capture_output=True, text=True, check=False,
     )
@@ -1961,6 +1966,181 @@ def test_a_clean_extract_records_a_measured_zero_rather_than_nothing(tmp_path):
     assert record["redacted"] == 0 and record["reasons"] == [], record
     assert "refused by the validator" not in (
         evidence / "export" / "failure-context.txt").read_text(encoding="utf-8")
+
+
+# ------------------------- #769 S7: the transformer-health canary's own glue
+#
+# The kernel's canary refuses a whole publication BEFORE the validator reaches
+# any verdict, so that refusal carries no violation and names no leg. Both
+# operator messages interpolated `len(violations)` — which is zero here — and
+# both attributed the refusal to the validator, so in the one case where the
+# operator loses every byte of failure evidence the two lines reported that
+# nothing had been refused and pointed at the wrong subsystem. Nothing else
+# corrects them: the export step is deliberately non-deciding, its failure
+# becomes a `contract_note`, and neither the verdict nor the exit code changes.
+
+#: The cause the kernel records for a failed canary, and the cause both messages
+#: must name. Declared here rather than read from the kernel, because a case
+#: that read the constant would agree with whatever string the kernel carried,
+#: including one that no longer states what happened.
+TRANSFORMER_HEALTH_REFUSAL = "transformer-health-check-failed"
+
+#: The transformer entry the canary's verdict depends on, as the kernel spells
+#: it. Deleting this entry is the mutation the kernel's own
+#: `test_the_canary_is_claimed_only_by_the_token_entry` performs: the canary line
+#: is then reduced by nothing, which is the single condition the health check
+#: reports, and every validator leg is left exactly as shipped.
+#:
+#: TWO SOURCE LINES, and the constant must carry BOTH. #820 added four prefixed
+#: spellings to this entry and the result no longer fits one line. A constant
+#: that matched only the first of them would delete a fragment of a tuple
+#: element and leave the copied kernel unparseable, which reaches the surfaces
+#: under test as a kernel that cannot load rather than as the unreduced canary
+#: line this mangle stages. The two are reported identically from here, so the
+#: helper below compiles the result rather than trusting this comment.
+TRANSFORMER_TOKEN_ENTRY_SOURCE = (
+    '    (re.compile(r"(?i)\\b(?:token|(?:access|refresh|id|bearer)_token)\\b"\n'
+    '                r"\\s*[:=]\\s*\\S+"), "<credential>"),\n'
+)
+
+#: Thirteen lines no leg refuses, so an export over them is refused for the
+#: reason the case injects and for nothing else. The same log the per-line
+#: export case above uses.
+_EXPORT_LOG_LINES = (
+    ["FAIL alpha: stdout diverged"] + ["passed: 1   failed: 1"] * 12
+)
+
+
+def _kernel_with_a_failing_canary(tmp_path, name):
+    """A copy of the evidence kernel whose transformer fails its own canary.
+
+    Mangled as a FILE, because both surfaces load the kernel in a subprocess.
+    The canary constants are left alone: a failing transformer is the condition
+    the branch exists to report, and mangling the expected placeholder instead
+    would exercise a broken check rather than a broken transformer.
+    """
+    target = tmp_path / name / EVIDENCE_KERNEL.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source = EVIDENCE_KERNEL.read_text(encoding="utf-8")
+    assert source.count(TRANSFORMER_TOKEN_ENTRY_SOURCE) == 1, (
+        "the transformer's token entry is no longer the source this mangle "
+        "deletes, so the mangle would leave the transformer healthy and this "
+        "case would assert a refusal that never happened"
+    )
+    mangled = source.replace(TRANSFORMER_TOKEN_ENTRY_SOURCE, "", 1)
+    # A partial match would delete a fragment of the entry, and a kernel that
+    # cannot be parsed fails the surfaces under test for a reason this case
+    # does not name. Compiling here separates the two.
+    compile(mangled, str(target), "exec")
+    target.write_text(mangled, encoding="utf-8")
+    return target
+
+
+def test_a_failed_canary_names_the_transformer_on_both_operator_surfaces(
+    tmp_path,
+):
+    """#769 S7. The console line and the export line, in their canary form.
+
+    Both counts are compared against what the run actually withheld — the line
+    count a healthy run over the same input publishes, and for the export the
+    sidecar record as well — rather than against a literal typed here. Reporting
+    zero was the defect, and zero is exactly what a count taken from the
+    violations prints on this path, so a case that pinned only the sentence
+    would keep passing with the count still wrong.
+    """
+    broken = _kernel_with_a_failing_canary(tmp_path, "broken")
+
+    healthy_console = _scrub_log(tmp_path, _SCRUB_LOG_LINES, "")
+    assert healthy_console.returncode == 0, healthy_console.stderr
+    published = healthy_console.stdout.splitlines()
+    assert len(published) == len(_SCRUB_LOG_LINES), published
+    console = _scrub_log(tmp_path, _SCRUB_LOG_LINES, "", kernel=broken)
+    assert console.returncode == 0, console.stdout + console.stderr
+    assert console.stdout == (
+        "[REDACTED: alpha context withheld whole: the transformer failed its "
+        "health canary, so all %d lines were withheld; cause: %s]\n"
+        % (len(published), TRANSFORMER_HEALTH_REFUSAL)
+    ), console.stdout
+    # The count the message states is neither zero nor a number this case
+    # supplied: it is every line the healthy run published from the same log.
+    assert len(published) != 0, published
+    # Fail-closed all the same — the withheld block's own bytes are gone.
+    assert CANONICAL_FAILURE not in console.stdout, console.stdout
+
+    healthy_dir, healthy = _embedded_export(
+        tmp_path / "healthy", _EXPORT_LOG_LINES
+    )
+    assert healthy.returncode == 0, healthy.stderr
+    extract = (
+        (healthy_dir / "export" / "failure-context.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    assert len(extract) != 0, extract
+    evidence, res = _embedded_export(
+        tmp_path / "refused", _EXPORT_LOG_LINES, kernel=broken
+    )
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert not (evidence / "export" / "failure-context.txt").exists()
+    assert (
+        "cctally-test-all: the transformer failed its health canary, so all %d "
+        "lines of the sanitized extract were withheld (cause: %s); no export "
+        "file was written" % (len(extract), TRANSFORMER_HEALTH_REFUSAL)
+    ) in res.stderr.splitlines(), res.stderr
+    sidecar = json.loads(
+        (evidence / "validator-redactions.json").read_text(encoding="utf-8")
+    )
+    assert sidecar["refused"] is True, sidecar
+    assert sidecar["refusal"] == TRANSFORMER_HEALTH_REFUSAL, sidecar
+    # The machine-readable record and the healthy publication agree on the
+    # withheld count, and the message states that number rather than the
+    # violation count the old wording used.
+    assert sidecar["total"] == len(extract), (sidecar, extract)
+    assert sidecar["redacted"] == 0, sidecar
+
+
+def test_an_ordinary_content_refusal_still_names_the_validator_on_both_surfaces(
+    tmp_path,
+):
+    """#769 S7. The other arm of the same branch, byte for byte.
+
+    A repair that improved the canary wording by respelling both paths would
+    leave the commoner refusal saying the wrong thing, and the two cannot share
+    one sentence: this count is the number of lines the validator refused,
+    while the canary's is the number withheld. The console arm restates the
+    sentence the `email` case above pins, under the reason the export arm uses,
+    so one command covers both surfaces for one refusal cause.
+    """
+    console = _scrub_log(tmp_path, _SCRUB_LOG_LINES, "unsubstituted-root")
+    assert console.returncode == 0, console.stdout + console.stderr
+    assert console.stdout == (
+        "[REDACTED: alpha context refused by the validator, 1 violations, "
+        "cause: unsubstituted-root]\n"
+    ), console.stdout
+    assert "health canary" not in console.stdout, console.stdout
+
+    # An unsubstituted root, reached the way the per-line export case reaches
+    # its violation: the coverage note is the aggregator's own sentence, so it
+    # is validated without being transformed and the transformer stays healthy.
+    root = tmp_path / "refused"
+    evidence, res = _embedded_export(
+        root,
+        _EXPORT_LOG_LINES,
+        {"EV_COVERAGE_NOTE": "the retained artifact is %s/logs" % root},
+    )
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert not (evidence / "export" / "failure-context.txt").exists()
+    sidecar = json.loads(
+        (evidence / "validator-redactions.json").read_text(encoding="utf-8")
+    )
+    assert sidecar["refusal"] == "unsubstituted-root", sidecar
+    assert sidecar["redacted"] == 1, sidecar
+    assert (
+        "cctally-test-all: the sanitized extract was refused by the validator "
+        "(%d of %d lines, cause: unsubstituted-root); no export file was "
+        "written" % (sidecar["redacted"], sidecar["total"])
+    ) in res.stderr.splitlines(), res.stderr
+    assert "health canary" not in res.stderr, res.stderr
 
 
 def test_no_extract_is_written_for_a_passing_run(tmp_path):

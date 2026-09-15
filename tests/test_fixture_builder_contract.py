@@ -1662,3 +1662,166 @@ def test_an_exported_as_of_does_not_change_what_the_builder_produces(
         {rel: have.get(rel, "<absent>") for rel in shared},
         {rel: produced[rel] for rel in shared},
     )
+
+
+# ── The journal-stamp boundary (#769 S4 #795) ────────────────────────────────
+#
+# `_cctally_core` adds a `journal_id` column to eleven stats tables through an
+# open-time ALTER that runs after the migration dispatcher. `create_stats_db`
+# declares that column for the tables a fixture actually seeds a stamp into
+# and deliberately omits the rest. Before #795 the omitted set included
+# `five_hour_blocks`, and the consequence was invisible: a scenario that
+# opened its store through the real modules gained the column, one that did
+# not stayed without it, and `_retained_block_facts_many` reads the column
+# directly — so the reader silently recomputed instead of failing.
+#
+# The two sets below are therefore checked against each other rather than
+# transcribed. Adding a seeded stamp to a third table fails here until the
+# table is declared, and declaring a table production does not stamp fails
+# here too.
+#
+# WHICH OF THESE THREE CASES THE #795 FIX ACTUALLY TURNED. `fb93d5b37`'s commit
+# body says all three fail against the pre-fix `bin/_fixture_builders.py`. Two
+# do: `test_the_fixture_ddl_declares_exactly_the_stamped_tables` fails because
+# the pre-fix DDL declares `journal_id` on `weekly_usage_snapshots` alone, and
+# `test_the_retained_block_read_path_finds_its_column_and_indexes` fails
+# because neither the column nor the two indexes exist on `five_hour_blocks`.
+# `test_every_fixture_stamped_table_is_one_production_stamps` does NOT: it
+# reads `bin/_cctally_core.py` and the constant below and never opens a built
+# store, so no state of `_fixture_builders.py` can turn it. It is a
+# direction-of-drift guard against declaring a column production does not add,
+# which is a different property and worth keeping — it is simply not evidence
+# that the #795 defect was reproduced. The record is corrected here because the
+# commit body cannot be.
+
+#: Stats tables whose `journal_id` `create_stats_db` declares in its own DDL,
+#: each because some committed fixture seeds a value into it.
+_FIXTURE_STAMPED_TABLES = frozenset({
+    "weekly_usage_snapshots",   # week-reset origin identity (#750 S3)
+    "five_hour_blocks",         # retained closed-block facts (#769 S4 #795)
+})
+
+
+def _production_journal_tables() -> frozenset:
+    """The tables `_cctally_core`'s open-time ALTER stamps, read from source.
+
+    Read by AST rather than by importing and running the opener, because
+    running it would need a real stats.db and would apply migrations. The
+    loop is a single `for _jtable in (...)` over a literal tuple, so the
+    literal is what this reads; a rewrite into another form fails loudly here
+    rather than returning a smaller set that looks live.
+    """
+    import ast
+
+    source = (BIN / "_cctally_core.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.For):
+            continue
+        if not isinstance(node.target, ast.Name) or node.target.id != "_jtable":
+            continue
+        assert isinstance(node.iter, ast.Tuple), (
+            "the journal-identity ALTER loop no longer iterates a literal "
+            "tuple, so this guard cannot read it"
+        )
+        for element in node.iter.elts:
+            assert isinstance(element, ast.Constant) and isinstance(
+                element.value, str), (
+                "the journal-identity ALTER loop carries a non-literal entry"
+            )
+            found.append(element.value)
+    assert found, (
+        "no `for _jtable in (...)` loop found in bin/_cctally_core.py; the "
+        "journal-identity ALTER moved and this guard is reading nothing"
+    )
+    return frozenset(found)
+
+
+def test_the_fixture_ddl_declares_exactly_the_stamped_tables(tmp_path):
+    """The fixture DDL's `journal_id` set is the declared seeded subset."""
+    sys.path.insert(0, str(BIN))
+    try:
+        from _fixture_builders import create_stats_db
+    finally:
+        sys.path.pop(0)
+    db = tmp_path / "stats.db"
+    create_stats_db(db)
+    with sqlite3.connect(db) as conn:
+        tables = [
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        ]
+        declared = {
+            name for name in tables
+            if any(
+                row[1] == "journal_id"
+                for row in conn.execute(f"PRAGMA table_info({name})")
+            )
+        }
+    assert declared == set(_FIXTURE_STAMPED_TABLES), (
+        "bin/_fixture_builders.py's create_stats_db declares journal_id on "
+        f"{sorted(declared)}, but _FIXTURE_STAMPED_TABLES names "
+        f"{sorted(_FIXTURE_STAMPED_TABLES)}. A fixture that seeds a stamp "
+        "into a new table must declare the column here and name the table "
+        "in that set; nothing else may declare it."
+    )
+
+
+def test_every_fixture_stamped_table_is_one_production_stamps():
+    """A fixture may only declare a column production actually adds."""
+    production = _production_journal_tables()
+    assert _FIXTURE_STAMPED_TABLES <= production, (
+        "these fixture-declared tables are not in _cctally_core's "
+        "journal-identity ALTER loop: "
+        f"{sorted(_FIXTURE_STAMPED_TABLES - production)}"
+    )
+
+
+def test_the_retained_block_read_path_finds_its_column_and_indexes(tmp_path):
+    """Every column `_retained_block_facts_many` SELECTs, and its two indexes.
+
+    The SELECT is inside a `try` that returns `{}` on `sqlite3.DatabaseError`,
+    so a missing column costs the caller its retained facts without raising.
+    The indexes matter for a different reason: production creates both with
+    `IF NOT EXISTS` at open, so a fixture that omits them has its bytes
+    rewritten the first time a real command opens it in tree.
+    """
+    sys.path.insert(0, str(BIN))
+    try:
+        from _fixture_builders import create_stats_db
+    finally:
+        sys.path.pop(0)
+    db = tmp_path / "stats.db"
+    create_stats_db(db)
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        # Every expression `_retained_block_facts_many`'s parent query selects,
+        # and its whole predicate. An earlier form selected two of the eight
+        # and called itself "the literal query shape the dashboard reader
+        # issues", which is the kind of label that survives a schema change the
+        # reader would not.
+        conn.execute(
+            """
+            SELECT id,
+                   unixepoch(block_start_at)      AS bs_epoch,
+                   unixepoch(five_hour_resets_at) AS rs_epoch,
+                   total_input_tokens, total_output_tokens,
+                   total_cache_create_tokens, total_cache_read_tokens,
+                   total_cost_usd
+              FROM five_hour_blocks
+             WHERE is_closed = 1
+               AND journal_id IS NOT NULL
+               AND unixepoch(block_start_at) IN (?)
+            """,
+            (0,),
+        ).fetchall()
+        indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(five_hour_blocks)")
+        }
+    assert {"idx_five_hour_blocks_journal_id",
+            "idx_five_hour_blocks_journal_id_null"} <= indexes, (
+        "five_hour_blocks is missing the journal-identity indexes production "
+        f"creates at open; present: {sorted(indexes)}"
+    )

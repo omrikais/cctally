@@ -276,6 +276,7 @@ from _cctally_dashboard_sources import (
     build_codex_source_state,
     capture_codex_source_state,
     codex_decision_deadline_passed,
+    read_account_registry,
     refresh_codex_source_clock,
     resolve_dashboard_source_semantics,
 )
@@ -302,6 +303,11 @@ from _lib_dashboard_sources import (
     degrade_source_state,
     reuse_coherent_source_state,
     unavailable_source_state,
+)
+from _lib_source_retry import (
+    EMPTY_RETRY_STATE,
+    clear_partial_retry,
+    plan_partial_retry,
 )
 
 
@@ -1033,10 +1039,13 @@ def _tui_build_percent_milestones(
 def _tui_build_five_hour_milestones(
     conn: sqlite3.Connection,
     five_hour_window_key: int | None,
+    account_key: "str | None" = None,
+    *,
+    block_id: "int | None" = None,
 ) -> list[dict]:
-    """Return per-percent 5h-block milestones for the given window, in
-    capture-time order. Spec §5.3 — drives the CurrentWeekModal's new
-    5h-milestone timeline section.
+    """Return per-percent 5h-block milestones for the dashboard's live
+    current-week route, in capture-time order. Spec §5.3 — drives the
+    CurrentWeekModal's 5h-milestone timeline section.
 
     Bucket B per §3.2: NO ``reset_event_id`` filter — both pre- and
     post-credit segments render in the merged chronological stream so
@@ -1044,40 +1053,29 @@ def _tui_build_five_hour_milestones(
     repeated threshold values after an in-place credit. The React layer
     differentiates rows by ``reset_event_id`` for key uniqueness.
 
-    Returns [] when the current week has no API-anchored 5h block. The
-    envelope-shaped dict mirrors the CLI ``five-hour-breakdown --json``
-    milestone objects but with snake_case keys (envelope convention).
+    #834 S1 (#836): a thin caller of the ONE milestone read,
+    ``_load_five_hour_milestones`` (bin/_cctally_five_hour.py). Its own query
+    filtered on ``five_hour_window_key`` alone while block uniqueness is
+    ``(account_key, five_hour_window_key)``, so one physical window's
+    per-account blocks all showed every account's milestones. ``block_id`` is
+    the precise selector and is preferred when the caller holds one; the
+    ``(window key, account)`` pair is the same uniqueness expressed as its two
+    parts and is what a caller holding only a window passes. ``account_key``
+    None stays the merged read, byte-stable on a single-account install.
+
+    The returned dicts carry the envelope's snake_case keys, including the
+    additive ``effective_seven_day_pct_at_crossing``.
+
+    Returns [] when the current week has no API-anchored 5h block.
     """
-    if five_hour_window_key is None:
+    if block_id is None and five_hour_window_key is None:
         return []
-    rows = conn.execute(
-        """
-        SELECT percent_threshold, captured_at_utc, block_cost_usd,
-               marginal_cost_usd, seven_day_pct_at_crossing,
-               reset_event_id
-          FROM five_hour_milestones
-         WHERE five_hour_window_key = ?
-         ORDER BY captured_at_utc ASC, id ASC
-        """,
-        (int(five_hour_window_key),),
-    ).fetchall()
-    out: list[dict] = []
-    for r in rows:
-        out.append({
-            "percent_threshold": int(r["percent_threshold"]),
-            "captured_at_utc":   r["captured_at_utc"],
-            "block_cost_usd":    float(r["block_cost_usd"]),
-            "marginal_cost_usd": (
-                None if r["marginal_cost_usd"] is None
-                else float(r["marginal_cost_usd"])
-            ),
-            "seven_day_pct_at_crossing": (
-                None if r["seven_day_pct_at_crossing"] is None
-                else float(r["seven_day_pct_at_crossing"])
-            ),
-            "reset_event_id": int(r["reset_event_id"] or 0),
-        })
-    return out
+    c = sys.modules["cctally"]
+    if block_id is not None:
+        return c._load_five_hour_milestones(conn, block_id=int(block_id))
+    return c._load_five_hour_milestones(
+        conn, five_hour_window_key=int(five_hour_window_key),
+        account_key=account_key)
 
 
 @dataclass(frozen=True)
@@ -1677,27 +1675,40 @@ def _tui_build_current_week(
 
     Returns None when no current-week usage snapshot exists.
     """
-    fetched = _fetch_current_week_snapshots(conn, now_utc)
+    # #769 S11 (#824): ONE read, held-inclusive, split per axis below.
+    fetched = _fetch_current_week_snapshots(conn, now_utc, include_held=True)
     if fetched is None:
         return None
-    week_start_at, week_end_at, samples = fetched
-    if not samples:
+    week_start_at, week_end_at, observations = fetched
+    if not observations:
         return None
     # Mirror the reset override applied by `_load_forecast_inputs` so the
     # Current Week card's spent_usd and $/1% reflect the post-reset window.
-    week_start_at, samples = _apply_midweek_reset_override(
-        conn, week_start_at, week_end_at, samples, now_utc=now_utc
+    week_start_at, observations = _apply_midweek_reset_override(
+        conn, week_start_at, week_end_at, observations, now_utc=now_utc
     )
-    if not samples:
+    if not observations:
         return None
-    # samples tuple shape: (captured_at_utc, weekly_percent, five_hour_percent).
-    # See _fetch_current_week_snapshots at bin/cctally:9122
-    # (lines ~9189-9194 and ~9221-9226). That helper does not surface
-    # five_hour_resets_at, so do a targeted lookup here for the freshest
+    # Held-inclusive sample shape: (captured_at_utc, weekly_percent,
+    # five_hour_percent, weekly_observation_held). That helper does not surface
+    # five_hour_resets_at, so do a targeted lookup below for the freshest
     # non-NULL reset timestamp on the current week.
-    latest = samples[-1]
+    #
+    # #769 S11 (#824). This card publishes BOTH axes, and the dashboard
+    # envelope reads `used_pct` and `latest_snapshot_at` straight off it for
+    # `current_week.freshness` and `snapshot_age_seconds`. A held row carries
+    # an older row's weekly value under this tick's capture instant, so
+    # letting one reach `latest` would present stale weekly evidence as freshly
+    # captured — review finding 5. The five-hour percentage takes the newest
+    # observation of either kind, because a held row is written exactly when
+    # its five-hour reading grew.
+    weekly_samples = [s for s in observations if not s[3]]
+    if not weekly_samples:
+        return None
+    latest = weekly_samples[-1]
     used_pct = float(latest[1])
-    five_hr_pct = float(latest[2]) if latest[2] is not None else None
+    five_hr_raw = observations[-1][2]
+    five_hr_pct = float(five_hr_raw) if five_hr_raw is not None else None
     # #556 S1 §3.3: one walk yields both halves. The range is whatever
     # `spent_usd` already used — taken AFTER `_apply_midweek_reset_override`
     # above, so a mid-week reset shortens the accumulation and the published
@@ -1734,6 +1745,10 @@ def _tui_build_current_week(
     five_hr_resets_at: dt.datetime | None = None
     if matching_ws_texts:
         placeholders = ",".join("?" * len(matching_ws_texts))
+        # HELD-INCLUSIVE, deliberately (#769 S11, #824): the reset instant is a
+        # five-hour fact, and a held row's five-hour fields are the writing
+        # tick's own. Excluding held rows here would make the countdown lag the
+        # five-hour percentage rendered beside it.
         reset_row = conn.execute(
             f"SELECT five_hour_resets_at FROM weekly_usage_snapshots "
             f"WHERE week_start_at IN ({placeholders}) "
@@ -2856,24 +2871,19 @@ def _tui_resolve_account_scope(stats_conn, provider: str) -> dict[str, object] |
     swallow-and-degrade behaviour for the accounts WIRE, where the fallback
     loses decoration styling; here it would publish a wrong number.
 
-    The catch is narrow on purpose. ``real_account_count`` is one SELECT over
-    ``accounts`` — no file I/O, no label lookups — so ``sqlite3.Error`` covers
-    every failure the CALL can produce, and anything else is a real defect that
-    must not be swallowed into a silent withholding. ``ImportError`` is caught
-    alongside it because the deferred import is a different failure class from
-    the query: an unimportable module is exactly the "count cannot be read"
-    state this function exists to report, and letting it propagate would fail
-    the whole dashboard tick instead of withholding one figure.
+    #819: the read and the narrow catch that used to be written out here now
+    live in ``read_account_registry``, which the Codex source build also uses
+    for its R8 decoration gate. That is the point — two written forms of one
+    read could classify a failure differently and publish a decorated envelope
+    beside a withheld combined figure. The reasoning for the catch is recorded
+    at that function.
+
+    This surface remains the resolver for CLAUDE, and for the Codex reuse and
+    degrade branches where no build established a reading this tick. A Codex
+    state this tick BUILT already carries the authoritative scope, and the
+    caller reuses that rather than reading a second time.
     """
-    try:
-        import _cctally_account
-        return {
-            "real_account_count": int(
-                _cctally_account.real_account_count(stats_conn, provider)
-            ),
-        }
-    except (ImportError, sqlite3.Error):
-        return None
+    return read_account_registry(stats_conn, provider).account_scope
 
 
 def _tui_with_account_scope(
@@ -3497,6 +3507,68 @@ def _tui_claude_data_with_budget(
     return merged
 
 
+#: Process-local retry state for degraded (``partial``) source generations.
+#:
+#: #834 S2 (#830). ``reuse_coherent_source_state`` now refuses every
+#: ``partial`` prior, which is the correct statement of reuse eligibility and
+#: replaces the hand-maintained warning-code allowlist that used to refuse two
+#: of them. That refusal makes a persistent structural cause pay for a full
+#: rebuild on every tick, and ``_lib_source_retry`` is what bounds that cost:
+#: it retains a REPEATED retainable cause under one non-extendable deadline
+#: and refuses everything else outright, so an unclassified cause fails closed.
+#:
+#: The state is process-local publication state, in the same class as the
+#: retained hero cohort: a fresh process starts with no continuity and must
+#: rebuild. It is cleared whenever a tick runs with no prior bundle, which is
+#: exactly that cold start.
+_PARTIAL_RETRY_STATE = EMPTY_RETRY_STATE
+
+
+def _tui_reset_partial_retry_state() -> None:
+    """Drop every armed retry key. Called on a cold tick; used by tests."""
+    global _PARTIAL_RETRY_STATE
+    _PARTIAL_RETRY_STATE = EMPTY_RETRY_STATE
+
+
+def _tui_retain_refused_partial(
+    prior, *, provider: str, now_utc, data_version: str,
+) -> bool:
+    """Whether a refused ``partial`` prior may nonetheless be retained now.
+
+    Consulted only where exact-version reuse already refused. The prior must
+    still be the generation that reuse WOULD have returned but for its
+    availability — same version, fresh, carrying data — because retaining a
+    generation whose evidence has moved on would republish stale rows rather
+    than throttle a repeat.
+
+    The provider's armed key is dropped first when the prior is not partial,
+    which is the tick after a healthy publish. A key left armed across a
+    recovery would still be inside its deadline when the same cause returned,
+    so the first partial after the recovery would be retained rather than
+    rebuilt.
+    """
+    global _PARTIAL_RETRY_STATE
+    if prior is None or prior.availability != "partial":
+        _PARTIAL_RETRY_STATE = clear_partial_retry(
+            _PARTIAL_RETRY_STATE, provider=provider,
+        )
+        return False
+    if (
+        prior.freshness != "fresh"
+        or prior.data is None
+        or prior.data_version != data_version
+    ):
+        return False
+    decision, _PARTIAL_RETRY_STATE = plan_partial_retry(
+        _PARTIAL_RETRY_STATE,
+        provider=provider,
+        cause=tuple(prior.warnings),
+        data_version=prior.data_version,
+        now=now_utc,
+    )
+    return decision.action == "retain"
+
+
 def _tui_note_codex_regime(value: str) -> None:
     """Stamp the REALISED Codex source-leg decision on the open tick (§1.5).
 
@@ -3766,6 +3838,18 @@ def _tui_build_source_bundle(
             claude = reuse_coherent_source_state(
                 prior_claude, data_version=claude_reuse_version,
             )
+            # #834 S2 (#830): exact-version reuse now refuses every `partial`
+            # prior. The kernel decides whether a REPEATED retainable cause
+            # may nonetheless be retained for this tick, so refusing reuse
+            # does not turn one persistent structural cause into a full
+            # rebuild on every tick for the life of the process.
+            if claude is None and _tui_retain_refused_partial(
+                prior_claude,
+                provider="claude",
+                now_utc=now_utc,
+                data_version=claude_reuse_version,
+            ):
+                claude = prior_claude
             # #556 S2 §3.6, gate 2 of 2. The version fragment above already
             # rejects a failed generation, but this gate is stated explicitly
             # rather than left implicit in string arithmetic: exact-version
@@ -3793,18 +3877,31 @@ def _tui_build_source_bundle(
                 else unavailable_source_state("codex", warning)
             )
         else:
+            # #834 S2 (#830): `_CODEX_NON_REUSABLE_WARNING_CODES` used to sit
+            # in this condition, naming the two warning codes whose degraded
+            # generation must not be reused. It is gone: a hand-maintained
+            # list of warning strings was a second and incomplete definition
+            # of non-reusability, and `reuse_coherent_source_state` now
+            # refuses every `partial` prior unconditionally.
+            _codex_forced_rebuild = prior_codex is not None and (
+                _codex_accounting_pending
+                or codex_decision_deadline_passed(prior_codex, now_utc)
+            )
             codex = (
-                None if prior_codex is not None and (
-                    _codex_accounting_pending
-                    or any(
-                        warning.code == "codex_projection_incoherent"
-                        for warning in prior_codex.warnings
-                    )
-                    or codex_decision_deadline_passed(prior_codex, now_utc)
-                ) else reuse_coherent_source_state(
+                None if _codex_forced_rebuild
+                else reuse_coherent_source_state(
                     prior_codex, data_version=codex_reuse_version,
                 )
             )
+            if codex is None and not _codex_forced_rebuild and (
+                _tui_retain_refused_partial(
+                    prior_codex,
+                    provider="codex",
+                    now_utc=now_utc,
+                    data_version=codex_reuse_version,
+                )
+            ):
+                codex = prior_codex
             if codex is not None and aggregate_scope_failed(codex):
                 codex = None
             _tui_note_codex_regime("active" if codex is None else "idle")
@@ -4020,6 +4117,11 @@ def _tui_build_source_bundle(
                 combined_accounting=claude_combined_accounting,
                 aggregate_scope=claude_aggregate_scope,
             )
+        # #819: did THIS tick build Codex, and therefore already establish the
+        # authoritative account reading? Only a fresh build has one; the reuse
+        # and degrade branches publish a generation some earlier tick produced,
+        # and their scope is still resolved from the current tick below.
+        codex_built_this_tick = False
         if codex is None:
             try:
                 if codex_capture_failed or codex_context is None:
@@ -4031,10 +4133,24 @@ def _tui_build_source_bundle(
                         codex_capture,
                         data_version=codex_version,
                         path_scope=codex_path_scope_value,
+                        # #769 S6 / #753: the prior bundle is handed forward so
+                        # a build landing in the reconcile gap can republish the
+                        # last coherent hero cohort instead of erasing a known
+                        # spend. Retention is process-local publication state:
+                        # after a restart whose first build is incoherent there
+                        # is no prior generation, and the hero renders Pending.
+                        prior_hero_cohort=(
+                            prior_codex.hero_cohort
+                            if prior_codex is not None else None
+                        ),
                     )
                 else:
                     codex = build_codex_source_state(
                         codex_context, data_version=codex_version,
+                        prior_hero_cohort=(
+                            prior_codex.hero_cohort
+                            if prior_codex is not None else None
+                        ),
                     )
                 # Attached ONLY on a fresh build, never on the reuse or degrade
                 # paths: those carry rows this tick did not produce, and their
@@ -4043,6 +4159,7 @@ def _tui_build_source_bundle(
                     codex,
                     aggregate_scope=build_aggregate_scope(published_range),
                 )
+                codex_built_this_tick = True
             except Exception:
                 _lib_log.get_logger("dashboard").error(
                     "codex_read_model source build failed",
@@ -4079,8 +4196,17 @@ def _tui_build_source_bundle(
         claude = _tui_with_account_scope(
             claude, _tui_resolve_account_scope(stats_conn, "claude"),
         )
+        # #819: a fresh Codex build already read the registry once, for its own
+        # R8 decoration gate, and published what it read as this state's
+        # `account_scope`. Reading again here is what let one tick decorate the
+        # Codex envelope while the combined figure was withheld for
+        # `account_scope_unresolved`, and it is also why a read failure could
+        # be reported by this surface and by nothing else. Reuse and degrade
+        # branches establish no reading, so they still resolve from this tick.
         codex = _tui_with_account_scope(
-            codex, _tui_resolve_account_scope(stats_conn, "codex"),
+            codex,
+            codex.account_scope if codex_built_this_tick
+            else _tui_resolve_account_scope(stats_conn, "codex"),
         )
         combined = compose_all_state(claude, codex)
         bundle = SourceDashboardBundle(
@@ -4193,6 +4319,24 @@ def _tui_source_bundle_can_idle(bundle: SourceDashboardBundle | None) -> bool:
         # to the bounded source-adapter rebuild, which re-folds — at most one
         # rebuild per tick, so it creates no retry loop.
         if aggregate_scope_failed(state):
+            return False
+        # #834 S2 (#829, #830), gate 2 of 2, and the same shape as gate 1. A
+        # caught detail-probe read failure ALSO leaves an otherwise `ok` and
+        # `fresh` provider, because `availability` turns `partial` only on
+        # incomplete accounting rows, a failed hero projection or an unreadable
+        # account registry -- never on the probe. Without this leg the bundle
+        # qualifies for idle reuse and the transient state is republished for
+        # the life of the process, which is what the browser measured: 4 minutes
+        # 47 seconds across roughly twenty generations with no rebuild.
+        #
+        # `_lib_dashboard_sources._reusable_provider` refuses the same
+        # generation, and refusing it there is NOT sufficient: this branch
+        # republishes through the clock refreshes without ever calling
+        # `reuse_coherent_source_state`, so the predicate is bypassed before it
+        # is consulted. Both legs are required, and the browser gate found this
+        # one by reading the path the first fix did not reach.
+        health = state.metadata_health
+        if health is not None and bool(health.get("retryable")):
             return False
     return True
 
@@ -4977,9 +5121,20 @@ def _tui_build_snapshot_once(
         with _perf.phase("build.five_hour_milestones"):
             try:
                 win_key = None
+                acct_key = None
+                block_id = None
                 if cw is not None and isinstance(cw.five_hour_block, dict):
                     win_key = cw.five_hour_block.get("five_hour_window_key")
-                fh_milestones = _tui_build_five_hour_milestones(conn, win_key)
+                    # #834 S1 (#836): the internal selector fields
+                    # `_select_current_block_for_envelope` carries. They are
+                    # stripped before publication (see `_five_hour_block_wire`),
+                    # so the wire shape is unchanged. `_block_id` is the precise
+                    # selector; `_account_key` scopes the window-key fallback,
+                    # which is what a stubbed or pre-#836 block dict takes.
+                    acct_key = cw.five_hour_block.get("_account_key")
+                    block_id = cw.five_hour_block.get("_block_id")
+                fh_milestones = _tui_build_five_hour_milestones(
+                    conn, win_key, acct_key, block_id=block_id)
             except Exception as exc:
                 capture_failure("five-hour-milestones", "stats", exc)
         # ---- hero-modal historical milestones week index (spec §1a/§3) ----

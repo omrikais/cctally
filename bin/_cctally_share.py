@@ -423,15 +423,34 @@ def _build_report_snapshot(
     rows = view.rows  # oldest-first; matches chart's left→right walk.
     snap_rows: list = []
     chart_pts: list = []
-    for i, r in enumerate(rows):
+    # The base label is the ISO `week_start_date`, kept exactly as it is so
+    # every uncredited artifact byte stays put. That column is the SHARED
+    # billing-cycle join key, though, so a credited week renders it twice —
+    # the same defect CLI-side surfaces do not have, because they read
+    # `display_start_date`. Switching this site to `r.week_label` would move
+    # every existing ISO date in every share artifact, so share gets its own
+    # collision path over the ISO base instead (#750 S4 §3.3).
+    _vm = sys.modules["cctally"]._load_sibling("_lib_view_models")
+
+    def _iso_base(r):
         wsd = r.week_start_date.isoformat() if r.week_start_date else None
         if isinstance(wsd, str) and wsd:
             try:
-                week_label = dt.date.fromisoformat(wsd).isoformat()
+                return dt.date.fromisoformat(wsd).isoformat()
             except ValueError:
-                week_label = wsd
-        else:
-            week_label = "—"
+                return wsd
+        return "—"
+
+    week_labels = _vm.apply_label_collision_suffixes(
+        # `getattr`, because this builder is also driven by hand-built row
+        # stand-ins that carry only the fields the artifact renders. A row
+        # with no instant simply cannot be disambiguated, and keeps its base.
+        [(_iso_base(r), _iso_base(r), getattr(r, "week_start_at", None))
+         for r in rows],
+        display_tz=display_tz,
+    )
+    for i, r in enumerate(rows):
+        week_label = week_labels[i]
         # Preserve None vs 0.0 distinction (parity with terminal/JSON).
         # Terminal _render_weekly_table renders missing values as "—";
         # share artifact follows the same convention. Coercing None to

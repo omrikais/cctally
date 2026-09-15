@@ -317,7 +317,12 @@ class TestWeeklyView:
                 week_start_date TEXT, week_end_date TEXT,
                 week_start_at TEXT, week_end_at TEXT,
                 weekly_percent REAL, five_hour_percent REAL,
-                captured_at_utc TEXT
+                captured_at_utc TEXT,
+                -- #769 S11 (#824): `get_latest_usage_for_week` excludes held
+                -- rows, so this hand-built table has to carry the column the
+                -- real schema declares or every overlay read here raises.
+                weekly_observation_held INTEGER NOT NULL DEFAULT 0
+                CHECK (weekly_observation_held IN (0, 1))
             );
         """)
         return conn
@@ -449,7 +454,12 @@ class TestTrendView:
                 week_start_date TEXT, week_end_date TEXT,
                 week_start_at TEXT, week_end_at TEXT,
                 weekly_percent REAL, five_hour_percent REAL,
-                captured_at_utc TEXT
+                captured_at_utc TEXT,
+                -- #769 S11 (#824): `get_latest_usage_for_week` excludes held
+                -- rows, so this hand-built table has to carry the column the
+                -- real schema declares or every overlay read here raises.
+                weekly_observation_held INTEGER NOT NULL DEFAULT 0
+                CHECK (weekly_observation_held IN (0, 1))
             );
             CREATE TABLE weekly_cost_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

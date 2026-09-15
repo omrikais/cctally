@@ -778,7 +778,11 @@ def test_codex_tick_drains_stdin_before_discovering_roots(runtime, monkeypatch):
     monkeypatch.setattr(record, "_codex_lifecycle_roots", lambda: order.append("roots") or [])
 
     assert ns["cmd_hook_tick"](_hook_args()) == 0
-    assert order == ["stdin", "roots"]
+    # Two discoveries, and stdin precedes BOTH. #769 S6 made the ticket write
+    # itself read the configured roots, because a Codex ticket now carries the
+    # digest of the hook configuration it was written under; the lifecycle body
+    # then reads them again for its own work.
+    assert order == ["stdin", "roots", "roots"]
 
 
 def test_codex_hook_records_dashboard_activity_before_lifecycle_work(
@@ -802,7 +806,12 @@ def test_codex_hook_records_dashboard_activity_before_lifecycle_work(
         json.loads(line)
         for line in frontier.activity_marker_path(ns["APP_DIR"]).read_text().splitlines()
     ]
-    assert rows[-1] == {"provider": "codex", "path": str(transcript)}
+    row = rows[-1]
+    assert row["provider"] == "codex"
+    assert row["path"] == str(transcript)
+    # #769 S6: the ledger generation and sequence ride on every ticket.
+    assert isinstance(row["epoch"], str) and row["epoch"]
+    assert row["seq"] == 1
 
 
 def test_claude_hook_parent_records_dashboard_activity_before_return(
@@ -828,7 +837,13 @@ def test_claude_hook_parent_records_dashboard_activity_before_return(
         json.loads(line)
         for line in frontier.activity_marker_path(ns["APP_DIR"]).read_text().splitlines()
     ]
-    assert rows[-1] == {"provider": "claude", "path": str(transcript)}
+    row = rows[-1]
+    assert row["provider"] == "claude"
+    assert row["path"] == str(transcript)
+    assert isinstance(row["epoch"], str) and row["epoch"]
+    assert row["seq"] == 1
+    # A Claude ticket carries no Codex configuration generation.
+    assert "cfg" not in row
 
 
 @pytest.mark.parametrize("source", ["claude", "codex"])

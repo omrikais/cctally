@@ -17,7 +17,6 @@ import os
 import pathlib
 import sqlite3
 import sys
-import types
 
 import pytest
 
@@ -580,7 +579,9 @@ def test_marker_params_hash_covers_every_scale(tmp_path):
 # bin/cctally-bench-test self-test.
 _EXPECTED_BENCHMARKS = {
     "snapshot.cold", "snapshot.warm", "snapshot.idle",
-    "frontier.caught_up",
+    "frontier.trusted_caught_up", "frontier.recent_active_restat",
+    "frontier.targeted_append", "frontier.racing_append_next_tick",
+    "frontier.expired_full",
     "sync.noop", "sync.delta",
     "conversations.page1", "conversations.sorted", "conversations.filtered",
     "search.cross_session", "find.in_conversation",
@@ -589,45 +590,30 @@ _EXPECTED_BENCHMARKS = {
 }
 
 
-def test_the_frontier_suspension_restores_on_every_exit_path():
-    """#740. The suspension rebinds a module global on a SHARED object.
+def test_the_bench_holds_no_way_to_suspend_the_certificate_age_bound():
+    """#769 S6 removed `_suspend_frontier_expiry` outright.
 
-    `_load_sibling` registers `_lib_ingest_frontier` in `sys.modules`, so the
-    object `bin/cctally-bench` rebinds is the object every importer in the
-    process holds. Before the scoped restore, `run_all` returned with
-    `float("inf")` still standing and the next certificate test on the same
-    xdist worker computed its age bound from `inf`.
+    It rebound `FRONTIER_CERTIFICATE_MAX_AGE_SECONDS` to `float("inf")` for a
+    whole run, which meant every recorded benchmark described a policy the
+    product never runs, and the whole-estate walk the bound forces was
+    invisible to every one of them. The five `frontier.*` scenarios reach
+    their states by SEEDING before each timed body instead, and
+    `frontier.expired_full` measures the cost the bound actually charges.
 
-    The exception path is asserted rather than only the ordinary one, because a
-    seed failure inside `_make_benchmarks` raises exactly there and was the one
-    path a `try`/`return` restore would still have leaked.
+    The absence is asserted, not merely the current value: a helper that comes
+    back would put every later measurement back under a suspended policy
+    without any single assertion noticing.
     """
-    import _lib_ingest_frontier as frontier
-
     bench = _load_bin("cctally-bench")
-    stub = types.SimpleNamespace(_load_sibling=lambda name: frontier)
-    before = frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS
-    assert before == 120.0, (
-        "precondition: something before this test already leaked the bound")
-
-    with bench._suspend_frontier_expiry(stub):
-        assert frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS == float("inf"), (
-            "non-vacuity: the suspension did not suspend anything, so its "
-            "restore proves nothing")
-    assert frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS == before
-
-    with pytest.raises(RuntimeError, match="seed failure"):
-        with bench._suspend_frontier_expiry(stub):
-            raise RuntimeError("seed failure")
-    assert frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS == before
+    assert not hasattr(bench, "_suspend_frontier_expiry")
 
 
 def test_run_all_leaves_the_certificate_age_bound_at_its_default(tmp_path):
-    """Acceptance 1: the whole runner, not only the context manager.
+    """Acceptance 1: the whole runner never moves the shared constant.
 
-    `run_all` enters the suspension through an `ExitStack` that spans both the
-    registry build and every timed body, so the restore covers a benchmark that
-    raises mid-run as well as an ordinary return.
+    `_load_sibling` registers `_lib_ingest_frontier` in `sys.modules`, so any
+    rebinding inside the runner is a rebinding every importer in the process
+    sees. #740 was that leak; #769 S6 removed the only writer.
     """
     import _lib_ingest_frontier as frontier
 
@@ -639,7 +625,7 @@ def test_run_all_leaves_the_certificate_age_bound_at_its_default(tmp_path):
         "the runner and this test hold different module objects, so this "
         "assertion could not observe the leak it exists for")
     assert frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS == 120.0, (
-        "run_all returned with the certificate age bound still suspended")
+        "run_all returned with the certificate age bound moved")
 
 
 def test_run_json_schema(tmp_path):

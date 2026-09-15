@@ -157,12 +157,18 @@ for scenario_dir in "$FIXTURES_DIR"/*/; do
     stderr_log="$scratch/stderr.log"
 
     # $extra is intentionally word-split into the requested share flags.
-    if ! HOME="$fake_home" \
-            CCTALLY_TEST_CHANGELOG_PATH="$changelog_path" \
-            python3 "$BIN" "$cmd" --format "$fmt" --theme "$theme" \
-                $extra --output "$out_file" \
-                >/dev/null 2>"$stderr_log"; then
-        echo "FAIL $scenario: cctally exited non-zero"
+    # The status is captured and reported rather than consumed by an `if !`
+    # (#783): `exited non-zero` said only that something went wrong, and the
+    # aggregator redacted the whole detail because `exited` and `non` are not
+    # reviewed vocabulary.
+    HOME="$fake_home" \
+        CCTALLY_TEST_CHANGELOG_PATH="$changelog_path" \
+        python3 "$BIN" "$cmd" --format "$fmt" --theme "$theme" \
+            $extra --output "$out_file" \
+            >/dev/null 2>"$stderr_log"
+    render_rc=$?
+    if [ "$render_rc" -ne 0 ]; then
+        echo "FAIL $scenario: cctally exit status $render_rc"
         sed 's/^/    /' "$stderr_log"
         fail_count=$((fail_count + 1))
         continue

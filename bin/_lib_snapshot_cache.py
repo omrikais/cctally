@@ -1079,6 +1079,14 @@ def reset_session_cache_state() -> None:
 # === #582 — persistent Codex accounting rows by dirty physical path =========
 
 
+#: Bumped when anything about how this population or the labels derived from
+#: it is COMPUTED changes, rather than when the data changes. A consumer
+#: comparing the signature is therefore invalidated by an algorithm change as
+#: well as by a mutation, which is what lets the project label cache retain
+#: derived labels across ticks at all.
+CODEX_POPULATION_SIGNATURE_VERSION = "codex-accounting-population-v1"
+
+
 @dataclass(frozen=True)
 class CodexAccountingCacheResult:
     """One cold or incrementally refreshed accounting population."""
@@ -1089,6 +1097,12 @@ class CodexAccountingCacheResult:
     cold: bool
     changed_old: tuple[object, ...] = ()
     changed_new: tuple[object, ...] = ()
+    #: The exact identity of the population in `entries` (#769 S6 T2a, #716
+    #: Task B). A consumer that compares this instead of scanning the rows
+    #: cannot serve a stale population, and a clean comparison visits no row at
+    #: all. `None` means "cannot establish an identity", which every consumer
+    #: must treat as a cold read rather than as a hit.
+    population_signature: tuple | None = None
 
 
 _CODEX_ACCOUNTING_CACHE_STATE: dict[str, object] = _ObservedSnapshotDict()
@@ -1135,6 +1149,64 @@ def _codex_accounting_mutation_seq(conn: sqlite3.Connection) -> int | None:
         return None
 
 
+def _codex_window_attribution_revision(conn: sqlite3.Connection) -> str | None:
+    """`codex_window_attributions`' revision — a LEADING attribution signal.
+
+    An earlier version of this docstring said that window-scoped spend adoption
+    rewrites `account_key` on existing rows and bumps this revision in the same
+    transaction. Both halves were wrong, and the leg is worth keeping for a
+    different reason.
+
+    The restamp does not need this leg. `account_key` is a member of
+    `_CODEX_ACCOUNTING_SEMANTIC_COLUMNS` (`bin/_cctally_db.py`), so an UPDATE to
+    it fires `trg_codex_accounting_upd`, advances `codex_accounting_mutation_seq`
+    and marks the path dirty — the ledger DDL's own docstring calls this "the
+    ordinary account-adoption case", and the sequence leg above already carries
+    it. And `apply_codex_window_spend_adoption` (`bin/_cctally_cache.py`) does
+    not call `bump_codex_window_attribution_revision` at all; the three callers
+    are in `bin/_cctally_journal.py` and belong to the `codex_window_attributions`
+    overlay, a different table outside the accounting population.
+
+    What this leg actually covers is the GAP BETWEEN the two. The revision
+    advances in the same transaction as the overlay's own rows, during journal
+    replay. The restamp those rows imply is performed later, by
+    `reconcile_codex_window_attribution_spend` at the end of the next Codex
+    sync. Between the two the accounting ledger head has not moved, so a memo
+    keyed on the ledger alone would keep serving a population built before the
+    operator's attribution landed. Carrying the revision turns that window into
+    an unnecessary miss, which is the direction this signature is written in.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_window_attribution_revision'"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return None if row is None or row[0] is None else str(row[0])
+
+
+def _codex_main_database_path(conn: sqlite3.Connection) -> str | None:
+    try:
+        return next(
+            str(row[2]) for row in conn.execute("PRAGMA database_list")
+            if str(row[1]) == "main"
+        )
+    except (sqlite3.Error, StopIteration):
+        return None
+
+
+def current_codex_population_signature() -> tuple | None:
+    """The signature of the population the process cache currently holds.
+
+    Read by the project and label caches, which are built from that population
+    but are not handed the `CodexAccountingCacheResult` that produced it.
+    """
+    _assert_owner()
+    signature = _CODEX_ACCOUNTING_CACHE_STATE.get("population_signature")
+    return signature if isinstance(signature, tuple) else None
+
+
 def codex_accounting_cache_pending(conn: sqlite3.Connection) -> bool:
     """Whether the process cache has not consumed the durable ledger head."""
     _assert_owner()
@@ -1174,8 +1246,35 @@ def build_cached_codex_accounting(
     ):
         raise ValueError("Codex accounting cache range must be aware and ordered")
     current_seq = _codex_accounting_mutation_seq(cache_conn)
+    database_path = _codex_main_database_path(cache_conn)
+    attribution_revision = _codex_window_attribution_revision(cache_conn)
     state = _CODEX_ACCOUNTING_CACHE_STATE
     prior_cached_entries = tuple(state.get("entries", ())) if state else ()
+
+    def signature(generation: int) -> tuple | None:
+        """The exact identity of the population this call is returning.
+
+        `range_end` is deliberately NOT a leg. It advances on every tick, so a
+        signature carrying it would move every tick and no consumer could ever
+        reuse anything — which is the same trap `_cached_projects_wire` already
+        records for its own key. An upper bound that actually reveals a row
+        dirties that row's path, and the generation below moves with it; an
+        upper bound that reveals nothing leaves the population identical, and
+        saying so is correct rather than optimistic.
+        """
+        if current_seq is None or database_path is None:
+            # No ledger is not an idle ledger. Refusing to name an identity is
+            # what makes every consumer take a cold read.
+            return None
+        return (
+            CODEX_POPULATION_SIGNATURE_VERSION,
+            database_path,
+            int(current_seq),
+            int(generation),
+            range_start,
+            extra_signature,
+            attribution_revision,
+        )
     cold = (
         current_seq is None
         or not state
@@ -1240,6 +1339,8 @@ def build_cached_codex_accounting(
             str(account_of(entry))
             for entry in (*prior_cached_entries, *entries)
         }))
+        generation = int(state.get("generation", 0)) + 1
+        population_signature = signature(generation)
         _CODEX_ACCOUNTING_CACHE_STATE.clear()
         _CODEX_ACCOUNTING_CACHE_STATE.update({
             "entries": entries,
@@ -1247,16 +1348,24 @@ def build_cached_codex_accounting(
             "start": range_start,
             "end": range_end,
             "extra": extra_signature,
+            "generation": generation,
+            "population_signature": population_signature,
         })
         return CodexAccountingCacheResult(
             entries, (), accounts, True, prior_cached_entries, entries,
+            population_signature=population_signature,
         )
 
     prior_entries = tuple(state["entries"])
     if not dirty:
+        population_signature = signature(int(state.get("generation", 0)))
         state["seq"] = current_seq
         state["end"] = range_end
-        return CodexAccountingCacheResult(prior_entries, (), (), False)
+        state["population_signature"] = population_signature
+        return CodexAccountingCacheResult(
+            prior_entries, (), (), False,
+            population_signature=population_signature,
+        )
 
     dirty_paths = tuple(sorted(dirty))
     prior_dirty = tuple(
@@ -1294,11 +1403,16 @@ def build_cached_codex_accounting(
     # while keeping the tuple's shallow shape. Mark this semantic replacement
     # explicitly; the routine ``seq``/``end`` watermark updates below do not.
     _mark_snapshot_accelerators_dirty()
+    generation = int(state.get("generation", 0)) + 1
+    population_signature = signature(generation)
     state["entries"] = entries
     state["seq"] = current_seq
     state["end"] = range_end
+    state["generation"] = generation
+    state["population_signature"] = population_signature
     return CodexAccountingCacheResult(
         entries, dirty_paths, dirty_accounts, False, changed_old, changed_new,
+        population_signature=population_signature,
     )
 
 

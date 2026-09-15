@@ -62,7 +62,7 @@ function alertRow(id: string) {
 function withAlerts(genAt: string, ids: string[]): Envelope {
   const rows = ids.map(alertRow);
   return envelope(genAt, 10, {
-    source_schema_version: 11,
+    source_schema_version: 12,
     default_source: 'claude',
     source_order: ['claude', 'codex', 'all'],
     sources: {

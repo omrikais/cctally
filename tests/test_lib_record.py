@@ -162,14 +162,13 @@ def test_projected_crossings_1e9_snap():
 
 # ── Fragment 8: usage-snapshot fold outcome classification ─────────────────
 def test_snapshot_fold_reasons_are_three_distinct_values():
-    # `_pipeline_claude_usage` gates the weekly milestone derivation on
-    # `reason != SNAPSHOT_SKIP_CLAMP`, so the two skips must never collapse
-    # onto one value. A dedup skip that compared equal to the clamp constant
-    # would silence the self-heal that recovers a tick killed between the
-    # snapshot insert and the milestone insert.
+    # These are retained legacy spellings with no live consumer since #769 S11
+    # (#824): the fold returns `UsageSnapshotFoldResult` and the weekly
+    # milestone gate reads its held flag, not a reason string. This test is
+    # therefore a pin on the exported names and their values, so that an
+    # out-of-tree reader that still imports them keeps getting what it got —
+    # NOT a statement about how the pipeline routes a skip today.
     assert len({SNAPSHOT_ACCEPT, SNAPSHOT_SKIP_CLAMP, SNAPSHOT_SKIP_DEDUP}) == 3
-    # The literal spellings are the pinned values: tests/test_writer_reroute.py
-    # asserts them by string at each `_usage_snapshot_fold_decision` outcome.
     assert (SNAPSHOT_ACCEPT, SNAPSHOT_SKIP_CLAMP, SNAPSHOT_SKIP_DEDUP) == (
         "accept", "clamp", "dedup")
 

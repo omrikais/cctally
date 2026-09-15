@@ -1480,6 +1480,15 @@ def test_the_report_ends_ok_when_the_record_and_the_tree_agree(tmp_path):
     repo = _seed_repo(tmp_path, artifact=doc)
     report = mod.run_check(repo, "public", discover=lambda _r: mod.live_axes(doc))
     assert mod.render_report(report).splitlines()[-1] == "end\tok"
+    transition_only = mod.run_check(
+        repo,
+        "public",
+        discover=lambda _r: (_ for _ in ()).throw(
+            AssertionError("transition-only admission must not discover tests")
+        ),
+        transitions_only=True,
+    )
+    assert mod.render_report(transition_only).splitlines()[-1] == "end\tok"
 
 
 # ---------------------------------------------------------------------------

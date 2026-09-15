@@ -18,11 +18,16 @@ counts intervals, which moves three reported quantities at once:
     interval started at the credit instant, `_load_week_snapshots` never
     matched it, and the whole week contributed nothing.
 
-The remaining mismatch is deliberate and out of scope here: the percentage
-the credited week contributes is the POST-credit 12.0, not the pre-credit
-peak, because `_load_week_snapshots` applies `_reset_aware_floor` per
-`week_start_date` rather than per segment. `weekly` reports the two segments
-separately (71.0 and 12.0). Filed as a follow-up, not fixed here.
+#750 S4 §2.1 / §2.4 closed the mismatch this module used to document as
+intended. `_load_week_snapshots` resolves one value per SEGMENT inside that
+cycle's own half-open interval, so the credited week now contributes BOTH of
+the percentages `weekly` already reported for it — the pre-credit 71.0 and the
+post-credit 12.0 — instead of the single floored 12.0. Every segment therefore
+has an observation, and `weeklyAttributionAvailable` is true.
+
+A billing cycle is the unit that owns a 100% quota, and this surface already
+sums one cycle per week across weeks, so a credited week contributing one
+percentage per cycle is the same arithmetic rather than a new one (D7).
 """
 from __future__ import annotations
 
@@ -173,17 +178,15 @@ def test_project_counts_segments_and_attributes_the_pre_credit_one(
     # reached a week further back.
     assert payload["weeksInRange"] == 3, payload["weeksInRange"]
 
-    # The post-credit segment starts at the credit instant, which is not any
-    # snapshot's `week_start_at`, so at least one interval reports no snapshot
-    # and the whole-window attribution flag goes false.
-    assert payload["totals"]["weeklyAttributionAvailable"] is False, payload
+    # Every segment now resolves an observation inside its own interval:
+    # the post-credit one is no longer looked up by an anchor no snapshot
+    # carries, so no interval reports a missing snapshot.
+    assert payload["totals"]["weeklyAttributionAvailable"] is True, payload
 
     row = payload["projects"][0]
-    # week-1 at 40.0 plus the pre-credit segment, which matches the credited
-    # week's snapshot row again now that its `start_ts` is the original
-    # `week_start_at`. `_load_week_snapshots` floors that week's MAX to the
-    # credit instant, so the percentage it contributes is the post-credit
-    # 12.0 — see the module docstring.
-    assert row["attributedUsedPercent"] == pytest.approx(52.0, abs=1e-6), (
-        f"expected 40.0 + 12.0; got {row['attributedUsedPercent']}"
+    # week-1 at 40.0, the pre-credit cycle at its own peak 71.0, and the
+    # post-credit cycle at 12.0 — the same two figures `weekly` reports for
+    # this week. A credited week contributes one percentage per cycle (D7).
+    assert row["attributedUsedPercent"] == pytest.approx(123.0, abs=1e-6), (
+        f"expected 40.0 + 71.0 + 12.0; got {row['attributedUsedPercent']}"
     )

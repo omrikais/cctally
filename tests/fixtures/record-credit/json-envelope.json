@@ -18,7 +18,7 @@
         "creditFloorInserted": true,
         "hwm7dBefore": 46.0,
         "hwm7dAfter": 31.0,
-        "staleReplaysDeleted": 0,
+        "staleReplaysDeleted": 1,
         "postCreditSnapshotInserted": true
     }
 }

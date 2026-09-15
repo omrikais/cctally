@@ -16,7 +16,9 @@ convention the sibling read-model tests use.
 from __future__ import annotations
 
 import datetime as dt
+import pathlib
 import sys
+import types
 
 import pytest
 
@@ -993,3 +995,376 @@ def test_an_empty_source_path_row_parts_the_two_accounting_readers(
     finally:
         cache.close()
         stats.close()
+
+
+# ── #819: a registry read failure is disclosed, not read as undecorated ─────
+
+
+def _seed_decorated_codex_install(cache, stats, monkeypatch, source_module):
+    """Two real Codex accounts with live spend and their own weekly cycles.
+
+    The same shape ``test_decorated_source_emits_per_account_cards_and_cycles``
+    builds, extracted so the failure cases below start from an install that is
+    provably decorated rather than from one whose registry happens to be empty.
+    Returns the patched observations so a caller can assert on them.
+    """
+    root = _cache_root_key(cache)
+    _seed_codex_accounts(stats, [
+        dict(account_key=_ACCT_A, email="a@x.com", label="alice", plan_type="pro"),
+        dict(account_key=_ACCT_B, email="b@x.com", label="bob", plan_type="team"),
+    ])
+    reset_a = NOW + dt.timedelta(days=2)
+    reset_b = NOW + dt.timedelta(days=3)
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_A,
+        timestamp=NOW - dt.timedelta(hours=1), session_id="a-live",
+        line_offset=90_001)
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_B,
+        timestamp=NOW - dt.timedelta(hours=1), session_id="b-live",
+        line_offset=90_002)
+    cache.commit()
+    observations = (
+        *_weekly_and_5h(root, _ACCT_A, reset_a, used_weekly=40.0, used_5h=12.0),
+        *_weekly_and_5h(root, _ACCT_B, reset_b, used_weekly=55.0, used_5h=30.0),
+    )
+    monkeypatch.setattr(
+        source_module, "load_codex_quota_observations", lambda **_k: observations)
+    return observations
+
+
+def test_a_codex_registry_read_failure_is_named_rather_than_read_as_undecorated(
+    tmp_path, monkeypatch,
+):
+    """#819. The bare ``except Exception`` converted a registry read failure
+    into a healthy-looking ``False``, so a two-account install published
+    exactly the <=1-real-account envelope R8 forbids there, and reported
+    nothing at all about why the three gated subtrees had gone.
+
+    The decoration itself cannot survive the failure — there is no count to
+    decorate by — so this case pins the DISCLOSURE, not the subtrees: the
+    source stays available with its non-account data intact, the envelope
+    carries a named warning, and the authoritative account fact is
+    ``unresolved`` rather than a count nobody read.
+    """
+    import sqlite3 as _sqlite3
+
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    import _cctally_account
+    _seed_decorated_codex_install(cache, stats, monkeypatch, source_module)
+    # Sanity: the install really is decorated, so the assertions below cannot
+    # be satisfied by an accidentally-empty registry.
+    assert _cctally_account.real_account_count(stats, "codex") == 2
+
+    def _unreadable(*_args, **_kwargs):
+        raise _sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(_cctally_account, "real_account_count", _unreadable)
+    try:
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="registry-unreadable-v1",
+        )
+
+        # The source stays available and its non-account data is preserved.
+        assert state.availability in ("ok", "partial", "empty")
+        assert state.data is not None
+        assert state.data["hero"]["cycle"] is not None
+        assert state.data["periods"]["daily"] is not None
+        assert state.data["sessions"] is not None
+        # The failure is NAMED, and it is not the generic build failure.
+        codes = {warning.code for warning in state.warnings}
+        assert "codex_account_scope_unresolved" in codes, codes
+        assert "source_build_failed" not in codes, codes
+        # The authoritative account fact is unresolved, never a healthy count.
+        assert state.account_scope is None
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_a_healthy_codex_registry_read_publishes_its_count_and_no_warning(
+    tmp_path, monkeypatch,
+):
+    """#819. The control for the case above: the same install, read normally,
+    must carry the decoration AND the count that produced it, with nothing
+    added to the warning tuple."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    _seed_decorated_codex_install(cache, stats, monkeypatch, source_module)
+    try:
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="registry-healthy-v1",
+        )
+
+        assert "accounts" in state.data
+        assert dict(state.account_scope or {}) == {"real_account_count": 2}
+        codes = {warning.code for warning in state.warnings}
+        assert "codex_account_scope_unresolved" not in codes, codes
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_one_codex_registry_reading_feeds_decoration_and_the_account_scope(
+    tmp_path, monkeypatch,
+):
+    """#819 item 1. The decoration gate and ``account_scope`` were two separate
+    reads of one registry — ``bin/_cctally_dashboard_sources.py`` inside the
+    build and ``bin/_cctally_tui.py`` after it — so one tick could publish a
+    decorated Codex envelope beside a combined figure withheld for
+    ``account_scope_unresolved``.
+
+    The stub below succeeds once and then fails, which is the disagreement in
+    its smallest form: under two reads the first decorates and the second
+    withholds. One reading cannot disagree with itself.
+    """
+    import sqlite3 as _sqlite3
+
+    from _fixture_builders import seed_account
+    from conftest import load_script, redirect_paths
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    # AFTER `load_script`: it drops cached `_cctally_*` siblings from
+    # `sys.modules`, so a module imported earlier is a stale instance the
+    # builder's own deferred import would not resolve to.
+    import _cctally_account
+
+    stats = ns["open_db"]()
+    try:
+        for key, label in ((_ACCT_A, "alice"), (_ACCT_B, "bob")):
+            seed_account(
+                stats, account_key=key, provider="codex",
+                natural_id=f"uuid-{label}", email=f"{label}@x.com",
+                label=label, plan_type="pro", label_source="user",
+                first_seen_utc="2026-07-01T00:00:00Z",
+                last_seen_utc="2026-07-01T00:00:00Z",
+            )
+        stats.commit()
+        inner = _cctally_account.real_account_count
+        codex_reads = []
+
+        def _first_read_only(conn, provider):
+            if provider != "codex":
+                return inner(conn, provider)
+            codex_reads.append(provider)
+            if len(codex_reads) > 1:
+                raise _sqlite3.OperationalError(
+                    "no such table: accounts")
+            return inner(conn, provider)
+
+        monkeypatch.setattr(
+            _cctally_account, "real_account_count", _first_read_only)
+        bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            stats_conn=stats,
+            now_utc=NOW,
+            display_tz_name="UTC",
+            codex_ingest_contended=False,
+            claude_cost_usd=0.0,
+            claude_total_tokens=0,
+        )
+    finally:
+        stats.close()
+
+    codex = bundle.sources["codex"]
+    assert len(codex_reads) == 1, (
+        "the Codex registry was read more than once in one tick, so the "
+        f"decoration gate and the account scope can disagree: {codex_reads}")
+    assert dict(codex.account_scope or {}) == {"real_account_count": 2}
+    # The two consumers agree BY CONSTRUCTION: decoration is published exactly
+    # when the one established count is above one.
+    decorated = "accounts" in (codex.data or {})
+    scoped = dict(codex.account_scope or {}).get("real_account_count", 0) > 1
+    assert decorated == scoped, (codex.account_scope, sorted(codex.data or {}))
+
+
+def test_the_share_period_rebuild_carries_the_same_registry_contract(
+    tmp_path, monkeypatch,
+):
+    """#819 item 1, the share half. A historical share period rebuilds the
+    Codex read model through ``_share_codex_state_for_period``, which calls the
+    same builder directly, so the disclosure contract has to hold on a surface
+    the dashboard tick never touches.
+
+    The call is DERIVED from the share module's own source rather than asserted
+    from memory, so moving the share rebuild onto another builder fails here
+    instead of silently leaving this surface uncovered.
+    """
+    import sqlite3 as _sqlite3
+
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    share = sys.modules["_cctally_dashboard_share"]
+    import _cctally_account
+
+    share_source = pathlib.Path(share.__file__).read_text(encoding="utf-8")
+    assert "build_codex_source_state(" in share_source, (
+        "the share period rebuild no longer calls the Codex source builder, "
+        "so this case no longer covers the surface it names")
+
+    _seed_decorated_codex_install(cache, stats, monkeypatch, source_module)
+    cache.close()
+    stats.close()
+
+    def _unreadable(*_args, **_kwargs):
+        raise _sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(_cctally_account, "real_account_count", _unreadable)
+    state = share._share_codex_state_for_period(
+        None, panel="daily",
+        options={"period": {
+            "kind": "custom",
+            "start": START.isoformat(),
+            "end": NOW.isoformat(),
+        }},
+    )
+
+    codes = {warning.code for warning in state.warnings}
+    assert "codex_account_scope_unresolved" in codes, codes
+    assert state.account_scope is None
+    assert state.data is not None
+
+
+def test_the_reading_decorates_on_exactly_the_registrys_own_rule(tmp_path, monkeypatch):
+    """#819. ``AccountRegistryReading.decorated`` evaluates R8 on the count it
+    established rather than issuing a second query, so the threshold it applies
+    is compared against ``provider_is_decorated``'s own answer instead of being
+    restated here as ``> 1``."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    import _cctally_account
+    try:
+        for expected_count, rows in (
+            (0, []),
+            (1, [dict(account_key=_ACCT_A, email="a@x.com", label="alice")]),
+            (2, [dict(account_key=_ACCT_B, email="b@x.com", label="bob")]),
+        ):
+            _seed_codex_accounts(stats, rows)
+            reading = source_module.read_account_registry(stats, "codex")
+            assert reading.count == expected_count
+            assert reading.error is None
+            assert reading.decorated is _cctally_account.provider_is_decorated(
+                stats, "codex")
+            assert dict(reading.account_scope or {}) == {
+                "real_account_count": expected_count}
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_the_share_period_rebuild_reaches_the_codex_builder_at_all(
+    tmp_path, monkeypatch,
+):
+    """#819 step 5, the precondition the contract case above rests on.
+
+    ``_share_codex_state_for_period`` composed its ``data_version`` from
+    ``semantics.identity``. ``DashboardSourceSemantics`` carried one
+    ``identity`` field when that line was written (`d4e801cfd`) and was later
+    split into ``claude_identity`` and ``codex_identity`` without updating it,
+    so every historical Codex share period raised ``AttributeError`` before it
+    reached the builder. Nothing caught it, because every existing share case
+    monkeypatches this function away and never runs its body.
+
+    The identity is asserted to be the CODEX one, not merely present: a Codex
+    read model versioned by the Claude configuration digest would reuse a
+    rebuilt share across a Codex-only configuration change.
+    """
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    share = sys.modules["_cctally_dashboard_share"]
+    _seed_decorated_codex_install(cache, stats, monkeypatch, source_module)
+    cache.close()
+    stats.close()
+
+    state = share._share_codex_state_for_period(
+        None, panel="daily",
+        options={"period": {
+            "kind": "custom",
+            "start": START.isoformat(),
+            "end": NOW.isoformat(),
+        }},
+    )
+
+    semantics = source_module.resolve_dashboard_source_semantics(
+        sys.modules["cctally"].load_config(), display_tz_name=None,
+    )
+    assert state.source == "codex"
+    # `combined_accounting_version` appends its own fragment after the version
+    # the share builder composes, so this is containment rather than a suffix.
+    assert f":{semantics.codex_identity}" in state.data_version, (
+        state.data_version)
+    assert semantics.claude_identity not in state.data_version
+    assert semantics.codex_identity != semantics.claude_identity
+
+
+def test_an_unresolved_account_scope_refuses_the_reuse_of_that_generation():
+    """#819 item 1. A withheld account scope must not outlive its cause.
+
+    The comment that shipped with the degraded build said `partial` disqualified
+    the state from `reuse_coherent_source_state`. It did not: `_coherent_provider`
+    admitted `partial`, the build always sets `freshness="fresh"`, and the Codex
+    reuse version is an identity digest that a transient registry read failure
+    does not move — so nothing in the kernel stopped the degraded object being
+    handed straight back for the life of the process.
+
+    #834 S2 (#830) moved the refusal into the kernel itself. `_reusable_provider`
+    refuses EVERY `partial` prior, so this generation is no longer reusable by
+    construction rather than because a hand-maintained list of warning strings
+    happens to name its code. That list, `_CODEX_NON_REUSABLE_WARNING_CODES`,
+    is gone: it was a second and incomplete definition of non-reusability, and
+    it admitted every partial generation whose cause nobody had added to it.
+
+    Refusing is also what keeps the published envelope internally consistent.
+    The reuse branch re-resolves `_tui_resolve_account_scope` on every tick, so
+    a registry that recovered while this object was being reused would publish
+    an `account_scope` naming two accounts beside a `data` carrying no
+    `accounts` and a warning still saying the scope is unresolved — the
+    disagreement between the two consumers that item 1's single authoritative
+    read exists to make impossible. That argument rules out RETAINING this
+    generation under the retry kernel too, which is why its cause is absent
+    from `RETAINABLE_PARTIAL_CAUSES`.
+    """
+    import _lib_dashboard_sources as lds
+    import _lib_source_retry as retry
+    from _lib_dashboard_sources import SourceDashboardWarning
+
+    def degraded(*codes):
+        return lds.SourceDashboardState(
+            source="codex",
+            availability="partial",
+            freshness="fresh",
+            warnings=tuple(
+                SourceDashboardWarning(code, "message", "accounts")
+                for code in codes
+            ),
+            data_version="codex-version",
+            last_success_at=None,
+            capabilities={},
+            data={"hero": {}},
+        )
+
+    for codes in (
+        ("codex_account_scope_unresolved",),
+        ("codex_projection_incoherent",),
+        (),
+        ("codex_metadata_incomplete", "codex_cycle_unavailable"),
+    ):
+        prior = degraded(*codes)
+        assert lds._reusable_provider(prior) is False, codes
+        assert lds.reuse_coherent_source_state(
+            prior, data_version="codex-version") is None, codes
+
+    # Neither of the two codes the retired allowlist named may be RETAINED by
+    # the retry kernel either, for the envelope-consistency reason above.
+    for code in ("codex_account_scope_unresolved", "codex_projection_incoherent"):
+        assert retry.is_retainable_partial_cause(
+            retry.normalize_partial_cause(code)) is False, code

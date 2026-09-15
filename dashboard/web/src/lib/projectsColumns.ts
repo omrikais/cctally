@@ -80,7 +80,7 @@ export const PROJECTS_COLUMNS: TableColumn<ProjectsTableRow>[] = [
     // and stays `used_pct`; only the rendered label changes.
     id: 'used_pct',
     label: 'Used pp (sum)',
-    title: "Sum of each week's attributed usage-% over the selected window (percentage-points; can exceed 100 across multiple weeks).",
+    title: "Sum of each billing cycle's attributed usage-% over the selected window (percentage-points; can exceed 100 across multiple cycles).",
     defaultDirection: 'desc',
     numeric: true,
     nullKey: (r) => r.windowPct,
@@ -104,11 +104,15 @@ export const PROJECTS_COLUMNS: TableColumn<ProjectsTableRow>[] = [
 // own menu instead. The tooltips stay; this caption is what a touch user can
 // actually read. It sits UNDER the window selector because both definitions
 // are relative to the window that selector chooses.
+// #750 S4 §4.3 / D7 states the arithmetic the sum actually performs: a week
+// that received a credit contributes ONE BUCKET PER CYCLE, so the buckets are
+// billing cycles rather than weeks.
 export const PROJECTS_WINDOW_CAPTION =
-  'Each selected window is a set of subscription-week buckets. Reset shifts '
-  + 'can leave gaps; the table and drill both use those same buckets. Used pp '
+  'Each selected window is a set of billing-cycle buckets, and a week that '
+  + 'received a credit contributes one bucket per cycle. Reset shifts can '
+  + 'leave gaps; the table and drill both use those same buckets. Used pp '
   + '(sum) adds each bucket\u2019s attributed usage percentage \u2014 a sum of '
-  + 'percentage points, not a share of any one week. Cost share is each '
+  + 'percentage points, not a share of any one cycle. Cost share is each '
   + 'project\u2019s share of total project spend in that same window.';
 
 // #620 S1 D1 — the merged-fold clause, stated on the surface rather than only

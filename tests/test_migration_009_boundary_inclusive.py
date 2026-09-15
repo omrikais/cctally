@@ -1,13 +1,22 @@
 """V1-style regression for stats migration 009: the
-``[block_start_at, last_observed_at_utc]`` interval is CLOSED on both
-sides, matching the live writer (``_compute_block_totals`` walks
-``session_entries`` with ``timestamp >= block_start AND <= range_end``).
+``[block_start_at, last_observed_at_utc]`` interval a block LOADS is
+CLOSED on both sides, matching the live writer (``_compute_block_totals``
+still walks ``session_entries`` with ``timestamp >= block_start AND <=
+range_end``).
 
 A pre-fix half-open ``<`` end would silently exclude any
 ``session_entries`` row whose ``timestamp_utc`` exactly equalled a
 block's ``last_observed_at_utc`` — and ``last_observed_at_utc`` IS the
 timestamp of some live status-line tick, so the boundary lands on a
 real entry with high probability.
+
+Loading and pricing became two predicates in #751a, and this module pins
+the first of them. The load range's upper bound is the observation
+cutoff and stays inclusive; ownership is separately the half-open
+``[start, reset)`` interval, so an entry at the cutoff is loaded and
+ownership then decides which window prices it. The two must not be
+collapsed, and introducing half-open ownership must not change the
+contract asserted below.
 
 Spec: docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §I3 (B1).
 """

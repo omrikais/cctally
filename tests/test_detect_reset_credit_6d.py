@@ -170,6 +170,19 @@ def _five_hour_setup(conn, *, journal_id="sa:seed5h", captured="2026-01-04T12:00
           weekly_percent=50.0, week_end_at=_CUR_END,
           five_hour_percent=28.0, five_hour_resets_at=_5H_FUTURE,
           five_hour_window_key=_5H_KEY, journal_id=journal_id)
+    # #769 S2 §3: a five-hour credit now needs a same-source observed descent
+    # followed by a distinct same-source confirmation. These tests call
+    # `detect_reset_and_credit` directly with no `source`, so the descent is
+    # seeded under the `unknown` bucket that such callers are filed in, at the
+    # same instant `_expected_fhc_key` floors.
+    conn.execute(
+        "INSERT INTO five_hour_credit_confirmation_state "
+        "(account_key, five_hour_window_key, source, baseline_pct, "
+        " pending_low_pct, pending_at_utc, pending_observation_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("unattributed", _5H_KEY, "unknown", 28.0, 4.0, _AS_OF,
+         "o:seeded-descent"),
+    )
 
 
 def _expected_fhc_key(ns):
@@ -230,6 +243,20 @@ def test_detect_5h_suppression_empty_on_replay(ns):
         )
         assert ctx.suppression_map == {}, (
             "rowcount==0 (crash-replay) must NOT re-capture suppression")
+        # An empty suppression map on its own does not say WHY it is empty: a
+        # credit that fired and whose INSERT collided produces one, and so does
+        # a credit that never fired at all. A COUNT over
+        # `five_hour_reset_events` cannot tell them apart either, because this
+        # test pre-inserts an event row. The stale-replica DELETE does, because
+        # it runs only on the credit path and unconditionally once there — the
+        # same pivot `test_detect_5h_legacy_no_ctx_still_fires_and_deletes`
+        # already asserts.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE journal_id = 'sa:seed5h'"
+        ).fetchone()[0] == 0, (
+            "the credit did not fire at all, so the empty suppression map "
+            "proves nothing about the crash-replay path")
     finally:
         conn.close()
 

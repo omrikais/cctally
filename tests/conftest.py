@@ -564,6 +564,62 @@ def _reset_perf_state():
 
 
 @pytest.fixture(autouse=True)
+def _reset_frontier_process_state():
+    """Isolate the two #769 S6 frontier process globals between tests.
+
+    ``_lib_ingest_frontier`` holds one counter dict and one coordinator
+    registry, both keyed by nothing a test owns. The counters accumulate the
+    deterministic plan and visit counts a benchmark asserts a tick's SHAPE
+    from, so residue quietly inflates a later reading. The coordinator registry
+    is the worse of the two: a coordinator holds CONSUMER REGISTRATIONS and
+    each consumer's ledger acknowledgement, so an entry left behind by an
+    earlier test is exactly the state in which a later one sees a registration
+    it never made — a generation that never retires, or a peer acknowledgement
+    reconciled against a store that no longer exists.
+
+    The registry is isolated by SUBSTITUTION rather than by a reset function,
+    because #769 S6's constraints forbid a production test hook and the module
+    had no other reason to expose one. This fixture installs a fresh dict for
+    the duration of the test and restores the real registry afterwards, which
+    is strictly better than clearing: the real object is never mutated, so its
+    identity and its length both survive the test, which is exactly the
+    comparison ``tests/_pytest_isolation_plugin.py`` makes over it. The
+    counters keep their reset function, which ``bin/cctally-bench`` also calls.
+
+    THE SUBSTITUTION IS A PLAIN SAVE AND RESTORE, NOT ``monkeypatch``, and the
+    reason is that ``monkeypatch`` is ONE function-scoped instance shared by
+    every fixture and by the test function of an item. A test body that calls
+    ``monkeypatch.undo()`` — about fifteen modules in this estate do, among
+    them ``test_quota_glue.py``, ``test_stats_perms.py``,
+    ``test_artifact_retention_fs.py`` and
+    ``test_codex_conversation_normalization.py`` — reverts this fixture's
+    substitution along with its own, restoring the REAL coordinator registry
+    for the rest of that test. Anything registered afterwards then leaks into
+    the next test and is reported against that test rather than against the
+    one that wrote it. A plain rebind in a ``try``/``finally`` cannot be undone
+    by a test body and keeps the identity-and-length property intact.
+
+    NOTHING HERE IS SWALLOWED. An earlier version wrapped both the import and
+    the reset in a bare ``except Exception: pass``, so a renamed or raising
+    reset silently stopped isolating anything and the failure resurfaced later
+    as a leaked registration reported against an unrelated test — the exact
+    failure this fixture exists to prevent. ``bin/`` is on ``sys.path`` from
+    the top of this file, so the import cannot fail for any reason a test
+    should continue past.
+    """
+    import _lib_ingest_frontier as _frontier  # bin/ is on sys.path (see top)
+
+    real_registry = _frontier._FRONTIER_GENERATIONS
+    _frontier._FRONTIER_GENERATIONS = {}
+    _frontier.reset_frontier_counters()
+    try:
+        yield
+    finally:
+        _frontier._FRONTIER_GENERATIONS = real_registry
+        _frontier.reset_frontier_counters()
+
+
+@pytest.fixture(autouse=True)
 def _reset_quota_projection_reconcile_flag():
     """Isolate the #496 S5b per-process quota-projection arming between tests.
 

@@ -59,9 +59,14 @@ SCRATCH_FIXTURES="$SCRATCH_ROOT/fixtures"
 mkdir -p "$SCRATCH_FIXTURES"
 if [ -x "$REPO/bin/build-statusline-fixtures.py" ]; then
     builder_log="$SCRATCH_ROOT/builder.log"
-    if ! python3 "$REPO/bin/build-statusline-fixtures.py" \
-            --out "$SCRATCH_FIXTURES" >"$builder_log" 2>&1; then
-        echo "FAIL: build-statusline-fixtures.py exited non-zero"
+    # #783: the status is captured and reported, and the builder is named in
+    # words rather than by filename, because `build` and `py` are not reviewed
+    # vocabulary and one unregistered token replaces the whole detail.
+    python3 "$REPO/bin/build-statusline-fixtures.py" \
+        --out "$SCRATCH_FIXTURES" >"$builder_log" 2>&1
+    builder_rc=$?
+    if [ "$builder_rc" -ne 0 ]; then
+        echo "FAIL: statusline fixture builder exit status $builder_rc"
         cat "$builder_log" >&2
         exit 1
     fi

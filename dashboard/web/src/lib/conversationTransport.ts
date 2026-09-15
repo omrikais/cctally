@@ -10,7 +10,91 @@ export type ConversationTransportStatus =
   | 'normalization_pending'
   | 'not_found'
   | 'gone'
-  | 'capability_unsupported';
+  | 'capability_unsupported'
+  | 'degraded';
+
+// #780 — every conversation read route can answer HTTP 200 with a typed
+// degraded envelope instead of opening the transcript store. The body carries
+// the route's own EMPTY SHAPE, which for `/api/conversations` is
+// `{conversations: [], total: 0}` and for the qualified browse is neither
+// `rows` nor `page`, so a client that parses it as an ordinary page throws.
+// Before #769 S6 both browse branches did exactly that and the TypeError landed
+// in the same `.catch` that prints a load failure, which is how a 200 became
+// "Couldn't load conversations." beside a Retry the state could never satisfy.
+//
+// The reason names a STORE state, not a request failure. It is the sibling of
+// `normalization_pending`, which the adapters have always read off the body and
+// reported as a pending surface rather than an error.
+export interface ConversationDegradedNotice {
+  reason: string;
+  message: string;
+  // Whether re-issuing the same read can plausibly clear the state. False for
+  // every reason that needs a process ALLOWED TO DO WORK to open the store:
+  // offering Retry there is a dead-end remedy, which is what the browser QA
+  // observed on `legacy_bridge_pending` under `dashboard --no-sync`.
+  retryable: boolean;
+}
+
+const CONVERSATION_DEGRADED_MESSAGES: Record<string, ConversationDegradedNotice> = {
+  legacy_bridge_pending: {
+    reason: 'legacy_bridge_pending',
+    message: 'Transcripts have not finished moving into the conversation store. '
+      + 'Run cctally cache-sync to finish the import.',
+    retryable: false,
+  },
+  maintenance: {
+    reason: 'maintenance',
+    message: 'The conversation store is busy with maintenance. '
+      + 'Conversations return once it finishes.',
+    retryable: true,
+  },
+  schema_behind: {
+    reason: 'schema_behind',
+    message: 'The conversation store is behind this version of cctally. '
+      + 'Run cctally cache-sync to bring it up to date.',
+    retryable: false,
+  },
+  schema_ahead: {
+    reason: 'schema_ahead',
+    message: 'The conversation store was written by a newer version of cctally. '
+      + 'Update cctally to read it.',
+    retryable: false,
+  },
+};
+
+const CONVERSATION_DEGRADED_FALLBACK: ConversationDegradedNotice = {
+  reason: 'unavailable',
+  message: 'The conversation store is not available right now.',
+  retryable: true,
+};
+
+/** The `degraded_reason` of a typed degraded envelope, or null for any other body.
+ *
+ * A degraded envelope with no reason still degrades: the status is what says
+ * the body carries no page, so parsing it would throw whether or not the server
+ * named a cause.
+ */
+export function conversationDegradedReason(body: unknown): string | null {
+  if (body == null || typeof body !== 'object') return null;
+  const envelope = body as { status?: unknown; degraded_reason?: unknown };
+  if (envelope.status !== 'degraded') return null;
+  return typeof envelope.degraded_reason === 'string' && envelope.degraded_reason
+    ? envelope.degraded_reason
+    : CONVERSATION_DEGRADED_FALLBACK.reason;
+}
+
+/** The user-facing sentence and remedy for one degraded reason.
+ *
+ * An unknown reason falls back to a plain sentence rather than printing the
+ * wire code: a new server reason must degrade to something a reader can act on,
+ * not to an identifier.
+ */
+export function conversationDegradedNotice(reason: string): ConversationDegradedNotice {
+  return CONVERSATION_DEGRADED_MESSAGES[reason] ?? {
+    ...CONVERSATION_DEGRADED_FALLBACK,
+    reason: reason || CONVERSATION_DEGRADED_FALLBACK.reason,
+  };
+}
 
 // Browse cursors are raw opaque conversation keys. Search cursors are the
 // S7 external, unpadded-base64url form; neither is decoded by the client.
@@ -83,8 +167,8 @@ export type QualifiedBrowseEnvelope =
     };
 
 export type QualifiedFacetsEnvelope =
-  | { status: 'ok'; facets: QualifiedConversationFacets }
-  | { status: 'normalization_pending'; facets: QualifiedConversationFacets };
+  | { status: 'ok'; facets: QualifiedConversationFacets; filter_degraded?: boolean }
+  | { status: 'normalization_pending'; facets: QualifiedConversationFacets; filter_degraded?: boolean };
 
 export interface QualifiedSearchHit {
   conversation_key: string;

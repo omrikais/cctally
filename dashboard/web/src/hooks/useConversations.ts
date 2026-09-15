@@ -5,7 +5,7 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSnapshot } from './useSnapshot';
 import { filterParams } from './conversationFilterParams';
 import { adaptQualifiedBrowse } from '../lib/conversationAdapters';
-import { qualifiedBrowseUrl, type QualifiedBrowseEnvelope } from '../lib/conversationTransport';
+import { conversationDegradedNotice, conversationDegradedReason, qualifiedBrowseUrl, type ConversationDegradedNotice, type QualifiedBrowseEnvelope } from '../lib/conversationTransport';
 import { conversationRefKey, conversationSummaryRef, sameConversationRef, type ConversationRef, type ConversationSource, type ConversationSummary, type ConversationsPage } from '../types/conversation';
 
 // Browse-rail list. Offset-paginated, accumulating. Revalidates the
@@ -50,6 +50,11 @@ export interface UseConversations {
   // #205 S3 (F8) — user-initiated re-load of page 1 after a failed fetch.
   retry: () => void;
   pending: boolean;
+  // #769 S6 / #802 browser QA P1 — the transcript store answered 200 with a
+  // typed degraded envelope. Distinct from `error`, which means the request
+  // itself failed, and from `pending`, which is the Codex normalization state.
+  // Never set together with `error`.
+  degraded: ConversationDegradedNotice | null;
 }
 
 const PAGE = 50;
@@ -69,6 +74,7 @@ export function useConversations(
   const [error, setError] = useState<string | null>(null);
   const [nextOffset, setNextOffset] = useState<number | string | null>(0);
   const [pending, setPending] = useState(false);
+  const [degraded, setDegraded] = useState<ConversationDegradedNotice | null>(null);
   const sourceRef = useRef(source);
   sourceRef.current = source;
   const qualifiedRef = useRef(qualified);
@@ -148,6 +154,22 @@ export function useConversations(
         if (sourceRef.current !== activeSource
           || qualifiedRef.current !== activeQualified
           || accountRef.current !== activeAccount) return;
+        // The degraded envelope carries neither `page` nor `rows`, so this must
+        // come BEFORE either branch parses it — reading a page out of it is the
+        // TypeError that used to be reported as a load failure.
+        const degradedReason = conversationDegradedReason(raw);
+        if (degradedReason != null) {
+          setRows([]);
+          setNextOffset(null);
+          setPending(false);
+          setFilterDegraded(false);
+          setSortDegraded(false);
+          setDegraded(conversationDegradedNotice(degradedReason));
+          setError(null);
+          setLoading(false);
+          return;
+        }
+        setDegraded(null);
         if (activeQualified) {
           const body = adaptQualifiedBrowse(activeSource, raw as QualifiedBrowseEnvelope, activeAccount);
           setRows(prependSelected(body.rows, body.selected)); setNextOffset(body.cursor); setPending(body.pending);
@@ -189,6 +211,7 @@ export function useConversations(
   // spinner over a populated list) — only this wrapper sets it.
   const retry = useCallback(() => {
     setError(null);
+    setDegraded(null);
     setLoading(true);
     loadFirstPage();
   }, [loadFirstPage]);
@@ -278,6 +301,14 @@ export function useConversations(
       if (sourceRef.current !== activeSource
         || qualifiedRef.current !== activeQualified
         || accountRef.current !== activeAccount) return;
+      // Same guard as page 1: a store that degrades mid-paging must stop the
+      // cursor and say why, not throw into the swallowing catch below.
+      const degradedReason = conversationDegradedReason(raw);
+      if (degradedReason != null) {
+        setNextOffset(null);
+        setDegraded(conversationDegradedNotice(degradedReason));
+        return;
+      }
       if (activeQualified) {
         const body = adaptQualifiedBrowse(activeSource, raw as QualifiedBrowseEnvelope, activeAccount);
         setRows((prev) => appendUnique(prev, body.rows)); setNextOffset(body.cursor); setPending(body.pending);
@@ -313,7 +344,7 @@ export function useConversations(
     dispatch({ type: 'CACHE_CONVERSATION_TITLES', titles: rows.map((r) => [conversationSummaryRef(r), r.title]) });
   }, [rows]);
 
-  return { rows, loading, error, hasMore: nextOffset != null, loadMore, loadingMore, filterDegraded, sortDegraded, retry, pending };
+  return { rows, loading, error, hasMore: nextOffset != null, loadMore, loadingMore, filterDegraded, sortDegraded, retry, pending, degraded };
 }
 
 function prependSelected(rows: ConversationSummary[], selected?: ConversationSummary): ConversationSummary[] {

@@ -990,6 +990,589 @@
         "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1012-1012]",
         "tests/test_record_credit.py::test_apply_clears_reset_zero_marker"
       ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0088",
+      "predecessorDigest": "6676c91d59000f79b07bd02d245b176279faf12c5987bd41b3655590e8e213a9",
+      "profile": "public",
+      "reason": "#750 S4 renamed this case because half of what its old name asserted is the defect the session removed. The projects envelope's usage-snapshot read reduced rows in SQL before Python saw them, which discarded every segment of a credited week except the last, so acceptance 5 required that reduction to move into the reducer. The case still asserts that the read is bounded, which is the half that survives the change; the per-segment reduction it used to assert is now asserted positively by test_every_segment_of_a_credited_week_gets_its_own_percent_in_the_envelope in the same module. The body is otherwise unchanged and no coverage leaves the estate.",
+      "renames": [
+        {
+          "from": "tests/test_projects_envelope.py::test_usage_snapshot_read_is_bounded_and_reduced_before_python",
+          "to": "tests/test_projects_envelope.py::test_usage_snapshot_read_is_bounded_before_python"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0090",
+      "predecessorDigest": "6676c91d59000f79b07bd02d245b176279faf12c5987bd41b3655590e8e213a9",
+      "profile": "public",
+      "reason": "#750 S3 made a credited week N-ary: N credits produce N+1 segments. This single case asserted the binary shape - one credit, two segments - and cannot express the N-ary contract S4 owns, so it was replaced rather than renamed. Five cases in the same module carry its coverage and extend it: test_two_segments_sharing_a_start_date_with_no_credit_are_not_bounded (the proven counterexample acceptance 1 requires), test_segments_of_a_real_credited_week_are_bounded_by_their_own_cut, test_a_week_with_n_cuts_yields_n_plus_one_bounded_segments, test_a_capture_exactly_at_the_credit_belongs_to_the_post_credit_segment, and test_a_credited_tail_with_no_post_cut_observation_reports_missing. Every assertion the retired case made is made by one of those five, so no behaviour it covered is now uncovered.",
+      "rows": [
+        "tests/test_weekly_credit_segments.py::test_build_weekly_view_resolves_each_segment_to_its_own_percent"
+      ]
+    },
+    {
+      "axis": "frontendTests",
+      "cause": "renamed",
+      "id": "R-0092",
+      "predecessorDigest": "6676c91d59000f79b07bd02d245b176279faf12c5987bd41b3655590e8e213a9",
+      "profile": "public",
+      "reason": "#750 S4 converts the client's counting noun from weeks to billing cycles, because a quota credit ends one cycle and starts another inside the same subscription week. Sixteen vitest identifiers move because their titles named the old unit; two playwright identifiers move because the spec file was renamed from period-native-vocabulary.spec.ts to period-vocabulary-convergence.spec.ts, which is what it now asserts. Fifteen of the eighteen keep their bodies unchanged and differ only in title text, or - for the two TrendModal cases under 'derives the week count from N (TR-1)' - in the enclosing describe. Three changed their assertions as well as their names, and that is recorded here rather than implied away: ProviderModalParity's 'All Trend modal uses cycle vocabulary only in the Codex history (#576)', TrendPanel's 'uses cycle vocabulary for the Codex series without changing Claude (#576)' and currentWeekHistory's 'names the Codex navigator in cycle vocabulary, and leaves Claude on week' each asserted that Claude kept week vocabulary while Codex did not. #576 recorded a provider difference that never existed in the data, because cctally report split a credited week into billing cycles long before this epic. S4 removes the difference, so each of those three now asserts convergence across both providers and additionally asserts that no week-flavoured string survives on either. The successors are strictly stronger than the cases they replace, and no coverage leaves the estate.",
+      "renames": [
+        {
+          "from": "playwright::chromium::period-native-vocabulary.spec.ts::provider-native period vocabulary at 1440x900",
+          "to": "playwright::chromium::period-vocabulary-convergence.spec.ts::period vocabulary convergence and provider-native tokens at 1440x900"
+        },
+        {
+          "from": "playwright::chromium::period-native-vocabulary.spec.ts::provider-native period vocabulary at 390x844",
+          "to": "playwright::chromium::period-vocabulary-convergence.spec.ts::period vocabulary convergence and provider-native tokens at 390x844"
+        },
+        {
+          "from": "vitest::__tests__/TrendModal.test.tsx::<TrendModal /> > renders the weeks pill and all three hero cards",
+          "to": "vitest::__tests__/TrendModal.test.tsx::<TrendModal /> > renders the cycles pill and all three hero cards"
+        },
+        {
+          "from": "vitest::__tests__/TrendModal.test.tsx::<TrendModal /> > renders x-axis labels W\u221211 / W\u22125 / Now",
+          "to": "vitest::__tests__/TrendModal.test.tsx::<TrendModal /> > renders x-axis labels C\u221211 / C\u22125 / Now"
+        },
+        {
+          "from": "vitest::__tests__/TrendPanel.test.tsx::<TrendPanel /> > renders the 8-week heading",
+          "to": "vitest::__tests__/TrendPanel.test.tsx::<TrendPanel /> > renders the 8-cycle heading"
+        },
+        {
+          "from": "vitest::src/modals/ProjectsModal.test.tsx::<ProjectsModal /> > clicking 8w pill updates prefs and re-renders the title",
+          "to": "vitest::src/modals/ProjectsModal.test.tsx::<ProjectsModal /> > clicking the 8 pill updates prefs and re-renders the title"
+        },
+        {
+          "from": "vitest::src/modals/ProjectsModal.test.tsx::<ProjectsModal /> > renders the \"Showing N weeks\" notice when actual < requested",
+          "to": "vitest::src/modals/ProjectsModal.test.tsx::<ProjectsModal /> > renders the \"Showing N cycles\" notice when actual < requested"
+        },
+        {
+          "from": "vitest::src/modals/ProjectsModal.test.tsx::<ProjectsModal /> > renders window pills with the current selection (default 4w)",
+          "to": "vitest::src/modals/ProjectsModal.test.tsx::<ProjectsModal /> > renders window pills with the current selection (default 4)"
+        },
+        {
+          "from": "vitest::src/modals/ProviderModalParity.test.tsx::All Trend modal uses cycle vocabulary only in the Codex history (#576)",
+          "to": "vitest::src/modals/ProviderModalParity.test.tsx::All Trend modal uses the cycle vocabulary in BOTH histories (#576, #750 S4)"
+        },
+        {
+          "from": "vitest::src/modals/TrendModal.test.tsx::<TrendModal /> derives the week count from N (TR-1) > renders the empty-state title as bare \"Trend\" (no misleading count)",
+          "to": "vitest::src/modals/TrendModal.test.tsx::<TrendModal /> derives the cycle count from N (TR-1) > renders the empty-state title as bare \"Trend\" (no misleading count)"
+        },
+        {
+          "from": "vitest::src/modals/TrendModal.test.tsx::<TrendModal /> derives the week count from N (TR-1) > states the real N in the title + section head, never \"12-week\"",
+          "to": "vitest::src/modals/TrendModal.test.tsx::<TrendModal /> derives the cycle count from N (TR-1) > states the real N in the title + section head, never \"12-week\""
+        },
+        {
+          "from": "vitest::src/modals/TrendModal.test.tsx::<TrendModal /> median-KPI collapse (TREND-KPI \u00b7 decision 8) > collapses to two tiles with an informational hint when <4 non-current weeks",
+          "to": "vitest::src/modals/TrendModal.test.tsx::<TrendModal /> median-KPI collapse (TREND-KPI \u00b7 decision 8) > collapses to two tiles with an informational hint when <4 non-current cycles"
+        },
+        {
+          "from": "vitest::src/modals/TrendModal.test.tsx::<TrendModal /> median-KPI collapse (TREND-KPI \u00b7 decision 8) > keeps the three-tile hero when >=4 non-current weeks (median present)",
+          "to": "vitest::src/modals/TrendModal.test.tsx::<TrendModal /> median-KPI collapse (TREND-KPI \u00b7 decision 8) > keeps the three-tile hero when >=4 non-current cycles (median present)"
+        },
+        {
+          "from": "vitest::src/modals/currentWeekHistory.test.tsx::provider-specific navigator vocabulary (#556 S4) > names the Codex navigator in cycle vocabulary, and leaves Claude on week",
+          "to": "vitest::src/modals/currentWeekHistory.test.tsx::provider-specific navigator vocabulary (#556 S4) > names both providers' navigators in cycle vocabulary"
+        },
+        {
+          "from": "vitest::src/panels/TrendPanel.test.tsx::TrendPanel card week count (TR-1 / #251) > renders the real week count in the card sub, never hardcoded \"8 weeks\"",
+          "to": "vitest::src/panels/TrendPanel.test.tsx::TrendPanel card week count (TR-1 / #251) > renders the real week count in the card sub, never hardcoded \"8 cycles\""
+        },
+        {
+          "from": "vitest::src/panels/TrendPanel.test.tsx::TrendPanel card week count (TR-1 / #251) > singularizes the count for a one-week stub",
+          "to": "vitest::src/panels/TrendPanel.test.tsx::TrendPanel card week count (TR-1 / #251) > singularizes the count for a one-cycle stub"
+        },
+        {
+          "from": "vitest::src/panels/TrendPanel.test.tsx::TrendPanel source seam \u2014 no Claude leak under Codex (#294 S5) > uses cycle vocabulary for the Codex series without changing Claude (#576)",
+          "to": "vitest::src/panels/TrendPanel.test.tsx::TrendPanel source seam \u2014 no Claude leak under Codex (#294 S5) > uses the cycle vocabulary for BOTH series (#576, re-argued by #750 S4)"
+        },
+        {
+          "from": "vitest::src/panels/hydratingSkeletons.test.tsx::per-panel hydrating headers (#278) > TrendPanel header shows the real week count when hydrated",
+          "to": "vitest::src/panels/hydratingSkeletons.test.tsx::per-panel hydrating headers (#278) > TrendPanel header shows the real cycle count when hydrated"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0094",
+      "predecessorDigest": "380e2be465829d9d845c5dba846f22f7620e767dbf60ed3ff414348c31a4e442",
+      "profile": "public",
+      "reason": "The approved focused-merge workflow adds scheduled and manual private full verification. Replace these two former zero-lane assertions with test_private_tags_stay_empty_and_background_verification_runs_once under the same tag-push and weekly-cron parameters: the private tag still executes zero estates, while the private background now executes exactly one. The declared topology also gains private-background coverage for schedule and workflow_dispatch. No test coverage or suppression is removed; the old identifiers are retired because their names and the old cron-zero expectation no longer describe the approved contract.",
+      "rows": [
+        "tests/test_frontend_estate_topology.py::test_a_private_tag_push_or_cron_admits_no_lane[tag push]",
+        "tests/test_frontend_estate_topology.py::test_a_private_tag_push_or_cron_admits_no_lane[weekly cron]"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0096",
+      "predecessorDigest": "8e420389badbdb5772d470c3d2d0f73732ec391d61ef44885ab955d42121063d",
+      "profile": "public",
+      "reason": "The retired name stated the contract that WAS the #755 stall: any higher candidate in the same physical window cancelled the pending drop, so one session still reporting the stale pre-reset percentage erased another session's real reset and the weekly reset of 2026-09-04 never reached the database. The maximum across contributors decides what is displayed; it may not erase the accumulated evidence that a drop is pending. Cancellation now means a retained SUPPORTER actively reporting at or above the baseline, which is what the successor asserts. The complementary half - a dissenting non-supporter at the baseline leaving the evidence alone - is asserted beside it by the new test_a_dissenting_contributor_at_the_baseline_does_not_erase_the_evidence. The cause is renamed rather than retired because the cancellation contract survived in narrowed form under one successor.",
+      "renames": [
+        {
+          "from": "tests/test_statusline_candidates.py::test_higher_same_window_candidate_cancels_pending_drop",
+          "to": "tests/test_statusline_candidates.py::test_a_supporter_reporting_the_baseline_cancels_the_pending_drop"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0097",
+      "predecessorDigest": "8e420389badbdb5772d470c3d2d0f73732ec391d61ef44885ab955d42121063d",
+      "profile": "public",
+      "reason": "The retired name pinned the behaviour #755 removed: an upward correction from one contributor called _new_pending, which reset first_seen_at and marked every contributor unsatisfied, so a single correcting session discarded every other session's progress. Once the drop carries a deadline, restarting the generation would also move that deadline, and D5 fixes it at the first pending drop. The successor asserts the replacement contract over the same shape: the correction updates that one contributor and the reduced maximum, and first_seen_at, deadline_at and every other contributor's progress are carried through unchanged.",
+      "renames": [
+        {
+          "from": "tests/test_statusline_candidates.py::test_lower_only_rise_restarts_pending_generation",
+          "to": "tests/test_statusline_candidates.py::test_an_upward_correction_updates_one_contributor_and_restarts_nothing"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0098",
+      "predecessorDigest": "8e420389badbdb5772d470c3d2d0f73732ec391d61ef44885ab955d42121063d",
+      "profile": "public",
+      "reason": "The retired name asserted the inverse of what the subsystem now guarantees. A candidate is active only while -5 <= now - received_at < 90 while the deadline is 180 seconds, so every contributor supporting a pending low can age out before that drop's own deadline expires. Cancelling on expiry therefore made the deadline unreachable in exactly the case it exists for, and contributors merely ageing out is silence rather than retraction. The successor asserts that the drop outlives them and publishes from its own retained evidence, which is acceptance criterion 21.",
+      "renames": [
+        {
+          "from": "tests/test_statusline_candidates.py::test_pending_drop_is_cancelled_when_every_contributor_has_expired",
+          "to": "tests/test_statusline_candidates.py::test_a_pending_drop_outlives_the_contributors_that_armed_it"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0099",
+      "predecessorDigest": "8e420389badbdb5772d470c3d2d0f73732ec391d61ef44885ab955d42121063d",
+      "profile": "public",
+      "reason": "The retired name promised the contract #755 removed, under which an empty spool expired a pending drop whatever it held. An empty spool is not a retraction now: a drop carrying retained evidence survives it and publishes at its own deadline. The body was already passing only because its helper builds a record with retained=None, so what it actually pins is the evidence-free record being cleared, and the successor says that. The body and every assertion are unchanged; only the name and the docstring moved.",
+      "renames": [
+        {
+          "from": "tests/test_statusline_persist.py::test_empty_spool_reconciles_expired_pending_drop",
+          "to": "tests/test_statusline_persist.py::test_empty_spool_clears_an_evidence_free_pending_drop"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0100",
+      "predecessorDigest": "8e420389badbdb5772d470c3d2d0f73732ec391d61ef44885ab955d42121063d",
+      "profile": "public",
+      "reason": "No test was renamed and no coverage moved: the case is parametrized over (raw_epoch, opened_epoch) drawn from _cctally_core.STATS_INDEX_EPOCH, and #769 S2 section 3 advanced that constant from 1013 to 1014 for the five_hour_credit_confirmation_state table. Two of the three generated identifiers therefore moved with it, [0-1013] to [0-1014] and [1013-1013] to [1014-1014], while [0-0] is a literal and is unchanged. The parameter list, the body and every assertion are untouched. The cause is renamed because each old identifier has exactly one successor that is absent from the previous estate and present in the current one; these identifiers name the current head rather than history, which is the distinction acceptance criterion 26 draws.",
+      "renames": [
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1013]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1014]"
+        },
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1013-1013]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1014-1014]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0103",
+      "predecessorDigest": "c3e5741467fa3ea0ab866cdd816b935dd4909e165120644ae078d97ad4c12bcc",
+      "profile": "public",
+      "reason": "No test was renamed, no coverage moved and no test was retired: this module DISCOVERS every `stats_open_guarded(...)` call site in `bin/` by walking the AST, and labels each one `<file>:<lineno>`, so the identifier is a source line number rather than a name. #769 S3 tranche 1 added 26 lines above that call in `bin/_cctally_dashboard.py` \u2014 the comment and guard that report a refused orphan prune (#729) \u2014 and the one dashboard site moved from line 7495 to line 7521. The call itself, its `connect=` lambda and every assertion over it are byte-identical, and the parameter list is the same length before and after. The cause is renamed because the old identifier has exactly one successor, absent from the previous estate and present in the current one.",
+      "renames": [
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7495]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7521]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0110",
+      "predecessorDigest": "a41aa831e96af4dbce9b7231b32b1fee6b4ad879a85e1c43d4675a3b8d4af393",
+      "profile": "public",
+      "reason": "No test was renamed, no coverage moved and no test was retired: this module DISCOVERS every `stats_open_guarded(...)` call site in `bin/` by walking the AST and labels each one `<file>:<lineno>`, so the identifier is a source line number rather than a name. The precedent is R-0103, which recorded the same class of move for the same module. #769 S3 tranche 2 added lines above all three sites: `bin/_cctally_dashboard.py` gained the frontier-drop comment recording the one-pass window a concurrent plan capture can slip through, and `bin/_cctally_db.py` gained conversations migration 009 with its staging/stamp schema helper and its resumable stamp backfill. Every call, its `connect=` lambda and every assertion over it are byte-identical, and the parameter list is the same length before and after. The cause is renamed because each old identifier has exactly one successor, absent from the previous estate and present in the current one.",
+      "renames": [
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7521]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7537]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:9832]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:10185]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:11295]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:11648]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0111",
+      "predecessorDigest": "a41aa831e96af4dbce9b7231b32b1fee6b4ad879a85e1c43d4675a3b8d4af393",
+      "profile": "public",
+      "reason": "The test was renamed, and its body was reframed to assert what is actually true rather than what the spec first claimed. It was titled `test_certification_verdict_flips_with_the_new_field` and its docstring said that adding `PruneResult.prune_refused` makes an existing blind `provider_sync_certifiable` check start firing in production. The tranche 1 review found that premise wrong: `PruneResult` is constructed in `_prune_orphaned_cache_entries` and consumed only by `_dashboard_self_heal_orphans` and its startup caller, while the sole production caller of `provider_sync_certifiable` passes accounting sync stats that already carry the field, so no production verdict can flip. The successor keeps both original assertions verbatim and states that the composition is synthetic. No coverage was lost: the same commit adds `test_no_production_path_routes_a_prune_result_to_the_certifier`, which fails if a production path ever does route one there.",
+      "renames": [
+        {
+          "from": "tests/test_cache_prune_orphans.py::test_certification_verdict_flips_with_the_new_field",
+          "to": "tests/test_cache_prune_orphans.py::test_the_shared_predicate_would_read_the_field_if_a_result_reached_it"
+        }
+      ]
+    },
+    {
+      "axis": "suppressions",
+      "cause": "retired",
+      "id": "R-0112",
+      "predecessorDigest": "a41aa831e96af4dbce9b7231b32b1fee6b4ad879a85e1c43d4675a3b8d4af393",
+      "profile": "public",
+      "reason": "A suppression was ADDED, and this declaration supplies its reason. `test_the_title_index_follows_the_publish` asserts that `conversation_title_fts` follows the #752 publish transaction through the existing `conv_title_fts_ai`/`_ad`/`_au` triggers. On a SQLite build without FTS5 that index does not exist at all, so there is nothing for the assertion to observe and the case has no meaning rather than a different answer. It is routed through `tests/_fts5_gate.require_fts5`, the ONE home for an FTS5 capability skip (#630 S6), rather than through an inline `pytest.skip` \u2014 so the estate records a helper call and the reason string stays the one every other FTS5 site uses. The product's no-FTS5 behaviour is not skipped anywhere: the publish itself is asserted unconditionally by the other nine cases in the module, and the migration goldens cover a store whose title index is absent.",
+      "rows": [
+        "tests/test_conversation_rebuild_generation.py::test_the_title_index_follows_the_publish::helper_call::helper=_fts5_gate.require_fts5"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0116",
+      "predecessorDigest": "0e7c4fd26dc7466655359cc677e47d70ef0df5d7a9f262225f31cca1582e60e4",
+      "profile": "public",
+      "reason": "The same line-number class as R-0103, R-0110 and R-0113: this module labels each discovered `stats_open_guarded(...)` call site `<file>:<lineno>`, so the identifier moves whenever lines are added above it. The stamp backfill in `bin/_cctally_db.py` grew by 49 lines when it was corrected to record a source file's whole identity \u2014 device, inode and committed-prefix digest, not only the incarnation \u2014 so both sites in that file moved. Each call, its `connect=` lambda and every assertion over it are byte-identical, and each old identifier has exactly one successor.",
+      "renames": [
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:10185]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:10234]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:11648]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:11697]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0118",
+      "predecessorDigest": "78fb7ad98b14bcd6e3374dc1b48044199b607f22ad025f1ed3b22da242818349",
+      "profile": "public",
+      "reason": "Line-number-keyed parametrisation, not a removal. `test_every_custom_connector_forwards_the_cache_option` names each connector `<file>:<lineno>`, so the identifier moves whenever lines are added above the call. #769 S3 edited `bin/_cctally_db.py` (the stamp backfill's per-offset gap causes) and `bin/_cctally_dashboard.py` (the #780 startup schema owner and the maintenance ring's publication), so three ids moved. RE-DECLARED IN THE `renamed` SHAPE during Tranche 4: the original entry used `cause: \"retired\"` with a `rows` list while its own prose called the change a rename, which is the shape R-0116 directly above already uses for exactly this churn, and a `retired` declaration reads as evidence that coverage was given up. Each call, its `connect=` lambda and every assertion over it are byte-identical, and each old identifier has exactly one successor, verified present at its new line number.",
+      "renames": [
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7537]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7594]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:10234]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:10249]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:11697]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:11712]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0120",
+      "predecessorDigest": "570935b33e519c43ed51ccb1d29b8e3ac65c5691aa9ccad7f8697d7e5a3f9b2e",
+      "profile": "public",
+      "reason": "Line-number-keyed parametrisation, not a removal \u2014 the same class as R-0116 and R-0118/R-0119, and declared in the same `renamed` shape. `test_every_custom_connector_forwards_the_cache_option` labels each discovered `stats_open_guarded(...)` call `<file>:<lineno>`, so the id moves whenever lines are added above it. #769 S3 Tranche 4 added about 150 lines to `bin/_cctally_dashboard.py` \u2014 the #714 pricing-file watch (`_PricingWatch`, `_start_pricing_watch`) and the one-shot background schema wake-up the Tranche 3 review required \u2014 so the single connector in that file moved from line 7594 to line 7746. The call, its `connect=` lambda and every assertion over it are byte-identical, and the successor is present at its new line number.",
+      "renames": [
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7594]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7746]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0122",
+      "predecessorDigest": "03d3ab0d250710e79920c67e52639255b4522d69fd4f176d6f0d43e37e6148f8",
+      "profile": "public",
+      "reason": "Line-number-keyed parametrisation, not a removal \u2014 the same class as R-0118/R-0119 and R-0120/R-0121, and declared in the same `renamed` shape. `test_every_custom_connector_forwards_the_cache_option` labels each discovered `stats_open_guarded(...)` call `<file>:<lineno>`, so the id moves whenever lines are added above it. The #769 S3 final remediation pass added about 29 lines to `bin/_cctally_dashboard.py` \u2014 the #714 pricing-snapshot context entered by `_dispatch`, `_make_dashboard_run_iteration` and `_conversation_sync_pass`, the `_STREAMING_ROUTE_HANDLERS` exclusion set, the `import _lib_pricing` line, and the schema wake-up's `thread.start()` moving inside the lock \u2014 so the single connector in that file moved from line 7746 to line 7775. The call, its `connect=` lambda and every assertion over it are byte-identical, and the successor is present at its new line number.",
+      "renames": [
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7746]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7775]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0124",
+      "predecessorDigest": "c3e5741467fa3ea0ab866cdd816b935dd4909e165120644ae078d97ad4c12bcc",
+      "profile": "public",
+      "reason": "The connector inventory parametrizes by call site, so each identifier ends in the LINE NUMBER of a stats_open_guarded call. #769 S3 inserted code above three of them and the identifiers moved with it; no case was removed, no connector stopped being covered, and the successor of each is present in this tree. Verified call site by call site against 2d1cfad11: _cctally_dashboard.py:7495 and :7775 are both the stats_open_guarded(_cctally_core.DB_PATH, ...) opener; _cctally_db.py:9832 and :10249 are both the stats_open_guarded(db_path, ...) reached from `db status` and doctor_gather_state; and _cctally_db.py:11295 and :11712 are both the stats_open_guarded(path, connect=_backup_source_connect) used by the stats backup. The declaration is owed only because merging origin/main into this branch made 2d1cfad11 a predecessor of HEAD, and that revision's artifact still records the pre-move line numbers; against the branch's own earlier predecessors the same three rows were unchanged.",
+      "renames": [
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7495]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7775]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:9832]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:10249]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:11295]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:11712]"
+        }
+      ]
+    },
+    {
+      "axis": "suppressions",
+      "cause": "retired",
+      "id": "R-0125",
+      "predecessorDigest": "c3e5741467fa3ea0ab866cdd816b935dd4909e165120644ae078d97ad4c12bcc",
+      "profile": "public",
+      "reason": "Nothing was retired. An addition is the harmful direction on this axis and the vocabulary offers only 'retired', 'reclassified' and 'renamed', so this entry follows R-0007 in using 'retired' for a suppression that arrived. What actually changed: #769 S3 added test_the_title_index_follows_the_publish, which asserts that conversation_title_fts \u2014 an external-content index over the live table \u2014 is driven by the publish's DELETE and INSERT through the existing triggers. Asserting that requires FTS5, so the test opens with the shared _fts5_gate.require_fts5() call, which is the one chokepoint every FTS5 capability skip in this repository already routes through. The skip fires only on a SQLite build without FTS5. No existing test was weakened and no coverage was suppressed on a runner that can execute it.",
+      "rows": [
+        "tests/test_conversation_rebuild_generation.py::test_the_title_index_follows_the_publish::helper_call::helper=_fts5_gate.require_fts5"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0130",
+      "predecessorDigest": "114f45838500ac9dedb59f50e1712f9f0877fae50b66a5610f339d145f2ecffa",
+      "profile": "public",
+      "reason": "#769 S6 (#716 Task A) retired one test and re-parametrized two. tests/test_bench.py::test_the_frontier_suspension_restores_on_every_exit_path asserted that bin/cctally-bench restored FRONTIER_CERTIFICATE_MAX_AGE_SECONDS after _suspend_frontier_expiry. That helper is gone: it rebound the bound to float(\"inf\") for a whole run, so every recorded benchmark described a policy the product never runs and the whole-estate walk the bound forces was invisible to all of them. Its replacement, test_the_bench_holds_no_way_to_suspend_the_certificate_age_bound, asserts the ABSENCE of any such helper, which is the stronger claim: a helper that came back would put every later measurement under a suspended policy again. Coverage of the constant itself is unchanged \u2014 test_run_all_leaves_the_certificate_age_bound_at_its_default still runs the whole runner and asserts the shared module global is still 120.0 afterwards. The two tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option rows are a RENAME rather than a removal: that test parametrizes on '<file>:<line>' of each custom connector call site in bin/_cctally_db.py, and this session's two new migrations and two new schema-apply helpers moved the lines below them. The same call sites are still enumerated and still asserted under their new line numbers; nothing left the estate on that axis.",
+      "rows": [
+        "tests/test_bench.py::test_the_frontier_suspension_restores_on_every_exit_path",
+        "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:10249]",
+        "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:11712]"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0133",
+      "predecessorDigest": "a5b60bfaa3a372829ca0b604d09ac7430f167f248a0d06bacd2be52850328b25",
+      "profile": "public",
+      "reason": "Six identifiers left tests/test_snapshot_bounded_work.py because #769 S6 T2a (#716 Task B) removed the mechanism they describe, and each was restated for the mechanism that replaced it rather than deleted. _CodexSourceMemoryWorker walked two full container copies of all eleven Codex source caches once per generation in a background thread; retained bytes are now charged at the mutation that changes them, so there is no worker to cancel, no traversal to recover from, and no submission to count. test_source_memory_worker_cancels_a_live_superseded_generation became test_a_superseded_source_generation_is_never_published_stale, test_source_memory_worker_reports_and_recovers_from_traversal_error became test_a_source_charge_failure_does_not_stop_later_charges, both test_source_memory_worker_enforces_completion_without_another_publisher parameters became test_source_admission_owns_its_eviction_on_the_publishing_thread, test_source_accelerator_admission_remeasures_only_mutated_generations became test_source_accelerator_admission_charges_only_what_was_mutated, and test_complete_source_accelerator_owner_fails_closed_on_entry_overflow became test_complete_source_accelerator_owner_bounds_the_entry_count, because segmented LRU eviction replaced the clear-all it asserted. The cause is retired rather than reclassified because these exact identifiers exist in neither profile afterwards. No coverage was dropped: every property they held is asserted by the successor named beside it, and tests/test_retained_byte_accounting.py, tests/test_source_overlay_rollback.py and tests/test_source_cache_degradation.py add the rest.",
+      "rows": [
+        "tests/test_snapshot_bounded_work.py::test_complete_source_accelerator_owner_fails_closed_on_entry_overflow",
+        "tests/test_snapshot_bounded_work.py::test_source_accelerator_admission_remeasures_only_mutated_generations",
+        "tests/test_snapshot_bounded_work.py::test_source_memory_worker_cancels_a_live_superseded_generation",
+        "tests/test_snapshot_bounded_work.py::test_source_memory_worker_enforces_completion_without_another_publisher[error]",
+        "tests/test_snapshot_bounded_work.py::test_source_memory_worker_enforces_completion_without_another_publisher[over-cap]",
+        "tests/test_snapshot_bounded_work.py::test_source_memory_worker_reports_and_recovers_from_traversal_error"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0135",
+      "predecessorDigest": "e4b34b9c1713742adea239038d8449a3e72d521921e7c7c670804785b2c96f98",
+      "profile": "public",
+      "reason": "Renamed rather than retired, in the #769 S6 T2a remediation. `test_a_store_replacement_moves_the_signature` changed no store at all: it changed the caller's own `extra_signature` argument, so it is now `test_a_caller_supplied_signature_leg_moves_the_signature`, and a new `test_replacing_the_store_moves_the_signature` opens a real second store through the SQLite backup API and asserts the `_cache_database_identity` leg that #809 added. `test_an_entry_larger_than_the_whole_budget_is_not_admitted` wrote the entry and then enforced, which proves admit-then-evict rather than never-admit, so it is now `..._is_never_admitted` with the cap set before the write, and `test_a_resident_bucket_above_the_budget_is_still_evicted_and_counted` keeps the pass-level backstop it used to cover. `test_the_visible_population_cap_records_why_it_stays_indivisible` asserted only that a string was longer than forty characters; it is now `test_the_visible_population_owner_is_declared_indivisible_and_evicted_whole` beside `test_the_visible_population_cap_is_still_all_or_nothing`, and both assert behaviour. No coverage is dropped: every retired row is rewritten in the same module, and the estate's added rows are those rewrites.",
+      "rows": [
+        "tests/test_population_signature.py::test_a_store_replacement_moves_the_signature",
+        "tests/test_source_cache_degradation.py::test_an_entry_larger_than_the_whole_budget_is_not_admitted",
+        "tests/test_source_cache_degradation.py::test_the_visible_population_cap_records_why_it_stays_indivisible"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0137",
+      "predecessorDigest": "08ad90069249f9ccfb8a709dd85305e142c88b821d3a337ef56b059df1083cb2",
+      "profile": "public",
+      "reason": "The parametrisation id embeds the source line of the connector call site, so #769 S6 T3's edits to bin/_cctally_dashboard.py moved the case from _cctally_dashboard.py:7775 to its new line. The case itself is unchanged and still runs; only its node id was renamed, and the manifest reads a rename as a removal plus an addition.",
+      "rows": [
+        "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7775]"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0139",
+      "predecessorDigest": "c4e922819f7493d1c4301b9ead06a9031ceb7a439bd6c6007405890d4c063bfe",
+      "profile": "public",
+      "reason": "The parametrisation id embeds the source line of the connector call site, so #769 S9's edits to bin/_cctally_dashboard.py (the split detail input path, the scoped block read and the account constraint) and to bin/_cctally_db.py (two comments that stated the withdrawn device-decides continuity rule) moved all three cases to new lines. The cases themselves are unchanged and still run; only their node ids were renamed, and the manifest reads a rename as a removal plus an addition. Same class as R-0137.",
+      "rows": [
+        "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7835]",
+        "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:10371]",
+        "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:11834]"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0141",
+      "predecessorDigest": "820b4810f7598f8758b51f886c72123d2f64eb29d446f3c750ac98f4282d3d8f",
+      "profile": "public",
+      "reason": "The parametrisation id embeds the source line of the connector call site, so this session's review-findings edits to bin/_cctally_dashboard.py moved this case to a new line. Those edits are the account predicate on the block selector (the P1 review finding: the account reached the stats candidate row but not the evidence, so the route rendered one account's percentage beside the other's observations) together with the comment corrections around the degradation gate and the operator-attribution overlay. The case itself is unchanged and still runs; only its node id was renamed, and the manifest reads a rename as a removal plus an addition. Same class as R-0137 and R-0139.",
+      "rows": [
+        "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:7945]"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0143",
+      "predecessorDigest": "82120ffdb0fe15e8a9cbe46eecf7349c7745a5ee1d6ea36355a2eabb7ab2d073",
+      "profile": "public",
+      "reason": "The case was not retired; #820 parametrised it. It anchors the property that the validator's `token-credential` denylist catches a transformer regression independently, and #820 extended the token grammar from the single word `token` to five spellings \u2014 `token`, `access_token`, `refresh_token`, `id_token` and `bearer_token` \u2014 because `_` is a word character, so `\\btoken\\b` never matched between a prefix and `token` and the four prefixed forms published their values in full through BOTH scrub surfaces. The case now runs once per spelling over TOKEN_CREDENTIAL_WORDS, so the bare node id is replaced by five bracketed ids and coverage grew fivefold rather than shrinking. A single bare row could not have caught #820: the word `token` passed throughout the period the four prefixed spellings matched neither surface, which is exactly why the case is now parametrised.",
+      "rows": [
+        "tests/test_test_evidence_kernel.py::test_the_validator_catches_a_transformer_regression_independently"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0145",
+      "predecessorDigest": "b1493585c5022ea5fe895a946e290105b7197598efda6d4cf6df377d133f4f4c",
+      "profile": "public",
+      "reason": "None of these five rows is a coverage loss, and three distinct mechanisms account for them.\n\nTwo are epoch renames. `test_live_ingest_acquires_maintenance_before_ingest_lock` is parametrised over `_cctally_core.STATS_INDEX_EPOCH`, which #824 moved from 1014 to 1015 because `weekly_usage_snapshots` gained the `weekly_observation_held` column and a stats schema change is always an epoch bump rather than a new migration (the registry is frozen). The `[0-1014]` and `[1014-1014]` ids are therefore replaced by `[0-1015]` and `[1015-1015]`, `[0-0]` is unchanged, the case count is identical, and the property the case anchors \u2014 that a live ingest acquires the maintenance lock before the ingest lock \u2014 is untouched. The identical 1013-to-1014 transition is already declared in this file, and this declaration follows it.\n\nTwo are line-number renames. `test_every_custom_connector_forwards_the_cache_option` is parametrised by the `<module>:<line>` of each custom stats connector, so any edit above a connector site renames its case without changing what is covered. S11 edited both modules above their sites: `bin/_cctally_journal.py` gained the axis-separated fold result and the five-hour high-water rematerialization, and `bin/_cctally_dashboard.py` gained the held-row exclusion on the rows it pre-fetches for `latest_usage_by_segment`. The same connectors are still enumerated and still asserted to forward the cache option.\n\nOne is a genuine removal, and it is a replacement rather than a retreat. `test_fold_decision_clamp_skip_7d` asserted that a weekly-clamped tick returned the `SNAPSHOT_SKIP_CLAMP` reason of the fold's old positional `(skip, adjusted, reason)` tuple. Both halves of that statement are now false by design: the fold returns `UsageSnapshotFoldResult`, which states the weekly and five-hour axes separately, and a weekly-clamped tick no longer skips at all \u2014 it writes a row marked `weekly_observation_held = 1` so that its five-hour evidence survives, which is the whole point of #824. The case is superseded in the same module by `test_fold_decision_clamp_holds_the_weekly_axis` and by `test_fold_truth_table`, which drives all eleven rows of the specification's decision table, so coverage of this predicate grew rather than shrank.",
+      "rows": [
+        "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1014]",
+        "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1014-1014]",
+        "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:8002]",
+        "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_journal.py:8585]",
+        "tests/test_writer_reroute.py::test_fold_decision_clamp_skip_7d"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0147",
+      "predecessorDigest": "4b3ead27c3573f85029fb718181d413247b4dd00d2fe81a7a303c33ed090fc25",
+      "profile": "public",
+      "reason": "Five pytest node identifiers moved in #834 S2, in two unrelated ways, and no coverage left the estate in either. Three are deliberate renames whose old names asserted the opposite of the behaviour the session established. `test_a_partial_generation_still_degrades_the_project_route` named a partial generation where #829 now distinguishes a transient read failure from a malformed row, so the name said `partial` about the one case that is not one. `test_a_complete_generation_publishes_no_metadata_qualifier` said the qualifier is absent, and #829 publishes it as a present null so every source entry within one schema version carries the same keys, which is the opposite claim. `test_fresh_partial_provider_is_reusable_and_contributes_all_totals` asserted reusability that #830 removed on purpose: a fresh partial provider still contributes to the All-source totals and is no longer eligible for reuse, so the old name now states the defect. Each body kept its assertions and gained the new ones; nothing was deleted. The remaining two moved without anybody editing them. `test_every_custom_connector_forwards_the_cache_option` is parametrized by connector SITE, and each identifier embeds the source line the site sits on, so inserting code anywhere above a site renames its node. `_cctally_dashboard.py:8006` became `:8067` because Tranche B added to that file above the site, and `_cctally_journal.py:8784` became `:8832` because Tranche A added the #827 prefix-digest helper above its site. The two connectors, their assertions and the inventory they are drawn from are untouched, and the parametrized set still holds eight sites before and after.",
+      "renames": [
+        {
+          "from": "tests/test_codex_detail_bounded_reads.py::test_a_partial_generation_still_degrades_the_project_route",
+          "to": "tests/test_codex_detail_bounded_reads.py::test_a_transient_read_failure_degrades_the_project_route_and_says_so"
+        },
+        {
+          "from": "tests/test_codex_session_detail_rows.py::test_a_complete_generation_publishes_no_metadata_qualifier",
+          "to": "tests/test_codex_session_detail_rows.py::test_a_complete_generation_publishes_a_null_metadata_qualifier"
+        },
+        {
+          "from": "tests/test_dashboard_source_kernel.py::test_fresh_partial_provider_is_reusable_and_contributes_all_totals",
+          "to": "tests/test_dashboard_source_kernel.py::test_fresh_partial_provider_contributes_all_totals_but_is_not_reusable"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:8006]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:8067]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_journal.py:8784]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_journal.py:8832]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0149",
+      "predecessorDigest": "15d707078d81e9a0d4bc05d8ccbbfa287c50d838625a324ed8b57945a5afeb9c",
+      "profile": "public",
+      "reason": "This node id is parametrized by the LINE NUMBER of a custom stats connector call site, so an edit anywhere ABOVE that line renames the identity without anyone touching the test. #834 S2's correction to `_codex_partial_source_detail` added sixteen lines to `bin/_cctally_dashboard.py` \u2014 a `read_failure_transient` parameter, the comment recording why the generation carrier must not qualify a live read, and the branch that takes the cause from the handled exception \u2014 which moved the `_cctally_store.stats_open_guarded` call from line 8067 to line 8083. The same call site is still enumerated and still asserted to forward the cache option, so no coverage left the estate; only the identity moved. This is the second such move for this one call site in this session: R-0147 and R-0148 declared 8006 to 8067 for the same reason, which is why the pair is declared rather than investigated.",
+      "renames": [
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:8067]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:8083]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0151",
+      "predecessorDigest": "20fcd3788a8c36d82f6e6c372a800eec80cb6909825e809fc781e2cef8d3fb79",
+      "profile": "public",
+      "reason": "The third self-rename of this one call site in this session, by the mechanism R-0147/R-0148 and R-0149/R-0150 already declared: the node id is parametrized by the LINE NUMBER of a custom stats connector call site, so any edit above that line renames the identity while nobody touches the test. The correction to the manufactured `QualifiedMetadataUnavailable` in `_build_codex_source_detail` added twelve lines above it \u2014 the carrier-state lookup, the explicit `transient` argument, and the comment recording that a malformed carrier was publishing the transient retry sentence against its own status chip \u2014 which moved the `_cctally_store.stats_open_guarded` call from line 8083 to line 8095. The same call site is still enumerated and still asserted to forward the cache option, so no coverage left the estate and the cause is `renamed` rather than the `retired` the generator's printed block defaults to. Three declarations for one unedited test in one session is a cost of the line-number parametrization itself, and is recorded as a follow-up against that test rather than against the estate.",
+      "renames": [
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:8083]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:8095]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0153",
+      "predecessorDigest": "fd5aa5057bf6409b4595a64cc5d9553e243599689a4e54c7c1b201f6dab72fb9",
+      "profile": "public",
+      "reason": "One pytest node is removed, and no coverage leaves the estate with it, because the node asserted a state that nothing in production can produce. `test_a_failed_read_outranks_a_malformed_count_in_the_source_warning` was written during #834 S2 to pin the order in which the Codex source warning tests `metadata_read_failed` against a non-zero `health.incomplete_rows`. That pair is unconstructible: `_capture_codex_accounting` issues the qualified accounting read only under `if not metadata_incomplete:`, so a window holding malformed rows never attempts the read that could fail, and the two conditions are mutually exclusive on every path. The gate sits upstream of the call, so patching `load_qualified_codex_entries` does not reach it either, which is why the test could not be made to pass by seeding rather than by patching. It was seeded in a real browser during the #834 S2 QA gate over the same tree, and the browser run established the same thing: seeding both conditions at once yields a `malformed_row_partial` carrier and the qualified-read-unavailable log line stops firing altogether. The ordering it tried to protect is kept, because both orders agree over every reachable state and the order stated is the one that stays correct if the gate is ever narrowed. What replaces the test is a comment at the ordering recording that no test covers the pair, deliberately, and that one was written here and removed for exactly this reason. A test that asserts an impossible state is not coverage; keeping it would have left a permanently failing node in the estate.",
+      "rows": [
+        "tests/test_dashboard_source_read_model.py::test_a_failed_read_outranks_a_malformed_count_in_the_source_warning"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0155",
+      "predecessorDigest": "4b3ead27c3573f85029fb718181d413247b4dd00d2fe81a7a303c33ed090fc25",
+      "profile": "public",
+      "reason": "Binds the #834 S2 dashboard call-site rename to the digest MAIN's parent records, which is the predecessor a merge commit's walk reaches and the branch's own run never consulted. `predecessor_revisions` returns just [HEAD] for an ordinary commit but [HEAD, p1, p2] for a merge, so a declaration bound only to a branch-internal digest passes the branch's authoritative run and then refuses main's CI at admission, before the pool starts, with no prior warning. That is what happened here: the branch gate saw no transition at all, because at its own HEAD the recorded estate IS the current one, and CI then refused on the merge. This node id is parametrized by the LINE NUMBER of a custom stats connector call site, so any edit above that line renames it while nobody touches the test. Across this session the site moved three times, 8006 to 8067 to 8083 to 8095, and R-0147, R-0149 and R-0151 each declared one hop against the digest current at that moment. None of them covers the transition seen from main's parent, because a `renamed` declaration requires its successor to be absent from the predecessor AND present in the current estate, and the two intermediate successors 8067 and 8083 are in neither. Only the end of the chain is, so this declaration names 8006 to 8095 directly. The other four pairs in R-0147 and R-0148 need no equivalent, because their successors are final and already satisfy that clause. No coverage left the estate: the same call site is still enumerated and still asserted to forward the cache option, which is why the cause is `renamed` rather than the `retired` a printed block would default to. The three hop declarations stay in the ledger as the historical record of transitions that did happen, and the retirement ledgers are outside `_canonical_active_set`, so this changes no estate digest and needs no re-cut.",
+      "renames": [
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:8006]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:8095]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0157",
+      "predecessorDigest": "c5025ca200c26aa15faf8a32ab16b13885b0c1933a6a0f4a710547ce4c99583a",
+      "profile": "public",
+      "reason": "#847 replaces the connector inventory's source-line parameter ids with durable semantic identities. Each successor names the same module and discovered stats_open_guarded call, plus its enclosing function, connector form and within-function ordinal. No call site or leaf assertion was removed; the inventory still discovers the same eight custom connectors. This is the one intentional migration away from the mechanism that forced repeated estate declarations whenever unrelated lines were inserted above a connector.",
+      "renames": [
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_alerts.py:293]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_alerts.py:_alert_label_prefix:lambda:1]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_alerts.py:546]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_alerts.py:_test_alert_account_key:lambda:1]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_config.py:641]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_config.py:_normalize_account_budget_refs:lambda:1]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:8095]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_dashboard.py:_stats_ro_guarded:lambda:1]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:10373]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:_db_status_for:lambda:1]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:11836]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_db.py:cmd_db_backup:_backup_source_connect:1]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_doctor.py:79]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_doctor.py:_stats_ro_guarded:lambda:1]"
+        },
+        {
+          "from": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_journal.py:8832]",
+          "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_journal.py:_open_publication_connection:lambda:1]"
+        }
+      ]
     }
   ],
   "schemaVersion": 1

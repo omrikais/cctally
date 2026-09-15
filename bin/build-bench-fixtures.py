@@ -812,6 +812,18 @@ def load_cctally():
     return mod
 
 
+def corpus_registry_stamp() -> str:
+    """The instant every journal record a corpus build appends is stamped at.
+
+    The corpus's OWN clock, in the spelling `_maybe_append_codex_account_observe`
+    writes: `_command_as_of().isoformat(timespec="seconds")` with the offset
+    replaced by `Z`. Derived from `CORPUS_CLOCK_UTC` rather than written out, so
+    the clock has one home.
+    """
+    return (CORPUS_CLOCK_UTC.astimezone(dt.timezone.utc)
+            .isoformat(timespec="seconds").replace("+00:00", "Z"))
+
+
 def _pin_env(data_dir: pathlib.Path, claude_dir: pathlib.Path):
     """Pin BOTH env axes + disable dev auto-detect, add bin/ to sys.path, load
     cctally, then re-resolve the path globals so a second build in the same
@@ -819,6 +831,34 @@ def _pin_env(data_dir: pathlib.Path, claude_dir: pathlib.Path):
     os.environ["CCTALLY_DATA_DIR"] = str(data_dir)
     os.environ["CLAUDE_CONFIG_DIR"] = str(claude_dir)
     os.environ.setdefault("CCTALLY_DISABLE_DEV_AUTODETECT", "1")
+    # #819: the corpus's own clock, for every journal record the build appends.
+    #
+    # `_maybe_append_codex_account_observe` stamps its `account_observe` record
+    # from `_cctally_core._command_as_of()`, which is the BUILDER'S WALL CLOCK
+    # at one-second resolution unless this is pinned — so each rebuild wrote
+    # whatever second it ran in. The two Codex accounts are observed
+    # microseconds apart, so they usually share that second and occasionally
+    # straddle a boundary.
+    #
+    # That is not cosmetic. `load_accounts` orders by
+    # `(provider, first_seen_utc, account_key)`, `_codex_accounts_wire` takes
+    # `ordered_keys` straight from it, and both `data.accounts[]` and
+    # `data.hero.cycles[]` are built in that order. Under a tie the order is the
+    # account_key order; when the two observations straddle a second it is the
+    # observation order, which for this corpus is the opposite. Two published
+    # lists invert, nothing else moves, and `semantic_hash` cannot see it
+    # because the registry is deliberately not one of its axes — so the corpus
+    # still reports the fingerprint the baseline names. Measured: the cold-pair
+    # case reproduced exactly that, reporting
+    # `['/sources/codex/data/accounts', '/sources/codex/data/hero/cycles']` as
+    # the entire difference between two captures of one corpus.
+    #
+    # SET rather than `setdefault`: a caller's stale value would put its own
+    # instant inside the corpus, which is the same defect with a different
+    # clock. `PINNED_ENV_KEYS` carries it, so `pinned_env` and
+    # `build_fixture_isolated` restore it exactly and the MEASUREMENT that
+    # follows a build is unaffected.
+    os.environ["CCTALLY_AS_OF"] = corpus_registry_stamp()
     bin_dir = str(pathlib.Path(__file__).resolve().parent)
     if bin_dir not in sys.path:
         sys.path.insert(0, bin_dir)
@@ -836,6 +876,10 @@ def _pin_env(data_dir: pathlib.Path, claude_dir: pathlib.Path):
 PINNED_ENV_KEYS = (
     "CCTALLY_DATA_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "HOME",
     "CCTALLY_DISABLE_DEV_AUTODETECT",
+    # #819. Absence is restored AS absence, so a build inside
+    # `build_fixture_isolated` freezes the journal's stamps and the measurement
+    # that follows it runs on the caller's own clock, exactly as before.
+    "CCTALLY_AS_OF",
 )
 
 
@@ -946,8 +990,9 @@ PRODUCER_SOURCE_EXCLUSIONS = (
 #: rebuilds that were not strictly required; under-inclusion silently reuses a
 #: corpus another tree's ingest wrote, which is the defect being repaired.
 #:
-#: COST, stated rather than assumed: 139 files, 9.9 MB, measured at 47 ms to
-#: digest, independent of corpus scale. Roughly a quarter of recent commits
+#: COST, stated rather than assumed: 140 files, and the 9.9 MB and 47 ms to
+#: digest were measured at 139, before #834 S2 added the 140th. The cost is
+#: independent of corpus scale. Roughly a quarter of recent commits
 #: touch one of these files, and each such change rebuilds any corpus root
 #: whose marker was written by the previous tree -- for `large` that is the
 #: 1m49s and 1.2 GiB recorded at the top of this file.
@@ -1080,6 +1125,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_snapshot_cache.py",
     "bin/_lib_source_analytics.py",
     "bin/_lib_source_identity.py",
+    "bin/_lib_source_retry.py",
     "bin/_lib_stats_damage.py",
     "bin/_lib_stats_publish.py",
     "bin/_lib_stats_wal.py",
@@ -1814,6 +1860,94 @@ def _attached_cache_path(conn: sqlite3.Connection) -> str:
     raise ValueError("no cache_db attachment on this connection")
 
 
+def two_account_scales() -> tuple:
+    """The scale names whose profile declares two Codex accounts (#819).
+
+    DERIVED from ``SCALES``, never written out. ``assembly`` and
+    ``assembly-small`` are valid generator scales declaring ``codex_accounts:
+    1``, so an invariant demanding two accounts of every corpus is simply wrong
+    on them — and the two-account discriminator inside ``validate_corpus``
+    already raises there. The envelope oracle needs the account axis to exist,
+    so it restricts itself to this set and takes its expected count from each
+    profile rather than from a constant of its own.
+    """
+    return tuple(sorted(
+        name for name, params in SCALES.items()
+        if int(params.get("codex_accounts", 0)) == 2
+    ))
+
+
+def _open_fixture_stats_db(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Open the corpus's stats.db READ-ONLY, derived from the same data dir.
+
+    The ``accounts`` registry lives in stats.db, which ``open_fixture_db``
+    deliberately does not attach: ``semantic_hash`` must stay
+    location-invariant, and the registry is not one of the axes it hashes. So
+    the registry is reachable from a fixture connection only by opening the
+    sibling file, which is what this does.
+
+    DERIVED from the attachment rather than taken as a parameter, which is the
+    whole point. A ``stats_conn`` keyword every caller may omit is a check that
+    silently does not run for the caller who forgot it, and this leg exists
+    because a registry that silently lost an account produced a corpus with an
+    UNCHANGED fingerprint and a completely different envelope. ``mode=ro``
+    because a read-write open of a corpus stats.db could advance
+    ``user_version`` on a store a concurrent reader holds.
+    """
+    stats_path = pathlib.Path(_attached_cache_path(conn)).with_name("stats.db")
+    if not stats_path.exists():
+        raise ValueError(
+            f"the corpus has no stats.db beside its cache at {stats_path}, so "
+            "its account registry cannot be read")
+    return sqlite3.connect("file:" + str(stats_path) + "?mode=ro", uri=True)
+
+
+def _codex_registry_stamps(conn: sqlite3.Connection) -> list:
+    """Every REAL Codex registry row as ``(account_key, first_seen, last_seen)``.
+
+    Read separately from `_codex_registry_accounts` because the two answer
+    different questions — how many accounts the corpus materialized, and
+    whether their stamps are the corpus's own — and a caller wanting one should
+    not have to discard the other.
+    """
+    import _lib_accounts
+
+    stats = _open_fixture_stats_db(conn)
+    try:
+        return sorted(
+            (str(row[0]), row[1], row[2]) for row in stats.execute(
+                "SELECT account_key, first_seen_utc, last_seen_utc FROM accounts "
+                "WHERE provider = 'codex' AND account_key != ?",
+                (_lib_accounts.UNATTRIBUTED,),
+            )
+        )
+    finally:
+        stats.close()
+
+
+def _codex_registry_accounts(conn: sqlite3.Connection) -> list:
+    """Every REAL Codex ``accounts`` row key the corpus materialized.
+
+    The ``unattributed`` sentinel is excluded on the same terms
+    ``_cctally_account.real_account_count`` excludes it, and through the same
+    constant, so the generator's idea of a real account and the R8 decoration
+    gate's cannot drift apart.
+    """
+    import _lib_accounts
+
+    stats = _open_fixture_stats_db(conn)
+    try:
+        return sorted(
+            str(row[0]) for row in stats.execute(
+                "SELECT account_key FROM accounts "
+                "WHERE provider = 'codex' AND account_key != ?",
+                (_lib_accounts.UNATTRIBUTED,),
+            )
+        )
+    finally:
+        stats.close()
+
+
 def _live_weekly_accounts(conn: sqlite3.Connection) -> dict:
     """``{account_key: {(window_minutes, resets_at)}}`` a READER would resolve.
 
@@ -1958,6 +2092,74 @@ def validate_corpus(conn: sqlite3.Connection, scale: str) -> dict:
     if len(accounts) < 2:
         raise ValueError(f"corpus {scale!r} realised {len(accounts)} Codex "
                          "account(s); the discriminator needs two")
+
+    # #819: the stats.db REGISTRY, which is a separate fact from the attributed
+    # spend above and is what the R8 decoration gate actually reads.
+    #
+    # This is the leg that was missing, and its absence is measurable rather
+    # than theoretical: deleting one `accounts` row from a built `tiny` corpus
+    # left `semantic_hash` byte-identical at `a4a5401d…` — the registry is not
+    # one of the hashed axes, by design — while the published envelope moved
+    # from 105,475 bytes to 73,165 and its stable digest from `8da8e5ec…` to
+    # `9fbbeda2…`, because `provider_is_decorated` went false and `accounts`,
+    # `hero.cycles` and `account_scopes` all left the payload. The capture
+    # exited 0 and reported the same corpus fingerprint the baseline names.
+    #
+    # The expected count is the SCALE'S OWN `codex_accounts`, never a constant:
+    # `assembly` and `assembly-small` declare one, and a universal two-account
+    # rule would be wrong on them.
+    registry = _codex_registry_accounts(conn)
+    expected_accounts = int(params.get("codex_accounts", 0))
+    if len(registry) != expected_accounts:
+        raise ValueError(
+            f"corpus {scale!r} materialized {len(registry)} REAL Codex "
+            f"account(s) in its stats.db registry, not the {expected_accounts} "
+            f"its profile declares: {registry}. The registry is not part of "
+            "`semantic_hash`, so this corpus still identifies itself as the "
+            "one the baseline names while the R8 decoration gate reads it "
+            "differently and the published envelope loses every account "
+            "subtree.")
+    missing = sorted(set(str(a[0]) for a in accounts) - set(registry))
+    if missing:
+        raise ValueError(
+            f"corpus {scale!r} attributes Codex spend to account(s) its "
+            f"registry does not hold: {missing}. Decoration is gated on the "
+            "registry, so that spend would be published under a merged row "
+            "with no account of its own.")
+
+    # #819: the registry's STAMPS must be the corpus's own clock, not the
+    # second the build happened to run in. `load_accounts` orders by
+    # `(provider, first_seen_utc, account_key)` and `_codex_accounts_wire`
+    # builds both `data.accounts[]` and `data.hero.cycles[]` in that order, so
+    # two accounts observed microseconds apart publish one order when their
+    # stamps tie and the opposite order when they straddle a second boundary.
+    # Measured: that is the entire difference the cold-pair reproduction saw
+    # between two captures of one corpus, and the fingerprint cannot see it.
+    # The two columns are refused SEPARATELY, because only one of them is the
+    # #819 hazard and a single message naming both reports the other one's
+    # drift as an ordering defect it cannot cause.
+    stamp = corpus_registry_stamp()
+    stamps = _codex_registry_stamps(conn)
+    ordering_drift = [row for row in stamps if row[1] != stamp]
+    if ordering_drift:
+        raise ValueError(
+            f"corpus {scale!r} stamped its Codex registry `first_seen_utc` at "
+            f"{ordering_drift}, not at the corpus clock {stamp}. "
+            "`load_accounts` orders by `first_seen_utc` before `account_key`, "
+            "so a registry carrying the builder's wall clock publishes an "
+            "account order that depends on the second the build ran in — and "
+            "`semantic_hash` does not cover the registry, so the corpus still "
+            "reports the fingerprint the baseline names.")
+    liveness_drift = [row for row in stamps if row[2] != stamp]
+    if liveness_drift:
+        raise ValueError(
+            f"corpus {scale!r} stamped its Codex registry `last_seen_utc` at "
+            f"{liveness_drift}, not at the corpus clock {stamp}. This column "
+            "takes no part in `load_accounts`'s ordering, so it is NOT the "
+            "#819 hazard. It is refused because `_account_of` advances it from "
+            "any data-bearing record's own `at`, so a stamp that is not the "
+            "corpus clock means some record carried a time the corpus did not "
+            "pin — and the next such record may be one that does order.")
     spend = {k: v for k, v in rows(
         "SELECT account_key, SUM(input_tokens + output_tokens) "
         "FROM cache_db.codex_session_entries WHERE account_key IS NOT NULL "
@@ -2011,7 +2213,8 @@ def validate_corpus(conn: sqlite3.Connection, scale: str) -> dict:
     # cannot see it either, because `_resolve_codex_weekly_cycle` degrades only
     # when NO account resolves. This is the property; assert the property.
     per_account = _live_weekly_accounts(conn)
-    expected_accounts = int(params.get("codex_accounts", 0))
+    # `expected_accounts` is the profile's own count, bound with the registry
+    # leg above so both checks read one number rather than two spellings of it.
     if len(per_account) != expected_accounts:
         raise ValueError(
             f"corpus {scale!r} retains a live, non-model-scoped weekly history "

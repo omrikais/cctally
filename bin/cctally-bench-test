@@ -86,7 +86,9 @@ for k in ("cctally_version", "machine_label", "scale", "seed",
     assert k in d, f"missing top-level key {k!r}"
 need = {
     "snapshot.cold", "snapshot.warm", "snapshot.idle",
-    "frontier.caught_up",
+    "frontier.trusted_caught_up", "frontier.recent_active_restat",
+    "frontier.targeted_append", "frontier.racing_append_next_tick",
+    "frontier.expired_full",
     "sync.noop", "sync.delta",
     "conversations.page1", "conversations.sorted", "conversations.filtered",
     "search.cross_session", "find.in_conversation",
@@ -127,7 +129,9 @@ for k in ("contract", "receipt"):
 c, receipt = d["contract"], d["receipt"]
 need = {
     "snapshot.cold", "snapshot.warm", "snapshot.idle",
-    "frontier.caught_up",
+    "frontier.trusted_caught_up", "frontier.recent_active_restat",
+    "frontier.targeted_append", "frontier.racing_append_next_tick",
+    "frontier.expired_full",
     "sync.noop", "sync.delta",
     "conversations.page1", "conversations.sorted", "conversations.filtered",
     "search.cross_session", "find.in_conversation",

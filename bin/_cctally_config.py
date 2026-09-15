@@ -640,8 +640,9 @@ def _normalize_account_budget_refs(raw_obj: dict, provider: str,
             try:
                 conn = _cctally_store.stats_open_guarded(
                     db_path,
-                    connect=lambda p: sqlite3.connect(
-                        f"file:{p}?mode=ro", uri=True),
+                    # #778: forward the opener's `cached_statements=0`.
+                    connect=lambda p, **kw: sqlite3.connect(
+                        f"file:{p}?mode=ro", uri=True, **kw),
                 )
             except _cctally_db.StatsDbMaintenanceError:
                 stats_maintenance_unavailable = True

@@ -11,6 +11,7 @@ import { allOneProject, visibleBadges } from './railDiscovery';
 import { modelChipStyle, modelChipSummary } from '../lib/model';
 import { fmt } from '../lib/fmt';
 import { mergeConversationRows, mergeSearchHits } from './conversationComposition';
+import type { ConversationDegradedNotice } from '../lib/conversationTransport';
 import { ALL_ACCOUNTS, resolveAccountFocus } from '../store/accountFocus';
 import {
   buildConversationJump,
@@ -426,6 +427,31 @@ function pickOr(
 
 interface RailCtx { tz: string; offsetLabel: string }
 
+// #769 S6 / #802 browser QA P1 — the one rendering of a typed degraded read,
+// shared by the browse rail and the search rail so the two cannot describe the
+// same store state differently. It says what is happening and what clears it;
+// the Retry affordance appears ONLY when re-issuing the read can plausibly
+// change the answer, because a button that can never succeed is worse than no
+// button at all.
+function DegradedNotice({ notice, onRetry }: {
+  notice: ConversationDegradedNotice;
+  onRetry?: () => void;
+}) {
+  return (
+    <div
+      className="conv-rail-empty conv-rail-empty--degraded"
+      role="status"
+      data-testid="conv-rail-degraded"
+      data-degraded-reason={notice.reason}
+    >
+      <div>{notice.message}</div>
+      {notice.retryable && onRetry && (
+        <button type="button" className="conv-rail-retry" onClick={() => onRetry()}>Retry</button>
+      )}
+    </div>
+  );
+}
+
 function BrowseList({ source, accountKey, selectedId, ctx, pickAnchor }: { source: ConversationSource; accountKey?: string; selectedId: ConversationRef | null; ctx: RailCtx; pickAnchor: ConversationRef | null }) {
   const data = useConversations(source, { accountKey, selectedRef: selectedId });
   return <BrowseResults data={data} selectedId={selectedId} ctx={ctx} pickAnchor={pickAnchor} />;
@@ -446,12 +472,23 @@ function AllBrowseList({ selectedId, ctx, pickAnchor }: { selectedId: Conversati
     sortDegraded: false,
     retry: () => { claude.retry(); codex.retry(); },
     pending: claude.pending && codex.pending,
+    // Only when BOTH sources degrade does the combined rail have nothing to
+    // show. One degraded source leaves the other's rows on screen with a note,
+    // the same way one failing source already does.
+    degraded: claude.degraded && codex.degraded ? claude.degraded : null,
   };
+  // When BOTH sources degrade the notice below already carries the sentence, so
+  // the partial note must not repeat it — the rail printed it twice before this
+  // guard. The note is for the genuinely PARTIAL case, where the other source's
+  // rows are on screen and nothing else would say why one source is missing.
+  const onlyOneDegraded = (claude.degraded == null) !== (codex.degraded == null);
   const partialNote = claude.error || codex.error
     ? 'One source is temporarily unavailable.'
-    : claude.pending || codex.pending
-      ? 'One source is still indexing.'
-      : null;
+    : onlyOneDegraded
+      ? (claude.degraded ?? codex.degraded)!.message
+      : claude.pending || codex.pending
+        ? 'One source is still indexing.'
+        : null;
   return <BrowseResults data={data} selectedId={selectedId} ctx={ctx} pickAnchor={pickAnchor} forcedRecent partialNote={partialNote} />;
 }
 
@@ -463,7 +500,7 @@ function BrowseResults({ data, selectedId, ctx, pickAnchor, forcedRecent = false
   forcedRecent?: boolean;
   partialNote?: string | null;
 }) {
-  const { rows, loading, error, hasMore, loadMore, loadingMore, filterDegraded, sortDegraded, retry, pending } = data;
+  const { rows, loading, error, hasMore, loadMore, loadingMore, filterDegraded, sortDegraded, retry, pending, degraded } = data;
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
   const railSort = useSyncExternalStore(subscribeStore, () => getState().conversationRailSort);
   // filters spec §1 dual-branch parity — a one-line muted note when the
@@ -481,6 +518,17 @@ function BrowseResults({ data, selectedId, ctx, pickAnchor, forcedRecent = false
         <div className="conv-rail-sort-degraded">Cost/Project sort unavailable while indexing — showing recent order.</div>
       )}
     </>
+  );
+  // #769 S6 / #802 browser QA P1 — a degraded read is a STORE state, not a
+  // load failure, so it takes the `pending` treatment (a `role="status"`
+  // message) rather than the error treatment, and it offers Retry only where a
+  // re-read can actually clear it. Placed above the error branch because the
+  // two are mutually exclusive by construction in both hooks; the order states
+  // that the named state wins over a generic one if that ever stops holding.
+  if (degraded) return (
+    <div className="conv-rail-list">{degradedNote}
+      <DegradedNotice notice={degraded} onRetry={retry} />
+    </div>
   );
   if (error) return (
     <div className="conv-rail-list">{degradedNote}
@@ -699,12 +747,16 @@ function AllSearchList({ needle, kind, ctx, selectedId, pickAnchor }: { needle: 
     error: claude.error && codex.error ? 'Search failed for both sources.' : null,
     loadMore: () => { if (claude.hits.length < claude.total) claude.loadMore(); if (codex.hits.length < codex.total) codex.loadMore(); },
     pending: claude.pending && codex.pending,
+    degraded: claude.degraded && codex.degraded ? claude.degraded : null,
   };
+  const onlyOneDegraded = (claude.degraded == null) !== (codex.degraded == null);
   const partialNote = claude.error || codex.error
     ? 'One source search is temporarily unavailable.'
-    : claude.pending || codex.pending
-      ? 'One source is still indexing.'
-      : null;
+    : onlyOneDegraded
+      ? (claude.degraded ?? codex.degraded)!.message
+      : claude.pending || codex.pending
+        ? 'One source is still indexing.'
+        : null;
   return <SearchResults data={data} needle={needle} kind={kind} ctx={ctx} selectedId={selectedId} pickAnchor={pickAnchor} partialNote={partialNote} />;
 }
 
@@ -717,7 +769,7 @@ function SearchResults({ data, needle, kind, ctx, selectedId, pickAnchor, partia
   pickAnchor: ConversationRef | null;
   partialNote?: string | null;
 }) {
-  const { hits, mode, total, loading, loadingMore, searchDepth, filterDegraded, error, loadMore, pending } = data;
+  const { hits, mode, total, loading, loadingMore, searchDepth, filterDegraded, error, loadMore, pending, degraded } = data;
   const proseOnly = searchDepth === 'prose-only';
   const remaining = total - hits.length;
   // #177 S6 M1 — when the active chip is a split-needing kind (Tools/Thinking)
@@ -749,7 +801,9 @@ function SearchResults({ data, needle, kind, ctx, selectedId, pickAnchor, partia
         <div className="conv-rail-search-filters-degraded">Some filters unavailable while indexing.</div>
       )}
       {partialNote && <div className="conv-rail-search-filters-degraded">{partialNote}</div>}
-      {error
+      {degraded
+        ? <DegradedNotice notice={degraded} />
+        : error
         ? <div className="conv-rail-empty" role="alert">{error}</div>
         : pending
           ? <div className="conv-rail-empty" role="status">Codex conversations are still indexing.</div>

@@ -51,19 +51,34 @@ def _cctally():
 def _get_canonical_boundary_for_date(
     conn: sqlite3.Connection,
     week_start_date_str: str,
+    *,
+    account_key: "str | None" = None,
 ) -> tuple[str | None, str | None]:
-    """Return the first established (week_start_at, week_end_at) for a week."""
+    """Return the first established (week_start_at, week_end_at) for a week.
+
+    #834 S2 (#837): ``account_key`` is keyword-only and defaults to ``None``,
+    which keeps the merged account-blind read every deliberately-merged caller
+    relies on. A real key or the ``unattributed`` sentinel scopes the read.
+
+    The scope matters because this query takes the EARLIEST established
+    boundary, so on a two-account store the account that captured first owned
+    every other account's boundary until it was scoped. Scoping to the
+    ``unattributed`` sentinel on a legacy store selects exactly the rows the
+    account-blind read selected, because every row there carries the sentinel.
+    """
+    acct_pred = "" if account_key is None else " AND account_key = ?"
+    acct_p: tuple = () if account_key is None else (account_key,)
     row = conn.execute(
-        """
+        f"""
         SELECT week_start_at, week_end_at
         FROM weekly_usage_snapshots
         WHERE week_start_date = ?
           AND week_start_at IS NOT NULL AND week_start_at != ''
-          AND week_end_at IS NOT NULL AND week_end_at != ''
+          AND week_end_at IS NOT NULL AND week_end_at != ''{acct_pred}
         ORDER BY captured_at_utc ASC, id ASC
         LIMIT 1
         """,
-        (week_start_date_str,),
+        (week_start_date_str, *acct_p),
     ).fetchone()
     if row:
         start_at = _canonicalize_optional_iso(row["week_start_at"], "weekStartAt")
@@ -106,7 +121,8 @@ def get_recent_weeks(
     refs: list[WeekRef] = []
     for row in rows:
         date_str = row["week_start_date"]
-        canon_start, canon_end = _get_canonical_boundary_for_date(conn, date_str)
+        canon_start, canon_end = _get_canonical_boundary_for_date(
+            conn, date_str, account_key=account_key)
         try:
             ref = make_week_ref(
                 week_start_date=date_str,
@@ -573,11 +589,18 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
         # window, where the only rows that can carry an hour-floored instant
         # live. After cutover this is False and every genuine reset is admitted.
         legacy_window = _legacy_reset_window(conn)
+        # `weekly_observation_held = 0` (#769 S11, #824): this is a weekly
+        # PREDECESSOR scan — it derives a reset from a consecutive boundary
+        # change plus a drop. A held row repeats its basis's boundary and
+        # weekly value, so it can only contribute a no-change pair, and the
+        # predicate is what makes a divergent one impossible rather than
+        # improbable.
         rows = conn.execute(
             "SELECT captured_at_utc, week_end_at, weekly_percent, account_key"
             f"{origin_select} "
             "FROM weekly_usage_snapshots "
             "WHERE week_end_at IS NOT NULL "
+            "  AND weekly_observation_held = 0 "
             "ORDER BY account_key ASC, captured_at_utc ASC, id ASC"
         ).fetchall()
     except sqlite3.DatabaseError:

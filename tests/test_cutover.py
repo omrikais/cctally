@@ -368,7 +368,8 @@ def test_epoch_constants(ns):
     # #661 S2 added `meter_rate_change_events` at 1011, #750 S2 added that
     # table's four rate-change disclosure columns at 1012, and #750 S3 added
     # reset-event origin identity plus the transactional debounce state at 1013.
-    assert core.STATS_INDEX_EPOCH == 1013
+    # #769 S11 added the weekly held-provenance column at 1015.
+    assert core.STATS_INDEX_EPOCH == 1015
     assert core.LEGACY_STATS_HEAD == 13
 
 

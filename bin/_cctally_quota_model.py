@@ -236,11 +236,16 @@ def _read_stats_component(conn, account_key, start):
     excluded at the query as a closed committed set; an unrecognized source is
     retained and counted.
     """
+    # `weekly_observation_held = 0` (#769 S11, #824): these rows ARE the meter
+    # readings the coefficients are fitted against. A held row repeats the
+    # latest genuine reading under a later capture instant, so admitting one
+    # would feed the fit a flat interval that no upstream meter reported —
+    # a fabricated observation rather than a missing one.
     placeholders = ",".join("?" for _ in SYNTHETIC_SNAPSHOT_SOURCES)
     sql = (
         "SELECT id, captured_at_utc, week_start_at, week_start_date,"
         " weekly_percent, source FROM weekly_usage_snapshots"
-        f" WHERE source NOT IN ({placeholders})"
+        f" WHERE weekly_observation_held = 0 AND source NOT IN ({placeholders})"
     )
     params: list = list(SYNTHETIC_SNAPSHOT_SOURCES)
     if start is not None:
@@ -345,10 +350,15 @@ def _retained_snapshot_span(conn, account_key):
     rows, so it needs the span the floor hides. An empty store returns
     `(None, None)` and says nothing.
     """
+    # Same population as `_read_stats_component` (#769 S11, #824). The finding
+    # this span qualifies is a statement about the readings the model used, so
+    # the two must count the same rows; a span computed over a wider set would
+    # report an era the fit never saw.
     placeholders = ",".join("?" for _ in SYNTHETIC_SNAPSHOT_SOURCES)
     sql = ("SELECT MIN(captured_at_utc), MAX(captured_at_utc)"
            " FROM weekly_usage_snapshots"
-           f" WHERE source NOT IN ({placeholders})")
+           " WHERE weekly_observation_held = 0"
+           f" AND source NOT IN ({placeholders})")
     params: list = list(SYNTHETIC_SNAPSHOT_SOURCES)
     clause, extra = _account_clause("account_key", account_key)
     sql += clause
@@ -509,6 +519,11 @@ def _unattributed_bucket_has_rows() -> bool:
         return False
     try:
         placeholders = ",".join("?" for _ in SYNTHETIC_SNAPSHOT_SOURCES)
+        # HELD-INCLUSIVE, decided rather than overlooked (#769 S11, #824).
+        # This asks whether the bucket contains any real observation at all,
+        # not what its weekly value is, and a held row is a real write by a
+        # real tick. The answer cannot differ in practice either way, because a
+        # held row implies a non-held basis in the same bucket.
         row = conn.execute(
             "SELECT 1 FROM weekly_usage_snapshots WHERE source NOT IN "
             f"({placeholders}) AND (account_key IS NULL OR account_key = ?)"

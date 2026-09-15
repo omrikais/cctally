@@ -173,6 +173,52 @@ describe('SourceStatusChip (§6.8)', () => {
     expect(chip).toHaveAttribute('aria-label', expect.stringContaining('codex source status'));
   });
 
+  it('names the withheld account scope rather than the generic degraded copy', () => {
+    // #819. The point of this case is the CONTRAST, so it renders both states
+    // and asserts they differ: a label shared with `source_build_failed` would
+    // tell a reader that the whole source failed to build, when in fact every
+    // non-account domain is real and only the per-account detail is withheld.
+    updateSnapshot(
+      envWith((b) => {
+        b.sources.codex = {
+          ...b.sources.codex,
+          availability: 'partial',
+          warnings: [{
+            code: 'codex_account_scope_unresolved',
+            message: 'Codex account registry could not be read, so per-account detail is withheld.',
+            domain: 'accounts',
+          }],
+        };
+      }),
+    );
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    const { unmount } = render(<SourceStatusChip />);
+    const chip = screen.getByTestId('source-status-chip');
+    expect(chip.querySelector('.source-status-label--full')).toHaveTextContent('Accounts unavailable');
+    expect(chip).not.toHaveTextContent('Source degraded');
+    expect(chip).toHaveAttribute(
+      'title', 'Codex account registry could not be read, so per-account detail is withheld.');
+    unmount();
+
+    updateSnapshot(
+      envWith((b) => {
+        b.sources.codex = {
+          ...b.sources.codex,
+          availability: 'partial',
+          warnings: [{
+            code: 'source_build_failed',
+            message: 'Source could not be built.',
+            domain: 'read_model',
+          }],
+        };
+      }),
+    );
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<SourceStatusChip />);
+    expect(screen.getByTestId('source-status-chip')
+      .querySelector('.source-status-label--full')).toHaveTextContent('Source degraded');
+  });
+
   it('uses concise domain copy while retaining the full Projects warning for assistive detail', () => {
     updateSnapshot(
       envWith((b) => {

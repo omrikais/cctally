@@ -100,21 +100,27 @@ def _stamp_journal_id(conn, table: str, rowid: int) -> None:
     )
 
 
-def _tick(ns, monkeypatch, *, at: str, percent: float) -> int:
+def _tick(ns, monkeypatch, *, at: str, percent: float,
+          five_hour_percent=None, five_hour_resets_at=None) -> int:
     """Drive one ``record-usage`` observation at a PINNED capture instant.
 
     ``CCTALLY_AS_OF`` pins the detection clock and ``CCTALLY_TEST_PIN_CAPTURE``
     makes ``cmd_record_usage`` stamp the observation's ``captured_at`` from that
     same pinned instant, so the hour-floored reset anchor and each snapshot's
     ``captured_at_utc`` land exactly where the incident put them.
+
+    The five-hour arguments default to absent, which is every pre-#824 caller.
+    They exist because a weekly-clamped tick that ALSO carries five-hour
+    evidence now writes a row, and the weekly milestone must stay suppressed on
+    exactly that tick.
     """
     monkeypatch.setenv("CCTALLY_AS_OF", at)
     monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
     return ns["cmd_record_usage"](argparse.Namespace(
         percent=percent,
         resets_at=WEEK_END_EPOCH,
-        five_hour_percent=None,
-        five_hour_resets_at=None,
+        five_hour_percent=five_hour_percent,
+        five_hour_resets_at=five_hour_resets_at,
         week_start_name=None,
     ))
 
@@ -123,14 +129,17 @@ def _seed_usage_snapshot(conn, *, captured_at_utc: str, weekly_percent: float,
                          week_start_date: str = WEEK_START_DATE,
                          week_end_date: str = WEEK_END_DATE,
                          week_start_at: str = WEEK_START_AT,
-                         week_end_at: str = WEEK_END_ISO) -> int:
+                         week_end_at: str = WEEK_END_ISO,
+                         weekly_observation_held: int = 0) -> int:
     cur = conn.execute(
         "INSERT INTO weekly_usage_snapshots "
         "(captured_at_utc, week_start_date, week_end_date, "
-        " week_start_at, week_end_at, weekly_percent, source, payload_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        " week_start_at, week_end_at, weekly_percent, source, payload_json, "
+        " weekly_observation_held) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (captured_at_utc, week_start_date, week_end_date,
-         week_start_at, week_end_at, weekly_percent, "test", "{}"),
+         week_start_at, week_end_at, weekly_percent, "test", "{}",
+         weekly_observation_held),
     )
     rowid = int(cur.lastrowid)
     _stamp_journal_id(conn, "weekly_usage_snapshots", rowid)
@@ -426,14 +435,18 @@ def test_the_fix_does_not_recover_the_crossings_the_replica_suppresses(
 
 
 def test_fold_decision_reports_why_it_skipped(ns):
-    """``_usage_snapshot_fold_decision`` distinguishes its two skips.
+    """``_usage_snapshot_fold_decision`` distinguishes a contradicting weekly
+    reading from an agreeing one.
 
-    The reason is what ``_pipeline_claude_usage`` gates the weekly milestone
-    derivation on, so it has to be part of the decision rather than re-derived
-    at the call site.
+    That distinction is what ``_pipeline_claude_usage`` gates the weekly
+    milestone derivation on, so it has to be part of the decision rather than
+    re-derived at the call site. #769 S11 (#824) moved it from a `reason`
+    string onto `weekly.disposition`, where it names the AXIS whose evidence is
+    in question instead of naming the skip that used to follow from it — a tick
+    whose weekly axis is held can now still write a row for its five-hour
+    evidence, so "clamp" and "did not write" are no longer the same fact.
     """
     import _cctally_journal as jr
-    import _lib_record
 
     def payload(weekly_percent):
         return {
@@ -445,18 +458,25 @@ def test_fold_decision_reports_why_it_skipped(ns):
 
     conn = ns["open_db"]()
     try:
-        skip, _adj, reason = jr._usage_snapshot_fold_decision(conn, payload(10.0))
-        assert (skip, reason) == (False, _lib_record.SNAPSHOT_ACCEPT)
+        result = jr._usage_snapshot_fold_decision(conn, payload(10.0))
+        assert result.weekly.disposition == jr.WEEKLY_OBSERVED
+        assert result.snapshot_action == jr.SNAPSHOT_WRITE_OBSERVED
 
         _seed_usage_snapshot(
             conn, captured_at_utc="2026-09-01T12:00:00Z", weekly_percent=40.0)
         conn.commit()
 
-        skip, _adj, reason = jr._usage_snapshot_fold_decision(conn, payload(39.0))
-        assert (skip, reason) == (True, _lib_record.SNAPSHOT_SKIP_CLAMP)
+        # CONTRADICTS the stored row: the weekly axis is held at 40.
+        result = jr._usage_snapshot_fold_decision(conn, payload(39.0))
+        assert result.weekly.disposition == jr.WEEKLY_HELD_CLAMP
+        assert result.weekly.raw_pct == 39.0
+        assert result.weekly.effective_pct == 40.0
+        assert result.snapshot_action == jr.SNAPSHOT_SKIP_NO_CHANGE
 
-        skip, _adj, reason = jr._usage_snapshot_fold_decision(conn, payload(40.0))
-        assert (skip, reason) == (True, _lib_record.SNAPSHOT_SKIP_DEDUP)
+        # AGREES with the stored row: nothing on either axis is new.
+        result = jr._usage_snapshot_fold_decision(conn, payload(40.0))
+        assert result.weekly.disposition == jr.WEEKLY_OBSERVED
+        assert result.snapshot_action == jr.SNAPSHOT_SKIP_NO_CHANGE
     finally:
         conn.close()
 
@@ -491,6 +511,51 @@ def test_clamp_skip_does_not_derive_a_weekly_milestone(ns, monkeypatch):
         ).fetchone()[0] == 0
     finally:
         conn.close()
+
+
+#: One physical five-hour window inside the incident week, as the epoch integer
+#: `cmd_record_usage` takes for `--five-hour-resets-at`.
+_FIVE_HOUR_RESETS_AT = 1788274800  # 2026-09-01T15:00:00Z
+
+
+def test_a_held_row_written_for_five_hour_evidence_derives_no_weekly_milestone(
+    ns, monkeypatch
+):
+    """#769 S11 (#824). The suppression must survive the change that made a
+    weekly-clamped tick write a row.
+
+    Before #824 the clamp wrote nothing, so "no weekly milestone" and "no row"
+    were the same outcome and either could have been what enforced the rule.
+    They are now different: the tick below writes a `weekly_observation_held`
+    row for its five-hour evidence, so if the gate had been keyed on whether a
+    row was written it would fire here. A weekly milestone derived from the
+    stale stored row is what fabricated a threshold-13 crossing on 2026-09-01,
+    and milestones are forward-only within an epoch, so that row forecloses
+    every genuine crossing below it.
+    """
+    assert _tick(ns, monkeypatch, at="2026-09-01T12:00:00Z", percent=40.0,
+                 five_hour_percent=10.0,
+                 five_hour_resets_at=_FIVE_HOUR_RESETS_AT) == 0
+    # Contradicts the stored 40 on the weekly axis, and carries genuine
+    # five-hour growth in the SAME physical five-hour window.
+    assert _tick(ns, monkeypatch, at="2026-09-01T12:05:00Z", percent=39.0,
+                 five_hour_percent=20.0,
+                 five_hour_resets_at=_FIVE_HOUR_RESETS_AT) == 0
+
+    conn = ns["open_db"]()
+    try:
+        rows = conn.execute(
+            "SELECT weekly_percent, five_hour_percent, weekly_observation_held "
+            "FROM weekly_usage_snapshots ORDER BY id").fetchall()
+        thresholds = [r["percent_threshold"] for r in _milestones(conn)]
+    finally:
+        conn.close()
+
+    # Non-vacuity: the held row exists, so the gate had something to fire on.
+    assert len(rows) == 2, [tuple(r) for r in rows]
+    assert tuple(rows[1]) == (40.0, 20.0, 1)
+    assert thresholds == [40], (
+        "the held tick derived a weekly milestone from the row it contradicts")
 
 
 def test_dedup_skip_still_derives_the_weekly_milestone(ns, monkeypatch):
@@ -551,6 +616,48 @@ def test_post_reset_seed_refused_without_a_lower_in_epoch_observation(ns):
     conn = ns["open_db"]()
     try:
         assert _milestones(conn) == [], [dict(r) for r in _milestones(conn)]
+    finally:
+        conn.close()
+
+
+def test_post_reset_seed_evidence_ignores_a_held_row(ns):
+    """#769 S11 (#824). A held row is not an observation of the weekly axis.
+
+    This is the 2026-09-01 failure mode reached through the new row shape. The
+    epoch's climb evidence is `MIN(weekly_percent)` over rows captured inside
+    the epoch, and a held row's capture time is the TICK's while its weekly
+    value is copied from a basis captured BEFORE the reset. Counting it carries
+    a pre-reset reading into a post-reset window and answers "did the counter
+    climb to 13?" with a number that observed nothing about this epoch. The
+    ladder would then open at 13, and because milestones are forward-only
+    within an epoch, every genuine crossing below 13 would be foreclosed.
+    """
+    conn = ns["open_db"]()
+    try:
+        _seed_cost_snapshot(conn, cost_usd=20.85)
+        _seed_reset_event(conn, effective="2026-09-01T17:00:00+00:00",
+                          observed_pre_credit_pct=14.0)
+        # The basis: a pre-reset reading of 5%, OUTSIDE the epoch.
+        _seed_usage_snapshot(
+            conn, captured_at_utc="2026-09-01T16:00:00Z", weekly_percent=5.0)
+        # The held row: captured INSIDE the epoch, carrying that 5% forward.
+        _seed_usage_snapshot(
+            conn, captured_at_utc="2026-09-01T17:20:00Z", weekly_percent=5.0,
+            weekly_observation_held=1)
+        usage_id = _seed_usage_snapshot(
+            conn, captured_at_utc="2026-09-01T17:33:38Z", weekly_percent=13.0)
+        conn.commit()
+    finally:
+        conn.close()
+
+    ns["maybe_record_milestone"](
+        _saved(usage_id, weekly_percent=13.0,
+               captured_at="2026-09-01T17:33:38Z"))
+
+    conn = ns["open_db"]()
+    try:
+        assert _milestones(conn) == [], (
+            "the held row supplied climb evidence it never observed")
     finally:
         conn.close()
 

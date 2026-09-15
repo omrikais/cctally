@@ -154,9 +154,15 @@ source/snapshot accelerators, conversation, outline-transfer, ingest-frontier,
 and hub-wide SSE delivery owners. It also reports the sum of those explicit
 ceilings, current server thread count, and the 1.5 GiB whole-process RSS
 ceiling. The values contain no cache keys, account identity, paths, or
-transcript content. An owner can serve an oversize response while
-declining to retain it; that increments `fallbackCount` and preserves the
-requested result instead of truncating it.
+transcript content. An owner can serve an oversize response while declining to
+retain it, and the requested result is preserved rather than truncated either
+way. Two different counters say which happened: `fallbackCount` counts an
+admission pass that found an oversized entry already resident, and also
+the last-resort branch that clears an owner outright because the total
+stayed over the budget for a reason the pass could not see, and
+`admissionRefusalCount` — reported for `codexSourceAccelerators` — counts an
+entry refused by the write that would have retained it, so it was never
+resident at all.
 
 **Dispatch mix.** Lifetime counts of `full`, `idle` and `degraded` ticks. The
 three sum to the number of completed refresh ticks. Both this and the Codex

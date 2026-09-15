@@ -292,7 +292,9 @@ def _alert_label_prefix(axis: str, account_key: "str | None",
         import _cctally_store
         conn = _cctally_store.stats_open_guarded(
             db_path,
-            connect=lambda p: _sq.connect(f"file:{p}?mode=ro", uri=True),
+            # #778: forward the opener's `cached_statements=0`.
+            connect=lambda p, **kw: _sq.connect(
+                f"file:{p}?mode=ro", uri=True, **kw),
         )
         try:
             if not _cctally_account.provider_is_decorated(conn, vendor):
@@ -543,7 +545,9 @@ def _test_alert_account_key(vendor: str) -> str:
             return _lib_accounts.VENDOR_WIDE
         conn = _cctally_store.stats_open_guarded(
             db_path,
-            connect=lambda p: _sq.connect(f"file:{p}?mode=ro", uri=True),
+            # #778: forward the opener's `cached_statements=0`.
+            connect=lambda p, **kw: _sq.connect(
+                f"file:{p}?mode=ro", uri=True, **kw),
         )
         try:
             for row in _cctally_account.load_accounts(conn, vendor):

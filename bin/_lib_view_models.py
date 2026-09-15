@@ -572,6 +572,81 @@ class WeeklyView:
     display_tz_label: str = ""
 
 
+def _parse_iso_or_none(value):
+    """A tz-aware datetime, or ``None`` when the string will not parse.
+
+    A malformed bound must not raise inside a render path; it loses its
+    collision suffix instead, which is what the caller already does with
+    every other unparseable timestamp on the row.
+    """
+    if not value:
+        return None
+    try:
+        return _load_lib("_cctally_core").parse_iso_datetime(
+            value, "segment.start_ts")
+    except (TypeError, ValueError):
+        return None
+
+
+def apply_label_collision_suffixes(items, *, display_tz=None):
+    """Suffix only the labels that two segments of ONE week render alike.
+
+    #750 S4 spec §3.2a / D5. ``items`` is a sequence of
+    ``(week_key, base_label, start_dt)`` and the return is a list of labels
+    positionally aligned with it.
+
+    ``week_key`` identifies the CANONICAL WEEK — the shared `start_date` /
+    `week_start_date` that epic invariant 3 keeps identical across a credited
+    week's segments — and grouping is confined to it. That restriction is
+    required rather than decorative: every base format in the tree is
+    year-free (`%m-%d` on the Weekly panel, `%b %d` on Trend), so grouping
+    across the whole rendered list would make two ordinary cycles exactly one
+    year apart collide and acquire suffixes neither needs.
+
+    Inside a group, a label is a collision when two or more siblings render it
+    identically. Only those gain a suffix, rendered from each segment's own
+    start instant through `format_display_dt`, the display-timezone
+    chokepoint. A segment whose rendered label is already unique is untouched,
+    so an uncredited week — and an ordinarily-credited week, whose segments
+    fall on different dates — is byte-identical.
+    """
+    items = list(items)
+    groups: dict = {}
+    for index, (week_key, base_label, _start) in enumerate(items):
+        groups.setdefault(week_key, {}).setdefault(base_label, []).append(index)
+    colliding: set = set()
+    for by_label in groups.values():
+        for indexes in by_label.values():
+            if len(indexes) > 1:
+                colliding.update(indexes)
+    if not colliding:
+        return [base for _key, base, _start in items]
+    tz = display_tz
+    if isinstance(tz, str):
+        tz = _load_lib("_lib_display_tz")._resolve_tz(tz)
+    fmt_dt = _cctally().format_display_dt
+    out: list = []
+    for index, (_key, base_label, start_dt) in enumerate(items):
+        if index not in colliding or start_dt is None:
+            out.append(base_label)
+            continue
+        out.append(
+            f"{base_label} "
+            f"{fmt_dt(start_dt, tz, fmt='%H:%M', suffix=False)}")
+    return out
+
+
+def _capture_bound_iso(value_dt: "dt.datetime") -> str:
+    """A segment bound spelled the way `captured_at_utc` is stored.
+
+    Delegates to `_cctally_core.canonical_capture_bound`: the projects
+    reducer spells its bounds the same way, and two copies of a
+    normalization SQLite's lexicographic compare depends on is how two
+    surfaces disagree about which snapshot a cycle owns.
+    """
+    return _load_lib("_cctally_core").canonical_capture_bound(value_dt)
+
+
 def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
                       as_of_utc=None, mode="auto", aggregated_override=None,
                       account_key=None):
@@ -624,67 +699,77 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
     make_ref = _cct_core.make_week_ref
     get_usage = _cct_core.get_latest_usage_for_week
 
-    # Segments of an in-place-credited week share `week_start_date`, so one
-    # global `as_of_utc` resolves both to the same snapshot and renders the
-    # same percent on both rows. Bound each such segment's lookup to its own
-    # `end_ts` so the pre-credit segment reads the last snapshot captured
-    # before the credit and the post-credit segment the latest one. Same
-    # shape as `build_trend_view`'s `split_keys` handling.
-    #
-    # Every segment sharing a `start_date` is bounded EXCEPT THE LAST one.
-    # The last segment's `end_ts` is the week's real end, not a credit
-    # moment, so bounding it would reject a snapshot stamped with this
-    # `week_start_date` but captured a few seconds past the boundary — the
-    # capture-jitter tolerance
-    # `test_build_weekly_view_keeps_the_global_as_of_for_an_uncredited_week`
-    # protects on every uncredited week. Dropping that tolerance moves the
-    # post-credit row's `Used %` to an earlier reading and raises `$/1%`
-    # with it, on a week nobody edited.
+    # A segment's usage lookup is bounded when, and only when, an in-place
+    # CREDIT cut it — never merely because two segments share a `start_date`
+    # (#736). The decision comes from `in_place_cut_instants` bound through
+    # `credited_segment_cuts`, the same pair `build_trend_view`'s split
+    # handling calls; one shared predicate is what stops the two consumers
+    # drifting apart from each other and from the two appliers (epic
+    # invariant 1).
+    _cut_instants = _cct_core.in_place_cut_instants(
+        conn, account_key=account_key)
+
+    def _canon(value):
+        try:
+            return parse_iso(
+                value, "week.bound").astimezone(dt.timezone.utc)
+        except ValueError:
+            return None
+
+    # Grouping by `start_date` identifies the WEEK, which is what that column
+    # is (invariant 3); it is never the segment's identity. `segment_key` is.
     _by_start_date: dict = {}
     for w in weeks:
         _by_start_date.setdefault(w.start_date.isoformat(), []).append(w)
     _bounded_keys: set = set()
+    _credited_keys: set = set()
     for _group in _by_start_date.values():
-        if len(_group) < 2:
+        # The week's cuts are matched through the segments' own STARTS, never
+        # through the week end: a cut is verbatim the start of the segment
+        # that follows it, whereas the tail's end is moved away from
+        # `new_week_end_at` by the overlap clamp or by a boundary shift.
+        _week_cuts = _cct_core.credited_segment_cuts(
+            (_canon(_w.start_ts) for _w in _group), _cut_instants)
+        if not _week_cuts:
             continue
-        # Order by the segment's own end instant; a malformed `end_ts`
-        # sorts last so the ordering stays total and the malformed segment
-        # keeps the global `as_of` (which `_as_of_for` also falls back to).
-        def _end_sort_key(w):
-            try:
-                return (0, parse_iso(w.end_ts, "week.end_ts"))
-            except ValueError:
-                return (1, dt.datetime.max.replace(tzinfo=dt.timezone.utc))
-        _ordered = sorted(_group, key=_end_sort_key)
-        _bounded_keys.update(w.segment_key for w in _ordered[:-1])
+        _credited_keys.update(w.segment_key for w in _group)
+        for _w in _group:
+            _end = _canon(_w.end_ts)
+            if _end is not None and _end in _week_cuts:
+                _bounded_keys.add(_w.segment_key)
 
-    def _as_of_for(sw):
-        if sw.segment_key not in _bounded_keys:
-            return as_of_utc
+    def _segment_bounds(sw):
+        """``(since_utc, before_utc)`` for one segment (#750 S4 spec §1.2).
+
+        A segment of an UNCREDITED week is unchanged in every respect, so
+        both are ``None`` there. Every segment of a credited week carries the
+        INCLUSIVE lower bound: without it a credited tail with no post-cut
+        observation resolves to the latest PRE-cut reading — a percent from
+        the previous cycle — instead of being reported as missing. Only a
+        segment whose own end IS a cut carries the EXCLUSIVE upper bound; the
+        tail keeps the global ``as_of_utc`` as its upper bound, which is the
+        post-boundary capture-jitter tolerance
+        ``test_build_weekly_view_keeps_the_global_as_of_for_an_uncredited_week``
+        protects on every uncredited week.
+        """
+        if sw.segment_key not in _credited_keys:
+            return None, None
         try:
-            seg_end_dt = parse_iso(sw.end_ts, "week.end_ts")
+            since = _capture_bound_iso(parse_iso(sw.start_ts, "week.start_ts"))
         except ValueError:
-            return as_of_utc
-        # Match the stored `captured_at_utc` spelling (UTC, seconds, `Z`)
-        # so SQLite's lexicographic compare orders correctly — the same
-        # normalization `cmd_weekly` applies to the global bound.
-        seg_end = (
-            seg_end_dt.astimezone(dt.timezone.utc)
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z")
-        )
-        if as_of_utc is None:
-            return seg_end
-        try:
-            global_dt = parse_iso(as_of_utc, "weekly.as_of_utc")
-        except ValueError:
-            return seg_end
-        return seg_end if seg_end_dt <= global_dt else as_of_utc
+            since = None
+        before = None
+        if sw.segment_key in _bounded_keys:
+            try:
+                before = _capture_bound_iso(parse_iso(sw.end_ts, "week.end_ts"))
+            except ValueError:
+                before = None
+        return since, before
 
     # Build asc overlay + asc WeeklyPeriodRow list first; reverse later.
     asc_overlay: list = []
     asc_rows: list = []
+    asc_label_items: list = []
     total_cost = 0.0
     total_tok = 0
     for i, b in enumerate(buckets_asc):
@@ -709,8 +794,11 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
             week_start_at=sw.start_ts,
             week_end_at=sw.end_ts,
         )
-        usage_row = get_usage(conn, ref, as_of_utc=_as_of_for(sw),
-                              account_key=account_key)
+        _since_utc, _before_utc = _segment_bounds(sw)
+        usage_row = get_usage(conn, ref, as_of_utc=as_of_utc,
+                              account_key=account_key,
+                              since_utc=_since_utc,
+                              before_utc=_before_utc)
         used_pct = None
         if usage_row is not None and usage_row["weekly_percent"] is not None:
             used_pct = float(usage_row["weekly_percent"])
@@ -735,7 +823,14 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
             is_current = False
 
         asc_rows.append(WeeklyPeriodRow(
-            label=sw.start_date.strftime("%m-%d"),
+            # `display_start_date`, NOT the shared `start_date` join key:
+            # the applier moves the display date per segment, so a
+            # credited week's two cycles carry two labels. Every renderer
+            # in the tree already reads that field — `_render_weekly_table`,
+            # the weekly share artifact, and `_dashboard_build_weekly_periods`,
+            # which OVERWRITES this one with it. Building it right here is
+            # what removes that overwrite's reason to exist (#750 S4 §3.2).
+            label=sw.display_start_date.strftime("%m-%d"),
             cost_usd=b.cost_usd,
             total_tokens=b.total_tokens,
             input_tokens=b.input_tokens,
@@ -752,8 +847,22 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
             week_start_at=sw.start_ts,
             week_end_at=sw.end_ts,
         ))
+        asc_label_items.append((
+            sw.start_date.isoformat(), asc_rows[-1].label,
+            _parse_iso_or_none(sw.start_ts),
+        ))
         total_cost += b.cost_usd
         total_tok += b.total_tokens
+
+    # D5 / §3.2a: two segments of one credited week whose display dates fall
+    # on ONE calendar day render the same `%m-%d`. Only those gain a time
+    # suffix; an uncredited week and an ordinarily-credited week are
+    # byte-identical.
+    for _row, _label in zip(
+            asc_rows,
+            apply_label_collision_suffixes(
+                asc_label_items, display_tz=display_tz)):
+        _row.label = _label
 
     # Reverse to newest-first across all three parallel lists.
     rows = list(reversed(asc_rows))
@@ -884,8 +993,10 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
     if latest_usage is not None and latest_usage["week_start_date"] is not None:
         current_key = latest_usage["week_start_date"]
         try:
+            # SCOPED to the requesting account (#834 S2, #837), as the
+            # `latest_usage` read above and `get_recent_weeks` already are.
             canon_start, canon_end = c._get_canonical_boundary_for_date(
-                conn, latest_usage["week_start_date"]
+                conn, latest_usage["week_start_date"], account_key=account_key
             )
             current_ref = make_ref(
                 week_start_date=latest_usage["week_start_date"],
@@ -893,7 +1004,12 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
                 week_start_at=canon_start,
                 week_end_at=canon_end,
             )
-            _adjusted = c._apply_reset_events_to_weekrefs(conn, [current_ref])
+            # Scoped too (#834 S2, #837). A scoped boundary followed by a
+            # merged reset-event applier is still a merged answer: another
+            # account's in-place credit would split THIS account's current
+            # ref and the trend row would stop matching it.
+            _adjusted = c._apply_reset_events_to_weekrefs(
+                conn, [current_ref], account_key=account_key)
             if _adjusted:
                 current_week_start_at = _adjusted[0].week_start_at
         except Exception:
@@ -903,13 +1019,56 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
     # week_refs come newest-first from get_recent_weeks; reverse.
     chrono = list(reversed(week_refs))
 
-    # Split-key set (Bug D): credited weeks appear twice in week_refs
-    # with identical WeekRef.key. Pin as_of_utc=week_end_at for those
-    # so each segment finds its own latest snapshot.
-    split_keys = {
-        r.key for r in week_refs
-        if sum(1 for x in week_refs if x.key == r.key) > 1
-    }
+    # Bug D, re-decided by #750 S4 §1.1: a credited week appears more than
+    # once in `week_refs` under one `WeekRef.key`, and each appearance must
+    # resolve its own snapshot. The trigger is the CREDIT, not the repeated
+    # key — a key repeated by reset-day drift, a backfill or a boundary
+    # repair must not silently move a rendered percent (#736). The predicate
+    # is `in_place_cut_instants` bound through `credited_segment_cuts`, the
+    # same pair `build_weekly_view` calls, which is what keeps the two
+    # consumers from drifting apart from each other and from the two appliers
+    # (epic invariant 1).
+    def _canon_bound(value):
+        if not value:
+            return None
+        try:
+            return parse_iso(
+                value, "week_ref.bound").astimezone(dt.timezone.utc)
+        except ValueError:
+            return None
+
+    _cut_instants = _cct_core.in_place_cut_instants(
+        conn, account_key=account_key)
+    _refs_by_key: dict = {}
+    for _index, _r in enumerate(chrono):
+        _refs_by_key.setdefault(_r.key, []).append((_index, _r))
+    # Keyed on the ref's POSITION in `chrono`, which is the loop below's own
+    # index: two segments of one credited week differ only in their bounds,
+    # and `WeekRef.key` — the one field that would look like an identity — is
+    # exactly what they share. `id(...)` also distinguishes them, but only
+    # while every object stays alive, so a later dedup or regeneration of the
+    # list would silently unbind every segment.
+    segment_bounds_by_index: dict = {}
+    for _refs in _refs_by_key.values():
+        # Matched through the segments' own STARTS. A cut is verbatim the
+        # start of the segment that follows it, whereas the tail's end is
+        # moved away from `new_week_end_at` by `_apply_overlap_clamp_to_
+        # subweeks` or by a boundary shift, and a lookup keyed on the week
+        # end then found nothing and reported the week as uncredited.
+        _week_cuts = _cct_core.credited_segment_cuts(
+            (_canon_bound(_r.week_start_at) for _, _r in _refs),
+            _cut_instants,
+        )
+        if not _week_cuts:
+            continue
+        for _index, _r in _refs:
+            _end = _canon_bound(_r.week_end_at)
+            _start = _canon_bound(_r.week_start_at)
+            segment_bounds_by_index[_index] = (
+                _capture_bound_iso(_start) if _start is not None else None,
+                _capture_bound_iso(_end)
+                if (_end is not None and _end in _week_cuts) else None,
+            )
 
     try:
         _fresh_cfg = c._get_oauth_usage_config(c.load_config())
@@ -917,13 +1076,13 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
         _fresh_cfg = c._get_oauth_usage_config({})
 
     intermediate: list = []
-    for week_ref in chrono:
+    for _chrono_index, week_ref in enumerate(chrono):
+        _since_utc, _before_utc = segment_bounds_by_index.get(
+            _chrono_index, (None, None))
         usage = get_usage(
-            conn, week_ref,
-            as_of_utc=(
-                week_ref.week_end_at if week_ref.key in split_keys else None
-            ),
+            conn, week_ref, as_of_utc=None,
             account_key=account_key,
+            since_utc=_since_utc, before_utc=_before_utc,
         )
         usage_captured_at = usage["captured_at_utc"] if usage else None
         if c._week_ref_has_reset_event(conn, week_ref):
@@ -1084,6 +1243,16 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
         ))
         if dpp is not None:
             prev_dpp = dpp
+
+    # D5 / §3.2a: two segments of one credited week whose start instants fall
+    # on ONE calendar day render the same `%b %d`. Only those gain a time
+    # suffix, and grouping is confined to siblings of one canonical week
+    # because `%b %d` is year-free.
+    for _row, _label in zip(rows, apply_label_collision_suffixes(
+            [(str(r.week_start_date), r.week_label, r.week_start_at)
+             for r in rows],
+            display_tz=display_tz)):
+        _row.week_label = _label
 
     # 3-sample average rule (spec §4.3): mean of non-None dpps iff at
     # least 3 samples qualify.
@@ -1362,6 +1531,13 @@ def build_blocks_view(
     _lib_blocks = _load_lib("_lib_blocks")
     _lib_pricing = _load_lib("_lib_pricing")
     c = _cctally()
+    # #751a: the grouping pass already decided which entry each block owns,
+    # and adjacent recorded windows can overlap after a reset shift. The
+    # per-model breakdown below consumes that decision instead of running
+    # its own `start <= timestamp < end` rescan, which counted an
+    # overlapping entry into both windows and made the breakdown exceed its
+    # own parent row.
+    entry_membership: dict[int, list] = {}
     blocks = _lib_blocks._group_entries_into_blocks(
         entries,
         mode=mode,
@@ -1369,6 +1545,7 @@ def build_blocks_view(
         block_start_overrides=block_start_overrides,
         canonical_intervals=canonical_intervals,
         now=now_utc,
+        _entry_membership=entry_membership,
     )
     rows: list = []
     total_cost = 0.0
@@ -1379,17 +1556,15 @@ def build_blocks_view(
                 continue
             if not skip_rows:
                 # Per-block per-model breakdown for the dashboard row.
-                # Mirrors `_dashboard_build_blocks_panel`'s historical
-                # inline body — re-aggregates entries inside the block
-                # interval through the single pricing chokepoint so per-
-                # model costs reconcile exactly with `b.cost_usd`.
+                # Prices the entries the grouping pass assigned to THIS
+                # block, through the single pricing chokepoint, so per-model
+                # costs reconcile exactly with `b.cost_usd`.
                 per_model: dict[str, float] = {}
-                for e in entries:
-                    if b.start_time <= e.timestamp < b.end_time:
-                        cost = _lib_pricing._calculate_entry_cost(
-                            e.model, e.usage, mode=mode, cost_usd=e.cost_usd,
-                        )
-                        per_model[e.model] = per_model.get(e.model, 0.0) + cost
+                for e in entry_membership.get(id(b), ()):
+                    cost = _lib_pricing._calculate_entry_cost(
+                        e.model, e.usage, mode=mode, cost_usd=e.cost_usd,
+                    )
+                    per_model[e.model] = per_model.get(e.model, 0.0) + cost
                 model_breakdowns = [
                     {"modelName": name, "cost": cost}
                     for name, cost in sorted(

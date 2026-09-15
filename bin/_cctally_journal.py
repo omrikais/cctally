@@ -887,6 +887,12 @@ class SegmentElisionPlan:
             certificate_covers=self._covers(name, summary),
             resolution_seen=self.resolution_seen,
             stat_identity=(stat_result.st_dev, stat_result.st_ino),
+            # #834 S2 (#827). Lazy on purpose: the predicate evaluates this ONLY
+            # on a device-only identity change, so the common path still reads
+            # no segment bytes. Hashing here on every segment would read exactly
+            # what elision exists to skip.
+            prefix_proof=lambda: _complete_prefix_digest(
+                name, int(summary.complete_line_covered_offset)),
         )
         if not ok:
             self.scanned += 1
@@ -1040,6 +1046,34 @@ def _refill_elided_quota_raw(quota_raw, gaps, *, failures=None):
     return out, complete
 
 
+def _complete_prefix_digest(name, covered_offset) -> str:
+    """Hex `sha256` of segment ``name``'s bytes in `[0, covered_offset)`.
+
+    #834 S2 (#827). The byte-identity proof `summary_is_elidable` requires
+    before it reuses a summary across a DEVICE-ONLY identity change. Read
+    straight from the file rather than from the pass's own accumulator, because
+    the question is what the file holds NOW, not what some earlier pass folded.
+
+    Raises `OSError` when the segment cannot be read, and the predicate treats
+    that as no proof and refuses — an unreadable prefix costs a re-read of one
+    segment, while accepting it would skip retained data silently.
+    """
+    digest = hashlib.sha256()
+    remaining = int(covered_offset)
+    with _open_segment_for_read(_cctally_core.JOURNAL_DIR / name) as fh:
+        while remaining > 0:
+            chunk = fh.read(min(_SEGMENT_READ_CHUNK, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            digest.update(chunk)
+    if remaining:
+        # A short read is not a proof either: the file no longer holds the
+        # prefix the summary describes.
+        raise OSError(f"segment {name} is shorter than its summarized prefix")
+    return digest.hexdigest()
+
+
 class _SegmentSummaryCollector:
     """Per-segment traversal facts, accumulated as the pass streams.
 
@@ -1056,7 +1090,7 @@ class _SegmentSummaryCollector:
 
     __slots__ = ("summaries", "last_seen", "_name", "_lo", "_stat",
                  "_lines", "_bytes", "_decodes", "_malformed", "_retained",
-                 "_line_end")
+                 "_line_end", "_prefix_digest")
 
     def __init__(self) -> None:
         self.summaries: dict = {}
@@ -1074,6 +1108,13 @@ class _SegmentSummaryCollector:
         self._malformed = 0
         self._retained = 0
         self._line_end = 0
+        # #834 S2 (#827): the running digest of the COMPLETE prefix this summary
+        # will describe. Accumulated from the bytes the pass is already reading,
+        # so recording it costs one `sha256.update` per line and no extra I/O.
+        # It is what settles a device-only identity change: `st_dev` is assigned
+        # at mount time, so a remount presents an unchanged file at a new device
+        # number, and an inode number is unique only within a device.
+        self._prefix_digest = hashlib.sha256()
 
     def begin(self, name, lo, hi, stat_result, running) -> None:
         """Open ``name``, closing whatever segment was open before it.
@@ -1095,6 +1136,12 @@ class _SegmentSummaryCollector:
         self._lines += 1
         self._bytes += len(raw) + 1
         self._line_end = int(end_offset)
+        # `_iter_segment_lines` yields each complete line WITHOUT its newline and
+        # splits on exactly one `\n`, and this writer only summarizes segments
+        # opened at offset 0, so line-plus-newline reproduces the file's bytes in
+        # `[0, self._line_end)` verbatim.
+        self._prefix_digest.update(raw)
+        self._prefix_digest.update(b"\n")
 
     def decoded(self, retained: bool) -> None:
         """One decoded record: one traversal decode AND one `decoded` element.
@@ -1141,6 +1188,7 @@ class _SegmentSummaryCollector:
                 malformed=self._malformed,
                 quota_only=self._retained == 0,
                 decoded_entry_count=self._decodes,
+                complete_prefix_sha256=self._prefix_digest.hexdigest(),
                 last_seen_stamped=(
                     {} if partial is None else dict(partial.stamped)),
                 last_seen_legacy_claude_at=(
@@ -3367,29 +3415,134 @@ def _now_iso() -> str:
     )
 
 
-def _usage_snapshot_fold_decision(conn, payload) -> tuple[bool, object, str]:
-    """The apply-time dedup for a Claude rate-limit obs — the exact predicate
-    ported from `cmd_record_usage`'s insert guard (bin/_cctally_record.py), now
-    at fold time (spec §4.5 / §5.3).
+#: #769 S11 (#824) — the axis dispositions and the snapshot action returned by
+#: ``_usage_snapshot_fold_decision``. Spelled as module-level constants because
+#: the pipeline, the replay path and the tests all compare against them by name;
+#: a bare string literal at a call site is how two of them silently collapse.
+#:
+#: WEEKLY axis. ``WEEKLY_OBSERVED`` — the incoming weekly percent is at or above
+#: the reset-aware in-window maximum, so it IS the week's evidence.
+#: ``WEEKLY_HELD_CLAMP`` — it is strictly below that maximum, so the weekly axis
+#: is held at the maximum and the incoming value is recorded only as the raw
+#: reading. A held weekly value is never fresh weekly evidence.
+WEEKLY_OBSERVED = "observed"
+WEEKLY_HELD_CLAMP = "held_clamp"
 
-    Returns `(skip, adjusted_five_hour_percent, reason)`:
-      - reset-aware 7d HWM clamp (`_reset_aware_floor` + reset-aware MAX +
-        `hwm_clamp_applies`) → skip when a lower 7d % would be clamped, with
-        reason `SNAPSHOT_SKIP_CLAMP`;
-      - the 5h clamp adjusts `five_hour_percent` UP to the in-window MAX but
-        never gates (mirrors the nested-else in the live code);
-      - dedup vs the latest snapshot in the week: both percents unchanged → skip,
-        with reason `SNAPSHOT_SKIP_DEDUP`;
-      - otherwise accept, with reason `SNAPSHOT_ACCEPT`.
+#: FIVE-HOUR axis. ``FIVE_HOUR_MISSING`` — the observation carries no five-hour
+#: percent or no canonical window key, so there is no five-hour evidence at all.
+#: ``FIVE_HOUR_AS_OBSERVED`` — the reading is at or above the in-window maximum.
+#: ``FIVE_HOUR_CLAMPED`` — it is below, so the effective value is the maximum.
+#: The five-hour clamp adjusts the value UP and NEVER gates the row, which is
+#: the rule the pre-#824 early return on the weekly clamp used to skip past.
+FIVE_HOUR_MISSING = "missing"
+FIVE_HOUR_AS_OBSERVED = "as_observed"
+FIVE_HOUR_CLAMPED = "clamped"
 
-    `reason` exists because the two skips mean OPPOSITE things about the
-    incoming observation and the stored row (see `_lib_record` Fragment 8): a
-    dedup skip AGREES with the stored row, so re-running the derivation
-    chokepoints against it heals a killed tick; a clamp skip CONTRADICTS it, so
-    deriving a weekly milestone from the higher stored value fabricates a
-    crossing. `_pipeline_claude_usage` gates the weekly milestone on it. The
-    reason is derived from the same `conn` state and payload as `skip` itself,
-    so it is exactly as replay-deterministic as the boolean it accompanies."""
+#: The materialized outcome. ``SNAPSHOT_WRITE_OBSERVED`` — write an ordinary
+#: row. ``SNAPSHOT_WRITE_HELD_5H`` — write a row whose weekly value and boundary
+#: are carried forward from the latest non-held basis and whose five-hour
+#: fields, capture time and source are the tick's own
+#: (``weekly_observation_held = 1``). ``SNAPSHOT_SKIP_NO_CHANGE`` — neither axis
+#: carries evidence the stored row does not already have.
+SNAPSHOT_WRITE_OBSERVED = "write_observed"
+SNAPSHOT_WRITE_HELD_5H = "write_held_5h"
+SNAPSHOT_SKIP_NO_CHANGE = "skip_no_change"
+
+
+@dataclass(frozen=True)
+class WeeklyBasis:
+    """The latest NON-held ``weekly_usage_snapshots`` row for this week and
+    account — the row a held row copies its weekly value and boundary from.
+
+    Selected with ``weekly_observation_held = 0`` so a held row never becomes
+    the basis for the next one. Compounding the carry that way would let a
+    boundary drift arbitrarily far from any observation that produced it, which
+    is the lineage half of review finding 7.
+    """
+
+    snapshot_id: int
+    captured_at_utc: str
+    weekly_percent: float
+    week_start_date: "str | None"
+    week_end_date: "str | None"
+    week_start_at: "str | None"
+    week_end_at: "str | None"
+
+
+@dataclass(frozen=True)
+class WeeklyFold:
+    """The weekly axis of one fold decision."""
+
+    raw_pct: float
+    effective_pct: float
+    disposition: str
+    basis: "WeeklyBasis | None"
+
+
+@dataclass(frozen=True)
+class FiveHourFold:
+    """The five-hour axis of one fold decision.
+
+    ``rollover_heal`` is deliberately ORTHOGONAL to the snapshot action: the
+    incoming observation can name a new physical window that no
+    ``five_hour_blocks`` row anchors yet while the snapshot itself is skipped,
+    and the block-only heal is owed in exactly that case. Folding it into the
+    action would lose the case where healing is required and no row is written.
+    """
+
+    raw_pct: "float | None"
+    effective_pct: "float | None"
+    disposition: str
+    window_key: "int | None"
+    rollover_heal: bool
+
+
+@dataclass(frozen=True)
+class UsageSnapshotFoldResult:
+    """One Claude rate-limit observation, folded per axis (#769 S11, #824).
+
+    It replaces the ``(skip, adjusted_five_hour, reason)`` tuple, whose single
+    boolean could not express the case this session exists to fix: a tick whose
+    weekly percent clamps while its five-hour reading genuinely grew. The tuple
+    also carried a ``deduped`` meaning inside ``reason``; ``snapshot_action``
+    now describes the final materialized pair directly, so that distinction no
+    longer has to be reconstructed from a string at every call site.
+    """
+
+    weekly: WeeklyFold
+    five_hour: FiveHourFold
+    snapshot_action: str
+
+
+def _usage_snapshot_fold_decision(conn, payload) -> UsageSnapshotFoldResult:
+    """The apply-time accept/hold/skip decision for a Claude rate-limit obs —
+    the predicate ported from `cmd_record_usage`'s insert guard
+    (bin/_cctally_record.py), made at fold time (spec §4.5 / §5.3).
+
+    Returns a :class:`UsageSnapshotFoldResult`. The two axes are evaluated
+    INDEPENDENTLY, which is the #824 change:
+
+      - the weekly leg takes the reset-aware 7d HWM clamp (`_reset_aware_floor`
+        + reset-aware MAX + `hwm_clamp_applies`). A clamp no longer RETURNS; it
+        sets `weekly.disposition = WEEKLY_HELD_CLAMP` and carries the maximum as
+        `weekly.effective_pct`;
+      - the 5h leg adjusts `five_hour.effective_pct` UP to the in-window MAX and
+        never gates, exactly as before — but it now runs on the clamped path
+        too, where the old early return meant the tick's five-hour reading was
+        returned RAW and then discarded entirely by the pipeline;
+      - `snapshot_action` then selects the materialized outcome from both.
+
+    The clamp/hold distinction is what `_pipeline_claude_usage` gates the weekly
+    milestone on, and the reason it must survive: a dedup skip AGREES with the
+    stored row, so re-running the derivation chokepoints against it heals a
+    killed tick; a clamp CONTRADICTS it, so deriving a weekly milestone from the
+    higher stored value fabricates a crossing (the 2026-09-01 incident, a
+    fabricated 13% milestone, and milestones are forward-only within an epoch).
+
+    Every value returned is derived from the same `conn` state and payload, so
+    the whole result is exactly as replay-deterministic as the boolean it
+    replaces.
+    """
     week_start_date = payload["week_start_date"]
     week_start_at = payload.get("week_start_at")
     week_end_at = payload.get("week_end_at")
@@ -3403,22 +3556,62 @@ def _usage_snapshot_fold_decision(conn, payload) -> tuple[bool, object, str]:
     # single-account install where every row shares one key).
     account_key = payload.get("account_key") or _lib_accounts.UNATTRIBUTED
 
+    # ── Weekly axis ────────────────────────────────────────────────────────
     clamp_floor_iso = _cctally_core._reset_aware_floor(
         conn, week_start_date, week_start_at, week_end_at,
         account_key=account_key,
     ) or "1970-01-01T00:00:00Z"
+    # `weekly_observation_held = 0` (#769 S11): a held row's weekly value is a
+    # copy of an OLDER row's, so counting it here would let pre-credit evidence
+    # re-enter a post-credit maximum and clamp a genuine reading. The MAX is a
+    # weekly read, and every weekly read excludes held rows.
     max_row = conn.execute(
         "SELECT MAX(weekly_percent) FROM weekly_usage_snapshots "
         "WHERE week_start_date = ? AND account_key = ? "
+        "  AND weekly_observation_held = 0 "
         "  AND unixepoch(captured_at_utc) >= unixepoch(?)",
         (week_start_date, account_key, clamp_floor_iso),
     ).fetchone()
     max_v = max_row[0] if max_row else None
-    if _lib_record.hwm_clamp_applies(weekly_percent, max_v):
-        return True, five_hour_percent, _lib_record.SNAPSHOT_SKIP_CLAMP
+    weekly_held = _lib_record.hwm_clamp_applies(weekly_percent, max_v)
+    weekly_effective = float(max_v) if weekly_held else weekly_percent
 
+    basis = None
+    if weekly_held:
+        basis_row = conn.execute(
+            "SELECT id, captured_at_utc, weekly_percent, week_start_date, "
+            "       week_end_date, week_start_at, week_end_at "
+            "FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? AND account_key = ? "
+            "  AND weekly_observation_held = 0 "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+            (week_start_date, account_key),
+        ).fetchone()
+        if basis_row is not None:
+            basis = WeeklyBasis(
+                snapshot_id=int(basis_row[0]),
+                captured_at_utc=str(basis_row[1]),
+                weekly_percent=float(basis_row[2]),
+                week_start_date=basis_row[3],
+                week_end_date=basis_row[4],
+                week_start_at=basis_row[5],
+                week_end_at=basis_row[6],
+            )
+
+    weekly = WeeklyFold(
+        raw_pct=weekly_percent,
+        effective_pct=weekly_effective,
+        disposition=WEEKLY_HELD_CLAMP if weekly_held else WEEKLY_OBSERVED,
+        basis=basis,
+    )
+
+    # ── Five-hour axis ─────────────────────────────────────────────────────
+    # Runs unconditionally. Before #824 the weekly clamp returned above this
+    # block, so a weekly-clamped tick reported its five-hour reading RAW.
     adjusted_5h = five_hour_percent
+    five_hour_disposition = FIVE_HOUR_MISSING
     if five_hour_percent is not None and five_hour_window_key is not None:
+        five_hour_disposition = FIVE_HOUR_AS_OBSERVED
         max_5h_row = conn.execute(
             "SELECT MAX(five_hour_percent) FROM weekly_usage_snapshots "
             "WHERE five_hour_window_key = ? AND account_key = ? "
@@ -3433,20 +3626,74 @@ def _usage_snapshot_fold_decision(conn, payload) -> tuple[bool, object, str]:
         max_5h = max_5h_row[0] if max_5h_row else None
         if _lib_record.hwm_clamp_applies(float(five_hour_percent), max_5h):
             adjusted_5h = float(max_5h)
+            five_hour_disposition = FIVE_HOUR_CLAMPED
+        else:
+            adjusted_5h = float(five_hour_percent)
 
+    # ── What the stored state already knows ────────────────────────────────
+    # HELD-INCLUSIVE, deliberately. This is a five-hour read as much as a
+    # weekly one: a held row carries the latest five-hour value, so excluding
+    # it would make the next held tick look like new five-hour evidence and
+    # write a duplicate row every tick. Its weekly value is by construction a
+    # copy of the basis's, so including it changes no weekly comparison.
     last = conn.execute(
-        "SELECT weekly_percent, five_hour_percent FROM weekly_usage_snapshots "
+        "SELECT weekly_percent, five_hour_percent, five_hour_window_key "
+        "FROM weekly_usage_snapshots "
         "WHERE week_start_date = ? AND account_key = ? "
         "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
         (week_start_date, account_key),
     ).fetchone()
-    if last is not None and float(last[0]) == weekly_percent:
-        last_5h = last[1]
-        if adjusted_5h is None or (
-            last_5h is not None and float(last_5h) == float(adjusted_5h)
+    last_5h = last[1] if last is not None else None
+    last_window_key = last[2] if last is not None else None
+
+    five_hour_unchanged = adjusted_5h is None or (
+        last_5h is not None and float(last_5h) == float(adjusted_5h)
+    )
+
+    # ── The window-rollover heal, orthogonal to the action ─────────────────
+    rollover_heal = False
+    if adjusted_5h is not None and five_hour_window_key is not None:
+        if last_window_key is None or int(last_window_key) != int(
+            five_hour_window_key
         ):
-            return True, adjusted_5h, _lib_record.SNAPSHOT_SKIP_DEDUP
-    return False, adjusted_5h, _lib_record.SNAPSHOT_ACCEPT
+            rollover_heal = conn.execute(
+                "SELECT 1 FROM five_hour_blocks WHERE five_hour_window_key = ? "
+                "  AND account_key = ? LIMIT 1",
+                (int(five_hour_window_key), account_key),
+            ).fetchone() is None
+
+    five_hour = FiveHourFold(
+        raw_pct=None if five_hour_percent is None else float(five_hour_percent),
+        effective_pct=adjusted_5h,
+        disposition=five_hour_disposition,
+        window_key=None if five_hour_window_key is None
+        else int(five_hour_window_key),
+        rollover_heal=rollover_heal,
+    )
+
+    # ── The materialized outcome ───────────────────────────────────────────
+    if weekly_held:
+        # The weekly axis carries nothing new by definition — its value is the
+        # stored maximum. Only the five-hour axis can justify a row, and it can
+        # only justify a HELD one. A clamp with no basis cannot be materialized
+        # at all (no boundary to copy), so it degrades to a skip rather than
+        # writing a row with a fabricated week.
+        if five_hour_unchanged or basis is None:
+            action = SNAPSHOT_SKIP_NO_CHANGE
+        else:
+            action = SNAPSHOT_WRITE_HELD_5H
+    else:
+        weekly_unchanged = (
+            last is not None and float(last[0]) == weekly_percent
+        )
+        action = (
+            SNAPSHOT_SKIP_NO_CHANGE
+            if weekly_unchanged and five_hour_unchanged
+            else SNAPSHOT_WRITE_OBSERVED
+        )
+
+    return UsageSnapshotFoldResult(
+        weekly=weekly, five_hour=five_hour, snapshot_action=action)
 
 
 # NOTE (rev 3): the direct obs -> weekly_usage_snapshots fold is GONE. That
@@ -7486,6 +7733,16 @@ _REBUILD_MILESTONE_ORDER = 60
 
 # Journal-covered families counted in the RebuildResult report (+ the two
 # re-materialized quota projection families, useful for the operator command).
+#
+# Two stats tables are deliberately ABSENT, and the absence is a decision
+# rather than an oversight: `weekly_reset_debounce_state` (#750 S3) and
+# `five_hour_credit_confirmation_state` (#769 S2). Both hold disposable
+# operational state that the journal does not describe, so a rebuild
+# reproduces none of their rows and a count over them would report zero on
+# every rebuild while implying the rebuild had checked something. Membership
+# here is "this family is journal truth the rebuild re-derives", which neither
+# is. `tests/test_epoch_1013_reset_origin.py` and
+# `tests/test_epoch_1014_source_local_confirmation.py` pin both exclusions.
 _REBUILD_COUNT_TABLES = (
     "weekly_usage_snapshots", "weekly_cost_snapshots", "week_reset_events",
     "five_hour_reset_events", "five_hour_blocks", "five_hour_block_models",
@@ -7659,6 +7916,7 @@ _REBUILD_REQUIRED_TABLES = frozenset(
         "five_hour_block_models",
         "five_hour_block_projects",
         "five_hour_blocks",
+        "five_hour_credit_confirmation_state",
         "five_hour_milestones",
         "five_hour_reset_events",
         "journal_cursor",
@@ -7735,7 +7993,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
 # omitted column, constraint, partial predicate, or index definition.  An epoch
 # schema change must update this contract alongside STATS_INDEX_EPOCH.
 _REBUILD_SCHEMA_FINGERPRINT = (
-    "41038fa21e2c9e3c586768d98bc3a0984d223af943ef25d7bdae1c0c8906e217"
+    "b8f18315bce871bd9692ba1db73cf7e2bda716b360616fc65149ce209248906d"
 )
 
 
@@ -8573,8 +8831,9 @@ def _open_publication_connection(destination) -> sqlite3.Connection:
 
     conn = _cctally_store.stats_open_guarded(
         pathlib.Path(destination),
-        connect=lambda path: sqlite3.connect(
-            pathlib.Path(path).resolve().as_uri(), uri=True
+        # #778: forward the opener's `cached_statements=0`.
+        connect=lambda path, **kw: sqlite3.connect(
+            pathlib.Path(path).resolve().as_uri(), uri=True, **kw
         ),
         recover_interruptions=False,
     )
@@ -10378,6 +10637,84 @@ def _observe_selector_desynchronization(path) -> "dict | None":
     }
 
 
+def _rematerialize_five_hour_high_water(destination) -> None:
+    """Rewrite the `hwm-5h` projection file from a freshly published LIVE stats
+    index (#769 S11, #824).
+
+    `hwm-7d` deliberately has no such pass, and the reason is recorded above:
+    the SQL 7d high-water clamp re-establishes the floor on the next status-line
+    tick, so a stale or absent file self-heals. The five-hour axis needs one
+    now, because a weekly-clamped tick's five-hour evidence lives only in a
+    `weekly_observation_held` row: `db rebuild` reconstructs that row from the
+    journal without rerunning the live pipeline, and `db rederive`'s scratch
+    derivation runs with projection writes disabled, so neither path would
+    otherwise leave `hwm-5h` describing the index it just published — and the
+    two would disagree with each other about it.
+
+    The read is HELD-INCLUSIVE, which is the whole point: the held row is where
+    the evidence is. The write is unconditional rather than monotonic, because
+    the published index IS the truth here — a rebuild holds maintenance
+    exclusive and the bounded ingest lock, so no concurrent tick can have
+    written a value this pass does not already account for, and a five-hour
+    credit legitimately lowers the value.
+
+    The MAX is bounded on the window's latest `effective_reset_at_utc` and
+    scoped to one account, mirroring the fold's own five-hour clamp. An
+    unfloored MAX is not the effective value: an in-place five-hour credit
+    retires the rows captured before it WITHOUT deleting them (the stale-replica
+    DELETE bands only at or after the credit instant), so the pre-credit peak
+    survives in the index and an unfloored read republishes it — re-inflating
+    the status line's no-regression floor past a level the meter has already
+    moved past, which is the exact outcome the credit's own force-write exists
+    to prevent. The account comes from the same latest row that selects the
+    window, because a reset generation is meaningful only inside the account
+    that was issued it; `hwm-5h` is nonetheless a single global file, so which
+    account owns it across a multi-account install is #832's question, not one
+    this pass can settle.
+
+    `hwm-7d` is never read or written here, so no held weekly value can reach
+    the file the status line renders the weekly axis from.
+
+    Best-effort and silent, matching every other projection-file writer: a
+    projection is re-derivable by definition and must never fail a publication.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{destination}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return
+    try:
+        latest = conn.execute(
+            "SELECT five_hour_window_key, account_key FROM weekly_usage_snapshots "
+            "WHERE five_hour_window_key IS NOT NULL "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+        ).fetchone()
+        if latest is None or latest[0] is None:
+            return
+        window_key = int(latest[0])
+        account_key = latest[1] or _lib_accounts.UNATTRIBUTED
+        row = conn.execute(
+            "SELECT MAX(five_hour_percent) FROM weekly_usage_snapshots "
+            "WHERE five_hour_window_key = ? AND account_key = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(COALESCE("
+            "        (SELECT effective_reset_at_utc FROM five_hour_reset_events "
+            "          WHERE five_hour_window_key = ? AND account_key = ? "
+            "          ORDER BY id DESC LIMIT 1),"
+            "        '1970-01-01T00:00:00Z'))",
+            (window_key, account_key, window_key, account_key),
+        ).fetchone()
+    except sqlite3.Error:
+        return
+    finally:
+        conn.close()
+    if row is None or row[0] is None:
+        return
+    try:
+        (_cctally_core.APP_DIR / "hwm-5h").write_text(
+            f"{window_key} {float(row[0])}\n")
+    except OSError:
+        pass
+
+
 def rebuild_stats_index(
     *,
     context: RebuildContext,
@@ -11025,6 +11362,12 @@ def _rebuild_stats_index_locked(
     )
     phase_seconds["publication"] = round(
         time.monotonic() - publication_started, 6)
+
+    # #769 S11 (#824). LIVE destination only. A `target_path` build is a scratch
+    # or preview index that nothing renders from, and mutating a projection file
+    # on its behalf would let a preview change what the status line shows.
+    if target_path is None:
+        _rematerialize_five_hour_high_water(dest)
 
     return RebuildResult(
         rows_by_table=rows_by_table, malformed=malformed,

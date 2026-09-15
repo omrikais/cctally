@@ -52,9 +52,12 @@ the raw `st_size`, and elision requires all three to be equal.
 This module performs no I/O beyond the sidecar itself and imports nothing from
 `_cctally_journal`, so it is unit-testable without a journal on disk — the same
 rule `bin/_lib_journal_router.py` and `bin/_lib_cache_coverage.py` follow. The
-two modules it does import, `_lib_journal_router` and `_cctally_core`, are
-themselves leaf modules; they are imported for the two constants
-`summary_version` is derived from, not for behaviour.
+three modules it does import — `_lib_journal_router`, `_cctally_core` and
+`_lib_ingest_frontier` — are themselves leaf modules; the first two supply the
+two constants `summary_version` is derived from, and the third supplies
+`source_identity_replaced`, the repository's single point of truth for "does a
+different file now occupy this pathname". The prefix proof the identity check
+may require is supplied BY THE CALLER as a callable, so the no-I/O rule holds.
 """
 from __future__ import annotations
 
@@ -66,6 +69,7 @@ import tempfile
 from dataclasses import dataclass, field, replace
 
 import _cctally_core
+import _lib_ingest_frontier
 import _lib_journal_router
 
 
@@ -80,7 +84,7 @@ SIDECAR_NAME = ".segment-summaries"
 #: Bumped by hand when a summary's FIELD SET or the meaning of one of its
 #: numbers changes. It is only one of the three inputs to `summary_version`; the
 #: other two are derived, for the reason that function's docstring gives.
-SUMMARY_SHAPE_VERSION = 2
+SUMMARY_SHAPE_VERSION = 3
 
 #: The refusal reasons `summary_is_elidable` returns. They are stable, because
 #: the rebuild record reports them (spec section 6.3, "recorded, not silent").
@@ -121,6 +125,14 @@ class SegmentSummary:
     #: retained records plus placeholders, and never a malformed line. `None`
     #: means the summary predates the field and cannot be elided against.
     decoded_entry_count: "int | None" = 0
+    #: Hex `sha256` of the segment's bytes in `[0, complete_line_covered_offset)`
+    #: — the COMPLETE prefix this summary describes. #834 S2 (#827): it exists
+    #: so a device-only identity change can be settled by content rather than
+    #: refused. Inode numbers are unique only within a device, and no other
+    #: field separates two files sharing device-independent identity, size and
+    #: pinned extent. `None` means the summary predates the field, and no proof
+    #: is possible against it, so such a summary refuses a device-only change.
+    complete_prefix_sha256: "str | None" = None
     #: The segment's partial `LastSeenAccumulator` state.
     last_seen_stamped: dict = field(default_factory=dict)
     last_seen_legacy_claude_at: "str | None" = None
@@ -129,7 +141,7 @@ class SegmentSummary:
 
 def summary_is_elidable(
     summary, *, pinned_raw_extent, is_last, certificate_covers,
-    resolution_seen, stat_identity=None,
+    resolution_seen, stat_identity=None, prefix_proof=None,
 ) -> "tuple[bool, str]":
     """``(verdict, reason)`` for one segment against spec section 5.5.
 
@@ -137,6 +149,13 @@ def summary_is_elidable(
     optional because the caller that has already stat'd the segment passes it
     and a unit test asserting one of the other conditions does not; when it is
     absent the identity condition is the caller's to have checked.
+
+    ``prefix_proof`` is a callable returning the hex ``sha256`` of the segment's
+    CURRENT bytes in ``[0, complete_line_covered_offset)``. It is evaluated ONLY
+    on a device-only identity change, because evaluating it on the common path
+    would read every segment elision exists to skip. ``None`` means the caller
+    can supply no proof, which refuses that change rather than reusing
+    optimistically.
 
     The order is deliberate, and two parts of it change behaviour rather than
     only wording. `resolution_seen` comes first because it is a property of the
@@ -149,15 +168,47 @@ def summary_is_elidable(
     segment the summary's own extent already disqualifies, and a test asserting
     the refusal REASON is what distinguishes the two mechanisms. Reordering
     these two is therefore a behaviour change, not a cleanup.
+
+    #834 S2 (#827): THE INODE DECIDES; THE DEVICE CORROBORATES. This used to
+    compare ``(st_dev, st_ino)`` as a pair, so an ordinary remount of a journal
+    on an external or network volume refused every summary for files that had
+    not changed at all — `st_dev` is assigned when a volume is mounted rather
+    than when a file is created. The verdict now goes through
+    `_lib_ingest_frontier.source_identity_replaced`, which both Codex walks and
+    `classify_recent_active_path` already use, because three copies of one
+    comparison is the shape in which one of them silently stops matching the
+    others.
+
+    A device-only change additionally requires the byte-identity proof, because
+    inode numbers are unique only WITHIN a device and no other field separates
+    two files sharing device-independent identity, size and pinned extent. The
+    collision is narrow — size and pinned extent must also match — but the
+    failure it produces is a silent omission of retained data rather than a
+    recomputation, so it is refused rather than argued about. A summary written
+    before the digest field carries ``None`` and refuses the same way.
     """
     if resolution_seen:
         return False, REASON_RESOLUTION
     if is_last:
         return False, REASON_LAST
     if stat_identity is not None:
-        if (int(summary.st_dev), int(summary.st_ino)) != (
-                int(stat_identity[0]), int(stat_identity[1])):
+        observed_dev, observed_ino = int(stat_identity[0]), int(stat_identity[1])
+        if _lib_ingest_frontier.source_identity_replaced(
+                int(summary.st_dev), int(summary.st_ino),
+                observed_dev, observed_ino):
             return False, REASON_IDENTITY
+        if int(summary.st_dev) != observed_dev:
+            digest = summary.complete_prefix_sha256
+            if not digest or prefix_proof is None:
+                return False, REASON_IDENTITY
+            try:
+                observed_digest = prefix_proof()
+            except OSError:
+                # An unreadable prefix is not a proof. Refusing costs a re-read
+                # of one segment; accepting would skip retained data.
+                return False, REASON_IDENTITY
+            if observed_digest != digest:
+                return False, REASON_IDENTITY
     # ONE equality over three operands, not two comparisons: see the module
     # docstring for why the raw size and the newline boundary are independent.
     if not (int(summary.complete_line_covered_offset)
@@ -176,7 +227,8 @@ def summary_is_elidable(
 _FIELDS = (
     "segment_name", "st_dev", "st_ino", "summarized_size",
     "complete_line_covered_offset", "lines", "bytes", "decodes", "malformed",
-    "quota_only", "decoded_entry_count", "last_seen_stamped",
+    "quota_only", "decoded_entry_count", "complete_prefix_sha256",
+    "last_seen_stamped",
     "last_seen_legacy_claude_at", "last_seen_legacy_codex_at",
 )
 
@@ -236,6 +288,9 @@ def to_wire(summary) -> dict:
         "decoded_entry_count": (
             None if summary.decoded_entry_count is None
             else int(summary.decoded_entry_count)),
+        "complete_prefix_sha256": (
+            None if summary.complete_prefix_sha256 is None
+            else str(summary.complete_prefix_sha256)),
         "last_seen_stamped": {
             str(key): str(value)
             for key, value in dict(summary.last_seen_stamped).items()
@@ -272,6 +327,9 @@ def from_wire(item) -> SegmentSummary:
         malformed=int(item["malformed"]),
         quota_only=bool(item["quota_only"]),
         decoded_entry_count=None if count is None else int(count),
+        complete_prefix_sha256=(
+            None if item["complete_prefix_sha256"] is None
+            else str(item["complete_prefix_sha256"])),
         last_seen_stamped={
             str(key): str(value) for key, value in stamped.items()},
         last_seen_legacy_claude_at=(

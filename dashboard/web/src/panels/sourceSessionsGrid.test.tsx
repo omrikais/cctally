@@ -75,6 +75,9 @@ describe('SourceSessionsGrid — Codex columns + vocabulary (§6.3)', () => {
       source: 'codex',
       resource: 'session',
       key: 'session:codex-a',
+      // #769 S9: sessions stay account-agnostic (Decision R4), so the opener
+      // names no row account and the state records the absence as null.
+      accountKey: null,
     });
   });
 
@@ -181,6 +184,7 @@ describe('SourceSessionsGrid — All-mode interleave (§6.3)', () => {
       source: 'claude',
       resource: 'session',
       key: 'session:claude-a',
+      accountKey: null,
     });
     expect(getState().openModal).toBeNull();
   });

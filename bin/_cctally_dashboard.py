@@ -475,6 +475,10 @@ from _lib_aggregators import (
     _finalize_bucket,
 )
 from _lib_fmt import stable_sum
+# The MODULE, not just the names: #714's `pricing_snapshot_context` has to be
+# reached through the live module object so a test that swaps the snapshot is
+# seen by the request, build and sync entries below.
+import _lib_pricing
 from _lib_pricing import (_calculate_entry_cost, _chip_for_model,
                           _short_model_name, claude_usage_dict)
 from _lib_five_hour import _canonical_5h_window_key, _round_to_ten_minutes
@@ -505,6 +509,14 @@ from _cctally_cache import (
     open_cache_db as _raw_open_cache_db,
     open_conversations_db, sync_cache, sync_claude_conversations,
     sync_codex_conversations,
+    # #780 read-route admission. Imported here so the conversation route module
+    # reaches them the same way it reaches `open_conversations_db` — through
+    # `sys.modules["_cctally_dashboard"]`, which is the seam its tests patch.
+    open_conversations_db_readonly,
+    probe_conversations_maintenance_free,
+    ConversationReaderUnavailable, MaintenanceInProgress,
+    SchemaBehind, SchemaAhead, LegacyBridgePending,
+    pricing_refusal_cause_phrase,
     _prune_orphaned_cache_entries,
 )
 from _lib_snapshot_cache import (
@@ -734,18 +746,27 @@ def _codex_totals_wire(totals) -> dict[str, Any]:
     }
 
 
-def _codex_detail_inputs(snapshot):
-    """Open one bounded, sync-free Codex relational read for a detail route."""
+def _codex_detail_context(snapshot):
+    """Open ONE sync-free Codex read context for a detail route (#815).
+
+    Yields exactly one ``DashboardReadContext`` and nothing else. Each resource
+    then loads only what it reads.
+
+    The retired ``_codex_detail_inputs`` loaded a full year of qualified Codex
+    accounting — ``range_start = now_utc - timedelta(days=365)`` — plus a
+    35-day, 1,000-row quota read, before either builder selected a row.
+    Measured on the production cache at S9 kickoff, every one of the 216,165
+    ``codex_session_entries`` rows falls inside that year predicate, so the
+    year bounded nothing and each detail click loaded the whole corpus. The
+    block builder received no qualified entries at all and read none, and the
+    third value that function yielded — ``_codex_entries_from_qualified(
+    qualified)`` — was consumed by neither builder.
+    """
     from _cctally_cache import open_cache_db
     from _cctally_dashboard_sources import (
-        DASHBOARD_QUOTA_OBSERVATION_LIMIT,
-        DASHBOARD_QUOTA_RECENT_DAYS,
         DashboardReadContext,
-        _codex_entries_from_qualified,
         resolve_dashboard_source_semantics,
     )
-    from _cctally_quota import load_codex_quota_observations
-    from _cctally_source_analytics import load_qualified_codex_entries
 
     now_utc = getattr(snapshot, "generated_at", None) or _command_as_of()
     if now_utc.tzinfo is None or now_utc.utcoffset() is None:
@@ -780,74 +801,176 @@ def _codex_detail_inputs(snapshot):
             codex_quota_projected_thresholds=semantics.codex_quota_projected_thresholds,
             cache_report_anomaly_threshold_pp=semantics.cache_report_anomaly_threshold_pp,
         )
-        qualified = load_qualified_codex_entries(
-            range_start,
-            now_utc + dt.timedelta(microseconds=1),
-            speed=semantics.speed,
-            sync=False,
-            cache_conn=cache_conn,
-        )
-        entries = _codex_entries_from_qualified(qualified)
-        active_roots = tuple(sorted(
-            str(row[0]) for row in cache_conn.execute(
-                "SELECT source_root_key FROM codex_source_roots"
-            )
-        ))
-        observations = load_codex_quota_observations(
-            source_root_keys=active_roots,
-            cache_conn=cache_conn,
-            captured_at_or_after=(
-                now_utc - dt.timedelta(days=DASHBOARD_QUOTA_RECENT_DAYS)
-            ),
-            active_at=now_utc,
-            max_rows=DASHBOARD_QUOTA_OBSERVATION_LIMIT,
-        )
-        yield context, qualified, entries, observations
+        yield context
     finally:
         cache_conn.close()
         stats_conn.close()
 
 
-def _build_codex_session_detail(context, entries, *, key: str) -> dict[str, Any]:
-    view = sys.modules["cctally"].build_codex_session_view(
-        entries,
-        now_utc=context.now_utc,
-        tz_name=context.display_tz_name,
-        speed=context.speed,
-    )
-    for row in view.rows:
-        candidate = dashboard_resource_key(
-            "session", "codex", row.codex_root or "single-root", row.session_id_path,
-        )
-        if candidate != key:
-            continue
-        return {
-            "detail_kind": "codex_session",
-            "key": key,
-            "last_activity": row.last_activity.astimezone(dt.timezone.utc).isoformat(),
-            "cost_usd": row.cost_usd,
-            "input_tokens": row.input_tokens,
-            "cached_input_tokens": row.cached_input_tokens,
-            "output_tokens": row.output_tokens,
-            "reasoning_output_tokens": row.reasoning_output_tokens,
-            "total_tokens": row.total_tokens,
-            "models": list(row.models),
-            "model_breakdowns": _codex_model_breakdowns(row.model_breakdowns),
-        }
-    raise SourceResourceNotFound()
+def _codex_generation_metadata_state(snapshot) -> str:
+    """The FROZEN generation's typed verdict on qualified project attribution.
+
+    #769 S6 / #781. `metadata_availability` used to be set only by
+    `_codex_partial_source_detail`, and that branch was selected by
+    `QualifiedMetadataUnavailable` escaping the expensive builder. A path that
+    never calls the builder can never raise it, so the status is decided here
+    instead, from what the published generation already carries.
+
+    #834 S2 (#828, #829) repoints it from the Projects CAPABILITY to the typed
+    `metadata_health`, for two reasons. The capability is decided over the
+    generation's ~30-day accounting window while both detail routes read a
+    YEAR, so a malformed row aged thirty-one to three hundred and sixty-five
+    days set no flag at all and the page rendered in full with that row's cost
+    silently absent. And the capability is one boolean, so a deterministically
+    unqualifiable row and a health read that FAILED published the same partial
+    explanation — the reader was told to rebuild the cache over a transient
+    SQLite error.
+
+    An absent or unreadable carrier answers `transient_read_failure` rather
+    than `healthy`: the route reaches this only after `source_detail_lookup`
+    read the same state, so it is defensive, and a claim of complete
+    attribution is the wrong thing to guess.
+    """
+    try:
+        health = snapshot.source_bundle.sources["codex"].metadata_health
+    except (AttributeError, KeyError, TypeError):
+        return "transient_read_failure"
+    if not isinstance(health, Mapping):
+        return "transient_read_failure"
+    state = health.get("state")
+    return state if isinstance(state, str) and state else "transient_read_failure"
 
 
-def _build_codex_project_detail(context, qualified, observations, *, key: str) -> dict[str, Any]:
-    from _lib_quota import build_blocks
+def _codex_generation_metadata_partial(snapshot) -> bool:
+    """Whether this generation's attribution is anything other than healthy."""
+    return _codex_generation_metadata_state(snapshot) != "healthy"
+
+
+#: What each non-healthy state tells the reader. #834 S2 (#829): these are two
+#: different situations with two different remedies, and before the typed
+#: carrier they published the same sentence — so a reader met by a transient
+#: SQLite error was told to rebuild their Codex cache.
+_METADATA_PARTIAL_REASONS = {
+    "malformed_row_partial": "Project metadata is unavailable for this item.",
+    "transient_read_failure": (
+        "This build could not check project metadata health; it will retry on "
+        "the next refresh."
+    ),
+}
+#: An unrecognized state is explained as a transient failure rather than left
+#: unexplained, matching `_codex_generation_metadata_state`'s own fallback.
+_METADATA_UNKNOWN_REASON = _METADATA_PARTIAL_REASONS["transient_read_failure"]
+
+
+def _metadata_detail_fields(state: str, *, missing: bool) -> dict[str, Any]:
+    """The two metadata keys every Codex detail carries, healthy or not.
+
+    #834 S2 (#829). Healthy details used to OMIT both keys, and
+    `tests/test_codex_session_detail_rows.py` asserted their absence. They are
+    explicitly null now, which is a deliberate wire change: a client cannot
+    tell an omitted key from a key this build could not fill, and that is the
+    exact ambiguity the typed health result exists to end. The schema bump to
+    12 carries it.
+    """
+    if state == "healthy" or not missing:
+        return {"metadata_availability": None, "metadata_reason": None}
+    return {
+        "metadata_availability": "partial",
+        "metadata_reason": _METADATA_PARTIAL_REASONS.get(
+            state, _METADATA_UNKNOWN_REASON),
+    }
+
+
+def _build_codex_session_detail(snapshot, row: Mapping, *,
+                                key: str) -> dict[str, Any]:
+    """Build the session detail from the row the route already looked up.
+
+    #769 S6 / #781. `source_detail_lookup` reads the frozen published bundle
+    with no I/O, matches `data["sessions"]["rows"]` by key and enforces account
+    ownership. The published row is a strict superset of the accounting fields
+    this detail returns, so no accounting query is required — which also means
+    no refresh can mix a newer database row into an older published row.
+
+    The retired implementation reloaded a full year of qualified Codex entries,
+    rebuilt every session row and linearly rescanned them, recomputing
+    `dashboard_resource_key` per row, to find the same row again. It also built
+    that key from `row.codex_root` raw while `_session_wire` builds it from
+    `identity_path(row.codex_root)`; with an alias active the two constructions
+    named different rows and the request 404ed. Serving from the published row
+    leaves exactly one construction.
+
+    No read of `private_session_labels` is introduced. That map is populated
+    unconditionally and request privacy is applied later to request-local
+    envelope copies, so reading it here would bypass the gate. The label
+    continues to arrive through the route's existing row merge.
+    """
+    if not isinstance(row, Mapping) or not row:
+        raise SourceResourceNotFound()
+    detail: dict[str, Any] = {
+        "detail_kind": "codex_session",
+        "key": key,
+        "last_activity": row.get("last_activity"),
+        "cost_usd": row.get("cost_usd"),
+        "input_tokens": row.get("input_tokens"),
+        "cached_input_tokens": row.get("cached_input_tokens"),
+        "output_tokens": row.get("output_tokens"),
+        "reasoning_output_tokens": row.get("reasoning_output_tokens"),
+        "total_tokens": row.get("total_tokens"),
+        "models": list(row.get("models") or ()),
+        "model_breakdowns": _codex_model_breakdowns(
+            row.get("model_breakdowns") or ()),
+    }
+    # The same rule the partial branch applied, over the same two inputs: a
+    # session is partial only when the generation's attribution is incomplete
+    # AND this row resolved no project of its own. Both keys are now always
+    # present, null when the session is not partial.
+    detail.update(_metadata_detail_fields(
+        _codex_generation_metadata_state(snapshot),
+        missing=not row.get("project"),
+    ))
+    return detail
+
+
+def _build_codex_project_detail(context, *, key: str) -> dict[str, Any]:
+    """Serve one Codex project from that project's OWN accounting rows (#815).
+
+    The published project row cannot replace this read, unlike the session
+    case: it carries neither `models` nor a per-session breakdown, and it is
+    built over roughly thirty calendar days while this detail is built over a
+    year, so substituting it would silently change every number reported.
+    What the read stops doing is loading the OTHER projects' rows.
+
+    `opaque_project_key` is not reversible and `dashboard_resource_key` is a
+    second non-reversible digest over it, so neither identifier becomes a SQL
+    predicate. The scoped reader re-derives each candidate's opaque key over
+    the metadata tables and this matcher decides, which is why it is a
+    predicate rather than a value.
+    """
     from _lib_source_analytics import build_codex_project_result
+    from _cctally_source_analytics import load_codex_project_scoped_entries
 
+    qualified = load_codex_project_scoped_entries(
+        context.range_start,
+        context.now_utc + dt.timedelta(microseconds=1),
+        speed=context.speed,
+        matches_project_key=lambda candidate: (
+            dashboard_resource_key("project", "codex", candidate) == key
+        ),
+        cache_conn=context.cache_conn,
+    )
+    # `blocks` and `allocation_entries` are GONE, and removing them is what
+    # makes a scoped read legitimate rather than a silent numeric change. They
+    # feed only `quota_attributions`, which this detail has never emitted.
+    # There is genuine cross-project allocation: `allocation_entries` supplies
+    # the whole root-and-window cost denominator while the project's own
+    # entries supply the numerator, so passing the scoped population as
+    # `allocation_entries` would set the project's quota share to 100%.
+    # Removing the argument is correct; narrowing it is not.
     result = build_codex_project_result(
         qualified,
         range_start=context.range_start,
         range_end=context.now_utc + dt.timedelta(microseconds=1),
-        blocks=build_blocks(observations),
         as_of=context.now_utc,
-        allocation_entries=qualified,
         include_breakdown=True,
     )
     data = result.data
@@ -889,29 +1012,125 @@ def _build_codex_project_detail(context, qualified, observations, *, key: str) -
     raise SourceResourceNotFound()
 
 
-def _build_codex_block_detail(context, observations, *, key: str) -> dict[str, Any]:
-    from _lib_quota import build_blocks, forecast_quota, percent_milestones, quota_freshness
-    from _cctally_quota import assert_projection_readable
+def _build_codex_block_detail(context, *, key: str,
+                              row: "Mapping | None" = None) -> dict[str, Any]:
+    """Serve one Codex quota block from its OWN physical group (#815).
 
+    The candidate is resolved FIRST and the evidence load is scoped to it,
+    which inverts the previous ordering for a reason: the candidate supplies
+    the coordinates the load is scoped to.
+
+    The retired shape loaded the last 35 days capped at 1,000 rows before this
+    ran. That bound is on CARDINALITY, not on the answer — it can return rows
+    belonging to windows nobody asked about while dropping rows belonging to
+    the window that was asked about, and ``block.observations``,
+    ``percent_milestones``, ``quota_freshness`` and ``forecast_quota`` are then
+    all recomputed from a set missing members. A group larger than the cap, or
+    an already-reset window sorted behind an active one, starved the requested
+    window completely and the route answered a spurious 404.
+    """
+    import _lib_accounts
+    from _lib_quota import build_blocks, forecast_quota, percent_milestones, quota_freshness
+    from _cctally_quota import assert_projection_readable, load_codex_quota_observations
+    from _lib_quota_ledger import loading_unit_from_identity, snap_equivalent_raw_groups
+
+    published = row if isinstance(row, Mapping) else {}
     # BEFORE the SQL, per #496 S5b section 4.7.
     assert_projection_readable(context.stats_conn)
+    # PREDICATED ON THE PUBLISHED ROW. The candidate read was `ORDER BY
+    # resets_at_utc DESC … LIMIT 250` with no predicate, so a request for a
+    # block beyond the 250th most recent was not found at all — and the
+    # account constraint below would have shared that cap across accounts.
+    # `source_detail_lookup` has already validated and returned the published
+    # row, and `_codex_quota_block_rows` builds both that row's `resets_at`
+    # field and the resource key from the SAME stored `resets_at_utc`, and its
+    # `window_minutes` from the same stored column. A match therefore REQUIRES
+    # both to be equal, so filtering on them cannot reject a block the
+    # unfiltered scan would have matched.
+    predicate = ""
+    params: tuple[object, ...] = ()
+    published_reset = published.get("resets_at")
+    published_minutes = published.get("window_minutes")
+    if isinstance(published_reset, str) and published_reset:
+        try:
+            minutes = int(published_minutes)
+        except (TypeError, ValueError):
+            minutes = None
+        if minutes is not None:
+            predicate = " AND resets_at_utc=? AND window_minutes=?"
+            params = (published_reset, minutes)
     rows = context.stats_conn.execute(
         "SELECT source_root_key, logical_limit_key, observed_slot, window_minutes, "
-        "limit_name, resets_at_utc, current_percent, orphaned_at "
-        "FROM quota_window_blocks WHERE source='codex' "
-        "ORDER BY resets_at_utc DESC, source_root_key, logical_limit_key, observed_slot LIMIT 250"
+        "limit_name, resets_at_utc, current_percent, orphaned_at, account_key "
+        "FROM quota_window_blocks WHERE source='codex'" + predicate + " "
+        "ORDER BY resets_at_utc DESC, source_root_key, logical_limit_key, observed_slot LIMIT 250",
+        params,
     ).fetchall()
+    # THE ACCOUNT IS PART OF THE BLOCK'S UNIQUENESS BUT NOT OF THE KEY. Two
+    # accounts agreeing on root, limit key, slot, window and reset produce one
+    # resource key, and the `ORDER BY` alone decided which one this loop
+    # returned — so a request qualified to A could be answered with B's block.
+    # The published row carries `account_key` only under decoration, and
+    # decoration is active only above one REAL account, which is also the only
+    # condition under which two blocks can collide. A single-account store
+    # therefore takes no predicate and its payload stays byte-identical.
+    owner = published.get("account_key")
     matched = None
-    for row in rows:
+    for candidate_row in rows:
         candidate = dashboard_resource_key(
-            "block", "codex", row[0], row[1], row[2], row[3], row[5],
+            "block", "codex", candidate_row[0], candidate_row[1],
+            candidate_row[2], candidate_row[3], candidate_row[5],
         )
-        if candidate == key:
-            matched = row
-            break
+        if candidate != key:
+            continue
+        # The SAME coercion the wire applies (`_codex_quota_block_rows` builds
+        # `block_account` as `str(block_account or UNATTRIBUTED)`). The column
+        # is `TEXT NOT NULL DEFAULT 'unattributed'` so a NULL is unreachable
+        # today, but coercing it to `""` here while the wire published
+        # `unattributed` would make the two sides disagree and 404.
+        if owner is not None and str(
+            candidate_row[8] or _lib_accounts.UNATTRIBUTED
+        ) != str(owner):
+            continue
+        matched = candidate_row
+        break
     if matched is None:
         raise SourceResourceNotFound()
+    matched_account = str(matched[8] or _lib_accounts.UNATTRIBUTED)
     reset_at = parse_iso_datetime(str(matched[5]), "codex.block.resets_at")
+    # THE ORDER IS LOAD-BEARING. The loader matches RAW stored coordinates, and
+    # rows are stored under whichever spelling the provider sent, so the
+    # interpreted block tuple has to be converted to its loading unit and then
+    # closed under the `window_minutes` snap before it can name a stored row.
+    # Passing the interpreted tuple straight through matches nothing and turns
+    # this route into a silent 404 generator.
+    groups = snap_equivalent_raw_groups((
+        loading_unit_from_identity(
+            source_root_key=str(matched[0]),
+            logical_limit_key=str(matched[1]),
+            observed_slot=str(matched[2]),
+            window_minutes=int(matched[3]),
+            canonical_reset_iso=str(matched[5]),
+        ),
+    ))
+    # The whole ACCOUNT-INDEPENDENT group, never pre-filtered by account, so
+    # `adopt_unidentified_observations` still sees every witness.
+    #
+    # `source_root_keys` is the matched block's own root, which NARROWS the
+    # loader's root-scoped operator-attribution overlay rather than avoiding
+    # it. Spec §9 residual 4 stays open: the overlay still runs, and on the
+    # production Codex shape — one root per account — the set it reaches is
+    # IDENTICAL to what it reached before, so the narrowing buys nothing on a
+    # single-root store. It bounds the overlay only where several roots exist.
+    # Spec §3.3 would also have permitted skipping the overlay under a
+    # validated non-weekly scope; scoping it is the more conservative of the
+    # two, and it is why the residual is narrowed and not closed.
+    observations = load_codex_quota_observations(
+        source_root_keys=(str(matched[0]),),
+        cache_conn=context.cache_conn,
+        active_at=context.now_utc,
+        physical_groups=groups,
+    )
     matching_observations = tuple(
         observation for observation in observations
         if observation.identity.source_root_key == matched[0]
@@ -935,8 +1154,29 @@ def _build_codex_block_detail(context, observations, *, key: str) -> dict[str, A
         # anchor), so both sides now agree.
         and observation.canonical_resets_at == reset_at
     )
+    # THE ACCOUNT SELECTS THE BLOCK, NOT ONLY THE CANDIDATE ROW. The load above
+    # is deliberately account-independent so `adopt_unidentified_observations`
+    # sees every witness, and `build_blocks` keys each block on the full
+    # `QuotaWindowIdentity`, which carries `account_key` (`_lib_quota.py:375`).
+    # One physical window observed by two accounts therefore yields TWO blocks
+    # at the same `resets_at`, and matching on the reset alone returned
+    # whichever `identity_sort_key` ordered first — the account ASCENDING
+    # (`:547`). The route then rendered the matched row's `current_percent`
+    # beside the OTHER account's `observations`, and with them its
+    # `milestones`, `forecast` and `freshness`, all of which derive from
+    # `block.observations` below.
+    #
+    # The predicate is the matched candidate row's own account rather than the
+    # published `owner`, because `matched[8]` is defined on every path —
+    # including an undecorated store and a direct builder call with no
+    # published row — and because it is the same row that supplies the rendered
+    # `current_percent`, which is what makes the payload internally consistent.
     block = next(
-        (item for item in build_blocks(matching_observations) if item.resets_at == reset_at),
+        (
+            item for item in build_blocks(matching_observations)
+            if item.resets_at == reset_at
+            and item.identity.account_key == matched_account
+        ),
         None,
     )
     if block is None:
@@ -980,28 +1220,102 @@ def _build_codex_block_detail(context, observations, *, key: str) -> dict[str, A
     }
 
 
-def _build_codex_source_detail(snapshot, *, resource: str, key: str) -> dict[str, Any]:
-    for context, qualified, entries, observations in _codex_detail_inputs(snapshot):
-        if resource == "session":
-            return _build_codex_session_detail(context, entries, key=key)
-        if resource == "project":
-            return _build_codex_project_detail(context, qualified, observations, key=key)
-        return _build_codex_block_detail(context, observations, key=key)
+def _build_codex_source_detail(snapshot, *, resource: str, key: str,
+                               row: "Mapping | None" = None) -> dict[str, Any]:
+    if resource == "session":
+        # #769 S6 / #781. The session detail is served from the published row,
+        # so this resource opens no read context at all. #769 S9 / #815 then
+        # removed the year-long qualified load from the other two: the block
+        # route never read what it loaded, and the project route reads only its
+        # own project's rows through `load_codex_project_scoped_entries`. No
+        # route pays a year-long unscoped accounting read any more.
+        return _build_codex_session_detail(snapshot, row or {}, key=key)
+    # THE DEGRADED PATH IS PRESERVED DELIBERATELY (#815, spec §3.1). The
+    # year-long qualified load these routes used to share was value-dead for
+    # the block route but not BEHAVIOUR-dead: a `QualifiedMetadataUnavailable`
+    # raised while qualifying is caught around this builder and routes the
+    # request into the published-row partial fallback, so on a store with
+    # incomplete Codex metadata both routes degrade today. Deleting the load
+    # would have removed that silently. The frozen generation already decided
+    # the same question, so it is consulted here instead of being provoked
+    # through a read neither route needs.
+    #
+    # THE GATE COVERS THE PROJECT ROUTE TOO, and deliberately. Restricting it
+    # to the block route, as spec §3.1 literally prescribes, would leave a
+    # malformed accounting row outside the resolved project raising nothing at
+    # all, which makes the disclosure loss larger rather than smaller.
+    #
+    # WHAT THE TWO WINDOWS ACTUALLY ARE. The generation's accounting window is
+    # `context.range_start`, roughly thirty calendar days from
+    # `resolve_shared_range(..., n=30)` and at most about thirty-one once the
+    # configured Codex budget month widens it. That is a SUBSET of this
+    # detail's 365 days, not a superset. Because
+    # `_CODEX_PROJECT_METADATA_HEALTH_SQL` mirrors the qualifier's own
+    # acceptance rule over the same rows, a partial generation always implies
+    # the retired detail read would already have raised, so no request that
+    # used to render a full page degrades to a partial one now.
+    #
+    # THE NARROWING IS IN THE OTHER DIRECTION, and spec §9 records it: a
+    # malformed row aged thirty-one to three hundred and sixty-five days used
+    # to degrade both detail routes through the year-long load, and it now sets
+    # no flag at all — the page renders in full with that row's cost silently
+    # absent from the totals.
+    # The carrier's own verdict has to TRAVEL with this raise, because this
+    # exception is manufactured from the generation rather than thrown by a
+    # read. Left to the constructor default (`transient=True`, chosen because
+    # an unclassified read failure is safer read as transient), a
+    # `malformed_row_partial` generation published the transient retry sentence
+    # on every project detail while its own status chip advised the cache
+    # rebuild — two surfaces naming opposite remedies for one cause, and the
+    # retry was never going to arrive, because `retryable` on that carrier is
+    # false. Every deterministic raise site in `_cctally_source_analytics`
+    # states `transient` explicitly; so must this one.
+    carrier_state = _codex_generation_metadata_state(snapshot)
+    if carrier_state != "healthy":
+        raise sys.modules["_cctally_source_analytics"].QualifiedMetadataUnavailable(
+            "Codex qualified project metadata is unavailable",
+            transient=carrier_state == "transient_read_failure",
+        )
+    for context in _codex_detail_context(snapshot):
+        detail = (
+            _build_codex_project_detail(context, key=key)
+            if resource == "project"
+            else _build_codex_block_detail(context, key=key, row=row)
+        )
+        # Only a HEALTHY generation reaches here — the predicate above raises
+        # otherwise — so both keys are published explicitly null rather than
+        # omitted. #834 S2 (#829): an omitted key and a key this build could
+        # not fill look identical to a client.
+        detail.update(_metadata_detail_fields("healthy", missing=False))
+        return detail
     raise SourceResourceNotFound()
 
 
 def _codex_partial_source_detail(snapshot, row: Mapping, *, resource: str,
-                                 key: str) -> dict[str, Any]:
+                                 key: str,
+                                 read_failure_transient: "bool | None" = None,
+                                 ) -> dict[str, Any]:
     """Keep a published cache-only row usable when project metadata is partial."""
     detail = _source_safe_native_detail(
         row, source="codex", resource=resource, key=key,
     )
     metadata_missing = resource != "session" or not row.get("project")
-    if metadata_missing:
-        detail.update({
-            "metadata_availability": "partial",
-            "metadata_reason": "Project metadata is unavailable for this item.",
-        })
+    # The CAUSE decides here, not the generation carrier. A project or block
+    # reaches this fallback because THIS request's year-long live read raised,
+    # and a healthy published carrier cannot speak to that: it measured a
+    # different read over a different window at a different instant. Consulting
+    # it published `metadata_availability: null` over the truncated cache-only
+    # payload this function exists to serve, so a degraded serve reported
+    # complete attribution. `transient` distinguishes the two remedies exactly
+    # as it does on the generation path.
+    if read_failure_transient is None:
+        state = _codex_generation_metadata_state(snapshot)
+    else:
+        state = (
+            "transient_read_failure" if read_failure_transient
+            else "malformed_row_partial"
+        )
+    detail.update(_metadata_detail_fields(state, missing=metadata_missing))
     if resource == "session":
         detail.setdefault("models", [])
         detail.setdefault("model_breakdowns", [])
@@ -1194,6 +1508,7 @@ PROJECT_WINDOW_WEEKS_CHOICES = (1, 4, 8, 12)
 
 def resolve_aggregate_project_window_weeks(
     requested: int, *, shared_start_at: object, current_week_start_at: object,
+    interval_starts: object = None,
 ) -> int:
     """The drill window a row published by the All ranking must resolve with.
 
@@ -1233,9 +1548,34 @@ def resolve_aggregate_project_window_weeks(
         )
     except ValueError:
         return requested
+    # #750 S4 §4.7: a choice's span comes from the SELECTED INTERVAL
+    # IDENTITIES when the caller has them. `cw_start - 7 * (weeks - 1)` assumes
+    # every cycle is seven calendar days, and a credited week adds a cycle
+    # WITHOUT adding seven days — so the arithmetic can decide that four cycles
+    # cover a shared start the last four emitted intervals do not reach. The
+    # instants are `projects.trend.weeks[].week_start_at`, oldest first. Absent
+    # or unparseable, the seven-day walk stands: it is what an envelope
+    # predating that field supports, and it is unchanged there.
+    parsed_starts: list = []
+    if isinstance(interval_starts, (list, tuple)):
+        for value in interval_starts:
+            if not isinstance(value, str):
+                continue
+            try:
+                parsed_starts.append(parse_iso_datetime(
+                    value, "projects.trend.week_start_at"))
+            except ValueError:
+                continue
+        parsed_starts.sort()
+
+    def _span_start(weeks: int) -> "dt.datetime":
+        if len(parsed_starts) >= weeks:
+            return parsed_starts[-weeks]
+        return cw_start - dt.timedelta(days=7 * (weeks - 1))
+
     covering = [
         weeks for weeks in PROJECT_WINDOW_WEEKS_CHOICES
-        if cw_start - dt.timedelta(days=7 * (weeks - 1)) <= shared_start
+        if _span_start(weeks) <= shared_start
     ]
     if not covering:
         return max(PROJECT_WINDOW_WEEKS_CHOICES[-1], requested)
@@ -1272,12 +1612,18 @@ def _project_window_weeks_for_key(snapshot, key: str, requested: int) -> int:
         return requested
     env = getattr(snapshot, "projects_envelope", None)
     current = env.get("current_week") if isinstance(env, Mapping) else None
+    trend = env.get("trend") if isinstance(env, Mapping) else None
+    weeks = trend.get("weeks") if isinstance(trend, Mapping) else None
     return resolve_aggregate_project_window_weeks(
         requested,
         shared_start_at=_published_aggregate_start_at(snapshot),
         current_week_start_at=(
             current.get("week_start_at") if isinstance(current, Mapping) else None
         ),
+        interval_starts=[
+            w.get("week_start_at") for w in (weeks or ())
+            if isinstance(w, Mapping)
+        ],
     )
 
 
@@ -1468,7 +1814,9 @@ def build_source_detail(*, snapshot, source: str, resource: str,
             window_weeks=window_weeks,
         )
     try:
-        detail = _build_codex_source_detail(snapshot, resource=resource, key=key)
+        detail = _build_codex_source_detail(
+            snapshot, resource=resource, key=key, row=row,
+        )
         if resource == "session":
             for field in ("label", "project", "started_at", "duration_min"):
                 detail[field] = row.get(field)
@@ -1481,9 +1829,10 @@ def build_source_detail(*, snapshot, source: str, resource: str,
             ):
                 detail[field] = row.get(field)
         return detail
-    except sys.modules["_cctally_source_analytics"].QualifiedMetadataUnavailable:
+    except sys.modules["_cctally_source_analytics"].QualifiedMetadataUnavailable as exc:
         return _codex_partial_source_detail(
             snapshot, row, resource=resource, key=key,
+            read_failure_transient=bool(getattr(exc, "transient", True)),
         )
 
 _ensure_sibling_loaded("_cctally_dashboard_share")
@@ -1685,6 +2034,13 @@ def _make_dashboard_run_iteration(
 
     def run_iteration(batch=None) -> dict:
         warnings: list = []
+        # #714: the whole snapshot build runs on ONE pricing revision. A swap
+        # landing part-way through would publish a snapshot whose panels were
+        # priced from two different tables.
+        with _lib_pricing.pricing_snapshot_context():
+            return _run_iteration_body(batch, warnings)
+
+    def _run_iteration_body(batch, warnings: list) -> dict:
         if batch is not None and batch[1] and not skip_sync:
             with sync_lock:
                 result = _refresh_usage_inproc()
@@ -1850,6 +2206,215 @@ def _dashboard_sync_loop(
             sleep(min(0.1, max(0.0, deadline - now)))
 
 
+def _dashboard_startup_schema_migration(*, run_derivations: bool = True) -> None:
+    """Advance both stores to head once, at startup, in EVERY mode (#780).
+
+    Under `--no-sync` nothing else will: `_dashboard_self_heal_orphans` is a
+    no-op with `skip_sync=True` and `_make_conversation_sync_thread` returns
+    None, so no process in that mode ever opens the store write-capable. The
+    read-only reader refuses a store that is behind head — correctly, because
+    it must never migrate from a request thread — and without an owner here a
+    `--no-sync` dashboard would serve a degraded conversation surface forever
+    with nothing able to fix it.
+
+    This performs the SCHEMA work only: one full open, which applies the schema
+    and runs the migration dispatcher, and then closes. It ingests nothing, so
+    it does not reintroduce the writing that `--no-sync` exists to suppress.
+    It never raises: a store that cannot be opened leaves the reader degraded,
+    which is the state it was already in.
+
+    #769 S6 / #802: "the SCHEMA work only" was not true of the open itself.
+    `_open_conversations_db_unlocked` runs `_import_legacy_conversation_rows`
+    and `_ensure_codex_conversation_contract` AFTER the dispatcher, as two
+    separate calls the dispatcher does not own, and the second consumes
+    `conversation_rebuild_codex_pending` and rebuilds the retained Codex
+    corpus — the measured 135-second startup. `run_derivations=False` bounds
+    this open to what the docstring already claimed. The caller ALSO sets the
+    process-level policy, because the read-route fallback and the live-tail
+    opener each reach the same full opener from a request thread.
+    """
+    try:
+        conn = sys.modules["cctally"].open_conversations_db(
+            run_derivations=run_derivations)
+    except Exception as exc:  # noqa: BLE001
+        eprint(f"[conversations] startup schema migration skipped: {exc}")
+        return
+    try:
+        conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+#: The one-shot wake-up dispatch state. `_SCHEMA_WAKE_THREAD` is the migration
+#: thread currently in flight, or None, and `_SCHEMA_WAKE_LOCK` serializes the
+#: check-and-start so eight simultaneous schema-behind requests start one
+#: migration rather than eight.
+_SCHEMA_WAKE_LOCK = threading.Lock()
+_SCHEMA_WAKE_THREAD: "threading.Thread | None" = None
+
+
+def _reset_schema_wake_state() -> None:
+    """Drop the recorded wake-up thread. Test seam only."""
+    global _SCHEMA_WAKE_THREAD
+    with _SCHEMA_WAKE_LOCK:
+        _SCHEMA_WAKE_THREAD = None
+
+
+def _join_schema_wake_thread(timeout: float = 30.0) -> None:
+    """Wait for an in-flight wake-up to finish. Test seam only."""
+    with _SCHEMA_WAKE_LOCK:
+        thread = _SCHEMA_WAKE_THREAD
+    if thread is not None:
+        thread.join(timeout)
+
+
+def _wake_schema_writer() -> None:
+    """`SCHEMA_WAKE_HOOK`: a reader found a store behind head (#780).
+
+    The reader raised rather than migrating, because a request thread must
+    never run the dispatcher. This performs the same schema-only open the
+    startup owner does, so the next request is admitted.
+
+    IT MUST NOT DO THAT WORK HERE. `_gate_reader_schema` calls this hook
+    inline, on the request thread, immediately before that thread returns its
+    degraded envelope — and the work is a full `open_conversations_db()`
+    including `_run_pending_migrations`, measured at 39.55 s for migration 009
+    plus its backfill on the production-shaped store. Running it here holds the
+    request open for that long and contradicts both the spec ("The opener never
+    migrates from a request thread") and the retry comment in this file. So the
+    hook dispatches onto one daemon thread and returns.
+
+    One at a time. Every schema-behind request reaches this hook, so an
+    unguarded dispatch would start one full open per request against a store
+    that is already behind, which adds write contention rather than progress.
+    The guard is per-flight, not permanent: once the thread finishes, a store
+    that falls behind again can wake a writer again.
+
+    Best-effort and silent on failure either way: the reader has already
+    answered with its typed degraded envelope.
+
+    THE START IS INSIDE THE LOCK, and that is the whole guard. `is_alive()` is
+    False for a thread that has been constructed but not started yet, so a
+    start outside the lock leaves a window in which a second caller reads a
+    non-None, not-alive thread, passes the guard, and dispatches the second
+    39.55-second migration this exists to prevent. Holding the lock across the
+    start costs only the microseconds `Thread.start` takes to hand off; the
+    migration itself runs on the new thread, outside the lock.
+    """
+    global _SCHEMA_WAKE_THREAD
+    with _SCHEMA_WAKE_LOCK:
+        if _SCHEMA_WAKE_THREAD is not None and _SCHEMA_WAKE_THREAD.is_alive():
+            return
+        thread = threading.Thread(
+            target=_dashboard_startup_schema_migration,
+            name="cctally-schema-wake",
+            daemon=True,
+        )
+        _SCHEMA_WAKE_THREAD = thread
+        try:
+            thread.start()
+        except RuntimeError as exc:  # interpreter shutdown, thread limit
+            eprint(f"[conversations] schema wake-up not dispatched ({exc})")
+            _SCHEMA_WAKE_THREAD = None
+
+
+#: How often the pricing watch stats the deployed pricing file. A monotonic
+#: cadence, because a wall-clock one would re-poll or stall across a system
+#: clock change.
+_PRICING_WATCH_INTERVAL_S = 60.0
+
+
+class _PricingWatch:
+    """Detect a replaced `_lib_pricing.py` and adopt it in process (#714).
+
+    An installer overwrites the deployed file under a running dashboard.
+    Nothing about that reaches this process: every CLI invocation re-imports
+    and picks the new tables up, and only a long-lived process holds the old
+    ones.
+
+    STAT FIRST, PARSE SECOND. The poll compares an inode/size/mtime signature
+    and parses only when it changed, so the steady state is one `stat` a
+    minute rather than an `ast.parse` of a 1,400-line file.
+
+    NEVER RAISES OUT OF `poll_once`. The file it reads is one an installer may
+    be part-way through writing, so a half-written file is the ordinary case
+    rather than an exceptional one; a raising poll would end the thread and
+    leave the process permanently stale, which is the very condition this
+    exists to clear.
+    """
+
+    def __init__(self, source_path=None, interval_s=None):
+        self.source_path = pathlib.Path(
+            source_path if source_path is not None
+            else sys.modules["_lib_pricing"].__file__)
+        self.interval_s = (_PRICING_WATCH_INTERVAL_S if interval_s is None
+                           else interval_s)
+        self._signature = None
+        self._stop = threading.Event()
+
+    def _current_signature(self):
+        try:
+            st = self.source_path.stat()
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+    def poll_once(self) -> bool:
+        """One check. Returns True iff a new snapshot was adopted."""
+        try:
+            signature = self._current_signature()
+            if signature is None or signature == self._signature:
+                return False
+            self._signature = signature
+            pricing = sys.modules["_lib_pricing"]
+            candidate = pricing.read_pricing_snapshot_from_source(
+                self.source_path)
+            if not pricing.adopt_pricing_candidate(candidate):
+                return False
+            eprint("[pricing] adopted pricing revision "
+                   f"{candidate.snapshot_date} without restarting")
+            return True
+        except Exception:  # noqa: BLE001
+            # Including `PricingCandidateRejected`: a rejected candidate is a
+            # normal outcome, and the signature is already recorded so the
+            # same bad file is not re-parsed every minute.
+            return False
+
+    def run(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            self.poll_once()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+_PRICING_WATCH: "_PricingWatch | None" = None
+
+
+def _start_pricing_watch() -> "_PricingWatch | None":
+    """Own the pricing detector on a lifecycle thread that runs in BOTH modes.
+
+    Deliberately not `_DashboardSyncThread` and not the conversation sync
+    thread: `cmd_dashboard` disables both under `--no-sync`, so a detector in
+    either would silently have no owner exactly where a long-lived process is
+    most likely to run.
+    """
+    global _PRICING_WATCH
+    if _PRICING_WATCH is not None:
+        return _PRICING_WATCH
+    try:
+        watch = _PricingWatch()
+        watch.poll_once()  # establish the baseline signature; adopts nothing
+        thread = threading.Thread(
+            target=watch.run, name="cctally-pricing-watch", daemon=True)
+        thread.start()
+    except Exception as exc:  # noqa: BLE001
+        eprint(f"[pricing] watch not started ({exc})")
+        return None
+    _PRICING_WATCH = watch
+    return watch
+
+
 def _dashboard_maybe_prune_retention() -> None:
     """#313 P3 (F7): throttled transcript retention prune driven from the
     independent conversation sync thread. Opens a dedicated transcript
@@ -1869,6 +2434,7 @@ def _dashboard_maybe_prune_retention() -> None:
                 conn,
                 now_utc=dt.datetime.now(dt.timezone.utc),
                 retention_days=retention_days,
+                record_phase=_lib_tick_stats.record_maintenance_phase,
             )
         finally:
             conn.close()
@@ -1981,6 +2547,16 @@ def _conversation_sync_pass() -> str:
     documented contract is a throttled prune driven by this thread, not a prune
     conditional on a successful ingest.
 
+    #780 makes the prune's own phases visible without moving them out of this
+    measured body. The plan asked for retention to leave the measured body; it
+    must not, because F5 above is exactly the rule that anything left outside it
+    is work outside the duty denominator, and reclaim is real work this thread
+    performs. What the reclaim actually needed was its own reporting, not its
+    own denominator: `delete`, `reclaim` and `checkpoint` are each recorded in
+    `_lib_tick_stats`'s separate maintenance ring with a duration, an outcome
+    and a pending flag, so a long reclaim can no longer hide inside one
+    `conversation_sync status="ok"` while the duty bound still covers it.
+
     The returned status describes the OPEN and the two SYNCS, and nothing else.
     `_dashboard_maybe_prune_retention`'s outcome is discarded here and that
     function ends in `except Exception: pass`, so a pass that ingested cleanly
@@ -1998,7 +2574,18 @@ def _conversation_sync_pass() -> str:
     therefore NO SECOND OPEN ATTEMPT AFTER A FAILED OPEN — stated that narrowly
     because a successful pass opens the store twice by design, once here and
     once inside the prune.
+
+    #714: the whole pass runs on ONE pricing revision. This pass writes
+    materialized cost, so a swap landing between the Claude leg and the Codex
+    leg would derive one store's rollup from two revisions — the ordered-write
+    guard would not even see it, because both halves are the same process.
     """
+    with _lib_pricing.pricing_snapshot_context():
+        return _conversation_sync_pass_body()
+
+
+def _conversation_sync_pass_body() -> str:
+    """The body of `_conversation_sync_pass`, run under its pricing context."""
     try:
         conn = open_conversations_db()
     except (OSError, sqlite3.DatabaseError) as exc:
@@ -2251,6 +2838,47 @@ def _dashboard_self_heal_orphans(*, skip_sync):
         except Exception:
             # Invalidation must never turn a successful prune into a failure;
             # a stale-cache tick is self-corrected once the signature next moves.
+            pass
+    if result is not None and result.prune_refused:
+        # #729: the deletions committed and the rollup re-derive that should
+        # have followed them did not. The cache invalidation above still runs,
+        # because those caches are keyed on the deletions and the deletions
+        # happened; this adds the two things a refusal needs on top.
+        #
+        # The certificate goes because the prune mutates the transcript store
+        # OUTSIDE a sync pass, so no stats object reaches
+        # `provider_sync_certifiable` and nothing else would notice. Claude
+        # only: the orphan prune surface is Claude-only, and Codex certifies on
+        # its own evidence.
+        # #769 S3: name the cause the prune actually recorded. Since #728 a
+        # refusal has three possible causes and only one of them is a pricing
+        # version difference.
+        eprint(
+            f"[dashboard] orphan prune: the conversation rollup re-derive was "
+            f"refused for {result.prune_refused_files} file(s) — "
+            f"{pricing_refusal_cause_phrase(result.prune_refused_state)}"
+            f". The rollup backfill is armed for the next authorized process."
+        )
+        try:
+            frontier = getattr(_conversation_sync_pass, "_frontier", None)
+            if frontier is not None:
+                # #769 S3 A9 — the bound this drop carries, stated. The pop
+                # happens on the sync-loop thread while the conversation sync
+                # thread reads the same dict. Both operations are single
+                # bytecodes under the GIL, so neither can observe a torn
+                # mapping; what the drop cannot do is reach a plan the other
+                # thread already captured. A pass that read its certificate
+                # microseconds before this line proceeds against a certificate
+                # this drop has invalidated, for that one pass. The next pass
+                # re-reads and finds nothing, so the window is one pass wide
+                # and self-closing — which is why this is a comment rather than
+                # a lock. Widening it into a lock would mean holding one across
+                # a whole conversation sync pass.
+                frontier.drop_provider("claude")
+        except Exception:
+            # Same posture as the invalidation above: never turn a prune that
+            # did commit its deletions into a raised exception on this
+            # best-effort background path.
             pass
     return result
 
@@ -3737,12 +4365,14 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
     for r in reversed(view.rows):
         sw = sw_by_window.get((r.week_start_at, r.week_end_at))
         if sw is not None:
-            # Label = MM-DD of the week's display_start_date — for non-reset
-            # weeks this equals start_date; for post-early-reset weeks the
-            # post-processor shifts it forward to the effective reset moment
-            # so the user sees the date the week actually began (04-23 vs the
-            # API-derived backdated 04-18).
-            r.label = sw.display_start_date.strftime("%m-%d")
+            # The label is NOT re-derived here any more (#750 S4 §3.2a).
+            # `build_weekly_view` already builds it from
+            # `sw.display_start_date` and then applies D5's collision suffix
+            # to the segments of a credited week that render one calendar
+            # day. Overwriting it with a bare `%m-%d` here would strip that
+            # suffix and put the two cycles back under one label — which is
+            # what this panel is supposed to stop doing.
+            #
             # is_current keys on segment identity on both sides of the
             # comparison; display_start_date may diverge for reset-event
             # weeks but that is intentional — display vs. lookup are kept
@@ -3764,10 +4394,146 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
     return rows[:n]
 
 
+def _retained_facts_from_rows(parent, children) -> "dict[str, Any] | None":
+    """Shape one parent row plus its child rows into retained facts.
+
+    Returns None when the retained facts fail their own internal
+    invariant: the parent and its children are two tables read at
+    request time with no transaction that makes them agree, so a child
+    set that does not sum to its parent, or a parent with no children at
+    all, is a disagreement in stored data rather than a reason to fail
+    the request. Raising there returned an HTTP 500 to the client, which
+    is the failure `367761bf4` was written to eliminate; a parent with
+    no children would also have served `entries_count: 0` beside a
+    nonzero `cost_usd`.
+    """
+    if not children:
+        return None
+    parent_cost = float(parent["total_cost_usd"] or 0.0)
+    child_cost = stable_sum(float(c["cost_usd"] or 0.0) for c in children)
+    if abs(child_cost - parent_cost) >= 1e-9:
+        return None
+    return {
+        "cost_usd": parent_cost,
+        "input_tokens": int(parent["total_input_tokens"] or 0),
+        "output_tokens": int(parent["total_output_tokens"] or 0),
+        "cache_creation_tokens": int(parent["total_cache_create_tokens"] or 0),
+        "cache_read_tokens": int(parent["total_cache_read_tokens"] or 0),
+        "entries_count": sum(int(c["entry_count"] or 0) for c in children),
+        "model_breakdowns": [
+            {"modelName": c["model"], "cost": float(c["cost_usd"] or 0.0)}
+            for c in children
+        ],
+    }
+
+
+def _retained_block_facts_many(conn, blocks) -> "dict[int, dict[str, Any]]":
+    """The frozen parent and child facts for every journal-stamped closed
+    block in `blocks`, keyed by ``id(block)``.
+
+    A closed block carrying a `journal_id` is immutable: later
+    observations and newly discovered cache rows cannot rewrite its
+    totals or its child membership (#399). A reader that recomputes from
+    the cache therefore reports something the rest of the estate does not
+    agree with, which is what `/api/block` did and what the Blocks panel
+    behind it did (#751a review P2-2).
+
+    A block is absent from the result whenever the retained facts are not
+    unambiguously its own — no row, no stamp, still open, more than one
+    account's row on the same physical window, or facts that fail the
+    internal invariant above. Recomputing is the honest answer there; a
+    guess between two accounts' rows is not.
+
+    Two queries regardless of how many blocks are asked about, because
+    the Blocks panel asks about a whole week of them on every tick.
+    """
+    wanted: "dict[tuple[int, int], list[Any]]" = {}
+    for block in blocks:
+        start = getattr(block, "start_time", None)
+        end = getattr(block, "end_time", None)
+        if start is None or end is None or getattr(block, "is_gap", False):
+            continue
+        key = (
+            int(start.astimezone(dt.timezone.utc).timestamp()),
+            int(end.astimezone(dt.timezone.utc).timestamp()),
+        )
+        wanted.setdefault(key, []).append(block)
+    if not wanted:
+        return {}
+    start_epochs = sorted({key[0] for key in wanted})
+    try:
+        placeholders = ",".join("?" for _ in start_epochs)
+        parent_rows = conn.execute(
+            f"""
+            SELECT id,
+                   unixepoch(block_start_at)      AS bs_epoch,
+                   unixepoch(five_hour_resets_at) AS rs_epoch,
+                   total_input_tokens, total_output_tokens,
+                   total_cache_create_tokens, total_cache_read_tokens,
+                   total_cost_usd
+              FROM five_hour_blocks
+             WHERE is_closed = 1
+               AND journal_id IS NOT NULL
+               AND unixepoch(block_start_at) IN ({placeholders})
+            """,
+            start_epochs,
+        ).fetchall()
+        parents: "dict[tuple[int, int], list[Any]]" = {}
+        for row in parent_rows:
+            parents.setdefault(
+                (int(row["bs_epoch"]), int(row["rs_epoch"])), [],
+            ).append(row)
+        block_ids = [
+            int(rows[0]["id"])
+            for key, rows in parents.items()
+            if key in wanted and len(rows) == 1
+        ]
+        children_by_block: "dict[int, list[Any]]" = {}
+        if block_ids:
+            placeholders = ",".join("?" for _ in block_ids)
+            child_rows = conn.execute(
+                f"SELECT block_id, model, cost_usd, entry_count "
+                f"  FROM five_hour_block_models "
+                f" WHERE block_id IN ({placeholders}) "
+                f" ORDER BY cost_usd DESC, model ASC",
+                block_ids,
+            ).fetchall()
+            for row in child_rows:
+                children_by_block.setdefault(
+                    int(row["block_id"]), [],
+                ).append(row)
+    except sqlite3.DatabaseError:
+        return {}
+    out: "dict[int, dict[str, Any]]" = {}
+    for key, claimants in wanted.items():
+        rows = parents.get(key) or []
+        if len(rows) != 1:
+            continue
+        parent = rows[0]
+        facts = _retained_facts_from_rows(
+            parent, children_by_block.get(int(parent["id"]), []),
+        )
+        if facts is None:
+            continue
+        for block in claimants:
+            out[id(block)] = facts
+    return out
+
+
+def _retained_block_facts(conn, block: "Block") -> "dict[str, Any] | None":
+    """The frozen parent and child facts for one journal-stamped closed
+    block, or None. Single-block entry point onto
+    ``_retained_block_facts_many``; the withholding rules are stated
+    there and are deliberately stated only once.
+    """
+    return _retained_block_facts_many(conn, [block]).get(id(block))
+
+
 def _build_block_detail(block: "Block",
                         entries: "list[UsageEntry]",
                         *,
-                        display_tz: "ZoneInfo | None" = None) -> "dict[str, Any]":
+                        display_tz: "ZoneInfo | None" = None,
+                        frozen_facts: "dict[str, Any] | None" = None) -> "dict[str, Any]":
     """Build the JSON payload for ``GET /api/block/:start_at``.
 
     Pure function over a single Block plus its constituent entries (already
@@ -3799,29 +4565,65 @@ def _build_block_detail(block: "Block",
             "cum": running,
         })
 
-    # Reconcile invariant: per-entry sum equals Block.cost_usd within 1e-9.
-    # Off only if pricing-dict drifted between block aggregation and now.
+    # Reconcile invariant: per-entry sum equals Block.cost_usd within
+    # 1e-9. Off only if pricing-dict drifted between block aggregation
+    # and now. Both sides derive in-process from the one entry list the
+    # grouping pass assigned to this block, so the invariant holds
+    # whether or not the headline below is served from retained facts.
+    # Restricting it to the computed path would drop it for the whole
+    # journal-stamped closed population — the population #751a most
+    # affects — which is why it sits above the split (#769 S2 review
+    # P1-2, prior art `367761bf4`).
     assert abs(running - block.cost_usd) < 1e-9, (
         f"_build_block_detail reconcile mismatch: per-entry sum "
         f"{running!r} vs block.cost_usd {block.cost_usd!r}"
     )
 
-    # Per-model breakdown — same shape `_dashboard_build_blocks_panel` uses.
-    model_breakdowns = [
-        {"modelName": name, "cost": cost}
-        for name, cost in sorted(per_model_cost.items(), key=lambda kv: -kv[1])
-    ]
-    models = _model_breakdowns_to_models(model_breakdowns, block.cost_usd)
+    if frozen_facts is None:
+        headline = {
+            "cost_usd": block.cost_usd,
+            "input_tokens": block.input_tokens,
+            "output_tokens": block.output_tokens,
+            "cache_creation_tokens": block.cache_creation_tokens,
+            "cache_read_tokens": block.cache_read_tokens,
+            "entries_count": block.entries_count,
+        }
+        model_breakdowns = [
+            {"modelName": name, "cost": cost}
+            for name, cost in sorted(
+                per_model_cost.items(), key=lambda kv: -kv[1],
+            )
+        ]
+    else:
+        # The frozen path renders retained facts, so the per-entry sum is
+        # NOT expected to equal them — the cache may have grown since the
+        # close, and that growth is exactly what a frozen block ignores.
+        # The retained set's own internal invariant (children sum to their
+        # parent) is checked in `_retained_block_facts`, which withholds
+        # the facts rather than raising here: a live read route must not
+        # return a 500 because two stored tables disagree.
+        headline = {
+            key: frozen_facts[key] for key in (
+                "cost_usd", "input_tokens", "output_tokens",
+                "cache_creation_tokens", "cache_read_tokens",
+                "entries_count",
+            )
+        }
+        model_breakdowns = list(frozen_facts["model_breakdowns"])
+
+    models = _model_breakdowns_to_models(
+        model_breakdowns, headline["cost_usd"],
+    )
 
     # Cache-hit %: cache_read / (input + cache_creation + cache_read) * 100.
     # Same denominator as the canonical _compute_cache_hit_percent helper —
     # cache_creation contributes to the input-side token count and must be
     # in the divisor or the ratio inflates toward 100% on heavy-cache blocks.
-    denom = (block.input_tokens
-             + block.cache_creation_tokens
-             + block.cache_read_tokens)
+    denom = (headline["input_tokens"]
+             + headline["cache_creation_tokens"]
+             + headline["cache_read_tokens"])
     cache_hit_pct = (
-        (block.cache_read_tokens / denom) * 100.0 if denom > 0 else None
+        (headline["cache_read_tokens"] / denom) * 100.0 if denom > 0 else None
     )
 
     # Active blocks expose burn_rate / projection in snake_case (the Block
@@ -3856,14 +4658,21 @@ def _build_block_detail(block: "Block",
             display_tz, fmt="%H:%M %b %d", suffix=True,
         ),
 
-        "entries_count": block.entries_count,
-        "cost_usd":      block.cost_usd,
-        "total_tokens":  block.total_tokens,
-        "input_tokens":  block.input_tokens,
-        "output_tokens": block.output_tokens,
-        "cache_creation_tokens": block.cache_creation_tokens,
-        "cache_read_tokens":     block.cache_read_tokens,
+        "entries_count": headline["entries_count"],
+        "cost_usd":      headline["cost_usd"],
+        "total_tokens":  (headline["input_tokens"]
+                          + headline["output_tokens"]
+                          + headline["cache_creation_tokens"]
+                          + headline["cache_read_tokens"]),
+        "input_tokens":  headline["input_tokens"],
+        "output_tokens": headline["output_tokens"],
+        "cache_creation_tokens": headline["cache_creation_tokens"],
+        "cache_read_tokens":     headline["cache_read_tokens"],
         "cache_hit_pct":         cache_hit_pct,
+        # Which body of evidence the numbers above came from. A frozen
+        # closed block reports its retained facts; everything else is
+        # computed from the entries this block owns.
+        "facts_source":  "computed" if frozen_facts is None else "retained",
 
         "models":     models,
         "burn_rate":  burn_rate_out,
@@ -3934,8 +4743,75 @@ def _dashboard_build_blocks_view(conn: "sqlite3.Connection",
         display_tz=display_tz,
         mode="auto",
     )
+    view = _blocks_view_with_retained_facts(conn, view)
     return _blocks_view_overlapping_week(
         view, week_start_at=week_start_at, week_end_at=week_end_at,
+    )
+
+
+def _blocks_view_with_retained_facts(conn, view):
+    """Serve each journal-stamped CLOSED block from the facts retained at
+    its close, rather than from cache contents that have moved on.
+
+    Spec line 174 binds readers, plural: `/api/block` was named because
+    it was the reader that recomputed, not because it is the only reader
+    the requirement binds. The Blocks panel behind that route recomputed
+    too, so clicking a row changed the number — on an install written
+    before #751a because the retained figure is the double-counted one,
+    and on any install because the retained figure stops at the block's
+    last observation while a recompute runs to the reset (#769 S2 review
+    P2-2).
+
+    Applied here in the dashboard adapter rather than in
+    ``build_blocks_view``: that builder is shared with ``cctally
+    blocks``, which is a ccusage drop-in computing from JSONL and has no
+    stats connection to read. `cctally five-hour-blocks` already renders
+    the same materialized ``total_cost_usd``, so this brings the panel
+    into agreement with it rather than away from it.
+
+    Applied BEFORE ``_blocks_view_overlapping_week``, which re-derives
+    the footer totals from the retained blocks, so rows, ``aggregated``
+    and totals all move together.
+    """
+    if conn is None:
+        return view
+    blocks = list(view.aggregated)
+    facts_by_block = _retained_block_facts_many(conn, blocks)
+    if not facts_by_block:
+        return view
+    rows_by_start = {r.start_at: r for r in view.rows}
+    for index, block in enumerate(blocks):
+        facts = facts_by_block.get(id(block))
+        if facts is None:
+            continue
+        tokens = (facts["input_tokens"] + facts["output_tokens"]
+                  + facts["cache_creation_tokens"]
+                  + facts["cache_read_tokens"])
+        blocks[index] = dataclasses.replace(
+            block,
+            entries_count=facts["entries_count"],
+            input_tokens=facts["input_tokens"],
+            output_tokens=facts["output_tokens"],
+            cache_creation_tokens=facts["cache_creation_tokens"],
+            cache_read_tokens=facts["cache_read_tokens"],
+            total_tokens=tokens,
+            cost_usd=facts["cost_usd"],
+            models=[mb["modelName"] for mb in facts["model_breakdowns"]],
+        )
+        iso = block.start_time.astimezone(dt.timezone.utc).isoformat()
+        row = rows_by_start.get(iso)
+        if row is not None:
+            rows_by_start[iso] = dataclasses.replace(
+                row,
+                cost_usd=facts["cost_usd"],
+                models=_model_breakdowns_to_models(
+                    facts["model_breakdowns"], facts["cost_usd"],
+                ),
+            )
+    return dataclasses.replace(
+        view,
+        rows=tuple(rows_by_start[r.start_at] for r in view.rows),
+        aggregated=tuple(blocks),
     )
 
 
@@ -4358,18 +5234,59 @@ class _ProjectsWeekGrid:
     end, never ``start + 7d``.
     """
 
-    __slots__ = ("starts", "ends", "_end_by_start", "_start_by_date")
+    __slots__ = ("starts", "ends", "_end_by_start", "_start_by_date",
+                 "_segment_by_start", "segments")
 
-    def __init__(self, bounds: "list[tuple[dt.datetime, dt.datetime]]"):
+    def __init__(self, bounds: "list[tuple[dt.datetime, dt.datetime]]",
+                 segments=None):
         ordered = sorted(bounds, key=lambda b: b[0])
         self.starts = [b[0] for b in ordered]
         self.ends = [b[1] for b in ordered]
         self._end_by_start = {s: e for s, e in ordered}
+        # #750 S4 §2.3: the grid keeps the emitted `SubWeek` beside each
+        # interval instead of being handed bare `(start, end)` tuples, so the
+        # segment's own identity survives into the percentage read. Flattening
+        # it away is what left the panel unable to tell two cycles of one
+        # credited week apart (#737).
+        self.segments = list(segments or ())
+        self._segment_by_start = {}
+        for sw in self.segments:
+            try:
+                key = parse_iso_datetime(
+                    sw.start_ts, "projects segment.start_ts",
+                ).astimezone(dt.timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            self._segment_by_start[key] = sw
         # `weekly_usage_snapshots.week_start_date` is the date-only lookup
-        # key a legacy row carries when it has no `week_start_at`. Later
-        # intervals win a collision, matching the "last capture per week
-        # wins" rule the percentage read already applies.
-        self._start_by_date = {s.date(): s for s in self.starts}
+        # key a legacy row carries when it has no `week_start_at`. A date that
+        # resolves to MORE THAN ONE interval is genuinely ambiguous — both
+        # cycles of a credited week share it — so it resolves to nothing
+        # rather than to a guess (#737). `tests/test_620_projects_unresolvable
+        # _week.py` already requires an unresolvable week to contribute
+        # nothing rather than be attributed somewhere.
+        self._start_by_date = {}
+        _ambiguous: set = set()
+        for s in self.starts:
+            if s.date() in self._start_by_date:
+                _ambiguous.add(s.date())
+            self._start_by_date[s.date()] = s
+        for day in _ambiguous:
+            self._start_by_date.pop(day, None)
+
+    def segment_for(self, start: "dt.datetime"):
+        """The emitted `SubWeek` whose start is ``start``, or None."""
+        return self._segment_by_start.get(start)
+
+    def segments_for_week(self, start_date):
+        """Every segment of the WEEK whose shared `start_date` is given.
+
+        `start_date` is the join key into
+        `weekly_usage_snapshots.week_start_date`, which epic invariant 3
+        keeps identical across a credited week's cycles. It identifies the
+        week; `segment_key` identifies the cycle.
+        """
+        return [sw for sw in self.segments if sw.start_date == start_date]
 
     def __bool__(self) -> bool:
         return bool(self.starts)
@@ -4396,7 +5313,12 @@ class _ProjectsWeekGrid:
     def start_for_date(self, day: "dt.date") -> "dt.datetime | None":
         """The interval start whose own date is ``day``, for a legacy
         snapshot row that carries ``week_start_date`` but no
-        ``week_start_at``."""
+        ``week_start_at``.
+
+        ``None`` when ``day`` resolves to more than one interval. That is a
+        credited week, whose cycles share the date, and picking the later one
+        would attribute a whole week's spend to whichever cycle happened to
+        sort last (#750 S4 §2.3 / #737)."""
         return self._start_by_date.get(day)
 
     def end_for(self, start: "dt.datetime") -> "dt.datetime":
@@ -4477,6 +5399,7 @@ def _projects_week_grid(
         # fallback still renders a coherent (if approximate) window.
         return None
     bounds: "list[tuple[dt.datetime, dt.datetime]]" = []
+    kept: list = []
     for sw in subweeks:
         try:
             s = parse_iso_datetime(
@@ -4489,18 +5412,25 @@ def _projects_week_grid(
             continue
         if e > s:
             bounds.append((s, e))
+            # The segment record travels with its interval (#750 S4 §2.3).
+            kept.append(sw)
     if not bounds:
         return None
-    return _ProjectsWeekGrid(bounds)
+    return _ProjectsWeekGrid(bounds, kept)
 
 
 def _projects_week_label(week_start: "dt.datetime") -> str:
-    """Render a `wk Mon DD` label for the trend chart x-axis.
+    """Render a `Mon DD` label for the trend chart x-axis and grid columns.
 
-    Per spec §5.2's `weeks[].week_label` example (`"wk Apr 22"`).
-    UTC-anchored so JSON output is tz-agnostic.
+    The `wk ` prefix is gone (#750 S4 D6). These columns are billing CYCLES,
+    not weeks — a credited week contributes one column per cycle — and the
+    panel heading plus the pills' unit label carry the noun instead. Dropping
+    it also frees the width D5's collision time suffix needs.
+
+    UTC-anchored so JSON output is tz-agnostic. The FIELD name stays
+    `week_label`: it is a frozen wire name.
     """
-    return f"wk {week_start.strftime('%b %d')}"
+    return week_start.strftime("%b %d")
 
 
 def _projects_iter_session_entries(conn: "sqlite3.Connection",
@@ -6060,33 +6990,32 @@ def _build_projects_envelope(
     # (bin/cctally:1162-1168) and the doctor credited-week check
     # (bin/cctally:8706-8714).
     #
-    # Reduce to one latest NON-NULL row per candidate date in SQLite, then let
-    # Python resolve those bounded rows onto the anchored interval grid. NULL
-    # rows never erased the prior known value in the former ascending fold, so
-    # they are excluded before ranking. The outer capture order preserves the
-    # same final-overwrite behaviour if two legacy date keys resolve to one
-    # interval. The date bounds keep historical status-line ticks out of the
-    # scan, while the per-date ranking makes the rows crossing into Python
-    # proportional to candidate boundary dates rather than tick count. Do not
-    # LIMIT before Python resolves legacy date keys: an unresolvable key must
-    # not evict a valid rendered-week row (#620 S1 A3).
+    # #750 S4 §2.2: the SQL no longer ranks rows away before Python sees
+    # them. `ROW_NUMBER() OVER (PARTITION BY week_start_date ...)` kept
+    # exactly ONE row per calendar date, and both cycles of a credited week
+    # share that date, so the panel could never give the second cycle its own
+    # reading however the Python below resolved intervals — #731's defect in
+    # a different surface. Every anchored NON-NULL row now crosses into
+    # Python, carrying `captured_at_utc` and `id`, and the shared reducer
+    # applies the segment capture bounds and picks the latest inside each
+    # cycle. NULL rows never erased the prior known value in the former
+    # ascending fold, so they are still excluded. The date bounds keep
+    # historical status-line ticks out of the scan. Do not LIMIT before
+    # Python resolves legacy date keys: an unresolvable key must not evict a
+    # valid rendered-week row (#620 S1 A3).
     weekly_pct_by_week: dict[dt.datetime, float] = {}
     try:
         cur = conn.execute(
-            "WITH ranked AS ("
             " SELECT week_start_date, week_start_at, weekly_percent,"
-            " captured_at_utc, id,"
-            " ROW_NUMBER() OVER ("
-            "  PARTITION BY week_start_date"
-            "  ORDER BY captured_at_utc DESC, id DESC"
-            " ) AS latest_rank"
+            " captured_at_utc, id"
             " FROM weekly_usage_snapshots"
+            # Held rows excluded: these rows feed `latest_usage_by_segment`,
+            # which is a weekly read, and the pre-fetch must select the same
+            # population the reducer would select for itself (#769 S11, #824).
             " WHERE week_start_date >= ? AND week_start_date < ?"
             " AND date(week_start_date) IS NOT NULL"
             " AND weekly_percent IS NOT NULL"
-            ")"
-            " SELECT week_start_date, week_start_at, weekly_percent"
-            " FROM ranked WHERE latest_rank = 1"
+            + _cctally_core.weekly_held_exclusion(conn) +
             " ORDER BY captured_at_utc ASC, id ASC",
             (
                 since_dt.date().isoformat(),
@@ -6098,7 +7027,13 @@ def _build_projects_envelope(
         # No weekly_usage_snapshots table — leaves attributed_pct = None
         # throughout (acceptable per spec §2.7).
         rows = []
-    for week_date_str, week_start_at, weekly_pct in rows:
+    # (segment_key, captured_at_utc, id, weekly_percent) for the reducer, plus
+    # the interval each segment key belongs to so the result can be keyed the
+    # way this function's consumers already key it.
+    reducer_rows: list = []
+    start_by_segment_key: dict = {}
+    fallback_rows: list = []
+    for week_date_str, week_start_at, weekly_pct, captured_at, row_id in rows:
         try:
             wd = dt.date.fromisoformat(week_date_str)
         except (TypeError, ValueError):
@@ -6127,11 +7062,53 @@ def _build_projects_envelope(
                 wstart = grid.start_for_date(wd)
             if wstart is None:
                 continue
-        else:
-            # No anchor anywhere in the store: the genuine Monday fallback.
-            wstart = _projects_week_start_monday_utc(dt.datetime.combine(
-                wd, dt.time(0, 0, 0), tzinfo=dt.timezone.utc,
-            ))
+            segment = grid.segment_for(wstart)
+            if segment is None:
+                # An interval the grid knows without a segment record behind
+                # it (the seven-day padding `window_ending_at` produces). It
+                # cannot carry capture bounds, so it keeps the last-capture
+                # rule the fold already applied.
+                fallback_rows.append((wstart, captured_at, row_id, weekly_pct))
+                continue
+            # The row's `week_start_at` anchor names the WEEK, never the
+            # cycle: every capture of a credited week carries the week's
+            # unchanged anchor, so resolving it to one interval would hand
+            # both cycles' observations to the head and leave the tail empty.
+            # The row is offered to every segment of that week and the
+            # reducer's half-open capture bounds decide which cycle owns it —
+            # exactly one does, because the bounds are contiguous and
+            # disjoint (#750 S4 §1.2).
+            for sibling in grid.segments_for_week(segment.start_date):
+                try:
+                    sibling_start = parse_iso_datetime(
+                        sibling.start_ts, "projects segment.start_ts",
+                    ).astimezone(dt.timezone.utc)
+                except (TypeError, ValueError):
+                    continue
+                start_by_segment_key[sibling.segment_key] = sibling_start
+                reducer_rows.append(
+                    (sibling.segment_key, captured_at, row_id, weekly_pct))
+            continue
+        # No anchor anywhere in the store: the genuine Monday fallback.
+        wstart = _projects_week_start_monday_utc(dt.datetime.combine(
+            wd, dt.time(0, 0, 0), tzinfo=dt.timezone.utc,
+        ))
+        fallback_rows.append((wstart, captured_at, row_id, weekly_pct))
+
+    # The bound-and-latest decision is the SHARED one (#750 S4 §2.1): the CLI
+    # and this panel resolve a cycle's percentage through one implementation,
+    # so they cannot answer the same question differently. The rows were
+    # fetched and resolved here because only this function knows the interval
+    # grid; the reducer is handed them rather than opening a second read
+    # against a connection that already holds a transaction.
+    if reducer_rows and grid is not None and grid.segments:
+        for segment_key, pct in c.latest_usage_by_segment(
+            conn, grid.segments, account_key=None, rows=reducer_rows,
+        ).items():
+            wstart = start_by_segment_key.get(segment_key)
+            if wstart is not None and pct is not None:
+                weekly_pct_by_week[wstart] = float(pct)
+    for wstart, _captured, _row_id, weekly_pct in fallback_rows:
         if weekly_pct is not None:
             weekly_pct_by_week[wstart] = float(weekly_pct)
 
@@ -6206,6 +7183,11 @@ def _build_projects_envelope(
         wpct = weekly_pct_by_week.get(w)
         trend_weeks_blocks.append({
             "week_start_date": w.date().isoformat(),
+            # #750 S4 §3.1/§3.5: the instant, additive, so a consumer can
+            # tell two cycles of a credited week apart. `week_start_date` is
+            # the shared join key and cannot; `ProjectsTrendChart` keys its
+            # x-axis on this.
+            "week_start_at":   _iso_z(w),
             "week_label":      _projects_week_label(w),
             "total_cost_usd":  total_cost_by_week.get(w, 0.0),
             "total_pct":       wpct,
@@ -7112,8 +8094,9 @@ def _stats_ro_guarded():
 
     return _cctally_store.stats_open_guarded(
         _cctally_core.DB_PATH,
-        connect=lambda p: sqlite3.connect(
-            f"{pathlib.Path(p).as_uri()}?mode=ro", uri=True),
+        # #778: forward the opener's `cached_statements=0`.
+        connect=lambda p, **kw: sqlite3.connect(
+            f"{pathlib.Path(p).as_uri()}?mode=ro", uri=True, **kw),
     )
 
 
@@ -7225,6 +8208,15 @@ def _debug_retained_memory(hub, *, main_frontier_stats=None) -> dict:
                 source_stats.get("measurementPending", 1)),
             "measurementErrorCount": int(
                 source_stats.get("measurementErrorCount", 0)),
+            # A WRITE-TIME admission refusal, which is a different event from
+            # `fallbackCount`: that counts an admission pass finding an
+            # oversized bucket already resident, this counts an entry refused
+            # by the write that would have retained it. `_debug_memory_owner`
+            # returns a fixed six-key set, so without this line the counter
+            # reached neither `/api/debug/backend` nor `cctally dashboard-perf`
+            # and a refusal nobody could see was a diagnostic nobody had.
+            "admissionRefusalCount": int(
+                source_stats.get("admissionRefusalCount", 0)),
             "workerAlive": int(source_stats.get("workerAlive", 0)),
         })
 
@@ -7379,6 +8371,19 @@ _GET_ROUTES = (
      ("scope", "endpoint.conversation_detail"), True),
 )
 
+#: Handlers that block for the life of a client connection rather than for one
+#: response. `_dispatch` must NOT pin a pricing revision around these: the pin
+#: would last as long as the stream, so a viewer who left a tab open would keep
+#: pricing from whichever revision was live when the tab connected — the exact
+#: staleness #714 removes. Both are streams that carry no cost of their own;
+#: the envelopes they forward are priced by the build that produced them, which
+#: has its own context.
+_STREAMING_ROUTE_HANDLERS = frozenset({
+    "_serve_api_events",
+    "_handle_get_update_stream",
+    "_handle_get_conversation_events",
+})
+
 _POST_ROUTES = (
     ("exact", "/api/auth", "_handle_post_auth", None, False),
     ("exact", "/api/sync", "_handle_post_sync", None, False),
@@ -7514,6 +8519,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         eleven path-taking handlers. (NOTE: returning a bool, not ``fn()`` —
         the void handlers all return None, so a None-return contract could not
         tell "handled" from "unmatched".)
+
+        #714: every matched route runs inside a pricing-snapshot context, so a
+        response is never assembled from two pricing revisions when an
+        installer replaces `_lib_pricing.py` mid-request. The two long-lived
+        streaming routes are excluded — a context entered there would pin one
+        revision for the whole life of the stream, which is minutes to hours
+        and the opposite of what the reload exists to achieve.
         """
         path = self.path.split("?", 1)[0]
         for kind, pattern, name, perf, wants_path in table:
@@ -7527,14 +8539,19 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 continue
             fn = getattr(self, name)
             args = (path,) if wants_path else ()
-            if perf is None:
-                fn(*args)
-            elif perf[0] == "scope":
-                with self._perf_scope(perf[1]):
+            if name in _STREAMING_ROUTE_HANDLERS:
+                pinned = contextlib.nullcontext()
+            else:
+                pinned = _lib_pricing.pricing_snapshot_context()
+            with pinned:
+                if perf is None:
                     fn(*args)
-            else:  # "phase"
-                with self._perf_gate().phase(perf[1]):
-                    fn(*args)
+                elif perf[0] == "scope":
+                    with self._perf_scope(perf[1]):
+                        fn(*args)
+                else:  # "phase"
+                    with self._perf_gate().phase(perf[1]):
+                        fn(*args)
             return True
         return False
 
@@ -8048,6 +9065,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 # thread), so the key is always present.
                 "conversation_sync": [
                     r.as_wire() for r in tick_state.conversation_records
+                ],
+                # #780: the maintenance phases, published beside the sync ring
+                # rather than inside it. A reclaim that ran for its whole budget
+                # used to be indistinguishable from a fast one, because both
+                # were one `conversation_sync` record reporting `ok`. Empty is
+                # a reachable steady state, so the key is always present.
+                "maintenance": [
+                    r.as_wire() for r in tick_state.maintenance_records
                 ],
             },
             "tracing": {
@@ -9986,8 +11011,22 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                         load_config(), type(self).display_tz_pref_override
                     )
                 )
+                # A journal-stamped closed block is frozen, so its detail
+                # is read rather than recomputed from cache contents that
+                # may have grown since the close (#399, #751a).
+                frozen_facts = None
+                try:
+                    _stats = open_db()
+                except Exception:
+                    _stats = None
+                if _stats is not None:
+                    try:
+                        frozen_facts = _retained_block_facts(_stats, target)
+                    finally:
+                        _stats.close()
                 detail = _build_block_detail(
                     target, block_entries, display_tz=_detail_tz,
+                    frozen_facts=frozen_facts,
                 )
                 status = 200
                 body = encode_dashboard_json_bytes(detail, ensure_ascii=False)
@@ -11062,10 +12101,34 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     # the initial render already excludes stale sessions from a deleted
     # worktree (rather than showing them until the first periodic tick).
     # Gated off under --no-sync (a frozen dashboard mutates nothing).
+    # #780: arm the reader's writer wake-up before any route can serve, then
+    # advance the schema once. Both run in EVERY mode, including --no-sync.
+    _cctally_cache_module = _cctally()._load_sibling("_cctally_cache")
+    _cctally_cache_module.SCHEMA_WAKE_HOOK = _wake_schema_writer
+    # #769 S6 / #802: set the PROCESS-level derivation policy before the first
+    # open, so the read-route fallback and the live-tail opener inherit it.
+    # A startup-only flag would freeze nothing, because both of those reach the
+    # same full opener from a request thread and would consume the marker.
+    _cctally_cache_module.set_conversation_derivations_suppressed(
+        bool(args.no_sync))
+    _dashboard_startup_schema_migration(run_derivations=not bool(args.no_sync))
+    # #714: the pricing-file watch, in EVERY mode for the same reason. Both
+    # `_DashboardSyncThread` and `_make_conversation_sync_thread` are disabled
+    # under `--no-sync`, so a detector placed in either would have no owner in
+    # the one mode a long-lived read-only dashboard runs in.
+    _start_pricing_watch()
     _heal = _dashboard_self_heal_orphans(skip_sync=bool(args.no_sync))
     if _heal is not None and _heal.pruned_files:
         print(f"dashboard: pruned {_heal.pruned_files} orphaned cache file(s) "
               f"from removed sessions on startup", flush=True)
+    if _heal is not None and _heal.prune_refused:
+        # #729: on stdout beside the pruned-files line, because the operator
+        # reading the startup banner is the one who can act on it. The heal
+        # helper has already armed the backfill and dropped the certificate.
+        print(f"dashboard: the conversation rollup re-derive was refused for "
+              f"{_heal.prune_refused_files} pruned file(s) — "
+              f"{pricing_refusal_cause_phrase(_heal.prune_refused_state)}",
+              flush=True)
 
     # #709: background retained-size verifiers own fail-closed completion.
     # Bind both owners to the same publisher lock before the initial build so

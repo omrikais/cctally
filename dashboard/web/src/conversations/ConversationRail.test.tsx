@@ -31,6 +31,10 @@ const loadMoreSpy = vi.fn();
 // #205 S3 (F8) — overridable error + retry spy so the error-branch Retry button
 // can be exercised. Default error null preserves every existing browse test.
 let browseError: string | null = null;
+// #769 S6 / #802 browser QA P1 — the typed degraded state both data hooks now
+// report instead of throwing on an envelope they cannot parse.
+let browseDegraded: { reason: string; message: string; retryable: boolean } | null = null;
+let searchDegraded: { reason: string; message: string; retryable: boolean } | null = null;
 const retrySpy = vi.fn();
 // #217 S3 E10#7 — overridable browse-list paging surface so the Load-more
 // disabled/loading state can be exercised. Defaults preserve every existing
@@ -43,7 +47,7 @@ vi.mock('../hooks/useConversations', () => ({
   useConversations: () => ({
     rows: browseRows, loading: false, error: browseError, hasMore: browseHasMore,
     loadMore: browseLoadMoreSpy, loadingMore: browseLoadingMore,
-    filterDegraded, sortDegraded, retry: retrySpy,
+    filterDegraded, sortDegraded, retry: retrySpy, degraded: browseDegraded,
   }),
 }));
 // Stub the popover so the rail render doesn't reach useConversationFacets' live
@@ -57,7 +61,7 @@ vi.mock('../hooks/useConversationSearch', () => ({
     hits: searchHits, mode: searchMode, total: searchTotal,
     loading: searchLoading, loadingMore: searchLoadingMore, searchDepth,
     filterDegraded: searchFilterDegraded,
-    error: searchError, loadMore: loadMoreSpy,
+    error: searchError, loadMore: loadMoreSpy, degraded: searchDegraded,
   }),
 }));
 vi.mock('../hooks/useDisplayTz', () => ({
@@ -114,6 +118,8 @@ beforeEach(() => {
   searchFilterDegraded = false;
   loadMoreSpy.mockReset();
   browseError = null;
+  browseDegraded = null;
+  searchDegraded = null;
   retrySpy.mockClear();
   browseHasMore = false;
   browseLoadingMore = false;
@@ -1052,6 +1058,60 @@ describe('ConversationRail browse-list error state (#205 S3 F8)', () => {
     expect(btn).toBeTruthy();
     fireEvent.click(btn);
     expect(retrySpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ConversationRail degraded transcript store (#769 S6 / #802 QA P1)', () => {
+  const bridge = {
+    reason: 'legacy_bridge_pending',
+    message: 'Transcripts have not finished moving into the conversation store. Run cctally cache-sync to finish the import.',
+    retryable: false,
+  };
+
+  it('states the degraded reason and its remedy instead of a load failure', () => {
+    browseDegraded = bridge;
+    render(<ConversationRail />);
+    const notice = screen.getByTestId('conv-rail-degraded');
+    expect(notice.getAttribute('role')).toBe('status');
+    expect(notice.textContent).toContain('cctally cache-sync');
+    expect(notice.textContent).not.toContain("Couldn't load conversations.");
+  });
+
+  it('offers no Retry for a state a re-read cannot change', () => {
+    browseDegraded = bridge;
+    render(<ConversationRail />);
+    expect(screen.queryByRole('button', { name: /retry/i })).toBeNull();
+  });
+
+  it('keeps Retry for a transient degraded state', () => {
+    browseDegraded = {
+      reason: 'maintenance',
+      message: 'The conversation store is busy with maintenance.',
+      retryable: true,
+    };
+    render(<ConversationRail />);
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
+    expect(retrySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('states the reason ONCE under All, not as a partial note as well', () => {
+    // Both merged sources degrade here, so the combined rail has nothing to
+    // show and the notice is the whole answer. The partial note exists for the
+    // case where the OTHER source still has rows on screen.
+    browseDegraded = bridge;
+    act(() => { dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' }); });
+    render(<ConversationRail />);
+    const occurrences = Array.from(document.querySelectorAll('.conv-rail-list *'))
+      .filter((el) => el.children.length === 0 && el.textContent === bridge.message);
+    expect(occurrences).toHaveLength(1);
+  });
+
+  it('states the same reason on the search branch', () => {
+    searchDegraded = bridge;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'flock' });
+    render(<ConversationRail />);
+    const notice = screen.getByTestId('conv-rail-degraded');
+    expect(notice.textContent).toContain('cctally cache-sync');
   });
 });
 

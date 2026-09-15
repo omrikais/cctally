@@ -290,6 +290,29 @@ def _claude_browse(
         for conv in convs
     ]
     facets = q._browse_facets(rows)
+    # #717. Computed HERE, at the source. An earlier draft of the spec claimed
+    # this function already computed a `filter_degraded` and merely discarded
+    # it; it did not, and correcting that is why §6 asks for computation
+    # rather than propagation. The authority is `_rollup_authoritative` — the
+    # absence of `conversation_sessions_backfill_pending` — and never the
+    # pricing refusal latch, which coexists with an intact rollup.
+    #
+    # DELIBERATE DIVERGENCE from §6's "when degraded, projects: []", for this
+    # producer only. §6 states that rule once for both Claude paths, and it is
+    # right for the unqualified one, whose `projects` is a GROUP BY over the
+    # `conversation_sessions` table and really is empty while that table is
+    # being rebuilt. It is wrong here: these facets are derived from the browse
+    # ROWS, and `_all_claude_conversations` pages `lcq.list_conversations`,
+    # which falls back to a live GROUP BY over `conversation_messages` whenever
+    # the rollup is not authoritative, so the rows — and the project facet
+    # built from them — stay complete. Emptying them anyway hid two real
+    # projects behind a "still indexing" message, which is what
+    # `test_neutral_browse_claude_same_basename_distinct_project_key` caught.
+    #
+    # The flag therefore reports the same fact without the false emptiness, and
+    # the client renders the explanatory line only where the list IS empty, so
+    # a complete list still renders as itself.
+    degraded = not lcq._rollup_authoritative(conn)
     filtered = [
         row for row in rows
         if (project_key is None or row["project_key"] == project_key)
@@ -298,6 +321,8 @@ def _claude_browse(
     filtered.sort(key=q._recent_sort_key, reverse=True)
     page_rows, page = q._paginate_rows(filtered, cursor=cursor, limit=limit)
     result = {"status": "ok", "rows": page_rows, "facets": facets, "page": page}
+    if degraded:
+        result["filter_degraded"] = True
     if selected is not None:
         selected_row = next(
             (row for row in rows if row["conversation_key"] == selected), None)
@@ -655,8 +680,13 @@ def neutral_facets(
         return q.list_codex_conversation_facets(conn)
     if source == "claude":
         env = _claude_browse(conn, effective_speed=speed)
-        return {"status": env.get("status"), "facets": env.get("facets") or {
+        # #717: this reshaping site keeps only `status` and `facets`, so the
+        # flag has to be carried across it explicitly or it is dropped here.
+        out = {"status": env.get("status"), "facets": env.get("facets") or {
             "projects": [], "models": []}}
+        if env.get("filter_degraded"):
+            out["filter_degraded"] = True
+        return out
     raise ValueError(f"unknown source: {source!r}")
 
 

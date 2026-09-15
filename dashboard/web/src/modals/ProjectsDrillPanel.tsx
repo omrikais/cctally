@@ -1,15 +1,18 @@
 // ProjectsDrillPanel — per-project drill that appears below the
 // projects table when a row is selected (spec §3.5, plan Task 5 Step 5).
 //
-// Lazy-fetches GET /api/project/<key>?weeks=N via `useProjectDetail`
-// (stale-while-revalidate). Renders two columns on desktop:
+// Renders the state of GET /api/project/<key>?weeks=N. Since #834 S2 (#775)
+// it does NOT fetch: `CanonicalProjectsModal` owns the one `useProjectDetail`
+// call and passes its state in, so the mobile and desktop mount points are the
+// same owner's output rather than two independent fetchers. Two columns on
+// desktop:
 //   - Models (this project): horizontal mini-bars sized to top model.
 //   - Recent sessions:        clickable rows opening SessionModal (the
 //                             cross-nav "replace pattern"; spec §4.2).
 //
 // `sessions_total > sessions.length` adds a "+N more" affordance below
 // the visible list (spec §3.5).
-import { useProjectDetail } from '../hooks/useProjectDetail';
+import type { ProjectDetailState } from '../hooks/useProjectDetail';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { exclusiveWindowSpan, formatSpan } from '../lib/projectWindow';
 import { dispatch } from '../store/store';
@@ -24,6 +27,14 @@ import type { ProjectDetailModelRow } from '../types/envelope';
 export interface ProjectsDrillPanelProps {
   projectKey: string;
   windowWeeks: number;
+  // #834 S2 (#775) — the fetch state, OWNED by `CanonicalProjectsModal`. This
+  // panel is presentation-only. It used to call `useProjectDetail` itself and
+  // was mounted at two places, one inside the mobile row and one below the
+  // table; crossing the 640px breakpoint unmounted one and mounted the other,
+  // and because the hook's state lives in the component the newly mounted copy
+  // started from `data == null`, dropped the drill to "Loading…" and refetched
+  // a project detail the process already had.
+  detail: ProjectDetailState;
 }
 
 export interface ProjectDetailContentData {
@@ -83,14 +94,16 @@ function useDrillWindowSpan(
   );
 }
 
-export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPanelProps) {
-  const { data, loading, error } = useProjectDetail(projectKey, windowWeeks);
+export function ProjectsDrillPanel(
+  { projectKey, windowWeeks, detail }: ProjectsDrillPanelProps,
+) {
+  const { data, loading, error } = detail;
 
   // Stale-on-switch guard: while `useProjectDetail` is fetching for the
   // newly selected project — OR for the same project under a different
   // window (e.g. 12w → 4w) — the SWR pattern keeps prior `data` mounted.
   // Without a window check the drill keeps rendering the prior window's
-  // cost/models/sessions under the new `{windowWeeks}w` heading until
+  // cost/models/sessions under the new `{windowWeeks} cycles` heading until
   // /api/project resolves; on large projects that fetch can take seconds
   // so the modal would show numbers that disagree with the visible
   // header. Render Loading… until the new fetch resolves so the drill
@@ -155,9 +168,12 @@ export function ProjectDetailContent({
           ▾ {data.label} · {data.sessions_total} session{data.sessions_total === 1 ? '' : 's'}
           {' · '}
           {fmt.usd2(data.window_cost_usd)}
+          {/* #750 S4 D2 / acceptance 11: the drill header names cycles on
+              BOTH branches. `window_weeks` is a frozen wire name; only the
+              rendered noun changes. */}
           {windowSpan == null
-            ? ` (${data.window_weeks}w)`
-            : ` · ${data.window_weeks}w · ${windowSpan}`}
+            ? ` (${data.window_weeks} ${data.window_weeks === 1 ? 'cycle' : 'cycles'})`
+            : ` · ${data.window_weeks} ${data.window_weeks === 1 ? 'cycle' : 'cycles'} · ${windowSpan}`}
           {resetGapCount > 0
             ? ` · ${resetGapCount} reset gap${resetGapCount === 1 ? '' : 's'}`
             : ''}

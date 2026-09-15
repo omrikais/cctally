@@ -322,8 +322,31 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # the hole `PROJECTION_DYNAMIC_READ_SITES` exists to close. `{table}` there
     # iterates a hardcoded conversation-table tuple, so none of them reaches a
     # projection family and none needs an entry below.
-    "_cctally_cache.py": 3,
-    "_cctally_core.py": 2,
+    #
+    # Seven, not three, since #769 S3. The four new reads all name the browse
+    # rollup or its staging twin — `_recompute_conversation_sessions`' two
+    # `SELECT … FROM {target}` derivations plus
+    # `_fill_conversation_sessions_filter_columns`' `PRAGMA table_info({target})`
+    # and its session-id scan — so a rebuild can derive its replacement
+    # generation into `conversation_sessions_staging` without touching what
+    # readers are reading (#752). `{target}` substitutes one of exactly two
+    # names chosen inside `_cctally_cache`, neither of which is a projection
+    # table, so none of them needs an entry below either.
+    #
+    # Nine, not seven, since #769 S3 tranche 3. `conversation_legacy_bridge_pending`
+    # adds `SELECT 1 FROM main.{table}` and `SELECT 1 FROM cache_db.{table}`,
+    # which are `_import_legacy_conversation_rows`' own condition read back as
+    # a pure predicate so the read-only reader can DETECT that the bridge still
+    # has work without performing it (#780). `{table}` iterates the same
+    # hardcoded `_LEGACY_BRIDGE_TABLES` tuple as the three reads above, so
+    # neither reaches a projection family and neither needs an entry below.
+    "_cctally_cache.py": 9,
+    # One, not two, since #750 S4: `_get_latest_row_for_week` composed
+    # its `WHERE` clauses instead of branching on `as_of_utc`, so its
+    # two near-identical `FROM {table_name}` reads became one. The
+    # target is still `weekly_usage_snapshots` or
+    # `weekly_cost_snapshots`; neither is a projection table.
+    "_cctally_core.py": 1,
     "_cctally_dashboard.py": 3,
     "_cctally_dashboard_envelope.py": 5,
     # Six, not seven: `cctally: rebuilt stats.db from {} journal segment(s)` is
@@ -347,12 +370,21 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     "_lib_codex_conversation_query.py": 1,
     "_lib_conversation_query.py": 1,
     "_lib_conversation_retention.py": 2,
-    # Three: `_target_has_cursor_gap` selects one of the two accounting source
-    # tables, while `_conversation_source_paths` and `_conversation_target_risk`
-    # select one of the two transcript source tables. Every choice is hardcoded;
-    # none is a quota projection table, so no
+    # Five: `_target_has_cursor_gap` selects one of the two accounting source
+    # tables, `_conversation_source_paths` and `_conversation_target_risk`
+    # select one of the two transcript source tables, and #769 S6's
+    # `select_recently_active_codex_paths` reads whichever Codex cursor table
+    # its caller owns — twice, once for the recency predicate and once for the
+    # ticket-named paths that predicate missed. That choice is confined to
+    # `_CODEX_CURSOR_TABLES` and validated against it before the query is
+    # built. Six, not five, since #769 S6 T2a's `32b8eaa0a`: `_source_paths`
+    # now reads `f"SELECT path FROM {table}"`, where `_ingest_source_table`
+    # returns `session_files` or `codex_session_files` in place of the literal
+    # pair the planner used to spell at its own call site. That function is
+    # total over those two names and raises on anything else. Every choice here
+    # is hardcoded; none is a quota projection table, so no
     # `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
-    "_lib_ingest_frontier.py": 3,
+    "_lib_ingest_frontier.py": 6,
     "_lib_snapshot_cache.py": 1,
     "_lib_subscription_weeks.py": 1,
 }

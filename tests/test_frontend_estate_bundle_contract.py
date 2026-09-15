@@ -78,7 +78,11 @@ def test_the_frontend_harness_is_discoverable_and_fails_loudly() -> None:
     # The missing-vitest branch reports a FAIL line and exits non-zero. A SKIP
     # there would recreate the gap F23 closes, so pin the loud path rather than
     # the word, which the header legitimately uses to describe the divergence.
-    assert "FAIL frontend-estate: vitest is not installed" in text
+    # The label moved under #769 S5 #808: the tool name and its private
+    # node_modules path now sit on the continuation line, because neither
+    # survives the evidence scrub on the marked line. The loud path is still
+    # what is pinned.
+    assert "FAIL frontend-estate: executable not installed" in text
     assert "passed: 0   failed: 1" in text
 
 
@@ -87,7 +91,7 @@ def test_the_frontend_harness_runs_hooks_lint_and_fails_loudly() -> None:
     text = harness.read_text()
     assert "node_modules/.bin/eslint" in text
     assert "npm run lint" in text
-    assert "FAIL hooks-lint: eslint is not installed" in text
+    assert "FAIL hooks-lint: executable not installed" in text
     assert "FAIL hooks-lint: npm run lint failed" in text
 
 
@@ -115,7 +119,11 @@ def test_playwright_sources_are_owned_by_the_build_static_checks() -> None:
 def test_the_frontend_harness_executes_the_build_typecheck_script() -> None:
     text = (ROOT / "bin" / "cctally-frontend-test").read_text()
     assert "npm run typecheck" in text
-    assert "FAIL typecheck: npm run typecheck reported type errors" in text
+    # `typecheck` is outside the reviewed evidence vocabulary, so the leg is
+    # labelled `frontend-check` and the script name it runs is asserted
+    # separately above (#769 S5 #808).
+    assert "FAIL frontend-check: npm run failed" in text
+    assert "'npm run typecheck' reported type errors" in text
 
 
 def test_every_bundle_ci_job_provisions_the_frontend_estate() -> None:

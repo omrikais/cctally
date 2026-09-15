@@ -2890,9 +2890,15 @@ def _render_project_table(
             return ("\u2014", _gray)  # em-dash for unknown
         base = f"{ap:.1f}%"
         if weeks_in_range > 1:
-            # Count weeks the user asked about; surface via `(Nwk)` suffix
-            # (spec §3). Keep the suffix short so column width stays sane.
-            base = f"{base} ({weeks_in_range}wk)"
+            # The count of BILLING CYCLES the window covers, surfaced as an
+            # `(Ncy)` suffix. It was `(Nwk)`, and a credited week contributes
+            # two cycles, so the abbreviation named the wrong unit — the same
+            # inconsistency #750 S4 D2 removes from every other surface. `cy`
+            # rather than the spelled-out word because the suffix is exactly as
+            # wide as before: the cell already truncates to `80.0% (…` at
+            # ordinary terminal widths, and a longer token would truncate more
+            # often. The summary line below the table spells `cycles` out.
+            base = f"{base} ({weeks_in_range}cy)"
         return (base, _used_pct_color(ap))
 
     def _cost_per_pct_cell(cpp: float | None) -> tuple[str, Any]:

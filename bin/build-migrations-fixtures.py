@@ -7362,6 +7362,294 @@ def build_per_migration_conversations_008_conversation_render_revision(
 
 
 
+def build_per_migration_conversations_009_conversation_title_staging_and_account_stamps(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for #769 S3's staging tables and account stamps.
+
+    The seeded `source_path` values are STABLE LITERALS that do not exist on
+    any filesystem, so every message row takes the backfill's classified-gap
+    branch. That is not a shortcut around the stamping branch — it is the only
+    branch a byte-idempotent golden can hold. A stamp carries a randomly minted
+    incarnation id and the absolute path of a real file, and a regen into a
+    different temporary directory would reproduce neither, so the #197
+    byte-idempotency guard would fail on every rebuild. The stamping branch is
+    pinned against a live store in
+    `tests/test_conversation_account_dimension.py`.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "009_conversation_title_staging_and_account_stamps"
+    source_a = "/fixtures/claude/projects/-p-alpha/a.jsonl"
+    source_b = "/fixtures/claude/projects/-p-beta/b.jsonl"
+
+    if pre.exists():
+        pre.unlink()
+    register_fixture_db(pre)
+    mod = _load_db_module()
+    conn = sqlite3.connect(pre)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        mod._apply_conversations_schema(conn)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+        )
+        for name in (
+            "001_adopt_schema_version_marker",
+            "002_codex_thread_source_inference_replay",
+            "003_background_mcp_result_replay",
+            "004_codex_find_projection",
+            "005_conversation_account_dimension",
+            "006_backfill_codex_file_touches",
+            "007_codex_find_projection_v2_meta",
+            "008_conversation_render_revision",
+        ):
+            conn.execute(
+                "INSERT INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+                (name, TS_STATS_FIVE_APPLIED),
+            )
+        for path_str, rows in (
+            (source_a, ((0, "sess-a", "acct-alpha"),
+                        (180, "sess-a", "acct-alpha"))),
+            (source_b, ((0, "sess-b", None),
+                        (140, "sess-b", "acct-beta"))),
+        ):
+            for offset, session_id, account_key in rows:
+                conn.execute(
+                    "INSERT INTO conversation_messages"
+                    "(session_id,source_path,byte_offset,entry_type,"
+                    "timestamp_utc,account_key) VALUES(?,?,?,?,?,?)",
+                    (session_id, path_str, offset, "assistant",
+                     "2026-01-01T00:00:00Z", account_key),
+                )
+            conn.execute(
+                "INSERT INTO conversation_source_files"
+                "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at) "
+                "VALUES(?,?,?,?,?)",
+                (path_str, 320, 1700000000000000000, 320,
+                 TS_STATS_FIVE_APPLIED),
+            )
+        # A real pre-009 store carries no coverage marker. The schema apply
+        # above set one because it ran before the message rows were seeded and
+        # therefore saw an empty store; leaving it would make the handler's
+        # backfill fast-return and the golden would pin nothing.
+        conn.execute(
+            "DELETE FROM cache_meta "
+            "WHERE key='claude_account_stamp_coverage_complete'")
+        conn.execute("DROP TABLE IF EXISTS conversation_ai_titles_staging")
+        conn.execute("DROP TABLE IF EXISTS conversation_sessions_staging")
+        conn.execute("DROP TABLE IF EXISTS claude_conversation_account_stamps")
+        conn.execute(
+            "DROP TABLE IF EXISTS claude_conversation_account_stamp_gaps")
+        for column in ("device_id", "inode", "source_incarnation_id",
+                       "committed_prefix_sha256"):
+            conn.execute(
+                f"ALTER TABLE conversation_source_files DROP COLUMN {column}")
+        conn.execute("PRAGMA user_version=8")
+        conn.commit()
+    finally:
+        conn.close()
+
+    if post.exists():
+        post.unlink()
+    import shutil
+    shutil.copy(pre, post)
+    register_fixture_db(post)
+    handler = next(
+        (m.handler for m in mod._CONVERSATIONS_MIGRATIONS if m.name == migration),
+        None,
+    )
+    if handler is None:
+        raise SystemExit(f"conversations migration {migration} not registered")
+    conn = sqlite3.connect(post)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        handler(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+            (migration, TS_STATS_FIVE_APPLIED),
+        )
+        conn.execute("PRAGMA user_version=9")
+        conn.commit()
+    finally:
+        conn.close()
+    for suffix in (".lock", ".codex.lock"):
+        lock = post.with_name(post.name + suffix)
+        if lock.exists():
+            lock.unlink()
+
+
+def build_per_migration_046_codex_source_file_identity(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for #769 S6's Codex accounting file identity.
+
+    ``pre.sqlite`` is a genuine 045-head install: the current schema apply
+    declares ``device_id``/``inode`` on ``codex_session_files``, so the two
+    columns are dropped after applying it to reproduce the shape an
+    already-current store carries. The seeded row is what proves the columns
+    arrive over existing data at NULL rather than at a fabricated stat.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "046_codex_source_file_identity"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill",
+                         "040_codex_quota_physical_group_index",
+                         "041_codex_quota_unresolved_model_index",
+                         "042_codex_entries_root_path_index",
+                         "043_codex_window_attributions",
+                         "044_codex_accounting_change_ledger",
+                         "045_conversation_render_revision_columns"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            conn.execute(
+                "INSERT INTO codex_session_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, "
+                " last_ingested_at) VALUES (?,?,?,?,?)",
+                ("/fixtures/codex/sessions/2026/09/10/rollout.jsonl",
+                 512, 1700000000000000000, 512, _TS_PUBLIC_5),
+            )
+            for column in ("device_id", "inode"):
+                conn.execute(
+                    f"ALTER TABLE codex_session_files DROP COLUMN {column}")
+            conn.execute("PRAGMA user_version=45")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=46")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_conversations_010_codex_conversation_source_file_identity(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for #769 S6's Codex transcript file identity.
+
+    The conversations twin of the 046 builder, at the 009 head.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "010_codex_conversation_source_file_identity"
+
+    if pre.exists():
+        pre.unlink()
+    register_fixture_db(pre)
+    mod = _load_db_module()
+    conn = sqlite3.connect(pre)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        mod._apply_conversations_schema(conn)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+        )
+        for name in (
+            "001_adopt_schema_version_marker",
+            "002_codex_thread_source_inference_replay",
+            "003_background_mcp_result_replay",
+            "004_codex_find_projection",
+            "005_conversation_account_dimension",
+            "006_backfill_codex_file_touches",
+            "007_codex_find_projection_v2_meta",
+            "008_conversation_render_revision",
+            "009_conversation_title_staging_and_account_stamps",
+        ):
+            conn.execute(
+                "INSERT INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+                (name, TS_STATS_FIVE_APPLIED),
+            )
+        conn.execute(
+            "INSERT INTO codex_conversation_source_files"
+            "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at,"
+            "source_root_key) VALUES(?,?,?,?,?,?)",
+            ("/fixtures/codex/sessions/2026/09/10/rollout.jsonl",
+             512, 1700000000000000000, 512, TS_STATS_FIVE_APPLIED, "rk"),
+        )
+        for column in ("device_id", "inode"):
+            conn.execute(
+                "ALTER TABLE codex_conversation_source_files "
+                f"DROP COLUMN {column}")
+        conn.execute("PRAGMA user_version=9")
+        conn.commit()
+    finally:
+        conn.close()
+
+    if post.exists():
+        post.unlink()
+    import shutil
+    shutil.copy(pre, post)
+    register_fixture_db(post)
+    handler = next(
+        (m.handler for m in mod._CONVERSATIONS_MIGRATIONS if m.name == migration),
+        None,
+    )
+    if handler is None:
+        raise SystemExit(f"conversations migration {migration} not registered")
+    conn = sqlite3.connect(post)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        handler(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+            (migration, TS_STATS_FIVE_APPLIED),
+        )
+        conn.execute("PRAGMA user_version=10")
+        conn.commit()
+    finally:
+        conn.close()
+    for suffix in (".lock", ".codex.lock"):
+        lock = post.with_name(post.name + suffix)
+        if lock.exists():
+            lock.unlink()
+
+
 def build_per_migration_002_five_hour_block_projects_backfill_v1(
     scenario_dir: Path,
 ) -> None:
@@ -8071,6 +8359,10 @@ def main() -> int:
         FIXTURES_ROOT / "per-migration"
         / "conversations_008_conversation_render_revision"
     )
+    build_per_migration_conversations_009_conversation_title_staging_and_account_stamps(
+        FIXTURES_ROOT / "per-migration"
+        / "conversations_009_conversation_title_staging_and_account_stamps"
+    )
     build_per_migration_036_codex_quota_window_identity_index(
         FIXTURES_ROOT / "per-migration"
         / "036_codex_quota_window_identity_index"
@@ -8109,6 +8401,14 @@ def main() -> int:
     build_per_migration_045_conversation_render_revision_columns(
         FIXTURES_ROOT / "per-migration"
         / "045_conversation_render_revision_columns"
+    )
+    build_per_migration_046_codex_source_file_identity(
+        FIXTURES_ROOT / "per-migration"
+        / "046_codex_source_file_identity"
+    )
+    build_per_migration_conversations_010_codex_conversation_source_file_identity(
+        FIXTURES_ROOT / "per-migration"
+        / "conversations_010_codex_conversation_source_file_identity"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0

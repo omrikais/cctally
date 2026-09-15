@@ -1742,7 +1742,11 @@ def test_dashboard_source_reader_releases_rollback_snapshot(
 
     observed: dict[str, int] = {}
 
-    def build_codex_state(context, *, data_version):
+    # `**_kwargs` rather than a fixed list: this double replaces the real
+    # builder to run a writer storm inside it, and the state it returns is
+    # hand-built, so a keyword added to that builder is nothing this case has
+    # an opinion about.
+    def build_codex_state(context, *, data_version, **_kwargs):
         child = subprocess.run(
             [
                 sys.executable,

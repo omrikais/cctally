@@ -328,6 +328,54 @@ describe('useConversations', () => {
     await waitFor(() => expect(result.current.sortDegraded).toBe(true));
   });
 
+  // #769 S6 / #802 browser QA P1 — the degraded envelope is a 200, not a
+  // failure. Before this the Claude branch read `body.page.next_offset` off a
+  // body that carries no `page`, the Codex branch read `body.rows.map` off a
+  // body that carries no `rows`, and both TypeErrors landed in the same
+  // `.catch` that prints "Couldn't load conversations." beside a Retry button
+  // the state can never satisfy.
+  it('reports a degraded Claude browse as a named state, not a load failure', async () => {
+    mockFetchOnce({
+      conversations: [], total: 0, status: 'degraded',
+      degraded_reason: 'legacy_bridge_pending',
+    });
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.degraded).not.toBeNull());
+    expect(result.current.error).toBeNull();
+    expect(result.current.degraded!.reason).toBe('legacy_bridge_pending');
+    expect(result.current.degraded!.message).toContain('cctally cache-sync');
+    expect(result.current.degraded!.retryable).toBe(false);
+    expect(result.current.loading).toBe(false);
+    expect(result.current.rows).toHaveLength(0);
+    // No cursor, so the rail cannot offer Load more over a surface that served
+    // nothing.
+    expect(result.current.hasMore).toBe(false);
+  });
+
+  it('reports a degraded qualified Codex browse the same way', async () => {
+    mockFetchOnce({
+      conversations: [], total: 0, status: 'degraded',
+      degraded_reason: 'legacy_bridge_pending',
+    });
+    const { result } = renderHook(() => useConversations('codex'));
+    await waitFor(() => expect(result.current.degraded).not.toBeNull());
+    expect(result.current.error).toBeNull();
+    expect(result.current.degraded!.reason).toBe('legacy_bridge_pending');
+    expect(result.current.pending).toBe(false);
+  });
+
+  it('clears the degraded state once the store serves again', async () => {
+    mockFetchOnce({ conversations: [], total: 0, status: 'degraded', degraded_reason: 'maintenance' });
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.degraded).not.toBeNull());
+    expect(result.current.degraded!.retryable).toBe(true);
+
+    mockFetchOnce(page1);
+    await act(async () => { result.current.retry(); });
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+    expect(result.current.degraded).toBeNull();
+  });
+
   it('recovers from a failed first load via retry() (#205 S3 F8)', async () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('boom'));
     const { result } = renderHook(() => useConversations());

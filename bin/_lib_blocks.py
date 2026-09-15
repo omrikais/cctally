@@ -95,6 +95,123 @@ def _floor_to_hour(ts: dt.datetime) -> dt.datetime:
 BLOCK_DURATION = dt.timedelta(hours=5)
 
 
+@dataclass(frozen=True)
+class OwnedWindow:
+    """One candidate owner of an entry: a canonical five-hour interval.
+
+    `key` is the window's canonical identity — the floored anchor
+    ``R`` on the grouping path, the ``five_hour_window_key`` on the
+    persisted path, a native block key in the diagnosis sources. It is
+    opaque to the rule apart from the tie-break below.
+    """
+    key: Any
+    start: dt.datetime
+    reset: dt.datetime
+
+
+def _canonical_key_order(key: Any) -> tuple:
+    """A total order over canonical keys of the shapes this repo uses.
+
+    Datetimes, numbers and everything else each order among themselves and
+    never against each other, so a heterogeneous set still sorts without
+    raising.
+    """
+    if isinstance(key, dt.datetime):
+        # A naive key is read as UTC, explicitly. `astimezone` on a naive
+        # datetime reads it as HOST-LOCAL, which would make the tie-break
+        # depend on where the process runs. Every caller passes an aware
+        # datetime today, and this states the rule rather than leaving it
+        # latent (#769 S2 review P3-5). UTC is the repository's reading of
+        # a naive moment elsewhere too (`--block-start`).
+        moment = key if key.tzinfo is not None else key.replace(
+            tzinfo=dt.timezone.utc,
+        )
+        return (0, moment.astimezone(dt.timezone.utc).isoformat(), 0.0, "")
+    if isinstance(key, bool):
+        return (2, "", 0.0, str(key))
+    if isinstance(key, (int, float)):
+        return (1, "", float(key), "")
+    return (2, "", 0.0, str(key))
+
+
+def _window_order(window: OwnedWindow) -> tuple:
+    """Earliest reset first; an equal reset breaks by canonical key."""
+    return (window.reset,) + _canonical_key_order(window.key)
+
+
+def _entry_timestamp(entry: Any) -> dt.datetime:
+    # `datetime` carries a `timestamp` METHOD, so the datetime case is
+    # tested first rather than reached through getattr.
+    if isinstance(entry, dt.datetime):
+        return entry
+    return entry.timestamp
+
+
+def resolve_owning_window(entry: Any, windows) -> "OwnedWindow | None":
+    """Return the one window that owns `entry`, or None (issue #751a).
+
+    An entry belongs to the containing half-open interval ``[start,
+    reset)`` whose reset is EARLIEST; an equal reset breaks
+    deterministically by canonical key. The result does not depend on the
+    order `windows` arrives in.
+
+    Ownership is decided among CONTAINING windows only, so the globally
+    earliest reset is not automatically the answer — a credit-truncated
+    window can reset before a later window that started after it.
+
+    `entry` is anything carrying a `.timestamp`, or a bare datetime.
+    Returning None means no exact window contains the entry, which is what
+    hands it to the heuristic grouper.
+
+    Pure: no I/O, no database, no clock.
+    """
+    owner = None
+    owner_order = None
+    ts = _entry_timestamp(entry)
+    for window in windows:
+        if not (window.start <= ts < window.reset):
+            continue
+        order = _window_order(window)
+        if owner is None or order < owner_order:
+            owner, owner_order = window, order
+    return owner
+
+
+def partition_entries_by_owner(entries, windows):
+    """Split `entries` across `windows` under `resolve_owning_window`.
+
+    Returns ``(owned, leftovers)`` where `owned` maps every window's
+    canonical key to the entries it owns — including the empty list for a
+    window that owns none — and `leftovers` holds the entries no exact
+    window contains. Input order is preserved inside each bucket.
+
+    Each entry appears exactly once across the two results, which is the
+    property that stops one physical entry being priced into two windows.
+
+    Pure: no I/O, no database, no clock.
+    """
+    window_list = list(windows)
+    ordered = sorted(window_list, key=_window_order)
+    reset_keys = [w.reset for w in ordered]
+    owned: dict[Any, list] = {w.key: [] for w in window_list}
+    leftovers: list = []
+    for entry in entries:
+        ts = _entry_timestamp(entry)
+        # Every containing window resets after `ts`, so the search starts
+        # at the first such window and walks in ownership order; the first
+        # one that also started early enough is the owner.
+        owner = None
+        for window in ordered[bisect.bisect_right(reset_keys, ts):]:
+            if window.start <= ts:
+                owner = window
+                break
+        if owner is None:
+            leftovers.append(entry)
+        else:
+            owned[owner.key].append(entry)
+    return owned, leftovers
+
+
 def _group_entries_into_blocks(
     entries: list[UsageEntry],
     mode: str = "auto",
@@ -176,27 +293,17 @@ def _group_entries_into_blocks(
     # shape) go into recorded_buckets[R]. Everything else (gaps between
     # recorded windows, or fully outside any window) drops into
     # `leftover` and runs through the existing heuristic grouper.
-    recorded_buckets: dict[dt.datetime, list[UsageEntry]] = {
-        R: [] for R in recorded_windows
-    }
-    leftover: list[UsageEntry] = []
-    # Sort the (interval, R) pairs by rs so bisect_right(rs_keys, ts)
-    # locates the candidate window in O(log n) per entry.
-    sorted_intervals: list[
-        tuple[tuple[dt.datetime, dt.datetime], dt.datetime]
-    ] = sorted(
-        [(_exact_interval(R), R) for R in recorded_windows],
-        key=lambda item: item[0][1],
+    # Ownership is `resolve_owning_window`'s rule, applied here through
+    # `partition_entries_by_owner` (issue #751a) so this pass and every
+    # consumer that later reasons about the same overlap share one rule
+    # rather than four independent reselections.
+    ownership_windows = [
+        OwnedWindow(key=R, start=bs, reset=rs)
+        for R, (bs, rs) in ((R, _exact_interval(R)) for R in recorded_windows)
+    ]
+    recorded_buckets, leftover = partition_entries_by_owner(
+        entries_sorted, ownership_windows,
     )
-    rs_keys = [iv[0][1] for iv in sorted_intervals]
-    for entry in entries_sorted:
-        idx = bisect.bisect_right(rs_keys, entry.timestamp)
-        if idx < len(sorted_intervals):
-            (bs, rs), R = sorted_intervals[idx]
-            if bs <= entry.timestamp < rs:
-                recorded_buckets[R].append(entry)
-                continue
-        leftover.append(entry)
 
     # Phase 1: Group leftover entries into raw activity blocks
     raw_blocks: list[dict[str, Any]] = []

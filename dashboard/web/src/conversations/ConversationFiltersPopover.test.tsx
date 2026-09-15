@@ -19,8 +19,13 @@ function displayEnvelope(resolvedTz: string, generatedAt = '2026-07-01T03:00:00Z
 // fixture, not a live fetch (mirrors the ConversationRail.test.tsx hook-stub).
 let facetProjects = [{ project_label: 'projA', count: 4 }, { project_label: 'projB', count: 1 }];
 let facetModels = [{ family: 'opus', count: 3 }, { family: 'sonnet', count: 1 }];
+// #717: absent by default, so every existing case renders the authoritative
+// state it always rendered.
+let facetDegraded: boolean | undefined;
 vi.mock('../hooks/useConversationFacets', () => ({
-  useConversationFacets: () => ({ projects: facetProjects, models: facetModels }),
+  useConversationFacets: () => ({
+    projects: facetProjects, models: facetModels, filter_degraded: facetDegraded,
+  }),
 }));
 
 beforeEach(() => {
@@ -30,6 +35,7 @@ beforeEach(() => {
   _resetForTests();
   facetProjects = [{ project_label: 'projA', count: 4 }, { project_label: 'projB', count: 1 }];
   facetModels = [{ family: 'opus', count: 3 }, { family: 'sonnet', count: 1 }];
+  facetDegraded = undefined;
   vi.useFakeTimers();
 });
 afterEach(() => {
@@ -284,5 +290,35 @@ describe('ConversationFiltersPopover', () => {
     render(<ConversationFiltersPopover />);
     const projA = screen.getByRole('checkbox', { name: /projA/ }).closest('label')!;
     expect(within(projA).getByText('4')).toBeTruthy();
+  });
+});
+
+// #717 — an empty project list means two different things, and the popover has
+// to say which. "No projects." is a statement about the corpus; while the
+// rollup is being rebuilt it is a statement about the index.
+describe('#717 degraded project facets', () => {
+  it('explains an empty project list while the index is rebuilding', () => {
+    facetProjects = [];
+    facetDegraded = true;
+    render(<ConversationFiltersPopover />);
+    expect(screen.getByText('Projects appear once indexing finishes.')).toBeTruthy();
+    expect(screen.queryByText('No projects.')).toBeNull();
+  });
+
+  it('keeps the bare empty state when the index is authoritative', () => {
+    facetProjects = [];
+    render(<ConversationFiltersPopover />);
+    expect(screen.getByText('No projects.')).toBeTruthy();
+    expect(screen.queryByText('Projects appear once indexing finishes.')).toBeNull();
+  });
+
+  it('keeps model counts while the project list is degraded', () => {
+    facetProjects = [];
+    facetDegraded = true;
+    render(<ConversationFiltersPopover />);
+    expect(screen.getByText('Projects appear once indexing finishes.')).toBeTruthy();
+    // The model axis does not read the rollup, so its counts stay live.
+    expect(screen.getByRole('button', { name: /opus/ })).toBeTruthy();
+    expect(screen.queryByText('No models.')).toBeNull();
   });
 });

@@ -76,6 +76,7 @@ pytest-internal
 pytest-no-failing-node-ids
 pytest-unavailable
 regeneration-enabled
+merge-runtime-budget-exceeded
 runtime-budget-exceeded
 runtime-budget-unavailable
 summary-unreadable
@@ -814,6 +815,7 @@ contract_emit_outcome() {  # <exit_code>
     CONTRACT_PYP_UNPARSED="$CONTRACT_PYTEST_UNPARSED" \
     CONTRACT_WALL="$CONTRACT_WALL_SECONDS" CONTRACT_OUTER="${OUTER:-0}" \
     CONTRACT_INNER="${INNER:-0}" CONTRACT_PYTEST_JOBS="${PYTEST:-0}" \
+    CONTRACT_MERGE_RECORD="${MERGE_RECORD:-}" \
     CONTRACT_COV_RESOLVED="${COVERAGE_RESOLVED:-0}" \
     CONTRACT_COV_MODE="${COVERAGE_MODE:-full}" \
     CONTRACT_COV_SELECTED="${COVERAGE_SELECTED:-}" \
@@ -912,6 +914,9 @@ if os.environ.get("CONTRACT_COV_RESOLVED") == "1":
             "committedPaths": _int("CONTRACT_COV_TIER_COMMITTED"),
             "worktreePaths": _int("CONTRACT_COV_TIER_WORKTREE"),
         }
+
+if os.environ.get("CONTRACT_MERGE_RECORD"):
+    doc["coverage"]["mergeSelection"] = json.loads(os.environ["CONTRACT_MERGE_RECORD"])
 
 print(json.dumps(doc, sort_keys=True))
 ' > "$tmp" && mv -f "$tmp" "$dest"

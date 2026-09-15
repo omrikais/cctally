@@ -12,9 +12,10 @@ describe('<TrendPanel />', () => {
     updateSnapshot(fixture as unknown as Envelope);
   });
 
-  it('renders the 8-week heading', () => {
+  it('renders the 8-cycle heading', () => {
     render(<TrendPanel />);
-    expect(screen.getByText(/8 weeks/i)).toBeInTheDocument();
+    // #750 S4 §4.1: one vocabulary, both providers.
+    expect(screen.getByText(/8 cycles/i)).toBeInTheDocument();
   });
 
   it('renders a bar-chart icon in the panel header', () => {

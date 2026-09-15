@@ -1111,6 +1111,198 @@ def test_wce_replay_moved_poisoned_set_takes_a_second_id_not_a_conflict(ns):
 
 
 # --------------------------------------------------------------------------
+# Family 4c — `wce:replay:` reached through CONFIRM_RESET twice (#761
+# residual 3). The two cases above call `_fire_in_place_credit` directly, so
+# neither of them traverses the debounce confirm leg, and it is that leg the
+# `at`-versus-id reasoning in `docs/journal-gotchas.md` is about. Here the
+# origin, the effective instant and the poisoned set are all held FIXED and
+# only the confirming percentage changes, which is the one input the confirm
+# leg contributes to the payload.
+# --------------------------------------------------------------------------
+
+#: Small enough that a confirming reading is NOT a >=25pp big drop, which the
+#: classifier tests before it looks at the armed marker at all. A larger
+#: baseline routes to FIRE_IMMEDIATE and never reaches CONFIRM_RESET.
+_CONFIRM_BASELINE = 10.0
+_CONFIRM_FIRST_ZERO = "2026-07-25T12:00:00+00:00"
+_CONFIRM_ORIGIN = "o:bbbbbbbbbbbbbbbb"
+
+
+def _arm_confirm_state(ns, conn):
+    """Arm the debounce state the confirm leg reads, and commit it.
+
+    The arming tick is the previous observation's, so the state is already
+    durable when the confirming tick runs. A mid-fire abort therefore rolls
+    back to an armed state rather than to no state at all, which is the
+    property `_clear_reset_debounce_state`'s placement after the fire exists
+    to give.
+    """
+    ns["_arm_reset_debounce_state"](
+        conn, ACCOUNT,
+        week_start_date="2026-07-20",
+        week_end_at="2026-07-27T00:00:00+00:00",
+        baseline_pct=_CONFIRM_BASELINE,
+        first_zero_at_utc=_CONFIRM_FIRST_ZERO,
+        first_zero_observation_id=_CONFIRM_ORIGIN,
+    )
+    conn.commit()
+
+
+def _seed_confirm_origin(conn):
+    """The committed reset the confirming tick's INSERT collides on."""
+    conn.execute(
+        "INSERT INTO week_reset_events "
+        "(detected_at_utc, old_week_end_at, new_week_end_at, "
+        " effective_reset_at_utc, observed_pre_credit_pct, account_key, "
+        " origin_observation_id) VALUES (?,?,?,?,?,?,?)",
+        (AT, _CONFIRM_FIRST_ZERO, "2026-07-27T00:00:00+00:00",
+         _CONFIRM_FIRST_ZERO, _CONFIRM_BASELINE, ACCOUNT, _CONFIRM_ORIGIN),
+    )
+    conn.commit()
+
+
+def _confirm_tick(ns, conn, *, percent, observation_id):
+    def _emit(ctx):
+        return ns["detect_reset_and_credit"](
+            conn,
+            week_start_date="2026-07-20",
+            week_end_at="2026-07-27T00:00:00+00:00",
+            weekly_percent=percent,
+            five_hour_window_key=None,
+            five_hour_percent=None,
+            as_of=AT,
+            commit=False,
+            ctx=ctx,
+            account_key=ACCOUNT,
+            origin_observation_id=observation_id,
+            capture_at=AT,
+            source="statusline",
+        )
+    return _emit
+
+
+def test_two_confirm_reset_traversals_take_two_ids_and_no_conflict(ns):
+    """The confirm leg contributes the confirming reading to the payload.
+
+    `_fire_in_place_credit` is called with `origin_observation_id=state[4]` —
+    the FIRST-ZERO observation — while `hwm_floor.weekly_percent` carries the
+    CONFIRMING tick's percent. So two confirmations of one armed first zero at
+    two different readings are two legitimate removals, and the payload digest
+    in the id is what keeps them apart. Without it they would collide on one
+    id, the second would classify as a same-revision conflict and be withheld,
+    and its DELETE would be left standing as an inline-only effect.
+
+    The abort is injected mid-fire so the armed state survives it: the clear
+    runs only after the fire returns.
+    """
+    jr = _jr()
+    conn = jr._cctally_core.open_db()
+    try:
+        _seed_confirm_origin(conn)
+        _seed_snapshot(conn, journal_id="sa:baseline", percent=_CONFIRM_BASELINE,
+                       source="record-usage", captured="2026-07-25T11:00:00Z")
+        _seed_snapshot(conn, journal_id="sa:poisoned", percent=_CONFIRM_BASELINE,
+                       source="record-usage", captured="2026-07-25T12:30:00Z")
+        _arm_confirm_state(ns, conn)
+
+        with pytest.raises(RuntimeError, match="forced abort"):
+            _run_in_cycle(
+                conn,
+                _confirm_tick(ns, conn, percent=2.0, observation_id="o:confirm1"),
+                abort=True,
+            )
+        assert ns["_read_reset_debounce_state"](conn, ACCOUNT) is not None, (
+            "the mid-fire abort must leave the state armed, or the second "
+            "traversal is not a CONFIRM_RESET at all"
+        )
+
+        _run_in_cycle(
+            conn,
+            _confirm_tick(ns, conn, percent=1.0, observation_id="o:confirm2"),
+        )
+    finally:
+        conn.close()
+
+    records = _journal_lines()
+    replayed = _evts(records, "wce:replay:")
+    assert len(replayed) == 2, [e["id"] for e in replayed]
+    assert [e["payload"]["hwm_floor"]["weekly_percent"] for e in replayed] == [
+        2.0, 1.0], "only the confirming reading changed between the two traversals"
+    assert [e["payload"]["suppression"] for e in replayed] == [
+        ["sa:poisoned"], ["sa:poisoned"]], "the poisoned set was held fixed"
+    assert len({e["id"] for e in replayed}) == 2, (
+        "two legitimate payloads under one id is the withheld-line defect",
+        [e["id"] for e in replayed])
+    assert _same_rev_conflicts(records) == set()
+    for event in replayed:
+        digested = {k: v for k, v in event["payload"].items() if k != "kind"}
+        assert event["id"] == J.evt_id(
+            "wce", "replay", _CONFIRM_ORIGIN,
+            J.effects_payload_digest(digested)), event["id"]
+
+    conn = jr._cctally_core.open_db()
+    try:
+        rows = conn.execute(
+            "SELECT effective_reset_at_utc, origin_observation_id "
+            "FROM week_reset_events WHERE account_key = ?", (ACCOUNT,)
+        ).fetchall()
+    finally:
+        conn.close()
+    assert [tuple(r) for r in rows] == [
+        (_CONFIRM_FIRST_ZERO, _CONFIRM_ORIGIN)], (
+        "both traversals name one reset identity, anchored at the first zero")
+
+
+def test_the_confirm_reset_traversals_rebuild_convergently(ns):
+    """A rebuild over the two recovery events reproduces the same removal."""
+    jr = _jr()
+    conn = jr._cctally_core.open_db()
+    try:
+        _seed_confirm_origin(conn)
+        _seed_snapshot(conn, journal_id="sa:baseline", percent=_CONFIRM_BASELINE,
+                       source="record-usage", captured="2026-07-25T11:00:00Z")
+        _seed_snapshot(conn, journal_id="sa:poisoned", percent=_CONFIRM_BASELINE,
+                       source="record-usage", captured="2026-07-25T12:30:00Z")
+        _arm_confirm_state(ns, conn)
+        with pytest.raises(RuntimeError, match="forced abort"):
+            _run_in_cycle(
+                conn,
+                _confirm_tick(ns, conn, percent=2.0, observation_id="o:confirm1"),
+                abort=True,
+            )
+        _run_in_cycle(
+            conn,
+            _confirm_tick(ns, conn, percent=1.0, observation_id="o:confirm2"),
+        )
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE journal_id = ?",
+            ("sa:poisoned",),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert remaining == 0, "the poisoned replica must be gone after the confirm"
+
+    records = _journal_lines()
+    replayed = _evts(records, "wce:replay:")
+    conn = jr._cctally_core.open_db()
+    try:
+        _seed_snapshot(conn, journal_id="sa:poisoned", percent=_CONFIRM_BASELINE,
+                       source="record-usage", captured="2026-07-25T12:30:00Z")
+        for event in replayed:
+            jr._apply_evt(conn, event, projection_writes=False)
+        conn.commit()
+        again = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE journal_id = ?",
+            ("sa:poisoned",),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert again == 0, (
+        "replaying both recovery events must converge on the same removal"
+    )
+
+
+# --------------------------------------------------------------------------
 # Family 5 — snapshot_accept (Model-A). Spec §7.5.
 # EXPECTED NEGATIVE: the payload carries no wall clock.
 # --------------------------------------------------------------------------

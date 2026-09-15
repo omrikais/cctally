@@ -78,6 +78,7 @@ def _import_pricing_kernel():
             m.CACHE_WRITE_1H_MULTIPLIER,
             m._claude_fast_multiplier,
             m.claude_usage_dict,
+            m.TIERED_THRESHOLD,
         )
     from pathlib import Path
     import importlib.util
@@ -97,16 +98,23 @@ def _import_pricing_kernel():
         m.CACHE_WRITE_1H_MULTIPLIER,
         m._claude_fast_multiplier,
         m.claude_usage_dict,
+        m.TIERED_THRESHOLD,
     )
 
 
 (CACHE_WRITE_1H_MULTIPLIER, _claude_fast_multiplier,
- claude_usage_dict) = _import_pricing_kernel()
+ claude_usage_dict, DEFAULT_TIERED_THRESHOLD) = _import_pricing_kernel()
 
 
-# Anthropic's per-call >200K-tokens tier — kept in sync with bin/_lib_pricing.
-# Callers may override via the ``tiered_threshold`` kwarg.
-DEFAULT_TIERED_THRESHOLD = 200_000
+# ``DEFAULT_TIERED_THRESHOLD`` above is Anthropic's per-call >200K-tokens tier,
+# READ FROM ``_lib_pricing`` rather than duplicated here (#714). It used to be a
+# literal `200_000` with nothing keeping it equal to
+# ``_lib_pricing.TIERED_THRESHOLD``, which made it a pricing value a reload
+# could not replace. It is refreshed by ``PRICING_EXPORT_BINDINGS`` on every
+# swap, and ``_compute_entry_cache_dollars`` resolves it at CALL time — a
+# default argument would bind it once at function-definition time, so the
+# refresh would reach the name and never the calls.
+# Callers may still override via the ``tiered_threshold`` kwarg.
 
 
 # Minimum baseline samples for the per-row anomaly classifier.
@@ -349,7 +357,7 @@ def _compute_entry_cache_dollars(
     cache_read_tokens: int,
     *,
     pricing: dict,
-    tiered_threshold: int = DEFAULT_TIERED_THRESHOLD,
+    tiered_threshold: "int | None" = None,
     cache_1h_tokens: int | None = None,
     speed=None,
 ) -> tuple[float, float, float]:
@@ -374,7 +382,14 @@ def _compute_entry_cache_dollars(
     Unknown models (no pricing entry) → ``(0.0, 0.0, 0.0)`` silently;
     the CLI's ``_calculate_entry_cost`` path emits the one-shot stderr
     warning for unknown models elsewhere.
+
+    ``tiered_threshold=None`` resolves ``DEFAULT_TIERED_THRESHOLD`` HERE rather
+    than in the signature (#714). A default argument is evaluated once, at
+    function-definition time, so an in-process pricing reload would refresh the
+    module global and leave every call pricing from the superseded revision.
     """
+    if tiered_threshold is None:
+        tiered_threshold = DEFAULT_TIERED_THRESHOLD
     p = _lookup_pricing(model, pricing) or {}
     if not p:
         return (0.0, 0.0, 0.0)

@@ -18,6 +18,7 @@ public bin/cctally-account-test
 public bin/cctally-alerts
 public bin/cctally-alerts-dispatch-test
 public bin/cctally-alerts-test
+private bin/cctally-bash-interpreter-probe
 public bin/cctally-bench-test
 public bin/cctally-blocks-test
 public bin/cctally-budget

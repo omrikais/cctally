@@ -225,6 +225,16 @@ claude_usage_dict = _load_lib("_lib_pricing").claude_usage_dict
 # stdlib leaf as the two names above.
 parse_pricing_fingerprint = _load_lib("_lib_pricing").parse_pricing_fingerprint
 
+# #728: the four-state observation and the two authorization predicates, from
+# the same circular-safe stdlib leaf. The classifier is pure — the SELECT and
+# its failure mode are reported to it by `_read_pricing_fingerprint_observation`
+# below.
+classify_pricing_fingerprint = _load_lib(
+    "_lib_pricing").classify_pricing_fingerprint
+may_write_materialized_cost = _load_lib(
+    "_lib_pricing").may_write_materialized_cost
+may_reset_rebuild_target = _load_lib("_lib_pricing").may_reset_rebuild_target
+
 # Shared by the fused per-file walk AND backfill_conversation_messages so the
 # column list, placeholders, and tuple order live in ONE place — a column
 # add/reorder can't silently desync the two ingest paths (which would land
@@ -256,6 +266,23 @@ _AI_TITLE_UPSERT_SQL = (
     "ON CONFLICT(session_id) DO UPDATE SET "
     "ai_title=excluded.ai_title, source_path=excluded.source_path, byte_offset=excluded.byte_offset"
 )
+
+def _ai_title_upsert_sql(table: str = "conversation_ai_titles") -> str:
+    """The AI-title upsert, targeted at the live table or its staging twin.
+
+    A rebuild builds its replacement generation into staging and leaves the
+    live table alone until the publish (#752), so the ONE statement that writes
+    a title has to be able to name either. Parameterised through this helper
+    rather than by two literals, because two literals drift.
+    """
+    return (
+        f"INSERT INTO {table}(session_id,ai_title,source_path,byte_offset) "
+        "VALUES(?,?,?,?) "
+        "ON CONFLICT(session_id) DO UPDATE SET "
+        "ai_title=excluded.ai_title, source_path=excluded.source_path, "
+        "byte_offset=excluded.byte_offset"
+    )
+
 
 # ---------------------------------------------------------------------------
 # session_entries upsert (#195: extracted from the inline string in sync_cache
@@ -428,6 +455,7 @@ def _iter_sync_entries(
     *,
     include_cost: bool = True,
     include_conversations: bool = True,
+    with_raw: bool = False,
 ):
     """Fused single-pass sync walker (#138). Yields
     ``(byte_offset, cost_or_None, msgrow_or_None, aititle_or_None)`` for each
@@ -453,19 +481,39 @@ def _iter_sync_entries(
     partial mid-write tail line (no trailing newline) rewinds the handle and
     stops, so ``fh.tell()`` after the loop is the cost cursor's ``final_offset``
     and the next sync re-reads the line once the newline lands.
+
+    ``with_raw`` (#777) makes the walker yield FIVE-tuples, appending the
+    record's exact raw on-disk bytes with the terminator removed, and requires
+    ``fh`` to be a BINARY handle. It exists because a durable account stamp is
+    keyed by a digest of those bytes, and the decoded text this walker otherwise
+    produces is not them: the text path decodes with ``errors="replace"``, so a
+    record carrying invalid UTF-8 decodes to a different string than it was
+    written as, and its digest would move the day that replacement policy did.
+    Re-reading or re-parsing the line to recover the bytes would break the
+    one-parse-per-line invariant (#138), so the binary branch decodes the line
+    it already read and hands both halves to the same classification below.
+    ``fh.tell()`` on a binary handle is a true byte offset rather than the text
+    layer's cookie, which is the same number the cursor has always stored.
     """
+    newline = b"\n" if with_raw else "\n"
     while True:
         offset = fh.tell()
         line = fh.readline()
         if not line:
             return
-        if not line.endswith("\n"):
+        if not line.endswith(newline):
             # Partial tail line — writer is mid-flight. Rewind so the next sync
             # re-reads this line once the newline is in place (and so fh.tell()
             # reports the cost cursor's stop, never past the partial).
             fh.seek(offset)
             return
-        stripped = line.strip()
+        if with_raw:
+            raw_span = _lib_conversation.strip_record_terminator(line)
+            text = line.decode("utf-8", errors="replace")
+        else:
+            raw_span = None
+            text = line
+        stripped = text.strip()
         if not stripped:
             continue
         # #279 S2 F1: passive parse-health counters over the new-byte span.
@@ -496,7 +544,10 @@ def _iter_sync_entries(
             if include_conversations else None
         )
         if cost is not None or mrow is not None or ai is not None:
-            yield offset, cost, mrow, ai
+            if with_raw:
+                yield offset, cost, mrow, ai, raw_span
+            else:
+                yield offset, cost, mrow, ai
 
 
 def _iter_claude_jsonl_files():
@@ -1977,8 +2028,13 @@ def _load_codex_session_files_rows(
 ) -> dict:
     """Cursor rows from ``codex_session_files`` for ONLY the given paths (spec
     §5.1 — the targeted preload must never load every row like the full-sync
-    path). Same 13-tuple value shape as ``sync_codex_cache``'s full ``existing``
-    map, so the per-file delta logic is byte-identical between the two modes."""
+    path). Same 15-tuple value shape as ``sync_codex_cache``'s full ``existing``
+    map, so the per-file delta logic is byte-identical between the two modes.
+
+    ``device_id``/``inode`` are the last two members and they are NOT
+    diagnostics: the resume decision reads them, because a replacement that
+    lands at the same size is otherwise indistinguishable from a file nothing
+    touched (#769 S6)."""
     out: dict = {}
     if not paths:
         return out
@@ -1986,7 +2042,8 @@ def _load_codex_session_files_rows(
         "path, size_bytes, mtime_ns, last_byte_offset, "
         "last_session_id, last_model, last_total_tokens, source_root_key, "
         "last_native_thread_id, last_root_thread_id, last_parent_thread_id, "
-        "last_conversation_key, last_turn_id, ingest_complete"
+        "last_conversation_key, last_turn_id, ingest_complete, "
+        "device_id, inode"
     )
     for i in range(0, len(paths), 400):
         chunk = paths[i:i + 400]
@@ -1995,10 +2052,7 @@ def _load_codex_session_files_rows(
             f"SELECT {cols} FROM codex_session_files WHERE path IN ({placeholders})",
             chunk,
         ):
-            out[row[0]] = (
-                row[1], row[2], row[3], row[4], row[5], row[6], row[7],
-                row[8], row[9], row[10], row[11], row[12], row[13],
-            )
+            out[row[0]] = tuple(row[1:])
     return out
 
 
@@ -3181,6 +3235,8 @@ def _write_codex_file_batch(
     file_account_decision: "tuple[int, str | None] | None" = None,
     anchor_resolver: "CodexResetAnchorResolver | None" = None,
     ingest_complete: bool = True,
+    device_id: "int | None" = None,
+    inode: "int | None" = None,
 ) -> int:
     """Write one fully-buffered Codex file atomically and return entry changes.
 
@@ -3278,19 +3334,27 @@ def _write_codex_file_batch(
                  last_seen_utc=excluded.last_seen_utc""",
             [(*row, now_iso, now_iso) for row in thread_rows],
         )
+    # #769 S6: `device_id`/`inode` are the identity of the file the caller
+    # STATTED before reading, and they land in the same statement as the scan
+    # target, the final offset and the completion flag. A replacement can
+    # therefore never leave a new identity paired with an old offset: either
+    # the whole file batch commits or none of it does.
     conn.execute(
         """INSERT OR REPLACE INTO codex_session_files
            (path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at,
             last_session_id, last_model, last_total_tokens, source_root_key,
             last_native_thread_id, last_root_thread_id, last_parent_thread_id,
-            last_conversation_key, last_turn_id, account_key, ingest_complete)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            last_conversation_key, last_turn_id, account_key, ingest_complete,
+            device_id, inode)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             path_str, size, mtime_ns, final_offset, now_iso, last_session_id,
             last_model, last_total_tokens, discovered.source_root_key,
             last_native_thread_id, last_root_thread_id, last_parent_thread_id,
             last_conversation_key, last_turn_id, account_key,
             1 if ingest_complete else 0,
+            None if device_id is None else int(device_id),
+            None if inode is None else int(inode),
         ),
     )
     if prune_roots:
@@ -3420,12 +3484,32 @@ class PruneResult:
     """Outcome of _prune_orphaned_cache_entries: how much of the derived Claude
     surface was removed for safely-orphaned source paths, plus the orphan paths
     left in place (residual — a gate failed, so `--rebuild` is the escape hatch)
-    and whether the flock was contended (nothing mutated)."""
+    and whether the flock was contended (nothing mutated).
+
+    ``prune_refused`` / ``prune_refused_files`` mirror ``CodexIngestStats``
+    (#729). The deletions still committed; what was refused is the
+    ``conversation_sessions`` re-derive that should have followed them, so the
+    store is left partially derived. `_prune_orphaned_cache_entries` discarded
+    `_recompute_conversation_sessions`' return, and
+    `_lib_ingest_frontier.provider_sync_certifiable` already tested
+    ``getattr(stats, "prune_refused", False)`` — with no such attribute the
+    test always read False and a refused prune certified as clean. Adding the
+    field does not add a check; it makes an existing blind one start firing.
+
+    ``prune_refused_state`` carries the observation state that refused (#769
+    S3). Until #728 a refusal had exactly one cause — this process's pricing
+    table being older than the store's — and the operator messages stated it as
+    a fact. MALFORMED and DEGRADED now refuse too, and neither is about which
+    table is older, so the cause travels with the result rather than being
+    re-derived (or guessed) at each message site."""
     pruned_files: int = 0
     pruned_entries: int = 0
     pruned_messages: int = 0
     residual_paths: "list[str]" = field(default_factory=list)
     contended: bool = False
+    prune_refused: bool = False
+    prune_refused_files: int = 0
+    prune_refused_state: "str | None" = None
 
 
 def _progress_stderr(stats: IngestStats, *, force: bool = False) -> None:
@@ -3740,7 +3824,20 @@ def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
                 f"DELETE FROM conversation_messages WHERE source_path IN ({ph})", safe_paths)
             conv.execute(
                 f"DELETE FROM conversation_ai_titles WHERE source_path IN ({ph})", safe_paths)
-            _recompute_conversation_sessions(conv, list(pruned_sids))
+            # #729: this return was discarded. A refused re-derive still
+            # commits — the three DELETEs above are done, and the refusal ARMS
+            # `conversation_sessions_backfill_pending` and latches its record
+            # inside this same BEGIN, so rolling back would discard the very
+            # signal that tells the next authorized process to finish the job.
+            # What must not happen is reporting the outcome as clean.
+            refusal_state: "list[str]" = []
+            if not _recompute_conversation_sessions(
+                conv, list(pruned_sids), refusal_out=refusal_state
+            ):
+                result.prune_refused = True
+                result.prune_refused_files = len(safe_paths)
+                result.prune_refused_state = (
+                    refusal_state[0] if refusal_state else None)
             conv.commit()
         except BaseException:
             conv.rollback()
@@ -5197,6 +5294,55 @@ CONVERSATION_ROLLUP_PRICING_REFUSED_KEY = (
 )
 
 
+def _read_pricing_fingerprint_observation(
+    conn, key: str = CONVERSATION_ROLLUP_PRICING_FP_KEY,
+):
+    """Read one store's recorded pricing fingerprint as a four-state
+    observation (#728). The ONE database half of the split.
+
+    Every writer site used to perform this SELECT itself and degrade a failed
+    read to the same falsy value an unrecorded fingerprint produces, so a
+    locked or schema-less store was indistinguishable from a fresh one and
+    every writer authorized itself over it. Here the failure is reported as
+    ``DEGRADED`` and the pure classifier in `_lib_pricing` decides what that
+    means; no caller may re-derive the state from a bare value again.
+
+    ``error_kind`` is the coarse ``"operational_error"`` rather than the
+    driver's message, because the message text is not a contract and the only
+    decision that rests on it is "the read did not happen".
+
+    A store with no ``cache_meta`` TABLE is ABSENT, not DEGRADED, and the
+    difference is decided by a structural probe rather than by matching the
+    driver's message. A store that has nowhere to record a fingerprint has
+    determinately recorded none — that is a fact read off ``sqlite_master``,
+    not an assumption — while a store whose ``sqlite_master`` probe fails too
+    is one this process genuinely could not read. The probe fails closed: an
+    unanswerable probe reports DEGRADED.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key=?", (key,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        try:
+            table_present = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='cache_meta'"
+            ).fetchone() is not None
+        except sqlite3.OperationalError:
+            table_present = True
+        if table_present:
+            return classify_pricing_fingerprint(
+                found=False, raw=None, error_kind="operational_error")
+        return classify_pricing_fingerprint(
+            found=False, raw=None, error_kind=None)
+    return classify_pricing_fingerprint(
+        found=row is not None,
+        raw=(row[0] if row is not None else None),
+        error_kind=None,
+    )
+
+
 def _pricing_write_authorized(stored, process=None) -> bool:
     """Whether a process holding `process` pricing may write materialized
     conversation cost over a store that recorded `stored` (#705).
@@ -5221,26 +5367,102 @@ def _pricing_write_authorized(stored, process=None) -> bool:
     The parse itself lives in `_lib_pricing.parse_pricing_fingerprint`, because
     `doctor pricing.conversation_rollup_writer` reports which refusal state a
     store is in and must classify a value exactly as this function acts on it.
-    Two parses of one contract had already drifted apart once."""
+    Two parses of one contract had already drifted apart once.
+
+    NO PRODUCTION CALLER REMAINS (#769 S3 A9). It takes a bare stored value, so
+    it cannot express a read that failed, and every writer site now reads
+    through `_read_pricing_fingerprint_observation` instead. It is kept as the
+    VALUE-shaped surface over the same contract (#728), for tests and for any
+    caller that genuinely holds a value rather than an observation; expressing
+    it on top of the shared predicate rather than beside it keeps the two from
+    drifting the way the two date parsers once did. Read this docstring as a
+    description of a retained helper, not of a live authorization site."""
     process = PRICING_SNAPSHOT_DATE if process is None else process
-    if not stored:
-        return True
-    stored_date = parse_pricing_fingerprint(stored)
-    process_date = parse_pricing_fingerprint(process)
-    if stored_date is None or process_date is None:
-        return False
-    return stored_date <= process_date
+    return may_write_materialized_cost(
+        classify_pricing_fingerprint(
+            found=stored is not None, raw=stored, error_kind=None),
+        process,
+    )
+
+
+#: One operator-facing clause per observation state that can refuse a
+#: materialized-cost write (#769 S3). Each message that reports a refusal reads
+#: its cause from here instead of restating the version-skew case, which #728
+#: made one of three. The `None` entry covers a caller that recorded no state —
+#: an older result object, or a refusal from a path that does not carry one —
+#: and must stay distinct from every real state rather than defaulting to the
+#: version-skew wording, which is what this mapping exists to stop.
+_PRICING_REFUSAL_CAUSE_PHRASES = {
+    "present": (
+        "this process's pricing table is older than the one the store recorded"
+    ),
+    "malformed": (
+        "the pricing fingerprint the store recorded is not a date cctally can "
+        "order against its own"
+    ),
+    "degraded": (
+        "cctally could not read the pricing fingerprint the store recorded, so "
+        "it has no evidence about what that store's cost needed protecting from"
+    ),
+    None: "cctally could not authorize the write",
+}
+
+
+def pricing_refusal_cause_phrase(state: "str | None") -> str:
+    """The operator-facing cause clause for one refusing observation state."""
+    return _PRICING_REFUSAL_CAUSE_PHRASES.get(
+        state, _PRICING_REFUSAL_CAUSE_PHRASES[None])
+
+
+def _pricing_refusal_timestamp() -> str:
+    """The instant an episode opened, to the second, in Zulu form.
+
+    A named seam rather than an inline expression so a test can pin it: the
+    episode rules below are entirely about WHICH instant survives, and at
+    second granularity two refusals in one test are otherwise indistinguishable.
+    """
+    return (
+        dt.datetime.now(dt.timezone.utc)
+        .replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
+
+
+def _pricing_refusal_record_active(record) -> bool:
+    """Whether a refusal record describes an OPEN episode (#729).
+
+    A record written before the ``active`` field existed was latched only on
+    refusal and DELETED on convergence, so its mere presence means an open
+    episode. Reading a missing ``active`` as False would silently stop
+    reporting every refusal latched by an earlier version.
+
+    The non-dict guard is DEFENSIVE, not reachable from production today: the
+    one caller decodes the stored JSON and short-circuits on anything that is
+    not a dict before asking. It is kept because the value comes from a
+    `cache_meta` row any version may have written, and a `True` returned for a
+    truthy non-dict is the same fail-toward-reporting posture as the missing
+    ``active`` key above (#769 S3 A9).
+    """
+    if not isinstance(record, dict):
+        return bool(record)
+    return record.get("active", True) is not False
 
 
 def _record_pricing_write_refusal(conn, stored) -> None:
-    """Latch that a process holding older pricing was refused a write (#705).
+    """Latch that a process holding older pricing was refused a write (#705),
+    as a durable tombstone with EPISODE semantics (#729).
 
-    Written only when the (process, store) pair DIFFERS from what is already
-    recorded. A dashboard ticks continuously, so rewriting per tick would take
-    the conversations writer lock purely to restate an unchanged fact — and it
-    would make the timestamp the latest refusal rather than the first, which
-    is the less useful of the two, because the first says how long the store
-    has been diverging.
+    Not rewritten when the (process, store) pair is unchanged AND the episode
+    is still open. A dashboard ticks continuously, so rewriting per tick would
+    take the conversations writer lock purely to restate an unchanged fact —
+    and it would make the timestamp the latest refusal rather than the first,
+    which is the less useful of the two, because the first says how long the
+    store has been diverging.
+
+    An INACTIVE-to-active transition for the same pair is the opposite case and
+    starts a NEW episode with a fresh timestamp. Carrying the old timestamp
+    across a completed convergence would report a fresh divergence as days old
+    — the mirror image of the bug the preserved timestamp exists to avoid. A
+    different pair likewise replaces the record and restamps.
 
     NEVER commits — the caller owns the transaction. _prune_orphaned_cache_entries
     reaches this from inside its own explicit ``BEGIN``, whose
@@ -5262,15 +5484,15 @@ def _record_pricing_write_refusal(conn, stored) -> None:
             existing = json.loads(row[0])
         except (ValueError, TypeError):
             existing = None  # unreadable -> replace it with a readable one
-        if isinstance(existing, dict) and all(
-            existing.get(field) == value for field, value in pair.items()
+        if (
+            isinstance(existing, dict)
+            and all(existing.get(f) == v for f, v in pair.items())
+            and _pricing_refusal_record_active(existing)
         ):
             return
     record = dict(pair)
-    record["first_refused_at_utc"] = (
-        dt.datetime.now(dt.timezone.utc)
-        .replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    )
+    record["first_refused_at_utc"] = _pricing_refusal_timestamp()
+    record["active"] = True
     try:
         _set_cache_meta(
             conn, CONVERSATION_ROLLUP_PRICING_REFUSED_KEY,
@@ -5283,8 +5505,19 @@ def _record_pricing_write_refusal(conn, stored) -> None:
 
 
 def _clear_pricing_write_refusal(conn) -> None:
-    """Drop the refusal latch, unconditionally. NEVER commits — the caller owns
-    the transaction, like the record and arm helpers beside it.
+    """SETTLE the refusal latch: close the episode, keep the record (#729).
+    NEVER commits — the caller owns the transaction, like the record and arm
+    helpers beside it.
+
+    It used to DELETE the row, so a store that had converged carried no
+    evidence it had ever diverged and doctor could not tell "never refused"
+    from "refused and recovered". The record now survives with
+    ``active: false``, preserving the pair and the timestamp that says when
+    that episode opened.
+
+    A store that never refused gets NO record: the settle is an UPDATE over an
+    existing row, never an insert, or every healthy install would grow a
+    tombstone for an episode that never happened.
 
     TWO callers, and the condition each satisfies before calling is the whole
     contract. The two pending-flag branches call it directly, atomically with
@@ -5301,9 +5534,31 @@ def _clear_pricing_write_refusal(conn) -> None:
     latched, while `doctor pricing.conversation_rollup_writer` promised the
     operator that the next tick would clear it."""
     try:
-        conn.execute(
-            "DELETE FROM cache_meta WHERE key=?",
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key=?",
             (CONVERSATION_ROLLUP_PRICING_REFUSED_KEY,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return
+    if not row or not row[0]:
+        return
+    try:
+        record = json.loads(row[0])
+    except (ValueError, TypeError):
+        record = None
+    if not isinstance(record, dict):
+        # An unreadable record is still evidence the guard fired, and doctor
+        # reports it under its own wording. There is no episode to settle and
+        # nothing this function could preserve, so leave it exactly as it is
+        # rather than replacing it with a settled record it cannot vouch for.
+        return
+    if record.get("active") is False:
+        return
+    record["active"] = False
+    try:
+        _set_cache_meta(
+            conn, CONVERSATION_ROLLUP_PRICING_REFUSED_KEY,
+            json.dumps(record, sort_keys=True),
         )
     except sqlite3.OperationalError:
         pass
@@ -5366,19 +5621,34 @@ def _arm_rollup_backfill_on_pricing_change(conn) -> bool:
     Crash-safety is unchanged: the DURABLE backfill flag remains the recompute
     signal, so advancing the fingerprint here cannot strand stale cost (a crash
     after arming leaves the flag set -> next sync recomputes regardless of the
-    fingerprint). No-op when cache_meta is unavailable (path-less / degraded
-    conn). Caller path holds the cache.db.lock flock. Unlike the recompute
+    fingerprint). Caller path holds the cache.db.lock flock. Unlike the recompute
     chokepoint, this helper owns its OWN transaction and commits, so the flag
-    and the refusal record are durable for the next process."""
-    try:
-        row = conn.execute(
-            "SELECT value FROM cache_meta WHERE key=?",
-            (CONVERSATION_ROLLUP_PRICING_FP_KEY,),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        return True
-    stored = row[0] if row is not None else None
-    if not _pricing_write_authorized(stored):
+    and the refusal record are durable for the next process.
+
+    #728: this site is the one whose ``except sqlite3.OperationalError:``
+    clause returned True — "authorized" — DIRECTLY, without ever reaching the
+    predicate, so a store it had failed to read authorized every writer behind
+    it. It reads a four-state observation now like its two siblings, and a
+    DEGRADED read refuses. Both refusal legs (arm the flag, latch the record,
+    commit) are shared by the DEGRADED, MALFORMED and store-is-newer states;
+    on a store whose ``cache_meta`` genuinely cannot be written, each of those
+    three is a caught no-op, so a degraded connection still returns False
+    without raising.
+
+    The docstring used to say "No-op when cache_meta is unavailable"; that
+    sentence described the early ``return True`` #728 removed, and stating the
+    replacement is the point of this paragraph (#769 S3 A9). An unavailable
+    ``cache_meta`` is now TWO outcomes decided structurally rather than one.
+    A store whose ``sqlite_master`` probe positively shows no ``cache_meta``
+    table is ABSENT — it determinately recorded nothing — so this helper is
+    authorized and proceeds, and `_set_cache_meta` creates the table and stamps
+    the fingerprint. A read that failed for any other reason, including a probe
+    that could not answer either, is DEGRADED and refuses; its three refusal
+    writes are each individually caught, so the return is False rather than an
+    exception."""
+    obs = _read_pricing_fingerprint_observation(conn)
+    stored = obs.raw
+    if not may_write_materialized_cost(obs, PRICING_SNAPSHOT_DATE):
         _record_pricing_write_refusal(conn, stored)
         _arm_rollup_backfill_pending(conn)
         conn.commit()
@@ -5394,7 +5664,8 @@ def _arm_rollup_backfill_on_pricing_change(conn) -> bool:
 
 def _recompute_conversation_sessions(
     conn, session_ids=None, *, advance_render_revision: bool = True,
-    authorize: bool = True,
+    authorize: bool = True, refusal_out: "list[str] | None" = None,
+    target: str = "conversation_sessions",
 ) -> bool:
     """Recompute the ``conversation_sessions`` browse-rail rollup from
     ``conversation_messages``. The caller holds the cache.db.lock flock and owns
@@ -5446,21 +5717,37 @@ def _recompute_conversation_sessions(
     persistent-store guard does not apply to it. The clear is gated for the
     OPPOSITE reason — its unqualified ``cache_meta`` is not shadowed and would
     reach ``main``, so on that connection it is the one statement here that
-    does touch a persistent row."""
+    does touch a persistent row.
+
+    ``refusal_out`` is an optional sink for the observation state that refused
+    (#769 S3). The bare False return says a write was declined but not why, and
+    since #728 there are three reasons — only one of which is the pricing-skew
+    case every operator message used to state as a fact. A caller that reports
+    the refusal to a person passes a list and reads the appended state; the
+    read happens exactly once here, so the reported cause is the one that
+    actually decided, not a second read that may disagree with it.
+
+    ``target`` names the table this writes. A rebuild builds its replacement
+    generation into ``conversation_sessions_staging`` and leaves the live table
+    untouched until the publish (#752), so the rollup derivation has to be able
+    to name either. It stays a parameter with the live default rather than two
+    copies of the derivation, because two copies of a GROUP BY that must stay
+    byte-identical to the rail's live aggregate is exactly the drift this
+    function's own docstring warns about. The account scoper's connection-local
+    TEMP table shadows the DEFAULT name, so passing nothing preserves it."""
     ids = None if session_ids is None else [s for s in session_ids if s is not None]
     if ids == []:
         return True
     if authorize:
-        try:
-            row = conn.execute(
-                "SELECT value FROM cache_meta WHERE key=?",
-                (CONVERSATION_ROLLUP_PRICING_FP_KEY,),
-            ).fetchone()
-        except sqlite3.OperationalError:
-            row = None
-        stored = row[0] if row else None
-        if not _pricing_write_authorized(stored):
-            _record_pricing_write_refusal(conn, stored)
+        # #728: the degrade-to-None shape this replaces reached the predicate,
+        # but with a value that said "this store recorded nothing" for a SELECT
+        # that had raised. The observation reports the failed read as DEGRADED
+        # instead, which this predicate refuses.
+        obs = _read_pricing_fingerprint_observation(conn)
+        if not may_write_materialized_cost(obs, PRICING_SNAPSHOT_DATE):
+            if refusal_out is not None:
+                refusal_out.append(obs.state)
+            _record_pricing_write_refusal(conn, obs.raw)
             _arm_rollup_backfill_pending(conn)
             # No commit: this helper documents that the CALLER owns it, and
             # every caller that can reach a refusal commits — the pruner inside
@@ -5470,16 +5757,18 @@ def _recompute_conversation_sessions(
             # Do NOT weaken any of those to "the arm helper already committed
             # the same two rows on this tick". That was the argument for the
             # two flag branches, and it holds only while the arm helper's read
-            # of the fingerprint and the read below AGREE. They diverge two
-            # ways. _arm_rollup_backfill_on_pricing_change returns True and
-            # writes nothing when its own SELECT raises OperationalError, and
-            # `database is locked` is transient, so the read below can succeed
-            # against a newer stored value and refuse. And another process can
-            # advance the fingerprint between the two reads — which
-            # _import_legacy_conversation_rows made more reachable, because it
-            # stamps CONVERSATION_ROLLUP_PRICING_FP_KEY at DB open holding only
-            # the shared maintenance lock, never the conversations writer flock.
-            # In either case this writes a genuinely new record,
+            # of the fingerprint and the read below AGREE. They still diverge,
+            # though #769 S3 corrects WHY: the pre-#728 reason — the arm helper
+            # returning True and writing nothing when its own SELECT raised —
+            # no longer exists, because a DEGRADED read now refuses there too.
+            # What remains is that another process can advance the fingerprint
+            # between the two reads, which _import_legacy_conversation_rows
+            # made more reachable, because it stamps
+            # CONVERSATION_ROLLUP_PRICING_FP_KEY at DB open holding only the
+            # shared maintenance lock, never the conversations writer flock.
+            # A transient `database is locked` also still splits the two reads,
+            # now in the other direction: the arm helper refuses and this read
+            # can succeed. In every case this writes a genuinely new record,
             # _arm_rollup_backfill_pending short-circuits on the already-set
             # flag, and nothing else commits.
             return False
@@ -5488,15 +5777,15 @@ def _recompute_conversation_sessions(
         if advance_render_revision else 0
     )
     if ids is None:
-        conn.execute("DELETE FROM conversation_sessions")
+        conn.execute(f"DELETE FROM {target}")
         conn.execute(
-            "INSERT INTO conversation_sessions "
+            f"INSERT INTO {target} "
             "(session_id, msg_count, started_utc, last_activity_utc) "
             + _CONV_SESSIONS_SELECT + " GROUP BY session_id"
         )
-        _fill_conversation_sessions_filter_columns(conn, None)
+        _fill_conversation_sessions_filter_columns(conn, None, target=target)
         conn.execute(
-            "UPDATE conversation_sessions SET render_revision=?",
+            f"UPDATE {target} SET render_revision=?",
             (render_revision,),
         )
         _clear_converged_pricing_write_refusal(conn, authorize=authorize)
@@ -5505,27 +5794,28 @@ def _recompute_conversation_sessions(
         chunk = ids[i:i + 400]
         placeholders = ",".join("?" for _ in chunk)
         conn.execute(
-            f"DELETE FROM conversation_sessions WHERE session_id IN ({placeholders})",
+            f"DELETE FROM {target} WHERE session_id IN ({placeholders})",
             chunk,
         )
         conn.execute(
-            "INSERT INTO conversation_sessions "
+            f"INSERT INTO {target} "
             "(session_id, msg_count, started_utc, last_activity_utc) "
             + _CONV_SESSIONS_SELECT
             + f" AND session_id IN ({placeholders}) GROUP BY session_id",
             chunk,
         )
         conn.execute(
-            f"UPDATE conversation_sessions SET render_revision=? "
+            f"UPDATE {target} SET render_revision=? "
             f"WHERE session_id IN ({placeholders})",
             (render_revision, *chunk),
         )
-    _fill_conversation_sessions_filter_columns(conn, ids)
+    _fill_conversation_sessions_filter_columns(conn, ids, target=target)
     _clear_converged_pricing_write_refusal(conn, authorize=authorize)
     return True
 
 
-def _fill_conversation_sessions_filter_columns(conn, session_ids):
+def _fill_conversation_sessions_filter_columns(conn, session_ids, *,
+                                               target="conversation_sessions"):
     """Fill the rollup's browse-FILTER columns (project_label / cost_usd /
     cache_rebuild_count, migration 015) AND the #302 DISPLAYED-enrichment columns
     (git_branch / models_json / title) for the given sessions, or ALL when
@@ -5553,13 +5843,13 @@ def _fill_conversation_sessions_filter_columns(conn, session_ids):
     No-op when any of the columns is absent (a pre-015 / pre-023 cache.db being
     re-derived before _apply_cache_schema adds them), so an early/partial sync
     never raises ``no such column``. The CALLER owns the commit (never commits)."""
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(conversation_sessions)")}
+    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({target})")}
     if not {"cache_rebuild_count", "git_branch", "models_json", "title"} <= cols:
         return
     lq = _load_lib("_lib_conversation_query")
     if session_ids is None:
         ids = [r[0] for r in conn.execute(
-            "SELECT session_id FROM conversation_sessions")]
+            f"SELECT session_id FROM {target}")]
     else:
         ids = [s for s in session_ids if s is not None]
     if not ids:
@@ -5576,7 +5866,7 @@ def _fill_conversation_sessions_filter_columns(conn, session_ids):
         models_json = json.dumps(m) if m else None
         title = first_titles.get(sid)
         conn.execute(
-            "UPDATE conversation_sessions SET project_label=?, cost_usd=?, "
+            f"UPDATE {target} SET project_label=?, cost_usd=?, "
             "cache_rebuild_count=?, git_branch=?, models_json=?, title=? "
             "WHERE session_id=?",
             (proj, round(cost.get(sid, 0.0), 6), rebuilds, branch, models_json,
@@ -7323,7 +7613,9 @@ def sync_codex_cache(
         # mtime_ns is selected into `existing` for diagnostics only —
         # delta detection consults size alone (Codex rollout JSONLs are
         # append-only, so a size change is a sufficient signal and mtime
-        # is prone to clock-skew false-positives).
+        # is prone to clock-skew false-positives). `device_id`/`inode` are
+        # NOT diagnostics: they are the only evidence that separates a file
+        # nothing touched from one replaced at the same size (#769 S6).
         if targeted:
             # §5.1: the cursor preload queries codex_session_files for the
             # REQUESTED paths only (the full-sync path loads every row; targeted
@@ -7332,15 +7624,13 @@ def sync_codex_cache(
                 conn, [str(item.source_path) for item in files])
         else:
             existing = {
-                row[0]: (
-                    row[1], row[2], row[3], row[4], row[5], row[6], row[7],
-                    row[8], row[9], row[10], row[11], row[12], row[13],
-                )
+                row[0]: tuple(row[1:])
                 for row in conn.execute(
                     "SELECT path, size_bytes, mtime_ns, last_byte_offset, "
                     "last_session_id, last_model, last_total_tokens, source_root_key, "
                     "last_native_thread_id, last_root_thread_id, last_parent_thread_id, "
-                    "last_conversation_key, last_turn_id, ingest_complete "
+                    "last_conversation_key, last_turn_id, ingest_complete, "
+                    "device_id, inode "
                     "FROM codex_session_files"
                 )
             }
@@ -7520,12 +7810,29 @@ def sync_codex_cache(
                     prev_size, _, prev_offset, prev_sid, prev_model, prev_ttot,
                     prev_root_key, prev_native_thread_id, prev_root_thread_id,
                     prev_parent_thread_id, prev_conversation_key, prev_turn_id,
-                    prev_complete,
+                    prev_complete, prev_device, prev_inode,
                 ) = prev
                 prev_total_tokens = (
                     int(prev_ttot) if prev_ttot is not None else None
                 )
                 requalified = prev_root_key != discovered.source_root_key
+                # #769 S6: IDENTITY OUTRANKS SIZE, here as well as in the
+                # frontier's `classify_recent_active_path`. Detecting the
+                # replacement in the planner and then letting the walk skip the
+                # file on `size == prev_size` retains the old offset AND the old
+                # identity, so the planner escalates again on the next tick and
+                # the whole-estate walk the escalation authorises becomes a
+                # per-tick walk that repairs nothing.
+                #
+                # THE INODE DECIDES and the device only corroborates, because
+                # `st_dev` is assigned at mount time: see
+                # `_lib_ingest_frontier.source_identity_replaced`, which owns
+                # this verdict for the planner and for both walks so the three
+                # cannot drift apart. It also owns the two no-evidence
+                # degradations — a NULL column and an unreadable stored value
+                # both fall through to the size comparison below.
+                replaced = _ingest_frontier.source_identity_replaced(
+                    prev_device, prev_inode, st.st_dev, st.st_ino)
                 # public #5 spec §4. `ingest_complete` is 1 for every row a
                 # pre-budget binary wrote and for every file read to its stored
                 # target, so this branch is unreachable until a budgeted stop
@@ -7535,9 +7842,13 @@ def sync_codex_cache(
                 # skipped on equality, which made the unread suffix permanently
                 # invisible on any rollout that never grows again.
                 incomplete = prev_complete is not None and not int(prev_complete)
-                if targeted and (requalified or size < prev_size):
-                    # §5.1 preflight-snapshot scoped: a shrink or requalification
-                    # landing AFTER the preflight is declined HERE, per file —
+                if targeted and (requalified or replaced or size < prev_size):
+                    # §5.1 preflight-snapshot scoped: a shrink, a requalification
+                    # or a replacement landing AFTER the preflight is declined
+                    # HERE, per file — the whole-call preflight above compares
+                    # sizes only, and a replacement is what the frontier already
+                    # answers with a full walk, so targeted mode reaches this
+                    # state only when the escalation lost a race —
                     # earlier per-file commits in this call stand, the call still
                     # reports dirty (files_failed → not targeted_clean), so the
                     # watch advances no cursor and emits nothing, and recovery
@@ -7546,7 +7857,10 @@ def sync_codex_cache(
                     # — that whole-cache-affecting escalation is the full sync's.
                     stats.files_failed += 1
                     continue
-                if not requalified and incomplete and size >= prev_offset:
+                if (
+                    not requalified and not replaced and incomplete
+                    and size >= prev_offset
+                ):
                     # Resume the stored scan target. Deliberately NOT a
                     # `delta_append`: that flag is what authorizes consulting
                     # the live `auth.json` and minting a new account range at
@@ -7568,10 +7882,16 @@ def sync_codex_cache(
                     initial_session_id = prev_sid
                     initial_model = prev_model
                     initial_total_tokens = prev_total_tokens or 0
-                elif not requalified and not incomplete and size == prev_size:
+                elif (
+                    not requalified and not replaced and not incomplete
+                    and size == prev_size
+                ):
                     stats.files_skipped_unchanged += 1
                     continue
-                elif not requalified and not incomplete and size > prev_size:
+                elif (
+                    not requalified and not replaced and not incomplete
+                    and size > prev_size
+                ):
                     start_offset = prev_offset
                     delta_append = True
                     initial_session_id = prev_sid
@@ -8026,6 +8346,11 @@ def sync_codex_cache(
                         file_account_decision=pending_decision,
                         anchor_resolver=anchor_resolver,
                         ingest_complete=not stopped_short["value"],
+                        # The SAME pre-read stat that defined `scan_target`.
+                        # Re-statting here would describe a file this pass may
+                        # never have read (#769 S6).
+                        device_id=st.st_dev,
+                        inode=st.st_ino,
                     )
                 except sqlite3.DatabaseError as exc:
                     conn.rollback()
@@ -10006,8 +10331,57 @@ def _acquire_conversation_provider_locks(
         raise
 
 
+#: #769 S6 / #802 — the process-level no-sync derivation policy.
+#:
+#: `--no-sync` freezes ingestion and the snapshot. It must also freeze the two
+#: POST-DISPATCH conversation derivations `_open_conversations_db_unlocked`
+#: runs after `_run_pending_migrations` — `_import_legacy_conversation_rows`
+#: and `_ensure_codex_conversation_contract` — because the second consumes
+#: `conversation_rebuild_codex_pending` and performs a full retained-event
+#: rebuild, measured at 135 seconds of startup against comparable launches of
+#: 15 and 30 seconds.
+#:
+#: The policy is PROCESS-level rather than call-site-level, and that is the
+#: whole point: startup is not the only opener. A read route falls back from
+#: the read-only opener to the full `open_conversations_db()` on a missing
+#: store, a lock, or a pending legacy bridge, and live-tail always uses the
+#: full opener. Either would run both derivations and consume the marker from
+#: an ordinary browse, so a startup-only flag would freeze nothing.
+#:
+#: It never affects the migration dispatcher. Under `--no-sync` no other
+#: process opens the store write-capable and the read-only reader refuses a
+#: store behind head rather than migrating from a request thread, so
+#: suppressing the dispatcher would leave that dashboard permanently degraded —
+#: the failure `_dashboard_startup_schema_migration` exists to prevent.
+_CONVERSATION_DERIVATIONS_SUPPRESSED = False
+
+
+def set_conversation_derivations_suppressed(value: bool) -> None:
+    """Set the process-level policy. Called once, by `--no-sync` startup."""
+    global _CONVERSATION_DERIVATIONS_SUPPRESSED
+    _CONVERSATION_DERIVATIONS_SUPPRESSED = bool(value)
+
+
+def conversation_derivations_suppressed() -> bool:
+    """Whether this process suppresses the two post-dispatch derivations."""
+    return _CONVERSATION_DERIVATIONS_SUPPRESSED
+
+
+def _conversation_derivations_enabled(run_derivations: "bool | None") -> bool:
+    """Resolve an explicit request against the process policy.
+
+    ``None`` means "follow the process policy", which is what every existing
+    caller passes by omission, and the policy defaults to running them — so
+    every existing caller is byte-unchanged.
+    """
+    if run_derivations is not None:
+        return bool(run_derivations)
+    return not conversation_derivations_suppressed()
+
+
 def _conversations_open_guarded(
     *, attach_cache: bool, allow_recovery_state: bool = False,
+    run_derivations: "bool | None" = None,
 ) -> sqlite3.Connection:
     """Open conversations.db while excluding confirmed family replacement."""
     path = pathlib.Path(_cctally_core.CONVERSATIONS_DB_PATH)
@@ -10101,6 +10475,7 @@ def _conversations_open_guarded(
             try:
                 conn = _open_conversations_db_unlocked(
                     attach_cache=attach_cache,
+                    run_derivations=run_derivations,
                 )
                 if marker.exists() or pending.exists():
                     conn.close()
@@ -10138,7 +10513,7 @@ def _harden_conversation_sidecars() -> None:
 
 
 def _open_conversations_db_unlocked(
-    *, attach_cache: bool = True,
+    *, attach_cache: bool = True, run_derivations: "bool | None" = None,
 ) -> sqlite3.Connection:
     """Open the independent transcript/search store (#320).
 
@@ -10147,6 +10522,20 @@ def _open_conversations_db_unlocked(
     Codex-thread metadata.  Core cache callers never take the inverse
     dependency, so a missing or locked transcript store cannot block quota or
     accounting refreshes.
+
+    ``run_derivations`` (#769 S6 / #802) selects whether the two POST-DISPATCH
+    derivations below run: ``_import_legacy_conversation_rows`` and
+    ``_ensure_codex_conversation_contract``. ``None`` follows the process-level
+    policy, which defaults to running them, so every existing caller is
+    byte-unchanged. ``--no-sync`` sets that policy to suppress them.
+
+    What ``--no-sync`` freezes and does not freeze is therefore exact: it
+    freezes ingestion, the snapshot and these two derivations; it does NOT
+    freeze the schema apply or the migration dispatcher, which run
+    unconditionally so the store still reaches head. The accepted consequence
+    is that a ``--no-sync`` dashboard over a store owing the Codex contract
+    rebuild serves ``normalization_pending`` for Codex conversation reads until
+    a mode allowed to do work runs.
     """
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -10220,14 +10609,283 @@ def _open_conversations_db_unlocked(
         cache.close()
         cache_uri = _cctally_core.CACHE_DB_PATH.resolve().as_uri() + "?mode=ro"
         conn.execute("ATTACH DATABASE ? AS cache_db", (cache_uri,))
-        _import_legacy_conversation_rows(conn)
-        _ensure_codex_conversation_contract(conn)
+        if _conversation_derivations_enabled(run_derivations):
+            _import_legacy_conversation_rows(conn)
+            _ensure_codex_conversation_contract(conn)
     _harden_conversation_sidecars()
     return conn
 
 
-def open_conversations_db(*, attach_cache: bool = True) -> sqlite3.Connection:
-    return _conversations_open_guarded(attach_cache=attach_cache)
+def open_conversations_db(
+    *, attach_cache: bool = True, run_derivations: "bool | None" = None,
+) -> sqlite3.Connection:
+    return _conversations_open_guarded(
+        attach_cache=attach_cache, run_derivations=run_derivations,
+    )
+
+
+# --------------------------------------------------------------------------
+# #780 — read-only reader admission
+# --------------------------------------------------------------------------
+
+#: Default busy timeout for a read route, in seconds. Route-bounded rather
+#: than the store policy's 15s: a reader that cannot be admitted quickly must
+#: fail soft and let the route render a degraded envelope, never hold a request
+#: thread for fifteen seconds behind a rebuild.
+CONVERSATION_READONLY_TIMEOUT_S = 0.25
+
+#: Called with no arguments when a reader finds the store BEHIND head. The
+#: opener never migrates from a request thread, so this is how it asks the
+#: process's writer to. Left None outside the dashboard.
+SCHEMA_WAKE_HOOK = None
+
+
+class ConversationReaderUnavailable(sqlite3.DatabaseError):
+    """A read route could not be admitted. Carries a typed ``reason``.
+
+    A subclass of ``sqlite3.DatabaseError`` so the existing route boundary,
+    which already catches ``DatabaseError`` and ``OSError``, keeps catching it
+    rather than letting a new exception class escape as a 500.
+    """
+
+    reason = "unavailable"
+
+
+class MaintenanceInProgress(ConversationReaderUnavailable):
+    """Maintenance holds the store; the reader declined to queue behind it."""
+
+    reason = "maintenance"
+
+
+class SchemaBehind(ConversationReaderUnavailable):
+    """A store is behind head. Soft: a writer can still advance it."""
+
+    reason = "schema_behind"
+
+
+class SchemaAhead(ConversationReaderUnavailable):
+    """A store is ahead of head. Closed: no recovery is attempted here."""
+
+    reason = "schema_ahead"
+
+
+class LegacyBridgePending(ConversationReaderUnavailable):
+    """The legacy transcript bridge is owed and this process may not run it.
+
+    `_import_legacy_conversation_rows` is a WRITER, and under `dashboard
+    --no-sync` the process policy suppresses it (#802), so a store whose rows
+    are still in `cache.db` after an interrupted migration 028 stays that way
+    for the life of the process. Serving that connection would render an empty
+    conversation list and an empty browse project filter with nothing said,
+    which is the silent failure this class exists to replace. Spec §9 names the
+    alternative: a route that cannot inherit the derivation policy returns a
+    typed degraded response instead.
+
+    Named for the state, like `normalization_pending` — the sibling answer the
+    Codex contract rebuild already produces under the same suppression.
+    """
+
+    reason = "legacy_bridge_pending"
+
+
+def probe_conversations_maintenance_free() -> None:
+    """Raise `MaintenanceInProgress` if maintenance holds the flock right now.
+
+    The non-blocking admission `open_conversations_db_readonly` performs,
+    factored out for the three request-path sites that must reach the BLOCKING
+    full opener but must not queue behind a rebuild on the way (#780).
+
+    Those sites are the live-tail preflight and `_open_conversation_reader`'s
+    two fallbacks. Each of them hands the open to `open_conversations_db`,
+    whose maintenance admission is a plain `LOCK_SH` with no timeout, so a
+    request arriving during a rebuild held a server thread for the rebuild's
+    whole duration — 716.9 s in the measured run. §4a names the live-tail
+    preflight among the routes that must fail soft, and the other two reach the
+    same opener by the same route.
+
+    An absent lock file is NOT a refusal, for the same reason the read-only
+    opener gives: it means no maintenance has ever claimed it, which is a
+    first-run state rather than a busy one, and the full opener is what creates
+    it. An unopenable lock file is not a refusal either — an undecidable probe
+    must not be what takes a read route down; the full opener behind it will
+    fail loudly on its own if the state is genuinely bad.
+    """
+    maintenance_path = pathlib.Path(
+        _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH
+    )
+    if not maintenance_path.is_file():
+        return
+    try:
+        probe_fh = open(maintenance_path, "r")
+    except OSError:
+        return
+    try:
+        try:
+            fcntl.flock(probe_fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise MaintenanceInProgress(
+                "conversations.db maintenance is in progress") from exc
+        try:
+            fcntl.flock(probe_fh, fcntl.LOCK_UN)
+        except OSError:
+            pass
+    finally:
+        probe_fh.close()
+
+
+def open_conversations_db_readonly(
+    *, attach_cache: bool = True, timeout: "float | None" = None,
+) -> sqlite3.Connection:
+    """A conversations.db connection for a READ route (#780).
+
+    The route this replaces opened the full mutation-capable
+    ``_conversations_open_guarded``, which executes, in order: a chmod on the
+    data directory, ``PRAGMA auto_vacuum=INCREMENTAL``, ``PRAGMA
+    journal_mode=WAL``, a schema-currency check that can apply the whole
+    schema, a commit, the migration dispatcher, a write-capable
+    ``open_cache_db()``, ``_import_legacy_conversation_rows``,
+    ``_ensure_codex_conversation_contract``, a chmod on the database, and
+    sidecar hardening. Every one of those is a write, so every browse became a
+    writer that could lose the SQLite write lock to maintenance.
+
+    This opener performs NONE of them. It does not call ``apply_policy``: that
+    helper emits ``PRAGMA auto_vacuum`` and ``PRAGMA journal_mode``, both
+    write-capable, so routing through it would defeat the whole point. The
+    busy timeout is supplied to ``sqlite3.connect`` instead of through a
+    PRAGMA, and the conversations policy's row factory is the driver default.
+
+    ``PRAGMA query_only`` is deliberately NOT set. ``mode=ro`` already refuses
+    every write to ``main``, and it still permits TEMP tables and TEMP views,
+    which is what ``scope_conversations_db_to_account`` needs; ``query_only``
+    breaks those TEMP writes and would take account scoping down with it
+    (verified empirically on SQLite 3.53.4).
+
+    Admission is non-blocking against the maintenance flock, and the marker
+    files are re-checked after the connection opens, so a maintenance pass that
+    starts during the open is not served from a store it is about to replace.
+
+    Both stores are then gated by the schema-qualified tri-state probe.
+    ``behind`` raises ``SchemaBehind`` after asking the process's writer to
+    advance the store; ``ahead`` raises ``SchemaAhead`` and attempts no
+    recovery, matching the existing version-ahead posture. The opener never
+    migrates from a request thread.
+    """
+    path = pathlib.Path(_cctally_core.CONVERSATIONS_DB_PATH)
+    marker = _cctally_db_sib._repair_marker_path(path)
+    pending = _cctally_db_sib._quarantine_pending_path(path)
+    recovery = _conversation_recovery_state_path()
+    maintenance_path = pathlib.Path(
+        _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH
+    )
+    busy = CONVERSATION_READONLY_TIMEOUT_S if timeout is None else timeout
+    if not path.is_file():
+        raise ConversationReaderUnavailable("transcript store is not present")
+    if not maintenance_path.is_file():
+        # NOT a maintenance refusal: an absent lock file means no maintenance
+        # has ever claimed it, which is a first-run state, not a busy one.
+        # `_conversations_open_guarded` creates it, so this hands the open back
+        # to the full opener the same way an absent store does. Refusing here
+        # instead left a fresh install permanently degraded, which is the
+        # opposite of the condition the file's absence describes.
+        raise ConversationReaderUnavailable(
+            "the transcript maintenance lock has not been established yet")
+    cache_path = pathlib.Path(_cctally_core.CACHE_DB_PATH)
+    if attach_cache and not cache_path.is_file():
+        raise ConversationReaderUnavailable("accounting store is not present")
+
+    conn: sqlite3.Connection | None = None
+    maintenance_fh = open(maintenance_path, "r")
+    try:
+        try:
+            fcntl.flock(maintenance_fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise MaintenanceInProgress(
+                "conversations.db maintenance is in progress") from exc
+        try:
+            if marker.exists() or pending.exists() or recovery.exists():
+                raise MaintenanceInProgress(
+                    "conversations.db maintenance is in progress")
+            conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=max(busy, 0.0),
+            )
+            if _cctally_store._TRACE_HOOK is not None:
+                conn.set_trace_callback(_cctally_store._TRACE_HOOK)
+            conn.row_factory = None
+            if marker.exists() or pending.exists() or recovery.exists():
+                raise MaintenanceInProgress(
+                    "conversations.db maintenance started during open")
+            if attach_cache:
+                conn.execute(
+                    "ATTACH DATABASE ? AS cache_db",
+                    (f"{cache_path.resolve().as_uri()}?mode=ro",),
+                )
+        finally:
+            try:
+                fcntl.flock(maintenance_fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        _gate_reader_schema(conn, attach_cache=attach_cache)
+        return conn
+    except BaseException:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        raise
+    finally:
+        maintenance_fh.close()
+
+
+def conversation_legacy_bridge_pending(conn: sqlite3.Connection) -> bool:
+    """Whether `_import_legacy_conversation_rows` still has work to do (#780).
+
+    The bridge is a WRITER, so the read-only opener cannot run it, and a route
+    that quietly skipped it would serve an empty transcript surface on a store
+    whose rows are still sitting in `cache.db` after an interrupted migration
+    028. Its own condition — the main table empty while the attached cache
+    table is not — is a pure read, so a reader can detect the state even though
+    it must not fix it, and hand the open back to the full opener. The route
+    checks this again AFTER that hand-back: under `dashboard --no-sync` the
+    bridge is suppressed, so the full opener returns without clearing it and
+    the route raises `LegacyBridgePending` instead of serving (#802).
+
+    Reports False rather than raising on any error: an undecidable answer must
+    not take a read route down.
+    """
+    for table in _LEGACY_BRIDGE_TABLES:
+        try:
+            if conn.execute(f"SELECT 1 FROM main.{table} LIMIT 1").fetchone():
+                continue
+            if conn.execute(
+                f"SELECT 1 FROM cache_db.{table} LIMIT 1"
+            ).fetchone():
+                return True
+        except sqlite3.Error:
+            continue
+    return False
+
+
+def _gate_reader_schema(conn: sqlite3.Connection, *, attach_cache: bool) -> None:
+    """Refuse a reader whose stores are not at head, by direction (#780)."""
+    probes = [("conversations", "main")]
+    if attach_cache:
+        probes.append(("cache", "cache_db"))
+    for store_name, schema in probes:
+        state = _cctally_store.schema_state(conn, store_name, schema=schema)
+        if state == "current":
+            continue
+        if state == "behind":
+            hook = SCHEMA_WAKE_HOOK
+            if hook is not None:
+                try:
+                    hook()
+                except Exception as exc:  # noqa: BLE001
+                    eprint(f"[conversations] schema wake-up failed ({exc})")
+            raise SchemaBehind(f"{store_name} store is behind head")
+        raise SchemaAhead(f"{store_name} store is ahead of head")
 
 
 def scope_conversations_db_to_account(
@@ -10901,8 +11559,8 @@ def _import_legacy_conversation_rows(conn: sqlite3.Connection) -> None:
     which table that was in ``CONVERSATION_ROLLUP_PRICING_FP_KEY``, so the
     provenance is written down rather than merely implied.
 
-    Deriving is required, not merely tidier: this runs at DB OPEN, and
-    ``dashboard --no-sync`` never runs a sync, so merely arming
+    Deriving is required, not merely tidier, in every mode allowed to do work:
+    this runs at DB OPEN, and merely arming
     ``conversation_sessions_backfill_pending`` left the rollup EMPTY and
     non-authoritative for the life of that process. The rail itself survives
     that (the flag routes it to live aggregation) but
@@ -10910,6 +11568,16 @@ def _import_legacy_conversation_rows(conn: sqlite3.Connection) -> None:
     with no authoritative gate, so the browse filter's project list went empty;
     and every rail read fell to the live branch, which is not the branch the
     materialized-cost contract is about.
+
+    ``dashboard --no-sync`` is the one mode NOT allowed to do work, and since
+    #802 the process policy suppresses this bridge there along with the Codex
+    contract rebuild. That does not reinstate the empty-rollup failure above,
+    because the read routes stop serving over an owed bridge: the reader raises
+    ``LegacyBridgePending`` and the route answers the typed degraded envelope
+    naming ``legacy_bridge_pending``, the sibling of the
+    ``normalization_pending`` the Codex case already returns under the same
+    suppression. The state is disclosed rather than rendered as an empty
+    surface, and it clears the moment a mode allowed to do work opens the store.
     """
     changed = False
     for table in _LEGACY_BRIDGE_TABLES:
@@ -11163,6 +11831,393 @@ def _prepare_claude_conversation_maintenance(
     return reingest
 
 
+# === #752 / #777: title generations, source incarnations, account stamps ====
+
+
+#: The digest of zero bytes. A rebuild resets each source file's committed
+#: prefix to this rather than dropping the row, so the replay starts at byte
+#: zero WITHOUT minting a new incarnation — which is what lets the durable
+#: stamps written before the rebuild still be found after it.
+_EMPTY_PREFIX_SHA256 = (
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+)
+
+#: The FLOOR of the rebuild free-space requirement, not the requirement.
+#:
+#: Tranche 2 sized a fixed 64 MiB against the staging tables alone, which hold
+#: only titles and one row per session — 65,536 B on the store observed during
+#: the #752 incident. Tranche 3 then measured what a whole rebuild costs the
+#: file: 9,310,744,576 B to 15,459,213,312 B, a growth of 6,148,468,736 B, of
+#: which 93% is freelist that `PRAGMA incremental_vacuum` returns afterwards.
+#: The clear does not let the replay reuse the pages it freed within the same
+#: rebuild, so the peak file size is roughly the live corpus written twice.
+#:
+#: A fixed constant therefore admits a rebuild that then runs out of space
+#: partway — precisely the state the preflight exists to prevent. The
+#: requirement is read off the store instead, by
+#: `_conversation_rebuild_free_bytes_required`, and this constant only stops a
+#: tiny or empty store from demanding nothing at all.
+_CONVERSATION_STAGING_FREE_BYTES_FLOOR = 64 * 1024 * 1024
+
+#: Retained under its Tranche 2 name for the module's re-export surface. New
+#: code reads the measured requirement, never this.
+_CONVERSATION_STAGING_FREE_BYTES_REQUIRED = _CONVERSATION_STAGING_FREE_BYTES_FLOOR
+
+
+class _SourceIncarnation(NamedTuple):
+    """One append-continuous life of a source file (#777).
+
+    ``mutable_digest`` is a LIVE, MUTABLE ``hashlib`` object, not a value, and
+    it is named that way because the distinction is load-bearing. It arrives
+    already positioned at ``start_offset``, and the ingester CONSUMES it by
+    updating it in place with the bytes that pass reads, so it may be updated
+    exactly once and its ``hexdigest()`` before that update is not the same
+    number as after. Returning a hex string instead would force a full rehash
+    of the whole file on every sync rather than only the committed prefix,
+    which is why it is an object at all.
+    """
+    incarnation_id: str
+    is_new: bool
+    start_offset: int
+    mutable_digest: Any
+
+
+def _path_is_genuinely_absent(path_str: str) -> bool:
+    """Whether ``path_str`` is really gone, as opposed to merely unwalked.
+
+    Only ``ENOENT`` and ``ENOTDIR`` answer yes. Every other ``OSError`` —
+    ``EPERM`` on a directory the walk could not enter, ``EIO`` on failing
+    media, ``ENOTCONN`` on a stale network mount — leaves the question
+    undecided, and an undecided answer must retain the row, because the
+    consequence of a wrong "absent" is a permanent loss of attribution while
+    the consequence of a wrong "present" is one retained row.
+
+    ``pathlib.Path.exists()`` cannot serve here: it reports False for every
+    ``OSError``, which is exactly the conflation this function exists to
+    avoid.
+
+    RESIDUAL, stated rather than left to be discovered. ``ENOENT`` is also what
+    an UNMOUNTED volume produces for a path beneath a mount point whose
+    directory still exists, so this reports such a path as genuinely absent
+    when it is only unreachable. The walk-liveness guard upstream covers the
+    common shape of that — a root whose whole tree went away is not walked, so
+    its rows are never offered here — but a volume that unmounts between the
+    walk and this check is not covered, and the consequence is the attribution
+    loss the paragraph above describes. Distinguishing it needs a mount-table
+    read, which this leaf deliberately does not do.
+    """
+    try:
+        os.lstat(path_str)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
+#: `_conversation_staging_free_bytes` returns this when it could not measure.
+#: A SENTINEL rather than a number, because every number is wrong here: the
+#: floor reads as "enough" only while the requirement is also the floor, and
+#: the requirement is now the store's live size.
+CONVERSATION_FREE_SPACE_UNKNOWN = None
+
+
+def _conversation_staging_free_bytes() -> "int | None":
+    """Free bytes on the volume holding ``conversations.db``.
+
+    A named seam so the preflight can be driven to refuse in a test without
+    filling a real disk.
+
+    Returns ``CONVERSATION_FREE_SPACE_UNKNOWN`` when the volume cannot be
+    measured, and the caller then SKIPS the check. This used to return the
+    staging floor with a comment saying that refusing every rebuild because
+    `statvfs` failed would be the worse failure — true while the comparison was
+    against that same floor, and false the moment the requirement became
+    `_conversation_rebuild_free_bytes_required`, which is gigabytes on any real
+    store. The degraded reading was then always below the requirement, so the
+    documented fail-open deferred every rebuild instead of admitting it.
+    """
+    try:
+        usage = shutil.disk_usage(_cctally_core.CONVERSATIONS_DB_PATH.parent)
+    except OSError:
+        return CONVERSATION_FREE_SPACE_UNKNOWN
+    return int(usage.free)
+
+
+def _conversation_rebuild_free_bytes_required(conn) -> int:
+    """Free bytes this particular store's rebuild needs (#752, #780).
+
+    The live corpus is `(page_count - freelist_count) * page_size`. A rebuild
+    clears and replays every message row without reusing the pages the clear
+    freed inside the same pass — measured on a copy-on-write clone of the
+    production store, where the file grew by 6.15 GB and 93% of the growth was
+    freelist — so the live size is what the replay can add before any of it
+    comes back. Demand that much, and never less than the staging floor.
+
+    An unreadable pragma degrades to the floor rather than raising: a preflight
+    that cannot measure must not be the thing that stops a rebuild.
+    """
+    try:
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    except (sqlite3.Error, TypeError, ValueError, IndexError):
+        return _CONVERSATION_STAGING_FREE_BYTES_FLOOR
+    live_bytes = max(0, page_count - freelist) * max(0, page_size)
+    return max(_CONVERSATION_STAGING_FREE_BYTES_FLOOR, live_bytes)
+
+
+def _resolve_source_incarnation(conn, path_str, fh, st, prev_row, *,
+                                force_replay: bool = False):
+    """Decide whether this file is still the file the cursor describes (#777).
+
+    Continuity requires ALL of: the same stored INODE; a current size at least
+    the committed offset; and a matching guard digest over the whole committed
+    prefix. Any of an inode change, a shrink, a size-preserving rewrite, or a
+    digest mismatch mints a new incarnation and forces byte-zero treatment.
+
+    The device is stored as corroborating evidence and as a diagnostic, and it
+    never decides (#814). `st_dev` is assigned when a volume is mounted rather
+    than when a file is created, so an ordinary remount renumbers every stored
+    `device_id` at once with no file changed; deciding on it minted a fresh
+    incarnation whose high-water is zero, and `_resolve_record_account` then
+    re-attributed that transcript's whole history to whichever account was
+    active at that moment. The verdict is delegated to
+    `_lib_ingest_frontier.source_identity_replaced`, which both Codex walks
+    already call, so one rule serves every provider.
+
+    THE RESIDUAL that creates: a file on a DIFFERENT device presenting the same
+    numeric inode, at least as long as the cursor, whose committed prefix
+    hashes identically, is no longer distinguishable as a new physical
+    incarnation. That is safe because it moves in the safe direction — it
+    PRESERVES continuity where a boundary arguably existed, so no bump occurs,
+    no high-water resets and no re-attribution happens. Resuming from the
+    cursor is content-correct, because the committed records and their
+    digest-bound stamps are byte-identical by construction, and any suffix is
+    processed as new input under the existing rules. What is lost is a physical
+    incarnation boundary, not data and not attribution.
+
+    This is strictly stronger than ``_conversation_target_risk``, which decides
+    the size-preserving case on mtime and is therefore defeated by a ``touch``.
+    A digest over the committed prefix cannot be restored by resetting metadata.
+
+    Reads through the caller's ALREADY-OPEN descriptor. The caller takes an
+    ``fstat`` before and after and treats any change across that pair as a new
+    incarnation, which closes the time-of-check/time-of-use gap a
+    stat-then-open sequence leaves open.
+
+    ``force_replay`` is set by a rebuild, and it separates two questions the
+    stored cursor would otherwise conflate: WHERE to start reading, and WHETHER
+    this is still the same file. A rebuild replays from byte zero regardless,
+    but it must still verify continuity against the cursor the previous life
+    committed — otherwise a file rewritten in place would keep its incarnation
+    across the rebuild and inherit stamps written for bytes that no longer
+    exist. The returned ``digest`` is empty in that case, because the caller is
+    about to hash the whole file from zero.
+    """
+    stored_incarnation = prev_row[3] if prev_row else None
+    stored_device = prev_row[4] if prev_row else None
+    stored_inode = prev_row[5] if prev_row else None
+    stored_prefix = prev_row[6] if prev_row else None
+    committed = int(prev_row[2]) if prev_row else 0
+    continuous = (
+        stored_incarnation is not None
+        # THE INODE DECIDES; THE DEVICE ONLY CORROBORATES (#814). `st_dev` is
+        # assigned when a volume is MOUNTED, not when a file is created, so an
+        # ordinary remount renumbers every stored `device_id` at once with no
+        # file changed. Deciding replacement on it mints a fresh incarnation
+        # whose high-water is zero, and `_resolve_record_account` then gives
+        # every already-attributed record to whichever account is active now.
+        # `#769 S6` removed this from both Codex walks; this was the last
+        # provider source-cursor site where the device still decided.
+        and not _ingest_frontier.source_identity_replaced(
+            stored_device, stored_inode, st.st_dev, st.st_ino,
+        )
+        and st.st_size >= committed
+    )
+    if continuous:
+        digest = _lib_conversation.prefix_digest(fh, committed)
+        if digest.hexdigest() == (stored_prefix or _EMPTY_PREFIX_SHA256):
+            if force_replay:
+                return _SourceIncarnation(
+                    stored_incarnation, False, 0,
+                    _lib_conversation.prefix_digest(fh, 0),
+                )
+            return _SourceIncarnation(
+                stored_incarnation, False, committed, digest)
+    return _SourceIncarnation(
+        _lib_conversation.new_source_incarnation_id(), True, 0,
+        _lib_conversation.prefix_digest(fh, 0),
+    )
+
+
+def _stat_pair_broken(before, after) -> bool:
+    """Whether the file's IDENTITY broke under the open descriptor (#777).
+
+    Classified by what changed across one open handle, not by whether anything
+    changed (spec §2, corrected after the Tranche 2 review). The provider
+    appends to an active transcript continuously, so reading any change as a
+    break made an ordinary append raise ``files_failed`` — which withholds the
+    conversation frontier certificate, leaves ``conversation_rebuild_claude_pending``
+    set so the whole rebuild runs again, and discards the records the pass had
+    already read.
+
+      * a different device or inode is a different file;
+      * a SMALLER size is a truncation, or a replacement written in place;
+      * the SAME size with a changed mtime is a size-preserving rewrite — the
+        case ``_conversation_target_risk`` classifies as ``source_replaced``;
+      * a LARGER size is an ordinary append, and a continuation. An mtime
+        change alongside it is that same append and is not read separately.
+
+    An append is safe to continue from because the bytes the reader validated
+    did not move: the guard digest covers exactly the range this pass read, the
+    partial-tail rewind in ``_iter_sync_entries`` already ends the read at a
+    record boundary, and the next sync resumes from the cursor this pass
+    commits.
+
+    What the pair CANNOT see is a ``rename``. The descriptor keeps the old
+    inode, so ``fstat`` reports the file the reader actually read. That is the
+    right outcome rather than a hole: those bytes are self-consistent and are
+    committed under the identity that really held them, and the next sync opens
+    the new directory entry, sees a different inode and mints a fresh
+    incarnation.
+    """
+    if before.st_dev != after.st_dev or before.st_ino != after.st_ino:
+        return True
+    if after.st_size < before.st_size:
+        return True
+    return (after.st_size == before.st_size
+            and after.st_mtime_ns != before.st_mtime_ns)
+
+
+def _load_account_stamps(conn, path_str):
+    """Every durable stamp and classified gap for one source path (#777)."""
+    stamps = {
+        (row[0], int(row[1]), row[2]): row[3] for row in conn.execute(
+            "SELECT source_incarnation_id,byte_offset,record_sha256,account_key "
+            "FROM claude_conversation_account_stamps WHERE canonical_source_path=?",
+            (path_str,),
+        )
+    }
+    gaps = {
+        int(row[0]): row[1] for row in conn.execute(
+            "SELECT byte_offset,account_key "
+            "FROM claude_conversation_account_stamp_gaps WHERE source_path=?",
+            (path_str,),
+        )
+    }
+    return stamps, gaps
+
+
+def _stamp_coverage_complete(conn) -> bool:
+    """Whether migration 009's stamp backfill has finished (#777).
+
+    Read defensively: a store whose ``cache_meta`` cannot be read reports
+    INCOMPLETE, so the rebuild defers rather than replaying under a rule whose
+    precondition it could not verify.
+    """
+    try:
+        return conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?",
+            ("claude_account_stamp_coverage_complete",),
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+
+
+def _resolve_record_account(stamps, gaps, incarnation_id, offset, digest,
+                            high_water, active_account_key):
+    """Which account one replayed record belongs to (#777). Pure.
+
+    Returns ``(account_key, needs_fresh_stamp)``.
+
+    THREE cases, and the separation between the last two is what the high-water
+    map exists to provide. Without it the miss rule and the new-bytes rule
+    contradict each other: a missing stamp would have to mean both "historical
+    and unknown" and "arriving now".
+
+    1. A stamp under THIS incarnation for this offset and this digest is the
+       recorded observation, and it wins. The digest is part of the key, so a
+       record whose bytes changed at the same offset cannot inherit it, and the
+       incarnation is part of the key, so a path reused by a different file
+       cannot either.
+    2. Below the published high-water mark with no stamp, a classified GAP row
+       still carries the attribution the pre-rebuild message row held — the
+       same evidence a stamp holds, minus a digest for bytes that no longer
+       exist. With neither, the record is genuinely historical and unknown, so
+       it takes NULL: writing the currently active account there is precisely
+       the silent re-attribution #777 reports.
+    3. At or beyond the high-water mark the record is first observed now, so it
+       takes the freshly resolved active identity and gets its own stamp.
+    """
+    stamped = stamps.get((incarnation_id, offset, digest))
+    if (incarnation_id, offset, digest) in stamps:
+        return stamped, False
+    if offset < high_water:
+        if offset in gaps:
+            return gaps[offset], False
+        return None, False
+    return active_account_key, True
+
+
+def _publish_title_generation(conn, _pause=None) -> None:
+    """Replace the live title and rollup tables with the staged generation.
+
+    ONE transaction containing both DELETEs and both INSERTs, so WAL snapshot
+    isolation gives every concurrent reader either the whole previous
+    generation or the whole new one. That is the guarantee the rejected A/B
+    slot design would have had to implement by hand with a published-slot
+    pointer, reader routing and a retirement protocol.
+
+    Nothing here writes ``conversation_title_fts``. It is an external-content
+    FTS5 index bound BY NAME to ``conversation_ai_titles``, so it follows
+    through the existing ``conv_title_fts_ai`` / ``_ad`` / ``_au`` triggers
+    when this rewrites the live table — and it is simply absent under
+    ``fts5_unavailable`` or inside migration 018's pending window, where the
+    triggers do not exist and there is nothing to drive.
+
+    Readers are NOT routed through a TEMP view. A TEMP view can serve neither
+    ``MATCH`` nor ``rowid``, so a reader behind one could not use the title
+    index at all.
+
+    ``_pause`` is a test seam invoked with the transaction OPEN and both
+    DELETEs issued. A concurrent reader running at that moment is the direct
+    evidence of atomicity, and raising from it is the direct evidence that a
+    crash inside the publish rolls back to the previous generation.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM conversation_ai_titles")
+        conn.execute("DELETE FROM conversation_sessions")
+        if _pause is not None:
+            _pause()
+        conn.execute(
+            "INSERT INTO conversation_ai_titles"
+            "(session_id,ai_title,source_path,byte_offset) "
+            "SELECT session_id,ai_title,source_path,byte_offset "
+            "FROM conversation_ai_titles_staging"
+        )
+        conn.execute(
+            "INSERT INTO conversation_sessions"
+            "(session_id,msg_count,started_utc,last_activity_utc,project_label,"
+            "cost_usd,cache_rebuild_count,git_branch,models_json,title,"
+            "render_revision) "
+            "SELECT session_id,msg_count,started_utc,last_activity_utc,"
+            "project_label,cost_usd,cache_rebuild_count,git_branch,models_json,"
+            "title,render_revision FROM conversation_sessions_staging"
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    # Truncated only AFTER the publish commits, so a crash between the two
+    # leaves a complete staged generation a retry can republish rather than a
+    # half-emptied one.
+    conn.execute("DELETE FROM conversation_ai_titles_staging")
+    conn.execute("DELETE FROM conversation_sessions_staging")
+    conn.commit()
+
+
 def _report_conversation_progress(
     progress: "Callable[[str, Any], None] | None",
     phase: str,
@@ -11187,6 +12242,19 @@ def sync_claude_conversations(
     transaction as its message/title rows.  No cache.db table is written, and
     the core accounting cursor is neither read nor advanced.
     """
+    # #779: FIRST executable statement, before IngestStats, before the data
+    # directory is created, before the lock file is touched or opened, and
+    # before any flock. This check used to sit below the rebuild branch, so a
+    # call carrying both arguments committed the pending marker, ran the
+    # maintenance preparation and executed the four destructive DELETEs, and
+    # only then raised over an already-emptied store. Nothing downstream may
+    # re-check the pair: `rebuild = rebuild or pending_rebuild` legitimately
+    # turns a targeted call into an inherited global rebuild, and that case is
+    # answered by the `deferred_reason="rebuild_pending"` return above it.
+    if only_paths is not None and rebuild:
+        raise ValueError(
+            "sync_claude_conversations: only_paths is incompatible with rebuild"
+        )
     stats = IngestStats()
     did_from_zero_replay = False
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -11240,15 +12308,17 @@ def sync_claude_conversations(
             # performing half of it from a stale binary is worse than not
             # performing it at all, and deferred_reason is how the caller
             # learns it did nothing.
-            try:
-                fp_row = conn.execute(
-                    "SELECT value FROM cache_meta WHERE key=?",
-                    (CONVERSATION_ROLLUP_PRICING_FP_KEY,),
-                ).fetchone()
-            except sqlite3.OperationalError:
-                fp_row = None
-            stored_fp = fp_row[0] if fp_row else None
-            if not _pricing_write_authorized(stored_fp):
+            # #728: `may_reset_rebuild_target`, not the write predicate. The
+            # ordering is the same, but this is the path that must fail closed
+            # — a refused clear costs nothing, while a clear performed on the
+            # strength of a read that never happened empties a rollup this
+            # process may then be refused permission to re-derive. The
+            # degrade-to-None shape this replaces made a failed read look like
+            # a store with nothing to protect, which is exactly the state that
+            # authorizes the clear.
+            fp_obs = _read_pricing_fingerprint_observation(conn)
+            stored_fp = fp_obs.raw
+            if not may_reset_rebuild_target(fp_obs, PRICING_SNAPSHOT_DATE):
                 _record_pricing_write_refusal(conn, stored_fp)
                 # COMMIT. _record_pricing_write_refusal leaves the transaction
                 # to its caller, and this caller returns immediately, so
@@ -11275,6 +12345,40 @@ def sync_claude_conversations(
                 conn.commit()
                 stats.deferred_reason = "pricing_write_refused"
                 return stats
+            # #777: a rebuild replays every record and decides its account
+            # from the durable stamps. Over a store whose backfill has not
+            # finished, the lookup-miss rule would read "no stamp" as
+            # "historical and unknown" and write NULL for records that DO have
+            # a recorded attribution — the whole loss the backfill exists to
+            # prevent, performed deliberately. Refuse before anything
+            # destructive; migration 009 completes the backfill on the next
+            # open, and the rebuild succeeds after it.
+            if not _stamp_coverage_complete(conn):
+                stats.deferred_reason = "stamp_backfill_pending"
+                return stats
+            # #752: check free space BEFORE the destructive step rather than
+            # failing partway through. A rebuild that runs out of space after
+            # clearing is the state that produced this issue.
+            #
+            # A reading of `CONVERSATION_FREE_SPACE_UNKNOWN` skips the check
+            # entirely rather than comparing. That is the documented fail-open:
+            # a preflight that could not measure must not be the thing that
+            # stops a rebuild.
+            _free_bytes = _conversation_staging_free_bytes()
+            if (_free_bytes is not CONVERSATION_FREE_SPACE_UNKNOWN
+                    and _free_bytes
+                    < _conversation_rebuild_free_bytes_required(conn)):
+                stats.deferred_reason = "insufficient_free_space"
+                return stats
+            # #780: refuse a new rebuild while the reclaim backlog is over its
+            # hard ceiling. A rebuild adds a whole staged generation of churn
+            # to a store that is already failing to return the space it freed,
+            # so starting one makes the condition worse rather than better.
+            _retention_sib = _load_lib("_lib_conversation_retention")
+            if _retention_sib.reclaim_backlog_over_ceiling(
+                    _retention_sib.read_reclaim_pending(conn)):
+                stats.deferred_reason = "reclaim_backlog_over_ceiling"
+                return stats
             # Commit the retry marker before the destructive clear. A killed
             # #395 worker therefore leaves a partial transcript store visibly
             # pending instead of advancing it to a false-complete state.
@@ -11290,25 +12394,52 @@ def sync_claude_conversations(
             active_account_key=active_account_key,
         )
 
-        rebuild_account_stamps: dict[tuple[str, int], str | None] = {}
+        # #777: the per-incarnation published high-water offset, captured at
+        # rebuild START. It is what separates the two attribution rules the
+        # review found contradictory otherwise: an offset BELOW it with no
+        # stamp is genuinely historical and unknown, so it takes NULL and never
+        # the active account; an offset AT OR BEYOND it is first observed now,
+        # so it resolves the active identity freshly and creates its stamp.
+        # Keyed by (path, incarnation) — PER-INCARNATION, which is the whole
+        # point. A high-water mark is a claim about what a particular life of a
+        # file already published; a file replaced since then has published
+        # nothing, so every one of its records is first observed now and takes
+        # the active identity rather than being read as historical-and-unknown.
+        high_water: "dict[tuple[str, str], int]" = {}
+        # #752: a rebuild writes its titles and rollup into staging and does
+        # not touch the live tables until the publish, so readers keep seeing
+        # the previous complete generation for the whole replay.
+        title_table = "conversation_ai_titles"
+        rollup_table = "conversation_sessions"
         if rebuild:
-            rebuild_account_stamps = {
-                (str(path), int(offset)): account_key
-                for path, offset, account_key in conn.execute(
-                    "SELECT source_path,byte_offset,account_key "
-                    "FROM conversation_messages"
+            high_water = {
+                (str(path), incarnation): int(offset)
+                for path, incarnation, offset in conn.execute(
+                    "SELECT path,source_incarnation_id,last_byte_offset "
+                    "FROM conversation_source_files "
+                    "WHERE source_incarnation_id IS NOT NULL"
                 )
             }
+            title_table = "conversation_ai_titles_staging"
+            rollup_table = "conversation_sessions_staging"
             clear_conversation_messages(conn)
-            conn.execute("DELETE FROM conversation_ai_titles")
-            conn.execute("DELETE FROM conversation_sessions")
-            conn.execute("DELETE FROM conversation_source_files")
+            # Staging starts empty; a leftover generation from an interrupted
+            # rebuild describes bytes this pass is about to replay.
+            conn.execute("DELETE FROM conversation_ai_titles_staging")
+            conn.execute("DELETE FROM conversation_sessions_staging")
+            # The source-file rows are LEFT INTACT (#777). Deleting them, as
+            # this used to, would take every `source_incarnation_id` with them,
+            # and a stamp is keyed by the incarnation — so every stamp written
+            # before the rebuild would miss and the replay that is supposed to
+            # preserve the retained attribution would discard all of it.
+            # Resetting the cursor instead would be almost as bad: continuity
+            # would then be checked against an empty prefix, which any file
+            # satisfies, so a file rewritten in place would keep its incarnation
+            # and inherit stamps for bytes that no longer exist. The rows stay
+            # exactly as the previous life committed them, and the replay is
+            # forced from byte zero by `force_replay` instead.
             conn.commit()
 
-        if only_paths is not None and rebuild:
-            raise ValueError(
-                "sync_claude_conversations: only_paths is incompatible with rebuild"
-            )
         paths = (
             [pathlib.Path(path) for path in sorted(only_paths)
              if pathlib.Path(path).is_file()]
@@ -11317,10 +12448,15 @@ def sync_claude_conversations(
         )
         stats.files_total = len(paths)
         _report_conversation_progress(progress, "ingest", stats)
+        # (size_bytes, mtime_ns, last_byte_offset, source_incarnation_id,
+        #  device_id, inode, committed_prefix_sha256) — the first three are the
+        # cursor this loop has always read; the last four are #777's identity,
+        # consumed by `_resolve_source_incarnation` at the same indices.
         existing = {
-            row[0]: (row[1], row[2], row[3])
+            row[0]: tuple(row[1:])
             for row in conn.execute(
-                "SELECT path,size_bytes,mtime_ns,last_byte_offset "
+                "SELECT path,size_bytes,mtime_ns,last_byte_offset,"
+                "source_incarnation_id,device_id,inode,committed_prefix_sha256 "
                 "FROM conversation_source_files"
             )
         }
@@ -11354,7 +12490,7 @@ def sync_claude_conversations(
                 continue
             size, mtime_ns = st.st_size, st.st_mtime_ns
             prev = existing.get(path_str)
-            if prev is not None and size == prev[0]:
+            if not rebuild and prev is not None and size == prev[0]:
                 stats.files_skipped_unchanged += 1
                 _report_conversation_progress(progress, "ingest", stats)
                 continue
@@ -11362,23 +12498,60 @@ def sync_claude_conversations(
             if targeted and truncated:
                 stats.deferred_reason = "truncation"
                 return stats
-            start_offset = 0 if prev is None or truncated else prev[2]
+            # The read start is decided by the incarnation resolver below,
+            # which is the only place that knows whether the cursor still
+            # describes this file. Initialised here only so the OSError path
+            # below has a value.
+            start_offset = 0
             conv_rows: list[tuple[Any, ...]] = []
             ai_rows: list[tuple[Any, ...]] = []
+            stamp_rows: list[tuple[Any, ...]] = []
             final_offset = start_offset
+            stamps, gaps = _load_account_stamps(conn, path_str)
             try:
-                with open(jp, "r", encoding="utf-8", errors="replace") as fh:
+                # BINARY, and ONE descriptor for the whole file (#777). Binary
+                # because a stamp's digest is over the record's raw bytes, which
+                # the text layer's replacement decoding does not preserve. One
+                # descriptor because the incarnation decision, the guard-digest
+                # read and the ingest read must all describe the same open file:
+                # a stat-then-open sequence leaves a window in which the file is
+                # replaced between the decision and the read, and the records
+                # would then be filed under the previous incarnation's identity.
+                with open(jp, "rb") as fh:
+                    st_before = os.fstat(fh.fileno())
+                    incarnation = _resolve_source_incarnation(
+                        conn, path_str, fh, st_before, prev,
+                        force_replay=rebuild)
+                    start_offset = incarnation.start_offset
+                    file_high_water = high_water.get(
+                        (path_str, incarnation.incarnation_id), 0)
+                    if incarnation.is_new:
+                        # A new incarnation forces byte-zero treatment: the
+                        # bytes before the cursor are not the bytes the cursor
+                        # described, so resuming from it would skip real records
+                        # and stamp the rest against an identity that never held
+                        # them.
+                        truncated = prev is not None
                     fh.seek(start_offset)
-                    for _offset, _cost, mrow, ai in _iter_sync_entries(
+                    for _offset, _cost, mrow, ai, raw in _iter_sync_entries(
                         fh,
                         path_str,
                         include_cost=False,
+                        with_raw=True,
                     ):
                         if mrow is not None:
-                            account_key = rebuild_account_stamps.get(
-                                (path_str, int(mrow.byte_offset)),
+                            offset = int(mrow.byte_offset)
+                            digest = _lib_conversation.record_sha256(raw)
+                            account_key, fresh_stamp = _resolve_record_account(
+                                stamps, gaps, incarnation.incarnation_id,
+                                offset, digest, file_high_water,
                                 active_account_key,
                             )
+                            if fresh_stamp:
+                                stamp_rows.append(
+                                    (path_str, incarnation.incarnation_id,
+                                     offset, digest, account_key)
+                                )
                             conv_rows.append(
                                 _conv_row_tuple(
                                     mrow, path_str, account_key,
@@ -11390,6 +12563,59 @@ def sync_claude_conversations(
                                 (ai.session_id, ai.ai_title, path_str, ai.byte_offset)
                             )
                     final_offset = fh.tell()
+                    st_after = os.fstat(fh.fileno())
+                    if _stat_pair_broken(st_before, st_after):
+                        # The file's IDENTITY broke while we were reading it —
+                        # a shrink, or a size-preserving rewrite. An append is
+                        # deliberately not this branch.
+                        #
+                        # Commit nothing. The next sync opens the file again
+                        # and re-decides the incarnation from scratch: the
+                        # committed-prefix guard mints a fresh incarnation and
+                        # replays from zero whenever the bytes before the
+                        # cursor moved, and otherwise continuity holds and it
+                        # resumes from the stored cursor. Either way nothing
+                        # from this partial read is carried forward, which is
+                        # what the descriptor pair exists to guarantee.
+                        stats.files_failed += 1
+                        _report_conversation_progress(progress, "ingest", stats)
+                        continue
+                    # The committed prefix digest is carried FORWARD from the
+                    # verified one rather than rehashed: the object is already
+                    # positioned at `start_offset`, so only the bytes this pass
+                    # ingested are added. That is what keeps the guard's cost
+                    # proportional to the append rather than to the file.
+                    fh.seek(start_offset)
+                    incarnation.mutable_digest.update(
+                        fh.read(max(0, final_offset - start_offset)))
+                    committed_prefix = incarnation.mutable_digest.hexdigest()
+                    device_id, inode = st_after.st_dev, st_after.st_ino
+                    # The recorded size and mtime come from the fstat taken at
+                    # the START of the read, not the end. They are not identity
+                    # — `_resolve_source_incarnation` decides that on device,
+                    # inode and the committed-prefix digest — they are the
+                    # change detector the `size == prev[0]` skip above reads.
+                    # Now that an append during the read is a continuation
+                    # rather than a break, recording the post-append size would
+                    # claim this pass consumed bytes it never reached, and the
+                    # next sync would skip the file as unchanged and lose those
+                    # records permanently. The pair is equal whenever nothing
+                    # raced, so this changes nothing outside that window.
+                    #
+                    # A RESIDUAL, stated rather than left implicit. The safest
+                    # recorded size is `final_offset`, because the partial-tail
+                    # rewind can end the read before `st_before.st_size` when
+                    # the file's last line is incomplete — so `size` can exceed
+                    # what this pass actually consumed by that tail. Narrowing
+                    # it to `final_offset` is not correct either: `size` is the
+                    # change detector for the `size == prev[0]` skip above, and
+                    # recording the consumed offset instead would make the next
+                    # sync see a size difference on an unchanged file and
+                    # re-read it every tick. The residual is bounded by one
+                    # partial record and is self-correcting, because the
+                    # writer finishes that line and the size moves again;
+                    # identity does not depend on either number.
+                    size, mtime_ns = st_before.st_size, st_before.st_mtime_ns
             except OSError as exc:
                 eprint(f"[conversations] could not read {jp}: {exc}")
                 stats.files_failed += 1
@@ -11416,7 +12642,7 @@ def sync_claude_conversations(
                         (path_str,),
                     )
                     conn.execute(
-                        "DELETE FROM conversation_ai_titles WHERE source_path=?",
+                        f"DELETE FROM {title_table} WHERE source_path=?",
                         (path_str,),
                     )
                     stats.files_reset_truncated += 1
@@ -11425,21 +12651,43 @@ def sync_claude_conversations(
                     _fill_file_touches(
                         conn, scope=[(row[3], row[4]) for row in conv_rows]
                     )
+                if stamp_rows:
+                    # #777: batched into the SAME transaction as the message
+                    # batch, never issued per row. One stamp per message is new
+                    # write volume across every future record, and a per-row
+                    # transaction would multiply the ingest's commit cost by the
+                    # record count.
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO claude_conversation_account_stamps"
+                        "(canonical_source_path,source_incarnation_id,"
+                        "byte_offset,record_sha256,account_key) "
+                        "VALUES(?,?,?,?,?)",
+                        stamp_rows,
+                    )
                 if ai_rows:
-                    conn.executemany(_AI_TITLE_UPSERT_SQL, ai_rows)
+                    conn.executemany(_ai_title_upsert_sql(title_table), ai_rows)
                 conn.execute(
                     "INSERT INTO conversation_source_files "
-                    "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at) "
-                    "VALUES(?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
+                    "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at,"
+                    "device_id,inode,source_incarnation_id,"
+                    "committed_prefix_sha256) "
+                    "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
                     "size_bytes=excluded.size_bytes,mtime_ns=excluded.mtime_ns,"
                     "last_byte_offset=excluded.last_byte_offset,"
-                    "last_ingested_at=excluded.last_ingested_at",
+                    "last_ingested_at=excluded.last_ingested_at,"
+                    "device_id=excluded.device_id,inode=excluded.inode,"
+                    "source_incarnation_id=excluded.source_incarnation_id,"
+                    "committed_prefix_sha256=excluded.committed_prefix_sha256",
                     (
                         path_str,
                         size,
                         mtime_ns,
                         final_offset,
                         dt.datetime.now(dt.timezone.utc).isoformat(),
+                        device_id,
+                        inode,
+                        incarnation.incarnation_id,
+                        committed_prefix,
                     ),
                 )
                 conn.commit()
@@ -11454,9 +12702,127 @@ def sync_claude_conversations(
                 stats.files_failed += 1
                 _report_conversation_progress(progress, "ingest", stats)
 
+        if rebuild and only_paths is None:
+            # A rebuild used to DELETE every `conversation_source_files` row and
+            # let the walk recreate the ones it found, which also removed rows
+            # for paths the walk no longer discovers. #777 stopped deleting the
+            # rows, because they carry the incarnation identity every durable
+            # stamp is keyed by — so the stale rows have to be removed here
+            # instead, by difference against the walked set. Without this a
+            # rebuild over a different corpus leaves the previous corpus's
+            # paths in the store, which is both wrong and a privacy leak.
+            #
+            # The STAMPS and GAPS for those paths go with the row. Tranche 2
+            # kept them, on the grounds that a stamp is the only surviving
+            # record of who the records belonged to — but no read path can
+            # reach one once the source-file row is gone. `_resolve_record_account`
+            # keys on `(source_incarnation_id, byte_offset, record_sha256)`;
+            # with no `conversation_source_files` row `_resolve_source_incarnation`
+            # sees `prev is None` and always mints a fresh incarnation, and the
+            # per-incarnation high-water map is built from that same table, so
+            # the gap half is unreachable for the same reason. Retaining them
+            # grows two tables without bound and preserves nothing. Giving them
+            # a reader instead was the alternative and is worse: a path-and-
+            # offset fallback would let an unrelated file that reuses a path
+            # inherit the old attribution, which is exactly the inheritance the
+            # incarnation key exists to prevent.
+            #
+            # GUARDED BY WALK LIVENESS (spec §2, second loss path). "Absent
+            # from this walk" is a weaker fact than "absent from disk", and
+            # taking the first for the second makes an unavailable corpus
+            # delete every stamp in the store: an unmounted volume or a wrong
+            # `CLAUDE_CONFIG_DIR` produces an empty walk, every tracked path is
+            # then a difference, and the one thing here that is NOT
+            # re-derivable goes with it. Two conditions, both required.
+            #
+            # THE PRICE OF THAT GUARD, stated rather than left to be found. A
+            # path that is still on disk but no longer in scope — the walk now
+            # covers a different tree, because `CLAUDE_CONFIG_DIR` moved or the
+            # store was copied beside the corpus it was derived from — is
+            # RETAINED, so the paragraph above overstates the case: the prune
+            # removes the previous corpus's paths only when that corpus is
+            # actually gone. Retaining them costs orphaned source rows and
+            # their stamps, since `clear_conversation_messages` has already
+            # removed every message they describe. That is deliberate. Nothing
+            # available here distinguishes a corpus that moved from a root that
+            # this walk could not reach, and only one of the two mistakes is
+            # recoverable.
+            walked = {str(jp) for jp in paths}
+            stale = (
+                [
+                    row[0] for row in conn.execute(
+                        "SELECT path FROM conversation_source_files")
+                    if row[0] not in walked and _path_is_genuinely_absent(row[0])
+                ]
+                if walked
+                else []
+            )
+            for start in range(0, len(stale), 400):
+                chunk = stale[start:start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                conn.execute(
+                    f"DELETE FROM conversation_source_files "
+                    f"WHERE path IN ({placeholders})",
+                    chunk,
+                )
+                conn.execute(
+                    f"DELETE FROM claude_conversation_account_stamps "
+                    f"WHERE canonical_source_path IN ({placeholders})",
+                    chunk,
+                )
+                conn.execute(
+                    f"DELETE FROM claude_conversation_account_stamp_gaps "
+                    f"WHERE source_path IN ({placeholders})",
+                    chunk,
+                )
+            if stale:
+                conn.commit()
+
         _report_conversation_progress(progress, "rollup", stats)
         rollup_authorized = _arm_rollup_backfill_on_pricing_change(conn)
-        if _conversation_sessions_backfill_pending(conn):
+        if rebuild:
+            # #752: a rebuild ALWAYS derives its rollup in full, into staging,
+            # regardless of the backfill flag — it has just replayed every
+            # message row, so a scoped recompute would describe a fraction of
+            # the store. The live rollup is still the previous complete
+            # generation at this point and stays so until the publish below.
+            if _recompute_conversation_sessions(conn, target=rollup_table):
+                conn.execute(
+                    "DELETE FROM cache_meta "
+                    "WHERE key='conversation_sessions_backfill_pending'"
+                )
+                _clear_pricing_write_refusal(conn)
+                conn.commit()
+                # Titles that arrived on the LIVE table while staging was being
+                # built are folded in before the publish, or the publish would
+                # silently drop them. `INSERT OR IGNORE` keeps the replayed
+                # generation authoritative for any session both hold.
+                #
+                # SCOPED to the sessions this replay actually produced (spec
+                # §1, corrected after the Tranche 2 review). An unconditional
+                # fold makes every published generation a permanent superset of
+                # the previous one: the table never shrinks, titles for deleted
+                # sessions and removed worktrees persist forever, and title
+                # search returns hits for sessions with no messages and no
+                # rollup row — because the rollup half IS re-derived and
+                # correctly drops them. Retention cannot compensate, because
+                # `_prune_claude` selects session ids from
+                # `conversation_messages` and a session with no message rows is
+                # never a prune candidate. The rollup staging table is the
+                # replayed generation's own session set, so it is the gate.
+                conn.execute(
+                    "INSERT OR IGNORE INTO conversation_ai_titles_staging"
+                    "(session_id,ai_title,source_path,byte_offset) "
+                    "SELECT session_id,ai_title,source_path,byte_offset "
+                    "FROM conversation_ai_titles WHERE session_id IN "
+                    "(SELECT session_id FROM conversation_sessions_staging)"
+                )
+                conn.commit()
+                _publish_title_generation(conn)
+            else:
+                conn.commit()
+                rollup_authorized = False
+        elif _conversation_sessions_backfill_pending(conn):
             # #705: a refused process must NOT consume the flag. It leaves it
             # set for the next authorized process, so a newer process that armed
             # the backfill and died is not followed by a stale successor either
@@ -11552,7 +12918,28 @@ def sync_codex_conversations(
     only_paths: "set[str] | None" = None,
     progress: "Callable[[str, CodexIngestStats], None] | None" = None,
 ) -> CodexIngestStats:
-    """Delta-sync Codex events/search rows into conversations.db (#320)."""
+    """Delta-sync Codex events/search rows into conversations.db (#320).
+
+    #779 (the Codex twin, folded in by the Tranche 1 review): the
+    incompatible-argument check below is the FIRST executable statement, for
+    exactly the reasons its Claude twin states. This function used to write the
+    `conversation_rebuild_codex_pending` marker, commit, call
+    `_clear_codex_conversation_store(conn)`, commit again, and only then raise
+    — so a bad argument pair destroyed the entire Codex conversation store
+    durably before refusing to do the work. The issue text named only the
+    Claude path; this is the same defect in the twin function in the same file,
+    and the remedy is the same reordering.
+
+    Nothing downstream may re-check the pair. `rebuild = rebuild or
+    pending_rebuild or contract_rebuild or codex_replay_pending` legitimately
+    turns a targeted call into inherited global work, and that case is answered
+    by the `deferred_reason="rebuild_pending"` return above the merge, not by
+    treating an inherited rebuild as an explicitly incompatible argument.
+    """
+    if only_paths is not None and rebuild:
+        raise ValueError(
+            "sync_codex_conversations: only_paths is incompatible with rebuild"
+        )
     stats = CodexIngestStats()
     did_from_zero_replay = False
     rebuild_account_stamps: dict[tuple[str, int], str | None] = {}
@@ -11657,10 +13044,6 @@ def sync_codex_conversations(
             _clear_codex_conversation_store(conn)
             conn.commit()
 
-        if only_paths is not None and rebuild:
-            raise ValueError(
-                "sync_codex_conversations: only_paths is incompatible with rebuild"
-            )
         files = (
             _qualify_codex_targets(only_paths)
             if only_paths is not None
@@ -11668,13 +13051,18 @@ def sync_codex_conversations(
         )
         stats.files_total = len(files)
         _report_conversation_progress(progress, "ingest", stats)
+        # The last two members are `device_id`/`inode` (#769 S6). They are read
+        # by the per-file decision below, not merely retained: a replacement
+        # that lands at the same size moves neither the size nor the cursor, so
+        # identity is the only evidence that the retained offset describes a
+        # file that is no longer there.
         existing = {
             row[0]: tuple(row[1:])
             for row in conn.execute(
                 "SELECT path,size_bytes,mtime_ns,last_byte_offset,source_root_key,"
                 "last_session_id,last_model,last_total_tokens,"
                 "last_native_thread_id,last_root_thread_id,last_parent_thread_id,"
-                "last_conversation_key,last_turn_id "
+                "last_conversation_key,last_turn_id,device_id,inode "
                 "FROM codex_conversation_source_files"
             )
         }
@@ -11779,18 +13167,37 @@ def sync_codex_conversations(
                 continue
             size, mtime_ns = st.st_size, st.st_mtime_ns
             prev = existing.get(path_str)
-            if prev is not None and size == prev[0] and prev[3] == discovered.source_root_key:
+            # A stored identity that differs from the one just statted means the
+            # retained offset points into a file that no longer occupies this
+            # pathname. THE INODE DECIDES and the device only corroborates:
+            # `_lib_ingest_frontier.source_identity_replaced` owns the verdict
+            # for the planner and for both walks, states why a remount must not
+            # reach it, and degrades a NULL or unreadable stored value to the
+            # size comparison below rather than raising out of this loop.
+            replaced = (
+                prev is not None
+                and _ingest_frontier.source_identity_replaced(
+                    prev[12], prev[13], st.st_dev, st.st_ino)
+            )
+            if (
+                prev is not None and not replaced and size == prev[0]
+                and prev[3] == discovered.source_root_key
+            ):
                 stats.files_skipped_unchanged += 1
                 _report_conversation_progress(progress, "ingest", stats)
                 continue
             reset_file = (
                 prev is not None
-                and (size < prev[0] or prev[3] != discovered.source_root_key)
+                and (
+                    size < prev[0] or replaced
+                    or prev[3] != discovered.source_root_key
+                )
             )
             if targeted and reset_file:
                 stats.deferred_reason = (
                     "requalification"
                     if prev is not None and prev[3] != discovered.source_root_key
+                    else "source_replaced" if replaced
                     else "truncation"
                 )
                 return stats
@@ -11995,8 +13402,8 @@ def sync_codex_conversations(
                     "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at,"
                     "source_root_key,last_session_id,last_model,last_total_tokens,"
                     "last_native_thread_id,last_root_thread_id,last_parent_thread_id,"
-                    "last_conversation_key,last_turn_id) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "last_conversation_key,last_turn_id,device_id,inode) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(path) DO UPDATE SET "
                     "size_bytes=excluded.size_bytes,mtime_ns=excluded.mtime_ns,"
                     "last_byte_offset=excluded.last_byte_offset,"
@@ -12009,7 +13416,8 @@ def sync_codex_conversations(
                     "last_root_thread_id=excluded.last_root_thread_id,"
                     "last_parent_thread_id=excluded.last_parent_thread_id,"
                     "last_conversation_key=excluded.last_conversation_key,"
-                    "last_turn_id=excluded.last_turn_id",
+                    "last_turn_id=excluded.last_turn_id,"
+                    "device_id=excluded.device_id,inode=excluded.inode",
                     (
                         path_str,
                         size,
@@ -12025,6 +13433,11 @@ def sync_codex_conversations(
                         terminal.parent_thread_id if terminal else initial_parent,
                         terminal.conversation_key if terminal else initial_conversation,
                         normalized.terminal.turn_id,
+                        # The SAME pre-read stat that produced `size`/`mtime_ns`
+                        # above, committed in this one statement beside the
+                        # offset it describes (#769 S6).
+                        int(st.st_dev),
+                        int(st.st_ino),
                     ),
                 )
                 conn.commit()
@@ -12402,6 +13815,30 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
             f"[cache-sync] pruned {res.pruned_files} orphaned file(s), "
             f"{res.pruned_entries} cost row(s), {res.pruned_messages} message(s)"
         )
+        if res.prune_refused:
+            # #729: a STAGED failure under docs/cli-contract.md — the command
+            # was understood and attempted, and part of it did not complete —
+            # so exit 3, not the parity-family 1 or the usage 2. Precedence:
+            # flock contention above is reported first because nothing was
+            # attempted at all, and this outranks the residual-path report
+            # below because a residual is work deliberately not done, while
+            # this is committed deletions that were not followed by an
+            # authorized re-derive.
+            # #769 S3: the cause travels on the result. Stating the version
+            # skew unconditionally described one of three refusing states as
+            # if it were the only one.
+            eprint(
+                f"[cache-sync] the conversation rollup re-derive was refused "
+                f"for {res.prune_refused_files} file(s): "
+                f"{pricing_refusal_cause_phrase(res.prune_refused_state)}. "
+                f"The orphan rows are deleted and the rollup backfill is "
+                f"armed; run `cctally cache-sync --prune-orphans` again once "
+                f"an authorized process can complete it, and see `cctally "
+                f"doctor pricing.conversation_rollup_writer` for the step "
+                f"that clears this state."
+            )
+            conn.close()
+            return 3
         if res.residual_paths:
             eprint(
                 f"[cache-sync] {len(res.residual_paths)} orphan(s) left in place "

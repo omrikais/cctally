@@ -679,15 +679,23 @@ def _read_db_projection_once() -> "_candidates.DbProjection":
     _acct_pred = "" if _sl_account is None else " AND account_key = ?"
     _acct_params: tuple = () if _sl_account is None else (_sl_account,)
     try:
+        # `weekly_observation_held = 0` (#769 S11, #824): the WEEKLY half of the
+        # projection. The rendered percentage and the capture instant that
+        # decides which candidate wins both come from the row selected here, so
+        # a held row would project an older reading as this tick's observation.
         weekly_rows = conn.execute(
             "SELECT id, weekly_percent, week_start_date, week_start_at, week_end_at, "
             "       captured_at_utc, source "
             "FROM weekly_usage_snapshots "
             "WHERE weekly_percent IS NOT NULL AND week_end_at IS NOT NULL"
+            "  AND weekly_observation_held = 0"
             + _acct_pred +
             " ORDER BY unixepoch(captured_at_utc) DESC, id DESC",
             _acct_params,
         ).fetchall()
+        # HELD-INCLUSIVE, deliberately: the FIVE-HOUR half. A held row exists
+        # because its five-hour reading grew, so dropping it here would hold
+        # the status line's five-hour percentage at the last unclamped tick.
         five_rows = conn.execute(
             "SELECT id, five_hour_percent, five_hour_resets_at, five_hour_window_key, "
             "       captured_at_utc, source "
@@ -850,13 +858,34 @@ def _pending_document(value: "_candidates.PendingDrop | None") -> dict | None:
                 "dbResetGeneration": signature.db_reset_generation,
             }
         ),
+        "deadlineAt": value.deadline_at,
+        "retained": (
+            None if value.retained is None else {
+                "percent": value.retained.percent,
+                "rawResetsAt": value.retained.raw_resets_at,
+                "canonicalKey": value.retained.canonical_key,
+                "observations": [
+                    {
+                        "observationId": item.observation_id,
+                        "token": item.token,
+                        "percent": item.percent,
+                        "rawResetsAt": item.raw_resets_at,
+                        "receivedAt": item.received_at,
+                    }
+                    for item in value.retained.observations
+                ],
+            }
+        ),
     }
 
 
 def _control_document(control: "_candidates.ControlState") -> dict:
     files = control.db_projection.db_files or {"main": None, "wal": None}
     return {
-        "schemaVersion": 1,
+        # Versioned independently of the candidate and tombstone documents, so
+        # that a control shape change cannot invalidate the spool documents a
+        # peer session running the previous binary is still writing.
+        "schemaVersion": _candidates.CONTROL_SCHEMA_VERSION,
         "dbProjection": {
             "fiveHour": _axis_projection_document(control.db_projection.five_hour),
             "sevenDay": _axis_projection_document(control.db_projection.seven_day),
@@ -1181,16 +1210,15 @@ def _statusline_reduce_and_publish(
     """
     now_epoch = int(time.time())
     candidates = _load_candidate_spool(now_epoch=now_epoch)
-    if not candidates:
-        existing = _read_control_state(now_epoch=now_epoch)
-        if existing is not None and any(existing.pending_drops.values()):
-            projection = _read_db_projection_stable()
-            control = _empty_control(projection)
-            _write_control_state(control)
-            return _candidates.ReductionDecision("WRITE_CONTROL", control)
-        return None
-    projection = _read_db_projection_stable()
     existing = _read_control_state(now_epoch=now_epoch)
+    if not candidates and (existing is None or not any(existing.pending_drops.values())):
+        return None
+    # An empty spool is NOT a retraction (#755).  Every contributor supporting a
+    # pending low can age out of its 90-second active window well before that
+    # drop's own 180-second deadline, so the reducer runs over the empty
+    # candidate set and lets the pending record decide from its own retained
+    # evidence.  Discarding the record here is what the production stall did.
+    projection = _read_db_projection_stable()
     control_repair_required = (
         existing is None or existing.db_projection.db_files != projection.db_files
     )
@@ -1727,6 +1755,9 @@ def _build_statusline_injections(warn_once):
             if five_resets is not None:
                 try:
                     key = c._canonical_5h_window_key(int(five_resets))
+                    # HELD-INCLUSIVE (#769 S11, #824): a five-hour maximum over
+                    # a five-hour window, and a held row's five-hour value is
+                    # the writing tick's own.
                     row = conn.execute(
                         "SELECT MAX(five_hour_percent) "
                         "FROM weekly_usage_snapshots "
@@ -1777,11 +1808,22 @@ def _build_statusline_injections(warn_once):
                         week_start_dt.isoformat(), week_end_dt.isoformat(),
                         account_key=_sl_account,
                     )
+                    # `weekly_observation_held = 0` (#769 S11, #824): a WEEKLY
+                    # maximum, and the floored leg is why it matters. A held
+                    # row written after a credit floor carries the PRE-credit
+                    # value forward under a post-floor capture instant, so
+                    # counting it would re-clamp the status line to a
+                    # high-water mark the credit retired — the same defence
+                    # `_resolve_reset_aware_hwm` carries, restated here because
+                    # this is an independent implementation of that maximum.
+                    # Both legs take the predicate: the two must not disagree
+                    # about what a held row is.
                     if floor_iso is not None:
                         row = conn.execute(
                             "SELECT MAX(weekly_percent) "
                             "FROM weekly_usage_snapshots "
                             "WHERE week_start_date = ?" + _acct_pred + " "
+                            "  AND weekly_observation_held = 0 "
                             "  AND unixepoch(captured_at_utc) >= unixepoch(?)",
                             (week_start_date, *_acct_params, floor_iso),
                         ).fetchone()
@@ -1789,7 +1831,8 @@ def _build_statusline_injections(warn_once):
                         row = conn.execute(
                             "SELECT MAX(weekly_percent) "
                             "FROM weekly_usage_snapshots "
-                            "WHERE week_start_date = ?" + _acct_pred,
+                            "WHERE week_start_date = ?" + _acct_pred +
+                            "  AND weekly_observation_held = 0",
                             (week_start_date, *_acct_params),
                         ).fetchone()
                     if row and row[0] is not None:
@@ -1816,20 +1859,41 @@ def _build_statusline_injections(warn_once):
             # may have `week_end_at` NULL — fall back to the date column
             # in that case. See the neighbor query in `pick_week_selection`
             # (bin/cctally:3849) for the precedent.
-            row = conn.execute(
-                "SELECT five_hour_percent, five_hour_window_key, "
-                "  weekly_percent, week_end_at, week_end_date "
+            #
+            # TWO queries, one per axis (#769 S11, #824). This used to be one
+            # row because one row carried both readings, and a
+            # `weekly_observation_held` row is the case where it does not: its
+            # five-hour fields are this tick's own while its weekly value and
+            # boundary were copied from an older row. The five-hour leg takes
+            # the newest row of either kind; the weekly leg takes the newest
+            # genuinely observed one. Asking one row for both would either hold
+            # the five-hour percentage back or present a carried-forward weekly
+            # percentage as this tick's reading.
+            five_row = conn.execute(
+                "SELECT five_hour_percent, five_hour_window_key "
                 "FROM weekly_usage_snapshots "
                 "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
             ).fetchone()
-            if not row:
+            weekly_row = conn.execute(
+                "SELECT weekly_percent, week_end_at, week_end_date "
+                "FROM weekly_usage_snapshots "
+                "WHERE weekly_observation_held = 0 "
+                "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+            ).fetchone()
+            if not five_row and not weekly_row:
                 return None
-            five_pct = float(row[0]) if row[0] is not None else None
-            five_resets = int(row[1]) if row[1] is not None else None
-            seven_pct = float(row[2]) if row[2] is not None else None
+            five_pct = (
+                float(five_row[0])
+                if five_row and five_row[0] is not None else None)
+            five_resets = (
+                int(five_row[1])
+                if five_row and five_row[1] is not None else None)
+            seven_pct = (
+                float(weekly_row[0])
+                if weekly_row and weekly_row[0] is not None else None)
             seven_resets = None
-            week_end_at = row[3]
-            week_end_date = row[4]
+            week_end_at = weekly_row[1] if weekly_row else None
+            week_end_date = weekly_row[2] if weekly_row else None
             if week_end_at:
                 try:
                     # `datetime.fromisoformat` accepts the trailing `Z`

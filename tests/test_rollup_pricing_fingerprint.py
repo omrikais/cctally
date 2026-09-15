@@ -12,14 +12,22 @@ full-recompute-then-drop-flag machinery re-derives every session's cost.
 Crash-safety is unchanged: the durable backfill flag remains the recompute
 signal, so advancing the fingerprint on arm cannot strand stale cost.
 """
+import contextlib
+import dataclasses
+import datetime as dt
 import json
 import pathlib
 import shutil
+import sqlite3
 import sys
 
 import pytest
 
-from conftest import load_script, redirect_paths  # type: ignore
+from conftest import (  # type: ignore
+    load_script,
+    redirect_paths,
+    redirect_paths_without_conversation_retention,
+)
 
 FLAG = "conversation_sessions_backfill_pending"
 FP = "conversation_sessions_pricing_fp"
@@ -86,6 +94,33 @@ def _synced(tmp_path, monkeypatch, *, model="claude-opus-4-8"):
     """A synced, authoritative rollup (flag clear) over one priced session."""
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
+    _bin_on_path(ns)
+    import _cctally_cache as cache
+    projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    projects.mkdir(parents=True, exist_ok=True)
+    (projects / "a.jsonl").write_text(
+        _asst_line("a1", "ma1", "ra1", "hi", session_id="s1",
+                   ts="2026-06-01T00:00:00Z", model=model))
+    core = ns["open_cache_db"]()
+    try:
+        cache.sync_cache(core)
+    finally:
+        core.close()
+    conn = ns["open_conversations_db"]()
+    cache.sync_claude_conversations(conn)
+    return cache, conn
+
+
+def _synced_retained(tmp_path, monkeypatch, *, model="claude-opus-4-8"):
+    """`_synced`, but with transcript retention disabled.
+
+    A rebuild deliberately forces the configured retention pass, and these
+    fixtures carry fixed 2026-06 timestamps, so under the production default a
+    rebuild prunes the very rows the assertion counts. Left that way the test
+    reports fixture expiry as a pricing-authorization defect.
+    """
+    ns = load_script()
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     _bin_on_path(ns)
     import _cctally_cache as cache
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
@@ -321,8 +356,11 @@ def test_an_authorized_process_recomputes_and_clears_both_keys(
         cache.sync_claude_conversations(conn)
 
         assert _get_meta(conn, FLAG) is None
-        assert _get_meta(
-            conn, cache.CONVERSATION_ROLLUP_PRICING_REFUSED_KEY) is None
+        # #729: settled, not deleted. The tombstone is what distinguishes a
+        # store that never refused from one that refused and recovered.
+        settled = json.loads(_get_meta(
+            conn, cache.CONVERSATION_ROLLUP_PRICING_REFUSED_KEY))
+        assert settled["active"] is False
     finally:
         conn.close()
 
@@ -728,9 +766,14 @@ def test_the_next_authorized_process_clears_the_flag_and_the_refusal_record(
 
         assert _get_meta(conn, FLAG) is None, \
             "an authorized process consumes the flag its refusal armed"
-        assert _get_meta(
-            conn, cache.CONVERSATION_ROLLUP_PRICING_REFUSED_KEY) is None, \
-            "and clears the refusal record atomically with it"
+        # #729: the record is SETTLED atomically with the flag, not deleted.
+        # It survives as a tombstone carrying `active: false`, which is what
+        # lets doctor tell "never refused" from "refused and recovered"; only
+        # active episodes warn.
+        settled = json.loads(_get_meta(
+            conn, cache.CONVERSATION_ROLLUP_PRICING_REFUSED_KEY))
+        assert settled["active"] is False, \
+            "and settles the refusal record atomically with it"
     finally:
         conn.close()
 
@@ -1160,9 +1203,11 @@ def test_an_authorized_scoped_recompute_clears_a_stale_refusal_record(
         conn = _reopened(cache, conn)
         assert _get_meta(conn, FLAG) is None, \
             "a scoped recompute must not arm the full backfill"
-        assert _get_meta(
-            conn, cache.CONVERSATION_ROLLUP_PRICING_REFUSED_KEY) is None, \
-            "an authorized recompute over a converged store clears the record"
+        # #729: settled rather than deleted — see the tombstone contract below.
+        settled = json.loads(_get_meta(
+            conn, cache.CONVERSATION_ROLLUP_PRICING_REFUSED_KEY))
+        assert settled["active"] is False, \
+            "an authorized recompute over a converged store settles the record"
     finally:
         conn.close()
 
@@ -1336,3 +1381,675 @@ def test_an_authorized_core_sync_reports_no_deferred_reason(
             core, cache.CONVERSATION_ROLLUP_PRICING_REFUSED_KEY) is None
     finally:
         core.close()
+
+
+# --- #728: four states, because a failed READ is not an empty store ---------
+# `_pricing_write_authorized(None)` returned True for BOTH "the store recorded
+# nothing" and "the SELECT raised OperationalError", so a locked store read as
+# a fresh one and every writer authorized itself over it. The observation type
+# separates them, and separates a recorded value that does not parse from a
+# recorded value that does.
+
+_PROCESS_DATE = dt.date(2026, 9, 5)
+
+
+def _pricing_module(tmp_path, monkeypatch):
+    return _cache_module(tmp_path, monkeypatch)._load_lib("_lib_pricing")
+
+
+def _obs(pricing, kind):
+    return {
+        "absent": lambda: pricing.classify_pricing_fingerprint(
+            found=False, raw=None, error_kind=None),
+        "empty": lambda: pricing.classify_pricing_fingerprint(
+            found=True, raw="", error_kind=None),
+        "present_older": lambda: pricing.classify_pricing_fingerprint(
+            found=True, raw="2026-08-25", error_kind=None),
+        "present_equal": lambda: pricing.classify_pricing_fingerprint(
+            found=True, raw="2026-09-05", error_kind=None),
+        "present_newer": lambda: pricing.classify_pricing_fingerprint(
+            found=True, raw="2026-09-30", error_kind=None),
+        "malformed": lambda: pricing.classify_pricing_fingerprint(
+            found=True, raw="not-a-date", error_kind=None),
+        "degraded": lambda: pricing.classify_pricing_fingerprint(
+            found=False, raw=None, error_kind="locked"),
+    }[kind]()
+
+
+@pytest.mark.parametrize("kind,expect", [
+    ("absent", True),
+    ("empty", True),
+    ("present_older", True),
+    ("present_equal", True),
+    ("present_newer", False),
+    ("malformed", False),
+    ("degraded", False),
+])
+def test_may_write_materialized_cost(kind, expect, tmp_path, monkeypatch):
+    pricing = _pricing_module(tmp_path, monkeypatch)
+    assert pricing.may_write_materialized_cost(
+        _obs(pricing, kind), _PROCESS_DATE) is expect
+
+
+@pytest.mark.parametrize("kind,expect", [
+    ("absent", True),
+    ("empty", True),
+    ("present_older", True),
+    ("present_equal", True),
+    ("present_newer", False),
+    ("malformed", False),
+    ("degraded", False),
+])
+def test_may_reset_rebuild_target(kind, expect, tmp_path, monkeypatch):
+    pricing = _pricing_module(tmp_path, monkeypatch)
+    assert pricing.may_reset_rebuild_target(
+        _obs(pricing, kind), _PROCESS_DATE) is expect
+
+
+def test_degraded_is_not_absent(tmp_path, monkeypatch):
+    """The load-bearing distinction. Both carry no value; only one is safe."""
+    pricing = _pricing_module(tmp_path, monkeypatch)
+    degraded = pricing.classify_pricing_fingerprint(
+        found=False, raw=None, error_kind="locked")
+    absent = pricing.classify_pricing_fingerprint(
+        found=False, raw=None, error_kind=None)
+    assert degraded.state == "degraded"
+    assert degraded.error_kind == "locked"
+    assert absent.state == "absent"
+    assert absent.error_kind is None
+    assert pricing.may_reset_rebuild_target(degraded, _PROCESS_DATE) is False
+    assert pricing.may_reset_rebuild_target(absent, _PROCESS_DATE) is True
+
+
+def test_unparseable_present_is_malformed_not_present(tmp_path, monkeypatch):
+    """`PRESENT(parsed_date, raw)` cannot also represent an unparseable value:
+    a `parsed_date` of None inside a `present` observation would compare
+    against the process date and raise, or be read as absent."""
+    pricing = _pricing_module(tmp_path, monkeypatch)
+    obs = pricing.classify_pricing_fingerprint(
+        found=True, raw="not-a-date", error_kind=None)
+    assert obs.state == "malformed"
+    assert obs.parsed_date is None
+    assert obs.raw == "not-a-date"
+
+
+def test_a_degraded_read_keeps_its_raw_and_error_kind(tmp_path, monkeypatch):
+    """An error_kind always wins, even when the read returned something.
+
+    A partially-completed read is not evidence about the store, so classifying
+    it by its value would be reading a torn observation as a settled one."""
+    pricing = _pricing_module(tmp_path, monkeypatch)
+    obs = pricing.classify_pricing_fingerprint(
+        found=True, raw="2026-08-25", error_kind="locked")
+    assert obs.state == "degraded"
+    assert obs.parsed_date is None
+    assert obs.error_kind == "locked"
+
+
+def test_present_parses_through_the_one_date_parser(tmp_path, monkeypatch):
+    """`parse_pricing_fingerprint` stays the sole parser; the classifier must
+    not grow a second `date.fromisoformat` that can drift from it."""
+    pricing = _pricing_module(tmp_path, monkeypatch)
+    obs = pricing.classify_pricing_fingerprint(
+        found=True, raw="2026-08-25", error_kind=None)
+    assert obs.state == "present"
+    assert obs.parsed_date == pricing.parse_pricing_fingerprint("2026-08-25")
+
+
+def test_an_unorderable_process_date_refuses(tmp_path, monkeypatch):
+    """Fails closed on BOTH sides. A process whose own snapshot date cannot be
+    ordered may not write, exactly as an unorderable stored value refuses."""
+    pricing = _pricing_module(tmp_path, monkeypatch)
+    obs = pricing.classify_pricing_fingerprint(
+        found=True, raw="2026-08-25", error_kind=None)
+    assert pricing.may_write_materialized_cost(obs, "not-a-date") is False
+    assert pricing.may_reset_rebuild_target(obs, None) is False
+    assert pricing.may_write_materialized_cost(obs, "2026-09-05") is True
+
+
+def test_the_observation_survives_copy_pickle_and_asdict(tmp_path, monkeypatch):
+    """It is a FIELD of `DoctorState`, and `dataclasses.asdict` deep-copies
+    every non-dataclass field value. `__slots__` plus a refusing `__setattr__`
+    makes the generic `copy._reconstruct` path re-assign each slot and raise,
+    so doctor's own state serialization broke on a value it merely carried."""
+    import copy
+    import dataclasses as dc
+    import pickle
+    cache = _cache_module(tmp_path, monkeypatch)
+    pricing = cache._load_lib("_lib_pricing")
+    obs = pricing.classify_pricing_fingerprint(
+        found=False, raw=None, error_kind="operational_error")
+    assert copy.deepcopy(obs) == obs
+    assert copy.copy(obs) == obs
+    assert pickle.loads(pickle.dumps(obs)) == obs
+
+    @dc.dataclass
+    class _Carrier:
+        observation: object = None
+
+    assert dc.asdict(_Carrier(observation=obs))["observation"] == obs
+
+
+def test_the_pricing_leaf_still_loads_under_a_bare_exec():
+    """`_lib_pricing.py` must import when executed under a private name that
+    is never registered in `sys.modules`.
+
+    Several test modules load it exactly that way. Under
+    `from __future__ import annotations` every field annotation is a string,
+    and `dataclasses` resolves a string annotation through
+    `sys.modules.get(cls.__module__).__dict__` while building the class — which
+    is None for such a load, so a `@dataclasses.dataclass` in this file raises
+    `AttributeError` at import and takes every one of those modules down at
+    COLLECTION time, before any test of theirs runs.
+    """
+    import importlib.util
+    path = pathlib.Path(__file__).resolve().parents[1] / "bin" / "_lib_pricing.py"
+    spec = importlib.util.spec_from_file_location(
+        "_pricing_leaf_bare_exec_probe", path)
+    module = importlib.util.module_from_spec(spec)
+    assert "_pricing_leaf_bare_exec_probe" not in sys.modules
+    spec.loader.exec_module(module)
+    obs = module.classify_pricing_fingerprint(
+        found=True, raw="2026-08-25", error_kind=None)
+    assert obs.state == "present"
+
+
+def test_the_observation_is_immutable(tmp_path, monkeypatch):
+    """A frozen record, so a consumer cannot downgrade a degraded read to an
+    absent one by assignment."""
+    pricing = _pricing_module(tmp_path, monkeypatch)
+    obs = pricing.classify_pricing_fingerprint(
+        found=False, raw=None, error_kind="locked")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        obs.state = "absent"
+
+
+# --- #728: each of the three writer sites, across all four states ----------
+# The three sites have TWO different shapes and must be asserted individually.
+# `_arm_rollup_backfill_on_pricing_change` returns True straight from its
+# `except sqlite3.OperationalError:` clause and never reaches the predicate at
+# all; the other two degrade `stored` to None and then consult it. One
+# pattern-based edit written for the degrade-to-None shape silently misses the
+# first, and the first is the one a locked store hits first.
+
+
+def _state_raw(cache, kind):
+    """The raw stored value for a state, relative to the LIVE snapshot date.
+
+    Derived rather than hardcoded: a literal "2026-09-30" stops being newer
+    than the process the day the embedded pricing table passes it, and the case
+    would then assert the opposite of its own name without failing.
+    """
+    base = dt.date.fromisoformat(cache.PRICING_SNAPSHOT_DATE)
+    return {
+        "absent": None,
+        "present_older": (base - dt.timedelta(days=30)).isoformat(),
+        "present_equal": base.isoformat(),
+        "present_newer": (base + dt.timedelta(days=30)).isoformat(),
+        "malformed": "not-a-date",
+        "degraded": None,
+    }[kind]
+
+
+def _observed(cache, kind):
+    pricing = cache._load_lib("_lib_pricing")
+    raw = _state_raw(cache, kind)
+    if kind == "degraded":
+        return pricing.classify_pricing_fingerprint(
+            found=False, raw=None, error_kind="operational_error")
+    return pricing.classify_pricing_fingerprint(
+        found=raw is not None, raw=raw, error_kind=None)
+
+
+def _pin_observation(monkeypatch, cache, kind):
+    """Pin what every writer site observes, without pinning HOW it observed it.
+
+    `raising=False` because the helper does not exist on the pre-fix tree: the
+    RED run must show each site authorizing anyway, which is the defect.
+    """
+    obs = _observed(cache, kind)
+    monkeypatch.setattr(
+        cache, "_read_pricing_fingerprint_observation",
+        lambda conn, key=None: obs, raising=False,
+    )
+    return obs
+
+
+_WRITER_STATES = [
+    ("absent", True),
+    ("present_older", True),
+    ("present_equal", True),
+    ("present_newer", False),
+    ("malformed", False),
+    ("degraded", False),
+]
+
+
+@contextlib.contextmanager
+def _locked_store(tmp_path, name="locked.db"):
+    """A REAL store whose reads raise `database is locked`.
+
+    A second connection holds `BEGIN EXCLUSIVE` and the reader is opened with
+    `timeout=0`, so every read on it raises immediately instead of blocking.
+    This is the failure the four-state observation exists for, and it is not
+    interchangeable with a store that merely has no `cache_meta` table: that
+    one determinately recorded nothing, while this one cannot be read at all.
+    """
+    path = tmp_path / name
+    writer = sqlite3.connect(str(path), isolation_level=None)
+    writer.execute("CREATE TABLE cache_meta(key TEXT PRIMARY KEY, value TEXT)")
+    writer.execute("BEGIN EXCLUSIVE")
+    reader = sqlite3.connect(str(path), timeout=0)
+    try:
+        yield reader
+    finally:
+        reader.close()
+        try:
+            writer.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        writer.close()
+
+
+def test_the_fingerprint_read_helper_reports_a_failed_read_as_degraded(
+        tmp_path, monkeypatch):
+    """The DB half of the split: a read that raised is not an empty store."""
+    cache = _cache_module(tmp_path, monkeypatch)
+    with _locked_store(tmp_path) as reader:
+        obs = cache._read_pricing_fingerprint_observation(reader)
+        assert obs.state == "degraded"
+        assert obs.error_kind is not None
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE cache_meta(key TEXT PRIMARY KEY, value TEXT)")
+        assert cache._read_pricing_fingerprint_observation(conn).state == "absent"
+        conn.execute("INSERT INTO cache_meta(key,value) VALUES(?,?)",
+                     (cache.CONVERSATION_ROLLUP_PRICING_FP_KEY, "2026-08-25"))
+        present = cache._read_pricing_fingerprint_observation(conn)
+        assert present.state == "present"
+        assert present.raw == "2026-08-25"
+    finally:
+        conn.close()
+
+
+def test_a_store_with_no_cache_meta_table_is_absent_not_degraded(
+        tmp_path, monkeypatch):
+    """A store with nowhere to record a fingerprint determinately recorded
+    none. The distinction is read off `sqlite_master`, not off the driver's
+    message, and it keeps a store that was never given the schema — every
+    hand-built fixture, and a connection opened before `_apply_cache_schema` —
+    out of the state reserved for reads that could not be performed."""
+    cache = _cache_module(tmp_path, monkeypatch)
+    conn = sqlite3.connect(":memory:")
+    try:
+        obs = cache._read_pricing_fingerprint_observation(conn)
+        assert obs.state == "absent"
+        assert obs.error_kind is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("kind,authorized", _WRITER_STATES)
+def test_site_arm_rollup_backfill_consults_the_observation(
+        kind, authorized, tmp_path, monkeypatch):
+    """Site 1. It never consulted the predicate on a failed read: the `except
+    sqlite3.OperationalError:` clause returned True directly."""
+    cache, conn = _synced(tmp_path, monkeypatch)
+    try:
+        conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+                     (FP, "2026-08-25"))
+        conn.commit()
+        _pin_observation(monkeypatch, cache, kind)
+        assert cache._arm_rollup_backfill_on_pricing_change(conn) is authorized
+        if not authorized:
+            assert _get_meta(conn, FP) == "2026-08-25", (
+                "a refused process must not stamp the fingerprint forward"
+            )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("kind,authorized", _WRITER_STATES)
+def test_site_recompute_conversation_sessions_consults_the_observation(
+        kind, authorized, tmp_path, monkeypatch):
+    """Site 2. A sentinel cost makes 'wrote' and 'did not write'
+    distinguishable — an authorized recompute is idempotent over real rows, so
+    row equality alone cannot tell them apart."""
+    cache, conn = _synced(tmp_path, monkeypatch)
+    try:
+        conn.execute("UPDATE conversation_sessions SET cost_usd=999.0")
+        conn.commit()
+        _pin_observation(monkeypatch, cache, kind)
+        assert cache._recompute_conversation_sessions(conn, ["s1"]) is authorized
+        conn.commit()
+        sentinel_survived = conn.execute(
+            "SELECT cost_usd FROM conversation_sessions WHERE session_id='s1'"
+        ).fetchone()[0] == 999.0
+        assert sentinel_survived is (not authorized), (
+            "a refused recompute must write no materialized cost"
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("kind,authorized", _WRITER_STATES)
+def test_site_rebuild_precheck_consults_the_observation(
+        kind, authorized, tmp_path, monkeypatch):
+    """Site 3, and the one that must fail closed: it clears the whole store
+    before re-deriving it, so a clear made on the strength of a read that never
+    happened leaves an empty rollup this process may then be refused permission
+    to rebuild."""
+    cache, conn = _synced_retained(tmp_path, monkeypatch)
+    try:
+        before = conn.execute(
+            "SELECT COUNT(*) FROM conversation_messages").fetchone()[0]
+        assert before > 0
+        _pin_observation(monkeypatch, cache, kind)
+        stats = cache.sync_claude_conversations(conn, rebuild=True)
+        if authorized:
+            assert stats.deferred_reason is None
+        else:
+            assert stats.deferred_reason == "pricing_write_refused"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_messages"
+        ).fetchone()[0] == before
+    finally:
+        conn.close()
+
+
+def test_a_null_store_date_in_a_refusal_record_means_the_read_failed(
+        tmp_path, monkeypatch):
+    """The record shape stays as it was, and that is readable because an ABSENT
+    fingerprint is authorized and never latches one. A refusal naming no store
+    date can therefore only have come from a read that failed.
+
+    The second half is what doctor DOES with that record (#769 S3 A1). The
+    DEGRADED branch fires only while the read is still failing, so a store that
+    has since become readable reaches the record branch instead — where the
+    version-skew wording renders the absent date verbatim and attaches a remedy
+    (restart or upgrade the writer) that cannot fix a read that failed.
+    """
+    import _lib_doctor as L
+    cache, conn = _synced(tmp_path, monkeypatch)
+    try:
+        _pin_observation(monkeypatch, cache, "degraded")
+        cache._arm_rollup_backfill_on_pricing_change(conn)
+        record = json.loads(_get_meta(
+            conn, cache.CONVERSATION_ROLLUP_PRICING_REFUSED_KEY))
+        assert record["store_snapshot_date"] is None
+        assert record["process_snapshot_date"] == cache.PRICING_SNAPSHOT_DATE
+    finally:
+        conn.close()
+    rendered = L._check_pricing_conversation_rollup_writer(
+        _doctor_state_with_refusal(record))
+    assert rendered.severity == "warn"
+    assert "None" not in rendered.summary
+    assert rendered.remediation != L.ROLLUP_WRITER_REFUSAL_REMEDIATION
+    assert rendered.remediation == (
+        L.rollup_writer_refused_degraded_read_remediation("conversations.db"))
+
+
+def _doctor_state_with_refusal(record):
+    """A DoctorState carrying one store's refusal record and nothing else.
+
+    Built by field name from the real dataclass rather than from a fixture, so
+    it stays honest if `DoctorState` grows a field.
+    """
+    import dataclasses
+    import _lib_doctor as L
+    fields = {f.name: None for f in dataclasses.fields(L.DoctorState)}
+    fields["conversation_rollup_pricing_refusal"] = record
+    return L.DoctorState(**fields)
+
+
+# --- #728: doctor's TWO reads, one per store -------------------------------
+# Doctor adds reads, not a fourth authorization site, but
+# `_cctally_doctor._read_rollup_pricing_state` performed its own SELECT and
+# collapsed `sqlite3.OperationalError` to absence, so a store it could not read
+# reported "no refused pricing write recorded" — an OK verdict over a store
+# doctor had no evidence about at all.
+
+
+def _doctor_module(cache):
+    import _cctally_doctor as doctor
+    return doctor
+
+
+@pytest.mark.parametrize("kind,expected_state", [
+    ("absent", "absent"),
+    ("present_older", "present"),
+    ("malformed", "malformed"),
+])
+def test_doctor_reads_a_readable_store_in_its_recorded_state(
+        kind, expected_state, tmp_path, monkeypatch):
+    """The three states a readable store can be in, over a REAL store."""
+    cache = _cache_module(tmp_path, monkeypatch)
+    doctor = _doctor_module(cache)
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE cache_meta(key TEXT PRIMARY KEY, value TEXT)")
+        raw = _state_raw(cache, kind)
+        if raw is not None:
+            conn.execute("INSERT INTO cache_meta(key,value) VALUES(?,?)",
+                         (cache.CONVERSATION_ROLLUP_PRICING_FP_KEY, raw))
+        _record, stored_fp, obs = doctor._read_rollup_pricing_state(conn)
+        assert obs.state == expected_state
+        assert stored_fp == raw
+    finally:
+        conn.close()
+
+
+def test_doctor_reports_an_unreadable_store_as_degraded_not_absent(
+        tmp_path, monkeypatch):
+    """The store with no `cache_meta` at all stands in for every read that
+    could not be performed — a lock, a schema not yet applied, a file doctor
+    may not open. Absence of evidence is not evidence of absence."""
+    cache = _cache_module(tmp_path, monkeypatch)
+    doctor = _doctor_module(cache)
+    with _locked_store(tmp_path) as reader:
+        record, stored_fp, obs = doctor._read_rollup_pricing_state(reader)
+        assert obs.state == "degraded"
+        assert obs.error_kind is not None
+        assert record is None and stored_fp is None
+
+
+def test_doctor_does_not_report_a_degraded_read_value_as_the_stored_one(
+        tmp_path, monkeypatch):
+    """#769 S3 A8. `_read_rollup_pricing_state` copied `observation.raw` into
+    `stored_fp` with no state check. `classify_pricing_fingerprint` accepts
+    `found=True, raw=..., error_kind=...`, so a read that failed while still
+    carrying a value would be published as the store's recorded fingerprint —
+    and an unorderable one routes doctor to the delete-this-row remedy for a
+    row the store may not even hold.
+    """
+    cache = _cache_module(tmp_path, monkeypatch)
+    doctor = _doctor_module(cache)
+    import _lib_pricing
+    degraded_with_value = _lib_pricing.classify_pricing_fingerprint(
+        found=True, raw="v2/2026-09-02", error_kind="operational_error")
+    assert degraded_with_value.state == "degraded"
+    assert degraded_with_value.raw == "v2/2026-09-02"
+    monkeypatch.setattr(
+        cache, "_read_pricing_fingerprint_observation",
+        lambda conn, key=None: degraded_with_value,
+    )
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE cache_meta(key TEXT PRIMARY KEY, value TEXT)")
+        _record, stored_fp, obs = doctor._read_rollup_pricing_state(conn)
+        assert obs.state == "degraded"
+        assert stored_fp is None, (
+            "a value read off a failed read is not the store's recorded one"
+        )
+    finally:
+        conn.close()
+
+
+def test_doctor_still_reports_a_malformed_value_it_actually_read(
+        tmp_path, monkeypatch):
+    """The negative direction of the gate above: MALFORMED is a value the read
+    DID produce, and dropping it would silently retire the unparseable-value
+    diagnosis Tranche 1 shipped."""
+    cache = _cache_module(tmp_path, monkeypatch)
+    doctor = _doctor_module(cache)
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE cache_meta(key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO cache_meta(key,value) VALUES(?,?)",
+                     (cache.CONVERSATION_ROLLUP_PRICING_FP_KEY, "not-a-date"))
+        _record, stored_fp, obs = doctor._read_rollup_pricing_state(conn)
+        assert obs.state == "malformed"
+        assert stored_fp == "not-a-date"
+    finally:
+        conn.close()
+
+
+def test_doctor_reads_each_store_independently(tmp_path, monkeypatch):
+    """Each store is classified on its own evidence: one unreadable store must
+    not be reported through the other store's state, in either direction."""
+    cache = _cache_module(tmp_path, monkeypatch)
+    doctor = _doctor_module(cache)
+    readable = sqlite3.connect(":memory:")
+    try:
+        readable.execute(
+            "CREATE TABLE cache_meta(key TEXT PRIMARY KEY, value TEXT)")
+        readable.execute(
+            "INSERT INTO cache_meta(key,value) VALUES(?,?)",
+            (cache.CONVERSATION_ROLLUP_PRICING_FP_KEY, "2026-08-25"))
+        with _locked_store(tmp_path) as unreadable:
+            assert doctor._read_rollup_pricing_state(
+                readable)[2].state == "present"
+            assert doctor._read_rollup_pricing_state(
+                unreadable)[2].state == "degraded"
+    finally:
+        readable.close()
+
+
+# --- #729: the refusal record is a tombstone with episode semantics ---------
+# `_clear_pricing_write_refusal` dropped the record entirely, so a store that
+# had converged carried no evidence it had ever diverged and doctor could not
+# distinguish "never refused" from "refused and recovered". The record now
+# survives convergence with `active=false`.
+#
+# The load-bearing half is the OTHER direction. A repeated refusal inside an
+# ACTIVE episode must keep its first timestamp, because that timestamp is how
+# long the store has been diverging. But an inactive-to-active transition for
+# the SAME pair must start a NEW episode with a fresh timestamp: carrying the
+# old one across a completed convergence reports a fresh divergence as days
+# old, which is the mirror image of the bug being fixed.
+
+REFUSED = "conversation_sessions_pricing_write_refused"
+
+
+def _record(cache, conn):
+    raw = _get_meta(conn, cache.CONVERSATION_ROLLUP_PRICING_REFUSED_KEY)
+    return None if raw is None else json.loads(raw)
+
+
+def _pin_refusal_clock(monkeypatch, cache, stamp):
+    monkeypatch.setattr(
+        cache, "_pricing_refusal_timestamp", lambda: stamp, raising=False)
+
+
+def test_convergence_keeps_the_record_and_marks_it_inactive(
+        tmp_path, monkeypatch):
+    cache, conn = _synced(tmp_path, monkeypatch)
+    try:
+        _pin_refusal_clock(monkeypatch, cache, "2026-09-01T00:00:00Z")
+        cache._record_pricing_write_refusal(conn, "2026-09-30")
+        assert _record(cache, conn)["active"] is True
+        cache._clear_pricing_write_refusal(conn)
+        settled = _record(cache, conn)
+        assert settled is not None, (
+            "a converged store must still carry the evidence it diverged"
+        )
+        assert settled["active"] is False
+        assert settled["store_snapshot_date"] == "2026-09-30"
+        assert settled["first_refused_at_utc"] == "2026-09-01T00:00:00Z"
+    finally:
+        conn.close()
+
+
+def test_repeat_refusal_within_an_active_episode_keeps_the_first_timestamp(
+        tmp_path, monkeypatch):
+    """The timestamp answers 'how long has this store been diverging', so the
+    FIRST refusal of the episode is the useful one, not the latest."""
+    cache, conn = _synced(tmp_path, monkeypatch)
+    try:
+        _pin_refusal_clock(monkeypatch, cache, "2026-09-01T00:00:00Z")
+        cache._record_pricing_write_refusal(conn, "2026-09-30")
+        _pin_refusal_clock(monkeypatch, cache, "2026-09-01T01:30:00Z")
+        cache._record_pricing_write_refusal(conn, "2026-09-30")
+        assert _record(cache, conn)["first_refused_at_utc"] == \
+            "2026-09-01T00:00:00Z"
+        assert _record(cache, conn)["active"] is True
+    finally:
+        conn.close()
+
+
+def test_converge_then_refuse_again_starts_a_new_episode(
+        tmp_path, monkeypatch):
+    """The trap. Preserving the timestamp across a COMPLETED convergence would
+    report a fresh divergence as six days old."""
+    cache, conn = _synced(tmp_path, monkeypatch)
+    try:
+        _pin_refusal_clock(monkeypatch, cache, "2026-09-01T00:00:00Z")
+        cache._record_pricing_write_refusal(conn, "2026-09-30")
+        cache._clear_pricing_write_refusal(conn)
+        assert _record(cache, conn)["active"] is False
+        assert _record(cache, conn)["first_refused_at_utc"] == \
+            "2026-09-01T00:00:00Z"
+        _pin_refusal_clock(monkeypatch, cache, "2026-09-07T00:00:00Z")
+        cache._record_pricing_write_refusal(conn, "2026-09-30")
+        reopened = _record(cache, conn)
+        assert reopened["active"] is True
+        assert reopened["first_refused_at_utc"] == "2026-09-07T00:00:00Z", (
+            "an inactive-to-active transition is a NEW episode"
+        )
+    finally:
+        conn.close()
+
+
+def test_a_different_pair_replaces_the_record_and_restamps(
+        tmp_path, monkeypatch):
+    cache, conn = _synced(tmp_path, monkeypatch)
+    try:
+        _pin_refusal_clock(monkeypatch, cache, "2026-09-01T00:00:00Z")
+        cache._record_pricing_write_refusal(conn, "2026-09-30")
+        _pin_refusal_clock(monkeypatch, cache, "2026-09-04T00:00:00Z")
+        cache._record_pricing_write_refusal(conn, "2026-10-15")
+        record = _record(cache, conn)
+        assert record["store_snapshot_date"] == "2026-10-15"
+        assert record["first_refused_at_utc"] == "2026-09-04T00:00:00Z"
+        assert record["active"] is True
+    finally:
+        conn.close()
+
+
+def test_converging_a_store_that_never_refused_writes_no_record(
+        tmp_path, monkeypatch):
+    """The clear must not mint a tombstone for an episode that never happened,
+    or every healthy install grows one."""
+    cache, conn = _synced(tmp_path, monkeypatch)
+    try:
+        assert _record(cache, conn) is None
+        cache._clear_pricing_write_refusal(conn)
+        assert _record(cache, conn) is None
+    finally:
+        conn.close()
+
+
+def test_an_authorized_recompute_settles_the_record_rather_than_dropping_it(
+        tmp_path, monkeypatch):
+    """The production convergence path, not just the primitive."""
+    cache, conn = _synced(tmp_path, monkeypatch)
+    try:
+        _pin_refusal_clock(monkeypatch, cache, "2026-09-01T00:00:00Z")
+        cache._record_pricing_write_refusal(conn, "2026-09-30")
+        conn.commit()
+        assert cache._recompute_conversation_sessions(conn, ["s1"]) is True
+        conn.commit()
+        settled = _record(cache, conn)
+        assert settled is not None and settled["active"] is False
+    finally:
+        conn.close()

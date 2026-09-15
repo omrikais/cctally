@@ -446,6 +446,10 @@ def _cmd_account_show(args: argparse.Namespace) -> int:
         ).fetchone()
         a = ({col: row[i] for i, col in enumerate(_ACCOUNT_COLUMNS)}
              if row is not None else None)
+        # HELD-INCLUSIVE, decided rather than overlooked (#769 S11,
+        # #824). This is an inventory of the rows the account actually
+        # wrote, not a reading of its weekly level, and a held row is a
+        # real write by a real tick.
         snap_count = _count_scoped(conn, "weekly_usage_snapshots", key)
         milestone_count = _count_scoped(conn, "percent_milestones", key)
         # Resolved while the connection is still open — the map is

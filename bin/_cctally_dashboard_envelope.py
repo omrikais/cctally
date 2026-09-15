@@ -211,7 +211,10 @@ def _select_current_block_for_envelope(
 
     Delta semantics:
       - Non-crossed block: ``current_used_pct - seven_day_pct_at_block_start``
-        (the natural "how much 7d% has changed during this 5h block" read).
+        (the natural "how much 7d% has changed during this 5h block" read), where
+        that axis is the CREDIT-AWARE read of the column rather than the stored
+        number (#834 S1, #835) — so a value an in-place weekly credit retired makes
+        both the published axis and the delta ``None``.
       - Crossed block (``crossed_seven_day_reset == 1``): the block straddles
         a weekly reset, so the natural delta would be dominated by the
         reset itself (e.g. −94pp) rather than the user's actual burn-rate.
@@ -222,6 +225,12 @@ def _select_current_block_for_envelope(
       - ``None`` only when ``current_used_pct`` is unknown OR the
         block-start anchor is missing AND no post-reset anchor was found.
     """
+    # HELD-INCLUSIVE, deliberately (#769 S11, #824). This read asks which
+    # five-hour window is current, and a `weekly_observation_held` row's
+    # five-hour fields are the writing tick's own — it is the freshest
+    # statement of that key. Its `week_start_at` is a byte copy of the
+    # non-held row it was derived from, so scoping the post-reset lookup
+    # below by it is unaffected.
     snap = conn.execute(
         """
         SELECT five_hour_window_key, week_start_at
@@ -235,15 +244,54 @@ def _select_current_block_for_envelope(
     if snap is None or snap["five_hour_window_key"] is None:
         return None
 
+    # #834 S1 (#836): `id` and `account_key` are selected so the live
+    # current-week milestone read can name ONE account's block. Block uniqueness
+    # is `(account_key, five_hour_window_key)`, and the milestone read used to
+    # filter on the window key alone, so one physical window's per-account blocks
+    # all showed every account's milestones. Both land on the returned dict under
+    # a leading underscore and `_five_hour_block_wire` strips them before
+    # publication, so the envelope's wire shape is unchanged — and no account key
+    # reaches a client that #341's R8 rule says must see no account decoration at
+    # all on a single-account install.
+    #
+    # `ORDER BY id ASC LIMIT 1` (#834 S1 Gate A R6): block uniqueness is
+    # `(account_key, five_hour_window_key)`, so two accounts observing one physical
+    # window own two rows here and this query had no order and no limit — SQLite
+    # decided which one `fetchone()` returned, and since #836 `_block_id` inherits
+    # that decision and it also decides whose milestones the live route loads. The
+    # order is `id` because that is what the current plan already yields: the
+    # `UNIQUE` index leads on `account_key`, so it is unusable for this predicate
+    # and SQLite scans the table in rowid order. Stating it therefore changes
+    # nothing about WHICH ACCOUNT IS SERVED, which is a product decision filed as
+    # #839 and deliberately not taken here.
+    # #834 S1 (#835) Gate A R8: `first_observed_at_utc` and `five_hour_resets_at`
+    # are selected because the credit-aware read below needs them — they are the
+    # START axis's capture instant and its fallback. `seven_day_pct_at_block_end`
+    # is deliberately NOT selected, and round three's comment claiming the
+    # credit-aware read needs it was wrong: this route publishes the start axis
+    # alone, the helper's second return value is discarded, and the helper tests
+    # each axis's stored value before resolving anything, so an absent end value
+    # skips a second week resolution and a second band set for a number nobody
+    # reads. `last_observed_at_utc` stays, and NOT because the helper needs it:
+    # every column the helper reads goes through `block.get(...)`, so dropping
+    # this one would raise nothing and change no published field — the end
+    # instant it feeds is discarded with the end axis. It stays because the
+    # helper's contract is a block ROW, and pruning this SELECT to the subset the
+    # helper happens to read today would couple this route to the helper's
+    # internals. Round four's comment implied necessity instead.
     block = conn.execute(
         """
-        SELECT five_hour_window_key, block_start_at, last_observed_at_utc,
+        SELECT id, account_key,
+               five_hour_window_key, block_start_at, five_hour_resets_at,
+               first_observed_at_utc, last_observed_at_utc,
                seven_day_pct_at_block_start,
                crossed_seven_day_reset
           FROM five_hour_blocks
          WHERE five_hour_window_key = ?
            AND is_closed = 0
            AND five_hour_resets_at > ?
+         ORDER BY id ASC
+         LIMIT 1
         """,
         (snap["five_hour_window_key"], _iso_z(now_utc)),
     ).fetchone()
@@ -251,7 +299,24 @@ def _select_current_block_for_envelope(
         return None
 
     crossed = bool(block["crossed_seven_day_reset"])
-    p_start = block["seven_day_pct_at_block_start"]
+    # #834 S1 (#835) Gate A R8: THE THIRD CONSUMER of the two derived weekly axes
+    # goes through the one read-time filter, the same one `cmd_five_hour_blocks` and
+    # `cmd_five_hour_breakdown` use. Reading the column raw published the value an
+    # in-place weekly credit retired, and `seven_day_pct_delta_pp` then published
+    # the difference between the live post-credit percentage and that retired
+    # number, which is a burn nobody observed. Measured on a store credited at 63.0
+    # with `current_used_pct` at 20.0: `seven_day_pct_at_block_start: 63.0` and
+    # `seven_day_pct_delta_pp: -43.0`, while the helper answered `(None, None)` for
+    # the same row. `sqlite3.Row` has no `.get()`, so the row is converted.
+    #
+    # Neither field is rendered by any client today: both are declared in
+    # `dashboard/web/src/types/envelope.ts` and used in one vitest module,
+    # `seven_day_pct_delta_pp` does not occur in the built bundle, and the TUI reads
+    # only `credits` / `five_hour_window_key` / `_account_key` / `_block_id` off
+    # this dict. This is therefore a correction to a published MACHINE surface, made
+    # because the marginal cost is one call site.
+    p_start, _p_end = sys.modules["cctally"]._credit_aware_block_weekly_axes(
+        conn, dict(block), now_utc=now_utc)
 
     # When the block crossed a weekly reset, recompute the delta against
     # the first post-reset snapshot inside the block instead of the
@@ -263,11 +328,18 @@ def _select_current_block_for_envelope(
     # the lookup to the current weekly window.
     p_anchor = p_start
     if crossed and snap["week_start_at"] is not None:
+        # `weekly_observation_held = 0` (#769 S11, #824): this is a weekly
+        # value selected by a CAPTURE-TIME window, which is exactly the shape a
+        # held row corrupts. A held row can be the first row captured after the
+        # reset while its weekly value was copied from a row captured BEFORE
+        # it, so the block's delta would be anchored on a pre-reset percentage
+        # and report a burn nobody observed.
         post = conn.execute(
             """
             SELECT weekly_percent
               FROM weekly_usage_snapshots
              WHERE week_start_at = ?
+               AND weekly_observation_held = 0
                AND unixepoch(captured_at_utc) >= unixepoch(?)
                AND unixepoch(captured_at_utc) <= unixepoch(?)
              ORDER BY captured_at_utc ASC, id ASC
@@ -321,7 +393,30 @@ def _select_current_block_for_envelope(
         "seven_day_pct_delta_pp":       delta,
         "crossed_seven_day_reset":      crossed,
         "credits":                      credits,
+        # #834 S1 (#836): INTERNAL selector fields, stripped by
+        # `_five_hour_block_wire` before publication. See the block SELECT above.
+        "_block_id":                    int(block["id"]),
+        "_account_key":                 block["account_key"],
     }
+
+
+#: The internal selector fields `_select_current_block_for_envelope` carries for
+#: the live milestone read. They are NOT part of the published envelope: a rowid
+#: is meaningless to a client, and an account key would be account decoration on
+#: a surface #341's R8 rule keeps undecorated below two real accounts.
+_INTERNAL_BLOCK_KEYS = ("_block_id", "_account_key")
+
+
+def _five_hour_block_wire(block: "dict | None") -> "dict | None":
+    """Drop the internal selector fields from a current-week block dict.
+
+    #834 S1 (#836). Called at the ONE publication site so the envelope's
+    `current_week.five_hour_block` shape is byte-unchanged. A pure function over a
+    copy — the caller's dict keeps its selectors, because the live milestone read
+    runs off the same object."""
+    if not isinstance(block, dict):
+        return block
+    return {k: v for k, v in block.items() if k not in _INTERNAL_BLOCK_KEYS}
 
 
 # === Alerts-envelope per-axis row-mappers (Task F) =========================
@@ -766,6 +861,11 @@ def _unavailable_source_wire() -> dict:
         "last_success_at": None,
         "capabilities": {},
         "data": None,
+        # #834 S2 (#828, #829): present and null, not absent. Every source
+        # entry within one schema version carries the same keys, so a client
+        # never has to branch on key presence to tell a v12 payload's honest
+        # "no evidence" from an older server's payload that has no such field.
+        "metadata_health": None,
     }
 
 
@@ -812,6 +912,15 @@ def _source_state_to_wire(state: object) -> dict:
             for name, capability in capabilities.items()
         },
         "data": _source_wire_value(getattr(state, "data", None)),
+        # #834 S2 (#828, #829): published from the state's carrier and from
+        # nowhere else, so the value the detail routes decide from and the
+        # value the client normalizes are the same object. `None` on a
+        # provider that describes no Codex metadata — and on every payload an
+        # older server produced, which is why the client normalizes an absent
+        # object to unknown rather than to healthy.
+        "metadata_health": _source_wire_value(
+            getattr(state, "metadata_health", None)
+        ),
     }
 
 
@@ -1318,6 +1427,27 @@ def _basis_presentation(basis):
         return None
     out = copy.basis_presentation(basis)
     return out or None
+
+
+def _trend_week_start_at(w) -> "str | None":
+    """``TuiTrendRow.week_start_at`` as canonical UTC ISO, or None.
+
+    #750 S4 §3.1. The row already carries the instant as a required
+    `dt.datetime`; the envelope simply omitted it, so the client had only
+    `label` to key on and a credited week's cycles can render one label.
+    `getattr` tolerates the minimal trend shapes (SimpleNamespace test rows,
+    older fixtures) the neighbouring fields already tolerate.
+    """
+    value = getattr(w, "week_start_at", None)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return value.astimezone(dt.timezone.utc).isoformat().replace(
+            "+00:00", "Z")
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def _forecast_quota_envelope(fc, cw, rate_change):
@@ -2157,7 +2287,11 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                 # `_tui_build_current_week`. `getattr` with default keeps
                 # legacy fixture modules that construct TuiCurrentWeek
                 # directly (without the new field) compatible.
-                "five_hour_block":          getattr(cw, "five_hour_block", None),
+                # #834 S1 (#836): the ONE publication site, so
+                # `_five_hour_block_wire` is where the internal selector fields
+                # are dropped and the wire shape stays byte-unchanged.
+                "five_hour_block":          _five_hour_block_wire(
+                    getattr(cw, "five_hour_block", None)),
                 "milestones": [
                     {
                         "percent":                m.percent,
@@ -2222,6 +2356,10 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                         "dollar_per_pct": w.dollars_per_percent,
                         "delta":          w.delta_dpp,
                         "is_current":     bool(w.is_current),
+                        # #750 S4 §3.1: the segment instant. `label` is
+                        # year-free and a credited week's cycles can render
+                        # the same one, so it cannot be a React key.
+                        "week_start_at":  _trend_week_start_at(w),
                         # #264 S3: additive weekly cost (already on the row via
                         # build_trend_view); rendered by the Trend modal's Cost
                         # column. ``getattr`` (like ``project_key`` /
@@ -2241,6 +2379,8 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                         "dollar_per_pct": w.dollars_per_percent,
                         "delta":          w.delta_dpp,
                         "is_current":     bool(w.is_current),
+                        # #750 S4 §3.1: the segment instant (see weeks[]).
+                        "week_start_at":  _trend_week_start_at(w),
                         # #264 S3: additive weekly cost (see weeks[] above; same
                         # getattr tolerance for minimal/older trend shapes).
                         "cost_usd":       round(_wc, 4) if (_wc := getattr(w, "weekly_cost_usd", None)) is not None else None,

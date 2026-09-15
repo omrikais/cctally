@@ -313,6 +313,17 @@ def test_json_mode_stamps_the_envelope_and_passes_the_payload_through(
             "codexOutlineDerivation", "outlineTransfers", "sseDelivery",
             "mainIngestFrontier",
         } <= set(memory["owners"])
+        # A write-time admission refusal is counted on its OWN counter, not on
+        # `fallbackCount`, and until it was published here nothing outside the
+        # process could see it: `_debug_memory_owner` returns a fixed six-key
+        # set and the source row's extras did not name it. A refusal nobody can
+        # read is a diagnostic nobody has, and `docs/commands/dashboard-perf.md`
+        # described the refusal as incrementing `fallbackCount` instead.
+        assert "admissionRefusalCount" in memory["owners"][
+            "codexSourceAccelerators"], (
+            "a write-time admission refusal must reach `/api/debug/backend`")
+        assert memory["owners"]["codexSourceAccelerators"][
+            "admissionRefusalCount"] >= 0
     finally:
         stop(srv, srv._test_thread)
 

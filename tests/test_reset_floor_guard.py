@@ -100,6 +100,13 @@ ALLOWLIST: dict[tuple[str, str], tuple[str, str]] = {
     ("_lib_diff_kernel.py", "_diff_resolve_used_pct"):
         (WIRED, "docstring occurrence; the executable max is Python-side via "
                 "_floored_week_max (pinned in MUST_CALL_FLOOR). #290."),
+    ("_cctally_core.py", "latest_usage_by_segment"):
+        (WIRED, "docstring occurrence, naming the per-week MAX this reducer "
+                "REPLACED (#750 S4 §2.1). The executable selection is "
+                "Python-side and latest-wins inside one billing cycle; its "
+                "lower bound comes from `segment_capture_bounds`, which "
+                "calls `_reset_aware_floor` per segment and is pinned in "
+                "MUST_CALL_FLOOR."),
 }
 
 # Authoritative wired-verification list: the executable clamp sites that MUST
@@ -108,12 +115,27 @@ ALLOWLIST: dict[tuple[str, str], tuple[str, str]] = {
 # floor; the forecast $/1% median takes the movement reducer instead, and
 # only it does — the accepted set is per site precisely so that a future edit
 # swapping one for the other at an unrelated site fails here.
+#: #750 S4 §2.1: `project`'s per-week MAX became a per-segment latest-wins
+#: read, so the chain from the call site to `_reset_aware_floor` gained two
+#: frames. Each is pinned separately, so an edit that drops one of them fails
+#: here rather than silently unbounding a cycle.
+SEGMENT_REDUCER_NAMES = frozenset({"latest_usage_by_segment"})
+SEGMENT_BOUNDS_NAMES = frozenset({"segment_capture_bounds"})
+
 MUST_CALL_FLOOR: list[tuple[str, str, frozenset]] = [
     ("_cctally_statusline.py",
      "_build_statusline_injections.<locals>._hwm_clamp", FLOOR_NAMES),
     ("_cctally_journal.py", "_usage_snapshot_fold_decision", FLOOR_NAMES),
     ("_cctally_record.py", "_resolve_reset_aware_hwm", FLOOR_NAMES),
-    ("_cctally_project.py", "_load_week_snapshots", FLOOR_NAMES),
+    # #750 S4 §2.1 moved this site's floor one frame down. `project`'s read
+    # is now per BILLING CYCLE, so the floor has to be resolved per segment
+    # rather than per week — a week-scoped floor discarded the pre-credit
+    # captures of BOTH cycles and erased the reading it existed to preserve.
+    # The site therefore consults the reducer, and the reducer's bounds
+    # helper is the row below that consults `_reset_aware_floor` itself.
+    ("_cctally_project.py", "_load_week_snapshots", SEGMENT_REDUCER_NAMES),
+    ("_cctally_core.py", "segment_capture_bounds", FLOOR_NAMES),
+    ("_cctally_core.py", "latest_usage_by_segment", SEGMENT_BOUNDS_NAMES),
     ("_cctally_core.py", "_floored_week_max", FLOOR_NAMES),
     ("_cctally_forecast.py", "_select_dollars_per_percent",
      MOVEMENT_REDUCER_NAMES),

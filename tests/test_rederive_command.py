@@ -629,7 +629,33 @@ def test_command_path_closes_family_and_preserves_provider_owned_state(
     assert mod.cmd_db_rederive(_args(yes=True)) == 0
     applied = json.loads(capsys.readouterr().out)
     assert applied["status"] == "applied"
-    assert (hwm7.read_bytes(), hwm5.read_bytes()) == hwm_before
+    # `hwm-7d` is still the sentinel: no rederive path derives or writes the
+    # weekly projection, and the SQL weekly high-water clamp re-establishes it
+    # on the next status-line tick.
+    assert hwm7.read_bytes() == hwm_before[0]
+    # `hwm-5h` is NOT, and that changed in #769 S11 (#824). An apply publishes
+    # a LIVE stats index, and a live publication now rematerializes the
+    # five-hour projection from the index it just published — because a
+    # weekly-clamped tick's five-hour evidence lives only in a
+    # `weekly_observation_held` row, and neither replay path reruns the live
+    # pipeline that would otherwise write the file. Asserted against the index
+    # rather than against a literal, so the assertion says what the rule is.
+    conn = mod.open_db()
+    try:
+        window_key = conn.execute(
+            "SELECT five_hour_window_key FROM weekly_usage_snapshots "
+            "WHERE five_hour_window_key IS NOT NULL "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1").fetchone()[0]
+    finally:
+        conn.close()
+    # The percent is a literal, not a recomputation. An oracle that re-runs the
+    # pass's own MAX agrees with that query whether or not it is correct, which
+    # is exactly how an unfloored MAX survived to review (#769 S11 F1/F5). Only
+    # the window key is read back, because it is a canonicalized derivation of
+    # the seeded reset instant rather than a value this scenario states.
+    assert hwm5.read_text() == f"{int(window_key)} 10.0\n"
+    assert hwm5.read_bytes() != hwm_before[1], (
+        "the sentinel survived, so the rematerialization never ran")
     conn = mod.open_db()
     try:
         assert tuple(conn.execute(
@@ -1123,11 +1149,18 @@ def test_rederive_clears_quarantined_same_revision_conflicts(
 #: loader cannot change its module bindings or payload hashes. Keep these as
 #: literals: a value the code under test produced for both sides of an equality
 #: proves only that it agrees with itself.
+#:
+#: #769 S11 (#824) moved `planHash` and `batchId`, and nothing else in either
+#: baseline. `weekly_observation_held` joined `_USAGE_SNAPSHOT_COLUMNS`, so it
+#: joins every `snapshot_accept` evt payload the planner derives, and the plan
+#: hash is taken over those payloads. The move is the schema change being
+#: visible where it should be; a MOVE WITHOUT a schema change would be the
+#: regression this baseline exists to catch.
 S5_CLEAN_BASELINE = {
     "actionCounts": {"add": 6, "retain": 0, "supersede": 0, "tombstone": 0},
     "batchId": (
-        "rederive:claude-usage:d871795ee622ea4c0133faf20d0ce81d0f7cbd9bcba413"
-        "d9e48c9e43d5ebe280"
+        "rederive:claude-usage:4013432f6fe090d1f5d70689de0e51cad163d60006947"
+        "c68edc846d6b1a32117"
     ),
     "conflicts": [],
     "dataGaps": [],
@@ -1140,8 +1173,8 @@ S5_CLEAN_BASELINE = {
     },
     "noOp": False,
     "planHash": (
-        "sha256:67d494243ccd64b24dcfdfb193f440645ab8ecb788451d9c0833d57d0eb28"
-        "b1d"
+        "sha256:c9e5be76a1f8fd8f3017b245be78863dfca5ba8cf58a4b9ce73c348026bd2"
+        "365"
     ),
     "preservedEventCount": 0,
     "rebuild": None,
@@ -1337,3 +1370,319 @@ def test_the_whole_rederive_apply_takes_one_prefix_traversal(
     # One snapshot: the apply path's own. The correction append writes through
     # the leaf lock's read-write handle, which is deliberately not this seam.
     assert opened == list(built["segments"]), opened
+
+
+# ==========================================================================
+# #769 S11 (#824) — `db rebuild` and `db rederive` must converge on a held
+# tick.
+#
+# The two replays are structurally different. `db rebuild` is apply-only and
+# reconstructs open blocks from snapshot history; `db rederive` reruns the raw
+# pipeline in a scratch epoch and compares what it derives against what the
+# journal holds. A five-hour effect that existed only as a block write and
+# never as a journalled snapshot decision would survive one and vanish in the
+# other, and the S8 decision record requires anything the snapshot decision
+# depends on to be reachable by both. Persisting the held tick as an ordinary
+# `snapshot_accept` decision is what satisfies that, and these two tests are
+# what say so.
+# ==========================================================================
+
+_HELD_WEEK_RESETS_AT = int(
+    dt.datetime(2026, 7, 27, 0, 0, tzinfo=dt.timezone.utc).timestamp())
+_HELD_5H_RESETS_AT = "2026-07-25T15:00:00+00:00"
+
+
+def _held_obs(lib, *, at, weekly_percent, five_hour_percent):
+    return lib.make_obs(
+        at=at, src="record-usage", provider="claude", account="acct-a",
+        payload={
+            "captured_at": at,
+            "source": "statusline",
+            "weekly_percent": weekly_percent,
+            "resets_at": _HELD_WEEK_RESETS_AT,
+            "five_hour_percent": five_hour_percent,
+            "five_hour_resets_at": _HELD_5H_RESETS_AT,
+        },
+    )
+
+
+def _drive_held_sequence(mod):
+    """t0 records a genuine weekly 63 with five-hour 20; t1 arrives in the same
+    physical windows carrying a raw weekly of 60, which clamps, and a genuine
+    five-hour rise to 25."""
+    import _cctally_journal as runtime
+    import _lib_journal as journal
+
+    _seed_cache(mod)
+    fixed = dt.datetime(2026, 7, 25, 12, 0, tzinfo=dt.timezone.utc)
+    for at, weekly, five_hour in (
+        ("2026-07-25T12:00:00Z", 63.0, 20.0),
+        ("2026-07-25T12:05:00Z", 60.0, 25.0),
+    ):
+        runtime.append_record(
+            _held_obs(journal, at=at, weekly_percent=weekly,
+                      five_hour_percent=five_hour),
+            now_utc=fixed)
+        assert runtime.run_stats_ingest(mode="authoritative").ran is True
+
+
+def _held_logical_state(mod):
+    """The logical oracle, row ids excluded because two builds legitimately
+    disagree on them."""
+    conn = mod.open_db()
+    try:
+        return {
+            "snapshots": [tuple(r) for r in conn.execute(
+                "SELECT weekly_percent, weekly_observation_held, "
+                "       five_hour_percent, five_hour_window_key, "
+                "       captured_at_utc, week_start_at, week_end_at, source "
+                "FROM weekly_usage_snapshots "
+                "ORDER BY captured_at_utc, weekly_observation_held")],
+            "blocks": [tuple(r) for r in conn.execute(
+                "SELECT five_hour_window_key, seven_day_pct_at_block_start, "
+                "       seven_day_pct_at_block_end, final_five_hour_percent "
+                "FROM five_hour_blocks ORDER BY five_hour_window_key")],
+            "fiveHourMilestones": [tuple(r) for r in conn.execute(
+                "SELECT five_hour_window_key, percent_threshold, "
+                "       seven_day_pct_at_crossing, reset_event_id "
+                "FROM five_hour_milestones "
+                "ORDER BY five_hour_window_key, percent_threshold")],
+            "weeklyMilestones": [tuple(r) for r in conn.execute(
+                "SELECT week_start_date, percent_threshold, reset_event_id "
+                "FROM percent_milestones "
+                "ORDER BY week_start_date, percent_threshold")],
+        }
+    finally:
+        conn.close()
+
+
+def _hwm(mod, name):
+    try:
+        return (pathlib.Path(mod.APP_DIR) / name).read_text().strip()
+    except OSError:
+        return None
+
+
+def test_a_held_tick_leaves_the_rederive_planner_with_nothing_to_correct(
+    tmp_path, monkeypatch, capsys
+):
+    """The rederive half of convergence, and the stronger of the two.
+
+    `db rederive` reruns the RAW observations through `_pipeline_claude_usage`
+    in a scratch epoch and diffs what it derives against what the journal
+    holds. A no-op therefore says the scratch rerun reproduced the held tick's
+    `snapshot_accept` decision exactly — the same held flag, the same carried
+    weekly value, the same boundary and the same effective five-hour value. If
+    the held decision were not journalled, or were journalled in a form the
+    rerun does not reproduce, the planner would report actions here.
+    """
+    mod = _isolated(tmp_path, monkeypatch)
+    _drive_held_sequence(mod)
+    capsys.readouterr()
+
+    before = _held_logical_state(mod)
+    # Non-vacuity: there IS a held row for the planner to disagree about.
+    assert [row[1] for row in before["snapshots"]] == [0, 1], before["snapshots"]
+    assert before["snapshots"][1][2] == 25.0
+
+    assert mod.cmd_db_rederive(_args()) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["status"] == "no-op", preview
+    counts = preview["actionCounts"]
+    assert (counts["add"], counts["supersede"], counts["tombstone"]) == (
+        0, 0, 0), preview
+    # `retain` is the non-vacuity: the planner DID rerun the pipeline and
+    # reproduce every journalled event, rather than reporting a no-op because
+    # it derived nothing at all.
+    assert counts["retain"] > 0, preview
+    assert _held_logical_state(mod) == before
+
+
+def test_a_rebuild_reproduces_the_held_tick_and_agrees_with_the_projection(
+    tmp_path, monkeypatch
+):
+    """The rebuild half, plus the projection the two replays must agree on.
+
+    `hwm-5h` is rematerialized from the published index at a LIVE-target
+    publication, so a rebuild leaves it describing the index it just published
+    rather than whatever it happened to hold. `hwm-7d` has no such pass and
+    must not gain one: the held weekly value is carried-forward evidence, and
+    the SQL weekly high-water clamp re-establishes that file on the next tick.
+    """
+    import _cctally_journal as runtime
+
+    mod = _isolated(tmp_path, monkeypatch)
+    _drive_held_sequence(mod)
+
+    before = _held_logical_state(mod)
+    weekly_before = _hwm(mod, "hwm-7d")
+    assert [row[1] for row in before["snapshots"]] == [0, 1], before["snapshots"]
+
+    # Corrupt the five-hour projection so the rematerialization is observable.
+    (pathlib.Path(mod.APP_DIR) / "hwm-5h").write_text("1 1.0\n")
+    runtime.rebuild_stats_index(
+        context=runtime.RebuildContext(trigger="test-fixture"))
+
+    assert _held_logical_state(mod) == before
+    assert _hwm(mod, "hwm-5h").split()[1] == "25.0"
+    assert _hwm(mod, "hwm-7d") == weekly_before
+
+
+# ==========================================================================
+# #834 S1 (#835) Gate A R5 — the rederive half. Specification line 124 requires
+# this module to be EXTENDED, not merely run. The credit's removal of a stale
+# replica is journalled as a suppression list precisely so a rederive does not
+# resurrect the poisoned row, and #835 changed which rows that list may name —
+# so convergence now has to be asserted over a store where a held row survived
+# a credit that removed its non-held twin.
+# ==========================================================================
+
+def _r5_drive_held_sequence_unattributed(mod):
+    """`_drive_held_sequence`'s twin, with the observations UNATTRIBUTED.
+
+    THE REASON IS THE FIXTURE, NOT THE COMMAND. `_isolated` pins `HOME` to
+    `tmp_path`, which carries no `~/.claude.json`, so
+    `_cctally_core._resolve_active_claude_identity()` returns a stably-absent read
+    and `cmd_record_credit` stamps the `unattributed` sentinel. On a real store
+    with an `oauthAccount` it stamps that account's own key — measured:
+    `{'account_key': 'unattributed', 'status': 'stably_absent'}` under an empty
+    HOME against `{'account_key': '875d…', 'status': 'identified'}` with one — and
+    a torn read exits 2 rather than falling back. So the credit reaches
+    `unattributed`'s rows here because the observations were driven under that
+    same sentinel, and the stale-replica band therefore matches, which is what
+    lets the suppression list this test is about get built at all.
+
+    An earlier version of this docstring said `record-credit` "resolves its whole
+    plan account-blind and stamps `unattributed` at the end". The second half is
+    false, and the correction is on #837 itself.
+
+    #837'S ACTUAL MECHANISM IS THE FIRST HALF, AND IT IS A WRONG-POPULATION DEFECT
+    RATHER THAN AN EMPTY ONE. `plan.from_pct` and the floor are resolved
+    account-blind while the stamp and the band's `account_key` predicate are the
+    ACTIVE account's. On a multi-account store the band's CENTRE can therefore be
+    another account's percentage, applied to the active account's rows: the band is
+    scoped correctly and centred wrongly, so it can remove the wrong rows or none
+    rather than simply matching nothing.
+
+    TWO ROUTES REACH `from_pct` ACCOUNT-BLIND, and a correction of record: an
+    earlier version of this docstring named only the first.
+
+      * `_resolve_reset_aware_hwm(..., account_key=None)`, the `hwm` source, which
+        is the default when the week carries no prior credit.
+      * the `existing` floor lookup, which selects
+        `weekly_credit_floors WHERE week_start_date = ?` with NO account predicate
+        and feeds its `observed_pre_credit_pct` through as `from_source ==
+        'prior_credit'`. That branch is PREFERRED over the HWM whenever a floor
+        already exists, so on a completion or a `--force` re-record it is the route
+        that actually runs. It appears twice in `bin/_cctally_record.py` — once in
+        `cmd_record_credit`'s body and once in the revalidation helper that re-runs
+        the plan under the write lock — and both copies are account-blind."""
+    import _cctally_journal as runtime
+    import _lib_journal as journal
+
+    _seed_cache(mod)
+    # The rederive planner refuses with `missing-source` when an account with
+    # positive usage has no Claude `session_entries`, so the unattributed bucket
+    # needs spend of its own. `_seed_cache` seeds `acct-a`'s.
+    path = "/tmp/claude/projects/repo/session-unattributed.jsonl"
+    conn = mod.open_cache_db()
+    conn.execute(
+        "INSERT INTO session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+        " session_id, project_path) VALUES (?,?,?,?,?,?,?)",
+        (path, 100, 1, 100, AT, "session-u", "/repo"),
+    )
+    conn.execute(
+        "INSERT INTO session_entries "
+        "(source_path, line_offset, timestamp_utc, model, input_tokens, "
+        " output_tokens, cache_create_tokens, cache_read_tokens, "
+        " cache_create_1h_tokens, account_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (path, 0, "2026-07-25T11:00:00+00:00",
+         "claude-3-5-sonnet-20241022", 0, 0, 100, 0, 40, "unattributed"),
+    )
+    conn.commit()
+    conn.close()
+    fixed = dt.datetime(2026, 7, 25, 12, 0, tzinfo=dt.timezone.utc)
+    for at, weekly, five_hour in (
+        ("2026-07-25T12:00:00Z", 63.0, 20.0),
+        ("2026-07-25T12:05:00Z", 60.0, 25.0),
+    ):
+        runtime.append_record(
+            journal.make_obs(
+                at=at, src="record-usage", provider="claude",
+                payload={
+                    "captured_at": at,
+                    "source": "statusline",
+                    "weekly_percent": weekly,
+                    "resets_at": _HELD_WEEK_RESETS_AT,
+                    "five_hour_percent": five_hour,
+                    "five_hour_resets_at": _HELD_5H_RESETS_AT,
+                }),
+            now_utc=fixed)
+        assert runtime.run_stats_ingest(mode="authoritative").ran is True
+
+
+def _r5_credit_args(*, week, **over):
+    args = dict(to=30.0, from_pct=63.0, at="2026-07-25T12:02:00Z", week=week,
+                dry_run=False, yes=True, json=False, force=False)
+    args.update(over)
+    return argparse.Namespace(**args)
+
+
+def _r5_week_start_date(mod):
+    conn = mod.open_db()
+    try:
+        return conn.execute(
+            "SELECT week_start_date FROM weekly_usage_snapshots "
+            "ORDER BY captured_at_utc LIMIT 1").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_a_rederive_converges_over_a_credit_that_preserved_a_held_row(
+    tmp_path, monkeypatch, capsys
+):
+    """The held row and the suppression list that spared it must both survive a
+    rerun of the raw pipeline.
+
+    The two seeded rows carry the same weekly 63.0 and differ only in
+    `weekly_observation_held`, and the credit's effective instant precedes both, so
+    they enter the stale-replica band together. The non-held one is removed through
+    the journalled suppression list; the held one is preserved, because it is the
+    only carrier of its tick's five-hour reading.
+
+    A rederive then reruns the pipeline and must reproduce exactly that: it must
+    not resurrect the suppressed row — which is the failure the suppression list
+    exists to prevent, since the poisoned row is itself a retained
+    `snapshot_accept` — and it must not drop the preserved held row either."""
+    mod = _isolated(tmp_path, monkeypatch)
+    _r5_drive_held_sequence_unattributed(mod)
+    week = _r5_week_start_date(mod)
+
+    seeded = _held_logical_state(mod)
+    assert [row[1] for row in seeded["snapshots"]] == [0, 1], seeded["snapshots"]
+
+    assert mod.cmd_record_credit(_r5_credit_args(week=week)) == 0
+    # Drain `record-credit`'s own line so the rederive preview is the only thing
+    # on stdout when it is parsed.
+    capsys.readouterr()
+
+    before = _held_logical_state(mod)
+    held = [row for row in before["snapshots"] if row[1] == 1]
+    assert len(held) == 1, (
+        "the credit removed the held row the preservation rule keeps")
+    assert held[0][2] == 25.0, (
+        "the held row survived but lost the five-hour reading it exists to hold")
+    assert not [row for row in before["snapshots"]
+                if row[1] == 0 and row[0] == 63.0], (
+        "non-vacuity: the NON-held stale replica must have been removed, or "
+        "there is no suppression list for the rederive to honour")
+
+    assert mod.cmd_db_rederive(_args()) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["status"] == "no-op", preview
+    counts = preview["actionCounts"]
+    assert (counts["add"], counts["supersede"], counts["tombstone"]) == (
+        0, 0, 0), preview
+    assert counts["retain"] > 0, preview
+    assert _held_logical_state(mod) == before

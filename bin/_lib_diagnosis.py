@@ -117,6 +117,15 @@ GAP_UNKNOWN_CONTEXT_WINDOW: str = "unknown_context_window"
 GAP_SCAN_BUDGET_EXHAUSTED: str = "scan_budget_exhausted"
 GAP_UNRESOLVED_SUBAGENT_ATTRIBUTION: str = "unresolved_subagent_attribution"
 GAP_AMBIGUOUS_ORIGIN_CATEGORY: str = "ambiguous_origin_category"
+# #834 S2 (#800). A conversation the accounting rows name for which the
+# transcript store retains no candidate row at all. The predicate needs a human
+# turn count and there is no evidence to count, so the conversation is NOT
+# decided — it leaves the evaluated population and lowers
+# `evaluabilityCoverage` instead of being reported as a non-contributor with
+# zero turns. Its own code, because none of the four above describes it: the
+# context window is known, the budget was not exhausted, the origin is
+# readable, and nothing about a subagent is unresolved.
+GAP_NO_RETAINED_TRANSCRIPT: str = "no_retained_transcript"
 
 # The closed set, so a test can enumerate it and a published code that no
 # constant defines fails rather than shipping.
@@ -125,6 +134,7 @@ GAP_CODES: frozenset[str] = frozenset({
     GAP_SCAN_BUDGET_EXHAUSTED,
     GAP_UNRESOLVED_SUBAGENT_ATTRIBUTION,
     GAP_AMBIGUOUS_ORIGIN_CATEGORY,
+    GAP_NO_RETAINED_TRANSCRIPT,
 })
 
 # Qualifications an S3 evidence field can carry.

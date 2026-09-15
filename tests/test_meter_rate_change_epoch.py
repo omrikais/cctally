@@ -79,7 +79,7 @@ def test_c1_the_epoch_is_bumped_and_the_legacy_registry_is_untouched():
     """The registry is FROZEN. A `@stats_migration` handler for this table
     would never run on an upgraded install, because an epoch-current open
     returns before any schema work."""
-    assert _cctally_core.STATS_INDEX_EPOCH == 1013
+    assert _cctally_core.STATS_INDEX_EPOCH == 1015
     assert _cctally_core.LEGACY_STATS_HEAD == 13
     import _cctally_db
     assert len(_cctally_db._STATS_MIGRATIONS) == 13, "the registry is FROZEN"
@@ -302,7 +302,7 @@ def test_690_an_1011_shaped_store_gains_the_disclosure_columns_on_rebuild(ns):
         conn.close()
 
     assert epoch == _cctally_core.STATS_INDEX_EPOCH
-    assert epoch == 1013
+    assert epoch == 1015
     assert epoch != PREVIOUS_EPOCH_1011, (
         "the epoch was not bumped, so nothing forced the rebuild")
     assert set(DISCLOSURE_COLUMNS) <= cols, (

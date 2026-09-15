@@ -68,7 +68,11 @@ describe('OPEN_SHARE source capture (§7)', () => {
     act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' }));
     act(() => dispatch({ type: 'OPEN_SOURCE_DETAIL', source: 'codex', resource: 'session', key: 'v1.native' }));
     act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' }));
-    expect(getState().openSourceDetail).toEqual({ source: 'codex', resource: 'session', key: 'v1.native' });
+    expect(getState().openSourceDetail).toEqual({
+      source: 'codex', resource: 'session', key: 'v1.native',
+      // #769 S9: sessions carry no row account (Decision R4).
+      accountKey: null,
+    });
   });
 
   it('shareReducer defaults source to claude for a bare dispatch', () => {

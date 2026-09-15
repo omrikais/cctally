@@ -16,7 +16,7 @@
 #   1. hooks-lint — `npm run lint`, so react-hooks/rules-of-hooks covers both
 #      the application and Playwright sources in the authoritative local bundle
 #      rather than only the separate CI build job.
-#   1b. typecheck — `npm run typecheck`. CI runs `npm run build`, which is
+#   1b. frontend-check — `npm run typecheck`. CI runs `npm run build`, which is
 #      `npm run lint && npm run typecheck && vite build`, so before this leg the
 #      local
 #      and remote gate was strictly WEAKER than CI: a type error failed CI while
@@ -30,7 +30,7 @@
 #   2. frontend-estate — `npx vitest run` with NO file arguments, so coverage is
 #      defined by the vitest configuration's own globs rather than by a curated
 #      list that drifts.
-#   3. codex-reader-wire — regenerates the committed Codex reader WIRE fixtures
+#   3. codex-reader-envelope — regenerates the committed Codex reader WIRE fixtures
 #      into a scratch directory via bin/build-codex-reader-fixtures.py and
 #      byte-compares them against the committed files. Without this leg the
 #      harness adapted the committed fixture and never regenerated it, so a
@@ -81,8 +81,8 @@ pass_count=0
 fail_count=0
 
 if [[ ! -x "$WEB_DIR/node_modules/.bin/vitest" ]]; then
-    echo "FAIL frontend-estate: vitest is not installed at dashboard/web/node_modules/.bin/vitest."
-    echo "  Run 'npm ci' in dashboard/web/ and try again."
+    echo "FAIL frontend-estate: executable not installed"
+    echo "  No vitest at dashboard/web/node_modules/.bin/vitest. Run 'npm ci' in dashboard/web/ and try again."
     echo "  This harness fails rather than skipping on purpose — see the header."
     echo "----"
     echo "passed: 0   failed: 1"
@@ -90,8 +90,8 @@ if [[ ! -x "$WEB_DIR/node_modules/.bin/vitest" ]]; then
 fi
 
 if [[ ! -x "$WEB_DIR/node_modules/.bin/eslint" ]]; then
-    echo "FAIL hooks-lint: eslint is not installed at dashboard/web/node_modules/.bin/eslint."
-    echo "  Run 'npm ci' in dashboard/web/ and try again."
+    echo "FAIL hooks-lint: executable not installed"
+    echo "  No eslint at dashboard/web/node_modules/.bin/eslint. Run 'npm ci' in dashboard/web/ and try again."
     echo "  This harness fails rather than skipping because hooks lint is a required gate."
     echo "----"
     echo "passed: 0   failed: 1"
@@ -99,8 +99,8 @@ if [[ ! -x "$WEB_DIR/node_modules/.bin/eslint" ]]; then
 fi
 
 if [[ ! -x "$WEB_DIR/node_modules/.bin/tsc" ]]; then
-    echo "FAIL typecheck: tsc is not installed at dashboard/web/node_modules/.bin/tsc."
-    echo "  Run 'npm ci' in dashboard/web/ and try again."
+    echo "FAIL frontend-check: executable not installed"
+    echo "  No tsc at dashboard/web/node_modules/.bin/tsc. Run 'npm ci' in dashboard/web/ and try again."
     echo "  This harness fails rather than skipping because CI's npm run build typechecks."
     echo "----"
     echo "passed: 0   failed: 1"
@@ -124,11 +124,11 @@ fi
 typecheck_log="$GOLDEN_DIFF_TMPDIR/typecheck.log"
 if (cd "$WEB_DIR" && npm run typecheck) >"$typecheck_log" 2>&1; then
     pass_count=$((pass_count + 1))
-    echo "ok typecheck"
+    echo "ok frontend-check"
 else
     fail_count=$((fail_count + 1))
-    echo "FAIL typecheck: npm run typecheck reported type errors"
-    echo "  CI runs the same compiler through 'npm run build' — fix these or CI fails."
+    echo "FAIL frontend-check: npm run failed"
+    echo "  'npm run typecheck' reported type errors. CI runs the same compiler through 'npm run build' — fix these or CI fails."
     tail -80 "$typecheck_log"
 fi
 
@@ -146,7 +146,7 @@ if (cd "$WEB_DIR" && npx vitest run \
     echo "ok frontend-estate"
 else
     fail_count=$((fail_count + 1))
-    echo "FAIL frontend-estate: vitest run failed"
+    echo "FAIL frontend-estate: test run failed"
     tail -80 "$estate_log"
 fi
 
@@ -167,19 +167,19 @@ if python3 "$REPO_ROOT/bin/build-codex-reader-fixtures.py" --out-dir "$wire_dir"
                      wire-outline-segmented-turn.json \
                      wire-outline-tool-legibility.json; do
         produced="$wire_dir/$wire_name"
-        committed="$REPO_ROOT/tests/fixtures/codex-reader/$wire_name"
+        wire_rel="tests/fixtures/codex-reader/$wire_name"
+        committed="$REPO_ROOT/$wire_rel"
         if [[ ! -f "$produced" ]]; then
             fail_count=$((fail_count + 1))
-            echo "FAIL codex-reader-wire: the builder wrote no $wire_name"
+            echo "FAIL codex-reader-envelope: builder output missing at $produced"
             tail -60 "$wire_log"
         elif [[ ! -f "$committed" ]]; then
             fail_count=$((fail_count + 1))
-            echo "FAIL codex-reader-wire: no committed fixture at"
-            echo "  tests/fixtures/codex-reader/$wire_name"
+            echo "FAIL codex-reader-envelope: no fixture at $wire_rel"
             echo "  Run: bin/build-codex-reader-fixtures.py"
         elif _golden_diff_files "$wire_name" "$committed" "$produced"; then
             pass_count=$((pass_count + 1))
-            echo "ok codex-reader-wire ($wire_name)"
+            echo "ok codex-reader-envelope at $wire_rel"
         else
             fail_count=$((fail_count + 1))
             echo "  The SERVER wire envelope changed without the committed fixture"
@@ -188,7 +188,7 @@ if python3 "$REPO_ROOT/bin/build-codex-reader-fixtures.py" --out-dir "$wire_dir"
     done
 else
     fail_count=$((fail_count + 1))
-    echo "FAIL codex-reader-wire: bin/build-codex-reader-fixtures.py failed"
+    echo "FAIL codex-reader-envelope: bin/build-codex-reader-fixtures.py failed"
     tail -60 "$wire_log"
 fi
 
@@ -219,13 +219,13 @@ if (cd "$WEB_DIR" && CCTALLY_READER_GOLDEN_OUT_DIR="$adapted_dir" \
         golden_file="$REPO_ROOT/tests/fixtures/codex-reader/${rest#*:}"
         if [[ ! -f "$produced" ]]; then
             fail_count=$((fail_count + 1))
-            echo "FAIL $name: the golden test ran but wrote no output"
+            echo "FAIL $name: golden test output missing"
             echo "  CCTALLY_READER_GOLDEN_OUT_DIR was not honoured — check the test's env plumbing."
             tail -60 "$golden_log"
         elif [[ ! -f "$golden_file" ]]; then
             mkdir -p "$(dirname "$golden_file")"
             cp "$produced" "$golden_file"
-            echo "MISSING GOLDEN $name: wrote initial golden, re-run to verify"
+            echo "MISSING GOLDEN $name: initial golden present, rerun to check"
             fail_count=$((fail_count + 1))
         elif _golden_diff_files "$name" "$golden_file" "$produced"; then
             pass_count=$((pass_count + 1))
@@ -236,7 +236,7 @@ if (cd "$WEB_DIR" && CCTALLY_READER_GOLDEN_OUT_DIR="$adapted_dir" \
     done
 else
     fail_count=$((fail_count + 1))
-    echo "FAIL codex-reader-golden: the golden vitest file did not run"
+    echo "FAIL codex-reader-golden: golden test run failed"
     tail -60 "$golden_log"
 fi
 

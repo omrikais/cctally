@@ -446,8 +446,22 @@ def _seed_five_hour_block(
     final_pct: float,
     total_cost_usd: float,
     account_key: str = "unattributed",
+    is_closed: int = 0,
+    journal_id: "str | None" = None,
+    total_input_tokens: int = 120_000,
+    total_output_tokens: int = 18_000,
+    total_cache_create_tokens: int = 0,
+    total_cache_read_tokens: int = 0,
 ) -> int:
-    """Seed one ``five_hour_blocks`` row and return its id."""
+    """Seed one ``five_hour_blocks`` row and return its id.
+
+    The five trailing keywords default to what every caller before #769 S4
+    passed implicitly, so adding them moves no committed fixture. They exist
+    for the retained-facts population (#795): the dashboard serves a block's
+    stored totals instead of recomputing them only when the row is BOTH
+    closed and journal-stamped, and it publishes the four token totals from
+    this row rather than from the cache.
+    """
     cur = stats_conn.execute(
         """INSERT INTO five_hour_blocks
            (five_hour_window_key, five_hour_resets_at, block_start_at,
@@ -456,8 +470,8 @@ def _seed_five_hour_block(
             seven_day_pct_at_block_end, crossed_seven_day_reset,
             total_input_tokens, total_output_tokens, total_cache_create_tokens,
             total_cache_read_tokens, total_cost_usd, is_closed,
-            created_at_utc, last_updated_at_utc, account_key)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            created_at_utc, last_updated_at_utc, account_key, journal_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             int(window_key),
             _iso(resets_at),
@@ -468,18 +482,61 @@ def _seed_five_hour_block(
             None,
             None,
             0,
-            120_000,
-            18_000,
-            0,
-            0,
+            int(total_input_tokens),
+            int(total_output_tokens),
+            int(total_cache_create_tokens),
+            int(total_cache_read_tokens),
             float(total_cost_usd),
-            0,
+            int(is_closed),
             _iso(block_start),
             _iso(resets_at),
             str(account_key),
+            journal_id,
         ),
     )
     return int(cur.lastrowid)
+
+
+def _seed_five_hour_block_model(
+    stats_conn: sqlite3.Connection,
+    *,
+    block_id: int,
+    window_key: int,
+    model: str,
+    cost_usd: float,
+    entry_count: int,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_create_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    account_key: str = "unattributed",
+) -> None:
+    """Seed one ``five_hour_block_models`` child of a retained block.
+
+    `_retained_facts_from_rows` returns None — and the reader falls back to
+    recomputation — unless the children's `cost_usd` sums to the parent's
+    `total_cost_usd` within 1e-9 and there is at least one child. These rows
+    are therefore what makes a stamped parent load-bearing rather than inert.
+    """
+    stats_conn.execute(
+        """INSERT INTO five_hour_block_models
+           (block_id, five_hour_window_key, model, input_tokens,
+            output_tokens, cache_create_tokens, cache_read_tokens,
+            cost_usd, entry_count, account_key)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (
+            int(block_id),
+            int(window_key),
+            str(model),
+            int(input_tokens),
+            int(output_tokens),
+            int(cache_create_tokens),
+            int(cache_read_tokens),
+            float(cost_usd),
+            int(entry_count),
+            str(account_key),
+        ),
+    )
 
 
 def _seed_five_hour_milestone(
@@ -1376,6 +1433,185 @@ def build_reset_week(as_of: dt.datetime) -> None:
     )
 
 
+def _build_credited_scenario(
+    name: str,
+    as_of: dt.datetime,
+    *,
+    week_start: dt.datetime,
+    week_end: dt.datetime,
+    cuts: "list[dt.datetime]",
+    pct_ladder: "list[tuple[dt.datetime, float]]",
+    display_tz: "str | None" = None,
+) -> None:
+    """One in-place-credited week, as `_apply_reset_events_to_subweeks` sees it.
+
+    #750 S4 §6.2 / #734. Neither fixture builder shipped a production-shaped
+    credited week. `build_reset_week` is NOT one: it writes
+    `old_week_end_at` = 14:00Z against a reset at 13:00Z, so `old != effective`
+    and it is a BOUNDARY SHIFT, which epic invariant 2 says must not split. It
+    stays as that control.
+
+    Here every event row carries `old_week_end_at == effective_reset_at_utc`
+    with `new_week_end_at` holding the week's unchanged end, which is the shape
+    both appliers require. N cuts produce N+1 billing cycles.
+
+    `display_tz` pins the scenario's rendered zone. The two collision paths
+    §3.2a describes derive their base date differently — the Weekly panel's
+    from host-local `display_start_date`, the Trend panel's through the
+    display-timezone chokepoint — so an unqualified "same calendar day"
+    exercises only one of them.
+    """
+    scenario_dir, app_dir = _scenario_dirs(name)
+    stats_path = app_dir / "stats.db"
+    cache_path = app_dir / "cache.db"
+    create_stats_db(stats_path)
+    create_cache_db(cache_path)
+    if display_tz is not None:
+        (app_dir / "config.json").write_text(
+            json.dumps({"display": {"tz": display_tz}}, indent=2) + "\n"
+        )
+
+    stats_conn = sqlite3.connect(stats_path)
+    cache_conn = sqlite3.connect(cache_path)
+    try:
+        next_off = _seed_prior_weeks(
+            stats_conn, cache_conn,
+            current_week_start=week_start,
+            count=3,
+            final_pct=44.0,
+            cost_usd=12.0,
+            model="claude-sonnet-4-6",
+            projects=["/fake/repos/alpha", "/fake/repos/beta"],
+        )
+        # Each cut NAMES the observation it originates from, and that
+        # observation carries the matching `"sa:"` journal id. Without the
+        # pair, `_backfill_week_reset_events` sees the >=25pp drop across the
+        # cut at first `open_db()` and mints a SECOND, capture-anchored event
+        # beside the seeded one — the fixture would then hold more cycles than
+        # it seeds and its cardinality would be an accident. The same pairing
+        # `build_reset_week` uses, for the same reason (#750 S3 §4.3).
+        origin_by_capture: dict = {}
+        for index, cut in enumerate(cuts):
+            following = [c for c, _pct in pct_ladder if c >= cut]
+            if following:
+                origin_by_capture[min(following)] = (
+                    f"o:{name.replace('-', '')[:12]}{index:02d}")
+        for captured_at, pct in pct_ladder:
+            origin = origin_by_capture.get(captured_at)
+            _insert_usage_snapshot(
+                stats_conn,
+                captured_at=captured_at,
+                week_start=week_start, week_end=week_end, pct=pct,
+                journal_id=(f"sa:{origin}" if origin else None),
+            )
+
+        def _iso_canon(d: dt.datetime) -> str:
+            return d.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
+
+        for index, cut in enumerate(cuts):
+            following = [c for c, _pct in pct_ladder if c >= cut]
+            origin = (origin_by_capture.get(min(following))
+                      if following else None)
+            # The in-place shape: `old_week_end_at == effective_reset_at_utc`,
+            # compared RAW by both appliers. `new_week_end_at` is the week's
+            # own end, unchanged — a credit does not move the boundary.
+            seed_week_reset_event(
+                stats_conn,
+                detected_at_utc=_iso_canon(cut),
+                old_week_end_at=_iso_canon(cut),
+                new_week_end_at=_iso_canon(week_end),
+                effective_reset_at_utc=_iso_canon(cut),
+                origin_observation_id=origin,
+            )
+
+        # One session per cycle so every segment has cost of its own and a
+        # segment reading another cycle's figure is visible in the output.
+        bounds = [week_start] + list(cuts) + [week_end]
+        for i in range(len(bounds) - 1):
+            seg_start = bounds[i]
+            sid = f"{name[:8]}-cyc{i}-0000-0000-0000-000000000000"
+            t0 = seg_start + dt.timedelta(minutes=30)
+            next_off = _seed_session(
+                cache_conn,
+                session_id=sid,
+                project_path="/fake/repos/alpha" if i % 2 == 0
+                else "/fake/repos/beta",
+                model="claude-sonnet-4-6",
+                entries=[
+                    (t0, 120_000 + 10_000 * i, 16_000, 0, 0),
+                    (t0 + dt.timedelta(minutes=20), 80_000, 11_000, 0, 0),
+                ],
+                line_offset_start=next_off,
+            )
+
+        _stamp_and_verify(stats_conn)
+        stats_conn.commit()
+        cache_conn.commit()
+    finally:
+        stats_conn.close()
+        cache_conn.close()
+
+    (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+
+
+def build_credited_week(as_of: dt.datetime) -> None:
+    """An ordinary single credit whose two cycles fall on DIFFERENT dates.
+
+    Their labels already differ, so D5 adds no suffix and every unchanged
+    label byte stays where it is. One observation is captured EXACTLY at the
+    cut, which pins §1.2's ownership rule: it belongs to the cycle that
+    STARTS there, so the pre-credit cycle reads 58.0 and the post-credit one
+    reads 6.0 rather than the other way round.
+    """
+    week_start = dt.datetime(2026, 4, 13, 14, 0, 0, tzinfo=dt.timezone.utc)
+    week_end = dt.datetime(2026, 4, 20, 14, 0, 0, tzinfo=dt.timezone.utc)
+    cut = dt.datetime(2026, 4, 16, 9, 0, 0, tzinfo=dt.timezone.utc)
+    _build_credited_scenario(
+        "credited-week", as_of,
+        week_start=week_start, week_end=week_end, cuts=[cut],
+        # Every drop across a cut is DELIBERATELY under the 25pp threshold
+        # `_backfill_week_reset_events` uses. Above it the backfill mints a
+        # second, capture-anchored event beside the seeded one at the harness's
+        # first `open_db()`, and the fixture would then hold more cycles than
+        # it seeds — an accidental cardinality in a byte-compared golden. The
+        # split under test comes from the seeded event, not from the drop size.
+        pct_ladder=[
+            (week_start + dt.timedelta(hours=20), 24.0),
+            (week_start + dt.timedelta(hours=50), 41.0),
+            (cut, 19.0),                                  # exactly at the cut
+            (cut + dt.timedelta(hours=20), 30.0),
+        ],
+        display_tz="Etc/UTC",
+    )
+
+
+def build_credited_week_same_day(as_of: dt.datetime) -> None:
+    """TWO cuts on one calendar day: three cycles whose labels collide.
+
+    This is the case D5 governs and the only one that gains a time suffix.
+    The display timezone is pinned explicitly so both collision paths of
+    §3.2a are exercised rather than only the one the host's zone happens to
+    produce.
+    """
+    week_start = dt.datetime(2026, 4, 13, 14, 0, 0, tzinfo=dt.timezone.utc)
+    week_end = dt.datetime(2026, 4, 20, 14, 0, 0, tzinfo=dt.timezone.utc)
+    cut_a = dt.datetime(2026, 4, 17, 3, 0, 0, tzinfo=dt.timezone.utc)
+    cut_b = dt.datetime(2026, 4, 17, 15, 0, 0, tzinfo=dt.timezone.utc)
+    _build_credited_scenario(
+        "credited-week-same-day", as_of,
+        week_start=week_start, week_end=week_end, cuts=[cut_a, cut_b],
+        # Sub-threshold drops, for the reason `build_credited_week` gives.
+        pct_ladder=[
+            (week_start + dt.timedelta(hours=30), 26.0),
+            (cut_a - dt.timedelta(hours=1), 44.0),
+            (cut_a + dt.timedelta(hours=2), 22.0),
+            (cut_b + dt.timedelta(hours=2), 5.0),
+            (cut_b + dt.timedelta(hours=14), 13.0),
+        ],
+        display_tz="Etc/UTC",
+    )
+
+
 def build_no_data(as_of: dt.datetime) -> None:
     """Empty DBs. All panels serialize as None; sessions.total == 0.
 
@@ -1417,10 +1653,21 @@ def build_tz_override(as_of: dt.datetime) -> None:
       * One ``weekly_usage_snapshots`` row carries
         ``five_hour_resets_at = 2026-04-20T15:00:00Z`` (recorded
         anchor); ``_load_recorded_five_hour_windows`` picks it up.
-      * One ``session_entries`` row at 2026-04-20T12:00:00Z falls
+      * Four ``session_entries`` rows between 10:30Z and 13:45Z fall
         inside the resulting block window so
         ``_handle_get_block_detail`` aggregates a block that the harness
         can fetch by URL.
+
+    It is also the estate's ONE retained-facts population (#769 S4 #795).
+    The block carries `is_closed = 1` and a `journal_id`, plus two
+    `five_hour_block_models` children summing exactly to its
+    `total_cost_usd`, so `_retained_block_facts_many` serves the STORED
+    facts instead of recomputing from the cache. The two populations are
+    deliberately different — a retained $41.50 over seven entries against a
+    cache recomputing to $18.60 over four — so a reader that regresses to
+    recomputation changes the published figure rather than reproducing it.
+    The fixture contract for S7 (#798/#799) is exactly that pair of numbers
+    plus the three conditions the retained path requires.
 
     The harness probes ``GET /api/block/2026-04-20T10:00:00+00:00`` and
     asserts the localized ``label`` uses the override zone (UTC →
@@ -1451,6 +1698,8 @@ def build_tz_override(as_of: dt.datetime) -> None:
     )
     captured_at = as_of  # 2026-04-20T12:00Z, inside the 10:00Z–15:00Z block
     entry_at = dt.datetime(2026, 4, 20, 12, 0, 0, tzinfo=dt.timezone.utc)
+    # The recorded anchor puts the block at [resets - 5h, resets).
+    block_start = five_hour_resets_at - dt.timedelta(hours=5)
 
     stats_conn = sqlite3.connect(stats_path)
     cache_conn = sqlite3.connect(cache_path)
@@ -1473,16 +1722,63 @@ def build_tz_override(as_of: dt.datetime) -> None:
                 _iso(five_hour_resets_at),
             ),
         )
-        # One session_entry inside the block window [10:00Z, 15:00Z)
-        # so `_handle_get_block_detail` aggregates a non-empty block
-        # at exactly start_at=2026-04-20T10:00Z.
-        _seed_session(
+        # Four session_entries inside the block window [10:00Z, 15:00Z) so
+        # `_handle_get_block_detail` aggregates a non-empty block at exactly
+        # start_at=2026-04-20T10:00Z.
+        #
+        # #769 S4 #795: these four are the RECOMPUTATION population, and they
+        # are deliberately not what the retained block below states. Two
+        # models over four samples price to exactly $18.60 (sonnet 6.00 +
+        # 3.00, haiku 4.00 + 5.60), against a retained parent of $41.50 over
+        # seven entries. A reader that regresses to recomputing a closed,
+        # journal-stamped block therefore publishes a different figure and a
+        # different entry count, and the golden moves.
+        _seed_session_multi_model(
             cache_conn,
             session_id="fixture-tz-override-block-0000000000000000",
             project_path="/fake/repos/fixture-tz-override",
-            model="claude-sonnet-4-6",
-            entries=[(entry_at, 100_000, 12_000, 0, 0)],
+            entries=[
+                (block_start + dt.timedelta(minutes=30),
+                 "claude-sonnet-4-6", 1_000_000, 200_000, 0, 0),
+                (block_start + dt.timedelta(hours=1, minutes=15),
+                 "claude-sonnet-4-6", 500_000, 100_000, 0, 0),
+                (entry_at, "claude-haiku-4-5", 2_000_000, 400_000, 0, 0),
+                (block_start + dt.timedelta(hours=3, minutes=45),
+                 "claude-haiku-4-5", 3_000_000, 520_000, 0, 0),
+            ],
         )
+        # The retained facts themselves. `_retained_block_facts_many` serves
+        # them instead of recomputing only when the parent is closed AND
+        # carries a `journal_id` AND its children sum to it within 1e-9, so
+        # all three conditions are seeded here and each is independently
+        # load-bearing: dropping either child, or the stamp, or the closed
+        # flag, returns the reader to the $18.60 recomputation above.
+        retained_block = _seed_five_hour_block(
+            stats_conn,
+            window_key=int(five_hour_resets_at.timestamp()),
+            block_start=block_start,
+            resets_at=five_hour_resets_at,
+            final_pct=22.0,
+            total_cost_usd=41.50,
+            is_closed=1,
+            journal_id="b:five_hour_blocks:1",
+            total_input_tokens=7_000_000,
+            total_output_tokens=900_000,
+            total_cache_create_tokens=250_000,
+            total_cache_read_tokens=4_000_000,
+        )
+        for _model, _cost, _entries in (
+            ("claude-opus-4-1", 27.50, 3),
+            ("claude-sonnet-4-6", 14.00, 4),
+        ):
+            _seed_five_hour_block_model(
+                stats_conn,
+                block_id=retained_block,
+                window_key=int(five_hour_resets_at.timestamp()),
+                model=_model,
+                cost_usd=_cost,
+                entry_count=_entries,
+            )
         _stamp_and_verify(stats_conn)
         stats_conn.commit()
         cache_conn.commit()
@@ -3346,6 +3642,14 @@ SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "reset-week": (
         dt.datetime(2026, 4, 18, 14, 0, 0, tzinfo=dt.timezone.utc),
         build_reset_week,
+    ),
+    "credited-week": (
+        dt.datetime(2026, 4, 18, 14, 0, 0, tzinfo=dt.timezone.utc),
+        build_credited_week,
+    ),
+    "credited-week-same-day": (
+        dt.datetime(2026, 4, 18, 14, 0, 0, tzinfo=dt.timezone.utc),
+        build_credited_week_same_day,
     ),
     "no-data": (
         dt.datetime(2026, 4, 20, 12, 0, 0, tzinfo=dt.timezone.utc),

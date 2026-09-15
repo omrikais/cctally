@@ -113,10 +113,18 @@ def test_empty_input_folds_to_a_zero_total():
 # --- the wrapper's contract is unchanged --------------------------------
 
 
+def _owned_window(ns, key, start, reset):
+    """One competing-window entry in the #751a ownership context."""
+    return ns["_lib_blocks"].OwnedWindow(key=key, start=start, reset=reset)
+
+
 class _FakeJoined:
-    def __init__(self, model, project_path, cost_usd):
+    def __init__(self, model, project_path, cost_usd,
+                 timestamp=dt.datetime(2026, 8, 1, 1, tzinfo=UTC)):
         self.model = model
         self.project_path = project_path
+        # #751a: ownership reads the timestamp off every loaded entry.
+        self.timestamp = timestamp
         self.input_tokens = 1
         self.output_tokens = 2
         self.cache_creation_tokens = 3
@@ -139,6 +147,12 @@ def test_compute_block_totals_still_returns_the_legacy_dict_shape(monkeypatch):
     out = rec._compute_block_totals(
         dt.datetime(2026, 8, 1, tzinfo=UTC),
         dt.datetime(2026, 8, 1, 5, tzinfo=UTC),
+        owner_key=1,
+        windows=[_owned_window(
+            ns, 1,
+            dt.datetime(2026, 8, 1, tzinfo=UTC),
+            dt.datetime(2026, 8, 1, 5, tzinfo=UTC),
+        )],
     )
     assert isinstance(out, dict)
     assert list(out) == [
@@ -168,7 +182,10 @@ def test_compute_block_totals_keeps_its_closed_interval_loader(monkeypatch):
     monkeypatch.setitem(ns, "get_claude_session_entries", _spy)
     start = dt.datetime(2026, 8, 1, tzinfo=UTC)
     end = dt.datetime(2026, 8, 1, 5, tzinfo=UTC)
-    rec._compute_block_totals(start, end, skip_sync=True)
+    rec._compute_block_totals(
+        start, end, skip_sync=True,
+        owner_key=1, windows=[_owned_window(ns, 1, start, end)],
+    )
     assert seen["args"][0] == start
     assert seen["args"][1] == end
     assert seen["args"][2] == {"skip_sync": True}

@@ -76,6 +76,9 @@ def test_doctor_state_has_required_fields():
         # #315: read-only cache.db free-page evidence.
         "cache_db_page_count", "cache_db_freelist_count",
         "conversations_db_page_count", "conversations_db_freelist_count",
+        # #780: the durable transcript reclaim backlog, absent on every store
+        # that has never fallen behind.
+        "conversations_reclaim_pending",
         # #344 Task B: privacy-safe repair-owner classification.
         "cache_repair_marker",
         # #411: file-level backup/sync classification.
@@ -149,6 +152,12 @@ def test_doctor_state_has_required_fields():
         "conversation_rollup_pricing_fp",
         "cache_rollup_pricing_refusal",
         "cache_rollup_pricing_fp",
+        # #728: the four-state observation of each store's fingerprint read.
+        # The fingerprint alone cannot say whether the read happened, so a
+        # store doctor failed to read was indistinguishable from one that
+        # recorded nothing.
+        "conversation_rollup_pricing_observation",
+        "cache_rollup_pricing_observation",
     }
     assert fields == expected, fields ^ expected
 
@@ -1911,6 +1920,13 @@ def test_the_rollup_writer_remediations_match_the_documented_ones():
            / "docs" / "commands" / "doctor.md").read_text()
     assert L.ROLLUP_WRITER_REFUSAL_REMEDIATION in doc
     assert L.ROLLUP_WRITER_UNPARSEABLE_FP_REMEDIATION in doc
+    # #769 S3: the check grew two further states after Tranche 1, each with its
+    # own remedy, and the document described only the two above. Both are
+    # store-parameterised, so the document quotes the `conversations.db` form
+    # and says the `--db` value follows the check's `store` detail.
+    assert L.rollup_writer_degraded_read_remediation("conversations.db") in doc
+    assert L.rollup_writer_refused_degraded_read_remediation(
+        "conversations.db") in doc
 
 
 # --- #705 FIX-2: the guard protects two stores, so the check reads two -------
@@ -2223,3 +2239,249 @@ def test_codex_liveness_and_activity_evaluate_only_enabled_roots():
     assert [row["source_root_key"] for row in activity.details["roots"]] == ["root-b"]
     liveness = L._check_hooks_codex_liveness_7d(state)
     assert [row["source_root_key"] for row in liveness.details["roots"]] == ["root-b"]
+
+
+# --- #728: a read that failed is reported as DEGRADED, never as OK ----------
+# The fingerprint value alone cannot distinguish "this store recorded nothing"
+# from "doctor could not read this store", so a locked cache.db reported "no
+# refused pricing write recorded" and doctor exited OK over a store it had no
+# evidence about.
+
+
+def _observation(state, *, raw=None, error_kind=None):
+    import _lib_pricing
+    return _lib_pricing.PricingFingerprintObservation(
+        state=state, parsed_date=None, raw=raw, error_kind=error_kind)
+
+
+def test_a_degraded_fingerprint_read_warns_rather_than_reporting_ok():
+    for field in ("conversation_rollup_pricing_observation",
+                  "cache_rollup_pricing_observation"):
+        s = dc.replace(_state(), **{
+            field: _observation("degraded", error_kind="operational_error")})
+        r = L._check_pricing_conversation_rollup_writer(s)
+        assert r.severity == "warn", field
+        assert r.remediation == L.rollup_writer_degraded_read_remediation(
+            r.details["store"]), field
+        assert r.details["store"] == (
+            "conversations.db" if field.startswith("conversation")
+            else "cache.db")
+
+
+def test_a_degraded_read_is_reported_distinctly_from_an_unparseable_value():
+    # Two different diagnoses with two different remedies: an unparseable value
+    # needs the row deleted, and a failed read needs whatever is holding the
+    # store released. Reporting either under the other's wording sends the
+    # operator to a step that cannot work.
+    degraded = L._check_pricing_conversation_rollup_writer(
+        dc.replace(_state(),
+                   conversation_rollup_pricing_observation=_observation(
+                       "degraded", error_kind="operational_error")))
+    malformed = L._check_pricing_conversation_rollup_writer(
+        _unparseable_fp_state(
+            conversation_rollup_pricing_observation=_observation(
+                "malformed", raw="v2/2026-09-02")))
+    assert degraded.summary != malformed.summary
+    assert degraded.remediation != malformed.remediation
+    assert malformed.remediation == L.ROLLUP_WRITER_UNPARSEABLE_FP_REMEDIATION
+
+
+def test_an_unparseable_value_outranks_a_degraded_read_in_the_other_store():
+    # An unparseable value is a diagnosed permanent state with a known step out
+    # of it; a failed read is undiagnosed and often transient. Report the one
+    # the operator can act on.
+    s = dc.replace(
+        _state(),
+        conversation_rollup_pricing_observation=_observation(
+            "degraded", error_kind="operational_error"),
+        cache_rollup_pricing_fp="v2/2026-09-02",
+        cache_rollup_pricing_observation=_observation(
+            "malformed", raw="v2/2026-09-02"),
+    )
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.remediation == L.ROLLUP_WRITER_UNPARSEABLE_FP_REMEDIATION
+    assert r.details["store"] == "cache.db"
+
+
+def test_a_degraded_read_outranks_a_recorded_refusal_in_the_other_store():
+    # A recorded refusal has a documented remedy; a store doctor could not read
+    # has no verdict at all, so it must not be hidden behind the other store's.
+    s = dc.replace(
+        _state(),
+        conversation_rollup_pricing_observation=_observation(
+            "degraded", error_kind="operational_error"),
+        cache_rollup_pricing_refusal={
+            "process_snapshot_date": "2026-08-25",
+            "store_snapshot_date": "2026-09-30",
+            "first_refused_at_utc": "2026-09-03T08:00:00Z",
+        },
+    )
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.remediation == L.rollup_writer_degraded_read_remediation(
+        "conversations.db")
+    assert r.details["store"] == "conversations.db"
+
+
+def test_a_degraded_read_can_never_fail_doctor():
+    # Same posture as every other leg of this check: the guard working is not
+    # a FAIL, and a transient lock must not move doctor's exit code.
+    s = dc.replace(_state(),
+                   conversation_rollup_pricing_observation=_observation(
+                       "degraded", error_kind="operational_error"))
+    assert L._check_pricing_conversation_rollup_writer(s).severity != "fail"
+
+
+def test_a_present_or_absent_observation_leaves_the_check_ok():
+    # Guard against over-reporting: the two ordinary states must stay silent,
+    # or every healthy install warns.
+    for state in ("absent", "present"):
+        s = dc.replace(_state(),
+                       conversation_rollup_pricing_observation=_observation(state),
+                       cache_rollup_pricing_observation=_observation(state))
+        assert L._check_pricing_conversation_rollup_writer(s).severity == "ok"
+
+
+# --- #729: doctor warns on ACTIVE episodes only -----------------------------
+
+
+def test_an_inactive_refusal_record_does_not_warn():
+    # A store that diverged and then converged is healthy. Warning on the
+    # surviving tombstone would make every recovered install warn forever,
+    # which is why the record used to be deleted rather than settled.
+    s = dc.replace(_state(), conversation_rollup_pricing_refusal={
+        "process_snapshot_date": "2026-08-25",
+        "store_snapshot_date": "2026-09-30",
+        "first_refused_at_utc": "2026-09-03T08:00:00Z",
+        "active": False,
+    })
+    assert L._check_pricing_conversation_rollup_writer(s).severity == "ok"
+
+
+def test_an_active_refusal_record_still_warns():
+    s = dc.replace(_state(), conversation_rollup_pricing_refusal={
+        "process_snapshot_date": "2026-08-25",
+        "store_snapshot_date": "2026-09-30",
+        "first_refused_at_utc": "2026-09-03T08:00:00Z",
+        "active": True,
+    })
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.severity == "warn"
+    assert r.details["first_refused_at_utc"] == "2026-09-03T08:00:00Z"
+
+
+def test_a_record_written_before_the_active_field_existed_still_warns():
+    # Back-compat: the older record was written only on refusal and DELETED on
+    # convergence, so its presence alone means an active episode. Reading a
+    # missing `active` as False would silently stop reporting every refusal
+    # latched by a version that shipped before this field.
+    s = dc.replace(_state(), conversation_rollup_pricing_refusal={
+        "process_snapshot_date": "2026-08-25",
+        "store_snapshot_date": "2026-09-30",
+        "first_refused_at_utc": "2026-09-03T08:00:00Z",
+    })
+    assert L._check_pricing_conversation_rollup_writer(s).severity == "warn"
+
+
+def test_an_inactive_record_in_one_store_does_not_mask_an_active_one():
+    s = dc.replace(
+        _state(),
+        conversation_rollup_pricing_refusal={
+            "process_snapshot_date": "2026-08-25",
+            "store_snapshot_date": "2026-09-30",
+            "first_refused_at_utc": "2026-09-03T08:00:00Z",
+            "active": False,
+        },
+        cache_rollup_pricing_refusal={
+            "process_snapshot_date": "2026-08-25",
+            "store_snapshot_date": "2026-10-15",
+            "first_refused_at_utc": "2026-09-05T08:00:00Z",
+            "active": True,
+        },
+    )
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.severity == "warn"
+    assert r.details["store"] == "cache.db"
+
+
+# --- #769 S3 A1: a refusal latched during a DEGRADED read ------------------
+# The store date a refusal records is the value the failed read produced, which
+# is None. Doctor's DEGRADED branch fires only while the read is STILL failing,
+# so once the store is readable again the record branch renders that None under
+# the version-skew wording and attaches the version-skew remedy — advice that
+# does nothing for a read that failed.
+
+
+def _degraded_read_record(**extra):
+    record = {
+        "process_snapshot_date": "2026-09-05",
+        "store_snapshot_date": None,
+        "first_refused_at_utc": "2026-09-06T08:00:00Z",
+    }
+    record.update(extra)
+    return record
+
+
+def test_a_refusal_with_no_store_date_is_not_reported_as_version_skew():
+    s = dc.replace(_state(),
+                   conversation_rollup_pricing_refusal=_degraded_read_record())
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.severity == "warn"
+    assert "None" not in r.summary, (
+        "the summary renders the failed read's absent store date verbatim"
+    )
+    assert r.remediation != L.ROLLUP_WRITER_REFUSAL_REMEDIATION, (
+        "restarting or upgrading the writer does not fix a read that failed"
+    )
+
+
+def test_a_refusal_with_no_store_date_carries_the_degraded_read_remedy():
+    s = dc.replace(_state(),
+                   conversation_rollup_pricing_refusal=_degraded_read_record())
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.remediation == L.rollup_writer_refused_degraded_read_remediation(
+        "conversations.db")
+    assert r.details["store"] == "conversations.db"
+    assert r.details["store_snapshot_date"] is None
+    assert r.details["first_refused_at_utc"] == "2026-09-06T08:00:00Z"
+
+
+def test_a_refusal_naming_a_store_date_keeps_the_version_skew_remedy():
+    # The negative direction: the ordinary refusal must not be re-routed.
+    s = dc.replace(_state(), conversation_rollup_pricing_refusal={
+        "process_snapshot_date": "2026-08-25",
+        "store_snapshot_date": "2026-09-30",
+        "first_refused_at_utc": "2026-09-03T08:00:00Z",
+    })
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.remediation == L.ROLLUP_WRITER_REFUSAL_REMEDIATION
+    assert "2026-09-30" in r.summary
+
+
+def test_an_inactive_degraded_read_record_still_does_not_warn():
+    s = dc.replace(_state(),
+                   conversation_rollup_pricing_refusal=_degraded_read_record(
+                       active=False))
+    assert L._check_pricing_conversation_rollup_writer(s).severity == "ok"
+
+
+# --- #769 S3 A7: the remedy names the database it is talking about ---------
+
+
+@pytest.mark.parametrize("field,store,db_flag", [
+    ("conversation_rollup_pricing_observation", "conversations.db",
+     "--db conversations"),
+    ("cache_rollup_pricing_observation", "cache.db", "--db cache"),
+])
+def test_the_degraded_read_remedy_names_the_affected_database(
+        field, store, db_flag):
+    """`db checkpoint` takes a `--db` value, and the check already knows which
+    store it is reporting. Naming the other one sends the operator to drain a
+    WAL that is not the one holding the read."""
+    s = dc.replace(_state(), **{
+        field: _observation("degraded", error_kind="operational_error")})
+    r = L._check_pricing_conversation_rollup_writer(s)
+    assert r.details["store"] == store
+    assert db_flag in r.remediation
+    other = "--db cache" if db_flag == "--db conversations" else (
+        "--db conversations")
+    assert other not in r.remediation

@@ -141,7 +141,8 @@ function buildSparklinePrimitives(
       out.push({
         el: 'text',
         attrs: { class: 'mtr-medlabel', x: PAD.left + 2, y: yDpp(med) - 3 },
-        text: `${N}-${vocabulary.unit === 'week' ? 'wk' : 'cycle'} median $` + med.toFixed(2),
+        // #750 S4 §4.1: one vocabulary, so there is no week branch left.
+        text: `${N}-${vocabulary.unit} median $` + med.toFixed(2),
         key: 'med-label',
       });
     }
@@ -647,7 +648,11 @@ export function TrendModal() {
   const codexN = presentation.sections.find((section) => section.source === 'codex')?.historyRows.length ?? 0;
   return (
     <Modal
-      title={`Trend · Claude ${claudeN} weeks · Codex ${codexN} cycles`}
+      // #750 S4 §4.1: the SECOND composed-header site. The first was routed
+      // through the vocabulary and this one was missed, so All mode rendered
+      // "Claude 1 weeks · Codex 1 cycles" beside its own section labels reading
+      // "1 cycle". `trendUnitCount` also fixes the plural at n=1.
+      title={`Trend · Claude ${trendUnitCount(claudeN, trendVocabulary('claude'))} · Codex ${trendUnitCount(codexN, trendVocabulary('codex'))}`}
       accentClass="accent-amber"
       headerExtras={headerExtras}
       wide
@@ -668,7 +673,10 @@ export function TrendModal() {
               </h3>
               <span className={`source-chip source-chip--${section.source}`}>{section.label}</span>
               <span className="provider-summary-label">
-                {section.historyRows.length} {section.source === 'claude' ? 'weeks' : 'cycles'}
+                {/* Routed through the vocabulary rather than branching on the
+                    provider, exactly as the panel's sibling head does
+                    (#750 S4 §4.1). */}
+                {trendUnitCount(section.historyRows.length, trendVocabulary(section.source))}
               </span>
             </div>
             <CanonicalTrendModal source={section.source} embedded />

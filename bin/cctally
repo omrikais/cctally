@@ -283,6 +283,11 @@ make_week_ref = _cctally_core.make_week_ref
 _get_latest_row_for_week = _cctally_core._get_latest_row_for_week
 _latest_reset_event_for_end = _cctally_core._latest_reset_event_for_end
 _ordered_in_place_cuts = _cctally_core._ordered_in_place_cuts
+in_place_cut_instants = _cctally_core.in_place_cut_instants
+credited_segment_cuts = _cctally_core.credited_segment_cuts
+canonical_capture_bound = _cctally_core.canonical_capture_bound
+segment_capture_bounds = _cctally_core.segment_capture_bounds
+latest_usage_by_segment = _cctally_core.latest_usage_by_segment
 _reset_aware_floor = _cctally_core._reset_aware_floor
 _floored_week_max = _cctally_core._floored_week_max
 get_latest_usage_for_week = _cctally_core.get_latest_usage_for_week
@@ -631,6 +636,11 @@ _build_activity_block = _lib_blocks._build_activity_block
 _blocks_to_json = _lib_blocks._blocks_to_json
 _max_completed_block_tokens = _lib_blocks._max_completed_block_tokens
 _parse_blocks_token_limit = _lib_blocks._parse_blocks_token_limit
+# #751a: the one five-hour ownership rule, re-exported for the consumers
+# that resolve ownership outside the grouping pass.
+OwnedWindow = _lib_blocks.OwnedWindow
+resolve_owning_window = _lib_blocks.resolve_owning_window
+partition_entries_by_owner = _lib_blocks.partition_entries_by_owner
 
 _lib_statusline = _load_sibling("_lib_statusline")
 STATUSLINE_BURN_RATE_BANDS = _lib_statusline.STATUSLINE_BURN_RATE_BANDS
@@ -688,6 +698,7 @@ MonthlyView = _lib_view_models.MonthlyView
 build_monthly_view = _lib_view_models.build_monthly_view
 WeeklyView = _lib_view_models.WeeklyView
 build_weekly_view = _lib_view_models.build_weekly_view
+apply_label_collision_suffixes = _lib_view_models.apply_label_collision_suffixes
 TrendView = _lib_view_models.TrendView
 build_trend_view = _lib_view_models.build_trend_view
 SessionsView = _lib_view_models.SessionsView
@@ -1153,6 +1164,15 @@ get_entries = _cctally_cache.get_entries
 AccountAttributionUnavailable = _cctally_cache.AccountAttributionUnavailable
 open_cache_db = _cctally_cache.open_cache_db
 open_conversations_db = _cctally_cache.open_conversations_db
+open_conversations_db_readonly = _cctally_cache.open_conversations_db_readonly
+probe_conversations_maintenance_free = (
+    _cctally_cache.probe_conversations_maintenance_free
+)
+ConversationReaderUnavailable = _cctally_cache.ConversationReaderUnavailable
+MaintenanceInProgress = _cctally_cache.MaintenanceInProgress
+SchemaBehind = _cctally_cache.SchemaBehind
+SchemaAhead = _cctally_cache.SchemaAhead
+LegacyBridgePending = _cctally_cache.LegacyBridgePending
 scope_conversations_db_to_account = (
     _cctally_cache.scope_conversations_db_to_account
 )
@@ -1209,6 +1229,25 @@ _resolve_active_five_hour_reset_event_id = _cctally_record._resolve_active_five_
 _apply_credit = _cctally_record._apply_credit
 _fire_in_place_credit = _cctally_record._fire_in_place_credit
 detect_reset_and_credit = _cctally_record.detect_reset_and_credit
+# #834 S1 (#835): the one semantic doomed-row classifier and the one stale-replica
+# removal, re-exported so both credit paths reach BOTH through this namespace (test
+# monkeypatching) and so tests can assert the classifier's two projections
+# directly. Gate A R7 item 2 made the first half of that sentence true:
+# `_fire_in_place_credit` called the module-local symbol, so patching this name
+# intercepted only the manual path.
+_doomed_snapshot_rows = _cctally_record._doomed_snapshot_rows
+_delete_doomed_snapshot_rows = _cctally_record._delete_doomed_snapshot_rows
+# #834 S1 (#835) Gate A R4: the band is a connection-taking builder now,
+# because the held predicate is omitted on a store predating the column.
+_stale_replica_band_sql = _cctally_record._stale_replica_band_sql
+# #834 S1 (#835): the read-side twin of the band above — which weekly
+# values a week's credits retired, and the predicate that recognizes one.
+# `_latest_seven_day_and_window` reaches both through this namespace.
+_credit_retirement_bands = _cctally_record._credit_retirement_bands
+_latest_credit_floor_instant = _cctally_record._latest_credit_floor_instant
+_weekly_value_is_retired_replica = (
+    _cctally_record._weekly_value_is_retired_replica)
+_stale_replay_candidates = _cctally_record._stale_replay_candidates
 _count_stale_replays = _cctally_record._count_stale_replays
 _credit_preview_text = _cctally_record._credit_preview_text
 _credit_json = _cctally_record._credit_json
@@ -1245,6 +1284,7 @@ _coerce_payload_captured_at = _cctally_record._coerce_payload_captured_at
 _derive_week_from_payload = _cctally_record._derive_week_from_payload
 insert_usage_snapshot = _cctally_record.insert_usage_snapshot
 _saved_dict_from_usage_row = _cctally_record._saved_dict_from_usage_row
+_five_hour_saved_from_fold = _cctally_record._five_hour_saved_from_fold
 
 # #372 Task B: side-effect-free Claude usage rederive planner. Loaded after the
 # record sibling so its scratch adapter can reuse the registered ingest hooks.
@@ -1530,10 +1570,21 @@ _select_non_overlapping_recorded_windows = _cctally_five_hour._select_non_overla
 _load_recorded_five_hour_windows = _cctally_five_hour._load_recorded_five_hour_windows
 cmd_blocks = _cctally_five_hour.cmd_blocks
 _maybe_swap_active_block_to_canonical = _cctally_five_hour._maybe_swap_active_block_to_canonical
+_ownership_windows_from_recorded = _cctally_five_hour._ownership_windows_from_recorded
 _format_block_start = _cctally_five_hour._format_block_start
 _format_hhmm_in_tz = _cctally_five_hour._format_hhmm_in_tz
 _block_is_active = _cctally_five_hour._block_is_active
 _latest_seven_day_and_window = _cctally_five_hour._latest_seven_day_and_window
+# #834 S1 (#835) Gate A S1: the ONE read-time filter for a block's two
+# weekly axes. Both five-hour commands reach it through this namespace.
+_parsed_block_instant = _cctally_five_hour._parsed_block_instant
+_block_weekly_start_instant = _cctally_five_hour._block_weekly_start_instant
+_block_weekly_end_instant = _cctally_five_hour._block_weekly_end_instant
+_credit_aware_block_weekly_axes = (
+    _cctally_five_hour._credit_aware_block_weekly_axes)
+# #834 S1 (#836): the ONE five-hour milestone read, shared by the CLI
+# breakdown and both dashboard routes.
+_load_five_hour_milestones = _cctally_five_hour._load_five_hour_milestones
 _parse_date_filter = _cctally_five_hour._parse_date_filter
 _load_breakdown = _cctally_five_hour._load_breakdown
 cmd_five_hour_blocks = _cctally_five_hour.cmd_five_hour_blocks
@@ -2486,10 +2537,19 @@ def _select_last_known_snapshot() -> dict | None:
     try:
         conn = open_db()
         try:
+            # `weekly_observation_held = 0` (#769 S11, #824). The payload this
+            # builds is ONE observation with ONE capture instant, and
+            # `_cmd_refresh_usage_handle_rate_limit` turns that instant into the
+            # freshness label it shows beside the seven-day percentage. A held
+            # row carries an older row's weekly value, so serving one would
+            # stamp a stale percentage as freshly captured. Taking the whole
+            # payload from the latest genuinely observed row keeps the label and
+            # every value it qualifies describing the same observation.
             row = conn.execute(
                 "SELECT captured_at_utc, weekly_percent, week_end_at, "
                 "       five_hour_percent, five_hour_resets_at "
                 "FROM weekly_usage_snapshots "
+                "WHERE weekly_observation_held = 0 "
                 "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
             ).fetchone()
         finally:
@@ -3308,8 +3368,17 @@ def _newest_snapshot_age_seconds(now_utc: dt.datetime | None = None) -> float | 
     try:
         conn = open_db()
         try:
+            # `weekly_observation_held = 0` (#769 S11, #824). This age gates the
+            # hook's OAuth fetch, and the question it answers is how recently a
+            # WEEKLY reading was ingested — a held row's weekly value is a copy
+            # of an older one's. Excluding held rows also keeps the fetch
+            # cadence exactly where it was before #824, when a weekly-clamped
+            # tick wrote no row at all; doctor's `data.latest_snapshot_age` is
+            # the deliberate counterpart, because it asks whether the WRITE PATH
+            # is alive rather than what the weekly meter last said.
             row = conn.execute(
                 "SELECT captured_at_utc FROM weekly_usage_snapshots "
+                "WHERE weekly_observation_held = 0 "
                 "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
             ).fetchone()
         finally:

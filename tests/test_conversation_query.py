@@ -5015,6 +5015,118 @@ def test_facets_models_fold_then_count(seeded_conn):
     assert "projects" in fac
 
 
+# --- #717: facets say when the project list is degraded --------------------
+
+
+def test_authoritative_facets_carry_no_degradation_key(seeded_conn):
+    """Byte stability on the ordinary path. The flag is OPTIONAL and omitted
+    when the rollup is authoritative, so every existing consumer sees exactly
+    the envelope it saw before."""
+    fac = cq.list_conversation_facets(seeded_conn)
+    assert set(fac) == {"projects", "models"}
+    assert fac["projects"], "the fixture must have projects to lose"
+
+
+def test_a_pending_rollup_reports_degraded_facets_with_live_models(
+        live_pending_conn):
+    """The rollup is what `projects` is read from, so while it is being
+    rebuilt the project list is empty for a reason the client cannot infer
+    from an empty array. `models` does NOT read the rollup — it folds
+    `conversation_messages` directly — so its counts stay live and correct."""
+    fac = cq.list_conversation_facets(live_pending_conn)
+    assert fac["filter_degraded"] is True
+    assert fac["projects"] == []
+    counts = {m["family"]: m["count"] for m in fac["models"]}
+    assert counts["opus"] == 3, (
+        "model counts do not come from the rollup and must survive")
+
+
+def test_the_flag_is_not_keyed_on_the_pricing_refusal_latch(seeded_conn):
+    """A rebuild pre-clear refusal coexists with an intact authoritative
+    rollup and arms no backfill flag, so it must not degrade the facets."""
+    seeded_conn.execute(
+        "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+        (cc.CONVERSATION_ROLLUP_PRICING_REFUSED_KEY,
+         '{"process_snapshot_date": "2026-01-01", '
+         '"store_snapshot_date": "2026-09-09", '
+         '"first_refused_at_utc": "2026-09-01T00:00:00Z", "active": true}'))
+    fac = cq.list_conversation_facets(seeded_conn)
+    assert "filter_degraded" not in fac
+    assert fac["projects"]
+
+
+def test_a_store_whose_authority_cannot_be_read_reports_degraded(seeded_conn):
+    """`_rollup_authoritative` fails closed on a read it could not perform, and
+    the facets must follow it rather than serving an unexplained empty list.
+
+    The condition is produced in the STORE, not by patching the function.
+    Patching `_rollup_authoritative` to return False certified the branch that
+    reads the flag's answer and said nothing about the fail-closed read that
+    produces it, which is the half #728's read side actually added. Here
+    `cache_meta` is present — so the structural carve-out does not apply — and
+    the flag SELECT cannot run against it, which is the shape a foreign or
+    partially-migrated store has.
+    """
+    seeded_conn.execute(
+        "ALTER TABLE cache_meta RENAME COLUMN key TO legacy_key")
+    assert cq._cache_meta_table_present(seeded_conn) is True, (
+        "the carve-out for a store with nowhere to record state must not be "
+        "what answers here")
+    with pytest.raises(sqlite3.OperationalError):
+        seeded_conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='conversation_sessions_backfill_pending'")
+    assert cq._rollup_authoritative(seeded_conn) is False
+    fac = cq.list_conversation_facets(seeded_conn)
+    assert fac["filter_degraded"] is True and fac["projects"] == []
+
+
+def test_the_authority_read_fails_closed_on_a_locked_store(tmp_path):
+    """The other unreadable store, and the one the source names first.
+
+    A real file store, a real second connection holding an exclusive lock, and
+    a reader with no busy timeout: the flag SELECT raises `database is locked`
+    for real, and the answer must be "not authoritative" rather than the
+    `except: return True` this replaced, which served a rollup nothing had
+    verified.
+    """
+    path = tmp_path / "conversations.db"
+    writer = sqlite3.connect(str(path))
+    db._apply_cache_schema(writer)
+    # Rollback-journal mode: in WAL a reader is never blocked by a writer, so
+    # the condition under test would not arise.
+    writer.execute("PRAGMA journal_mode=DELETE")
+    writer.commit()
+    writer.close()
+
+    reader = sqlite3.connect(str(path), timeout=0)
+    holder = sqlite3.connect(str(path), timeout=0)
+    holder.isolation_level = None
+    try:
+        assert cq._rollup_authoritative(reader) is True, (
+            "a readable store with no pending flag is authoritative")
+        # BEGIN EXCLUSIVE, not BEGIN IMMEDIATE: IMMEDIATE takes a RESERVED lock,
+        # under which a rollback-journal reader still reads.
+        holder.execute("BEGIN EXCLUSIVE")
+        holder.execute(
+            "INSERT OR REPLACE INTO cache_meta(key,value) VALUES('probe','1')")
+        with pytest.raises(sqlite3.OperationalError):
+            reader.execute(
+                "SELECT 1 FROM cache_meta "
+                "WHERE key='conversation_sessions_backfill_pending'")
+        assert cq._rollup_authoritative(reader) is False, (
+            "a read that did not happen must report the rollup as "
+            "non-authoritative, which costs live aggregation rather than a "
+            "wrong answer")
+    finally:
+        try:
+            holder.rollback()
+        except sqlite3.Error:
+            pass
+        holder.close()
+        reader.close()
+
+
 # ---- #281 S4: anon-plan identity source + existence probe -------------------
 
 def _sf(c, *, path, session_id=None, project_path=None):

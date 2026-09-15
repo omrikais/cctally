@@ -110,6 +110,8 @@ def retained_size_bytes(
     *,
     stop_after: int | None = None,
     cancelled: Callable[[], bool] | None = None,
+    borrowed: Callable[[object], bool] | None = None,
+    opaque: Callable[[object], bool] | None = None,
     _object_id: Callable[[object], int] = id,
 ) -> int:
     """Return owned reachable bytes, or ``stop_after + 1`` once over budget.
@@ -120,6 +122,25 @@ def retained_size_bytes(
     charged for their object shell and, when present, ``__dict__``/``__slots__``.
     Modules, functions and classes therefore do not cause an unbounded walk of
     interpreter-global state.
+
+    ``borrowed`` is the ownership-graph seam (#769 S6 T2a, #716 Task B). It
+    answers, for one referent, "does some OTHER declared owner carry this
+    payload's charge?".  A borrowed referent is charged nothing AND is not
+    descended into, so a cache that merely repeats a payload another cache
+    retains pays for its own containers and references and for nothing else.
+    That is what makes a sum of per-owner charges comparable with one walk of
+    the whole retained graph instead of double counting every repeat.  The
+    predicate is never applied to ``value`` itself: a caller asking for the
+    size of an object it declares borrowed is asking a contradictory question,
+    and answering zero would silently drop the owner's own charge.
+
+    ``opaque`` is the same seam for a CONTAINER of borrowed payloads.  The
+    container's own shell is the owner's charge — a tuple of 200,000 borrowed
+    rows costs eight bytes a slot and somebody has to pay for them — but
+    descending into it to ask ``borrowed`` about each slot would make the
+    charge proportional to a population the owner does not own.  An opaque
+    referent is therefore charged its ``sys.getsizeof`` and not descended into.
+    Like ``borrowed`` it is never applied to ``value`` itself.
     """
     if stop_after is not None and stop_after < 0:
         raise ValueError("stop_after must be non-negative or None")
@@ -146,12 +167,16 @@ def retained_size_bytes(
             )
         )
 
-    def walk(obj) -> bool:
+    def walk(obj, root: bool = False) -> bool:
         object_id = _object_id(obj)
         if object_id in seen:
             return False
+        if not root and borrowed is not None and borrowed(obj):
+            return False
         if add(obj, object_id):
             return True
+        if not root and opaque is not None and opaque(obj):
+            return False
         if isinstance(obj, _ATOMIC):
             return False
         if isinstance(obj, (types.ModuleType, type)) or callable(obj):
@@ -183,5 +208,5 @@ def retained_size_bytes(
                 return True
         return False
 
-    exceeded = walk(value)
+    exceeded = walk(value, root=True)
     return sentinel if exceeded and sentinel is not None else total

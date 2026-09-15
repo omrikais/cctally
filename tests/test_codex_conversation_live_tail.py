@@ -405,6 +405,121 @@ def test_targeted_parity_with_full_sync_for_that_file(tmp_path, monkeypatch):
     assert targeted == full
 
 
+# ── #779 (Codex twin): reject the incompatible pair before any side effect ──
+# `sync_codex_conversations` carried the identical defect its Claude twin had:
+# it wrote `conversation_rebuild_codex_pending`, committed, called
+# `_clear_codex_conversation_store(conn)`, committed again, and only THEN raised
+# the `only_paths`+`rebuild` ValueError — destroying the entire Codex
+# conversation store durably before refusing.
+
+_CODEX_FINGERPRINT_TABLES = (
+    "codex_conversation_events",
+    "codex_conversation_messages",
+    "codex_conversation_source_files",
+)
+
+
+def _codex_store_fingerprint(conn):
+    """Every row of every table the rejected call could reach, plus cache_meta.
+
+    Row-for-row and marker-for-marker, not "one event row survived": the
+    destructive path cleared the whole store and committed a pending marker,
+    and both are invisible to a single-row assertion.
+    """
+    fingerprint = {}
+    for table in _CODEX_FINGERPRINT_TABLES:
+        fingerprint[table] = sorted(
+            (tuple(row) for row in conn.execute(f"SELECT * FROM {table}")),
+            key=repr,
+        )
+    fingerprint["cache_meta"] = sorted(
+        (tuple(row) for row in conn.execute("SELECT key, value FROM cache_meta")),
+        key=repr,
+    )
+    return fingerprint
+
+
+def _codex_lock_mtime(core):
+    try:
+        return core.CONVERSATIONS_LOCK_CODEX_PATH.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def test_codex_rebuild_with_only_paths_mutates_nothing(tmp_path, monkeypatch):
+    ns, root = _setup(tmp_path, monkeypatch)
+    a = _place(root, "a", "modern-full")
+    core = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](core, rebuild=True)
+    finally:
+        core.close()
+    import _cctally_core
+    import _cctally_cache as cache
+    conn = ns["open_conversations_db"]()
+    try:
+        ns["sync_codex_conversations"](conn, rebuild=True)
+        before = _codex_store_fingerprint(conn)
+        assert before["codex_conversation_events"], (
+            "the guard needs real rows to protect"
+        )
+        _cctally_core.CONVERSATIONS_LOCK_CODEX_PATH.unlink(missing_ok=True)
+        lock_mtime = _codex_lock_mtime(_cctally_core)
+        calls = []
+        monkeypatch.setattr(
+            cache, "_report_conversation_progress",
+            lambda *a, **k: calls.append(a),
+        )
+        with pytest.raises(
+            ValueError, match="only_paths is incompatible with rebuild"
+        ):
+            ns["sync_codex_conversations"](
+                conn, rebuild=True, only_paths={str(a)})
+        assert _codex_store_fingerprint(conn) == before
+        assert _codex_lock_mtime(_cctally_core) == lock_mtime
+        assert calls == []
+    finally:
+        conn.close()
+
+
+def test_codex_rejection_survives_a_reopen(tmp_path, monkeypatch):
+    """Through a connection that did NOT make the call. The destructive path
+    COMMITTED its clear, so a rollback-on-close would not have hidden it — but
+    reading through a fresh connection is what proves the store on disk is
+    intact rather than the writer's own uncommitted view."""
+    ns, root = _setup(tmp_path, monkeypatch)
+    a = _place(root, "a", "modern-full")
+    core = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](core, rebuild=True)
+    finally:
+        core.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        ns["sync_codex_conversations"](conn, rebuild=True)
+        before = _codex_store_fingerprint(conn)
+    finally:
+        conn.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        with pytest.raises(ValueError):
+            ns["sync_codex_conversations"](
+                conn, rebuild=True, only_paths={str(a)})
+    finally:
+        conn.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        assert _codex_store_fingerprint(conn) == before
+        assert conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='conversation_rebuild_codex_pending'"
+        ).fetchone() is None, (
+            "the pending marker is the durable half of the damage"
+        )
+    finally:
+        conn.close()
+
+
 # ── B2: codex_conversation_source_paths ───────────────────────────────────────
 
 

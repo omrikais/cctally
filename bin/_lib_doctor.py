@@ -256,6 +256,17 @@ class DoctorState:
     # one of them.
     cache_rollup_pricing_refusal: Optional[dict] = None
     cache_rollup_pricing_fp: Optional[str] = None
+    # #728: the four-state `_lib_pricing.PricingFingerprintObservation` of each
+    # store's fingerprint READ, one per store. The two `_fp` fields above carry
+    # a value and therefore cannot say whether the read happened at all: a
+    # `sqlite3.OperationalError` collapsed to None, which is also what a store
+    # that recorded nothing produces, so a locked or schema-less store reported
+    # "no refused pricing write recorded" and doctor exited OK over a store it
+    # had no evidence about. Typed loosely so this kernel keeps no import of
+    # the pricing leaf at module scope; the check reads `.state` and
+    # `.error_kind`. None means the gather did not produce one.
+    conversation_rollup_pricing_observation: Optional[object] = None
+    cache_rollup_pricing_observation: Optional[object] = None
     # #279 S2 (F5b): PRAGMA quick_check(1) results, gathered ONLY under
     # doctor_gather_state(deep=True) (CLI cmd_doctor) — the dashboard
     # rebuild loop calls the gather every rebuild and quick_check on a
@@ -294,6 +305,10 @@ class DoctorState:
     # visibility, with remediation targeted at its own VACUUM surface.
     conversations_db_page_count: Optional[int] = None
     conversations_db_freelist_count: Optional[int] = None
+    #: #780 — the durable reclaim backlog record, or None when nothing is
+    #: pending. Absent on every store that has never fallen behind, which is
+    #: why the check below adds nothing to its output in that case.
+    conversations_reclaim_pending: Optional[dict] = None
     # #294 S2: root-qualified physical Codex quota freshness, per-root native
     # hook state, and lifecycle activity are gathered by _cctally_doctor.
     codex_quota_windows: Optional[list[dict]] = None
@@ -996,7 +1011,7 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
             # current index as a mismatch; keep this in lockstep with core
             # (#496 S5b §6.1). It stays a literal because this kernel is pure and
             # must not import `_cctally_core`.
-            epoch = 1013
+            epoch = 1015
         mismatch = uv > legacy_head and uv != epoch
         return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
                 "mismatch": mismatch}
@@ -2048,6 +2063,101 @@ ROLLUP_WRITER_UNPARSEABLE_FP_REMEDIATION = (
     "are degraded."
 )
 
+#: The `--db` value `cctally db checkpoint` takes for each store this check
+#: reports. The check always knows which store it is talking about, so the
+#: remediation names that one rather than naming a fixed store and being wrong
+#: half the time.
+_ROLLUP_WRITER_STORE_DB_FLAG = {
+    "conversations.db": "conversations",
+    "cache.db": "cache",
+}
+
+
+def _rollup_writer_store_db_flag(store: str) -> str:
+    """The `db checkpoint --db` value for a store name, defaulting to
+    `conversations` for an unrecognised one so the text stays a whole
+    sentence."""
+    return _ROLLUP_WRITER_STORE_DB_FLAG.get(store, "conversations")
+
+
+#: Remediation for a fingerprint READ that did not happen (#728). Neither of
+#: the two remediations above applies: there is no unparseable row to delete,
+#: and no refusal has been latched, because the process that would latch one is
+#: equally unable to read the store. The step is to release whatever is holding
+#: it and look again.
+_ROLLUP_WRITER_DEGRADED_READ_REMEDIATION_TEMPLATE = (
+    "cctally could not read the pricing fingerprint recorded in the rollup "
+    "(`conversation_sessions_pricing_fp` in the `cache_meta` table of "
+    "`{store}`), so it cannot say whether that store's materialized cost is "
+    "protected. This is usually a store held by another process: check for a "
+    "`cctally dashboard` or a long ingest running against this installation, "
+    "and run `cctally db checkpoint --db {db}` if the WAL has grown. "
+    "Run `cctally doctor` again once the store is quiet. While the read keeps "
+    "failing every rollup writer refuses rather than assuming the store had "
+    "nothing to protect, so cost sorting and project filtering may be "
+    "degraded, but no session is hidden."
+)
+
+#: Remediation for a refusal that was LATCHED by a failed read, reported once
+#: the store reads cleanly again (#769 S3, Tranche 1 review). Distinct from
+#: both neighbours: there is no unparseable row to delete, and the version-skew
+#: remedy above is advice about a pricing table when the refusal was never
+#: about one. A refusal records the store date its read produced, and a failed
+#: read produces none, so a null `store_snapshot_date` identifies this case
+#: exactly — an ABSENT fingerprint is authorized and latches no record at all.
+_ROLLUP_WRITER_REFUSED_DEGRADED_READ_REMEDIATION_TEMPLATE = (
+    "A rollup write to `{store}` was refused because cctally could not read "
+    "that store's recorded pricing fingerprint "
+    "(`conversation_sessions_pricing_fp` in its `cache_meta` table) at the "
+    "time, so it had no evidence about what the store's materialized cost "
+    "needed protecting from. The store reads cleanly now, so there is no "
+    "unparseable value to delete and no version difference to resolve — "
+    "restarting or upgrading the writing process is not the step here. The "
+    "next authorized sync that recomputes the rollup clears this record: on "
+    "its next tick when the refusal also armed the rollup backfill, and "
+    "otherwise on the next sync that touches a session. If it keeps coming "
+    "back, the store is intermittently unreadable — check for another process "
+    "holding it, and run `cctally db checkpoint --db {db}` if the WAL has "
+    "grown. While the backfill is armed the conversation list falls back to "
+    "live aggregation, so every session stays visible, but cost sorting and "
+    "project filtering are degraded."
+)
+
+
+def rollup_writer_degraded_read_remediation(store: str) -> str:
+    """The failed-read remediation, naming the store it is about (#769 S3)."""
+    return _ROLLUP_WRITER_DEGRADED_READ_REMEDIATION_TEMPLATE.format(
+        store=store, db=_rollup_writer_store_db_flag(store))
+
+
+def rollup_writer_refused_degraded_read_remediation(store: str) -> str:
+    """The remediation for a refusal a failed read latched (#769 S3)."""
+    return _ROLLUP_WRITER_REFUSED_DEGRADED_READ_REMEDIATION_TEMPLATE.format(
+        store=store, db=_rollup_writer_store_db_flag(store))
+
+
+def _refusal_latched_by_a_failed_read(record) -> bool:
+    """Whether a refusal record describes a read that failed (#769 S3).
+
+    `_record_pricing_write_refusal` stores whatever the observation's raw value
+    was, and a DEGRADED observation carries None. Every other refusal state
+    names a value: MALFORMED records the unparseable text and a store-is-newer
+    refusal records the newer date. An ABSENT fingerprint is authorized, so it
+    never reaches the record at all. A null `store_snapshot_date` is therefore
+    a positive discriminator rather than a missing field.
+    """
+    return isinstance(record, dict) and record.get("store_snapshot_date") is None
+
+
+def _degraded_pricing_read(observation) -> bool:
+    """Whether a store's fingerprint read failed (#728).
+
+    Reads the observation defensively: a `DoctorState` assembled before this
+    field existed, or by a gather that could not build one, carries None, and
+    that must report as "no evidence of a failed read" rather than raise.
+    """
+    return getattr(observation, "state", None) == "degraded"
+
 
 def _check_pricing_conversation_rollup_writer(s: DoctorState) -> CheckResult:
     """WARN when a process holding older pricing was refused a write to the
@@ -2109,11 +2219,13 @@ def _check_pricing_conversation_rollup_writer(s: DoctorState) -> CheckResult:
 
     stores = (
         ("conversations.db", s.conversation_rollup_pricing_fp,
-         s.conversation_rollup_pricing_refusal),
+         s.conversation_rollup_pricing_refusal,
+         s.conversation_rollup_pricing_observation),
         ("cache.db", s.cache_rollup_pricing_fp,
-         s.cache_rollup_pricing_refusal),
+         s.cache_rollup_pricing_refusal,
+         s.cache_rollup_pricing_observation),
     )
-    for store, stored_fp, record in stores:
+    for store, stored_fp, record, _obs in stores:
         if _lib_pricing.pricing_fingerprint_is_comparable(stored_fp):
             continue
         details = {"store": store, "stored_fingerprint": stored_fp}
@@ -2133,8 +2245,37 @@ def _check_pricing_conversation_rollup_writer(s: DoctorState) -> CheckResult:
             remediation=ROLLUP_WRITER_UNPARSEABLE_FP_REMEDIATION,
             details=details,
         )
-    for store, _stored_fp, record in stores:
-        if not record:
+    # #728: a fingerprint read that FAILED, reported between the unparseable
+    # value and the recorded refusals. Below the unparseable pass because that
+    # is a diagnosed permanent state with a known step out of it, while this
+    # one is undiagnosed and often transient. Above the record passes because a
+    # store doctor could not read has no verdict at all, and hiding it behind
+    # the other store's recorded refusal is how the collapsed read reported OK.
+    for store, _stored_fp, _record, observation in stores:
+        if not _degraded_pricing_read(observation):
+            continue
+        return CheckResult(
+            id="pricing.conversation_rollup_writer", title="Rollup writer",
+            severity="warn",
+            summary=(
+                "the rollup's stored pricing fingerprint could not be read, "
+                "so this store's materialized cost is unverified"
+            ),
+            remediation=rollup_writer_degraded_read_remediation(store),
+            details={
+                "store": store,
+                "read_error_kind": getattr(observation, "error_kind", None),
+            },
+        )
+    for store, _stored_fp, record, _obs in stores:
+        # #729: ACTIVE episodes only. The record now survives convergence as a
+        # tombstone carrying `active: false`, so a store that diverged and then
+        # recovered is healthy and must not warn forever — that permanent warn
+        # is why the record used to be deleted instead of settled. A record
+        # written before the field existed carries no `active` key and is read
+        # as active, because that older record was latched only on refusal and
+        # deleted on convergence, so its presence alone means an open episode.
+        if not record or record.get("active") is False:
             continue
         if record.get("__malformed__"):
             return CheckResult(
@@ -2143,6 +2284,29 @@ def _check_pricing_conversation_rollup_writer(s: DoctorState) -> CheckResult:
                 summary="a refused pricing write is recorded but cannot be read",
                 remediation=ROLLUP_WRITER_REFUSAL_REMEDIATION,
                 details={"store": store},
+            )
+        if _refusal_latched_by_a_failed_read(record):
+            # #769 S3: the refusal came from a read that failed, and the store
+            # reads cleanly now — the DEGRADED pass above did not claim it.
+            # Rendering it under the version-skew wording printed the absent
+            # store date verbatim ("refused a write over stored None") and
+            # attached a remedy about pricing versions, which is not what
+            # happened.
+            return CheckResult(
+                id="pricing.conversation_rollup_writer", title="Rollup writer",
+                severity="warn",
+                summary=(
+                    "a rollup write was refused because this store's pricing "
+                    "fingerprint could not be read at the time"
+                ),
+                remediation=rollup_writer_refused_degraded_read_remediation(
+                    store),
+                details={
+                    "store": store,
+                    "process_snapshot_date": record.get("process_snapshot_date"),
+                    "store_snapshot_date": record.get("store_snapshot_date"),
+                    "first_refused_at_utc": record.get("first_refused_at_utc"),
+                },
             )
         return CheckResult(
             id="pricing.conversation_rollup_writer", title="Rollup writer",
@@ -2757,6 +2921,50 @@ def _check_db_conversations_reclaimable(s: DoctorState) -> CheckResult:
         "conversations_db_free_ratio": ratio,
         "warn_ratio": DOCTOR_RECLAIMABLE_WARN_RATIO,
     }
+    # #780: the reclaim backlog rides on this check rather than adding a new
+    # check id, and it contributes NOTHING — no detail key, no severity change
+    # — on a store with no pending record. That is every store that has never
+    # fallen behind, so an install in the ordinary state renders exactly what
+    # it rendered before.
+    pending = s.conversations_reclaim_pending
+    if pending:
+        import _lib_conversation_retention as _conv_retention
+
+        backlog = _conv_retention.reclaim_backlog_bytes(pending)
+        details["reclaim_pending"] = pending
+        details["reclaim_backlog_bytes"] = backlog
+        details["reclaim_ceiling_bytes"] = _conv_retention.RECLAIM_CEILING_BYTES
+        if _conv_retention.reclaim_backlog_over_ceiling(pending):
+            return CheckResult(
+                id="db.conversations_reclaimable",
+                title="Reclaimable transcript space",
+                severity="fail",
+                summary=(
+                    f"reclaim backlog {_gib_text(backlog)} is at or over the "
+                    f"{_gib_text(_conv_retention.RECLAIM_CEILING_BYTES)} "
+                    "ceiling; transcript rebuilds are refused"
+                ),
+                remediation=(
+                    "Run `cctally db vacuum --db conversations` to drain the "
+                    "backlog, then `cctally db checkpoint --db conversations`."
+                ),
+                details=details,
+            )
+        if _conv_retention.reclaim_backlog_escalated(pending):
+            return CheckResult(
+                id="db.conversations_reclaimable",
+                title="Reclaimable transcript space",
+                severity="warn",
+                summary=(
+                    f"reclaim backlog {_gib_text(backlog)} is draining across "
+                    "continuation passes"
+                ),
+                remediation=(
+                    "No action is required unless it keeps growing; "
+                    "`cctally db vacuum --db conversations` drains it now."
+                ),
+                details=details,
+            )
     if ratio is not None and ratio >= DOCTOR_RECLAIMABLE_WARN_RATIO:
         return CheckResult(
             id="db.conversations_reclaimable",

@@ -1,4 +1,5 @@
 import type { Envelope } from '../types/envelope';
+import { normalizeEnvelopeMetadataHealth } from '../types/envelope';
 import type {
   DashboardStreamClientMessage,
   DashboardStreamWorkerMessage,
@@ -103,7 +104,10 @@ export class DashboardStreamHub {
       try {
         const parsed = this.parse(event.data);
         if (!isEnvelope(parsed)) throw new Error('invalid dashboard envelope');
-        const snapshot = parsed;
+        // #834 S2 (#829): the SAME normalizer the direct transport calls. Two
+        // copies of this is the shape in which one stops matching the other,
+        // and both deliver into the same store.
+        const snapshot = normalizeEnvelopeMetadataHealth(parsed);
         this.deliveryGeneration += 1;
         this.lastSnapshot = { snapshot, deliveryGeneration: this.deliveryGeneration };
         for (const state of this.ports.values()) {

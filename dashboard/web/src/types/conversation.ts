@@ -779,6 +779,29 @@ export const EMPTY_FILTERS: ConversationFilters = {
 export interface ConversationFacets {
   projects: { project_label: string; count: number; filter_value?: string }[];
   models: { family: string; count: number; filter_value?: string }[];
+  // #717. Present and true while the project list may be incomplete because
+  // the index is rebuilding — the Claude rollup is being rebuilt, or the Codex
+  // normalized corpus is awaiting a replay. It may still be complete: the
+  // QUALIFIED Claude producer enumerates projects fully from browse rows that
+  // `list_conversations` still produces through its live GROUP-BY fallback, so
+  // it sets the flag without emptying the list, and the client renders the
+  // explanatory line only where the list is genuinely empty. Absent otherwise,
+  // so the ordinary envelope is byte-identical to what shipped before.
+  // `models` keeps live counts on the Claude side; Codex derives none in that
+  // state.
+  //
+  // `filter_degraded` carries TWO meanings on the wire, and they are different
+  // facts. This one, top-level on a facets envelope (and on a search
+  // envelope), means "the project list may be incomplete". The pre-existing
+  // `page.filter_degraded` on a browse envelope means something else entirely:
+  // the rollup-only filter axes — cost, project, cache-rebuilds — were dropped
+  // because the query ran on the live GROUP-BY fallback that cannot express
+  // them. Read the field's position, not its name.
+  //
+  // `QualifiedBrowseEnvelope` in `lib/conversationTransport.ts` was NOT updated
+  // for the top-level key, because the qualified BROWSE route does not carry
+  // it; only `QualifiedFacetsEnvelope` does.
+  filter_degraded?: boolean;
 }
 
 // #166: per-subagent kind + toolUseResult meta, keyed by subagent_key (the same

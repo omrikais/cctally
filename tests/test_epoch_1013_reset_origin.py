@@ -31,7 +31,13 @@ from conftest import load_script, redirect_paths
 
 FIXED = dt.datetime(2026, 9, 5, 12, 0, 0, tzinfo=dt.timezone.utc)
 PREVIOUS_EPOCH = 1012
-NEW_EPOCH = 1013
+#: The CURRENT head, not the 1013 this module is named for. Two assertions
+#: below mean "the epoch a store ends up at": the head constant itself, and the
+#: epoch an upgraded 1012 store reaches, which is always the head rather than
+#: the intermediate epoch that first added these objects. #769 S11 moved the
+#: head to 1015. Everything else here — what epoch 1013 ADDED, and the prose
+#: recording it — is historical fact and stays.
+NEW_EPOCH = 1015
 DEBOUNCE_TABLE = "weekly_reset_debounce_state"
 ORIGIN_INDEX = "idx_week_reset_events_origin"
 LEGACY_TUPLE_INDEX = "idx_week_reset_events_legacy_tuple"

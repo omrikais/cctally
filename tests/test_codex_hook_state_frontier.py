@@ -67,7 +67,14 @@ def _cache_store(path: pathlib.Path) -> sqlite3.Connection:
     conn.executescript(
         "CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT);"
         "CREATE TABLE session_files (path TEXT);"
-        "CREATE TABLE codex_session_files (path TEXT);"
+        # #769 S6: the planner's bounded recently-active restat reads the
+        # cursor columns, so a stand-in that carries only `path` is a store
+        # whose shape this binary cannot plan over.
+        "CREATE TABLE codex_session_files ("
+        "  path TEXT PRIMARY KEY, size_bytes INTEGER, mtime_ns INTEGER,"
+        "  last_byte_offset INTEGER, last_ingested_at TEXT,"
+        "  ingest_complete INTEGER NOT NULL DEFAULT 1,"
+        "  device_id INTEGER, inode INTEGER);"
         "INSERT INTO cache_meta VALUES ('claude_ingest_walk_complete','1');"
         "INSERT INTO cache_meta VALUES "
         "('dashboard_codex_full_walk_complete','1');"
@@ -83,9 +90,13 @@ def _conversation_store(path: pathlib.Path) -> sqlite3.Connection:
         "CREATE TABLE conversation_source_files "
         "(path TEXT, size_bytes INTEGER, mtime_ns INTEGER, "
         "last_byte_offset INTEGER);"
+        # #769 S6: the transcript planner's bounded restat reads its OWN
+        # cursor table's recency and identity columns, so a stand-in without
+        # them is a store whose shape this binary cannot plan over.
         "CREATE TABLE codex_conversation_source_files "
-        "(path TEXT, size_bytes INTEGER, mtime_ns INTEGER, "
-        "last_byte_offset INTEGER);"
+        "(path TEXT PRIMARY KEY, size_bytes INTEGER, mtime_ns INTEGER, "
+        "last_byte_offset INTEGER, last_ingested_at TEXT, "
+        "device_id INTEGER, inode INTEGER);"
     )
     conn.commit()
     return conn

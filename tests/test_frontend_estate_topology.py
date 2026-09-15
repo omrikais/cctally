@@ -40,6 +40,7 @@ EXPECTED = {
     "public-mirror-pr": 1,
     "public-mirror-push": 0,
     "tag-or-cron": 3,
+    "private-background": 1,
 }
 
 
@@ -562,7 +563,7 @@ def _estate_executions(event: dict) -> int:
 
 
 def _push(repository, *, ref="refs/heads/main", changed=("bin/cctally",),
-          skip_heavy="false", discharged="false"):
+          skip_heavy="false", admitted="true", discharged="false"):
     return {
         "event_name": "push", "ref": ref, "action": None,
         "changed_paths": list(changed),
@@ -579,6 +580,7 @@ def _push(repository, *, ref="refs/heads/main", changed=("bin/cctally",),
             "needs.release-stamp-gate.outputs.skipHeavy": skip_heavy,
             # #630 S4's second conjunct on `test-macos`.
             "needs.receipt-gate.result": "success",
+            "needs.receipt-gate.outputs.admitted": admitted,
             "needs.receipt-gate.outputs.discharged": discharged,
         },
     }
@@ -608,9 +610,25 @@ def _pull_request(repository, head_repository):
             # model derives, and `test-macos` refuses a fork PR on its own
             # head-repository equality whatever this status says.
             "needs.receipt-gate.result": "success",
+            "needs.receipt-gate.outputs.admitted": "false",
             "needs.receipt-gate.outputs.discharged": "false",
         },
     }
+
+
+def _background(repository, event_name="schedule"):
+    event = _push(repository)
+    event.update(event_name=event_name, action=None)
+    event["needs"] = {"release-stamp-gate": "skipped", "receipt-gate": "skipped"}
+    event["context"].update({
+        "github.event_name": event_name,
+        "needs.release-stamp-gate.result": "skipped",
+        "needs.release-stamp-gate.outputs.skipHeavy": ABSENT,
+        "needs.receipt-gate.result": "skipped",
+        "needs.receipt-gate.outputs.admitted": ABSENT,
+        "needs.receipt-gate.outputs.discharged": ABSENT,
+    })
+    return event
 
 
 PRIVATE = "omrikais/cctally-dev"
@@ -620,6 +638,7 @@ PUBLIC = "omrikais/cctally"
 # events lists all of them and every one must produce the row's count, so a
 # row cannot be satisfied by whichever member happens to agree with it.
 EVENT_CONTEXTS = {
+    "private-background": [_background(PRIVATE), _background(PRIVATE, "workflow_dispatch")],
     "private-push-nonstamp": [
         _push(PRIVATE),
         # A MIXED code-and-markdown push, and the only input on which
@@ -646,10 +665,7 @@ EVENT_CONTEXTS = {
     # row's own wording does not cover it.
     "tag-or-cron": [
         _push(PUBLIC, ref="refs/tags/v1.95.6", changed=("package.json",)),
-        {"event_name": "schedule", "ref": "refs/heads/main", "action": None,
-         "changed_paths": ["bin/cctally"], "needs": {},
-         "context": {"cancelled()": False, "github.event_name": "schedule",
-                     "github.repository": PUBLIC}},
+        _background(PUBLIC),
     ],
 }
 
@@ -657,9 +673,8 @@ EVENT_CONTEXTS = {
 def test_every_declared_event_has_at_least_one_concrete_context():
     assert set(EVENT_CONTEXTS) == set(EXPECTED), (
         sorted(EVENT_CONTEXTS), sorted(EXPECTED))
-    # Bumped from 8 to 9 by #630 S4, deliberately: the anchor exists so that a
-    # new topology row is a decision rather than a side effect.
-    assert len(EXPECTED) == 9, sorted(EXPECTED)
+    # Background full verification is a separate, explicit topology row.
+    assert len(EXPECTED) == 10, sorted(EXPECTED)
     for event, contexts in EVENT_CONTEXTS.items():
         assert contexts, event
 
@@ -700,6 +715,12 @@ def test_a_failed_receipt_gate_also_still_admits_the_gated_lane():
     event = _push(PRIVATE, discharged="true")
     event["needs"]["receipt-gate"] = "failure"
     event["context"]["needs.receipt-gate.result"] = "failure"
+    assert _estate_executions(event) == 1
+
+    # A byte-valid receipt cannot skip the estate when the independent
+    # commit-graph admission fails. This is a successful gate job with two
+    # different outputs, not the failed-job case above.
+    event = _push(PRIVATE, admitted="false", discharged="true")
     assert _estate_executions(event) == 1
 
 
@@ -818,30 +839,17 @@ def test_an_unmodelled_push_filter_refuses_rather_than_undercounting(label, spec
         _workflow_starts(_push_trigger_doc(spec), _push(PRIVATE))
 
 
-PRIVATE_ZERO_CONTEXTS = {
-    "tag push": _push(PRIVATE, ref="refs/tags/v1.95.6", changed=("package.json",)),
-    "weekly cron": {
-        "event_name": "schedule", "ref": "refs/heads/main", "action": None,
-        "changed_paths": ["bin/cctally"], "needs": {},
-        "context": {"cancelled()": False, "github.event_name": "schedule",
-                    "github.repository": PRIVATE}},
+PRIVATE_NONPUSH_CONTEXTS = {
+    "tag push": (_push(PRIVATE, ref="refs/tags/v1.95.6", changed=("package.json",)), 0),
+    "weekly cron": (_background(PRIVATE), 1),
 }
 
 
-@pytest.mark.parametrize("label", sorted(PRIVATE_ZERO_CONTEXTS))
-def test_a_private_tag_push_or_cron_admits_no_lane(label):
-    """Recorded rather than folded into the table above. The D2 row groups the
-    tag push and the cron at three legs, and that is true of the contexts where
-    `ci-linux-matrix` admits — which are the PUBLIC tag push and the PUBLIC
-    cron. The two private events are not among them: `ci.yml` triggers only on
-    `push: branches: [main]`, and `test-linux` admits the public repository
-    only, since #630 S5 retired the private lane.
-
-    Both matter concretely. The release tool's own Phase 2 tag push is private,
-    so the event this repository actually produces runs the estate zero times,
-    and the private weekly cron does the same for the same reason.
-    """
-    assert _estate_executions(PRIVATE_ZERO_CONTEXTS[label]) == 0
+@pytest.mark.parametrize("label", sorted(PRIVATE_NONPUSH_CONTEXTS))
+def test_private_tags_stay_empty_and_background_verification_runs_once(label):
+    """Private tags admit no estate; the new private background gate runs one."""
+    context, expected = PRIVATE_NONPUSH_CONTEXTS[label]
+    assert _estate_executions(context) == expected
 
 
 def test_the_linux_matrix_declares_no_workflow_dispatch():

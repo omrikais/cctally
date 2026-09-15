@@ -45,10 +45,15 @@ helpers they source unguarded.
 from __future__ import annotations
 
 import ast
+import collections.abc
 import functools
 import pathlib
 import re
 import subprocess
+import sys
+import types
+
+import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -214,6 +219,9 @@ BLOCKING_CALLEES = {
         "`tests/journal_fixture_496_s4.py` runs one rebuild in a child process "
         "and waits for it; reached across modules as `F.run_worker`"),
     "run_stats_ingest": "takes the ingest lock and waits for the holder",
+    "_join_schema_wake_thread": (
+        "`_cctally_dashboard._join_schema_wake_thread` joins the schema "
+        "wake-up thread, so its `timeout=` is a real wait"),
     "retention_shared": "takes the retention flock and waits for the holder",
     "AppServerClient": "connects to the app server before it returns",
 }
@@ -338,6 +346,16 @@ RECORDED = {
      "test_stats_open_fails_fast_while_maintenance_is_held",
      "elapsed-ceiling", 30.0): (
         "keep — a fail-fast claim: the alternative behaviour is blocking until a lock is released, so the ceiling separates bounded from unbounded rather than fast from slow"),
+    ("tests/test_statusline_bounded_consensus_755.py",
+     "test_the_unanimous_fast_path_still_publishes_well_before_the_deadline",
+     "elapsed-ceiling", 180.0): (
+        "keep — the duration is simulated, not measured: `_drive` returns "
+        "`clock.value - start` from a clock the test advances by hand, and "
+        "`_Clock` patches the statusline importer's `time` reference, so no "
+        "wall-clock reading reaches the assertion and machine load cannot move "
+        "it. The ceiling is the claim itself — unanimous agreement must publish "
+        "without waiting out the 180-second deadline — so bounding it by that "
+        "deadline is what separates the fast path from the deadline path"),
     ("tests/test_statusline_persist.py",
      "test_statusline_oauth_tick_never_waits_for_another_session",
      "elapsed-ceiling", 0.1): (
@@ -433,7 +451,64 @@ class Finding:
 SUPPORT_MODULE = "tests._support_http"
 
 
-def _module_constants(tree: ast.Module, follow_support=True) -> dict:
+class _ModuleFacts:
+    """The seven whole-tree derivations, memoized for ONE parsed module (#810).
+
+    Each of `_module_constants`, `_clock_bare_names`, `_clock_module_names`,
+    `_bare_sleep_names`, `_blocking_names`, `_clock_derived_names` and
+    `_clock_reading_helpers` walks the whole tree, and the three collectors
+    between them asked for those answers 27 times per file — measured, not
+    estimated. The answers cannot differ between those calls, because the tree
+    does not change, so this object computes each at most once per file.
+
+    It is bound to the tree it was built from and ASSERTS that binding, so it
+    can never answer for a different parse. Two alternatives were rejected: a
+    module global cleared between files leaks on an exception and across direct
+    test calls, and a `WeakKeyDictionary` keyed on tree identity hides both
+    lifetime and synchronization.
+    """
+
+    __slots__ = ("tree", "_values")
+
+    def __init__(self, tree):
+        self.tree = tree
+        self._values = {}
+
+    def value(self, key, compute):
+        try:
+            return self._values[key]
+        except KeyError:
+            self._values[key] = computed = compute()
+            return computed
+
+
+def _facts(tree, cache):
+    """The cache to answer from: the one handed in, or a fresh private one.
+
+    A caller that omits `_cache` — every scaffold case below that parses its own
+    small snippet — gets a cache of its own for its own tree, so those paths
+    behave exactly as they did before this change.
+    """
+    if cache is None:
+        return _ModuleFacts(tree)
+    assert cache.tree is tree, (
+        "a per-file cache was asked about a tree it was not built from, so its "
+        "answer would describe a different module"
+    )
+    return cache
+
+
+def _module_constants(tree: ast.Module, follow_support=True, *, _cache=None):
+    """Read-only. `follow_support` is part of the cache key, because it varies
+    per call and the two answers differ."""
+    facts = _facts(tree, _cache)
+    return facts.value(
+        ("module_constants", bool(follow_support)),
+        lambda: _derive_module_constants(tree, follow_support),
+    )
+
+
+def _derive_module_constants(tree: ast.Module, follow_support=True):
     found = {}
     if follow_support:
         shared = _support_constants()
@@ -450,11 +525,14 @@ def _module_constants(tree: ast.Module, follow_support=True) -> dict:
                 value = _resolve(node.value, found, {})
                 if value is not None:
                     found[target.id] = value
-    return found
+    # Published read-only rather than as a defensive copy: no caller mutates it
+    # today, and a copy would permit exactly the caller behaviour the shared
+    # cache forbids while re-allocating on every read.
+    return types.MappingProxyType(found)
 
 
 @functools.lru_cache(maxsize=1)
-def _support_constants() -> dict:
+def _support_constants() -> collections.abc.Mapping:
     """The numeric module constants of `tests/_support_http.py`.
 
     `PRESENCE_BACKSTOP_SECONDS` is the load-safe budget every consolidated call
@@ -469,7 +547,7 @@ def _support_constants() -> dict:
         ast.parse(path.read_text(encoding="utf-8")), follow_support=False)
 
 
-def _resolve(node, consts: dict, local: dict):
+def _resolve(node, consts: collections.abc.Mapping, local: collections.abc.Mapping):
     """The seconds this expression denotes, or None when it cannot be read.
 
     Constants, names bound to numbers, and simple arithmetic over those. Not
@@ -504,7 +582,12 @@ def _resolve(node, consts: dict, local: dict):
     return None
 
 
-def _clock_bare_names(tree) -> set:
+def _clock_bare_names(tree, *, _cache=None) -> frozenset:
+    facts = _facts(tree, _cache)
+    return facts.value("clock_bare_names", lambda: _derive_clock_bare_names(tree))
+
+
+def _derive_clock_bare_names(tree) -> frozenset:
     """Names `from time import monotonic` binds, so the bare call is read too.
 
     Only the attribute spelling was recognised, so one import line disabled the
@@ -518,10 +601,15 @@ def _clock_bare_names(tree) -> set:
         for alias in node.names:
             if alias.name in CLOCK_FUNCTIONS:
                 names.add(alias.asname or alias.name)
-    return names
+    return frozenset(names)
 
 
-def _clock_module_names(tree) -> set:
+def _clock_module_names(tree, *, _cache=None) -> frozenset:
+    facts = _facts(tree, _cache)
+    return facts.value("clock_module_names", lambda: _derive_clock_module_names(tree))
+
+
+def _derive_clock_module_names(tree) -> frozenset:
     """Names an ``import time`` statement binds in this module.
 
     The attribute ``time`` is ambiguous: ``time.time()`` reads the clock, but
@@ -536,10 +624,15 @@ def _clock_module_names(tree) -> set:
         for alias in node.names:
             if alias.name == "time":
                 names.add(alias.asname or alias.name)
-    return names
+    return frozenset(names)
 
 
-def _bare_sleep_names(tree) -> set:
+def _bare_sleep_names(tree, *, _cache=None) -> frozenset:
+    facts = _facts(tree, _cache)
+    return facts.value("bare_sleep_names", lambda: _derive_bare_sleep_names(tree))
+
+
+def _derive_bare_sleep_names(tree) -> frozenset:
     """Names `from time import sleep` binds, for the same reason."""
     names = set()
     for node in ast.walk(tree):
@@ -548,7 +641,7 @@ def _bare_sleep_names(tree) -> set:
         for alias in node.names:
             if alias.name == "sleep":
                 names.add(alias.asname or alias.name)
-    return names
+    return frozenset(names)
 
 
 def _is_clock_call(node, bare=frozenset(), modules=frozenset()) -> bool:
@@ -575,7 +668,13 @@ def _callee_of(call) -> str:
     return getattr(call.func, "attr", getattr(call.func, "id", ""))
 
 
-def _blocking_names(tree) -> set:
+def _blocking_names(tree, *, _cache=None) -> frozenset:
+    facts = _facts(tree, _cache)
+    return facts.value(
+        "blocking_names", lambda: _derive_blocking_names(tree, facts))
+
+
+def _derive_blocking_names(tree, facts) -> frozenset:
     """Every name a call in THIS module can block through.
 
     `BLOCKING_CALLEES` plus the module's own wait helpers, to a fixpoint. The
@@ -591,9 +690,9 @@ def _blocking_names(tree) -> set:
     errs toward reporting, which is the safe direction here.
     """
     known = set(BLOCKING_CALLEES)
-    bare_sleep = _bare_sleep_names(tree)
-    bare_clock = _clock_bare_names(tree)
-    clock_modules = _clock_module_names(tree)
+    bare_sleep = _bare_sleep_names(tree, _cache=facts)
+    bare_clock = _clock_bare_names(tree, _cache=facts)
+    clock_modules = _clock_module_names(tree, _cache=facts)
     definitions, aliases = [], []
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -621,7 +720,7 @@ def _blocking_names(tree) -> set:
             if source in known and target not in known:
                 known.add(target)
                 changed = True
-    return known
+    return frozenset(known)
 
 
 def _reaches_a_wait(node, known: set, bare_sleep: set, bare_clock: set,
@@ -982,10 +1081,13 @@ def _collect_raw_budgets(relative, text) -> list:
     which made the claim true by luck rather than by construction.
     """
     tree = ast.parse(text)
-    consts = _module_constants(tree)
-    clocky = (_clock_derived_names(tree), _clock_reading_helpers(tree),
-              _clock_bare_names(tree), _clock_module_names(tree))
-    blocking = _blocking_names(tree)
+    cache = _ModuleFacts(tree)
+    consts = _module_constants(tree, _cache=cache)
+    clocky = (_clock_derived_names(tree, _cache=cache),
+              _clock_reading_helpers(tree, _cache=cache),
+              _clock_bare_names(tree, _cache=cache),
+              _clock_module_names(tree, _cache=cache))
+    blocking = _blocking_names(tree, _cache=cache)
     out = []
     for func in ast.walk(tree):
         if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1024,7 +1126,7 @@ def _collect_raw_budgets(relative, text) -> list:
     return _deduplicate(out)
 
 
-def collect_budgets(path, source=None) -> list:
+def collect_budgets(path, source=None, tree=None, *, _cache=None) -> list:
     """Every blocking budget in PATH, with each sequential path summed.
 
     Returns a flat list of findings: one per over-cap single budget, one per
@@ -1033,11 +1135,20 @@ def collect_budgets(path, source=None) -> list:
     relative = str(pathlib.Path(path).resolve().relative_to(REPO)) \
         if pathlib.Path(path).is_absolute() else str(path)
     text = source if source is not None else pathlib.Path(path).read_text(encoding="utf-8")
-    tree = ast.parse(text)
-    consts = _module_constants(tree)
-    clocky = (_clock_derived_names(tree), _clock_reading_helpers(tree),
-              _clock_bare_names(tree), _clock_module_names(tree))
-    blocking = _blocking_names(tree)
+    # `tree` is the same module's AST, supplied by a caller that already parsed
+    # it (#769 S4 #805). Passing one that does not correspond to `text` is a
+    # caller error; `python_findings` derives both from one read.
+    tree = ast.parse(text) if tree is None else tree
+    # `_cache` is the per-file `_ModuleFacts` a caller that already built one
+    # supplies (#810). Omitted, this collector builds one for its own tree, so a
+    # scaffold case that parses its own snippet behaves exactly as before.
+    facts = _facts(tree, _cache)
+    consts = _module_constants(tree, _cache=facts)
+    clocky = (_clock_derived_names(tree, _cache=facts),
+              _clock_reading_helpers(tree, _cache=facts),
+              _clock_bare_names(tree, _cache=facts),
+              _clock_module_names(tree, _cache=facts))
+    blocking = _blocking_names(tree, _cache=facts)
     lines = text.splitlines()
 
     findings, budget_lines = [], set()
@@ -1129,11 +1240,19 @@ def collect_budgets(path, source=None) -> list:
     # wall-clock ceiling states its reason at the assertion, and reading only
     # the budget collector here would report that reason as an excuse for
     # nothing in the same run the ceiling rule accepted it.
+    # The tree is forwarded, not re-derived: these two calls parsed the same
+    # module a second and a third time for every file the scan visits, which is
+    # two thirds of the parses `python_findings` performed (#769 S4 #805).
+    # The cache is forwarded for the same reason the tree is: without it these
+    # two calls rebuilt all seven whole-tree derivations a second time for every
+    # file the scan visits (#810).
     budget_lines.update(
         f.lineno for f in collect_elapsed_assertions(
-            path, source=text, include_annotated=True)
+            path, source=text, include_annotated=True, tree=tree, _cache=facts)
     )
-    budget_lines.update(f.lineno for f in collect_fixed_waits(path, source=text))
+    budget_lines.update(
+        f.lineno for f in collect_fixed_waits(
+            path, source=text, tree=tree, _cache=facts))
     findings.extend(_annotation_findings(lines, budget_lines, relative))
     return _deduplicate(findings)
 
@@ -1196,7 +1315,13 @@ def _deduplicate(findings):
 # ------------------------------------------------------- elapsed assertions
 
 
-def _clock_derived_names(tree) -> set:
+def _clock_derived_names(tree, *, _cache=None) -> frozenset:
+    facts = _facts(tree, _cache)
+    return facts.value(
+        "clock_derived_names", lambda: _derive_clock_derived_names(tree, facts))
+
+
+def _derive_clock_derived_names(tree, facts) -> frozenset:
     """Names assigned, directly or transitively, from a reading of the clock.
 
     Provenance rather than spelling. A name-based rule reports
@@ -1206,8 +1331,8 @@ def _clock_derived_names(tree) -> set:
     measurement of this run.
     """
     derived, changed = set(), True
-    bare = _clock_bare_names(tree)
-    modules = _clock_module_names(tree)
+    bare = _clock_bare_names(tree, _cache=facts)
+    modules = _clock_module_names(tree, _cache=facts)
     assignments = [
         (node.targets[0].id, node.value)
         for node in ast.walk(tree)
@@ -1222,10 +1347,18 @@ def _clock_derived_names(tree) -> set:
             if _reads_the_clock(value, derived, bare=bare, modules=modules):
                 derived.add(name)
                 changed = True
-    return derived
+    # Built mutably by the fixpoint above, then frozen once at the boundary.
+    return frozenset(derived)
 
 
-def _clock_reading_helpers(tree) -> set:
+def _clock_reading_helpers(tree, *, _cache=None) -> frozenset:
+    facts = _facts(tree, _cache)
+    return facts.value(
+        "clock_reading_helpers",
+        lambda: _derive_clock_reading_helpers(tree, facts))
+
+
+def _derive_clock_reading_helpers(tree, facts) -> frozenset:
     """Module-level functions whose body reads the clock.
 
     `deadline_s=_remaining(overall_deadline)` is the correct way to share one
@@ -1233,8 +1366,8 @@ def _clock_reading_helpers(tree) -> set:
     Without following the helper, the guard reports it as a number it cannot
     read and demands an annotation on the very shape it wants people to use.
     """
-    names, bare = set(), _clock_bare_names(tree)
-    modules = _clock_module_names(tree)
+    names, bare = set(), _clock_bare_names(tree, _cache=facts)
+    modules = _clock_module_names(tree, _cache=facts)
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -1242,7 +1375,7 @@ def _clock_reading_helpers(tree) -> set:
             _is_clock_call(inner, bare, modules) for inner in ast.walk(node)
         ):
             names.add(node.name)
-    return names
+    return frozenset(names)
 
 
 def _reads_the_clock(node, derived: set, helpers: set = frozenset(),
@@ -1347,7 +1480,8 @@ def _numeric(node, module_constants, shadowed=frozenset()):
     return None
 
 
-def collect_elapsed_assertions(path, source=None, include_annotated=False) -> list:
+def collect_elapsed_assertions(path, source=None, include_annotated=False,
+                              tree=None, *, _cache=None) -> list:
     """Assertions that bound a measured duration from ABOVE by a literal.
 
     A lower bound is a different claim — "this actually waited" — and cannot be
@@ -1362,11 +1496,19 @@ def collect_elapsed_assertions(path, source=None, include_annotated=False) -> li
     relative = str(pathlib.Path(path).resolve().relative_to(REPO)) \
         if pathlib.Path(path).is_absolute() else str(path)
     text = source if source is not None else pathlib.Path(path).read_text(encoding="utf-8")
-    tree = ast.parse(text)
+    # `tree` is the same module's AST, supplied by a caller that already parsed
+    # it (#769 S4 #805). Passing one that does not correspond to `text` is a
+    # caller error; `python_findings` derives both from one read.
+    tree = ast.parse(text) if tree is None else tree
+    # `_cache` is the per-file `_ModuleFacts` a caller that already built one
+    # supplies (#810). Omitted, this collector builds one for its own tree, so a
+    # scaffold case that parses its own snippet behaves exactly as before.
+    facts = _facts(tree, _cache)
     lines = text.splitlines()
-    module_constants = _module_constants(tree)
-    derived, bare = _clock_derived_names(tree), _clock_bare_names(tree)
-    modules = _clock_module_names(tree)
+    module_constants = _module_constants(tree, _cache=facts)
+    derived = _clock_derived_names(tree, _cache=facts)
+    bare = _clock_bare_names(tree, _cache=facts)
+    modules = _clock_module_names(tree, _cache=facts)
 
     enclosing = {}
     for func in ast.walk(tree):
@@ -1568,15 +1710,294 @@ def _tracked(pattern) -> list:
     return [REPO / rel for rel in proc.stdout.split("\0") if rel]
 
 
+#: The aggregate, held for the process. Two cases call `python_findings`, and
+#: nothing they do changes the tree between calls, so recomputing it made the
+#: guard scan the whole estate twice over. It is a per-process cache and the
+#: parallel leg does not guarantee both consumers share a worker, so it
+#: removes a repeated scan rather than guaranteeing a single one.
+_PYTHON_FINDINGS_CACHE = None
+
+
 def python_findings() -> list:
+    """Every Python finding in the tracked estate: one read, one parse per file.
+
+    The three collectors each accepted a `source` and then called `ast.parse`
+    themselves, so a file was read once and parsed three times, and this
+    module's own scan grew toward the 120-second cap it exists to pin (#769 S4
+    #805). They now accept the tree as well, and this function derives both
+    from a single read.
+
+    A copy is returned so a caller cannot mutate the cache. The cache binds
+    per PROCESS, not per session: `bin/cctally-test-all` runs pytest under
+    xdist's default `--dist load`, so the consumers below can be handed to
+    different workers and each pays its own scan there. Driving a bounded
+    sample is what `_scan_python_findings` is for; no caller resets this
+    global, and none should.
+    """
+    global _PYTHON_FINDINGS_CACHE
+    if _PYTHON_FINDINGS_CACHE is None:
+        _PYTHON_FINDINGS_CACHE = _scan_python_findings(
+            [path for path in _tracked("tests/*.py") if path.exists()])
+    return list(_PYTHON_FINDINGS_CACHE)
+
+
+def _scan_python_findings(paths) -> list:
+    """The scan itself, uncached, over the paths it is handed.
+
+    Split out so the coverage case below can drive a bounded sample without
+    discarding the process cache. Resetting the cache to count reads made the
+    counting case pay a full scan AND left the cache empty for the next
+    consumer, so the module ran the scan more times than before the change.
+    """
     out = []
-    for path in _tracked("tests/*.py"):
-        if not path.exists():
-            continue
-        out.extend(collect_budgets(path))
-        out.extend(collect_elapsed_assertions(path))
-        out.extend(collect_fixed_waits(path))
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        # One cache per FILE, shared by the three collectors, so the seven
+        # whole-tree helpers run once each instead of 27 times (#810). It goes
+        # out of scope with the file, so nothing leaks between them and an
+        # exception cannot leave a stale answer behind.
+        cache = _ModuleFacts(tree)
+        out.extend(collect_budgets(path, source=text, tree=tree, _cache=cache))
+        out.extend(
+            collect_elapsed_assertions(path, source=text, tree=tree, _cache=cache))
+        out.extend(collect_fixed_waits(path, source=text, tree=tree, _cache=cache))
     return out
+
+
+def test_the_python_scan_reads_and_parses_each_file_once(monkeypatch):
+    """This module's own scan cost, bounded by construction (#769 S4 #805).
+
+    `python_findings` fans every tracked test module out to three collectors,
+    and each collector used to call `ast.parse` itself, so the estate was read
+    once and parsed three times per scan — with three cases calling the
+    function, nine parses per file per run. The node then failed intermittently
+    against the very cap this module declares, which is the guard reporting its
+    own cost as a defect in the estate.
+
+    Counting is done over `ast.parse` and `pathlib.Path.read_text` rather than
+    by timing, because a wall-clock assertion here would be exactly the shape
+    this module refuses everywhere else.
+    """
+    # A bounded sample, because the property is per file: proving it over
+    # twenty five modules proves it over eight hundred, and scanning all of
+    # them here would add a second full scan to the module's own cost, which
+    # is the thing this case exists to reduce.
+    #
+    # `tests/_support_http.py` is excluded by name. `_module_constants` follows
+    # that one module to resolve constants imported from it, so it is read a
+    # second time by a path that is not the scan and is not per file.
+    #
+    # Sampled from the top level of `tests/` rather than from the whole glob,
+    # which also matches fixture inputs under `tests/fixtures/`: several of
+    # those are byte-identical to each other, and a per-file parse count keyed
+    # on the source text cannot tell eight copies apart from eight parses of
+    # one file.
+    estate = sorted(
+        path for path in _tracked("tests/*.py")
+        if path.exists() and path.parent.name == "tests"
+        and path.name != "_support_http.py")
+    assert len(estate) > 25, (
+        f"only {len(estate)} tracked top-level modules, so this proves nothing")
+    estate = estate[:25]
+    contents = {str(path): path.read_text(encoding="utf-8") for path in estate}
+
+    # `_module_constants` follows `tests/_support_http.py` to resolve constants
+    # imported from it, reading and parsing that one module once per process
+    # behind `_support_constants`'s `lru_cache`. Warmed here, outside the
+    # counted window, so the counts below are the scan's own and not a
+    # once-per-process cost that lands on whichever case runs first.
+    _support_constants()
+
+    parsed: list = []
+    reads: list = []
+    real_parse, real_read_text = ast.parse, pathlib.Path.read_text
+
+    def counting_parse(source, *args, **kwargs):
+        parsed.append(source)
+        return real_parse(source, *args, **kwargs)
+
+    def counting_read_text(self, *args, **kwargs):
+        text = real_read_text(self, *args, **kwargs)
+        reads.append(str(self))
+        return text
+
+    monkeypatch.setattr(ast, "parse", counting_parse)
+    monkeypatch.setattr(pathlib.Path, "read_text", counting_read_text)
+
+    _scan_python_findings(estate)
+
+    estate_reads = collections.Counter(
+        name for name in reads if name in contents)
+    over_read = sorted(
+        f"{name} read {count} times" for name, count in estate_reads.items()
+        if count != 1)
+    assert not over_read, over_read
+    assert len(estate_reads) == len(contents), (
+        f"{len(estate_reads)} of {len(contents)} tracked modules were read")
+
+    parse_counts = collections.Counter(parsed)
+    over_parsed = sorted(
+        f"{name} parsed {parse_counts[text]} times"
+        for name, text in contents.items() if parse_counts[text] < 1)
+    assert not over_parsed, over_parsed
+    # The total, not a per-file count: two sampled files can hold identical
+    # bytes, and a Counter over source text cannot tell a second copy from a
+    # second parse. Paired with the per-file READ count above — which is keyed
+    # on the path and so cannot collide — a total equal to the file count means
+    # each file was read once and parsed once, because the scan parses each
+    # file immediately after reading it.
+    assert len(parsed) == len(contents), (
+        f"{len(parsed)} parses for {len(contents)} sampled modules; the scan "
+        "parses a file more than once")
+
+
+def test_the_python_findings_cache_is_not_shared_by_reference(monkeypatch):
+    """A caller that mutates the returned list must not corrupt the next scan.
+
+    The cache is SEEDED rather than scanned. An earlier form relied on a warm
+    cache left by another case, reasoning that resetting it would make a
+    property about one list object pay a full estate scan. That reasoning does
+    not survive `--dist load`: this case can be handed to a worker where no
+    other consumer has run, and it would then pay the full scan anyway — a
+    third one, since it is a third consumer. Seeding costs nothing and holds
+    wherever the case lands.
+    """
+    seeded = Finding("tests/seed.py", 1, "sleep", 1.0, "seeded", "test_seed")
+    monkeypatch.setattr(
+        sys.modules[__name__], "_PYTHON_FINDINGS_CACHE", [seeded])
+    first = python_findings()
+    assert first is not python_findings()
+    assert first == [seeded]
+    first.append("not a finding")
+    assert "not a finding" not in python_findings()
+
+
+#: The seven whole-tree derivations `_ModuleFacts` memoizes, named by the
+#: function that performs each one. The regression below counts COMPUTATIONS,
+#: which is what the cache removes; the public helpers are still called as often
+#: as before, and counting those would report the same number either way.
+_WHOLE_TREE_DERIVATIONS = (
+    "_derive_module_constants",
+    "_derive_clock_bare_names",
+    "_derive_clock_module_names",
+    "_derive_bare_sleep_names",
+    "_derive_blocking_names",
+    "_derive_clock_derived_names",
+    "_derive_clock_reading_helpers",
+)
+
+
+def _count_derivations(monkeypatch):
+    """A counter per whole-tree derivation, installed on this module."""
+    counts = collections.Counter()
+    module = sys.modules[__name__]
+    for name in _WHOLE_TREE_DERIVATIONS:
+        original = getattr(module, name)
+
+        def counting(*args, _name=name, _original=original, **kwargs):
+            counts[_name] += 1
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, counting)
+    return counts
+
+
+def test_each_whole_tree_derivation_runs_once_per_file(monkeypatch):
+    """The seven walks happen once per shared per-file cache (#810).
+
+    Measured before the cache existed, on this runner: one file's scan performed
+    `_module_constants` 3 times, `_clock_bare_names` 8, `_clock_module_names` 8,
+    `_bare_sleep_names` 3, `_clock_derived_names` 3, `_blocking_names` 1 and
+    `_clock_reading_helpers` 1 — 27 whole-tree walks for seven answers that
+    cannot differ between them, because the tree does not change.
+
+    `_support_constants` is warmed first on purpose. It is `lru_cache`d per
+    PROCESS and derives constants from a DIFFERENT tree, so leaving it cold
+    would charge this file's count with one derivation belonging to
+    `tests/_support_http.py`.
+    """
+    _support_constants()
+    subject = REPO / "tests" / "test_timing_budget_guard.py"
+    counts = _count_derivations(monkeypatch)
+
+    _scan_python_findings([subject])
+
+    assert dict(counts) == {name: 1 for name in _WHOLE_TREE_DERIVATIONS}, (
+        "a whole-tree derivation ran more than once for one file, so the "
+        "per-file cache is not reaching every collector: " + repr(dict(counts))
+    )
+
+
+def test_a_shared_cache_and_a_private_one_report_the_same_findings():
+    """The cache is memoization, not a change of meaning.
+
+    Each collector called WITHOUT `_cache` builds a private one for its own
+    tree, which is the path every scaffold case below takes. Those findings must
+    equal the ones the shared per-file cache produces, or the cache is deciding
+    something rather than remembering it.
+    """
+    # Derived from the tracked estate rather than named. A literal second
+    # subject would have to be some other module, and naming a mirror-PRIVATE
+    # one puts a path in a PUBLIC test that a public clone does not have —
+    # which `tests/test_public_test_dep_closure.py` refuses, correctly.
+    this_module = REPO / "tests" / "test_timing_budget_guard.py"
+    tracked = sorted(path for path in _tracked("tests/*.py") if path.exists())
+    subjects = [this_module] + [path for path in tracked if path != this_module][:2]
+    shared = _scan_python_findings(subjects)
+
+    private = []
+    for path in subjects:
+        text = path.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        private.extend(collect_budgets(path, source=text, tree=tree))
+        private.extend(collect_elapsed_assertions(path, source=text, tree=tree))
+        private.extend(collect_fixed_waits(path, source=text, tree=tree))
+
+    assert shared == private
+
+
+def test_a_published_derivation_cannot_be_mutated():
+    """The seven results are published immutable rather than copied.
+
+    A defensive copy would permit the very caller behaviour a shared cache
+    forbids, and would re-allocate on every read. An exhaustive audit found no
+    caller that mutates one today, so this makes a future regression impossible
+    to introduce silently instead of merely unlikely.
+    """
+    tree = ast.parse(
+        "import time\n"
+        "from time import monotonic, sleep\n"
+        "LIMIT = 5\n"
+        "def _wait(deadline_s=1.0):\n"
+        "    started = monotonic()\n"
+        "    sleep(deadline_s)\n"
+    )
+    cache = _ModuleFacts(tree)
+
+    constants = _module_constants(tree, _cache=cache)
+    assert constants["LIMIT"] == 5
+    with pytest.raises(TypeError):
+        constants["LIMIT"] = 9
+    assert _module_constants(tree, _cache=cache)["LIMIT"] == 5
+
+    for helper in (_clock_bare_names, _clock_module_names, _bare_sleep_names,
+                   _blocking_names, _clock_derived_names,
+                   _clock_reading_helpers):
+        published = helper(tree, _cache=cache)
+        assert isinstance(published, frozenset), helper.__name__
+        before = set(published)
+        with pytest.raises(AttributeError):
+            published.add("injected")
+        assert set(helper(tree, _cache=cache)) == before, helper.__name__
+
+
+def test_a_cache_refuses_a_tree_it_was_not_built_from():
+    """The binding is asserted, so a cache can never answer for another parse."""
+    one = ast.parse("import time\n")
+    other = ast.parse("from time import sleep\n")
+    with pytest.raises(AssertionError):
+        _clock_module_names(other, _cache=_ModuleFacts(one))
 
 
 _SHEBANG = re.compile(r"^#!.*\b(?:ba|z|k|da)?sh\b")
@@ -1793,10 +2214,13 @@ def test_the_composed_threshold_is_not_parked_on_a_sum():
         relative = str(path.relative_to(REPO))
         text = path.read_text(encoding="utf-8")
         tree = ast.parse(text)
-        consts = _module_constants(tree)
-        clocky = (_clock_derived_names(tree), _clock_reading_helpers(tree),
-                  _clock_bare_names(tree), _clock_module_names(tree))
-        blocking = _blocking_names(tree)
+        cache = _ModuleFacts(tree)
+        consts = _module_constants(tree, _cache=cache)
+        clocky = (_clock_derived_names(tree, _cache=cache),
+                  _clock_reading_helpers(tree, _cache=cache),
+                  _clock_bare_names(tree, _cache=cache),
+                  _clock_module_names(tree, _cache=cache))
+        blocking = _blocking_names(tree, _cache=cache)
         for func in ast.walk(tree):
             if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -2388,7 +2812,12 @@ def test_the_recorded_baseline_holds_no_unconverted_disposition():
         if reason.startswith("convert")
     )
     assert not unconverted, unconverted
-    assert len(RECORDED) == 21, len(RECORDED)
+    # 22 since #769 S2 added the simulated-clock entry for
+    # test_statusline_bounded_consensus_755. The count is pinned so growing the
+    # baseline is a deliberate act rather than a side effect, which is exactly
+    # what that addition was: the scan cannot see that the duration it flagged
+    # comes from a clock the test advances by hand.
+    assert len(RECORDED) == 22, len(RECORDED)
 
 
 def test_an_empty_budget_annotation_is_rejected():
@@ -2851,7 +3280,7 @@ def test_a_tolerance_on_stored_data_is_not_an_elapsed_ceiling():
 # ------------------------------------------------------- python fixed waits
 
 
-def collect_fixed_waits(path, source=None) -> list:
+def collect_fixed_waits(path, source=None, tree=None, *, _cache=None) -> list:
     """`time.sleep(N)` with N at or above a second, outside any loop.
 
     The same defect the shell half reports, in the other language. Inside a
@@ -2862,8 +3291,14 @@ def collect_fixed_waits(path, source=None) -> list:
     relative = str(pathlib.Path(path).resolve().relative_to(REPO)) \
         if pathlib.Path(path).is_absolute() else str(path)
     text = source if source is not None else pathlib.Path(path).read_text(encoding="utf-8")
-    tree = ast.parse(text)
-    bare = _bare_sleep_names(tree)
+    # `tree` is the same module's AST, supplied by a caller that already parsed
+    # it (#769 S4 #805). Passing one that does not correspond to `text` is a
+    # caller error; `python_findings` derives both from one read.
+    tree = ast.parse(text) if tree is None else tree
+    # `_cache` is the per-file `_ModuleFacts` a caller that already built one
+    # supplies (#810). Omitted, this collector builds one for its own tree, so a
+    # scaffold case that parses its own snippet behaves exactly as before.
+    bare = _bare_sleep_names(tree, _cache=_facts(tree, _cache))
 
     in_loop = set()
     for node in ast.walk(tree):

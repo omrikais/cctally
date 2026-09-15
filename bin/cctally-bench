@@ -183,30 +183,13 @@ def _capture_phases(name, body, perf, has_own_root):
 
 # ── benchmark registry ───────────────────────────────────────────────────
 
-@contextlib.contextmanager
-def _suspend_frontier_expiry(cctally):
-    """Hold ingest certificates open for the length of a measurement run.
-
-    ``FRONTIER_CERTIFICATE_MAX_AGE_SECONDS`` bounds how long one certificate
-    may stand without an exhaustive walk.  The scenarios below time the
-    caught-up validation itself, so a run whose timing loops outlast that bound
-    would silently measure a forced full walk instead.  Suspending it keeps the
-    measured quantity the validation cost; the bound's own cost is one walk per
-    interval, which the full-walk scenarios already measure separately.
-
-    The scope has to be a context manager, not an assignment.
-    ``_load_sibling`` registers the module in ``sys.modules``, so the object
-    this rebinds is the same object every other importer in the process holds,
-    and an in-process caller leaves ``float("inf")`` standing for the rest of
-    the interpreter unless every exit path — exceptions included — restores it.
-    """
-    frontier_mod = cctally._load_sibling("_lib_ingest_frontier")
-    previous = frontier_mod.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS
-    frontier_mod.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS = float("inf")
-    try:
-        yield frontier_mod
-    finally:
-        frontier_mod.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS = previous
+# #769 S6 removed `_suspend_frontier_expiry`. It rebound
+# `FRONTIER_CERTIFICATE_MAX_AGE_SECONDS` to `float("inf")` for the length of a
+# run so a caught-up validation could be timed without the age bound firing
+# underneath it. Every scenario below now runs the PRODUCTION policy with that
+# constant byte-unchanged, and reaches its state by SEEDING immediately before
+# its timed body instead — which is also what makes `frontier.expired_full` a
+# measurement of something the committed harness had never measured at all.
 
 
 def _make_benchmarks(cctally, perf, now_utc=None, *, scope):
@@ -282,8 +265,10 @@ def _make_benchmarks(cctally, perf, now_utc=None, *, scope):
         return _snapshot()              # unchanged signature → reuse (near-zero)
 
     # ── family 2: ingest ──
-    frontier_mod = scope.enter_context(_suspend_frontier_expiry(cctally))
+    frontier_mod = cctally._load_sibling("_lib_ingest_frontier")
     frontier = frontier_mod.DashboardIngestFrontier(
+        cctally._cctally_core.APP_DIR)
+    conversation_frontier = frontier_mod.ConversationSyncFrontier(
         cctally._cctally_core.APP_DIR)
     claude_roots = tuple(cctally._cctally_core._resolve_claude_projects_dirs())
     codex_roots = tuple(
@@ -294,49 +279,282 @@ def _make_benchmarks(cctally, perf, now_utc=None, *, scope):
     # Mirrors the TUI and dashboard guard sets exactly (#719 §2.6a); a
     # benchmark seeded over a narrower set would measure a certificate the
     # product never issues.
-    codex_guards = codex_hooks.codex_frontier_guard_paths(
-        codex_hooks.codex_hook_roots(cctally._codex_home_roots())
+    codex_hook_roots = codex_hooks.codex_hook_roots(
+        cctally._codex_home_roots())
+    codex_guards = codex_hooks.codex_frontier_guard_paths(codex_hook_roots)
+    # #769 S6: the digest a real Codex hook stamps into every ticket it
+    # writes. The benchmark writes its ticket directly rather than through the
+    # hook, so it has to supply the same value the hook would — an unstamped
+    # ticket beside a readable configuration is the "written by an older
+    # binary" state, and the planner correctly answers that with a full walk.
+    codex_generation = codex_hooks.codex_configuration_generation(
+        codex_hook_roots)
+    _FRONTIER_PROVIDERS = (
+        ("claude", claude_roots, claude_guards),
+        ("codex", codex_roots, codex_guards),
     )
-    seed_conn = cctally.open_cache_db()
-    try:
-        cutoff = frontier.capture_cutoff()
-        for provider, roots, guards in (
-            ("claude", claude_roots, claude_guards),
-            ("codex", codex_roots, codex_guards),
-        ):
-            if not frontier.seed_provider(
-                provider, seed_conn, roots=roots, guard_paths=guards,
-                trusted=True, cutoff=cutoff,
-            ):
-                raise RuntimeError(
-                    f"benchmark frontier could not seed {provider}: "
-                    f"{frontier.last_seed_failure.get(provider, 'unknown')}"
-                )
-    finally:
-        seed_conn.close()
 
-    def frontier_caught_up():
-        """Run the exact O(roots) validation used before an idle provider skip."""
+    def _seed_frontier():
+        """Mint both providers' certificates from one cutoff, untimed.
+
+        Called immediately before each frontier scenario's timed body rather
+        than once for the whole run, because the production expiry is now in
+        force: a certificate minted when the registry was built would be
+        minutes old by the time the later families finished, and the scenario
+        would measure a forced full walk while claiming to measure a
+        validation.
+        """
         conn = cctally.open_cache_db()
         try:
-            plans = (
+            cutoff = frontier.capture_cutoff()
+            for provider, roots, guards in _FRONTIER_PROVIDERS:
+                if not frontier.seed_provider(
+                    provider, conn, roots=roots, guard_paths=guards,
+                    trusted=True, cutoff=cutoff,
+                ):
+                    raise RuntimeError(
+                        f"benchmark frontier could not seed {provider}: "
+                        f"{frontier.last_seed_failure.get(provider, 'unknown')}"
+                    )
+        finally:
+            conn.close()
+        # The transcript consumer seeds from the SAME cutoff, so both
+        # consumers join one provider evidence generation rather than two.
+        conv = cctally.open_conversations_db()
+        try:
+            for provider, roots, guards in _FRONTIER_PROVIDERS:
+                conversation_frontier.seed_provider(
+                    provider, conv, roots=roots, guard_paths=guards,
+                    trusted=True, cutoff=cutoff)
+        finally:
+            conv.close()
+
+    def _age_codex_cursors(*, keep=()):
+        """Push every Codex cursor out of the recency window except `keep`.
+
+        The synthetic corpus is ingested moments before the benchmarks run, so
+        EVERY rollout is recently active and the restat would visit all of
+        them. That is a property of the fixture, not of a real estate, where a
+        turn touches one file. Ageing the rest is what makes the idle and
+        single-path scenarios describe the shape they are named for.
+        """
+        import datetime as _dt
+
+        now = _dt.datetime.now(_dt.timezone.utc)
+        stale = (now - _dt.timedelta(days=1)).isoformat()
+        keep = tuple(str(item) for item in keep)
+        conn = cctally.open_cache_db()
+        try:
+            if keep:
+                placeholders = ",".join("?" for _ in keep)
+                conn.execute(
+                    "UPDATE codex_session_files SET last_ingested_at=? "
+                    f"WHERE path NOT IN ({placeholders})", (stale, *keep))
+                # The kept paths are stamped FORWARD as well, not merely left
+                # alone. The corpus is ingested once at the start of the run
+                # and the later families take minutes, so a path this scenario
+                # calls recently-active would otherwise have aged out of the
+                # window before its own body ran, and the scenario would
+                # measure zero stats while claiming to measure one.
+                conn.execute(
+                    "UPDATE codex_session_files SET last_ingested_at=? "
+                    f"WHERE path IN ({placeholders})",
+                    (now.isoformat(), *keep))
+            else:
+                conn.execute(
+                    "UPDATE codex_session_files SET last_ingested_at=?",
+                    (stale,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _codex_target():
+        """The largest retained Codex rollout, or None on a Claude-only corpus."""
+        conn = cctally.open_cache_db()
+        try:
+            row = conn.execute(
+                "SELECT path FROM codex_session_files WHERE path LIKE '/%' "
+                "ORDER BY size_bytes DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+        return None if row is None else str(row[0])
+
+    codex_target = _codex_target()
+    codex_append_state = {"size": None}
+
+    def _append_to_codex_target():
+        """Append one valid token_count record and remember the old length."""
+        if codex_target is None:
+            return
+        path = pathlib.Path(codex_target)
+        if codex_append_state["size"] is None:
+            codex_append_state["size"] = path.stat().st_size
+        record = json.dumps({
+            "timestamp": "2026-09-10T12:00:00.000Z",
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {
+                "last_token_usage": {
+                    "input_tokens": 61, "cached_input_tokens": 0,
+                    "output_tokens": 41, "reasoning_output_tokens": 0,
+                    "total_tokens": 102},
+                "total_token_usage": {"total_tokens": 10_000_000}}},
+        }, separators=(",", ":")) + "\n"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(record)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def _restore_codex_target():
+        if codex_target is None or codex_append_state["size"] is None:
+            return
+        with pathlib.Path(codex_target).open("r+b") as fh:
+            fh.truncate(codex_append_state["size"])
+            fh.flush()
+            os.fsync(fh.fileno())
+        codex_append_state["size"] = None
+
+    scope.callback(_restore_codex_target)
+
+    def _plan_both():
+        conn = cctally.open_cache_db()
+        try:
+            return tuple(
                 frontier.plan_provider(
-                    "claude", conn, roots=claude_roots,
-                    guard_paths=claude_guards,
-                ),
-                frontier.plan_provider(
-                    "codex", conn, roots=codex_roots,
-                    guard_paths=codex_guards,
-                ),
+                    provider, conn, roots=roots, guard_paths=guards)
+                for provider, roots, guards in _FRONTIER_PROVIDERS
             )
         finally:
             conn.close()
-        if any(plan.mode != "caught_up" for plan in plans):
-            raise RuntimeError(
-                "benchmark frontier stopped being caught up: "
-                + ", ".join(f"{plan.provider}={plan.reason}" for plan in plans)
-            )
+
+    def _plan_codex():
+        conn = cctally.open_cache_db()
+        try:
+            return frontier.plan_provider(
+                "codex", conn, roots=codex_roots, guard_paths=codex_guards)
+        finally:
+            conn.close()
+
+    def _require(plans, mode, label):
+        for plan in plans:
+            if plan.mode != mode:
+                raise RuntimeError(
+                    f"{label}: {plan.provider} planned {plan.mode} "
+                    f"({plan.reason}), not {mode}")
         return plans
+
+    # ── the five frontier scenarios ──
+    def setup_trusted_caught_up():
+        _restore_codex_target()
+        _age_codex_cursors()
+        _seed_frontier()
+
+    def _plan_conversations():
+        conv = cctally.open_conversations_db()
+        try:
+            return tuple(
+                conversation_frontier.plan_provider(
+                    provider, conv, roots=roots, guard_paths=guards)
+                for provider, roots, guards in _FRONTIER_PROVIDERS
+            )
+        finally:
+            conv.close()
+
+    def frontier_trusted_caught_up():
+        """Both consumers' O(roots) validation before an idle skip, ZERO stats.
+
+        Also the place the shared evidence generation is asserted: two
+        consumers reporting themselves caught up on two different bodies of
+        evidence is precisely the state the coordinator exists to prevent.
+        """
+        plans = _require(_plan_both(), "caught_up", "frontier.trusted_caught_up")
+        plans += _require(
+            _plan_conversations(), "caught_up", "frontier.trusted_caught_up")
+        for provider, _roots, _guards in _FRONTIER_PROVIDERS:
+            accounting_generation = frontier.evidence_generation(provider)
+            transcript_generation = conversation_frontier.evidence_generation(
+                provider)
+            if accounting_generation != transcript_generation:
+                raise RuntimeError(
+                    f"benchmark consumers disagree on {provider}'s evidence "
+                    f"generation: {accounting_generation} vs "
+                    f"{transcript_generation}")
+        return plans
+
+    def setup_recent_active_restat():
+        _restore_codex_target()
+        _age_codex_cursors(keep=(codex_target,) if codex_target else ())
+        _seed_frontier()
+
+    def frontier_recent_active_restat():
+        """One recently-active rollout, unchanged: one stat, still caught up."""
+        return _require(
+            (_plan_codex(),), "caught_up", "frontier.recent_active_restat")
+
+    def setup_targeted_append():
+        _restore_codex_target()
+        _age_codex_cursors()
+        _seed_frontier()
+        _append_to_codex_target()
+        if codex_target is not None and not frontier_mod.record_activity(
+            cctally._cctally_core.APP_DIR, "codex", codex_target,
+            configuration_generation=codex_generation,
+        ):
+            raise RuntimeError("could not record a benchmark Codex ticket")
+
+    def frontier_targeted_append():
+        """A ticketed append: the path the ledger names, and nothing else."""
+        return _require(
+            (_plan_codex(),), "targeted", "frontier.targeted_append")
+
+    def setup_racing_append_next_tick():
+        _restore_codex_target()
+        _age_codex_cursors(keep=(codex_target,) if codex_target else ())
+        _seed_frontier()
+        _append_to_codex_target()
+
+    def frontier_racing_append_next_tick():
+        """#724: no ticket at all, found by the bounded restat."""
+        return _require(
+            (_plan_codex(),), "targeted", "frontier.racing_append_next_tick")
+
+    def setup_expired_full():
+        _restore_codex_target()
+        _age_codex_cursors()
+        _seed_frontier()
+
+    def frontier_expired_full():
+        """The cost the 120-second backstop actually charges, per interval.
+
+        The committed harness never measured this: it suspended the age bound
+        outright, so the whole-estate walk the bound forces was invisible to
+        every recorded run. The certificate is aged past the bound rather than
+        the bound being changed — spec §4 keeps
+        `FRONTIER_CERTIFICATE_MAX_AGE_SECONDS` byte-unchanged — and the body is
+        then exactly what an expired certificate produces: a full plan, the
+        exhaustive Codex walk it authorises, and the reseed that follows.
+        """
+        for provider, _roots, _guards in _FRONTIER_PROVIDERS:
+            state = frontier._states.get(provider)
+            if state is not None:
+                state.seeded_at = (
+                    frontier_mod._now()
+                    - frontier_mod.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS - 1.0)
+        plan = _plan_codex()
+        if plan.mode != "full" or plan.reason != "certificate_expired":
+            raise RuntimeError(
+                f"frontier.expired_full planned {plan.mode} ({plan.reason})")
+        conn = cctally.open_cache_db()
+        try:
+            stats = cctally.sync_codex_cache(conn)
+            if not stats.full_walk_complete:
+                raise RuntimeError("the expired full walk did not complete")
+            cutoff = frontier.capture_cutoff()
+            frontier.seed_provider(
+                "codex", conn, roots=codex_roots, guard_paths=codex_guards,
+                trusted=True, cutoff=cutoff)
+        finally:
+            conn.close()
+        return stats
 
     def sync_noop():
         conn = cctally.open_cache_db()
@@ -456,25 +674,45 @@ def _make_benchmarks(cctally, perf, now_utc=None, *, scope):
     def _total(r):
         return r.get("total") if isinstance(r, dict) else None
 
+    def _plan_paths(result):
+        plans = result if isinstance(result, tuple) else (result,)
+        try:
+            return sum(len(plan.paths) for plan in plans)
+        except Exception:
+            return None
+
+    # Each entry is (name, body, has_own_root, count_of, setup). `setup` runs
+    # ONCE before the timed loop and is never measured, which is what lets a
+    # frontier scenario reach its state under the production expiry.
     benchmarks = [
-        ("snapshot.cold", snapshot_cold, True, None),
-        ("snapshot.warm", snapshot_warm, True, None),
-        ("snapshot.idle", snapshot_idle, True, None),
-        ("frontier.caught_up", frontier_caught_up, False,
-         lambda _r: num_files + num_codex_files),
-        ("sync.noop", sync_noop, False, lambda r: num_files),
-        ("sync.delta", sync_delta, False, lambda r: 1 if delta_path else 0),
-        ("conversations.page1", conv_page1, False, _len_conversations),
-        ("conversations.sorted", conv_sorted, False, _len_conversations),
-        ("conversations.filtered", conv_filtered, False, _len_conversations),
-        ("search.cross_session", search_cross, False, _total),
+        ("snapshot.cold", snapshot_cold, True, None, None),
+        ("snapshot.warm", snapshot_warm, True, None, None),
+        ("snapshot.idle", snapshot_idle, True, None, None),
+        ("frontier.trusted_caught_up", frontier_trusted_caught_up, False,
+         lambda _r: num_files + num_codex_files, setup_trusted_caught_up),
+        ("frontier.recent_active_restat", frontier_recent_active_restat, False,
+         lambda _r: 1 if codex_target else 0, setup_recent_active_restat),
+        ("frontier.targeted_append", frontier_targeted_append, False,
+         _plan_paths, setup_targeted_append),
+        ("frontier.racing_append_next_tick", frontier_racing_append_next_tick,
+         False, _plan_paths, setup_racing_append_next_tick),
+        ("frontier.expired_full", frontier_expired_full, False,
+         lambda r: getattr(r, "files_total", None), setup_expired_full),
+        ("sync.noop", sync_noop, False, lambda r: num_files, None),
+        ("sync.delta", sync_delta, False,
+         lambda r: 1 if delta_path else 0, None),
+        ("conversations.page1", conv_page1, False, _len_conversations, None),
+        ("conversations.sorted", conv_sorted, False, _len_conversations, None),
+        ("conversations.filtered", conv_filtered, False,
+         _len_conversations, None),
+        ("search.cross_session", search_cross, False, _total, None),
         ("find.in_conversation", find_in_conv, False,
-         lambda r: (r or {}).get("total")),
-        ("payload.assemble", payload_assemble, False, None),
-        ("outline.build", outline_build, False, None),
-        ("payload.assemble_memo_hit", outline_memo, False, None),
-        ("reconcile.cache_report", reconcile_cache_report, False, None),
-        ("reconcile.projects_env", reconcile_projects_env, False, None),
+         lambda r: (r or {}).get("total"), None),
+        ("payload.assemble", payload_assemble, False, None, None),
+        ("outline.build", outline_build, False, None, None),
+        ("payload.assemble_memo_hit", outline_memo, False, None, None),
+        ("reconcile.cache_report", reconcile_cache_report, False, None, None),
+        ("reconcile.projects_env", reconcile_projects_env, False, None, None),
     ]
 
     def cleanup():
@@ -565,9 +803,14 @@ def run_all(*, scale, seed, iterations, trace, root=None,
         benchmarks, cleanup = _make_benchmarks(
             cctally, perf, bench_now, scope=frontier_scope)
         try:
-            for name, body, has_own_root, count_of in benchmarks:
+            frontier_mod = cctally._load_sibling("_lib_ingest_frontier")
+            for name, body, has_own_root, count_of, setup in benchmarks:
                 _reset_perf(perf)
+                if setup is not None:
+                    setup()
+                frontier_mod.reset_frontier_counters()
                 median, mn, mx, last = time_body(body, iterations)
+                counters = frontier_mod.frontier_counters()
                 count = None
                 if count_of is not None:
                     try:
@@ -581,6 +824,12 @@ def run_all(*, scale, seed, iterations, trace, root=None,
                     "count": count,
                     "bytes": None,
                     "phases": None,
+                    # #769 S6: the deterministic shape of the work, by
+                    # provider, consumer and plan mode, so a regression that
+                    # starts visiting every retained rollout is visible as a
+                    # COUNT rather than only as a slower millisecond figure on
+                    # whatever machine happened to run.
+                    "frontier": counters or None,
                 }
                 if trace:
                     entry["phases"] = _capture_phases(
@@ -790,126 +1039,127 @@ def run_assembly_scan(*, ladder_scale="small", iterations=DEFAULT_ITERATIONS,
     # Exercise the exact dashboard transcript pass after the ladder reads. The
     # first pass advances/certifies the independent transcript frontier; every
     # timed pass must then be a caught-up O(roots) validation with zero files.
-    # Scoped, and restored on every exit path (#740): this rebinds a module
-    # global on the shared `_lib_ingest_frontier` object, so an unrestored
-    # assignment would outlive the run and change what every later importer
-    # in the process reads as the certificate age bound.
-    with _suspend_frontier_expiry(cctally):
-        dashboard = cctally._load_sibling("_cctally_dashboard")
-        first_sync = dashboard._conversation_sync_pass()
-        if first_sync != "ok":
-            raise RuntimeError(
-                f"conversation frontier bootstrap failed: {first_sync}")
-        conversation_sync_caught_up_ms = _time_median(
-            dashboard._conversation_sync_pass, iterations)
-        final_sync = dashboard._conversation_sync_pass()
-        sync_modes = dict(getattr(final_sync, "modes", {}))
-        sync_files = dict(getattr(final_sync, "files", {}))
-        if (final_sync != "ok"
-                or sync_modes != {"claude": "caught_up", "codex": "caught_up"}
-                or sync_files != {"claude": 0, "codex": 0}):
-            raise RuntimeError(
-                "conversation frontier did not stay caught up: "
-                f"status={final_sync} modes={sync_modes} files={sync_files}")
+    #
+    # #769 S6: this ran under `_suspend_frontier_expiry`, which rebound the age
+    # bound to infinity for the whole block. The bound now stands, and the
+    # bootstrap pass immediately below is what mints the certificate the timed
+    # passes rest on — a few milliseconds before them, so the production policy
+    # is in force and the measured quantity is still the validation.
+    dashboard = cctally._load_sibling("_cctally_dashboard")
+    first_sync = dashboard._conversation_sync_pass()
+    if first_sync != "ok":
+        raise RuntimeError(
+            f"conversation frontier bootstrap failed: {first_sync}")
+    conversation_sync_caught_up_ms = _time_median(
+        dashboard._conversation_sync_pass, iterations)
+    final_sync = dashboard._conversation_sync_pass()
+    sync_modes = dict(getattr(final_sync, "modes", {}))
+    sync_files = dict(getattr(final_sync, "files", {}))
+    if (final_sync != "ok"
+            or sync_modes != {"claude": "caught_up", "codex": "caught_up"}
+            or sync_files != {"claude": 0, "codex": 0}):
+        raise RuntimeError(
+            "conversation frontier did not stay caught up: "
+            f"status={final_sync} modes={sync_modes} files={sync_files}")
 
-        if append_target is None:
-            raise RuntimeError("assembly corpus has no appendable Claude source")
-        append_sid, append_path, parent_uuid, append_cwd, append_branch = append_target
-        append_path = pathlib.Path(append_path)
-        append_stat = append_path.stat()
-        append_size = append_stat.st_size
-        append_uuid = f"{append_sid}-bench-source-append"
-        append_marker = f"bench-source-append-{append_sid}"
-        append_record = {
-            "type": "user",
-            "uuid": append_uuid,
-            "parentUuid": parent_uuid,
-            "sessionId": append_sid,
-            "timestamp": gen._iso(50_000),
-            "cwd": append_cwd,
-            "gitBranch": append_branch,
-            "message": {"role": "user", "content": append_marker},
-        }
-        append_wall_start = time.perf_counter_ns()
-        append_cpu_start = time.process_time_ns()
-        frontier = cctally._load_sibling("_lib_ingest_frontier")
+    if append_target is None:
+        raise RuntimeError("assembly corpus has no appendable Claude source")
+    append_sid, append_path, parent_uuid, append_cwd, append_branch = append_target
+    append_path = pathlib.Path(append_path)
+    append_stat = append_path.stat()
+    append_size = append_stat.st_size
+    append_uuid = f"{append_sid}-bench-source-append"
+    append_marker = f"bench-source-append-{append_sid}"
+    append_record = {
+        "type": "user",
+        "uuid": append_uuid,
+        "parentUuid": parent_uuid,
+        "sessionId": append_sid,
+        "timestamp": gen._iso(50_000),
+        "cwd": append_cwd,
+        "gitBranch": append_branch,
+        "message": {"role": "user", "content": append_marker},
+    }
+    append_wall_start = time.perf_counter_ns()
+    append_cpu_start = time.process_time_ns()
+    frontier = cctally._load_sibling("_lib_ingest_frontier")
+    try:
+        with append_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(append_record) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        if not frontier.record_activity(
+            pathlib.Path(data_dir), "claude", str(append_path)
+        ):
+            raise RuntimeError("could not record benchmark Claude activity")
+        append_sync = dashboard._conversation_sync_pass()
+        append_modes = dict(getattr(append_sync, "modes", {}))
+        append_files = dict(getattr(append_sync, "files", {}))
+        if (append_sync != "ok"
+                or append_modes != {"claude": "targeted", "codex": "caught_up"}
+                or append_files != {"claude": 1, "codex": 0}):
+            raise RuntimeError(
+                "source append did not take the targeted transcript path: "
+                f"status={append_sync} modes={append_modes} files={append_files}")
+        visible_conn = cctally.open_conversations_db()
         try:
-            with append_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(append_record) + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-            if not frontier.record_activity(
-                pathlib.Path(data_dir), "claude", str(append_path)
-            ):
-                raise RuntimeError("could not record benchmark Claude activity")
-            append_sync = dashboard._conversation_sync_pass()
-            append_modes = dict(getattr(append_sync, "modes", {}))
-            append_files = dict(getattr(append_sync, "files", {}))
-            if (append_sync != "ok"
-                    or append_modes != {"claude": "targeted", "codex": "caught_up"}
-                    or append_files != {"claude": 1, "codex": 0}):
-                raise RuntimeError(
-                    "source append did not take the targeted transcript path: "
-                    f"status={append_sync} modes={append_modes} files={append_files}")
-            visible_conn = cctally.open_conversations_db()
-            try:
-                visible = cq.find_in_conversation(
-                    visible_conn, append_sid, append_marker)
-                if visible is None or int(visible.get("total", 0) or 0) != 1:
-                    raise RuntimeError("source append was not query-visible")
-            finally:
-                visible_conn.close()
-            append_visible_ns = time.perf_counter_ns() - append_wall_start
-            append_cpu_ns = time.process_time_ns() - append_cpu_start
+            visible = cq.find_in_conversation(
+                visible_conn, append_sid, append_marker)
+            if visible is None or int(visible.get("total", 0) or 0) != 1:
+                raise RuntimeError("source append was not query-visible")
         finally:
-            with append_path.open("r+b") as fh:
-                fh.truncate(append_size)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.utime(
-                append_path,
-                ns=(append_stat.st_atime_ns, append_stat.st_mtime_ns),
+            visible_conn.close()
+        append_visible_ns = time.perf_counter_ns() - append_wall_start
+        append_cpu_ns = time.process_time_ns() - append_cpu_start
+    finally:
+        with append_path.open("r+b") as fh:
+            fh.truncate(append_size)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.utime(
+            append_path,
+            ns=(append_stat.st_atime_ns, append_stat.st_mtime_ns),
+        )
+        cleanup_conn = cctally.open_conversations_db()
+        try:
+            cleanup_conn.execute(
+                "DELETE FROM conversation_file_touches WHERE message_id IN "
+                "(SELECT id FROM conversation_messages "
+                "WHERE source_path=? AND uuid=?)",
+                (str(append_path), append_uuid),
             )
-            cleanup_conn = cctally.open_conversations_db()
-            try:
-                cleanup_conn.execute(
-                    "DELETE FROM conversation_file_touches WHERE message_id IN "
-                    "(SELECT id FROM conversation_messages "
-                    "WHERE source_path=? AND uuid=?)",
-                    (str(append_path), append_uuid),
-                )
-                cleanup_conn.execute(
-                    "DELETE FROM conversation_messages WHERE source_path=? AND uuid=?",
-                    (str(append_path), append_uuid),
-                )
-                cleanup_conn.execute(
-                    "UPDATE conversation_source_files SET size_bytes=?,mtime_ns=?,"
-                    "last_byte_offset=? WHERE path=?",
-                    (append_size, append_stat.st_mtime_ns, append_size, str(append_path)),
-                )
-                cache_mod = cctally._load_sibling("_cctally_cache")
-                cache_mod._recompute_conversation_sessions(
-                    cleanup_conn, {append_sid})
-                cleanup_conn.commit()
-            finally:
-                cleanup_conn.close()
-            cleanup_sync = dashboard._conversation_sync_pass()
-            cleanup_caught_up = dashboard._conversation_sync_pass()
-            if cleanup_sync != "ok" or cleanup_caught_up != "ok":
-                raise RuntimeError("could not restore benchmark append probe")
-            if dict(getattr(cleanup_caught_up, "modes", {})) != {
-                "claude": "caught_up", "codex": "caught_up"
-            }:
-                raise RuntimeError("benchmark append cleanup did not recertify")
-            cq._assemble_memo_clear()
-            restored_conn = cctally.open_conversations_db()
-            try:
-                restored = cq.find_in_conversation(
-                    restored_conn, append_sid, append_marker)
-                if restored is not None and int(restored.get("total", 0) or 0):
-                    raise RuntimeError("benchmark append cleanup left visible rows")
-            finally:
-                restored_conn.close()
+            cleanup_conn.execute(
+                "DELETE FROM conversation_messages WHERE source_path=? AND uuid=?",
+                (str(append_path), append_uuid),
+            )
+            cleanup_conn.execute(
+                "UPDATE conversation_source_files SET size_bytes=?,mtime_ns=?,"
+                "last_byte_offset=? WHERE path=?",
+                (append_size, append_stat.st_mtime_ns, append_size, str(append_path)),
+            )
+            cache_mod = cctally._load_sibling("_cctally_cache")
+            cache_mod._recompute_conversation_sessions(
+                cleanup_conn, {append_sid})
+            cleanup_conn.commit()
+        finally:
+            cleanup_conn.close()
+        cleanup_sync = dashboard._conversation_sync_pass()
+        cleanup_caught_up = dashboard._conversation_sync_pass()
+        if cleanup_sync != "ok" or cleanup_caught_up != "ok":
+            raise RuntimeError("could not restore benchmark append probe")
+        if dict(getattr(cleanup_caught_up, "modes", {})) != {
+            "claude": "caught_up", "codex": "caught_up"
+        }:
+            raise RuntimeError("benchmark append cleanup did not recertify")
+        cq._assemble_memo_clear()
+        restored_conn = cctally.open_conversations_db()
+        try:
+            restored = cq.find_in_conversation(
+                restored_conn, append_sid, append_marker)
+            if restored is not None and int(restored.get("total", 0) or 0):
+                raise RuntimeError("benchmark append cleanup left visible rows")
+        finally:
+            restored_conn.close()
     conversation_store = pathlib.Path(data_dir) / "conversations.db"
 
     return {

@@ -2240,6 +2240,22 @@ def test_incomplete_codex_metadata_keeps_nonproject_dashboard_data(
         assert state.data["hero"]["cycle"]["window_minutes"] == 10_080
         assert state.data["hero"]["total_tokens"] >= 0
         assert [row["label"] for row in state.data["projects"]["rows"]] == ["project-red"]
+
+        # A deterministically unqualifiable row inside the accounting window is
+        # the ONE state whose remedy IS the cache rebuild, so this message must
+        # keep naming it — and must NOT promise a retry, which would be false:
+        # rebuilding is the only thing that clears a malformed row. The count
+        # is not pinned here because `metadata_kind` varies how many rows are
+        # unqualified; the count itself is covered by the probe's own tests.
+        metadata_warnings = [
+            warning for warning in state.warnings
+            if warning.code == "codex_metadata_incomplete"
+        ]
+        assert len(metadata_warnings) == 1
+        assert "lack project metadata" in metadata_warnings[0].message
+        assert "cache-sync --source codex --rebuild" in (
+            metadata_warnings[0].message)
+        assert "retry" not in metadata_warnings[0].message
     finally:
         cache.close()
         stats.close()
@@ -2389,11 +2405,20 @@ def test_complete_metadata_defensively_falls_back_once_when_qualified_read_fails
         assert state.availability == "partial"
         assert state.freshness == "fresh"
         assert state.warnings[0].code == "codex_metadata_incomplete"
+        # #834 S2 (#829) CHANGED this expectation deliberately. The raise above
+        # carries the constructor's default `transient=True`, so this is a
+        # failure of the READ, and the published carrier is overridden to
+        # `transient_read_failure` with `retryable` true. Advising the cache
+        # rebuild here named a remedy for a problem the reader does not have,
+        # while the detail note beside it said the build would retry — the
+        # exact conflation the typed health result exists to end. The message
+        # now matches the carrier.
         assert state.warnings[0].message == (
-            "Codex project metadata could not be read; "
-            "run `cctally cache-sync --source codex --rebuild`."
+            "Codex project metadata could not be read for this build; it will "
+            "retry on the next refresh."
         )
         assert "0 Codex accounting row(s)" not in state.warnings[0].message
+        assert "--rebuild" not in state.warnings[0].message
         assert [row["label"] for row in state.data["projects"]["rows"]] == ["project-red"]
     finally:
         cache.close()
@@ -4309,6 +4334,7 @@ def test_hero_quota_tracks_the_clocked_top_level_summary(tmp_path, monkeypatch):
 def test_one_tick_applies_quota_expiry_and_budget_together(tmp_path, monkeypatch):
     """#429 §4.5: three hero mutations compose on ONE hero copy; three
     independent copies would let the last write win."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
     state = _build_codex_state_with_expiring_cycle_and_budget(tmp_path, monkeypatch)
     assert state.capabilities["hero"].status == "supported"
     assert isinstance(state.data["hero"]["cycle"], Mapping)
@@ -4323,6 +4349,14 @@ def test_one_tick_applies_quota_expiry_and_budget_together(tmp_path, monkeypatch
     assert hero["quota"] == clocked.data["quota"]["summary"]    # quota applied
     assert clocked.capabilities["hero"].status == "unavailable"
     assert any(w.code == "codex_cycle_unavailable" for w in clocked.warnings)
+    # #849: the clock-expiry candidate never reaches the no-cause retry arm.
+    # The same retained evidence records a decision deadline, and expiry makes
+    # it true on the tick that publishes the partial state. The adapter therefore
+    # forces a rebuild before `_tui_retain_refused_partial` can consult its
+    # positive allowlist; no per-tick rebuild regression is introduced by the
+    # `NO_STATED_CAUSE` branch.
+    assert source_module.codex_decision_deadline_passed(clocked, later) is True
+    assert clocked.warnings, "cycle expiry must not manufacture a no-cause partial"
 
 
 # =========================================================================
@@ -5102,6 +5136,24 @@ S3_583_SCOPED_DELTAS = frozenset({
 })
 
 
+# #834 S2 (#828, #829) — the typed Codex metadata-health carrier. FULLY
+# QUALIFIED for the same reason every set above is: `metadata_health` is a new
+# key this oracle must keep watching everywhere ELSE it could appear, and
+# admitting the bare leaf name would stop it seeing one inside `data`.
+#
+# All three provider entries are listed, and each is a different intentional
+# change. Codex publishes the result its probe observed. Claude publishes null
+# because it has no Codex conversation metadata, and the All source publishes
+# null because metadata health is a provider fact and a composition is not a
+# provider. Null is exactly what an older server's payload looks like, which is
+# why the client normalizes an absent object to unknown rather than to healthy.
+S2_834_SCOPED_DELTAS = frozenset({
+    "sources.all.metadata_health",
+    "sources.claude.metadata_health",
+    "sources.codex.metadata_health",
+})
+
+
 def _is_s2_556_delta(path):
     return any(
         path == prefix or path.startswith(prefix + ".")
@@ -5125,6 +5177,8 @@ def _is_allowed_delta(path):
     if path in S1_556_SCOPED_DELTAS or _is_s2_556_delta(path):
         return True
     if _is_s5_556_delta(path) or path in S3_583_SCOPED_DELTAS:
+        return True
+    if path in S2_834_SCOPED_DELTAS:
         return True
     return segments[-1] in CODEX_SCOPED_DELTAS and "codex" in segments
 # NOT a wire semantic: `data_version` embeds `current_generation()`, a
@@ -5227,7 +5281,9 @@ def test_claude_source_state_is_unchanged(tmp_path, monkeypatch):
 
     This was raw equality, because #429 touched only Codex. #556 S1 repoints
     `domain_freshness.hero` on BOTH providers, so exactly one Claude delta is
-    admitted — the fully-qualified path in `S1_556_SCOPED_DELTAS`.
+    admitted — the fully-qualified path in `S1_556_SCOPED_DELTAS`. #834 S2 adds
+    a second: every source state now publishes `metadata_health`, null on
+    Claude because it has no Codex conversation metadata to describe.
 
     It deliberately does NOT reuse `_is_allowed_delta`. That predicate also
     admits the bare leaf names in `ALLOWED_DELTAS`, none of which #429 or #556
@@ -5254,6 +5310,7 @@ def _unexpected_claude_deltas(before_claude, after_claude):
         )
         if path.split(".")[-1] not in VOLATILE_FIELDS
         and path not in S1_556_SCOPED_DELTAS
+        and path not in S2_834_SCOPED_DELTAS
         and not _is_s2_556_delta(path)
         and not _is_s5_556_delta(path)
     ]
@@ -5420,3 +5477,330 @@ def test_s5_delta_predicate_reports_a_path_it_does_not_name():
     assert not _is_s5_556_delta("sources.all.data.providers.claude.budget.status")
     assert not _is_s5_556_delta("sources.claude.capabilities.budget.status")
     assert not _is_s5_556_delta("sources.claude.capabilities.quota.semantics")
+
+
+# ── #769 S4 #782 — the ordering-dependent cache-report failure ───────────────
+#
+# `_codex_cache_report_wire`'s incremental path keeps three pieces of state per
+# `cache_key`: the wrapped rows, a per-day `groups` index of cache entry ids,
+# and the frozen day rows. A day is only re-frozen when it lands in
+# `affected_days`, and an id is only removed from a day's group when it lands
+# in `old_ids`. Replacing a row whose day MOVED updated neither for the
+# previous day, so the id stayed filed under it. Re-freezing that day then fed
+# `_aggregate_cache_by_day` two dates and it raised
+# "one cache-report day produced multiple rows"; when the day was not
+# re-frozen, the stale row was published under a day it no longer belonged to.
+#
+# The condition is reachable in one process because the memo's signature
+# carries no store identity — it is
+# `(semantic_signature, speed, window_days, display_tz_name)` under the
+# literal key `("parent",)` — so two corpora that share a range start and a
+# timezone share the state, and deterministic fixture builders reuse
+# `cache_entry_id` values across them.
+
+_CR_UTC = dt.timezone.utc
+_CR_NOW = dt.datetime(2026, 7, 20, 12, 0, tzinfo=_CR_UTC)
+_CR_DAY_ONE = dt.datetime(2026, 7, 18, 9, 0, tzinfo=_CR_UTC)
+_CR_DAY_TWO = dt.datetime(2026, 7, 19, 9, 0, tzinfo=_CR_UTC)
+_CR_SIGNATURE = ("codex-accounting-v1",
+                 dt.datetime(2026, 7, 1, tzinfo=_CR_UTC), False)
+_CR_KEY = ("parent",)
+
+
+def _cache_report_entry(cache_entry_id, timestamp, *, source_path):
+    return SimpleNamespace(
+        timestamp=timestamp,
+        source_root_key="root-a",
+        source_path=source_path,
+        conversation_key=f"v1.conv-{cache_entry_id}",
+        project_label="corpus",
+        model="gpt-5",
+        input_tokens=100,
+        cached_input_tokens=80,
+        output_tokens=10,
+        reasoning_output_tokens=2,
+        total_tokens=110,
+        cost_usd=0.01,
+        cache_entry_id=cache_entry_id,
+    )
+
+
+@pytest.fixture
+def cache_report_memo():
+    """Own the module global for the case, in both directions.
+
+    Leaving state behind would report this defect against whichever test ran
+    next, and inheriting state from an earlier test would make the case's own
+    warm build depend on collection order.
+    """
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    source_module._CODEX_CACHE_REPORT_ROWS.clear()
+    try:
+        yield source_module
+    finally:
+        source_module._CODEX_CACHE_REPORT_ROWS.clear()
+
+
+def _cache_report_call(source_module, entries, *, changed_new=()):
+    return source_module._codex_cache_report_wire(
+        tuple(entries), metadata={}, now_utc=_CR_NOW, display_tz_name="UTC",
+        speed="standard", cache_key=_CR_KEY,
+        semantic_signature=_CR_SIGNATURE, changed_new=changed_new,
+    )
+
+
+def test_a_replaced_cache_report_row_retires_the_day_it_moved_off(
+    cache_report_memo,
+):
+    """One process, no xdist dependence: warming then moving a row's day."""
+    source_module = cache_report_memo
+    first = [
+        _cache_report_entry(1, _CR_DAY_ONE, source_path="/private/a.jsonl"),
+        _cache_report_entry(2, _CR_DAY_ONE, source_path="/private/a.jsonl"),
+    ]
+    _cache_report_call(source_module, first)
+    assert _CR_KEY in source_module._CODEX_CACHE_REPORT_ROWS
+
+    # The second corpus reuses both ids. Id 2 now falls on the following day,
+    # and id 1 changed in place on the first day, so the first day is
+    # re-frozen while its group still names id 2.
+    moved = [
+        _cache_report_entry(1, _CR_DAY_ONE, source_path="/private/b.jsonl"),
+        _cache_report_entry(2, _CR_DAY_TWO, source_path="/private/b.jsonl"),
+    ]
+    report = _cache_report_call(source_module, moved, changed_new=moved)
+
+    observed = [row["date"] for row in report["days"] if row["observed"]]
+    assert observed == ["2026-07-19", "2026-07-18"], observed
+
+
+def test_a_warm_cache_report_equals_a_cold_build_after_a_day_move(
+    cache_report_memo,
+):
+    """The stronger statement: no observable difference, not merely no raise."""
+    source_module = cache_report_memo
+    first = [
+        _cache_report_entry(1, _CR_DAY_ONE, source_path="/private/a.jsonl"),
+        _cache_report_entry(2, _CR_DAY_ONE, source_path="/private/a.jsonl"),
+    ]
+    moved = [
+        _cache_report_entry(1, _CR_DAY_ONE, source_path="/private/b.jsonl"),
+        _cache_report_entry(2, _CR_DAY_TWO, source_path="/private/b.jsonl"),
+    ]
+
+    cold = _cache_report_call(source_module, moved)
+    source_module._CODEX_CACHE_REPORT_ROWS.clear()
+    _cache_report_call(source_module, first)
+    warm = _cache_report_call(source_module, moved, changed_new=moved)
+
+    assert warm == cold
+
+
+def test_a_cache_report_row_that_ages_out_of_the_window_leaves_its_group(
+    cache_report_memo,
+):
+    """The same retirement, for a replacement the wrapper drops entirely.
+
+    A row replaced by one older than the fourteen-day cutoff wraps to None.
+    Without retiring its previous day the id stays in `groups` while
+    `cached_rows` no longer holds it, and the next re-freeze of that day
+    raises KeyError while sorting the group.
+    """
+    source_module = cache_report_memo
+    first = [
+        _cache_report_entry(1, _CR_DAY_ONE, source_path="/private/a.jsonl"),
+        _cache_report_entry(2, _CR_DAY_ONE, source_path="/private/a.jsonl"),
+    ]
+    _cache_report_call(source_module, first)
+
+    aged = _cache_report_entry(
+        2, _CR_NOW - dt.timedelta(days=30), source_path="/private/b.jsonl")
+    still_here = _cache_report_entry(
+        1, _CR_DAY_ONE, source_path="/private/b.jsonl")
+    report = _cache_report_call(
+        source_module, [still_here], changed_new=[still_here, aged])
+
+    observed = [row["date"] for row in report["days"] if row["observed"]]
+    assert observed == ["2026-07-18"], observed
+
+
+# ── #769 S6 #809 — store identity in the accounting memo signature ───────────
+#
+# `_CODEX_CACHE_REPORT_ROWS` and six sibling memos are validated by
+# `(semantic_signature, speed, window_days, display_tz_name)`, whose
+# `semantic_signature` was `("codex-accounting-v1", range_start,
+# metadata_incomplete)`. Two stores built in one process that agree on those
+# values shared one memo entry, and because the incremental path evicts a
+# cached row only when it ages past the cutoff or appears in `changed_old` /
+# `changed_new`, a row simply ABSENT from the second corpus survived into that
+# corpus's published rows.
+#
+# The sibling `("codex-visible-population-v1", _cache_database_identity(...),
+# …)` already folds store identity in. The accounting signature was the
+# outlier in its own family.
+
+
+def _cr_store(tmp_path, name):
+    """A real file-backed cache.db, because identity is device and inode."""
+    path = tmp_path / name
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    return conn
+
+
+def test_two_stores_do_not_share_one_accounting_memo_signature(tmp_path):
+    """D3: a second corpus misses the memo and builds cold."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    a = _cr_store(tmp_path, "a.db")
+    b = _cr_store(tmp_path, "b.db")
+    try:
+        sig_a = source_module._codex_accounting_period_signature(
+            a, _CR_SIGNATURE[1], False)
+        sig_b = source_module._codex_accounting_period_signature(
+            b, _CR_SIGNATURE[1], False)
+        again_a = source_module._codex_accounting_period_signature(
+            a, _CR_SIGNATURE[1], False)
+    finally:
+        a.close()
+        b.close()
+    assert sig_a != sig_b, (
+        "two distinct stores produced the same accounting memo signature"
+    )
+    assert sig_a == again_a, (
+        "the same store produced two signatures, which would miss every tick"
+    )
+
+
+@pytest.fixture
+def loaded_cache_report_memo(monkeypatch, tmp_path):
+    """`cache_report_memo`, but with `sys.modules['cctally']` established.
+
+    `_codex_cache_report_wire` reaches the shared cache-report kernel through
+    `sys.modules["cctally"]`, and `load_script` re-binds that module while
+    dropping every cached `_cctally_*` sibling. It therefore has to run BEFORE
+    the source module is captured, which is why this does not compose with
+    `cache_report_memo` as a second fixture.
+    """
+    import importlib
+
+    load_script()
+    redirect_paths(sys.modules["cctally"].__dict__, monkeypatch, tmp_path)
+    source_module = importlib.import_module("_cctally_dashboard_sources")
+    source_module._CODEX_CACHE_REPORT_ROWS.clear()
+    try:
+        yield source_module
+    finally:
+        source_module._CODEX_CACHE_REPORT_ROWS.clear()
+
+
+def test_a_second_corpus_does_not_inherit_the_first_corpus_rows(
+    loaded_cache_report_memo, tmp_path,
+):
+    """The issue's reproduction sketch.
+
+    Corpus A holds one cache-report row at a fixed non-zero `cache_entry_id`.
+    Corpus B is a DIFFERENT store built in the same process with the module
+    globals left alone, and it is driven with empty `changed_old` and
+    `changed_new` — the incremental path's steady state. B's warm result must
+    equal a cold build of B, and must carry no A-only row.
+    """
+    source_module = loaded_cache_report_memo
+    a = _cr_store(tmp_path, "corpus-a.db")
+    b = _cr_store(tmp_path, "corpus-b.db")
+    try:
+        sig_a = source_module._codex_accounting_period_signature(
+            a, _CR_SIGNATURE[1], False)
+        sig_b = source_module._codex_accounting_period_signature(
+            b, _CR_SIGNATURE[1], False)
+
+        a_only = _cache_report_entry(
+            41, _CR_DAY_ONE, source_path="/private/corpus-a.jsonl")
+        b_rows = [
+            _cache_report_entry(
+                42, _CR_DAY_TWO, source_path="/private/corpus-b.jsonl"),
+        ]
+
+        def call(signature, entries):
+            return source_module._codex_cache_report_wire(
+                tuple(entries), metadata={}, now_utc=_CR_NOW,
+                display_tz_name="UTC", speed="standard", cache_key=_CR_KEY,
+                semantic_signature=signature, changed_new=(),
+            )
+
+        # A cold build of B alone, taken first and with the memo cleared, is
+        # the oracle the warm build must equal.
+        cold = call(sig_b, b_rows)
+        source_module._CODEX_CACHE_REPORT_ROWS.clear()
+
+        call(sig_a, [a_only])
+        warm = call(sig_b, b_rows)
+    finally:
+        a.close()
+        b.close()
+
+    assert warm == cold, "corpus B's warm build differs from its cold build"
+    observed = [row["date"] for row in warm["days"] if row["observed"]]
+    assert observed == ["2026-07-19"], observed
+
+
+def test_an_in_memory_store_identity_is_not_a_reusable_integer():
+    """`id()` is handed back to the next allocation of the same size.
+
+    Without a handle-lifetime token, a new in-memory corpus opened after the
+    previous handle was released matches the stale process memo — exactly the
+    collision #809 exists to close, moved from file-backed stores to in-memory
+    ones.
+    """
+    import gc
+
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    identities = []
+    addresses = []
+    for _ in range(8):
+        conn = sqlite3.connect(":memory:")
+        identities.append(source_module._cache_database_identity(conn))
+        addresses.append(id(conn))
+        conn.close()
+        del conn
+        gc.collect()
+
+    # Measured on CPython 3.14: a create/close/drop cycle hands the released
+    # address straight back, so nineteen of twenty sequential allocations share
+    # one `id()`. The precondition is asserted rather than assumed, because a
+    # future allocator that stopped reusing addresses would make this case pass
+    # for a reason that has nothing to do with the fix.
+    assert len(set(addresses)) < len(addresses), (
+        "precondition: CPython did not hand any released address back"
+    )
+    assert len(set(identities)) == len(identities), (
+        "distinct in-memory stores shared an identity: "
+        f"{len(set(identities))} distinct of {len(identities)}"
+    )
+
+
+def test_a_live_in_memory_store_keeps_one_stable_identity():
+    """The token is bound to the handle, so it must not churn per call.
+
+    A per-call token would fail closed but would also make every in-memory
+    build cold on every tick, which is a different defect.
+    """
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    conn = sqlite3.connect(":memory:")
+    try:
+        assert (source_module._cache_database_identity(conn)
+                == source_module._cache_database_identity(conn))
+    finally:
+        conn.close()
+
+
+def test_two_live_in_memory_stores_have_distinct_identities():
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    first = sqlite3.connect(":memory:")
+    second = sqlite3.connect(":memory:")
+    try:
+        assert (source_module._cache_database_identity(first)
+                != source_module._cache_database_identity(second))
+    finally:
+        first.close()
+        second.close()

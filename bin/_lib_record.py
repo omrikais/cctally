@@ -111,6 +111,122 @@ def plan_five_hour_credit(
     return prior_resets_in_future and (prior_pct - new_pct) >= drop_threshold
 
 
+# ── Fragment 3b: 5h source-local confirmation state machine (#769 S2 §3) ───
+FIVE_HOUR_HOLD = "hold"
+FIVE_HOUR_SET_BASELINE = "set_baseline"
+FIVE_HOUR_ARM = "arm"
+FIVE_HOUR_CONFIRM = "confirm"
+FIVE_HOUR_CANCEL = "cancel"
+
+
+@dataclass(frozen=True)
+class FiveHourSourceDecision:
+    """What one contributor's observation does to that contributor's own
+    five-hour credit state.
+
+    ``action`` is one of the FIVE_HOUR_* constants above. ``baseline_pct`` is
+    the baseline to persist afterwards, and is ``None`` exactly when the action
+    writes no baseline (FIVE_HOUR_HOLD).
+
+    ``credit_prior_pct`` and ``credit_post_pct`` are set only on
+    FIVE_HOUR_CONFIRM and are the two ends of the credit this decision found:
+    the pre-drop baseline and the armed low that dropped away from it. They are
+    what the credit event records as ``prior_percent`` and ``post_percent``.
+    Both belong to the ARMING observation, because that is the observation that
+    saw the drop; the confirming observation only establishes that the drop was
+    not a single stale reading, and its own percent is not one end of the
+    credit. Binding ``post_percent`` to the confirming percent instead records
+    a drop that can be arbitrarily smaller than the eligibility threshold the
+    arming leg required — down to nothing at all, since confirmation asks only
+    for a reading below the baseline — which is what `R-5HC1` in
+    ``bin/cctally-reconcile-test`` forbids.
+    """
+    action: str
+    baseline_pct: float | None = None
+    credit_prior_pct: float | None = None
+    credit_post_pct: float | None = None
+
+
+def plan_five_hour_source_local_credit(
+    *, baseline_pct, pending_low_pct, pending_observation_id,
+    new_pct, observation_id, drop_threshold, window_live,
+):
+    """Classify one observation against ONE contributor's own five-hour state
+    (glue call site: ``detect_reset_and_credit``'s 5h branch).
+
+    The rule this implements (#769 S2 §3, issue #751): a credit needs a
+    same-source observed descent followed by a distinct same-source
+    confirmation that is still below that source's own pre-drop baseline,
+    inside one physical window. Detection used to compare an incoming reading
+    against the latest accepted snapshot whatever contributor produced it, so a
+    single stale ``source=statusline`` sample below an ``source=api`` baseline
+    fabricated a credit with no confirmation from any source.
+
+    All inputs are that ONE source's own state; the caller selects the row by
+    ``(account_key, five_hour_window_key, source)`` and therefore cannot pass
+    another contributor's evidence in. ``baseline_pct is None`` means the
+    source has no state for this window — a fresh window, or state a rebuild
+    dropped.
+
+    ``drop_threshold`` stays ELIGIBILITY only. It decides whether a decrease is
+    large enough to be worth arming; it is not evidence of freshness, and there
+    is deliberately no maximum gap, no maximum climb and no confirmation-value
+    band, because observations arrive at an unbounded interval and every finite
+    threshold on the change between two of them has a legitimate crossing.
+    """
+    new_pct = float(new_pct)
+
+    if baseline_pct is None:
+        # No state for this source in this window. Establish the baseline and
+        # emit nothing: a first reading is not a descent, whatever any other
+        # contributor has already reported.
+        return FiveHourSourceDecision(FIVE_HOUR_SET_BASELINE, new_pct)
+
+    baseline_pct = float(baseline_pct)
+
+    if pending_low_pct is not None:
+        # An armed descent from this source.
+        if (
+            observation_id is not None
+            and pending_observation_id is not None
+            and observation_id == pending_observation_id
+        ):
+            # The arming observation replayed. It cannot confirm itself, so
+            # leave the state armed and write nothing — the same rule the
+            # weekly debounce applies at `first_zero_observation_id`.
+            return FiveHourSourceDecision(FIVE_HOUR_HOLD)
+        if window_live and new_pct < baseline_pct:
+            # A distinct same-source observation, still below the pre-drop
+            # baseline, inside the live window. This is the confirmation. The
+            # baseline to persist afterwards is this observation's own percent
+            # — the source's current level — while the credit itself is the
+            # arming observation's descent from `baseline_pct` to
+            # `pending_low_pct`.
+            return FiveHourSourceDecision(
+                FIVE_HOUR_CONFIRM, new_pct, baseline_pct,
+                float(pending_low_pct))
+        # Back at or above the baseline (or the window is no longer live):
+        # the descent was not sustained, so the candidate is cancelled.
+        return FiveHourSourceDecision(
+            FIVE_HOUR_CANCEL, max(baseline_pct, new_pct))
+
+    if plan_five_hour_credit(
+        baseline_pct, new_pct,
+        drop_threshold=drop_threshold, prior_resets_in_future=window_live,
+    ):
+        return FiveHourSourceDecision(FIVE_HOUR_ARM, baseline_pct)
+
+    if new_pct > baseline_pct:
+        return FiveHourSourceDecision(FIVE_HOUR_SET_BASELINE, new_pct)
+
+    # Equal, or a decrease too small to be eligible. The baseline is this
+    # source's running maximum inside the window, which is what the write-time
+    # MAX clamp already makes the accepted snapshots behave like, so a
+    # sub-threshold dip does not lower it and a later cumulative drop past the
+    # threshold still arms.
+    return FiveHourSourceDecision(FIVE_HOUR_HOLD)
+
+
 # ── Fragment 4: reset-aware HWM clamp comparison ───────────────────────────
 def hwm_clamp_applies(incoming_pct: float, recorded_max_pct) -> bool:
     """Return True when ``incoming_pct`` is below the reset-aware recorded MAX
@@ -181,19 +297,21 @@ def projected_crossings(value: float, levels) -> list:
 
 
 # ── Fragment 8: usage-snapshot fold outcome classification ─────────────────
-#: The three outcomes of ``_cctally_journal._usage_snapshot_fold_decision``.
-#: ACCEPT journals a ``snapshot_accept`` evt. The two SKIPs both suppress that
-#: insert, but they mean OPPOSITE things about the incoming observation and the
-#: stored row, so the glue must be able to tell them apart:
+#: RETAINED LEGACY SPELLINGS with no live consumer (#769 S11, #824).
 #:
-#:   * ``SNAPSHOT_SKIP_DEDUP`` — the incoming observation AGREES with the latest
-#:     stored row (both percents unchanged). Re-running the derivation
-#:     chokepoints against that row is correct; it is what heals a tick killed
-#:     between the snapshot insert and the milestone insert.
-#:   * ``SNAPSHOT_SKIP_CLAMP`` — the incoming 7d percent is strictly BELOW the
-#:     reset-aware in-window maximum, so the observation CONTRADICTS the stored
-#:     row. Deriving a weekly milestone from the higher stored value would
-#:     record a crossing the meter says did not happen.
+#: These were the three outcomes of ``_usage_snapshot_fold_decision`` while it
+#: returned a positional ``(skip, adjusted, reason)`` tuple. It now returns
+#: ``UsageSnapshotFoldResult``, which states the weekly and five-hour axes
+#: separately, and the weekly milestone gate reads that result's held flag
+#: rather than comparing a reason string. Nothing outside this module and its
+#: own test reads these names today.
+#:
+#: They are kept rather than deleted because an out-of-tree reader could still
+#: import them, and because the distinction they encode is still true of the
+#: system: a dedup outcome means the incoming observation AGREES with the stored
+#: row, while a clamp outcome means it CONTRADICTS it, and only the second must
+#: suppress a weekly milestone. Deleting them is a behaviour-neutral cleanup,
+#: not part of this change.
 SNAPSHOT_ACCEPT = "accept"
 SNAPSHOT_SKIP_CLAMP = "clamp"
 SNAPSHOT_SKIP_DEDUP = "dedup"

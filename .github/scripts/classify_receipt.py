@@ -48,6 +48,7 @@ RECEIPT_WIRE_VERSION = 1
 # a test reads that literal out of the wrapper and compares it here — drift
 # would refuse every receipt while looking exactly like "no receipt matched".
 GATE_ID_FULL_SUITE = "cctally-test-remote/full-suite@1"
+GATE_ID_MERGE = "cctally-test-remote/merge-focused@1"
 
 TYPE_FILE, TYPE_DIR, TYPE_LINK = "f", "d", "l"
 MODE_EXEC, MODE_PLAIN, MODE_LINK = "0755", "0644", "0777"
@@ -262,7 +263,7 @@ def toolchain_digest(repo: str = "."):
 
 
 def verify_candidate(receipt, *, tree_oid, ref_namespace, reconstructed_digest,
-                     toolchain_digest):
+                     toolchain_digest, merge_selection=None):
     """Return None when the candidate verifies, else the reason it does not.
 
     Every condition is deciding. A candidate that fails any one of them
@@ -288,7 +289,8 @@ def verify_candidate(receipt, *, tree_oid, ref_namespace, reconstructed_digest,
         return "the run was not authoritative"
     if receipt.get("timezone") != "Etc/UTC":
         return "the run executed under timezone %r" % (receipt.get("timezone"),)
-    if receipt.get("gateId") != GATE_ID_FULL_SUITE:
+    focused = receipt.get("gateId") == GATE_ID_MERGE and merge_selection is not None
+    if receipt.get("gateId") != GATE_ID_FULL_SUITE and not focused:
         return ("its recorded gate is %r, not the releasable full-suite gate %r"
                 % (receipt.get("gateId") or "<none>", GATE_ID_FULL_SUITE))
     if receipt.get("declaredToolchainDigest") != toolchain_digest:
@@ -303,11 +305,32 @@ def verify_candidate(receipt, *, tree_oid, ref_namespace, reconstructed_digest,
     coverage = receipt.get("coverage")
     if not isinstance(coverage, dict):
         return "the receipt states no coverage"
-    if coverage.get("mode") != "full" or coverage.get("pytest") != "full":
-        return ("the run did not cover the whole estate (mode=%r pytest=%r)"
-                % (coverage.get("mode"), coverage.get("pytest")))
-    if coverage.get("omittedHarnesses"):
-        return "the run omitted %d harness(es)" % len(coverage["omittedHarnesses"])
+    if focused:
+        if not isinstance(merge_selection, dict) or merge_selection.get("mode") != "merge-focused":
+            return "the incoming change requires full coverage"
+        actual = coverage.get("mergeSelection")
+        if not isinstance(actual, dict):
+            return "the receipt states no merge selection"
+        # A merge may create a new commit over the same certified tree. Its
+        # actual parent/base, policy, paths, and test populations must agree.
+        def comparable(value):
+            result = json.loads(json.dumps(value))
+            basis = result.get("mergeBasis")
+            if not isinstance(basis, dict) or basis.get("worktreePaths") != 0:
+                return None
+            basis.pop("headOid", None)
+            return result
+        if comparable(actual) is None or comparable(actual) != comparable(merge_selection):
+            return "the receipt selection differs from the actual incoming change"
+        for key in ("mode", "pytest", "selectedHarnesses", "omittedHarnesses"):
+            if coverage.get(key) != merge_selection.get(key):
+                return "the executed coverage differs from the required merge selection"
+    else:
+        if coverage.get("mode") != "full" or coverage.get("pytest") != "full":
+            return ("its coverage is %r / pytest %r, not the whole estate"
+                    % (coverage.get("mode"), coverage.get("pytest")))
+        if coverage.get("omittedHarnesses"):
+            return "the run omitted %d harness(es)" % len(coverage["omittedHarnesses"])
     if receipt.get("testedTreeDigest") != reconstructed_digest:
         return ("the tree it tested does not reconstruct (digest %s, now %s)"
                 % ((receipt.get("testedTreeDigest") or "<none>")[:12],
@@ -332,6 +355,27 @@ def _load_candidates(directory):
         except (OSError, ValueError):
             candidates.append((name, None))
     return candidates
+
+
+def topology_admission(repo, profile):
+    """Run the live commit-graph transition check without test discovery."""
+    checker = os.path.join(repo, "bin", "_lib_test_estate.py")
+    proc = subprocess.run(
+        [sys.executable, checker, "--repo", repo, "--profile", profile,
+         "--check-transitions"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    lines = proc.stdout.splitlines()
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or "checker exited %d" % proc.returncode
+        return False, detail
+    if not lines or lines[-1] != "end\tok":
+        detail = next(
+            (line for line in lines if line.startswith(("uncovered\t", "inability\t"))),
+            lines[-1] if lines else "checker produced no report",
+        )
+        return False, detail
+    return True, ""
 
 
 def _write_summary(path, accepted, tree_oid, digest, reasons):
@@ -387,6 +431,17 @@ def _decide(ns):
         reasons.append(("<repository>",
                         "tests/requirements-dev.txt is absent, so no receipt "
                         "can be checked against the declared toolchain"))
+    merge_selection = None
+    if getattr(ns, "merge_base", None):
+        try:
+            import importlib.util
+            selector_path = os.path.join(ns.repo, "bin", "_lib_merge_gate.py")
+            spec = importlib.util.spec_from_file_location("merge_gate", selector_path)
+            selector = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(selector)
+            merge_selection = selector.plan(ns.repo, ns.merge_base, ns.sha, working=False)
+        except Exception as exc:
+            reasons.append(("<merge-selection>", str(exc)))
     accepted = None
     if tree_oid and digest and declared is not None:
         for name, receipt in _load_candidates(ns.receipts_dir):
@@ -399,6 +454,7 @@ def _decide(ns):
                 ref_namespace=ns.ref_namespace,
                 reconstructed_digest=digest,
                 toolchain_digest=declared,
+                merge_selection=merge_selection,
             )
             if reason is None:
                 accepted = receipt
@@ -414,12 +470,16 @@ def main(argv=None):
                         help="the full 40-hex commit the push is at")
     parser.add_argument("--repo", default=".",
                         help="the checkout to reconstruct from")
+    parser.add_argument("--merge-base", help="actual pre-merge main revision; omitted means full coverage only")
     parser.add_argument("--receipts-dir",
                         help="a directory of candidate receipt JSON files")
     parser.add_argument("--ref-namespace",
                         help="the tree oid the candidates were fetched under")
     parser.add_argument("--summary-file",
                         help="append a job step summary here")
+    parser.add_argument("--topology-profile", choices=("public", "private"),
+                        help="require topology-sensitive estate admission "
+                             "before any receipt can discharge")
     parser.add_argument("--self-test-manifest", action="store_true",
                         help="print only the reconstructed manifest digest")
     ns = parser.parse_args(argv)
@@ -440,7 +500,17 @@ def main(argv=None):
     if not _HEX40.match(ns.ref_namespace):
         parser.error("--ref-namespace must be a full 40-hex tree oid")
 
-    accepted, tree_oid, digest, reasons = _decide(ns)
+    admitted = True
+    admission_reason = ""
+    if ns.topology_profile:
+        admitted, admission_reason = topology_admission(ns.repo, ns.topology_profile)
+        if not admitted:
+            admission_reason = "topology admission failed: " + admission_reason
+    if admitted:
+        accepted, tree_oid, digest, reasons = _decide(ns)
+    else:
+        accepted, tree_oid, digest, reasons = None, "", "", []
+        reasons.append(("<topology-admission>", admission_reason))
     for name, reason in reasons:
         sys.stderr.write("receipt-gate: %s contributes no evidence: %s\n"
                          % (name, reason))
@@ -452,6 +522,7 @@ def main(argv=None):
         sys.stderr.write("receipt-gate: no candidate discharged this tree; "
                          "the estate runs\n")
     _write_summary(ns.summary_file, accepted, tree_oid, digest, reasons)
+    print("admitted=%s" % ("true" if admitted else "false"))
     print("discharged=%s" % ("true" if accepted is not None else "false"))
     return 0
 

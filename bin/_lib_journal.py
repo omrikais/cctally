@@ -333,7 +333,7 @@ def week_reset_identity_parts(account_key, old_week_end_at, new_week_end_at,
     return (account_key, old_week_end_at, new_week_end_at)
 
 
-def effects_payload_digest(payload: dict) -> str:
+def effects_payload_digest(payload: dict, refs: dict | None = None) -> str:
     """A 16-hex digest over an effects-only evt payload, for its id.
 
     An evt id must discriminate every payload a family can emit under it,
@@ -348,14 +348,31 @@ def effects_payload_digest(payload: dict) -> str:
     own event while a genuine byte-identical replay still collapses to the
     duplicate the journal already tolerates.
 
+    The digest covers the EFFECTIVE payload, formed the way `emit_model_a`
+    forms the line it writes (`_cctally_journal.py:4476`): a copy of `columns`
+    updated with `refs` when `refs` is non-empty. Digesting `columns` alone
+    would let two events differing only in their refs collide on one id, and
+    the second would then classify as a conflict and be withheld — leaving its
+    destructive effect applied inline and undone by the next rebuild.
+
+    The hashed bytes are unchanged when `refs` is absent or empty, which is what
+    makes this a straight edit rather than a versioned digest: the only
+    production caller passes no refs (`_cctally_record.py:3575`), so no retained
+    identity moves. An unconditional `{columns, refs}` envelope was rejected for
+    exactly that reason — it would change every existing digest.
+
     The digest is over the canonical JSON, so it is stable under key order.
     Reproducing it from a decoded line takes one step: the input is the payload
     the emitter passes as `columns`, and `make_evt` adds the `kind` fold
     discriminator to the payload AFTERWARDS, so a reader must drop `kind`
     before re-digesting.
     """
+    effective = payload
+    if refs:
+        effective = dict(payload)
+        effective.update(refs)
     return hashlib.sha256(
-        _canonical_json(payload).encode("utf-8")).hexdigest()[:16]
+        _canonical_json(effective).encode("utf-8")).hexdigest()[:16]
 
 
 # --------------------------------------------------------------------------

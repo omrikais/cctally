@@ -249,6 +249,27 @@ it('Codex Weekly uses native cycle vocabulary throughout the shared shell', () =
   expect(container.textContent).not.toContain('Subscription window:');
 });
 
+// #750 S4 AC11 — the Codex test above pinned the VISIBLE strings and one
+// accessible name; nothing pinned the Claude arm's accessible names, and that
+// is the gap the third browser gate found. `weeklyVocabulary` left `nav`
+// undefined on Claude, so `PeriodMiniBars` fell back to its own `unit` ('week')
+// for the two region names and to the literal 'period' for the two steppers.
+// The dialog announced "Cost by week" while its own title, column and field
+// all said cycle — on the DEFAULT source tab. Assert all four names, and
+// assert the absence of the two strings it used to emit, because a fallback
+// this test cannot see would otherwise pass by omission.
+it('Claude Weekly names cycles in its accessible names too (#750 S4 AC11)', () => {
+  const { container } = renderFor('claude', <WeeklyModal />);
+
+  expect(container.querySelector('[aria-label="Cost by cycle"]')).not.toBeNull();
+  expect(container.querySelector('[aria-label="Cost by cycle histogram"]')).not.toBeNull();
+  expect(container.querySelector('[aria-label="Step to older cycle"]')).not.toBeNull();
+  expect(container.querySelector('[aria-label="Step to newer cycle"]')).not.toBeNull();
+
+  expect(container.querySelector('[aria-label="Cost by week"]')).toBeNull();
+  expect(container.querySelector('[aria-label*="period"]')).toBeNull();
+});
+
 it('All Weekly uses neutral provider-period vocabulary while retaining source ownership', () => {
   const composed = structuredClone(envelope);
   composed.sources!.claude.data!.periods.weekly.rows = composed.weekly.rows;
@@ -282,17 +303,23 @@ it('All Trend modal renders two provider-owned histories and no All-sources quot
   expect(container.textContent).not.toContain('All sources');
 });
 
-it('All Trend modal uses cycle vocabulary only in the Codex history (#576)', () => {
+// #750 S4 §4.1 re-argues #576's decision rather than regenerating it. #576
+// gave Codex a cycle vocabulary and left Claude on weeks; that described a
+// difference which does not exist, because `report` split a credited week
+// into two billing cycles long before this epic. BOTH sections now count in
+// cycles, and the assertion that Codex leaks no week-flavoured string is what
+// keeps the collapse honest in the other direction.
+it('All Trend modal uses the cycle vocabulary in BOTH histories (#576, #750 S4)', () => {
   const { container } = renderFor('all', <TrendModal />);
   const claude = container.querySelector('[data-provider-section="claude"]')!;
   const codex = container.querySelector('[data-provider-section="codex"]')!;
 
-  expect(claude.querySelector('#mtr-weeks-pill-claude')?.textContent).toMatch(/weeks?/);
-  expect(claude.querySelector('.sec-spark')?.textContent).toMatch(/week history/i);
-  expect(claude.querySelector('.sec-tbl')?.textContent).toContain('Weekly detail');
-  expect(claude.querySelector('[data-col="week"]')?.textContent).toContain('Week');
-  expect(claude.querySelector('.mtr-tbl-sub')?.textContent).toContain('prior week');
-  expect(claude.querySelector('#mtr-svg-claude')?.getAttribute('aria-label')).toMatch(/weeks?/);
+  expect(claude.querySelector('#mtr-weeks-pill-claude')?.textContent).toMatch(/cycles?/);
+  expect(claude.querySelector('.sec-spark')?.textContent).toMatch(/-cycle history/i);
+  expect(claude.querySelector('.sec-tbl')?.textContent).toContain('Cycle detail');
+  expect(claude.querySelector('[data-col="week"]')?.textContent).toContain('Cycle');
+  expect(claude.querySelector('.mtr-tbl-sub')?.textContent).toContain('prior cycle');
+  expect(claude.querySelector('#mtr-svg-claude')?.getAttribute('aria-label')).toMatch(/cycles?/);
 
   expect(codex.querySelector('#mtr-weeks-pill-codex')?.textContent).toMatch(/cycles?/);
   expect(codex.querySelector('.sec-spark')?.textContent).toMatch(/-cycle history/i);
@@ -637,7 +664,7 @@ describe('the pane-scroll contract is opt-in, not implied by width (#556 S4)', (
   // The All branch is the one that names its provider on the card; the
   // single-provider branch is already scoped by the board and never passed a
   // value. #556 S4 F7 deleted the attribute outright as unread, which turned
-  // `e2e/period-native-vocabulary.spec.ts` red on main.
+  // `e2e/period-vocabulary-convergence.spec.ts` red on main.
   it('publishes data-source only on the All Trend card', () => {
     for (const source of ['claude', 'codex'] as const) {
       const { container } = renderFor(source, <TrendModal />);

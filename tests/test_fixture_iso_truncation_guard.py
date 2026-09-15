@@ -37,6 +37,21 @@ BIN = Path(__file__).resolve().parents[1] / "bin"
 ALLOWLIST: dict[tuple[str, str], str] = {
     (
         "build-bench-fixtures.py",
+        'CORPUS_CLOCK_UTC.astimezone(dt.timezone.utc) '
+        '.isoformat(timespec="seconds").replace("+00:00", "Z")',
+    ): (
+        "corpus_registry_stamp — the corpus's Codex account registry must "
+        "carry the stamp production writes, which "
+        "_maybe_append_codex_account_observe renders with "
+        "isoformat(timespec='seconds') at bin/_cctally_cache.py:1740-1742. "
+        "Preserving the fraction here would be WRONG rather than merely "
+        "harmless: validate_corpus compares the registry's first_seen_utc and "
+        "last_seen_utc against this value for equality, and production never "
+        "writes a sub-second stamp, so a microsecond form would refuse every "
+        "corpus this generator builds (#769 S10 #819)"
+    ),
+    (
+        "build-bench-fixtures.py",
         'base.strftime("%Y-%m-%dT%H:%M:%S.000Z")',
     ): (
         "takes an int minute-offset, never a datetime, so no caller fraction "

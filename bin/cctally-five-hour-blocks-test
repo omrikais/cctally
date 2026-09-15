@@ -13,6 +13,64 @@ set -uo pipefail
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN="$REPO_ROOT/bin/cctally"
 
+# THE CASE REGISTRY (#834 S1 #808). A verdict line carries a fixed numeric
+# case identifier and a registered reason code, and nothing else. The
+# aggregator that builds a failure export replaces a marked line's detail when
+# it cannot vouch for every word, and it replaces an unmarked line whole, so
+# `FAIL fhb-dedup-migration: …` reached its one reader as
+# `FAIL [REDACTED: unclassified detail]`, all 38 of its FAIL forms did so when
+# driven with one of its own accumulated comparison messages, and 34 of its 38
+# `PASS <scenario>` lines were replaced entirely — the four survivors are scenario
+# names built from already-registered words. The scenario names live here instead,
+# and each one is still printed beside its failure on the continuation line.
+#
+#    1  A_schema_exists
+#    2  B_block_first_insert
+#    3  C_block_update_in_window
+#    4  D_close_older_block
+#    5  E_first_observation_no_synth
+#    6  F_subsequent_crossings
+#    7  G_cross_reset_flag
+#    8  T_cross_reset_flag_natural_boundary
+#    9  T2_cross_reset_flag_tz_mismatch
+#   10  H_backfill
+#   11  I_no_5h_anchor_skips
+#   12  J_cache_db_unavailable
+#   13  K1_breakdowns_schema_exists
+#   14  K_multi_model_breakdown
+#   15  L_multi_project_breakdown
+#   16  M_unknown_project_sentinel
+#   17  N_replace_all_drains_unknown
+#   18  P_fresh_install_backfill
+#   19  Q_upgrade_user_backfill
+#   20  Q2_upgrade_gate_does_not_re_fire_on_empty
+#   21  O_reconcile_invariant
+#   22  R_cache_db_unavailable_breakdowns
+#   23  S_upgrade_backfill_ingests_jsonl_when_cache_empty
+#   24  fhb-list-rendering
+#   25  fhb-breakdown-default-current
+#   26  fhb-breakdown-active-elapsed-pinned
+#   27  fhb-breakdown-by-start
+#   28  fhb-breakdown-by-ago
+#   29  fhb-breakdown-empty-block
+#   30  fhb-breakdown-crossed-reset
+#   31  fhb-invalid-tz
+#   32  fhb-dedup-migration
+#   33  fhb-dedup-milestone-collision
+#   34  fhb-banner-shown
+#   35  fhb-banner-autoclear
+#   36  fhb-banner-diff-json-routing
+#   37  fhb-banner-status-line-suppressed
+#   38  fhb-mode-noop
+#
+# The one reason code:
+#
+#   expected-mismatch  an assert_eq inside the scenario recorded a mismatch
+#
+# Both of its words are registered in `DIAGNOSTIC_TOKENS`, which is
+# hand-reviewed. A word registered only because a `tests/fixtures/` directory
+# is named for it would lose this line the day somebody renames that
+# directory.
 pass_count=0
 fail_count=0
 
@@ -23,21 +81,13 @@ cleanup_on_exit () {
     if [ "$fail_count" -eq 0 ] && [ $rc -eq 0 ]; then
         rm -rf "$SCRATCH_DIR"
     else
-        printf 'Scratch dir preserved for debugging: %s\n' "$SCRATCH_DIR" >&2
+        # Worded out of registered vocabulary so the one sentence saying where
+        # the evidence went is not replaced in an aggregated export (#834 S1
+        # #808). The path itself is reduced to `<path>` by design.
+        echo "scratch retained at $SCRATCH_DIR" >&2
     fi
 }
 trap cleanup_on_exit EXIT
-
-report () {
-    local scenario="$1"; local status="$2"; local detail="${3-}"
-    if [ "$status" = PASS ]; then
-        printf 'PASS %s\n' "$scenario"
-        pass_count=$((pass_count + 1))
-    else
-        printf 'FAIL %s%s\n' "$scenario" "${detail:+: $detail}"
-        fail_count=$((fail_count + 1))
-    fi
-}
 
 assert_eq () {
     local got="$1"; local want="$2"; local label="$3"
@@ -53,12 +103,25 @@ begin_scenario () {
     mkdir -p "$home"
 }
 
+# $1 = the scenario name, which stays off the verdict line. $2 = the fixed case
+# identifier, which is what an aggregated export retains. The verdict lines
+# interpolate `$2` DIRECTLY rather than through a local alias or a second helper,
+# so each resolves from the literal argument its call site passes; `report` used
+# to stand between them and is gone, because a two-hop chain leaves the printed
+# value unresolvable from the source (#834 S1 #808).
+#
+# This harness has exactly ONE failure path — an `assert_eq` inside the scenario
+# recorded a mismatch into `$_err` — so there is one reason code. The case
+# identifier is what tells the failures apart, and `$_err` carries the comparison
+# on the continuation line below.
 finish_scenario () {
-    local name="$1"
     if [ -z "$_err" ]; then
-        report "$name" PASS
+        echo "PASS case=$2"
+        pass_count=$((pass_count + 1))
     else
-        report "$name" FAIL "$_err"
+        echo "FAIL case=$2 reason=expected-mismatch"
+        printf '  %s: %s\n' "$1" "$_err"
+        fail_count=$((fail_count + 1))
     fi
 }
 
@@ -216,7 +279,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     [ "$blocks_unique" -ge 1 ] || _err="${_err:+$_err; }five_hour_blocks missing UNIQUE index (got $blocks_unique)"
     [ "$milestones_unique" -ge 1 ] || _err="${_err:+$_err; }five_hour_milestones missing UNIQUE index (got $milestones_unique)"
 
-    finish_scenario A_schema_exists
+    finish_scenario A_schema_exists 1
 }
 
 # ─── Scenario B: first observation creates a five_hour_blocks row ────
@@ -267,7 +330,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     assert_eq "$cc_tok"   "0"   "total_cache_create_tokens zero"
     assert_eq "$cr_tok"   "0"   "total_cache_read_tokens zero"
 
-    finish_scenario B_block_first_insert
+    finish_scenario B_block_first_insert 2
 }
 
 # ─── Scenario C: subsequent tick within same window updates same row ─
@@ -297,7 +360,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     pct_start_7d=$(sql "$home" "SELECT seven_day_pct_at_block_start FROM five_hour_blocks LIMIT 1;")
     assert_eq "$pct_start_7d" "25.0" "seven_day_pct_at_block_start immutable"
 
-    finish_scenario C_block_update_in_window
+    finish_scenario C_block_update_in_window 3
 }
 
 # ─── Scenario D: new window closes the strictly-older block ──────────
@@ -324,7 +387,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     assert_eq "$old_closed" "1" "older block closed"
     assert_eq "$new_closed" "0" "newer block still open"
 
-    finish_scenario D_close_older_block
+    finish_scenario D_close_older_block 4
 }
 
 # ─── Scenario E: first observation at 47% records ONE milestone (47),
@@ -348,7 +411,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     marginal_is_null=$(sql "$home" "SELECT marginal_cost_usd IS NULL FROM five_hour_milestones LIMIT 1;")
     assert_eq "$marginal_is_null" "1" "marginal_cost_usd NULL on first crossing of block"
 
-    finish_scenario E_first_observation_no_synth
+    finish_scenario E_first_observation_no_synth 5
 }
 
 # ─── Scenario F: tick at 50% after prior 47% records 48, 49, 50 ──────
@@ -392,7 +455,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     fk_match=$(sql "$home" "SELECT (SELECT COUNT(*) FROM five_hour_milestones) = (SELECT COUNT(*) FROM five_hour_milestones m JOIN five_hour_blocks b ON m.block_id = b.id);")
     assert_eq "$fk_match" "1" "block_id FK references valid block row"
 
-    finish_scenario F_subsequent_crossings
+    finish_scenario F_subsequent_crossings 6
 }
 
 # ─── Scenario G: mid-week reset flags the spanning block ─────────────
@@ -430,7 +493,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     crossed=$(sql "$home" "SELECT crossed_seven_day_reset FROM five_hour_blocks WHERE five_hour_window_key = $BASE;")
     assert_eq "$crossed" "1" "crossed_seven_day_reset on spanning block"
 
-    finish_scenario G_cross_reset_flag
+    finish_scenario G_cross_reset_flag 7
 }
 
 # ─── Scenario T: NATURAL weekly boundary flags the spanning block ────
@@ -471,7 +534,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     crossed=$(sql "$home" "SELECT crossed_seven_day_reset FROM five_hour_blocks WHERE five_hour_window_key = $BASE;")
     assert_eq "$crossed" "1" "crossed_seven_day_reset on naturally-spanning block"
 
-    finish_scenario T_cross_reset_flag_natural_boundary
+    finish_scenario T_cross_reset_flag_natural_boundary 8
 }
 
 # ─── Scenario T2: cross-flag with non-UTC display tz (host-local) ────
@@ -511,7 +574,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     crossed=$(sql "$home" "SELECT crossed_seven_day_reset FROM five_hour_blocks WHERE five_hour_window_key = $BASE;")
     assert_eq "$crossed" "1" "crossed_seven_day_reset on tz-mismatched naturally-spanning block"
 
-    finish_scenario T2_cross_reset_flag_tz_mismatch
+    finish_scenario T2_cross_reset_flag_tz_mismatch 9
 }
 
 # ─── Scenario H: historical backfill reconstructs five_hour_blocks ───
@@ -572,7 +635,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     milestone_count=$(sql "$home" "SELECT COUNT(*) FROM five_hour_milestones;")
     assert_eq "$milestone_count" "0" "milestones NOT backfilled (forward-only)"
 
-    finish_scenario H_backfill
+    finish_scenario H_backfill 10
 }
 
 # ─── Scenario I: no 5h anchor → bail-out gate skips the rollup ──────
@@ -593,7 +656,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     snapshot_count=$(sql "$home" "SELECT COUNT(*) FROM weekly_usage_snapshots;")
     assert_eq "$snapshot_count" "1" "snapshot insert still happened"
 
-    finish_scenario I_no_5h_anchor_skips
+    finish_scenario I_no_5h_anchor_skips 11
 }
 
 # ─── Scenario J: cache.db unavailable → helper still populates ──────
@@ -621,7 +684,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     final_pct=$(sql "$home" "SELECT final_five_hour_percent FROM five_hour_blocks LIMIT 1;")
     assert_eq "$final_pct" "10.0" "block fields populated from snapshot, not cache"
 
-    finish_scenario J_cache_db_unavailable
+    finish_scenario J_cache_db_unavailable 12
 }
 
 # ─── Scenario K1: per-(block, model|project) schema migration ─────────
@@ -669,7 +732,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     assert_eq "$has_projects_block_idx"  "1" "idx_five_hour_block_projects_block exists"
     assert_eq "$has_projects_window_idx" "1" "idx_five_hour_block_projects_window exists"
 
-    finish_scenario K1_breakdowns_schema_exists
+    finish_scenario K1_breakdowns_schema_exists 13
 }
 
 # ─── Scenario K: multi-model breakdown ────────────────────────────────
@@ -682,15 +745,18 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     # Bootstrap: run any cctally command to materialize cache.db.
     run_cctally "$home" cache-sync
 
-    # Seed 3 entries inside the [BASE, BASE+5h] window.
-    # 2025-04-30T13:00:00Z = epoch 1746018000 (BASE + 1h).
-    seed_session_entry "$home" "2025-04-30T13:00:00+00:00" \
+    # Seed 3 entries inside the block BASE anchors. BASE is the window's
+    # RESET, so the block is [BASE-5h, BASE) = 07:00-12:00Z, and #751a
+    # ownership prices only what falls in it. These sat at 13:00-14:00Z and
+    # were counted anyway, because the pre-#751a totals summed the raw
+    # [block_start_at, captured_at] interval and captured_at is wall clock.
+    seed_session_entry "$home" "2025-04-30T08:00:00+00:00" \
         "claude-sonnet-4-6" 1000 100 0 0 \
         "/tmp/seeded/k/sonnet1.jsonl" "/repo/k"
-    seed_session_entry "$home" "2025-04-30T13:30:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:30:00+00:00" \
         "claude-sonnet-4-6" 2000 200 0 0 \
         "/tmp/seeded/k/sonnet2.jsonl" "/repo/k"
-    seed_session_entry "$home" "2025-04-30T14:00:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T09:00:00+00:00" \
         "claude-opus-4-7" 500 50 0 0 \
         "/tmp/seeded/k/opus1.jsonl" "/repo/k"
 
@@ -715,7 +781,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     in_tok_diff=$(sql "$home" "SELECT (SELECT SUM(input_tokens) FROM five_hour_block_models) - (SELECT total_input_tokens FROM five_hour_blocks);")
     assert_eq "$in_tok_diff" "0" "models input_tokens reconciles exactly"
 
-    finish_scenario K_multi_model_breakdown
+    finish_scenario K_multi_model_breakdown 14
 }
 
 # ─── Scenario L: multi-project breakdown ──────────────────────────────
@@ -724,16 +790,16 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
 
     run_cctally "$home" cache-sync
 
-    seed_session_entry "$home" "2025-04-30T13:00:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:00:00+00:00" \
         "claude-sonnet-4-6" 1000 100 0 0 \
         "/tmp/seeded/l/a1.jsonl" "/repo/A"
-    seed_session_entry "$home" "2025-04-30T13:15:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:15:00+00:00" \
         "claude-sonnet-4-6" 1000 100 0 0 \
         "/tmp/seeded/l/a2.jsonl" "/repo/A"
-    seed_session_entry "$home" "2025-04-30T13:30:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:30:00+00:00" \
         "claude-sonnet-4-6" 1000 100 0 0 \
         "/tmp/seeded/l/b1.jsonl" "/repo/B"
-    seed_session_entry "$home" "2025-04-30T13:45:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:45:00+00:00" \
         "claude-sonnet-4-6" 1000 100 0 0 \
         "/tmp/seeded/l/b2.jsonl" "/repo/B"
 
@@ -752,7 +818,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     diff=$(sql "$home" "SELECT ABS((SELECT SUM(cost_usd) FROM five_hour_block_projects) - (SELECT total_cost_usd FROM five_hour_blocks)) < 1e-9;")
     assert_eq "$diff" "1" "projects cost reconciles to parent total within 1e-9"
 
-    finish_scenario L_multi_project_breakdown
+    finish_scenario L_multi_project_breakdown 15
 }
 
 # ─── Scenario M: NULL project_path → '(unknown)' sentinel ─────────────
@@ -763,10 +829,10 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
 
     run_cctally "$home" cache-sync
 
-    seed_session_entry "$home" "2025-04-30T13:00:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:00:00+00:00" \
         "claude-sonnet-4-6" 1000 100 0 0 \
         "/tmp/seeded/m/orphan1.jsonl" "NULL"
-    seed_session_entry "$home" "2025-04-30T13:30:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:30:00+00:00" \
         "claude-sonnet-4-6" 1000 100 0 0 \
         "/tmp/seeded/m/orphan2.jsonl" "NULL"
 
@@ -783,7 +849,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     diff=$(sql "$home" "SELECT ABS((SELECT SUM(cost_usd) FROM five_hour_block_projects) - (SELECT total_cost_usd FROM five_hour_blocks)) < 1e-9;")
     assert_eq "$diff" "1" "sentinel cost reconciles to parent total"
 
-    finish_scenario M_unknown_project_sentinel
+    finish_scenario M_unknown_project_sentinel 16
 }
 
 # ─── Scenario N: replace-all drains '(unknown)' bucket ────────────────
@@ -824,7 +890,7 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     assert_eq "$tick2_path"    "/repo/X"  "tick2: '/repo/X' replaces '(unknown)'"
     assert_eq "$tick2_unknown" "0"        "tick2: zero '(unknown)' rows after drain"
 
-    finish_scenario N_replace_all_drains_unknown
+    finish_scenario N_replace_all_drains_unknown 17
 }
 
 # ─── Scenario P: fresh-install backfill populates parent + both children ──
@@ -917,7 +983,7 @@ EOF
     diff=$(sql "$home" "SELECT MAX(ABS(IFNULL(child.s, 0) - parent.total_cost_usd)) < 1e-9 FROM five_hour_blocks parent LEFT JOIN (SELECT five_hour_window_key, SUM(cost_usd) AS s FROM five_hour_block_models GROUP BY five_hour_window_key) child ON parent.five_hour_window_key = child.five_hour_window_key;")
     assert_eq "$diff" "1" "fresh-install backfill: models reconcile per window within 1e-9"
 
-    finish_scenario P_fresh_install_backfill
+    finish_scenario P_fresh_install_backfill 18
 }
 
 # ─── Scenario Q: upgrade-user backfill (parent populated, children empty) ──
@@ -927,7 +993,7 @@ EOF
     run_cctally "$home" weekly
 
     # Drive record-usage so parent + children populate naturally.
-    seed_session_entry "$home" "2025-04-30T13:00:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:00:00+00:00" \
         "claude-sonnet-4-6" 1000 100 0 0 \
         "/tmp/seeded/q/file.jsonl" "/repo/Q"
     record_usage "$home" \
@@ -971,7 +1037,7 @@ EOF
     diff_p=$(sql "$home" "SELECT MAX(ABS(IFNULL(child.s, 0) - parent.total_cost_usd)) < 1e-9 FROM five_hour_blocks parent LEFT JOIN (SELECT five_hour_window_key, SUM(cost_usd) AS s FROM five_hour_block_projects GROUP BY five_hour_window_key) child ON parent.five_hour_window_key = child.five_hour_window_key;")
     assert_eq "$diff_p" "1" "upgrade backfill: projects reconcile per window within 1e-9"
 
-    finish_scenario Q_upgrade_user_backfill
+    finish_scenario Q_upgrade_user_backfill 19
 }
 
 # ─── Scenario Q2: empty-row backfill still closes the gate ────────────
@@ -1020,7 +1086,7 @@ EOF
     assert_eq "$final_models_mig"   "1" "second open_db: models marker still 1 row"
     assert_eq "$final_projects_mig" "1" "second open_db: projects marker still 1 row"
 
-    finish_scenario Q2_upgrade_gate_does_not_re_fire_on_empty
+    finish_scenario Q2_upgrade_gate_does_not_re_fire_on_empty 20
 }
 
 # ─── Scenario O: full reconcile invariant across both children ────────
@@ -1033,22 +1099,22 @@ EOF
     run_cctally "$home" cache-sync
 
     # 6 entries: 3 models × 2 projects.
-    seed_session_entry "$home" "2025-04-30T13:00:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:00:00+00:00" \
         "claude-sonnet-4-6" 1000 100 200 50 \
         "/tmp/seeded/o/s_a.jsonl" "/repo/A"
-    seed_session_entry "$home" "2025-04-30T13:10:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:10:00+00:00" \
         "claude-opus-4-7" 800 80 0 0 \
         "/tmp/seeded/o/o_a.jsonl" "/repo/A"
-    seed_session_entry "$home" "2025-04-30T13:20:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:20:00+00:00" \
         "claude-haiku-4-5-20251001" 500 50 0 0 \
         "/tmp/seeded/o/h_a.jsonl" "/repo/A"
-    seed_session_entry "$home" "2025-04-30T13:30:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:30:00+00:00" \
         "claude-sonnet-4-6" 1500 150 300 75 \
         "/tmp/seeded/o/s_b.jsonl" "/repo/B"
-    seed_session_entry "$home" "2025-04-30T13:40:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:40:00+00:00" \
         "claude-opus-4-7" 600 60 0 0 \
         "/tmp/seeded/o/o_b.jsonl" "/repo/B"
-    seed_session_entry "$home" "2025-04-30T13:50:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:50:00+00:00" \
         "claude-haiku-4-5-20251001" 400 40 0 0 \
         "/tmp/seeded/o/h_b.jsonl" "/repo/B"
 
@@ -1082,7 +1148,7 @@ EOF
     assert_eq "$m_count" "$p_count" "entry_count cross-children consistency"
     assert_eq "$m_count" "6"        "entry_count totals 6"
 
-    finish_scenario O_reconcile_invariant
+    finish_scenario O_reconcile_invariant 21
 }
 
 # ─── Scenario R: cache.db unavailable → zero child rows + reconcile ────
@@ -1117,7 +1183,7 @@ EOF
     assert_eq "$m_total"      "0"   "models COALESCE(SUM, 0) == 0"
     assert_eq "$p_total"      "0"   "projects COALESCE(SUM, 0) == 0"
 
-    finish_scenario R_cache_db_unavailable_breakdowns
+    finish_scenario R_cache_db_unavailable_breakdowns 22
 }
 
 # ─── Scenario S: upgrade backfill ingests JSONL when cache is empty ───
@@ -1132,7 +1198,7 @@ EOF
     run_cctally "$home" weekly
 
     # Live writes populate parent + children + markers via seed-into-cache.
-    seed_session_entry "$home" "2025-04-30T13:00:00+00:00" \
+    seed_session_entry "$home" "2025-04-30T08:00:00+00:00" \
         "claude-sonnet-4-6" 1000 100 0 0 \
         "/tmp/seeded/s/dummy.jsonl" "/repo/S"
     record_usage "$home" \
@@ -1197,7 +1263,7 @@ EOF
     assert_eq "$diff_m" "1" "S: models reconcile after JSONL re-ingest within 1e-9"
     assert_eq "$diff_p" "1" "S: projects reconcile after JSONL re-ingest within 1e-9"
 
-    finish_scenario S_upgrade_backfill_ingests_jsonl_when_cache_empty
+    finish_scenario S_upgrade_backfill_ingests_jsonl_when_cache_empty 23
 }
 
 # ─── Render harness scenarios ─────────────────────────────────────────
@@ -1255,7 +1321,7 @@ INSERT INTO five_hour_blocks (
         *) _err="${_err:+$_err; }list missing footer count" ;;
     esac
 
-    finish_scenario "$name"
+    finish_scenario "$name" 24
 }
 fhb_list_rendering
 
@@ -1304,7 +1370,7 @@ INSERT INTO five_hour_milestones (
         *) _err="${_err:+$_err; }default missing delta" ;;
     esac
 
-    finish_scenario "$name"
+    finish_scenario "$name" 25
 }
 fhb_breakdown_default_current
 
@@ -1358,7 +1424,7 @@ INSERT INTO five_hour_blocks (
         *) _err="${_err:+$_err; }active-elapsed not pinned to as-of" ;;
     esac
 
-    finish_scenario "$name"
+    finish_scenario "$name" 26
 }
 fhb_breakdown_active_elapsed_pinned
 
@@ -1396,7 +1462,7 @@ INSERT INTO five_hour_blocks (
         *) _err="${_err:+$_err; }by-start picked wrong block" ;;
     esac
 
-    finish_scenario "$name"
+    finish_scenario "$name" 27
 }
 fhb_breakdown_by_start
 
@@ -1433,7 +1499,7 @@ INSERT INTO five_hour_blocks (
         *) _err="${_err:+$_err; }--ago 1 picked wrong block" ;;
     esac
 
-    finish_scenario "$name"
+    finish_scenario "$name" 28
 }
 fhb_breakdown_by_ago
 
@@ -1465,7 +1531,7 @@ INSERT INTO five_hour_blocks (
         *) _err="${_err:+$_err; }empty block missing footer text" ;;
     esac
 
-    finish_scenario "$name"
+    finish_scenario "$name" 29
 }
 fhb_breakdown_empty_block
 
@@ -1509,7 +1575,7 @@ INSERT INTO five_hour_milestones (
         *) _err="${_err:+$_err; }crossed-reset delta not suppressed" ;;
     esac
 
-    finish_scenario "$name"
+    finish_scenario "$name" 30
 }
 fhb_breakdown_crossed_reset
 
@@ -1542,7 +1608,7 @@ fhb_invalid_tz () {
         *) _err="${_err:+$_err; }five-hour-breakdown invalid-tz stderr message" ;;
     esac
 
-    finish_scenario "$name"
+    finish_scenario "$name" 31
 }
 fhb_invalid_tz
 
@@ -1666,7 +1732,7 @@ INSERT INTO weekly_usage_snapshots (
     post_count2=$(sql "$home" "SELECT COUNT(*) FROM five_hour_blocks;")
     assert_eq "$post_count2" "1" "second open_db() leaves canonical row alone"
 
-    finish_scenario "$name"
+    finish_scenario "$name" 32
 }
 fhb_dedup_migration
 
@@ -1764,7 +1830,7 @@ INSERT INTO five_hour_milestones (
     assert_eq "$ms_captured" "2026-04-30T08:00:00+00:00" \
         "earliest captured_at wins per-threshold dedup"
 
-    finish_scenario "$name"
+    finish_scenario "$name" 33
 }
 fhb_dedup_milestone_collision
 
@@ -1824,7 +1890,7 @@ fhb_banner_shown () {
         _err="${_err:+$_err; }json mode banner missing on stderr"
     fi
 
-    finish_scenario "$name"
+    finish_scenario "$name" 34
 }
 fhb_banner_shown
 
@@ -1892,7 +1958,7 @@ INSERT INTO five_hour_blocks (
         _err="${_err:+$_err; }migration-errors.log not unlinked after success (contents: $remaining)"
     fi
 
-    finish_scenario "$name"
+    finish_scenario "$name" 35
 }
 fhb_banner_autoclear
 
@@ -1938,7 +2004,7 @@ fhb_banner_diff_json_routing () {
         _err="${_err:+$_err; }diff --json banner missing on stderr"
     fi
 
-    finish_scenario "$name"
+    finish_scenario "$name" 36
 }
 fhb_banner_diff_json_routing
 
@@ -2004,7 +2070,7 @@ INSERT INTO weekly_usage_snapshots (
         _err="${_err:+$_err; }banner leaked to status-line stderr (status-line discards stderr — surfacing here is misleading)"
     fi
 
-    finish_scenario "$name"
+    finish_scenario "$name" 37
 }
 fhb_banner_status_line_suppressed
 
@@ -2061,7 +2127,7 @@ INSERT INTO five_hour_blocks (
     assert_eq "$out_calc" "$out_none" "five-hour-blocks --mode calculate byte-identical to no-flag"
     assert_eq "$out_disp" "$out_none" "five-hour-blocks --mode display byte-identical to no-flag"
 
-    finish_scenario "$name"
+    finish_scenario "$name" 38
 }
 fhb_mode_noop
 

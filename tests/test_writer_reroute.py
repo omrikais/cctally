@@ -19,10 +19,13 @@ sys.modules["cctally"] + the tmp JOURNAL_DIR / data dir.
 """
 from __future__ import annotations
 
+import argparse
 import datetime as dt
+import json
 import multiprocessing as mp
 import os
 import pathlib
+import sqlite3
 
 import pytest
 
@@ -69,6 +72,7 @@ def _seed_snapshot(
     five_hour_percent=None,
     five_hour_window_key=None,
     source="test",
+    weekly_observation_held=0,
 ):
     if week_start_at is None:
         week_start_at = week_start_date + "T00:00:00+00:00"
@@ -78,11 +82,13 @@ def _seed_snapshot(
         "INSERT INTO weekly_usage_snapshots "
         "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
         " week_end_at, weekly_percent, source, payload_json, "
-        " five_hour_percent, five_hour_resets_at, five_hour_window_key) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " five_hour_percent, five_hour_resets_at, five_hour_window_key, "
+        " weekly_observation_held) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (captured_at_utc, week_start_date, week_start_date[:10], week_start_at,
          week_end_at, weekly_percent, source, "{}",
-         five_hour_percent, None, five_hour_window_key),
+         five_hour_percent, None, five_hour_window_key,
+         weekly_observation_held),
     )
     conn.commit()
 
@@ -103,6 +109,42 @@ def _payload(weekly_percent, *, week_start_date="2026-01-01",
 
 
 # ==========================================================================
+# #769 S11 (#824) — the held-provenance column. `weekly_observation_held`
+# separates a weekly value that was genuinely observed on this tick from one
+# carried forward so a weekly-clamped tick can still persist its five-hour
+# evidence.
+# ==========================================================================
+
+def test_weekly_usage_snapshots_carries_the_held_provenance_column(ns):
+    conn = ns["open_db"]()
+    try:
+        cols = {row[1]: row for row in conn.execute(
+            "PRAGMA table_info(weekly_usage_snapshots)")}
+    finally:
+        conn.close()
+    assert "weekly_observation_held" in cols
+    # notnull flag is index 3, default value index 4
+    assert cols["weekly_observation_held"][3] == 1
+    assert str(cols["weekly_observation_held"][4]) == "0"
+
+
+def test_weekly_observation_held_rejects_a_value_outside_the_flag_domain(ns):
+    import sqlite3
+
+    conn = ns["open_db"]()
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            _seed_snapshot(
+                conn, captured_at_utc="2026-01-04T08:00:00Z",
+                week_start_date="2026-01-01", weekly_percent=10.0,
+                weekly_observation_held=2,
+            )
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+# ==========================================================================
 # _usage_snapshot_fold_decision (gate P2 pickup a): clamp-skip, 5h-adjust-up-
 # never-gate, dedup-skip, accept — all over seeded rows.
 # ==========================================================================
@@ -111,29 +153,38 @@ def test_fold_decision_accept_on_empty_week(ns):
     jr = _jr()
     conn = ns["open_db"]()
     try:
-        skip, adj, reason = jr._usage_snapshot_fold_decision(conn, _payload(10.0))
+        result = jr._usage_snapshot_fold_decision(conn, _payload(10.0))
     finally:
         conn.close()
-    assert skip is False
-    assert adj is None
-    assert reason == "accept"
+    assert result.snapshot_action == jr.SNAPSHOT_WRITE_OBSERVED
+    assert result.weekly.disposition == jr.WEEKLY_OBSERVED
+    assert result.weekly.raw_pct == 10.0
+    assert result.weekly.effective_pct == 10.0
+    assert result.weekly.basis is None
+    assert result.five_hour.disposition == jr.FIVE_HOUR_MISSING
+    assert result.five_hour.raw_pct is None
+    assert result.five_hour.effective_pct is None
 
 
-def test_fold_decision_clamp_skip_7d(ns):
+def test_fold_decision_clamp_holds_the_weekly_axis(ns):
     jr = _jr()
     conn = ns["open_db"]()
     try:
         # A higher 7d MAX already sits in this week; a lower incoming % is
-        # below the reset-aware HWM → clamp fires → skip.
+        # below the reset-aware HWM → the weekly axis is HELD at the MAX.
+        # With no five-hour evidence on either side there is nothing to
+        # persist, so the row is still not written.
         _seed_snapshot(
             conn, captured_at_utc="2026-01-04T08:00:00Z",
             week_start_date="2026-01-01", weekly_percent=50.0,
         )
-        skip, adj, reason = jr._usage_snapshot_fold_decision(conn, _payload(40.0))
+        result = jr._usage_snapshot_fold_decision(conn, _payload(40.0))
     finally:
         conn.close()
-    assert skip is True
-    assert reason == "clamp"
+    assert result.weekly.disposition == jr.WEEKLY_HELD_CLAMP
+    assert result.weekly.raw_pct == 40.0
+    assert result.weekly.effective_pct == 50.0
+    assert result.snapshot_action == jr.SNAPSHOT_SKIP_NO_CHANGE
 
 
 def test_fold_decision_5h_adjusts_up_never_gates(ns):
@@ -148,34 +199,768 @@ def test_fold_decision_5h_adjusts_up_never_gates(ns):
             week_start_date="2026-01-01", weekly_percent=10.0,
             five_hour_percent=20.0, five_hour_window_key=7770,
         )
-        skip, adj, reason = jr._usage_snapshot_fold_decision(
+        result = jr._usage_snapshot_fold_decision(
             conn, _payload(15.0, five_hour_percent=5.0, five_hour_window_key=7770)
         )
     finally:
         conn.close()
-    assert skip is False
-    assert adj == 20.0
-    assert reason == "accept"
+    assert result.snapshot_action == jr.SNAPSHOT_WRITE_OBSERVED
+    assert result.weekly.disposition == jr.WEEKLY_OBSERVED
+    assert result.five_hour.disposition == jr.FIVE_HOUR_CLAMPED
+    assert result.five_hour.raw_pct == 5.0
+    assert result.five_hour.effective_pct == 20.0
 
 
 def test_fold_decision_dedup_skip(ns):
     jr = _jr()
     conn = ns["open_db"]()
     try:
-        # Latest snapshot has identical weekly AND 5h → dedup skip.
+        # Latest snapshot has identical weekly AND 5h → nothing changed.
         _seed_snapshot(
             conn, captured_at_utc="2026-01-04T08:00:00Z",
             week_start_date="2026-01-01", weekly_percent=30.0,
             five_hour_percent=8.0, five_hour_window_key=7771,
         )
-        skip, adj, reason = jr._usage_snapshot_fold_decision(
+        result = jr._usage_snapshot_fold_decision(
             conn, _payload(30.0, five_hour_percent=8.0, five_hour_window_key=7771)
         )
     finally:
         conn.close()
-    assert skip is True
-    assert adj == 8.0
-    assert reason == "dedup"
+    assert result.snapshot_action == jr.SNAPSHOT_SKIP_NO_CHANGE
+    assert result.weekly.disposition == jr.WEEKLY_OBSERVED
+    assert result.five_hour.effective_pct == 8.0
+
+
+# ==========================================================================
+# #769 S11 (#824) — the fold's axis-aware truth table, driven row by row.
+#
+# Every row of the specification's eleven-row table appears once here, named
+# for the case it pins. The decisive rows are the four `WEEKLY_HELD_CLAMP`
+# ones: before this change the fold returned on the weekly clamp, so the
+# five-hour clamp below it never ran and the tick's genuine five-hour reading
+# was returned unclamped and then discarded by the pipeline.
+# ==========================================================================
+
+#: (name, seeded rows, payload kwargs, expected fold fields). Each seed is the
+#: kwargs of one `_seed_snapshot` call, applied in order.
+_TRUTH_TABLE = [
+    (
+        # Row 1. Weekly changed and genuinely observed; no five-hour input.
+        "weekly_changed_five_hour_missing",
+        [dict(captured_at_utc="2026-01-04T08:00:00Z",
+              week_start_date="2026-01-01", weekly_percent=10.0)],
+        dict(weekly_percent=20.0),
+        dict(weekly_disposition="WEEKLY_OBSERVED",
+             weekly_raw=20.0, weekly_effective=20.0,
+             five_hour_disposition="FIVE_HOUR_MISSING",
+             five_hour_raw=None, five_hour_effective=None,
+             action="SNAPSHOT_WRITE_OBSERVED", rollover_heal=False),
+    ),
+    (
+        # Row 2. Weekly changed; the five-hour value rose in the same window.
+        "weekly_changed_five_hour_as_observed",
+        [dict(captured_at_utc="2026-01-04T08:00:00Z",
+              week_start_date="2026-01-01", weekly_percent=10.0,
+              five_hour_percent=5.0, five_hour_window_key=7770)],
+        dict(weekly_percent=20.0, five_hour_percent=8.0,
+             five_hour_window_key=7770),
+        dict(weekly_disposition="WEEKLY_OBSERVED",
+             weekly_raw=20.0, weekly_effective=20.0,
+             five_hour_disposition="FIVE_HOUR_AS_OBSERVED",
+             five_hour_raw=8.0, five_hour_effective=8.0,
+             action="SNAPSHOT_WRITE_OBSERVED", rollover_heal=False),
+    ),
+    (
+        # Row 3. Weekly changed; the five-hour reading is BELOW the in-window
+        # maximum, so it clamps UP and still never gates the row.
+        "weekly_changed_five_hour_clamped",
+        [dict(captured_at_utc="2026-01-04T08:00:00Z",
+              week_start_date="2026-01-01", weekly_percent=10.0,
+              five_hour_percent=20.0, five_hour_window_key=7770)],
+        dict(weekly_percent=15.0, five_hour_percent=5.0,
+             five_hour_window_key=7770),
+        dict(weekly_disposition="WEEKLY_OBSERVED",
+             weekly_raw=15.0, weekly_effective=15.0,
+             five_hour_disposition="FIVE_HOUR_CLAMPED",
+             five_hour_raw=5.0, five_hour_effective=20.0,
+             action="SNAPSHOT_WRITE_OBSERVED", rollover_heal=False),
+    ),
+    (
+        # Row 4. Weekly unchanged and genuine; the five-hour value moved.
+        "weekly_unchanged_five_hour_moved",
+        [dict(captured_at_utc="2026-01-04T08:00:00Z",
+              week_start_date="2026-01-01", weekly_percent=30.0,
+              five_hour_percent=8.0, five_hour_window_key=7771)],
+        dict(weekly_percent=30.0, five_hour_percent=12.0,
+             five_hour_window_key=7771),
+        dict(weekly_disposition="WEEKLY_OBSERVED",
+             weekly_raw=30.0, weekly_effective=30.0,
+             five_hour_disposition="FIVE_HOUR_AS_OBSERVED",
+             five_hour_raw=12.0, five_hour_effective=12.0,
+             action="SNAPSHOT_WRITE_OBSERVED", rollover_heal=False),
+    ),
+    (
+        # Row 5a. Weekly unchanged and genuine; the five-hour pair is identical.
+        "weekly_unchanged_five_hour_identical",
+        [dict(captured_at_utc="2026-01-04T08:00:00Z",
+              week_start_date="2026-01-01", weekly_percent=30.0,
+              five_hour_percent=8.0, five_hour_window_key=7771)],
+        dict(weekly_percent=30.0, five_hour_percent=8.0,
+             five_hour_window_key=7771),
+        dict(weekly_disposition="WEEKLY_OBSERVED",
+             weekly_raw=30.0, weekly_effective=30.0,
+             five_hour_disposition="FIVE_HOUR_AS_OBSERVED",
+             five_hour_raw=8.0, five_hour_effective=8.0,
+             action="SNAPSHOT_SKIP_NO_CHANGE", rollover_heal=False),
+    ),
+    (
+        # Row 5b. Weekly unchanged and genuine; no five-hour input at all.
+        "weekly_unchanged_five_hour_missing",
+        [dict(captured_at_utc="2026-01-04T08:00:00Z",
+              week_start_date="2026-01-01", weekly_percent=30.0)],
+        dict(weekly_percent=30.0),
+        dict(weekly_disposition="WEEKLY_OBSERVED",
+             weekly_raw=30.0, weekly_effective=30.0,
+             five_hour_disposition="FIVE_HOUR_MISSING",
+             five_hour_raw=None, five_hour_effective=None,
+             action="SNAPSHOT_SKIP_NO_CHANGE", rollover_heal=False),
+    ),
+    (
+        # Row 6. Weekly unchanged and genuine; the five-hour value is the same
+        # but the physical window rolled over and no block anchors the new one.
+        # The row stays unwritten and the heal flag is what the pipeline acts
+        # on, which is why `rollover_heal` is orthogonal to `snapshot_action`.
+        "weekly_unchanged_rollover_heal",
+        [dict(captured_at_utc="2026-01-04T08:00:00Z",
+              week_start_date="2026-01-01", weekly_percent=30.0,
+              five_hour_percent=8.0, five_hour_window_key=7771)],
+        dict(weekly_percent=30.0, five_hour_percent=8.0,
+             five_hour_window_key=7772),
+        dict(weekly_disposition="WEEKLY_OBSERVED",
+             weekly_raw=30.0, weekly_effective=30.0,
+             five_hour_disposition="FIVE_HOUR_AS_OBSERVED",
+             five_hour_raw=8.0, five_hour_effective=8.0,
+             action="SNAPSHOT_SKIP_NO_CHANGE", rollover_heal=True),
+    ),
+    (
+        # Row 7. THE DECISIVE ROW. The weekly axis clamps against the stored
+        # 63 while the five-hour axis carries genuine growth to 25, so the row
+        # is written with the weekly value HELD.
+        "weekly_held_five_hour_grew",
+        [dict(captured_at_utc="2026-01-04T08:00:00Z",
+              week_start_date="2026-01-01", weekly_percent=63.0,
+              five_hour_percent=10.0, five_hour_window_key=7772)],
+        dict(weekly_percent=60.0, five_hour_percent=25.0,
+             five_hour_window_key=7772),
+        dict(weekly_disposition="WEEKLY_HELD_CLAMP",
+             weekly_raw=60.0, weekly_effective=63.0,
+             five_hour_disposition="FIVE_HOUR_AS_OBSERVED",
+             five_hour_raw=25.0, five_hour_effective=25.0,
+             action="SNAPSHOT_WRITE_HELD_5H", rollover_heal=False),
+    ),
+    (
+        # Row 8. Weekly held; the five-hour reading is an exact duplicate in
+        # the same window, so neither axis carries new evidence.
+        "weekly_held_five_hour_exact_duplicate",
+        [dict(captured_at_utc="2026-01-04T08:00:00Z",
+              week_start_date="2026-01-01", weekly_percent=63.0,
+              five_hour_percent=10.0, five_hour_window_key=7772)],
+        dict(weekly_percent=60.0, five_hour_percent=10.0,
+             five_hour_window_key=7772),
+        dict(weekly_disposition="WEEKLY_HELD_CLAMP",
+             weekly_raw=60.0, weekly_effective=63.0,
+             five_hour_disposition="FIVE_HOUR_AS_OBSERVED",
+             five_hour_raw=10.0, five_hour_effective=10.0,
+             action="SNAPSHOT_SKIP_NO_CHANGE", rollover_heal=False),
+    ),
+    (
+        # Row 9. Weekly held; the raw five-hour reading clamps UP onto the
+        # stored value, so the effective pair is a duplicate after the clamp
+        # the old early return never reached.
+        "weekly_held_five_hour_clamps_to_duplicate",
+        [dict(captured_at_utc="2026-01-04T08:00:00Z",
+              week_start_date="2026-01-01", weekly_percent=63.0,
+              five_hour_percent=10.0, five_hour_window_key=7772)],
+        dict(weekly_percent=60.0, five_hour_percent=5.0,
+             five_hour_window_key=7772),
+        dict(weekly_disposition="WEEKLY_HELD_CLAMP",
+             weekly_raw=60.0, weekly_effective=63.0,
+             five_hour_disposition="FIVE_HOUR_CLAMPED",
+             five_hour_raw=5.0, five_hour_effective=10.0,
+             action="SNAPSHOT_SKIP_NO_CHANGE", rollover_heal=False),
+    ),
+    (
+        # Row 10. Weekly held and no five-hour input: nothing to persist.
+        "weekly_held_five_hour_missing",
+        [dict(captured_at_utc="2026-01-04T08:00:00Z",
+              week_start_date="2026-01-01", weekly_percent=63.0)],
+        dict(weekly_percent=60.0),
+        dict(weekly_disposition="WEEKLY_HELD_CLAMP",
+             weekly_raw=60.0, weekly_effective=63.0,
+             five_hour_disposition="FIVE_HOUR_MISSING",
+             five_hour_raw=None, five_hour_effective=None,
+             action="SNAPSHOT_SKIP_NO_CHANGE", rollover_heal=False),
+    ),
+    (
+        # Row 11. Weekly held; the five-hour value is unchanged but the window
+        # rolled over, so the heal is owed without a row being written.
+        "weekly_held_rollover_heal",
+        [dict(captured_at_utc="2026-01-04T08:00:00Z",
+              week_start_date="2026-01-01", weekly_percent=63.0,
+              five_hour_percent=10.0, five_hour_window_key=7772)],
+        dict(weekly_percent=60.0, five_hour_percent=10.0,
+             five_hour_window_key=7773),
+        dict(weekly_disposition="WEEKLY_HELD_CLAMP",
+             weekly_raw=60.0, weekly_effective=63.0,
+             five_hour_disposition="FIVE_HOUR_AS_OBSERVED",
+             five_hour_raw=10.0, five_hour_effective=10.0,
+             action="SNAPSHOT_SKIP_NO_CHANGE", rollover_heal=True),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "name,seeds,payload_kwargs,expected",
+    _TRUTH_TABLE,
+    ids=[row[0] for row in _TRUTH_TABLE],
+)
+def test_fold_truth_table(ns, name, seeds, payload_kwargs, expected):
+    jr = _jr()
+    conn = ns["open_db"]()
+    try:
+        for seed in seeds:
+            _seed_snapshot(conn, **seed)
+        weekly_percent = payload_kwargs.pop("weekly_percent")
+        result = jr._usage_snapshot_fold_decision(
+            conn, _payload(weekly_percent, **payload_kwargs))
+    finally:
+        conn.close()
+
+    assert result.weekly.disposition == getattr(
+        jr, expected["weekly_disposition"])
+    assert result.weekly.raw_pct == expected["weekly_raw"]
+    assert result.weekly.effective_pct == expected["weekly_effective"]
+    assert result.five_hour.disposition == getattr(
+        jr, expected["five_hour_disposition"])
+    assert result.five_hour.raw_pct == expected["five_hour_raw"]
+    assert result.five_hour.effective_pct == expected["five_hour_effective"]
+    assert result.snapshot_action == getattr(jr, expected["action"])
+    assert result.five_hour.rollover_heal is expected["rollover_heal"]
+
+
+def test_the_truth_table_covers_every_declared_outcome():
+    """Non-vacuity for the table above. Coverage by counting rows is not
+    coverage: the point is that each declared weekly disposition, five-hour
+    disposition and snapshot action is actually exercised."""
+    jr = _jr()
+    weeklies = {row[3]["weekly_disposition"] for row in _TRUTH_TABLE}
+    five_hours = {row[3]["five_hour_disposition"] for row in _TRUTH_TABLE}
+    actions = {row[3]["action"] for row in _TRUTH_TABLE}
+    assert weeklies == {"WEEKLY_OBSERVED", "WEEKLY_HELD_CLAMP"}
+    assert five_hours == {
+        "FIVE_HOUR_MISSING", "FIVE_HOUR_AS_OBSERVED", "FIVE_HOUR_CLAMPED"}
+    assert actions == {
+        "SNAPSHOT_WRITE_OBSERVED", "SNAPSHOT_WRITE_HELD_5H",
+        "SNAPSHOT_SKIP_NO_CHANGE"}
+    assert any(row[3]["rollover_heal"] for row in _TRUTH_TABLE)
+    # And the constants are distinct strings, so a copy-paste that collapsed
+    # two of them would fail here rather than silently reclassify a tick.
+    assert len({
+        jr.WEEKLY_OBSERVED, jr.WEEKLY_HELD_CLAMP,
+        jr.FIVE_HOUR_MISSING, jr.FIVE_HOUR_AS_OBSERVED, jr.FIVE_HOUR_CLAMPED,
+        jr.SNAPSHOT_WRITE_OBSERVED, jr.SNAPSHOT_WRITE_HELD_5H,
+        jr.SNAPSHOT_SKIP_NO_CHANGE,
+    }) == 8
+
+
+def test_the_weekly_basis_is_the_latest_NON_held_row(ns):
+    """A held row's weekly value and boundary are carried forward, so a later
+    held row that took its basis from another held row would compound the
+    carry. The basis is therefore selected from non-held rows only.
+
+    Non-vacuous by construction: the seeded held row carries a DIFFERENT
+    boundary from the genuine one, so selecting it would be visible.
+    """
+    jr = _jr()
+    conn = ns["open_db"]()
+    try:
+        _seed_snapshot(
+            conn, captured_at_utc="2026-01-04T08:00:00Z",
+            week_start_date="2026-01-01", weekly_percent=63.0,
+            week_end_at="2026-01-08T00:00:00+00:00",
+            five_hour_percent=10.0, five_hour_window_key=7772)
+        _seed_snapshot(
+            conn, captured_at_utc="2026-01-04T08:30:00Z",
+            week_start_date="2026-01-01", weekly_percent=63.0,
+            week_end_at="2026-01-09T00:00:00+00:00",
+            five_hour_percent=15.0, five_hour_window_key=7772,
+            weekly_observation_held=1)
+        result = jr._usage_snapshot_fold_decision(
+            conn, _payload(60.0, five_hour_percent=25.0,
+                           five_hour_window_key=7772))
+    finally:
+        conn.close()
+    assert result.snapshot_action == jr.SNAPSHOT_WRITE_HELD_5H
+    assert result.weekly.basis is not None
+    assert result.weekly.basis.captured_at_utc == "2026-01-04T08:00:00Z"
+    assert result.weekly.basis.week_end_at == "2026-01-08T00:00:00+00:00"
+    assert result.weekly.basis.weekly_percent == 63.0
+
+
+def test_a_held_row_is_excluded_from_the_weekly_high_water_max(ns):
+    """Review finding 7, the half a `= 0` predicate on the predecessor query
+    alone does not cover. A credit moves the reset-aware clamp floor forward,
+    and the MAX is taken over rows at or after it. A held row written after the
+    floor carries a weekly value from BEFORE it, so counting it would clamp a
+    genuine post-credit reading against pre-credit evidence — the exact
+    contamination that makes a fresh low look stale."""
+    jr = _jr()
+    conn = ns["open_db"]()
+    try:
+        _seed_snapshot(
+            conn, captured_at_utc="2026-01-04T08:00:00Z",
+            week_start_date="2026-01-01", weekly_percent=63.0)
+        conn.execute(
+            "INSERT INTO weekly_credit_floors "
+            "(week_start_date, effective_at_utc, observed_pre_credit_pct, "
+            " applied_at_utc, account_key) VALUES (?,?,?,?,?)",
+            ("2026-01-01", "2026-01-04T09:00:00+00:00", 63.0,
+             "2026-01-04T09:00:00Z", "unattributed"))
+        # The held row lands AFTER the credit floor and carries the pre-credit
+        # 63 forward, because that is what a held row is.
+        _seed_snapshot(
+            conn, captured_at_utc="2026-01-04T10:00:00Z",
+            week_start_date="2026-01-01", weekly_percent=63.0,
+            five_hour_percent=10.0, five_hour_window_key=7772,
+            weekly_observation_held=1)
+        conn.commit()
+        result = jr._usage_snapshot_fold_decision(
+            conn, _payload(40.0, five_hour_percent=12.0,
+                           five_hour_window_key=7772))
+    finally:
+        conn.close()
+    assert result.weekly.disposition == jr.WEEKLY_OBSERVED, (
+        "the held row's carried-forward weekly value entered the post-credit "
+        "high-water MAX and clamped a genuine reading")
+    assert result.weekly.effective_pct == 40.0
+    assert result.snapshot_action == jr.SNAPSHOT_WRITE_OBSERVED
+
+
+def test_the_fold_result_is_frozen(ns):
+    """The pipeline threads one result through the milestone gate, the block
+    derivation and both high-water writers. A mutable result would let any of
+    them rewrite a decision the journal has already recorded."""
+    import dataclasses
+
+    jr = _jr()
+    conn = ns["open_db"]()
+    try:
+        result = jr._usage_snapshot_fold_decision(conn, _payload(10.0))
+    finally:
+        conn.close()
+    for obj in (result, result.weekly, result.five_hour):
+        assert dataclasses.is_dataclass(obj)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(obj, "disposition" if obj is not result else
+                    "snapshot_action", "tampered")
+
+
+# ==========================================================================
+# #769 S11 (#824) — a held row is invisible to every WEEKLY read and visible to
+# every five-hour one. The reads a held row can actually change are the ones
+# whose answer depends on a TIME filter, because a held row's capture time is
+# the tick's while its weekly value is an older row's: a filter can admit the
+# held row and exclude the basis it copied from, which carries a value from
+# outside the window into a window it does not belong to.
+# ==========================================================================
+
+def _seed_credit_floor(conn, *, week_start_date="2026-01-01",
+                       effective_at_utc, observed_pre_credit_pct):
+    conn.execute(
+        "INSERT INTO weekly_credit_floors "
+        "(week_start_date, effective_at_utc, observed_pre_credit_pct, "
+        " applied_at_utc, account_key) VALUES (?,?,?,?,?)",
+        (week_start_date, effective_at_utc, observed_pre_credit_pct,
+         effective_at_utc, "unattributed"))
+    conn.commit()
+
+
+def test_the_reset_aware_weekly_hwm_excludes_held_rows(ns):
+    """`_resolve_reset_aware_hwm` is the `--from` default and the record-credit
+    tests' source of truth for "what the week reached". A held row written after
+    a credit floor carries the PRE-credit value forward, so counting it would
+    report a high-water mark the credit already retired."""
+    conn = ns["open_db"]()
+    try:
+        _seed_snapshot(
+            conn, captured_at_utc="2026-01-04T08:00:00Z",
+            week_start_date="2026-01-01", weekly_percent=63.0)
+        _seed_credit_floor(
+            conn, effective_at_utc="2026-01-04T09:00:00+00:00",
+            observed_pre_credit_pct=63.0)
+        _seed_snapshot(
+            conn, captured_at_utc="2026-01-04T10:00:00Z",
+            week_start_date="2026-01-01", weekly_percent=63.0,
+            five_hour_percent=25.0, five_hour_window_key=7772,
+            weekly_observation_held=1)
+        hwm = ns["_resolve_reset_aware_hwm"](
+            conn, "2026-01-01", "2026-01-01T00:00:00+00:00",
+            "2026-01-08T00:00:00+00:00", account_key="unattributed")
+    finally:
+        conn.close()
+    assert hwm is None, (
+        "the held row's carried-forward weekly value survived the credit floor")
+
+
+def test_the_weekly_predecessor_for_reset_detection_skips_held_rows(ns):
+    """The query `detect_reset_and_credit` reads its previous boundary from.
+
+    The pipeline copies a held row's boundary from its basis, so on a row this
+    binary wrote the two agree and excluding held rows changes nothing. That is
+    the point: the exclusion is what makes the copy's correctness NOT
+    load-bearing. A row whose boundary diverges is seeded directly here — a
+    hand-written row, or one an older shape produced — and the predecessor must
+    still be the basis.
+    """
+    conn = ns["open_db"]()
+    try:
+        _seed_snapshot(
+            conn, captured_at_utc="2026-01-04T08:00:00Z",
+            week_start_date="2026-01-01", weekly_percent=63.0,
+            week_end_at="2026-01-08T00:00:00+00:00")
+        _seed_snapshot(
+            conn, captured_at_utc="2026-01-04T10:00:00Z",
+            week_start_date="2026-01-01", weekly_percent=41.0,
+            week_end_at="2026-01-11T00:00:00+00:00",
+            weekly_observation_held=1)
+        prior = conn.execute(
+            "SELECT week_end_at, weekly_percent FROM weekly_usage_snapshots "
+            "WHERE week_end_at IS NOT NULL AND account_key = ? "
+            "  AND weekly_observation_held = 0 "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+            ("unattributed",),
+        ).fetchone()
+        shipped = ns["detect_reset_and_credit"]
+    finally:
+        conn.close()
+    assert prior["week_end_at"] == "2026-01-08T00:00:00+00:00"
+    assert prior["weekly_percent"] == 63.0
+    # And the shipped query carries the predicate, so the assertion above is
+    # about the code rather than about a query this test wrote for itself.
+    import inspect
+    source = inspect.getsource(shipped)
+    assert "SELECT week_end_at, weekly_percent FROM weekly_usage_snapshots" in source
+    assert source.count("weekly_observation_held = 0") >= 1
+
+
+def test_a_held_predecessor_does_not_become_the_reset_baseline(ns):
+    """The behavioural half of the weekly exclusion, which the two tests around
+    it assert only against the text of the shipped queries.
+
+    `detect_reset_and_credit` derives a week rollover by comparing the incoming
+    boundary against the previous accepted row's, and records that row's
+    boundary as the week the reset moved away from. A held row can carry a
+    boundary that diverges from its basis, so which row is selected is directly
+    observable in `old_week_end_at`: the basis gives 2026-01-08 and the held row
+    gives 2026-01-11.
+
+    `observed_pre_credit_pct` stays NULL here and is not asserted, because a
+    plain rollover is not an in-place credit and only the credit path fills it.
+    """
+    conn = ns["open_db"]()
+    try:
+        _seed_snapshot(
+            conn, captured_at_utc="2026-01-04T08:00:00Z",
+            week_start_date="2026-01-01", weekly_percent=63.0,
+            week_end_at="2026-01-08T00:00:00+00:00")
+        _seed_snapshot(
+            conn, captured_at_utc="2026-01-04T10:00:00Z",
+            week_start_date="2026-01-01", weekly_percent=41.0,
+            week_end_at="2026-01-11T00:00:00+00:00",
+            weekly_observation_held=1)
+        moment = "2026-01-04T11:00:00Z"
+        ns["detect_reset_and_credit"](
+            conn,
+            week_start_date="2026-01-08",
+            week_end_at="2026-01-15T00:00:00+00:00",
+            weekly_percent=5.0,
+            five_hour_window_key=None,
+            five_hour_percent=None,
+            as_of=moment,
+            commit=False,
+            capture_at=moment,
+        )
+        events = conn.execute(
+            "SELECT old_week_end_at, observed_pre_credit_pct "
+            "FROM week_reset_events ORDER BY id DESC").fetchall()
+    finally:
+        conn.close()
+    assert events, "non-vacuity: the boundary change derived no reset at all"
+    assert events[0]["old_week_end_at"] == "2026-01-08T00:00:00+00:00", (
+        "the rollover was measured from the held row's divergent boundary")
+
+
+def test_the_reset_event_backfill_scan_skips_held_rows(ns):
+    """`_backfill_week_reset_events` walks each account's snapshots in capture
+    order and derives a reset from a consecutive boundary change plus a drop. A
+    held row repeats its basis's boundary and value, so it can only ever
+    contribute a no-change pair — but a row whose boundary diverges would derive
+    a phantom reset, and the exclusion is what makes that impossible rather than
+    improbable."""
+    import inspect
+    import _cctally_weekrefs
+    source = inspect.getsource(_cctally_weekrefs._backfill_week_reset_events)
+    assert "FROM weekly_usage_snapshots" in source
+    assert "weekly_observation_held = 0" in source
+
+
+def test_the_five_hour_reads_stay_held_inclusive(ns):
+    """The other half of the rule, at the level of stored state: the latest
+    five-hour window and value must come from the held row, because that row is
+    where a weekly-clamped tick's five-hour evidence now lives.
+
+    This asserts the index the pipeline wrote, using test-local queries; it
+    drives no production five-hour read of its own. The production reads are
+    exercised by the fold's own clamp in the truth-table cases above and by the
+    rematerialization tests below.
+    """
+    jr = _jr()
+    J = _jlib()
+    _held_sequence(jr, J)
+
+    conn = ns["open_db"]()
+    try:
+        latest = conn.execute(
+            "SELECT five_hour_percent, five_hour_window_key "
+            "FROM weekly_usage_snapshots "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1").fetchone()
+        max_5h = conn.execute(
+            "SELECT MAX(five_hour_percent) FROM weekly_usage_snapshots"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert latest["five_hour_percent"] == 25.0
+    assert max_5h == 25.0
+
+
+# ==========================================================================
+# #769 S11 (#824) — replay. `db rebuild` is apply-only and reconstructs open
+# blocks from snapshot history; `db rederive` reruns the raw pipeline. A
+# five-hour effect that existed only as a block write and never as a journalled
+# snapshot decision would survive one and vanish in the other, which is why the
+# held tick is persisted as an ordinary `snapshot_accept` decision.
+# ==========================================================================
+
+def _held_convergence_oracle(conn, app_dir):
+    """The logical comparison the specification names — row ids excluded,
+    because two builds legitimately disagree on them."""
+    snap = conn.execute(
+        "SELECT weekly_percent, weekly_observation_held, five_hour_percent, "
+        "       five_hour_window_key, captured_at_utc, week_start_date, "
+        "       week_end_date, week_start_at, week_end_at, source "
+        "FROM weekly_usage_snapshots "
+        "ORDER BY captured_at_utc, weekly_observation_held").fetchall()
+    blocks = conn.execute(
+        "SELECT five_hour_window_key, seven_day_pct_at_block_start, "
+        "       seven_day_pct_at_block_end, final_five_hour_percent "
+        "FROM five_hour_blocks ORDER BY five_hour_window_key").fetchall()
+    five_hour_milestones = conn.execute(
+        "SELECT five_hour_window_key, percent_threshold, captured_at_utc, "
+        "       seven_day_pct_at_crossing, reset_event_id "
+        "FROM five_hour_milestones "
+        "ORDER BY five_hour_window_key, percent_threshold").fetchall()
+    weekly_milestones = conn.execute(
+        "SELECT week_start_date, percent_threshold, reset_event_id "
+        "FROM percent_milestones "
+        "ORDER BY week_start_date, percent_threshold").fetchall()
+    return {
+        "snapshots": [tuple(r) for r in snap],
+        "blocks": [tuple(r) for r in blocks],
+        "fiveHourMilestones": [tuple(r) for r in five_hour_milestones],
+        "weeklyMilestones": [tuple(r) for r in weekly_milestones],
+        "hwm5h": _read_projection(app_dir, "hwm-5h"),
+        "hwm7d": _read_projection(app_dir, "hwm-7d"),
+    }
+
+
+def _read_projection(app_dir, name):
+    try:
+        return app_dir.joinpath(name).read_text().strip()
+    except OSError:
+        return None
+
+
+def test_a_rebuild_reproduces_the_held_row_and_its_five_hour_effects(ns):
+    """`db rebuild`'s whole contract for this change: the held tick was
+    journalled as a `snapshot_accept` decision, so an apply-only replay into a
+    fresh index reproduces the row, its block and its milestone without
+    rerunning the pipeline."""
+    jr = _jr()
+    J = _jlib()
+    _held_sequence(jr, J)
+    app_dir = pathlib.Path(str(ns["APP_DIR"]))
+
+    conn = ns["open_db"]()
+    try:
+        before = _held_convergence_oracle(conn, app_dir)
+    finally:
+        conn.close()
+    assert before["snapshots"][-1][1] == 1, "non-vacuity: a held row exists"
+
+    result = jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"))
+    assert result is not None
+
+    conn = ns["open_db"]()
+    try:
+        after = _held_convergence_oracle(conn, app_dir)
+    finally:
+        conn.close()
+
+    assert after["snapshots"] == before["snapshots"]
+    assert after["blocks"] == before["blocks"]
+    assert after["fiveHourMilestones"] == before["fiveHourMilestones"]
+    assert after["weeklyMilestones"] == before["weeklyMilestones"]
+    assert after["hwm5h"] == before["hwm5h"]
+    assert after["hwm7d"] == before["hwm7d"]
+
+
+def test_a_rebuild_rematerializes_hwm_5h_and_never_touches_hwm_7d(ns):
+    """The projection half. A rebuild does not rerun the live pipeline, so
+    without a rematerialization pass `hwm-5h` would keep whatever it happened to
+    hold — and `db rederive`, whose scratch derivation disables projection
+    writes, would leave it somewhere else again."""
+    jr = _jr()
+    J = _jlib()
+    _held_sequence(jr, J)
+    app_dir = pathlib.Path(str(ns["APP_DIR"]))
+
+    # Corrupt both projections, then rebuild.
+    app_dir.joinpath("hwm-5h").write_text("1 1.0\n")
+    app_dir.joinpath("hwm-7d").write_text("2026-01-01 5.0\n")
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
+
+    assert _read_projection(app_dir, "hwm-5h").split()[1] == "25.0", (
+        "hwm-5h was not rematerialized from the published index")
+    assert _read_projection(app_dir, "hwm-7d") == "2026-01-01 5.0", (
+        "the rebuild wrote the weekly projection")
+
+
+def _seed_five_hour_index(path, *, window_key, account_key, rows, reset_at=None):
+    """Build a minimal read-only stand-in for a published stats index.
+
+    `_rematerialize_five_hour_high_water` opens its destination read-only and
+    touches exactly two tables, so a hand-built database exercises the real
+    query. Hand-built rows would be worthless in a test that then rebuilds —
+    a rebuild reconstructs the index from the journal and would discard them —
+    but nothing here rebuilds: the subject is the SQL this pass runs against an
+    index that has already been published.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE weekly_usage_snapshots ("
+            " id INTEGER PRIMARY KEY, captured_at_utc TEXT, "
+            " five_hour_percent REAL, five_hour_window_key INTEGER, "
+            " account_key TEXT NOT NULL DEFAULT 'unattributed')")
+        conn.execute(
+            "CREATE TABLE five_hour_reset_events ("
+            " id INTEGER PRIMARY KEY, five_hour_window_key INTEGER, "
+            " account_key TEXT, effective_reset_at_utc TEXT)")
+        for captured_at, pct in rows:
+            conn.execute(
+                "INSERT INTO weekly_usage_snapshots "
+                "(captured_at_utc, five_hour_percent, five_hour_window_key, "
+                " account_key) VALUES (?, ?, ?, ?)",
+                (captured_at, pct, window_key, account_key))
+        if reset_at is not None:
+            conn.execute(
+                "INSERT INTO five_hour_reset_events "
+                "(five_hour_window_key, account_key, effective_reset_at_utc) "
+                "VALUES (?, ?, ?)", (window_key, account_key, reset_at))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_the_rematerialization_publishes_the_reset_aware_maximum(ns, tmp_path):
+    """The pass publishes the EFFECTIVE five-hour value, which is the
+    reset-aware in-window maximum the fold's own clamp computes — not the raw
+    maximum.
+
+    An in-place five-hour credit retires the pre-credit peak without deleting
+    every row that carries it: the stale-replica DELETE bands only at or after
+    the credit instant, so the earlier climb stays in the index. A pass that
+    took an unfloored MAX would republish that retired peak and push the status
+    line's no-regression floor back above a level the meter has already moved
+    past, which is the outcome the credit's own force-write exists to prevent.
+
+    The expectation is a literal rather than a recomputation from the index,
+    because an oracle that re-runs production's own query agrees with it whether
+    or not that query is correct.
+    """
+    jr = _jr()
+    app_dir = pathlib.Path(str(ns["APP_DIR"]))
+    destination = tmp_path / "published-stats.db"
+    _seed_five_hour_index(
+        destination, window_key=7772, account_key="unattributed",
+        rows=[("2026-01-04T08:00:00Z", 30.0),
+              ("2026-01-04T08:30:00Z", 5.0)],
+        reset_at="2026-01-04T08:20:00Z")
+
+    conn = sqlite3.connect(f"file:{destination}?mode=ro", uri=True)
+    try:
+        raw_max = conn.execute(
+            "SELECT MAX(five_hour_percent) FROM weekly_usage_snapshots"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert raw_max == 30.0, (
+        "non-vacuity: the retired pre-credit peak is still in the index, so an "
+        "unfloored MAX would find it")
+
+    app_dir.joinpath("hwm-5h").write_text("1 1.0\n")
+    jr._rematerialize_five_hour_high_water(str(destination))
+
+    assert _read_projection(app_dir, "hwm-5h") == "7772 5.0", (
+        "the pass republished a five-hour level the credit retired")
+
+
+def test_the_rematerialization_without_a_credit_uses_the_whole_window(ns,
+                                                                     tmp_path):
+    """The floor is a floor, not a filter: with no reset event in the window
+    the pass still publishes the window's full maximum. Without this, a change
+    that over-restricted the floor would pass the test above by publishing a
+    value that is merely lower."""
+    jr = _jr()
+    app_dir = pathlib.Path(str(ns["APP_DIR"]))
+    destination = tmp_path / "published-stats.db"
+    _seed_five_hour_index(
+        destination, window_key=7772, account_key="unattributed",
+        rows=[("2026-01-04T08:00:00Z", 30.0),
+              ("2026-01-04T08:30:00Z", 12.0)])
+
+    app_dir.joinpath("hwm-5h").write_text("1 1.0\n")
+    jr._rematerialize_five_hour_high_water(str(destination))
+
+    assert _read_projection(app_dir, "hwm-5h") == "7772 30.0"
+
+
+def test_a_scratch_target_rebuild_mutates_no_projection_file(ns, tmp_path):
+    """Preview and scratch-target operations mutate no high-water file. A
+    preview that moved what the status line renders would be a preview with a
+    side effect."""
+    jr = _jr()
+    J = _jlib()
+    _held_sequence(jr, J)
+    app_dir = pathlib.Path(str(ns["APP_DIR"]))
+    app_dir.joinpath("hwm-5h").write_text("1 1.0\n")
+
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(tmp_path / "scratch-stats.db"))
+
+    assert _read_projection(app_dir, "hwm-5h") == "1 1.0"
 
 
 # ==========================================================================
@@ -765,6 +1550,325 @@ def test_obs_hook_dedup_skip_runs_dollar_axes_no_second_snapshot(ns, monkeypatch
     assert n == 1, "dedup tick appended an obs but wrote no second snapshot"
     # The budget axis fired on BOTH the accept tick and the dedup-skip tick.
     assert dollar_calls == [3.0, 3.0], "dollar axes run on the dedup-skip tick too"
+
+
+# ==========================================================================
+# #769 S11 (#824) — the held write path, end to end through the obs hook.
+#
+# The acceptance sequence from the specification: t0 records a genuine weekly
+# 63 with five-hour 20, then t1 arrives in the SAME physical weekly and
+# five-hour windows carrying a raw weekly of 60, which clamps, and a genuine
+# five-hour rise to 25. Before this change the tick wrote no row at all, so the
+# 25 was lost from durable state entirely.
+# ==========================================================================
+
+#: One physical five-hour window, shared by both ticks of the held sequence.
+_HELD_5H_RESETS_AT = "2026-01-04T13:00:00+00:00"
+
+
+def _held_sequence(jr, J, *, second_five_hour_percent=25.0,
+                   second_five_hour_resets_at=_HELD_5H_RESETS_AT):
+    """Drive the two-tick held sequence through real ingest cycles."""
+    jr.append_record(
+        _claude_obs(J, at="2026-01-04T09:00:00Z", weekly_percent=63.0,
+                    five_hour_percent=20.0,
+                    five_hour_resets_at=_HELD_5H_RESETS_AT),
+        now_utc=FIXED)
+    assert jr.run_stats_ingest(mode="authoritative").ran is True
+    jr.append_record(
+        _claude_obs(J, at="2026-01-04T09:05:00Z", weekly_percent=60.0,
+                    five_hour_percent=second_five_hour_percent,
+                    five_hour_resets_at=second_five_hour_resets_at),
+        now_utc=FIXED)
+    assert jr.run_stats_ingest(mode="authoritative").ran is True
+
+
+def _latest_usage_row(conn):
+    return conn.execute(
+        "SELECT * FROM weekly_usage_snapshots "
+        "ORDER BY captured_at_utc DESC, id DESC LIMIT 1").fetchone()
+
+
+def test_held_tick_persists_five_hour_and_leaves_weekly_untouched(ns):
+    jr = _jr()
+    J = _jlib()
+    _held_sequence(jr, J)
+
+    conn = ns["open_db"]()
+    try:
+        latest = _latest_usage_row(conn)
+        rows = conn.execute(
+            "SELECT weekly_percent, five_hour_percent, weekly_observation_held "
+            "FROM weekly_usage_snapshots ORDER BY id").fetchall()
+    finally:
+        conn.close()
+
+    assert len(rows) == 2, (
+        "the weekly-clamped tick wrote no row, so its five-hour reading is gone")
+    assert latest["weekly_percent"] == 63.0, (
+        "the held row carries the effective weekly value, not the raw 60")
+    assert latest["five_hour_percent"] == 25.0
+    assert latest["weekly_observation_held"] == 1
+    assert latest["captured_at_utc"] == "2026-01-04T09:05:00Z", (
+        "the capture time is the TICK's, because the five-hour evidence is")
+    assert rows[0][2] == 0, "the genuine t0 row is not held"
+
+    app_dir = pathlib.Path(str(ns["APP_DIR"]))
+    assert app_dir.joinpath("hwm-7d").read_text().split() == [
+        "2026-01-01", "63.0"]
+    assert app_dir.joinpath("hwm-5h").read_text().split()[1] == "25.0"
+
+
+def test_the_held_row_retains_the_raw_weekly_reading_in_its_payload(ns):
+    """The stored weekly value is the carried-forward 63, so the tick's own 60
+    exists nowhere in the row's columns. It is retained in `payload_json` for
+    audit and for `db rederive`, which reruns the raw observation."""
+    import json as _json
+
+    jr = _jr()
+    J = _jlib()
+    _held_sequence(jr, J)
+
+    conn = ns["open_db"]()
+    try:
+        latest = _latest_usage_row(conn)
+    finally:
+        conn.close()
+    payload = _json.loads(latest["payload_json"])
+    assert payload["weeklyPercent"] == 63.0, (
+        "the column and the payload's own weekly value must agree")
+    assert payload["rawWeeklyPercent"] == 60.0
+    assert payload["weeklyObservationHeld"] is True
+
+
+def test_the_held_row_copies_its_boundary_from_the_non_held_basis(ns):
+    """Review finding 7. A held row whose boundary came from the tick could
+    reclassify a later reset as an in-place credit, because the reset detector
+    compares the incoming boundary against the latest stored one."""
+    jr = _jr()
+    J = _jlib()
+    _held_sequence(jr, J)
+
+    conn = ns["open_db"]()
+    try:
+        rows = conn.execute(
+            "SELECT week_start_date, week_end_date, week_start_at, week_end_at "
+            "FROM weekly_usage_snapshots ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 2
+    assert tuple(rows[1]) == tuple(rows[0]), (
+        "the held row's four boundary columns must equal the basis's")
+
+
+def test_a_held_tick_never_advances_the_weekly_high_water_file(ns):
+    """Structural, not defensive. The monotonic `hwm_file_next` guard happens
+    to suppress the weekly write here because 60 is below 63, but if `hwm-7d`
+    ever trailed the stored value the HELD weekly 63 would be written into the
+    file the status line renders from. The weekly writer is simply not called
+    on a held tick, so the guard is not what is being relied on."""
+    jr = _jr()
+    J = _jlib()
+    app_dir = pathlib.Path(str(ns["APP_DIR"]))
+    app_dir.mkdir(parents=True, exist_ok=True)
+
+    jr.append_record(
+        _claude_obs(J, at="2026-01-04T09:00:00Z", weekly_percent=63.0,
+                    five_hour_percent=20.0,
+                    five_hour_resets_at=_HELD_5H_RESETS_AT),
+        now_utc=FIXED)
+    assert jr.run_stats_ingest(mode="authoritative").ran is True
+
+    # Make the projection file TRAIL the stored value, which is the state the
+    # monotonic guard cannot save us from.
+    app_dir.joinpath("hwm-7d").write_text("2026-01-01 5.0\n")
+
+    jr.append_record(
+        _claude_obs(J, at="2026-01-04T09:05:00Z", weekly_percent=60.0,
+                    five_hour_percent=25.0,
+                    five_hour_resets_at=_HELD_5H_RESETS_AT),
+        now_utc=FIXED)
+    assert jr.run_stats_ingest(mode="authoritative").ran is True
+
+    assert app_dir.joinpath("hwm-7d").read_text().split() == ["2026-01-01", "5.0"], (
+        "the held weekly value reached hwm-7d")
+    assert app_dir.joinpath("hwm-5h").read_text().split()[1] == "25.0", (
+        "the five-hour writer must still run on a held tick")
+
+
+def test_a_held_tick_derives_no_weekly_milestone(ns, monkeypatch):
+    """Weekly milestone suppression on a clamp is preserved. A weekly milestone
+    derived from the stale stored row fabricated a 13% milestone on 2026-09-01,
+    and milestones are forward-only within an epoch, so that row forecloses
+    every genuine crossing below it."""
+    jr = _jr()
+    J = _jlib()
+    weekly_calls = []
+    real = ns["maybe_record_milestone"]
+    monkeypatch.setitem(
+        ns, "maybe_record_milestone",
+        lambda saved, **k: (weekly_calls.append(saved.get("weeklyPercent")),
+                            real(saved, **k))[1])
+
+    _held_sequence(jr, J)
+    assert weekly_calls == [63.0], (
+        "the weekly milestone chokepoint ran on the held tick")
+
+
+def test_a_held_tick_with_no_five_hour_change_still_writes_nothing(ns):
+    """Non-vacuity for the write. The held row exists because the five-hour
+    axis carried evidence; an identical five-hour reading must still write no
+    row, or every clamped tick would grow the table."""
+    jr = _jr()
+    J = _jlib()
+    _held_sequence(jr, J, second_five_hour_percent=20.0)
+
+    conn = ns["open_db"]()
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots").fetchone()[0]
+    finally:
+        conn.close()
+    assert n == 1
+
+
+# ==========================================================================
+# #769 S11 (#824) — one `weeklyPercent` used to serve three distinct concepts:
+# the block's weekly start, the block's weekly end, and a five-hour milestone's
+# crossing metadata. On a held tick they are NOT the same number. The block
+# takes the EFFECTIVE weekly value, because a block whose weekly start and end
+# straddle a raw and an effective reading reports a weekly delta nobody
+# observed (review finding 6). The crossing takes the RAW reading, because it
+# is contemporaneous observation metadata.
+# ==========================================================================
+
+#: A SECOND physical five-hour window, so the held tick opens a new block whose
+#: weekly start it writes itself.
+_HELD_5H_RESETS_AT_NEXT = "2026-01-04T18:00:00+00:00"
+
+
+def _latest_five_hour_block(conn):
+    return conn.execute(
+        "SELECT * FROM five_hour_blocks ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def _latest_five_hour_milestone(conn):
+    return conn.execute(
+        "SELECT * FROM five_hour_milestones ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def test_held_tick_block_uses_effective_weekly_and_crossing_uses_raw(ns):
+    jr = _jr()
+    J = _jlib()
+    _held_sequence(
+        jr, J, second_five_hour_percent=25.0,
+        second_five_hour_resets_at=_HELD_5H_RESETS_AT_NEXT)
+
+    conn = ns["open_db"]()
+    try:
+        block = _latest_five_hour_block(conn)
+        milestone = _latest_five_hour_milestone(conn)
+        block_count = conn.execute(
+            "SELECT COUNT(*) FROM five_hour_blocks").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert block_count == 2, "the held tick opened a block for the new window"
+    assert block["final_five_hour_percent"] == 25.0
+    assert block["seven_day_pct_at_block_start"] == 63.0
+    assert block["seven_day_pct_at_block_end"] == 63.0
+    assert milestone["percent_threshold"] == 25
+    assert milestone["seven_day_pct_at_crossing"] == 60.0
+
+
+def test_a_held_rollover_heal_also_uses_the_effective_weekly_value(ns):
+    """The no-row-written half of the same rule. When the five-hour value is
+    unchanged but the window rolled over, the tick writes no row and step 4'
+    materializes the block alone — and that path had the raw reading wired
+    straight into the block's weekly start."""
+    jr = _jr()
+    J = _jlib()
+    _held_sequence(
+        jr, J, second_five_hour_percent=20.0,
+        second_five_hour_resets_at=_HELD_5H_RESETS_AT_NEXT)
+
+    conn = ns["open_db"]()
+    try:
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots").fetchone()[0]
+        block = _latest_five_hour_block(conn)
+        block_count = conn.execute(
+            "SELECT COUNT(*) FROM five_hour_blocks").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert rows == 1, "an unchanged five-hour value writes no row"
+    assert block_count == 2, "the rollover heal still anchored the new window"
+    assert block["seven_day_pct_at_block_start"] == 63.0, (
+        "the block-only heal fabricated a weekly delta from the raw reading")
+    assert block["seven_day_pct_at_block_end"] == 63.0
+
+
+def test_an_ordinary_tick_binds_both_concepts_to_the_same_reading(ns):
+    """Non-vacuity in the other direction. On a tick whose weekly axis is
+    observed, the raw and effective values ARE the same number, and the split
+    must not change what such a tick records."""
+    jr = _jr()
+    J = _jlib()
+    jr.append_record(
+        _claude_obs(J, at="2026-01-04T09:00:00Z", weekly_percent=63.0,
+                    five_hour_percent=25.0,
+                    five_hour_resets_at=_HELD_5H_RESETS_AT),
+        now_utc=FIXED)
+    assert jr.run_stats_ingest(mode="authoritative").ran is True
+
+    conn = ns["open_db"]()
+    try:
+        block = _latest_five_hour_block(conn)
+        milestone = _latest_five_hour_milestone(conn)
+    finally:
+        conn.close()
+    assert block["seven_day_pct_at_block_start"] == 63.0
+    assert block["seven_day_pct_at_block_end"] == 63.0
+    assert milestone["seven_day_pct_at_crossing"] == 63.0
+
+
+def test_the_builder_names_the_two_concepts_separately(ns):
+    """A unit assertion on the builder itself, because the whole point of it is
+    that a caller cannot pick the two values by hand. Given one fold result it
+    returns both, and they differ exactly when the weekly axis is held."""
+    jr = _jr()
+    conn = ns["open_db"]()
+    try:
+        _seed_snapshot(
+            conn, captured_at_utc="2026-01-04T08:00:00Z",
+            week_start_date="2026-01-01", weekly_percent=63.0,
+            five_hour_percent=10.0, five_hour_window_key=7772)
+        held = jr._usage_snapshot_fold_decision(
+            conn, _payload(60.0, five_hour_percent=25.0,
+                           five_hour_window_key=7772))
+        observed = jr._usage_snapshot_fold_decision(
+            conn, _payload(70.0, five_hour_percent=25.0,
+                           five_hour_window_key=7772))
+    finally:
+        conn.close()
+
+    build = ns["_five_hour_saved_from_fold"]
+    held_saved = build(held, snapshot_id=7, capture_at="2026-01-04T09:05:00Z",
+                       five_hour_resets_at="2026-01-04T13:00:00+00:00")
+    assert held_saved["blockWeeklyPercent"] == 63.0
+    assert held_saved["sevenDayPercentAtCrossing"] == 60.0
+    assert held_saved["fiveHourPercent"] == 25.0
+    assert held_saved["fiveHourWindowKey"] == 7772
+    assert held_saved["fiveHourResetsAt"] == "2026-01-04T13:00:00+00:00"
+    assert held_saved["id"] == 7
+    assert held_saved["capturedAt"] == "2026-01-04T09:05:00Z"
+
+    observed_saved = build(
+        observed, snapshot_id=8, capture_at="2026-01-04T09:05:00Z",
+        five_hour_resets_at="2026-01-04T13:00:00+00:00")
+    assert observed_saved["blockWeeklyPercent"] == 70.0
+    assert observed_saved["sevenDayPercentAtCrossing"] == 70.0
 
 
 # (g)/(h) live derivation dispatches a crossed alert exactly once, from the
@@ -1486,3 +2590,116 @@ def test_concurrency_storm_every_id_materialized_once(tmp_path):
     assert tag == "count", f"drain failed: {n}"
     assert n == n_workers, f"expected {n_workers} materialized snapshots, got {n}"
     assert distinct == n_workers, "every snapshot_accept id materialized exactly once"
+
+
+# ==========================================================================
+# #834 S1 (#835) Gate A R5 — the writer reroute half. Specification line 124
+# requires this module to be EXTENDED, not merely run: a held row that the
+# stale-replica removal now preserves has to survive the production ingest
+# path, where nothing is deleted inline and the removal happens through a
+# journalled suppression list instead.
+# ==========================================================================
+
+def _r5_credit_args(**over):
+    args = dict(to=30.0, from_pct=63.0, at="2026-01-04T09:02:00Z",
+                week="2026-01-01", dry_run=False, yes=True, json=False,
+                force=False)
+    args.update(over)
+    return argparse.Namespace(**args)
+
+
+def test_a_preserved_held_row_survives_the_writer_reroute(ns):
+    """The production `record-credit` path deletes nothing inline: it captures the
+    doomed rows' `journal_id`s into a `weekly_credit_effects` evt and the applier
+    deletes by logical id. So the held-row preservation has to hold in the
+    SUPPRESSION LIST, not only in a DELETE predicate — a list that named the held
+    row would destroy on replay what the live pass kept.
+
+    Both rows carry the same weekly 63.0 and differ only in
+    `weekly_observation_held`, and the credit's effective instant precedes both, so
+    the two are in the band together. The non-held one must go and the held one
+    must stay, with its five-hour reading intact — it is the only carrier of that
+    reading, which is why #824 wrote it."""
+    jr = _jr()
+    J = _jlib()
+    _held_sequence(jr, J)
+
+    conn = ns["open_db"]()
+    try:
+        seeded = conn.execute(
+            "SELECT id, weekly_observation_held, five_hour_percent, journal_id "
+            "FROM weekly_usage_snapshots ORDER BY captured_at_utc, id"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert [r["weekly_observation_held"] for r in seeded] == [0, 1], (
+        "non-vacuity: the sequence must leave one genuine row and one held row")
+    held_journal_id = seeded[1]["journal_id"]
+
+    assert ns["cmd_record_credit"](_r5_credit_args()) == 0
+
+    conn = ns["open_db"]()
+    try:
+        after = conn.execute(
+            "SELECT weekly_percent, weekly_observation_held, "
+            "       five_hour_percent, journal_id "
+            "FROM weekly_usage_snapshots ORDER BY captured_at_utc, id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # The suppression list lives in the append-only journal, not in a table:
+    # `weekly_credit_effects` is an effects-only evt whose applier deletes by
+    # logical id. Reading it there is what makes the last assertion non-vacuous.
+    suppressed = [
+        line for line in _all_journal_lines(jr, J)
+        if _r5_evt_kind(line) == "weekly_credit_effects"
+    ]
+    assert suppressed, (
+        "non-vacuity: the credit must have journalled a weekly_credit_effects "
+        "evt for there to be a suppression list at all")
+
+    held = [r for r in after if r["weekly_observation_held"] == 1]
+    assert len(held) == 1, (
+        "the held row did not survive the journalled stale-replica removal")
+    assert held[0]["five_hour_percent"] == 25.0, (
+        "the held row survived but lost the five-hour reading it exists to hold")
+    assert not [r for r in after
+                if r["weekly_observation_held"] == 0
+                and r["weekly_percent"] == 63.0], (
+        "the NON-held stale replica must still be removed")
+    named = set()
+    for line in suppressed:
+        named.update(_r5_evt_suppression(line))
+    assert named, (
+        "non-vacuity: the evt must name the non-held replica it removed")
+    assert held_journal_id not in named, (
+        "the suppression list names the held row, so a replay would delete "
+        "what the live pass preserved")
+
+
+def _r5_evt_dict(line):
+    """The evt mapping inside a decoded journal line, whatever its envelope
+    spelling. Written defensively rather than against one shape, because this
+    test asserts the ABSENCE of an id and a wrong key would make it vacuous."""
+    for candidate in (line, getattr(line, "evt", None),
+                      getattr(line, "payload", None)):
+        if isinstance(candidate, dict):
+            if "kind" in candidate:
+                return candidate
+            inner = candidate.get("evt") or candidate.get("payload")
+            if isinstance(inner, dict) and "kind" in inner:
+                return inner
+    return {}
+
+
+def _r5_evt_kind(line):
+    return _r5_evt_dict(line).get("kind")
+
+
+def _r5_evt_suppression(line):
+    evt = _r5_evt_dict(line)
+    columns = evt.get("columns")
+    if isinstance(columns, dict):
+        return list(columns.get("suppression") or ())
+    return list(evt.get("suppression") or ())

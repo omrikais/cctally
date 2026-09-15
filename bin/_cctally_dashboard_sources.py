@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import itertools
 import os
 import pathlib
 import sqlite3
@@ -14,7 +15,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType, SimpleNamespace
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 from zoneinfo import ZoneInfo
 
 from _cctally_core import get_week_start_name
@@ -29,27 +30,25 @@ from _cctally_quota import (
 )
 from _cctally_source_analytics import (
     QualifiedMetadataUnavailable,
+    RootedCodexAccountingEntry,
     has_cached_codex_accounting_entries,
     load_cached_rooted_codex_accounting_entries,
     load_codex_project_metadata_health,
     load_qualified_codex_entries,
+    probe_codex_detail_metadata_health,
 )
 import _lib_log
 import _lib_accounts
 import _lib_perf
 import _lib_snapshot_cache
-from _lib_retained_size import (
-    RETAINED_SIZE_WORK_LOCK,
-    RETAINED_SIZE_WORKER_DUTY,
-    RetainedSizeCancelled,
-    retained_size_bytes,
-)
+from _lib_retained_size import retained_size_bytes
 from _lib_dashboard_sources import (
     CapabilityRecord,
     ProjectionCoherence,
     SourceDashboardState,
     SourceDashboardWarning,
     assess_codex_projection_coherence,
+    build_metadata_health,
     canonical_alerted_at,
     canonical_alerted_at_sql,
     claude_stats_digest,
@@ -80,6 +79,7 @@ from _lib_fmt import stable_sum
 from _lib_aggregators import _aggregate_codex_buckets, codex_path_scope
 from _lib_five_hour import _FIVE_HOUR_JITTER_FLOOR_SECONDS
 from _lib_source_analytics import (
+    QualifiedCodexEntry,
     assign_collision_safe_project_labels,
     build_codex_project_result,
     collision_safe_project_label_map,
@@ -115,49 +115,340 @@ def _mark_codex_source_accelerators_dirty() -> None:
             _CODEX_SOURCE_ACCELERATOR_GENERATION += 1
 
 
+#: Every mutation surface `_ObservedCacheMixin` accounts for, and the three it
+#: deliberately classifies rather than accounts for.
+#: `tests/test_retained_byte_accounting.py` DERIVES the surface it checks these
+#: against from `dir(dict)` and `dir(OrderedDict)` on the running interpreter,
+#: compared to a frozen snapshot of the names those types carried when this set
+#: was written, so a mutator a future interpreter version adds is a test
+#: failure rather than a silent desynchronisation between the running total and
+#: the retained graph.
+_OBSERVED_CACHE_ACCOUNTED_MUTATORS = frozenset({
+    "__setitem__", "__delitem__", "clear", "pop", "popitem", "setdefault",
+    "update",
+})
+#: Reordering changes eviction order and nothing else, so it adjusts no byte
+#: total and marks nothing dirty — a memo HIT calls `move_to_end`, and dirtying
+#: the accelerators on a read would make every read a generation. It DOES stamp
+#: recency, because a reordering is the memo saying which entry it just used,
+#: and an eviction order that could not see that would evict the hottest entry.
+_OBSERVED_CACHE_REORDERING_MUTATORS = frozenset({"move_to_end"})
+#: Refused outright. `dict.__ior__` mutates in place without routing through
+#: `update`, so a `cache |= other` would move the retained graph while the
+#: running total stood still. There is no caller; the refusal is what keeps it
+#: that way.
+_OBSERVED_CACHE_PROHIBITED_MUTATORS = frozenset({"__ior__"})
+#: Population rather than mutation: `__init__` runs the C-level constructor,
+#: which fills the mapping without routing through `__setitem__`. It is safe
+#: only because the ledgers are initialised in the SAME call, immediately
+#: before that constructor runs, so a fresh object's total and contents agree.
+#: Re-invoking it on a live cache is what the classification forbids, and
+#: `_ObservedCacheMixin.__init__` refuses that outright rather than leaving a
+#: zeroed ledger beside a populated mapping.
+_OBSERVED_CACHE_CONSTRUCTION_SURFACES = frozenset({"__init__"})
+#: The names `dict` and `OrderedDict` carried when the classification above was
+#: written, on CPython 3.13. The completeness test compares the RUNNING
+#: interpreter's `dir()` against this, so a name either type gains later has to
+#: be classified before the estate goes green again.
+_OBSERVED_CACHE_KNOWN_MAPPING_NAMES = frozenset({
+    "__class__", "__class_getitem__", "__contains__", "__delattr__",
+    "__delitem__", "__dict__", "__dir__", "__doc__", "__eq__", "__format__",
+    "__ge__", "__getattribute__", "__getitem__", "__getstate__", "__gt__",
+    "__hash__", "__init__", "__init_subclass__", "__ior__", "__iter__",
+    "__le__", "__len__", "__lt__", "__ne__", "__new__", "__or__",
+    "__reduce__", "__reduce_ex__", "__repr__", "__reversed__", "__ror__",
+    "__setattr__", "__setitem__", "__sizeof__", "__str__",
+    "__subclasshook__", "clear", "copy", "fromkeys", "get", "items", "keys",
+    "move_to_end", "pop", "popitem", "setdefault", "update", "values",
+})
+
+
+#: One monotonic clock for cache recency, so entries from different caches are
+#: comparable when the budget has to choose between them.
+_CODEX_SOURCE_RECENCY = 0
+_CODEX_SOURCE_RECENCY_LOCK = threading.Lock()
+
+
+def _next_cache_recency() -> int:
+    global _CODEX_SOURCE_RECENCY
+    with _CODEX_SOURCE_RECENCY_LOCK:
+        _CODEX_SOURCE_RECENCY += 1
+        return _CODEX_SOURCE_RECENCY
+
+
+#: The build whose journal this thread's cache mutations belong to. A thread
+#: with no open overlay journals nothing, which is what keeps eviction, reset
+#: and test setup out of a build's rollback.
+_CODEX_SOURCE_OVERLAY_STATE = threading.local()
+
+
+def _journal_source_mutation(cache, key) -> None:
+    """Record one key's prior state for the open build on this thread."""
+    overlay = getattr(_CODEX_SOURCE_OVERLAY_STATE, "overlay", None)
+    if overlay is not None:
+        overlay.record(cache, key)
+
+
+def _journal_source_removed(cache, key, prior) -> None:
+    """Record a key whose prior value is only known after its removal."""
+    overlay = getattr(_CODEX_SOURCE_OVERLAY_STATE, "overlay", None)
+    if overlay is not None:
+        overlay.record_removed(cache, key, prior)
+
+
+def _journal_source_clear(cache) -> None:
+    overlay = getattr(_CODEX_SOURCE_OVERLAY_STATE, "overlay", None)
+    if overlay is not None:
+        overlay.record_all(cache)
+
+
 class _ObservedCacheMixin:
-    """Make every retained-cache mutation visible to aggregate admission."""
+    """Make every retained-cache mutation visible to aggregate admission.
+
+    Two things happen at each mutation. The generation counter is bumped, which
+    is what schedules aggregate admission, and the owner's RETAINED-BYTE TOTAL
+    is adjusted by the delta this mutation makes. The second is what replaced
+    the per-generation recursive traversal: the byte total is now known when
+    the mutation returns, so nothing has to walk the whole retained graph
+    afterwards to find it out.
+
+    Each entry is charged ONCE, when it is admitted, by its owner's declared
+    charge function (see `_CODEX_SOURCE_CACHE_OWNERS`), and the charge is
+    retained beside the entry. A replacement subtracts the stored charge before
+    it adds the new one, so a same-key overwrite cannot leave the old charge
+    standing. A removal subtracts. An owner with no declared charge function
+    accounts nothing and reports zero, which is the state of a cache during
+    module import before `_declare_codex_source_cache_owner` reaches it.
+    """
+
+    #: Set by `_declare_codex_source_cache_owner`. `None` means "not a declared
+    #: owner", which accounts nothing rather than guessing a charge.
+    _cache_owner_name: str | None = None
+    _cache_owner_charge = None
+
+    def __init__(self, *args, **kwargs):
+        # `dict.__init__` populates at C level without routing through
+        # `__setitem__`, so it is a POPULATION surface rather than an accounted
+        # mutation. It is sound exactly once, because the ledgers below are
+        # created in the same call immediately before it runs. Re-invoking it
+        # on a live cache would leave a zeroed ledger beside a populated
+        # mapping — the silent desynchronisation the whole surface
+        # classification exists to prevent — so it is refused rather than
+        # left implicit. See `_OBSERVED_CACHE_CONSTRUCTION_SURFACES`.
+        if "_cache_entry_bytes" in vars(self):
+            raise TypeError(
+                f"{type(self).__name__} refuses a second __init__; it "
+                "populates without charging, which would zero the byte ledger "
+                "beside a populated mapping")
+        self._cache_entry_bytes: dict[object, int] = {}
+        self._cache_entry_recency: dict[object, int] = {}
+        self._cache_retained_bytes = 0
+        super().__init__(*args, **kwargs)
+
+    # ── recency, for byte-weighted segmented eviction ──────────────────────
+
+    def touch(self, key) -> None:
+        """Mark one entry as recently used.
+
+        Recency is stamped on every WRITE, and read recency has to be declared
+        by the reuse sites, because stamping it inside `get` would add a dict
+        write per read and the adapter cache is read once per accounting row
+        per build. The sites that return an entry without rewriting it are the
+        ones that call this: a cache whose hits never say so would age while
+        it was in constant use and be evicted first.
+        """
+        if key in self._cache_entry_bytes or key in self:
+            self._cache_entry_recency[key] = _next_cache_recency()
+
+    # ── the byte ledger ────────────────────────────────────────────────────
+
+    @property
+    def retained_owner_bytes(self) -> int:
+        """This owner's charge for what it currently retains."""
+        return int(self._cache_retained_bytes)
+
+    def _charge(self, key, value) -> None:
+        # RECENCY IS STAMPED FIRST, and unconditionally. A self-reported owner
+        # has no per-entry charge, but it still has to age: when the stamp sat
+        # after this early return, every key of every self-reported owner
+        # carried recency 0 and therefore sorted as the coldest thing in the
+        # process — so the quota memo, written last, and the whole visible
+        # population were the first two buckets any over-budget pass evicted,
+        # ahead of genuinely older and far cheaper buckets.
+        self._cache_entry_recency[key] = _next_cache_recency()
+        charge = self._cache_owner_charge
+        if charge is None:
+            return
+        try:
+            entry_bytes = int(charge(key, value))
+        except Exception:  # noqa: BLE001 - a charge never fails a mutation
+            # A charge that cannot be computed must not take the write with it.
+            # Charging zero is the conservative direction: it understates the
+            # total, and admission compares the total against a ceiling. The
+            # failure is COUNTED rather than swallowed, on the same counter the
+            # background verifier used to report its own failures on, so a
+            # charge that has stopped working is visible in
+            # `/api/debug/backend` instead of quietly deflating the total.
+            global _CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS
+            _CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS += 1
+            entry_bytes = 0
+        self._cache_entry_bytes[key] = entry_bytes
+        self._cache_retained_bytes += entry_bytes
+
+    def _discharge(self, key) -> None:
+        self._cache_entry_recency.pop(key, None)
+        if self._cache_owner_charge is None:
+            return
+        self._cache_retained_bytes -= self._cache_entry_bytes.pop(key, 0)
+
+    def _discharge_all(self) -> None:
+        self._cache_entry_recency.clear()
+        if self._cache_owner_charge is None:
+            return
+        self._cache_entry_bytes.clear()
+        self._cache_retained_bytes = 0
+
+    def eviction_candidates(self) -> "list[tuple[int, object, int]]":
+        """`(recency, key, bytes)` for everything this owner could give up."""
+        return [
+            (int(self._cache_entry_recency.get(key, 0)), key,
+             int(self._cache_entry_bytes.get(key, 0)))
+            for key in tuple(self)
+        ]
+
+    # ── the accounted mutation surface ─────────────────────────────────────
+
+    def _refuse_if_oversized(self, key) -> bool:
+        """Never admit a single entry that alone exceeds the whole budget.
+
+        This is the accelerator's counterpart to the quota memo's own
+        never-admit branch. Admitting an oversized entry and discovering it on
+        the NEXT admission pass is not the same thing: between the two the
+        cache is over the ceiling, and the pass that finds it has to evict
+        other buckets first because it works coldest-first and the oversized
+        entry is the one just written. Refusing at the write means the result
+        is computed and used by the caller that asked for it, and simply not
+        retained — which is what "computed without admission" says.
+
+        A self-reported owner has no per-entry charge and cannot answer this;
+        it is bounded by its own admission meter instead.
+        """
+        if self._cache_owner_charge is None:
+            return False
+        if self._cache_entry_bytes.get(key, 0) <= (
+                _CODEX_SOURCE_ACCELERATOR_MAX_BYTES):
+            return False
+        global _CODEX_SOURCE_ACCELERATOR_ADMISSION_REFUSALS
+        _CODEX_SOURCE_ACCELERATOR_ADMISSION_REFUSALS += 1
+        self._discharge(key)
+        super().__delitem__(key)
+        return True
 
     def __setitem__(self, key, value):
+        _journal_source_mutation(self, key)
+        # Subtract before adding: a same-key overwrite otherwise leaves the
+        # superseded entry's charge standing in the running total forever.
+        self._discharge(key)
         super().__setitem__(key, value)
+        self._charge(key, value)
+        self._refuse_if_oversized(key)
         _mark_codex_source_accelerators_dirty()
 
     def __delitem__(self, key):
+        _journal_source_mutation(self, key)
         super().__delitem__(key)
+        self._discharge(key)
         _mark_codex_source_accelerators_dirty()
 
     def clear(self):
         if self:
+            _journal_source_clear(self)
             super().clear()
+            self._discharge_all()
             _mark_codex_source_accelerators_dirty()
 
     def pop(self, key, default=_CACHE_MISSING):
         existed = key in self
+        if existed:
+            _journal_source_mutation(self, key)
         if default is _CACHE_MISSING:
             value = super().pop(key)
         else:
             value = super().pop(key, default)
         if existed:
+            self._discharge(key)
             _mark_codex_source_accelerators_dirty()
         return value
 
     def popitem(self, *args, **kwargs):
+        # The key is not known until the call returns, so the journal has to
+        # take it afterwards. Recording an already-removed key still restores
+        # it, because the prior value comes back with the journal entry.
         value = super().popitem(*args, **kwargs)
+        _journal_source_removed(self, value[0], value[1])
+        self._discharge(value[0])
         _mark_codex_source_accelerators_dirty()
         return value
 
     def setdefault(self, key, default=None):
         existed = key in self
+        if not existed:
+            _journal_source_mutation(self, key)
         value = super().setdefault(key, default)
         if not existed:
+            self._charge(key, value)
+            self._refuse_if_oversized(key)
             _mark_codex_source_accelerators_dirty()
         return value
 
     def update(self, *args, **kwargs):
         before = len(self)
-        super().update(*args, **kwargs)
+        # The keys are enumerated WITHOUT materialising a copy of the source
+        # MAPPING. `dict(other)` here would reintroduce a full-container copy
+        # on the restore path, which is one of the two copies this tranche
+        # removes.
+        #
+        # A NON-MAPPING SOURCE IS MATERIALISED ONCE, because `dict.update`
+        # accepts any iterable of pairs and a one-shot iterator can only be
+        # walked once. Enumerating the keys out of the iterator and then
+        # handing the exhausted iterator to `super().update` inserted nothing
+        # and then raised `KeyError` charging keys that were never there —
+        # `update(iter([("a", 1)]))` failed that way. Rebinding the argument to
+        # the materialised pairs keeps `dict.update`'s documented contract.
+        sources: list = []
+        changed: list = []
+        for source in args:
+            if hasattr(source, "keys"):
+                sources.append(source)
+                changed.extend(source.keys())
+            else:
+                pairs = list(source)
+                sources.append(pairs)
+                changed.extend(key for key, _value in pairs)
+        changed.extend(kwargs)
+        # ONE KEY, ONE CHARGE. `dict.update` accepts a key in the positional
+        # source AND in `kwargs`, and it appeared twice in `changed`: the
+        # discharge loop subtracted it once and then subtracted nothing, while
+        # the charge loop ADDED it twice against a `_cache_entry_bytes` that
+        # holds it once. The running total then stood permanently above the
+        # graph it describes and the caches evicted early for the life of the
+        # process, and nothing raised. `dict.fromkeys` deduplicates in
+        # first-seen order, which is the order the journal and the discharge
+        # loop want anyway.
+        changed = list(dict.fromkeys(changed))
+        for key in changed:
+            _journal_source_mutation(self, key)
+            self._discharge(key)
+        super().update(*sources, **kwargs)
+        for key in changed:
+            self._charge(key, self[key])
         if args or kwargs or len(self) != before:
             _mark_codex_source_accelerators_dirty()
+
+    def __ior__(self, other):
+        raise TypeError(
+            f"{type(self).__name__} refuses |=; use update() so the retained-"
+            "byte total moves with the entry")
 
 
 class _ObservedDict(_ObservedCacheMixin, dict):
@@ -165,7 +456,18 @@ class _ObservedDict(_ObservedCacheMixin, dict):
 
 
 class _ObservedOrderedDict(_ObservedCacheMixin, OrderedDict):
-    pass
+    def move_to_end(self, key, last=True):
+        """Reorder, and stamp recency — a reordering IS a use.
+
+        `OrderedDict.move_to_end` is how the quota memo records a hit, and it
+        is the only signal that memo emits on one. Leaving it unstamped made
+        every memoized entry look untouched since it was written, which is what
+        put the most recently used quota window at the head of the eviction
+        order. It adjusts no byte total and marks nothing dirty, because
+        dirtying the accelerators on a read would make every read a generation.
+        """
+        super().move_to_end(key, last)
+        self._cache_entry_recency[key] = _next_cache_recency()
 
 
 _CODEX_QUOTA_OBSERVATION_MAX_ENTRIES = 32
@@ -212,13 +514,26 @@ def codex_quota_observation_cache_stats() -> Mapping[str, int]:
         })
 
 
-def _quota_observation_cache_checkpoint() -> tuple[dict, int, int, int]:
+def _quota_observation_cache_checkpoint() -> tuple[dict, int, int, int, tuple]:
+    """The memo's byte ledger, its counters, AND its LRU key order.
+
+    THE ORDER IS CHECKPOINTED OUTRIGHT, because the journal cannot reconstruct
+    it. Replaying a journal in reverse reinstates the prior order only when the
+    build's removals were last-in-first-out, and this memo evicts with
+    `popitem(last=False)`, which takes the OLDEST key; re-assigning that key
+    afterwards appends it at the young end. Worse, a memo HIT calls
+    `move_to_end`, which is a reordering the journal does not record at all, so
+    a build that only READ the memo and was then discarded would leave it
+    permanently reordered. Thirty-two keys is a cheap thing to remember, and
+    remembering it is the only way the overlay bundle's ordering claim is true.
+    """
     with _CODEX_QUOTA_OBSERVATION_CACHE_LOCK:
         return (
             dict(_CODEX_QUOTA_OBSERVATION_CACHE_SIZES),
             int(_CODEX_QUOTA_OBSERVATION_CACHE_BYTES),
             int(_CODEX_QUOTA_OBSERVATION_CACHE_EVICTIONS),
             int(_CODEX_QUOTA_OBSERVATION_CACHE_FALLBACKS),
+            tuple(_CODEX_QUOTA_OBSERVATION_CACHE),
         )
 
 
@@ -226,13 +541,22 @@ def _restore_quota_observation_cache_checkpoint(checkpoint) -> None:
     global _CODEX_QUOTA_OBSERVATION_CACHE_BYTES
     global _CODEX_QUOTA_OBSERVATION_CACHE_EVICTIONS
     global _CODEX_QUOTA_OBSERVATION_CACHE_FALLBACKS
-    sizes, retained_bytes, evictions, fallbacks = checkpoint
+    sizes, retained_bytes, evictions, fallbacks, order = checkpoint
     with _CODEX_QUOTA_OBSERVATION_CACHE_LOCK:
         _CODEX_QUOTA_OBSERVATION_CACHE_SIZES.clear()
         _CODEX_QUOTA_OBSERVATION_CACHE_SIZES.update(sizes)
         _CODEX_QUOTA_OBSERVATION_CACHE_BYTES = int(retained_bytes)
         _CODEX_QUOTA_OBSERVATION_CACHE_EVICTIONS = int(evictions)
         _CODEX_QUOTA_OBSERVATION_CACHE_FALLBACKS = int(fallbacks)
+        # Reinstate the eviction order the build started from. The journal has
+        # already restored WHICH keys are resident; this restores the order
+        # they were in, for the two reasons `_quota_observation_cache_checkpoint`
+        # gives. Keys the checkpoint does not name are left where they are
+        # rather than dropped, because membership is the journal's business and
+        # a restore that also deleted would undo a key this build never wrote.
+        for key in order:
+            if key in _CODEX_QUOTA_OBSERVATION_CACHE:
+                _CODEX_QUOTA_OBSERVATION_CACHE.move_to_end(key)
 
 
 def _codex_quota_reuse_identity(
@@ -1260,13 +1584,81 @@ class DashboardReadContext:
             raise ValueError("codex_budget must be a mapping or None")
 
 
+#: #769 S6 / #809. Handle-lifetime tokens for connections with no file
+#: identity. ``id()`` is an ADDRESS, not an identity: CPython hands a released
+#: connection's address straight to the next allocation of the same size —
+#: measured, nineteen of twenty sequential create/close/drop cycles share one
+#: ``id()`` — so an in-memory corpus opened after the previous handle was
+#: released matched the stale process memo. That is exactly the collision #809
+#: exists to close, moved from file-backed stores to in-memory ones.
+#:
+#: The registry holds a STRONG reference to each connection it has issued a
+#: token for, which is what makes the token an identity: while the entry lives
+#: the object cannot be freed, so its address cannot be handed to anything
+#: else. ``sqlite3.Connection`` supports neither weak references nor attribute
+#: assignment, so there is no lighter binding available.
+#:
+#: Pruning of entries whose connection has been CLOSED runs on the MISS path
+#: only, immediately before a new token is issued. A hit returns at
+#: ``move_to_end`` without pruning, so a closed connection's entry — and the
+#: strong reference it holds — stays resident until the next miss prunes it or
+#: the capacity below evicts it. That is a bounded retention rather than a
+#: prompt release, and it is deliberate: pruning is O(registry) and a hit is
+#: the common call. Tokens are drawn from a monotonic counter and never
+#: reused, so a pruned or evicted connection that is used again simply
+#: receives a NEW token and misses the memo — fail-closed in both directions.
+_CONNECTION_IDENTITY_TOKENS: "OrderedDict[int, tuple[sqlite3.Connection, str]]" = (
+    OrderedDict()
+)
+_CONNECTION_IDENTITY_LOCK = threading.Lock()
+_CONNECTION_IDENTITY_SEQUENCE = itertools.count(1)
+#: Bounds what the registry retains. Only in-memory and unreadable-path stores
+#: reach it, so this is generous; eviction is safe because it can only cause a
+#: miss, never a false hit.
+_CONNECTION_IDENTITY_CAPACITY = 64
+
+
+def _connection_is_closed(conn: sqlite3.Connection) -> bool:
+    """True when the handle has been closed. Never raises."""
+    try:
+        conn.total_changes
+    except sqlite3.ProgrammingError:
+        return True
+    except Exception:                                       # noqa: BLE001
+        return False
+    return False
+
+
+def _connection_identity_token(conn: sqlite3.Connection) -> str:
+    """A token bound to this handle's lifetime, never to its address."""
+    key = id(conn)
+    with _CONNECTION_IDENTITY_LOCK:
+        entry = _CONNECTION_IDENTITY_TOKENS.get(key)
+        if entry is not None and entry[0] is conn:
+            _CONNECTION_IDENTITY_TOKENS.move_to_end(key)
+            return entry[1]
+        for stale in [
+            stale_key
+            for stale_key, (held, _token) in _CONNECTION_IDENTITY_TOKENS.items()
+            if _connection_is_closed(held)
+        ]:
+            _CONNECTION_IDENTITY_TOKENS.pop(stale, None)
+        while len(_CONNECTION_IDENTITY_TOKENS) >= _CONNECTION_IDENTITY_CAPACITY:
+            _CONNECTION_IDENTITY_TOKENS.popitem(last=False)
+        token = f"handle-{next(_CONNECTION_IDENTITY_SEQUENCE)}"
+        _CONNECTION_IDENTITY_TOKENS[key] = (conn, token)
+        return token
+
+
 def _cache_database_identity(conn: sqlite3.Connection) -> tuple[object, ...]:
     """Identity of the cache.db file currently backing ``conn``.
 
     A pathname is not an identity: rebuild publishes a replacement at the same
     pathname.  The device/inode pair makes every process memo fail closed on
-    that replacement.  In-memory and unreadable paths use the connection
-    object, which intentionally prevents reuse across a newly-opened handle.
+    that replacement.  In-memory and unreadable paths use a handle-lifetime
+    token, which intentionally prevents reuse across a newly-opened handle —
+    see ``_connection_identity_token`` for why the connection's address is not
+    usable for this.
     """
     try:
         db_path = next(
@@ -1274,14 +1666,172 @@ def _cache_database_identity(conn: sqlite3.Connection) -> tuple[object, ...]:
             if str(row[1]) == "main"
         )
     except (sqlite3.Error, StopIteration):
-        return ("connection", id(conn))
+        return ("connection", _connection_identity_token(conn))
     if not db_path:
-        return ("connection", id(conn))
+        return ("connection", _connection_identity_token(conn))
     try:
         stat = os.stat(db_path)
     except OSError:
-        return ("path-unreadable", db_path, id(conn))
+        return ("path-unreadable", db_path, _connection_identity_token(conn))
     return ("file", db_path, int(stat.st_dev), int(stat.st_ino))
+
+
+#: #769 S6 / #753. The named per-account hero operands, and nothing else. The
+#: cohort copies exactly these keys out of an account card; a card also carries
+#: a label, a plan, a percentage, a reset and freshness disclosure, none of
+#: which is a hero operand and all of which belong to the current generation.
+_HERO_CARD_OPERANDS = (
+    "spendUsd", "inputTokens", "cachedInputTokens", "outputTokens",
+    "reasoningOutputTokens", "totalTokens",
+)
+
+#: The provider hero's own accounting operands.
+_HERO_PROVIDER_OPERANDS = (
+    "cost_usd", "input_tokens", "cached_input_tokens", "output_tokens",
+    "reasoning_output_tokens", "total_tokens",
+)
+
+
+def _codex_cycle_vector(cycles: "Iterable[CodexCycleBoundary]") -> tuple:
+    """The per-account cycle boundary vector, as the cohort's validity input.
+
+    Boundaries only. The spend a cycle bounds is the thing being retained, so
+    folding it in here would invalidate the cohort on exactly the ticks the
+    retention exists to survive.
+    """
+    return tuple(sorted(
+        (
+            str(
+                cycle.quota_identity.account_key
+                if cycle.quota_identity is not None
+                else _lib_accounts.UNATTRIBUTED
+            ),
+            int(cycle.window_minutes),
+            cycle.start_at.astimezone(UTC).isoformat(),
+            cycle.resets_at.astimezone(UTC).isoformat(),
+        )
+        for cycle in cycles
+    ))
+
+
+def _codex_hero_cohort_validity(
+    context: DashboardReadContext,
+    *,
+    cycle_vector: tuple,
+) -> "dict[str, object] | None":
+    """The retained hero cohort's validity key, or None when unresolvable.
+
+    R8 decoration turns on at more than one REAL account, so a count or a
+    decoration boolean cannot distinguish the account set A and B from A and C,
+    nor a label change, nor a change of active account — and a cohort retained
+    across any of those would show an account or a decoration the current
+    generation should not. The key is therefore the existing
+    ``accounts_identity_digest``, which already covers account keys, provider,
+    labels and active identities, together with the full per-account cycle
+    vector and BOTH store identities.
+
+    ``None`` means the key could not be resolved, and the caller drops the
+    cohort and renders Pending. The retention fails closed.
+    """
+    try:
+        # `accounts_identity_digest` swallows a read failure and returns "",
+        # which is also exactly what a no-account install returns. Probing the
+        # registry here is what separates the two, so an unreadable registry
+        # fails closed rather than matching every other unreadable one.
+        context.stats_conn.execute("SELECT COUNT(*) FROM accounts").fetchone()
+        if context.stats_identity is not None:
+            accounts_digest = str(context.stats_identity[1])
+        else:
+            accounts_digest = accounts_identity_digest(context.stats_conn)
+        return {
+            "accounts_digest": accounts_digest,
+            "cycle_vector": cycle_vector,
+            "cache_identity": _cache_database_identity(context.cache_conn),
+            # The same helper, on the other store. It reads `PRAGMA
+            # database_list` off whatever connection it is given, so it is
+            # generic over SQLite handles despite its name naming the store it
+            # was written for.
+            "stats_identity": _cache_database_identity(context.stats_conn),
+        }
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _retained_hero_cohort(
+    prior_hero_cohort: "Mapping[str, object] | None",
+    validity: "Mapping[str, object] | None",
+) -> "Mapping[str, object] | None":
+    """The prior cohort, but only when this generation still certifies it."""
+    if not isinstance(prior_hero_cohort, Mapping) or validity is None:
+        return None
+    prior_validity = prior_hero_cohort.get("validity")
+    if not isinstance(prior_validity, Mapping):
+        return None
+    if _cohort_validity_key(prior_validity) != _cohort_validity_key(validity):
+        return None
+    return prior_hero_cohort
+
+
+def _cohort_validity_key(validity: "Mapping[str, object]") -> str:
+    """One canonical spelling of a validity key.
+
+    The prior cohort was frozen when its state was constructed, so its tuples
+    arrive as read-only mappings and sequences while the freshly-derived key
+    holds plain dicts and tuples. Rendering both through the same serializer is
+    what makes the comparison an equality of VALUES rather than of containers.
+    """
+    def normalize(value: object) -> object:
+        # `_freeze` turns the retained key's dicts into read-only mappings and
+        # `json.dumps` refuses those, so a plain dump would fall through to
+        # `default=str` on one side and produce a repr that no freshly-derived
+        # key can ever equal. Sequences are levelled to lists for the same
+        # reason: a tuple and a list of the same values must compare equal.
+        if isinstance(value, Mapping):
+            return {str(key): normalize(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [normalize(item) for item in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    return json.dumps(
+        normalize(validity), sort_keys=True, allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
+def _codex_accounting_period_signature(
+    cache_conn: sqlite3.Connection,
+    range_start: dt.datetime,
+    metadata_incomplete: bool,
+) -> tuple[object, ...]:
+    """The accounting memo's semantic signature — the ONE construction site.
+
+    #769 S6 / #809. This signature has SEVEN direct consumers — the daily,
+    monthly, weekly, session and project views, the cache-report wire and the
+    account scope, which passes it on to the account-scoped session memo — and
+    until this change it carried no store identity. Two stores built in one
+    process that agreed on ``range_start`` and ``metadata_incomplete`` shared
+    one memo entry, and because the incremental path evicts a cached row only
+    when it ages past the cutoff or appears in ``changed_old`` / ``changed_new``,
+    a row simply ABSENT from the second corpus survived into that corpus's
+    published rows.
+
+    Its sibling ``("codex-visible-population-v1", _cache_database_identity(…),
+    …)`` already folds store identity in, as does the accounting loader's
+    ``extra_signature``. This signature was the outlier in its own family, and
+    the element is inserted in the same position the sibling puts it.
+
+    The identity never reaches the wire, so #782's single-store behaviour and
+    published bytes are unchanged: on a single store the added element is
+    constant.
+    """
+    return (
+        "codex-accounting-v1",
+        _cache_database_identity(cache_conn),
+        range_start,
+        metadata_incomplete,
+    )
 
 
 _RESOURCE_ROWS = {
@@ -1602,6 +2152,7 @@ def _cached_codex_session_view(
     values = tuple(entries)
     signature = (semantic_signature, tz_name, speed)
     state = _CODEX_SESSION_VIEW_CACHE.get(cache_key)
+    _CODEX_SESSION_VIEW_CACHE.touch(cache_key)
     if state is None or state[0] != signature:
         view = build_codex_session_view(
             values, now_utc=now_utc, tz_name=tz_name, speed=speed,
@@ -1716,6 +2267,7 @@ def _cached_codex_period_view(
     values = tuple(entries)
     signature = (semantic_signature, kind, tz_name, speed)
     state = _CODEX_PERIOD_VIEW_CACHE.get((cache_key, kind))
+    _CODEX_PERIOD_VIEW_CACHE.touch((cache_key, kind))
     builder = build_codex_daily_view if kind == "daily" else build_codex_monthly_view
     if state is None or state[0] != signature:
         view = builder(values, now_utc=now_utc, tz_name=tz_name, speed=speed)
@@ -1968,6 +2520,7 @@ def _codex_cache_report_wire(
         ]
     else:
         state = _CODEX_CACHE_REPORT_ROWS.get(cache_key)
+        _CODEX_CACHE_REPORT_ROWS.touch(cache_key)
         if state is None or len(state) != 4 or state[0] != signature:
             cached_rows = {}
             for entry in values:
@@ -2015,9 +2568,30 @@ def _codex_cache_report_wire(
                 if not cache_entry_id:
                     continue
                 wrapped_entry = _wrap_entry(entry)
+                # A replaced row's PREVIOUS day has to be retired with it
+                # (#769 S4 #782). `groups` files each id under the day it was
+                # last frozen at, and only `old_ids` removes it from there, so
+                # replacing a row whose day moved left the id in both groups.
+                # Refreezing the old day then handed `_aggregate_cache_by_day`
+                # two dates at once and it raised
+                # "one cache-report day produced multiple rows" — and when the
+                # old day was NOT refrozen, it silently kept publishing a row
+                # that no longer belonged to it. The same applies when the
+                # replacement wraps to None (the row aged past the window):
+                # without this the id stays in `groups` while `cached_rows` no
+                # longer holds it, and the next refreeze of that day raises
+                # KeyError while sorting.
+                prior = cached_rows.get(cache_entry_id)
                 if wrapped_entry is None:
+                    if prior is not None:
+                        old_ids.add(cache_entry_id)
+                        affected_days.add(prior._cache_day)
                     cached_rows.pop(cache_entry_id, None)
                 else:
+                    if (prior is not None
+                            and prior._cache_day != wrapped_entry._cache_day):
+                        old_ids.add(cache_entry_id)
+                        affected_days.add(prior._cache_day)
                     cached_rows[cache_entry_id] = wrapped_entry
                     affected_days.add(wrapped_entry._cache_day)
             for day in affected_days:
@@ -3625,6 +4199,17 @@ def refresh_codex_source_clock(
         # dropping it here would withhold the aggregate on any idle tick whose
         # clock moved.
         aggregate_scope=state.aggregate_scope,
+        # #769 S6 / #753: this constructor lists every field explicitly, so an
+        # omission drops the retained hero cohort on the first idle tick that
+        # moved a clock — and the next incoherent build would then render
+        # Pending on a process that had published a coherent hero.
+        hero_cohort=state.hero_cohort,
+        # #834 S2 (#828, #829): this clock publishes the SAME rows over
+        # refreshed presentation axes, so it carries the health result that
+        # described those rows. Re-deriving it here would need provider I/O
+        # the idle path must not perform, and dropping it would report the
+        # metadata health as unknown on the first idle tick.
+        metadata_health=state.metadata_health,
     )
     return state if refreshed_state == state else refreshed_state
 
@@ -3743,19 +4328,108 @@ def _alerts_wire(
 
 _CODEX_PROJECT_LABEL_CACHE: dict[object, dict[str, object]] = _ObservedDict()
 
+#: Bumped when `assign_collision_safe_project_labels` changes what it produces
+#: for the same population. It joins the accounting population signature so a
+#: retained label set is invalidated by an algorithm change as well as by a
+#: data change.
+_CODEX_PROJECT_LABEL_ALGORITHM_VERSION = "collision-safe-labels-v1"
+
+
+def _codex_project_label_signature(base: tuple | None) -> tuple | None:
+    """Extend one accounting population name with the labelling algorithm's.
+
+    The accounting carrier names the population; the label caches also depend
+    on HOW labels are assigned, so a change to
+    `assign_collision_safe_project_labels` has to invalidate every retained
+    label set even though not one row moved. Appending the algorithm version is
+    what makes that true, and it is a separate function from the reader below
+    so a caller holding its own build's signature can extend that one rather
+    than re-reading a process-wide global.
+    """
+    if base is None:
+        return None
+    return (*base, _CODEX_PROJECT_LABEL_ALGORITHM_VERSION)
+
+
+def _codex_project_population_signature() -> tuple | None:
+    """The identity the project and label caches compare instead of scanning.
+
+    `None` means the accounting carrier could not establish an identity, and
+    every consumer must then prove its hit the old way rather than assume one.
+    """
+    return _codex_project_label_signature(
+        _lib_snapshot_cache.current_codex_population_signature())
+
+
+def _label_pair_counts(entries: Iterable[object]) -> dict[tuple[str, str], int]:
+    counts: dict[tuple[str, str], int] = {}
+    for entry in entries:
+        pair = (str(entry.project_key), str(entry.project_label))
+        counts[pair] = counts.get(pair, 0) + 1
+    return counts
+
 
 def _cached_project_labeled_entries(
     entries: tuple[object, ...], cache_key: object | None,
+    *,
+    population_signature: tuple | None = None,
+    changed_old: Iterable[object] = (),
+    changed_new: Iterable[object] = (),
 ) -> tuple[object, ...]:
-    """Reuse per-scope display-label annotation for unchanged accounting rows."""
+    """Reuse per-scope display-label annotation for unchanged accounting rows.
+
+    A CLEAN HIT VISITS NO ROW. Proving the hit used to mean building a
+    `frozenset` of every entry's `(project_key, project_label)` pair and then
+    iterating every entry again to assemble the answer, so the nominal reuse
+    path cost the whole population on every tick — 891,584 pairs visited across
+    one run on the sealed 222,888-row measurement corpus. When the accounting
+    carrier can name the population, comparing that name answers the same
+    question without touching a row, and the labelled tuple it produced last
+    time is still the right answer.
+
+    Without a signature the old proof stands. `None` is "cannot establish an
+    identity", and the fail-safe for that is to look.
+    """
+    state = _CODEX_PROJECT_LABEL_CACHE.get(cache_key)
+    if (
+        cache_key is not None
+        and population_signature is not None
+        and state is not None
+        and state.get("population_signature") == population_signature
+    ):
+        labelled = state.get("labeled")
+        if labelled is not None:
+            # A hit that rewrites nothing must still say it was used, or the
+            # bucket ages while it is in constant use and is evicted first.
+            _CODEX_PROJECT_LABEL_CACHE.touch(cache_key)
+            return labelled
     if cache_key is None or any(
         not int(getattr(entry, "cache_entry_id", 0) or 0) for entry in entries
     ):
         return tuple(assign_collision_safe_project_labels(entries))
-    pairs = frozenset(
-        (str(entry.project_key), str(entry.project_label)) for entry in entries
-    )
-    state = _CODEX_PROJECT_LABEL_CACHE.get(cache_key)
+    if (
+        population_signature is not None
+        and state is not None
+        and (changed_old or changed_new)
+        and isinstance(state.get("label_counts"), dict)
+    ):
+        # The delta lists say exactly which pairs left and which arrived, so
+        # the multiset moves in time proportional to the change rather than to
+        # the population.
+        counts = dict(state["label_counts"])
+        for entry in changed_old:
+            pair = (str(entry.project_key), str(entry.project_label))
+            remaining = counts.get(pair, 0) - 1
+            if remaining > 0:
+                counts[pair] = remaining
+            else:
+                counts.pop(pair, None)
+        for entry in changed_new:
+            pair = (str(entry.project_key), str(entry.project_label))
+            counts[pair] = counts.get(pair, 0) + 1
+    else:
+        counts = _label_pair_counts(entries)
+    pairs = frozenset(counts)
     if state is None or state.get("pairs") != pairs:
         labeled = tuple(assign_collision_safe_project_labels(entries))
     else:
@@ -3773,6 +4447,9 @@ def _cached_project_labeled_entries(
         )
     _CODEX_PROJECT_LABEL_CACHE[cache_key] = {
         "pairs": pairs,
+        "label_counts": counts,
+        "population_signature": population_signature,
+        "labeled": labeled,
         "labels": {
             str(entry.project_key): entry.display_label for entry in labeled
         },
@@ -3791,10 +4468,15 @@ def _projects_wire(
     *,
     accounting_end: dt.datetime,
     cache_key: object | None = None,
+    population_signature: tuple | None = None,
+    changed_old: Iterable[object] = (),
+    changed_new: Iterable[object] = (),
 ) -> dict[str, object]:
     """Adapt S3's already-qualified attribution result without re-formulas."""
     qualified_entries = _cached_project_labeled_entries(
         tuple(entries), cache_key,
+        population_signature=population_signature,
+        changed_old=changed_old, changed_new=changed_new,
     )
     result = build_codex_project_result(
         qualified_entries,
@@ -3838,24 +4520,40 @@ def _cached_projects_wire(
     accounting_end: dt.datetime,
     cache_key: object,
     semantic_signature: object,
+    population_signature: tuple | None = None,
 ) -> dict[str, object]:
-    """Rebuild only project groups touched by accounting changes."""
+    """Rebuild only project groups touched by accounting changes.
+
+    The population half of the key is the accounting carrier's own signature
+    when it can name one, and the per-entry `(project_key, project_label)`
+    multiset only when it cannot. The multiset answered the same question by
+    visiting every row, which made the nominal reuse path proportional to the
+    whole population on every tick.
+    """
     values = tuple(entries)
-    pairs = frozenset(
-        (str(entry.project_key), str(entry.project_label)) for entry in values
-    )
+    changed_old = tuple(changed_old)
+    changed_new = tuple(changed_new)
+    if population_signature is not None:
+        population_key: object = population_signature
+    else:
+        population_key = frozenset(
+            (str(entry.project_key), str(entry.project_label))
+            for entry in values
+        )
     # `entries` is already the complete half-open population for the advancing
     # upper bound.  A moving wall clock is therefore not an aggregation
     # semantic: `build_cached_codex_accounting` emits newly-visible rows in the
     # delta when its upper bound advances.  Keeping `accounting_end` here made
     # every live dirty tick discard every project group before that delta could
     # be spliced.
-    signature = (semantic_signature, pairs, context.range_start)
+    signature = (semantic_signature, population_key, context.range_start)
     state = _CODEX_PROJECT_WIRE_CACHE.get(cache_key)
     if state is None or state[0] != signature:
         value = _projects_wire(
             context, quota_observations, values,
             accounting_end=accounting_end, cache_key=cache_key,
+            population_signature=population_signature,
+            changed_old=changed_old, changed_new=changed_new,
         )
         groups: dict[tuple[str, str], list[object]] = {}
         for entry in values:
@@ -3868,9 +4566,10 @@ def _cached_projects_wire(
         )
         return value
 
+    _CODEX_PROJECT_WIRE_CACHE.touch(cache_key)
     affected = {
         (str(entry.source_root_key), str(entry.project_key))
-        for entry in (*tuple(changed_old), *tuple(changed_new))
+        for entry in (*changed_old, *changed_new)
     }
     if not affected:
         return state[1]
@@ -4062,6 +4761,7 @@ def _codex_entries_from_accounting(entries: Iterable[object]) -> list[CodexEntry
         cache_entry_id = int(getattr(entry, "cache_entry_id", 0) or 0)
         cached = _CODEX_ENTRY_ADAPTER_CACHE.get(cache_entry_id)
         if cache_entry_id and cached is not None and cached[0] == entry:
+            _CODEX_ENTRY_ADAPTER_CACHE.touch(cache_entry_id)
             converted.append(cached[1])
             continue
         source_path = str(getattr(entry, "source_path", "") or "")
@@ -4240,6 +4940,7 @@ def _cached_codex_native_weekly_view(
         account_key, include_account_keys,
     )
     state = _CODEX_WEEKLY_VIEW_CACHE.get(cache_key)
+    _CODEX_WEEKLY_VIEW_CACHE.touch(cache_key)
     if state is None or state[0] != signature:
         view = _build_codex_native_weekly_view(
             stats_conn, values, source_root_keys=roots,
@@ -4542,6 +5243,7 @@ def _codex_accounts_wire(
             context.speed,
         ) if account_versions is not None and population_signature is not None else None
         cached = _CODEX_ACCOUNT_CARD_TOTALS_CACHE.get(account_key)
+        _CODEX_ACCOUNT_CARD_TOTALS_CACHE.touch(account_key)
         if signature is not None and cached is not None and cached[0] == signature:
             return cached[1]
         entries = _codex_entries_from_accounting(rows)
@@ -4809,7 +5511,7 @@ def _cached_codex_visible_rows(
     changed_old: tuple[object, ...],
     changed_new: tuple[object, ...],
     semantic_signature: object,
-) -> "tuple[list[CodexEntry], dict[str, tuple[object, ...]], dict[str, tuple[CodexEntry, ...]], dict[str, int]]":
+) -> "tuple[Sequence[CodexEntry], dict[str, tuple[object, ...]], dict[str, tuple[CodexEntry, ...]], dict[str, int]]":
     """Reuse the immutable visible population, updating only dirty accounts.
 
     The durable accounting ledger supplies exact old/new path populations.  A
@@ -4834,8 +5536,15 @@ def _cached_codex_visible_rows(
                 for row in (*changed_old, *changed_new))
     )
     if reusable and not changed_old and not changed_new:
+        state.touch("entries")
         return (
-            list(state["entries"]),
+            # The RETAINED TUPLE, not a copy of it. `list(state["entries"])`
+            # here rebuilt a 222,932-element list on every clean tick on the
+            # measurement corpus, and no consumer mutates what this returns.
+            # The three per-account maps beside it are keyed by account, so
+            # copying them costs a handful of slots and keeps the state's own
+            # mappings out of a caller's hands.
+            state["entries"],
             dict(state["rows_by_account"]),
             dict(state["entries_by_account"]),
             dict(state["account_versions"]),
@@ -4977,7 +5686,7 @@ def _cached_codex_visible_rows(
             "account_count": len(rows_by_account),
             "fallback_count": prior_fallbacks,
         })
-    return list(entries), rows_by_account, entries_by_account, account_versions
+    return entries, rows_by_account, entries_by_account, account_versions
 
 
 _CODEX_ACCOUNT_SCOPE_CACHE: dict[
@@ -5022,6 +5731,7 @@ def _codex_account_scopes_wire(
     hero_failure: bool = False,
     dirty_accounts: Iterable[str] = (),
     scope_signature: object | None = None,
+    project_population_signature: tuple | None = None,
     changed_old_by_account: Mapping[str, tuple[CodexEntry, ...]] | None = None,
     changed_new_by_account: Mapping[str, tuple[CodexEntry, ...]] | None = None,
     changed_old_rows_by_account: Mapping[str, tuple[object, ...]] | None = None,
@@ -5183,6 +5893,7 @@ def _codex_account_scopes_wire(
                     accounting_end=accounting_end,
                     cache_key=("account", key),
                     semantic_signature=scope_signature,
+                    population_signature=project_population_signature,
                 )
             ),
             "cache_report": _codex_cache_report_wire(
@@ -5266,6 +5977,7 @@ def _codex_account_scopes_wire(
             hero_failure,
         )
         cached = _CODEX_ACCOUNT_SCOPE_CACHE.get(key)
+        _CODEX_ACCOUNT_SCOPE_CACHE.touch(key)
         if (
             scope_signature is not None
             and key not in dirty_account_keys
@@ -5358,12 +6070,45 @@ def _claude_accounts_wire(
     ordered_keys = [r["account_key"] for r in reg]
 
     def _latest_usage(key: str):
-        return stats_conn.execute(
-            "SELECT weekly_percent, five_hour_percent, week_end_at "
+        # SPLIT PER AXIS (#769 S11, #824). This card publishes both axes, so
+        # one row cannot serve it: the weekly figure comes from the latest
+        # GENUINELY OBSERVED row and the five-hour figure from the latest row
+        # of either kind, which is the held one whenever a weekly-clamped tick
+        # carried a fresher five-hour reading.
+        #
+        # An earlier pass kept this held-inclusive, reasoning that a held row's
+        # weekly value is the same account's latest genuine reading because the
+        # fold copies it from a basis selected by account and week. That is
+        # true of every row this binary writes, so the two queries agree in
+        # production — but the browser gate rendered a divergent held row and
+        # the card showed 91% beside a trend panel and an alert that both said
+        # 63%, on one screen. The split is what stops that copy from being
+        # load-bearing, which is the same reason every other weekly consumer
+        # excludes held rows rather than trusting it.
+        #
+        # None is still returned only when the account retained NO row at all,
+        # because the caller uses that to decide whether the unattributed
+        # bucket appears.
+        weekly = stats_conn.execute(
+            "SELECT weekly_percent, week_end_at "
             "FROM weekly_usage_snapshots WHERE account_key=? "
+            "  AND weekly_observation_held = 0 "
             "ORDER BY captured_at_utc DESC LIMIT 1",
             (key,),
         ).fetchone()
+        five_hour = stats_conn.execute(
+            "SELECT five_hour_percent FROM weekly_usage_snapshots "
+            "WHERE account_key=? "
+            "ORDER BY captured_at_utc DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+        if weekly is None and five_hour is None:
+            return None
+        return (
+            None if weekly is None else weekly[0],
+            None if five_hour is None else five_hour[0],
+            None if weekly is None else weekly[1],
+        )
 
     def _latest_cost(key: str):
         row = stats_conn.execute(
@@ -5525,6 +6270,419 @@ def _codex_source_caches() -> tuple[dict, ...]:
     )
 
 
+# ── the retained-byte ownership graph (#769 S6 T2a, #716 Task B) ───────────
+#
+# The retained-size oracle counts a shared object identity ONCE across
+# everything it walks. A sum of per-cache charges only agrees with that if each
+# shared payload has exactly one cache carrying its charge, so the graph below
+# names that cache for every payload the Codex source caches repeat.
+#
+# Three payload classes are shared, and each has one owner:
+#
+#   accounting rows (`QualifiedCodexEntry`, `RootedCodexAccountingEntry`) are
+#     retained by `_lib_snapshot_cache._CODEX_ACCOUNTING_CACHE_STATE` and are
+#     BORROWED by every cache here. That state is charged by the snapshot
+#     cache's own accelerator, which is a separate owner with its own ceiling;
+#     charging the rows here as well would count one population twice.
+#
+#   adapted `CodexEntry` values are OWNED by `_CODEX_ENTRY_ADAPTER_CACHE`,
+#     which is where they are constructed and keyed by durable row id, and are
+#     borrowed by the visible-population fold and every view built from it.
+#
+#   labelled row copies (`replace(row, display_label=...)`) are OWNED by
+#     `_CODEX_PROJECT_LABEL_CACHE`. They are the same class as an accounting
+#     row and cannot be told apart by type, so that owner names its borrowed
+#     rows BY IDENTITY out of the entry it is charging.
+#
+# A cache whose charge is `None` is SELF-REPORTED: it already maintains an
+# incremental byte estimate of its own, and a second charge computed here would
+# be the same number derived twice. Those readers are named beside the owner.
+#
+# WHAT THE TOTAL IS, AND WHAT IT IS NOT. It is the sum of eleven DECLARED
+# CHARGES. It is not a measurement of process memory, and
+# `_CODEX_SOURCE_ACCELERATOR_MAX_BYTES` is not a cap on process memory: it is a
+# budget over these charges, and the charges depart from the retained graph in
+# both directions.
+#
+# UPWARD, and bounded. A charge is computed per entry, so two entries of the
+# SAME owner that share an ordinary string — a model name, a session id, both
+# of which the view models carry through by reference — pay for it twice, where
+# one walk of the whole graph would pay once. The predicate is type-based and
+# cannot see that a `str` belongs to a row. This direction errs toward evicting
+# early, which is the safe direction for a budget.
+#
+# DOWNWARD, and NOT bounded. FOUR owners are charged in CLOSED FORM rather
+# than by a walk, deliberately, because walking them would make an ordinary
+# tick proportional to the whole population again — which is the cost this
+# tranche exists to remove. `_charge_adapter_entry` charges two shells and a
+# float, `_charge_project_wire_entry` charges the group containers and not the
+# rows inside them, and `_visible_population_owner_bytes` charges four
+# references per indexed row rather than anything the fold reaches. Each is a
+# reasoned decision and each understates. Nothing in this file bounds by how
+# much, so a comparison of the total against the ceiling cannot be read as a
+# statement about how much memory the caches hold.
+#
+# `CODEX_SOURCE_CHARGE_FIDELITY` below is what makes the split checkable, and
+# `tests/test_source_cache_ownership.py` holds the WALKED owners to a two-sided
+# band against one walk of their own cache — the upper half is what caught the
+# adapter walking its row's strings once per row — while asserting only the
+# upper bound for the four closed-form owners and asserting that the
+# closed-form set is exactly the four named here.
+
+
+def _is_codex_accounting_row(obj) -> bool:
+    """Is this a payload the accounting carrier retains and charges?"""
+    return isinstance(obj, (QualifiedCodexEntry, RootedCodexAccountingEntry))
+
+
+def _is_borrowed_codex_payload(obj) -> bool:
+    """Accounting rows and adapted entries, both charged by another owner."""
+    return isinstance(
+        obj,
+        (QualifiedCodexEntry, RootedCodexAccountingEntry, CodexEntry),
+    )
+
+
+def _charge_borrowing_payloads(_key, value) -> int:
+    """Charge one entry's own structure, never a payload another owner holds."""
+    return retained_size_bytes(value, borrowed=_is_borrowed_codex_payload)
+
+
+def _charge_adapter_entry(_key, value) -> int:
+    """`(source_row, CodexEntry)` — the row is borrowed, the entry is owned.
+
+    The charge is CLOSED FORM rather than a walk, and the reason is that the
+    adapted entry shares every string it has with the row beside it: the
+    adapter builds each field with `str(x)`, and `str` on a `str` returns the
+    same object. Walking the entry would therefore charge the accounting
+    carrier's strings to this cache once per adapted row — a systematic double
+    charge proportional to the whole population, which is the failure this
+    graph exists to prevent. What the entry actually owns is its own shell, the
+    pair holding it, and the one float `float(entry.cost_usd)` constructs.
+    """
+    total = sys.getsizeof(value) + sys.getsizeof(value[1])
+    cost = getattr(value[1], "cost_usd", None)
+    if cost is not None:
+        total += sys.getsizeof(cost)
+    return total
+
+
+def _charge_project_label_entry(_key, value) -> int:
+    """Container shells, plus one shell and one label string per copy.
+
+    A labelled copy is `replace(row, display_label=...)`, so every field except
+    `display_label` is the SAME object as the borrowed row's. Charging it by a
+    walk would descend into fields the accounting carrier owns; charging the
+    copy's own shell and its one new string is both exact and constant per row.
+    """
+    total = sys.getsizeof(value)
+    total += retained_size_bytes(
+        value.get("pairs", frozenset()), borrowed=_is_borrowed_codex_payload)
+    total += retained_size_bytes(
+        value.get("labels", {}), borrowed=_is_borrowed_codex_payload)
+    total += retained_size_bytes(
+        value.get("label_counts") or {}, borrowed=_is_borrowed_codex_payload)
+    total += retained_size_bytes(
+        value.get("population_signature") or (),
+        borrowed=_is_borrowed_codex_payload)
+    # The labelled tuple holds the SAME copies the `entries` map does, so only
+    # its own shell is owed here; charging its members would pay twice.
+    total += sys.getsizeof(value.get("labeled") or ())
+    entries = value.get("entries") or {}
+    total += sys.getsizeof(entries)
+    for _raw, labelled in entries.values():
+        total += sys.getsizeof(labelled) + 8 * 2
+        label = getattr(labelled, "display_label", None)
+        if label is not None:
+            total += sys.getsizeof(label)
+    return total
+
+
+def _charge_project_wire_entry(_key, value) -> int:
+    """`(signature, wire, groups)` — the wire is owned, the groups are shells.
+
+    `groups` maps a project identity to a tuple of BORROWED accounting rows.
+    Its own charge is the mapping plus one tuple shell per project, which is
+    constant in the number of projects; descending into the tuples to ask about
+    each row would make an ordinary tick proportional to the whole population
+    again, which is the cost this tranche exists to remove.
+    """
+    signature, wire, groups = value[0], value[1], value[2]
+    total = sys.getsizeof(value)
+    total += retained_size_bytes(
+        signature, borrowed=_is_borrowed_codex_payload)
+    total += retained_size_bytes(wire, borrowed=_is_borrowed_codex_payload)
+    total += sys.getsizeof(groups)
+    for key, group in groups.items():
+        total += sys.getsizeof(key) + sys.getsizeof(group)
+    return total
+
+
+#: How faithfully each owner's declared charge tracks what one walk of that
+#: owner's own cache would reach. `walked` means the charge descends the entry
+#: and departs from a whole-graph walk only by the shared-string residual
+#: described above. `closed-form` means the charge is a constant-per-entry
+#: formula that DELIBERATELY UNDERSTATES, with no stated bound on the gap; the
+#: value beside the name is why that trade was taken.
+#:
+#: The budget is compared against a sum that includes the four closed-form
+#: owners, so the budget is a heuristic over declared charges rather than a cap
+#: on memory. Adding a fifth closed-form owner without adding it here is a
+#: test failure, which is the only reason this constant exists.
+CODEX_SOURCE_CHARGE_FIDELITY = MappingProxyType({
+    "quota_observations": "walked",
+    "period_views": "walked",
+    "cache_report_rows": "walked",
+    "session_views": "walked",
+    "project_labels": (
+        "closed-form: the labelled copies' shells and their one new label "
+        "string each, because a labelled copy is `replace(row, "
+        "display_label=...)` and every other field is the borrowed row's own "
+        "object"),
+    "project_wire": (
+        "closed-form: the group containers, never the borrowed rows inside "
+        "them, because descending into them makes an ordinary tick "
+        "proportional to the whole population"),
+    "entry_adapters": (
+        "closed-form: two object shells and one float, because the adapted "
+        "entry shares every string with the row beside it and walking it "
+        "would charge the accounting carrier's strings once per adapted row"),
+    "visible_population": (
+        "closed-form: four references per indexed row, one container per "
+        "account and the state mapping, because every payload the fold "
+        "indexes is charged by the owner that constructed it"),
+    "account_card_totals": "walked",
+    "weekly_views": "walked",
+    "account_scopes": "walked",
+})
+
+
+@dataclass(frozen=True)
+class _CodexCacheOwner:
+    """One declared owner in the retained-byte graph."""
+
+    name: str
+    cache: object
+    charge: object
+    reader: object
+    owns: str
+    borrows: str
+    #: Whether this owner's keys are independently rebuildable buckets. An
+    #: indivisible owner is evicted whole, because its keys are the internal
+    #: fields of one result rather than separate results.
+    indivisible: bool = False
+    #: Per-key byte reader for a SELF-REPORTED owner that keeps its own ledger
+    #: beside the mapping. Without it every one of that owner's keys reported
+    #: zero bytes to the eviction sort, so the byte weighting was meaningless
+    #: there and `bucket_bytes > budget` could never fire for it.
+    entry_reader: object = None
+    #: The whole eviction, for an owner whose byte ledger lives beside the
+    #: mapping under its own lock. Popping the key and adjusting the ledger in
+    #: two steps crosses that lock's discipline; this runs both inside it.
+    evict_fn: object = None
+
+    def retained_bytes(self) -> int:
+        if self.reader is not None:
+            return int(self.reader())
+        return int(getattr(self.cache, "retained_owner_bytes", 0))
+
+    def entry_bytes(self, key) -> int:
+        """This owner's charge for one key, however that owner keeps it."""
+        if self.entry_reader is not None:
+            return int(self.entry_reader(key))
+        if self.reader is not None:
+            # An indivisible self-reported owner is one bucket, so the whole
+            # owner IS the entry the budget is deciding about.
+            return self.retained_bytes()
+        return int(getattr(self.cache, "_cache_entry_bytes", {}).get(key, 0))
+
+    def evict(self, key) -> None:
+        if self.evict_fn is not None:
+            self.evict_fn(key)
+            return
+        self.cache.pop(key, None)
+
+    def evict_all(self) -> int:
+        removed = len(self.cache)
+        for key in tuple(self.cache):
+            self.evict(key)
+        return removed
+
+
+def _quota_observation_owner_bytes() -> int:
+    with _CODEX_QUOTA_OBSERVATION_CACHE_LOCK:
+        return int(_CODEX_QUOTA_OBSERVATION_CACHE_BYTES)
+
+
+def _quota_observation_entry_bytes(key) -> int:
+    """One memoized quota window's charge, out of the memo's own ledger."""
+    with _CODEX_QUOTA_OBSERVATION_CACHE_LOCK:
+        return int(_CODEX_QUOTA_OBSERVATION_CACHE_SIZES.get(key, 0))
+
+
+def _quota_observation_evicted(key) -> None:
+    """Evict one memoized window, mapping and byte ledger together.
+
+    This memo predates the ownership graph and keeps its sizes beside the
+    mapping rather than inside the mixin, so an eviction that only popped the
+    key would leave its byte total standing and the budget would never come
+    back inside the ceiling. BOTH steps run under the memo's own lock, because
+    `_codex_quota_observations_memoized` does its `get`, `popitem` and
+    `__setitem__` under that lock: popping outside it and adjusting the ledger
+    inside it afterwards leaves a window in which a concurrent memo write sees
+    a mapping and a byte total that disagree.
+    """
+    global _CODEX_QUOTA_OBSERVATION_CACHE_BYTES
+    with _CODEX_QUOTA_OBSERVATION_CACHE_LOCK:
+        _CODEX_QUOTA_OBSERVATION_CACHE.pop(key, None)
+        _CODEX_QUOTA_OBSERVATION_CACHE_BYTES -= (
+            _CODEX_QUOTA_OBSERVATION_CACHE_SIZES.pop(key, 0))
+        if _CODEX_QUOTA_OBSERVATION_CACHE_BYTES < 0:
+            _CODEX_QUOTA_OBSERVATION_CACHE_BYTES = 0
+
+
+def _visible_population_owner_bytes() -> int:
+    """The fold's OWN containers and references, never its borrowed payloads.
+
+    `_codex_visible_population_estimated_bytes` is this cache's admission
+    meter, and it deliberately charges the shell of every row and every adapted
+    entry so that the 128 MiB cap it guards is a bound on the whole fold. Those
+    shells are charged elsewhere in the ownership graph — the rows by the
+    accounting carrier, the adapted entries by the adapter cache — so reusing
+    that number here would pay for one population twice. The remaining terms of
+    the same formula are exactly the fold's own share: four references per
+    indexed row, one per-account container, and the state mapping itself.
+    """
+    state = _CODEX_VISIBLE_POPULATION_CACHE
+    if state.get("signature") is None:
+        return 0
+    return (
+        int(state.get("entry_count", 0)) * 8 * 4
+        + int(state.get("account_count", 0)) * 1024
+        + 4096
+    )
+
+
+def _declare_codex_source_cache_owners() -> tuple[_CodexCacheOwner, ...]:
+    """Bind each cache to its charge, in the order `_codex_source_caches` lists.
+
+    Declared as a function rather than as a literal so the binding happens
+    after every cache object exists, and so the ordering assertion below is
+    evaluated once at import: an owner list that has drifted from the
+    checkpointed set is a desynchronised byte total, not a cosmetic mismatch.
+    """
+    owners = (
+        _CodexCacheOwner(
+            "quota_observations", _CODEX_QUOTA_OBSERVATION_CACHE, None,
+            _quota_observation_owner_bytes,
+            owns="the frozen quota observations it memoizes",
+            borrows="nothing",
+            entry_reader=_quota_observation_entry_bytes,
+            evict_fn=_quota_observation_evicted,
+        ),
+        _CodexCacheOwner(
+            "period_views", _CODEX_PERIOD_VIEW_CACHE,
+            _charge_borrowing_payloads, None,
+            owns="the rendered daily/monthly view models",
+            borrows="accounting rows and adapted entries",
+        ),
+        _CodexCacheOwner(
+            "cache_report_rows", _CODEX_CACHE_REPORT_ROWS,
+            _charge_borrowing_payloads, None,
+            owns="the rendered cache-report rows",
+            borrows="accounting rows and adapted entries",
+        ),
+        _CodexCacheOwner(
+            "session_views", _CODEX_SESSION_VIEW_CACHE,
+            _charge_borrowing_payloads, None,
+            owns="the rendered session view models",
+            borrows="accounting rows and adapted entries",
+        ),
+        _CodexCacheOwner(
+            "project_labels", _CODEX_PROJECT_LABEL_CACHE,
+            _charge_project_label_entry, None,
+            owns="the labelled row copies and the label map",
+            borrows="the raw accounting rows, named by identity",
+        ),
+        _CodexCacheOwner(
+            "project_wire", _CODEX_PROJECT_WIRE_CACHE,
+            _charge_project_wire_entry, None,
+            owns="the rendered project wire and the group container shells",
+            borrows="the accounting rows inside those groups",
+        ),
+        _CodexCacheOwner(
+            "entry_adapters", _CODEX_ENTRY_ADAPTER_CACHE,
+            _charge_adapter_entry, None,
+            owns="the adapted CodexEntry values",
+            borrows="the source accounting row beside each one",
+        ),
+        _CodexCacheOwner(
+            "visible_population", _CODEX_VISIBLE_POPULATION_CACHE, None,
+            _visible_population_owner_bytes,
+            owns="the fold's own containers and references",
+            borrows="every accounting row and adapted entry it indexes",
+            # Its keys are the internal fields of ONE ordered population, not
+            # separate results. See
+            # `CODEX_VISIBLE_POPULATION_INDIVISIBLE_REASON`.
+            indivisible=True,
+        ),
+        _CodexCacheOwner(
+            "account_card_totals", _CODEX_ACCOUNT_CARD_TOTALS_CACHE,
+            _charge_borrowing_payloads, None,
+            owns="one finalized totals mapping per account",
+            borrows="nothing, though the borrowing charge is used so a future "
+                    "payload cannot silently be charged twice",
+        ),
+        _CodexCacheOwner(
+            "weekly_views", _CODEX_WEEKLY_VIEW_CACHE,
+            _charge_borrowing_payloads, None,
+            owns="the rendered native weekly view models",
+            borrows="accounting rows and adapted entries",
+        ),
+        _CodexCacheOwner(
+            "account_scopes", _CODEX_ACCOUNT_SCOPE_CACHE,
+            _charge_borrowing_payloads, None,
+            owns="the finalized per-account scope mappings",
+            borrows="accounting rows and adapted entries",
+        ),
+    )
+    caches = _codex_source_caches()
+    if tuple(owner.cache for owner in owners) != caches:
+        raise RuntimeError(
+            "the retained-byte ownership graph does not describe the "
+            "checkpointed cache set")
+    for owner in owners:
+        owner.cache._cache_owner_name = owner.name
+        owner.cache._cache_owner_charge = owner.charge
+    return owners
+
+
+_CODEX_SOURCE_CACHE_OWNERS = _declare_codex_source_cache_owners()
+
+
+def codex_source_retained_bytes() -> int:
+    """The eleven Codex source caches' DECLARED CHARGES, summed.
+
+    Read it as "what these caches say they cost", not as "how much memory
+    these caches hold". FOUR of the eleven are charged in closed form and
+    understate without a stated bound — see `CODEX_SOURCE_CHARGE_FIDELITY` —
+    so this figure is the input to a heuristic budget rather than a
+    measurement of the retained graph.
+
+    Maintained at mutation, so this is a read rather than a traversal. It
+    replaced a background worker that walked two full container copies of the
+    whole cache set once per generation: on the sealed 222,888-row measurement
+    corpus that walk visited over eleven million objects across one run and
+    never once completed a generation, so the only verdict it ever published
+    was the over-budget sentinel that cleared every cache at once.
+    """
+    return sum(owner.retained_bytes() for owner in _CODEX_SOURCE_CACHE_OWNERS)
+
+
+#: The budget the declared charges are held to. NOT a bound on process memory:
+#: it is compared against `codex_source_retained_bytes()`, four of whose
+#: eleven terms are closed-form under-charges with no stated bound on the gap.
+#: See `CODEX_SOURCE_CHARGE_FIDELITY`.
 _CODEX_SOURCE_ACCELERATOR_MAX_BYTES = 768 * 1024 * 1024
 _CODEX_SOURCE_ACCELERATOR_MAX_ENTRIES = 500_000
 _CODEX_SOURCE_ACCELERATOR_STATS_LOCK = threading.Lock()
@@ -5534,219 +6692,53 @@ _CODEX_SOURCE_ACCELERATOR_EVICTIONS = 0
 _CODEX_SOURCE_ACCELERATOR_FALLBACKS = 0
 _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION = -1
 _CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS = 0
+#: Entries refused at the write because one of them alone exceeds the whole
+#: budget. Counted separately from `_CODEX_SOURCE_ACCELERATOR_FALLBACKS`, which
+#: counts an admission pass that found an oversized bucket already resident.
+_CODEX_SOURCE_ACCELERATOR_ADMISSION_REFUSALS = 0
+#: Evict to this fraction of the budget rather than to the budget itself, so a
+#: permanently above-budget population is not one entry over again on the very
+#: next build and paying a full candidate pass over every resident key on every
+#: tick. The margin buys the headroom that lets
+#: `enforce_codex_source_accelerator_bounds` take its early return instead.
+_CODEX_SOURCE_ACCELERATOR_LOW_WATER = 0.9
+#: …and it applies ONLY above this many resident entries. The margin exists to
+#: avoid an O(resident) pass per tick; below this the pass is already cheap, and
+#: evicting past the budget there would discard buckets that fit for no gain —
+#: which is a worse trade, not a smaller one.
+_CODEX_SOURCE_ACCELERATOR_LOW_WATER_MIN_ENTRIES = 1024
 _CODEX_SOURCE_MEMORY_COMPLETION_LOCK = None
 
 
-class _CodexSourceMemoryWorker:
-    """One latest-wins, cancellable retained-size verifier.
+def set_codex_source_memory_completion_lock(lock) -> None:
+    """Retained no-op: there is no longer a background verifier to bind.
 
-    The source caches are shallow-copied at a successful build boundary.  The
-    worker traverses that immutable container snapshot so its multi-second
-    production-scale admission pass neither blocks the five-second publisher
-    nor races a live dict mutation.  A newer generation cancels the old walk;
-    shutdown uses the same cooperative cancellation path.
+    The dashboard binds this at startup and unbinds it at shutdown. It existed
+    to let a background retained-size walk evict an over-budget generation
+    under the publisher's own lock without waiting for another tick. That walk
+    is gone, so the completion it serialized no longer exists and the function
+    stays only to keep the dashboard's startup and shutdown paths in shape.
+
+    WHAT IS NOT SERIALIZED ANY MORE, stated rather than implied. Admission now
+    runs inline at the end of whichever build finished, and there are two
+    builders: the synchronized dashboard tick and the share render on an HTTP
+    request thread (`bin/_cctally_dashboard_share.py`). So a share render's
+    admission pass can evict entries a concurrent dashboard fold is about to
+    read. The consequence is an unnecessary MISS and never a wrong answer —
+    every miss rebuilds from the current immutable accounting generation — but
+    it is a real behaviour difference from binding the publisher's lock, and
+    "there is no completion to serialize" was true of the deleted worker rather
+    than of the two builders.
     """
 
-    def __init__(self) -> None:
-        self._condition = threading.Condition()
-        self._pending: tuple[int, tuple[dict, ...]] | None = None
-        self._result: tuple[int, int | None, str | None] | None = None
-        self._latest_generation = -1
-        self._active_generation: int | None = None
-        self._stop = False
-        self._thread: threading.Thread | None = None
-        self._duty_wall = 0.0
-        self._duty_cpu = 0.0
 
-    def submit(self, generation: int, snapshot: tuple[dict, ...]) -> None:
-        with self._condition:
-            if self._stop:
-                return
-            self._latest_generation = int(generation)
-            self._pending = (int(generation), snapshot)
-            if self._thread is None or not self._thread.is_alive():
-                self._thread = threading.Thread(
-                    target=self._run,
-                    name="cctally-source-memory",
-                    daemon=True,
-                )
-                self._thread.start()
-            self._condition.notify()
+def shutdown_codex_source_memory_worker() -> None:
+    """Retained no-op: see `set_codex_source_memory_completion_lock`.
 
-    def take_result(self) -> tuple[int, int | None, str | None] | None:
-        with self._condition:
-            result = self._result
-            self._result = None
-            return result
-
-    def _cooperate(self) -> bool:
-        with self._condition:
-            cancelled = (
-                self._stop
-                or self._active_generation != self._latest_generation
-            )
-        if cancelled:
-            return True
-        cpu_elapsed = time.thread_time() - self._duty_cpu
-        wall_elapsed = time.monotonic() - self._duty_wall
-        delay = (cpu_elapsed / RETAINED_SIZE_WORKER_DUTY) - wall_elapsed
-        if delay > 0:
-            time.sleep(min(delay, 0.01))
-        with self._condition:
-            return (
-                self._stop
-                or self._active_generation != self._latest_generation
-            )
-
-    def _run(self) -> None:
-        while True:
-            with self._condition:
-                while self._pending is None and not self._stop:
-                    self._condition.wait()
-                if self._stop:
-                    return
-                generation, snapshot = self._pending
-                self._pending = None
-                self._active_generation = generation
-            estimated: int | None = None
-            error: str | None = None
-            entry_count = sum(len(cache) for cache in snapshot)
-            try:
-                while not RETAINED_SIZE_WORK_LOCK.acquire(timeout=0.05):
-                    if self._cooperate():
-                        raise RetainedSizeCancelled()
-                try:
-                    self._duty_wall = time.monotonic()
-                    self._duty_cpu = time.thread_time()
-                    estimated = retained_size_bytes(
-                        snapshot,
-                        stop_after=_CODEX_SOURCE_ACCELERATOR_MAX_BYTES,
-                        cancelled=self._cooperate,
-                    )
-                finally:
-                    RETAINED_SIZE_WORK_LOCK.release()
-            except RetainedSizeCancelled:
-                continue
-            except Exception as exc:  # noqa: BLE001 - keep the sole worker alive
-                error = f"{type(exc).__name__}: {exc}"
-            finally:
-                snapshot = ()
-            published = (
-                error is None
-                and estimated is not None
-                and _publish_codex_source_measurement(
-                    generation, int(estimated), entry_count)
-            )
-            enforced = False
-            completion_lock = _CODEX_SOURCE_MEMORY_COMPLETION_LOCK
-            if not published and completion_lock is not None:
-                with completion_lock:
-                    enforced = _enforce_codex_source_unsafe_completion(
-                        generation,
-                        None if estimated is None else int(estimated),
-                        error,
-                    )
-            with self._condition:
-                self._active_generation = None
-                if (
-                    not published and not enforced
-                    and not self._stop
-                    and generation == self._latest_generation
-                ):
-                    self._result = (
-                        generation,
-                        None if estimated is None else int(estimated),
-                        error,
-                    )
-
-    def shutdown(self) -> bool:
-        with self._condition:
-            self._stop = True
-            self._pending = None
-            thread = self._thread
-            self._condition.notify_all()
-        if thread is not None:
-            thread.join(timeout=1.0)
-        return thread is None or not thread.is_alive()
-
-    def is_alive(self) -> bool:
-        with self._condition:
-            return self._thread is not None and self._thread.is_alive()
-
-
-_CODEX_SOURCE_MEMORY_WORKER = _CodexSourceMemoryWorker()
-
-
-def set_codex_source_memory_completion_lock(lock) -> None:
-    """Bind unsafe verifier completions to the dashboard publisher lock."""
-    global _CODEX_SOURCE_MEMORY_COMPLETION_LOCK
-    _CODEX_SOURCE_MEMORY_COMPLETION_LOCK = lock
-
-
-def _enforce_codex_source_unsafe_completion(
-    generation: int, estimated: int | None, error: str | None,
-) -> bool:
-    """Evict a current over-cap/error result without awaiting another tick."""
-    if error is None and (
-        estimated is None or estimated <= _CODEX_SOURCE_ACCELERATOR_MAX_BYTES
-    ):
-        return False
-    with _CODEX_SOURCE_ACCELERATOR_DIRTY_LOCK:
-        if (
-            _CODEX_SOURCE_ACCELERATOR_DIRTY
-            or generation != _CODEX_SOURCE_ACCELERATOR_GENERATION
-        ):
-            return False
-    caches = _codex_source_caches()
-    entry_count = sum(len(cache) for cache in caches)
-    global _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES
-    global _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT
-    global _CODEX_SOURCE_ACCELERATOR_EVICTIONS
-    global _CODEX_SOURCE_ACCELERATOR_FALLBACKS
-    global _CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS
-    with _CODEX_SOURCE_ACCELERATOR_STATS_LOCK:
-        reset_codex_quota_observation_cache()
-        for cache in caches[1:]:
-            cache.clear()
-        _CODEX_SOURCE_ACCELERATOR_EVICTIONS += entry_count
-        _CODEX_SOURCE_ACCELERATOR_FALLBACKS += 1
-        if error is not None:
-            _CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS += 1
-        _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES = 0
-        _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = 0
-    return True
-
-
-def _publish_codex_source_measurement(
-    generation: int, estimated: int, entry_count: int,
-) -> bool:
-    """Publish an under-cap current generation without waiting for a tick."""
-    if estimated > _CODEX_SOURCE_ACCELERATOR_MAX_BYTES:
-        return False
-    with _CODEX_SOURCE_ACCELERATOR_DIRTY_LOCK:
-        if (
-            _CODEX_SOURCE_ACCELERATOR_DIRTY
-            or generation != _CODEX_SOURCE_ACCELERATOR_GENERATION
-        ):
-            return False
-    global _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES
-    global _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT
-    global _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION
-    with _CODEX_SOURCE_ACCELERATOR_STATS_LOCK:
-        _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES = int(estimated)
-        _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = int(entry_count)
-        _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION = int(generation)
-    return True
-
-
-def _take_codex_source_accelerator_dirty() -> int | None:
-    """Claim one dirty generation for a serialized source-build admission."""
-    global _CODEX_SOURCE_ACCELERATOR_DIRTY
-    with _CODEX_SOURCE_ACCELERATOR_DIRTY_LOCK:
-        if not _CODEX_SOURCE_ACCELERATOR_DIRTY:
-            return None
-        _CODEX_SOURCE_ACCELERATOR_DIRTY = False
-        return int(_CODEX_SOURCE_ACCELERATOR_GENERATION)
+    Shutdown used to have to cancel and join a walk that could be seconds from
+    finishing. There is no thread to stop, so there is nothing that can fail to
+    stop, and this raises nothing.
+    """
 
 
 def _mark_codex_source_accelerators_clean() -> None:
@@ -5755,79 +6747,191 @@ def _mark_codex_source_accelerators_clean() -> None:
         _CODEX_SOURCE_ACCELERATOR_DIRTY = False
 
 
+#: The one cap this tranche leaves all-or-nothing, and why. Recorded rather
+#: than quietly segmented, because a partition that buys nothing is worse than
+#: an admitted limit: it looks like degradation and behaves like a clear.
+CODEX_VISIBLE_POPULATION_INDIVISIBLE_REASON = (
+    "The visible-population fold's product is ONE ordered population, "
+    "reconstructed by integer-id lookup over `entries_by_id` so that "
+    "downstream floating-point accumulation order stays byte-identical. A "
+    "partial index fails that lookup, and the fold already falls closed to a "
+    "complete cold rebuild when it does, so evicting some accounts costs the "
+    "same rebuild as clearing the state and loses the eviction bookkeeping as "
+    "well. Segmenting it needs the fold restructured to produce per-account "
+    "populations that compose, which is a change to what it emits rather than "
+    "to how much of it is kept."
+)
+
+
+def _evict_codex_source_buckets(caches) -> tuple[int, bool]:
+    """Evict byte-weighted least-recently-used buckets until within budget.
+
+    Returns `(evicted_entries, saw_an_indivisible_oversized_bucket)`.
+
+    Ten of the eleven caches are already keyed by stable semantic units —
+    `("account", key)`, `("parent",)`, a project identity, a session identity,
+    a physical row id — so those keys ARE the buckets and no new partition is
+    needed. The eleventh is declared indivisible and is evicted whole; see
+    `CODEX_VISIBLE_POPULATION_INDIVISIBLE_REASON`.
+
+    Cold buckets go first and everything else stays resident, which is what
+    makes an above-cap steady state rebuild only what it lost. Clearing all
+    eleven caches, which is what this replaced, made a population permanently
+    above a cap rebuild and discard on every generation: measured on the sealed
+    #786 v3 `current` corpus, one run cleared 222,932 entries at a stroke.
+
+    A bucket that alone exceeds the whole budget cannot be split further and is
+    computed WITHOUT admission: it is dropped and counted as a fallback, rather
+    than sitting above the ceiling or taking the rest of the cache with it.
+    """
+    owners = _CODEX_SOURCE_CACHE_OWNERS
+    budget = int(_CODEX_SOURCE_ACCELERATOR_MAX_BYTES)
+    max_entries = int(_CODEX_SOURCE_ACCELERATOR_MAX_ENTRIES)
+    total = int(codex_source_retained_bytes())
+    count = sum(len(cache) for cache in caches)
+    if total <= budget and count <= max_entries:
+        return 0, False
+    # Evict PAST the ceiling, to a low-water mark. Stopping exactly at the
+    # budget leaves the next build one entry over it again, and every tick then
+    # pays the candidate build below over every resident key — 222,932 of them
+    # on the measurement corpus. Freeing headroom instead lets the early return
+    # above answer the next several ticks for eleven integer reads.
+    if count >= int(_CODEX_SOURCE_ACCELERATOR_LOW_WATER_MIN_ENTRIES):
+        low_water = min(
+            budget, int(budget * _CODEX_SOURCE_ACCELERATOR_LOW_WATER))
+        low_water_entries = min(
+            max_entries, int(max_entries * _CODEX_SOURCE_ACCELERATOR_LOW_WATER))
+    else:
+        low_water, low_water_entries = budget, max_entries
+
+    candidates: list[tuple[int, int, int, object, int]] = []
+    position = 0
+    for index, owner in enumerate(owners):
+        entries = owner.cache.eviction_candidates()
+        if not entries:
+            continue
+        if owner.indivisible:
+            # One bucket, weighted by the whole owner and aged by its MOST
+            # recently used field. `min` was wrong: every field of this state
+            # is written in one `update` and then only the reuse path touches
+            # one of them, so aging the bucket by its coldest field reported
+            # the write time forever and sorted a population in constant use
+            # ahead of buckets nothing had read in hours.
+            #
+            # WHAT `max` COSTS, WHERE A READER WILL FIND IT. The clean-hit path
+            # calls `state.touch("entries")` on EVERY reuse
+            # (`_cached_codex_visible_rows`), so on a dashboard that keeps
+            # reusing its population this bucket is the youngest thing in the
+            # process on every tick and eviction pressure never reaches it.
+            # That is the same owner the budget under-counts most — its charge
+            # is four references per indexed row and nothing the fold reaches
+            # (`CODEX_SOURCE_CHARGE_FIDELITY`). Both decisions are right on
+            # their own: a bucket in constant use should not be evicted first,
+            # and charging what the fold reaches would make an ordinary tick
+            # proportional to the whole population. Together they mean the
+            # owner with the largest under-charge is also the last one this
+            # pass will ever reach, so freeing memory by lowering the budget
+            # acts on the other ten owners first.
+            candidates.append((
+                max(recency for recency, _key, _bytes in entries),
+                index, position, _CACHE_MISSING, owner.retained_bytes(),
+            ))
+            position += 1
+            continue
+        # A charged owner's per-key figure IS the one the mixin just returned.
+        # A self-reported owner keeps its ledger beside the mapping, and the
+        # mixin reports zero for every one of its keys, so ask the owner —
+        # otherwise the byte weighting is meaningless there and
+        # `bucket_bytes > budget` can never fire for it.
+        reads_its_own = owner.entry_reader is not None
+        for recency, key, mixin_bytes in entries:
+            candidates.append((
+                recency, index, position, key,
+                owner.entry_bytes(key) if reads_its_own else mixin_bytes,
+            ))
+            position += 1
+    # Coldest first. The owner index and the enumeration position keep the
+    # order total and stable when two buckets were stamped in the same tick.
+    # The position replaced `repr(key)`, which formatted every resident key on
+    # every over-budget tick to buy the same tie-break an integer already
+    # provides.
+    candidates.sort(key=lambda item: item[:3])
+
+    evicted = 0
+    oversized = False
+    for _recency, index, _position, key, bucket_bytes in candidates:
+        if total <= low_water and count <= low_water_entries:
+            break
+        owner = owners[index]
+        if bucket_bytes > budget:
+            oversized = True
+        before_owner_bytes = owner.retained_bytes()
+        if key is _CACHE_MISSING:
+            removed = owner.evict_all()
+        elif key in owner.cache:
+            owner.evict(key)
+            removed = 1
+        else:
+            continue
+        evicted += removed
+        count -= removed
+        # Re-read ONE owner rather than summing all eleven after every single
+        # eviction. A charged owner's total moves by exactly this bucket, and a
+        # self-reported one answers for itself; either way the arithmetic below
+        # is checked against a full re-read once, after the loop.
+        total -= before_owner_bytes - owner.retained_bytes()
+
+    # THE ONE CLEAR-ALL BRANCH THAT SURVIVES, and it is a backstop rather than
+    # the ordinary path. The loop above tracks the total by owner delta, and a
+    # self-reported owner reports what it holds rather than what it was
+    # charged, so the arithmetic is checked against a full re-read once here.
+    # Anything still over the ceiling after every candidate has been offered is
+    # over it for a reason this pass cannot see, and the fail-closed answer is
+    # the cold rebuild the caps always had. `CHANGELOG.md` names this branch
+    # rather than claiming eviction replaced clearing outright.
+    if int(codex_source_retained_bytes()) > budget:
+        for owner in owners:
+            if owner.cache:
+                oversized = True
+                evicted += owner.evict_all()
+    return evicted, oversized
+
+
 def enforce_codex_source_accelerator_bounds() -> None:
-    """Schedule byte admission and apply completed results without cadence I/O."""
+    """Apply byte and entry admission from the incrementally maintained total.
+
+    The byte total is a sum of eleven integers each owner keeps current, so
+    admission is a read. It used to be a background traversal of two full
+    container copies of the whole cache set, once per generation, in a worker
+    limited to a quarter of one core — which on the measurement corpus never
+    finished a generation at all, so the caches were admitted against a byte
+    figure that stayed at zero until the walk finally returned the over-budget
+    sentinel and cleared all eleven at once.
+
+    Publication is unconditional now rather than gated on the dirty flag,
+    because there is nothing left to schedule: an unchanged generation costs
+    the same eleven reads and publishes the same number.
+    """
     caches = _codex_source_caches()
-    entry_count = sum(len(cache) for cache in caches)
     global _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES
     global _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT
     global _CODEX_SOURCE_ACCELERATOR_EVICTIONS
     global _CODEX_SOURCE_ACCELERATOR_FALLBACKS
     global _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION
-    global _CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS
-    completed = _CODEX_SOURCE_MEMORY_WORKER.take_result()
-    with _CODEX_SOURCE_ACCELERATOR_DIRTY_LOCK:
-        current_generation = int(_CODEX_SOURCE_ACCELERATOR_GENERATION)
-        currently_dirty = bool(_CODEX_SOURCE_ACCELERATOR_DIRTY)
-    measured = (
-        None if completed is None or completed[1] is None
-        else int(completed[1])
-    )
-    measured_generation = -1 if completed is None else int(completed[0])
-    measurement_error = None if completed is None else completed[2]
-    measurement_is_current = (
-        completed is not None
-        and measured_generation == current_generation
-        and not currently_dirty
-    )
     with _CODEX_SOURCE_ACCELERATOR_STATS_LOCK:
-        if measurement_is_current and measurement_error is not None:
-            reset_codex_quota_observation_cache()
-            for cache in caches[1:]:
-                cache.clear()
-            _CODEX_SOURCE_ACCELERATOR_EVICTIONS += entry_count
+        evicted, oversized = _evict_codex_source_buckets(caches)
+        if evicted:
+            _CODEX_SOURCE_ACCELERATOR_EVICTIONS += evicted
+        if oversized:
             _CODEX_SOURCE_ACCELERATOR_FALLBACKS += 1
-            _CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS += 1
-            _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES = 0
-            _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = 0
-        elif (
-            (measurement_is_current
-             and measured is not None
-             and measured > _CODEX_SOURCE_ACCELERATOR_MAX_BYTES)
-            or entry_count > _CODEX_SOURCE_ACCELERATOR_MAX_ENTRIES
-        ):
-            # The caller already owns the completed SourceDashboardState.  A
-            # cold next build preserves wire semantics and prevents any one
-            # history/account/root churn pattern from growing process state.
-            reset_codex_quota_observation_cache()
-            for cache in caches[1:]:
-                cache.clear()
-            _CODEX_SOURCE_ACCELERATOR_EVICTIONS += entry_count
-            _CODEX_SOURCE_ACCELERATOR_FALLBACKS += 1
-            _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES = 0
-            _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = 0
-        elif measured is not None:
-            _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES = measured
-            _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = int(entry_count)
-            _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION = measured_generation
-        else:
-            # Entry count is exact immediately; bytes remain the last complete
-            # generation until the latest-wins verifier publishes a result.
-            _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = int(entry_count)
-
-    generation = _take_codex_source_accelerator_dirty()
-    if generation is not None:
-        _CODEX_SOURCE_MEMORY_WORKER.submit(
-            generation, tuple(dict(cache) for cache in caches))
-
-
-def shutdown_codex_source_memory_worker() -> None:
-    """Cancel and join the one aggregate verifier during dashboard shutdown."""
-    global _CODEX_SOURCE_MEMORY_WORKER
-    worker = _CODEX_SOURCE_MEMORY_WORKER
-    if not worker.shutdown():
-        raise RuntimeError("Codex source memory verifier did not stop")
-    _CODEX_SOURCE_MEMORY_WORKER = _CodexSourceMemoryWorker()
+        _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES = int(
+            codex_source_retained_bytes())
+        _CODEX_SOURCE_ACCELERATOR_ENTRY_COUNT = sum(
+            len(cache) for cache in caches)
+    with _CODEX_SOURCE_ACCELERATOR_DIRTY_LOCK:
+        _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION = int(
+            _CODEX_SOURCE_ACCELERATOR_GENERATION)
+    _mark_codex_source_accelerators_clean()
 
 
 def codex_source_accelerator_memory_stats() -> Mapping[str, int]:
@@ -5840,6 +6944,8 @@ def codex_source_accelerator_memory_stats() -> Mapping[str, int]:
             "maxEntries": int(_CODEX_SOURCE_ACCELERATOR_MAX_ENTRIES),
             "evictionCount": int(_CODEX_SOURCE_ACCELERATOR_EVICTIONS),
             "fallbackCount": int(_CODEX_SOURCE_ACCELERATOR_FALLBACKS),
+            "admissionRefusalCount": int(
+                _CODEX_SOURCE_ACCELERATOR_ADMISSION_REFUSALS),
             "measurementErrorCount": int(
                 _CODEX_SOURCE_ACCELERATOR_MEASUREMENT_ERRORS),
             "measuredGeneration": int(
@@ -5849,9 +6955,10 @@ def codex_source_accelerator_memory_stats() -> Mapping[str, int]:
                 _CODEX_SOURCE_ACCELERATOR_MEASURED_GENERATION
                 != _CODEX_SOURCE_ACCELERATOR_GENERATION
             ),
-            "workerAlive": int(
-                getattr(_CODEX_SOURCE_MEMORY_WORKER, "is_alive", lambda: False)()
-            ),
+            # Retained at zero rather than removed: `/api/debug/backend`
+            # publishes this key and a client that reads it must keep reading
+            # something. There is no verifier thread to be alive.
+            "workerAlive": 0,
         })
 
 
@@ -5880,6 +6987,219 @@ def reset_codex_source_caches() -> None:
         _CODEX_SOURCE_ACCELERATOR_GENERATION)
 
 
+# ── the per-build generation overlay (#769 S6 T2a, #716 Task B) ────────────
+
+#: What a discard restores, enumerated rather than assumed. `capture` and its
+#: restore covered these pieces; a piece added later and left out of this map
+#: would survive a discard, which is a generation the build was supposed to
+#: throw away still being served.
+CODEX_SOURCE_OVERLAY_BUNDLE = MappingProxyType({
+    "mappings": tuple(owner.name for owner in _CODEX_SOURCE_CACHE_OWNERS),
+    "extra_state": (
+        # The quota memo's size map, byte total, eviction and fallback
+        # counters, and its key order.
+        "quota_observation_cache_stats",
+        # The account-card totals fallback counter.
+        "account_card_totals_fallbacks",
+        # `_lib_snapshot_cache`'s accounting population, cursor, generation and
+        # signature — a handful of keys, so it stays a plain shallow copy.
+        "snapshot_accounting_cache_state",
+    ),
+    # LRU ORDER is transactional state too: the quota memo is an OrderedDict
+    # whose eviction order decides what survives the next admission. It is
+    # covered by an EXPLICIT ORDER CHECKPOINT taken beside the byte ledger, not
+    # by the journal.
+    #
+    # An earlier version of this entry claimed the journal covered it, on the
+    # ground that re-assigning each key in reverse reinstates the order the
+    # keys were in. That is false in both directions. Reverse replay reinstates
+    # the order only when the build's removals were last-in-first-out, and this
+    # memo evicts with `popitem(last=False)`, which takes the OLDEST key:
+    #
+    #     start     ['a', 'b', 'c']
+    #     in-build  ['b', 'c', 'e']   # popitem(last=False) took 'a'
+    #     replayed  ['b', 'c', 'a']   # not ['a', 'b', 'c']
+    #
+    # And `move_to_end` — which is how a memo HIT records itself — is
+    # classified as reordering and journaled not at all, so a build that only
+    # read the memo and was then discarded left it permanently reordered.
+    # `_quota_observation_cache_checkpoint` remembers the order instead.
+    "ordering": ("quota_observation_lru_order",),
+    "not_rolled_back": (
+        # A rolled-back build still HAPPENED. These count work the process did,
+        # and a counter that forgot a discarded generation would under-report
+        # it. The eviction and fallback counters are the exception and ARE
+        # rolled back, because they describe what the caches currently hold.
+        "codex_source_accelerator_generation",
+        "codex_source_accelerator_measurement_errors",
+    ),
+})
+
+#: Advanced by every build that publishes. A build records the value it started
+#: from and refuses to publish if it has moved, which is the compare-and-swap
+#: that keeps a share render and a dashboard tick from publishing into each
+#: other's generation.
+_CODEX_SOURCE_PUBLISH_EPOCH = 0
+_CODEX_SOURCE_PUBLISH_LOCK = threading.Lock()
+
+
+class _CodexSourceBuildOverlay:
+    """One build's tentative generation over the eleven source caches.
+
+    THE JOURNAL IS THE OVERLAY. Rather than hold changed keys in a separate
+    mapping every read would have to consult, each mutation records the key's
+    PRIOR state once, before it applies. Publishing is then free — the
+    mutations are already the base generation — and discarding replays the
+    journal in reverse, which restores exactly the keys this build touched and
+    leaves every other key alone. That is what makes an invalidation of one
+    physical path cost the one path instead of a complete container copy of
+    every retained cache.
+
+    Recording happens once per key, on FIRST touch, so a key written repeatedly
+    inside one build costs one journal entry and restores to what it held
+    before the build rather than to an intermediate value.
+    """
+
+    __slots__ = ("base_epoch", "_journal", "_touched", "_open", "_published")
+
+    def __init__(self, base_epoch: int) -> None:
+        self.base_epoch = int(base_epoch)
+        self._journal: list[tuple[object, object, object]] = []
+        self._touched: set[tuple[int, object]] = set()
+        self._open = True
+        self._published = False
+
+    @property
+    def open(self) -> bool:
+        return self._open
+
+    @property
+    def published(self) -> bool:
+        return self._published
+
+    def journal_size(self) -> int:
+        return len(self._journal)
+
+    def record(self, cache, key) -> None:
+        if not self._open:
+            return
+        identity = (id(cache), key)
+        if identity in self._touched:
+            return
+        self._touched.add(identity)
+        self._journal.append((cache, key, cache.get(key, _CACHE_MISSING)))
+
+    def record_removed(self, cache, key, prior) -> None:
+        if not self._open:
+            return
+        identity = (id(cache), key)
+        if identity in self._touched:
+            return
+        self._touched.add(identity)
+        self._journal.append((cache, key, prior))
+
+    def record_all(self, cache) -> None:
+        if not self._open:
+            return
+        for key in tuple(cache):
+            self.record(cache, key)
+
+    def _close(self) -> None:
+        self._open = False
+        if getattr(_CODEX_SOURCE_OVERLAY_STATE, "overlay", None) is self:
+            _CODEX_SOURCE_OVERLAY_STATE.overlay = None
+
+    def publish(self) -> bool:
+        """Commit this build's generation, or refuse because the base moved."""
+        global _CODEX_SOURCE_PUBLISH_EPOCH
+        self._close()
+        with _CODEX_SOURCE_PUBLISH_LOCK:
+            if _CODEX_SOURCE_PUBLISH_EPOCH != self.base_epoch:
+                return False
+            _CODEX_SOURCE_PUBLISH_EPOCH += 1
+        self._published = True
+        self._journal.clear()
+        self._touched.clear()
+        return True
+
+    def base_moved(self) -> bool:
+        """Has another build published into the generation this one started from?"""
+        with _CODEX_SOURCE_PUBLISH_LOCK:
+            return _CODEX_SOURCE_PUBLISH_EPOCH != self.base_epoch
+
+    def abandon(self) -> None:
+        """Close without replaying, for a base generation that has moved.
+
+        Replaying the journal writes each key's PRIOR value back, and those
+        prior values predate this build. When another build has published in
+        between, a key it legitimately republished would be overwritten with a
+        value older than both builds — which is a stale hit, not a rollback.
+        The caller clears the affected caches instead.
+        """
+        self._close()
+        self._journal.clear()
+        self._touched.clear()
+
+    def discard(self) -> None:
+        """Undo exactly the keys this build touched, newest first.
+
+        ONLY SOUND WHILE THE BASE GENERATION HAS NOT MOVED; see `abandon`.
+        Every caller has to compare the publish epoch before choosing this over
+        `abandon`, and there are three: `_restore_codex_source_capture`,
+        `capture_codex_source_state`'s exception path, and
+        `_open_codex_source_overlay` when it closes a journal a caller opened
+        and never built from. An earlier version of this docstring named the
+        first of those as the one caller that decides, and the third did not
+        decide at all — which left the T11 stale-hit defect standing on that
+        path while the other two were fixed.
+        """
+        self._close()
+        for cache, key, prior in reversed(self._journal):
+            if prior is _CACHE_MISSING:
+                cache.pop(key, None)
+            else:
+                cache[key] = prior
+        self._journal.clear()
+        self._touched.clear()
+
+
+def _open_codex_source_overlay() -> _CodexSourceBuildOverlay:
+    """Open this thread's build journal, discarding an abandoned one first.
+
+    `capture_codex_source_state` and `build_codex_source_state_from_capture`
+    are two calls with caller code between them (`bin/_cctally_tui.py:3868` and
+    `:4030`), so a caller can capture and never build. An abandoned journal left
+    open would keep recording another build's mutations and roll them back if
+    it were ever discarded, so opening a new one closes it first.
+
+    AND IT TAKES THE SAME EPOCH DECISION EVERY OTHER DISCARD PATH TAKES. An
+    abandoned journal's prior values predate the build that recorded them, so
+    when another build has published in between, replaying them writes values
+    older than BOTH builds over keys the winner legitimately republished —
+    which is a stale hit rather than a rollback, and is exactly the defect the
+    other paths fixed. Not reachable today, because only `bin/_cctally_tui.py`
+    splits capture from build and nothing else publishes into these module
+    globals in that process; it is closed here so the rule holds on every path
+    rather than on four of five.
+
+    The account-card fallback counter has no pre-build checkpoint to restore on
+    this path, because the caller that captured it never came back to hand one
+    over. The CURRENT value is carried across the reset instead of being zeroed
+    by it, which keeps a counter that describes work the process really did.
+    """
+    stale = getattr(_CODEX_SOURCE_OVERLAY_STATE, "overlay", None)
+    if stale is not None and stale.open:
+        if stale.base_moved():
+            _drop_codex_source_generation(
+                stale, _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS)
+        else:
+            stale.discard()
+    with _CODEX_SOURCE_PUBLISH_LOCK:
+        overlay = _CodexSourceBuildOverlay(_CODEX_SOURCE_PUBLISH_EPOCH)
+    _CODEX_SOURCE_OVERLAY_STATE.overlay = overlay
+    return overlay
+
+
 @dataclass(frozen=True)
 class _CodexAccountingCapture:
     qualified_entries: tuple[object, ...]
@@ -5888,6 +7208,61 @@ class _CodexAccountingCapture:
     changed_new: tuple[object, ...]
     entries: tuple[object, ...]
     metadata_incomplete: bool
+    #: #834 S2 (#829). Whether THIS capture's own qualified read failed, which
+    #: `metadata_incomplete` above cannot say: that boolean is true both for a
+    #: row that is deterministically unqualifiable and for a read that failed,
+    #: and those want different explanations and different remedies.
+    metadata_read_failed: bool = False
+    #: The name of the population THIS capture read, taken from the accounting
+    #: result rather than re-read from `_lib_snapshot_cache`'s module global at
+    #: fold time. The global is process-wide, so a concurrent share render's
+    #: capture can overwrite it between this build's capture and its fold, and
+    #: a build would then stamp another build's population name onto its own
+    #: entries. No stale hit was reachable through that, because the
+    #: compare-and-swap refuses to publish a build whose base moved — but the
+    #: safety came from the compare-and-swap rather than from the signature,
+    #: and carrying the value makes the signature answer for itself.
+    population_signature: tuple | None = None
+
+
+#: The detail routes' horizon: one year ending at the generation instant. It
+#: is stated here because the probe has to use the EXACT window both routes
+#: read (`_cctally_dashboard._codex_detail_context`), not a convenient
+#: approximation of it.
+CODEX_DETAIL_HORIZON = dt.timedelta(days=365)
+
+
+def _probe_codex_detail_metadata_health(
+    context: DashboardReadContext,
+) -> "Mapping[str, object]":
+    """Run the ONE detail-horizon metadata probe this generation carries.
+
+    #834 S2 (#828). Neither detail route queries independently and no
+    ingest-maintained marker is introduced: the generation is built once, this
+    runs inside it, and both routes read the frozen result.
+
+    A bare SQLite error here is a failure of the READ, not a property of the
+    rows, so it publishes `transient_read_failure` — the build could not check
+    metadata health and will retry on the next refresh. Telling the reader to
+    rebuild the cache would name a remedy for a problem they do not have.
+    """
+    try:
+        probe = probe_codex_detail_metadata_health(
+            cache_conn=context.cache_conn,
+            start=context.now_utc - CODEX_DETAIL_HORIZON,
+            end=context.now_utc,
+        )
+    except (sqlite3.Error, RuntimeError):
+        _lib_log.get_logger("dashboard").warning(
+            "Codex detail metadata probe failed; publishing a retryable "
+            "transient health result for this generation"
+        )
+        return build_metadata_health("transient_read_failure")
+    if probe.incomplete_rows > 0:
+        return build_metadata_health(
+            "malformed_row_partial", incomplete_rows=probe.incomplete_rows,
+        )
+    return build_metadata_health("healthy")
 
 
 def _capture_codex_accounting(
@@ -5897,13 +7272,26 @@ def _capture_codex_accounting(
     accounting_end: dt.datetime,
     active_roots: tuple[str, ...],
     path_scope: object,
-    metadata_incomplete: bool,
+    incomplete_rows: int,
 ) -> _CodexAccountingCapture:
-    """Read the incremental accounting carrier without folding public views."""
+    """Read the incremental accounting carrier without folding public views.
+
+    #834 S2 (#828, #829): the caller passes the probe's ROW COUNT rather than
+    a boolean, because the typed health result this capture returns has to
+    report the count a malformed-row partial measured, and a boolean has
+    already thrown it away.
+    """
+    metadata_incomplete = incomplete_rows > 0
+    #: #834 S2 (#829). Set only when THIS capture's qualified read failed. The
+    #: published health comes from the detail-horizon probe; a failure here
+    #: overrides it, because a build whose own qualified read raised has not
+    #: established anything about the rows.
+    metadata_read_failed = False
     qualified_entries: tuple[object, ...] = ()
     dirty_accounts: tuple[str, ...] = ()
     changed_old: tuple[object, ...] = ()
     changed_new: tuple[object, ...] = ()
+    population_signature: tuple | None = None
     if not metadata_incomplete:
         try:
             cached_accounting = _lib_snapshot_cache.build_cached_codex_accounting(
@@ -5947,12 +7335,21 @@ def _capture_codex_accounting(
             dirty_accounts = cached_accounting.dirty_accounts
             changed_old = cached_accounting.changed_old
             changed_new = cached_accounting.changed_new
+            population_signature = cached_accounting.population_signature
             entries: tuple[object, ...] = qualified_entries
-        except QualifiedMetadataUnavailable:
+        except QualifiedMetadataUnavailable as exc:
             _lib_log.get_logger("dashboard").warning(
                 "Codex qualified metadata read became unavailable; using cache-only accounting fallback"
             )
             metadata_incomplete = True
+            # #834 S2 (#829): only a TRANSIENT refusal overrides the published
+            # health. A failure of the read established nothing about the rows,
+            # so reporting a malformed-row partial would tell the reader to
+            # rebuild a cache that is not the problem. A DETERMINISTIC refusal
+            # does not override: the detail-horizon probe measures exactly that
+            # class over a superset of this window, so its count is the
+            # measured answer and this exception carries none.
+            metadata_read_failed = getattr(exc, "transient", True)
             _lib_snapshot_cache.reset_codex_accounting_cache_state()
             entries = load_cached_rooted_codex_accounting_entries(
                 accounting_start,
@@ -5985,7 +7382,83 @@ def _capture_codex_accounting(
         changed_new=changed_new,
         entries=tuple(entries),
         metadata_incomplete=metadata_incomplete,
+        metadata_read_failed=metadata_read_failed,
+        population_signature=(
+            None if metadata_incomplete else population_signature),
     )
+
+
+@dataclass(frozen=True)
+class AccountRegistryReading:
+    """One provider's REAL account count, or the failure that hid it (#819).
+
+    Exactly one of the two fields is set. The distinction is the whole point:
+    the decoration gate used to resolve through a ``try`` whose bare
+    ``except Exception`` returned ``False``, so a registry read that failed and
+    a registry holding one account produced the identical answer and the two
+    states were indistinguishable afterwards. #819's investigation needed that
+    exception text and there was none to read.
+
+    Both consumers of the registry read this one object: the R8 decoration gate
+    in the Codex source build, and the ``account_scope`` the combined figure
+    composes from. Two separate reads could disagree inside one tick — one
+    decorating the envelope while the other withheld the combined figure for
+    ``account_scope_unresolved`` — and
+    ``test_one_codex_registry_reading_feeds_decoration_and_the_account_scope``
+    measured exactly two Codex reads per tick before this existed.
+    """
+
+    count: int | None
+    error: BaseException | None = None
+
+    @property
+    def decorated(self) -> bool:
+        """R8: more than one REAL account, evaluated on the ESTABLISHED count.
+
+        The threshold is ``_cctally_account.provider_is_decorated``'s own rule
+        applied to the count this reading already holds, rather than a second
+        query. An unresolved count is never decorated, because there is nothing
+        to decorate by — but that withholding now travels with `error` and the
+        named warning the build publishes, instead of looking like a healthy
+        single-account install.
+        """
+        return self.count is not None and self.count > 1
+
+    @property
+    def account_scope(self) -> "dict[str, object] | None":
+        """The published ``SourceDashboardState.account_scope``, or None.
+
+        ``None`` is the fail-closed reading `_lib_dashboard_sources` turns into
+        ``account_scope_unresolved``: composition withholds the combined figure
+        rather than assuming a single account.
+        """
+        if self.count is None:
+            return None
+        return {"real_account_count": int(self.count)}
+
+
+def read_account_registry(stats_conn, provider: str) -> AccountRegistryReading:
+    """Read one provider's REAL account count once, reporting any failure.
+
+    The ONE implementation of this read and of its catch policy. The catch is
+    narrow on purpose, and the reasoning is the one
+    ``_cctally_tui._tui_resolve_account_scope`` recorded when it was the only
+    surface that refused to swallow: ``real_account_count`` is a single SELECT
+    over ``accounts`` with no file I/O and no label lookups, so
+    ``sqlite3.Error`` covers every failure the CALL can produce, and anything
+    else is a real defect that must not be reported as an unreadable registry.
+    ``ImportError`` is caught beside it because the deferred import is a
+    different failure class from the query — an unimportable module is exactly
+    the "count cannot be read" state — and letting it propagate would fail the
+    whole tick instead of withholding one figure.
+    """
+    try:
+        import _cctally_account
+        return AccountRegistryReading(
+            count=int(_cctally_account.real_account_count(stats_conn, provider)),
+        )
+    except (ImportError, sqlite3.Error) as exc:
+        return AccountRegistryReading(count=None, error=exc)
 
 
 @dataclass(frozen=True)
@@ -6000,24 +7473,110 @@ class CodexSourceCapture:
     accounting_start: dt.datetime
     accounting_end: dt.datetime
     health: object
+    #: #834 S2 (#828). The ONE detail-horizon probe result this generation
+    #: carries, kept SEPARATE from `health` above: that one bounds the ~30-day
+    #: accounting window and decides Projects availability, while this one
+    #: bounds the year both detail routes read. Folding them would let a
+    #: year-old malformed row withhold a thirty-day project ranking no figure
+    #: of which ever counted it.
+    detail_metadata_health: Mapping[str, object]
     accounting: _CodexAccountingCapture
     accounting_exists: bool
     accounting_exists_error: Exception | None
     conversation_metadata: Mapping
-    decorated: bool
+    #: #819: the count OR the exception, never a boolean that cannot tell them
+    #: apart. `AccountRegistryReading` states why, and the build threads this
+    #: one object into both the decoration gate and the published
+    #: `account_scope`.
+    account_registry: AccountRegistryReading
     card_population: tuple[object, ...]
     breakdowns: Mapping
-    cache_checkpoint: tuple[dict, ...]
+    overlay: _CodexSourceBuildOverlay
     quota_cache_stats_checkpoint: tuple[dict, int, int, int]
     account_card_fallbacks_checkpoint: int
     accounting_checkpoint: object
 
 
-def _restore_codex_source_capture(capture: CodexSourceCapture) -> None:
+def _drop_codex_source_generation(
+    overlay: "_CodexSourceBuildOverlay", account_card_fallbacks: int,
+) -> None:
+    """Take this build's generation cold, without writing anything back.
+
+    Used when the base generation has moved — a refused compare-and-swap, or an
+    exception raised while another build published in between. The journal is
+    ABANDONED rather than replayed, because every value in it predates both
+    builds and replaying it would overwrite whatever the other build
+    legitimately published.
+
+    ALL ELEVEN CACHES GO, not only the ones this build wrote to, and that is a
+    correctness requirement rather than caution. Ten of them are fed by the
+    accounting carrier's DELTA lists, not by its population: a build hands
+    `_cached_codex_period_view` and its siblings `changed_old` and
+    `changed_new`, and they apply that delta to what they already hold. The
+    accounting state itself has to be reset here, because the checkpoint this
+    build captured predates the winning build and restoring it would be a stale
+    hit. A reset accounting state then reports its next reconstruction as cold
+    with `changed_old` EMPTY and `changed_new` the whole population — so a
+    period view that survived would add the entire population to a generation
+    it already held and publish exactly double. Measured, not reasoned about:
+    `tests/test_source_cache_degradation.py` compares published envelope bytes,
+    and a partial clear published `cost_usd` and every token count at twice
+    their value.
+
+    The cost of that is real and is not reduced here. Under sustained
+    concurrent share rendering and dashboard ticking, every refused publication
+    costs both parties a full cold rebuild. Reducing it needs the derived
+    caches to consume a population rather than a delta, or the accounting state
+    and its consumers to move under one generation stamp — neither of which is
+    a bounded change to this function. Recorded in spec section 5.2.
+    """
     global _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS
-    for cache, prior in zip(_codex_source_caches(), capture.cache_checkpoint):
-        cache.clear()
-        cache.update(prior)
+    overlay.abandon()
+    reset_codex_source_caches()
+    # `_CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS` is enumerated `extra_state`, so it
+    # is RESTORED from the checkpoint rather than left at the zero
+    # `reset_codex_source_caches` writes. The value restored is this build's own
+    # pre-build one, so an increment the winning build made in between is lost;
+    # that is a diagnostic counter off by at most one build's fallbacks,
+    # against a counter that otherwise described entries no longer resident.
+    #
+    # THE QUOTA MEMO'S OWN EVICTION AND FALLBACK COUNTERS ARE DELIBERATELY NOT
+    # RESTORED HERE, and the asymmetry is a decision rather than an oversight.
+    # `reset_codex_quota_observation_cache` zeroes
+    # `_CODEX_QUOTA_OBSERVATION_CACHE_EVICTIONS` and `..._FALLBACKS`, and this
+    # path leaves them at zero. Those two describe what that memo currently
+    # holds — how many windows it has given up and how many it declined to
+    # admit — and this path has just emptied it, so zero is the true reading
+    # for an empty memo. The account-card counter is different in kind: it
+    # counts BUILDS that fell back, not entries that are resident, so zeroing
+    # it would erase work the process really did. `CODEX_SOURCE_OVERLAY_BUNDLE`
+    # states the same split from the other side, under `not_rolled_back`.
+    _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS = int(account_card_fallbacks)
+
+
+def _restore_codex_source_capture(capture: CodexSourceCapture) -> None:
+    """Discard this build's generation, restoring what preceded it.
+
+    The mappings are restored from the build's own journal, so only the keys it
+    touched move. The three pieces of extra state named in
+    `CODEX_SOURCE_OVERLAY_BUNDLE` are small enough to have been copied outright
+    at capture and are restored the way they always were.
+
+    UNLESS THE BASE GENERATION HAS MOVED, in which case there is nothing to
+    restore to. The exception path and the refused-publication path used to
+    differ here: the second reset the caches and the first replayed its journal
+    over whatever the other build had published. Every reachable case
+    self-corrected to an unnecessary miss rather than a stale hit, but only
+    because the signature-bearing caches store their signature inside the value
+    and compare it on read — the safety lived two functions away rather than in
+    the discard. It lives here now, and the two paths take the same decision.
+    """
+    global _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS
+    if capture.overlay.base_moved():
+        _drop_codex_source_generation(
+            capture.overlay, capture.account_card_fallbacks_checkpoint)
+        return
+    capture.overlay.discard()
     _restore_quota_observation_cache_checkpoint(
         capture.quota_cache_stats_checkpoint)
     _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS = (
@@ -6033,8 +7592,7 @@ def capture_codex_source_state(
 ) -> CodexSourceCapture:
     """Capture Codex cache evidence without constructing public view models."""
     global _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS
-    caches = _codex_source_caches()
-    cache_checkpoint = tuple(dict(cache) for cache in caches)
+    overlay = _open_codex_source_overlay()
     quota_cache_stats_checkpoint = _quota_observation_cache_checkpoint()
     account_card_fallbacks_checkpoint = _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS
     accounting_checkpoint = (
@@ -6079,13 +7637,14 @@ def capture_codex_source_state(
                 start=accounting_start,
                 end=accounting_end,
             )
+            detail_metadata_health = _probe_codex_detail_metadata_health(context)
             accounting = _capture_codex_accounting(
                 context,
                 accounting_start=accounting_start,
                 accounting_end=accounting_end,
                 active_roots=active_roots,
                 path_scope=path_scope,
-                metadata_incomplete=health.incomplete_rows > 0,
+                incomplete_rows=health.incomplete_rows,
             )
         try:
             accounting_exists = has_cached_codex_accounting_entries(
@@ -6100,12 +7659,9 @@ def capture_codex_source_state(
         conversation_metadata = MappingProxyType(
             _codex_conversation_metadata(context.cache_conn))
         with _lib_perf.phase("source.accounts"):
-            try:
-                import _cctally_account
-                decorated = _cctally_account.provider_is_decorated(
-                    context.stats_conn, "codex")
-            except Exception:
-                decorated = False
+            account_registry = read_account_registry(
+                context.stats_conn, "codex")
+        decorated = account_registry.decorated
         card_population_start = accounting_start
         if decorated:
             card_population_start = min(
@@ -6149,23 +7705,28 @@ def capture_codex_source_state(
             accounting_start=accounting_start,
             accounting_end=accounting_end,
             health=health,
+            detail_metadata_health=detail_metadata_health,
             accounting=accounting,
             accounting_exists=accounting_exists,
             accounting_exists_error=accounting_exists_error,
             conversation_metadata=conversation_metadata,
-            decorated=decorated,
+            account_registry=account_registry,
             card_population=tuple(card_population),
             breakdowns=breakdowns,
-            cache_checkpoint=cache_checkpoint,
+            overlay=overlay,
             quota_cache_stats_checkpoint=quota_cache_stats_checkpoint,
             account_card_fallbacks_checkpoint=(
                 account_card_fallbacks_checkpoint),
             accounting_checkpoint=accounting_checkpoint,
         )
     except Exception:
-        for cache, prior in zip(caches, cache_checkpoint):
-            cache.clear()
-            cache.update(prior)
+        # The same decision `_restore_codex_source_capture` takes, made here
+        # because the capture object does not exist yet to pass to it.
+        if overlay.base_moved():
+            _drop_codex_source_generation(
+                overlay, account_card_fallbacks_checkpoint)
+            raise
+        overlay.discard()
         _restore_quota_observation_cache_checkpoint(
             quota_cache_stats_checkpoint)
         _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS = (
@@ -6180,6 +7741,7 @@ def build_codex_source_state_from_capture(
     *,
     data_version: str,
     path_scope: object,
+    prior_hero_cohort: "Mapping[str, object] | None" = None,
 ) -> SourceDashboardState:
     """Fold one captured Codex generation without issuing cache SQL."""
     try:
@@ -6189,18 +7751,32 @@ def build_codex_source_state_from_capture(
                 data_version=data_version,
                 path_scope=path_scope,
                 capture=capture,
+                prior_hero_cohort=prior_hero_cohort,
             )
-        enforce_codex_source_accelerator_bounds()
-        return result
     except Exception:
         _restore_codex_source_capture(capture)
         raise
+    if not capture.overlay.publish():
+        # Another build published into the base generation this one started
+        # from — the share render on an HTTP request thread reaching the same
+        # module-global caches as the synchronized builder. Neither generation
+        # is trustworthy as a mixture, so the caches this build wrote to go
+        # cold and the next build reconstructs them. The RESULT is still
+        # returned, because it was folded from this build's own captured
+        # evidence and is internally consistent.
+        _drop_codex_source_generation(
+            capture.overlay, capture.account_card_fallbacks_checkpoint)
+    # Admission runs AFTER publication, so its eviction is a change to the
+    # published generation rather than a tentative one a discard would undo.
+    enforce_codex_source_accelerator_bounds()
+    return result
 
 
 def build_codex_source_state(
     context: DashboardReadContext,
     *,
     data_version: str,
+    prior_hero_cohort: "Mapping[str, object] | None" = None,
 ) -> SourceDashboardState:
     """Build Codex data strictly from the coordinated cache/stats reads.
 
@@ -6224,7 +7800,8 @@ def build_codex_source_state(
         capture = capture_codex_source_state(
             context, path_scope=path_scope)
         return build_codex_source_state_from_capture(
-            capture, data_version=data_version, path_scope=path_scope)
+            capture, data_version=data_version, path_scope=path_scope,
+            prior_hero_cohort=prior_hero_cohort)
 
 
 def _build_codex_cycle_accounting(
@@ -6251,6 +7828,7 @@ def _build_codex_source_state(
     data_version: str,
     path_scope: object,
     capture: "CodexSourceCapture | None" = None,
+    prior_hero_cohort: "Mapping[str, object] | None" = None,
 ) -> SourceDashboardState:
     active_roots = (
         capture.active_roots
@@ -6362,13 +7940,10 @@ def _build_codex_source_state(
             end=accounting_end,
         )
     )
-    metadata_incomplete = health.incomplete_rows > 0
-    metadata_warning_message = (
-        f"{health.incomplete_rows} Codex accounting row(s) lack project metadata; "
-        "run `cctally cache-sync --source codex --rebuild`."
-        if metadata_incomplete
-        else "Codex project metadata could not be read; "
-        "run `cctally cache-sync --source codex --rebuild`."
+    detail_metadata_health = (
+        capture.detail_metadata_health
+        if capture is not None
+        else _probe_codex_detail_metadata_health(context)
     )
     accounting_capture = (
         capture.accounting
@@ -6379,7 +7954,7 @@ def _build_codex_source_state(
             accounting_end=accounting_end,
             active_roots=active_roots,
             path_scope=path_scope,
-            metadata_incomplete=metadata_incomplete,
+            incomplete_rows=health.incomplete_rows,
         )
     )
     qualified_entries = accounting_capture.qualified_entries
@@ -6388,6 +7963,42 @@ def _build_codex_source_state(
     accounting_changed_new = accounting_capture.changed_new
     accounting_entries = accounting_capture.entries
     metadata_incomplete = accounting_capture.metadata_incomplete
+    # Derived HERE rather than beside `health`, because `metadata_incomplete`
+    # is reassigned on the line above and the message has to answer for the
+    # state that is actually published. Computed early, a transient read
+    # failure — which leaves `health.incomplete_rows` at zero — selected the
+    # rebuild sentence, so the chip told the reader to rebuild a Codex cache
+    # for a SQLite error that will retry on its own. That is the exact
+    # conflation #829 exists to end, and the detail note already avoided it
+    # while this message did not.
+    #
+    # `metadata_read_failed` is tested FIRST, and that ordering is currently
+    # DEFENSIVE rather than load-bearing: `_capture_codex_accounting` issues
+    # the qualified read only under `if not metadata_incomplete:`, so a window
+    # holding malformed rows never attempts the read that could fail, and the
+    # two conditions are mutually exclusive on every path today. Both orders
+    # therefore produce identical output over every reachable state, verified
+    # in a browser. The order is stated this way round so that REMOVING that
+    # gate — making the pair reachable — cannot silently make the chip advise
+    # a rebuild while the carrier it sits beside reports a retryable transient
+    # failure. NO TEST COVERS THE PAIR, deliberately: the gate decides before
+    # the call, so patching `load_qualified_codex_entries` does not reach it
+    # either, and a test that tries asserts a state nothing can produce. One
+    # was written during #834 S2 and removed for exactly that reason.
+    #
+    # The count is the accounting window's, matching this warning's own scope;
+    # the carrier's count comes from the detail-horizon probe over a superset,
+    # so the two are deliberately not the same number.
+    metadata_warning_message = (
+        "Codex project metadata could not be read for this build; it will "
+        "retry on the next refresh."
+        if accounting_capture.metadata_read_failed
+        else f"{health.incomplete_rows} Codex accounting row(s) lack project "
+        "metadata; run `cctally cache-sync --source codex --rebuild`."
+        if health.incomplete_rows > 0
+        else "Codex project metadata could not be read; "
+        "run `cctally cache-sync --source codex --rebuild`."
+    )
     cycles_all: list[CodexCycleBoundary] = []
     try:
         # Per-account list (#341 Task 2). ``cycles_all`` drives the per-account
@@ -6536,9 +8147,27 @@ def _build_codex_source_state(
     # discard every clean period/session/project/account group.  The accounting
     # population cache above owns upper-bound, root and speed invalidation; the
     # individual builders add their own tz/speed/period/cycle dimensions.
-    period_signature = (
-        "codex-accounting-v1", context.range_start, metadata_incomplete,
+    period_signature = _codex_accounting_period_signature(
+        context.cache_conn, context.range_start, metadata_incomplete,
     )
+    # The accounting carrier's own exact name for the population these domains
+    # are built from. The project and label caches compare it instead of
+    # scanning every row to prove a hit; `None` means it could not establish
+    # one, and they then prove the hit the old way.
+    # Taken from THIS build's own accounting capture where there is one, and
+    # only re-read from the process-wide module global on the uncaptured path.
+    # See `_CodexAccountingCapture.population_signature`.
+    if capture is not None:
+        project_population_signature = (
+            None if metadata_incomplete
+            else _codex_project_label_signature(
+                capture.accounting.population_signature)
+        )
+    else:
+        project_population_signature = (
+            None if metadata_incomplete
+            else _codex_project_population_signature()
+        )
     daily = _cached_codex_period_view(
         entries, changed_old=changed_old_entries,
         changed_new=changed_new_entries, kind="daily", cache_key=("parent",),
@@ -6554,15 +8183,17 @@ def _build_codex_source_state(
     # R8 gate, resolved once before the parent weekly projection so that only
     # a decorated merged row gains the additive account axis. Focused children
     # and <=1-real-account providers remain byte-identical.
-    if capture is not None:
-        _codex_decorated = capture.decorated
-    else:
-        try:
-            import _cctally_account
-            _codex_decorated = _cctally_account.provider_is_decorated(
-                context.stats_conn, "codex")
-        except Exception:
-            _codex_decorated = False
+    #
+    # #819: ONE reading, carried rather than re-derived. It gates decoration
+    # below, it is published as this state's `account_scope`, and a failure to
+    # read it becomes a named warning instead of a silent `False`. The
+    # uncaptured branch — the share path and any direct builder call — performs
+    # the same single read, so both entry points publish the same contract.
+    account_registry = (
+        capture.account_registry if capture is not None
+        else read_account_registry(context.stats_conn, "codex")
+    )
+    _codex_decorated = account_registry.decorated
     weekly = _cached_codex_native_weekly_view(
         context.stats_conn,
         visible_accounting_entries,
@@ -6664,6 +8295,7 @@ def _build_codex_source_state(
             accounting_end=accounting_end,
             cache_key=("parent",),
             semantic_signature=period_signature,
+            population_signature=project_population_signature,
         )
     )
     alerts = _alerts_wire(context.stats_conn, decorated=_codex_decorated)
@@ -6676,8 +8308,29 @@ def _build_codex_source_state(
         metadata=conversation_metadata,
         private_labels=private_session_labels,
     )
+    # #819: an unreadable account registry makes this build PARTIAL. The
+    # source itself is intact — every non-account domain below is built from
+    # cache evidence the registry never touches — but the three R8-gated
+    # subtrees are withheld, and publishing that as `ok` is precisely the
+    # silent degradation this axis exists to end. `partial` keeps the provider
+    # COMPOSABLE (`_coherent_provider` admits it), so the combined figure still
+    # reports `account_scope_unresolved` rather than the blunter
+    # `provider_incoherent`.
+    #
+    # It does stop the state being REUSED, since #834 S2 (#830):
+    # `_reusable_provider` refuses every `partial` prior, which is what the
+    # reuse docstring always claimed and what the Codex reuse version — an
+    # identity digest a transient registry failure does not move — could never
+    # achieve on its own. That refusal replaced the hand-maintained
+    # `_CODEX_NON_REUSABLE_WARNING_CODES` allowlist in `_cctally_tui`, which
+    # named this warning's code for exactly that reason and named nothing
+    # else. This cause is deliberately NOT retainable under the retry kernel
+    # either: the reuse branch re-resolves the account scope from the current
+    # registry, so retaining this generation across a registry that recovered
+    # would publish a scope naming two accounts beside a `data` carrying none.
     availability = (
-        "partial" if metadata_incomplete or hero_failure
+        "partial"
+        if metadata_incomplete or hero_failure or account_registry.error is not None
         else ("ok" if (entries or quota_blocks or budget_rows) else "empty")
     )
     hero_input = None if hero_failure else sum(entry.input_tokens for entry in cycle_entries)
@@ -6703,6 +8356,19 @@ def _build_codex_source_state(
             "codex_cycle_unavailable",
             "Codex native reset cycle is unavailable.",
             "hero",
+        ))
+    if account_registry.error is not None:
+        # #819. The named disclosure that replaces the silent `False`. It is
+        # deliberately its own code rather than the generic
+        # `source_build_failed` the TUI's outer catch publishes: the build
+        # SUCCEEDED and every non-account domain below is real, so a reader
+        # must be able to tell "the account registry could not be read" from
+        # "this source could not be built at all".
+        warnings.append(SourceDashboardWarning(
+            "codex_account_scope_unresolved",
+            "Codex account registry could not be read, so per-account "
+            "detail is withheld.",
+            "accounts",
         ))
     # #341 Task 4: the conditional per-account wire. Built ONLY when the Codex
     # provider has >1 REAL account (R8) — a <=1-real-account install adds nothing
@@ -6852,6 +8518,7 @@ def _build_codex_source_state(
                 # accounting-only semantic key here so an unrelated account's
                 # fresh quota sample cannot evict every clean child.
                 scope_signature=period_signature,
+                project_population_signature=project_population_signature,
             )
             # #416 QA P1-A — the "All accounts" Blocks panel is the UNION of
             # every account's 5-hour blocks. `_quota_wire` filters
@@ -6948,6 +8615,99 @@ def _build_codex_source_state(
         hero_reasoning = sum(
             int(card["reasoningOutputTokens"]) for card in accounts_wire)
         hero_total = sum(int(card["totalTokens"]) for card in accounts_wire)
+    # #769 S6 / #753 — the retained hero cohort.
+    #
+    # The Codex hook commits cache ingestion with `quota_reconcile="defer"`,
+    # closes that handle, and then runs `reconcile_codex_quota_projection`,
+    # whose stats projection commits before the cache-side certificate is
+    # stamped. A dashboard read landing in that window sees new cache facts
+    # against an old stats projection, `codex_projection_coherence` correctly
+    # rejects it, and this source used to publish that rejection destructively:
+    # a null hero spend over still-populated account cards.
+    #
+    # A coherent generation publishes its cohort. An incoherent one republishes
+    # the last coherent cohort — the provider hero operands AND each card's own
+    # hero operands, so the hero and the card it sits above agree by
+    # construction — together with the projection-update warning and a quiet
+    # `update_state` marker (D4). When no coherent cohort has ever been
+    # published in this process, or the retained one is no longer certified,
+    # the hero renders an explicit Pending state (D5) rather than a zero, a
+    # dash, or a blank.
+    #
+    # Publishing the whole cohort atomically also preserves latest-wins SSE,
+    # because each frame carries exactly one coherent set.
+    hero_cohort_validity = _codex_hero_cohort_validity(
+        context, cycle_vector=_codex_cycle_vector(cycles_all),
+    )
+    hero_update_state: str | None = None
+    published_hero_cohort: "Mapping[str, object] | None" = None
+    retained_cycle: object | None = None
+    if not hero_failure:
+        if hero_cohort_validity is not None:
+            published_hero_cohort = {
+                "hero": {
+                    "cost_usd": cycle_cost_usd,
+                    "input_tokens": hero_input,
+                    "cached_input_tokens": hero_cached,
+                    "output_tokens": hero_output,
+                    "reasoning_output_tokens": hero_reasoning,
+                    "total_tokens": hero_total,
+                    "cycle": (
+                        {
+                            "window_minutes": cycle.window_minutes,
+                            "start_at": cycle.start_at.astimezone(UTC).isoformat(),
+                            "resets_at": cycle.resets_at.astimezone(UTC).isoformat(),
+                        }
+                        if cycle is not None else None
+                    ),
+                },
+                "accounts": {
+                    str(card["accountKey"]): {
+                        name: card[name] for name in _HERO_CARD_OPERANDS
+                        if name in card
+                    }
+                    for card in accounts_wire
+                },
+                "validity": hero_cohort_validity,
+            }
+    elif not projection_incoherent:
+        # #769 S6 / #753 (T2b closing review W1). Retention is scoped to the
+        # PROJECTION gap, which is the transient reconciliation window §6
+        # describes. A cycle failure is not that gap: `cycle_failure` requires
+        # a missing cycle AND existing accounting, so an install with neither
+        # publishes a COHERENT cohort whose spend is 0.0 over an empty cycle
+        # vector, and the user's first Codex session then flips only
+        # `cycle_failure` while every element of the validity key stays put.
+        # Retaining there republished that 0.0 with `update_state="updating"`
+        # beside a `SPENT THIS WEEK` label, and suppressed the
+        # `codex_cycle_unavailable` reason the client surfaces only when
+        # `cost_usd` is null. Beside that label a zero is a claim, so a cycle
+        # failure takes the Pending path D5 exists for.
+        hero_update_state = "pending"
+    else:
+        retained = _retained_hero_cohort(
+            prior_hero_cohort, hero_cohort_validity)
+        if retained is None:
+            hero_update_state = "pending"
+        else:
+            published_hero_cohort = retained
+            hero_update_state = "updating"
+            retained_hero = retained.get("hero") or {}
+            cycle_cost_usd = retained_hero.get("cost_usd")
+            hero_input = retained_hero.get("input_tokens")
+            hero_cached = retained_hero.get("cached_input_tokens")
+            hero_output = retained_hero.get("output_tokens")
+            hero_reasoning = retained_hero.get("reasoning_output_tokens")
+            hero_total = retained_hero.get("total_tokens")
+            retained_cycle = retained_hero.get("cycle")
+            retained_cards = retained.get("accounts") or {}
+            for card in accounts_wire:
+                operands = retained_cards.get(str(card["accountKey"]))
+                if isinstance(operands, Mapping):
+                    card.update(
+                        {name: operands[name] for name in _HERO_CARD_OPERANDS
+                         if name in operands}
+                    )
     return SourceDashboardState(
         source="codex",
         availability=availability,
@@ -6999,7 +8759,27 @@ def _build_codex_source_state(
                         "start_at": cycle.start_at.astimezone(UTC).isoformat(),
                         "resets_at": cycle.resets_at.astimezone(UTC).isoformat(),
                     }
-                    if cycle is not None and not hero_failure else None
+                    if cycle is not None and not hero_failure
+                    # #769 S6 / #753: during a gap the retained cohort's own
+                    # cycle travels with the operands it bounds. Publishing
+                    # the current build's cycle instead would describe the
+                    # retained spend with a boundary from a generation that
+                    # did not produce it.
+                    else (
+                        dict(retained_cycle)
+                        if hero_update_state == "updating"
+                        and isinstance(retained_cycle, Mapping)
+                        else None
+                    )
+                ),
+                # #769 S6 / #753 (D4, D5): additive, omitted on the healthy
+                # path, so a coherent generation's payload is byte-identical.
+                # `updating` means the figures beside it are the last coherent
+                # ones and reconciliation is in flight; `pending` means this
+                # process has never published a coherent hero.
+                **(
+                    {"update_state": hero_update_state}
+                    if hero_update_state is not None else {}
                 ),
                 # #350 (spec §3.4): additive, hero-local staleness disclosure.
                 # OMITTED when the cycle is fresh — never emitted as "fresh" —
@@ -7081,5 +8861,24 @@ def _build_codex_source_state(
             ),
         },
         private_session_labels=private_session_labels,
+        # #819: the SAME reading that gated decoration above. Attaching it here
+        # is what makes the two facts one: a caller that composes the All
+        # source can no longer pair a decorated Codex payload with a scope some
+        # second read withheld, and the share path — which never reaches the
+        # TUI's own attachment — now carries the count at all.
+        account_scope=account_registry.account_scope,
         combined_accounting=combined_accounting,
+        hero_cohort=published_hero_cohort,
+        # #834 S2 (#828, #829): the detail-horizon probe's typed result,
+        # published from here and read back by both detail routes. A qualified
+        # accounting read that FAILED overrides it, because a build whose own
+        # read raised has established nothing about the rows however healthy
+        # the probe found them. This constructor lists every field explicitly,
+        # so an omission would publish a generation that reports its metadata
+        # health as unknown on a store whose probe read fine.
+        metadata_health=(
+            build_metadata_health("transient_read_failure")
+            if accounting_capture.metadata_read_failed
+            else detail_metadata_health
+        ),
     )

@@ -39,6 +39,24 @@ export const CODEX_STALE_CYCLE_NOTE =
   'Codex quota evidence is stale — this spend is current, but the forecast is paused '
   + 'until Codex reports again.';
 
+// #769 S6 / #753 — the ONE sentence for a hero whose figure is real but belongs
+// to the last coherent generation while the quota projection reconciles.
+// Exported and shared with the current-week modal, which previously printed the
+// server's `projection_incoherent` warning verbatim ("Codex quota projection is
+// unavailable.") directly above the same published figures — one surface saying
+// a newer number is coming, the other saying the projection is gone. The hero's
+// framing is the correct one, so the modal reads this.
+export const CODEX_HERO_RECONCILING_NOTE =
+  'The quota projection is reconciling. This is the last figure that was coherent.';
+
+// #769 S6 / #753 browser QA P2 — the VISIBLE short form of the sentence above.
+// The full sentence reached only a `title` on a non-interactive element, which
+// is hover-only and therefore unreachable on touch, and the `.hero-spent` zone
+// exposed no accessible name in that state either. This repository already
+// recorded and fixed that class for this same zone (public #5 QA P2): the
+// remedy is a sentence on the zone plus a short visible line, not a tooltip.
+const CODEX_HERO_RECONCILING_LABEL = 'last coherent figure';
+
 // The spend zone's default spoken period claim. Named because the zone's
 // `aria-label` compares against it to decide whether the label has to be
 // announced on its own (#564 review P2).
@@ -147,6 +165,24 @@ function HeroSpendFigure({
       style={{ '--hs-chars': text.length } as CSSProperties}
     >
       {text}
+    </div>
+  );
+}
+
+// #769 S6 / #753 (D5). An explicit state, not a formatted blank: `fmt.usd0`
+// renders an em dash for null, and beside a `SPENT THIS WEEK` label an em dash
+// reads as "nothing spent". `is-blank` is the same dim treatment the drill
+// figure already uses for an absent value, so no new visual vocabulary is
+// introduced.
+function HeroPendingFigure() {
+  return (
+    <div
+      className="hs-big is-blank hs-pending"
+      data-testid="hero-spend-pending"
+      style={{ '--hs-chars': 7 } as CSSProperties}
+      title="No coherent reading yet. The figure appears once the quota projection resolves."
+    >
+      Pending
     </div>
   );
 }
@@ -331,8 +367,19 @@ function SharedHero({
       || Date.parse(b.current.captured_at) - Date.parse(a.current.captured_at);
   })[0];
   const fiveHour = windows.find((window) => window.windowMinutes === 300);
-  const codexUnavailable = codexEntry?.capabilities?.hero?.status === 'unavailable'
-    || codex?.hero?.cost_usd == null;
+  // #769 S6 / #753 — the server decides what the hero shows, and this reads it.
+  //
+  // The provider capability is `unavailable` for the whole reconciliation gap,
+  // and gating on it here is what erased a known spend: the server had
+  // republished the last coherent figure, and the client blanked it anyway
+  // while the account card beneath went on showing a number. The capability is
+  // no longer part of this predicate. A null value is the only thing that
+  // blanks the figure now, which is the state the server publishes when it has
+  // nothing coherent to show.
+  const codexHeroUpdateState = codex?.hero?.update_state ?? null;
+  const codexHeroUpdating = codexHeroUpdateState === 'updating';
+  const codexHeroPending = codexHeroUpdateState === 'pending';
+  const codexUnavailable = codex?.hero?.cost_usd == null;
   // #350 — disclosure ONLY. Codex has no background quota poll, so a weekly
   // observation goes stale after an idle hour while the spend, tokens and cycle
   // bounds it bounds stay correct. This must never gate rendering: the values
@@ -350,7 +397,7 @@ function SharedHero({
     : null;
   const codexHeroLabel = heroFreshnessLabel(ageSeconds);
   const usedPct = weekly?.current.current_percent ?? null;
-  const spentUsd = codexUnavailable ? null : codex?.hero.cost_usd;
+  const spentUsd = codex?.hero.cost_usd ?? null;
   const dollarPerPct = spentUsd != null && usedPct != null && usedPct > 0
     ? spentUsd / usedPct
     : null;
@@ -431,6 +478,13 @@ function SharedHero({
         unavailableReason={!perAccount && codexUnavailable
           ? warning?.message ?? 'Cycle accounting unavailable'
           : null}
+        // D5: an explicit Pending state, never an em dash that reads as no
+        // spend. D4: a quiet marker beside a figure that IS real, so it must
+        // not be routed through `unavailableReason`, whose text says the
+        // accounting is unavailable.
+        spendState={
+          codexHeroPending ? 'pending' : codexHeroUpdating ? 'updating' : null
+        }
         // The two disclosures have DIFFERENT scopes and cannot share one gate.
         // The stale-cycle note is account-scoped — under focus `focusedHero`
         // derives `cycle_freshness` from that child's own quota summary, and
@@ -441,11 +495,16 @@ function SharedHero({
         // the incomplete number it qualifies; suppressing it there hid the
         // caveat in the one view that most needed it (QA P1).
         spentNote={joinHeroNotes(
+          codexHeroUpdating ? CODEX_HERO_RECONCILING_NOTE : null,
           perAccount || !codexCycleStale ? null : CODEX_STALE_CYCLE_NOTE,
           spendWindowNote,
           codexBacklogNote,
         )}
-        spentNoteLabel={joinHeroNotes(spendWindowNote, codexBacklogLabel)}
+        spentNoteLabel={joinHeroNotes(
+          codexHeroUpdating ? CODEX_HERO_RECONCILING_LABEL : null,
+          spendWindowNote,
+          codexBacklogLabel,
+        )}
         // #564 ui-qa P2 — the fallback note now has its own shorthand, so the
         // compact line is set whenever EITHER disclosure has one. It was
         // previously gated on the backlog shorthand alone, which left the
@@ -456,7 +515,13 @@ function SharedHero({
         spentNoteCompactLabel={
           spendWindowCompactNote == null && codexBacklogCompactLabel == null
             ? null
+            // The reconciling label is already short, so it has no shorthand of
+            // its own — but it must ride along whenever a compact sibling
+            // exists, or the responsive swap would drop it at narrow widths and
+            // leave the retained figure unqualified on exactly the device where
+            // the tooltip is unreachable.
             : joinHeroNotes(
+              codexHeroUpdating ? CODEX_HERO_RECONCILING_LABEL : null,
               spendWindowCompactNote ?? spendWindowNote,
               codexBacklogCompactLabel ?? codexBacklogLabel,
             )}
@@ -864,6 +929,7 @@ function CanonicalHero({
   freshness,
   showFiveHour,
   unavailableReason = null,
+  spendState = null,
   spentNote = null,
   spentNoteLabel = null,
   spentNoteCompactLabel = null,
@@ -886,6 +952,11 @@ function CanonicalHero({
   freshness: FreshnessEnvelope | null;
   showFiveHour: boolean;
   unavailableReason?: string | null;
+  // #769 S6 / #753. `updating` marks a figure that is REAL but belongs to the
+  // last coherent generation; `pending` names a hero this server process has
+  // never resolved. Distinct from `unavailableReason`, which explains a hero
+  // the server could not produce at all.
+  spendState?: 'updating' | 'pending' | null;
   // #350 — disclosure for a hero whose values ARE present but whose bounding
   // quota evidence is stale. Distinct from `unavailableReason`, which explains
   // an ABSENT hero; when both apply the unavailable reason wins.
@@ -1012,7 +1083,18 @@ function CanonicalHero({
         })()}
       >
         <div className="hs-label">{spentLabel}</div>
-        <HeroSpendFigure amount={spentUsd} />
+        {spendState === 'pending'
+          ? <HeroPendingFigure />
+          : <HeroSpendFigure amount={spentUsd} />}
+        {spendState === 'updating' && (
+          <div
+            className="chip chip-aging hs-updating"
+            data-testid="hero-spend-updating"
+            title={CODEX_HERO_RECONCILING_NOTE}
+          >
+            updating
+          </div>
+        )}
         <div className="hs-sub">
           {perAccountValue == null
             ? <><span>{fmt.usd2(dollarPerPct)}</span> / 1% used</>

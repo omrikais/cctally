@@ -108,7 +108,21 @@ CapabilityStatus = Literal[
 # each leg gains `scope`, and account-cycle legs publish their exact account
 # contribution periods. These fields change both shape and meaning, so the
 # version moves even though undecorated arithmetic remains unchanged.
-SOURCE_SCHEMA_VERSION = 11
+# 11 -> 12 (#834 S2, #828/#829): the MEANING of Codex metadata availability
+# changed. It used to be one frozen boolean, and a partial detail said the
+# same thing whether a row was deterministically unqualifiable or the health
+# read itself had failed — so a reader met by a transient SQLite error was
+# told to rebuild the cache. Every source state now publishes a typed
+# `metadata_health` beside `data`, with three states and an explicit
+# `retryable` flag, and the two partial causes render different explanations.
+# The field is null on a provider that has none, which is exactly what an
+# older server's payload looks like to a newer client — so the client
+# normalizes an absent object to UNKNOWN and never to healthy. The dashboard
+# `execvp`s itself on an in-place update while an already-loaded client
+# reconnects over its existing EventSource, so an old client demonstrably does
+# meet a new server, and `docs/cli-contract.md` calls a changed meaning
+# breaking. That is why this is a bump and not a silent addition.
+SOURCE_SCHEMA_VERSION = 12
 DEFAULT_SOURCE = "claude"
 SOURCE_ORDER = ("claude", "codex", "all")
 SOURCE_FRESHNESS_DOMAINS = ("hero", "quota", "sessions")
@@ -121,6 +135,75 @@ _CAPABILITY_STATUSES = frozenset((
     "supported", "derived", "unavailable", "deferred", "not_applicable",
 ))
 _RESOURCE_RE = re.compile(r"[a-z][a-z0-9_]*\Z")
+
+# === #834 S2 (#828, #829) — the typed Codex metadata-health result =========
+#
+# One boolean cannot distinguish a row that is deterministically unqualifiable
+# from a read that failed and may succeed on the next refresh, and the tree
+# published the same partial explanation for both. These three states are the
+# complete taxonomy and the factory below is their only constructor.
+METADATA_HEALTH_STATES: tuple[str, ...] = (
+    "healthy", "malformed_row_partial", "transient_read_failure",
+)
+MetadataHealthState = Literal[
+    "healthy", "malformed_row_partial", "transient_read_failure",
+]
+_METADATA_HEALTH_KEYS = frozenset(("state", "incomplete_rows", "retryable"))
+
+
+def build_metadata_health(
+    state: object, *, incomplete_rows: object = None,
+) -> Mapping[str, object]:
+    """Return one frozen metadata-health result, or raise on a contradiction.
+
+    ``transient_read_failure`` carries a null count and ``retryable: true``: a
+    read that failed learned nothing, and reporting zero would be
+    indistinguishable from a healthy probe, which is the exact confusion this
+    result exists to end. ``malformed_row_partial`` carries the positive row
+    count it measured and is NOT retryable, because rebuilding the cache
+    clears it and refreshing the dashboard does not.
+    """
+    if state not in METADATA_HEALTH_STATES:
+        raise ValueError(
+            f"metadata health state must be one of {list(METADATA_HEALTH_STATES)}"
+        )
+    if state == "transient_read_failure":
+        if incomplete_rows is not None:
+            raise ValueError("a transient read failure counts no rows")
+        return MappingProxyType({
+            "state": state, "incomplete_rows": None, "retryable": True,
+        })
+    if isinstance(incomplete_rows, bool) or not isinstance(
+        incomplete_rows, (int, type(None))
+    ):
+        raise ValueError("incomplete_rows must be an integer or None")
+    rows = 0 if incomplete_rows is None else int(incomplete_rows)
+    if rows < 0:
+        raise ValueError("incomplete_rows must not be negative")
+    if state == "healthy" and rows:
+        raise ValueError("a healthy probe cannot carry incomplete rows")
+    if state == "malformed_row_partial" and rows <= 0:
+        raise ValueError("a malformed-row partial must count at least one row")
+    return MappingProxyType({
+        "state": state, "incomplete_rows": rows, "retryable": False,
+    })
+
+
+def _validated_metadata_health(value: object) -> Mapping[str, object]:
+    """Re-derive the carrier through its factory so no builder can bypass it."""
+    if not isinstance(value, Mapping):
+        raise ValueError("metadata_health must be a mapping")
+    if set(value) != _METADATA_HEALTH_KEYS:
+        raise ValueError(
+            "metadata_health must carry exactly state, incomplete_rows and "
+            "retryable"
+        )
+    rebuilt = build_metadata_health(
+        value.get("state"), incomplete_rows=value.get("incomplete_rows"),
+    )
+    if dict(rebuilt) != dict(value):
+        raise ValueError("metadata_health contradicts its own state")
+    return rebuilt
 
 
 def _nonempty_string(value: object, name: str) -> str:
@@ -213,11 +296,14 @@ class SourceDashboardState:
     #
     # ``None`` means UNRESOLVED and must fail closed (withhold the combined
     # figure), never "undecorated". Inferring decoration from the published
-    # `data.accounts` is forbidden for exactly this reason: both physical
-    # builders swallow a decoration-read failure and fall back to the
-    # undecorated shape, so a two-account install whose account read failed
-    # would present as single-account and publish the one number §3.2 forbids,
-    # on precisely the install where it is wrong.
+    # `data.accounts` is forbidden for exactly this reason: a builder that
+    # swallowed a decoration-read failure would fall back to the undecorated
+    # shape, so a two-account install whose account read failed would present
+    # as single-account and publish the one number §3.2 forbids, on precisely
+    # the install where it is wrong. #819 ended that silence on the Codex side
+    # — the read failure is now a named `codex_account_scope_unresolved`
+    # warning over a `partial` source — so the sentence is stated as the rule
+    # it always was rather than as a description of both builders.
     account_scope: Mapping[str, object] | None = None
     # Server-only evidence used to compose decorated providers without
     # re-deriving account truth from the public card shape. The carrier travels
@@ -246,6 +332,54 @@ class SourceDashboardState:
     # describes and is never re-derived on a reuse or degrade path. Explicit
     # constructors must copy it.
     aggregate_scope: Mapping[str, object] | None = None
+    # #769 S6 / #753 — the last COHERENT Codex hero, retained across a
+    # transient projection gap. Server-only, in the same class as
+    # ``clock_data`` and ``account_scope``: it never enters the public source
+    # envelope, and the build reads from it to decide what ``data.hero``
+    # publishes rather than shipping it as a second hero.
+    #
+    # It carries the provider hero's accounting operands, the named per-account
+    # hero operands, and a validity key. It deliberately does NOT carry whole
+    # ``account_scopes``, which also hold sessions and projects that have
+    # nothing to do with hero coherence and would age independently, and it
+    # MUST NOT carry ``private_session_labels``: request privacy is applied
+    # after state publication, so a retained private map would outlive the
+    # request that was allowed to see it.
+    #
+    # Shape:
+    #
+    #   {"hero": {"cost_usd", "input_tokens", "cached_input_tokens",
+    #             "output_tokens", "reasoning_output_tokens", "total_tokens",
+    #             "cycle"},
+    #    "accounts": {<account_key>: {"spendUsd", "inputTokens",
+    #                                 "cachedInputTokens", "outputTokens",
+    #                                 "reasoningOutputTokens", "totalTokens"}},
+    #    "validity": {"accounts_digest", "cycle_vector", "cache_identity",
+    #                 "stats_identity"}}
+    #
+    # Retention is process-local publication state. After a restart whose first
+    # build is incoherent the hero renders Pending (D5); once a process has
+    # published one coherent cohort it retains it through transient gaps until
+    # its validity key changes. Every explicit constructor must copy it — a
+    # field omitted from one is dropped without error.
+    hero_cohort: Mapping[str, object] | None = None
+    # #834 S2 (#828, #829) — the typed Codex metadata-health result for THIS
+    # generation. Unlike the server-only carriers above, this one is PUBLISHED:
+    # `_source_state_to_wire` serializes it from here and nowhere else, so the
+    # value the detail routes decide from and the value the client normalizes
+    # are the same object.
+    #
+    # ``None`` means the generation describes no Codex metadata at all — an
+    # unavailable state, the hydrating seed, the Claude provider, or the
+    # composed All source. It must NEVER be read as healthy: absence is no
+    # evidence, and an older server's payload looks exactly like it to a newer
+    # client, which is why the client normalizes an absent object to unknown.
+    #
+    # Every explicit constructor must pass it or be declared exempt; the gate
+    # is `tests/test_829_health_states.py::
+    # test_829_every_state_constructor_decides_the_carrier`, which walks the
+    # `bin/` AST rather than trusting this comment.
+    metadata_health: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         validate_dashboard_selection(self.source)
@@ -307,6 +441,34 @@ class SourceDashboardState:
             }
             object.__setattr__(
                 self, "private_session_labels", _freeze(private_session_labels),
+            )
+        if self.hero_cohort is not None:
+            # #769 S6 / #753. Refused rather than dropped, because a cohort
+            # carrying transcript-derived titles would be a disclosure surface
+            # the request privacy gate never sees, and silently stripping the
+            # key would let the wrong construction ship unnoticed.
+            #
+            # The check is a positive whitelist rather than a list of the two
+            # names known to be harmful. A denylist admits every key nobody
+            # thought of, which is the wrong default for a published surface;
+            # the cohort's shape is fixed at exactly these three members, so
+            # naming them is both stricter and easier to keep true. It
+            # constrains the TOP LEVEL only, because the operand vocabulary
+            # inside `accounts` is the builder's and importing it here would
+            # invert this module's dependency direction.
+            unexpected = sorted(
+                set(self.hero_cohort) - {"hero", "accounts", "validity"}
+            )
+            if unexpected:
+                raise ValueError(
+                    "hero_cohort must carry only hero, accounts and validity, "
+                    f"not {', '.join(unexpected)}"
+                )
+            object.__setattr__(self, "hero_cohort", _freeze(self.hero_cohort))
+        if self.metadata_health is not None:
+            object.__setattr__(
+                self, "metadata_health",
+                _validated_metadata_health(self.metadata_health),
             )
 
 
@@ -424,6 +586,16 @@ def degrade_source_state(
         # that bounded those rows — re-deriving it from the current tick would
         # publish a range the retained rows do not cover.
         aggregate_scope=prior.aggregate_scope,
+        # #769 S6 / #753: a degraded generation republishes `prior.data`, so it
+        # must keep the cohort that certifies the hero inside it. Dropping it
+        # here would send the next incoherent tick to Pending on a process that
+        # HAD published a coherent hero.
+        hero_cohort=prior.hero_cohort,
+        # #834 S2 (#828, #829): a degraded generation republishes `prior.data`,
+        # so it must republish what that generation knew about its own Codex
+        # metadata. Dropping it here would turn a transient ingest failure into
+        # an unknown metadata health on an install whose probe read fine.
+        metadata_health=prior.metadata_health,
     )
 
 
@@ -467,12 +639,64 @@ def source_domain_freshness(
 
 
 def _coherent_provider(state: SourceDashboardState) -> bool:
+    """Whether a generation's data may be COMPOSED into the All source.
+
+    #834 S2 (#830): this predicate deliberately still admits ``partial``, and
+    it is not the one that decides reuse. The two questions are different. A
+    fresh partial provider's data is real — an incomplete Codex project
+    attribution withholds Projects and nothing else — and #556 S2 §3.7 settled
+    that withholding a whole cross-provider ranking over it would discard that
+    real data. Narrowing this predicate would also turn the precise
+    ``account_scope_unresolved`` combined cause into the blunt
+    ``provider_incoherent`` on every install whose registry read failed, which
+    is the opposite of what #819 established.
+
+    Reuse asks whether the SAME OBJECT may be published again unexamined, and
+    is answered by ``_reusable_provider`` below.
+    """
     return (
         state.availability in ("ok", "empty", "partial")
         and state.freshness == "fresh"
         and bool(state.data_version)
         and state.data is not None
     )
+
+
+def _reusable_provider(state: SourceDashboardState) -> bool:
+    """Whether the exact prior object may be republished without rebuilding.
+
+    #834 S2 (#830): ``partial`` is NOT reusable. The docstring on the function
+    this serves has always said a degraded generation does not qualify;
+    admitting ``partial`` is what let a provider that reports
+    ``freshness="fresh"`` hand the same degraded object back for the life of
+    the process, because the reuse version is an identity digest that a
+    transient read failure does not move.
+
+    A RETRYABLE metadata-health result is refused for the same reason, and
+    refusing it needs its own clause because ``availability`` does not carry
+    it. That field is ``partial`` only when the accounting capture counted
+    incomplete rows, a hero projection failed or the account registry could
+    not be read; a detail-probe read failure sets none of those, so the
+    generation stays ``ok`` and the clause above admitted it. The result was
+    the exact defect this function was written to end, one state later: a
+    ``transient_read_failure`` republished unexamined for the life of the
+    process, while the note on screen promised it would retry on the next
+    refresh and the payload said ``retryable: true``. Both were false.
+
+    ``retryable`` is the right predicate rather than a state name, because the
+    factory derives it: only ``transient_read_failure`` carries it, and a
+    ``malformed_row_partial`` deliberately does not, since rebuilding the
+    cache clears that one and refreshing the dashboard does not.
+
+    Throttling a REPEATED structural cause is ``_lib_source_retry``'s job, not
+    this predicate's: this stays a pure statement about reuse eligibility. A
+    transient cause is never throttled there, so refusing it here means the
+    next tick genuinely re-reads, which is what makes the promise true.
+    """
+    health = state.metadata_health
+    if health is not None and bool(health.get("retryable")):
+        return False
+    return _coherent_provider(state) and state.availability != "partial"
 
 
 def reuse_coherent_source_state(
@@ -490,7 +714,7 @@ def reuse_coherent_source_state(
         return None
     if not isinstance(prior, SourceDashboardState):
         raise ValueError("prior must be a SourceDashboardState or None")
-    return prior if _coherent_provider(prior) and prior.data_version == data_version else None
+    return prior if _reusable_provider(prior) and prior.data_version == data_version else None
 
 
 # === #556 S1 — the typed combined outcome (spec §3.5, §3.7) =================
@@ -1454,6 +1678,40 @@ class ProjectionCoherence:
     reason: str | None = None
 
 
+# #769 S6 / #765. `meter_rate_change_events` is published in the alert
+# envelope, but no numeric leg of the dispatch signature moves when a
+# rate-change row is written: the stats legs are `MAX(id)` over the two weekly
+# snapshot tables plus the reset-event change signal, and neither registry
+# below listed the table. A write therefore left the idle short-circuit
+# serving the previous envelope.
+#
+# The projection is exactly the twelve columns
+# `_cctally_dashboard_envelope._alert_meter_rate_change_rows` publishes, in
+# that order. `id` is a surrogate and `notified_at` is not published, so
+# neither enters the digest — arming a notification is not a republication
+# reason, and folding it in would rebuild the whole envelope on every notifier
+# pass. Because the digest hashes the complete canonical row population,
+# insert, semantic update and delete all move it.
+#
+# One relation per registry, provider-filtered, so a Codex rate change does
+# not rebuild the Claude source and the reverse.
+_METER_RATE_CHANGE_COLUMNS = (
+    "provider, account_key, effective_from, previous_units_per_point, "
+    "new_units_per_point, severity, detected_at_utc, created_at_utc, "
+    "withholding_status, detector_input_causes, composition_provenance, "
+    "baseline_withheld_days"
+)
+
+
+def _meter_rate_change_relation(provider: str) -> tuple[str, str]:
+    return (
+        "meter_rate_change_events",
+        f"SELECT {_METER_RATE_CHANGE_COLUMNS} FROM meter_rate_change_events "
+        f"WHERE provider='{provider}' "
+        f"ORDER BY {_METER_RATE_CHANGE_COLUMNS}",
+    )
+
+
 # The column order is the approved cross-database identity contract.  Keep the
 # relation sequence and tuples fixed: neither SQLite insertion order nor
 # surrogate/provenance/reconciliation-only fields may perturb the digest.
@@ -1507,6 +1765,7 @@ _CODEX_STATS_DIGEST_RELATIONS: tuple[tuple[str, str], ...] = (
         "WHERE metric='codex_budget_usd' ORDER BY week_start_at, period, metric, threshold, "
         "projected_value, denominator, crossed_at_utc, alerted_at",
     ),
+    _meter_rate_change_relation("codex"),
 )
 
 
@@ -1564,6 +1823,7 @@ _CLAUDE_STATS_DIGEST_RELATIONS: tuple[tuple[str, str], ...] = (
         "ORDER BY week_start_at, project_key, threshold, account_key, "
         "budget_usd, spent_usd, consumption_pct, crossed_at_utc, alerted_at",
     ),
+    _meter_rate_change_relation("claude"),
 )
 
 

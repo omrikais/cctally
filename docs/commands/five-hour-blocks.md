@@ -48,8 +48,16 @@ only, and adds 7d-drift columns plus a `⚡` reset-crossing marker.
 - **5h %** — `final_five_hour_percent`; live for the active row.
 - **Cost** — `total_cost_usd` (recomputed every tick from `session_entries`).
 - **$/1%** — `cost / 5h%`. Renders `—` when 5h% < 0.5 (matches `report` $/1% clamp).
-- **7d % range** — `seven_day_pct_at_block_start → seven_day_pct_at_block_end`, e.g. `62.5→66.7`. Right side is the latest live 7d% for the active row.
-- **Δ7d** — signed pp delta (`end − start`); `—` when `crossed_seven_day_reset=1` or when `seven_day_pct_at_block_start` is null.
+- **7d % range** — `seven_day_pct_at_block_start → seven_day_pct_at_block_end`, e.g. `62.5→66.7`. Right side is the latest live 7d% for the active row. Either side renders `—` when it is withheld; see below.
+- **Δ7d** — signed pp delta (`end − start`); `—` when `crossed_seven_day_reset=1`, when `seven_day_pct_at_block_start` is null, or when either side is withheld.
+
+### A weekly percentage a credit retired is withheld, not shown
+
+When an in-place weekly credit retires a weekly percentage, a block whose weekly start or weekly end was observed at that retired level no longer renders the number. The cell reads `—`, and `Δ7d` reads `—` with it, because a delta against a withheld value would state a burn nobody observed. This applies at both ends of the range, to closed blocks as well as to the active one, and to reset-crossing blocks. **A block observed only before the credit is unchanged** — that is historical truth, not a retired value, so its stored figures still render.
+
+The rule is a read-time filter, so it applies to stores recorded before the behaviour existed as well as to new ones, and `--json` follows the table: `sevenDayPctAtBlockStart`, `sevenDayPctAtBlockEnd` and `sevenDayPctDeltaPp` are `null` where the table renders `—`. Read a `null` there as withheld, never as zero.
+
+**One condition, on a multi-account install only.** The guarantee is unconditional when the machine has a single Claude account. With more than one, it is conditional on open issue #837: `cctally record-credit` builds its whole credit plan from reads that name no account and resolves the account it stamps only afterwards, so a manual credit's floor can be recorded under an account other than the one whose value it retired. This command's filter is correctly scoped to each block's own account — a credit under one account must not retire another account's observations — so when the floor lands under the wrong account the filter finds no credit for the right one and the retired value is still shown. `cctally account list` reports how many accounts a store holds.
 
 ## Default time window
 

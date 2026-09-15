@@ -704,9 +704,14 @@ def _diff_resolve_used_pct(window: ParsedWindow) -> tuple:
         except Exception:
             return None, "n/a"
         try:
+            # `weekly_observation_held = 0` (#769 S11, #824): a weekly
+            # percentage chosen by capture time. A held row carries an older
+            # row's weekly value under a newer instant, so it can win this
+            # ORDER BY and report a reading the window never observed.
             row = conn.execute(
                 "SELECT weekly_percent FROM weekly_usage_snapshots "
                 "WHERE week_start_date = ? "
+                "  AND weekly_observation_held = 0 "
                 "  AND captured_at_utc <= ? "
                 "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
                 (window.start_utc.date().isoformat(), _iso_z(window.end_utc)),
@@ -728,11 +733,17 @@ def _diff_resolve_used_pct(window: ParsedWindow) -> tuple:
             # Raw rows (NO NULL-bounds filter: legacy NULL rows still count via
             # the helper's NULL tolerance); helper reduces to floored per-week
             # max keyed on week_start_date.
+            # `weekly_observation_held = 0` (#769 S11, #824): the window is a
+            # CAPTURE-TIME range and the reducer takes a per-week MAXIMUM, so a
+            # held row captured inside the window can carry a weekly value from
+            # a row captured outside it and raise that week's maximum above
+            # anything the window observed.
             raw = conn.execute(
                 "SELECT week_start_date, week_start_at, week_end_at, "
                 "       captured_at_utc, weekly_percent "
                 "FROM weekly_usage_snapshots "
-                "WHERE captured_at_utc >= ? AND captured_at_utc < ?",
+                "WHERE weekly_observation_held = 0 "
+                "  AND captured_at_utc >= ? AND captured_at_utc < ?",
                 (_iso_z(window.start_utc), _iso_z(window.end_utc)),
             ).fetchall()
             floored = _floored_week_max(

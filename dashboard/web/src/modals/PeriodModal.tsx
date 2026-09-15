@@ -63,9 +63,14 @@ function weeklyVocabulary(source: DashboardSelection) {
   // "last 12 weeks" would name twelve weeks over a shorter span. The column
   // counts in cycles too, because it shows each row's own start and the
   // second segment of a credited week starts at the credit, not at the week.
-  // Only `window` stays week-flavoured: that names the subscription window,
-  // which the credit genuinely does not rename.
-  return { plural: 'cycles', noun: 'cycle', window: 'Subscription window', column: 'Cycle', nav: undefined };
+  //
+  // #750 S4 D3: `window` is now `Reset cycle` here as well — the same string
+  // the Codex branch above already uses. The earlier comment defended the
+  // week-flavoured name on the grounds that a credit does not rename the
+  // subscription window, which is true and beside the point: the field's
+  // VALUE is the span the row covers, and on a credited week that span is one
+  // cycle rather than the week. The value beside the label is unchanged.
+  return { plural: 'cycles', noun: 'cycle', window: 'Reset cycle', column: 'Cycle', nav: 'cycle' as const };
 }
 
 interface Keyed { key: string; nav: PeriodNavRow; period: PeriodRow; }
@@ -176,10 +181,12 @@ export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panel
   const monthlyPlural = navRows.length === 1 ? 'provider month' : 'provider months';
   const title = navRows.length > 0
     ? source === 'all' && variant === 'week'
-      ? `${panelLabel} · ${navRows.length} ${vocabulary.plural}`
+      ? `${panelLabel} · ${navRows.length} ${navRows.length === 1 ? vocabulary.noun : vocabulary.plural}`
       : source === 'all' && variant === 'month'
         ? `${panelLabel} · ${navRows.length} ${monthlyPlural}`
-        : `${panelLabel} · last ${navRows.length} ${variant === 'week' ? vocabulary.plural : UNIT_PLURAL[variant]}`
+        : `${panelLabel} · last ${navRows.length} ${variant === 'week'
+            ? (navRows.length === 1 ? vocabulary.noun : vocabulary.plural)
+            : UNIT_PLURAL[variant]}`
     : panelLabel;
 
   // #556 S2 §6.3 — the modal owns SELECTION, so it resolves the legs for the

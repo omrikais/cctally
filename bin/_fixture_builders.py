@@ -281,9 +281,24 @@ def create_stats_db(path: Path) -> None:
     the column `_backfill_week_reset_events` reads to name a synthesized
     event's origin, so a fixture that seeds an event WITH an origin must seed
     the originating snapshot's `journal_id` too, or the backfill re-derives
-    the same reset as a second, origin-null row. Production adds `journal_id`
-    to ten further stats tables through the open-time ALTER; those stay as
-    they are, because no fixture seeds a value into them.
+    the same reset as a second, origin-null row.
+
+    `five_hour_blocks.journal_id` is here for the same reason (#769 S4 #795):
+    the dashboard serves a closed block's RETAINED facts instead of
+    recomputing them only when the row carries a stamp, and
+    `_retained_block_facts_many` reads the column directly, so a store
+    without it raises `sqlite3.DatabaseError` and the reader silently falls
+    back to recomputation. A fixture that pins the retained-facts path has to
+    seed a value into the column, so the column belongs in this DDL. The two
+    indexes are the ones `_cctally_core`'s open-time ALTER creates for this
+    table; declaring them here keeps a fixture opened by a real command from
+    silently creating them and flipping its bytes.
+
+    Production adds `journal_id` to nine further stats tables through that
+    same open-time ALTER; those stay as they are, because no fixture seeds a
+    value into them. `tests/test_fixture_builder_contract.py` derives that
+    boundary rather than restating it, so a third table gaining a seeded
+    stamp fails there instead of drifting silently.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -309,6 +324,8 @@ def create_stats_db(path: Path) -> None:
                 five_hour_resets_at TEXT,
                 five_hour_window_key INTEGER,
                 account_key TEXT NOT NULL DEFAULT 'unattributed',
+                weekly_observation_held INTEGER NOT NULL DEFAULT 0
+                    CHECK (weekly_observation_held IN (0, 1)),
                 journal_id TEXT
             );
             CREATE UNIQUE INDEX idx_weekly_usage_snapshots_journal_id
@@ -396,8 +413,13 @@ def create_stats_db(path: Path) -> None:
                 created_at_utc                TEXT    NOT NULL,
                 last_updated_at_utc           TEXT    NOT NULL,
                 account_key                   TEXT    NOT NULL DEFAULT 'unattributed',
+                journal_id                    TEXT,
                 UNIQUE(account_key, five_hour_window_key)
             );
+            CREATE UNIQUE INDEX idx_five_hour_blocks_journal_id
+                ON five_hour_blocks(journal_id) WHERE journal_id IS NOT NULL;
+            CREATE INDEX idx_five_hour_blocks_journal_id_null
+                ON five_hour_blocks(id) WHERE journal_id IS NULL;
             CREATE INDEX idx_five_hour_blocks_block_start
                 ON five_hour_blocks(block_start_at DESC);
 
@@ -660,6 +682,19 @@ def _self_test_create_stats_db() -> None:
             "PRAGMA table_info(weekly_usage_snapshots)")}
         assert "journal_id" in wus_cols, \
             "weekly_usage_snapshots.journal_id missing (drift vs _cctally_core)"
+        # #769 S4 #795. This is the column that silently differed between
+        # fixture generations: a store built by this DDL lacked it, while a
+        # store some scenario opened through `_cctally_core` gained it from
+        # the open-time ALTER. `_retained_block_facts_many` SELECTs it, so a
+        # store without it makes the reader fall back to recomputation
+        # instead of failing. Nothing in the estate executes this module, so
+        # the enforced form of this check is
+        # `tests/test_fixture_builder_contract.py`; this assertion keeps the
+        # self-test honest for a maintainer running it by hand.
+        fhb_cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(five_hour_blocks)")}
+        assert "journal_id" in fhb_cols, \
+            "five_hour_blocks.journal_id missing (drift vs _cctally_core)"
     print("OK: create_stats_db")
 
 

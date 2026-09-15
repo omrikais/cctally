@@ -117,11 +117,16 @@ def _private_corpus(data_dir, tmp_path, name="corpus"):
 def _plan_detail(plan, note=""):
     """A frontier plan's mode AND its reason, for an assertion message.
 
-    ``plan_provider`` distinguishes eleven refusals — ``certificate_expired``,
+    ``plan_provider`` distinguishes eighteen refusals — ``certificate_expired``,
     ``database_replaced``, ``schema_changed``, ``incomplete_store``,
     ``maintenance_changed``, ``hook_config_changed``, ``filesystem_changed``,
-    ``marker_replaced``, ``ambiguous_activity``, ``target_outside_scope`` and
-    ``cursor_gap`` — and every one of them presents to a bare
+    ``marker_replaced``, ``ambiguous_activity``, ``target_outside_scope``,
+    ``cursor_gap``, and #769 S6's SEVEN ledger-continuity refusals
+    ``ledger_epoch_changed``, ``ledger_cursor_beyond_tail``,
+    ``ledger_sequence_gap``, ``ledger_sequence_duplicated``,
+    ``ledger_sequence_regressed``, ``ledger_legacy_record`` and the
+    cross-consumer ``ledger_acknowledgements_irreconcilable`` — and every one
+    of them presents to a bare
     ``assert plan.mode == "caught_up"`` as the single word ``full``. That is
     why no retained log from any past failure of this module could be
     diagnosed after the fact, and why every assertion over a plan here reports
@@ -217,6 +222,57 @@ def _assert_roots_are_private(conn, tables, private_root):
         )
 
 
+def _drop_inherited_source_rows(conn, tables, private_root):
+    """Drop the copied store's source rows that name the tree it was copied FROM.
+
+    A rebuild no longer removes them, and that is deliberate rather than a
+    defect. #777 replaced the unconditional ``conversation_source_files``
+    delete with a prune by difference against the walked set, because those
+    rows carry the ``source_incarnation_id`` every durable account stamp is
+    keyed by. #780 then guarded that prune with disk liveness: a row is deleted
+    only when ``_path_is_genuinely_absent`` confirms its path is really gone,
+    because "absent from this walk" and "absent from disk" are different facts
+    and taking the first for the second lets one unreadable root destroy the
+    only non-re-derivable data in the store. ``test_conversation_account_
+    dimension.py::test_a_path_still_on_disk_survives_a_walk_that_missed_it``
+    states that rule directly.
+
+    Every path this copy inherits names a file in the SHARED corpus, and that
+    corpus is a live directory the other xdist workers are still reading — so
+    the rebuild below correctly keeps all of them, and the copy is what has to
+    drop them. Removing the rows here rather than after the rebuild keeps
+    ``_assert_roots_are_private`` a statement about what the rebuild wrote.
+
+    The Codex twin is dropped through the same loop even though
+    ``_clear_codex_conversation_store`` still truncates its table on every
+    rebuild: the two tables are one frontier root set, and a helper that
+    cleaned only the half that currently needs it would go quietly wrong the
+    day the Codex side adopts the same durable-identity treatment.
+    """
+    for table in tables:
+        stale = [
+            str(row[0]) for row in conn.execute(f"SELECT path FROM {table}")
+            if not pathlib.Path(str(row[0])).resolve().is_relative_to(
+                private_root)
+        ]
+        if not stale:
+            continue
+        placeholders = ",".join("?" for _ in stale)
+        conn.execute(
+            f"DELETE FROM {table} WHERE path IN ({placeholders})", stale)
+        if table == "conversation_source_files":
+            # The stamps and the gap records are keyed by the source path and
+            # become unreachable the moment its row is gone, which is the same
+            # reasoning the production prune applies.
+            conn.execute(
+                "DELETE FROM claude_conversation_account_stamps "
+                f"WHERE canonical_source_path IN ({placeholders})", stale)
+            conn.execute(
+                "DELETE FROM claude_conversation_account_stamp_gaps "
+                f"WHERE source_path IN ({placeholders})", stale)
+    conn.commit()
+
+
 def _private_frontier_corpus(data_dir, tmp_path, bbf, name="corpus"):
     """Copy then rederive cache paths so an exhaustive walk can certify it.
 
@@ -241,6 +297,12 @@ def _private_frontier_corpus(data_dir, tmp_path, bbf, name="corpus"):
     write by any other worker then trips its ``filesystem_changed`` guard and
     degrades the plan to ``full`` — a cross-worker race whose victim is
     whichever test happens to be between its seed and its plan.
+
+    Rederiving ``conversations.db`` is no longer sufficient on its own. The
+    rebuild keeps a source row whose path still exists on disk, and every path
+    this copy inherits does, so ``_drop_inherited_source_rows`` removes them
+    first; its docstring records why that rule is right and why the copy owns
+    the cleanup.
     """
     corpus = _private_corpus(data_dir, tmp_path, name)
     private_root = pathlib.Path(corpus).parent.resolve()
@@ -263,6 +325,8 @@ def _private_frontier_corpus(data_dir, tmp_path, bbf, name="corpus"):
             conn.close()
         conv = cctally.open_conversations_db()
         try:
+            _drop_inherited_source_rows(
+                conv, _FRONTIER_ROOT_TABLES["conversations"], private_root)
             _assert_clean_rebuild(
                 "sync_claude_conversations(rebuild=True)",
                 cctally.sync_claude_conversations(conv, rebuild=True))
@@ -1637,6 +1701,188 @@ def test_frontier_refuses_to_seed_while_maintenance_is_pending(
             conn.close()
 
 
+def _codex_roots_from(conn):
+    """The Codex session roots the private corpus actually ingested."""
+    return tuple(sorted({
+        pathlib.Path(str(row[0])).parent
+        for row in conn.execute(
+            "SELECT path FROM codex_session_files WHERE path LIKE '/%'")
+    }, key=str))
+
+
+def _codex_append_record(session_id: str, marker: str) -> str:
+    """One valid Codex rollout record the ingesters both accept."""
+    return json.dumps({
+        "timestamp": "2026-09-10T12:00:00.000Z",
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": {
+            "last_token_usage": {
+                "input_tokens": 61, "cached_input_tokens": 0,
+                "output_tokens": 41, "reasoning_output_tokens": 0,
+                "total_tokens": 102},
+            "total_token_usage": {"total_tokens": 10_000_000},
+            "marker": marker,
+            "session_id": session_id,
+        }},
+    }, separators=(",", ":")) + "\n"
+
+
+def test_a_codex_append_racing_the_walk_is_found_on_the_next_normal_tick(
+    small_corpus, tmp_path, monkeypatch,
+):
+    """#724, the whole of it, at the freshness bound that produced the lag.
+
+    An append that lands mid-turn moves nothing any guard reads. There is no
+    ticket, because the ticket is written by the post-turn hook; there is no
+    directory change, because the file already existed; and the cursor is the
+    one the walk itself just committed. The measured 83-, 151- and 165-second
+    lag is the certificate's 120-second expiry being the only evidence that
+    ever forced a re-walk.
+
+    The race is the sharpest form of it: the append lands AFTER the walk
+    committed that file's scan target and BEFORE the walk finished, so the
+    certificate the walk mints is already stale at the moment it is minted.
+
+    It passes for a stated reason rather than by accident. The file was just
+    ingested, so it is in the recently-active set; the restat of that bounded
+    set compares its size against the scan target the walk committed; and the
+    clock is held at half the expiry throughout, so nothing here is the age
+    bound firing.
+    """
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    clock = _FrozenClock()
+    monkeypatch.setattr(frontier, "_now", clock)
+    app_dir = pathlib.Path(corpus)
+    marker = "769-s6-racing-append"
+
+    with _corpus_env(corpus, bbf) as cctally:
+        conn = cctally.open_cache_db()
+        try:
+            codex_roots = _codex_roots_from(conn)
+            assert codex_roots, "the private corpus retained no Codex rollout"
+            target_row = conn.execute(
+                "SELECT path, last_session_id FROM codex_session_files "
+                "WHERE path LIKE '/%' ORDER BY size_bytes DESC LIMIT 1"
+            ).fetchone()
+            target = str(target_row[0])
+            session_id = str(target_row[1] or "racing-session")
+
+            accounting = frontier.DashboardIngestFrontier(app_dir)
+            cutoff = accounting.capture_cutoff()
+            assert isinstance(cutoff, frontier.MarkerCutoff)
+        finally:
+            conn.close()
+
+        # The transcript consumer is certified FIRST, over the corpus as it
+        # stands now. Both appends below therefore land behind its certificate
+        # too, which is the real shape of a tick: one pass finishes, the turn
+        # continues, and the next pass has to find what arrived in between.
+        conv = cctally.open_conversations_db()
+        try:
+            transcripts = frontier.ConversationSyncFrontier(app_dir)
+            conversation_cutoff = transcripts.capture_cutoff()
+            cctally.sync_codex_conversations(conv)
+            assert transcripts.seed_provider(
+                "codex", conv, roots=codex_roots, cutoff=conversation_cutoff,
+            ), _seed_detail(transcripts)
+        finally:
+            conv.close()
+
+        conn = cctally.open_cache_db()
+        try:
+            # The walk must actually PROCESS this file for the race to have
+            # a moment to land in, so one ordinary append precedes it. That is
+            # also the real shape of the incident: a turn is under way, the
+            # walk picks the file up, and the next record arrives while the
+            # walk is still running.
+            with open(target, "a", encoding="utf-8") as fh:
+                fh.write(_codex_append_record(session_id, marker + "-pre"))
+                fh.flush()
+                os.fsync(fh.fileno())
+
+            appended = {"done": False}
+
+            def race(path_str):
+                # After THIS file's scan target committed, before the walk
+                # finishes. No ticket is written, exactly as a mid-turn append
+                # produces none.
+                if appended["done"] or path_str != target:
+                    return
+                with open(target, "a", encoding="utf-8") as fh:
+                    fh.write(_codex_append_record(session_id, marker))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                appended["done"] = True
+
+            walk = cctally.sync_codex_cache(conn, _on_file_committed=race)
+            assert appended["done"], (
+                "the race never fired, so this test proves nothing")
+            assert walk.full_walk_complete, walk
+
+            assert accounting.seed_provider(
+                "codex", conn, roots=codex_roots, cutoff=cutoff,
+            ), _seed_detail(accounting)
+        finally:
+            conn.close()
+
+        # Well inside the age bound for every assertion below.
+        clock.advance(frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS * 0.5)
+
+        conn = cctally.open_cache_db()
+        try:
+            plan = _assert_plan(
+                accounting.plan_provider("codex", conn, roots=codex_roots),
+                mode="targeted", reason="recent_activity",
+                note=("the racing append left no ticket, so only the "
+                      "recently-active restat can find it before the expiry"),
+            )
+            assert plan.paths == frozenset({target}), plan.paths
+            stats = cctally.sync_codex_cache(conn, only_paths=set(plan.paths))
+            assert stats.files_failed == 0, stats
+            accounting.commit_provider(plan, conn, roots=codex_roots)
+            published = conn.execute(
+                "SELECT COUNT(*) FROM codex_session_entries "
+                " WHERE source_path=? AND total_tokens=102",
+                (target,)).fetchone()[0]
+            assert published >= 1, (
+                "the appended record never reached the accounting store")
+        finally:
+            conn.close()
+
+        conv = cctally.open_conversations_db()
+        try:
+            conversation_plan = _assert_plan(
+                transcripts.plan_provider("codex", conv, roots=codex_roots),
+                mode="targeted", reason="recent_activity",
+                note="the transcript consumer is blind to the same append",
+            )
+            assert conversation_plan.paths == frozenset({target})
+            cctally.sync_codex_conversations(
+                conv, only_paths=set(conversation_plan.paths))
+            transcripts.commit_provider(
+                conversation_plan, conv, roots=codex_roots)
+            stored = conv.execute(
+                "SELECT COUNT(*) FROM codex_conversation_events "
+                " WHERE source_path=?", (target,)).fetchone()[0]
+            assert stored >= 1, (
+                "the appended record never reached the transcript store")
+        finally:
+            conv.close()
+
+        # One generation, and both consumers on it.
+        assert accounting.evidence_generation("codex") is not None
+        assert (
+            accounting.evidence_generation("codex")
+            == transcripts.evidence_generation("codex")
+        )
+        assert accounting.generation_retired(
+            "codex", accounting.evidence_generation("codex")), (
+            "both consumers committed, so the shared generation must retire")
+
+
 class _FrozenClock:
     """A monotonic clock a test advances deliberately."""
 
@@ -1921,6 +2167,12 @@ def test_activity_marker_write_all_handles_regular_file_short_writes(
     writes = []
 
     def short_then_complete(fd, payload):
+        # Shorten the TICKET's first write, not the ledger sidecar's. #769 S6
+        # routes the sidecar through the same `_write_all`, and the ticket
+        # payload is the one that ends with the record terminator, so that is
+        # what selects it.
+        if not bytes(payload).endswith(b"\n"):
+            return real_write(fd, payload)
         writes.append(len(payload))
         if len(writes) == 1:
             prefix = max(1, len(payload) // 2)
@@ -1931,9 +2183,13 @@ def test_activity_marker_write_all_handles_regular_file_short_writes(
     assert frontier.record_activity(app_dir, "claude", "/tmp/session.jsonl")
     raw = marker.read_bytes()
     assert raw.endswith(b"\n")
-    assert json.loads(raw.decode("utf-8")) == {
-        "path": "/tmp/session.jsonl", "provider": "claude",
-    }
+    record = json.loads(raw.decode("utf-8"))
+    assert record["path"] == "/tmp/session.jsonl"
+    assert record["provider"] == "claude"
+    # #769 S6: every ticket carries the ledger generation it was written under
+    # and its durable sequence in that ledger.
+    assert isinstance(record["epoch"], str) and record["epoch"]
+    assert record["seq"] == 1
     assert len(writes) >= 2
 
 

@@ -278,6 +278,7 @@
         "block_count": 0,
         "detail_stamp": "546943a02c138a59",
         "end_at_utc": "2026-04-20T14:00:00Z",
+        "has_observation_gap": false,
         "is_current": true,
         "key": "milestone_cycle:aZdZxAXXphSd6kEd7WGBxWDlX2Uv6opMPHlqn42hguQ",
         "label": "Apr 17\u2013Apr 20",
@@ -289,6 +290,7 @@
         "block_count": 0,
         "detail_stamp": "9d6c40e1f6663986",
         "end_at_utc": "2026-04-17T13:00:00Z",
+        "has_observation_gap": false,
         "is_current": false,
         "key": "milestone_cycle:_iSnVfr_YQYBaFcecKJyJK5dRhKCjLE9NGJMvrxktZs",
         "label": "Apr 13\u2013Apr 17",
@@ -300,6 +302,7 @@
         "block_count": 0,
         "detail_stamp": "716ec5b81e26a888",
         "end_at_utc": "2026-04-13T14:00:00Z",
+        "has_observation_gap": false,
         "is_current": false,
         "key": "milestone_cycle:LXm8h_xZWmQCCsfaNx8GWmtUmxSnOUXlBAGiAykHUe4",
         "label": "Apr 06\u2013Apr 13",
@@ -311,6 +314,7 @@
         "block_count": 0,
         "detail_stamp": "203f152309b967cf",
         "end_at_utc": "2026-04-06T14:00:00Z",
+        "has_observation_gap": false,
         "is_current": false,
         "key": "milestone_cycle:j9Cobw1pFov3iizWupXqRxuL7uzd99kGEBxA8Jpm7t8",
         "label": "Mar 30\u2013Apr 06",
@@ -322,6 +326,7 @@
         "block_count": 0,
         "detail_stamp": "3938be516ad1feb2",
         "end_at_utc": "2026-03-30T14:00:00Z",
+        "has_observation_gap": false,
         "is_current": false,
         "key": "milestone_cycle:p_fBbPz334KkI6ckAwO9MsGBAbb3GDSjsS0TtMyUSQw",
         "label": "Mar 23\u2013Mar 30",
@@ -333,6 +338,7 @@
         "block_count": 0,
         "detail_stamp": "3de94af742bdb1af",
         "end_at_utc": "2026-03-23T14:00:00Z",
+        "has_observation_gap": false,
         "is_current": false,
         "key": "milestone_cycle:8IMeRkcgcoytuJXKe-jwbM3xxomaywCH9Z1QY62gT90",
         "label": "Mar 16\u2013Mar 23",
@@ -1024,7 +1030,7 @@
         }
       ],
       "total_cost_usd": 7.209999999999999,
-      "week_label": "wk Apr 13",
+      "week_label": "Apr 13",
       "week_start_at": "2026-04-13T00:00:00Z",
       "week_start_date": "2026-04-13"
     },
@@ -1170,31 +1176,36 @@
         {
           "total_cost_usd": 18.0,
           "total_pct": 38.0,
-          "week_label": "wk Mar 16",
+          "week_label": "Mar 16",
+          "week_start_at": "2026-03-16T00:00:00Z",
           "week_start_date": "2026-03-16"
         },
         {
           "total_cost_usd": 18.0,
           "total_pct": 38.0,
-          "week_label": "wk Mar 23",
+          "week_label": "Mar 23",
+          "week_start_at": "2026-03-23T00:00:00Z",
           "week_start_date": "2026-03-23"
         },
         {
           "total_cost_usd": 18.0,
           "total_pct": 38.0,
-          "week_label": "wk Mar 30",
+          "week_label": "Mar 30",
+          "week_start_at": "2026-03-30T00:00:00Z",
           "week_start_date": "2026-03-30"
         },
         {
           "total_cost_usd": 18.0,
           "total_pct": 38.0,
-          "week_label": "wk Apr 06",
+          "week_label": "Apr 06",
+          "week_start_at": "2026-04-06T00:00:00Z",
           "week_start_date": "2026-04-06"
         },
         {
           "total_cost_usd": 7.209999999999999,
           "total_pct": 5.0,
-          "week_label": "wk Apr 13",
+          "week_label": "Apr 13",
+          "week_start_at": "2026-04-13T00:00:00Z",
           "week_start_date": "2026-04-13"
         }
       ],
@@ -1302,7 +1313,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 11,
+  "source_schema_version": 12,
   "sources": {
     "all": {
       "availability": "ok",
@@ -1386,6 +1397,7 @@
       },
       "freshness": "fresh",
       "last_success_at": "2026-04-18T14:00:00Z",
+      "metadata_health": null,
       "warnings": []
     },
     "claude": {
@@ -1618,6 +1630,7 @@
                 "block_count": 0,
                 "detail_stamp": "546943a02c138a59",
                 "end_at_utc": "2026-04-20T14:00:00Z",
+                "has_observation_gap": false,
                 "is_current": true,
                 "key": "milestone_cycle:aZdZxAXXphSd6kEd7WGBxWDlX2Uv6opMPHlqn42hguQ",
                 "label": "Apr 17\u2013Apr 20",
@@ -1629,6 +1642,7 @@
                 "block_count": 0,
                 "detail_stamp": "9d6c40e1f6663986",
                 "end_at_utc": "2026-04-17T13:00:00Z",
+                "has_observation_gap": false,
                 "is_current": false,
                 "key": "milestone_cycle:_iSnVfr_YQYBaFcecKJyJK5dRhKCjLE9NGJMvrxktZs",
                 "label": "Apr 13\u2013Apr 17",
@@ -1640,6 +1654,7 @@
                 "block_count": 0,
                 "detail_stamp": "716ec5b81e26a888",
                 "end_at_utc": "2026-04-13T14:00:00Z",
+                "has_observation_gap": false,
                 "is_current": false,
                 "key": "milestone_cycle:LXm8h_xZWmQCCsfaNx8GWmtUmxSnOUXlBAGiAykHUe4",
                 "label": "Apr 06\u2013Apr 13",
@@ -1651,6 +1666,7 @@
                 "block_count": 0,
                 "detail_stamp": "203f152309b967cf",
                 "end_at_utc": "2026-04-06T14:00:00Z",
+                "has_observation_gap": false,
                 "is_current": false,
                 "key": "milestone_cycle:j9Cobw1pFov3iizWupXqRxuL7uzd99kGEBxA8Jpm7t8",
                 "label": "Mar 30\u2013Apr 06",
@@ -1662,6 +1678,7 @@
                 "block_count": 0,
                 "detail_stamp": "3938be516ad1feb2",
                 "end_at_utc": "2026-03-30T14:00:00Z",
+                "has_observation_gap": false,
                 "is_current": false,
                 "key": "milestone_cycle:p_fBbPz334KkI6ckAwO9MsGBAbb3GDSjsS0TtMyUSQw",
                 "label": "Mar 23\u2013Mar 30",
@@ -1673,6 +1690,7 @@
                 "block_count": 0,
                 "detail_stamp": "3de94af742bdb1af",
                 "end_at_utc": "2026-03-23T14:00:00Z",
+                "has_observation_gap": false,
                 "is_current": false,
                 "key": "milestone_cycle:8IMeRkcgcoytuJXKe-jwbM3xxomaywCH9Z1QY62gT90",
                 "label": "Mar 16\u2013Mar 23",
@@ -1798,7 +1816,8 @@
                 "dollar_per_pct": 0.39473684210526316,
                 "is_current": false,
                 "label": "Mar 16",
-                "used_pct": 38.0
+                "used_pct": 38.0,
+                "week_start_at": "2026-03-16T14:00:00Z"
               },
               {
                 "cost_usd": 15.0,
@@ -1806,7 +1825,8 @@
                 "dollar_per_pct": 0.39473684210526316,
                 "is_current": false,
                 "label": "Mar 23",
-                "used_pct": 38.0
+                "used_pct": 38.0,
+                "week_start_at": "2026-03-23T14:00:00Z"
               },
               {
                 "cost_usd": 15.0,
@@ -1814,7 +1834,8 @@
                 "dollar_per_pct": 0.39473684210526316,
                 "is_current": false,
                 "label": "Mar 30",
-                "used_pct": 38.0
+                "used_pct": 38.0,
+                "week_start_at": "2026-03-30T14:00:00Z"
               },
               {
                 "cost_usd": 15.0,
@@ -1822,7 +1843,8 @@
                 "dollar_per_pct": 0.39473684210526316,
                 "is_current": false,
                 "label": "Apr 06",
-                "used_pct": 38.0
+                "used_pct": 38.0,
+                "week_start_at": "2026-04-06T14:00:00Z"
               },
               {
                 "cost_usd": 0.0,
@@ -1830,7 +1852,8 @@
                 "dollar_per_pct": 0.0,
                 "is_current": true,
                 "label": "Apr 13",
-                "used_pct": 5.0
+                "used_pct": 5.0,
+                "week_start_at": "2026-04-13T14:00:00Z"
               }
             ],
             "history_median_dpp": 0.39473684210526316,
@@ -1848,7 +1871,8 @@
                 "dollar_per_pct": 0.39473684210526316,
                 "is_current": false,
                 "label": "Mar 16",
-                "used_pct": 38.0
+                "used_pct": 38.0,
+                "week_start_at": "2026-03-16T14:00:00Z"
               },
               {
                 "cost_usd": 15.0,
@@ -1856,7 +1880,8 @@
                 "dollar_per_pct": 0.39473684210526316,
                 "is_current": false,
                 "label": "Mar 23",
-                "used_pct": 38.0
+                "used_pct": 38.0,
+                "week_start_at": "2026-03-23T14:00:00Z"
               },
               {
                 "cost_usd": 15.0,
@@ -1864,7 +1889,8 @@
                 "dollar_per_pct": 0.39473684210526316,
                 "is_current": false,
                 "label": "Mar 30",
-                "used_pct": 38.0
+                "used_pct": 38.0,
+                "week_start_at": "2026-03-30T14:00:00Z"
               },
               {
                 "cost_usd": 15.0,
@@ -1872,7 +1898,8 @@
                 "dollar_per_pct": 0.39473684210526316,
                 "is_current": false,
                 "label": "Apr 06",
-                "used_pct": 38.0
+                "used_pct": 38.0,
+                "week_start_at": "2026-04-06T14:00:00Z"
               },
               {
                 "cost_usd": 0.0,
@@ -1880,7 +1907,8 @@
                 "dollar_per_pct": 0.0,
                 "is_current": true,
                 "label": "Apr 13",
-                "used_pct": 5.0
+                "used_pct": 5.0,
+                "week_start_at": "2026-04-13T14:00:00Z"
               }
             ]
           }
@@ -3044,7 +3072,7 @@
               }
             ],
             "total_cost_usd": 7.209999999999999,
-            "week_label": "wk Apr 13",
+            "week_label": "Apr 13",
             "week_start_at": "2026-04-13T00:00:00Z",
             "week_start_date": "2026-04-13"
           },
@@ -3206,31 +3234,36 @@
               {
                 "total_cost_usd": 18.0,
                 "total_pct": 38.0,
-                "week_label": "wk Mar 16",
+                "week_label": "Mar 16",
+                "week_start_at": "2026-03-16T00:00:00Z",
                 "week_start_date": "2026-03-16"
               },
               {
                 "total_cost_usd": 18.0,
                 "total_pct": 38.0,
-                "week_label": "wk Mar 23",
+                "week_label": "Mar 23",
+                "week_start_at": "2026-03-23T00:00:00Z",
                 "week_start_date": "2026-03-23"
               },
               {
                 "total_cost_usd": 18.0,
                 "total_pct": 38.0,
-                "week_label": "wk Mar 30",
+                "week_label": "Mar 30",
+                "week_start_at": "2026-03-30T00:00:00Z",
                 "week_start_date": "2026-03-30"
               },
               {
                 "total_cost_usd": 18.0,
                 "total_pct": 38.0,
-                "week_label": "wk Apr 06",
+                "week_label": "Apr 06",
+                "week_start_at": "2026-04-06T00:00:00Z",
                 "week_start_date": "2026-04-06"
               },
               {
                 "total_cost_usd": 7.209999999999999,
                 "total_pct": 5.0,
-                "week_label": "wk Apr 13",
+                "week_label": "Apr 13",
+                "week_start_at": "2026-04-13T00:00:00Z",
                 "week_start_date": "2026-04-13"
               }
             ],
@@ -3344,6 +3377,7 @@
                 "block_count": 0,
                 "detail_stamp": "546943a02c138a59",
                 "end_at_utc": "2026-04-20T14:00:00Z",
+                "has_observation_gap": false,
                 "is_current": true,
                 "key": "milestone_cycle:aZdZxAXXphSd6kEd7WGBxWDlX2Uv6opMPHlqn42hguQ",
                 "label": "Apr 17\u2013Apr 20",
@@ -3355,6 +3389,7 @@
                 "block_count": 0,
                 "detail_stamp": "9d6c40e1f6663986",
                 "end_at_utc": "2026-04-17T13:00:00Z",
+                "has_observation_gap": false,
                 "is_current": false,
                 "key": "milestone_cycle:_iSnVfr_YQYBaFcecKJyJK5dRhKCjLE9NGJMvrxktZs",
                 "label": "Apr 13\u2013Apr 17",
@@ -3366,6 +3401,7 @@
                 "block_count": 0,
                 "detail_stamp": "716ec5b81e26a888",
                 "end_at_utc": "2026-04-13T14:00:00Z",
+                "has_observation_gap": false,
                 "is_current": false,
                 "key": "milestone_cycle:LXm8h_xZWmQCCsfaNx8GWmtUmxSnOUXlBAGiAykHUe4",
                 "label": "Apr 06\u2013Apr 13",
@@ -3377,6 +3413,7 @@
                 "block_count": 0,
                 "detail_stamp": "203f152309b967cf",
                 "end_at_utc": "2026-04-06T14:00:00Z",
+                "has_observation_gap": false,
                 "is_current": false,
                 "key": "milestone_cycle:j9Cobw1pFov3iizWupXqRxuL7uzd99kGEBxA8Jpm7t8",
                 "label": "Mar 30\u2013Apr 06",
@@ -3388,6 +3425,7 @@
                 "block_count": 0,
                 "detail_stamp": "3938be516ad1feb2",
                 "end_at_utc": "2026-03-30T14:00:00Z",
+                "has_observation_gap": false,
                 "is_current": false,
                 "key": "milestone_cycle:p_fBbPz334KkI6ckAwO9MsGBAbb3GDSjsS0TtMyUSQw",
                 "label": "Mar 23\u2013Mar 30",
@@ -3399,6 +3437,7 @@
                 "block_count": 0,
                 "detail_stamp": "3de94af742bdb1af",
                 "end_at_utc": "2026-03-23T14:00:00Z",
+                "has_observation_gap": false,
                 "is_current": false,
                 "key": "milestone_cycle:8IMeRkcgcoytuJXKe-jwbM3xxomaywCH9Z1QY62gT90",
                 "label": "Mar 16\u2013Mar 23",
@@ -3563,6 +3602,7 @@
       },
       "freshness": "fresh",
       "last_success_at": "2026-04-18T14:00:00Z",
+      "metadata_health": null,
       "warnings": []
     },
     "codex": {
@@ -3732,6 +3772,11 @@
       },
       "freshness": "fresh",
       "last_success_at": "2026-04-18T14:00:00Z",
+      "metadata_health": {
+        "incomplete_rows": 0,
+        "retryable": false,
+        "state": "healthy"
+      },
       "warnings": []
     }
   },
@@ -3756,7 +3801,8 @@
         "dollar_per_pct": 0.39473684210526316,
         "is_current": false,
         "label": "Mar 16",
-        "used_pct": 38.0
+        "used_pct": 38.0,
+        "week_start_at": "2026-03-16T14:00:00Z"
       },
       {
         "cost_usd": 15.0,
@@ -3764,7 +3810,8 @@
         "dollar_per_pct": 0.39473684210526316,
         "is_current": false,
         "label": "Mar 23",
-        "used_pct": 38.0
+        "used_pct": 38.0,
+        "week_start_at": "2026-03-23T14:00:00Z"
       },
       {
         "cost_usd": 15.0,
@@ -3772,7 +3819,8 @@
         "dollar_per_pct": 0.39473684210526316,
         "is_current": false,
         "label": "Mar 30",
-        "used_pct": 38.0
+        "used_pct": 38.0,
+        "week_start_at": "2026-03-30T14:00:00Z"
       },
       {
         "cost_usd": 15.0,
@@ -3780,7 +3828,8 @@
         "dollar_per_pct": 0.39473684210526316,
         "is_current": false,
         "label": "Apr 06",
-        "used_pct": 38.0
+        "used_pct": 38.0,
+        "week_start_at": "2026-04-06T14:00:00Z"
       },
       {
         "cost_usd": 0.0,
@@ -3788,7 +3837,8 @@
         "dollar_per_pct": 0.0,
         "is_current": true,
         "label": "Apr 13",
-        "used_pct": 5.0
+        "used_pct": 5.0,
+        "week_start_at": "2026-04-13T14:00:00Z"
       }
     ],
     "history_median_dpp": 0.39473684210526316,
@@ -3806,7 +3856,8 @@
         "dollar_per_pct": 0.39473684210526316,
         "is_current": false,
         "label": "Mar 16",
-        "used_pct": 38.0
+        "used_pct": 38.0,
+        "week_start_at": "2026-03-16T14:00:00Z"
       },
       {
         "cost_usd": 15.0,
@@ -3814,7 +3865,8 @@
         "dollar_per_pct": 0.39473684210526316,
         "is_current": false,
         "label": "Mar 23",
-        "used_pct": 38.0
+        "used_pct": 38.0,
+        "week_start_at": "2026-03-23T14:00:00Z"
       },
       {
         "cost_usd": 15.0,
@@ -3822,7 +3874,8 @@
         "dollar_per_pct": 0.39473684210526316,
         "is_current": false,
         "label": "Mar 30",
-        "used_pct": 38.0
+        "used_pct": 38.0,
+        "week_start_at": "2026-03-30T14:00:00Z"
       },
       {
         "cost_usd": 15.0,
@@ -3830,7 +3883,8 @@
         "dollar_per_pct": 0.39473684210526316,
         "is_current": false,
         "label": "Apr 06",
-        "used_pct": 38.0
+        "used_pct": 38.0,
+        "week_start_at": "2026-04-06T14:00:00Z"
       },
       {
         "cost_usd": 0.0,
@@ -3838,7 +3892,8 @@
         "dollar_per_pct": 0.0,
         "is_current": true,
         "label": "Apr 13",
-        "used_pct": 5.0
+        "used_pct": 5.0,
+        "week_start_at": "2026-04-13T14:00:00Z"
       }
     ]
   },

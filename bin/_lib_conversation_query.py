@@ -1203,20 +1203,45 @@ def _rollup_authoritative(conn) -> bool:
     durable ``conversation_sessions_backfill_pending`` flag is NOT set, so the
     rollup has been fully recomputed and the fast read is safe.
 
-    Returns True (authoritative) when the flag is absent, including the case
-    where cache_meta does not exist at all (a path-less / schema-not-applied or
-    in-memory connection). This mirrors Task A's
-    _conversation_sessions_backfill_pending OperationalError degrade-to-False —
-    here that means "no pending flag" -> authoritative -> read the rollup. A
-    populated cache.db always has cache_meta, so this only affects bare conns."""
+    FAILS CLOSED on a read it could not perform (#769 S3, the read side of
+    #728). It used to `except sqlite3.OperationalError: return True`, so a
+    locked or otherwise unreadable store reported the rollup as authoritative
+    and the rail served a rollup nothing had verified. That is the same failure
+    class the writer sites had, in the more dangerous direction: a refused
+    write costs a stale rollup, while a wrongly-authoritative read costs a
+    wrong answer. A read that did not happen now reports "not authoritative",
+    which costs live aggregation.
+
+    The one carve-out is structural and matches
+    `_cctally_cache._read_pricing_fingerprint_observation` exactly: a store
+    whose ``sqlite_master`` probe positively shows no ``cache_meta`` table
+    determinately holds no pending flag, so it stays authoritative. That keeps
+    every bare / in-memory / schema-not-applied connection on the fast path,
+    which is the case the old blanket True was actually protecting. The probe
+    itself fails closed: a lock that defeats the flag SELECT defeats the probe
+    too, so an unanswerable probe is a failed read, not an absent table."""
     try:
         pending = conn.execute(
             "SELECT 1 FROM cache_meta "
             "WHERE key='conversation_sessions_backfill_pending'"
         ).fetchone() is not None
     except sqlite3.OperationalError:
-        return True
+        return not _cache_meta_table_present(conn)
     return not pending
+
+
+def _cache_meta_table_present(conn) -> bool:
+    """Whether ``cache_meta`` exists, answering False only on a probe that
+    succeeded and found nothing. An unanswerable probe reports True, so its
+    caller treats the store as one it failed to read rather than one that has
+    nowhere to record state."""
+    try:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='cache_meta'"
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        return True
 
 
 # --- Browse-list filter predicates (spec §2) ------------------------------
@@ -1492,12 +1517,26 @@ def list_conversation_facets(conn) -> dict:
 
     Returns ``{"projects": [{"project_label", "count"}, ...],
                 "models": [{"family", "count"}, ...]}``."""
-    rows = conn.execute(
-        "SELECT project_label, COUNT(*) FROM conversation_sessions "
-        "WHERE project_label IS NOT NULL AND project_label != '' "
-        "GROUP BY project_label ORDER BY project_label"
-    ).fetchall()
-    projects = [{"project_label": p, "count": n} for p, n in rows]
+    # #717. `projects` is read from the rollup, so while the rollup is being
+    # rebuilt this list is empty for a reason no client can infer from an
+    # empty array — and "no projects" and "the projects are not indexed yet"
+    # are different facts that call for different words in the popover.
+    #
+    # The authority is `_rollup_authoritative` — the absence of
+    # `conversation_sessions_backfill_pending` — and explicitly NOT the
+    # pricing refusal latch: a rebuild pre-clear refusal coexists with an
+    # intact authoritative rollup and arms no backfill flag, so keying on it
+    # would degrade a rail that is perfectly correct.
+    degraded = not _rollup_authoritative(conn)
+    if degraded:
+        projects: list = []
+    else:
+        rows = conn.execute(
+            "SELECT project_label, COUNT(*) FROM conversation_sessions "
+            "WHERE project_label IS NOT NULL AND project_label != '' "
+            "GROUP BY project_label ORDER BY project_label"
+        ).fetchall()
+        projects = [{"project_label": p, "count": n} for p, n in rows]
 
     fam_sessions: dict = {}
     for sid, model in conn.execute(
@@ -1513,7 +1552,15 @@ def list_conversation_facets(conn) -> dict:
         for fam in _MODEL_FAMILY_ORDER
         if fam in fam_sessions
     ]
-    return {"projects": projects, "models": models}
+    # `models` keeps its live counts in both states: it folds
+    # `conversation_messages` directly and never touches the rollup, so a
+    # pending backfill does not make it wrong. The flag is OMITTED on the
+    # authoritative path, so the ordinary envelope is byte-identical to what
+    # every existing consumer already parses.
+    facets = {"projects": projects, "models": models}
+    if degraded:
+        facets["filter_degraded"] = True
+    return facets
 
 
 def _selected_conversation_summary(conn, session_id):

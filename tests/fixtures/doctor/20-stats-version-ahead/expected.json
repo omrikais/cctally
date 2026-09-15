@@ -210,11 +210,11 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 45,
+                            "registry_size": 46,
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1013,
+                            "epoch": 1015,
                             "journal_has_bytes": false,
                             "journal_present": false,
                             "legacy_head": 13,
@@ -225,7 +225,7 @@
                     "id": "db.version_ahead",
                     "remediation": "Restore the journal/ directory from backup, then run `cctally db rebuild --db stats`",
                     "severity": "warn",
-                    "summary": "stats.db index mismatch (v99 \u2260 epoch v1013) \u2014 no journal data available",
+                    "summary": "stats.db index mismatch (v99 \u2260 epoch v1015) \u2014 no journal data available",
                     "title": "Version ahead"
                 },
                 {
@@ -279,7 +279,8 @@
                                     "042_codex_entries_root_path_index",
                                     "043_codex_window_attributions",
                                     "044_codex_accounting_change_ledger",
-                                    "045_conversation_render_revision_columns"
+                                    "045_conversation_render_revision_columns",
+                                    "046_codex_source_file_identity"
                                 ],
                                 "skipped": []
                             },
@@ -307,7 +308,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/58 applied",
+                    "summary": "0/59 applied",
                     "title": "Migrations"
                 },
                 {
@@ -544,13 +545,17 @@
                             [
                                 "cache.db",
                                 "045_conversation_render_revision_columns"
+                            ],
+                            [
+                                "cache.db",
+                                "046_codex_source_file_identity"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "58 pending",
+                    "summary": "59 pending",
                     "title": "Pending migrations"
                 },
                 {

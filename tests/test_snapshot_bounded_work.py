@@ -71,6 +71,105 @@ def _widen_corpus(cache, *, files=3, per_file=4, prefix="widened",
     cache.commit()
 
 
+#: The shape `_broaden_corpus` builds, asserted by its own callers so a
+#: fixture that quietly stopped producing several of each thing fails there
+#: rather than silently narrowing every test built on it.
+BROADENED_ACCOUNTS = ("acct-alpha", "acct-beta", "acct-gamma")
+BROADENED_MODELS = ("gpt-5", "gpt-5-codex", "gpt-5.1-codex-mini")
+#: Four projects across two roots, and the FIRST TWO COLLIDE on their label:
+#: `assign_collision_safe_project_labels` only has work to do when two distinct
+#: project keys present the same basename, and a corpus of one project never
+#: reaches that branch at all.
+BROADENED_CWDS = (
+    "/broadened/one/api",
+    "/broadened/two/api",
+    "/broadened/three/web",
+    "/broadened/four/ledger",
+)
+BROADENED_SESSIONS = 6
+BROADENED_ROWS_PER_SESSION = 9
+
+
+def _broaden_corpus(cache, *, days=5):
+    """A population with several of everything, not thirteen clones of one row.
+
+    `_widen_corpus` above clones ONE template row twelve times: same account,
+    same session, same model, same project, same conversation. That is the
+    right fixture for the bound it was written for — entries must outnumber
+    files — and the wrong one for anything that partitions the population,
+    because every partition then has exactly one bucket. A label algorithm with
+    one project never resolves a collision, an eviction order with one bucket
+    is trivially correct, and a double-charge residual over one shared string
+    counted thirteen times is far inside any bound a test could state.
+
+    This builds 3 accounts x 4 projects (two of which collide on their label)
+    x 6 sessions x 3 models over `days` days, with one physical rollout path
+    per session, and returns the shape it produced so a caller can assert
+    against it rather than trusting this docstring.
+    """
+    template = cache.execute(
+        "SELECT timestamp_utc, session_id, model, input_tokens, "
+        "cached_input_tokens, output_tokens, reasoning_output_tokens, "
+        "total_tokens, source_root_key, conversation_key "
+        "FROM codex_session_entries ORDER BY id LIMIT 1"
+    ).fetchone()
+    assert template is not None, "precondition: the corpus synced a row"
+    root_key = str(template[8])
+    base = dt.datetime(2026, 7, 2, tzinfo=dt.timezone.utc)
+
+    conversations: list[tuple[str, str]] = []
+    for index, cwd in enumerate(BROADENED_CWDS):
+        conversation_key = f"broadened-conv-{index}"
+        cache.execute(
+            "INSERT OR REPLACE INTO codex_conversation_threads "
+            "(conversation_key, source_root_key, native_thread_id, "
+            " root_thread_id, parent_thread_id, source_path, cwd, git_json, "
+            " source_kind, thread_source_json, model_provider, "
+            " context_window, first_seen_utc, last_seen_utc) "
+            "VALUES (?,?,?,?,NULL,?,?,NULL,'rollout',NULL,'openai',NULL,?,?)",
+            (conversation_key, root_key, f"native-{index}",
+             f"native-{index}", f"/broadened/rollout-{index}.jsonl", cwd,
+             base.isoformat(), base.isoformat()),
+        )
+        conversations.append((conversation_key, cwd))
+
+    offset = 700_000
+    rows = 0
+    for session_index in range(BROADENED_SESSIONS):
+        conversation_key, _cwd = conversations[
+            session_index % len(conversations)]
+        account = BROADENED_ACCOUNTS[session_index % len(BROADENED_ACCOUNTS)]
+        session_id = f"broadened-session-{session_index}"
+        path = f"/broadened/rollout-{session_index}.jsonl"
+        for row_index in range(BROADENED_ROWS_PER_SESSION):
+            offset += 1
+            model = BROADENED_MODELS[row_index % len(BROADENED_MODELS)]
+            stamp = base + dt.timedelta(
+                days=(row_index % days), hours=session_index, minutes=row_index)
+            cache.execute(
+                "INSERT INTO codex_session_entries "
+                "(source_path, line_offset, timestamp_utc, session_id, "
+                " model, input_tokens, cached_input_tokens, output_tokens, "
+                " reasoning_output_tokens, total_tokens, source_root_key, "
+                " conversation_key, account_key) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (path, offset, stamp.isoformat(), session_id, model,
+                 100 + row_index, 10 + row_index, 20 + row_index,
+                 5 + row_index, 135 + 4 * row_index, root_key,
+                 conversation_key, account),
+            )
+            rows += 1
+    cache.commit()
+    return {
+        "rows": rows,
+        "accounts": len(BROADENED_ACCOUNTS),
+        "models": len(BROADENED_MODELS),
+        "sessions": BROADENED_SESSIONS,
+        "conversations": len(conversations),
+        "root_key": root_key,
+    }
+
+
 @pytest.fixture
 def source_env(tmp_path, monkeypatch):
     ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
@@ -88,6 +187,68 @@ def _context(module, cache, stats, *, now_utc=None):
         cache_conn=cache, stats_conn=stats, range_start=START,
         now_utc=NOW if now_utc is None else now_utc, display_tz_name="UTC",
     )
+
+
+def test_the_broadened_corpus_really_collides_two_project_labels(
+    tmp_path, monkeypatch,
+):
+    """`BROADENED_CWDS` exists to create a collision; nothing checked that it does.
+
+    The tuple's own comment says its first two entries collide on their label,
+    because `assign_collision_safe_project_labels` has work to do only when two
+    DISTINCT project keys present the same basename. No assertion held it
+    there, so an edit to that tuple could remove the collision and every test
+    built on the fixture would stay green while quietly losing the branch the
+    fixture exists to reach.
+
+    This module defines `_broaden_corpus` and was the one of its five modules
+    that never called it. It calls it here, which is the answer to that as
+    well.
+    """
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        _widen_corpus(cache)
+        shape = _broaden_corpus(cache)
+        assert shape["conversations"] == len(BROADENED_CWDS), shape
+        module.reset_codex_source_caches()
+        module.build_codex_source_state(
+            _context(module, cache, stats), data_version="label-collision")
+
+        states = [
+            state for state in module._CODEX_PROJECT_LABEL_CACHE.values()
+            if isinstance(state, dict) and state.get("label_counts")
+        ]
+        assert states, (
+            "non-vacuity: the build must have labelled a population")
+        keys_by_label: dict[str, set[str]] = {}
+        labels: dict[str, str] = {}
+        for state in states:
+            labels.update(state["labels"])
+            for project_key, project_label in state["label_counts"]:
+                keys_by_label.setdefault(project_label, set()).add(project_key)
+
+        collided = {
+            label: keys for label, keys in keys_by_label.items()
+            if len(keys) > 1
+        }
+        assert collided, (
+            "two of BROADENED_CWDS must present DISTINCT project keys under "
+            "ONE label, or the collision branch is never reached; the corpus "
+            f"produced {sorted(keys_by_label)}")
+        for label, keys in collided.items():
+            display = {labels[key] for key in keys}
+            assert len(display) == len(keys), (
+                f"{len(keys)} project keys collided on {label!r} and "
+                f"disambiguated to {sorted(display)}, so two projects share "
+                "one display label")
+            for shown in display:
+                assert shown.startswith(label), (
+                    f"{shown!r} does not disambiguate {label!r}")
+    finally:
+        module.reset_codex_source_caches()
+        cache.close()
+        stats.close()
 
 
 def test_retained_size_is_cycle_safe_and_stops_above_the_budget():
@@ -182,75 +343,70 @@ def test_retained_size_background_pass_is_cooperatively_cancellable():
         )
 
 
-def test_source_memory_worker_cancels_a_live_superseded_generation(monkeypatch):
-    """Latest-wins must interrupt the active walk, not only replace pending."""
-    import _cctally_dashboard_sources as module
-    from _lib_retained_size import RetainedSizeCancelled
+def test_a_superseded_source_generation_is_never_published_stale():
+    """Latest-wins, with nothing left running to publish an older answer.
 
-    started = threading.Event()
-    cancel_observed = threading.Event()
-
-    def controlled(value, *, stop_after, cancelled: callable):
-        generation = value[0]["generation"]
-        if generation == 1:
-            started.set()
-            while not cancelled():
-                time.sleep(0.001)
-            cancel_observed.set()
-            raise RetainedSizeCancelled()
-        return 222
-
-    monkeypatch.setattr(module, "retained_size_bytes", controlled)
-    worker = module._CodexSourceMemoryWorker()
-    worker.submit(1, ({"generation": 1},))
-    assert started.wait(PRESENCE_BACKSTOP_SECONDS)
-    worker.submit(2, ({"generation": 2},))
-
-    deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
-    result = None
-    while result is None and time.monotonic() < deadline:
-        result = worker.take_result()
-        time.sleep(0.005)
-    assert result == (2, 222, None)
-    assert cancel_observed.is_set()
-    assert worker.shutdown()
-
-
-def test_source_memory_worker_reports_and_recovers_from_traversal_error(
-    monkeypatch,
-):
-    """One bad object graph cannot kill the sole verifier silently."""
+    A background verifier had to be interrupted when a newer generation
+    arrived, because a walk that started against generation 1 would otherwise
+    publish generation 1's bytes over generation 2's. The charge now happens
+    inside the mutation that caused it, so there is no walk to supersede and
+    the published total is by construction the total after the last mutation.
+    """
     import _cctally_dashboard_sources as module
 
+    module.reset_codex_source_caches()
+    try:
+        module._CODEX_PERIOD_VIEW_CACHE["one"] = ("payload",) * 40
+        module.enforce_codex_source_accelerator_bounds()
+        first = module.codex_source_accelerator_memory_stats()["estimatedBytes"]
+
+        module._CODEX_PERIOD_VIEW_CACHE["one"] = ("payload",)
+        module.enforce_codex_source_accelerator_bounds()
+        second = module.codex_source_accelerator_memory_stats()[
+            "estimatedBytes"]
+
+        assert 0 < second < first
+        assert second == module.codex_source_retained_bytes()
+    finally:
+        module.reset_codex_source_caches()
+
+
+def test_a_source_charge_failure_does_not_stop_later_charges():
+    """One bad object graph cannot silently stop the accounting.
+
+    The background verifier reported a traversal failure and then carried on
+    with the next generation. The inline charge keeps both halves of that: the
+    failure is counted on the same diagnostic counter, and the next mutation
+    charges normally rather than leaving the owner permanently at zero.
+    """
+    import _cctally_dashboard_sources as module
+
+    module.reset_codex_source_caches()
+    cache = module._CODEX_PERIOD_VIEW_CACHE
+    original = cache._cache_owner_charge
     calls = 0
 
-    def flaky(_value, *, stop_after, cancelled):
+    def flaky(key, value):
         nonlocal calls
         calls += 1
         if calls == 1:
-            raise RuntimeError("synthetic traversal failure")
-        return 333
+            raise RuntimeError("synthetic charge failure")
+        return original(key, value)
 
-    monkeypatch.setattr(module, "retained_size_bytes", flaky)
-    worker = module._CodexSourceMemoryWorker()
-    worker.submit(1, ({"generation": 1},))
-    deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
-    first = None
-    while first is None and time.monotonic() < deadline:
-        first = worker.take_result()
-        time.sleep(0.005)
-    assert first is not None
-    assert first[0:2] == (1, None)
-    assert "synthetic traversal failure" in first[2]
+    before = module.codex_source_accelerator_memory_stats()[
+        "measurementErrorCount"]
+    cache._cache_owner_charge = flaky
+    try:
+        cache["first"] = ("payload",) * 8
+        assert cache.retained_owner_bytes == 0
+        assert module.codex_source_accelerator_memory_stats()[
+            "measurementErrorCount"] == before + 1
 
-    worker.submit(2, ({"generation": 2},))
-    deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
-    second = None
-    while second is None and time.monotonic() < deadline:
-        second = worker.take_result()
-        time.sleep(0.005)
-    assert second == (2, 333, None)
-    assert worker.shutdown()
+        cache["second"] = ("payload",) * 8
+        assert cache.retained_owner_bytes > 0
+    finally:
+        cache._cache_owner_charge = original
+        module.reset_codex_source_caches()
 
 
 def test_the_path_memo_parses_once_per_distinct_session_file(
@@ -1560,10 +1716,17 @@ def test_the_cold_reset_covers_every_cache_the_build_checkpoints(source_env):
         "reset_codex_source_caches left a checkpointed cache populated")
 
 
-def test_complete_source_accelerator_owner_fails_closed_on_entry_overflow(
+def test_complete_source_accelerator_owner_bounds_the_entry_count(
     source_env, monkeypatch,
 ):
-    """All eleven caches share one numeric byte and entry admission owner."""
+    """All eleven caches share one numeric byte and entry admission owner.
+
+    The owner used to fail CLOSED by clearing every cache, which made a
+    population permanently above the cap rebuild and discard on every
+    generation. #769 S6 T2a replaced that with byte-weighted segmented
+    eviction, so the bound is now stated as the bound: the entry count comes
+    down to the cap, and what fits stays resident.
+    """
     _ns, _cache, _stats, module = source_env
     module.reset_codex_source_caches()
     module._CODEX_PERIOD_VIEW_CACHE["one"] = object()
@@ -1572,45 +1735,62 @@ def test_complete_source_accelerator_owner_fails_closed_on_entry_overflow(
 
     module.enforce_codex_source_accelerator_bounds()
 
-    assert not any(module._codex_source_caches())
     observed = dict(module.codex_source_accelerator_memory_stats())
-    assert observed["entryCount"] == 0
+    assert observed["entryCount"] == 1
     assert observed["maxEntries"] == 1
-    assert observed["fallbackCount"] >= 1
+    assert observed["evictionCount"] >= 1
+    assert sum(len(cache) for cache in module._codex_source_caches()) == 1
 
 
 @pytest.mark.parametrize("outcome", ["over-cap", "error"])
-def test_source_memory_worker_enforces_completion_without_another_publisher(
+def test_source_admission_owns_its_eviction_on_the_publishing_thread(
     monkeypatch, outcome,
 ):
-    """A current unsafe result owns its eviction, including frozen mode."""
+    """An unsafe generation is evicted by the tick that produced it.
+
+    This used to require a background verifier to finish a walk and then take
+    the publisher's lock to evict without waiting for another tick. Retained
+    bytes are known when the mutation returns, so admission decides on the
+    publisher's own thread and there is nothing to wait for. Both unsafe
+    outcomes are still covered: a total above the ceiling, and a charge that
+    cannot be computed, which is counted and deflates the total rather than
+    taking the write with it.
+    """
     import _cctally_dashboard_sources as module
 
-    worker = module._CodexSourceMemoryWorker()
-    monkeypatch.setattr(module, "_CODEX_SOURCE_MEMORY_WORKER", worker)
     module.reset_codex_source_caches()
-    module.set_codex_source_memory_completion_lock(threading.Lock())
 
-    def measured(_value, **_kwargs):
-        if outcome == "error":
-            raise RuntimeError("measured failure")
-        return module._CODEX_SOURCE_ACCELERATOR_MAX_BYTES + 1
+    if outcome == "error":
+        def charge(_key, _value):
+            raise RuntimeError("charge failed")
 
-    monkeypatch.setattr(module, "retained_size_bytes", measured)
-    module._CODEX_PERIOD_VIEW_CACHE["resident"] = object()
-    try:
-        module.enforce_codex_source_accelerator_bounds()
-        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
-        while module._CODEX_PERIOD_VIEW_CACHE and time.monotonic() < deadline:
-            time.sleep(0.005)
+        monkeypatch.setattr(
+            module._CODEX_PERIOD_VIEW_CACHE, "_cache_owner_charge", charge)
+    else:
+        monkeypatch.setattr(module, "_CODEX_SOURCE_ACCELERATOR_MAX_BYTES", 1)
+
+    before = dict(module.codex_source_accelerator_memory_stats())
+    module._CODEX_PERIOD_VIEW_CACHE["resident"] = ("payload",) * 8
+    module.enforce_codex_source_accelerator_bounds()
+    observed = dict(module.codex_source_accelerator_memory_stats())
+    if outcome == "error":
+        assert observed["measurementErrorCount"] > before[
+            "measurementErrorCount"]
+        assert module._CODEX_PERIOD_VIEW_CACHE["resident"] == ("payload",) * 8
+    else:
         assert not module._CODEX_PERIOD_VIEW_CACHE
-        observed = dict(module.codex_source_accelerator_memory_stats())
-        assert observed["fallbackCount"] >= 1
-        if outcome == "error":
-            assert observed["measurementErrorCount"] >= 1
-    finally:
-        worker.shutdown()
-        module.set_codex_source_memory_completion_lock(None)
+        # #769 S6 T2a remediation: an entry whose own charge exceeds the whole
+        # budget is now refused AT THE WRITE rather than admitted and evicted
+        # by the next pass, so the unsafe outcome is counted as an admission
+        # refusal. Either counter moving proves the entry was not retained;
+        # requiring the eviction one specifically would assert that it had to
+        # be admitted first.
+        assert (
+            observed["admissionRefusalCount"] > before["admissionRefusalCount"]
+            or observed["fallbackCount"] > before["fallbackCount"]), (
+            "an entry above the whole budget must be refused or evicted, and "
+            "the counter that says which must move")
+    module.reset_codex_source_caches()
 
 
 @pytest.mark.parametrize("outcome", ["over-cap", "error"])
@@ -1650,33 +1830,45 @@ def test_snapshot_memory_worker_enforces_completion_without_another_publisher(
         snapshot.reset_owner_thread()
 
 
-def test_source_accelerator_admission_remeasures_only_mutated_generations(
-    source_env, monkeypatch,
+def test_source_accelerator_admission_charges_only_what_was_mutated(
+    source_env,
 ):
-    """Unchanged ticks do not rescan retained history; same-key writes do."""
+    """Unchanged ticks rescan nothing; a same-key write recharges one entry.
+
+    The old shape of this bound counted SUBMISSIONS to a background verifier,
+    which is what dirty-generation scheduling was for. Nothing is scheduled
+    now, so the bound is stated where it belongs: a charge happens once per
+    mutation, an unchanged tick performs none, and a replacement that changes
+    retained bytes without moving `entryCount` still moves the total.
+    """
     _ns, _cache, _stats, module = source_env
     module.reset_codex_source_caches()
-    submissions = []
+    charges = []
+    original = module._CODEX_PERIOD_VIEW_CACHE._cache_owner_charge
 
-    class _Worker:
-        def submit(self, generation, snapshot):
-            submissions.append((generation, snapshot))
+    def counted(key, value):
+        charges.append(key)
+        return original(key, value)
 
-        def take_result(self):
-            return None
+    module._CODEX_PERIOD_VIEW_CACHE._cache_owner_charge = counted
+    try:
+        module._CODEX_PERIOD_VIEW_CACHE["one"] = ("payload",) * 24
+        assert len(charges) == 1
 
-    monkeypatch.setattr(module, "_CODEX_SOURCE_MEMORY_WORKER", _Worker())
-    module._CODEX_PERIOD_VIEW_CACHE["one"] = object()
+        module.enforce_codex_source_accelerator_bounds()
+        module.enforce_codex_source_accelerator_bounds()
+        assert len(charges) == 1, (
+            "an unchanged tick must not recharge a resident entry")
+        big = module.codex_source_retained_bytes()
 
-    module.enforce_codex_source_accelerator_bounds()
-    module.enforce_codex_source_accelerator_bounds()
-    assert len(submissions) == 1
-
-    # A replacement can change retained bytes without moving entryCount.
-    module._CODEX_PERIOD_VIEW_CACHE["one"] = object()
-    module.enforce_codex_source_accelerator_bounds()
-    assert len(submissions) == 2
-    assert module.codex_source_accelerator_memory_stats()["entryCount"] == 1
+        module._CODEX_PERIOD_VIEW_CACHE["one"] = ("payload",)
+        assert len(charges) == 2
+        module.enforce_codex_source_accelerator_bounds()
+        assert module.codex_source_retained_bytes() < big
+        assert module.codex_source_accelerator_memory_stats()["entryCount"] == 1
+    finally:
+        module._CODEX_PERIOD_VIEW_CACHE._cache_owner_charge = original
+        module.reset_codex_source_caches()
 
 
 def test_complete_snapshot_accelerator_owner_fails_closed_on_entry_overflow(

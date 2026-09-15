@@ -33,7 +33,10 @@ from __future__ import annotations
 
 import datetime as dt
 import fcntl
+import json
+import os
 import sqlite3
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -44,6 +47,122 @@ UTC = dt.timezone.utc
 # cache_meta throttle key (framework-untracked KV — NO schema migration, F7).
 _RETENTION_LAST_PRUNE_KEY = "conversation_retention_last_prune_at"
 _RETENTION_THROTTLE_SECONDS = 24 * 60 * 60
+
+# --------------------------------------------------------------------------
+# #780 — bounded, resumable reclaim
+# --------------------------------------------------------------------------
+
+#: Durable reclaim state (framework-untracked KV, same class as the throttle
+#: key above — a value shape, not a schema change).
+RECLAIM_PENDING_KEY = "conversation_retention_reclaim_pending"
+
+#: One reclaim pass gets this much wall clock. The pass runs under the
+#: maintenance flock and BOTH provider flocks, so an unbounded run holds all
+#: three: the previous implementation drove the freelist to completion in
+#: 4096-page chunks with no budget at all, and on a multi-GiB store that is
+#: minutes of held locks against a live reader surface.
+#:
+#: THE DEADLINE IS CHECKED BETWEEN CHUNKS, so a pass can exceed it by at most
+#: one chunk, and that bound is stated rather than hidden because
+#: `PRAGMA incremental_vacuum(n)` cannot be preempted. Chunk size is the only
+#: control, and the cost of a chunk is dominated by CACHE STATE, not by `n`.
+#:
+#: Measured on a copy-on-write clone of the production store, cold: 1 page
+#: 0.006 s, 8 pages 0.001 s, 64 pages 0.009 s, 512 pages 7.754 s. An earlier
+#: version of this comment read that series as per-page cost rising with chunk
+#: size and concluded that "no estimator fixes this". The Tranche 3 review
+#: disproved it and the correction matters, because the false version tells
+#: the next maintainer not to bother measuring. Two facts settle it. Warm
+#: passes on the SAME store sustain about 2,300 pages a second at 1,024 and
+#: 2,048-page chunks, so a large chunk is not intrinsically expensive per page.
+#: And the 8-page chunk being SIX TIMES cheaper than the 1-page chunk is not a
+#: size effect at all — it is the second reading of a cold ramp warming up.
+#: The 512-page chunk is the fourth reading of that ramp, and it is expensive
+#: because it is the first one to reach a genuinely cold region of a multi-GiB
+#: file, not because it asked for 512 pages.
+#:
+#: So the real hazard is that the ramp doubles into cold territory before it
+#: has measured a slow chunk there — an estimator built from warm readings
+#: cannot see the first-touch cost of pages nobody has read yet. The growth cap
+#: below is the control that matters for exactly that reason, and a plausible
+#: refinement, not taken here because it is unmeasured, is to require two or
+#: three consecutive chunks at the current size before permitting a doubling,
+#: so a size increase always rests on more than one observation.
+#:
+#: Observed worst case on that store: 9.9 s for the first, cold pass, then
+#: 2.05-2.11 s for every warm pass. That is the overshoot this design accepts,
+#: and it is bounded and reported (`deadline_hit`) rather than unbounded: the
+#: implementation it replaces held the maintenance flock and both provider
+#: flocks for the whole drain, which on the same store was part of a 25-minute
+#: rebuild.
+RECLAIM_DEADLINE_SECONDS = 2.0
+
+#: Chunk sizing. Start small so the FIRST chunk cannot overshoot the deadline
+#: on a cold multi-GiB file, then adapt upward from measured throughput —
+#: DOUBLING at most, and from the SLOWEST rate this pass has seen rather than
+#: the most recent one. Neither is a cure — see the cold-cache first-touch cost
+#: recorded on the deadline above — but together they bound the growth to one
+#: doubling per chunk, so the pass takes many measured steps and the single
+#: chunk that can overshoot is at most twice the last chunk that fit inside the
+#: budget.
+RECLAIM_INITIAL_PAGES = 64
+RECLAIM_MAX_PAGES = 2048
+RECLAIM_CHUNK_GROWTH_FACTOR = 2
+
+#: Backlog bounds. "Unbounded growth is not accepted" needs numbers, so these
+#: are them, and each has a distinct consequence.
+#:   * above ESCALATION, reclaim stops waiting for the daily throttle and
+#:     continues on the next cycle;
+#:   * below MIN_PAGES_PER_SECOND, the pass is recorded as making no progress
+#:     and stays pending — it is never declared complete;
+#:   * above CEILING, doctor raises a FAIL and a new rebuild is refused,
+#:     because a rebuild adds staging churn to a store already failing to drain.
+#:
+#: THE CEILING IS SIZED FROM A MEASUREMENT, not chosen. One full rebuild of a
+#: copy-on-write clone of the 9.2 GB production store left 1,398,528 free pages
+#: — 5.33 GiB, 37% of the file — because reclaim is now budgeted and the
+#: remainder is deferred. A ceiling below that would FAIL doctor and refuse the
+#: next rebuild after every ordinary production-scale rebuild, which is a false
+#: alarm rather than an enforcement mechanism. 16 GiB is three times the
+#: measured single-rebuild leftover.
+#:
+#: The escalation threshold is what actually drains it. Measured steady rate on
+#: the same clone: about 2,300 pages a second, so roughly 4,600 pages a 2 s
+#: pass, so about 300 passes for that backlog. At the daily throttle that is
+#: 300 days; at the escalated per-cycle cadence it is under an hour. That
+#: ratio is the reason escalation exists.
+RECLAIM_ESCALATION_BYTES = 256 * 1024 * 1024
+RECLAIM_MIN_PAGES_PER_SECOND = 1.0
+RECLAIM_CEILING_BYTES = 16 * 1024 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ReclaimOutcome:
+    """What one bounded reclaim pass observed. Never a claim about the file."""
+
+    freelist_before: int = 0
+    freelist_after: int = 0
+    page_size: int = 0
+    pages_reclaimed: int = 0
+    duration_s: float = 0.0
+    deadline_hit: bool = False
+
+    @property
+    def unreclaimed_bytes(self) -> int:
+        return max(0, self.freelist_after) * max(0, self.page_size)
+
+    @property
+    def made_progress(self) -> bool:
+        if self.pages_reclaimed <= 0:
+            return False
+        if self.duration_s <= 0:
+            return True
+        return (self.pages_reclaimed / self.duration_s) >= (
+            RECLAIM_MIN_PAGES_PER_SECOND)
+
+    @property
+    def freelist_drained(self) -> bool:
+        return self.freelist_after <= 0
 
 
 @dataclass(frozen=True)
@@ -221,25 +340,257 @@ def _stamp_retention_prune(conn: sqlite3.Connection, now_utc: dt.datetime) -> No
     )
 
 
-def _reclaim_incremental_vacuum(conn: sqlite3.Connection) -> None:
-    """Drive zero-column incremental-vacuum rows to completion portably."""
-    remaining = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
-    if remaining <= 0:
-        return
-    chunk_pages = 4096
-    max_passes = (remaining + chunk_pages - 1) // chunk_pages + 1
-    for _ in range(max_passes):
-        requested = min(remaining, chunk_pages)
-        # executescript() routes through sqlite3_exec(), which steps zero-column
-        # pragma rows through SQLITE_DONE on Python/SQLite combinations where a
-        # Cursor.fetchall() can stop after the first row (public Linux 3.11).
-        conn.executescript(f"PRAGMA incremental_vacuum({requested});")
-        after = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
-        if after <= 0:
-            return
+def _run_incremental_vacuum_chunk(conn: sqlite3.Connection, pages: int) -> int:
+    """Reclaim at most ``pages`` freelist pages; return the freelist count after.
+
+    The one seam every chunk goes through, so a test can replace it to hold the
+    real SQLite write lock at a barrier and observe what a concurrent reader
+    does. ``executescript()`` routes through ``sqlite3_exec()``, which steps
+    zero-column pragma rows through ``SQLITE_DONE`` on Python/SQLite
+    combinations where ``Cursor.fetchall()`` can stop after the first row
+    (public Linux 3.11).
+    """
+    conn.executescript(f"PRAGMA incremental_vacuum({int(pages)});")
+    return int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+
+
+def _reclaim_incremental_vacuum(
+    conn: sqlite3.Connection,
+    *,
+    deadline_seconds: float = RECLAIM_DEADLINE_SECONDS,
+    clock: "Callable[[], float]" = time.monotonic,
+) -> ReclaimOutcome:
+    """Reclaim freelist pages under a monotonic wall-clock budget (#780).
+
+    The pass runs under the maintenance flock and both provider flocks, so its
+    cost is a cost every reader and both ingesters pay. It therefore stops at
+    the deadline and leaves the remainder for the next pass rather than driving
+    the freelist to zero however long that takes.
+
+    Chunks start small and adapt to measured throughput, so a slow disk cannot
+    overshoot the budget on the first chunk and a fast one is not held to 64
+    pages a chunk for the whole pass. The freelist is re-read after every
+    chunk, which is also how a chunk that reclaimed nothing is detected.
+    """
+    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    before = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    started = clock()
+    if before <= 0:
+        return ReclaimOutcome(
+            freelist_before=before, freelist_after=before, page_size=page_size)
+    remaining = before
+    pages = RECLAIM_INITIAL_PAGES
+    # The SLOWEST rate observed in THIS pass, not the most recent one. A cold
+    # store's per-page cost is about twenty times its warm cost, so sizing the
+    # next chunk from the chunk just measured is optimistic exactly when it
+    # matters: measured on a clone of the production store, that estimator ran
+    # a first pass to 7.9 s against a 2.0 s budget. Taking the minimum makes
+    # one slow chunk hold the rest of the pass conservative, and the estimate
+    # resets each pass, so a warm pass still ramps.
+    slowest_rate = None
+    deadline_hit = False
+    while remaining > 0:
+        elapsed = clock() - started
+        if elapsed >= deadline_seconds:
+            deadline_hit = True
+            break
+        requested = min(remaining, pages)
+        chunk_started = clock()
+        after = _run_incremental_vacuum_chunk(conn, requested)
+        chunk_elapsed = max(clock() - chunk_started, 0.0)
         if after >= remaining:
-            return
+            # The chunk reclaimed nothing. Continuing would spin against a
+            # store that is not releasing pages.
+            remaining = after
+            break
+        if chunk_elapsed > 0:
+            # Aim each chunk at a quarter of the remaining budget, so the pass
+            # takes several measured steps rather than one guess — and never
+            # more than DOUBLE the chunk just measured, so a cold first chunk
+            # cannot extrapolate the pass past its deadline.
+            rate = (remaining - after) / chunk_elapsed
+            slowest_rate = (
+                rate if slowest_rate is None else min(slowest_rate, rate))
+            budget_left = max(deadline_seconds - (clock() - started), 0.0)
+            pages = int(max(
+                RECLAIM_INITIAL_PAGES,
+                min(RECLAIM_MAX_PAGES,
+                    slowest_rate * budget_left / 4,
+                    requested * RECLAIM_CHUNK_GROWTH_FACTOR),
+            ))
         remaining = after
+    return ReclaimOutcome(
+        freelist_before=before,
+        freelist_after=remaining,
+        page_size=page_size,
+        pages_reclaimed=max(0, before - remaining),
+        duration_s=max(clock() - started, 0.0),
+        deadline_hit=deadline_hit,
+    )
+
+
+def _resolve_main_db_path(conn: sqlite3.Connection):
+    """The file behind this connection's ``main`` schema.
+
+    Read off the connection rather than assumed, because the orchestrator is
+    called with a conversations connection by the dashboard and with a cache
+    connection by the from-zero-replay callers; measuring the wrong family's
+    size would report a reclaim against a file the pass never touched. Falls
+    back to the conversations path when the connection reports no file, which
+    is the in-memory case.
+    """
+    try:
+        for _seq, name, file_name in conn.execute("PRAGMA database_list"):
+            if name == "main" and file_name:
+                return file_name
+    except sqlite3.Error:
+        pass
+    return _cctally_core.CONVERSATIONS_DB_PATH
+
+
+def _db_family_bytes(path) -> int:
+    """Database plus WAL plus shm, in bytes. Missing members count as zero."""
+    total = 0
+    base = str(path)
+    for member in (base, base + "-wal", base + "-shm"):
+        try:
+            total += os.path.getsize(member)
+        except OSError:
+            continue
+    return total
+
+
+def _checkpoint_truncate(conn: sqlite3.Connection) -> "tuple[int, int, int] | None":
+    """`wal_checkpoint(TRUNCATE)`, returning its `(busy, log, checkpointed)` row.
+
+    Completion is PHYSICAL, not a freelist reading. `incremental_vacuum` moves
+    pages off the freelist and drops `page_count`, but the bytes stay in the
+    WAL until it is truncated, so clearing the pending state at
+    `freelist_count == 0` would declare success while the space is still
+    occupied. Returns None when the checkpoint could not run at all.
+    """
+    try:
+        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    return (int(row[0]), int(row[1]), int(row[2]))
+
+
+def read_reclaim_pending(conn: sqlite3.Connection) -> "dict | None":
+    """The durable reclaim backlog record, or None when nothing is pending."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key=?",
+            (RECLAIM_PENDING_KEY,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or not row[0]:
+        return None
+    try:
+        state = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _write_reclaim_pending(conn: sqlite3.Connection, state: "dict | None") -> None:
+    if state is None:
+        conn.execute("DELETE FROM cache_meta WHERE key=?", (RECLAIM_PENDING_KEY,))
+        return
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (RECLAIM_PENDING_KEY, json.dumps(state, sort_keys=True)),
+    )
+
+
+def reclaim_backlog_bytes(state: "dict | None") -> int:
+    """Unreclaimed bytes a pending record reports, or 0 when nothing is."""
+    if not state:
+        return 0
+    try:
+        return max(0, int(state.get("unreclaimed_bytes") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def reclaim_backlog_escalated(state: "dict | None") -> bool:
+    """Whether the backlog is large enough to stop waiting a whole day."""
+    return reclaim_backlog_bytes(state) >= RECLAIM_ESCALATION_BYTES
+
+
+def reclaim_backlog_over_ceiling(state: "dict | None") -> bool:
+    """Whether the backlog has reached the hard ceiling: doctor FAIL, and a new
+    rebuild is refused because it would add staging churn to a store that is
+    already failing to drain."""
+    return reclaim_backlog_bytes(state) >= RECLAIM_CEILING_BYTES
+
+
+def run_reclaim_pass(
+    conn: sqlite3.Connection,
+    *,
+    now_utc: dt.datetime,
+    db_path=None,
+    deadline_seconds: float = RECLAIM_DEADLINE_SECONDS,
+    clock: "Callable[[], float]" = time.monotonic,
+) -> "dict":
+    """One bounded reclaim + checkpoint pass, with durable pending state.
+
+    Returns a phase record: ``{reclaim: {...}, checkpoint: {...}, pending: ...}``.
+    The pending record is retained until a MEASURED reduction in the database
+    family's size, or the checkpoint's own result, shows the space was really
+    returned. A pass that made no progress stays pending and is reported; it is
+    never declared complete.
+    """
+    path = _resolve_main_db_path(conn) if db_path is None else db_path
+    family_before = _db_family_bytes(path)
+    outcome = _reclaim_incremental_vacuum(
+        conn, deadline_seconds=deadline_seconds, clock=clock)
+    checkpoint = _checkpoint_truncate(conn)
+    family_after = _db_family_bytes(path)
+    returned = max(0, family_before - family_after)
+    complete = (
+        outcome.freelist_drained
+        and checkpoint is not None
+        and checkpoint[0] == 0
+        and checkpoint[1] == 0
+    )
+    state = None
+    if not complete:
+        state = {
+            "freelist_count": outcome.freelist_after,
+            "unreclaimed_bytes": outcome.unreclaimed_bytes,
+            "attempted_at": now_utc.astimezone(UTC).isoformat(),
+            "made_progress": bool(outcome.made_progress),
+            "deadline_hit": bool(outcome.deadline_hit),
+        }
+    # Write and commit ONLY when the record actually changed. A pass over a
+    # store with no backlog would otherwise issue a no-op DELETE and a commit
+    # on every cycle, which is both pointless and visible to callers counting
+    # transaction boundaries.
+    if state != read_reclaim_pending(conn):
+        _write_reclaim_pending(conn, state)
+        conn.commit()
+    return {
+        "reclaim": {
+            "pages_reclaimed": outcome.pages_reclaimed,
+            "freelist_before": outcome.freelist_before,
+            "freelist_after": outcome.freelist_after,
+            "duration_s": outcome.duration_s,
+            "deadline_hit": outcome.deadline_hit,
+            "made_progress": outcome.made_progress,
+        },
+        "checkpoint": {
+            "result": checkpoint,
+            "bytes_returned": returned,
+            "family_bytes": family_after,
+        },
+        "pending": state,
+        "complete": complete,
+    }
 
 
 def _maybe_prune_conversation_retention(
@@ -248,6 +599,7 @@ def _maybe_prune_conversation_retention(
     now_utc: dt.datetime,
     retention_days: int,
     force: bool = False,
+    record_phase: "Callable[[str, dict], None] | None" = None,
 ) -> "PruneStats | None":
     """Throttled, flock-serialized transcript retention prune (F7 + F9).
 
@@ -287,8 +639,14 @@ def _maybe_prune_conversation_retention(
             fcntl.flock(maint_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (BlockingIOError, OSError):
             return None  # another prune holds it; skip cleanly, do NOT stamp
+        # The daily throttle governs DELETION. A reclaim backlog above the
+        # escalation threshold still continues on the next cycle, because a
+        # doctor warning once a day is a report, not an enforcement mechanism.
+        reclaim_only = False
         if not force and not _retention_due(conn, now_utc):
-            return None
+            if not reclaim_backlog_escalated(read_reclaim_pending(conn)):
+                return None
+            reclaim_only = True
         claude_fh = open(core.CONVERSATIONS_LOCK_PATH, "w")
         try:
             try:
@@ -321,6 +679,18 @@ def _maybe_prune_conversation_retention(
                     fcntl.flock(maint_fh, fcntl.LOCK_SH)
                 except OSError:
                     pass  # keep the exclusive hold; correctness is unchanged
+                if reclaim_only:
+                    # Deletion is throttled; the backlog is not. Nothing here
+                    # stamps the throttle, so the ordinary daily deletion still
+                    # happens on its own schedule.
+                    try:
+                        phases = run_reclaim_pass(conn, now_utc=now_utc)
+                    except sqlite3.Error:
+                        phases = None
+                    if phases is not None and record_phase is not None:
+                        record_phase("reclaim", phases["reclaim"])
+                        record_phase("checkpoint", phases["checkpoint"])
+                    return None
                 cutoff = now_utc - dt.timedelta(days=int(retention_days))
                 conn.execute("BEGIN IMMEDIATE")
                 try:
@@ -328,6 +698,7 @@ def _maybe_prune_conversation_retention(
                         conn.commit()
                         conn.execute("BEGIN IMMEDIATE")
 
+                    delete_started = time.monotonic()
                     stats = prune_conversation_transcripts(
                         conn,
                         cutoff_utc=cutoff,
@@ -338,6 +709,13 @@ def _maybe_prune_conversation_retention(
                 except Exception:
                     conn.rollback()
                     raise
+                if record_phase is not None:
+                    record_phase("delete", {
+                        "duration_s": max(
+                            time.monotonic() - delete_started, 0.0),
+                        "claude_messages": stats.claude_messages,
+                        "codex_events": stats.codex_events,
+                    })
                 # Return the freed pages to the OS. On an INCREMENTAL auto-vacuum
                 # cache.db (the default for freshly-created DBs, #313 P3) this
                 # shrinks the file on disk instead of leaving a growing freelist,
@@ -348,15 +726,25 @@ def _maybe_prune_conversation_retention(
                 # still under the maintenance + provider flocks (no concurrent
                 # writer), and best-effort — a reclaim error must never fail the
                 # already-durable prune.
-                if stats.total_rows > 0:
+                # Deletion is complete and durable at this point, and only
+                # deletion completion is stamped. Reclaim is a SEPARATE phase
+                # with its own budget and its own durable pending state, so a
+                # pass that runs out of budget continues on the next cycle
+                # instead of holding three flocks until the freelist drains.
+                #
+                # A pass with no new deletion still continues an outstanding
+                # backlog: the previous implementation reclaimed only when the
+                # prune had deleted something, so a store that fell behind had
+                # no way to catch up.
+                pending_before = read_reclaim_pending(conn)
+                if stats.total_rows > 0 or pending_before is not None:
                     try:
-                        # Use the sqlite3_exec path and verify progress between
-                        # bounded chunks. This clears the freelist and drops
-                        # page_count; the physical file shrinks on the next
-                        # `wal_checkpoint(TRUNCATE)` the sync loop forces (#297).
-                        _reclaim_incremental_vacuum(conn)
+                        phases = run_reclaim_pass(conn, now_utc=now_utc)
                     except sqlite3.Error:
-                        pass
+                        phases = None
+                    if phases is not None and record_phase is not None:
+                        record_phase("reclaim", phases["reclaim"])
+                        record_phase("checkpoint", phases["checkpoint"])
                 return stats
             finally:
                 try:

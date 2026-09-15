@@ -50,18 +50,18 @@ function envWithTrend(weekCount: number): Envelope {
 }
 
 describe('TrendPanel card week count (TR-1 / #251)', () => {
-  it('renders the real week count in the card sub, never hardcoded "8 weeks"', () => {
+  it('renders the real week count in the card sub, never hardcoded "8 cycles"', () => {
     updateSnapshot(envWithTrend(6));
     render(<TrendPanel />);
     const sub = document.querySelector('#panel-trend .sub') as HTMLElement;
-    expect(sub.textContent).toBe('(6 weeks)');
+    expect(sub.textContent).toBe('(6 cycles)');
   });
 
-  it('singularizes the count for a one-week stub', () => {
+  it('singularizes the count for a one-cycle stub', () => {
     updateSnapshot(envWithTrend(1));
     render(<TrendPanel />);
     const sub = document.querySelector('#panel-trend .sub') as HTMLElement;
-    expect(sub.textContent).toBe('(1 week)');
+    expect(sub.textContent).toBe('(1 cycle)');
   });
 });
 
@@ -262,7 +262,7 @@ describe('TrendPanel source seam — no Claude leak under Codex (#294 S5)', () =
       .toEqual(['trend-rows-claude', 'trend-rows-codex']);
   });
 
-  it('uses cycle vocabulary for the Codex series without changing Claude (#576)', () => {
+  it('uses the cycle vocabulary for BOTH series (#576, re-argued by #750 S4)', () => {
     const env = trendLeakEnv();
     const template = env.sources!.codex.data!.periods.weekly.rows[0];
     env.sources!.codex.data!.periods.weekly.rows = [
@@ -277,9 +277,10 @@ describe('TrendPanel source seam — no Claude leak under Codex (#294 S5)', () =
     const claude = container.querySelector('[data-provider-section="claude"]')!;
     const codex = container.querySelector('[data-provider-section="codex"]')!;
 
-    expect(claude.querySelector('[data-col="week"]')?.textContent).toContain('Week');
+    // #750 S4 §4.1: one vocabulary — the Claude column counts cycles too.
+    expect(claude.querySelector('[data-col="week"]')?.textContent).toContain('Cycle');
     expect(claude.querySelector('[role="img"]')?.getAttribute('aria-label')).toMatch(
-      /3 weeks.*prior week/,
+      /3 cycles.*prior cycle/,
     );
 
     expect(codex.querySelector('[data-col="week"]')?.textContent).toContain('Cycle');
@@ -351,6 +352,58 @@ describe('#569 — the Trend composition renders outside the truncating h2', () 
     updateSnapshot(envWithTrend(6));
     const { container } = render(<TrendPanel />);
     expect(container.querySelector('#panel-trend .panel-range-note')!.textContent)
-      .toBe('(6 weeks)');
+      .toBe('(6 cycles)');
+  });
+});
+
+// #750 S4 §3.1 / §3.4 / D5. An in-place credit splits one week into cycles
+// that can render the same year-free label, so `label` alone gave React
+// duplicate keys. The shipped bundle is a production build with the
+// duplicate-key warning compiled out, so the keys are read from the fibers
+// directly rather than inferred from console output.
+function sameDayCreditedEnvelope(): Envelope {
+  const env = baseEnvelope();
+  const weeks: TrendRow[] = [
+    { label: 'May 15', week_start_at: '2026-05-15T02:00:00Z', used_pct: 30,
+      dollar_per_pct: 1, delta: null, is_current: false },
+    { label: 'May 15', week_start_at: '2026-05-15T08:00:00Z', used_pct: 20,
+      dollar_per_pct: 2, delta: null, is_current: false },
+    { label: 'May 15', week_start_at: '2026-05-15T14:00:00Z', used_pct: 10,
+      dollar_per_pct: 3, delta: null, is_current: true },
+  ];
+  env.trend = {
+    weeks, spark_heights: [1, 2, 3], history: weeks,
+    avg_dollars_per_pct: null,
+  };
+  return env;
+}
+
+function rowFiberKeys(container: HTMLElement): string[] {
+  return Array.from(container.querySelectorAll('tbody tr')).map((el) => {
+    const fiberKey = Object.keys(el).find((k) => k.startsWith('__reactFiber$'));
+    if (!fiberKey) return '';
+    return String(
+      (el as unknown as Record<string, { key: string | null }>)[fiberKey].key,
+    );
+  });
+}
+
+describe('<TrendPanel /> — credited-week row identity (#750 S4)', () => {
+  it('renders distinct React fiber keys for three same-day cycles', () => {
+    updateSnapshot(sameDayCreditedEnvelope());
+    const { container } = render(<TrendPanel />);
+    const keys = rowFiberKeys(container).filter((k) => k !== '');
+    expect(keys.length).toBe(3);
+    expect(new Set(keys).size).toBe(3);
+  });
+
+  it('still renders when an older envelope omits week_start_at', () => {
+    const env = sameDayCreditedEnvelope();
+    env.trend!.weeks = env.trend!.weeks.map(({ week_start_at: _drop, ...rest }) => rest);
+    env.trend!.history = env.trend!.weeks;
+    updateSnapshot(env);
+    const { container } = render(<TrendPanel />);
+    // Degrades to today's label keying rather than crashing.
+    expect(container.querySelectorAll('tbody tr').length).toBeGreaterThan(0);
   });
 });
